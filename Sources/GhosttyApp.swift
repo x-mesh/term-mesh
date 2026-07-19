@@ -364,6 +364,27 @@ class GhosttyApp {
             let pasteboard = GhosttyPasteboardHelper.pasteboard(for: location)
             let value = pasteboard.flatMap { GhosttyPasteboardHelper.stringContents(from: $0) } ?? ""
 
+            // A picture or a Finder file pastes as a local PATH, which is what a
+            // CLI agent can act on. That path is meaningless on a peer, so when
+            // one is connected the bytes are sent across first and the peer's
+            // path is pasted instead. Off the main thread and completed later —
+            // ghostty keeps the request alive because we returned true — so a
+            // multi-megabyte screenshot does not freeze the UI.
+            // The clipboard callback already runs on the main actor, which is
+            // where the connection list lives; only the copy itself moves off it.
+            if let localPath = RemotePasteTransfer.localPath(from: value),
+               let target = MainActor.assumeIsolated({ RemotePasteTransfer.destination() }) {
+                DispatchQueue.global(qos: .userInitiated).async {
+                    let pasted = RemotePasteTransfer.send(localPath: localPath, to: target) ?? value
+                    DispatchQueue.main.async {
+                        pasted.withCString { ptr in
+                            ghostty_surface_complete_clipboard_request(surface, ptr, state, false)
+                        }
+                    }
+                }
+                return true
+            }
+
             value.withCString { ptr in
                 ghostty_surface_complete_clipboard_request(surface, ptr, state, false)
             }
@@ -523,6 +544,13 @@ class GhosttyApp {
         let contents = """
         # term-mesh baseline defaults. User config overrides these.
         shell-integration-features = ssh-env,ssh-terminfo
+        # Viewport scrollback keys. Ghostty's built-in defaults for these are
+        # not present in term-mesh's programmatically-built config, so restore
+        # them explicitly (Shift+PageUp/Down page-scroll, Shift+Home/End jump).
+        keybind = shift+page_up=scroll_page_up
+        keybind = shift+page_down=scroll_page_down
+        keybind = shift+home=scroll_to_top
+        keybind = shift+end=scroll_to_bottom
         """
         guard let url = Self.baselineDefaultsURL() else { return }
         do {
@@ -989,7 +1017,18 @@ class GhosttyApp {
             return true
         }
 
-        guard let surfaceView = callbackContext?.surfaceView else { return false }
+        // Every surface-targeted action dies here when the view cannot be
+        // resolved, before any case runs, so a dropped action is indis-
+        // tinguishable from one ghostty never sent. Say which it was for the
+        // actions we depend on.
+        guard let surfaceView = callbackContext?.surfaceView else {
+            #if DEBUG
+            if action.tag == GHOSTTY_ACTION_PWD {
+                dlog("pwd.dropped no surfaceView (tab=\(callbackTabId?.uuidString.prefix(8) ?? "<nil>") surface=\(callbackSurfaceId?.uuidString.prefix(8) ?? "<nil>"))")
+            }
+            #endif
+            return false
+        }
         if action.tag == GHOSTTY_ACTION_RELOAD_CONFIG ||
             action.tag == GHOSTTY_ACTION_CONFIG_CHANGE ||
             action.tag == GHOSTTY_ACTION_COLOR_CHANGE {
@@ -1147,9 +1186,18 @@ class GhosttyApp {
             }
             return true
         case GHOSTTY_ACTION_PWD:
+            let pwd = action.action.pwd.pwd.flatMap { String(cString: $0) } ?? ""
+            // The only place a working directory is learned from the terminal
+            // stream, and it fires for local panes only: Ghostty refuses an
+            // OSC 7 whose hostname is not local, so a pane hosted on another
+            // machine never reaches here. That is why a remote pane's
+            // directory is asked of its host instead (Workspace
+            // `remoteDirectory(for:)`) rather than waited for here.
+            #if DEBUG
+            dlog("pwd.action pwd=\(pwd) tabId=\(surfaceView.tabId?.uuidString.prefix(8) ?? "<nil>") surfaceId=\(surfaceView.terminalSurface?.id.uuidString.prefix(8) ?? "<nil>")")
+            #endif
             guard let tabId = surfaceView.tabId,
                   let surfaceId = surfaceView.terminalSurface?.id else { return true }
-            let pwd = action.action.pwd.pwd.flatMap { String(cString: $0) } ?? ""
             DispatchQueue.main.async {
                 AppDelegate.shared?.tabManager?.updateSurfaceDirectory(
                     tabId: tabId,

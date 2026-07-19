@@ -71,10 +71,7 @@ pub async fn emit(
         .or_else(|| {
             tasks.iter().find(|t| {
                 let st = t.get("status").and_then(|s| s.as_str()).unwrap_or("");
-                !matches!(
-                    st,
-                    "completed" | "failed" | "abandoned" | "cancelled"
-                )
+                !matches!(st, "completed" | "failed" | "abandoned" | "cancelled")
             })
         });
 

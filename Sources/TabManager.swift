@@ -894,7 +894,12 @@ class TabManager: ObservableObject {
     // MARK: - Surface Directory Updates (Backwards Compatibility)
 
     func updateSurfaceDirectory(tabId: UUID, surfaceId: UUID, directory: String) {
-        guard let tab = tabs.first(where: { $0.id == tabId }) else { return }
+        guard let tab = tabs.first(where: { $0.id == tabId }) else {
+            #if DEBUG
+            dlog("pwd.drop no tab \(tabId.uuidString.prefix(8)) among \(tabs.count)")
+            #endif
+            return
+        }
         let normalized = normalizeDirectory(directory)
         tab.updatePanelDirectory(panelId: surfaceId, directory: normalized)
     }
@@ -968,7 +973,36 @@ class TabManager: ObservableObject {
             let replacement = addWorkspace(select: true)
             tabs.remove(at: tabs.firstIndex(where: { $0.id == workspace.id }) ?? index)
             selectedTabId = replacement.id
+
+            // Peer federation: the WorkspaceRemoved push below only tells
+            // attached clients the OLD workspace_id is gone — without this,
+            // a push-only viewer's roster goes from "1 workspace" to "0"
+            // and never learns the replacement exists (it never gets a
+            // ListWorkspaces re-poll). `replacement`'s own bonsplit
+            // delegate hasn't fired yet (wired up after Workspace.init
+            // returns), so nothing else announces it — post the same
+            // layout-changed signal a normal new-tab/split does.
+            // PeerHostCoordinator's existing debounce (120 ms) plus
+            // GhosttyPaneSurfaceProvider.listWorkspaces()'s own lazy-surface
+            // poll (up to 300 ms) already tolerate the replacement's
+            // ghostty_surface_t not being ready yet at this exact instant —
+            // no extra "wait for pane" step is needed here.
+            replacement.postPeerLayoutChange()
         }
+
+        // Peer federation: tell PeerHostCoordinator this workspace_id is
+        // gone regardless of how it was closed — peer-initiated
+        // DeleteWorkspaceRequest (GhosttyPaneSurfaceProvider.deleteWorkspace
+        // calls closeWorkspace directly) or host-local UI (Cmd+W, sidebar,
+        // tab-bar). Fires the ORIGINAL workspace's id even in the
+        // last-tab self-heal branch above — the id that's actually gone,
+        // not its blank replacement. No-op when no peer server is running
+        // (NotificationCenter post with zero observers).
+        NotificationCenter.default.post(
+            name: .peerWorkspaceDidClose,
+            object: nil,
+            userInfo: ["workspaceID": workspace.id]
+        )
 
         scheduleSessionSave()
     }

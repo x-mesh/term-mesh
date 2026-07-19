@@ -220,9 +220,13 @@ pub struct Context {
     /// R4: runner + sink cloned into Context so `watch.trigger_now` can fire
     /// checks directly without routing through the scheduler's interval loop.
     pub watch_runner: Option<Arc<dyn crate::headless::one_shot::WatchCheckRunner>>,
-    pub watch_sink: Option<tokio::sync::mpsc::UnboundedSender<crate::headless::one_shot::WatchCheckOutcome>>,
+    pub watch_sink:
+        Option<tokio::sync::mpsc::UnboundedSender<crate::headless::one_shot::WatchCheckOutcome>>,
     pub pane_tracker: PaneTracker,
     pub event_tx: EventSender,
+    pub project_registry: Arc<crate::sync::ProjectRegistry>,
+    pub paused_sync_projects: Arc<RwLock<HashSet<String>>>,
+    pub operation_manager: crate::sync::OperationManager,
 }
 
 pub fn default_socket_path() -> PathBuf {
@@ -250,7 +254,9 @@ pub async fn serve(
     headless: Arc<tokio::sync::Mutex<HeadlessManager>>,
     watch_registry: crate::drift_watch::WatchRegistry,
     watch_runner: Option<Arc<dyn crate::headless::one_shot::WatchCheckRunner>>,
-    watch_sink: Option<tokio::sync::mpsc::UnboundedSender<crate::headless::one_shot::WatchCheckOutcome>>,
+    watch_sink: Option<
+        tokio::sync::mpsc::UnboundedSender<crate::headless::one_shot::WatchCheckOutcome>,
+    >,
     mut shutdown_rx: watch::Receiver<bool>,
 ) -> anyhow::Result<()> {
     if path.exists() {
@@ -264,6 +270,19 @@ pub async fn serve(
     let owner_uid = current_uid();
     let (event_tx, _) = tokio::sync::broadcast::channel(256);
     let pane_tracker = PaneTracker::new().start();
+    let project_registry = Arc::new(
+        crate::sync::ProjectRegistry::open(crate::sync::default_registry_db_path()).map_err(
+            |error| {
+                tracing::error!("project registry open failed: {error:?}");
+                error
+            },
+        )?,
+    );
+    let operation_manager = build_sync_operation_manager(project_registry.clone())
+        .map_err(|error| {
+            tracing::error!("sync operation manager setup failed: {error:?}");
+            error
+        })?;
     let ctx = Arc::new(Context {
         monitor_rx,
         monitor_handle,
@@ -278,6 +297,9 @@ pub async fn serve(
         watch_sink,
         pane_tracker,
         event_tx,
+        project_registry,
+        paused_sync_projects: Arc::new(RwLock::new(HashSet::new())),
+        operation_manager,
     });
     let heartbeat_task = tokio::spawn(run_heartbeat_staleness_watcher(
         ctx.clone(),
@@ -386,7 +408,7 @@ async fn handle_connection(
     mut shutdown_rx: watch::Receiver<bool>,
 ) -> anyhow::Result<()> {
     let (reader, mut writer) = stream.into_split();
-    let mut lines = BufReader::new(reader).lines();
+    let mut reader = BufReader::new(reader);
 
     loop {
         let line = tokio::select! {
@@ -396,10 +418,29 @@ async fn handle_connection(
                 }
                 continue;
             }
-            line = timeout(Duration::from_secs(60), lines.next_line()) => {
+            line = timeout(
+                Duration::from_secs(60),
+                read_bounded_line(&mut reader, crate::sync::MAX_OPERATION_ENVELOPE_BYTES),
+            ) => {
                 match line.map_err(|_| anyhow::anyhow!("read timeout"))?? {
-                    Some(line) => line,
-                    None => break,
+                    BoundedLine::Line(line) => line,
+                    BoundedLine::TooLarge => {
+                        let resp = Response {
+                            id: None,
+                            result: None,
+                            error: Some(RpcError {
+                                code: -32600,
+                                message: "request envelope exceeds 64 KiB".to_string(),
+                            }),
+                        };
+                        let mut buf = serde_json::to_vec(&resp)?;
+                        buf.push(b'\n');
+                        timeout(Duration::from_secs(5), writer.write_all(&buf))
+                            .await
+                            .map_err(|_| anyhow::anyhow!("write timeout"))??;
+                        continue;
+                    }
+                    BoundedLine::Eof => break,
                 }
             }
         };
@@ -424,17 +465,17 @@ async fn handle_connection(
             }
         };
 
-        tracing::debug!("req: {} {:?}", req.method, req.params);
+        tracing::debug!("req method={}", req.method);
 
         // Streaming handlers hold the writer for their lifetime and must
         // exit handle_connection entirely — they cannot share the loop.
         if req.method == "events.subscribe" {
-            return stream_subscribe_events(req, writer, lines, ctx, shutdown_rx).await;
+            return stream_subscribe_events(req, writer, reader, ctx, shutdown_rx).await;
         }
 
         let resp = dispatch(&req, ctx).await;
 
-        let mut buf = serde_json::to_vec(&resp)?;
+        let mut buf = serialize_bounded_response(&resp, req.id.clone())?;
         buf.push(b'\n');
         timeout(Duration::from_secs(5), writer.write_all(&buf))
             .await
@@ -444,8 +485,96 @@ async fn handle_connection(
     Ok(())
 }
 
-/// Streaming handler for `events.subscribe`. Takes ownership of the writer and
-/// streams JSONL events until the timeout expires or the client disconnects.
+fn serialize_bounded_response(
+    response: &Response,
+    id: Option<serde_json::Value>,
+) -> Result<Vec<u8>, serde_json::Error> {
+    if let BoundedSerialization::Payload(encoded) = serialize_bounded(response)? {
+        return Ok(encoded);
+    }
+    serde_json::to_vec(&Response {
+        id,
+        result: None,
+        error: Some(RpcError {
+            code: -32603,
+            message: "response envelope exceeds 64 KiB".to_string(),
+        }),
+    })
+}
+
+enum BoundedSerialization {
+    Payload(Vec<u8>),
+    TooLarge,
+}
+
+fn serialize_bounded<T: serde::Serialize>(
+    value: &T,
+) -> Result<BoundedSerialization, serde_json::Error> {
+    let encoded = serde_json::to_vec(value)?;
+    if encoded.len() <= crate::sync::MAX_OPERATION_ENVELOPE_BYTES {
+        Ok(BoundedSerialization::Payload(encoded))
+    } else {
+        Ok(BoundedSerialization::TooLarge)
+    }
+}
+
+enum BoundedLine {
+    Line(String),
+    TooLarge,
+    Eof,
+}
+
+async fn read_bounded_line<R: tokio::io::AsyncBufRead + Unpin>(
+    reader: &mut R,
+    limit: usize,
+) -> std::io::Result<BoundedLine> {
+    let mut bytes = Vec::with_capacity(limit.min(8 * 1024));
+    let mut too_large = false;
+    loop {
+        let available = reader.fill_buf().await?;
+        if available.is_empty() {
+            if too_large {
+                return Ok(BoundedLine::TooLarge);
+            }
+            if bytes.is_empty() {
+                return Ok(BoundedLine::Eof);
+            }
+            if bytes.len() > limit {
+                return Ok(BoundedLine::TooLarge);
+            }
+            return String::from_utf8(bytes)
+                .map(BoundedLine::Line)
+                .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidData));
+        }
+        let newline = available.iter().position(|byte| *byte == b'\n');
+        let consumed = newline.map_or(available.len(), |index| index + 1);
+        let payload = newline.map_or(available, |index| &available[..index]);
+        if !too_large {
+            if bytes.len().saturating_add(payload.len()) > limit.saturating_add(1) {
+                too_large = true;
+                bytes.clear();
+            } else {
+                bytes.extend_from_slice(payload);
+            }
+        }
+        reader.consume(consumed);
+        if newline.is_some() {
+            if too_large {
+                return Ok(BoundedLine::TooLarge);
+            }
+            if bytes.last() == Some(&b'\r') {
+                bytes.pop();
+            }
+            if bytes.len() > limit {
+                return Ok(BoundedLine::TooLarge);
+            }
+            return String::from_utf8(bytes)
+                .map(BoundedLine::Line)
+                .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidData));
+        }
+    }
+}
+
 /// Streaming handler for `events.subscribe`. Takes ownership of the writer and
 /// streams JSONL events until the timeout expires or the client disconnects.
 ///
@@ -453,7 +582,7 @@ async fn handle_connection(
 async fn stream_subscribe_events(
     req: Request,
     mut writer: tokio::net::unix::OwnedWriteHalf,
-    mut lines: tokio::io::Lines<BufReader<tokio::net::unix::OwnedReadHalf>>,
+    mut reader: BufReader<tokio::net::unix::OwnedReadHalf>,
     ctx: &Context,
     mut shutdown_rx: watch::Receiver<bool>,
 ) -> anyhow::Result<()> {
@@ -488,7 +617,7 @@ async fn stream_subscribe_events(
 
     // Send initial subscription ack.
     let ack = serde_json::json!({
-        "id": req.id,
+        "id": req.id.clone(),
         "result": {
             "status": "subscribed",
             "filter": filter_kinds.iter().collect::<Vec<_>>(),
@@ -496,7 +625,20 @@ async fn stream_subscribe_events(
         },
         "error": null,
     });
-    let mut buf = serde_json::to_vec(&ack)?;
+    let mut buf = match serialize_bounded(&ack)? {
+        BoundedSerialization::Payload(payload) => payload,
+        BoundedSerialization::TooLarge => serialize_bounded_response(
+            &Response {
+                id: req.id.clone(),
+                result: None,
+                error: Some(RpcError {
+                    code: -32603,
+                    message: "subscription ack exceeds 64 KiB".to_string(),
+                }),
+            },
+            req.id.clone(),
+        )?,
+    };
     buf.push(b'\n');
     timeout(Duration::from_secs(5), writer.write_all(&buf))
         .await
@@ -531,7 +673,7 @@ async fn stream_subscribe_events(
                 }
                 _ = tokio::time::sleep_until(dl) => break,
                 _ = ping_interval.tick() => {
-                    Some(serde_json::to_vec(&serde_json::json!({"kind":"keepalive","ts_ms":ts_ms()}))?)
+                    bounded_subscriber_payload(&serde_json::json!({"kind":"keepalive","ts_ms":ts_ms()}))?
                 }
                 recv = event_rx.recv() => {
                     match recv {
@@ -543,11 +685,10 @@ async fn stream_subscribe_events(
                         Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                     }
                 }
-                read_result = lines.next_line() => {
+                read_result = read_bounded_line(&mut reader, crate::sync::MAX_OPERATION_ENVELOPE_BYTES) => {
                     match read_result {
-                        Ok(None) => break,   // client disconnected (EOF)
-                        Err(_) => break,     // read error → treat as disconnect
-                        Ok(Some(_)) => None, // ignore unexpected input from client
+                        Ok(BoundedLine::Eof | BoundedLine::TooLarge) | Err(_) => break,
+                        Ok(BoundedLine::Line(_)) => None,
                     }
                 }
             }
@@ -560,7 +701,7 @@ async fn stream_subscribe_events(
                     None
                 }
                 _ = ping_interval.tick() => {
-                    Some(serde_json::to_vec(&serde_json::json!({"kind":"keepalive","ts_ms":ts_ms()}))?)
+                    bounded_subscriber_payload(&serde_json::json!({"kind":"keepalive","ts_ms":ts_ms()}))?
                 }
                 recv = event_rx.recv() => {
                     match recv {
@@ -572,11 +713,10 @@ async fn stream_subscribe_events(
                         Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                     }
                 }
-                read_result = lines.next_line() => {
+                read_result = read_bounded_line(&mut reader, crate::sync::MAX_OPERATION_ENVELOPE_BYTES) => {
                     match read_result {
-                        Ok(None) => break,   // client disconnected (EOF)
-                        Err(_) => break,     // read error → treat as disconnect
-                        Ok(Some(_)) => None, // ignore unexpected input from client
+                        Ok(BoundedLine::Eof | BoundedLine::TooLarge) | Err(_) => break,
+                        Ok(BoundedLine::Line(_)) => None,
                     }
                 }
             }
@@ -623,7 +763,32 @@ fn filter_and_serialize(
     // leader_session_id filtering is intentionally relaxed in W-2: any subscriber
     // without a leader_session_id filter receives all events (generous default).
     // Per-leader scoping can be tightened in a follow-up without protocol changes.
-    serde_json::to_vec(ev).ok()
+    bounded_subscriber_payload(ev).ok().flatten()
+}
+
+static OVERSIZED_SUBSCRIBER_EVENTS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+fn bounded_subscriber_payload<T: serde::Serialize>(
+    value: &T,
+) -> Result<Option<Vec<u8>>, serde_json::Error> {
+    match serialize_bounded(value)? {
+        BoundedSerialization::Payload(payload) => Ok(Some(payload)),
+        BoundedSerialization::TooLarge => {
+            let count =
+                OVERSIZED_SUBSCRIBER_EVENTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+            let error = serde_json::json!({
+                "kind": "error",
+                "code": "event_too_large",
+                "dropped": true,
+                "oversized_event_count": count,
+            });
+            match serialize_bounded(&error)? {
+                BoundedSerialization::Payload(payload) => Ok(Some(payload)),
+                BoundedSerialization::TooLarge => Ok(None),
+            }
+        }
+    }
 }
 
 /// XK-EVENTS-v1 caps (contract §4 rule 4): whole event and redacted tail.
@@ -1114,10 +1279,7 @@ fn assigned_threshold_for_cli(cli: &str) -> u64 {
     }
 }
 
-async fn run_assigned_timeout_watcher(
-    ctx: Arc<Context>,
-    mut shutdown_rx: watch::Receiver<bool>,
-) {
+async fn run_assigned_timeout_watcher(ctx: Arc<Context>, mut shutdown_rx: watch::Receiver<bool>) {
     let mut interval = tokio::time::interval(Duration::from_secs(30));
     interval.tick().await; // consume immediate first tick
     let mut notified: HashSet<String> = HashSet::new();
@@ -1341,6 +1503,268 @@ async fn dispatch(req: &Request, ctx: &Context) -> Response {
     let result = match req.method.as_str() {
         // --- General ---
         "ping" => Ok(serde_json::json!({"status": "pong"})),
+
+        // --- Durable sync operations (off-main, non-focus) ---
+        "operation.start" => {
+            match serde_json::from_value::<crate::sync::OperationStartParams>(req.params.clone()) {
+                Ok(params) => ctx
+                    .operation_manager
+                    .start(params)
+                    .await
+                    .map_err(|error| error.to_string())
+                    .and_then(operation_json),
+                Err(_) => Err("invalid params".to_string()),
+            }
+        }
+        "operation.status" => {
+            match serde_json::from_value::<crate::sync::OperationIdParams>(req.params.clone()) {
+                Ok(params) => ctx
+                    .operation_manager
+                    .status(&params.operation_id, &params.project_id)
+                    .map_err(|error| error.to_string())
+                    .and_then(operation_json),
+                Err(_) => Err("invalid params".to_string()),
+            }
+        }
+        "operation.cancel" => {
+            match serde_json::from_value::<crate::sync::OperationIdParams>(req.params.clone()) {
+                Ok(params) => ctx
+                    .operation_manager
+                    .cancel(&params.operation_id, &params.project_id)
+                    .map_err(|error| error.to_string())
+                    .and_then(operation_json),
+                Err(_) => Err("invalid params".to_string()),
+            }
+        }
+        "operation.retry" => {
+            match serde_json::from_value::<crate::sync::OperationRetryParams>(req.params.clone()) {
+                Ok(params) => ctx
+                    .operation_manager
+                    .retry(params)
+                    .await
+                    .map_err(|error| error.to_string())
+                    .and_then(operation_json),
+                Err(_) => Err("invalid params".to_string()),
+            }
+        }
+
+        // --- Mesh project control plane (off-main, non-focus) ---
+        "project.add" => match serde_json::from_value::<ProjectAddParams>(req.params.clone()) {
+            Ok(params) => match params.project_id.as_deref().map(parse_project_id).transpose() {
+                Ok(explicit_id) => {
+                    let registry = ctx.project_registry.clone();
+                    let root_path = params.root_path;
+                    tokio::task::spawn_blocking(move || match explicit_id {
+                        Some(id) => registry.add_with_id(&root_path, id),
+                        None => registry.add(&root_path),
+                    })
+                    .await
+                    .map_err(|_| "PROJECT_STORAGE_ERROR: registry worker failed".to_string())
+                    .and_then(|result| result.map_err(registry_error))
+                    .map(|record| project_json(record, false))
+                }
+                Err(error) => Err(error),
+            },
+            Err(_) => Err("INVALID_PARAMS: root_path is required".to_string()),
+        },
+        "project.list" => {
+            let registry = ctx.project_registry.clone();
+            let paused = ctx
+                .paused_sync_projects
+                .read()
+                .map_err(|_| "PROJECT_STATE_ERROR: pause state unavailable".to_string())
+                .map(|set| set.clone());
+            match paused {
+                Err(error) => Err(error),
+                Ok(paused) => tokio::task::spawn_blocking(move || registry.list())
+                    .await
+                    .map_err(|_| "PROJECT_STORAGE_ERROR: registry worker failed".to_string())
+                    .and_then(|result| result.map_err(registry_error))
+                    .map(|records| {
+                        let projects = records
+                            .into_iter()
+                            .map(|record| {
+                                let is_paused = paused.contains(&record.project_id.to_string());
+                                project_json(record, is_paused)
+                            })
+                            .collect::<Vec<_>>();
+                        serde_json::json!({ "projects": projects })
+                    }),
+            }
+        }
+        "project.status" => match project_id_param(&req.params) {
+            Ok(project_id) => match load_project(ctx, project_id).await {
+                Ok(record) => ctx
+                    .paused_sync_projects
+                    .read()
+                    .map_err(|_| "PROJECT_STATE_ERROR: pause state unavailable".to_string())
+                    .map(|paused| project_json(record, paused.contains(&project_id.to_string()))),
+                Err(error) => Err(error),
+            },
+            Err(error) => Err(error),
+        },
+        "project.pause" | "project.resume" => match project_id_param(&req.params) {
+            Ok(project_id) => match load_project(ctx, project_id).await {
+                Ok(record) => {
+                    let paused = req.method == "project.pause";
+                    let update = ctx.paused_sync_projects.write().map_err(|_| {
+                        "PROJECT_STATE_ERROR: pause state unavailable".to_string()
+                    });
+                    match update {
+                        Ok(mut state) => {
+                            if paused {
+                                state.insert(project_id.to_string());
+                            } else {
+                                state.remove(&project_id.to_string());
+                            }
+                            Ok(project_json(record, paused))
+                        }
+                        Err(error) => Err(error),
+                    }
+                }
+                Err(error) => Err(error),
+            },
+            Err(error) => Err(error),
+        },
+        "project.scan" => {
+            match serde_json::from_value::<crate::sync::OperationStartParams>(req.params.clone()) {
+                Ok(params) => match sync_is_paused(ctx, &params.project_id) {
+                    Ok(true) => Err("PROJECT_PAUSED: resume the project before scanning".to_string()),
+                    Ok(false) => ctx
+                        .operation_manager
+                        .start(params)
+                        .await
+                        .map_err(|error| format!("OPERATION_ERROR: {error}"))
+                        .and_then(operation_json),
+                    Err(error) => Err(error),
+                },
+                Err(_) => Err("INVALID_PARAMS: project_id and request_id are required".to_string()),
+            }
+        }
+        "sync.start" => match serde_json::from_value::<SyncStartParams>(req.params.clone()) {
+            Ok(params) => match sync_is_paused(ctx, &params.project_id) {
+                Ok(true) => Err("PROJECT_PAUSED: resume the project before syncing".to_string()),
+                Ok(false) => ctx
+                    .operation_manager
+                    .start(crate::sync::OperationStartParams {
+                        request_id: params.request_id,
+                        project_id: params.project_id,
+                        // A peer target makes this a network sync; without one it
+                        // stays a local scan (backward compatible). The peer id is
+                        // resolved by the SyncTransport, which is only present once
+                        // the daemon provisions peer identity + trust — until then
+                        // a Sync operation fails `sync_transport_not_configured`.
+                        kind: if params.peer_id.is_some() {
+                            crate::sync::OperationKind::Sync
+                        } else {
+                            params.kind
+                        },
+                        peer: params.peer_id,
+                    })
+                    .await
+                    .map_err(|error| format!("OPERATION_ERROR: {error}"))
+                    .and_then(operation_json),
+                Err(error) => Err(error),
+            },
+            Err(_) => Err("INVALID_PARAMS: project_id and request_id are required".to_string()),
+        },
+        "sync.status" | "sync.cancel" => {
+            match serde_json::from_value::<crate::sync::OperationIdParams>(req.params.clone()) {
+                Ok(params) => {
+                    let result = if req.method == "sync.status" {
+                        ctx.operation_manager
+                            .status(&params.operation_id, &params.project_id)
+                    } else {
+                        ctx.operation_manager
+                            .cancel(&params.operation_id, &params.project_id)
+                    };
+                    result
+                        .map_err(|error| format!("OPERATION_ERROR: {error}"))
+                        .and_then(operation_json)
+                }
+                Err(_) => Err("INVALID_PARAMS: project_id and operation_id are required".to_string()),
+            }
+        }
+        // Dev/test-grade explicit-endpoint bootstrap (wiring-plan §6 D3). Two
+        // phases: `bootstrap_identity` ensures this daemon's TLS identity and
+        // returns its cert hash so the driver can assemble the roster; then
+        // `bootstrap_trust` applies the roster + shared DEK + peer address book.
+        // Both are keychain-backed, hence macOS-only for now.
+        "sync.bootstrap_identity" => {
+            match serde_json::from_value::<SyncBootstrapIdentityParams>(req.params.clone()) {
+                Ok(params) => handle_sync_bootstrap_identity(params).await,
+                Err(_) => Err("INVALID_PARAMS: project_id and device_id are required".to_string()),
+            }
+        }
+        "sync.bootstrap_trust" => {
+            match serde_json::from_value::<SyncBootstrapTrustParams>(req.params.clone()) {
+                Ok(params) => handle_sync_bootstrap_trust(params).await,
+                Err(_) => {
+                    Err("INVALID_PARAMS: bootstrap-trust descriptor is malformed".to_string())
+                }
+            }
+        }
+        // Start the responder listener for a provisioned project (piece 6): bind a
+        // per-project QUIC endpoint and serve incoming syncs in a background task.
+        "sync.serve" => match serde_json::from_value::<SyncServeParams>(req.params.clone()) {
+            Ok(params) => handle_sync_serve(ctx, params).await,
+            Err(_) => Err("INVALID_PARAMS: project_id and bind_addr are required".to_string()),
+        },
+        // Conflicts recorded by the bidirectional reconcile (BD-4c). Listing is
+        // read-only; resolving writes the chosen side and re-anchors the base.
+        "conflict.list" => match serde_json::from_value::<ConflictListParams>(req.params.clone()) {
+            Ok(params) => handle_conflict_list(ctx, params).await,
+            Err(_) => Err("INVALID_PARAMS: project_id is required".to_string()),
+        },
+        "conflict.get" => match serde_json::from_value::<ConflictGetParams>(req.params.clone()) {
+            Ok(params) => handle_conflict_get(ctx, params).await,
+            Err(_) => Err("INVALID_PARAMS: project_id and conflict_id are required".to_string()),
+        },
+        "conflict.resolve" => {
+            match serde_json::from_value::<ConflictResolveParams>(req.params.clone()) {
+                Ok(params) => handle_conflict_resolve(ctx, params).await,
+                Err(_) => Err(
+                    "INVALID_PARAMS: project_id, conflict_id and choice are required".to_string(),
+                ),
+            }
+        }
+        "pairing.list" => match project_id_param(&req.params) {
+            Ok(project_id) => match load_project(ctx, project_id).await {
+                Ok(_) => Ok(serde_json::json!({
+                    "project_id": project_id.to_string(),
+                    "devices": [],
+                    "state": "not_configured",
+                    "user_presence_required": true,
+                })),
+                Err(error) => Err(error),
+            },
+            Err(error) => Err(error),
+        },
+        "pairing.approve" | "pairing.revoke" | "pairing.recovery_export" | "pairing.recovery_import" => {
+            match project_id_param(&req.params) {
+                Ok(project_id) => match load_project(ctx, project_id).await {
+                    Ok(_) => Err(format!(
+                        "USER_PRESENCE_REQUIRED: {} must run through an authenticated local user-presence flow",
+                        req.method
+                    )),
+                    Err(error) => Err(error),
+                },
+                Err(error) => Err(error),
+            }
+        }
+        "gc.status" => match project_id_param(&req.params) {
+            Ok(project_id) => match load_project(ctx, project_id).await {
+                Ok(_) => Ok(serde_json::json!({
+                    "project_id": project_id.to_string(),
+                    "state": "idle",
+                    "eligible": false,
+                    "retention_days": 90,
+                    "reason": "gc_coordinator_not_initialized",
+                })),
+                Err(error) => Err(error),
+            },
+            Err(error) => Err(error),
+        },
 
         "daemon.status" => {
             let uptime_secs = crate::START_TIME
@@ -1799,7 +2223,8 @@ async fn dispatch(req: &Request, ctx: &Context) -> Response {
                     } else {
                         String::new()
                     };
-                    let task_team_name = req.params
+                    let task_team_name = req
+                        .params
                         .get("team_name")
                         .and_then(|v| v.as_str())
                         .unwrap_or_default()
@@ -1843,7 +2268,8 @@ async fn dispatch(req: &Request, ctx: &Context) -> Response {
                                     let headless = ctx.headless.clone();
                                     tokio::spawn(async move {
                                         let mut mgr = headless.lock().await;
-                                        mgr.handle_auto_recycle_completion_by_name(&assignee, &tn).await;
+                                        mgr.handle_auto_recycle_completion_by_name(&assignee, &tn)
+                                            .await;
                                     });
                                 }
                             }
@@ -1948,54 +2374,54 @@ async fn dispatch(req: &Request, ctx: &Context) -> Response {
             if req.params.get("kind").and_then(|v| v.as_str()) == Some("xk_run") {
                 publish_xk_run(&req.params, &ctx.event_tx)
             } else {
-            #[derive(Deserialize)]
-            struct P {
-                kind: String,
-                #[serde(default)]
-                team: String,
-                #[serde(default)]
-                agent: String,
-                #[serde(default)]
-                task_id: String,
-                #[serde(default)]
-                status: String,
-                #[serde(default)]
-                prev_status: String,
-                #[serde(default)]
-                header: String,
-            }
-            match serde_json::from_value::<P>(req.params.clone()) {
-                Ok(p) => {
-                    let ts_ms = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_millis() as u64;
-                    let ev_res: Result<DaemonEvent, String> = match p.kind.as_str() {
-                        "task_status" => Ok(DaemonEvent::TaskStatus {
-                            team: p.team,
-                            agent: p.agent,
-                            task_id: p.task_id,
-                            status: p.status,
-                            prev_status: p.prev_status,
-                            ts_ms,
-                        }),
-                        "reply" => Ok(DaemonEvent::Reply {
-                            team: p.team,
-                            agent: p.agent,
-                            task_id: p.task_id,
-                            header: p.header,
-                            ts_ms,
-                        }),
-                        other => Err(format!("events.publish: unknown kind '{other}'")),
-                    };
-                    ev_res.map(|ev| {
-                        // Err means no subscribers — fine to ignore.
-                        let _ = ctx.event_tx.send(ev);
-                        serde_json::json!({"published": true})
-                    })
+                #[derive(Deserialize)]
+                struct P {
+                    kind: String,
+                    #[serde(default)]
+                    team: String,
+                    #[serde(default)]
+                    agent: String,
+                    #[serde(default)]
+                    task_id: String,
+                    #[serde(default)]
+                    status: String,
+                    #[serde(default)]
+                    prev_status: String,
+                    #[serde(default)]
+                    header: String,
                 }
-                Err(e) => Err(format!("invalid params: {e}")),
-            }
+                match serde_json::from_value::<P>(req.params.clone()) {
+                    Ok(p) => {
+                        let ts_ms = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_millis() as u64;
+                        let ev_res: Result<DaemonEvent, String> = match p.kind.as_str() {
+                            "task_status" => Ok(DaemonEvent::TaskStatus {
+                                team: p.team,
+                                agent: p.agent,
+                                task_id: p.task_id,
+                                status: p.status,
+                                prev_status: p.prev_status,
+                                ts_ms,
+                            }),
+                            "reply" => Ok(DaemonEvent::Reply {
+                                team: p.team,
+                                agent: p.agent,
+                                task_id: p.task_id,
+                                header: p.header,
+                                ts_ms,
+                            }),
+                            other => Err(format!("events.publish: unknown kind '{other}'")),
+                        };
+                        ev_res.map(|ev| {
+                            // Err means no subscribers — fine to ignore.
+                            let _ = ctx.event_tx.send(ev);
+                            serde_json::json!({"published": true})
+                        })
+                    }
+                    Err(e) => Err(format!("invalid params: {e}")),
+                }
             }
         }
 
@@ -2416,7 +2842,11 @@ async fn dispatch(req: &Request, ctx: &Context) -> Response {
                         None => Err(format!("no watch state found for team '{}'", p.team_id)),
                         Some(st) => {
                             if let Some(v) = p.target {
-                                st.target = if v.is_empty() || v == "all" { None } else { Some(v) };
+                                st.target = if v.is_empty() || v == "all" {
+                                    None
+                                } else {
+                                    Some(v)
+                                };
                             }
                             // Mirror watch.on cost guard: clamp positive values up to the
                             // minimum so a partial update cannot bypass the 30s floor.
@@ -2425,12 +2855,24 @@ async fn dispatch(req: &Request, ctx: &Context) -> Response {
                                     st.interval_secs = v.max(MIN_WATCH_INTERVAL_SECS);
                                 }
                             }
-                            if let Some(v) = p.exec_to_dir_ratio { st.exec_to_dir_ratio = v; }
-                            if let Some(v) = p.stance { st.stance = v; }
-                            if let Some(v) = p.spec { st.spec = v; }
-                            if let Some(v) = p.cli { st.cli = v; }
-                            if let Some(v) = p.model { st.model = v; }
-                            if let Some(v) = p.reply_timeout_secs { st.reply_timeout_secs = v; }
+                            if let Some(v) = p.exec_to_dir_ratio {
+                                st.exec_to_dir_ratio = v;
+                            }
+                            if let Some(v) = p.stance {
+                                st.stance = v;
+                            }
+                            if let Some(v) = p.spec {
+                                st.spec = v;
+                            }
+                            if let Some(v) = p.cli {
+                                st.cli = v;
+                            }
+                            if let Some(v) = p.model {
+                                st.model = v;
+                            }
+                            if let Some(v) = p.reply_timeout_secs {
+                                st.reply_timeout_secs = v;
+                            }
                             if let Some(mut workers) = p.workers {
                                 let had_dup = {
                                     let mut s = std::collections::HashSet::new();
@@ -2474,34 +2916,34 @@ async fn dispatch(req: &Request, ctx: &Context) -> Response {
             }
             match serde_json::from_value::<P>(req.params.clone()) {
                 Ok(p) if p.team_id.is_empty() => Err("team_id required".to_string()),
-                Ok(p) => {
-                    match (&ctx.watch_runner, &ctx.watch_sink) {
-                        (Some(runner), Some(sink)) => {
-                            match crate::drift_watch::trigger_now(
-                                &p.team_id,
-                                &ctx.watch_registry,
-                                runner,
-                                sink,
-                            )
-                            .await
-                            {
-                                Ok(n) => Ok(serde_json::json!({
-                                    "status": "ok",
-                                    "team_id": p.team_id,
-                                    "triggered": true,
-                                    "check_count": n,
-                                })),
-                                Err(reason) => Ok(serde_json::json!({
-                                    "status": "rejected",
-                                    "team_id": p.team_id,
-                                    "triggered": false,
-                                    "reason": reason,
-                                })),
-                            }
+                Ok(p) => match (&ctx.watch_runner, &ctx.watch_sink) {
+                    (Some(runner), Some(sink)) => {
+                        match crate::drift_watch::trigger_now(
+                            &p.team_id,
+                            &ctx.watch_registry,
+                            runner,
+                            sink,
+                        )
+                        .await
+                        {
+                            Ok(n) => Ok(serde_json::json!({
+                                "status": "ok",
+                                "team_id": p.team_id,
+                                "triggered": true,
+                                "check_count": n,
+                            })),
+                            Err(reason) => Ok(serde_json::json!({
+                                "status": "rejected",
+                                "team_id": p.team_id,
+                                "triggered": false,
+                                "reason": reason,
+                            })),
                         }
-                        _ => Err("watch runner not available (headless watch not initialised)".to_string()),
                     }
-                }
+                    _ => Err(
+                        "watch runner not available (headless watch not initialised)".to_string(),
+                    ),
+                },
                 Err(e) => Err(format!("invalid params: {e}")),
             }
         }
@@ -2595,8 +3037,10 @@ async fn dispatch(req: &Request, ctx: &Context) -> Response {
                     "duplicate_name_warning": st.duplicate_name_warning,
                 })
             }
-            let params: P = serde_json::from_value(req.params.clone())
-                .unwrap_or(P { team_id: None, working_directory: None });
+            let params: P = serde_json::from_value(req.params.clone()).unwrap_or(P {
+                team_id: None,
+                working_directory: None,
+            });
             // Snapshot in-memory registry under the lock, then drop before file I/O.
             let in_mem: std::collections::HashMap<String, crate::drift_watch::WatchState> = {
                 let reg = ctx.watch_registry.lock().await;
@@ -2605,7 +3049,8 @@ async fn dispatch(req: &Request, ctx: &Context) -> Response {
             // Config.json fallback: teams persisted but absent from the registry
             // (e.g. daemon restarted from a different cwd). In-memory wins on collision.
             let config_fallback: std::collections::HashMap<String, crate::drift_watch::WatchState> =
-                params.working_directory
+                params
+                    .working_directory
                     .as_deref()
                     .filter(|wd| !wd.is_empty())
                     .map(|wd| {
@@ -2616,7 +3061,8 @@ async fn dispatch(req: &Request, ctx: &Context) -> Response {
                     .unwrap_or_default();
             match params.team_id {
                 Some(tid) => {
-                    let state = in_mem.get(&tid)
+                    let state = in_mem
+                        .get(&tid)
                         .or_else(|| config_fallback.get(&tid))
                         .map(|st| serialize_state(&tid, st));
                     Ok(serde_json::json!({ "status": "ok", "watch": state }))
@@ -2666,8 +3112,7 @@ async fn dispatch(req: &Request, ctx: &Context) -> Response {
                 .as_deref()
                 .filter(|s| !s.is_empty())
                 .map(|s| s.to_string());
-            let resolved: Result<(Option<String>, String), String> = if let Some(wd) = explicit_wd
-            {
+            let resolved: Result<(Option<String>, String), String> = if let Some(wd) = explicit_wd {
                 Ok((params.team_id.clone(), wd))
             } else {
                 let reg = ctx.watch_registry.lock().await;
@@ -2799,8 +3244,7 @@ async fn dispatch(req: &Request, ctx: &Context) -> Response {
             match serde_json::from_value::<crate::headless::ResumePaneParams>(req.params.clone()) {
                 Ok(p) => {
                     let mgr = ctx.headless.lock().await;
-                    mgr.resume_pane(p)
-                        .map(|r| serde_json::to_value(r).unwrap())
+                    mgr.resume_pane(p).map(|r| serde_json::to_value(r).unwrap())
                 }
                 Err(e) => Err(format!("invalid params: {e}")),
             }
@@ -2808,7 +3252,8 @@ async fn dispatch(req: &Request, ctx: &Context) -> Response {
         "team.delete_archive" => {
             // On-demand archive removal from the resume picker. Works for both
             // pane-mode and headless archives — both live in the same directory.
-            match serde_json::from_value::<crate::headless::DeleteArchiveParams>(req.params.clone()) {
+            match serde_json::from_value::<crate::headless::DeleteArchiveParams>(req.params.clone())
+            {
                 Ok(p) => {
                     let mgr = ctx.headless.lock().await;
                     mgr.delete_archive(p)
@@ -2992,6 +3437,539 @@ async fn dispatch(req: &Request, ctx: &Context) -> Response {
                 message: msg,
             }),
         },
+    }
+}
+
+fn operation_json(record: crate::sync::OperationRecord) -> Result<serde_json::Value, String> {
+    let value =
+        serde_json::to_value(record).map_err(|_| "operation response failed".to_string())?;
+    let encoded =
+        serde_json::to_vec(&value).map_err(|_| "operation response failed".to_string())?;
+    if encoded.len() > crate::sync::MAX_OPERATION_ENVELOPE_BYTES {
+        return Err("operation response exceeds 64 KiB".to_string());
+    }
+    Ok(value)
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProjectAddParams {
+    root_path: PathBuf,
+    /// Optional explicit project id (64 hex). Cross-machine sync registers the
+    /// responder's tree under the id the initiator assigned; omitted → random.
+    #[serde(default)]
+    project_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SyncStartParams {
+    request_id: String,
+    project_id: String,
+    kind: crate::sync::OperationKind,
+    peer_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SyncBootstrapIdentityParams {
+    project_id: String,
+    device_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BootstrapRosterEntry {
+    device_id: String,
+    certificate_hash: String,
+    epoch: u64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BootstrapPeerEntry {
+    peer_id: String,
+    addr: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SyncBootstrapTrustParams {
+    project_id: String,
+    /// 32-byte ed25519 recovery seed, hex. Dev-grade: the driver holds it.
+    recovery: String,
+    /// Shared project DEK — 16-byte key id + 32-byte key, both hex.
+    dek_key_id: String,
+    dek_key: String,
+    /// This daemon's own device id + roster epoch.
+    device_id: String,
+    epoch: u64,
+    roster: Vec<BootstrapRosterEntry>,
+    peers: Vec<BootstrapPeerEntry>,
+}
+
+/// Parse exactly `N` bytes of lowercase hex, naming the field in the error.
+fn parse_hex_bytes<const N: usize>(value: &str, field: &str) -> Result<[u8; N], String> {
+    let decoded = hex::decode(value)
+        .map_err(|_| format!("INVALID_PARAMS: {field} must be {} hex characters", N * 2))?;
+    decoded
+        .try_into()
+        .map_err(|_| format!("INVALID_PARAMS: {field} must be {} hex characters", N * 2))
+}
+
+fn bootstrap_error(error: crate::sync::BootstrapError) -> String {
+    use crate::sync::BootstrapError::{InvalidRoster, Keychain, Provisioning, Storage, Trust};
+    match error {
+        InvalidRoster => "SYNC_BOOTSTRAP_INVALID_ROSTER: the roster does not match this daemon's identity or epochs".to_string(),
+        Storage => "SYNC_BOOTSTRAP_STORAGE: the per-project store directory could not be created".to_string(),
+        Trust(_) => "SYNC_BOOTSTRAP_TRUST: applying trust grants failed".to_string(),
+        Keychain(_) => "SYNC_BOOTSTRAP_KEYCHAIN: keychain access failed".to_string(),
+        Provisioning(_) => "SYNC_BOOTSTRAP_PROVISIONING: writing provisioning coordinates failed".to_string(),
+    }
+}
+
+/// Identity phase: ensure `(project, device)`'s TLS identity, return its cert
+/// hash. Keychain + generation is blocking, so it runs on a blocking worker.
+async fn handle_sync_bootstrap_identity(
+    params: SyncBootstrapIdentityParams,
+) -> Result<serde_json::Value, String> {
+    let project_id = parse_project_id(&params.project_id)?;
+    let device_id = parse_hex_bytes::<32>(&params.device_id, "device_id")?;
+    let hash = tokio::task::spawn_blocking(move || {
+        crate::sync::ensure_device_identity(
+            crate::sync::daemon_keychain().as_ref(),
+            project_id,
+            device_id,
+        )
+        .map(|identity| identity.certificate_hash())
+    })
+    .await
+    .map_err(|_| "SYNC_BOOTSTRAP_ERROR: identity worker failed".to_string())?
+    .map_err(bootstrap_error)?;
+    Ok(serde_json::json!({
+        "project_id": project_id.to_string(),
+        "device_id": hex::encode(device_id),
+        "certificate_hash": hex::encode(hash),
+    }))
+}
+
+/// Apply phase: open this daemon's per-project trust store + the provisioning
+/// store and provision the project from the descriptor. Blocking I/O runs on a
+/// blocking worker.
+async fn handle_sync_bootstrap_trust(
+    params: SyncBootstrapTrustParams,
+) -> Result<serde_json::Value, String> {
+    let project_id = parse_project_id(&params.project_id)?;
+    let recovery_seed = parse_hex_bytes::<32>(&params.recovery, "recovery")?;
+    let dek_key_id = parse_hex_bytes::<16>(&params.dek_key_id, "dek_key_id")?;
+    let dek_key = parse_hex_bytes::<32>(&params.dek_key, "dek_key")?;
+    let local_device = parse_hex_bytes::<32>(&params.device_id, "device_id")?;
+    let local_epoch = params.epoch;
+
+    let mut roster = Vec::with_capacity(params.roster.len());
+    for entry in &params.roster {
+        roster.push(crate::sync::BootstrapDevice {
+            device_id: parse_hex_bytes::<32>(&entry.device_id, "roster.device_id")?,
+            certificate_hash: parse_hex_bytes::<32>(&entry.certificate_hash, "roster.certificate_hash")?,
+            epoch: entry.epoch,
+        });
+    }
+    let mut peers = Vec::with_capacity(params.peers.len());
+    for entry in &params.peers {
+        let addr: std::net::SocketAddr = entry.addr.parse().map_err(|_| {
+            format!("INVALID_PARAMS: peer addr '{}' is not a socket address", entry.addr)
+        })?;
+        peers.push((entry.peer_id.clone(), addr));
+    }
+    let roster_size = roster.len();
+    let peers_size = peers.len();
+
+    let hash = tokio::task::spawn_blocking(move || {
+        let recovery = ed25519_dalek::SigningKey::from_bytes(&recovery_seed);
+        let dek = crate::sync::ProjectKeyMaterial {
+            key_id: crate::sync::KeyId(dek_key_id),
+            key: crate::sync::ProjectKey::new(dek_key),
+        };
+        let paths = crate::sync::DaemonBootstrapPaths::defaults(project_id);
+        let local = crate::sync::LocalCoordinates {
+            device_id: local_device,
+            roster_epoch: local_epoch,
+        };
+        crate::sync::run_bootstrap_trust(
+            crate::sync::daemon_keychain().as_ref(),
+            &paths,
+            project_id,
+            &recovery,
+            &dek,
+            local,
+            &roster,
+            &peers,
+        )
+    })
+    .await
+    .map_err(|_| "SYNC_BOOTSTRAP_ERROR: bootstrap worker failed".to_string())?
+    .map_err(bootstrap_error)?;
+
+    Ok(serde_json::json!({
+        "project_id": project_id.to_string(),
+        "device_id": hex::encode(local_device),
+        "certificate_hash": hex::encode(hash),
+        "roster_size": roster_size,
+        "peers_size": peers_size,
+    }))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ConflictListParams {
+    project_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ConflictGetParams {
+    project_id: String,
+    conflict_id: String,
+}
+
+/// One conflict by id, or `CONFLICT_NOT_FOUND`.
+async fn handle_conflict_get(
+    ctx: &Context,
+    params: ConflictGetParams,
+) -> Result<serde_json::Value, String> {
+    let wanted = params.conflict_id.to_ascii_lowercase();
+    let (context, domain, _root) = conflict_context(ctx, &params.project_id).await?;
+    tokio::task::spawn_blocking(move || {
+        let store = context
+            .apply_store
+            .lock()
+            .map_err(|_| "CONFLICT_STORE: apply store is poisoned".to_string())?;
+        let set = store
+            .load_conflicts(domain)
+            .map_err(|error| format!("CONFLICT_STORE: {error:?}"))?;
+        crate::sync::summarize_conflicts(&set)
+            .into_iter()
+            .find(|summary| summary.conflict_id == wanted)
+            .map(|summary| serde_json::json!({
+                "project_id": domain.project_id.to_string(),
+                "conflict": summary,
+            }))
+            .ok_or_else(|| {
+                "CONFLICT_NOT_FOUND: no durable conflict record matches the request".to_string()
+            })
+    })
+    .await
+    .map_err(|_| "CONFLICT_ERROR: get worker failed".to_string())?
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ConflictResolveParams {
+    project_id: String,
+    /// Hex conflict id from `conflict.list`.
+    conflict_id: String,
+    /// `keep_local` | `keep_remote` | `keep_base` | `delete`. Named `choice` to
+    /// match what `tm-agent conflict resolve` already sends.
+    choice: String,
+}
+
+/// Everything a conflict command needs, resolved from the provisioned stores.
+async fn conflict_context(
+    ctx: &Context,
+    project_id_text: &str,
+) -> Result<
+    (
+        std::sync::Arc<crate::sync::SyncContext>,
+        crate::sync::ObjectDomain,
+        crate::sync::HeldProjectRoot,
+    ),
+    String,
+> {
+    use crate::sync::SyncContextProvider;
+
+    let project_id = parse_project_id(project_id_text)?;
+    let registry = ctx.project_registry.clone();
+    tokio::task::spawn_blocking(move || {
+        let provisioning = std::sync::Arc::new(
+            crate::sync::SyncProvisioningStore::open(crate::sync::default_provisioning_db_path())
+                .map_err(|error| format!("CONFLICT_PROVISIONING: {error:?}"))?,
+        );
+        let provider = crate::sync::ProvisioningSyncContextProvider::new(
+            crate::sync::daemon_keychain(),
+            provisioning,
+            crate::sync::default_sync_state_root(),
+        );
+        let context = provider.context_for(&project_id.to_string())?;
+        let root = registry
+            .resolve_root(project_id)
+            .map_err(|error| format!("CONFLICT_ROOT: {error:?}"))?;
+        let domain = crate::sync::ObjectDomain {
+            project_id,
+            object_type: crate::sync::ObjectType::FILE,
+            version: 1,
+        };
+        Ok::<_, String>((context, domain, root))
+    })
+    .await
+    .map_err(|_| "CONFLICT_ERROR: setup worker failed".to_string())?
+}
+
+/// The project's unresolved conflicts. Read-only: listing never touches the tree.
+async fn handle_conflict_list(
+    ctx: &Context,
+    params: ConflictListParams,
+) -> Result<serde_json::Value, String> {
+    let (context, domain, _root) = conflict_context(ctx, &params.project_id).await?;
+    tokio::task::spawn_blocking(move || {
+        let store = context
+            .apply_store
+            .lock()
+            .map_err(|_| "CONFLICT_STORE: apply store is poisoned".to_string())?;
+        let set = store
+            .load_conflicts(domain)
+            .map_err(|error| format!("CONFLICT_STORE: {error:?}"))?;
+        Ok::<_, String>(serde_json::json!({
+            "project_id": domain.project_id.to_string(),
+            "conflicts": crate::sync::summarize_conflicts(&set),
+        }))
+    })
+    .await
+    .map_err(|_| "CONFLICT_ERROR: list worker failed".to_string())?
+}
+
+/// Decide one conflict: write the chosen side to the working tree, drop the
+/// conflict, and re-anchor the base so the decision propagates to the peer on the
+/// next sync (see `resolve_conflict`).
+async fn handle_conflict_resolve(
+    ctx: &Context,
+    params: ConflictResolveParams,
+) -> Result<serde_json::Value, String> {
+    let resolution = match params.choice.as_str() {
+        "keep_local" => crate::sync::ConflictResolution::KeepLocal,
+        "keep_remote" => crate::sync::ConflictResolution::KeepRemote,
+        "keep_base" => crate::sync::ConflictResolution::KeepBase,
+        "delete" => crate::sync::ConflictResolution::Delete,
+        other => {
+            return Err(format!(
+                "INVALID_PARAMS: choice '{other}' must be keep_local, keep_remote, keep_base, or delete"
+            ))
+        }
+    };
+    let raw = hex::decode(&params.conflict_id)
+        .map_err(|_| "INVALID_PARAMS: conflict_id must be hex".to_string())?;
+    let conflict_id: [u8; 32] = raw
+        .try_into()
+        .map_err(|_| "INVALID_PARAMS: conflict_id must be 32 bytes".to_string())?;
+
+    let (context, domain, root) = conflict_context(ctx, &params.project_id).await?;
+    tokio::task::spawn_blocking(move || {
+        let material = context
+            .cas
+            .current_project_key(domain.project_id)
+            .map_err(|error| format!("CONFLICT_KEY: {error:?}"))?;
+        let outcome = crate::sync::resolve_conflict(
+            context.apply_store.as_ref(),
+            context.cas.as_ref(),
+            domain,
+            root.canonical_path(),
+            conflict_id,
+            resolution,
+            &material.key,
+            material.key_id,
+        )
+        .map_err(|code| format!("CONFLICT_RESOLVE_FAILED: {code}"))?;
+        Ok::<_, String>(serde_json::json!({
+            "project_id": domain.project_id.to_string(),
+            "paths": outcome.paths,
+            "remaining": outcome.remaining,
+        }))
+    })
+    .await
+    .map_err(|_| "CONFLICT_ERROR: resolve worker failed".to_string())?
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SyncServeParams {
+    project_id: String,
+    bind_addr: String,
+}
+
+/// Start the responder listener for a provisioned, registered project: resolve
+/// its `SyncContext` + DEK + root from the stores bootstrap wrote, bind a
+/// per-project QUIC endpoint, and spawn the accept loop. Returns the bound
+/// address (the initiator's peer address book points at it). The listener runs
+/// until daemon shutdown (v0 has no stop RPC).
+async fn handle_sync_serve(
+    ctx: &Context,
+    params: SyncServeParams,
+) -> Result<serde_json::Value, String> {
+    use crate::sync::SyncContextProvider;
+
+    let project_id = parse_project_id(&params.project_id)?;
+    let bind: std::net::SocketAddr = params.bind_addr.parse().map_err(|_| {
+        format!("INVALID_PARAMS: bind_addr '{}' is not a socket address", params.bind_addr)
+    })?;
+    let project_bytes = *project_id.as_bytes();
+    let registry = ctx.project_registry.clone();
+
+    // Open the provisioned stores + resolve context/DEK/root off the runtime.
+    let (context, dek, root) = tokio::task::spawn_blocking(move || {
+        let keychain = crate::sync::daemon_keychain();
+        let provisioning = Arc::new(
+            crate::sync::SyncProvisioningStore::open(crate::sync::default_provisioning_db_path())
+                .map_err(|error| format!("SYNC_SERVE_PROVISIONING: {error:?}"))?,
+        );
+        let provider = crate::sync::ProvisioningSyncContextProvider::new(
+            keychain.clone(),
+            provisioning,
+            crate::sync::default_sync_state_root(),
+        );
+        let context = provider.context_for(&project_id.to_string())?;
+        let dek = crate::sync::load_project_key(keychain.as_ref(), project_bytes)
+            .map_err(|error| format!("SYNC_SERVE_KEYCHAIN: {error:?}"))?;
+        let root = registry
+            .resolve_root(project_id)
+            .map_err(|error| format!("SYNC_SERVE_ROOT: {error:?}"))?;
+        Ok::<_, String>((context, dek, root))
+    })
+    .await
+    .map_err(|_| "SYNC_SERVE_ERROR: setup worker failed".to_string())??;
+
+    // Bind the per-project QUIC listener (needs the runtime) + spawn the loop.
+    let server = crate::sync::SyncEndpoint::server(bind, context.trust.clone(), &context.identity)
+        .map_err(|error| format!("SYNC_SERVE_BIND_FAILED: {error:?}"))?;
+    let bound = server
+        .local_addr()
+        .map_err(|error| format!("SYNC_SERVE_BIND_FAILED: {error:?}"))?;
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    tokio::spawn(crate::sync::serve_project(
+        server,
+        context,
+        root,
+        dek.key,
+        dek.key_id,
+        stop,
+    ));
+
+    Ok(serde_json::json!({
+        "project_id": project_id.to_string(),
+        "bound_addr": bound.to_string(),
+    }))
+}
+
+/// Build the `OperationManager` with the network sync transport wired in (P0).
+///
+/// The transport resolves each project's `SyncContext` from the keychain +
+/// provisioning + per-project stores (`ProvisioningSyncContextProvider`) and peer
+/// addresses from the provisioning address book, so `sync.start` with a peer over
+/// a bootstrapped project actually dials and syncs. A project not provisioned for
+/// sync fails cleanly (`sync_project_not_provisioned`); peerless scan operations
+/// are unaffected (the composite runner routes them to the scan runner). The
+/// keychain backend is `daemon_keychain()`, so this works on macOS (OS keychain)
+/// and on Linux / unsigned binaries (file keychain via `TERMMESH_SYNC_KEYCHAIN_DIR`).
+fn build_sync_operation_manager(
+    project_registry: Arc<crate::sync::ProjectRegistry>,
+) -> anyhow::Result<crate::sync::OperationManager> {
+    let operation_db = crate::sync::default_operation_db_path();
+    let keychain = crate::sync::daemon_keychain();
+    let provisioning = Arc::new(
+        crate::sync::SyncProvisioningStore::open(crate::sync::default_provisioning_db_path())
+            .map_err(|error| anyhow::anyhow!("open sync provisioning store: {error:?}"))?,
+    );
+    let provider = Arc::new(crate::sync::ProvisioningSyncContextProvider::new(
+        keychain,
+        provisioning.clone(),
+        crate::sync::default_sync_state_root(),
+    ));
+    let resolver = Arc::new(crate::sync::ProvisioningPeerResolver::new(provisioning));
+    let runner = Arc::new(crate::sync::NetworkSyncRunner::new(
+        provider,
+        resolver,
+        tokio::runtime::Handle::current(),
+    ));
+    Ok(crate::sync::OperationManager::open_with_sync_transport(
+        operation_db,
+        project_registry,
+        runner,
+    )?)
+}
+
+fn parse_project_id(value: &str) -> Result<crate::sync::ProjectId, String> {
+    let decoded = hex::decode(value).map_err(|_| {
+        "INVALID_PROJECT_ID: expected 64 lowercase hexadecimal characters".to_string()
+    })?;
+    let bytes: [u8; crate::sync::PROJECT_ID_BYTES] = decoded.try_into().map_err(|_| {
+        "INVALID_PROJECT_ID: expected 64 lowercase hexadecimal characters".to_string()
+    })?;
+    Ok(crate::sync::ProjectId::from_bytes(bytes))
+}
+
+fn project_id_param(params: &serde_json::Value) -> Result<crate::sync::ProjectId, String> {
+    let project_id = params
+        .get("project_id")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| "INVALID_PARAMS: project_id is required".to_string())?;
+    parse_project_id(project_id)
+}
+
+async fn load_project(
+    ctx: &Context,
+    project_id: crate::sync::ProjectId,
+) -> Result<crate::sync::ProjectRecord, String> {
+    let registry = ctx.project_registry.clone();
+    tokio::task::spawn_blocking(move || registry.get(project_id))
+        .await
+        .map_err(|_| "PROJECT_STORAGE_ERROR: registry worker failed".to_string())?
+        .map_err(registry_error)?
+        .ok_or_else(|| format!("PROJECT_NOT_FOUND: project {project_id} was not found"))
+}
+
+fn sync_is_paused(ctx: &Context, project_id: &str) -> Result<bool, String> {
+    let project_id = parse_project_id(project_id)?.to_string();
+    ctx.paused_sync_projects
+        .read()
+        .map(|paused| paused.contains(&project_id))
+        .map_err(|_| "PROJECT_STATE_ERROR: pause state unavailable".to_string())
+}
+
+fn project_json(record: crate::sync::ProjectRecord, paused: bool) -> serde_json::Value {
+    serde_json::json!({
+        "project_id": record.project_id.to_string(),
+        "root_path": record.root_path,
+        "active_manifest": record.active_manifest.map(hex::encode),
+        "roster_epoch": record.roster_epoch,
+        "paused": paused,
+    })
+}
+
+fn registry_error(error: crate::sync::RegistryError) -> String {
+    use crate::sync::RegistryError;
+    match error {
+        RegistryError::ProjectNotFound(project_id) => {
+            format!("PROJECT_NOT_FOUND: project {project_id} was not found")
+        }
+        RegistryError::RootNotDirectory(path) => {
+            format!(
+                "INVALID_PROJECT_ROOT: {} is not a directory",
+                path.display()
+            )
+        }
+        RegistryError::NonUtf8Path(path) => {
+            format!(
+                "INVALID_PROJECT_ROOT: {} is not valid UTF-8",
+                path.display()
+            )
+        }
+        RegistryError::InvalidRoot => "INVALID_PROJECT_ROOT: project root is invalid".to_string(),
+        RegistryError::RootIdentityChanged(path) => format!(
+            "PROJECT_ROOT_CHANGED: {} changed after registration",
+            path.display()
+        ),
+        RegistryError::Security | RegistryError::Quarantined { .. } => {
+            "PROJECT_STORAGE_QUARANTINED: registry integrity check failed".to_string()
+        }
+        other => format!("PROJECT_STORAGE_ERROR: {other}"),
     }
 }
 
@@ -3258,12 +4236,7 @@ async fn query_gui_team_workers(app_socket: &str, team_id: &str) -> Vec<String> 
     let _ = wr.flush().await;
     let mut resp = String::new();
     let mut reader = BufReader::new(rd);
-    if let Ok(Ok(_)) = timeout(
-        Duration::from_secs(3),
-        reader.read_line(&mut resp),
-    )
-    .await
-    {
+    if let Ok(Ok(_)) = timeout(Duration::from_secs(3), reader.read_line(&mut resp)).await {
         if let Ok(v) = serde_json::from_str::<serde_json::Value>(&resp) {
             if let Some(agents) = v["result"]["agents"].as_array() {
                 return agents
@@ -3281,6 +4254,77 @@ async fn query_gui_team_workers(app_socket: &str, team_id: &str) -> Vec<String> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn bounded_line_reader_drains_oversized_envelopes_without_allocating_them() {
+        let input = format!("{}\nok\n", "x".repeat(17));
+        let mut reader = BufReader::new(input.as_bytes());
+        assert!(matches!(
+            read_bounded_line(&mut reader, 16).await.unwrap(),
+            BoundedLine::TooLarge
+        ));
+        match read_bounded_line(&mut reader, 16).await.unwrap() {
+            BoundedLine::Line(line) => assert_eq!(line, "ok"),
+            _ => panic!("oversized line must be fully drained"),
+        }
+    }
+
+    #[tokio::test]
+    async fn bounded_line_reader_has_exact_crlf_utf8_and_eof_semantics() {
+        let exact = format!("{}\r\n", "x".repeat(16));
+        let mut reader = BufReader::with_capacity(1, exact.as_bytes());
+        assert!(matches!(
+            read_bounded_line(&mut reader, 16).await.unwrap(),
+            BoundedLine::Line(line) if line.len() == 16
+        ));
+
+        let utf8 = "é\n";
+        let mut reader = BufReader::new(utf8.as_bytes());
+        assert!(matches!(
+            read_bounded_line(&mut reader, 2).await.unwrap(),
+            BoundedLine::Line(line) if line == "é"
+        ));
+        let mut reader = BufReader::new(utf8.as_bytes());
+        assert!(matches!(
+            read_bounded_line(&mut reader, 1).await.unwrap(),
+            BoundedLine::TooLarge
+        ));
+
+        let mut reader = BufReader::new(&b"eof"[..]);
+        assert!(matches!(
+            read_bounded_line(&mut reader, 3).await.unwrap(),
+            BoundedLine::Line(line) if line == "eof"
+        ));
+    }
+
+    #[test]
+    fn oversized_responses_are_replaced_by_a_bounded_error() {
+        let response = Response {
+            id: Some(json!(7)),
+            result: Some(json!("x".repeat(crate::sync::MAX_OPERATION_ENVELOPE_BYTES))),
+            error: None,
+        };
+        let encoded = serialize_bounded_response(&response, Some(json!(7))).unwrap();
+        assert!(encoded.len() <= crate::sync::MAX_OPERATION_ENVELOPE_BYTES);
+        let decoded: serde_json::Value = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(decoded["id"], 7);
+        assert_eq!(decoded["error"]["code"], -32603);
+        assert!(decoded["result"].is_null());
+    }
+
+    #[test]
+    fn subscriber_payload_accepts_actual_max_and_bounds_max_plus_one() {
+        let exact = "x".repeat(crate::sync::MAX_OPERATION_ENVELOPE_BYTES - 2);
+        let encoded = bounded_subscriber_payload(&exact).unwrap().unwrap();
+        assert_eq!(encoded.len(), crate::sync::MAX_OPERATION_ENVELOPE_BYTES);
+
+        let oversized = format!("{exact}x");
+        let encoded = bounded_subscriber_payload(&oversized).unwrap().unwrap();
+        assert!(encoded.len() <= crate::sync::MAX_OPERATION_ENVELOPE_BYTES);
+        let decoded: serde_json::Value = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(decoded["code"], "event_too_large");
+        assert_eq!(decoded["dropped"], true);
+    }
     use serde_json::json;
 
     // ── xk_run publish/subscribe (XK-EVENTS-v1) ──
@@ -3344,7 +4388,12 @@ mod tests {
         publish_xk_run(&valid_xk_params(), &tx).unwrap();
         let ev = rx.try_recv().unwrap();
         // Default subscriber filter set (events.subscribe with no kinds param).
-        let default_set = xk_kinds(&["task_status", "reply", "heartbeat_stale", "agent_usage_tick"]);
+        let default_set = xk_kinds(&[
+            "task_status",
+            "reply",
+            "heartbeat_stale",
+            "agent_usage_tick",
+        ]);
         assert!(
             filter_and_serialize(&ev, &default_set, None).is_none(),
             "default subscribers must not receive xk_run"
@@ -3575,11 +4624,11 @@ mod tests {
     fn watch_on_clamps_interval_to_minimum() {
         // Test that watch.on request with interval < MIN_WATCH_INTERVAL_SECS
         // results in the interval being clamped to 30
-        let requested_interval = 5u64;  // < 30
+        let requested_interval = 5u64; // < 30
         let clamped = if requested_interval == 0 {
-            300  // DEFAULT_WATCH_INTERVAL_SECS
+            300 // DEFAULT_WATCH_INTERVAL_SECS
         } else {
-            requested_interval.max(30)  // MIN_WATCH_INTERVAL_SECS
+            requested_interval.max(30) // MIN_WATCH_INTERVAL_SECS
         };
         assert_eq!(clamped, 30, "interval 5 should be clamped to 30");
 
@@ -3606,7 +4655,7 @@ mod tests {
     fn watch_state_enabled_construction() {
         // Test that WatchState::enabled applies defaults correctly
         let st = drift_watch::WatchState::enabled(
-            0,  // 0 triggers default
+            0, // 0 triggers default
             Some("executor".into()),
             "claude",
             "sonnet",

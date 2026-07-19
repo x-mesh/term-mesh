@@ -91,6 +91,29 @@ struct TabItemView: View {
     @State private var isHovering = false
     @State private var rowHeight: CGFloat = 1
     @State private var cachedSlotWidth: CGFloat = 28
+
+    /// Host chip for a relay/remote workspace row. Extracted from `body`
+    /// to keep the row's VStack within the Swift type-checker's budget.
+    @ViewBuilder
+    private var hostChip: some View {
+        if let hostKey = tab.dominantRemoteHostKey {
+            let chipColor = Color(nsColor: PeerHostAccent.primaryColor(for: hostKey))
+            // Dot always carries the host hue. Text switches to white on a
+            // selected row (bright gradient background) where the host hue
+            // would blend in; on an unselected (dark) row it keeps the hue.
+            let textColor = usesInvertedActiveForeground ? Color.white : chipColor.opacity(0.9)
+            HStack(spacing: 4) {
+                Circle()
+                    .fill(chipColor)
+                    .frame(width: 5, height: 5)
+                Text(hostKey.shortLabel)
+                    .font(.system(size: 10, weight: usesInvertedActiveForeground ? .medium : .regular, design: .monospaced))
+                    .foregroundColor(textColor)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+            }
+        }
+    }
     @AppStorage(ShortcutHintDebugSettings.sidebarHintXKey) private var sidebarShortcutHintXOffset = ShortcutHintDebugSettings.defaultSidebarHintX
     @AppStorage(ShortcutHintDebugSettings.sidebarHintYKey) private var sidebarShortcutHintYOffset = ShortcutHintDebugSettings.defaultSidebarHintY
     @AppStorage(ShortcutHintDebugSettings.alwaysShowHintsKey) private var alwaysShowShortcutHints = ShortcutHintDebugSettings.defaultAlwaysShowHints
@@ -286,6 +309,12 @@ struct TabItemView: View {
                 .animation(.easeInOut(duration: 0.14), value: showsCommandShortcutHints || alwaysShowShortcutHints)
                 .frame(width: cachedSlotWidth, height: 16, alignment: .trailing)
             }
+
+            // Remote pane host chip — pane-mixing model (distinct from the
+            // peerMirror row gradient above): shows which host receives
+            // input for THIS workspace's panes so a relay workspace isn't
+            // just an anonymous shell CWD in the list.
+            hostChip
 
             if let subtitle = latestNotificationText {
                 Text(subtitle)

@@ -575,7 +575,12 @@ pub fn diff_summary(params: serde_json::Value) -> Result<DiffSummaryResult, Stri
         };
         total_add += add;
         total_del += del;
-        files.push(DiffFileStat { path, kind, add, del });
+        files.push(DiffFileStat {
+            path,
+            kind,
+            add,
+            del,
+        });
     }
 
     // Dirty: uncommitted changes in the worktree (mirrors `status()`).
@@ -917,7 +922,10 @@ mod tests {
         .expect("diff_summary should succeed");
         assert!(result.dirty);
         assert_eq!(result.ahead, 0, "no commits made, only a dirty file");
-        assert_eq!(result.file_count, 0, "diff is tree-to-tree, not working dir");
+        assert_eq!(
+            result.file_count, 0,
+            "diff is tree-to-tree, not working dir"
+        );
     }
 
     #[test]

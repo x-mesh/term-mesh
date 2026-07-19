@@ -19,6 +19,18 @@ enum PeerHostTestResult: Equatable {
     case sshFailed(String)
 }
 
+/// Which process is actually serving this peer. The version-probe
+/// unification principle is "ask whoever is serving the peer, not
+/// whichever binary the Linux install script would have dropped": a
+/// Linux host runs the term-meshd systemd service, but a Mac host
+/// serves peers from the term-mesh.app itself — there is no separate
+/// daemon binary there, so a `command -v term-meshd` miss on a Mac is
+/// not "not installed", it's "wrong question".
+enum PeerHostKind: String, Equatable {
+    case daemon
+    case app
+}
+
 enum PeerHostDoctor {
     /// Pinned to the repo's install entrypoint. Fixed constant — never
     /// built from user input.
@@ -36,14 +48,22 @@ enum PeerHostDoctor {
     /// failure spaces never collide on the same wire.
     static let versionMissingExitCode: Int32 = 44
 
-    /// Fixed version-probe command: resolves term-meshd off PATH first,
-    /// falling back to the installer's default `~/.local/bin/term-meshd`
-    /// (a non-login ssh session often has a bare PATH that skips it),
-    /// then prints `--version` or exits with `versionMissingExitCode`
-    /// when no binary is found either way. No single quotes in the body
-    /// (same sh -c '…' wrapper constraint as remoteCommand/diagnoseCommand).
+    /// Fixed, OS-aware version-probe command — asks whoever actually
+    /// serves the peer on this host rather than always looking for
+    /// term-meshd:
+    /// - Darwin (Mac host): the peer is served by the term-mesh.app
+    ///   bundle itself, so this reads its `CFBundleShortVersionString`
+    ///   straight out of Info.plist and prints `term-mesh-app X.Y.Z`.
+    /// - anything else (Linux host): resolves term-meshd off PATH
+    ///   first, falling back to the installer's default
+    ///   `~/.local/bin/term-meshd` (a non-login ssh session often has a
+    ///   bare PATH that skips it), then prints `term-meshd X.Y.Z` via
+    ///   `--version`.
+    /// Either branch exits with `versionMissingExitCode` when it can't
+    /// determine a version. No single quotes in the body (same sh -c
+    /// '…' wrapper constraint as remoteCommand/diagnoseCommand).
     static let versionProbeCommand =
-        #"sh -c 'b=$(command -v term-meshd 2>/dev/null); [ -x "$b" ] || b="$HOME/.local/bin/term-meshd"; [ -x "$b" ] && "$b" --version || exit 44'"#
+        #"sh -c 'if [ "$(uname -s)" = Darwin ]; then v=$(/usr/bin/defaults read /Applications/term-mesh.app/Contents/Info.plist CFBundleShortVersionString 2>/dev/null) && [ -n "$v" ] && echo "term-mesh-app $v" || exit 44; else b=$(command -v term-meshd 2>/dev/null); [ -x "$b" ] || b="$HOME/.local/bin/term-meshd"; [ -x "$b" ] && "$b" --version || exit 44; fi'"#
 
     /// Test reachability: SSH + peer-socket presence. An explicit
     /// `remoteSocket` is NOT trusted blindly — the probe checks the
@@ -94,18 +114,19 @@ enum PeerHostDoctor {
         )) ?? "diagnosis unavailable"
     }
 
-    /// Probes the remote term-meshd version. Covers the "daemon down"
-    /// case that a live-socket probe cannot: this shells out directly
-    /// rather than going through the peer socket. Returns nil whenever
-    /// no reliable version could be read — binary missing (exit 44),
-    /// ssh/timeout failure, or output that doesn't match the expected
-    /// `term-meshd X.Y.Z` shape. Never throws; the caller only cares
-    /// about "known version" vs "unknown".
+    /// Probes the remote host's version — term-meshd on Linux, the
+    /// term-mesh.app bundle on a Mac (see `PeerHostKind`). Covers the
+    /// "daemon down" case that a live-socket probe cannot: this shells
+    /// out directly rather than going through the peer socket. Returns
+    /// nil whenever no reliable version could be read — nothing found
+    /// (exit 44), ssh/timeout failure, or output that doesn't match
+    /// either expected shape. Never throws; the caller only cares about
+    /// "known version" vs "unknown".
     static func checkVersion(
         sshTarget: String,
         port: Int?,
         identityFile: String?
-    ) async -> String? {
+    ) async -> (version: String, hostKind: PeerHostKind)? {
         do {
             let output = try await runRemote(
                 sshTarget: sshTarget, port: port, identityFile: identityFile,
@@ -129,28 +150,39 @@ enum PeerHostDoctor {
         exitCode: Int32,
         timedOut: Bool,
         stdout: String
-    ) -> String? {
+    ) -> (version: String, hostKind: PeerHostKind)? {
         guard !timedOut, exitCode == 0 else { return nil }
-        return parseVersionLine(from: stdout)
+        return parseHostVersionLine(from: stdout)
     }
 
-    /// Extracts the version from a `term-meshd X.Y.Z` line. A non-login
-    /// shell can still print MOTD/banner text ahead of the real output,
-    /// so this scans every line and keeps the LAST match rather than
-    /// the first. Returns nil when no line matches.
-    static func parseVersionLine(from output: String) -> String? {
-        guard let regex = try? NSRegularExpression(pattern: #"^term-meshd\s+(\S+)\s*$"#) else {
-            return nil
-        }
-        var found: String?
+    /// Extracts (version, hostKind) from whichever probe line matched —
+    /// `term-meshd X.Y.Z` (Linux daemon) or `term-mesh-app X.Y.Z` (Mac
+    /// app bundle). A non-login shell can still print MOTD/banner text
+    /// ahead of the real output, so this scans every line and keeps the
+    /// LAST match rather than the first, regardless of which of the two
+    /// prefixes it came from. Returns nil when no line matches either.
+    static func parseHostVersionLine(from output: String) -> (version: String, hostKind: PeerHostKind)? {
+        guard let regex = try? NSRegularExpression(
+            pattern: #"^(term-meshd|term-mesh-app)\s+(\S+)\s*$"#
+        ) else { return nil }
+        var found: (version: String, hostKind: PeerHostKind)?
         for rawLine in output.split(separator: "\n", omittingEmptySubsequences: true) {
             let line = rawLine.trimmingCharacters(in: .whitespacesAndNewlines)
             let range = NSRange(line.startIndex..., in: line)
             guard let match = regex.firstMatch(in: line, range: range),
-                  let versionRange = Range(match.range(at: 1), in: line) else { continue }
-            found = String(line[versionRange])
+                  let kindRange = Range(match.range(at: 1), in: line),
+                  let versionRange = Range(match.range(at: 2), in: line) else { continue }
+            let kind: PeerHostKind = line[kindRange] == "term-meshd" ? .daemon : .app
+            found = (String(line[versionRange]), kind)
         }
         return found
+    }
+
+    /// Back-compat, daemon-only view of `parseHostVersionLine` — kept
+    /// for call sites (and existing tests) that only ever fed it Linux
+    /// `term-meshd X.Y.Z` output and don't care about `hostKind`.
+    static func parseVersionLine(from output: String) -> String? {
+        parseHostVersionLine(from: output)?.version
     }
 
     /// Compact human line out of a diagnosis dump — surfaces the known

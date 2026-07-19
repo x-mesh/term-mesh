@@ -47,16 +47,25 @@ Rules:
 - Always use 'WIP' as the type prefix, never feat/fix/refactor/etc.
 - If needed, add a blank line then bullet points for details
 - Be concise and specific
+- NEVER wrap the message in \`\`\` fenced code-block markers
 - Output ONLY the commit message, nothing else" 2>/dev/null) || true
 fi
+
+# Strip fenced code-block marker lines (\`\`\` or \`\`\`lang) that the model
+# tends to wrap the message in. The .githooks/commit-msg hook does the same,
+# but this path commits with hooks enabled only as a backstop — belt and braces.
+COMMIT_MSG=$(printf '%s\n' "$COMMIT_MSG" | awk '/^[[:space:]]*```/ { next } { print }')
+COMMIT_MSG=$(printf '%s\n' "$COMMIT_MSG" | sed -e '/./,$!d')
 
 # Fallback if claude -p failed or returned empty
 if [ -z "$COMMIT_MSG" ]; then
   COMMIT_MSG="wip: update $FILE_COUNT files"
 fi
 
-# Commit using -F - to safely handle special characters
-if echo "$COMMIT_MSG" | git commit -F - --no-verify 2>/dev/null; then
+# Commit using -F - to safely handle special characters.
+# Hooks stay ENABLED: .githooks/commit-msg is the fence-stripping backstop,
+# and --no-verify here is what let ``` markers into history in the first place.
+if echo "$COMMIT_MSG" | git commit -F - 2>/dev/null; then
   FIRST_LINE=$(echo "$COMMIT_MSG" | head -1)
   SHORT_SHA=$(git rev-parse --short HEAD 2>/dev/null)
   echo "Auto-committed: ${SHORT_SHA} ${FIRST_LINE} (${FILE_COUNT} files)"

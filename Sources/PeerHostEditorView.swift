@@ -70,6 +70,18 @@ struct PeerHostEditorView: View {
     /// itself isn't running (`.daemonMissing`). Kept out of that case's
     /// associated value since its signature must not change.
     @State private var daemonMissingVersion: String?
+    /// `PeerHostKind` paired with `daemonMissingVersion` — same
+    /// "kept out of the frozen case's associated value" reasoning.
+    @State private var daemonMissingHostKind: PeerHostKind?
+    /// Which kind of host the LAST successful version probe found —
+    /// Linux term-meshd or a Mac term-mesh.app. Kept as its own @State
+    /// rather than widening `.okUpToDate`/`.updateAvailable`/
+    /// `.legacyDaemon`'s associated values, per the same
+    /// frozen-signature discipline as `daemonMissingVersion`; every
+    /// switch over `doctorState` stays untouched by this addition.
+    /// Reset alongside the rest of the doctor state in
+    /// `invalidateDoctorState()`.
+    @State private var testedHostKind: PeerHostKind?
     /// The exact (sshTarget, port, identityFile) — as a validated
     /// `PeerHostProfile` — that the last `runTest()` actually probed.
     /// `runInstall()` reads ONLY this, never a fresh `validatedDraft()`,
@@ -251,8 +263,15 @@ struct PeerHostEditorView: View {
     /// update attempt this session (see `updateAttempted`), and only
     /// when there's an actual tested target to act on (`testedDraft`) —
     /// belt-and-suspenders alongside the generation guard in `runInstall`.
+    /// Also suppressed for a Mac host (`testedHostKind == .app`):
+    /// `PeerHostDoctor.install` only knows how to run the Linux install
+    /// script, which is a guaranteed failure over SSH to a Mac (its
+    /// `uname` guard dies immediately) — the doctor status line's
+    /// `doctorMessageWithMacHint` covers that case with manual-update
+    /// copy instead of a button that can't work (1st-scope decision;
+    /// remote-automated Mac update is a later candidate).
     private var showsUpdateButton: Bool {
-        guard !updateAttempted, testedDraft != nil else { return false }
+        guard !updateAttempted, testedDraft != nil, testedHostKind != .app else { return false }
         switch doctorState {
         case .updateAvailable, .legacyDaemon: return true
         default: return false
@@ -275,16 +294,18 @@ struct PeerHostEditorView: View {
                   systemImage: "exclamationmark.triangle.fill")
                 .font(.caption).foregroundColor(.orange)
         case .okUpToDate(_, let version):
-            Label("term-meshd v\(displayVersion(version)) — up to date", systemImage: "checkmark.seal")
+            Label("\(serverLabel) v\(displayVersion(version)) — up to date", systemImage: "checkmark.seal")
                 .font(.caption).foregroundColor(.green)
         case .updateAvailable(_, let remote, let latest):
-            Label("Update available: v\(displayVersion(remote)) → v\(displayVersion(latest))", systemImage: "arrow.up.circle")
-                .font(.caption).foregroundColor(.orange)
+            doctorMessageWithMacHint(
+                "Update available: \(serverLabel) v\(displayVersion(remote)) → v\(displayVersion(latest))",
+                systemImage: "arrow.up.circle"
+            )
         case .legacyDaemon(_, let remote):
-            Label("Legacy daemon (v\(displayVersion(remote))) — update recommended (version reporting predates v\(displayVersion(PeerDaemonVersion.versionSyncFloor)))",
-                  systemImage: "exclamationmark.arrow.circlepath")
-                .font(.caption).foregroundColor(.orange)
-                .fixedSize(horizontal: false, vertical: true)
+            doctorMessageWithMacHint(
+                "Legacy \(serverLabel) (v\(displayVersion(remote))) — update recommended (version reporting predates v\(displayVersion(PeerDaemonVersion.versionSyncFloor)))",
+                systemImage: "exclamationmark.arrow.circlepath"
+            )
         case .okVersionUnknown(let path):
             Label("Connected — daemon socket: \(path) — version unknown",
                   systemImage: "questionmark.circle")
@@ -313,12 +334,45 @@ struct PeerHostEditorView: View {
     }
 
     /// `.daemonMissing`'s base copy, plus (when a binary was found on the
-    /// host despite the daemon not running) the version it reports.
+    /// host despite the daemon not running) the version it reports and
+    /// which kind of host reported it.
     private var daemonMissingStatusText: String {
         guard let version = daemonMissingVersion else {
-            return "SSH OK, but term-meshd is not running on the host."
+            return "SSH OK, but no peer server was found on the host."
         }
-        return "SSH OK, term-meshd v\(displayVersion(version)) is installed but not running on the host."
+        let label = daemonMissingHostKind == .app ? "term-mesh app" : "term-meshd"
+        let verb = daemonMissingHostKind == .app
+            ? "is installed, but its peer socket is not running"
+            : "is installed but not running"
+        return "SSH OK, \(label) v\(displayVersion(version)) \(verb) on the host."
+    }
+
+    /// "term-meshd" for a Linux host, "term-mesh app" for a Mac host —
+    /// tracks whichever `testedHostKind` the last successful probe
+    /// found. Falls back to "term-meshd" when the kind isn't known yet
+    /// (shouldn't happen once a version is known, but keeps old copy as
+    /// the safe default rather than rendering a nil-derived label).
+    private var serverLabel: String {
+        testedHostKind == .app ? "term-mesh app" : "term-meshd"
+    }
+
+    /// Shared renderer for `.updateAvailable`/`.legacyDaemon`: the
+    /// primary orange status line, plus — only for a Mac host, where
+    /// there is no automatic remote-update button (see
+    /// `showsUpdateButton`) — a secondary hint pointing at the manual
+    /// `brew upgrade --cask term-mesh` path.
+    @ViewBuilder
+    private func doctorMessageWithMacHint(_ text: String, systemImage: String) -> some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Label(text, systemImage: systemImage)
+                .font(.caption).foregroundColor(.orange)
+                .fixedSize(horizontal: false, vertical: true)
+            if testedHostKind == .app {
+                Text("Mac hosts run the app itself — update term-mesh on that Mac (brew upgrade --cask term-mesh) and relaunch.")
+                    .font(.caption2).foregroundColor(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
     }
 
     /// Strips any existing "v"/"V" prefix so callers can prepend exactly
@@ -348,6 +402,8 @@ struct PeerHostEditorView: View {
         doctorState = .idle
         testedDraft = nil
         daemonMissingVersion = nil
+        daemonMissingHostKind = nil
+        testedHostKind = nil
         updateAttempted = false
         showInstallConfirm = false
         showUpdateConfirm = false
@@ -365,6 +421,7 @@ struct PeerHostEditorView: View {
         let gen = doctorGeneration
         doctorState = .testing
         daemonMissingVersion = nil
+        daemonMissingHostKind = nil
         // Snapshot NOW — this is the exact target Install/Update must use
         // later, even if the form fields change before the user acts on
         // the result (see `testedDraft`/`invalidateDoctorState()`).
@@ -393,15 +450,16 @@ struct PeerHostEditorView: View {
                 // terminal assignment mutates doctorState, so the Test
                 // button stays disabled while this runs. The generation
                 // guard below is the actual safety net either way.
-                let version = await PeerHostDoctor.checkVersion(
+                let probed = await PeerHostDoctor.checkVersion(
                     sshTarget: draft.sshTarget, port: draft.sshPort,
                     identityFile: draft.identityFile
                 )
                 guard gen == doctorGeneration else { return }
                 #if DEBUG
-                dlog("peer.doctor.version state=daemonMissing remote=\(version ?? "nil") latest=n/a")
+                dlog("peer.doctor.version state=daemonMissing remote=\(probed?.version ?? "nil") kind=\(probed?.hostKind.rawValue ?? "nil") latest=n/a")
                 #endif
-                daemonMissingVersion = version
+                daemonMissingVersion = probed?.version
+                daemonMissingHostKind = probed?.hostKind
                 doctorState = .daemonMissing
             case .sshFailed(let msg): doctorState = .sshFailed(msg)
             }
@@ -482,14 +540,17 @@ struct PeerHostEditorView: View {
         socketPath: String,
         draft: PeerHostProfile
     ) async -> DoctorState {
-        guard let installed = await PeerHostDoctor.checkVersion(
+        guard let probed = await PeerHostDoctor.checkVersion(
             sshTarget: draft.sshTarget, port: draft.sshPort, identityFile: draft.identityFile
         ) else {
             #if DEBUG
             dlog("peer.doctor.version state=unknown remote=nil latest=n/a")
             #endif
+            testedHostKind = nil
             return .okVersionUnknown(socket: socketPath)
         }
+        let installed = probed.version
+        testedHostKind = probed.hostKind
         guard let latest = await PeerDaemonVersion.fetchLatestRelease() else {
             #if DEBUG
             dlog("peer.doctor.version state=unknown remote=\(installed) latest=nil")

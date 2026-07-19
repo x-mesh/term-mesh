@@ -28,31 +28,72 @@ if $ALL; then
   echo ""
 fi
 
-echo "=== Daemon sockets ==="
+echo "=== Daemon / peer / tunnel sockets ==="
 SOCKETS=()
-# Standard locations
-for pattern in /tmp/term-meshd*.sock "$HOME/Library/Application Support/term-mesh/term-meshd"*.sock; do
+# Standard locations: daemon sockets, peer host sockets, app-side SSH tunnel
+# sockets, and test/tagged leftovers. Active ones (with a listener) are kept.
+# TMPDIR is unset in non-interactive SSH shells — resolve the real macOS
+# per-user temp dir (where the app's daemon binds) instead of falling back
+# to /tmp, or every daemon looks like an orphan when run remotely.
+USER_TMP="${TMPDIR:-$(getconf DARWIN_USER_TEMP_DIR 2>/dev/null || echo /tmp)}"
+for pattern in /tmp/term-meshd*.sock \
+               "$USER_TMP"/term-meshd*.sock \
+               "$HOME/Library/Application Support/term-mesh/term-meshd"*.sock \
+               /tmp/term-mesh-peer-*.sock \
+               /tmp/term-mesh-peer-*/peer.sock \
+               /tmp/tm-peer-ssh-*.sock \
+               /tmp/tm-peer-*/peer.sock \
+               /tmp/term-mesh*.sock; do
   # shellcheck disable=SC2086
   for sock in $pattern; do
     [ -S "$sock" ] 2>/dev/null && SOCKETS+=("$sock") || true
   done
 done
+# De-duplicate (patterns overlap)
+if [ ${#SOCKETS[@]} -gt 0 ]; then
+  IFS=$'\n' read -r -d '' -a SOCKETS < <(printf '%s\n' "${SOCKETS[@]}" | sort -u && printf '\0') || true
+fi
+
+# Liveness = a real connect attempt. On macOS, `lsof <socket-file>` cannot
+# see tokio (Rust) listeners — it reports live daemon sockets as having no
+# process, so an lsof-based STALE verdict would delete active sockets.
+socket_alive() {
+  nc -U -w 1 "$1" < /dev/null > /dev/null 2>&1
+}
+
+# For live daemon RPC sockets, ask the daemon for its pid (daemon.status).
+daemon_pid_via_rpc() {
+  printf '{"jsonrpc":"2.0","id":1,"method":"daemon.status","params":{}}\n' \
+    | nc -U -w 2 "$1" 2>/dev/null \
+    | /usr/bin/python3 -c 'import json,sys
+try: print(json.load(sys.stdin)["result"]["pid"])
+except Exception: pass' 2>/dev/null || true
+}
 
 STALE_COUNT=0
+ACTIVE_PIDS=""
 if [ ${#SOCKETS[@]} -gt 0 ]; then
   for sock in "${SOCKETS[@]}"; do
-    PID=$(lsof -t "$sock" 2>/dev/null || true)
-    if [ -z "$PID" ]; then
-      echo "  STALE: $sock (no process)"
+    if ! socket_alive "$sock"; then
+      echo "  STALE: $sock (connection refused)"
       STALE_COUNT=$((STALE_COUNT + 1))
       if $KILL; then
         rm -f "$sock"
         echo "    → removed"
       fi
     else
-      echo "  ACTIVE: $sock (pid: $PID)"
+      PID=""
+      case "$sock" in
+        *term-meshd*.sock) PID=$(daemon_pid_via_rpc "$sock") ;;
+      esac
+      if [ -n "$PID" ]; then
+        echo "  ACTIVE: $sock (pid: $PID)"
+        ACTIVE_PIDS="$ACTIVE_PIDS $PID"
+      else
+        echo "  ACTIVE: $sock"
+      fi
       if $ALL; then
-        kill "$PID" 2>/dev/null || true
+        [ -n "$PID" ] && kill "$PID" 2>/dev/null || true
         rm -f "$sock"
         echo "    → killed and removed"
       fi
@@ -66,10 +107,40 @@ else
 fi
 echo ""
 
+echo "=== Orphan daemons (not listening on any known socket) ==="
+ORPHANS=0
+for pid in $(pgrep -x term-meshd 2>/dev/null || true); do
+  case " $ACTIVE_PIDS " in
+    *" $pid "*) continue ;;
+  esac
+  CMD=$(ps -o command= -p "$pid" 2>/dev/null || echo "?")
+  echo "  ORPHAN: pid $pid ($CMD)"
+  ORPHANS=$((ORPHANS + 1))
+  if $KILL; then
+    kill "$pid" 2>/dev/null || true
+    # Pre-v0.157 builds ignore SIGTERM (FSEvents watcher bug) — escalate.
+    for _ in 1 2 3; do
+      sleep 1
+      kill -0 "$pid" 2>/dev/null || break
+    done
+    if kill -0 "$pid" 2>/dev/null; then
+      kill -9 "$pid" 2>/dev/null || true
+      echo "    → SIGKILL (ignored SIGTERM)"
+    else
+      echo "    → terminated"
+    fi
+  fi
+done
+[ "$ORPHANS" -eq 0 ] && echo "  (none)"
+echo ""
+
 echo "=== Tag data directories ==="
 TAG_DIRS=0
 for dir in /tmp/term-mesh-*/; do
   [ -d "$dir" ] 2>/dev/null || continue
+  # Peer socket dirs are live infrastructure, not tag leftovers — the socket
+  # section above already reclaims stale sockets inside them.
+  case "$dir" in */term-mesh-peer-*) continue ;; esac
   AGE=$(( ( $(date +%s) - $(stat -f %m "$dir") ) / 86400 ))
   echo "  $dir (${AGE}d old)"
   TAG_DIRS=$((TAG_DIRS + 1))
@@ -81,11 +152,19 @@ done
 [ "$TAG_DIRS" -eq 0 ] && echo "  (none)"
 echo ""
 
-echo "=== Daemon log files ==="
-for log in /tmp/term-meshd*.log; do
+echo "=== Daemon / debug log files ==="
+for log in /tmp/term-meshd*.log /tmp/term-mesh-debug-*.log /tmp/term-mesh-debug.log; do
   [ -f "$log" ] 2>/dev/null || continue
   SIZE=$(du -h "$log" | cut -f1)
-  echo "  $log ($SIZE)"
+  if lsof "$log" >/dev/null 2>&1; then
+    echo "  OPEN: $log ($SIZE) — in use, kept"
+  else
+    echo "  $log ($SIZE)"
+    if $KILL; then
+      rm -f "$log"
+      echo "    → removed"
+    fi
+  fi
 done
 echo ""
 

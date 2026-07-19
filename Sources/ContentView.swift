@@ -52,6 +52,7 @@ struct ContentView: View {
     @State private var titlebarWorktreeName: String = ""
     @State private var titlebarIsWorktree: Bool = false
     @State private var titlebarDirBasename: String = ""
+    @State private var titlebarHostKey: PeerPaneHostKey? = nil
     @State private var titlebarPorts: [Int] = []
     @State private var titlebarSessionStart: Date? = nil
     @State private var titlebarTag: String? = nil
@@ -403,21 +404,23 @@ struct ContentView: View {
                     let isInputActive = isSelectedWorkspace
                     let isVisible = isSelectedWorkspace || isRetiringWorkspace
                     let portalPriority = isSelectedWorkspace ? 2 : (isRetiringWorkspace ? 1 : 0)
-                    WorkspaceContentView(
-                        workspace: tab,
-                        isWorkspaceVisible: isVisible,
-                        isWorkspaceInputActive: isInputActive,
-                        workspacePortalPriority: portalPriority,
-                        onThemeRefreshRequest: { reason, eventId, source, payloadHex in
-                            scheduleTitlebarThemeRefreshFromWorkspace(
-                                workspaceId: tab.id,
-                                reason: reason,
-                                backgroundEventId: eventId,
-                                backgroundSource: source,
-                                notificationPayloadHex: payloadHex
-                            )
-                        }
-                    )
+                    WorkspaceRetrievalChrome(workspace: tab) {
+                        WorkspaceContentView(
+                            workspace: tab,
+                            isWorkspaceVisible: isVisible,
+                            isWorkspaceInputActive: isInputActive,
+                            workspacePortalPriority: portalPriority,
+                            onThemeRefreshRequest: { reason, eventId, source, payloadHex in
+                                scheduleTitlebarThemeRefreshFromWorkspace(
+                                    workspaceId: tab.id,
+                                    reason: reason,
+                                    backgroundEventId: eventId,
+                                    backgroundSource: source,
+                                    notificationPayloadHex: payloadHex
+                                )
+                            }
+                        )
+                    }
                     .opacity(isVisible ? 1 : 0)
                     .allowsHitTesting(isSelectedWorkspace)
                     .zIndex(isSelectedWorkspace ? 2 : (isRetiringWorkspace ? 1 : 0))
@@ -580,6 +583,16 @@ struct ContentView: View {
                 Text(titlebarDirBasename)
                     .font(.system(size: 11, weight: .regular))
                     .foregroundColor(titlebarColor(opacity: 0.6))
+            }
+            if let hostKey = titlebarHostKey {
+                let hostColor = Color(nsColor: PeerHostAccent.primaryColor(for: hostKey))
+                Circle()
+                    .fill(hostColor)
+                    .frame(width: 5, height: 5)
+                    .padding(.leading, 6)
+                Text(hostKey.shortLabel)
+                    .font(.system(size: 11, weight: .medium, design: .monospaced))
+                    .foregroundColor(hostColor)
             }
         }
         .lineLimit(1)
@@ -1004,6 +1017,7 @@ struct ContentView: View {
             if !titlebarWorktreeName.isEmpty { titlebarWorktreeName = "" }
             if titlebarIsWorktree { titlebarIsWorktree = false }
             if !titlebarDirBasename.isEmpty { titlebarDirBasename = "" }
+            if titlebarHostKey != nil { titlebarHostKey = nil }
             if !titlebarPorts.isEmpty { titlebarPorts = [] }
             if titlebarSessionStart != nil { titlebarSessionStart = nil }
             if titlebarTag != nil { titlebarTag = nil }
@@ -1021,6 +1035,7 @@ struct ContentView: View {
         let snapCurrentDir = tab.currentDirectory
         let snapWorktreeName = tab.worktreeName
         let snapIsInsideWorktree = tab.isInsideWorktree
+        let snapHostKey = tab.dominantRemoteHostKey
         let snapCustomTitle = tab.customTitle
         let snapListeningPorts = tab.listeningPorts
         let snapCreatedAt = tab.createdAt
@@ -1037,7 +1052,7 @@ struct ContentView: View {
         let focusedTTY: String? = focusedPanelId.flatMap { snapTTYNames[$0] }
         let hasPanelDir = focusedPanelId != nil && snapPanelDirs[focusedPanelId!] != nil
         #if DEBUG
-        dlog("titlebar.update focusedPanel=\(focusedPanelId?.uuidString.prefix(8) ?? "nil") gitBranch=\(branchState?.branch ?? "nil") panelBranches=\(snapPanelBranches.mapValues { $0.branch }) currentDir=\(snapCurrentDir) focusedDir=\(focusedDir) tty=\(focusedTTY ?? "nil") hasPanelDir=\(hasPanelDir) worktreeName=\(snapWorktreeName ?? "nil")")
+        dlog("titlebar.update focusedPanel=\(focusedPanelId?.uuidString.prefix(8) ?? "nil") gitBranch=\(branchState?.branch ?? "nil") panelBranches=\(snapPanelBranches.mapValues { $0.branch }) currentDir=\(snapCurrentDir) focusedDir=\(focusedDir) tty=\(focusedTTY ?? "nil") hasPanelDir=\(hasPanelDir) worktreeName=\(snapWorktreeName ?? "nil") hostKey=\(snapHostKey?.description ?? "nil")")
         #endif
         if let bs = branchState {
             let branch = bs.branch
@@ -1095,6 +1110,10 @@ struct ContentView: View {
         let rawDirBase = (snapCurrentDir as NSString).lastPathComponent
         let dirBase = hasWorktree ? "" : rawDirBase
         if titlebarDirBasename != dirBase { titlebarDirBasename = dirBase }
+
+        // Remote pane host chip — "keys go to a remote host" signal,
+        // same identity color as the sidebar row / pane strip.
+        if titlebarHostKey != snapHostKey { titlebarHostKey = snapHostKey }
 
         // Listening ports
         let ports = snapListeningPorts

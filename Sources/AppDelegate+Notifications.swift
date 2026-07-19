@@ -243,6 +243,24 @@ extension AppDelegate {
             }
         }
 
+        // Peer federation: a whole-window close (red-button close, Cmd+Shift+W,
+        // or app quit closing every window) tears down every workspace in
+        // `removed.tabManager.tabs` WITHOUT going through
+        // `TabManager.closeWorkspace` — so its `.peerWorkspaceDidClose` post
+        // never fires for any of them, and attached peers keep those
+        // workspace_ids in their roster forever. Post the same signal here,
+        // once per surviving workspace, so PeerHostCoordinator's existing
+        // bridge broadcasts WorkspaceRemoved for each. Harmless during app
+        // quit (no peer server left listening by then, or a no-op broadcast
+        // to zero sessions).
+        for tab in removed.tabManager.tabs {
+            NotificationCenter.default.post(
+                name: .peerWorkspaceDidClose,
+                object: nil,
+                userInfo: ["workspaceID": tab.id]
+            )
+        }
+
         if tabManager === removed.tabManager {
             // Repoint "active" pointers to any remaining main terminal window.
             let nextContext: MainWindowContext? = {

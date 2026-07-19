@@ -40,6 +40,143 @@ enum WorktreePolicyArg {
     Off,
 }
 
+#[cfg(test)]
+mod project_sync_cli_tests {
+    use super::*;
+    use clap::CommandFactory;
+
+    #[test]
+    fn parses_project_and_conflict_command_groups() {
+        let project =
+            Cli::try_parse_from(["tm-agent", "project", "scan", "00", "--request-id", "r1"])
+                .unwrap();
+        assert!(matches!(project.command, Commands::Project(_)));
+
+        let conflict =
+            Cli::try_parse_from(["tm-agent", "conflict", "resolve", "00", "c1", "local"]).unwrap();
+        assert!(matches!(conflict.command, Commands::Conflict(_)));
+    }
+
+    #[test]
+    fn daemon_errors_preserve_stable_machine_code() {
+        let error = decode_daemon_response(json!({
+            "error": { "code": -32601, "message": "USER_PRESENCE_REQUIRED: approve locally" }
+        }))
+        .unwrap_err();
+        assert_eq!(error, "USER_PRESENCE_REQUIRED: approve locally");
+    }
+
+    #[test]
+    fn peer_ensure_requires_all_identity_and_policy_flags() {
+        let parsed = Cli::try_parse_from([
+            "tm-agent",
+            "peer",
+            "ensure",
+            "--host",
+            "root@jw-server",
+            "--key",
+            "runner-smoke",
+            "--cwd",
+            "/app/runner",
+            "--executable",
+            "/bin/sh",
+            "--arg=-lc",
+            "--arg",
+            "exec sleep 60",
+            "--policy",
+            "on-daemon-restart",
+        ])
+        .unwrap();
+        assert!(matches!(parsed.command, Commands::Peer(_)));
+
+        let missing_policy = Cli::try_parse_from([
+            "tm-agent",
+            "peer",
+            "ensure",
+            "--host",
+            "root@jw-server",
+            "--key",
+            "runner-smoke",
+            "--cwd",
+            "/app/runner",
+            "--executable",
+            "/bin/sh",
+        ]);
+        assert!(missing_policy.is_err());
+    }
+
+    #[test]
+    fn peer_attach_accepts_exact_surface_id_with_host() {
+        let parsed = Cli::try_parse_from([
+            "tm-agent",
+            "peer",
+            "attach",
+            "--host",
+            "root@jw-server",
+            "--surface-id",
+            "00112233445566778899aabbccddeeff",
+        ])
+        .unwrap();
+        assert!(matches!(parsed.command, Commands::Peer(_)));
+    }
+
+    #[test]
+    fn peer_terminate_requires_host_and_exact_surface_flag() {
+        let parsed = Cli::try_parse_from([
+            "tm-agent",
+            "peer",
+            "terminate",
+            "--host",
+            "root@jw-server",
+            "--surface-id",
+            "00112233445566778899aabbccddeeff",
+            "--remote-socket",
+            "/run/user/0/tm-peer.sock",
+        ])
+        .unwrap();
+        assert!(matches!(parsed.command, Commands::Peer(_)));
+        assert!(Cli::try_parse_from(
+            ["tm-agent", "peer", "terminate", "--host", "root@jw-server",]
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn peer_help_names_the_implemented_contract() {
+        let mut command = Cli::command();
+        let peer = command
+            .find_subcommand_mut("peer")
+            .unwrap()
+            .find_subcommand_mut("ensure")
+            .unwrap();
+        let mut help = Vec::new();
+        peer.write_long_help(&mut help).unwrap();
+        let help = String::from_utf8(help).unwrap();
+        for flag in [
+            "--host",
+            "--key",
+            "--cwd",
+            "--executable",
+            "--arg",
+            "--policy",
+        ] {
+            assert!(help.contains(flag), "missing {flag} from help: {help}");
+        }
+
+        let terminate = command
+            .find_subcommand_mut("peer")
+            .unwrap()
+            .find_subcommand_mut("terminate")
+            .unwrap();
+        let mut help = Vec::new();
+        terminate.write_long_help(&mut help).unwrap();
+        let help = String::from_utf8(help).unwrap();
+        for flag in ["--host", "--surface-id", "--remote-socket"] {
+            assert!(help.contains(flag), "missing {flag} from help: {help}");
+        }
+    }
+}
+
 fn worktree_policy_name(policy: WorktreePolicyArg) -> &'static str {
     match policy {
         WorktreePolicyArg::Auto => "auto",
@@ -285,12 +422,31 @@ enum Commands {
     /// Install per-agent runbooks into local agent tool configs
     #[command(subcommand)]
     Runbook(RunbookCommands),
+    /// Project registry and local scan operations
+    Project(ProjectCommands),
+    /// Device pairing and recovery operations
+    Pairing(PairingCommands),
+    /// Project synchronization operations
+    Sync(SyncCommands),
+    /// Synchronization conflict operations
+    Conflict(ConflictCommands),
+    /// Project garbage-collection status
+    Gc(GcCommands),
 
     // ── Simple RPC wrappers ────────────────────────────────────────
     /// Destroy the current team
     Destroy,
     /// List all teams
     List,
+    /// List this host's own workspaces with pane/surface/busy counts
+    Ls {
+        /// Emit machine-readable JSON instead of a table
+        #[arg(long)]
+        json: bool,
+        /// Also print each workspace's split/pane tree
+        #[arg(long)]
+        tree: bool,
+    },
     /// Read an agent's terminal output
     Read {
         agent: String,
@@ -847,6 +1003,51 @@ enum DaemonCommand {
 
 #[derive(Subcommand)]
 enum PeerCommand {
+    /// Check that a remote term-meshd peer socket is reachable and authenticates.
+    Status {
+        /// Explicit SSH target, for example root@jw-server.
+        #[arg(long)]
+        host: String,
+        /// Explicit remote peer socket; omit to auto-detect it.
+        #[arg(long)]
+        remote_socket: Option<String>,
+    },
+    /// Create or reuse one deterministic remote PTY surface.
+    Ensure {
+        /// Explicit SSH target, for example root@jw-server.
+        #[arg(long)]
+        host: String,
+        /// Explicit remote peer socket; omit to auto-detect it.
+        #[arg(long)]
+        remote_socket: Option<String>,
+        /// Caller-owned logical surface key.
+        #[arg(long)]
+        key: String,
+        /// Absolute working directory on the remote host.
+        #[arg(long)]
+        cwd: PathBuf,
+        /// Absolute executable path on the remote host.
+        #[arg(long)]
+        executable: PathBuf,
+        /// One executable argument; repeat for multiple arguments.
+        #[arg(long = "arg", visible_alias = "args", allow_hyphen_values = true)]
+        args: Vec<String>,
+        /// Lifecycle policy: never or on-daemon-restart.
+        #[arg(long, value_enum)]
+        policy: PeerRestartPolicyArg,
+    },
+    /// Terminate one exact ensured remote surface.
+    Terminate {
+        /// Explicit SSH target, for example root@jw-server.
+        #[arg(long)]
+        host: String,
+        /// Exact full surface ID returned by `peer ensure`.
+        #[arg(long)]
+        surface_id: String,
+        /// Explicit remote peer socket; omit to auto-detect it.
+        #[arg(long)]
+        remote_socket: Option<String>,
+    },
     /// List the surfaces a peer-federation host exposes.
     ///
     /// Prints one surface per line: `<title>  <cols>x<rows>  <status>  <id>`
@@ -857,15 +1058,22 @@ enum PeerCommand {
     },
     /// Attach to a surface exposed by a peer-federation host.
     ///
-    /// Without `--name`, attaches to the first surface listed by the host.
+    /// Without `--name` or `--surface-id`, attaches to the first surface listed by the host.
     /// Stream PtyData from the host to stdout; relay stdin as Input.
     /// Ctrl-] detaches in interactive mode; stdin EOF detaches otherwise.
     Attach {
-        /// Path to the host's peer-federation unix socket.
-        socket: PathBuf,
+        /// Local peer-federation Unix socket (legacy direct mode).
+        #[arg(conflicts_with = "host")]
+        socket: Option<PathBuf>,
+        /// Explicit SSH target. Opens a temporary forwarded socket.
+        #[arg(long, conflicts_with = "socket", required_unless_present = "socket")]
+        host: Option<String>,
         /// Title of the surface to attach to; defaults to the first listed.
-        #[arg(long)]
+        #[arg(long, conflicts_with = "surface_id")]
         name: Option<String>,
+        /// Full surface ID returned by `peer ensure`; skips picker selection.
+        #[arg(long, conflicts_with = "name")]
+        surface_id: Option<String>,
     },
     /// Benchmark peer-relay latency/throughput (P8 measurement harness).
     ///
@@ -888,6 +1096,154 @@ enum PeerCommand {
         #[arg(long)]
         json: bool,
     },
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum PeerRestartPolicyArg {
+    Never,
+    OnDaemonRestart,
+}
+
+#[derive(clap::Args)]
+struct ProjectCommands {
+    #[command(subcommand)]
+    command: ProjectCommand,
+}
+
+#[derive(Subcommand)]
+enum ProjectCommand {
+    Add {
+        path: PathBuf,
+        /// Explicit project id (64 hex) — register under a chosen id so a second
+        /// machine can share it for cross-machine sync. Omitted → random.
+        #[arg(long)]
+        id: Option<String>,
+    },
+    List,
+    Status {
+        project: String,
+    },
+    Pause {
+        project: String,
+    },
+    Resume {
+        project: String,
+    },
+    Scan {
+        project: String,
+        #[arg(long)]
+        request_id: Option<String>,
+    },
+}
+
+#[derive(clap::Args)]
+struct PairingCommands {
+    #[command(subcommand)]
+    command: PairingCommand,
+}
+
+#[derive(Subcommand)]
+enum PairingCommand {
+    List {
+        project: String,
+    },
+    Approve {
+        project: String,
+        request: String,
+    },
+    Revoke {
+        project: String,
+        device: String,
+    },
+    #[command(name = "recovery-export")]
+    RecoveryExport {
+        project: String,
+    },
+    #[command(name = "recovery-import")]
+    RecoveryImport {
+        project: String,
+    },
+}
+
+#[derive(clap::Args)]
+struct SyncCommands {
+    #[command(subcommand)]
+    command: SyncCommand,
+}
+
+#[derive(Subcommand)]
+enum SyncCommand {
+    Start {
+        project: String,
+        #[arg(long)]
+        peer: Option<String>,
+        #[arg(long)]
+        request_id: Option<String>,
+    },
+    Status {
+        project: String,
+        operation: String,
+    },
+    Cancel {
+        project: String,
+        operation: String,
+    },
+    /// Dev/test bootstrap — identity phase: ensure this daemon's TLS identity for
+    /// a project and print its certificate hash (feeds the roster).
+    BootstrapIdentity {
+        #[arg(long)]
+        project: String,
+        #[arg(long)]
+        device: String,
+    },
+    /// Dev/test bootstrap — apply phase: provision this daemon from a JSON
+    /// descriptor (`{project_id, recovery, dek_key_id, dek_key, device_id, epoch,
+    /// roster[], peers[]}`). Pass a file path, or `-` to read stdin.
+    BootstrapTrust {
+        #[arg(long)]
+        descriptor: String,
+    },
+    /// Dev/test — responder: bind a listener for a provisioned project and serve
+    /// incoming syncs. Prints the bound address for the initiator's address book.
+    Serve {
+        #[arg(long)]
+        project: String,
+        #[arg(long)]
+        bind: String,
+    },
+}
+
+#[derive(clap::Args)]
+struct ConflictCommands {
+    #[command(subcommand)]
+    command: ConflictCommand,
+}
+
+#[derive(Subcommand)]
+enum ConflictCommand {
+    List {
+        project: String,
+    },
+    Get {
+        project: String,
+        conflict: String,
+    },
+    Resolve {
+        project: String,
+        conflict: String,
+        choice: String,
+    },
+}
+
+#[derive(clap::Args)]
+struct GcCommands {
+    #[command(subcommand)]
+    command: GcCommand,
+}
+
+#[derive(Subcommand)]
+enum GcCommand {
+    Status { project: String },
 }
 
 #[derive(Subcommand)]
@@ -2919,6 +3275,155 @@ fn rpc_call(sock: &PathBuf, method: &str, params: Value) -> Result<Value, String
     rpc_call_timeout(sock, method, params, timeout)
 }
 
+fn daemon_result(sock: &PathBuf, method: &str, params: Value) -> Result<Value, String> {
+    decode_daemon_response(rpc_call(sock, method, params)?)
+}
+
+fn decode_daemon_response(response: Value) -> Result<Value, String> {
+    if let Some(error) = response.get("error").filter(|value| !value.is_null()) {
+        let message = error
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or("RPC_ERROR: daemon request failed");
+        return Err(message.to_string());
+    }
+    response
+        .get("result")
+        .cloned()
+        .ok_or_else(|| "PROTOCOL_ERROR: daemon response has no result".to_string())
+}
+
+fn local_request_id() -> String {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    format!("tm-agent-{}-{nanos}", process::id())
+}
+
+fn run_project_sync_command(sock: &PathBuf, command: &Commands) -> Result<Value, String> {
+    let (method, params) = match command {
+        Commands::Project(group) => match &group.command {
+            ProjectCommand::Add { path, id } => (
+                "project.add",
+                json!({ "root_path": path.to_string_lossy(), "project_id": id }),
+            ),
+            ProjectCommand::List => ("project.list", json!({})),
+            ProjectCommand::Status { project } => {
+                ("project.status", json!({ "project_id": project }))
+            }
+            ProjectCommand::Pause { project } => {
+                ("project.pause", json!({ "project_id": project }))
+            }
+            ProjectCommand::Resume { project } => {
+                ("project.resume", json!({ "project_id": project }))
+            }
+            ProjectCommand::Scan {
+                project,
+                request_id,
+            } => (
+                "project.scan",
+                json!({
+                    "project_id": project,
+                    "request_id": request_id.clone().unwrap_or_else(local_request_id),
+                    "kind": "manifest_scan",
+                }),
+            ),
+        },
+        Commands::Pairing(group) => match &group.command {
+            PairingCommand::List { project } => ("pairing.list", json!({ "project_id": project })),
+            PairingCommand::Approve { project, request } => (
+                "pairing.approve",
+                json!({ "project_id": project, "request_id": request }),
+            ),
+            PairingCommand::Revoke { project, device } => (
+                "pairing.revoke",
+                json!({ "project_id": project, "device_id": device }),
+            ),
+            PairingCommand::RecoveryExport { project } => {
+                ("pairing.recovery_export", json!({ "project_id": project }))
+            }
+            PairingCommand::RecoveryImport { project } => {
+                ("pairing.recovery_import", json!({ "project_id": project }))
+            }
+        },
+        Commands::Sync(group) => match &group.command {
+            SyncCommand::Start {
+                project,
+                peer,
+                request_id,
+            } => (
+                "sync.start",
+                json!({
+                    "project_id": project,
+                    "peer_id": peer,
+                    "request_id": request_id.clone().unwrap_or_else(local_request_id),
+                    "kind": "manifest_scan",
+                }),
+            ),
+            SyncCommand::Status { project, operation } => (
+                "sync.status",
+                json!({ "project_id": project, "operation_id": operation }),
+            ),
+            SyncCommand::Cancel { project, operation } => (
+                "sync.cancel",
+                json!({ "project_id": project, "operation_id": operation }),
+            ),
+            SyncCommand::BootstrapIdentity { project, device } => (
+                "sync.bootstrap_identity",
+                json!({ "project_id": project, "device_id": device }),
+            ),
+            SyncCommand::BootstrapTrust { descriptor } => {
+                // The descriptor JSON matches the RPC params 1:1, so forward it
+                // verbatim (file path, or `-` for stdin).
+                let raw = if descriptor == "-" {
+                    let mut buf = String::new();
+                    std::io::Read::read_to_string(&mut std::io::stdin(), &mut buf)
+                        .map_err(|error| format!("failed to read descriptor from stdin: {error}"))?;
+                    buf
+                } else {
+                    std::fs::read_to_string(descriptor).map_err(|error| {
+                        format!("failed to read descriptor '{descriptor}': {error}")
+                    })?
+                };
+                let params: Value = serde_json::from_str(&raw)
+                    .map_err(|error| format!("descriptor is not valid JSON: {error}"))?;
+                ("sync.bootstrap_trust", params)
+            }
+            SyncCommand::Serve { project, bind } => (
+                "sync.serve",
+                json!({ "project_id": project, "bind_addr": bind }),
+            ),
+        },
+        Commands::Conflict(group) => match &group.command {
+            ConflictCommand::List { project } => {
+                ("conflict.list", json!({ "project_id": project }))
+            }
+            ConflictCommand::Get { project, conflict } => (
+                "conflict.get",
+                json!({ "project_id": project, "conflict_id": conflict }),
+            ),
+            ConflictCommand::Resolve {
+                project,
+                conflict,
+                choice,
+            } => (
+                "conflict.resolve",
+                json!({
+                    "project_id": project,
+                    "conflict_id": conflict,
+                    "choice": choice,
+                }),
+            ),
+        },
+        Commands::Gc(group) => match &group.command {
+            GcCommand::Status { project } => ("gc.status", json!({ "project_id": project })),
+        },
+        _ => return Err("INTERNAL_ERROR: unsupported project sync command".to_string()),
+    };
+    daemon_result(sock, method, params)
+}
+
 fn rpc_call_timeout(
     sock: &PathBuf,
     method: &str,
@@ -4188,11 +4693,57 @@ fn is_leap(y: u32) -> bool {
 fn main() {
     let cli = Cli::parse();
 
+    // `ls` queries the host's own peer socket, not the team control
+    // socket — handle it before detect_socket() (same rationale as Peer).
+    if let Commands::Ls { json, tree } = &cli.command {
+        process::exit(peer::ls_local_cmd(*json, *tree));
+    }
+
     // Peer commands carry their own socket path — handle them before
     // the daemon-socket detection that would otherwise fail when there
     // is no running term-mesh daemon in the environment.
     if let Commands::Peer(ref peer_cmd) = cli.command {
         match &peer_cmd.command {
+            PeerCommand::Status {
+                host,
+                remote_socket,
+            } => {
+                process::exit(peer::status_cmd(host, remote_socket.as_deref()));
+            }
+            PeerCommand::Ensure {
+                host,
+                remote_socket,
+                key,
+                cwd,
+                executable,
+                args,
+                policy,
+            } => {
+                let policy = match policy {
+                    PeerRestartPolicyArg::Never => peer::RestartPolicy::Never,
+                    PeerRestartPolicyArg::OnDaemonRestart => peer::RestartPolicy::OnDaemonRestart,
+                };
+                process::exit(peer::ensure_cmd(
+                    host,
+                    remote_socket.as_deref(),
+                    key,
+                    cwd,
+                    executable,
+                    args,
+                    policy,
+                ));
+            }
+            PeerCommand::Terminate {
+                host,
+                surface_id,
+                remote_socket,
+            } => {
+                process::exit(peer::terminate_cmd(
+                    host,
+                    remote_socket.as_deref(),
+                    surface_id,
+                ));
+            }
             PeerCommand::List { socket } => {
                 if let Err(e) = peer::list_cmd(socket) {
                     eprintln!("peer list failed: {e:#}");
@@ -4200,8 +4751,22 @@ fn main() {
                 }
                 return;
             }
-            PeerCommand::Attach { socket, name } => {
-                if let Err(e) = peer::attach_cmd(socket, name.as_deref()) {
+            PeerCommand::Attach {
+                socket,
+                host,
+                name,
+                surface_id,
+            } => {
+                let result = if let Some(host) = host {
+                    peer::attach_host_cmd(host, name.as_deref(), surface_id.as_deref())
+                } else {
+                    peer::attach_cmd(
+                        socket.as_deref().expect("clap requires socket or host"),
+                        name.as_deref(),
+                        surface_id.as_deref(),
+                    )
+                };
+                if let Err(e) = result {
                     eprintln!("peer attach failed: {e:#}");
                     process::exit(1);
                 }
@@ -4214,9 +4779,7 @@ fn main() {
                 name,
                 json,
             } => {
-                if let Err(e) =
-                    peer::bench_cmd(socket, mode, *iterations, name.as_deref(), *json)
-                {
+                if let Err(e) = peer::bench_cmd(socket, mode, *iterations, name.as_deref(), *json) {
                     eprintln!("peer bench failed: {e:#}");
                     process::exit(1);
                 }
@@ -4229,6 +4792,22 @@ fn main() {
     // They must work before term-mesh is running so onboarding can bootstrap itself.
     if let Commands::Runbook(ref runbook_cmd) = cli.command {
         print_result(run_runbook_command(runbook_cmd));
+        return;
+    }
+
+    if matches!(
+        cli.command,
+        Commands::Project(_)
+            | Commands::Pairing(_)
+            | Commands::Sync(_)
+            | Commands::Conflict(_)
+            | Commands::Gc(_)
+    ) {
+        let sock = detect_watch_socket().unwrap_or_else(|| {
+            eprintln!("Error: DAEMON_UNAVAILABLE: no term-meshd socket found");
+            process::exit(1);
+        });
+        print_result(run_project_sync_command(&sock, &cli.command));
         return;
     }
 
@@ -4859,6 +5438,7 @@ fn main() {
         ),
         Commands::TaskClear2 => rpc_call(&sock, "team.task.clear", json!({ "team_name": team })),
         Commands::Peer(_) => unreachable!("peer commands exit before detect_socket()"),
+        Commands::Ls { .. } => unreachable!("ls exits before detect_socket()"),
         Commands::Runbook(_) => unreachable!("runbook commands exit before detect_socket()"),
         Commands::Doctor { .. } => unreachable!("doctor command exits before detect_socket()"),
         Commands::Daemon(_) => unreachable!("daemon command exits before detect_socket()"),
@@ -5791,6 +6371,11 @@ fn main() {
             }
             return;
         }
+        Commands::Project(_)
+        | Commands::Pairing(_)
+        | Commands::Sync(_)
+        | Commands::Conflict(_)
+        | Commands::Gc(_) => unreachable!("project sync commands return before app socket routing"),
     };
 
     print_result(result);
@@ -5815,19 +6400,14 @@ fn parse_byte_size(raw: &str) -> Result<usize, String> {
         return Err("empty value".to_string());
     }
     let lower = s.to_ascii_lowercase();
-    let (digits, multiplier) = if let Some(prefix) = lower
-        .strip_suffix("kb")
-        .or_else(|| lower.strip_suffix('k'))
-    {
-        (prefix, 1024usize)
-    } else if let Some(prefix) = lower
-        .strip_suffix("mb")
-        .or_else(|| lower.strip_suffix('m'))
-    {
-        (prefix, 1024usize * 1024)
-    } else {
-        (lower.as_str(), 1usize)
-    };
+    let (digits, multiplier) =
+        if let Some(prefix) = lower.strip_suffix("kb").or_else(|| lower.strip_suffix('k')) {
+            (prefix, 1024usize)
+        } else if let Some(prefix) = lower.strip_suffix("mb").or_else(|| lower.strip_suffix('m')) {
+            (prefix, 1024usize * 1024)
+        } else {
+            (lower.as_str(), 1usize)
+        };
     let n: usize = digits
         .trim()
         .parse()
@@ -10185,10 +10765,12 @@ fn run_xk_bridge(sock: &PathBuf, timeout_secs: u32, leader_session: Option<&str>
     let xm_root = resolve_xk_xm_root();
     match &xm_root {
         Some(p) => eprintln!("[xk-bridge] .xm root: {}", p.display()),
-        None => eprintln!(
+        None => {
+            eprintln!(
             "[xk-bridge] warning: no .xm directory found from {} — trace/metric writeback disabled",
             env::current_dir().map(|p| p.display().to_string()).unwrap_or_default()
-        ),
+        )
+        }
     }
     // T2: xk_run (x-panel run telemetry, XK-EVENTS-v1) is mirrored onto the team
     // task board so a leader `tm-agent wait`s on a panel instead of polling files.
@@ -10252,7 +10834,10 @@ fn handle_xk_reply(event: &Value, state: &mut XkBridgeState) -> Result<(), Strin
         );
         return Ok(());
     };
-    let agent = event.get("agent").and_then(Value::as_str).unwrap_or("agent");
+    let agent = event
+        .get("agent")
+        .and_then(Value::as_str)
+        .unwrap_or("agent");
     let team = event.get("team").and_then(Value::as_str).unwrap_or("");
 
     // 1) build plugin → x-build tasks.json transition (reuses xmb machinery).
@@ -10310,10 +10895,7 @@ fn handle_xk_reply(event: &Value, state: &mut XkBridgeState) -> Result<(), Strin
                 "timestamp": ts,
             });
             // Path matches x-build's cost engine (ROOT = .xm/build).
-            let metrics_path = root
-                .join("build")
-                .join("metrics")
-                .join("sessions.jsonl");
+            let metrics_path = root.join("build").join("metrics").join("sessions.jsonl");
             if let Err(e) = xk_append_jsonl(&metrics_path, &metric) {
                 eprintln!("[xk-bridge] metrics: {e}");
             }
@@ -10415,7 +10997,11 @@ fn handle_xk_run(event: &Value, state: &mut XkBridgeState) -> Result<(), String>
                 .and_then(Value::as_str)
                 .filter(|s| !s.is_empty())
                 .unwrap_or(run);
-            let ns = if run_kind == "cross" { "cross" } else { "panel" };
+            let ns = if run_kind == "cross" {
+                "cross"
+            } else {
+                "panel"
+            };
             let created = rpc_call(
                 &app_sock,
                 "team.task.create",
@@ -10707,17 +11293,11 @@ mod xk_bridge_tests {
 
         // Path form (as written by trace subcommand `start`)
         fs::write(traces.join(".active"), ".xm/traces/op-1.jsonl\n").expect("marker");
-        assert_eq!(
-            xk_active_trace_path(&dir),
-            Some(traces.join("op-1.jsonl"))
-        );
+        assert_eq!(xk_active_trace_path(&dir), Some(traces.join("op-1.jsonl")));
 
         // Bare filename form
         fs::write(traces.join(".active"), "op-1.jsonl").expect("marker");
-        assert_eq!(
-            xk_active_trace_path(&dir),
-            Some(traces.join("op-1.jsonl"))
-        );
+        assert_eq!(xk_active_trace_path(&dir), Some(traces.join("op-1.jsonl")));
 
         // Stale marker (file gone) → None
         fs::write(traces.join(".active"), "gone.jsonl").expect("marker");
@@ -10856,7 +11436,10 @@ mod xk_bridge_tests {
         // done → completed
         handle_xk_run(&xk_run_event("done", ""), &mut state).expect("done");
         let calls = calls.lock().unwrap();
-        let methods: Vec<&str> = calls.iter().map(|c| c["method"].as_str().unwrap()).collect();
+        let methods: Vec<&str> = calls
+            .iter()
+            .map(|c| c["method"].as_str().unwrap())
+            .collect();
         assert_eq!(
             methods,
             vec!["team.task.create", "team.task.update", "team.task.update"],
@@ -11695,24 +12278,29 @@ fn run_claim(sock: &PathBuf, team: &str, agent: &str) {
                 let goal = details.clone().unwrap_or_else(|| title.clone());
                 let policy = parse_worktree_policy_name(task["worktree_policy"].as_str());
 
-                if task["worktree_path"].as_str().filter(|s| !s.is_empty()).is_none()
+                if task["worktree_path"]
+                    .as_str()
+                    .filter(|s| !s.is_empty())
+                    .is_none()
                     && should_acquire_worktree(policy, agent, &goal, &title, details.as_deref())
                 {
                     let branch = worktree_branch_for_task(team, &task, &goal);
                     match gk_wt_acquire(&branch, None) {
-                        Ok(meta) => match update_task_with_worktree(sock, team, &task_id, &meta, policy)
-                        {
-                            Ok(updated) => {
-                                task = updated["result"].clone();
-                                v["result"] = task.clone();
+                        Ok(meta) => {
+                            match update_task_with_worktree(sock, team, &task_id, &meta, policy) {
+                                Ok(updated) => {
+                                    task = updated["result"].clone();
+                                    v["result"] = task.clone();
+                                }
+                                Err(e) => {
+                                    let reason =
+                                        format!("task.update worktree metadata failed: {e}");
+                                    block_task_for_worktree_error(sock, team, &task_id, &reason);
+                                    eprintln!("Error: {reason}");
+                                    process::exit(1);
+                                }
                             }
-                            Err(e) => {
-                                let reason = format!("task.update worktree metadata failed: {e}");
-                                block_task_for_worktree_error(sock, team, &task_id, &reason);
-                                eprintln!("Error: {reason}");
-                                process::exit(1);
-                            }
-                        },
+                        }
                         Err(e) => {
                             let reason = format!("worktree acquire failed: {e}");
                             block_task_for_worktree_error(sock, team, &task_id, &reason);
@@ -11722,7 +12310,8 @@ fn run_claim(sock: &PathBuf, team: &str, agent: &str) {
                     }
                 }
 
-                let instruction = format_task_instruction(sock, team, &task, &goal, false, None, None);
+                let instruction =
+                    format_task_instruction(sock, team, &task, &goal, false, None, None);
                 let send_text = format!("{instruction}\n");
                 let send_result = if let Some(daemon_sock) = detect_daemon_socket() {
                     if let Some(agent_id) = is_headless_agent(&daemon_sock, team, agent) {

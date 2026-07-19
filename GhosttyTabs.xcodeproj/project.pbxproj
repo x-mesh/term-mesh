@@ -17,7 +17,18 @@
 			CVB00006 /* SidebarTabItem.swift in Sources */ = {isa = PBXBuildFile; fileRef = CVS00006 /* SidebarTabItem.swift */; };
 			CVB00007 /* SidebarViews.swift in Sources */ = {isa = PBXBuildFile; fileRef = CVS00007 /* SidebarViews.swift */; };
 			CVB00008 /* MenuBarExtra.swift in Sources */ = {isa = PBXBuildFile; fileRef = CVS00008 /* MenuBarExtra.swift */; };
-			CVB00009 /* SettingsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = CVS00009 /* SettingsView.swift */; };
+		CVB00009 /* SettingsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = CVS00009 /* SettingsView.swift */; };
+		A14000000000000000000001 /* ProjectSyncViewModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = A14000000000000000000004 /* ProjectSyncViewModel.swift */; };
+		A14000000000000000000002 /* ProjectSyncPanelView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A14000000000000000000005 /* ProjectSyncPanelView.swift */; };
+		A14000000000000000000003 /* ProjectSyncViewModelTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A14000000000000000000006 /* ProjectSyncViewModelTests.swift */; };
+		A15000000000000000000001 /* WorkspaceRemoteRetrievalModels.swift in Sources */ = {isa = PBXBuildFile; fileRef = A15000000000000000000003 /* WorkspaceRemoteRetrievalModels.swift */; };
+		A15000000000000000000002 /* WorkspaceRemoteRetrievalModelsTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A15000000000000000000004 /* WorkspaceRemoteRetrievalModelsTests.swift */; };
+		A15100000000000000000001 /* RemoteGitCheckpointService.swift in Sources */ = {isa = PBXBuildFile; fileRef = A15100000000000000000005 /* RemoteGitCheckpointService.swift */; };
+		A15100000000000000000039 /* RemoteWorkLog.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1510000000000000000003A /* RemoteWorkLog.swift */; };
+		A15100000000000000000034 /* RemotePasteTransfer.swift in Sources */ = {isa = PBXBuildFile; fileRef = A15100000000000000000038 /* RemotePasteTransfer.swift */; };
+		A15100000000000000000002 /* WorkspaceRetrievalStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = A15100000000000000000006 /* WorkspaceRetrievalStore.swift */; };
+		A15100000000000000000003 /* WorkspaceRetrievalViews.swift in Sources */ = {isa = PBXBuildFile; fileRef = A15100000000000000000007 /* WorkspaceRetrievalViews.swift */; };
+		A15100000000000000000004 /* WorkspaceRetrievalStoreTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A15100000000000000000008 /* WorkspaceRetrievalStoreTests.swift */; };
 			CVB00010 /* AppearanceSettings.swift in Sources */ = {isa = PBXBuildFile; fileRef = CVS00010 /* AppearanceSettings.swift */; };
 			CVB00039 /* TerminalSettings.swift in Sources */ = {isa = PBXBuildFile; fileRef = CVS00039 /* TerminalSettings.swift */; };
 			CVB00011 /* Logging.swift in Sources */ = {isa = PBXBuildFile; fileRef = CVS00011 /* Logging.swift */; };
@@ -188,10 +199,12 @@
 				F7000000A1B2C3D4E5F60718 /* IMEHistoryTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = F7000001A1B2C3D4E5F60718 /* IMEHistoryTests.swift */; };
 				F8000000A1B2C3D4E5F60718 /* IMESendKeyTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = F8000001A1B2C3D4E5F60718 /* IMESendKeyTests.swift */; };
 				F9000000A1B2C3D4E5F60718 /* AutoReplyDetectorTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = F9000001A1B2C3D4E5F60718 /* AutoReplyDetectorTests.swift */; };
+				F9000010A1B2C3D4E5F60718 /* WorkspaceRetrievalDirectoryTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = F9000011A1B2C3D4E5F60718 /* WorkspaceRetrievalDirectoryTests.swift */; };
 				FA000000A1B2C3D4E5F60718 /* PeerSocketProberTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = FA000001A1B2C3D4E5F60718 /* PeerSocketProberTests.swift */; };
 				FB000000A1B2C3D4E5F60718 /* PeerPaneSessionTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = FB000001A1B2C3D4E5F60718 /* PeerPaneSessionTests.swift */; };
 				FC000000A1B2C3D4E5F60718 /* PeerWorkspaceMirrorTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = FC000001A1B2C3D4E5F60718 /* PeerWorkspaceMirrorTests.swift */; };
 				FD000000A1B2C3D4E5F60718 /* PeerDaemonVersionTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = FD000001A1B2C3D4E5F60718 /* PeerDaemonVersionTests.swift */; };
+				FE000000A1B2C3D4E5F60718 /* PeerHostProfileDedupeTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = FE000001A1B2C3D4E5F60718 /* PeerHostProfileDedupeTests.swift */; };
 		/* End PBXBuildFile section */
 
 /* Begin PBXCopyFilesBuildPhase section */
@@ -259,6 +272,17 @@
 			CVS00007 /* SidebarViews.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SidebarViews.swift; sourceTree = "<group>"; };
 			CVS00008 /* MenuBarExtra.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MenuBarExtra.swift; sourceTree = "<group>"; };
 			CVS00009 /* SettingsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SettingsView.swift; sourceTree = "<group>"; };
+			A14000000000000000000004 /* ProjectSyncViewModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ProjectSyncViewModel.swift; sourceTree = "<group>"; };
+			A14000000000000000000005 /* ProjectSyncPanelView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ProjectSyncPanelView.swift; sourceTree = "<group>"; };
+			A14000000000000000000006 /* ProjectSyncViewModelTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ProjectSyncViewModelTests.swift; sourceTree = "<group>"; };
+			A15000000000000000000003 /* WorkspaceRemoteRetrievalModels.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WorkspaceRemoteRetrievalModels.swift; sourceTree = "<group>"; };
+			A15000000000000000000004 /* WorkspaceRemoteRetrievalModelsTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WorkspaceRemoteRetrievalModelsTests.swift; sourceTree = "<group>"; };
+			A15100000000000000000005 /* RemoteGitCheckpointService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RemoteGitCheckpointService.swift; sourceTree = "<group>"; };
+			A1510000000000000000003A /* RemoteWorkLog.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RemoteWorkLog.swift; sourceTree = "<group>"; };
+			A15100000000000000000038 /* RemotePasteTransfer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RemotePasteTransfer.swift; sourceTree = "<group>"; };
+			A15100000000000000000006 /* WorkspaceRetrievalStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WorkspaceRetrievalStore.swift; sourceTree = "<group>"; };
+			A15100000000000000000007 /* WorkspaceRetrievalViews.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WorkspaceRetrievalViews.swift; sourceTree = "<group>"; };
+			A15100000000000000000008 /* WorkspaceRetrievalStoreTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WorkspaceRetrievalStoreTests.swift; sourceTree = "<group>"; };
 			CVS00010 /* AppearanceSettings.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppearanceSettings.swift; sourceTree = "<group>"; };
 			CVS00039 /* TerminalSettings.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TerminalSettings.swift; sourceTree = "<group>"; };
 			CVS00011 /* Logging.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Logging.swift; sourceTree = "<group>"; };
@@ -429,10 +453,12 @@
 			F7000001A1B2C3D4E5F60718 /* IMEHistoryTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = IMEHistoryTests.swift; sourceTree = "<group>"; };
 			F8000001A1B2C3D4E5F60718 /* IMESendKeyTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = IMESendKeyTests.swift; sourceTree = "<group>"; };
 			F9000001A1B2C3D4E5F60718 /* AutoReplyDetectorTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AutoReplyDetectorTests.swift; sourceTree = "<group>"; };
+			F9000011A1B2C3D4E5F60718 /* WorkspaceRetrievalDirectoryTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WorkspaceRetrievalDirectoryTests.swift; sourceTree = "<group>"; };
 			FA000001A1B2C3D4E5F60718 /* PeerSocketProberTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PeerSocketProberTests.swift; sourceTree = "<group>"; };
 			FB000001A1B2C3D4E5F60718 /* PeerPaneSessionTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PeerPaneSessionTests.swift; sourceTree = "<group>"; };
 			FC000001A1B2C3D4E5F60718 /* PeerWorkspaceMirrorTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PeerWorkspaceMirrorTests.swift; sourceTree = "<group>"; };
 			FD000001A1B2C3D4E5F60718 /* PeerDaemonVersionTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PeerDaemonVersionTests.swift; sourceTree = "<group>"; };
+			FE000001A1B2C3D4E5F60718 /* PeerHostProfileDedupeTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PeerHostProfileDedupeTests.swift; sourceTree = "<group>"; };
 		/* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -549,6 +575,14 @@
 					CVS00007 /* SidebarViews.swift */,
 					CVS00008 /* MenuBarExtra.swift */,
 					CVS00009 /* SettingsView.swift */,
+					A14000000000000000000004 /* ProjectSyncViewModel.swift */,
+					A14000000000000000000005 /* ProjectSyncPanelView.swift */,
+					A15000000000000000000003 /* WorkspaceRemoteRetrievalModels.swift */,
+					A15100000000000000000005 /* RemoteGitCheckpointService.swift */,
+					A1510000000000000000003A /* RemoteWorkLog.swift */,
+					A15100000000000000000038 /* RemotePasteTransfer.swift */,
+					A15100000000000000000006 /* WorkspaceRetrievalStore.swift */,
+					A15100000000000000000007 /* WorkspaceRetrievalViews.swift */,
 					CVS00010 /* AppearanceSettings.swift */,
 					CVS00039 /* TerminalSettings.swift */,
 					CVS00011 /* Logging.swift */,
@@ -749,10 +783,15 @@
 				F7000001A1B2C3D4E5F60718 /* IMEHistoryTests.swift */,
 				F8000001A1B2C3D4E5F60718 /* IMESendKeyTests.swift */,
 				F9000001A1B2C3D4E5F60718 /* AutoReplyDetectorTests.swift */,
+				F9000011A1B2C3D4E5F60718 /* WorkspaceRetrievalDirectoryTests.swift */,
 				FA000001A1B2C3D4E5F60718 /* PeerSocketProberTests.swift */,
 				FB000001A1B2C3D4E5F60718 /* PeerPaneSessionTests.swift */,
 				FC000001A1B2C3D4E5F60718 /* PeerWorkspaceMirrorTests.swift */,
 				FD000001A1B2C3D4E5F60718 /* PeerDaemonVersionTests.swift */,
+				FE000001A1B2C3D4E5F60718 /* PeerHostProfileDedupeTests.swift */,
+				A14000000000000000000006 /* ProjectSyncViewModelTests.swift */,
+				A15000000000000000000004 /* WorkspaceRemoteRetrievalModelsTests.swift */,
+				A15100000000000000000008 /* WorkspaceRetrievalStoreTests.swift */,
 			);
 			path = termMeshTests;
 			sourceTree = "<group>";
@@ -903,6 +942,14 @@
 					CVB00007 /* SidebarViews.swift in Sources */,
 					CVB00008 /* MenuBarExtra.swift in Sources */,
 					CVB00009 /* SettingsView.swift in Sources */,
+					A14000000000000000000001 /* ProjectSyncViewModel.swift in Sources */,
+					A14000000000000000000002 /* ProjectSyncPanelView.swift in Sources */,
+					A15000000000000000000001 /* WorkspaceRemoteRetrievalModels.swift in Sources */,
+					A15100000000000000000001 /* RemoteGitCheckpointService.swift in Sources */,
+					A15100000000000000000039 /* RemoteWorkLog.swift in Sources */,
+					A15100000000000000000034 /* RemotePasteTransfer.swift in Sources */,
+					A15100000000000000000002 /* WorkspaceRetrievalStore.swift in Sources */,
+					A15100000000000000000003 /* WorkspaceRetrievalViews.swift in Sources */,
 					CVB00010 /* AppearanceSettings.swift in Sources */,
 					CVB00039 /* TerminalSettings.swift in Sources */,
 					CVB00011 /* Logging.swift in Sources */,
@@ -1075,10 +1122,15 @@
 				F7000000A1B2C3D4E5F60718 /* IMEHistoryTests.swift in Sources */,
 				F8000000A1B2C3D4E5F60718 /* IMESendKeyTests.swift in Sources */,
 				F9000000A1B2C3D4E5F60718 /* AutoReplyDetectorTests.swift in Sources */,
+				F9000010A1B2C3D4E5F60718 /* WorkspaceRetrievalDirectoryTests.swift in Sources */,
 				FA000000A1B2C3D4E5F60718 /* PeerSocketProberTests.swift in Sources */,
 				FB000000A1B2C3D4E5F60718 /* PeerPaneSessionTests.swift in Sources */,
 				FC000000A1B2C3D4E5F60718 /* PeerWorkspaceMirrorTests.swift in Sources */,
 				FD000000A1B2C3D4E5F60718 /* PeerDaemonVersionTests.swift in Sources */,
+				FE000000A1B2C3D4E5F60718 /* PeerHostProfileDedupeTests.swift in Sources */,
+				A14000000000000000000003 /* ProjectSyncViewModelTests.swift in Sources */,
+				A15000000000000000000002 /* WorkspaceRemoteRetrievalModelsTests.swift in Sources */,
+				A15100000000000000000004 /* WorkspaceRetrievalStoreTests.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -1179,7 +1231,7 @@
 				CODE_SIGN_ENTITLEMENTS = "";
 				CODE_SIGN_STYLE = Automatic;
 				COMBINE_HIDPI_IMAGES = YES;
-				CURRENT_PROJECT_VERSION = 216;
+				CURRENT_PROJECT_VERSION = 217;
 				DEVELOPMENT_TEAM = "";
 				ENABLE_HARDENED_RUNTIME = NO;
 				GENERATE_INFOPLIST_FILE = NO;
@@ -1188,7 +1240,7 @@
 					"$(inherited)",
 					"@executable_path/../Frameworks",
 				);
-				MARKETING_VERSION = 0.159.0;
+				MARKETING_VERSION = 0.160.0;
 				OTHER_LDFLAGS = (
 					"-lc++",
 					"-framework",
@@ -1218,7 +1270,7 @@
 				CODE_SIGN_ENTITLEMENTS = "";
 				CODE_SIGN_STYLE = Automatic;
 				COMBINE_HIDPI_IMAGES = YES;
-				CURRENT_PROJECT_VERSION = 216;
+				CURRENT_PROJECT_VERSION = 217;
 				DEVELOPMENT_TEAM = "";
 				ENABLE_HARDENED_RUNTIME = NO;
 				GENERATE_INFOPLIST_FILE = NO;
@@ -1227,7 +1279,7 @@
 					"$(inherited)",
 					"@executable_path/../Frameworks",
 				);
-				MARKETING_VERSION = 0.159.0;
+				MARKETING_VERSION = 0.160.0;
 				OTHER_LDFLAGS = (
 					"-lc++",
 					"-framework",
@@ -1281,10 +1333,10 @@
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 216;
+				CURRENT_PROJECT_VERSION = 217;
 				GENERATE_INFOPLIST_FILE = YES;
 				MACOSX_DEPLOYMENT_TARGET = 14.0;
-				MARKETING_VERSION = 0.159.0;
+				MARKETING_VERSION = 0.160.0;
 				ONLY_ACTIVE_ARCH = YES;
 				PRODUCT_BUNDLE_IDENTIFIER = com.termmesh.appuitests;
 				PRODUCT_NAME = "$(TARGET_NAME)";
@@ -1298,10 +1350,10 @@
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 216;
+				CURRENT_PROJECT_VERSION = 217;
 				GENERATE_INFOPLIST_FILE = YES;
 				MACOSX_DEPLOYMENT_TARGET = 14.0;
-				MARKETING_VERSION = 0.159.0;
+				MARKETING_VERSION = 0.160.0;
 				ONLY_ACTIVE_ARCH = YES;
 				PRODUCT_BUNDLE_IDENTIFIER = com.termmesh.appuitests;
 				PRODUCT_NAME = "$(TARGET_NAME)";
@@ -1315,10 +1367,10 @@
 			buildSettings = {
 				BUNDLE_LOADER = "$(TEST_HOST)";
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 216;
+				CURRENT_PROJECT_VERSION = 217;
 				GENERATE_INFOPLIST_FILE = YES;
 				MACOSX_DEPLOYMENT_TARGET = 14.0;
-				MARKETING_VERSION = 0.159.0;
+				MARKETING_VERSION = 0.160.0;
 				ONLY_ACTIVE_ARCH = YES;
 				PRODUCT_BUNDLE_IDENTIFIER = com.termmesh.apptests;
 				PRODUCT_NAME = "$(TARGET_NAME)";
@@ -1334,10 +1386,10 @@
 			buildSettings = {
 				BUNDLE_LOADER = "$(TEST_HOST)";
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 216;
+				CURRENT_PROJECT_VERSION = 217;
 				GENERATE_INFOPLIST_FILE = YES;
 				MACOSX_DEPLOYMENT_TARGET = 14.0;
-				MARKETING_VERSION = 0.159.0;
+				MARKETING_VERSION = 0.160.0;
 				ONLY_ACTIVE_ARCH = YES;
 				PRODUCT_BUNDLE_IDENTIFIER = com.termmesh.apptests;
 				PRODUCT_NAME = "$(TARGET_NAME)";

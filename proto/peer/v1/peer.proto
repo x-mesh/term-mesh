@@ -57,6 +57,12 @@ message Envelope {
     // Gated behind capability "workspace.lifecycle.v1" (Hello.capabilities).
     RenameWorkspaceRequest rename_workspace_request = 41;
     DeleteWorkspaceRequest delete_workspace_request = 42;
+    // Gated behind capability "surface.ensure.v1" (Hello.capabilities).
+    EnsureSurfaceRequest ensure_surface_request = 43;
+    EnsureSurfaceResponse ensure_surface_response = 44;
+    // Gated behind capability "surface.terminate.v1" (Hello.capabilities).
+    TerminateSurfaceRequest terminate_surface_request = 45;
+    TerminateSurfaceResponse terminate_surface_response = 46;
 
     Ping ping = 50;
     Pong pong = 51;
@@ -170,6 +176,155 @@ message DetachSurface {
 }
 
 // ============================================================
+// Deterministic surface reconciliation
+// ============================================================
+//
+// EnsureSurface reconciles a caller-chosen logical key to exactly one
+// daemon-owned PTY surface. A peer MUST advertise "surface.ensure.v1" before
+// either message is sent. Legacy peers safely ignore the new Envelope fields.
+// Request ids are one-shot for the authenticated connection across BOTH
+// EnsureSurface and TerminateSurface. A dropped response is retried with a
+// fresh request_id; the resource operation, not request replay, is idempotent.
+
+enum EnsureSurfaceRestartPolicy {
+  ENSURE_SURFACE_RESTART_POLICY_UNSPECIFIED = 0;
+  // The logical key is forgotten when its process exits.
+  ENSURE_SURFACE_RESTART_POLICY_NEVER = 1;
+  // Preserve the logical key/spec and recreate the process after daemon start.
+  ENSURE_SURFACE_RESTART_POLICY_ON_DAEMON_RESTART = 2;
+}
+
+message EnsureSurfaceRequest {
+  // Exactly 16 opaque bytes. A daemon MUST reject reuse of a request_id from
+  // either EnsureSurface or TerminateSurface as DUPLICATE_REQUEST_ID. Retrying
+  // a dropped request with a fresh request_id is safe and returns REUSED.
+  bytes request_id = 1;
+  // Caller-scoped logical identity. UTF-8, non-empty, at most 256 bytes.
+  string key = 2;
+  // Absolute existing directory. UTF-8, non-empty, at most 4096 bytes.
+  string cwd = 3;
+  // Absolute executable path. UTF-8, non-empty, at most 4096 bytes.
+  string executable = 4;
+  // Arguments exclude argv[0]. At most 256 entries, each at most 64 KiB.
+  repeated string args = 5;
+  EnsureSurfaceRestartPolicy restart_policy = 6;
+}
+
+enum EnsureSurfaceResult {
+  ENSURE_SURFACE_RESULT_UNSPECIFIED = 0;
+  ENSURE_SURFACE_RESULT_CREATED = 1;
+  ENSURE_SURFACE_RESULT_REUSED = 2;
+  ENSURE_SURFACE_RESULT_RECREATED = 3;
+  ENSURE_SURFACE_RESULT_SPEC_CONFLICT = 4;
+  ENSURE_SURFACE_RESULT_FAILED = 5;
+}
+
+enum EnsureSurfaceErrorCode {
+  ENSURE_SURFACE_ERROR_CODE_UNSPECIFIED = 0;
+  ENSURE_SURFACE_ERROR_CODE_INVALID_REQUEST = 1;
+  // The decoded request violates a field limit above. Frames over 16 MiB are
+  // rejected earlier by framing as ERR_FRAME_TOO_LARGE.
+  ENSURE_SURFACE_ERROR_CODE_REQUEST_TOO_LARGE = 2;
+  ENSURE_SURFACE_ERROR_CODE_DUPLICATE_REQUEST_ID = 3;
+  ENSURE_SURFACE_ERROR_CODE_CWD_NOT_FOUND = 4;
+  ENSURE_SURFACE_ERROR_CODE_CWD_NOT_DIRECTORY = 5;
+  ENSURE_SURFACE_ERROR_CODE_CWD_PERMISSION_DENIED = 6;
+  ENSURE_SURFACE_ERROR_CODE_COMMAND_NOT_FOUND = 7;
+  ENSURE_SURFACE_ERROR_CODE_COMMAND_EXITED = 8;
+  ENSURE_SURFACE_ERROR_CODE_SPEC_CONFLICT = 9;
+  ENSURE_SURFACE_ERROR_CODE_INTERNAL = 10;
+  ENSURE_SURFACE_ERROR_CODE_COMMAND_PERMISSION_DENIED = 11;
+  ENSURE_SURFACE_ERROR_CODE_COMMAND_SIGNALED = 12;
+  // exec(3) failed with an errno other than not-found or permission-denied.
+  ENSURE_SURFACE_ERROR_CODE_COMMAND_EXEC_ERROR = 13;
+  // chdir(2) failed with an errno not covered by the specific cwd codes.
+  ENSURE_SURFACE_ERROR_CODE_CWD_ERROR = 14;
+  ENSURE_SURFACE_ERROR_CODE_EXEC_HANDSHAKE_TRUNCATED = 15;
+  ENSURE_SURFACE_ERROR_CODE_EXEC_HANDSHAKE_INVALID_STAGE = 16;
+  ENSURE_SURFACE_ERROR_CODE_EXEC_HANDSHAKE_TIMEOUT = 17;
+}
+
+message EnsureSurfaceError {
+  EnsureSurfaceErrorCode code = 1;
+  // Stable machine-readable stage, e.g. "validate", "chdir", or "exec".
+  string stage = 2;
+  // Redacted diagnostic context. MUST NOT contain args or environment values.
+  string safe_context = 3;
+  // Child exit status when code is COMMAND_EXITED; zero otherwise.
+  int32 exit_code = 4;
+  // Terminating signal when code is COMMAND_SIGNALED; zero otherwise.
+  int32 signal = 5;
+  // Unix errno for CWD_ERROR or COMMAND_EXEC_ERROR; zero otherwise.
+  int32 os_error = 6;
+}
+
+message EnsureSurfaceResponse {
+  // Echoes EnsureSurfaceRequest.request_id exactly.
+  bytes request_id = 1;
+  EnsureSurfaceResult result = 2;
+  // Stable for a logical key, including across daemon recreation.
+  bytes surface_id = 3;
+  // Unique to one live PTY process instance.
+  bytes instance_id = 4;
+  // Monotonically increases whenever a key is recreated.
+  uint64 generation = 5;
+  // Host process id for diagnostics; zero when no process is running.
+  uint32 pid = 6;
+  // Canonical hash of cwd/executable/args/restart_policy. Never raw secrets.
+  bytes spec_hash = 7;
+  // Present for SPEC_CONFLICT and FAILED; absent on success.
+  EnsureSurfaceError error = 8;
+}
+
+// TerminateSurface removes exactly one ensured surface from the live PTY
+// registry, durable ensured-state, and workspace layout. It never selects a
+// surface by name or by current attachment.
+message TerminateSurfaceRequest {
+  // Exactly 16 opaque bytes; one-shot across EnsureSurface and
+  // TerminateSurface for the authenticated connection. If a response is
+  // dropped, retry with a fresh request_id. Reusing this id is always
+  // DUPLICATE_REQUEST_ID and is never a response-replay mechanism.
+  bytes request_id = 1;
+  // Exact 16-byte SurfaceInfo.surface_id returned by EnsureSurfaceResponse.
+  bytes surface_id = 2;
+}
+
+enum TerminateSurfaceResult {
+  TERMINATE_SURFACE_RESULT_UNSPECIFIED = 0;
+  TERMINATE_SURFACE_RESULT_TERMINATED = 1;
+  // Idempotent success: the exact surface does not exist or is not ensured.
+  // A fresh-id retry after a successful terminate whose response was dropped
+  // therefore returns NOT_FOUND.
+  TERMINATE_SURFACE_RESULT_NOT_FOUND = 2;
+  TERMINATE_SURFACE_RESULT_FAILED = 3;
+}
+
+enum TerminateSurfaceErrorCode {
+  TERMINATE_SURFACE_ERROR_CODE_UNSPECIFIED = 0;
+  TERMINATE_SURFACE_ERROR_CODE_INVALID_REQUEST = 1;
+  TERMINATE_SURFACE_ERROR_CODE_DUPLICATE_REQUEST_ID = 2;
+  TERMINATE_SURFACE_ERROR_CODE_INTERNAL = 3;
+}
+
+message TerminateSurfaceError {
+  TerminateSurfaceErrorCode code = 1;
+  // Stable machine-readable stage: "validate", "terminate", or "internal".
+  string stage = 2;
+  // Redacted diagnostic context; never command, args, env, or secrets.
+  string safe_context = 3;
+}
+
+message TerminateSurfaceResponse {
+  // Echoes TerminateSurfaceRequest.request_id exactly.
+  bytes request_id = 1;
+  TerminateSurfaceResult result = 2;
+  // Echoes the exact requested surface_id on every result.
+  bytes surface_id = 3;
+  // Present only for FAILED; absent for TERMINATED and NOT_FOUND.
+  TerminateSurfaceError error = 4;
+}
+
+// ============================================================
 // Workspace listing (layout-preserving attach)
 // ============================================================
 //
@@ -250,6 +405,15 @@ message WorkspacePane {
   // ask the host to switch the active tab via
   // WorkspaceControl.activate_tab.
   repeated PaneTab tabs = 6;
+  // Activity indicator: true when the pane's ACTIVE surface has a
+  // foreground process group distinct from its shell — i.e. a command is
+  // running — and false when the shell sits at its prompt (idle). Derived
+  // host-side from tcgetpgrp(pty_master) != shell_pgid at serialization
+  // time (ListWorkspaces + every WorkspaceLayoutChanged push), so it costs
+  // one syscall per pane on an event that already fires — no polling.
+  // Field-additive and backward compatible: hosts that predate this leave
+  // it false, which clients render as idle.
+  bool busy = 7;
 }
 
 message PaneTab {

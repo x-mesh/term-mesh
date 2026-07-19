@@ -43,6 +43,14 @@ final class PeerWorkspaceMirrorController {
     /// Host split id bytes → local bonsplit split UUID. Rebuilt on every
     /// structural reconcile; consumed by divider fast path + outbound diff.
     var hostSplitToLocal: [Data: UUID] = [:]
+    /// Panels displaced by `markAllPanesStale()` (resync / reconnect),
+    /// captured before the map is wiped so `reconcile` can reap them AFTER
+    /// spawning their replacements (spawn-before-close). Without this,
+    /// wiping the map leaves B3's stale-close loop nothing to iterate, so
+    /// the old panels survive as orphaned ghost tabs — each retaining a
+    /// dead `term-mesh-peer-relay` helper process (the v0.159 relay leak).
+    /// Internal (not private): reaped by `reconcile` in the +Reconcile file.
+    var pendingStalePanelIds: [UUID] = []
 
     private var subscriptionTransport: UnixSocketTransport?
     private var subscriptionSession: PeerSession?
@@ -358,6 +366,12 @@ final class PeerWorkspaceMirrorController {
         // complex than it's worth: dropping the map makes every target
         // leaf "missing" (fresh spawn) and every mapped panel unmatched
         // (stale close) in one reconcile pass.
+        //
+        // But dropping the map also erases B3's only handle to these
+        // panels, so snapshot them first — `reconcile` closes them once
+        // it has spawned their replacements (B3b), reaping each old pane's
+        // relay helper process instead of orphaning it as a ghost tab.
+        pendingStalePanelIds.append(contentsOf: panelBySurfaceID.values)
         panelBySurfaceID.removeAll()
         hostSplitToLocal.removeAll()
     }

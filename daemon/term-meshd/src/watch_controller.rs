@@ -160,10 +160,7 @@ fn board_dir(working_dir: &Path) -> PathBuf {
 /// Append one finding to `.xm/watch/board.jsonl`, deduped by `check_id`.
 /// Returns `Ok(true)` when a new row was written, `Ok(false)` when the
 /// `check_id` was already present (idempotent skip).
-pub(crate) fn append_board_finding(
-    working_dir: &Path,
-    f: &BoardFinding,
-) -> std::io::Result<bool> {
+pub(crate) fn append_board_finding(working_dir: &Path, f: &BoardFinding) -> std::io::Result<bool> {
     use std::io::Write;
     let dir = board_dir(working_dir);
     std::fs::create_dir_all(&dir)?;
@@ -248,11 +245,7 @@ impl LeaderInbox for AppSocketInbox {
 /// Focus-free `team.message.post` over the app Unix socket. NO `to` field, so the
 /// app routes it to the leader inbox; this is a data command and never activates
 /// or raises any window (NFR2).
-async fn post_team_message(
-    app_socket: &str,
-    team_id: &str,
-    content: &str,
-) -> std::io::Result<()> {
+async fn post_team_message(app_socket: &str, team_id: &str, content: &str) -> std::io::Result<()> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let mut stream = tokio::net::UnixStream::connect(app_socket).await?;
     let req = serde_json::json!({
@@ -359,12 +352,18 @@ pub(crate) async fn handle_outcome<I: LeaderInbox + ?Sized>(
         .drift_type
         .clone()
         .unwrap_or_else(|| outcome.drift_kind.as_str().to_string());
-    let severity = parsed.severity.clone().unwrap_or_else(|| "medium".to_string());
+    let severity = parsed
+        .severity
+        .clone()
+        .unwrap_or_else(|| "medium".to_string());
     let finding = parsed
         .finding
         .clone()
         .unwrap_or_else(|| "drift detected".to_string());
-    let spec_clause = parsed.spec_clause.clone().unwrap_or_else(|| "n/a".to_string());
+    let spec_clause = parsed
+        .spec_clause
+        .clone()
+        .unwrap_or_else(|| "n/a".to_string());
 
     let finding_row = BoardFinding {
         ts: now_unix(),
@@ -381,7 +380,11 @@ pub(crate) async fn handle_outcome<I: LeaderInbox + ?Sized>(
             // D2 (leader-as-watch-target): a "leader" target means the report loops
             // back into the leader's own inbox (self-watch). Tag it so the user can
             // tell self-oversight from worker oversight at a glance.
-            let self_watch = if outcome.target == "leader" { "[self-watch] " } else { "" };
+            let self_watch = if outcome.target == "leader" {
+                "[self-watch] "
+            } else {
+                ""
+            };
             let content = format!(
                 "{self_watch}[watch:{drift_type}/{severity}] {target}: {finding} (spec: {spec_clause}) [check_id={cid}]",
                 target = outcome.target,
@@ -557,7 +560,8 @@ mod tests {
         }
         let o = outcome("chk-1", DRIFT_VERDICT);
 
-        let action = handle_outcome(&o, dir.path(), Some("/tmp/dummy.sock"), &inbox, &registry).await;
+        let action =
+            handle_outcome(&o, dir.path(), Some("/tmp/dummy.sock"), &inbox, &registry).await;
         assert_eq!(action, ControllerAction::Appended);
 
         let board = std::fs::read_to_string(board_dir(dir.path()).join("board.jsonl")).unwrap();
@@ -595,16 +599,32 @@ mod tests {
             );
         }
 
-        let first =
-            handle_outcome(&outcome("chk-dup", DRIFT_VERDICT), dir.path(), Some("/tmp/dummy.sock"), &inbox, &registry).await;
+        let first = handle_outcome(
+            &outcome("chk-dup", DRIFT_VERDICT),
+            dir.path(),
+            Some("/tmp/dummy.sock"),
+            &inbox,
+            &registry,
+        )
+        .await;
         assert_eq!(first, ControllerAction::Appended);
         // Same check_id again (a retried tick) → idempotent skip.
-        let second =
-            handle_outcome(&outcome("chk-dup", DRIFT_VERDICT), dir.path(), Some("/tmp/dummy.sock"), &inbox, &registry).await;
+        let second = handle_outcome(
+            &outcome("chk-dup", DRIFT_VERDICT),
+            dir.path(),
+            Some("/tmp/dummy.sock"),
+            &inbox,
+            &registry,
+        )
+        .await;
         assert_eq!(second, ControllerAction::Duplicate);
 
         let board = std::fs::read_to_string(board_dir(dir.path()).join("board.jsonl")).unwrap();
-        assert_eq!(board.lines().count(), 1, "duplicate must not add a board row");
+        assert_eq!(
+            board.lines().count(),
+            1,
+            "duplicate must not add a board row"
+        );
         assert_eq!(
             inbox.posts.lock().unwrap().len(),
             1,
@@ -634,7 +654,14 @@ mod tests {
         }
         let ok = "[VERDICT] on-track\n[FINDING] none\n[SPEC_CLAUSE] n/a";
 
-        let action = handle_outcome(&outcome("chk-ok", ok), dir.path(), Some("/tmp/dummy.sock"), &inbox, &registry).await;
+        let action = handle_outcome(
+            &outcome("chk-ok", ok),
+            dir.path(),
+            Some("/tmp/dummy.sock"),
+            &inbox,
+            &registry,
+        )
+        .await;
         assert_eq!(action, ControllerAction::NoDrift);
 
         assert!(
@@ -671,7 +698,8 @@ mod tests {
         o.reported = false;
         o.error = Some("spawn failed: boom".into());
 
-        let action = handle_outcome(&o, dir.path(), Some("/tmp/dummy.sock"), &inbox, &registry).await;
+        let action =
+            handle_outcome(&o, dir.path(), Some("/tmp/dummy.sock"), &inbox, &registry).await;
         assert_eq!(action, ControllerAction::Errored);
         assert!(!board_dir(dir.path()).join("board.jsonl").exists());
         assert!(inbox.posts.lock().unwrap().is_empty());
@@ -782,11 +810,17 @@ mod tests {
                 ),
             );
         }
-        let action = handle_outcome(&outcome, dir.path(), Some("/tmp/dummy.sock"), &inbox, &registry).await;
+        let action = handle_outcome(
+            &outcome,
+            dir.path(),
+            Some("/tmp/dummy.sock"),
+            &inbox,
+            &registry,
+        )
+        .await;
         assert_eq!(action, ControllerAction::Appended);
 
-        let board =
-            std::fs::read_to_string(board_dir(dir.path()).join("board.jsonl")).unwrap();
+        let board = std::fs::read_to_string(board_dir(dir.path()).join("board.jsonl")).unwrap();
         assert!(board.contains("\"check_id\":\"chk-e2e\""));
         assert!(board.contains("\"drift_type\":\"execution\""));
         assert!(board.contains("ignored a failing build"));
@@ -821,8 +855,7 @@ mod tests {
         drop(tx); // close channel → controller drains then exits
         handle.await.unwrap();
 
-        let board =
-            std::fs::read_to_string(board_dir(dir.path()).join("board.jsonl")).unwrap();
+        let board = std::fs::read_to_string(board_dir(dir.path()).join("board.jsonl")).unwrap();
         assert!(board.contains("\"check_id\":\"chk-int\""));
         assert!(board.contains("\"agent\":\"executor\""));
         let posts = posts.lock().unwrap();

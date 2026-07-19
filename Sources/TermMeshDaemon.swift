@@ -222,6 +222,27 @@ final class TermMeshDaemon: ObservableObject {
                 }
             }
 
+            // Where the sync layer keeps THIS daemon's own secrets: its QUIC
+            // TLS keypair and the project DEK. Nothing to do with reaching a
+            // peer — that is ssh's job — only with keeping a stable identity
+            // across restarts.
+            //
+            // The macOS Keychain backend needs a code-signing entitlement this
+            // app does not carry, so asking for it fails provisioning outright
+            // (`SYNC_BOOTSTRAP_KEYCHAIN`). Pointing at a directory selects the
+            // file backend instead. Revisit when the app is signed with a
+            // keychain entitlement.
+            if env["TERMMESH_SYNC_KEYCHAIN_DIR"] == nil,
+               let support = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first {
+                let dir = support.appendingPathComponent("term-mesh/sync-keychain", isDirectory: true)
+                try? FileManager.default.createDirectory(
+                    at: dir,
+                    withIntermediateDirectories: true,
+                    attributes: [.posixPermissions: 0o700]
+                )
+                env["TERMMESH_SYNC_KEYCHAIN_DIR"] = dir.path
+            }
+
             // Dashboard settings
             // Tagged apps (parallel dev builds) disable HTTP to avoid port conflicts.
             let isTaggedBuild = termMeshEnv("TAG") != nil

@@ -1,12 +1,17 @@
 [package]
 name = "term-meshd"
-version = "0.159.0"
+version = "0.160.0"
 edition = "2021"
+rust-version = "1.88"
 description = "term-mesh background daemon — worktree orchestration, resource monitoring, file heatmap"
 
 [[bin]]
 name = "term-meshd"
 path = "src/main.rs"
+
+[[bench]]
+name = "mesh_sync_scale"
+harness = false
 
 [dependencies]
 # Async runtime
@@ -14,6 +19,9 @@ tokio = { version = "1", features = ["full"] }
 
 # Git worktree orchestration (F-01)
 git2 = { version = "0.19", features = ["vendored-openssl", "vendored-libgit2"] }
+flate2 = "1"
+sha1 = "0.10"
+memmap2 = "0.9"
 
 # Serialization (JSON-RPC over Unix Socket)
 serde = { version = "1", features = ["derive"] }
@@ -50,6 +58,7 @@ getrandom = "0.2"
 
 # Peer federation protocol bindings
 peer-proto = { path = "../peer-proto" }
+sync-protocol = { path = "../sync-protocol" }
 prost = "0.13"
 
 # Platform directories
@@ -58,6 +67,19 @@ dirs = "6"
 # SHA-256 hashing for headless agent instructions integrity (Phase 2)
 sha2 = "0.10"
 hex = "0.4"
+blake3 = "1"
+chacha20poly1305 = "0.10.1"
+zeroize = { version = "1.8.1", features = ["derive"] }
+ed25519-dalek = "=3.0.0"
+x25519-dalek = { version = "=3.0.0", features = ["static_secrets"] }
+hkdf = "=0.12.4"
+unicode-casefold = "0.2.0"
+unicode-normalization = "0.1"
+quinn = { version = "=0.11.11", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
+rcgen = { version = "=0.14.8", default-features = false, features = ["ring"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+security-framework = { version = "=3.7.0", features = ["OSX_10_15"] }
 
 # Force static zlib linking so term-meshd doesn't depend on Homebrew's libz.
 # Without this, libgit2-sys links dynamically to /opt/homebrew/opt/zlib/lib/libz.1.dylib

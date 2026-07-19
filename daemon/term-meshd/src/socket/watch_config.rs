@@ -171,7 +171,10 @@ mod tests {
         // Removing the final entry deletes the config file.
         remove_watch_state(wd, "b");
         assert!(load_watch_states(wd).is_empty());
-        assert!(!config_path(wd).exists(), "empty config file should be removed");
+        assert!(
+            !config_path(wd).exists(),
+            "empty config file should be removed"
+        );
     }
 
     #[test]

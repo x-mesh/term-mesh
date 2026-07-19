@@ -69,6 +69,10 @@ struct VerticalTabsSidebar: View {
 
                         SidebarRemoteHostsSection(store: remoteHostStore)
 
+                        if let selectedWorkspace = tabManager.tabs.first(where: { $0.id == tabManager.selectedTabId }) {
+                            WorkspaceRetrievalSidebarSection(workspace: selectedWorkspace)
+                        }
+
                         SidebarEmptyArea(
                             rowSpacing: tabRowSpacing,
                             selection: $selection,
@@ -1014,9 +1018,18 @@ struct RemoteHostGroupView: View {
                 // "jw-server (3)". Hidden while saved/connecting so the
                 // row doesn't flash a stale/zero count.
                 if host.isConnected, !host.workspaces.isEmpty {
-                    Text("(\(host.workspaces.count))")
+                    let panes = host.workspaces.reduce(0) { $0 + $1.paneCount }
+                    let busy = host.workspaces.reduce(0) { $0 + $1.busyCount }
+                    Text("(\(host.workspaces.count) · \(panes)p)")
                         .font(.system(size: 10))
+                        .monospacedDigit()
                         .foregroundColor(Color.secondary.opacity(0.7))
+                    if busy > 0 {
+                        Circle()
+                            .fill(Color.orange)
+                            .frame(width: 5, height: 5)
+                            .help("\(busy) pane\(busy == 1 ? "" : "s") running a command across this host")
+                    }
                 }
                 // Inline "+" = New Workspace…, mirroring the section
                 // header's add-host affordance. Only rendered when the
@@ -1191,6 +1204,23 @@ struct RemoteWorkspaceRowView: View {
                     .truncationMode(.tail)
             }
             Spacer()
+            // Pane/surface counts + a busy dot — the workspace's live
+            // inventory at a glance (hidden mid-rename so the field is
+            // uncluttered). "2p" when panes == surfaces, else "2p·4s".
+            if !isRenaming {
+                Text(workspace.paneCount == workspace.surfaceCount
+                     ? "\(workspace.paneCount)p"
+                     : "\(workspace.paneCount)p·\(workspace.surfaceCount)s")
+                    .font(.system(size: 9.5))
+                    .monospacedDigit()
+                    .foregroundColor(Color.secondary.opacity(0.7))
+                if workspace.busyCount > 0 {
+                    Circle()
+                        .fill(Color.orange)
+                        .frame(width: 5, height: 5)
+                        .help("\(workspace.busyCount) pane\(workspace.busyCount == 1 ? "" : "s") running a command")
+                }
+            }
         }
         .padding(.leading, 20)
         .padding(.trailing, 10)

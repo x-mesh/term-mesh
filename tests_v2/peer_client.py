@@ -46,6 +46,8 @@ PROTOCOL_VERSION = "1.0.0"
 MAX_FRAME_BYTES = 16 * 1024 * 1024
 AUTH_METHOD = "ssh-passthrough"
 WORKSPACE_LIFECYCLE_CAPABILITY = "workspace.lifecycle.v1"
+SURFACE_ENSURE_CAPABILITY = "surface.ensure.v1"
+SURFACE_TERMINATE_CAPABILITY = "surface.terminate.v1"
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_DAEMON_BINARY = REPO_ROOT / "daemon" / "target" / "release" / "term-meshd"
@@ -69,6 +71,37 @@ class WorkspaceInfo:
         return self.id.hex()
 
 
+@dataclass(frozen=True)
+class EnsureSurfaceOutcome:
+    """Stable, client-friendly view of one correlated ensure response."""
+
+    request_id: bytes
+    result: int
+    surface_id: bytes
+    instance_id: bytes
+    generation: int
+    pid: int
+    spec_hash: bytes
+    error_code: int
+    error_stage: str
+    error_context: str
+    exit_code: int
+    signal: int
+    os_error: int
+
+
+@dataclass(frozen=True)
+class TerminateSurfaceOutcome:
+    """Stable, client-friendly view of one correlated terminate response."""
+
+    request_id: bytes
+    result: int
+    surface_id: bytes
+    error_code: int
+    error_stage: str
+    error_context: str
+
+
 def _count_panes(layout: "pb.WorkspaceLayout") -> int:
     """Recursively count leaf panes in a `WorkspaceLayout` tree."""
     kind = layout.WhichOneof("node")
@@ -82,9 +115,19 @@ def _count_panes(layout: "pb.WorkspaceLayout") -> int:
 class PeerClient:
     """One handshake-driven connection to a term-meshd peer-federation host."""
 
-    def __init__(self, socket_path: str, display_name: str = "peer-e2e-test"):
+    def __init__(
+        self,
+        socket_path: str,
+        display_name: str = "peer-e2e-test",
+        capabilities: Optional[List[str]] = None,
+    ):
         self.socket_path = str(socket_path)
         self.display_name = display_name
+        self.capabilities = list(capabilities) if capabilities is not None else [
+            WORKSPACE_LIFECYCLE_CAPABILITY,
+            SURFACE_ENSURE_CAPABILITY,
+            SURFACE_TERMINATE_CAPABILITY,
+        ]
         self._sock: Optional[socket.socket] = None
         self._recv_buf = b""
         self._seq = 0
@@ -208,7 +251,7 @@ class PeerClient:
                 protocol_version=PROTOCOL_VERSION,
                 peer_id=uuid.uuid4().bytes,
                 display_name=self.display_name,
-                capabilities=[WORKSPACE_LIFECYCLE_CAPABILITY],
+                capabilities=self.capabilities,
                 app_version="peer-e2e-test",
             )
         )
@@ -275,6 +318,199 @@ class PeerClient:
         self._send(ping=pb.Ping(nonce=nonce))
         self._read_until(lambda e: e.WhichOneof("payload") == "pong" and e.pong.nonce == nonce, timeout_s)
 
+    # ---- deterministic surface RPCs -----------------------------------------
+
+    def ensure_surface(
+        self,
+        key: str,
+        cwd: str,
+        executable: str,
+        args: Optional[List[str]] = None,
+        restart_policy: int = pb.ENSURE_SURFACE_RESTART_POLICY_ON_DAEMON_RESTART,
+        request_id: Optional[bytes] = None,
+        timeout_s: float = 10.0,
+    ) -> EnsureSurfaceOutcome:
+        request_id = request_id if request_id is not None else uuid.uuid4().bytes
+        seq = self._send(
+            ensure_surface_request=pb.EnsureSurfaceRequest(
+                request_id=request_id,
+                key=key,
+                cwd=cwd,
+                executable=executable,
+                args=list(args or []),
+                restart_policy=restart_policy,
+            )
+        )
+        env = self._read_until(
+            lambda e: e.correlation_id == seq and e.WhichOneof("payload") == "ensure_surface_response",
+            timeout_s,
+        )
+        return self._ensure_outcome(env.ensure_surface_response)
+
+    @staticmethod
+    def _ensure_outcome(response: "pb.EnsureSurfaceResponse") -> EnsureSurfaceOutcome:
+        error = response.error if response.HasField("error") else None
+        return EnsureSurfaceOutcome(
+            request_id=bytes(response.request_id),
+            result=response.result,
+            surface_id=bytes(response.surface_id),
+            instance_id=bytes(response.instance_id),
+            generation=response.generation,
+            pid=response.pid,
+            spec_hash=bytes(response.spec_hash),
+            error_code=error.code if error else pb.ENSURE_SURFACE_ERROR_CODE_UNSPECIFIED,
+            error_stage=error.stage if error else "",
+            error_context=error.safe_context if error else "",
+            exit_code=error.exit_code if error else 0,
+            signal=error.signal if error else 0,
+            os_error=error.os_error if error else 0,
+        )
+
+    def ensure_same_surface_concurrently(
+        self,
+        count: int,
+        key: str,
+        cwd: str,
+        executable: str,
+        args: Optional[List[str]] = None,
+        timeout_s: float = 30.0,
+    ) -> List[EnsureSurfaceOutcome]:
+        """Pipeline requests on one connection and demux reordered replies."""
+        deadline = time.monotonic() + timeout_s
+        pending = {}
+        for _ in range(count):
+            request_id = uuid.uuid4().bytes
+            seq = self._send(
+                ensure_surface_request=pb.EnsureSurfaceRequest(
+                    request_id=request_id,
+                    key=key,
+                    cwd=cwd,
+                    executable=executable,
+                    args=list(args or []),
+                    restart_policy=pb.ENSURE_SURFACE_RESTART_POLICY_ON_DAEMON_RESTART,
+                )
+            )
+            pending[seq] = request_id
+
+        outcomes = []
+        while pending:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise PeerClientError(
+                    f"timed out with {len(pending)} ensure responses still pending"
+                )
+            env = self._read_until(
+                lambda e: e.correlation_id in pending
+                and e.WhichOneof("payload") == "ensure_surface_response",
+                remaining,
+            )
+            expected_request_id = pending.pop(env.correlation_id)
+            outcome = self._ensure_outcome(env.ensure_surface_response)
+            if outcome.request_id != expected_request_id:
+                raise PeerClientError(
+                    f"ensure response request_id mismatch for correlation {env.correlation_id}"
+                )
+            outcomes.append(outcome)
+        return outcomes
+
+    def send_ensure_without_waiting(
+        self,
+        key: str,
+        cwd: str,
+        executable: str,
+        args: Optional[List[str]] = None,
+        request_id: Optional[bytes] = None,
+    ) -> bytes:
+        """Send a valid ensure then let the caller drop the connection."""
+        request_id = request_id if request_id is not None else uuid.uuid4().bytes
+        self._send(
+            ensure_surface_request=pb.EnsureSurfaceRequest(
+                request_id=request_id,
+                key=key,
+                cwd=cwd,
+                executable=executable,
+                args=list(args or []),
+                restart_policy=pb.ENSURE_SURFACE_RESTART_POLICY_ON_DAEMON_RESTART,
+            )
+        )
+        return request_id
+
+    def terminate_surface(
+        self,
+        surface_id: bytes,
+        request_id: Optional[bytes] = None,
+        timeout_s: float = 10.0,
+    ) -> TerminateSurfaceOutcome:
+        """Terminate one exact ensured surface.
+
+        Normal calls generate a fresh request_id. If a response is dropped,
+        call this method again without reusing the old id: request ids are
+        one-shot, while resource idempotency returns NOT_FOUND after a prior
+        successful termination.
+        """
+        request_id = request_id if request_id is not None else uuid.uuid4().bytes
+        seq = self._send(
+            terminate_surface_request=pb.TerminateSurfaceRequest(
+                request_id=request_id,
+                surface_id=surface_id,
+            )
+        )
+        env = self._read_until(
+            lambda e: e.correlation_id == seq
+            and e.WhichOneof("payload") == "terminate_surface_response",
+            timeout_s,
+        )
+        response = env.terminate_surface_response
+        error = response.error if response.HasField("error") else None
+        return TerminateSurfaceOutcome(
+            request_id=bytes(response.request_id),
+            result=response.result,
+            surface_id=bytes(response.surface_id),
+            error_code=error.code
+            if error
+            else pb.TERMINATE_SURFACE_ERROR_CODE_UNSPECIFIED,
+            error_stage=error.stage if error else "",
+            error_context=error.safe_context if error else "",
+        )
+
+    def list_surfaces(self, timeout_s: float = 10.0) -> List["pb.SurfaceInfo"]:
+        seq = self._send(list_surfaces=pb.ListSurfaces())
+        env = self._read_until(
+            lambda e: e.correlation_id == seq and e.WhichOneof("payload") == "surface_list",
+            timeout_s,
+        )
+        return list(env.surface_list.surfaces)
+
+    def attach_surface(self, surface_id: bytes, timeout_s: float = 10.0) -> None:
+        seq = self._send(
+            attach_surface=pb.AttachSurface(
+                surface_id=surface_id,
+                mode=pb.ATTACH_MODE_CO_WRITE,
+                client_cols=80,
+                client_rows=24,
+                resume_from_seq=0,
+            )
+        )
+        env = self._read_until(
+            lambda e: e.correlation_id == seq and e.WhichOneof("payload") == "attach_result",
+            timeout_s,
+        )
+        if not env.attach_result.accepted:
+            raise PeerClientError(f"attach refused: {env.attach_result.reason}")
+
+    def detach_surface(self, surface_id: bytes) -> None:
+        self._send(detach_surface=pb.DetachSurface(surface_id=surface_id))
+
+    def send_malformed_frame(self, payload: bytes) -> None:
+        if self._sock is None:
+            raise PeerClientError("not connected")
+        self._sock.sendall(struct.pack("<I", len(payload)) + payload)
+
+    def send_oversized_frame_header(self) -> None:
+        if self._sock is None:
+            raise PeerClientError("not connected")
+        self._sock.sendall(struct.pack("<I", MAX_FRAME_BYTES + 1))
+
 
 class TermMeshDaemon:
     """Spawns an isolated `term-meshd` process for peer-federation e2e tests.
@@ -285,6 +521,9 @@ class TermMeshDaemon:
         `<home>/Library/Application Support/term-meshd/` (`dirs::data_local_dir()`
         resolves via `$HOME` on macOS/unix -- verified against the vendored
         `dirs-sys` 0.5.0 source; see `daemon/term-meshd/src/peer/persist.rs`).
+      - `XDG_DATA_HOME`, `XDG_CONFIG_HOME`, and `XDG_CACHE_HOME` are all
+        rooted under the same disposable workdir. This also isolates Linux,
+        where `dirs::data_local_dir()` prefers XDG over HOME.
       - `TERMMESH_PEER_SOCKET` -> isolated peer-protocol socket (opt-in;
         unset means no peer server at all).
       - `TERMMESH_DAEMON_UNIX_PATH` -> isolated main app-protocol socket.
@@ -318,6 +557,11 @@ class TermMeshDaemon:
         self.workdir = Path(workdir) if workdir else Path(tempfile.mkdtemp(prefix="tm-peer-e2e-"))
         self.home_dir = self.workdir / "home"
         self.home_dir.mkdir(parents=True, exist_ok=True)
+        self.xdg_data_dir = self.workdir / "xdg-data"
+        self.xdg_config_dir = self.workdir / "xdg-config"
+        self.xdg_cache_dir = self.workdir / "xdg-cache"
+        for directory in (self.xdg_data_dir, self.xdg_config_dir, self.xdg_cache_dir):
+            directory.mkdir(parents=True, exist_ok=True)
         self._sock_dir = Path(tempfile.mkdtemp(prefix="tm-peer-e2e-sock-", dir="/tmp"))
         self.peer_socket_path = self._sock_dir / "peer.sock"
         self.daemon_socket_path = self._sock_dir / "daemon.sock"
@@ -330,11 +574,18 @@ class TermMeshDaemon:
     def workspaces_path(self) -> Path:
         """Where this instance's `peer-workspaces.json` lives, for tests
         that want to assert on the persisted file directly."""
-        return self.home_dir / "Library" / "Application Support" / "term-meshd" / "peer-workspaces.json"
+        if sys.platform == "darwin":
+            data_root = self.home_dir / "Library" / "Application Support"
+        else:
+            data_root = self.xdg_data_dir
+        return data_root / "term-meshd" / "peer-workspaces.json"
 
     def _env(self) -> Dict[str, str]:
         env = dict(os.environ)
         env["HOME"] = str(self.home_dir)
+        env["XDG_DATA_HOME"] = str(self.xdg_data_dir)
+        env["XDG_CONFIG_HOME"] = str(self.xdg_config_dir)
+        env["XDG_CACHE_HOME"] = str(self.xdg_cache_dir)
         env["TERMMESH_PEER_SOCKET"] = str(self.peer_socket_path)
         env["TERMMESH_DAEMON_UNIX_PATH"] = str(self.daemon_socket_path)
         env["TERM_MESH_HTTP_DISABLED"] = "1"
