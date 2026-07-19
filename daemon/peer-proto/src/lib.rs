@@ -50,6 +50,11 @@ pub mod capability {
     /// The host can terminate one exact ensured surface and remove its
     /// runtime, persistence, and layout state.
     pub const SURFACE_TERMINATE_V1: &str = "surface.terminate.v1";
+    /// The host pushes `HostStats` (load, memory, disk and network rates)
+    /// for the machine it runs on. Advertised by the client, since the
+    /// client is what decides whether it wants the traffic — a host sends
+    /// these only to connections that asked.
+    pub const HOST_STATS_V1: &str = "host.stats.v1";
 
     /// Every capability this build supports. Single source of truth for
     /// populating outgoing `Hello.capabilities` — callers should use
@@ -61,6 +66,7 @@ pub mod capability {
         WORKSPACE_LIFECYCLE_V1,
         SURFACE_ENSURE_V1,
         SURFACE_TERMINATE_V1,
+        HOST_STATS_V1,
     ];
 
     /// `Hello.capabilities` value for an outgoing handshake message.

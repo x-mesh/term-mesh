@@ -30,11 +30,16 @@ public enum PeerCapability {
     /// Exact ensured-surface termination via
     /// `TerminateSurfaceRequest`/`TerminateSurfaceResponse`.
     public static let surfaceTerminateV1 = "surface.terminate.v1"
+    /// `HostStats` pushes — load, memory, disk and network rates for the
+    /// machine hosting the panes. Advertised by the side that WANTS them,
+    /// so a host sends them only to a client that asked. Mirrors
+    /// `HOST_STATS_V1` on the Rust side.
+    public static let hostStatsV1 = "host.stats.v1"
 
     /// Every capability this build supports. Single source of truth for
     /// populating outgoing `Hello.capabilities` — don't hand-roll the list
     /// at each call site.
-    public static let supported: [String] = [ptyDataCoalesceV1, replayRingV1, workspaceLifecycleV1, surfaceEnsureV1, surfaceTerminateV1]
+    public static let supported: [String] = [ptyDataCoalesceV1, replayRingV1, workspaceLifecycleV1, surfaceEnsureV1, surfaceTerminateV1, hostStatsV1]
 }
 
 /// The other side's advertised feature flags, parsed once out of its
