@@ -392,7 +392,14 @@ pub async fn run_fetch_pull(
                         _ => return Err("fetch_out_of_order".to_string()),
                     }
                 }
-                staging.finish().map_err(|_| "cas_finish_failed".to_string())?;
+                staging.finish().map_err(|error| {
+                    // Keep the reason: `finish` fails on a decrypt error, a
+                    // chunk-length mismatch, an identity mismatch and several
+                    // I/O faults, and collapsing them all to one code makes a
+                    // real failure unactionable.
+                    tracing::warn!(?error, "CAS finish failed");
+                    "cas_finish_failed".to_string()
+                })?;
                 resolved.insert(path, object_id);
             }
             _ => return Err("fetch_out_of_order".to_string()),
@@ -608,7 +615,14 @@ async fn receive_push_inner(
                         _ => return Err("push_out_of_order".to_string()),
                     }
                 }
-                staging.finish().map_err(|_| "cas_finish_failed".to_string())?;
+                staging.finish().map_err(|error| {
+                    // Keep the reason: `finish` fails on a decrypt error, a
+                    // chunk-length mismatch, an identity mismatch and several
+                    // I/O faults, and collapsing them all to one code makes a
+                    // real failure unactionable.
+                    tracing::warn!(?error, "CAS finish failed");
+                    "cas_finish_failed".to_string()
+                })?;
                 resolved.insert(path, object_id);
             }
             _ => return Err("push_out_of_order".to_string()),

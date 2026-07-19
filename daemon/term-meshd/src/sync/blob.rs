@@ -59,7 +59,14 @@ pub fn put_plaintext(
             .write_encrypted_chunk(index as u32, &envelope)
             .map_err(|_| "cas_write_failed".to_string())?;
     }
-    staging.finish().map_err(|_| "cas_finish_failed".to_string())?;
+    staging.finish().map_err(|error| {
+                    // Keep the reason: `finish` fails on a decrypt error, a
+                    // chunk-length mismatch, an identity mismatch and several
+                    // I/O faults, and collapsing them all to one code makes a
+                    // real failure unactionable.
+                    tracing::warn!(?error, "CAS finish failed");
+                    "cas_finish_failed".to_string()
+                })?;
     Ok(object_id)
 }
 
@@ -148,6 +155,13 @@ pub async fn recv_object(
             .map_err(|_| "cas_write_failed".to_string())?;
         received += 1;
     }
-    staging.finish().map_err(|_| "cas_finish_failed".to_string())?;
+    staging.finish().map_err(|error| {
+                    // Keep the reason: `finish` fails on a decrypt error, a
+                    // chunk-length mismatch, an identity mismatch and several
+                    // I/O faults, and collapsing them all to one code makes a
+                    // real failure unactionable.
+                    tracing::warn!(?error, "CAS finish failed");
+                    "cas_finish_failed".to_string()
+                })?;
     Ok(())
 }
