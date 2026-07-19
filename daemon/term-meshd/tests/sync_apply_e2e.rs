@@ -13,7 +13,8 @@ use std::sync::Arc;
 
 use ed25519_dalek::SigningKey;
 use sync::{
-    build_apply_plan, diff_manifests, put_plaintext, recv_object, scan_project_entries,
+    build_apply_plan, chunk_count_for, diff_manifests, put_plaintext, recv_object,
+    scan_project_entries, CHUNK_SIZE,
     seed_trust_store, send_object, ApplyAction, ApplyPlan, ApplyPlanEntry, ApplyPrecondition,
     ApplyStore, BootstrapDevice, CasError, CasLimits, CasStore, DeviceTlsIdentity, EntryKind, KeyId,
     ObjectDomain, ObjectType, ProjectId, ProjectKey, ProjectKeyMaterial, ProjectKeyProvider,
@@ -256,4 +257,57 @@ async fn file_overwrite_replaces_existing_content() {
 
     let applied = std::fs::read(dest_root.path().join("report.txt")).expect("file exists");
     assert_eq!(applied, new, "overwrite did not replace the old content");
+}
+
+/// An empty file is ordinary — `__init__.py`, `.gitkeep`, a freshly-created
+/// log — and it has to survive a sync like any other.
+///
+/// `put_plaintext` iterated `plaintext.chunks(CHUNK_SIZE)`, which yields NOTHING
+/// for an empty slice, while the CAS counts a zero-length object as one chunk.
+/// The object was staged with no chunks at all and `finish` rejected it as
+/// incomplete, so a single empty file anywhere in a project failed the whole
+/// sync with `cas_finish_failed`.
+#[test]
+fn an_empty_file_round_trips_through_the_cas() {
+    let temporary = tempfile::tempdir().unwrap();
+    let project = ProjectId::from_bytes([61; 32]);
+    let store = cas(&temporary.path().join("cas"));
+    let object_domain = ObjectDomain {
+        project_id: project,
+        object_type: ObjectType::FILE,
+        version: 1,
+    };
+
+    let object_id = put_plaintext(&store, object_domain, &ProjectKey::new(KEY_BYTES), KEY_ID, b"")
+        .expect("an empty file must be storable");
+
+    let mut readback = Vec::new();
+    store
+        .copy_verified_plaintext(object_domain, object_id, &mut readback)
+        .expect("an empty object must be readable back");
+    assert!(readback.is_empty(), "an empty file must read back empty");
+}
+
+/// The wire and the CAS must agree on how many chunks an object has.
+///
+/// They disagreed for zero-length objects: `chunk_count_for` said none while
+/// the CAS counted one, so a sender wrote no chunk for an empty file, the
+/// receiver waited for none, and the CAS rejected the staged object as
+/// incomplete. Anchoring the two together is what keeps an empty file syncable.
+#[test]
+fn the_wire_and_the_cas_agree_on_chunk_counts() {
+    for length in [0_u64, 1, 1024, CHUNK_SIZE as u64 - 1, CHUNK_SIZE as u64, CHUNK_SIZE as u64 + 1] {
+        let wire = chunk_count_for(length);
+        assert!(wire >= 1, "every object owns at least one chunk (len={length})");
+        // An empty object is the case the two used to disagree on.
+        if length == 0 {
+            assert_eq!(wire, 1, "an empty object still has one chunk");
+        } else {
+            assert_eq!(
+                u64::from(wire),
+                length.div_ceil(CHUNK_SIZE as u64),
+                "chunk count for len={length}"
+            );
+        }
+    }
 }
