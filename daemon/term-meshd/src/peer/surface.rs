@@ -175,9 +175,9 @@ pub struct PtySurface {
     pub cols: AtomicU32,
     pub rows: AtomicU32,
     /// Directory the child was spawned in (absolute path when resolvable).
+    /// Only a fallback for reporting: what a viewer is shown is where the
+    /// shell is *now*, via [`PtySurface::current_cwd`].
     pub cwd: String,
-    /// Git branch of `cwd` at spawn time; empty when cwd is not in a repo.
-    pub branch: String,
     /// The authoritative broadcast sender. Subscribers are created via
     /// `.subscribe()`; the reader task owns a cloned sender for fan-out.
     pub broadcast_tx: broadcast::Sender<PtyChunk>,
@@ -242,7 +242,6 @@ impl PtySurface {
                 .map(|p| p.to_string_lossy().into_owned())
                 .unwrap_or_default()
         });
-        let branch = resolve_git_branch(&resolved_cwd);
 
         let surface = Arc::new(PtySurface {
             surface_id: surface_id.clone(),
@@ -251,7 +250,6 @@ impl PtySurface {
             cols: AtomicU32::new(cols as u32),
             rows: AtomicU32::new(rows as u32),
             cwd: resolved_cwd,
-            branch,
             broadcast_tx: tx.clone(),
             dead: AtomicBool::new(false),
             dead_notify: Notify::new(),
@@ -618,7 +616,33 @@ impl PtySurface {
         fg > 0 && fg != shell_pgid
     }
 
+    /// Where the shell sits *now*, not where it was spawned.
+    ///
+    /// A terminal normally learns this from the shell's own OSC 7 report, but
+    /// that channel is closed to us by design: a pane hosted here is drawn on
+    /// another machine, and a terminal refuses an OSC 7 whose hostname is not
+    /// local — otherwise any SSH session could tell your terminal what its
+    /// working directory is. Asking the OS instead sidesteps the terminal byte
+    /// stream entirely, which also means it works for any shell with no shell
+    /// integration installed and survives a shell restart.
+    ///
+    /// Best-effort by construction: a dead child, a platform without a lookup,
+    /// or a permission failure all fall back to the spawn directory, so callers
+    /// always get a usable path rather than an empty one.
+    pub fn current_cwd(&self) -> String {
+        let pid = match self.child.lock() {
+            Ok(child) if child.state == ChildState::Running => child.pid,
+            _ => return self.cwd.clone(),
+        };
+        process_cwd(pid).unwrap_or_else(|| self.cwd.clone())
+    }
+
     pub fn info(&self) -> SurfaceInfo {
+        // Both are derived live. A branch pinned at spawn time would contradict
+        // a cwd that has since moved into a different repository, and a viewer
+        // showing that pair has no way to tell which of the two is stale.
+        let cwd = self.current_cwd();
+        let branch = resolve_git_branch(&cwd);
         SurfaceInfo {
             surface_id: self.surface_id.clone(),
             workspace_name: self.workspace_name.clone(),
@@ -627,10 +651,60 @@ impl PtySurface {
             rows: self.rows.load(Ordering::Relaxed),
             surface_type: "terminal".into(),
             attachable: self.is_live(),
-            cwd: self.cwd.clone(),
-            branch: self.branch.clone(),
+            cwd,
+            branch,
         }
     }
+}
+
+/// The working directory of `pid`, or `None` when it cannot be determined.
+#[cfg(target_os = "linux")]
+fn process_cwd(pid: libc::pid_t) -> Option<String> {
+    std::fs::read_link(format!("/proc/{pid}/cwd"))
+        .ok()
+        .map(|path| path.to_string_lossy().into_owned())
+}
+
+/// The working directory of `pid`, or `None` when it cannot be determined.
+///
+/// macOS has no `/proc`, so this asks the kernel directly. `proc_pidinfo`
+/// returns the count of bytes it filled in, and rejecting a short write keeps
+/// a partially-populated struct from being read as a real path.
+#[cfg(target_os = "macos")]
+fn process_cwd(pid: libc::pid_t) -> Option<String> {
+    let mut info: libc::proc_vnodepathinfo = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of::<libc::proc_vnodepathinfo>() as libc::c_int;
+    let written = unsafe {
+        libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDVNODEPATHINFO,
+            0,
+            (&raw mut info).cast(),
+            size,
+        )
+    };
+    if written != size {
+        return None;
+    }
+    // `vip_path` is MAXPATHLEN laid out as chunked rows, so flatten before
+    // looking for the NUL that ends the path.
+    let bytes: Vec<u8> = info
+        .pvi_cdir
+        .vip_path
+        .iter()
+        .flatten()
+        .take_while(|&&c| c != 0)
+        .map(|&c| c as u8)
+        .collect();
+    if bytes.is_empty() {
+        return None;
+    }
+    String::from_utf8(bytes).ok()
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn process_cwd(_pid: libc::pid_t) -> Option<String> {
+    None
 }
 
 /// Best-effort current-branch lookup via `git2`. Returns empty string when
@@ -2328,5 +2402,46 @@ mod tests {
         assert!(!manager.terminate_ensured(&created.surface_id).unwrap());
         assert!(manager.list().is_empty());
         assert!(super::super::persist::load_ensured_surfaces(&path).is_empty());
+    }
+
+    /// The whole point of reading cwd from the OS: it has to follow a `cd`.
+    /// Reporting the spawn directory forever is the bug this replaced, and
+    /// that bug passes any assertion that only checks the starting value.
+    #[tokio::test]
+    async fn current_cwd_follows_the_shell_into_a_new_directory() {
+        let start = tempfile::tempdir().unwrap();
+        let moved_to = tempfile::tempdir().unwrap();
+        // Resolve both sides: macOS hands out /var/... symlinks into /private.
+        let expected = std::fs::canonicalize(moved_to.path()).unwrap();
+
+        let surface = PtySurface::spawn(
+            surface_id_from_name("cwd-follows-test"),
+            "sh".into(),
+            "/bin/sh",
+            &[],
+            80,
+            24,
+            Some(start.path().to_str().unwrap()),
+        )
+        .expect("spawn /bin/sh");
+
+        surface
+            .write_all(format!("cd {}\n", expected.display()).as_bytes())
+            .expect("write cd");
+
+        // The shell chdir()s on its own schedule, so poll rather than sleep a
+        // fixed amount: fast when it is prompt, still correct when it is slow.
+        let mut observed = String::new();
+        for _ in 0..100 {
+            observed = surface.current_cwd();
+            if observed == expected.to_string_lossy() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert_eq!(observed, expected.to_string_lossy());
+        // The spawn directory is what the old code would have reported, so
+        // stating it separately makes the regression unmistakable.
+        assert_ne!(observed, surface.cwd);
     }
 }

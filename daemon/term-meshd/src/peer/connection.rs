@@ -418,13 +418,14 @@ async fn reader_loop(
                 // show the remote surface's cwd / branch immediately. Future
                 // dynamic updates (branch changed, ports opened) would ride
                 // the same channel.
+                let attach_info = surface.info();
                 let meta_env = Envelope {
                     seq: next_seq(&seq_counter),
                     correlation_id: 0,
                     payload: Some(Payload::WorkspaceUpdate(WorkspaceUpdate {
                         kind: Some(workspace_update::Kind::Meta(WorkspaceMeta {
-                            branch: surface.branch.clone(),
-                            cwd: surface.cwd.clone(),
+                            branch: attach_info.branch,
+                            cwd: attach_info.cwd,
                             ports: vec![],
                             latest_notification: String::new(),
                         })),
