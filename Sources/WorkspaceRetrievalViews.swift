@@ -334,20 +334,10 @@ private struct RetrievalActivityDrawer: View {
             .onAppear {
                 store.adoptLogSettings()
                 // The drawer is where the live directory is needed, and the
-                // workspace is what knows it.
-                store.liveDirectoryForPane = { [weak workspace] panelID in
+                // workspace is what can reach the host that knows it.
+                store.remoteDirectoryProvider = { [weak workspace] pane in
                     guard let workspace else { return nil }
-                    let table = workspace.surfaceDirectories
-                    let hit = table[panelID]
-                    if hit == nil, !table.isEmpty {
-                        // The writer keys this table by the surface id and the
-                        // reader by the panel id. If those are different
-                        // namespaces the lookup silently misses, so show both
-                        // rather than leaving it to be guessed.
-                        let keys = table.keys.map { $0.uuidString.prefix(8) }.joined(separator: ", ")
-                        RemoteWorkLog.debug("cwd table has \(table.count) entr(ies) keyed [\(keys)] — none match panel \(panelID.uuidString.prefix(8))")
-                    }
-                    return hit
+                    return await workspace.remoteDirectory(for: pane)
                 }
             }
             .sheet(isPresented: $isEditingProject) {
@@ -814,14 +804,21 @@ private struct ProjectBindingSheet: View {
                 remoteRoot = editing.remoteRoot
                 return
             }
-            // Default to the pane the user is looking at: its host, and the
-            // directory it was spawned in. That is almost always the project
-            // being bound, and typing an absolute remote path by hand is the
-            // step most likely to be got wrong.
+            // Default to the pane the user is looking at: its host, and where
+            // its shell currently is. That is almost always the project being
+            // bound, and typing an absolute remote path by hand is the step
+            // most likely to be got wrong.
             let source = store.selectedPane ?? store.panes.first
             if peerID.isEmpty { peerID = source?.hostLabel ?? hosts.first ?? "" }
-            if remoteRoot.isEmpty, let source {
-                remoteRoot = store.currentDirectory(of: source)
+            guard remoteRoot.isEmpty, let source else { return }
+            // Fill from what is already known first so the field is never
+            // blank, then let the host's answer replace it. Asking costs a
+            // round trip, and a sheet that opens empty and fills in later
+            // reads as broken.
+            remoteRoot = store.currentDirectory(of: source)
+            Task {
+                let fresh = await store.refreshedDirectory(of: source)
+                if remoteRoot.isEmpty || remoteRoot == source.remoteRoot { remoteRoot = fresh }
             }
         }
     }

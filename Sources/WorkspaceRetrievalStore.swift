@@ -86,28 +86,49 @@ final class WorkspaceRetrievalStore: ObservableObject {
         projectBindings.first { $0.id == selectedBindingID } ?? projectBindings.first
     }
 
-    /// Where a remote pane's shell is RIGHT NOW, when the terminal has told us.
+    /// Where a remote pane's shell is RIGHT NOW, asked of the host that runs it.
     ///
-    /// `pane.remoteRoot` is the directory the pane was spawned in and, as the
-    /// protocol says, does not follow a later `cd` — so a shell the user has
-    /// navigated somewhere else reports a stale path or none at all. The
-    /// terminal itself does know: a shell emitting OSC 7 updates the panel's
-    /// directory on every `cd`, remote panes included, because that sequence
-    /// rides the relay like any other output.
-    var liveDirectoryForPane: ((UUID) -> String?)?
+    /// Not read from the terminal stream, which cannot answer: a shell reports
+    /// its directory with OSC 7, and a terminal refuses one whose hostname is
+    /// not local — otherwise any SSH session could tell your terminal where it
+    /// is. A hosted pane always names its own host, so that report is dropped
+    /// before anything here could see it.
+    ///
+    /// The host has the answer either way, since it reads the directory from
+    /// the OS rather than from the shell, so this asks the host directly.
+    var remoteDirectoryProvider: ((WorkspaceRemotePaneRecord) async -> String?)?
 
+    /// The pane's directory without going out to the host: the value from the
+    /// last time it was asked, or the spawn-time one. Callers that can await
+    /// should prefer `refreshedDirectory(of:)`.
     func currentDirectory(of pane: WorkspaceRemotePaneRecord) -> String {
-        let live = liveDirectoryForPane?(pane.panelID)
+        let known = observedDirectories[pane.panelID] ?? pane.remoteRoot
         RemoteWorkLog.debug(
-            "cwd lookup panel=\(pane.panelID.uuidString.prefix(8)) live=\(live ?? "<none>") spawn=\(pane.remoteRoot.isEmpty ? "<empty>" : pane.remoteRoot)"
+            "cwd cached panel=\(pane.panelID.uuidString.prefix(8)) value=\(known.isEmpty ? "<empty>" : known)"
         )
-        if let live, live.hasPrefix("/") { return live }
-        // Nothing live means the shell never reported one: OSC 7 is how a
-        // terminal learns the working directory, and a shell that does not emit
-        // it leaves only the spawn-time value, which does not follow `cd`.
-        RemoteWorkLog.debug("cwd falling back to the spawn-time directory (no OSC 7 seen for this pane)")
-        return pane.remoteRoot
+        return known
     }
+
+    /// The pane's directory as the host reports it now, falling back to the
+    /// cached value when the host cannot be reached — a binding sheet should
+    /// open with a stale suggestion rather than an empty field.
+    func refreshedDirectory(of pane: WorkspaceRemotePaneRecord) async -> String {
+        guard let provider = remoteDirectoryProvider else {
+            RemoteWorkLog.debug("cwd no host provider wired — using the cached value")
+            return currentDirectory(of: pane)
+        }
+        let fresh = await provider(pane)
+        RemoteWorkLog.debug(
+            "cwd asked host panel=\(pane.panelID.uuidString.prefix(8)) got=\(fresh ?? "<none>") spawn=\(pane.remoteRoot.isEmpty ? "<empty>" : pane.remoteRoot)"
+        )
+        guard let fresh, fresh.hasPrefix("/") else { return currentDirectory(of: pane) }
+        observedDirectories[pane.panelID] = fresh
+        return fresh
+    }
+
+    /// Last directory each pane's host reported, so a second look is instant
+    /// and a host that has gone away still yields its most recent answer.
+    private var observedDirectories: [UUID: String] = [:]
 
     /// Bind a folder pair by hand, for a remote shell that was opened without a
     /// project — which is every shell that did not spawn inside one, because

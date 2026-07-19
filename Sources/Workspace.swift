@@ -2494,6 +2494,34 @@ final class Workspace: Identifiable, ObservableObject {
         }
     }
 
+    /// Ask the host where this pane's shell currently is.
+    ///
+    /// The host reads it from the OS, so it is right even for a shell with no
+    /// shell integration — and it is the only source available, since a
+    /// terminal drops a remote shell's own OSC 7 report as untrusted.
+    ///
+    /// Costs a short-lived connection to the host, so this is for moments of
+    /// intent (opening the binding sheet), not for anything that repeats.
+    func remoteDirectory(for pane: WorkspaceRemotePaneRecord) async -> String? {
+        guard let panel = terminalPanel(for: pane.panelID),
+              let session = panel.peerPaneSession else {
+            RemoteWorkLog.debug("cwd panel \(pane.panelID.uuidString.prefix(8)) has no live peer session")
+            return nil
+        }
+        let wanted = session.originSurface.surfaceID
+        do {
+            let surfaces = try await PeerPaneSession.listSurfaces(on: session.lease)
+            guard let match = surfaces.first(where: { $0.surfaceID == wanted }) else {
+                RemoteWorkLog.debug("cwd host no longer lists this surface — it may have exited")
+                return nil
+            }
+            return match.cwd.isEmpty ? nil : match.cwd
+        } catch {
+            RemoteWorkLog.debug("cwd host lookup failed: \(error.localizedDescription)")
+            return nil
+        }
+    }
+
     func terminateRemotePane(panelID: UUID) async {
         guard let panel = terminalPanel(for: panelID),
               let session = panel.peerPaneSession else { return }
