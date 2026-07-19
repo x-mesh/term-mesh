@@ -606,11 +606,17 @@ struct ContentView: View {
                 // cutting the last one mid-number. All of them rank below the
                 // branch and directory, which say where you are.
                 ForEach(titlebarHostStats, id: \.text) { group in
-                    Text(group.text)
-                        .font(.system(size: 10, weight: .regular, design: .monospaced))
-                        .foregroundColor(titlebarColor(opacity: 0.55))
-                        .fixedSize()
-                        .layoutPriority(group.dropPriority)
+                    // Separator and reading travel together so a group that
+                    // gets dropped takes its divider with it, rather than
+                    // leaving a dangling "|" at the end of the line.
+                    HStack(spacing: 5) {
+                        titlebarInfoSeparator
+                        Text(group.text)
+                            .font(.system(size: 10, weight: .regular, design: .monospaced))
+                            .foregroundColor(titlebarColor(opacity: 0.55))
+                    }
+                    .fixedSize()
+                    .layoutPriority(group.dropPriority)
                 }
             }
         }
