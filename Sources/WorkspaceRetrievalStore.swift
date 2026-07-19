@@ -130,9 +130,11 @@ final class WorkspaceRetrievalStore: ObservableObject {
     /// and a host that has gone away still yields its most recent answer.
     private var observedDirectories: [UUID: String] = [:]
 
-    /// Bind a folder pair by hand, for a remote shell that was opened without a
-    /// project — which is every shell that did not spawn inside one, because
-    /// the remote directory is captured at spawn and does not follow a `cd`.
+    /// Bind a folder pair by hand, naming the local folder and the remote one.
+    ///
+    /// Explicit rather than inferred: a pane's directory says where a shell is,
+    /// not which project the user means to move between machines, and those
+    /// differ the moment someone `cd`s into a subdirectory.
     @discardableResult
     func addBinding(peerID: String, localRoot: String, remoteRoot: String) -> ProjectBinding? {
         let local = localRoot.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -244,6 +246,9 @@ final class WorkspaceRetrievalStore: ObservableObject {
     func removeBinding(panelID: UUID) {
         guard let pane = panes.first(where: { $0.panelID == panelID }) else { return }
         panes.removeAll { $0.panelID == panelID }
+        // The pane is the only thing that could ever ask for its directory
+        // again, so its remembered one would outlive every use of it.
+        observedDirectories[panelID] = nil
         activity.insert(RemotePaneActivity(paneID: pane.id, message: "Removed from this Workspace"), at: 0)
         if selectedPaneID == pane.id { selectedPaneID = panes.first?.id }
         pendingClosePanelID = nil

@@ -815,10 +815,14 @@ private struct ProjectBindingSheet: View {
             // blank, then let the host's answer replace it. Asking costs a
             // round trip, and a sheet that opens empty and fills in later
             // reads as broken.
-            remoteRoot = store.currentDirectory(of: source)
+            let suggested = store.currentDirectory(of: source)
+            remoteRoot = suggested
             Task {
                 let fresh = await store.refreshedDirectory(of: source)
-                if remoteRoot.isEmpty || remoteRoot == source.remoteRoot { remoteRoot = fresh }
+                // Replace only what we put there ourselves. Anything else in
+                // the field is what the user typed while the host was being
+                // asked, and that is their answer, not a placeholder.
+                if remoteRoot == suggested { remoteRoot = fresh }
             }
         }
     }
