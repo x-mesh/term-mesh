@@ -1207,12 +1207,25 @@ class GhosttyApp {
             }
             return true
         case GHOSTTY_ACTION_DESKTOP_NOTIFICATION:
-            guard let tabId = surfaceView.tabId else { return true }
             let surfaceId = surfaceView.terminalSurface?.id
             let actionTitle = action.action.desktop_notification.title
                 .flatMap { String(cString: $0) } ?? ""
             let actionBody = action.action.desktop_notification.body
                 .flatMap { String(cString: $0) } ?? ""
+            // A pane on another machine reports through the same OSC as a
+            // local one, so this is also the arrival point for a remote
+            // agent asking for a decision. Logged because a notification
+            // that never appears is otherwise indistinguishable from one
+            // the remote never sent.
+            #if DEBUG
+            dlog("notify.osc title=\(actionTitle) body=\(actionBody.prefix(60)) tab=\(surfaceView.tabId?.uuidString.prefix(8) ?? "<nil>") surface=\(surfaceId?.uuidString.prefix(8) ?? "<nil>")")
+            #endif
+            guard let tabId = surfaceView.tabId else {
+                #if DEBUG
+                dlog("notify.osc dropped — surface has no tab")
+                #endif
+                return true
+            }
             DispatchQueue.main.async { [self] in
                 let tabTitle = AppDelegate.shared?.tabManager?.titleForTab(tabId) ?? "Terminal"
                 let command = actionTitle.isEmpty ? tabTitle : actionTitle
