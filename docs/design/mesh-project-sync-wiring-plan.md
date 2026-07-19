@@ -1,12 +1,80 @@
 # Mesh Project Sync — Wiring & Implementation Plan
 
-> Status: **DRAFT — ready for review** (2026-07-17). Turns the currently-dormant
+> Status: **BUILT AND PARKED** (2026-07-19). The plan below was carried out —
+> the engine is wired end to end and verified between a real Mac and a real
+> Linux peer. It ships in `term-meshd` but **nothing in the app calls it**, on
+> purpose. Read §0 before planning work here.
+>
+> Originally: DRAFT — ready for review (2026-07-17). Turns the currently-dormant
 > sync engine into a working, verifiable cross-machine sync in small phases.
 > Companion to the `mesh-project-sync-protocol.md` ADR (the *what*); this doc is
 > the *how to wire it up and prove it*. §2 interface inventory is filled from a
 > five-layer source survey (transport, orchestration, data-plane, transfer/CAS,
 > design-intent); every claim carries a `file:line`. Confirm §6 decisions
 > (esp. D3 trust provisioning — it gates all e2e) before Phase S0 coding.
+
+## 0. Current status — why this is parked (2026-07-19)
+
+**The engine works.** Everything §4 planned is done and proven on hardware: two
+daemons provision each other, exchange manifests, and move files, directories,
+permissions and deletions both ways, with conflicts detected and resolvable.
+`daemon/scripts/run-synctest-jwserver.sh` runs the whole thing end to end.
+
+**Nothing in the app uses it.** No Swift code calls `sync.start`,
+`sync.status` or `project.register`; the only way in is `tm-agent`. That is a
+decision, not an unfinished edge.
+
+### Why
+
+The product need is "a remote agent writes code and I review it". Code travels
+home through git — checkpoints for work in progress, GitHub for history and
+review — and that is the right shape for it, because review is the goal and
+commits are what review is made of.
+
+A mirrored folder answers a different question: what to do when both sides
+changed the same file. The honest answer is a merge, and git already gives a
+better one. Building toward it meant recreating conflict resolution next to a
+tool that solves it well, and the first real use showed the cost — an edit on
+both sides was correctly held back as a conflict, and all the user saw was a
+sync that reported success and changed nothing.
+
+What replaced it is smaller: transfer at the moment of intent, one direction,
+no shared state. Pasting a file into a remote pane copies the bytes and pastes
+the peer's path (`Sources/RemotePasteTransfer.swift`). A paste carries its own
+trigger, scope and direction, so there is nothing to reconcile.
+
+### What is where
+
+- **Engine** (`daemon/term-meshd/src/sync/`, ~26k lines): stays on `develop`.
+  It is exercised by the integration suite and the hardware e2e, and it found
+  three real bugs while being used. Compiled unconditionally into `term-meshd`;
+  it opens nothing at startup, so an unused daemon pays only binary size.
+- **UI** (Mirror tab, `SyncService`, `SyncMirrorStore`, `SyncMirrorView`):
+  branch `feat/sync-mirror-ui`. Self-contained — check it out and it builds.
+
+### Operational facts worth knowing before reviving it
+
+Learned the hard way; none of these are in the code's own documentation:
+
+- **Provisioning is not idempotent.** Applying the same grants at the same
+  roster epoch twice is refused (`applying trust grants failed`). Provision
+  once, record it, and never repeat — a caller that re-provisions after any
+  later failure locks itself out permanently.
+- **`serve` is per daemon PROCESS, not per provisioning.** A peer that restarts
+  keeps its trust and loses its listener; a sync against it then hangs. Bind
+  before every sync and treat `AddrInUse` as success.
+- **A project registration cannot be removed.** There is no `project remove`,
+  so a folder's project id is permanent on that machine — adopt the existing id
+  rather than minting one.
+- **The project recovery key and DEK must be stable for the project's life.**
+  A `TrustStore` verifies every later grant against the recovery key it was
+  opened with, and a fresh DEK orphans everything already in the peer's CAS.
+
+### What would justify reviving it
+
+A need for data git genuinely cannot carry — large artifacts or datasets that
+do not belong in a repo, moving continuously rather than at a moment of intent.
+Until then, this is a working engine kept warm, not a feature in progress.
 
 ## 1. Where we actually are (honest state)
 
