@@ -51,7 +51,17 @@ pub fn put_plaintext(
     let mut staging = cas
         .begin_stage(domain, object_id, len)
         .map_err(|_| "cas_stage_failed".to_string())?;
-    for (index, chunk) in plaintext.chunks(CHUNK_SIZE).enumerate() {
+    // `chunks()` yields nothing for an empty slice, but the CAS counts a
+    // zero-length object as ONE chunk (`validate_chunk_count`) — so iterating
+    // the slice directly writes no chunk for an empty file and `finish` then
+    // rejects it as incomplete. An empty file is ordinary (`__init__.py`,
+    // `.gitkeep`), so it has to carry its one empty chunk.
+    let chunks: Vec<&[u8]> = if plaintext.is_empty() {
+        vec![&[]]
+    } else {
+        plaintext.chunks(CHUNK_SIZE).collect()
+    };
+    for (index, chunk) in chunks.into_iter().enumerate() {
         let envelope =
             encrypt_chunk_for_key(key, key_id, domain, object_id, len, index as u32, chunk)
                 .map_err(|_| "cas_encrypt_failed".to_string())?;
