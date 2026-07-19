@@ -1018,8 +1018,9 @@ class GhosttyApp {
         }
 
         // Every surface-targeted action dies here when the view cannot be
-        // resolved, before any case runs — which made a missing PWD look like
-        // ghostty never sending one. Say so for the actions we depend on.
+        // resolved, before any case runs, so a dropped action is indis-
+        // tinguishable from one ghostty never sent. Say which it was for the
+        // actions we depend on.
         guard let surfaceView = callbackContext?.surfaceView else {
             #if DEBUG
             if action.tag == GHOSTTY_ACTION_PWD {
@@ -1186,9 +1187,12 @@ class GhosttyApp {
             return true
         case GHOSTTY_ACTION_PWD:
             let pwd = action.action.pwd.pwd.flatMap { String(cString: $0) } ?? ""
-            // The only place a working directory is learned (OSC 7). It fed
-            // nothing for remote panes and there was no way to see why, so say
-            // what arrived and which half of the guard rejected it.
+            // The only place a working directory is learned from the terminal
+            // stream, and it fires for local panes only: Ghostty refuses an
+            // OSC 7 whose hostname is not local, so a pane hosted on another
+            // machine never reaches here. That is why a remote pane's
+            // directory is asked of its host instead (Workspace
+            // `remoteDirectory(for:)`) rather than waited for here.
             #if DEBUG
             dlog("pwd.action pwd=\(pwd) tabId=\(surfaceView.tabId?.uuidString.prefix(8) ?? "<nil>") surfaceId=\(surfaceView.terminalSurface?.id.uuidString.prefix(8) ?? "<nil>")")
             #endif
