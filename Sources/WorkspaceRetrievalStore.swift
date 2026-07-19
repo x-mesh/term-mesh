@@ -338,6 +338,14 @@ final class WorkspaceRetrievalStore: ObservableObject {
         activity.insert(RemotePaneActivity(paneID: paneID, message: message), at: 0)
     }
 
+    /// Empty the drawer so the next run reads on its own.
+    ///
+    /// The on-disk log is deliberately untouched: this clears a view, and a
+    /// run someone wanted to keep is still behind Reveal Log.
+    func clearActivity() {
+        activity.removeAll()
+    }
+
     func setChangesetState(_ id: ChangesetID, state: IncomingChangesetState, error: String? = nil) {
         guard let index = incoming.firstIndex(where: { $0.id == id }) else { return }
         incoming[index].state = state
