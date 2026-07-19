@@ -60,6 +60,12 @@ const REPLAY_CAPACITY_MAX_BYTES: usize = 64 * 1024 * 1024; // 64 MiB
 const FORCE_KILL_GRACE_POLLS: u32 = 10;
 const FORCE_KILL_GRACE_INTERVAL: std::time::Duration = std::time::Duration::from_millis(10);
 
+/// Bound on the post-SIGKILL reap. Generous next to the pre-kill grace window
+/// (a SIGKILLed child normally goes on the first poll) but finite, because the
+/// teardown path must never be able to block its caller forever.
+const REAP_AFTER_KILL_POLLS: u32 = 50;
+const REAP_AFTER_KILL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(20);
+
 /// Process-wide replay buffer capacity, in bytes. Every `PtySurface`'s
 /// `ReplayBuffer::push` reads this on each call, so a runtime change via
 /// `set_replay_capacity` takes effect for all surfaces on their next PTY
@@ -201,6 +207,14 @@ enum ChildState {
     Running,
     Signaled,
     Reaped,
+    /// SIGKILL was delivered but the child could not be reaped within the
+    /// teardown's bounded window — it is stuck mid-exit in the kernel.
+    ///
+    /// Terminal, and deliberately NOT `Reaped`: the pid was never waited on,
+    /// so it may still be recycled, and every signalling path must therefore
+    /// leave it alone from here on. Treated as gone for liveness, because a
+    /// SIGKILLed process never comes back.
+    Abandoned,
 }
 
 #[derive(Debug)]
@@ -433,7 +447,7 @@ impl PtySurface {
         let Ok(mut child) = self.child.lock() else {
             return;
         };
-        if child.state == ChildState::Reaped {
+        if matches!(child.state, ChildState::Reaped | ChildState::Abandoned) {
             return;
         }
         if child.state == ChildState::Running {
@@ -456,37 +470,40 @@ impl PtySurface {
         unsafe {
             libc::kill(child.pid, libc::SIGKILL);
         }
-        Self::reap_blocking_locked(&mut child, &self.reap_owners);
+        Self::reap_after_kill_locked(&mut child, &self.reap_owners);
     }
 
-    /// Blocking companion to `observe_exit_locked`, used only right after a
-    /// SIGKILL where a prompt exit is guaranteed: waits (no `WNOHANG`) until
-    /// the child is reaped so a later caller can never re-signal a recycled
-    /// pid. Retries on `EINTR`; treats `ECHILD` (already reaped elsewhere) as
-    /// done.
-    fn reap_blocking_locked(child: &mut ChildLifecycle, reap_owners: &AtomicUsize) {
-        if child.state == ChildState::Reaped {
+    /// Reap the child after a SIGKILL, giving up after a bounded window.
+    ///
+    /// This used to be a plain blocking `waitpid` (no `WNOHANG`), on the
+    /// premise that a SIGKILLed child exits promptly. It does not always: a
+    /// PTY child stuck mid-exit in the kernel — output buffered on a master
+    /// nobody is draining — stays unreapable for as long as the drain is
+    /// starved. `shutdown_forcibly` runs on the caller's thread, so on a
+    /// current-thread runtime that caller can BE the drain, and the wait then
+    /// never ends. `remove()` is the pane-close and workspace-delete path, so
+    /// that hung the daemon, not just a test.
+    ///
+    /// Polling with `WNOHANG` against a deadline keeps the pid-recycling
+    /// guarantee where it matters and drops only the unbounded wait: either
+    /// the child is reaped here, or it is marked [`ChildState::Abandoned`] and
+    /// no path signals that pid again. SIGKILL is already delivered, so the
+    /// process is gone as soon as the kernel lets it finish; init reaps it.
+    fn reap_after_kill_locked(child: &mut ChildLifecycle, reap_owners: &AtomicUsize) {
+        if matches!(child.state, ChildState::Reaped | ChildState::Abandoned) {
             return;
         }
-        loop {
-            let mut status = 0;
-            // Safety: all waitpid calls for this surface are serialized by
-            // `child`; no second owner can reap concurrently.
-            let result = unsafe { libc::waitpid(child.pid, &mut status, 0) };
-            if result == child.pid
-                || (result < 0
-                    && std::io::Error::last_os_error().raw_os_error() == Some(libc::ECHILD))
-            {
-                child.state = ChildState::Reaped;
-                reap_owners.fetch_add(1, Ordering::Relaxed);
+        for _ in 0..REAP_AFTER_KILL_POLLS {
+            if Self::observe_exit_locked(child, reap_owners) {
                 return;
             }
-            if result < 0
-                && std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted
-            {
-                return;
-            }
+            std::thread::sleep(REAP_AFTER_KILL_INTERVAL);
         }
+        tracing::warn!(
+            pid = child.pid,
+            "SIGKILLed child not reapable within the teardown window; abandoning its pid"
+        );
+        child.state = ChildState::Abandoned;
     }
 
     fn child_has_exited(&self) -> bool {
@@ -503,7 +520,9 @@ impl PtySurface {
     }
 
     fn observe_exit_locked(child: &mut ChildLifecycle, reap_owners: &AtomicUsize) -> bool {
-        if child.state == ChildState::Reaped {
+        // Abandoned is terminal too: SIGKILL was delivered, so the child is
+        // never coming back, and its pid must not be waited on again.
+        if matches!(child.state, ChildState::Reaped | ChildState::Abandoned) {
             return true;
         }
         loop {
@@ -1652,6 +1671,61 @@ mod tests {
         assert_eq!(surface.child.lock().unwrap().state, ChildState::Reaped);
         surface.hangup();
         assert_eq!(surface.signal_owners.load(Ordering::Relaxed), 1);
+    }
+
+    /// `Abandoned` is terminal. It is reached when a SIGKILLed child cannot be
+    /// reaped inside the teardown window, and the pid was therefore never
+    /// waited on — so from that point nothing may signal it again (it can be
+    /// recycled), nothing may block on it again, and the surface must read as
+    /// dead. Before the bounded reap existed there was no such state: the
+    /// teardown simply blocked in `waitpid` forever, hanging every caller of
+    /// `remove()` — pane close and workspace delete included.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_abandoned_child_is_terminal_and_never_signalled_again() {
+        let surface = PtySurface::spawn(
+            surface_id_from_name("abandoned-contract"),
+            "cat".into(),
+            "/bin/cat",
+            &[],
+            80,
+            24,
+            None,
+        )
+        .expect("spawn /bin/cat");
+
+        // Reap it for real first, so the live child does not outlive the test,
+        // then drive the state to Abandoned as an unreapable child would.
+        surface.shutdown_forcibly();
+        let signals_before = surface.signal_owners.load(Ordering::Relaxed);
+        let reaps_before = surface.reap_owners.load(Ordering::Relaxed);
+        surface.child.lock().unwrap().state = ChildState::Abandoned;
+
+        // Reads as gone...
+        assert!(
+            surface.child_has_exited(),
+            "an abandoned child must read as exited"
+        );
+        assert!(!surface.is_live(), "an abandoned surface must not be live");
+
+        // ...and every lifecycle call is now a no-op: no new signal, no new
+        // wait, and — the point of the fix — it RETURNS.
+        surface.hangup();
+        surface.shutdown_forcibly();
+        assert_eq!(
+            surface.signal_owners.load(Ordering::Relaxed),
+            signals_before,
+            "an abandoned pid must never be signalled again"
+        );
+        assert_eq!(
+            surface.reap_owners.load(Ordering::Relaxed),
+            reaps_before,
+            "an abandoned pid must never be waited on again"
+        );
+        assert_eq!(
+            surface.child.lock().unwrap().state,
+            ChildState::Abandoned,
+            "Abandoned is terminal"
+        );
     }
 
     /// A destructive terminate must leave no live process, even when the
