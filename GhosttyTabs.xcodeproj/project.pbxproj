@@ -26,6 +26,7 @@
 		A15100000000000000000001 /* RemoteGitCheckpointService.swift in Sources */ = {isa = PBXBuildFile; fileRef = A15100000000000000000005 /* RemoteGitCheckpointService.swift */; };
 		A15100000000000000000032 /* SyncMirrorStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = A15100000000000000000036 /* SyncMirrorStore.swift */; };
 		A15100000000000000000033 /* SyncMirrorView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A15100000000000000000037 /* SyncMirrorView.swift */; };
+		A15100000000000000000034 /* RemotePasteTransfer.swift in Sources */ = {isa = PBXBuildFile; fileRef = A15100000000000000000038 /* RemotePasteTransfer.swift */; };
 		A15100000000000000000031 /* SyncService.swift in Sources */ = {isa = PBXBuildFile; fileRef = A15100000000000000000035 /* SyncService.swift */; };
 		A15100000000000000000002 /* WorkspaceRetrievalStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = A15100000000000000000006 /* WorkspaceRetrievalStore.swift */; };
 		A15100000000000000000003 /* WorkspaceRetrievalViews.swift in Sources */ = {isa = PBXBuildFile; fileRef = A15100000000000000000007 /* WorkspaceRetrievalViews.swift */; };
@@ -280,6 +281,7 @@
 			A15100000000000000000005 /* RemoteGitCheckpointService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RemoteGitCheckpointService.swift; sourceTree = "<group>"; };
 			A15100000000000000000036 /* SyncMirrorStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SyncMirrorStore.swift; sourceTree = "<group>"; };
 			A15100000000000000000037 /* SyncMirrorView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SyncMirrorView.swift; sourceTree = "<group>"; };
+			A15100000000000000000038 /* RemotePasteTransfer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RemotePasteTransfer.swift; sourceTree = "<group>"; };
 			A15100000000000000000035 /* SyncService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SyncService.swift; sourceTree = "<group>"; };
 			A15100000000000000000006 /* WorkspaceRetrievalStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WorkspaceRetrievalStore.swift; sourceTree = "<group>"; };
 			A15100000000000000000007 /* WorkspaceRetrievalViews.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WorkspaceRetrievalViews.swift; sourceTree = "<group>"; };
@@ -581,6 +583,7 @@
 					A15100000000000000000005 /* RemoteGitCheckpointService.swift */,
 					A15100000000000000000036 /* SyncMirrorStore.swift */,
 					A15100000000000000000037 /* SyncMirrorView.swift */,
+					A15100000000000000000038 /* RemotePasteTransfer.swift */,
 					A15100000000000000000035 /* SyncService.swift */,
 					A15100000000000000000006 /* WorkspaceRetrievalStore.swift */,
 					A15100000000000000000007 /* WorkspaceRetrievalViews.swift */,
@@ -948,6 +951,7 @@
 					A15100000000000000000001 /* RemoteGitCheckpointService.swift in Sources */,
 					A15100000000000000000032 /* SyncMirrorStore.swift in Sources */,
 					A15100000000000000000033 /* SyncMirrorView.swift in Sources */,
+					A15100000000000000000034 /* RemotePasteTransfer.swift in Sources */,
 					A15100000000000000000031 /* SyncService.swift in Sources */,
 					A15100000000000000000002 /* WorkspaceRetrievalStore.swift in Sources */,
 					A15100000000000000000003 /* WorkspaceRetrievalViews.swift in Sources */,
