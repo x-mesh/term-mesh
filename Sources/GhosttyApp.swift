@@ -913,6 +913,13 @@ class GhosttyApp {
                     .flatMap { String(cString: $0) } ?? ""
                 let actionBody = action.action.desktop_notification.body
                     .flatMap { String(cString: $0) } ?? ""
+                // The app-wide arrival point, taken when the action carries no
+                // surface. Logged alongside the surface-scoped one so a missing
+                // notification can be told apart from one that arrived and was
+                // attributed somewhere unexpected.
+                #if DEBUG
+                dlog("notify.osc.app title=\(actionTitle) body=\(actionBody.prefix(60))")
+                #endif
                 DispatchQueue.main.async { [self] in
                     guard let tabManager = AppDelegate.shared?.tabManager,
                           let tabId = tabManager.selectedTabId else {
@@ -1025,6 +1032,9 @@ class GhosttyApp {
             #if DEBUG
             if action.tag == GHOSTTY_ACTION_PWD {
                 dlog("pwd.dropped no surfaceView (tab=\(callbackTabId?.uuidString.prefix(8) ?? "<nil>") surface=\(callbackSurfaceId?.uuidString.prefix(8) ?? "<nil>"))")
+            }
+            if action.tag == GHOSTTY_ACTION_DESKTOP_NOTIFICATION {
+                dlog("notify.dropped no surfaceView (tab=\(callbackTabId?.uuidString.prefix(8) ?? "<nil>") surface=\(callbackSurfaceId?.uuidString.prefix(8) ?? "<nil>"))")
             }
             #endif
             return false
