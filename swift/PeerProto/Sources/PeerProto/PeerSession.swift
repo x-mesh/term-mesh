@@ -61,6 +61,10 @@ public enum PeerIncomingMessage: Sendable {
     /// Pushed when a workspace itself (not a pane inside one) was deleted
     /// on the host. Gated behind capability "workspace.lifecycle.v1".
     case workspaceRemoved(workspaceID: Data)
+    /// How loaded the host machine is, pushed on the host's own sampling
+    /// cadence. Gated behind capability "host.stats.v1", so a host that
+    /// predates it simply never sends one.
+    case hostStats(Termmesh_Peer_V1_HostStats)
     case error(code: UInt32, message: String)
     case goodbye(reason: String)
     case other
@@ -839,6 +843,8 @@ public actor PeerSession {
             default:
                 return .other
             }
+        case .hostStats(let s):
+            return .hostStats(s)
         case .error(let e):
             return .error(code: e.code, message: e.message)
         case .goodbye(let g):

@@ -53,6 +53,10 @@ struct ContentView: View {
     @State private var titlebarIsWorktree: Bool = false
     @State private var titlebarDirBasename: String = ""
     @State private var titlebarHostKey: PeerPaneHostKey? = nil
+    /// Pre-rendered by `PeerHostStats`, never composed here: this view's
+    /// update is a measured hot path (TERM-MESH-1K/1N), so it may read a
+    /// finished string but must not build one.
+    @State private var titlebarHostStats: String = ""
     @State private var titlebarPorts: [Int] = []
     @State private var titlebarSessionStart: Date? = nil
     @State private var titlebarTag: String? = nil
@@ -593,6 +597,18 @@ struct ContentView: View {
                 Text(hostKey.shortLabel)
                     .font(.system(size: 11, weight: .medium, design: .monospaced))
                     .foregroundColor(hostColor)
+                // How loaded that machine is, when it tells us. Dimmer than
+                // the host name: it is context for the pane, not its identity,
+                // and it changes every couple of seconds.
+                if !titlebarHostStats.isEmpty {
+                    Text(titlebarHostStats)
+                        .font(.system(size: 10, weight: .regular, design: .monospaced))
+                        .foregroundColor(titlebarColor(opacity: 0.55))
+                        // First to go when the window is too narrow — the
+                        // branch and directory say where you are, which
+                        // matters more than how busy the box is.
+                        .layoutPriority(-1)
+                }
             }
         }
         .lineLimit(1)
@@ -1018,6 +1034,7 @@ struct ContentView: View {
             if titlebarIsWorktree { titlebarIsWorktree = false }
             if !titlebarDirBasename.isEmpty { titlebarDirBasename = "" }
             if titlebarHostKey != nil { titlebarHostKey = nil }
+            if !titlebarHostStats.isEmpty { titlebarHostStats = "" }
             if !titlebarPorts.isEmpty { titlebarPorts = [] }
             if titlebarSessionStart != nil { titlebarSessionStart = nil }
             if titlebarTag != nil { titlebarTag = nil }
@@ -1114,6 +1131,13 @@ struct ContentView: View {
         // Remote pane host chip — "keys go to a remote host" signal,
         // same identity color as the sidebar row / pane strip.
         if titlebarHostKey != snapHostKey { titlebarHostKey = snapHostKey }
+
+        // How loaded that host is. A dictionary lookup of an
+        // already-formatted string; the store returns nothing once a
+        // sample ages out, so a dead link empties the field rather than
+        // freezing on its last reading.
+        let hostStats = snapHostKey.flatMap { PeerHostStatsStore.shared.stats(for: $0)?.summary } ?? ""
+        if titlebarHostStats != hostStats { titlebarHostStats = hostStats }
 
         // Listening ports
         let ports = snapListeningPorts

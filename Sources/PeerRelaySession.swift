@@ -520,6 +520,13 @@ final class PeerRelaySession {
 
     let hostSockPath: String
     let hostDisplayName: String
+    /// Which machine this session reaches, for state that belongs to the
+    /// host rather than to one pane (its load, memory, and I/O rates).
+    /// `hostSockPath` cannot stand in: for an SSH host it is the local end
+    /// of a tunnel, which says nothing about which machine is on the far
+    /// side. Set by the caller that owns the lease; nil for sessions opened
+    /// without one, which simply record nothing.
+    var hostKey: PeerPaneHostKey?
     private let surfaceID: Data
     private let remoteCols: UInt32
     private let remoteRows: UInt32
@@ -1278,6 +1285,16 @@ final class PeerRelaySession {
                         } catch {
                             endReason = "hostToRelay-enqueue-failed"
                             break pumpLoop
+                        }
+                    case .hostStats(let stats):
+                        // About the machine, not this pane, so it does not go
+                        // to the relay — it lands in the host-keyed store the
+                        // titlebar reads. Only for a session that knows which
+                        // host it reached.
+                        if let hostKey = await self.hostKey {
+                            await MainActor.run {
+                                PeerHostStatsStore.shared.record(stats, for: hostKey)
+                            }
                         }
                     case .goodbye:
                         try? await writer.enqueue(type: kTypeGoodbye, payload: Data("host-goodbye".utf8))

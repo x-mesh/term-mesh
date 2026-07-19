@@ -310,6 +310,10 @@ final class PeerPaneSession {
             await conn.cancel()
             throw error
         }
+        // The lease is the only thing that knows WHICH machine this reached;
+        // the session itself holds a socket path that, over SSH, is a local
+        // tunnel end. Host-scoped pushes need the real identity.
+        relay.hostKey = lease.key
         do {
             // Bind the local relay socket BEFORE Ghostty spawns the relay
             // binary as the pane's shell — the binary connects immediately
