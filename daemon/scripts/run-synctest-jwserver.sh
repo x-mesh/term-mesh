@@ -1,11 +1,20 @@
 #!/usr/bin/env bash
 # Run the two-daemon sync e2e on a single Linux host (jwserver68): two isolated
-# term-meshd daemons on loopback, driven by hw-sync-e2e.sh. Dev/e2e only.
+# term-meshd daemons on loopback, driven by hw-sync-e2e.sh and then
+# hw-sync-features.sh. Dev/e2e only.
+#
+# Both drivers run against the SAME project: the bootstrap proves the trust
+# chain and one fetch, and the feature checks then exercise the behaviours that
+# only a live pair shows (both directions at once, permissions, conflicts,
+# deletes, directory semantics, the wipe guard). Keeping them in one run is the
+# point — the feature checks need a bootstrapped project, and bootstrapping by
+# hand is exactly what this script exists to avoid.
 set -uo pipefail
 
 ROOT=/root/term-mesh-synctest
 BIN=$ROOT/daemon/target/release
 DRIVER=$ROOT/daemon/scripts/hw-sync-e2e.sh
+FEATURES=$ROOT/daemon/scripts/hw-sync-features.sh
 PORT=47820
 
 start_daemon() { # $1=tag
@@ -42,10 +51,19 @@ sleep 1
 start_daemon A || exit 1
 start_daemon B || exit 1
 
-echo "=== running driver ==="
+# One project id for both drivers.
+PROJECT="$(openssl rand -hex 32)"
+
+# The bootstrap driver verifies a file that must already exist on B; seed it
+# here rather than making every caller remember to.
+mkdir -p /root/sync-e2e-test-A /root/sync-e2e-test-B
+printf 'hardware-e2e-seed' > /root/sync-e2e-test-B/extra.txt
+
+echo "=== running bootstrap driver ==="
 bash "$DRIVER" \
   --peer-ssh "" \
   --peer-addr 127.0.0.1 \
+  --project "$PROJECT" \
   --local-path /root/sync-e2e-test-A \
   --remote-path /root/sync-e2e-test-B \
   --verify-file extra.txt \
@@ -53,5 +71,18 @@ bash "$DRIVER" \
   --tm-agent "env TERMMESH_DAEMON_SOCKET=/tmp/synctest-A.sock $BIN/tm-agent" \
   --remote-tm-agent "env TERMMESH_DAEMON_SOCKET=/tmp/synctest-B.sock $BIN/tm-agent"
 rc=$?
-echo "=== driver exit $rc ==="
+echo "=== bootstrap driver exit $rc ==="
+[ "$rc" -eq 0 ] || exit $rc
+
+echo "=== running feature checks ==="
+bash "$FEATURES" \
+  --project "$PROJECT" \
+  --peer-id daemon-b \
+  --peer-ssh "" \
+  --local-path /root/sync-e2e-test-A \
+  --remote-path /root/sync-e2e-test-B \
+  --tm-agent "env TERMMESH_DAEMON_SOCKET=/tmp/synctest-A.sock $BIN/tm-agent" \
+  --remote-tm-agent "env TERMMESH_DAEMON_SOCKET=/tmp/synctest-B.sock $BIN/tm-agent"
+rc=$?
+echo "=== feature checks exit $rc ==="
 exit $rc

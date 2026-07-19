@@ -25,6 +25,7 @@
 #     --local-path  /Users/jinwoo/sync-test \
 #     --remote-path /Users/jinwoo/sync-test \
 #     [--bind-port 47820] \
+#     [--project <hex64>] \
 #     [--verify-file extra.txt] \
 #     [--tm-agent tm-agent] \
 #     [--remote-tm-agent tm-agent]
@@ -37,6 +38,7 @@ LOCAL_PATH=""
 REMOTE_PATH=""
 BIND_PORT="47820"
 VERIFY_FILE=""
+PROJECT_ID=""
 TM_AGENT="tm-agent"
 REMOTE_TM_AGENT="tm-agent"
 
@@ -49,6 +51,7 @@ while [ $# -gt 0 ]; do
     --local-path)      LOCAL_PATH="$2"; shift 2 ;;
     --remote-path)     REMOTE_PATH="$2"; shift 2 ;;
     --bind-port)       BIND_PORT="$2"; shift 2 ;;
+    --project)         PROJECT_ID="$2"; shift 2 ;;
     --verify-file)     VERIFY_FILE="$2"; shift 2 ;;
     --tm-agent)        TM_AGENT="$2"; shift 2 ;;
     --remote-tm-agent) REMOTE_TM_AGENT="$2"; shift 2 ;;
@@ -76,7 +79,9 @@ fi
 
 # Deterministic device ids (they also seed the dev control signing key); the
 # recovery seed + DEK are fresh random per run.
-PROJECT_ID="$(openssl rand -hex 32)"
+# Caller-supplied when it wants to keep driving this project (see
+# `run-synctest-jwserver.sh`, which hands the same id to the feature checks).
+[ -n "$PROJECT_ID" ] || PROJECT_ID="$(openssl rand -hex 32)"
 DEVICE_A="$(printf '41%.0s' {1..32})"   # 0x41 * 32
 DEVICE_B="$(printf '42%.0s' {1..32})"   # 0x42 * 32
 RECOVERY="$(openssl rand -hex 32)"

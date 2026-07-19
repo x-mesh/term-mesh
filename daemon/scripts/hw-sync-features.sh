@@ -6,9 +6,10 @@
 # `hw-sync-e2e.sh` proves the bootstrap chain and one fetch. This goes further and
 # checks the behaviours that only a live pair can show: both directions in one
 # pass, permissions surviving the trip, a conflict being detected, listed,
-# resolved and then propagated, deletes moving both ways, and the wipe guard
-# refusing a mass delete. Several of these were found broken by hand exactly this
-# way, so they are worth having as a script rather than a memory.
+# resolved and then propagated, deletes moving both ways, a directory subtree
+# draining while a directory holding untracked content is spared, and the wipe
+# guard refusing a mass delete. Several of these were found broken by hand
+# exactly this way, so they are worth having as a script rather than a memory.
 #
 # It assumes both daemons are already bootstrapped against a shared project —
 # run `hw-sync-e2e.sh` first and pass it the same project id and peer id.
@@ -175,7 +176,58 @@ local_exists "$LOCAL_PATH/feat-shared.txt" && die "the peer's delete of a never-
 remote_exists "$REMOTE_PATH/feat-shared.txt" && die "a never-transferred file was resurrected on the peer"
 ok "deletes propagated both ways, including a never-transferred path"
 
-# ── 4. The wipe guard. ──────────────────────────────────────────────────────
+# ── 4. Directory semantics. ─────────────────────────────────────────────────
+echo "-- directory deletes --"
+# A directory is only removed once it is EMPTY, and only after the leaves inside
+# it. Two cases, and the second is the one worth having hardware for:
+#
+#   dir-drain — every path inside it is tracked and going, so the whole subtree
+#               drains bottom-up and the directory itself disappears.
+#   dir-keep  — holds a nested git repo. The scanner skips `.git`, so the
+#               manifest cannot see that content at all; only the empty-directory
+#               precondition can. The delete must be refused and the repo left
+#               alone, rather than the directory being renamed away with the
+#               user's work inside it.
+mkdir -p "$LOCAL_PATH/dir-drain/nested" "$LOCAL_PATH/dir-keep"
+printf 'leaf'  > "$LOCAL_PATH/dir-drain/nested/leaf.txt"
+printf 'tracked' > "$LOCAL_PATH/dir-keep/tracked.txt"
+sync_must_succeed "directory seed sync failed"
+remote_exists "$REMOTE_PATH/dir-drain/nested/leaf.txt" || die "the seeded subtree never reached the peer"
+remote_exists "$REMOTE_PATH/dir-keep/tracked.txt"      || die "dir-keep never reached the peer"
+ok "seeded a nested subtree on the peer"
+
+# Untracked-by-construction: `.git` is the one name the scanner skips, so this
+# file exists on the peer's disk and in no manifest.
+remote "mkdir -p '$REMOTE_PATH/dir-keep/.git' && printf 'HEAD-ish' > '$REMOTE_PATH/dir-keep/.git/config'"
+
+rm -rf "$LOCAL_PATH/dir-drain" "$LOCAL_PATH/dir-keep"
+sync_must_succeed "directory delete sync failed"
+
+remote_exists "$REMOTE_PATH/dir-drain" \
+  && die "a fully-tracked subtree was not removed on the peer"
+ok "a fully-tracked subtree drained and its directories went with it"
+
+remote_exists "$REMOTE_PATH/dir-keep" \
+  || die "a directory holding untracked content was swept away"
+[ "$(remote "cat '$REMOTE_PATH/dir-keep/.git/config'")" = "HEAD-ish" ] \
+  || die "untracked content inside a deleted directory was destroyed"
+remote_exists "$REMOTE_PATH/dir-keep/tracked.txt" \
+  && die "the tracked file inside dir-keep should still have been deleted"
+ok "a directory with untracked content survived, with that content intact"
+
+# The refusal must stay a refusal: outstanding, not flapping. A second pass must
+# neither destroy it nor push the directory back to the side that deleted it.
+sync_must_succeed "second directory sync failed"
+remote_exists "$REMOTE_PATH/dir-keep" || die "dir-keep was removed on a later pass"
+local_exists "$LOCAL_PATH/dir-keep"   && die "a refused delete pushed the directory back"
+ok "the refused directory stayed outstanding without flapping"
+
+# Leave the tree as this section found it: the guard below reasons about how many
+# entries are present, so leftovers would move its threshold.
+remote "rm -rf '$REMOTE_PATH/dir-keep'"
+sync_must_succeed "directory cleanup sync failed"
+
+# ── 5. The wipe guard. ──────────────────────────────────────────────────────
 echo "-- delete guard --"
 remote "cd '$REMOTE_PATH' && for i in \$(seq 1 12); do printf 'bulk-%s' \"\$i\" > guard-\$i.txt; done"
 sync_must_succeed "guard seed sync failed"
