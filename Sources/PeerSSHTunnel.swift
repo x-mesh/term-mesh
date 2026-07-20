@@ -670,32 +670,26 @@ final class PeerSSHTunnel: @unchecked Sendable {
     /// (impossible in practice — Process.run is a direct fork — but
     /// the owner-PID check is independent of ancestry).
     static func sweepStaleTunnels() {
-        // (a) Files on disk: unlink only if its embedded owner PID is
-        //     no longer alive AND no ssh currently holds the path.
-        //     Files whose owner is alive (our run, or a sibling
-        //     instance's run) are preserved even if we can't read
-        //     the lsof state.
-        if let entries = try? FileManager.default.contentsOfDirectory(atPath: "/tmp") {
-            for name in entries
-                where name.hasPrefix("tm-peer-ssh-") && name.hasSuffix(".sock")
-            {
-                let path = "/tmp/\(name)"
-                if let owner = ownerPidFromSockName(name), isPidAlive(owner) {
-                    continue
-                }
-                if pidsHoldingPath(path).isEmpty {
-                    try? FileManager.default.removeItem(atPath: path)
-                }
-            }
-        }
+        // The sweep itself reported nothing, which is why a leak of dozens of
+        // orphaned tunnels could run for weeks without a trace. Counting what
+        // it saw and what it acted on is the only way to tell "found nothing"
+        // apart from "never got here".
+        let started = Date()
+        var unlinked = 0
+        var inspected = 0
 
-        // (b) Orphaned ssh subprocesses: any ssh whose -L argv references
+        // (a) Orphaned ssh subprocesses: any ssh whose -L argv references
         //     /tmp/tm-peer-ssh-<owner>-<uuid>.sock where <owner> is a
         //     dead PID. PPID is intentionally NOT in the predicate — it
         //     would false-positive a sibling app's child after that
         //     sibling exits (PPID becomes 1) AND mis-classify our own
         //     children if they're enumerated mid-fork.
         let pids = orphanedTunnelPids()
+        RemoteWorkLog.infoOffMain(
+            pids.isEmpty
+                ? "Stale-tunnel sweep: no orphaned ssh tunnels"
+                : "Stale-tunnel sweep: reaping \(pids.count) orphaned ssh tunnel(s) — \(pids.map(String.init).joined(separator: ", "))"
+        )
         for pid in pids {
             kill(pid, SIGTERM)
         }
@@ -711,6 +705,34 @@ final class PeerSSHTunnel: @unchecked Sendable {
                 kill(pid, SIGKILL)
             }
         }
+
+        // (b) Files on disk, and only after the reaping above. A running
+        //     orphan holds its own socket path, so a file pass that went
+        //     first skipped every file it was about to free and left them
+        //     for some later launch to notice. Unlink only when the
+        //     embedded owner PID is gone AND nothing holds the path;
+        //     files whose owner is alive (our run, or a sibling
+        //     instance's) are preserved even if the lsof state is
+        //     unreadable.
+        if let entries = try? FileManager.default.contentsOfDirectory(atPath: "/tmp") {
+            for name in entries
+                where name.hasPrefix("tm-peer-ssh-") && name.hasSuffix(".sock")
+            {
+                let path = "/tmp/\(name)"
+                inspected += 1
+                if let owner = ownerPidFromSockName(name), isPidAlive(owner) {
+                    continue
+                }
+                if pidsHoldingPath(path).isEmpty {
+                    try? FileManager.default.removeItem(atPath: path)
+                    unlinked += 1
+                }
+            }
+        }
+
+        RemoteWorkLog.infoOffMain(
+            "Stale-tunnel sweep: inspected \(inspected) socket file(s), unlinked \(unlinked), in \(String(format: "%.1f", Date().timeIntervalSince(started)))s"
+        )
     }
 
     /// Extracts `<owner>` from a basename like
@@ -753,11 +775,13 @@ final class PeerSSHTunnel: @unchecked Sendable {
         proc.arguments = ["-t", "--", path]
         let out = Pipe()
         proc.standardOutput = out
-        proc.standardError = Pipe()
+        proc.standardError = FileHandle.nullDevice
         do { try proc.run() } catch { return [] }
+        // Same ordering as above. This one's output is a few PIDs today, but
+        // the deadlock is a property of the shape, not of the size.
+        let data = out.fileHandleForReading.readDataToEndOfFile()
         proc.waitUntilExit()
-        guard let data = try? out.fileHandleForReading.readToEnd(),
-              let s = String(data: data, encoding: .utf8) else { return [] }
+        guard let s = String(data: data, encoding: .utf8) else { return [] }
         return s.split(whereSeparator: { $0.isNewline })
             .compactMap { pid_t($0) }
     }
@@ -776,11 +800,19 @@ final class PeerSSHTunnel: @unchecked Sendable {
         proc.arguments = ["-Ao", "pid=,command="]
         let out = Pipe()
         proc.standardOutput = out
-        proc.standardError = Pipe()
+        // Never an unread Pipe: anything the child writes there would sit in a
+        // buffer nobody drains and wedge it exactly like the stdout case below.
+        proc.standardError = FileHandle.nullDevice
         do { try proc.run() } catch { return [] }
+        // Drain BEFORE waiting. `ps -Ao` prints ~300KB on an ordinary machine
+        // and a pipe holds 64KB, so waiting first blocks ps on a full pipe
+        // while we block on ps — the sweep never returned, never reaped
+        // anything, and orphaned tunnels accumulated indefinitely. Worse, each
+        // leftover tunnel added a line to this very output, so the failure got
+        // more certain the more it had already leaked.
+        let data = out.fileHandleForReading.readDataToEndOfFile()
         proc.waitUntilExit()
-        guard let data = try? out.fileHandleForReading.readToEnd(),
-              let s = String(data: data, encoding: .utf8) else { return [] }
+        guard let s = String(data: data, encoding: .utf8) else { return [] }
 
         var result: [pid_t] = []
         for line in s.split(whereSeparator: { $0.isNewline }) {

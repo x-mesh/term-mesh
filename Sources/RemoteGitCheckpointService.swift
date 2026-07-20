@@ -356,6 +356,12 @@ final class RemoteGitCheckpointService: RemoteGitCheckpointServicing, @unchecked
         return joined.count > 160 ? "\(name) \(joined.prefix(160))…" : "\(name) \(joined)"
     }
 
+    /// Drains child stderr while the caller drains stdout — see `run`.
+    private static let stderrQueue = DispatchQueue(
+        label: "com.termmesh.remote-git-checkpoint.stderr",
+        attributes: .concurrent
+    )
+
     private func run(_ executable: String, _ arguments: [String]) async throws -> String {
         // Every step of every remote-work action passes through here. Until
         // now the drawer showed the PLAN and then nothing, so an action that
@@ -374,9 +380,22 @@ final class RemoteGitCheckpointService: RemoteGitCheckpointServicing, @unchecked
                 process.standardError = stderr
                 do {
                     try process.run()
-                    process.waitUntilExit()
+                    // Both pipes are drained before waiting, and stderr on its
+                    // own queue. Waiting first deadlocks as soon as a command
+                    // outproduces the 64KB pipe buffer — `git diff --name-only`
+                    // on a large checkpoint does exactly that — and draining
+                    // them one after the other only moves the deadlock to
+                    // whichever pipe fills while the other is being read.
+                    var errorOutput = Data()
+                    let stderrDone = DispatchGroup()
+                    stderrDone.enter()
+                    Self.stderrQueue.async {
+                        errorOutput = stderr.fileHandleForReading.readDataToEndOfFile()
+                        stderrDone.leave()
+                    }
                     let output = stdout.fileHandleForReading.readDataToEndOfFile()
-                    let errorOutput = stderr.fileHandleForReading.readDataToEndOfFile()
+                    stderrDone.wait()
+                    process.waitUntilExit()
                     guard process.terminationStatus == 0 else {
                         let message = String(data: errorOutput, encoding: .utf8)?
                             .trimmingCharacters(in: .whitespacesAndNewlines)
