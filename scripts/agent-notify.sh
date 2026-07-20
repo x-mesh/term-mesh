@@ -96,8 +96,12 @@ TITLE="$(printf '%s' "$TITLE" | tr -d '\033\007;' | tr '\n' ' ')"
 # from the terminal entirely - no controlling tty, so `/dev/tty` cannot
 # open - while leaving stderr pointed at the pty, so that is the fallback;
 # gated on stderr being a terminal so a captured stderr is not fed escapes.
+# The braces matter: a failed open of /dev/tty is reported by the shell
+# while it sets up the redirect, before a trailing 2>/dev/null on the
+# command itself takes effect - dash prints "cannot create /dev/tty"
+# into the hook's output. Grouping first silences the shell too.
 SINK="none"
-if printf '\033]777;notify;%s;%s\007' "$TITLE" "$MESSAGE" > /dev/tty 2>/dev/null; then
+if { printf '\033]777;notify;%s;%s\007' "$TITLE" "$MESSAGE" > /dev/tty; } 2>/dev/null; then
     SINK="tty"
 elif [ -t 2 ]; then
     printf '\033]777;notify;%s;%s\007' "$TITLE" "$MESSAGE" >&2 && SINK="stderr" || true

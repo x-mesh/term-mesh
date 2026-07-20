@@ -38,6 +38,6 @@ TITLE="$(printf '%s' "$TITLE" | tr -d '\033\007' | tr '\n' ' ')"
 # OSC 2 sets the window title, which is the one term-mesh reads. `/dev/tty`
 # rather than stdout: a hook's stdout is captured by the agent and never
 # reaches the terminal.
-printf '\033]2;%s\007' "$TITLE" > /dev/tty 2>/dev/null || true
+{ printf '\033]2;%s\007' "$TITLE" > /dev/tty; } 2>/dev/null || true
 
 exit 0
