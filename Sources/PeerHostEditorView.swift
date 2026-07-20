@@ -425,9 +425,19 @@ struct PeerHostEditorView: View {
         var missing: [String] = []
         if !status.scriptsInstalled { missing.append("scripts not installed") }
         if status.hasClaude && !status.hooksWired { missing.append("Claude hooks not wired") }
-        var text = "Agent notifications: " + missing.joined(separator: ", ")
-        if !status.hasPython3 { text += " (python3 missing on host — required)" }
-        return text
+        // python3 gates the Claude-hook path specifically (isComplete
+        // requires it whenever claude is present), so it belongs in the
+        // missing list itself — not as a trailing aside — when claude is
+        // there. Otherwise it's advisory only.
+        if !status.hasPython3 {
+            if status.hasClaude {
+                missing.append("python3 missing (required for Claude hooks)")
+            } else if missing.isEmpty {
+                missing.append("python3 missing (needed for notifications)")
+            }
+        }
+        let detail = missing.isEmpty ? "setup incomplete" : missing.joined(separator: ", ")
+        return "Agent notifications: " + detail
     }
 
     /// `.daemonMissing`'s base copy, plus (when a binary was found on the
@@ -686,6 +696,12 @@ struct PeerHostEditorView: View {
                 )
                 guard gen == doctorGeneration else { return }
                 agentStackState = .installed(summary)
+                // Install can land partial (scripts up, hooks skipped for
+                // a missing python3 — installAgentStack returns rather
+                // than throws), so re-probe: the lane then shows the true
+                // state (green complete, or orange with what's still
+                // missing) instead of a static "set up" that might not be.
+                await refreshAgentStack(draft: draft, gen: gen)
             } catch {
                 guard gen == doctorGeneration else { return }
                 agentStackState = .installFailed(String(describing: error))

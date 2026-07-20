@@ -54,8 +54,17 @@ struct PeerAgentStackStatus: Equatable {
 
     var scriptsInstalled: Bool { notifyPath != nil && titlePath != nil }
     /// Hooks count as complete when wired, or when there is no claude on
-    /// the host for them to serve.
-    var isComplete: Bool { scriptsInstalled && (hooksWired || !hasClaude) }
+    /// the host for them to serve. When claude IS present, python3 is a
+    /// hard requirement too: a Claude hook runs detached, so the only
+    /// path from it to the terminal is agent-notify.sh's terminalSequence
+    /// JSON leg, which is python3. Without it the hooks are wired but
+    /// silent — reporting that as "ready" is the exact false-green this
+    /// probe exists to prevent.
+    var isComplete: Bool {
+        guard scriptsInstalled else { return false }
+        guard hasClaude else { return true }
+        return hooksWired && hasPython3
+    }
 }
 
 enum PeerHostDoctor {
@@ -118,7 +127,7 @@ enum PeerHostDoctor {
     /// up with a timestamp before writing.
     static let agentWireHooksCommand = #"sh -c 'python3 -'"#
     static let agentWireHooksProgram = """
-    import json, os, shutil, time
+    import json, os, shutil, sys, time
     path = os.path.expanduser("~/.claude/settings.json")
     notify = os.path.expanduser("~/.local/bin/agent-notify.sh") + " --title \\"\u{2733} Claude\\""
     try:
@@ -126,6 +135,12 @@ enum PeerHostDoctor {
             settings = json.load(f)
     except FileNotFoundError:
         settings = {}
+    except json.JSONDecodeError as e:
+        # Overwriting an unparseable settings.json would wipe hand edits;
+        # a non-zero exit surfaces this as a stage message, not a raw
+        # traceback (runRemote turns stderr + exit!=0 into the error).
+        sys.stderr.write("existing settings.json is not valid JSON: " + str(e))
+        sys.exit(1)
     hooks = settings.setdefault("hooks", {})
     def wire(event, command):
         entries = hooks.setdefault(event, [])
@@ -227,11 +242,19 @@ enum PeerHostDoctor {
             )
         }
 
+        // The uploads already succeeded and are useful on their own
+        // (agent-title.sh names the pane; agent-notify.sh notifies over
+        // /dev/tty in an interactive session), so a missing python3 is
+        // reported as a partial result, not thrown — throwing after the
+        // side effect landed would flag a real install as pure failure
+        // and every retry would repeat the same upload. The re-probe
+        // then shows the stack as incomplete (isComplete requires
+        // python3 when claude is present), which is the honest state.
         var notes: [String] = ["scripts installed to ~/.local/bin"]
         if status.hasClaude {
             guard status.hasPython3 else {
-                throw PeerSocketProbeError.spawnFailed(
-                    "python3 missing on the host — required to wire Claude hooks")
+                return (notes + ["python3 missing — Claude hooks not wired; install python3 and re-run"])
+                    .joined(separator: "; ")
             }
             let wired = try await runRemote(
                 sshTarget: sshTarget, port: port, identityFile: identityFile,

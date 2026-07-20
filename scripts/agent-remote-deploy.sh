@@ -46,6 +46,20 @@ done
 
 [ -n "$HOST" ] || { echo "usage: $0 <ssh-host> [--claude-hooks] [--bin-dir DIR] [--title NAME]" >&2; exit 2; }
 
+# Both scp and the single-quoted remote sh commands below take BIN_DIR
+# literally - scp expands no shell variable, single quotes expand no ~ -
+# so the help's recommended ~/.local/bin would reach the host unexpanded
+# and every command would miss. Resolve the remote $HOME once and rewrite
+# a leading ~ to that absolute path: correct for scp, safe inside single
+# quotes, and unchanged for an already-absolute --bin-dir.
+case "$BIN_DIR" in
+    "~"|"~/"*)
+        REMOTE_HOME="$(ssh "$HOST" 'printf %s "$HOME"')" || {
+            echo "could not resolve remote home for ~ in --bin-dir" >&2; exit 1; }
+        BIN_DIR="$REMOTE_HOME${BIN_DIR#\~}"
+        ;;
+esac
+
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
 for f in agent-notify.sh agent-title.sh; do
@@ -83,6 +97,11 @@ try:
         settings = json.load(f)
 except FileNotFoundError:
     settings = {}
+except json.JSONDecodeError as e:
+    # Overwriting an unparseable settings.json would silently wipe hand
+    # edits, so refuse and let the user fix it rather than clobber.
+    sys.stderr.write(f"    settings.json is not valid JSON ({e}); left untouched\n")
+    sys.exit(1)
 
 hooks = settings.setdefault("hooks", {})
 
@@ -109,6 +128,9 @@ backup = f"{path}.bak.{time.strftime('%Y%m%d-%H%M%S')}"
 if os.path.exists(path):
     shutil.copy2(path, backup)
     print(f"    backup: {backup}")
+# A host where claude has never run has no ~/.claude directory yet, so
+# create it before the first write rather than let open() fail.
+os.makedirs(os.path.dirname(path), exist_ok=True)
 with open(path, "w") as f:
     json.dump(settings, f, indent=2, ensure_ascii=False)
 for change in changes:
