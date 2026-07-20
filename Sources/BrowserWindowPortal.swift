@@ -499,6 +499,13 @@ final class WindowBrowserPortal: NSObject {
             container.addSubview(hostView, positioned: .above, relativeTo: terminalHost)
         }
 
+        // Same contract as the terminal portal: the command palette shares this
+        // container and must stay above both portal hosts.
+        if let palette = container.subviews.first(where: { $0 is CommandPaletteOverlayContainerView }),
+           !Self.isView(palette, above: hostView, in: container) {
+            container.addSubview(palette, positioned: .above, relativeTo: hostView)
+        }
+
         synchronizeHostFrameToReference()
         return true
     }

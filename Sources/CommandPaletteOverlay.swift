@@ -79,6 +79,18 @@ final class WindowCommandPaletteOverlayController: NSObject {
             themeFrame.addSubview(containerView, positioned: .above, relativeTo: nil)
         }
 
+        // Subview order alone does not decide what the compositor draws on top:
+        // the terminal portal is Metal-backed and paints by layer, so being the
+        // last subview only lost the race more slowly. Portals already run on an
+        // explicit zPosition scale — terminal 100, browser 200, the file-drop
+        // overlay 300 — and the palette was simply not on it, so a portal sync
+        // (which fires many times a second) painted the terminal back over it
+        // within a frame or two of opening. Set here rather than from the
+        // portals so the palette does not depend on a sync running to be
+        // visible.
+        containerView.wantsLayer = true
+        containerView.layer?.zPosition = 400
+
         return true
     }
 
