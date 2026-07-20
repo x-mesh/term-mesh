@@ -564,7 +564,10 @@ final class SocketControlSettingsTests: XCTestCase {
         XCTAssertEqual(SocketControlMode.termMeshOnly.socketFilePermissions, 0o600)
         XCTAssertEqual(SocketControlMode.automation.socketFilePermissions, 0o600)
         XCTAssertEqual(SocketControlMode.password.socketFilePermissions, 0o600)
-        XCTAssertEqual(SocketControlMode.allowAll.socketFilePermissions, 0o666)
+        // 0o600, not 0o666: group-write was removed so a same-group,
+        // different-UID process cannot inject PTY commands through the socket.
+        // The mode name is about who may CONNECT, not about file permissions.
+        XCTAssertEqual(SocketControlMode.allowAll.socketFilePermissions, 0o600)
     }
 
     func testInvalidEnvSocketModeDoesNotOverrideUserMode() {
@@ -652,13 +655,61 @@ final class SocketControlSettingsTests: XCTestCase {
             SocketControlSettings.defaultSocketPath(bundleIdentifier: "com.termmesh.app.nightly", isDebugBuild: false),
             "/tmp/term-mesh-nightly.sock"
         )
+        // A tagged bundle gets its OWN socket. This asserted the untagged path
+        // until tagged isolation was added to stop a tagged build from seizing
+        // production's socket, and was never updated — it has been failing ever
+        // since, unnoticed because a duplicate class name kept the other file's
+        // (correct) expectations from running at all.
         XCTAssertEqual(
             SocketControlSettings.defaultSocketPath(bundleIdentifier: "com.termmesh.app.debug.tag", isDebugBuild: false),
-            "/tmp/term-mesh-debug.sock"
+            "/tmp/term-mesh-debug-tag.sock"
         )
         XCTAssertEqual(
             SocketControlSettings.defaultSocketPath(bundleIdentifier: "com.termmesh.app.staging.tag", isDebugBuild: false),
-            "/tmp/term-mesh-staging.sock"
+            "/tmp/term-mesh-staging-tag.sock"
+        )
+    }
+
+    /// The identifiers reload.sh actually builds.
+    ///
+    /// `--tag remote-work-log` becomes `com.termmesh.app.debug.remote.work.log`:
+    /// a bundle identifier is dot-delimited, so `sanitize_bundle` turns every
+    /// non-alphanumeric run into ".". The socket name reload.sh advertises in
+    /// TERMMESH_SOCKET_PATH comes from `sanitize_path`, which uses "-" instead.
+    /// These have to agree — a tagged bundle ignores that env override on
+    /// purpose, so when they diverged the advertised socket simply did not
+    /// exist and every CLI attaching by env failed. Only single-word tags
+    /// happened to match, which is why it went unnoticed.
+    func testTaggedSocketPathMatchesTheNameReloadAdvertises() {
+        XCTAssertEqual(
+            SocketControlSettings.defaultSocketPath(
+                bundleIdentifier: "com.termmesh.app.debug.remote.work.log", isDebugBuild: false),
+            "/tmp/term-mesh-debug-remote-work-log.sock"
+        )
+        XCTAssertEqual(
+            SocketControlSettings.defaultSocketPath(
+                bundleIdentifier: "com.termmesh.app.staging.fix.blur.effect", isDebugBuild: false),
+            "/tmp/term-mesh-staging-fix-blur-effect.sock"
+        )
+        // `--tag my_tag`: sanitize_bundle gives `my.tag`, sanitize_path gives
+        // `my-tag`. Underscores never survive into an identifier, so both
+        // sides still have to land on the same name.
+        XCTAssertEqual(
+            SocketControlSettings.defaultSocketPath(
+                bundleIdentifier: "com.termmesh.app.debug.my.tag", isDebugBuild: false),
+            "/tmp/term-mesh-debug-my-tag.sock"
+        )
+        // A hand-written identifier keeps its hyphens as written.
+        XCTAssertEqual(
+            SocketControlSettings.defaultSocketPath(
+                bundleIdentifier: "com.termmesh.app.debug.fix-blur-effect", isDebugBuild: false),
+            "/tmp/term-mesh-debug-fix-blur-effect.sock"
+        )
+        // An untagged debug bundle must still land on the untagged socket.
+        XCTAssertEqual(
+            SocketControlSettings.defaultSocketPath(
+                bundleIdentifier: "com.termmesh.app.debug", isDebugBuild: false),
+            "/tmp/term-mesh-debug.sock"
         )
     }
 }
