@@ -401,6 +401,10 @@ final class PeerWorkspaceMirrorController {
         }
     }
 
+    /// Deadline for the setup RPCs of a reconnect attempt, matching
+    /// `PeerRelaySession`'s own.
+    private static let setupReadTimeoutSeconds: TimeInterval = 10
+
     private func reconnectLoop() async {
         var attempt = 0
         // "lost its host — reconnecting" is a promise, and this loop can exit
@@ -422,17 +426,38 @@ final class PeerWorkspaceMirrorController {
             if isTornDown { return }
             do {
                 let transport = try await UnixSocketTransport.connect(socketPath: lease.hostSockPath)
+                // A host that is frozen rather than gone — asleep, behind a
+                // blackholed network — still has a listening socket, so
+                // connect() succeeds and the handshake then waits for a
+                // HostHello that never arrives. With no deadline this loop
+                // stopped inside its first attempt and never retried, never
+                // gave up and never said a word: the workspace title just read
+                // "reconnecting…" for as long as the app stayed open. Same
+                // budget the primary connect path puts around its setup.
+                await transport.setReadTimeoutSeconds(Self.setupReadTimeoutSeconds)
                 let session = PeerSession(
                     read: { try await transport.read() },
                     write: { try await transport.write($0) }
                 )
-                _ = try await session.handshake()
-                let workspaces = try await session.listWorkspaces()
+                let workspaces: [Termmesh_Peer_V1_Workspace]
+                do {
+                    _ = try await session.handshake()
+                    workspaces = try await session.listWorkspaces()
+                } catch {
+                    // Now that a failed attempt can actually fail instead of
+                    // hanging, every retry would otherwise leave its socket
+                    // behind.
+                    await transport.close()
+                    throw error
+                }
                 guard let target = Self.matchWorkspace(workspaces, id: hostWorkspaceID) else {
                     await transport.close()
                     markHostWorkspaceGone()
                     return
                 }
+                // Cleared before the receive loop: a subscription is idle most
+                // of the time and a read deadline there would kill it.
+                await transport.setReadTimeoutSeconds(nil)
                 subscriptionTransport = transport
                 subscriptionSession = session
                 subscriptionAlive = true
