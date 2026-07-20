@@ -520,6 +520,13 @@ final class PeerRelaySession {
 
     let hostSockPath: String
     let hostDisplayName: String
+    /// Which machine this session reaches, for state that belongs to the
+    /// host rather than to one pane (its load, memory, and I/O rates).
+    /// `hostSockPath` cannot stand in: for an SSH host it is the local end
+    /// of a tunnel, which says nothing about which machine is on the far
+    /// side. Set by the caller that owns the lease; nil for sessions opened
+    /// without one, which simply record nothing.
+    var hostKey: PeerPaneHostKey?
     private let surfaceID: Data
     private let remoteCols: UInt32
     private let remoteRows: UInt32
@@ -660,6 +667,13 @@ final class PeerRelaySession {
         #if DEBUG
         dlog("peer.relay.hostVersion displayName=\(info.hostDisplayName) appVersion=\(info.hostAppVersion) protocolVersion=\(info.hostProtocolVersion)")
         #endif
+        // Debug rather than info: it is the same three values on every
+        // connection until the day they are not, and a version skew is the
+        // first thing to check when a feature works on one host and not
+        // another.
+        RemoteWorkLog.debugOffMain(
+            "Host \(info.hostDisplayName) — app \(info.hostAppVersion), protocol \(info.hostProtocolVersion)"
+        )
         return PeerRelayConnection(
             hostSockPath: hostSockPath,
             hostDisplayName: info.hostDisplayName,
@@ -690,6 +704,13 @@ final class PeerRelaySession {
         }
         await connection.transport.setReadTimeoutSeconds(nil)
         guard outcome.surfaceID == surface.surfaceID else {
+            // Nothing logged this at all, and the error reaches the user as a
+            // pane that simply never opens. Both ids are here because the
+            // difference between them is the diagnosis: the host redirected
+            // the attachment to a surface other than the one that was picked.
+            RemoteWorkLog.infoOffMain(
+                "Attach refused: asked for surface \(surface.surfaceID), host attached \(outcome.surfaceID)"
+            )
             throw RelayError.surfaceIDMismatch
         }
 
@@ -1054,6 +1075,7 @@ final class PeerRelaySession {
                 #if DEBUG
                 dlog("peer.relay.heartbeat.dead — no pong for 30s, closing transport (this will end hostToRelay with receive-error → pane closes)")
                 #endif
+                RemoteWorkLog.infoOffMain("Host stopped answering for 30s — closing the connection")
                 Task { await weakTransport.close() }
             }
         }
@@ -1204,13 +1226,19 @@ final class PeerRelaySession {
                             let gap = chunk.byteSeq - expected
                             gapBytesTotal += gap
                             gapCount += 1
-                            #if DEBUG
                             // Rate-limited like the owned path: one line per
                             // 500 gaps keeps a flood from wiping the ring.
                             if gapCount == 1 || gapCount % 500 == 0 {
+                                #if DEBUG
                                 dlog("peer.relay.gap #\(gapCount) dropped=\(gap) totalDropped=\(gapBytesTotal) — shared-path drop (content truncated)")
+                                #endif
+                                // Not DEBUG-only: truncated output is what the
+                                // user actually sees, and until now a release
+                                // build lost every trace of why.
+                                RemoteWorkLog.debugOffMain(
+                                    "Output dropped on the shared path — \(gap) bytes (\(gapBytesTotal) total over \(gapCount) gaps); the pane is missing content"
+                                )
                             }
-                            #endif
                             await resizeCoalescer.noteGapForHeal()
                         }
                         expectedByteSeq = chunk.byteSeq + UInt64(chunk.payload.count)
@@ -1258,16 +1286,19 @@ final class PeerRelaySession {
                             let gap = byteSeq - expected
                             gapBytesTotal += gap
                             gapCount += 1
-                            #if DEBUG
                             // Rate-limited: a heavy flood drops thousands of
                             // chunks/sec; logging every one floods the debug
                             // ring (opening its circuit breaker and dropping
                             // OTHER events, including the heal logs). One line
                             // per 500 gaps is enough to see truncation happening.
                             if gapCount == 1 || gapCount % 500 == 0 {
+                                #if DEBUG
                                 dlog("peer.relay.gap #\(gapCount) dropped=\(gap) totalDropped=\(gapBytesTotal) — host broadcast Lag (content truncated)")
+                                #endif
+                                RemoteWorkLog.debugOffMain(
+                                    "Host output lagged — \(gap) bytes dropped (\(gapBytesTotal) total over \(gapCount) gaps); the pane is missing content"
+                                )
                             }
-                            #endif
                             // P9.2: schedule a debounced redraw heal so a TUI
                             // corrupted by the drop recovers once output settles.
                             await resizeCoalescer.noteGapForHeal()
@@ -1278,6 +1309,16 @@ final class PeerRelaySession {
                         } catch {
                             endReason = "hostToRelay-enqueue-failed"
                             break pumpLoop
+                        }
+                    case .hostStats(let stats):
+                        // About the machine, not this pane, so it does not go
+                        // to the relay — it lands in the host-keyed store the
+                        // titlebar reads. Only for a session that knows which
+                        // host it reached.
+                        if let hostKey = await self.hostKey {
+                            await MainActor.run {
+                                PeerHostStatsStore.shared.record(stats, for: hostKey)
+                            }
                         }
                     case .goodbye:
                         try? await writer.enqueue(type: kTypeGoodbye, payload: Data("host-goodbye".utf8))
@@ -1362,6 +1403,10 @@ final class PeerRelaySession {
         // the heartbeat starved and killed the session under output load.
         dlog("peer.relay.disconnect reason=\(reason) ownsSession=\(ownsSession)")
         #endif
+        // The reason is the whole value here: "heartbeat.dead" and
+        // "user closed the pane" produce an identical empty pane, and which
+        // one it was decides whether anything is wrong.
+        RemoteWorkLog.infoOffMain("Relay session ended: \(reason)")
         pumpTask?.cancel()
         pumpTask = nil
         relaySocket?.close()

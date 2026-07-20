@@ -166,6 +166,21 @@ final class TerminalNotificationStore: ObservableObject {
             AppDelegate.shared?.tabManager?.moveTabToTop(tabId)
         }
 
+        // The card that says someone is waiting should also be named after
+        // them. A workspace title normally follows the focused pane, so an
+        // agent asking from an unfocused pane leaves the card reading
+        // whatever was focused instead - a notification renames it the same
+        // way focusing the pane would have. `applyProcessTitle` keeps a
+        // user-set custom name authoritative.
+        if let surfaceId,
+           let manager = AppDelegate.shared?.contextContainingTabId(tabId)?.tabManager
+               ?? AppDelegate.shared?.tabManager,
+           let tab = manager.tabs.first(where: { $0.id == tabId }),
+           let paneTitle = tab.panelTitles[surfaceId],
+           !paneTitle.isEmpty {
+            tab.applyProcessTitle(paneTitle)
+        }
+
         let notification = TerminalNotification(
             id: UUID(),
             tabId: tabId,

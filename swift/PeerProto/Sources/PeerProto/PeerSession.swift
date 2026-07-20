@@ -61,6 +61,10 @@ public enum PeerIncomingMessage: Sendable {
     /// Pushed when a workspace itself (not a pane inside one) was deleted
     /// on the host. Gated behind capability "workspace.lifecycle.v1".
     case workspaceRemoved(workspaceID: Data)
+    /// How loaded the host machine is, pushed on the host's own sampling
+    /// cadence. Gated behind capability "host.stats.v1", so a host that
+    /// predates it simply never sends one.
+    case hostStats(Termmesh_Peer_V1_HostStats)
     case error(code: UInt32, message: String)
     case goodbye(reason: String)
     case other
@@ -629,7 +633,10 @@ public actor PeerSession {
                     return
                 }
                 inboundReadInProgress = true
-                envelope = try await readFrame()
+                // The pump is the one reader that wants everything: pushes
+                // are precisely what it exists to deliver, so it must not
+                // use the reply-shaped read that filters them out.
+                envelope = try await readAnyFrame()
                 inboundReadInProgress = false
             } catch {
                 inboundReadInProgress = false
@@ -839,6 +846,8 @@ public actor PeerSession {
             default:
                 return .other
             }
+        case .hostStats(let s):
+            return .hostStats(s)
         case .error(let e):
             return .error(code: e.code, message: e.message)
         case .goodbye(let g):
@@ -978,7 +987,29 @@ public actor PeerSession {
         return r
     }
 
+    /// The next frame, skipping host-initiated pushes that no request asked
+    /// for.
+    ///
+    /// Every caller here is waiting for one specific reply and rejects
+    /// anything else, which was safe only while the host spoke solely when
+    /// spoken to. `HostStats` breaks that: it arrives on its own schedule,
+    /// so without this any RPC unlucky enough to be in flight when a sample
+    /// landed would fail with "unexpected message" — including the surface
+    /// listing behind the pane picker, which made a host unreachable
+    /// outright.
+    ///
+    /// Only stats are dropped. An `Error` frame still surfaces, and every
+    /// other push is left alone rather than quietly discarded here, where
+    /// no caller would ever see it.
     private func readFrame() async throws -> Termmesh_Peer_V1_Envelope {
+        while true {
+            let env = try await readAnyFrame()
+            if case .hostStats = env.payload { continue }
+            return env
+        }
+    }
+
+    private func readAnyFrame() async throws -> Termmesh_Peer_V1_Envelope {
         while true {
             do {
                 if let env = try decodeFrame(from: &pendingInbound) {

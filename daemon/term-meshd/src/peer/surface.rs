@@ -233,7 +233,7 @@ impl PtySurface {
         rows: u16,
         cwd: Option<&str>,
     ) -> std::io::Result<Arc<Self>> {
-        let child = pty::spawn(command, args, cols, rows, cwd)?;
+        let child = pty::spawn(command, args, cols, rows, cwd, &pane_environment(&surface_id))?;
         pty::set_nonblocking(child.master_fd)?;
         let (tx, _rx) = broadcast::channel::<PtyChunk>(BROADCAST_CAPACITY);
 
@@ -714,6 +714,95 @@ fn process_cwd(pid: libc::pid_t) -> Option<String> {
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn process_cwd(_pid: libc::pid_t) -> Option<String> {
     None
+}
+
+/// Terminal this host claims to be when a better answer is unavailable.
+/// Every system with terminfo at all has it, so it is a safe floor.
+const FALLBACK_TERM: &str = "xterm-256color";
+/// What panes are told they are talking to, when the machine can describe it.
+const PREFERRED_TERM: &str = "xterm-ghostty";
+
+/// What a pane's shell is told about the terminal it is attached to.
+///
+/// A pane started by the daemon inherits the daemon's own environment, which
+/// under systemd contains no `TERM` whatsoever. A shell with no `TERM` cannot
+/// tell what its terminal supports, so programs fall back to their dumbest
+/// behaviour — and an agent deciding how to raise a notification concludes the
+/// terminal supports none, which is why a remote pane stayed silent while an
+/// identical local one did not.
+///
+/// Only what remains true on this machine is set. The viewer's own pane
+/// environment carries paths into the Mac's app bundle (terminfo, shell
+/// integration, its control socket); copying those here would point a remote
+/// shell at directories that do not exist.
+fn pane_environment(surface_id: &[u8]) -> Vec<(String, String)> {
+    let mut env = vec![
+        ("TERM".to_string(), resolve_term()),
+        ("TERM_PROGRAM".to_string(), "ghostty".to_string()),
+        (
+            "TERM_PROGRAM_VERSION".to_string(),
+            env!("CARGO_PKG_VERSION").to_string(),
+        ),
+        ("COLORTERM".to_string(), "truecolor".to_string()),
+    ];
+    // The pane's own identity, so anything running inside it can name the
+    // surface it belongs to. Both spellings, matching what a local pane gets.
+    let id = hex_id(surface_id);
+    env.push(("TERMMESH_SURFACE_ID".to_string(), id.clone()));
+    env.push(("CMUX_SURFACE_ID".to_string(), id));
+    env
+}
+
+/// `PREFERRED_TERM` when this machine can describe it, else the floor.
+///
+/// Naming a terminal the machine has no terminfo entry for is worse than
+/// naming a plainer one: every curses program fails to start rather than
+/// merely losing a capability.
+fn resolve_term() -> String {
+    if terminfo_entry_exists(PREFERRED_TERM) {
+        PREFERRED_TERM.to_string()
+    } else {
+        FALLBACK_TERM.to_string()
+    }
+}
+
+/// Whether a compiled terminfo entry for `name` is installed.
+///
+/// Checks the directories terminfo is conventionally read from rather than
+/// linking ncurses for one lookup. Both layouts are searched: `x/xterm-...`
+/// on most systems, and the hashed `78/xterm-...` used on macOS.
+fn terminfo_entry_exists(name: &str) -> bool {
+    let Some(first) = name.chars().next() else {
+        return false;
+    };
+    let mut roots: Vec<PathBuf> = Vec::new();
+    if let Ok(dir) = std::env::var("TERMINFO") {
+        roots.push(PathBuf::from(dir));
+    }
+    if let Ok(home) = std::env::var("HOME") {
+        roots.push(PathBuf::from(home).join(".terminfo"));
+    }
+    roots.extend(
+        [
+            "/usr/share/terminfo",
+            "/lib/terminfo",
+            "/etc/terminfo",
+            "/usr/lib/terminfo",
+            "/usr/local/share/terminfo",
+        ]
+        .iter()
+        .map(PathBuf::from),
+    );
+
+    let letter = first.to_string();
+    let hashed = format!("{:x}", first as u32);
+    roots.iter().any(|root| {
+        root.join(&letter).join(name).exists() || root.join(&hashed).join(name).exists()
+    })
+}
+
+fn hex_id(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 /// Best-effort current-branch lookup via `git2`. Returns empty string when
@@ -2512,5 +2601,102 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
         assert_eq!(observed, expected.to_string_lossy());
+    }
+
+    /// The regression this exists for: a pane inherited the daemon's own
+    /// environment, which under systemd has no `TERM` at all. A shell with no
+    /// `TERM` cannot tell what its terminal supports, and an agent deciding
+    /// how to raise a notification concludes it supports none.
+    #[tokio::test]
+    async fn a_pane_is_told_what_terminal_it_is_attached_to() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("env.txt");
+        let surface = PtySurface::spawn(
+            surface_id_from_name("env-test"),
+            "sh".into(),
+            "/bin/sh",
+            // Writes what it was given, then stays alive: `spawn` refuses a
+            // child that has already exited by the time it checks.
+            &[
+                "-c",
+                &format!(
+                    "{{ printenv TERM; printenv TERM_PROGRAM; printenv COLORTERM; }} > {}; exec cat",
+                    out.display()
+                ),
+            ],
+            80,
+            24,
+            None,
+        )
+        .expect("spawn");
+
+        for _ in 0..100 {
+            if std::fs::read_to_string(&out).is_ok_and(|c| c.lines().count() >= 3) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        drop(surface);
+
+        let written = std::fs::read_to_string(&out).expect("the pane wrote its environment");
+        let lines: Vec<&str> = written.lines().collect();
+        assert_eq!(lines.len(), 3, "every variable must be set, got {written:?}");
+        assert!(
+            lines[0] == PREFERRED_TERM || lines[0] == FALLBACK_TERM,
+            "TERM must name a terminal this machine can describe, got {:?}",
+            lines[0]
+        );
+        assert_eq!(lines[1], "ghostty");
+        assert_eq!(lines[2], "truecolor");
+    }
+
+    /// Inherited, not replaced: `PATH` and `HOME` are where the pane's shell
+    /// comes from, and losing them would break it far louder than a missing
+    /// `TERM` ever did.
+    #[tokio::test]
+    async fn a_pane_keeps_the_environment_it_inherited() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("path.txt");
+        let surface = PtySurface::spawn(
+            surface_id_from_name("env-inherit-test"),
+            "sh".into(),
+            "/bin/sh",
+            &[
+                "-c",
+                &format!("printenv PATH > {}; exec cat", out.display()),
+            ],
+            80,
+            24,
+            None,
+        )
+        .expect("spawn");
+
+        for _ in 0..100 {
+            if out.exists() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        drop(surface);
+
+        let written = std::fs::read_to_string(&out).unwrap_or_default();
+        assert!(!written.trim().is_empty(), "PATH must survive");
+    }
+
+    /// Naming a terminal the machine has no terminfo for is worse than naming
+    /// a plainer one: curses programs fail to start rather than lose a
+    /// capability. So whatever is chosen must actually be installed.
+    #[test]
+    fn the_chosen_term_is_one_this_machine_can_describe() {
+        let term = resolve_term();
+        assert!(
+            terminfo_entry_exists(&term),
+            "resolved TERM {term:?} has no terminfo entry here"
+        );
+    }
+
+    #[test]
+    fn an_unknown_terminal_is_not_claimed_to_exist() {
+        assert!(!terminfo_entry_exists("term-mesh-no-such-terminal-xyz"));
     }
 }

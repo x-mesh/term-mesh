@@ -126,8 +126,19 @@ struct TermMeshApp: App {
             setenv("TERM", "xterm-ghostty", 1)
         }
 
-        if getenv("TERM_PROGRAM") == nil {
-            setenv("TERM_PROGRAM", "ghostty", 1)
+        // A terminal that launched term-mesh leaves its own name here, and the
+        // daemon and every headless agent inherit it. Ghostty is what a pane
+        // actually is, so the name is set outright rather than only when the
+        // slot is empty.
+        setenv("TERM_PROGRAM", "ghostty", 1)
+
+        // Warp leaves more than a name: a client version and a protocol
+        // version, and a CLI agent finding both will speak Warp's own
+        // notification protocol instead of raising a plain one. A pane's
+        // environment is a copy of this process's and Ghostty's env_vars can
+        // only add to that copy, so the variables have to go from here.
+        for key in ProcessInfo.processInfo.environment.keys where key.hasPrefix("WARP_") {
+            unsetenv(key)
         }
 
         if let resourcesDir = getenv("GHOSTTY_RESOURCES_DIR").flatMap({ String(cString: $0) }) {

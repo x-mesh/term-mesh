@@ -43,6 +43,7 @@
 			CVB00082 /* PeerServerHost.swift in Sources */ = {isa = PBXBuildFile; fileRef = CVS00082 /* PeerServerHost.swift */; };
 			CVB00083 /* GhosttyPaneSurfaceProvider.swift in Sources */ = {isa = PBXBuildFile; fileRef = CVS00083 /* GhosttyPaneSurfaceProvider.swift */; };
 			CVB00084 /* PeerRelaySession.swift in Sources */ = {isa = PBXBuildFile; fileRef = CVS00084 /* PeerRelaySession.swift */; };
+			CVB00105 /* PeerHostStatsStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = CVS00105 /* PeerHostStatsStore.swift */; };
 			CVB00085 /* PeerRelayWindowController.swift in Sources */ = {isa = PBXBuildFile; fileRef = CVS00085 /* PeerRelayWindowController.swift */; };
 			CVB00086 /* PeerRelayWorkspaceWindowController.swift in Sources */ = {isa = PBXBuildFile; fileRef = CVS00086 /* PeerRelayWorkspaceWindowController.swift */; };
 			CVB00087 /* PeerSSHTunnel.swift in Sources */ = {isa = PBXBuildFile; fileRef = CVS00087 /* PeerSSHTunnel.swift */; };
@@ -200,7 +201,10 @@
 				F8000000A1B2C3D4E5F60718 /* IMESendKeyTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = F8000001A1B2C3D4E5F60718 /* IMESendKeyTests.swift */; };
 				F9000000A1B2C3D4E5F60718 /* AutoReplyDetectorTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = F9000001A1B2C3D4E5F60718 /* AutoReplyDetectorTests.swift */; };
 				F9000010A1B2C3D4E5F60718 /* WorkspaceRetrievalDirectoryTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = F9000011A1B2C3D4E5F60718 /* WorkspaceRetrievalDirectoryTests.swift */; };
+				F9000014A1B2C3D4E5F60718 /* PeerHostStatsTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = F9000015A1B2C3D4E5F60718 /* PeerHostStatsTests.swift */; };
 				FA000000A1B2C3D4E5F60718 /* PeerSocketProberTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = FA000001A1B2C3D4E5F60718 /* PeerSocketProberTests.swift */; };
+			FE000004A1B2C3D4E5F60718 /* PasteQueueTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = FE000005A1B2C3D4E5F60718 /* PasteQueueTests.swift */; };
+			FE000008A1B2C3D4E5F60718 /* WorkspaceManualUnreadTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = FE000009A1B2C3D4E5F60718 /* WorkspaceManualUnreadTests.swift */; };
 				FB000000A1B2C3D4E5F60718 /* PeerPaneSessionTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = FB000001A1B2C3D4E5F60718 /* PeerPaneSessionTests.swift */; };
 				FC000000A1B2C3D4E5F60718 /* PeerWorkspaceMirrorTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = FC000001A1B2C3D4E5F60718 /* PeerWorkspaceMirrorTests.swift */; };
 				FD000000A1B2C3D4E5F60718 /* PeerDaemonVersionTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = FD000001A1B2C3D4E5F60718 /* PeerDaemonVersionTests.swift */; };
@@ -297,6 +301,7 @@
 			CVS00082 /* PeerServerHost.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PeerServerHost.swift; sourceTree = "<group>"; };
 			CVS00083 /* GhosttyPaneSurfaceProvider.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GhosttyPaneSurfaceProvider.swift; sourceTree = "<group>"; };
 			CVS00084 /* PeerRelaySession.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PeerRelaySession.swift; sourceTree = "<group>"; };
+			CVS00105 /* PeerHostStatsStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PeerHostStatsStore.swift; sourceTree = "<group>"; };
 			CVS00085 /* PeerRelayWindowController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PeerRelayWindowController.swift; sourceTree = "<group>"; };
 			CVS00086 /* PeerRelayWorkspaceWindowController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PeerRelayWorkspaceWindowController.swift; sourceTree = "<group>"; };
 			CVS00087 /* PeerSSHTunnel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PeerSSHTunnel.swift; sourceTree = "<group>"; };
@@ -454,7 +459,10 @@
 			F8000001A1B2C3D4E5F60718 /* IMESendKeyTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = IMESendKeyTests.swift; sourceTree = "<group>"; };
 			F9000001A1B2C3D4E5F60718 /* AutoReplyDetectorTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AutoReplyDetectorTests.swift; sourceTree = "<group>"; };
 			F9000011A1B2C3D4E5F60718 /* WorkspaceRetrievalDirectoryTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WorkspaceRetrievalDirectoryTests.swift; sourceTree = "<group>"; };
+			F9000015A1B2C3D4E5F60718 /* PeerHostStatsTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PeerHostStatsTests.swift; sourceTree = "<group>"; };
 			FA000001A1B2C3D4E5F60718 /* PeerSocketProberTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PeerSocketProberTests.swift; sourceTree = "<group>"; };
+			FE000005A1B2C3D4E5F60718 /* PasteQueueTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PasteQueueTests.swift; sourceTree = "<group>"; };
+			FE000009A1B2C3D4E5F60718 /* WorkspaceManualUnreadTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WorkspaceManualUnreadTests.swift; sourceTree = "<group>"; };
 			FB000001A1B2C3D4E5F60718 /* PeerPaneSessionTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PeerPaneSessionTests.swift; sourceTree = "<group>"; };
 			FC000001A1B2C3D4E5F60718 /* PeerWorkspaceMirrorTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PeerWorkspaceMirrorTests.swift; sourceTree = "<group>"; };
 			FD000001A1B2C3D4E5F60718 /* PeerDaemonVersionTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PeerDaemonVersionTests.swift; sourceTree = "<group>"; };
@@ -540,7 +548,7 @@
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 			shellPath = /bin/sh;
-			shellScript = "# Generate BuildInfo.swift with git SHA\n\"${SRCROOT}/scripts/generate-build-info.sh\"\nset -euo pipefail\nDEST=\"${TARGET_BUILD_DIR}/${UNLOCALIZED_RESOURCES_FOLDER_PATH}\"\nGHOSTTY_DEST=\"${DEST}/ghostty\"\nTERMINFO_DEST=\"${DEST}/terminfo\"\nTERMMESH_SHELL_DEST=\"${DEST}/shell-integration\"\nSRC_SHARE=\"${SRCROOT}/ghostty/zig-out/share\"\nGHOSTTY_SRC=\"${SRC_SHARE}/ghostty\"\nTERMINFO_SRC=\"${SRC_SHARE}/terminfo\"\nFALLBACK_GHOSTTY=\"${SRCROOT}/Resources/ghostty\"\nFALLBACK_TERMINFO=\"${SRCROOT}/Resources/ghostty/terminfo\"\nTERMINFO_OVERLAY=\"${SRCROOT}/Resources/terminfo-overlay\"\nTERMMESH_SHELL_SRC=\"${SRCROOT}/Resources/shell-integration\"\nif [ -d \"$GHOSTTY_SRC\" ]; then\n  mkdir -p \"$GHOSTTY_DEST\"\n  rsync -a --delete \"$GHOSTTY_SRC/\" \"$GHOSTTY_DEST/\"\nelif [ -d \"$FALLBACK_GHOSTTY\" ]; then\n  mkdir -p \"$GHOSTTY_DEST\"\n  rsync -a --delete \"$FALLBACK_GHOSTTY/\" \"$GHOSTTY_DEST/\"\nfi\nif [ -d \"$TERMINFO_SRC\" ]; then\n  mkdir -p \"$TERMINFO_DEST\"\n  rsync -a --delete \"$TERMINFO_SRC/\" \"$TERMINFO_DEST/\"\nelif [ -d \"$FALLBACK_TERMINFO\" ]; then\n  mkdir -p \"$TERMINFO_DEST\"\n  rsync -a --delete \"$FALLBACK_TERMINFO/\" \"$TERMINFO_DEST/\"\nfi\n# Overlay any term-mesh-specific terminfo adjustments.\n# This intentionally does not use --delete so we only patch specific entries.\nif [ -d \"$TERMINFO_OVERLAY\" ]; then\n  mkdir -p \"$TERMINFO_DEST\"\n  rsync -a \"$TERMINFO_OVERLAY/\" \"$TERMINFO_DEST/\"\nfi\nif [ -d \"$TERMMESH_SHELL_SRC\" ]; then\n  mkdir -p \"$TERMMESH_SHELL_DEST\"\n  # Use '/.' so dotfiles like .zshenv/.zprofile are copied too.\n  rsync -a \"$TERMMESH_SHELL_SRC/.\" \"$TERMMESH_SHELL_DEST/\"\nfi\n# Copy term-mesh Ghostty config overrides (e.g. shell-integration=none).\nTERMMESH_CONF=\"${SRCROOT}/Resources/ghostty-termmesh.conf\"\nif [ -f \"$TERMMESH_CONF\" ]; then\n  cp -p \"$TERMMESH_CONF\" \"$DEST/ghostty-termmesh.conf\"\nfi\nTEAM_TEMPLATES_BUILTIN=\"${SRCROOT}/Resources/team-templates.builtin.json\"\nif [ -f \"$TEAM_TEMPLATES_BUILTIN\" ]; then\n  cp -p \"$TEAM_TEMPLATES_BUILTIN\" \"$DEST/team-templates.builtin.json\"\nfi\n# Copy team scripts into the bundle for Release builds.\nTEAM_SCRIPTS_SRC=\"${SRCROOT}/scripts\"\nTEAM_SCRIPTS_DEST=\"${DEST}/scripts\"\nif [ -d \"$TEAM_SCRIPTS_SRC\" ]; then\n  mkdir -p \"$TEAM_SCRIPTS_DEST\"\n  for f in team-leader.sh team-leader-claude.sh tm-agent.sh; do\n    [ -f \"$TEAM_SCRIPTS_SRC/$f\" ] && cp -p \"$TEAM_SCRIPTS_SRC/$f\" \"$TEAM_SCRIPTS_DEST/$f\"\n  done\n  chmod +x \"$TEAM_SCRIPTS_DEST\"/*.sh 2>/dev/null || true\nfi\n# Copy Claude slash commands + skills into the bundle (single source of truth).\n# Command/skill list lives in scripts/copy-claude-commands.sh.\n\"${SRCROOT}/scripts/copy-claude-commands.sh\"\nINFO_PLIST=\"${TARGET_BUILD_DIR}/${INFOPLIST_PATH}\"\nCOMMIT=\"$(git -C \"${SRCROOT}\" rev-parse --short=9 HEAD 2>/dev/null || true)\"\nif [ -n \"$COMMIT\" ] && [ -f \"$INFO_PLIST\" ]; then\n  /usr/libexec/PlistBuddy -c \"Set :TermMeshCommit $COMMIT\" \"$INFO_PLIST\" >/dev/null 2>&1 || /usr/libexec/PlistBuddy -c \"Add :TermMeshCommit string $COMMIT\" \"$INFO_PLIST\" >/dev/null 2>&1 || true\nfi\n";
+			shellScript = "# Generate BuildInfo.swift with git SHA\n\"${SRCROOT}/scripts/generate-build-info.sh\"\nset -euo pipefail\nDEST=\"${TARGET_BUILD_DIR}/${UNLOCALIZED_RESOURCES_FOLDER_PATH}\"\nGHOSTTY_DEST=\"${DEST}/ghostty\"\nTERMINFO_DEST=\"${DEST}/terminfo\"\nTERMMESH_SHELL_DEST=\"${DEST}/shell-integration\"\nSRC_SHARE=\"${SRCROOT}/ghostty/zig-out/share\"\nGHOSTTY_SRC=\"${SRC_SHARE}/ghostty\"\nTERMINFO_SRC=\"${SRC_SHARE}/terminfo\"\nFALLBACK_GHOSTTY=\"${SRCROOT}/Resources/ghostty\"\nFALLBACK_TERMINFO=\"${SRCROOT}/Resources/ghostty/terminfo\"\nTERMINFO_OVERLAY=\"${SRCROOT}/Resources/terminfo-overlay\"\nTERMMESH_SHELL_SRC=\"${SRCROOT}/Resources/shell-integration\"\nif [ -d \"$GHOSTTY_SRC\" ]; then\n  mkdir -p \"$GHOSTTY_DEST\"\n  rsync -a --delete \"$GHOSTTY_SRC/\" \"$GHOSTTY_DEST/\"\nelif [ -d \"$FALLBACK_GHOSTTY\" ]; then\n  mkdir -p \"$GHOSTTY_DEST\"\n  rsync -a --delete \"$FALLBACK_GHOSTTY/\" \"$GHOSTTY_DEST/\"\nfi\nif [ -d \"$TERMINFO_SRC\" ]; then\n  mkdir -p \"$TERMINFO_DEST\"\n  rsync -a --delete \"$TERMINFO_SRC/\" \"$TERMINFO_DEST/\"\nelif [ -d \"$FALLBACK_TERMINFO\" ]; then\n  mkdir -p \"$TERMINFO_DEST\"\n  rsync -a --delete \"$FALLBACK_TERMINFO/\" \"$TERMINFO_DEST/\"\nfi\n# Overlay any term-mesh-specific terminfo adjustments.\n# This intentionally does not use --delete so we only patch specific entries.\nif [ -d \"$TERMINFO_OVERLAY\" ]; then\n  mkdir -p \"$TERMINFO_DEST\"\n  rsync -a \"$TERMINFO_OVERLAY/\" \"$TERMINFO_DEST/\"\nfi\nif [ -d \"$TERMMESH_SHELL_SRC\" ]; then\n  mkdir -p \"$TERMMESH_SHELL_DEST\"\n  # Use '/.' so dotfiles like .zshenv/.zprofile are copied too.\n  rsync -a \"$TERMMESH_SHELL_SRC/.\" \"$TERMMESH_SHELL_DEST/\"\nfi\n# Copy term-mesh Ghostty config overrides (e.g. shell-integration=none).\nTERMMESH_CONF=\"${SRCROOT}/Resources/ghostty-termmesh.conf\"\nif [ -f \"$TERMMESH_CONF\" ]; then\n  cp -p \"$TERMMESH_CONF\" \"$DEST/ghostty-termmesh.conf\"\nfi\nTEAM_TEMPLATES_BUILTIN=\"${SRCROOT}/Resources/team-templates.builtin.json\"\nif [ -f \"$TEAM_TEMPLATES_BUILTIN\" ]; then\n  cp -p \"$TEAM_TEMPLATES_BUILTIN\" \"$DEST/team-templates.builtin.json\"\nfi\n# Copy team scripts into the bundle for Release builds.\nTEAM_SCRIPTS_SRC=\"${SRCROOT}/scripts\"\nTEAM_SCRIPTS_DEST=\"${DEST}/scripts\"\nif [ -d \"$TEAM_SCRIPTS_SRC\" ]; then\n  mkdir -p \"$TEAM_SCRIPTS_DEST\"\n  for f in team-leader.sh team-leader-claude.sh tm-agent.sh agent-notify.sh agent-title.sh; do\n    [ -f \"$TEAM_SCRIPTS_SRC/$f\" ] && cp -p \"$TEAM_SCRIPTS_SRC/$f\" \"$TEAM_SCRIPTS_DEST/$f\"\n  done\n  chmod +x \"$TEAM_SCRIPTS_DEST\"/*.sh 2>/dev/null || true\nfi\n# Copy Claude slash commands + skills into the bundle (single source of truth).\n# Command/skill list lives in scripts/copy-claude-commands.sh.\n\"${SRCROOT}/scripts/copy-claude-commands.sh\"\nINFO_PLIST=\"${TARGET_BUILD_DIR}/${INFOPLIST_PATH}\"\nCOMMIT=\"$(git -C \"${SRCROOT}\" rev-parse --short=9 HEAD 2>/dev/null || true)\"\nif [ -n \"$COMMIT\" ] && [ -f \"$INFO_PLIST\" ]; then\n  /usr/libexec/PlistBuddy -c \"Set :TermMeshCommit $COMMIT\" \"$INFO_PLIST\" >/dev/null 2>&1 || /usr/libexec/PlistBuddy -c \"Add :TermMeshCommit string $COMMIT\" \"$INFO_PLIST\" >/dev/null 2>&1 || true\nfi\n";
 		};
 /* End PBXShellScriptBuildPhase section */
 
@@ -597,6 +605,7 @@
 					CVS00082 /* PeerServerHost.swift */,
 				CVS00083 /* GhosttyPaneSurfaceProvider.swift */,
 				CVS00084 /* PeerRelaySession.swift */,
+				CVS00105 /* PeerHostStatsStore.swift */,
 				CVS00085 /* PeerRelayWindowController.swift */,
 				CVS00086 /* PeerRelayWorkspaceWindowController.swift */,
 				CVS00087 /* PeerSSHTunnel.swift */,
@@ -784,7 +793,10 @@
 				F8000001A1B2C3D4E5F60718 /* IMESendKeyTests.swift */,
 				F9000001A1B2C3D4E5F60718 /* AutoReplyDetectorTests.swift */,
 				F9000011A1B2C3D4E5F60718 /* WorkspaceRetrievalDirectoryTests.swift */,
+				F9000015A1B2C3D4E5F60718 /* PeerHostStatsTests.swift */,
 				FA000001A1B2C3D4E5F60718 /* PeerSocketProberTests.swift */,
+				FE000005A1B2C3D4E5F60718 /* PasteQueueTests.swift */,
+				FE000009A1B2C3D4E5F60718 /* WorkspaceManualUnreadTests.swift */,
 				FB000001A1B2C3D4E5F60718 /* PeerPaneSessionTests.swift */,
 				FC000001A1B2C3D4E5F60718 /* PeerWorkspaceMirrorTests.swift */,
 				FD000001A1B2C3D4E5F60718 /* PeerDaemonVersionTests.swift */,
@@ -964,6 +976,7 @@
 					CVB00082 /* PeerServerHost.swift in Sources */,
 				CVB00083 /* GhosttyPaneSurfaceProvider.swift in Sources */,
 				CVB00084 /* PeerRelaySession.swift in Sources */,
+				CVB00105 /* PeerHostStatsStore.swift in Sources */,
 				CVB00085 /* PeerRelayWindowController.swift in Sources */,
 				CVB00086 /* PeerRelayWorkspaceWindowController.swift in Sources */,
 				CVB00087 /* PeerSSHTunnel.swift in Sources */,
@@ -1123,7 +1136,10 @@
 				F8000000A1B2C3D4E5F60718 /* IMESendKeyTests.swift in Sources */,
 				F9000000A1B2C3D4E5F60718 /* AutoReplyDetectorTests.swift in Sources */,
 				F9000010A1B2C3D4E5F60718 /* WorkspaceRetrievalDirectoryTests.swift in Sources */,
+				F9000014A1B2C3D4E5F60718 /* PeerHostStatsTests.swift in Sources */,
 				FA000000A1B2C3D4E5F60718 /* PeerSocketProberTests.swift in Sources */,
+				FE000004A1B2C3D4E5F60718 /* PasteQueueTests.swift in Sources */,
+				FE000008A1B2C3D4E5F60718 /* WorkspaceManualUnreadTests.swift in Sources */,
 				FB000000A1B2C3D4E5F60718 /* PeerPaneSessionTests.swift in Sources */,
 				FC000000A1B2C3D4E5F60718 /* PeerWorkspaceMirrorTests.swift in Sources */,
 				FD000000A1B2C3D4E5F60718 /* PeerDaemonVersionTests.swift in Sources */,
@@ -1231,7 +1247,7 @@
 				CODE_SIGN_ENTITLEMENTS = "";
 				CODE_SIGN_STYLE = Automatic;
 				COMBINE_HIDPI_IMAGES = YES;
-				CURRENT_PROJECT_VERSION = 217;
+				CURRENT_PROJECT_VERSION = 218;
 				DEVELOPMENT_TEAM = "";
 				ENABLE_HARDENED_RUNTIME = NO;
 				GENERATE_INFOPLIST_FILE = NO;
@@ -1240,7 +1256,7 @@
 					"$(inherited)",
 					"@executable_path/../Frameworks",
 				);
-				MARKETING_VERSION = 0.160.0;
+				MARKETING_VERSION = 0.161.0;
 				OTHER_LDFLAGS = (
 					"-lc++",
 					"-framework",
@@ -1270,7 +1286,7 @@
 				CODE_SIGN_ENTITLEMENTS = "";
 				CODE_SIGN_STYLE = Automatic;
 				COMBINE_HIDPI_IMAGES = YES;
-				CURRENT_PROJECT_VERSION = 217;
+				CURRENT_PROJECT_VERSION = 218;
 				DEVELOPMENT_TEAM = "";
 				ENABLE_HARDENED_RUNTIME = NO;
 				GENERATE_INFOPLIST_FILE = NO;
@@ -1279,7 +1295,7 @@
 					"$(inherited)",
 					"@executable_path/../Frameworks",
 				);
-				MARKETING_VERSION = 0.160.0;
+				MARKETING_VERSION = 0.161.0;
 				OTHER_LDFLAGS = (
 					"-lc++",
 					"-framework",
@@ -1333,10 +1349,10 @@
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 217;
+				CURRENT_PROJECT_VERSION = 218;
 				GENERATE_INFOPLIST_FILE = YES;
 				MACOSX_DEPLOYMENT_TARGET = 14.0;
-				MARKETING_VERSION = 0.160.0;
+				MARKETING_VERSION = 0.161.0;
 				ONLY_ACTIVE_ARCH = YES;
 				PRODUCT_BUNDLE_IDENTIFIER = com.termmesh.appuitests;
 				PRODUCT_NAME = "$(TARGET_NAME)";
@@ -1350,10 +1366,10 @@
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 217;
+				CURRENT_PROJECT_VERSION = 218;
 				GENERATE_INFOPLIST_FILE = YES;
 				MACOSX_DEPLOYMENT_TARGET = 14.0;
-				MARKETING_VERSION = 0.160.0;
+				MARKETING_VERSION = 0.161.0;
 				ONLY_ACTIVE_ARCH = YES;
 				PRODUCT_BUNDLE_IDENTIFIER = com.termmesh.appuitests;
 				PRODUCT_NAME = "$(TARGET_NAME)";
@@ -1367,10 +1383,10 @@
 			buildSettings = {
 				BUNDLE_LOADER = "$(TEST_HOST)";
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 217;
+				CURRENT_PROJECT_VERSION = 218;
 				GENERATE_INFOPLIST_FILE = YES;
 				MACOSX_DEPLOYMENT_TARGET = 14.0;
-				MARKETING_VERSION = 0.160.0;
+				MARKETING_VERSION = 0.161.0;
 				ONLY_ACTIVE_ARCH = YES;
 				PRODUCT_BUNDLE_IDENTIFIER = com.termmesh.apptests;
 				PRODUCT_NAME = "$(TARGET_NAME)";
@@ -1386,10 +1402,10 @@
 			buildSettings = {
 				BUNDLE_LOADER = "$(TEST_HOST)";
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 217;
+				CURRENT_PROJECT_VERSION = 218;
 				GENERATE_INFOPLIST_FILE = YES;
 				MACOSX_DEPLOYMENT_TARGET = 14.0;
-				MARKETING_VERSION = 0.160.0;
+				MARKETING_VERSION = 0.161.0;
 				ONLY_ACTIVE_ARCH = YES;
 				PRODUCT_BUNDLE_IDENTIFIER = com.termmesh.apptests;
 				PRODUCT_NAME = "$(TARGET_NAME)";

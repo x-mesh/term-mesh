@@ -3,7 +3,7 @@ import Foundation
 
 final class AutomationSocketUITests: XCTestCase {
     private var socketPath = ""
-    private let defaultsDomain = "com.term-meshterm.app.debug"
+    private let defaultsDomain = "com.termmesh.app.debug"
     private let modeKey = "socketControlMode"
     private let legacyKey = "socketControlEnabled"
 

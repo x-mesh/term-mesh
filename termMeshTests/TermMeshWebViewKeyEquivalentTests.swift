@@ -3438,7 +3438,11 @@ final class BrowserHistoryStoreTests: XCTestCase {
         XCTAssertEqual(suggestions.first?.title, "Example Foo Updated")
     }
 
-    func testSuggestionsLoadsPersistedHistoryImmediatelyOnFirstQuery() async throws {
+    /// The store loads off the main thread on purpose, so the first query can
+    /// legitimately see nothing — `loadIfNeeded` says so in as many words, and
+    /// the omnibar re-queries on every keystroke. What has to hold is that the
+    /// persisted history does arrive and does produce the right suggestions.
+    func testSuggestionsReturnPersistedHistoryOnceItHasLoaded() async throws {
         let tempDir = FileManager.default.temporaryDirectory
             .appendingPathComponent("BrowserHistoryStoreTests-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
@@ -3471,7 +3475,14 @@ final class BrowserHistoryStoreTests: XCTestCase {
         try data.write(to: fileURL, options: [.atomic])
 
         let store = await MainActor.run { BrowserHistoryStore(fileURL: fileURL) }
-        let suggestions = await MainActor.run { store.suggestions(for: "go", limit: 10) }
+        // Kick the load, then wait for it rather than assuming it was synchronous.
+        _ = await MainActor.run { store.suggestions(for: "go", limit: 10) }
+        var suggestions: [BrowserHistoryStore.Entry] = []
+        for _ in 0..<100 {
+            suggestions = await MainActor.run { store.suggestions(for: "go", limit: 10) }
+            if suggestions.count >= 2 { break }
+            try await Task.sleep(nanoseconds: 20_000_000)
+        }
 
         XCTAssertGreaterThanOrEqual(suggestions.count, 2)
         XCTAssertEqual(suggestions.first?.url, "https://go.dev/")

@@ -87,8 +87,17 @@ enum CommandPaletteSwitcherSearchIndexer {
         case .workspace:
             return [trimmed]
         case .surface:
+            // The name after the last "/", the way a directory contributes its
+            // basename. Without it a branch was only ever its whole string and
+            // its individual words, because "-" is a delimiter too — so
+            // "feature/cmd-palette-indexing" offered "feature", "cmd",
+            // "palette", "indexing" and never "cmd-palette-indexing". Typing
+            // that still found the workspace, by matching inside the full
+            // string, but scored roughly half what the identical search
+            // against a directory name did.
+            let basename = trimmed.split(separator: "/").last.map(String.init)
             let components = trimmed.components(separatedBy: metadataDelimiters).filter { !$0.isEmpty }
-            return uniqueNormalizedPreservingOrder([trimmed] + components)
+            return uniqueNormalizedPreservingOrder([trimmed] + [basename].compactMap { $0 } + components)
         }
     }
 

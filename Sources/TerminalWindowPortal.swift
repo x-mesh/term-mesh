@@ -789,6 +789,16 @@ final class WindowTerminalPortal: NSObject {
             container.addSubview(hostView, positioned: .below, relativeTo: browserHost)
         }
 
+        // The command palette installs into this same container with `.above`,
+        // so the last of the two to run wins — and a portal sync runs many
+        // times a second. Opening the palette over a terminal therefore buried
+        // it behind that terminal within a frame or two, leaving only the strip
+        // that happened to fall between two panes visible.
+        if let palette = container.subviews.first(where: { $0 is CommandPaletteOverlayContainerView }),
+           !Self.isView(palette, above: hostView, in: container) {
+            container.addSubview(palette, positioned: .above, relativeTo: hostView)
+        }
+
         // Keep the drag/mouse forwarding overlay above portal-hosted terminal views.
         if let overlay = objc_getAssociatedObject(window, &fileDropOverlayKey) as? NSView,
            overlay.superview === container,
@@ -1408,7 +1418,10 @@ final class WindowTerminalPortal: NSObject {
     }
 
     func debugHostedSubviewCount() -> Int {
-        hostView.subviews.count
+        // Hosted surfaces only. hostView also carries the split-divider
+        // overlay, so a raw subview count reads one higher than the number of
+        // terminals — which made a correct prune look like a leaked view.
+        hostView.subviews.filter { !($0 is SplitDividerOverlayView) }.count
     }
 #endif
 

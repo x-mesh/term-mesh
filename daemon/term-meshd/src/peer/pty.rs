@@ -36,12 +36,20 @@ pub struct PtyChild {
 /// optionally chdir'd to `cwd` before exec. The caller owns `master_fd`
 /// and must close it when done; the child is reaped by the caller via
 /// [`teardown`] or by dropping [`PtySurface`].
+/// Spawn a child on a new PTY.
+///
+/// `env` entries are added to the environment this process runs with,
+/// replacing any variable of the same name. A pane started without them
+/// inherits whatever launched the daemon — under systemd that is a service
+/// environment with no `TERM` at all, which leaves every program in the pane
+/// unable to tell what terminal it is talking to.
 pub fn spawn(
     command: &str,
     args: &[&str],
     cols: u16,
     rows: u16,
     cwd: Option<&str>,
+    env: &[(String, String)],
 ) -> io::Result<PtyChild> {
     // Allocate all CStrings before forking; in the child we can only
     // call async-signal-safe functions.
@@ -67,6 +75,13 @@ pub fn spawn(
         .chain(c_args.iter().map(|s| s.as_ptr()))
         .collect();
     argv.push(std::ptr::null());
+
+    // Built here, before the fork, for the same reason as argv: assembling it
+    // in the child would mean allocating, and the child may only call
+    // async-signal-safe functions.
+    let c_env = build_child_env(env)?;
+    let mut envp: Vec<*const libc::c_char> = c_env.iter().map(|s| s.as_ptr()).collect();
+    envp.push(std::ptr::null());
 
     let mut master_fd: RawFd = -1;
     let mut ws = libc::winsize {
@@ -110,6 +125,11 @@ pub fn spawn(
                     libc::_exit(126);
                 }
             }
+            // `execvp` reads the environment from the global `environ`, so
+            // pointing that at the array built above is enough to hand the
+            // child its environment. A pointer store rather than `setenv`,
+            // which allocates and is not safe to call here.
+            set_environ(envp.as_ptr());
             libc::execvp(c_cmd.as_ptr(), argv.as_ptr());
             let errno = current_errno();
             report_child_failure(exec_write_fd, CHILD_STAGE_EXEC, errno);
@@ -138,6 +158,50 @@ pub fn spawn(
     }
 
     Ok(PtyChild { master_fd, pid })
+}
+
+/// This process's environment with `overrides` applied, as `KEY=VALUE`
+/// strings ready for `environ`.
+///
+/// Inherited rather than replaced: the daemon's environment is where the
+/// child's `PATH`, `HOME` and locale come from, and a pane that lost those
+/// would be broken in ways far louder than the missing terminal variables
+/// this exists to add.
+fn build_child_env(overrides: &[(String, String)]) -> io::Result<Vec<CString>> {
+    let mut merged: Vec<(String, String)> = std::env::vars()
+        .filter(|(key, _)| !overrides.iter().any(|(name, _)| name == key))
+        .collect();
+    merged.extend(overrides.iter().cloned());
+
+    merged
+        .into_iter()
+        .map(|(key, value)| {
+            CString::new(format!("{key}={value}")).map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidInput, "env entry contains NUL")
+            })
+        })
+        .collect()
+}
+
+/// Point the C library's `environ` at `envp`.
+///
+/// Safety: called only in the forked child, between fork and exec, where this
+/// process is single-threaded and nothing else reads `environ`.
+#[cfg(target_os = "macos")]
+unsafe fn set_environ(envp: *const *const libc::c_char) {
+    extern "C" {
+        fn _NSGetEnviron() -> *mut *mut *mut libc::c_char;
+    }
+    *_NSGetEnviron() = envp as *mut *mut libc::c_char;
+}
+
+/// Point the C library's `environ` at `envp`. See the macOS variant.
+#[cfg(not(target_os = "macos"))]
+unsafe fn set_environ(envp: *const *const libc::c_char) {
+    extern "C" {
+        static mut environ: *mut *mut libc::c_char;
+    }
+    environ = envp as *mut *mut libc::c_char;
 }
 
 fn validate_cwd(path: &str) -> io::Result<()> {
@@ -610,7 +674,7 @@ mod tests {
     use std::thread;
 
     fn spawn_shell(cwd: Option<&str>, script: &str) -> io::Result<PtyChild> {
-        spawn("/bin/sh", &["-c", script], 80, 24, cwd)
+        spawn("/bin/sh", &["-c", script], 80, 24, cwd, &[])
     }
 
     fn expect_spawn_error(result: io::Result<PtyChild>) -> io::Error {
@@ -705,6 +769,7 @@ mod tests {
             80,
             24,
             None,
+            &[],
         ));
         assert_eq!(error.kind(), io::ErrorKind::NotFound);
         assert_eq!(error.to_string(), "COMMAND_NOT_FOUND");

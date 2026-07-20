@@ -593,6 +593,15 @@ public nonisolated struct Termmesh_Peer_V1_Envelope: Sendable {
     set {payload = .terminateSurfaceResponse(newValue)}
   }
 
+  /// Host-pushed, gated behind capability "host.stats.v1" (Hello.capabilities).
+  public var hostStats: Termmesh_Peer_V1_HostStats {
+    get {
+      if case .hostStats(let v)? = payload {return v}
+      return Termmesh_Peer_V1_HostStats()
+    }
+    set {payload = .hostStats(newValue)}
+  }
+
   public var ping: Termmesh_Peer_V1_Ping {
     get {
       if case .ping(let v)? = payload {return v}
@@ -658,6 +667,8 @@ public nonisolated struct Termmesh_Peer_V1_Envelope: Sendable {
     /// Gated behind capability "surface.terminate.v1" (Hello.capabilities).
     case terminateSurfaceRequest(Termmesh_Peer_V1_TerminateSurfaceRequest)
     case terminateSurfaceResponse(Termmesh_Peer_V1_TerminateSurfaceResponse)
+    /// Host-pushed, gated behind capability "host.stats.v1" (Hello.capabilities).
+    case hostStats(Termmesh_Peer_V1_HostStats)
     case ping(Termmesh_Peer_V1_Ping)
     case pong(Termmesh_Peer_V1_Pong)
     case goodbye(Termmesh_Peer_V1_Goodbye)
@@ -790,12 +801,17 @@ public nonisolated struct Termmesh_Peer_V1_SurfaceInfo: Sendable {
   /// Host policy may forbid per-surface attach.
   public var attachable: Bool = false
 
-  /// Captured at spawn time, i.e. the directory the child was chdir'd into
-  /// before exec. Does NOT track runtime cd; for that, subscribe to
-  /// WorkspaceUpdate.meta events (future).
+  /// Where the surface's shell is NOW: the host reads it from the OS at
+  /// the moment it answers, so it follows a `cd`. Older hosts reported the
+  /// spawn directory here and never updated it.
+  ///
+  /// A resolved path, which may differ textually from the one the surface
+  /// was asked to start in — on macOS a spawn in /var/... reports back as
+  /// /private/var/... . Compare these by resolving both, never as strings.
   public var cwd: String = String()
 
-  /// Git branch of `cwd` resolved at spawn time, or empty if not a git repo.
+  /// Git branch of `cwd`, resolved when the host answers, or empty if not
+  /// a git repo. Follows `cwd` into a different repository.
   public var branch: String = String()
 
   public var unknownFields = SwiftProtobuf.UnknownStorage()
@@ -1917,6 +1933,61 @@ public nonisolated struct Termmesh_Peer_V1_WorkspaceLayoutChanged: Sendable {
   fileprivate var _layout: Termmesh_Peer_V1_WorkspaceLayout? = nil
 }
 
+/// How loaded the machine hosting these panes currently is.
+///
+/// Pushed by the host on its own schedule (whatever cadence its monitor
+/// already samples at) rather than polled, so a viewer that wants to show
+/// this continuously does not have to ask repeatedly. Sent only to clients
+/// that advertised "host.stats.v1", so an older viewer receives nothing.
+///
+/// Deliberately about the HOST, not a workspace: the numbers are the same
+/// for every workspace on that machine, and attaching them to
+/// `WorkspaceUpdate` would send N copies of one fact.
+///
+/// Every field is a point-in-time sample and may be absent (zero) on a
+/// host that cannot measure it — a viewer must render what it has rather
+/// than wait for a complete set.
+public nonisolated struct Termmesh_Peer_V1_HostStats: Sendable {
+  // SwiftProtobuf.Message conformance is added in an extension below. See the
+  // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
+  // methods supported on all messages.
+
+  /// Load averages over the last 1, 5 and 15 minutes. None are normalized
+  /// by core count; pair with `cpu_count` to judge whether they are high.
+  ///
+  /// All three are worth carrying: one figure says how busy the machine is,
+  /// but the three together say whether it is climbing, settled, or on its
+  /// way back down — which is what tells you to wait or to go look.
+  public var load1M: Double = 0
+
+  public var cpuCount: UInt32 = 0
+
+  /// Percentage of physical memory in use, 0-100.
+  public var memoryPercent: Float = 0
+
+  public var memoryUsedBytes: UInt64 = 0
+
+  public var memoryTotalBytes: UInt64 = 0
+
+  /// Aggregate across all disks / all network interfaces. Rates, not
+  /// totals: bytes moved during the host's last sampling interval.
+  public var diskReadBytesPerSec: UInt64 = 0
+
+  public var diskWriteBytesPerSec: UInt64 = 0
+
+  public var netRxBytesPerSec: UInt64 = 0
+
+  public var netTxBytesPerSec: UInt64 = 0
+
+  public var load5M: Double = 0
+
+  public var load15M: Double = 0
+
+  public var unknownFields = SwiftProtobuf.UnknownStorage()
+
+  public init() {}
+}
+
 public nonisolated struct Termmesh_Peer_V1_Ping: Sendable {
   // SwiftProtobuf.Message conformance is added in an extension below. See the
   // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
@@ -2002,7 +2073,7 @@ nonisolated extension Termmesh_Peer_V1_TerminateSurfaceErrorCode: SwiftProtobuf.
 
 nonisolated extension Termmesh_Peer_V1_Envelope: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
   public static let protoMessageName: String = _protobuf_package + ".Envelope"
-  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{1}seq\0\u{3}correlation_id\0\u{2}\u{8}hello\0\u{3}auth_challenge\0\u{1}auth\0\u{3}auth_result\0\u{4}\u{7}list_surfaces\0\u{3}surface_list\0\u{3}attach_surface\0\u{3}attach_result\0\u{3}detach_surface\0\u{3}list_workspaces\0\u{3}workspace_list\0\u{3}workspace_control\0\u{3}create_workspace_request\0\u{3}create_workspace_response\0\u{3}pty_data\0\u{1}input\0\u{1}resize\0\u{3}grid_snapshot\0\u{3}data_ack\0\u{4}\u{6}workspace_update\0\u{3}rename_workspace_request\0\u{3}delete_workspace_request\0\u{3}ensure_surface_request\0\u{3}ensure_surface_response\0\u{3}terminate_surface_request\0\u{3}terminate_surface_response\0\u{2}\u{4}ping\0\u{1}pong\0\u{2}\u{9}goodbye\0\u{2}'error\0")
+  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{1}seq\0\u{3}correlation_id\0\u{2}\u{8}hello\0\u{3}auth_challenge\0\u{1}auth\0\u{3}auth_result\0\u{4}\u{7}list_surfaces\0\u{3}surface_list\0\u{3}attach_surface\0\u{3}attach_result\0\u{3}detach_surface\0\u{3}list_workspaces\0\u{3}workspace_list\0\u{3}workspace_control\0\u{3}create_workspace_request\0\u{3}create_workspace_response\0\u{3}pty_data\0\u{1}input\0\u{1}resize\0\u{3}grid_snapshot\0\u{3}data_ack\0\u{4}\u{6}workspace_update\0\u{3}rename_workspace_request\0\u{3}delete_workspace_request\0\u{3}ensure_surface_request\0\u{3}ensure_surface_response\0\u{3}terminate_surface_request\0\u{3}terminate_surface_response\0\u{3}host_stats\0\u{2}\u{3}ping\0\u{1}pong\0\u{2}\u{9}goodbye\0\u{2}'error\0")
 
   public mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
     while let fieldNumber = try decoder.nextFieldNumber() {
@@ -2350,6 +2421,19 @@ nonisolated extension Termmesh_Peer_V1_Envelope: SwiftProtobuf.Message, SwiftPro
           self.payload = .terminateSurfaceResponse(v)
         }
       }()
+      case 47: try {
+        var v: Termmesh_Peer_V1_HostStats?
+        var hadOneofValue = false
+        if let current = self.payload {
+          hadOneofValue = true
+          if case .hostStats(let m) = current {v = m}
+        }
+        try decoder.decodeSingularMessageField(value: &v)
+        if let v = v {
+          if hadOneofValue {try decoder.handleConflictingOneOf()}
+          self.payload = .hostStats(v)
+        }
+      }()
       case 50: try {
         var v: Termmesh_Peer_V1_Ping?
         var hadOneofValue = false
@@ -2522,6 +2606,10 @@ nonisolated extension Termmesh_Peer_V1_Envelope: SwiftProtobuf.Message, SwiftPro
     case .terminateSurfaceResponse?: try {
       guard case .terminateSurfaceResponse(let v)? = self.payload else { preconditionFailure() }
       try visitor.visitSingularMessageField(value: v, fieldNumber: 46)
+    }()
+    case .hostStats?: try {
+      guard case .hostStats(let v)? = self.payload else { preconditionFailure() }
+      try visitor.visitSingularMessageField(value: v, fieldNumber: 47)
     }()
     case .ping?: try {
       guard case .ping(let v)? = self.payload else { preconditionFailure() }
@@ -5027,6 +5115,86 @@ nonisolated extension Termmesh_Peer_V1_WorkspaceLayoutChanged: SwiftProtobuf.Mes
   public static func ==(lhs: Termmesh_Peer_V1_WorkspaceLayoutChanged, rhs: Termmesh_Peer_V1_WorkspaceLayoutChanged) -> Bool {
     if lhs.workspaceID != rhs.workspaceID {return false}
     if lhs._layout != rhs._layout {return false}
+    if lhs.unknownFields != rhs.unknownFields {return false}
+    return true
+  }
+}
+
+nonisolated extension Termmesh_Peer_V1_HostStats: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
+  public static let protoMessageName: String = _protobuf_package + ".HostStats"
+  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{3}load_1m\0\u{3}cpu_count\0\u{3}memory_percent\0\u{3}memory_used_bytes\0\u{3}memory_total_bytes\0\u{3}disk_read_bytes_per_sec\0\u{3}disk_write_bytes_per_sec\0\u{3}net_rx_bytes_per_sec\0\u{3}net_tx_bytes_per_sec\0\u{3}load_5m\0\u{3}load_15m\0")
+
+  public mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
+    while let fieldNumber = try decoder.nextFieldNumber() {
+      // The use of inline closures is to circumvent an issue where the compiler
+      // allocates stack space for every case branch when no optimizations are
+      // enabled. https://github.com/apple/swift-protobuf/issues/1034
+      switch fieldNumber {
+      case 1: try { try decoder.decodeSingularDoubleField(value: &self.load1M) }()
+      case 2: try { try decoder.decodeSingularUInt32Field(value: &self.cpuCount) }()
+      case 3: try { try decoder.decodeSingularFloatField(value: &self.memoryPercent) }()
+      case 4: try { try decoder.decodeSingularUInt64Field(value: &self.memoryUsedBytes) }()
+      case 5: try { try decoder.decodeSingularUInt64Field(value: &self.memoryTotalBytes) }()
+      case 6: try { try decoder.decodeSingularUInt64Field(value: &self.diskReadBytesPerSec) }()
+      case 7: try { try decoder.decodeSingularUInt64Field(value: &self.diskWriteBytesPerSec) }()
+      case 8: try { try decoder.decodeSingularUInt64Field(value: &self.netRxBytesPerSec) }()
+      case 9: try { try decoder.decodeSingularUInt64Field(value: &self.netTxBytesPerSec) }()
+      case 10: try { try decoder.decodeSingularDoubleField(value: &self.load5M) }()
+      case 11: try { try decoder.decodeSingularDoubleField(value: &self.load15M) }()
+      default: break
+      }
+    }
+  }
+
+  public func traverse<V: SwiftProtobuf.Visitor>(visitor: inout V) throws {
+    if self.load1M.bitPattern != 0 {
+      try visitor.visitSingularDoubleField(value: self.load1M, fieldNumber: 1)
+    }
+    if self.cpuCount != 0 {
+      try visitor.visitSingularUInt32Field(value: self.cpuCount, fieldNumber: 2)
+    }
+    if self.memoryPercent.bitPattern != 0 {
+      try visitor.visitSingularFloatField(value: self.memoryPercent, fieldNumber: 3)
+    }
+    if self.memoryUsedBytes != 0 {
+      try visitor.visitSingularUInt64Field(value: self.memoryUsedBytes, fieldNumber: 4)
+    }
+    if self.memoryTotalBytes != 0 {
+      try visitor.visitSingularUInt64Field(value: self.memoryTotalBytes, fieldNumber: 5)
+    }
+    if self.diskReadBytesPerSec != 0 {
+      try visitor.visitSingularUInt64Field(value: self.diskReadBytesPerSec, fieldNumber: 6)
+    }
+    if self.diskWriteBytesPerSec != 0 {
+      try visitor.visitSingularUInt64Field(value: self.diskWriteBytesPerSec, fieldNumber: 7)
+    }
+    if self.netRxBytesPerSec != 0 {
+      try visitor.visitSingularUInt64Field(value: self.netRxBytesPerSec, fieldNumber: 8)
+    }
+    if self.netTxBytesPerSec != 0 {
+      try visitor.visitSingularUInt64Field(value: self.netTxBytesPerSec, fieldNumber: 9)
+    }
+    if self.load5M.bitPattern != 0 {
+      try visitor.visitSingularDoubleField(value: self.load5M, fieldNumber: 10)
+    }
+    if self.load15M.bitPattern != 0 {
+      try visitor.visitSingularDoubleField(value: self.load15M, fieldNumber: 11)
+    }
+    try unknownFields.traverse(visitor: &visitor)
+  }
+
+  public static func ==(lhs: Termmesh_Peer_V1_HostStats, rhs: Termmesh_Peer_V1_HostStats) -> Bool {
+    if lhs.load1M != rhs.load1M {return false}
+    if lhs.cpuCount != rhs.cpuCount {return false}
+    if lhs.memoryPercent != rhs.memoryPercent {return false}
+    if lhs.memoryUsedBytes != rhs.memoryUsedBytes {return false}
+    if lhs.memoryTotalBytes != rhs.memoryTotalBytes {return false}
+    if lhs.diskReadBytesPerSec != rhs.diskReadBytesPerSec {return false}
+    if lhs.diskWriteBytesPerSec != rhs.diskWriteBytesPerSec {return false}
+    if lhs.netRxBytesPerSec != rhs.netRxBytesPerSec {return false}
+    if lhs.netTxBytesPerSec != rhs.netTxBytesPerSec {return false}
+    if lhs.load5M != rhs.load5M {return false}
+    if lhs.load15M != rhs.load15M {return false}
     if lhs.unknownFields != rhs.unknownFields {return false}
     return true
   }

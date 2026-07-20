@@ -707,8 +707,9 @@ Notes:
 
 ## Lessons (x-humble)
 <!-- Section managed by x-humble. Manual editing allowed. -->
-- STOP: 같은 가설이 2회 실패해도 계속 밀어붙이는 것 — 가설 자체를 폐기하고 다른 방향(데이터/호스트/회귀)으로 전환. (L3, confirmed 2 times, 2026-06-03)
-- START: UI/렌더링 버그 디버깅 시 코드·아키텍처 추론 전에 런타임 ground-truth(계측·바이트 단위 로그)부터 확인. (L2, confirmed 2 times, 2026-06-03)
+- STOP: 같은 가설이 2회 실패해도 계속 밀어붙이는 것 — 가설 자체를 폐기하고 다른 방향(데이터/호스트/회귀)으로 전환. (L3, confirmed 3 times, 2026-07-20)
+- START: UI/렌더링 버그 디버깅 시 코드·아키텍처 추론 전에 런타임 ground-truth(계측·바이트 단위 로그)부터 확인. (L2, confirmed 3 times, 2026-07-20)
+- START: 실패한 기능에 "동작하는 선례"(플러그인·유사 구현)가 있으면 내 가설 실험 전에 그 구현 전체를 독해 — source된 파일 포함. 부분 독해는 답을 옆에 두고 우회하게 만든다. (L5, confirmed 1 times, 2026-07-20)
 
 <!-- gk:agents:begin v14 — managed by `gk agents install`; edit outside this block -->
 ## Git workflow (git-kit)

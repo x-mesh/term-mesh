@@ -119,6 +119,27 @@ struct PeerHostEditorView: View {
     /// in-flight install/update completes.
     @State private var installInFlight = false
 
+    /// Agent-notification stack (scripts + Claude hooks) on the host —
+    /// a second doctor lane beside the daemon one, so "connected" and
+    /// "notifications will actually work" are answered separately.
+    /// Additive: DoctorState's frozen cases stay untouched.
+    enum AgentStackState: Equatable {
+        case idle
+        case checking
+        /// Probe answered — status says what is and isn't there.
+        case status(PeerAgentStackStatus)
+        case installing
+        case installFailed(String)
+        /// Install finished; the message is the doctor's summary line.
+        case installed(String)
+    }
+    @State private var agentStackState: AgentStackState = .idle
+    @State private var showAgentInstallConfirm = false
+    /// Same latch discipline as `installInFlight`, same reason: the
+    /// generation guard discards stale results, but only this keeps the
+    /// buttons locked while a remote install is genuinely under way.
+    @State private var agentInstallInFlight = false
+
     /// Fixed tag palette (one-dark hues) + nil for "no color".
     private static let colorChoices: [String?] = [
         nil, "#E06C75", "#D19A66", "#E5C07B",
@@ -191,6 +212,8 @@ struct PeerHostEditorView: View {
 
             doctorStatusLine
 
+            agentStackStatusLine
+
             HStack {
                 Button("Test", action: runTest)
                     .disabled(doctorBusy
@@ -201,6 +224,10 @@ struct PeerHostEditorView: View {
                 }
                 if showsUpdateButton {
                     Button("Update term-meshd…") { showUpdateConfirm = true }
+                        .disabled(doctorBusy)
+                }
+                if showsAgentInstallButton {
+                    Button("Set up notifications…") { showAgentInstallConfirm = true }
                         .disabled(doctorBusy)
                 }
                 Spacer()
@@ -246,15 +273,35 @@ struct PeerHostEditorView: View {
         } message: {
             Text("Updating restarts the remote daemon and terminates all sessions on this host.")
         }
+        .confirmationDialog(
+            "Set up agent notifications on \"\(profile.sshTarget)\"?",
+            isPresented: $showAgentInstallConfirm
+        ) {
+            Button("Set Up") { runAgentStackInstall() }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("Copies agent-notify.sh and agent-title.sh to ~/.local/bin and, when Claude Code is installed there, wires its Notification and Stop hooks (existing settings are backed up).")
+        }
     }
 
     private var doctorBusy: Bool {
         // installInFlight can outlive `.installing` in doctorState (e.g.
         // right after invalidateDoctorState() resets state mid-install)
         // so it's checked independently, not folded into the switch.
-        if installInFlight { return true }
+        if installInFlight || agentInstallInFlight { return true }
         switch doctorState {
         case .testing, .installing, .diagnosing: return true
+        default: return false
+        }
+    }
+
+    /// Offered when the last probe answered and found something missing;
+    /// requires the tested target for the same reason Install/Update do.
+    private var showsAgentInstallButton: Bool {
+        guard testedDraft != nil else { return false }
+        switch agentStackState {
+        case .status(let status): return !status.isComplete
+        case .installFailed: return true
         default: return false
         }
     }
@@ -333,6 +380,66 @@ struct PeerHostEditorView: View {
         }
     }
 
+    /// The agent-stack lane, rendered beneath the daemon status line.
+    /// Silent until a Test has run — the whole point is answering "will
+    /// an agent in a pane on this host actually notify me", which only
+    /// makes sense against a reachable host.
+    @ViewBuilder
+    private var agentStackStatusLine: some View {
+        switch agentStackState {
+        case .idle:
+            EmptyView()
+        case .checking:
+            Label("Checking agent notification setup…", systemImage: "ellipsis.circle")
+                .font(.caption).foregroundColor(.secondary)
+        case .status(let status):
+            if status.isComplete {
+                Label(agentStackCompleteText(status), systemImage: "bell.badge")
+                    .font(.caption).foregroundColor(.green)
+            } else {
+                Label(agentStackMissingText(status), systemImage: "bell.slash")
+                    .font(.caption).foregroundColor(.orange)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        case .installing:
+            Label("Setting up agent notifications…", systemImage: "arrow.down.circle")
+                .font(.caption).foregroundColor(.secondary)
+        case .installFailed(let msg):
+            Label("Notification setup failed: \(msg)", systemImage: "xmark.circle.fill")
+                .font(.caption).foregroundColor(.red)
+                .fixedSize(horizontal: false, vertical: true)
+        case .installed(let summary):
+            Label("Agent notifications set up — \(summary)", systemImage: "bell.badge")
+                .font(.caption).foregroundColor(.green)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+    }
+
+    private func agentStackCompleteText(_ status: PeerAgentStackStatus) -> String {
+        status.hasClaude
+            ? "Agent notifications ready — scripts installed, Claude hooks wired"
+            : "Agent notification scripts installed (no claude on this host)"
+    }
+
+    private func agentStackMissingText(_ status: PeerAgentStackStatus) -> String {
+        var missing: [String] = []
+        if !status.scriptsInstalled { missing.append("scripts not installed") }
+        if status.hasClaude && !status.hooksWired { missing.append("Claude hooks not wired") }
+        // python3 gates the Claude-hook path specifically (isComplete
+        // requires it whenever claude is present), so it belongs in the
+        // missing list itself — not as a trailing aside — when claude is
+        // there. Otherwise it's advisory only.
+        if !status.hasPython3 {
+            if status.hasClaude {
+                missing.append("python3 missing (required for Claude hooks)")
+            } else if missing.isEmpty {
+                missing.append("python3 missing (needed for notifications)")
+            }
+        }
+        let detail = missing.isEmpty ? "setup incomplete" : missing.joined(separator: ", ")
+        return "Agent notifications: " + detail
+    }
+
     /// `.daemonMissing`'s base copy, plus (when a binary was found on the
     /// host despite the daemon not running) the version it reports and
     /// which kind of host reported it.
@@ -407,6 +514,8 @@ struct PeerHostEditorView: View {
         updateAttempted = false
         showInstallConfirm = false
         showUpdateConfirm = false
+        agentStackState = .idle
+        showAgentInstallConfirm = false
     }
 
     // MARK: - Doctor actions
@@ -440,6 +549,7 @@ struct PeerHostEditorView: View {
                 let resolved = await resolveConnectedState(socketPath: path, draft: draft)
                 guard gen == doctorGeneration else { return }
                 doctorState = resolved
+                await refreshAgentStack(draft: draft, gen: gen)
             case .daemonMissing:
                 // Binary may still be present with the service just not
                 // running — surface that without touching the frozen
@@ -461,6 +571,10 @@ struct PeerHostEditorView: View {
                 daemonMissingVersion = probed?.version
                 daemonMissingHostKind = probed?.hostKind
                 doctorState = .daemonMissing
+                // SSH itself works, so the agent stack is still worth
+                // answering — a host can carry the scripts and hooks
+                // before its daemon is ever installed.
+                await refreshAgentStack(draft: draft, gen: gen)
             case .sshFailed(let msg): doctorState = .sshFailed(msg)
             }
         }
@@ -526,6 +640,81 @@ struct PeerHostEditorView: View {
                 doctorState = .diagnosed(PeerHostDoctor.summarizeDiagnosis(raw))
             case .sshFailed(let msg):
                 doctorState = .sshFailed(msg)
+            }
+        }
+    }
+
+    /// Probes the agent-notification stack and publishes the result —
+    /// runs after any Test that proved SSH works. A failed probe leaves
+    /// the lane at `.idle` rather than inventing a red state: the daemon
+    /// line already reports connectivity problems, and this lane only
+    /// speaks when it actually measured something.
+    private func refreshAgentStack(draft: PeerHostProfile, gen: Int) async {
+        guard gen == doctorGeneration else { return }
+        agentStackState = .checking
+        let status = await PeerHostDoctor.checkAgentStack(
+            sshTarget: draft.sshTarget, port: draft.sshPort,
+            identityFile: draft.identityFile
+        )
+        guard gen == doctorGeneration else { return }
+        #if DEBUG
+        if let status {
+            dlog("peer.doctor.agentStack notify=\(status.notifyPath ?? "nil") title=\(status.titlePath ?? "nil") hooks=\(status.hooksWired) claude=\(status.hasClaude) python3=\(status.hasPython3)")
+        } else {
+            dlog("peer.doctor.agentStack probe failed")
+        }
+        #endif
+        // The editor shows this as a badge that the next Test overwrites.
+        // Keeping it in the log means "was the host ever equipped, and when
+        // did that change" is answerable after the fact.
+        if let status {
+            RemoteWorkLog.debug(
+                "Agent stack on \(draft.sshTarget): scripts=\(status.scriptsInstalled) hooks=\(status.hooksWired) claude=\(status.hasClaude) python3=\(status.hasPython3)"
+            )
+        } else {
+            RemoteWorkLog.debug("Agent stack probe failed on \(draft.sshTarget)")
+        }
+        agentStackState = status.map { .status($0) } ?? .idle
+    }
+
+    /// Installs the agent stack against the exact target the last Test
+    /// probed — same `testedDraft` + generation + in-flight discipline
+    /// as `runInstall()`.
+    private func runAgentStackInstall() {
+        guard let draft = testedDraft else { return }
+        guard case .status(let status) = agentStackState else {
+            // `.installFailed` retry: re-probe first so the install gets
+            // a current status (claude/python3 presence steer it).
+            Task {
+                let gen = doctorGeneration
+                await refreshAgentStack(draft: draft, gen: gen)
+                guard gen == doctorGeneration,
+                      case .status = agentStackState else { return }
+                runAgentStackInstall()
+            }
+            return
+        }
+        let gen = doctorGeneration
+        agentStackState = .installing
+        agentInstallInFlight = true
+        Task {
+            defer { agentInstallInFlight = false }
+            do {
+                let summary = try await PeerHostDoctor.installAgentStack(
+                    sshTarget: draft.sshTarget, port: draft.sshPort,
+                    identityFile: draft.identityFile, status: status
+                )
+                guard gen == doctorGeneration else { return }
+                agentStackState = .installed(summary)
+                // Install can land partial (scripts up, hooks skipped for
+                // a missing python3 — installAgentStack returns rather
+                // than throws), so re-probe: the lane then shows the true
+                // state (green complete, or orange with what's still
+                // missing) instead of a static "set up" that might not be.
+                await refreshAgentStack(draft: draft, gen: gen)
+            } catch {
+                guard gen == doctorGeneration else { return }
+                agentStackState = .installFailed(String(describing: error))
             }
         }
     }

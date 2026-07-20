@@ -28,7 +28,11 @@ const MAX_PEER_CONNECTIONS: usize = 16;
 /// `TERMMESH_PEER_WORKSPACE_TITLE`, and persisted back. Keeping that
 /// disk I/O out of `serve_with_manager` means the ~20 tests that call it
 /// directly never touch (or race on) the real on-disk workspaces file.
-pub async fn serve(path: PathBuf, shutdown_rx: watch::Receiver<bool>) -> anyhow::Result<()> {
+pub async fn serve(
+    path: PathBuf,
+    shutdown_rx: watch::Receiver<bool>,
+    monitor_rx: watch::Receiver<Option<crate::monitor::SystemSnapshot>>,
+) -> anyhow::Result<()> {
     let manager = Arc::new(PtyManager::new());
     manager.spawn_from_config();
     let workspaces_path = persist::default_workspaces_path();
@@ -44,6 +48,9 @@ pub async fn serve(path: PathBuf, shutdown_rx: watch::Receiver<bool>) -> anyhow:
     // this path — wired here (rather than baked into `with_workspaces`)
     // so that constructor stays I/O-free for every test/embedder caller.
     host.set_persist_path(workspaces_path);
+    // Only the daemon has a monitor; the test/embedder constructors below
+    // leave the host without one and simply never push HostStats.
+    host.set_monitor(monitor_rx);
     serve_with_host(path, shutdown_rx, host).await
 }
 
@@ -1257,8 +1264,14 @@ mod integration_tests {
         }
         let (cwd, branch) =
             meta_seen.expect("WorkspaceUpdate.meta never arrived after AttachResult");
+        // Resolve both sides rather than comparing strings: the host reads
+        // the directory from the OS, which hands back the real path, while
+        // the spec recorded whatever it was given — and on macOS a temp dir
+        // is handed out as /var/... but resolves to /private/var/... .
+        let reported = std::fs::canonicalize(&cwd).expect("reported cwd exists");
+        let expected = std::fs::canonicalize(&spawn_cwd).expect("spawn cwd exists");
         assert_eq!(
-            cwd, spawn_cwd,
+            reported, expected,
             "meta cwd did not match the registered SpawnSpec cwd"
         );
         assert_eq!(

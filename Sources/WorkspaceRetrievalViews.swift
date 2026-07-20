@@ -303,13 +303,16 @@ private struct RetrievalActivityDrawer: View {
                     .toggleStyle(.checkbox)
                     .help("Report what each action would do, without doing it.")
                     .accessibilityIdentifier("retrieval.dryRun")
+                // A menu rather than segments: this is a setting that gets
+                // chosen once and then left alone, and segments spend width
+                // permanently displaying the option nobody picked.
                 Picker("", selection: $store.logLevel) {
                     ForEach(RemoteWorkLogLevel.allCases) { level in
                         Text(level.label).tag(level)
                     }
                 }
-                .pickerStyle(.segmented)
-                .frame(width: 116)
+                .pickerStyle(.menu)
+                .frame(width: 96)
                 .help("How much the actions report into Live Activity.")
 
                 Button("Prepare Project") {
@@ -411,6 +414,15 @@ private struct RetrievalActivityDrawer: View {
                 .controlSize(.small)
                 .disabled(store.activity.isEmpty)
                 .accessibilityIdentifier("retrieval.copyActivity")
+                // Clears what is on screen, not the file behind Reveal Log —
+                // a run worth re-reading is still there afterwards.
+                Button("Clear Log") {
+                    store.clearActivity()
+                }
+                .controlSize(.small)
+                .disabled(store.activity.isEmpty)
+                .help("Clear the events shown here. The log file keeps them.")
+                .accessibilityIdentifier("retrieval.clearActivity")
                 Button("Reveal Log") {
                     NSWorkspace.shared.selectFile(RemoteWorkLog.path, inFileViewerRootedAtPath: "")
                 }
@@ -426,9 +438,12 @@ private struct RetrievalActivityDrawer: View {
 
     private var activityEvents: some View {
         ScrollView {
-            LazyVStack(alignment: .leading, spacing: 8) {
-                ForEach(store.activity.prefix(40)) { event in
-                    HStack(alignment: .firstTextBaseline, spacing: 10) {
+            // Tight rows: these are log lines, and the drawer is short. The
+            // point is to see the sequence that led somewhere, which costs
+            // more when three events fill the view than any leading gains.
+            LazyVStack(alignment: .leading, spacing: 2) {
+                ForEach(store.activity.prefix(200)) { event in
+                    HStack(alignment: .firstTextBaseline, spacing: 8) {
                         Text(event.occurredAt, style: .time)
                             .font(.system(size: 10).monospacedDigit())
                             .foregroundStyle(.secondary)
@@ -439,7 +454,8 @@ private struct RetrievalActivityDrawer: View {
                     }
                 }
             }
-            .padding(12)
+            .padding(.horizontal, 12)
+            .padding(.vertical, 6)
             .frame(maxWidth: .infinity, alignment: .leading)
         }
     }

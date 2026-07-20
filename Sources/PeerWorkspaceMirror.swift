@@ -192,6 +192,10 @@ final class PeerWorkspaceMirrorController {
                     #if DEBUG
                     dlog("peer.mirror.error code=\(code) msg=\(message)")
                     #endif
+                    // The host refusing something is its own event: the loop
+                    // carries on afterwards, so without a line here the only
+                    // evidence is whatever silently failed to happen.
+                    RemoteWorkLog.infoOffMain("Host refused a workspace request (\(code)): \(message)")
                 }
                 switch Self.receiveLoopAction(for: msg, hostWorkspaceID: self.hostWorkspaceID) {
                 case .applyLayout(let layout):
@@ -226,6 +230,7 @@ final class PeerWorkspaceMirrorController {
                 // superseded by a newer push
             } catch {
                 NSLog("[peer-mirror] reconcile failed: %@", String(describing: error))
+                RemoteWorkLog.infoOffMain("Workspace layout sync failed: \(error.localizedDescription)")
             }
         }
     }
@@ -358,6 +363,7 @@ final class PeerWorkspaceMirrorController {
             try await reconcile(target: target.layout)
         } catch {
             NSLog("[peer-mirror] forceResync failed: %@", String(describing: error))
+            RemoteWorkLog.infoOffMain("Workspace resync failed: \(error.localizedDescription)")
         }
     }
 
@@ -388,14 +394,31 @@ final class PeerWorkspaceMirrorController {
         #if DEBUG
         dlog("peer.mirror.lost reason=\(reason)")
         #endif
+        RemoteWorkLog.infoOffMain("Workspace mirror lost its host: \(reason) — reconnecting")
         markWorkspaceTitle(suffix: "reconnecting…")
         Task { [weak self] in
             await self?.reconnectLoop()
         }
     }
 
+    /// Deadline for the setup RPCs of a reconnect attempt, matching
+    /// `PeerRelaySession`'s own.
+    private static let setupReadTimeoutSeconds: TimeInterval = 10
+
     private func reconnectLoop() async {
         var attempt = 0
+        // "lost its host — reconnecting" is a promise, and this loop can exit
+        // without keeping it: when the last pane goes the workspace is torn
+        // down, the condition below is false on the first pass, and not one
+        // attempt is ever made. Saying so is the difference between "gave up"
+        // and "there was nothing left to reconnect to".
+        defer {
+            if attempt == 0 {
+                RemoteWorkLog.debugOffMain(
+                    "Workspace mirror stopped reconnecting before the first attempt — the workspace was already gone"
+                )
+            }
+        }
         while !isTornDown, workspace != nil {
             attempt += 1
             let delaySeconds = min(30.0, pow(2.0, Double(min(attempt, 5))))
@@ -403,17 +426,38 @@ final class PeerWorkspaceMirrorController {
             if isTornDown { return }
             do {
                 let transport = try await UnixSocketTransport.connect(socketPath: lease.hostSockPath)
+                // A host that is frozen rather than gone — asleep, behind a
+                // blackholed network — still has a listening socket, so
+                // connect() succeeds and the handshake then waits for a
+                // HostHello that never arrives. With no deadline this loop
+                // stopped inside its first attempt and never retried, never
+                // gave up and never said a word: the workspace title just read
+                // "reconnecting…" for as long as the app stayed open. Same
+                // budget the primary connect path puts around its setup.
+                await transport.setReadTimeoutSeconds(Self.setupReadTimeoutSeconds)
                 let session = PeerSession(
                     read: { try await transport.read() },
                     write: { try await transport.write($0) }
                 )
-                _ = try await session.handshake()
-                let workspaces = try await session.listWorkspaces()
+                let workspaces: [Termmesh_Peer_V1_Workspace]
+                do {
+                    _ = try await session.handshake()
+                    workspaces = try await session.listWorkspaces()
+                } catch {
+                    // Now that a failed attempt can actually fail instead of
+                    // hanging, every retry would otherwise leave its socket
+                    // behind.
+                    await transport.close()
+                    throw error
+                }
                 guard let target = Self.matchWorkspace(workspaces, id: hostWorkspaceID) else {
                     await transport.close()
                     markHostWorkspaceGone()
                     return
                 }
+                // Cleared before the receive loop: a subscription is idle most
+                // of the time and a read deadline there would kill it.
+                await transport.setReadTimeoutSeconds(nil)
                 subscriptionTransport = transport
                 subscriptionSession = session
                 subscriptionAlive = true
@@ -435,6 +479,11 @@ final class PeerWorkspaceMirrorController {
                     #if DEBUG
                     dlog("peer.mirror.heartbeat.dead (post-reconnect) — closing subscription transport (ALL mirrored panes drop)")
                     #endif
+                    // Every mirrored pane dies with this one transport, so it is
+                    // the loudest failure the mirror has and was the quietest.
+                    RemoteWorkLog.infoOffMain(
+                        "Host stopped answering the workspace subscription for 30s — every mirrored pane drops"
+                    )
                     Task { await weakTransport.close() }
                 }
                 markAllPanesStale()
@@ -444,11 +493,22 @@ final class PeerWorkspaceMirrorController {
                 #if DEBUG
                 dlog("peer.mirror.reconnected attempt=\(attempt)")
                 #endif
+                RemoteWorkLog.infoOffMain("Workspace mirror reconnected on attempt \(attempt)")
                 return
             } catch {
                 #if DEBUG
                 dlog("peer.mirror.reconnect.failed attempt=\(attempt) err=\(error)")
                 #endif
+                // This loop has no cap — it retries every 30s forever. Logging
+                // the first few and then one in ten keeps "still trying" answerable
+                // without a line every half minute for the rest of the session.
+                // Without any line, one "lost its host" and then permanent silence
+                // is indistinguishable from having quietly given up.
+                if attempt <= 3 || attempt % 10 == 0 {
+                    RemoteWorkLog.debugOffMain(
+                        "Workspace mirror reconnect attempt \(attempt) failed: \(error.localizedDescription)"
+                    )
+                }
             }
         }
     }
@@ -472,6 +532,7 @@ final class PeerWorkspaceMirrorController {
         #if DEBUG
         dlog("peer.mirror.hostGone action=autoclose host=\(spec.hostKey) workspace=\(title)")
         #endif
+        RemoteWorkLog.infoOffMain("Host deleted the workspace \"\(title)\" on \(spec.hostKey) — closing the mirror here")
         guard let workspace, let tabManager = AppDelegate.shared?.tabManager else {
             // No window/TabManager context (headless/test) — just release
             // the layout-sync plane; there's no tab to close or notify.

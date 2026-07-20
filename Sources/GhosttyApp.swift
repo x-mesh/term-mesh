@@ -913,6 +913,13 @@ class GhosttyApp {
                     .flatMap { String(cString: $0) } ?? ""
                 let actionBody = action.action.desktop_notification.body
                     .flatMap { String(cString: $0) } ?? ""
+                // The app-wide arrival point, taken when the action carries no
+                // surface. Logged alongside the surface-scoped one so a missing
+                // notification can be told apart from one that arrived and was
+                // attributed somewhere unexpected.
+                #if DEBUG
+                dlog("notify.osc.app title=\(actionTitle) body=\(actionBody.prefix(60))")
+                #endif
                 DispatchQueue.main.async { [self] in
                     guard let tabManager = AppDelegate.shared?.tabManager,
                           let tabId = tabManager.selectedTabId else {
@@ -1025,6 +1032,9 @@ class GhosttyApp {
             #if DEBUG
             if action.tag == GHOSTTY_ACTION_PWD {
                 dlog("pwd.dropped no surfaceView (tab=\(callbackTabId?.uuidString.prefix(8) ?? "<nil>") surface=\(callbackSurfaceId?.uuidString.prefix(8) ?? "<nil>"))")
+            }
+            if action.tag == GHOSTTY_ACTION_DESKTOP_NOTIFICATION {
+                dlog("notify.dropped no surfaceView (tab=\(callbackTabId?.uuidString.prefix(8) ?? "<nil>") surface=\(callbackSurfaceId?.uuidString.prefix(8) ?? "<nil>"))")
             }
             #endif
             return false
@@ -1207,16 +1217,36 @@ class GhosttyApp {
             }
             return true
         case GHOSTTY_ACTION_DESKTOP_NOTIFICATION:
-            guard let tabId = surfaceView.tabId else { return true }
             let surfaceId = surfaceView.terminalSurface?.id
             let actionTitle = action.action.desktop_notification.title
                 .flatMap { String(cString: $0) } ?? ""
             let actionBody = action.action.desktop_notification.body
                 .flatMap { String(cString: $0) } ?? ""
+            // A pane on another machine reports through the same OSC as a
+            // local one, so this is also the arrival point for a remote
+            // agent asking for a decision. Logged because a notification
+            // that never appears is otherwise indistinguishable from one
+            // the remote never sent.
+            #if DEBUG
+            dlog("notify.osc title=\(actionTitle) body=\(actionBody.prefix(60)) tab=\(surfaceView.tabId?.uuidString.prefix(8) ?? "<nil>") surface=\(surfaceId?.uuidString.prefix(8) ?? "<nil>")")
+            #endif
+            guard let tabId = surfaceView.tabId else {
+                #if DEBUG
+                dlog("notify.osc dropped — surface has no tab")
+                #endif
+                return true
+            }
             DispatchQueue.main.async { [self] in
                 let tabTitle = AppDelegate.shared?.tabManager?.titleForTab(tabId) ?? "Terminal"
                 let command = actionTitle.isEmpty ? tabTitle : actionTitle
                 let body = actionBody
+                // Only while a peer is connected. A local agent notifying is
+                // ordinary and would bury the drawer; the same OSC arriving
+                // over a relay is the whole point of the notification path,
+                // and its absence is the symptom people report.
+                if !PeerClientCoordinator.shared.activeConnections().isEmpty {
+                    RemoteWorkLog.info("Agent notification in \(tabTitle): \(command)")
+                }
                 notifications.addNotification(
                     tabId: tabId,
                     surfaceId: surfaceId,

@@ -20,7 +20,7 @@ struct NotificationsPage: View {
                         ForEach(notificationStore.notifications) { notification in
                             NotificationRow(
                                 notification: notification,
-                                tabTitle: tabTitle(for: notification.tabId),
+                                tabTitle: originText(for: notification),
                                 onOpen: {
                                     // SwiftUI action closures are not guaranteed to run on the main actor.
                                     // Ensure window focus + tab selection happens on the main thread.
@@ -151,6 +151,14 @@ struct NotificationsPage: View {
 
     private func tabTitle(for tabId: UUID) -> String? {
         AppDelegate.shared?.tabTitle(for: tabId) ?? tabManager.tabs.first(where: { $0.id == tabId })?.title
+    }
+
+    /// Where a notification came from — the shared resolver on AppDelegate,
+    /// so this page and the titlebar popover always describe the origin the
+    /// same way.
+    private func originText(for notification: TerminalNotification) -> String? {
+        AppDelegate.shared?.notificationOrigin(for: notification)
+            ?? tabTitle(for: notification.tabId)
     }
 }
 

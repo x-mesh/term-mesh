@@ -315,9 +315,30 @@ struct SocketControlSettings {
         return "/tmp/term-mesh.sock"
     }
 
-    /// Keep tag chars consistent with reload.sh sanitization (alphanumeric, -, _).
+    /// Rebuild the tag reload.sh started from.
+    ///
+    /// A bundle identifier is dot-delimited, so reload.sh turns every
+    /// non-alphanumeric run in `--tag` into a "." to build one: `remote-work-log`
+    /// arrives here as `remote.work.log`. Those dots are separators it
+    /// introduced, not characters of the tag — and dropping them yielded
+    /// `remoteworklog` while reload.sh was advertising
+    /// `TERMMESH_SOCKET_PATH=/tmp/term-mesh-debug-remote-work-log.sock`. Since a
+    /// tagged bundle deliberately ignores that override (see
+    /// `shouldHonorSocketPathOverride`), the two could never agree and every
+    /// tag containing a hyphen pointed tooling at a socket that did not exist.
+    ///
+    /// Mapping "." back to "-" reproduces reload.sh's own `sanitize_path`, which
+    /// is the name it advertises and the name its cleanup instructions print.
+    /// Tags that are a single word are unaffected, which is why this went
+    /// unnoticed. A hyphen already in the identifier is kept as-is, so a
+    /// hand-written `--bundle-id` still resolves the way it reads.
     private static func sanitizeTag(_ raw: String) -> String {
-        return raw.filter { $0.isLetter || $0.isNumber || $0 == "-" || $0 == "_" }
+        return String(raw.compactMap { character in
+            if character.isLetter || character.isNumber || character == "-" || character == "_" {
+                return character
+            }
+            return character == "." ? "-" : nil
+        })
     }
 
     static func shouldHonorSocketPathOverride(

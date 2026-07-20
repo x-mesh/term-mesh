@@ -26,8 +26,9 @@ use peer_proto::v1::{
     WorkspaceControl, WorkspaceLayout, WorkspaceLayoutChanged, WorkspacePane, WorkspaceRemoved,
     WorkspaceSplit, WorkspaceUpdate,
 };
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 
+use crate::monitor::SystemSnapshot;
 use super::persist::PersistedWorkspace;
 use super::surface::{
     surface_id_from_name, EnsureError, EnsureOutcome, PtyManager, PtySurface, SpawnSpec,
@@ -744,6 +745,13 @@ pub struct PeerHost {
     /// Host-level lifecycle boundary covering PTY, layout, and reverse index.
     /// The manager's per-id lock remains authoritative for PTY internals.
     surface_lifecycle: Mutex<HashMap<SurfaceId, Weak<Mutex<()>>>>,
+    /// Live system stats for the machine this host runs on, if the daemon
+    /// wired its monitor in. `None` for every host built without one (the
+    /// test constructors, and any embedder that has no monitor) — those
+    /// simply never push `HostStats`, which is the same thing a client
+    /// sees when talking to a daemon too old to have it. Set by
+    /// `server::serve` right after construction, mirroring `persist_path`.
+    monitor: Mutex<Option<watch::Receiver<Option<SystemSnapshot>>>>,
 }
 
 /// Debounce window for layout pushes. Mirrors the Swift host's 120 ms
@@ -853,6 +861,7 @@ impl PeerHost {
             persist_path: Mutex::new(None),
             workspace_persistence: Mutex::new(()),
             surface_lifecycle: Mutex::new(HashMap::new()),
+            monitor: Mutex::new(None),
         }
     }
 
@@ -878,6 +887,26 @@ impl PeerHost {
         self.pty
             .set_ensured_persist_path(super::persist::ensured_surfaces_path(&path));
         *self.persist_path.lock().unwrap() = Some(path);
+    }
+
+    /// Wire the daemon's system monitor so connections can push `HostStats`.
+    ///
+    /// Injected after construction for the same reason as the persistence
+    /// path: the constructors stay free of daemon-wide dependencies, so
+    /// every test and embedder keeps building a host without one. A host
+    /// left unwired never pushes stats, which is indistinguishable from a
+    /// daemon predating the feature — exactly the fallback the capability
+    /// gate already gives an older client.
+    pub fn set_monitor(&self, monitor: watch::Receiver<Option<SystemSnapshot>>) {
+        *self.monitor.lock().unwrap() = Some(monitor);
+    }
+
+    /// A receiver for the live system stats, if a monitor was wired in.
+    ///
+    /// Each caller gets its own receiver so one connection's polling does
+    /// not consume another's — `watch` marks per-receiver seen state.
+    pub fn monitor_receiver(&self) -> Option<watch::Receiver<Option<SystemSnapshot>>> {
+        self.monitor.lock().unwrap().clone()
     }
 
     /// Deterministically ensure a runner and expose it in the default

@@ -18,7 +18,7 @@ use peer_proto::v1::{
     workspace_update, AttachMode, AttachResult, AuthChallenge, AuthResult, CreateWorkspaceResponse,
     EnsureSurfaceError as WireEnsureError, EnsureSurfaceErrorCode, EnsureSurfaceRequest,
     EnsureSurfaceResponse, EnsureSurfaceRestartPolicy, EnsureSurfaceResult, Envelope, Error, Hello,
-    Pong, PtyData, SurfaceList, TerminateSurfaceError as WireTerminateError,
+    HostStats, Pong, PtyData, SurfaceList, TerminateSurfaceError as WireTerminateError,
     TerminateSurfaceErrorCode, TerminateSurfaceRequest, TerminateSurfaceResponse,
     TerminateSurfaceResult, Workspace, WorkspaceList, WorkspaceMeta, WorkspaceUpdate,
 };
@@ -29,6 +29,7 @@ use tokio::net::UnixStream;
 use tokio::sync::{broadcast, mpsc, Notify, OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinHandle;
 
+use crate::monitor::SystemSnapshot;
 use super::framing::{read_envelope, write_envelope};
 use super::layout::{self, PeerHost};
 use super::surface::{
@@ -100,6 +101,9 @@ async fn reader_loop(
     // handshake reaches Ready, dropped (= unregistered) with this frame.
     // Underscore: the binding exists for its Drop, it is never read.
     let mut _broadcast_guard: Option<layout::BroadcastGuard> = None;
+    // Started at Ready for a client that asked for stats; aborted when this
+    // loop returns, on every exit path (see the abort below).
+    let mut host_stats_task: Option<JoinHandle<()>> = None;
     // Parsed once out of the client's Hello and kept for the rest of the
     // connection — plumbing only for now (see P3, docs/peer-perf-proposal.md):
     // nothing branches on it yet, but future wire changes (P8 and later)
@@ -204,6 +208,15 @@ async fn reader_loop(
                 _broadcast_guard = Some(
                     host.clients
                         .register(outgoing_tx.clone(), seq_counter.clone()),
+                );
+                // Only for a client that advertised host.stats.v1; everyone
+                // else costs nothing. Aborted on teardown below rather than
+                // left to notice the closed channel on its next sample.
+                host_stats_task = spawn_host_stats_push(
+                    &host,
+                    &peer_capabilities,
+                    outgoing_tx.clone(),
+                    seq_counter.clone(),
                 );
                 tracing::info!("peer authenticated (ssh-passthrough)");
             }
@@ -504,7 +517,87 @@ async fn reader_loop(
         entry.cancel.notify_one();
         let _ = entry.task.await;
     }
+    // Aborted rather than awaited: it is parked on the monitor's next
+    // sample, which is seconds away, and it holds nothing that needs
+    // unwinding.
+    if let Some(task) = host_stats_task.take() {
+        task.abort();
+    }
     Ok(())
+}
+
+/// Flatten one monitor sample into the wire shape.
+///
+/// Per-interface and per-disk detail is summed away on purpose: a viewer
+/// showing "how busy is that machine" wants one number per axis, and
+/// sending the full breakdown would put an unbounded list on a message
+/// that repeats every couple of seconds.
+fn host_stats_from(snapshot: &SystemSnapshot) -> HostStats {
+    let (net_rx, net_tx) = snapshot
+        .network_io
+        .iter()
+        .fold((0f64, 0f64), |(rx, tx), io| (rx + io.rx_rate, tx + io.tx_rate));
+    HostStats {
+        // `load_avg` is [1m, 5m, 15m]. All three travel: the 1-minute
+        // figure says how busy the machine is, and the other two say
+        // whether that is a spike or a trend.
+        load_1m: snapshot.load_avg[0],
+        load_5m: snapshot.load_avg[1],
+        load_15m: snapshot.load_avg[2],
+        cpu_count: snapshot.cpu_count as u32,
+        memory_percent: snapshot.memory_percent,
+        memory_used_bytes: snapshot.used_memory_bytes,
+        memory_total_bytes: snapshot.total_memory_bytes,
+        disk_read_bytes_per_sec: snapshot.disk_read_bytes_per_sec,
+        disk_write_bytes_per_sec: snapshot.disk_write_bytes_per_sec,
+        // Rates are already per-second and non-negative; the cast is only
+        // narrowing a float the monitor computed by dividing a byte delta.
+        net_rx_bytes_per_sec: net_rx.max(0.0) as u64,
+        net_tx_bytes_per_sec: net_tx.max(0.0) as u64,
+    }
+}
+
+/// Forward the host's system stats to one client for as long as it stays
+/// connected.
+///
+/// Driven by the monitor's own sampling rather than a timer of its own, so
+/// the wire cadence is whatever the daemon already measures at and a
+/// connection never pushes a value it has already sent. Returning without
+/// spawning is the normal path for a client that did not ask for stats.
+fn spawn_host_stats_push(
+    host: &Arc<PeerHost>,
+    peer_capabilities: &PeerCapabilities,
+    outgoing_tx: mpsc::Sender<Envelope>,
+    seq_counter: Arc<AtomicU64>,
+) -> Option<JoinHandle<()>> {
+    if !peer_capabilities.has(capability::HOST_STATS_V1) {
+        return None;
+    }
+    let mut monitor_rx = host.monitor_receiver()?;
+
+    Some(tokio::spawn(async move {
+        loop {
+            // Waits for a sample the monitor produced after this receiver
+            // last looked, so a slow client cannot accumulate a backlog of
+            // identical frames.
+            if monitor_rx.changed().await.is_err() {
+                return; // monitor gone: daemon is shutting down
+            }
+            let Some(stats) = monitor_rx.borrow_and_update().as_ref().map(host_stats_from) else {
+                continue; // no sample taken yet
+            };
+            let env = Envelope {
+                seq: next_seq(&seq_counter),
+                correlation_id: 0,
+                payload: Some(Payload::HostStats(stats)),
+            };
+            // A closed channel means the connection is gone; stats are the
+            // least important thing on it, so give up rather than retry.
+            if outgoing_tx.send(env).await.is_err() {
+                return;
+            }
+        }
+    }))
 }
 
 fn spawn_attach_relay(
@@ -1791,11 +1884,15 @@ mod terminate_tests {
         EnsureSurfaceResult, TerminateSurfaceErrorCode, TerminateSurfaceRequest,
         TerminateSurfaceResult,
     };
-    use tokio::sync::mpsc;
+    use tokio::sync::{mpsc, watch};
+
+    use crate::monitor::SystemSnapshot;
+    use crate::peer::surface::PtyManager;
+    use peer_proto::{capability, PeerCapabilities};
 
     use super::{
-        dispatch_ensure_surface, dispatch_terminate_surface, EnsureWorkGate, EnsureWorker,
-        TerminateWorker,
+        dispatch_ensure_surface, dispatch_terminate_surface, host_stats_from,
+        spawn_host_stats_push, EnsureWorkGate, EnsureWorker, PeerHost, TerminateWorker,
     };
 
     #[tokio::test]
@@ -2014,5 +2111,145 @@ mod terminate_tests {
             duplicate.error.expect("duplicate error").code,
             EnsureSurfaceErrorCode::DuplicateRequestId as i32
         );
+    }
+
+    fn snapshot_with_network(interfaces: Vec<(&str, f64, f64)>) -> SystemSnapshot {
+        SystemSnapshot {
+            timestamp_ms: 0,
+            total_memory_bytes: 16_000_000_000,
+            used_memory_bytes: 8_000_000_000,
+            memory_percent: 50.0,
+            cpu_count: 8,
+            cpu_usage_percent: 12.5,
+            disk_total_bytes: 0,
+            disk_available_bytes: 0,
+            disk_read_bytes_per_sec: 1_024,
+            disk_write_bytes_per_sec: 2_048,
+            processes: Vec::new(),
+            alerts: Vec::new(),
+            load_avg: [1.5, 1.0, 0.5],
+            swap_total: 0,
+            swap_used: 0,
+            network_io: interfaces
+                .into_iter()
+                .map(|(name, rx_rate, tx_rate)| crate::monitor::NetworkIO {
+                    name: name.to_string(),
+                    rx_bytes: 0,
+                    tx_bytes: 0,
+                    rx_rate,
+                    tx_rate,
+                })
+                .collect(),
+            per_core_cpu: Vec::new(),
+            disk_space: Vec::new(),
+            anomalies: Vec::new(),
+        }
+    }
+
+    /// A machine has more than one interface, and reporting whichever one
+    /// happened to be first would under-report the traffic by however much
+    /// the others carried.
+    #[test]
+    fn host_stats_sums_every_network_interface() {
+        let snapshot = snapshot_with_network(vec![
+            ("lo", 100.0, 200.0),
+            ("eth0", 1_000.0, 2_000.0),
+            ("tailscale0", 50.0, 25.0),
+        ]);
+
+        let stats = host_stats_from(&snapshot);
+
+        assert_eq!(stats.net_rx_bytes_per_sec, 1_150);
+        assert_eq!(stats.net_tx_bytes_per_sec, 2_225);
+    }
+
+    /// A host with no interfaces up must report zero rather than refuse to
+    /// produce a sample — the other fields are still worth showing.
+    #[test]
+    fn host_stats_reports_zero_when_no_interfaces() {
+        let stats = host_stats_from(&snapshot_with_network(Vec::new()));
+
+        assert_eq!(stats.net_rx_bytes_per_sec, 0);
+        assert_eq!(stats.net_tx_bytes_per_sec, 0);
+        assert_eq!(stats.load_1m, 1.5);
+        assert_eq!(stats.cpu_count, 8);
+    }
+
+    /// The 1-minute figure is the one that tracks what is happening now;
+    /// picking the wrong element of `load_avg` would show a number that
+    /// lags minutes behind the machine.
+    #[test]
+    fn host_stats_takes_the_one_minute_load() {
+        let stats = host_stats_from(&snapshot_with_network(Vec::new()));
+
+        assert_eq!(stats.load_1m, 1.5, "load_avg[0], not the 5m or 15m figure");
+    }
+
+    /// A client that never asked for stats must not be sent any, so an
+    /// older viewer talking to a new daemon sees exactly what it did
+    /// before this feature existed.
+    #[test]
+    fn no_stats_task_without_the_capability() {
+        let host = Arc::new(PeerHost::new(Arc::new(PtyManager::new())));
+        let (tx, _rx) = watch::channel(None);
+        host.set_monitor(tx.subscribe());
+        let (outgoing_tx, _outgoing_rx) = mpsc::channel(8);
+
+        let task = spawn_host_stats_push(
+            &host,
+            &PeerCapabilities::from_hello(vec![capability::REPLAY_RING_V1.to_string()]),
+            outgoing_tx,
+            Arc::new(AtomicU64::new(0)),
+        );
+
+        assert!(task.is_none(), "capability absent — nothing should be spawned");
+    }
+
+    /// A host with no monitor wired (every test constructor, and any
+    /// embedder) must also stay silent, even for a client that asked.
+    #[test]
+    fn no_stats_task_without_a_monitor() {
+        let host = Arc::new(PeerHost::new(Arc::new(PtyManager::new())));
+        let (outgoing_tx, _outgoing_rx) = mpsc::channel(8);
+
+        let task = spawn_host_stats_push(
+            &host,
+            &PeerCapabilities::from_hello(vec![capability::HOST_STATS_V1.to_string()]),
+            outgoing_tx,
+            Arc::new(AtomicU64::new(0)),
+        );
+
+        assert!(task.is_none(), "no monitor — nothing to push");
+    }
+
+    /// The push carries the monitor's samples, and only samples: a client
+    /// that asked gets a frame per tick, not a frame per poll.
+    #[tokio::test]
+    async fn stats_task_pushes_one_frame_per_sample() {
+        let host = Arc::new(PeerHost::new(Arc::new(PtyManager::new())));
+        let (monitor_tx, monitor_rx) = watch::channel(None);
+        host.set_monitor(monitor_rx);
+        let (outgoing_tx, mut outgoing_rx) = mpsc::channel(8);
+
+        let task = spawn_host_stats_push(
+            &host,
+            &PeerCapabilities::from_hello(vec![capability::HOST_STATS_V1.to_string()]),
+            outgoing_tx,
+            Arc::new(AtomicU64::new(0)),
+        )
+        .expect("capability and monitor both present");
+
+        monitor_tx
+            .send(Some(snapshot_with_network(vec![("eth0", 10.0, 20.0)])))
+            .expect("first sample");
+
+        let env = outgoing_rx.recv().await.expect("a frame for the sample");
+        let Some(Payload::HostStats(stats)) = env.payload else {
+            panic!("expected HostStats");
+        };
+        assert_eq!(stats.net_rx_bytes_per_sec, 10);
+        assert_eq!(stats.memory_percent, 50.0);
+
+        task.abort();
     }
 }

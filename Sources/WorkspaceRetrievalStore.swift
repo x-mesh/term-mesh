@@ -63,6 +63,11 @@ final class WorkspaceRetrievalStore: ObservableObject {
                 ![.applied, .discarded].contains($0.state)
             })?.id
         }
+        // Wired here rather than when the drawer appears. Waiting for the
+        // drawer meant nothing was collected until someone opened it, so the
+        // first thing they saw after a tunnel dropped was an empty list — the
+        // events they came to read had happened while nobody was listening.
+        adoptLogSettings()
     }
 
     var incomingCount: Int {
@@ -253,10 +258,7 @@ final class WorkspaceRetrievalStore: ObservableObject {
             ))
             persistRecoveryState()
         }
-        activity.insert(RemotePaneActivity(
-            paneID: pane.id,
-            message: "Attached as a read-only remote activity view"
-        ), at: 0)
+        recordActivity(paneID: pane.id, message: "Attached as a read-only remote activity view")
     }
 
     func removeBinding(panelID: UUID) {
@@ -265,7 +267,7 @@ final class WorkspaceRetrievalStore: ObservableObject {
         // The pane is the only thing that could ever ask for its directory
         // again, so its remembered one would outlive every use of it.
         observedDirectories[panelID] = nil
-        activity.insert(RemotePaneActivity(paneID: pane.id, message: "Removed from this Workspace"), at: 0)
+        recordActivity(paneID: pane.id, message: "Removed from this Workspace")
         if selectedPaneID == pane.id { selectedPaneID = panes.first?.id }
         pendingClosePanelID = nil
     }
@@ -308,10 +310,7 @@ final class WorkspaceRetrievalStore: ObservableObject {
             pane.state = .readyToClose
             pane.hasUncollectedChanges = false
         }
-        activity.insert(RemotePaneActivity(
-            paneID: result.checkpoint.paneID,
-            message: "Checkpoint fetched as Incoming changes"
-        ), at: 0)
+        recordActivity(paneID: result.checkpoint.paneID, message: "Checkpoint fetched as Incoming changes")
     }
 
     func failCheckpoint(panelID: UUID, message: String) {
@@ -329,13 +328,34 @@ final class WorkspaceRetrievalStore: ObservableObject {
         dryRun = UserDefaults.standard.bool(forKey: Self.dryRunKey)
         RemoteWorkLog.level = logLevel
         RemoteWorkLog.sink = { [weak self] message in
-            guard let self, let paneID = self.selectedPane?.id ?? self.panes.first?.id else { return }
-            self.recordActivity(paneID: paneID, message: message)
+            guard let self else { return }
+            // No pane is not a reason to drop the line. Connection events
+            // arrive before the first remote pane exists, and dropping them
+            // was why the drawer looked empty exactly when it mattered.
+            self.recordActivity(paneID: self.selectedPane?.id ?? self.panes.first?.id, message: message)
         }
     }
 
-    func recordActivity(paneID: RemotePaneID, message: String) {
+    /// How many events the drawer keeps in memory.
+    ///
+    /// The list shows 200 and the file keeps everything, so holding more than
+    /// this buys nothing and grows without bound in a session that stays
+    /// connected for days.
+    private static let activityLimit = 500
+
+    func recordActivity(paneID: RemotePaneID?, message: String) {
         activity.insert(RemotePaneActivity(paneID: paneID, message: message), at: 0)
+        if activity.count > Self.activityLimit {
+            activity.removeLast(activity.count - Self.activityLimit)
+        }
+    }
+
+    /// Empty the drawer so the next run reads on its own.
+    ///
+    /// The on-disk log is deliberately untouched: this clears a view, and a
+    /// run someone wanted to keep is still behind Reveal Log.
+    func clearActivity() {
+        activity.removeAll()
     }
 
     func setChangesetState(_ id: ChangesetID, state: IncomingChangesetState, error: String? = nil) {

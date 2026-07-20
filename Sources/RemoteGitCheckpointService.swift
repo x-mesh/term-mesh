@@ -105,24 +105,39 @@ final class RemoteGitCheckpointService: RemoteGitCheckpointServicing, @unchecked
 
         let quotedRoot = Self.shellQuote(remoteRoot)
         let quotedBase = Self.shellQuote(base)
+        // `--is-inside-work-tree` answers for the whole ancestry, so a bare
+        // folder sitting anywhere under an unrelated repository claims to be
+        // a worktree and sends us down the "compare its HEAD" path — where
+        // git then fails on a revision that has nothing to do with us. Ask
+        // whether the path is a repository ROOT instead, and say so plainly
+        // when it is merely inside one.
         let remoteCommand = """
         set -eu
         root=\(quotedRoot)
         expected=\(quotedBase)
-        if git -C "$root" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
-          actual=$(git -C "$root" rev-parse HEAD)
-          test "$actual" = "$expected" || { printf 'Remote HEAD %s does not match local base %s.\n' "$actual" "$expected" >&2; exit 42; }
-          printf 'existing\n'
+        toplevel=$(git -C "$root" rev-parse --show-toplevel 2>/dev/null || true)
+        if test -n "$toplevel"; then
+          if test "$toplevel" != "$root"; then
+            printf 'Remote path is inside another Git repository (%s), not a project of its own. Pick a path outside it, or remove that repository.\\n' "$toplevel" >&2
+            exit 44
+          fi
+          actual=$(git -C "$root" rev-parse HEAD 2>/dev/null || true)
+          if test -z "$actual"; then
+            printf 'Remote Git repository at %s has no commits yet, so there is no base to match. Remove it and let this create one.\\n' "$root" >&2
+            exit 45
+          fi
+          test "$actual" = "$expected" || { printf 'Remote HEAD %s does not match local base %s.\\n' "$actual" "$expected" >&2; exit 42; }
+          printf 'existing\\n'
           exit 0
         fi
         if test -d "$root" && test -n "$(find "$root" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null)"; then
-          printf 'Remote project folder is not empty and is not a Git worktree.\n' >&2
+          printf 'Remote project folder is not empty and is not a Git worktree.\\n' >&2
           exit 43
         fi
         mkdir -p "$root"
         git -C "$root" init -b term-mesh-base >/dev/null
         git -C "$root" config receive.denyCurrentBranch updateInstead
-        printf 'initialized\n'
+        printf 'initialized\\n'
         """
         let state = try await run("/usr/bin/ssh", [sshTarget, remoteCommand])
             .trimmingCharacters(in: .whitespacesAndNewlines)
@@ -165,7 +180,17 @@ final class RemoteGitCheckpointService: RemoteGitCheckpointServicing, @unchecked
         set -eu
         root=\(quotedRoot)
         ref=\(quotedRef)
-        git -C "$root" rev-parse --is-inside-work-tree >/dev/null
+        # Root, not merely inside one: committing against an enclosing
+        # repository would capture that repository's tree, not this project.
+        toplevel=$(git -C "$root" rev-parse --show-toplevel 2>/dev/null || true)
+        if test "$toplevel" != "$root"; then
+          if test -n "$toplevel"; then
+            printf 'Remote path is inside another Git repository (%s), not a project of its own. Run Prepare Project first, or bind a path outside it.\\n' "$toplevel" >&2
+          else
+            printf 'Remote path %s is not a Git repository. Run Prepare Project first.\\n' "$root" >&2
+          fi
+          exit 44
+        fi
         base=$(git -C "$root" rev-parse HEAD)
         git -C "$root" add -A
         tree=$(git -C "$root" write-tree)
@@ -316,8 +341,35 @@ final class RemoteGitCheckpointService: RemoteGitCheckpointServicing, @unchecked
         }
     }
 
+    /// A one-line name for a command, for the log.
+    ///
+    /// Arguments are summarised rather than printed: the checkpoint's remote
+    /// argument is a whole shell script, and pasting it into the log per run
+    /// would bury the sequence this is here to make readable.
+    private static func describe(_ executable: String, _ arguments: [String]) -> String {
+        let name = (executable as NSString).lastPathComponent
+        let parts = arguments.map { argument -> String in
+            if argument.contains("\n") { return "<script>" }
+            return argument.count > 48 ? String(argument.prefix(48)) + "…" : argument
+        }
+        let joined = parts.joined(separator: " ")
+        return joined.count > 160 ? "\(name) \(joined.prefix(160))…" : "\(name) \(joined)"
+    }
+
+    /// Drains child stderr while the caller drains stdout — see `run`.
+    private static let stderrQueue = DispatchQueue(
+        label: "com.termmesh.remote-git-checkpoint.stderr",
+        attributes: .concurrent
+    )
+
     private func run(_ executable: String, _ arguments: [String]) async throws -> String {
-        try await withCheckedThrowingContinuation { continuation in
+        // Every step of every remote-work action passes through here. Until
+        // now the drawer showed the PLAN and then nothing, so an action that
+        // died on its third command was indistinguishable from one that never
+        // started.
+        let label = Self.describe(executable, arguments)
+        RemoteWorkLog.debugOffMain("run \(label)")
+        return try await withCheckedThrowingContinuation { continuation in
             queue.async {
                 let process = Process()
                 let stdout = Pipe()
@@ -328,14 +380,31 @@ final class RemoteGitCheckpointService: RemoteGitCheckpointServicing, @unchecked
                 process.standardError = stderr
                 do {
                     try process.run()
-                    process.waitUntilExit()
+                    // Both pipes are drained before waiting, and stderr on its
+                    // own queue. Waiting first deadlocks as soon as a command
+                    // outproduces the 64KB pipe buffer — `git diff --name-only`
+                    // on a large checkpoint does exactly that — and draining
+                    // them one after the other only moves the deadlock to
+                    // whichever pipe fills while the other is being read.
+                    var errorOutput = Data()
+                    let stderrDone = DispatchGroup()
+                    stderrDone.enter()
+                    Self.stderrQueue.async {
+                        errorOutput = stderr.fileHandleForReading.readDataToEndOfFile()
+                        stderrDone.leave()
+                    }
                     let output = stdout.fileHandleForReading.readDataToEndOfFile()
-                    let errorOutput = stderr.fileHandleForReading.readDataToEndOfFile()
+                    stderrDone.wait()
+                    process.waitUntilExit()
                     guard process.terminationStatus == 0 else {
                         let message = String(data: errorOutput, encoding: .utf8)?
                             .trimmingCharacters(in: .whitespacesAndNewlines)
                         let resolvedMessage = message.flatMap { $0.isEmpty ? nil : $0 }
                             ?? "Command failed: \(executable)"
+                        // Names the command only. The caller logs the failure
+                        // with its message, and repeating stderr here would
+                        // print the same paragraph twice in a row.
+                        RemoteWorkLog.infoOffMain("Command failed: \(label)")
                         continuation.resume(throwing: RemoteGitCheckpointError.commandFailed(resolvedMessage))
                         return
                     }

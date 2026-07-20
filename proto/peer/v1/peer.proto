@@ -63,6 +63,8 @@ message Envelope {
     // Gated behind capability "surface.terminate.v1" (Hello.capabilities).
     TerminateSurfaceRequest terminate_surface_request = 45;
     TerminateSurfaceResponse terminate_surface_response = 46;
+    // Host-pushed, gated behind capability "host.stats.v1" (Hello.capabilities).
+    HostStats host_stats = 47;
 
     Ping ping = 50;
     Pong pong = 51;
@@ -135,11 +137,16 @@ message SurfaceInfo {
   string surface_type = 6;
   // Host policy may forbid per-surface attach.
   bool attachable = 7;
-  // Captured at spawn time, i.e. the directory the child was chdir'd into
-  // before exec. Does NOT track runtime cd; for that, subscribe to
-  // WorkspaceUpdate.meta events (future).
+  // Where the surface's shell is NOW: the host reads it from the OS at
+  // the moment it answers, so it follows a `cd`. Older hosts reported the
+  // spawn directory here and never updated it.
+  //
+  // A resolved path, which may differ textually from the one the surface
+  // was asked to start in — on macOS a spawn in /var/... reports back as
+  // /private/var/... . Compare these by resolving both, never as strings.
   string cwd = 8;
-  // Git branch of `cwd` resolved at spawn time, or empty if not a git repo.
+  // Git branch of `cwd`, resolved when the host answers, or empty if not
+  // a git repo. Follows `cwd` into a different repository.
   string branch = 9;
 }
 
@@ -687,6 +694,47 @@ message SplitChanged {
 message WorkspaceLayoutChanged {
   bytes workspace_id = 1;
   WorkspaceLayout layout = 2;
+}
+
+// ============================================================
+// Host system stats
+// ============================================================
+
+// How loaded the machine hosting these panes currently is.
+//
+// Pushed by the host on its own schedule (whatever cadence its monitor
+// already samples at) rather than polled, so a viewer that wants to show
+// this continuously does not have to ask repeatedly. Sent only to clients
+// that advertised "host.stats.v1", so an older viewer receives nothing.
+//
+// Deliberately about the HOST, not a workspace: the numbers are the same
+// for every workspace on that machine, and attaching them to
+// `WorkspaceUpdate` would send N copies of one fact.
+//
+// Every field is a point-in-time sample and may be absent (zero) on a
+// host that cannot measure it — a viewer must render what it has rather
+// than wait for a complete set.
+message HostStats {
+  // Load averages over the last 1, 5 and 15 minutes. None are normalized
+  // by core count; pair with `cpu_count` to judge whether they are high.
+  //
+  // All three are worth carrying: one figure says how busy the machine is,
+  // but the three together say whether it is climbing, settled, or on its
+  // way back down — which is what tells you to wait or to go look.
+  double load_1m = 1;
+  uint32 cpu_count = 2;
+  // Percentage of physical memory in use, 0-100.
+  float memory_percent = 3;
+  uint64 memory_used_bytes = 4;
+  uint64 memory_total_bytes = 5;
+  // Aggregate across all disks / all network interfaces. Rates, not
+  // totals: bytes moved during the host's last sampling interval.
+  uint64 disk_read_bytes_per_sec = 6;
+  uint64 disk_write_bytes_per_sec = 7;
+  uint64 net_rx_bytes_per_sec = 8;
+  uint64 net_tx_bytes_per_sec = 9;
+  double load_5m = 10;
+  double load_15m = 11;
 }
 
 // ============================================================
