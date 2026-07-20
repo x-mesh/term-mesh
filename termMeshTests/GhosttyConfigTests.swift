@@ -739,14 +739,17 @@ final class PostHogAnalyticsPropertiesTests: XCTestCase {
             ]
         )
 
-        XCTAssertEqual(properties["platform"] as? String, "term-meshterm")
+        // "termmesh" is what PostHogAnalytics actually sends and has been
+        // sending; "term-meshterm" is a rename pass that rewrote the test
+        // and not the source. The dashboard dimension is the authority.
+        XCTAssertEqual(properties["platform"] as? String, "termmesh")
         XCTAssertEqual(properties["app_version"] as? String, "0.31.0")
         XCTAssertEqual(properties["app_build"] as? String, "230")
     }
 
     func testPropertiesOmitVersionFieldsWhenUnavailable() {
         let superProperties = PostHogAnalytics.superProperties(infoDictionary: [:])
-        XCTAssertEqual(superProperties["platform"] as? String, "term-meshterm")
+        XCTAssertEqual(superProperties["platform"] as? String, "termmesh")
         XCTAssertNil(superProperties["app_version"])
         XCTAssertNil(superProperties["app_build"])
 

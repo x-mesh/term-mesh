@@ -23,14 +23,22 @@ final class PeerPaneSessionTests: XCTestCase {
         private var listenerFD: Int32 = -1
         private var clientFDs: Set<Int32> = []
         private var attachedSurfaceIDs: [Data] = []
-        private let deadline: Date
+        /// Set when the listener starts, not when this object is built, and
+        /// generous on purpose. Its job is to stop a wedged test hanging
+        /// forever — not to assert how fast the machine is. At eight seconds
+        /// from construction it was doing the latter: the XCTest host here is
+        /// the whole term-mesh app, a passing run already spent ~6s of the
+        /// budget, and on a loaded machine the host gave up mid-handshake and
+        /// closed the listener, which the client then saw as ENOTCONN.
+        private var deadline: Date = .distantFuture
+        private static let listenerBudget: TimeInterval = 120
 
         init(socketPath: String) {
             self.socketPath = socketPath
-            self.deadline = Date().addingTimeInterval(8)
         }
 
         func start() throws -> Task<Void, Error> {
+            deadline = Date().addingTimeInterval(Self.listenerBudget)
             unlink(socketPath)
             let fd = socket(AF_UNIX, SOCK_STREAM, 0)
             guard fd >= 0 else { throw Failure.syscall("socket", errno) }
@@ -363,6 +371,19 @@ final class PeerPaneSessionTests: XCTestCase {
 
     @MainActor
     func test_savedRunnerRepeatedLaunchReusesExactEnsuredSurfaceID() async throws {
+        // Attaching spawns term-mesh-peer-relay out of the app bundle, and the
+        // Rust binaries are copied in by reload.sh / reloadp.sh / reloads.sh —
+        // not by an Xcode build phase. A plain `xcodebuild test` therefore
+        // produces a bundle without it and this test could never pass there; it
+        // failed as an opaque ENOTCONN, because the mock host closed its
+        // listener while the client was failing on the missing binary.
+        let relay = Bundle.main.resourceURL?
+            .appendingPathComponent("bin/term-mesh-peer-relay").path
+        try XCTSkipUnless(
+            relay.map { FileManager.default.isExecutableFile(atPath: $0) } ?? false,
+            "needs term-mesh-peer-relay in the app bundle — run through reload.sh, not a bare xcodebuild"
+        )
+
         let socketPath = "/tmp/peer-runner-test-\(getpid())-\(UUID().uuidString.prefix(8)).sock"
         let host = RunnerMockHost(socketPath: socketPath)
         let hostTask = try host.start()
@@ -379,12 +400,31 @@ final class PeerPaneSessionTests: XCTestCase {
         )
         let attachment = PeerRunnerAttachment(title: "Build Runner", cols: 120, rows: 36)
 
-        let first = try await PeerPaneSession.ensureAndAttach(
-            lease: lease,
-            surfaceSpec: surface,
-            attachment: attachment,
-            hostSpec: hostSpec
-        )
+        // The mock host runs in a detached Task nobody awaits, so when it
+        // rejects a step it just closes the socket and the client reports
+        // ENOTCONN — the same opaque symptom no matter what actually went
+        // wrong. Report the host's own reason alongside the client's.
+        func mockHostReason() async -> String {
+            do {
+                try await hostTask.value
+                return "host finished without error"
+            } catch {
+                return String(describing: error)
+            }
+        }
+
+        let first: (session: PeerPaneSession, outcome: PeerEnsureSurfaceOutcome)
+        do {
+            first = try await PeerPaneSession.ensureAndAttach(
+                lease: lease,
+                surfaceSpec: surface,
+                attachment: attachment,
+                hostSpec: hostSpec
+            )
+        } catch {
+            XCTFail("first ensureAndAttach failed: \(error) — mock host: \(await mockHostReason())")
+            return
+        }
         defer { first.session.teardown() }
         let second = try await PeerPaneSession.ensureAndAttach(
             lease: lease,

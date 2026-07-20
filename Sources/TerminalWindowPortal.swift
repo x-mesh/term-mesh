@@ -1418,7 +1418,10 @@ final class WindowTerminalPortal: NSObject {
     }
 
     func debugHostedSubviewCount() -> Int {
-        hostView.subviews.count
+        // Hosted surfaces only. hostView also carries the split-divider
+        // overlay, so a raw subview count reads one higher than the number of
+        // terminals — which made a correct prune look like a leaked view.
+        hostView.subviews.filter { !($0 is SplitDividerOverlayView) }.count
     }
 #endif
 
