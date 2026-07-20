@@ -1278,6 +1278,14 @@ final class PeerRelaySession {
                     // guard makes a shared session's stray frame a drop, not a
                     // mis-echo to the wrong pane's relay) falls to `default`.
                     case .ptyData(let sid, let byteSeq, let data) where sid == mySurfaceID:
+                        #if DEBUG
+                        // TEMP INSTRUMENT: observe byteSeq flow to diagnose the gap-detection blind spot
+                        if let e = expectedByteSeq {
+                            dlog("peer.relay.owned.pty byteSeq=\(byteSeq) expected=\(e) len=\(data.count) delta=\(Int64(byteSeq) - Int64(e))")
+                        } else {
+                            dlog("peer.relay.owned.pty FIRST byteSeq=\(byteSeq) len=\(data.count)")
+                        }
+                        #endif
                         // P9 gap detection: a byte_seq that jumps past the end of
                         // the previous frame means the host's broadcast dropped
                         // (Lagged) the bytes in between under load — the terminal
