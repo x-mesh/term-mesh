@@ -153,42 +153,12 @@ struct NotificationsPage: View {
         AppDelegate.shared?.tabTitle(for: tabId) ?? tabManager.tabs.first(where: { $0.id == tabId })?.title
     }
 
-    /// Where a notification came from: the workspace, the pane inside it, and
-    /// the machine when that is not this one.
-    ///
-    /// The workspace name alone is not an answer. Several panes share one, and
-    /// an agent names its workspace after itself often enough that the line
-    /// ends up repeating the title — "Claude Code" under "Claude Code" says
-    /// nothing about which of them is waiting.
-    ///
-    /// Parts that would repeat each other are dropped rather than shown twice.
+    /// Where a notification came from — the shared resolver on AppDelegate,
+    /// so this page and the titlebar popover always describe the origin the
+    /// same way.
     private func originText(for notification: TerminalNotification) -> String? {
-        let workspace = tabTitle(for: notification.tabId)
-        guard let tab = tabManager.tabs.first(where: { $0.id == notification.tabId }) else {
-            return workspace
-        }
-        var parts: [String] = []
-        if let workspace, !workspace.isEmpty { parts.append(workspace) }
-
-        if let surfaceId = notification.surfaceId {
-            // The pane's own title, which for an agent pane is what it is
-            // working on — the part that tells two of them apart.
-            if let paneTitle = tab.panelTitles[surfaceId],
-               !paneTitle.isEmpty,
-               !parts.contains(paneTitle) {
-                parts.append(paneTitle)
-            }
-            // Named only for a pane on another machine: saying "this Mac" on
-            // every local notification is noise, but not saying which host a
-            // remote one came from leaves the reader to guess.
-            if let panel = tab.panels[surfaceId] as? TerminalPanel,
-               let host = panel.peerPaneSession?.lease.key.shortLabel,
-               !host.isEmpty {
-                parts.append(host)
-            }
-        }
-        let text = parts.joined(separator: " · ")
-        return text.isEmpty ? nil : text
+        AppDelegate.shared?.notificationOrigin(for: notification)
+            ?? tabTitle(for: notification.tabId)
     }
 }
 
