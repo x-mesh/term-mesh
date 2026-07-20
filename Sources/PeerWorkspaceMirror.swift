@@ -403,6 +403,18 @@ final class PeerWorkspaceMirrorController {
 
     private func reconnectLoop() async {
         var attempt = 0
+        // "lost its host — reconnecting" is a promise, and this loop can exit
+        // without keeping it: when the last pane goes the workspace is torn
+        // down, the condition below is false on the first pass, and not one
+        // attempt is ever made. Saying so is the difference between "gave up"
+        // and "there was nothing left to reconnect to".
+        defer {
+            if attempt == 0 {
+                RemoteWorkLog.debugOffMain(
+                    "Workspace mirror stopped reconnecting before the first attempt — the workspace was already gone"
+                )
+            }
+        }
         while !isTornDown, workspace != nil {
             attempt += 1
             let delaySeconds = min(30.0, pow(2.0, Double(min(attempt, 5))))
