@@ -95,7 +95,14 @@ def measure_surface(tm, surface, iterations, timeout_s, settle_s, key_mode=None)
                 break
 
         t0 = time.perf_counter()
-        if key_mode:
+        if key_mode == "roundtrip":
+            # The echo of a typed character can be produced locally, which is
+            # not what we are timing — a relayed pane that draws your keystroke
+            # before the host has seen it will look faster than the speed of
+            # light. This sends a command whose OUTPUT differs from its echo,
+            # so the string we wait for can only have come back from the host.
+            tm.send_surface(surface, f"echo {token[:4]}''{token[4:]}\n")
+        elif key_mode:
             tm.send_key_surface(surface, key_mode)
         else:
             tm.send_surface(surface, token)
@@ -137,6 +144,8 @@ def main():
     ap.add_argument("--timeout", type=float, default=5.0, help="give up on one sample after N s")
     ap.add_argument("--settle", type=float, default=0.05, help="idle between samples, seconds")
     ap.add_argument("--socket", help="control socket path")
+    ap.add_argument("--roundtrip", action="store_true",
+                    help="wait for command OUTPUT, not the keystroke echo — immune to local echo")
     ap.add_argument("--json", action="store_true")
     args = ap.parse_args()
 
@@ -146,11 +155,12 @@ def main():
     floor = measure_poll_floor(tm, args.surface)
     floor_summary = summarize("poll floor (read only)", floor)
 
-    a_samples, a_dropped = measure_surface(tm, args.surface, args.iterations, args.timeout, args.settle)
+    mode = "roundtrip" if args.roundtrip else None
+    a_samples, a_dropped = measure_surface(tm, args.surface, args.iterations, args.timeout, args.settle, mode)
     result = {"poll_floor": floor_summary, "a": summarize(args.label, a_samples, a_dropped)}
 
     if args.compare:
-        b_samples, b_dropped = measure_surface(tm, args.compare, args.iterations, args.timeout, args.settle)
+        b_samples, b_dropped = measure_surface(tm, args.compare, args.iterations, args.timeout, args.settle, mode)
         result["b"] = summarize(args.compare_label, b_samples, b_dropped)
         result["delta_p50"] = result["b"]["p50"] - result["a"]["p50"]
         result["delta_p99"] = result["b"]["p99"] - result["a"]["p99"]
