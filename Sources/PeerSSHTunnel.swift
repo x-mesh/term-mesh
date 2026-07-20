@@ -352,6 +352,9 @@ final class PeerSSHTunnel: @unchecked Sendable {
                 // socket-wait timeout — is not a dashboard problem, and
                 // retrying it would just pay the same timeout twice.
                 guard Self.looksLikeForwardBindFailure(error) else { throw error }
+                RemoteWorkLog.debugOffMain(
+                    "Dashboard port forward lost its bind race on \(sshTarget) — respawning the tunnel without it"
+                )
             }
         }
         try await spawnAttempt(dashboardLocalPort: nil)
@@ -605,9 +608,35 @@ final class PeerSSHTunnel: @unchecked Sendable {
         state = newState
         let cb = onStateChange
         lock.unlock()
+        report(newState)
         guard let cb else { return }
         Task { @MainActor in
             cb(newState)
+        }
+    }
+
+    /// Put every tunnel transition in the Remote Work log.
+    ///
+    /// This is the one place all of them pass through, and until now the only
+    /// trace of a tunnel dying was a banner that a workspace window had to be
+    /// open to show and that erased itself three seconds later. A relay that
+    /// dropped at 2am and came back left nothing to read in the morning.
+    private func report(_ newState: PeerSSHTunnelState) {
+        switch newState {
+        case .starting:
+            RemoteWorkLog.debugOffMain("Tunnel starting → \(sshTarget) (\(remoteSockPath))")
+        case .up:
+            RemoteWorkLog.infoOffMain("Tunnel up → \(sshTarget)")
+        case .down(let reason):
+            RemoteWorkLog.infoOffMain("Tunnel down → \(sshTarget): \(reason)")
+        case .reconnecting(let attempt):
+            RemoteWorkLog.infoOffMain(
+                "Reconnecting to \(sshTarget) — attempt \(attempt) of \(Self.maxReconnectAttempts)"
+            )
+        case .failed(let reason):
+            RemoteWorkLog.infoOffMain("Tunnel failed → \(sshTarget): \(reason)")
+        case .stopped:
+            RemoteWorkLog.debugOffMain("Tunnel stopped → \(sshTarget)")
         }
     }
 

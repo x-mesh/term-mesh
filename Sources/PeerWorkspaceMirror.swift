@@ -192,6 +192,10 @@ final class PeerWorkspaceMirrorController {
                     #if DEBUG
                     dlog("peer.mirror.error code=\(code) msg=\(message)")
                     #endif
+                    // The host refusing something is its own event: the loop
+                    // carries on afterwards, so without a line here the only
+                    // evidence is whatever silently failed to happen.
+                    RemoteWorkLog.infoOffMain("Host refused a workspace request (\(code)): \(message)")
                 }
                 switch Self.receiveLoopAction(for: msg, hostWorkspaceID: self.hostWorkspaceID) {
                 case .applyLayout(let layout):
@@ -226,6 +230,7 @@ final class PeerWorkspaceMirrorController {
                 // superseded by a newer push
             } catch {
                 NSLog("[peer-mirror] reconcile failed: %@", String(describing: error))
+                RemoteWorkLog.infoOffMain("Workspace layout sync failed: \(error.localizedDescription)")
             }
         }
     }
@@ -358,6 +363,7 @@ final class PeerWorkspaceMirrorController {
             try await reconcile(target: target.layout)
         } catch {
             NSLog("[peer-mirror] forceResync failed: %@", String(describing: error))
+            RemoteWorkLog.infoOffMain("Workspace resync failed: \(error.localizedDescription)")
         }
     }
 
@@ -388,6 +394,7 @@ final class PeerWorkspaceMirrorController {
         #if DEBUG
         dlog("peer.mirror.lost reason=\(reason)")
         #endif
+        RemoteWorkLog.infoOffMain("Workspace mirror lost its host: \(reason) — reconnecting")
         markWorkspaceTitle(suffix: "reconnecting…")
         Task { [weak self] in
             await self?.reconnectLoop()
@@ -435,6 +442,11 @@ final class PeerWorkspaceMirrorController {
                     #if DEBUG
                     dlog("peer.mirror.heartbeat.dead (post-reconnect) — closing subscription transport (ALL mirrored panes drop)")
                     #endif
+                    // Every mirrored pane dies with this one transport, so it is
+                    // the loudest failure the mirror has and was the quietest.
+                    RemoteWorkLog.infoOffMain(
+                        "Host stopped answering the workspace subscription for 30s — every mirrored pane drops"
+                    )
                     Task { await weakTransport.close() }
                 }
                 markAllPanesStale()
@@ -444,11 +456,22 @@ final class PeerWorkspaceMirrorController {
                 #if DEBUG
                 dlog("peer.mirror.reconnected attempt=\(attempt)")
                 #endif
+                RemoteWorkLog.infoOffMain("Workspace mirror reconnected on attempt \(attempt)")
                 return
             } catch {
                 #if DEBUG
                 dlog("peer.mirror.reconnect.failed attempt=\(attempt) err=\(error)")
                 #endif
+                // This loop has no cap — it retries every 30s forever. Logging
+                // the first few and then one in ten keeps "still trying" answerable
+                // without a line every half minute for the rest of the session.
+                // Without any line, one "lost its host" and then permanent silence
+                // is indistinguishable from having quietly given up.
+                if attempt <= 3 || attempt % 10 == 0 {
+                    RemoteWorkLog.debugOffMain(
+                        "Workspace mirror reconnect attempt \(attempt) failed: \(error.localizedDescription)"
+                    )
+                }
             }
         }
     }
@@ -472,6 +495,7 @@ final class PeerWorkspaceMirrorController {
         #if DEBUG
         dlog("peer.mirror.hostGone action=autoclose host=\(spec.hostKey) workspace=\(title)")
         #endif
+        RemoteWorkLog.infoOffMain("Host deleted the workspace \"\(title)\" on \(spec.hostKey) — closing the mirror here")
         guard let workspace, let tabManager = AppDelegate.shared?.tabManager else {
             // No window/TabManager context (headless/test) — just release
             // the layout-sync plane; there's no tab to close or notify.

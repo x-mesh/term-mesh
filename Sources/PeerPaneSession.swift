@@ -338,6 +338,7 @@ final class PeerPaneSession {
         #if DEBUG
         dlog("peer.pane.attach key=\(lease.key) surface=\(title)")
         #endif
+        RemoteWorkLog.infoOffMain("Remote pane attached: \(title) on \(lease.key)")
         return paneSession
     }
 
@@ -436,5 +437,6 @@ final class PeerPaneSession {
         #if DEBUG
         dlog("peer.pane.teardown key=\(lease.key) surface=\(surfaceTitle)")
         #endif
+        RemoteWorkLog.infoOffMain("Remote pane closed: \(surfaceTitle) on \(lease.key)")
     }
 }

@@ -341,8 +341,29 @@ final class RemoteGitCheckpointService: RemoteGitCheckpointServicing, @unchecked
         }
     }
 
+    /// A one-line name for a command, for the log.
+    ///
+    /// Arguments are summarised rather than printed: the checkpoint's remote
+    /// argument is a whole shell script, and pasting it into the log per run
+    /// would bury the sequence this is here to make readable.
+    private static func describe(_ executable: String, _ arguments: [String]) -> String {
+        let name = (executable as NSString).lastPathComponent
+        let parts = arguments.map { argument -> String in
+            if argument.contains("\n") { return "<script>" }
+            return argument.count > 48 ? String(argument.prefix(48)) + "…" : argument
+        }
+        let joined = parts.joined(separator: " ")
+        return joined.count > 160 ? "\(name) \(joined.prefix(160))…" : "\(name) \(joined)"
+    }
+
     private func run(_ executable: String, _ arguments: [String]) async throws -> String {
-        try await withCheckedThrowingContinuation { continuation in
+        // Every step of every remote-work action passes through here. Until
+        // now the drawer showed the PLAN and then nothing, so an action that
+        // died on its third command was indistinguishable from one that never
+        // started.
+        let label = Self.describe(executable, arguments)
+        RemoteWorkLog.debugOffMain("run \(label)")
+        return try await withCheckedThrowingContinuation { continuation in
             queue.async {
                 let process = Process()
                 let stdout = Pipe()
@@ -361,6 +382,10 @@ final class RemoteGitCheckpointService: RemoteGitCheckpointServicing, @unchecked
                             .trimmingCharacters(in: .whitespacesAndNewlines)
                         let resolvedMessage = message.flatMap { $0.isEmpty ? nil : $0 }
                             ?? "Command failed: \(executable)"
+                        // Names the command only. The caller logs the failure
+                        // with its message, and repeating stderr here would
+                        // print the same paragraph twice in a row.
+                        RemoteWorkLog.infoOffMain("Command failed: \(label)")
                         continuation.resume(throwing: RemoteGitCheckpointError.commandFailed(resolvedMessage))
                         return
                     }

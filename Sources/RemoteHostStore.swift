@@ -477,6 +477,18 @@ final class RemoteHostStore: ObservableObject {
         dlog("peer.sidebar.disconnect key=\(key)")
         #endif
         rebuild()
+        // Reported AFTER rebuild, because rebuild is what decides the answer:
+        // it re-promotes the entry when a pane or mirror opened from this host
+        // still holds its own lease. Saying so is the point — Disconnect
+        // leaving a live terminal open is correct, and without a line here it
+        // reads as the button having done nothing at all.
+        if hosts[key]?.connectionState == .connected {
+            RemoteWorkLog.info(
+                "Disconnected the \(host.displayName) entry — panes opened from it hold their own connection and stay open"
+            )
+        } else {
+            RemoteWorkLog.info("Disconnected \(host.displayName)")
+        }
     }
 
     private func fetchWorkspaces(for hostSockPath: String, key: String) {

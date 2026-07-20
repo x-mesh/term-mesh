@@ -1240,6 +1240,13 @@ class GhosttyApp {
                 let tabTitle = AppDelegate.shared?.tabManager?.titleForTab(tabId) ?? "Terminal"
                 let command = actionTitle.isEmpty ? tabTitle : actionTitle
                 let body = actionBody
+                // Only while a peer is connected. A local agent notifying is
+                // ordinary and would bury the drawer; the same OSC arriving
+                // over a relay is the whole point of the notification path,
+                // and its absence is the symptom people report.
+                if !PeerClientCoordinator.shared.activeConnections().isEmpty {
+                    RemoteWorkLog.info("Agent notification in \(tabTitle): \(command)")
+                }
                 notifications.addNotification(
                     tabId: tabId,
                     surfaceId: surfaceId,

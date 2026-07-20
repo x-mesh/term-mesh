@@ -219,8 +219,10 @@ enum PeerHostDoctor {
         identityFile: String?,
         status: PeerAgentStackStatus
     ) async throws -> String {
+        RemoteWorkLog.infoOffMain("Installing the agent notification stack on \(sshTarget)")
         guard let scriptsDir = Bundle.main.resourceURL?
             .appendingPathComponent("scripts", isDirectory: true) else {
+            RemoteWorkLog.infoOffMain("Agent stack install failed: the app bundle has no scripts directory")
             throw PeerSocketProbeError.spawnFailed("app bundle has no scripts directory")
         }
         let uploads: [(command: String, file: String)] = [
@@ -253,6 +255,13 @@ enum PeerHostDoctor {
         var notes: [String] = ["scripts installed to ~/.local/bin"]
         if status.hasClaude {
             guard status.hasPython3 else {
+                // A partial install that reads as success is the worst outcome
+                // here: the scripts are there, so the host looks equipped, and
+                // the reason no notification ever arrives is a missing python3
+                // nobody was told about.
+                RemoteWorkLog.infoOffMain(
+                    "Agent stack partly installed on \(sshTarget): scripts are in ~/.local/bin, but python3 is missing so Claude's hooks were NOT wired"
+                )
                 return (notes + ["python3 missing — Claude hooks not wired; install python3 and re-run"])
                     .joined(separator: "; ")
             }
@@ -272,11 +281,16 @@ enum PeerHostDoctor {
                 input: Data(agentSmokePayload.utf8)
             )
             guard smoke.contains("terminalSequence") else {
+                RemoteWorkLog.infoOffMain(
+                    "Agent stack smoke test failed on \(sshTarget): agent-notify.sh answered \(String(smoke.prefix(120)))"
+                )
                 throw PeerSocketProbeError.spawnFailed(
                     "smoke test failed — expected terminalSequence JSON, got: \(String(smoke.prefix(120)))")
             }
         }
-        return notes.joined(separator: "; ")
+        let summary = notes.joined(separator: "; ")
+        RemoteWorkLog.infoOffMain("Agent stack installed on \(sshTarget): \(summary)")
+        return summary
     }
 
     /// Test reachability: SSH + peer-socket presence. An explicit

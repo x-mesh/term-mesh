@@ -664,6 +664,16 @@ struct PeerHostEditorView: View {
             dlog("peer.doctor.agentStack probe failed")
         }
         #endif
+        // The editor shows this as a badge that the next Test overwrites.
+        // Keeping it in the log means "was the host ever equipped, and when
+        // did that change" is answerable after the fact.
+        if let status {
+            RemoteWorkLog.debug(
+                "Agent stack on \(draft.sshTarget): scripts=\(status.scriptsInstalled) hooks=\(status.hooksWired) claude=\(status.hasClaude) python3=\(status.hasPython3)"
+            )
+        } else {
+            RemoteWorkLog.debug("Agent stack probe failed on \(draft.sshTarget)")
+        }
         agentStackState = status.map { .status($0) } ?? .idle
     }
 

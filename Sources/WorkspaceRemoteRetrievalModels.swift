@@ -88,11 +88,17 @@ struct IncomingChangeset: Identifiable, Hashable, Codable, Sendable {
 
 struct RemotePaneActivity: Identifiable, Hashable, Sendable {
     let id: UUID
-    let paneID: RemotePaneID
+    /// The pane this happened to, when it happened to one.
+    ///
+    /// Optional because the most useful events do not belong to a pane: a
+    /// tunnel coming up, a reconnect giving up, a file copied to a peer. They
+    /// also tend to happen BEFORE any pane exists, and requiring one here is
+    /// what made them vanish from the drawer entirely.
+    let paneID: RemotePaneID?
     let message: String
     let occurredAt: Date
 
-    init(id: UUID = UUID(), paneID: RemotePaneID, message: String, occurredAt: Date = Date()) {
+    init(id: UUID = UUID(), paneID: RemotePaneID?, message: String, occurredAt: Date = Date()) {
         self.id = id
         self.paneID = paneID
         self.message = message

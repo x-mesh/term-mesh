@@ -157,8 +157,11 @@ enum PeerSocketProber {
         proc.standardError = errPipe
         proc.standardInput = nil
 
-        #if DEBUG
+        // Outside the DEBUG gate: the elapsed time is reported to the Remote
+        // Work log in every build, because "cannot reach the host" and "took
+        // 9 seconds to say so" are different problems.
         let startedAt = Date()
+        #if DEBUG
         dlog("peer.probe start target=\(sshTarget)")
         #endif
 
@@ -199,15 +202,24 @@ enum PeerSocketProber {
             stdout: stdout, stderr: stderr
         )
 
-        #if DEBUG
         let elapsed = String(format: "%.2f", Date().timeIntervalSince(startedAt))
         switch result {
         case .success(let path):
+            #if DEBUG
             dlog("peer.probe ok target=\(sshTarget) path=\(path) elapsed=\(elapsed)s")
+            #endif
+            RemoteWorkLog.debugOffMain("Probed \(sshTarget) — daemon at \(path) (\(elapsed)s)")
         case .failure(let error):
+            #if DEBUG
             dlog("peer.probe fail target=\(sshTarget) exit=\(exitCode) timedOut=\(timedOut) error=\(error) elapsed=\(elapsed)s")
+            #endif
+            // The exit code and the timeout flag separate the three ways this
+            // fails — SSH could not connect, it connected and found no daemon,
+            // or it never answered — which look identical from the UI.
+            RemoteWorkLog.infoOffMain(
+                "Cannot reach \(sshTarget): \(error) (exit \(exitCode)\(timedOut ? ", timed out" : ""), \(elapsed)s)"
+            )
         }
-        #endif
 
         switch result {
         case .success(let path): return path

@@ -183,6 +183,12 @@ extension PeerWorkspaceMirrorController {
         #if DEBUG
         dlog("peer.mirror.reconcile leaves=\(targetLeaves.count) spawned=\(newSessions.count) shape=\(Self.shapeHash(target))")
         #endif
+        // The shape hash is what makes this readable as a sequence: two
+        // reconciles with the same hash mean the layout settled, and a hash
+        // that keeps changing with nothing spawned means it is flapping.
+        RemoteWorkLog.debugOffMain(
+            "Layout synced — \(targetLeaves.count) pane(s), \(newSessions.count) spawned, shape \(Self.shapeHash(target))"
+        )
     }
 
     // MARK: - Divider fast path
