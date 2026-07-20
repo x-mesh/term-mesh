@@ -7,6 +7,10 @@ import AppKit
 @testable import term_mesh
 #endif
 
+// @MainActor because the helpers under test are: these cases were written
+// before Swift enforced isolation at the call site, and the file was never
+// in the test target, so nothing ever compiled them to say so.
+@MainActor
 final class WorkspaceManualUnreadTests: XCTestCase {
     func testShouldClearManualUnreadWhenFocusMovesToDifferentPanel() {
         let previousFocusedPanelId = UUID()
@@ -166,8 +170,10 @@ final class CommandPaletteFuzzyMatcherTests: XCTestCase {
             ]
         )
 
+        // The matcher returns nil when nothing matches, so the unrelated set
+        // scoring nil is the strongest form of what this asserts, not a
+        // failure of it. Written when a non-match still produced a score.
         XCTAssertNotNil(renameScore)
-        XCTAssertNotNil(unrelatedScore)
         XCTAssertGreaterThan(renameScore ?? 0, unrelatedScore ?? 0)
     }
 
@@ -281,7 +287,7 @@ final class CommandPaletteSwitcherSearchIndexerTests: XCTestCase {
         XCTAssertFalse(keywords.contains("cmd-palette-indexing"))
     }
 
-    func testSurfaceDetailOutranksWorkspaceDetailForPathToken() {
+    func testSurfaceDetailOutranksWorkspaceDetailForPathToken() throws {
         let metadata = CommandPaletteSwitcherSearchMetadata(
             directories: ["/tmp/worktrees/term-mesh"],
             branches: ["feature/cmd-palette"],

@@ -203,6 +203,8 @@
 				F9000010A1B2C3D4E5F60718 /* WorkspaceRetrievalDirectoryTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = F9000011A1B2C3D4E5F60718 /* WorkspaceRetrievalDirectoryTests.swift */; };
 				F9000014A1B2C3D4E5F60718 /* PeerHostStatsTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = F9000015A1B2C3D4E5F60718 /* PeerHostStatsTests.swift */; };
 				FA000000A1B2C3D4E5F60718 /* PeerSocketProberTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = FA000001A1B2C3D4E5F60718 /* PeerSocketProberTests.swift */; };
+			FE000004A1B2C3D4E5F60718 /* PasteQueueTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = FE000005A1B2C3D4E5F60718 /* PasteQueueTests.swift */; };
+			FE000008A1B2C3D4E5F60718 /* WorkspaceManualUnreadTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = FE000009A1B2C3D4E5F60718 /* WorkspaceManualUnreadTests.swift */; };
 				FB000000A1B2C3D4E5F60718 /* PeerPaneSessionTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = FB000001A1B2C3D4E5F60718 /* PeerPaneSessionTests.swift */; };
 				FC000000A1B2C3D4E5F60718 /* PeerWorkspaceMirrorTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = FC000001A1B2C3D4E5F60718 /* PeerWorkspaceMirrorTests.swift */; };
 				FD000000A1B2C3D4E5F60718 /* PeerDaemonVersionTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = FD000001A1B2C3D4E5F60718 /* PeerDaemonVersionTests.swift */; };
@@ -459,6 +461,8 @@
 			F9000011A1B2C3D4E5F60718 /* WorkspaceRetrievalDirectoryTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WorkspaceRetrievalDirectoryTests.swift; sourceTree = "<group>"; };
 			F9000015A1B2C3D4E5F60718 /* PeerHostStatsTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PeerHostStatsTests.swift; sourceTree = "<group>"; };
 			FA000001A1B2C3D4E5F60718 /* PeerSocketProberTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PeerSocketProberTests.swift; sourceTree = "<group>"; };
+			FE000005A1B2C3D4E5F60718 /* PasteQueueTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PasteQueueTests.swift; sourceTree = "<group>"; };
+			FE000009A1B2C3D4E5F60718 /* WorkspaceManualUnreadTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WorkspaceManualUnreadTests.swift; sourceTree = "<group>"; };
 			FB000001A1B2C3D4E5F60718 /* PeerPaneSessionTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PeerPaneSessionTests.swift; sourceTree = "<group>"; };
 			FC000001A1B2C3D4E5F60718 /* PeerWorkspaceMirrorTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PeerWorkspaceMirrorTests.swift; sourceTree = "<group>"; };
 			FD000001A1B2C3D4E5F60718 /* PeerDaemonVersionTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PeerDaemonVersionTests.swift; sourceTree = "<group>"; };
@@ -791,6 +795,8 @@
 				F9000011A1B2C3D4E5F60718 /* WorkspaceRetrievalDirectoryTests.swift */,
 				F9000015A1B2C3D4E5F60718 /* PeerHostStatsTests.swift */,
 				FA000001A1B2C3D4E5F60718 /* PeerSocketProberTests.swift */,
+				FE000005A1B2C3D4E5F60718 /* PasteQueueTests.swift */,
+				FE000009A1B2C3D4E5F60718 /* WorkspaceManualUnreadTests.swift */,
 				FB000001A1B2C3D4E5F60718 /* PeerPaneSessionTests.swift */,
 				FC000001A1B2C3D4E5F60718 /* PeerWorkspaceMirrorTests.swift */,
 				FD000001A1B2C3D4E5F60718 /* PeerDaemonVersionTests.swift */,
@@ -1132,6 +1138,8 @@
 				F9000010A1B2C3D4E5F60718 /* WorkspaceRetrievalDirectoryTests.swift in Sources */,
 				F9000014A1B2C3D4E5F60718 /* PeerHostStatsTests.swift in Sources */,
 				FA000000A1B2C3D4E5F60718 /* PeerSocketProberTests.swift in Sources */,
+				FE000004A1B2C3D4E5F60718 /* PasteQueueTests.swift in Sources */,
+				FE000008A1B2C3D4E5F60718 /* WorkspaceManualUnreadTests.swift in Sources */,
 				FB000000A1B2C3D4E5F60718 /* PeerPaneSessionTests.swift in Sources */,
 				FC000000A1B2C3D4E5F60718 /* PeerWorkspaceMirrorTests.swift in Sources */,
 				FD000000A1B2C3D4E5F60718 /* PeerDaemonVersionTests.swift in Sources */,
