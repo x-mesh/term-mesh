@@ -117,7 +117,11 @@ echo ""
 #   3. the parenthesised form ps prints when argv is unreadable — `(zsh)`,
 #      accepted ONLY when the process still holds a tty, since that is the
 #      thing making it worth reclaiming and the only evidence left.
-ORPHAN_ROWS=$(ps -eo pid,ppid,etime,tty,command 2>/dev/null | awk '
+# One matcher, used twice: for the initial sweep here AND re-applied per PID
+# immediately before signalling (still_orphan_shell). Selection and kill must
+# never drift apart — a PID is only ever signalled by the same rule that
+# selected it.
+ORPHAN_MATCH_AWK='
   $2 == 1 {
     cmd = ""
     for (i = 5; i <= NF; i++) cmd = cmd (i > 5 ? " " : "") $i
@@ -126,7 +130,19 @@ ORPHAN_ROWS=$(ps -eo pid,ppid,etime,tty,command 2>/dev/null | awk '
         cmd ~ ("^-" shell "$") ||
         ($4 != "??" && cmd ~ ("^\\(" shell "\\)$")))
       print $1 "\t" $3 "\t" $4 "\t" cmd
-  }' || true)
+  }'
+
+# The candidate list is frozen before the confirmation prompt, and that prompt
+# can sit unanswered for hours — long enough for a candidate to exit and its
+# PID to be handed to an unrelated process. Ask the live process table again
+# right before signalling; a PID that no longer matches has changed identity
+# and must not be touched.
+still_orphan_shell() {
+  ps -o pid=,ppid=,etime=,tty=,command= -p "$1" 2>/dev/null \
+    | awk "$ORPHAN_MATCH_AWK" | grep -q . 2>/dev/null
+}
+
+ORPHAN_ROWS=$(ps -eo pid,ppid,etime,tty,command 2>/dev/null | awk "$ORPHAN_MATCH_AWK" || true)
 
 echo "=== Orphaned shells (PPID=1) ==="
 if [ -z "$ORPHAN_ROWS" ]; then
@@ -260,8 +276,13 @@ fi
 # Killing destroys the only evidence of who leaked the ptys — a dead process
 # cannot be asked what its fd table looked like. Snapshot the heavy holders
 # first so the next occurrence is diagnosable instead of guesswork.
-FORENSICS="/tmp/term-mesh-pty-forensics-$(date +%Y%m%d-%H%M%S).txt"
-{
+# mktemp, not a hand-built name: /tmp is world-writable and the old path was
+# predictable to the second, so a pre-planted symlink there would have made
+# this `>` truncate whatever it pointed at (macOS has no protected_symlinks
+# defence for sticky dirs). mktemp creates the file O_EXCL under our uid; the
+# timestamp stays in the template so snapshots still sort by time.
+FORENSICS=$(mktemp "/tmp/term-mesh-pty-forensics-$(date +%Y%m%d-%H%M%S)-XXXXXX") || FORENSICS=""
+[ -n "$FORENSICS" ] && {
   echo "# pty forensics captured before reclaim"
   echo "# ptmx_max=$PTMX_MAX allocated=$PTY_USED candidates=$CAND_COUNT"
   echo ""
@@ -283,12 +304,21 @@ FORENSICS="/tmp/term-mesh-pty-forensics-$(date +%Y%m%d-%H%M%S).txt"
     lsof -p "$pid" 2>/dev/null | grep ptmx || true
   done
 } > "$FORENSICS" 2>/dev/null || true
-echo "Forensics snapshot: $FORENSICS"
+if [ -n "$FORENSICS" ]; then
+  echo "Forensics snapshot: $FORENSICS"
+else
+  echo "WARNING: mktemp failed — proceeding without a forensics snapshot" >&2
+fi
 echo ""
 
 echo "=== Reclaiming ==="
-TERMED=0; KILLED=0; GONE=0
+TERMED=0; KILLED=0; GONE=0; CHANGED=0
 for pid in $CANDIDATES; do
+  # Identity check at the last possible moment — see still_orphan_shell.
+  if ! still_orphan_shell "$pid"; then
+    CHANGED=$((CHANGED + 1))
+    continue
+  fi
   kill "$pid" 2>/dev/null || { GONE=$((GONE + 1)); continue; }
   TERMED=$((TERMED + 1))
 done
@@ -298,6 +328,11 @@ done
 sleep 2
 for pid in $CANDIDATES; do
   if kill -0 "$pid" 2>/dev/null; then
+    # Same identity check before the SIGKILL: a candidate that died on SIGTERM
+    # and was recycled inside the 2s window must not eat a -9. A shell that
+    # merely ignored SIGTERM (these do) still matches and gets escalated; a
+    # zombie stops matching (tty gone) and needs no signal anyway.
+    still_orphan_shell "$pid" || continue
     kill -9 "$pid" 2>/dev/null || true
     KILLED=$((KILLED + 1))
   fi
@@ -306,6 +341,9 @@ done
 printf '  SIGTERM sent : %s\n' "$TERMED"
 printf '  SIGKILL sent : %s\n' "$KILLED"
 if [ "$GONE" -gt 0 ]; then printf '  already gone : %s\n' "$GONE"; fi
+if [ "$CHANGED" -gt 0 ]; then
+  printf '  skipped (identity changed since selection): %s\n' "$CHANGED"
+fi
 echo ""
 
 sleep 1
