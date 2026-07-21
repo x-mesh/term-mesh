@@ -2465,6 +2465,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
             return true
         }
 
+        let isCommandShiftV = normalizedFlags == [.command, .shift] && (chars == "v" || event.keyCode == 9)
+        if isCommandShiftV, let terminal = tabManager?.selectedTerminalPanel?.surface {
+            NotificationCenter.default.post(name: .pasteShelfToggleRequested, object: terminal)
+            return true
+        }
+
         if normalizedFlags == [.command], chars == "q" {
             return handleQuitShortcutWarning()
         }
