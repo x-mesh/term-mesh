@@ -31,7 +31,16 @@ while [ $# -gt 0 ]; do
     --yes|-y) ASSUME_YES=true ;;
     --include-busy) INCLUDE_BUSY=true ;;
     --no-fd-scan) FD_SCAN=false ;;
-    --min-age) MIN_AGE="${2:-}"; shift ;;
+    # Guard the arity here: with no value, `shift` below would fail under
+    # `set -e` and exit 1 silently, never reaching the validation written for it.
+    --min-age)
+      if [ $# -lt 2 ]; then
+        echo "--min-age expects seconds (integer), got no value" >&2
+        exit 2
+      fi
+      MIN_AGE="$2"
+      shift
+      ;;
     -h|--help) sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
@@ -97,16 +106,25 @@ echo ""
 
 # ── 2. orphaned pane shells ────────────────────────────────────────────────
 
-# Login shells only: `-l` flag, a dash-prefixed argv[0], or the parenthesised
-# form ps prints when the argv is no longer readable. A `zsh -c <command>`
-# worker is not a pane shell and must never be swept up here.
+# Login shells only, by one of three positive signals — never a bare `zsh`.
+# An argv-less shell says nothing about how it was started: a LaunchAgent
+# helper, a disowned background shell and a pane shell all look identical, and
+# killing the first two is someone else's outage. A `zsh -c <command>` worker
+# is likewise not a pane shell and must never be swept up here.
+#
+#   1. an explicit login flag  — `/bin/zsh -l`, `/bin/bash --login`
+#   2. a dash-prefixed argv[0] — `-zsh` (how a login shell names itself)
+#   3. the parenthesised form ps prints when argv is unreadable — `(zsh)`,
+#      accepted ONLY when the process still holds a tty, since that is the
+#      thing making it worth reclaiming and the only evidence left.
 ORPHAN_ROWS=$(ps -eo pid,ppid,etime,tty,command 2>/dev/null | awk '
   $2 == 1 {
     cmd = ""
     for (i = 5; i <= NF; i++) cmd = cmd (i > 5 ? " " : "") $i
-    if (cmd ~ /^\(?-?\/?([a-z\/]*\/)?(zsh|bash|sh|fish)\)?( -[a-z]*l[a-z]*)?$/ ||
-        cmd ~ /^-(zsh|bash|sh|fish)/ ||
-        cmd ~ /^\((zsh|bash|sh|fish)\)$/)
+    shell = "(zsh|bash|sh|fish)"
+    if (cmd ~ ("^-?/?([a-z0-9_.-]+/)*" shell "[[:space:]]+(-[a-z]*l[a-z]*|--login)$") ||
+        cmd ~ ("^-" shell "$") ||
+        ($4 != "??" && cmd ~ ("^\\(" shell "\\)$")))
       print $1 "\t" $3 "\t" $4 "\t" cmd
   }' || true)
 
@@ -194,9 +212,11 @@ if $FD_SCAN; then
     WORST=$(printf '%s\n' "$BY_PROC" | head -1 | awk '{print $1}' || true)
     if [ "${WORST:-0}" -gt 4 ]; then
       echo "  NOTE: a single process holds ${WORST} master fds — one such process"
-      echo "        pins that many ptys on its own. ghostty sets FD_CLOEXEC on the"
-      echo "        master (ghostty/src/pty.zig:153), so a shell holding many is NOT"
-      echo "        explained by the pane path — capture it before killing (see below)."
+      echo "        pins that many ptys on its own. A staircase (74/74/72/69/...)"
+      echo "        means each spawn inherited the masters opened before it: the"
+      echo "        daemon's peer-surface path did exactly this until it set"
+      echo "        FD_CLOEXEC on the forkpty master. Capture before killing"
+      echo "        (see below) — the fd table is the only evidence of the source."
     fi
   fi
   echo ""
