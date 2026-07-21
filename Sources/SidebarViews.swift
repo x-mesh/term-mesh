@@ -970,12 +970,22 @@ struct RemoteHostGroupView: View {
     var body: some View {
         DisclosureGroup(isExpanded: $isExpanded) {
             if host.workspaces.isEmpty {
-                Text(emptyBodyText)
-                    .font(.system(size: 10))
-                    .foregroundColor(.secondary)
-                    .padding(.leading, 20)
-                    .padding(.vertical, 4)
-                    .frame(maxWidth: .infinity, alignment: .leading)
+                HStack(spacing: 8) {
+                    Text(emptyBodyText)
+                        .font(.system(size: 10))
+                        .foregroundColor(.secondary)
+                    if case .connecting = host.connectionState {
+                        Spacer(minLength: 4)
+                        Button("Cancel") { store.cancelConnectingHost(host) }
+                            .buttonStyle(.borderless)
+                            .controlSize(.mini)
+                            .help("Cancel connection attempt")
+                    }
+                }
+                .padding(.leading, 20)
+                .padding(.trailing, 8)
+                .padding(.vertical, 4)
+                .frame(maxWidth: .infinity, alignment: .leading)
             } else {
                 let windowGroups = groupWorkspacesByWindow(
                     host.workspaces,
@@ -1080,7 +1090,7 @@ struct RemoteHostGroupView: View {
                         Button("Disconnect") { store.disconnectSavedHost(host) }
                     }
                 case .connecting:
-                    EmptyView()
+                    Button("Cancel Connection") { store.cancelConnectingHost(host) }
                 }
                 profileMenuItems
             }

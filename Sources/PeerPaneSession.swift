@@ -133,7 +133,12 @@ final class PeerPaneHostRegistry {
     private var leases: [PeerPaneHostKey: PeerPaneHostLease] = [:]
     /// Coalesces concurrent first-acquires of the same host so exactly
     /// one tunnel is spawned (double-click, multi-pane open, …).
-    private var starting: [PeerPaneHostKey: Task<PeerPaneHostLease, Error>] = [:]
+    private struct StartingLease {
+        let id = UUID()
+        let task: Task<PeerPaneHostLease, Error>
+    }
+
+    private var starting: [PeerPaneHostKey: StartingLease] = [:]
 
     /// Acquire a lease for the host (+1 ref). Starts the SSH tunnel on
     /// first acquire; later acquires reuse the live lease.
@@ -143,16 +148,22 @@ final class PeerPaneHostRegistry {
             lease.refCount += 1
             return lease
         }
-        if let task = starting[key] {
-            let lease = try await task.value
+        if let startingLease = starting[key] {
+            let lease = try await startingLease.task.value
+            try Task.checkCancellation()
             lease.refCount += 1
             return lease
         }
-        let task = Task { try await Self.makeLease(spec: spec) }
-        starting[key] = task
-        defer { starting[key] = nil }
+        let startingLease = StartingLease(task: Task { try await Self.makeLease(spec: spec) })
+        starting[key] = startingLease
+        defer {
+            if starting[key]?.id == startingLease.id {
+                starting[key] = nil
+            }
+        }
         do {
-            let lease = try await task.value
+            let lease = try await startingLease.task.value
+            try Task.checkCancellation()
             // A racing acquire may have landed the lease already (both
             // awaited the same task); pool exactly one instance.
             if let existing = leases[key] {
@@ -166,6 +177,13 @@ final class PeerPaneHostRegistry {
             #endif
             return lease
         }
+    }
+
+    /// Stop an in-flight first acquire without affecting an already-live
+    /// lease, which may be owned by another pane or workspace mirror.
+    func cancelPendingAcquire(for key: PeerPaneHostKey) {
+        guard let startingLease = starting.removeValue(forKey: key) else { return }
+        startingLease.task.cancel()
     }
 
     /// Additional ref on an already-acquired lease (a new pane joining

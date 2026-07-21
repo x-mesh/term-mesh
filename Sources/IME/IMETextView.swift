@@ -462,8 +462,13 @@ final class IMETextView: NSTextView {
 
     // MARK: - Paste (image → inline thumbnail)
 
-    /// Pasted image attachments and their /tmp file paths.
-    var imageAttachments: [(attachment: NSTextAttachment, path: String)] = []
+    private enum ImageAttachmentOrigin {
+        case clipboard
+        case shelf
+    }
+
+    /// Pasted image attachments and their local file paths.
+    private var imageAttachments: [(attachment: NSTextAttachment, path: String, origin: ImageAttachmentOrigin)] = []
 
     override func paste(_ sender: Any?) {
         let pb = NSPasteboard.general
@@ -476,29 +481,52 @@ final class IMETextView: NSTextView {
             return
         }
         if let path = GhosttyPasteboardHelper.saveClipboardImageToTempFile(from: pb),
-           let image = NSImage(contentsOfFile: path) {
-            let attachment = NSTextAttachment()
-            let maxHeight: CGFloat = 48
-            let scale = min(maxHeight / image.size.height, 1.0)
-            let thumbSize = NSSize(width: image.size.width * scale, height: image.size.height * scale)
-            let cell = NSTextAttachmentCell(imageCell: image)
-            cell.image?.size = thumbSize
-            attachment.attachmentCell = cell
-
-            let attrStr = NSMutableAttributedString(attributedString: NSAttributedString(attachment: attachment))
-            attrStr.append(NSAttributedString(string: " ",
-                attributes: [.font: font ?? NSFont.monospacedSystemFont(ofSize: 14, weight: .regular)]))
-
-            // Capture selectedRange() once to avoid TOCTOU: if text changes between the
-            // insert and setSelectedRange calls, both calls see a consistent location.
-            let insertLoc = selectedRange().location
-            textStorage?.insert(attrStr, at: insertLoc)
-            setSelectedRange(NSRange(location: insertLoc + attrStr.length, length: 0))
-            imageAttachments.append((attachment: attachment, path: path))
-            delegate?.textDidChange?(Notification(name: NSText.didChangeNotification, object: self))
+           insertImageAttachment(at: URL(fileURLWithPath: path), origin: .clipboard) {
             return
         }
         pasteAsPlainText(sender)
+    }
+
+    /// Inserts a Shelf image without consulting or changing the system clipboard.
+    @discardableResult
+    func insertImageAttachment(at url: URL) -> Bool {
+        insertImageAttachment(at: url, origin: .shelf)
+    }
+
+    private func insertImageAttachment(at url: URL, origin: ImageAttachmentOrigin) -> Bool {
+        guard let image = NSImage(contentsOf: url) else { return false }
+        let attachment = NSTextAttachment()
+        let maxHeight: CGFloat = 48
+        let scale = min(maxHeight / image.size.height, 1.0)
+        let thumbSize = NSSize(width: image.size.width * scale, height: image.size.height * scale)
+        let cell = NSTextAttachmentCell(imageCell: image)
+        cell.image?.size = thumbSize
+        attachment.attachmentCell = cell
+
+        let attrStr = NSMutableAttributedString(attributedString: NSAttributedString(attachment: attachment))
+        attrStr.append(NSAttributedString(string: " ",
+            attributes: [.font: font ?? NSFont.monospacedSystemFont(ofSize: 14, weight: .regular)]))
+
+        // Capture selectedRange() once to avoid TOCTOU: if text changes between the
+        // insert and setSelectedRange calls, both calls see a consistent location.
+        let insertLoc = selectedRange().location
+        textStorage?.insert(attrStr, at: insertLoc)
+        setSelectedRange(NSRange(location: insertLoc + attrStr.length, length: 0))
+        imageAttachments.append((attachment: attachment, path: url.path, origin: origin))
+        delegate?.textDidChange?(Notification(name: NSText.didChangeNotification, object: self))
+        return true
+    }
+
+    func insertShelfText(_ text: String) {
+        insertText(text, replacementRange: selectedRange())
+    }
+
+    func shelfImageAttachmentPaths() -> [String] {
+        imageAttachments.compactMap { $0.origin == .shelf ? $0.path : nil }
+    }
+
+    func clearImageAttachments() {
+        imageAttachments.removeAll()
     }
 
     /// Returns text with image attachments replaced by their file paths.

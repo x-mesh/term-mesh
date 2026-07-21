@@ -177,6 +177,12 @@ final class RemoteHostStore: ObservableObject {
     /// kills them (registry refcount semantics).
     private var sidebarLeases: [String: PeerPaneHostLease] = [:]
     private var connectTasks: [String: Task<Void, Never>] = [:]
+    /// Available only after an auto socket probe. It lets Cancel stop exactly
+    /// the matching pending SSH acquire, never another host's live lease.
+    private var connectingLeaseKeys: [String: PeerPaneHostKey] = [:]
+    /// A late completion from a cancelled attempt must not turn the row back
+    /// into connected after the user has already pressed Retry.
+    private var connectAttemptIDs: [String: UUID] = [:]
     private var profileCancellable: AnyCancellable?
 
     private init() {
@@ -371,13 +377,21 @@ final class RemoteHostStore: ObservableObject {
         let key = host.id
         guard let target = host.sshTarget, !target.isEmpty else { return }
         guard sidebarLeases[key] == nil, connectTasks[key] == nil else { return }
+        let attemptID = UUID()
+        connectAttemptIDs[key] = attemptID
         hosts[key]?.connectionState = .connecting
         #if DEBUG
         dlog("peer.sidebar.connect start key=\(key)")
         #endif
         connectTasks[key] = Task { [weak self] in
             guard let self else { return }
-            defer { self.connectTasks[key] = nil }
+            defer {
+                if self.connectAttemptIDs[key] == attemptID {
+                    self.connectTasks[key] = nil
+                    self.connectingLeaseKeys[key] = nil
+                    self.connectAttemptIDs[key] = nil
+                }
+            }
             do {
                 let profile = PeerHostProfileStore.shared.profile(id: host.profileID)
                 var socket = host.remoteSockPath ?? ""
@@ -394,9 +408,14 @@ final class RemoteHostStore: ObservableObject {
                     port: profile?.sshPort,
                     identityFile: profile?.identityFile
                 )
+                self.connectingLeaseKeys[key] = spec.hostKey
                 let lease = try await PeerPaneHostRegistry.shared.acquire(spec)
-                // The entry may have been deleted while connecting.
-                guard self.hosts[key] != nil else {
+                // Cancellation is cooperative. If the acquire completed while
+                // ssh was being reaped, balance it instead of reviving this row.
+                guard !Task.isCancelled,
+                      self.connectAttemptIDs[key] == attemptID,
+                      self.hosts[key] != nil
+                else {
                     PeerPaneHostRegistry.shared.release(lease)
                     return
                 }
@@ -415,13 +434,41 @@ final class RemoteHostStore: ObservableObject {
                 #if DEBUG
                 dlog("peer.sidebar.connect ok key=\(key) sock=\(lease.hostSockPath)")
                 #endif
+            } catch is CancellationError {
+                // cancelConnectingHost already restored the row to `.saved`.
             } catch {
+                guard self.connectAttemptIDs[key] == attemptID else { return }
                 self.hosts[key]?.connectionState = .failed(String(describing: error))
                 #if DEBUG
                 dlog("peer.sidebar.connect fail key=\(key) error=\(error)")
                 #endif
             }
         }
+    }
+
+    /// Cancel an in-progress sidebar connection and return immediately to a
+    /// retryable state. Existing panes/mirrors retain their independent
+    /// leases; only this host-row attempt is stopped.
+    func cancelConnectingHost(_ host: HostEntry) {
+        let key = host.id
+        guard case .connecting = hosts[key]?.connectionState else { return }
+        connectAttemptIDs[key] = nil
+        connectTasks[key]?.cancel()
+        connectTasks[key] = nil
+        if let hostKey = connectingLeaseKeys[key] {
+            PeerPaneHostRegistry.shared.cancelPendingAcquire(for: hostKey)
+        }
+        connectingLeaseKeys[key] = nil
+        fetchTasks[key]?.cancel()
+        fetchTasks[key] = nil
+        hosts[key]?.workspaces = []
+        hosts[key]?.activeSockPath = ""
+        hosts[key]?.supportsWorkspaceLifecycle = nil
+        hosts[key]?.connectionState = .saved
+        #if DEBUG
+        dlog("peer.sidebar.connect cancelled key=\(key)")
+        #endif
+        RemoteWorkLog.info("Cancelled connection to \(host.displayName)")
     }
 
     /// Delete the backing profile. Releases the sidebar lease first so
