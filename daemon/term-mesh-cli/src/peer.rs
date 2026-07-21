@@ -1802,7 +1802,17 @@ impl AnsiStripper {
                     if b == 0x1b {
                         StripState::Esc
                     } else {
-                        if b == b'\n' || b == b'\r' || b == b'\t' || (0x20..0x7f).contains(&b) {
+                        // Printable ASCII, the three whitespace controls, and
+                        // every byte >= 0x80. The last part matters: in a UTF-8
+                        // stream those are lead/continuation bytes, so dropping
+                        // them erases Korean, emoji, and box-drawing glyphs
+                        // rather than the escape sequences we mean to strip.
+                        let keep = b == b'\n'
+                            || b == b'\r'
+                            || b == b'\t'
+                            || (0x20..0x7f).contains(&b)
+                            || b >= 0x80;
+                        if keep {
                             out.push(b);
                         }
                         StripState::Normal
@@ -2760,6 +2770,31 @@ mod tests {
         stripper.feed(b"\x07 world\n", &mut out);
 
         assert_eq!(out, b"hello red world\n");
+    }
+
+    #[test]
+    fn ansi_stripper_keeps_utf8_text_while_dropping_escapes() {
+        let mut stripper = AnsiStripper::new();
+        let mut out = Vec::new();
+
+        // Korean, emoji, and box-drawing all live above 0x7f; only the SGR
+        // sequences around them should disappear.
+        stripper.feed("┌ \x1b[1m한글\x1b[0m 🎉 ┐\n".as_bytes(), &mut out);
+
+        assert_eq!(String::from_utf8(out).unwrap(), "┌ 한글 🎉 ┐\n");
+    }
+
+    #[test]
+    fn ansi_stripper_keeps_utf8_split_across_feeds() {
+        let mut stripper = AnsiStripper::new();
+        let mut out = Vec::new();
+
+        // A multi-byte character straddling two reads must survive intact.
+        let text = "한".as_bytes();
+        stripper.feed(&text[..1], &mut out);
+        stripper.feed(&text[1..], &mut out);
+
+        assert_eq!(String::from_utf8(out).unwrap(), "한");
     }
 
     fn surface_info(id: u8, title: &str) -> peer_proto::v1::SurfaceInfo {
