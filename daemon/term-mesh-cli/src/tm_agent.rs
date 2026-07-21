@@ -1053,8 +1053,12 @@ enum PeerCommand {
     /// Prints one surface per line: `<title>  <cols>x<rows>  <status>  <id>`
     /// where status is "live" or "dead". Exits after printing.
     List {
-        /// Path to the host's peer-federation unix socket.
-        socket: PathBuf,
+        /// Local peer-federation Unix socket (direct mode).
+        #[arg(conflicts_with = "host")]
+        socket: Option<PathBuf>,
+        /// Explicit SSH target. Opens a temporary forwarded socket.
+        #[arg(long, conflicts_with = "socket", required_unless_present = "socket")]
+        host: Option<String>,
     },
     /// Attach to a surface exposed by a peer-federation host.
     ///
@@ -1072,6 +1076,49 @@ enum PeerCommand {
         #[arg(long, conflicts_with = "surface_id")]
         name: Option<String>,
         /// Full surface ID returned by `peer ensure`; skips picker selection.
+        #[arg(long, conflicts_with = "name")]
+        surface_id: Option<String>,
+        /// Strip ANSI/OSC escape sequences from the streamed output.
+        #[arg(long)]
+        plain: bool,
+    },
+    /// Send one or more keys to a surface, then detach.
+    ///
+    /// Keys are names (`Enter`, `Up`, `Down`, `Tab`, `Esc`, `C-c`, …) or
+    /// literal tokens (`2`, `y`). Multiple keys are sent in order:
+    /// `peer send-key --name shell Down Down Enter`.
+    SendKey {
+        /// Local peer-federation Unix socket (direct mode).
+        #[arg(long, conflicts_with = "host")]
+        socket: Option<PathBuf>,
+        /// Explicit SSH target. Opens a temporary forwarded socket.
+        #[arg(long, conflicts_with = "socket", required_unless_present = "socket")]
+        host: Option<String>,
+        /// Title of the surface; defaults to the first listed.
+        #[arg(long, conflicts_with = "surface_id")]
+        name: Option<String>,
+        /// Full surface ID; skips picker selection.
+        #[arg(long, conflicts_with = "name")]
+        surface_id: Option<String>,
+        /// Keys to send, in order.
+        #[arg(required = true)]
+        keys: Vec<String>,
+    },
+    /// Print a surface's current screen once, escapes stripped, then exit.
+    ///
+    /// Read-only: never sends input, so it won't disturb the surface. Useful
+    /// for a bridge to sample "what's on screen right now" without scraping.
+    Snapshot {
+        /// Local peer-federation Unix socket (direct mode).
+        #[arg(long, conflicts_with = "host")]
+        socket: Option<PathBuf>,
+        /// Explicit SSH target. Opens a temporary forwarded socket.
+        #[arg(long, conflicts_with = "socket", required_unless_present = "socket")]
+        host: Option<String>,
+        /// Title of the surface; defaults to the first listed.
+        #[arg(long, conflicts_with = "surface_id")]
+        name: Option<String>,
+        /// Full surface ID; skips picker selection.
         #[arg(long, conflicts_with = "name")]
         surface_id: Option<String>,
     },
@@ -4744,8 +4791,13 @@ fn main() {
                     surface_id,
                 ));
             }
-            PeerCommand::List { socket } => {
-                if let Err(e) = peer::list_cmd(socket) {
+            PeerCommand::List { socket, host } => {
+                let result = if let Some(host) = host {
+                    peer::list_host_cmd(host)
+                } else {
+                    peer::list_cmd(socket.as_deref().expect("clap requires socket or host"))
+                };
+                if let Err(e) = result {
                     eprintln!("peer list failed: {e:#}");
                     process::exit(1);
                 }
@@ -4756,18 +4808,64 @@ fn main() {
                 host,
                 name,
                 surface_id,
+                plain,
             } => {
                 let result = if let Some(host) = host {
-                    peer::attach_host_cmd(host, name.as_deref(), surface_id.as_deref())
+                    peer::attach_host_cmd(host, name.as_deref(), surface_id.as_deref(), *plain)
                 } else {
                     peer::attach_cmd(
+                        socket.as_deref().expect("clap requires socket or host"),
+                        name.as_deref(),
+                        surface_id.as_deref(),
+                        *plain,
+                    )
+                };
+                if let Err(e) = result {
+                    eprintln!("peer attach failed: {e:#}");
+                    process::exit(1);
+                }
+                return;
+            }
+            PeerCommand::SendKey {
+                socket,
+                host,
+                name,
+                surface_id,
+                keys,
+            } => {
+                let result = if let Some(host) = host {
+                    peer::send_key_host_cmd(host, name.as_deref(), surface_id.as_deref(), keys)
+                } else {
+                    peer::send_key_cmd(
+                        socket.as_deref().expect("clap requires socket or host"),
+                        name.as_deref(),
+                        surface_id.as_deref(),
+                        keys,
+                    )
+                };
+                if let Err(e) = result {
+                    eprintln!("peer send-key failed: {e:#}");
+                    process::exit(1);
+                }
+                return;
+            }
+            PeerCommand::Snapshot {
+                socket,
+                host,
+                name,
+                surface_id,
+            } => {
+                let result = if let Some(host) = host {
+                    peer::snapshot_host_cmd(host, name.as_deref(), surface_id.as_deref())
+                } else {
+                    peer::snapshot_cmd(
                         socket.as_deref().expect("clap requires socket or host"),
                         name.as_deref(),
                         surface_id.as_deref(),
                     )
                 };
                 if let Err(e) = result {
-                    eprintln!("peer attach failed: {e:#}");
+                    eprintln!("peer snapshot failed: {e:#}");
                     process::exit(1);
                 }
                 return;

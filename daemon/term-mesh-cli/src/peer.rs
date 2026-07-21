@@ -1160,6 +1160,18 @@ fn public_peer_stage(stage: &str) -> &'static str {
     }
 }
 
+pub fn list_host_cmd(host: &str) -> anyhow::Result<()> {
+    let tunnel = RemotePeer::open(host, None).map_err(|error| {
+        anyhow::anyhow!(
+            "{} at {}: {}",
+            error.code,
+            error.stage,
+            public_error_context(error.code)
+        )
+    })?;
+    list_cmd(&tunnel.local_socket)
+}
+
 pub fn list_cmd(socket_path: &Path) -> anyhow::Result<()> {
     let (mut read_stream, mut write_stream, seq, _host_capabilities) =
         connect_and_authenticate(socket_path, /* emit_banners */ false)?;
@@ -1470,6 +1482,7 @@ pub fn attach_host_cmd(
     host: &str,
     name: Option<&str>,
     surface_id: Option<&str>,
+    plain: bool,
 ) -> anyhow::Result<()> {
     let tunnel = RemotePeer::open(host, None).map_err(|error| {
         anyhow::anyhow!(
@@ -1479,20 +1492,17 @@ pub fn attach_host_cmd(
             public_error_context(error.code)
         )
     })?;
-    attach_cmd(&tunnel.local_socket, name, surface_id)
+    attach_cmd(&tunnel.local_socket, name, surface_id, plain)
 }
 
-pub fn attach_cmd(
-    socket_path: &Path,
+/// Pick a surface by full 32-hex ID, by exact title or short-ID prefix, or
+/// fall back to the first attachable surface. Shared by attach and send-key.
+fn select_surface(
+    surfaces: &[peer_proto::v1::SurfaceInfo],
     name: Option<&str>,
     surface_id: Option<&str>,
-) -> anyhow::Result<()> {
-    let (mut read_stream_init, mut write_stream, seq, _host_capabilities) =
-        connect_and_authenticate(socket_path, /* emit_banners */ true)?;
-
-    let surfaces = list_surfaces(&mut read_stream_init, &mut write_stream, &seq)?;
-
-    let chosen = match surface_id {
+) -> anyhow::Result<peer_proto::v1::SurfaceInfo> {
+    match surface_id {
         Some(id) => {
             let normalized = id.to_ascii_lowercase();
             if normalized.len() != 32 || !normalized.bytes().all(|b| b.is_ascii_hexdigit()) {
@@ -1502,7 +1512,7 @@ pub fn attach_cmd(
                 .iter()
                 .find(|surface| hex_full(&surface.surface_id) == normalized)
                 .cloned()
-                .ok_or_else(|| anyhow::anyhow!("surface ID {id:?} not found on host"))?
+                .ok_or_else(|| anyhow::anyhow!("surface ID {id:?} not found on host"))
         }
         None => match name {
             Some(n) => {
@@ -1521,14 +1531,28 @@ pub fn attach_cmd(
                             "surface \"{n}\" not found on host; available: {}",
                             available.join(", ")
                         )
-                    })?
+                    })
             }
             None => surfaces
                 .first()
                 .cloned()
-                .ok_or_else(|| anyhow::anyhow!("host reports no attachable surfaces"))?,
+                .ok_or_else(|| anyhow::anyhow!("host reports no attachable surfaces")),
         },
-    };
+    }
+}
+
+pub fn attach_cmd(
+    socket_path: &Path,
+    name: Option<&str>,
+    surface_id: Option<&str>,
+    plain: bool,
+) -> anyhow::Result<()> {
+    let (mut read_stream_init, mut write_stream, seq, _host_capabilities) =
+        connect_and_authenticate(socket_path, /* emit_banners */ true)?;
+
+    let surfaces = list_surfaces(&mut read_stream_init, &mut write_stream, &seq)?;
+
+    let chosen = select_surface(&surfaces, name, surface_id)?;
 
     eprintln!(
         "[peer] attaching surface \"{}\" ({}) {}x{}",
@@ -1587,6 +1611,8 @@ pub fn attach_cmd(
     // Socket → stdout reader thread.
     let reader_handle = std::thread::spawn(move || -> io::Result<()> {
         let stdout = io::stdout();
+        let mut stripper = AnsiStripper::new();
+        let mut stripped: Vec<u8> = Vec::new();
         loop {
             let env = match read_envelope(&mut read_stream) {
                 Ok(e) => e,
@@ -1596,7 +1622,13 @@ pub fn attach_cmd(
             match env.payload {
                 Some(Payload::PtyData(p)) => {
                     let mut out = stdout.lock();
-                    out.write_all(&p.payload)?;
+                    if plain {
+                        stripped.clear();
+                        stripper.feed(&p.payload, &mut stripped);
+                        out.write_all(&stripped)?;
+                    } else {
+                        out.write_all(&p.payload)?;
+                    }
                     out.flush()?;
                 }
                 Some(Payload::WorkspaceUpdate(wu)) => {
@@ -1732,6 +1764,333 @@ pub fn attach_cmd(
     if detached {
         eprintln!("[peer] detached.");
     }
+    Ok(())
+}
+
+/// Streaming ANSI/OSC stripper. Removes CSI (`\e[…`), OSC (`\e]…`, including
+/// the shell-integration `]133;…` prompt markers), single-char escapes, NUL,
+/// and other non-printable control bytes, keeping printable text plus
+/// `\n`/`\r`/`\t`. Stateful, so escape sequences split across `PtyData` chunks
+/// are still handled.
+#[derive(Default)]
+struct AnsiStripper {
+    state: StripState,
+}
+
+#[derive(Default, Clone, Copy)]
+enum StripState {
+    #[default]
+    Normal,
+    Esc,
+    /// ESC + charset-designator intermediate: consume exactly one more byte.
+    EscInter,
+    Csi,
+    Osc,
+    /// ESC seen inside an OSC string; a following `\` is ST (terminator).
+    OscEsc,
+}
+
+impl AnsiStripper {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    fn feed(&mut self, input: &[u8], out: &mut Vec<u8>) {
+        for &b in input {
+            self.state = match self.state {
+                StripState::Normal => {
+                    if b == 0x1b {
+                        StripState::Esc
+                    } else {
+                        if b == b'\n' || b == b'\r' || b == b'\t' || (0x20..0x7f).contains(&b) {
+                            out.push(b);
+                        }
+                        StripState::Normal
+                    }
+                }
+                StripState::Esc => match b {
+                    b'[' => StripState::Csi,
+                    b']' => StripState::Osc,
+                    b'(' | b')' | b'*' | b'+' => StripState::EscInter,
+                    // ESC + a single final byte (ESC =, ESC >, ESC M, …): done.
+                    _ => StripState::Normal,
+                },
+                StripState::EscInter => StripState::Normal,
+                StripState::Csi => {
+                    // Final byte 0x40–0x7e ends the CSI; params/intermediates continue.
+                    if (0x40..=0x7e).contains(&b) {
+                        StripState::Normal
+                    } else {
+                        StripState::Csi
+                    }
+                }
+                StripState::Osc => {
+                    if b == 0x07 {
+                        StripState::Normal // BEL terminates OSC
+                    } else if b == 0x1b {
+                        StripState::OscEsc
+                    } else {
+                        StripState::Osc
+                    }
+                }
+                StripState::OscEsc => {
+                    if b == b'\\' {
+                        StripState::Normal // ESC \ (ST) terminates OSC
+                    } else {
+                        StripState::Osc
+                    }
+                }
+            };
+        }
+    }
+}
+
+/// Translate a key name into the terminal byte sequence to send.
+///
+/// Recognized names: `Enter`/`Return`, `Tab`, `Esc`, `Space`, `Backspace`,
+/// `Up`/`Down`/`Left`/`Right`, `Home`/`End`, `PageUp`/`PageDown`, `Delete`,
+/// and control keys as `C-x` / `Ctrl-x` / `^x`. Anything else is sent as its
+/// literal UTF-8 bytes, so `2`, `y`, or `q` type through unchanged. Names are
+/// case-insensitive.
+fn key_bytes(name: &str) -> anyhow::Result<Vec<u8>> {
+    let lower = name.to_ascii_lowercase();
+    let bytes = match lower.as_str() {
+        "enter" | "return" | "cr" => vec![b'\r'],
+        "tab" => vec![b'\t'],
+        "esc" | "escape" => vec![0x1b],
+        "space" => vec![b' '],
+        "backspace" | "bs" => vec![0x7f],
+        "up" => vec![0x1b, b'[', b'A'],
+        "down" => vec![0x1b, b'[', b'B'],
+        "right" => vec![0x1b, b'[', b'C'],
+        "left" => vec![0x1b, b'[', b'D'],
+        "home" => vec![0x1b, b'[', b'H'],
+        "end" => vec![0x1b, b'[', b'F'],
+        "pageup" | "pgup" => vec![0x1b, b'[', b'5', b'~'],
+        "pagedown" | "pgdn" => vec![0x1b, b'[', b'6', b'~'],
+        "delete" | "del" => vec![0x1b, b'[', b'3', b'~'],
+        s if s.starts_with("ctrl-") || s.starts_with("c-") || s.starts_with('^') => {
+            let letter = s
+                .trim_start_matches("ctrl-")
+                .trim_start_matches("c-")
+                .trim_start_matches('^');
+            let mut chars = letter.chars();
+            match (chars.next(), chars.next()) {
+                // Ctrl-A = 0x01 … Ctrl-Z = 0x1a (letter & 0x1f).
+                (Some(c), None) if c.is_ascii_alphabetic() => {
+                    vec![(c.to_ascii_uppercase() as u8) - b'@']
+                }
+                _ => anyhow::bail!("unknown control key: {name:?}"),
+            }
+        }
+        _ => name.as_bytes().to_vec(),
+    };
+    Ok(bytes)
+}
+
+pub fn send_key_host_cmd(
+    host: &str,
+    name: Option<&str>,
+    surface_id: Option<&str>,
+    keys: &[String],
+) -> anyhow::Result<()> {
+    let tunnel = RemotePeer::open(host, None).map_err(|error| {
+        anyhow::anyhow!(
+            "{} at {}: {}",
+            error.code,
+            error.stage,
+            public_error_context(error.code)
+        )
+    })?;
+    send_key_cmd(&tunnel.local_socket, name, surface_id, keys)
+}
+
+/// Attach to a surface, send one or more keys as `Input` frames, then detach.
+///
+/// Non-interactive: no raw mode, no stdin relay, no stdout streaming — it
+/// resolves the keys, attaches co-write, fires the input, and leaves. Menu
+/// navigation is deterministic: `send-key --name shell Down Down Enter`.
+pub fn send_key_cmd(
+    socket_path: &Path,
+    name: Option<&str>,
+    surface_id: Option<&str>,
+    keys: &[String],
+) -> anyhow::Result<()> {
+    if keys.is_empty() {
+        anyhow::bail!("no keys given (e.g. `peer send-key --name shell Enter`)");
+    }
+    // Resolve every key up front so a bad name fails before we touch the host.
+    let payloads: Vec<Vec<u8>> = keys
+        .iter()
+        .map(|k| key_bytes(k))
+        .collect::<anyhow::Result<_>>()?;
+
+    let (read_stream, mut write_stream, seq, _host_capabilities) =
+        connect_and_authenticate(socket_path, /* emit_banners */ false)?;
+    let mut read_stream = read_stream;
+    let surfaces = list_surfaces(&mut read_stream, &mut write_stream, &seq)?;
+    let chosen = select_surface(&surfaces, name, surface_id)?;
+    let surface_id = chosen.surface_id.clone();
+
+    // Attach co-write so the host accepts our Input frames.
+    let (cols, rows) = term_size().unwrap_or((DEFAULT_COLS, DEFAULT_ROWS));
+    write_envelope(
+        &mut write_stream,
+        &Envelope {
+            seq: next_seq(&seq),
+            correlation_id: 0,
+            payload: Some(Payload::AttachSurface(AttachSurface {
+                surface_id: surface_id.clone(),
+                mode: AttachMode::CoWrite as i32,
+                client_cols: cols,
+                client_rows: rows,
+                resume_from_seq: 0,
+            })),
+        },
+    )?;
+    match read_envelope(&mut read_stream)?.payload {
+        Some(Payload::AttachResult(r)) if r.accepted => {}
+        Some(Payload::AttachResult(r)) => anyhow::bail!("attach rejected: {}", r.reason),
+        other => anyhow::bail!("expected AttachResult, got {other:?}"),
+    }
+
+    // Drain (discard) the host's replay/PtyData so its socket writes never
+    // block and stall its read of our Input frames. Bounded so join() can't
+    // hang if the host never closes.
+    let mut drain_stream = read_stream;
+    let _ = drain_stream.set_read_timeout(Some(Duration::from_secs(3)));
+    let drain = thread::spawn(move || while read_envelope(&mut drain_stream).is_ok() {});
+
+    for bytes in payloads {
+        write_envelope(
+            &mut write_stream,
+            &Envelope {
+                seq: next_seq(&seq),
+                correlation_id: 0,
+                payload: Some(Payload::Input(Input {
+                    surface_id: surface_id.clone(),
+                    kind: Some(peer_proto::v1::input::Kind::Keys(bytes)),
+                })),
+            },
+        )?;
+    }
+
+    // Goodbye + half-close: the host applies our ordered Input before it reads
+    // the Goodbye and closes, which ends the drain thread on EOF.
+    let _ = write_envelope(
+        &mut write_stream,
+        &Envelope {
+            seq: next_seq(&seq),
+            correlation_id: 0,
+            payload: Some(Payload::Goodbye(Goodbye {
+                reason: "send-key done".into(),
+            })),
+        },
+    );
+    let _ = write_stream.flush();
+    let _ = write_stream.shutdown(std::net::Shutdown::Write);
+    let _ = drain.join();
+    Ok(())
+}
+
+pub fn snapshot_host_cmd(
+    host: &str,
+    name: Option<&str>,
+    surface_id: Option<&str>,
+) -> anyhow::Result<()> {
+    let tunnel = RemotePeer::open(host, None).map_err(|error| {
+        anyhow::anyhow!(
+            "{} at {}: {}",
+            error.code,
+            error.stage,
+            public_error_context(error.code)
+        )
+    })?;
+    snapshot_cmd(&tunnel.local_socket, name, surface_id)
+}
+
+/// Attach read-only, collect the surface's current screen until the stream
+/// goes quiet (repaint delivered) or a hard cap elapses, strip escapes, print
+/// the plain text once, and detach. Never sends input, so it can't disturb the
+/// surface the operator is using.
+pub fn snapshot_cmd(
+    socket_path: &Path,
+    name: Option<&str>,
+    surface_id: Option<&str>,
+) -> anyhow::Result<()> {
+    let (read_stream, mut write_stream, seq, _host_capabilities) =
+        connect_and_authenticate(socket_path, /* emit_banners */ false)?;
+    let mut read_stream = read_stream;
+    let surfaces = list_surfaces(&mut read_stream, &mut write_stream, &seq)?;
+    let chosen = select_surface(&surfaces, name, surface_id)?;
+    let surface_id = chosen.surface_id.clone();
+
+    // Use the surface's own dimensions so the emulated grid matches what other
+    // viewers see and attaching does not resize/reflow the shared PTY.
+    let cols = if chosen.cols == 0 { DEFAULT_COLS } else { chosen.cols };
+    let rows = if chosen.rows == 0 { DEFAULT_ROWS } else { chosen.rows };
+    write_envelope(
+        &mut write_stream,
+        &Envelope {
+            seq: next_seq(&seq),
+            correlation_id: 0,
+            payload: Some(Payload::AttachSurface(AttachSurface {
+                surface_id: surface_id.clone(),
+                mode: AttachMode::ReadOnly as i32,
+                client_cols: cols,
+                client_rows: rows,
+                resume_from_seq: 0,
+            })),
+        },
+    )?;
+    match read_envelope(&mut read_stream)?.payload {
+        Some(Payload::AttachResult(r)) if r.accepted => {}
+        Some(Payload::AttachResult(r)) => anyhow::bail!("attach rejected: {}", r.reason),
+        other => anyhow::bail!("expected AttachResult, got {other:?}"),
+    }
+
+    // Collect PtyData until the stream is quiet for one read-timeout window
+    // (repaint delivered) or a hard cap elapses.
+    let _ = read_stream.set_read_timeout(Some(Duration::from_millis(200)));
+    // Feed the replay through a real VT emulator and render the resulting grid,
+    // so the output is the ONE current screen — not the raw output history
+    // (which duplicates every redraw and concatenates cursor-positioned text).
+    let mut parser = vt100::Parser::new(rows as u16, cols as u16, 0);
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        if Instant::now() >= deadline {
+            break;
+        }
+        match read_envelope(&mut read_stream) {
+            Ok(env) => match env.payload {
+                Some(Payload::PtyData(p)) => parser.process(&p.payload),
+                Some(Payload::Goodbye(_)) => break,
+                _ => {}
+            },
+            Err(e)
+                if e.kind() == io::ErrorKind::WouldBlock
+                    || e.kind() == io::ErrorKind::TimedOut =>
+            {
+                break; // quiescent — repaint finished
+            }
+            Err(_) => break,
+        }
+    }
+
+    let _ = write_envelope(
+        &mut write_stream,
+        &Envelope {
+            seq: next_seq(&seq),
+            correlation_id: 0,
+            payload: Some(Payload::Goodbye(Goodbye {
+                reason: "snapshot done".into(),
+            })),
+        },
+    );
+    let _ = write_stream.shutdown(std::net::Shutdown::Write);
+
+    // Render the current screen grid (trailing blank rows trimmed).
+    println!("{}", parser.screen().contents().trim_end());
     Ok(())
 }
 
@@ -2380,6 +2739,64 @@ mod tests {
         let mut cur = Cursor::new(buf);
         let err = read_envelope(&mut cur).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn key_bytes_maps_terminal_names_controls_and_literals() {
+        assert_eq!(key_bytes("Enter").unwrap(), b"\r");
+        assert_eq!(key_bytes("PgDn").unwrap(), b"\x1b[6~");
+        assert_eq!(key_bytes("C-c").unwrap(), b"\x03");
+        assert_eq!(key_bytes("한글").unwrap(), "한글".as_bytes());
+        assert!(key_bytes("Ctrl-ab").is_err());
+    }
+
+    #[test]
+    fn ansi_stripper_preserves_text_across_split_csi_and_osc_sequences() {
+        let mut stripper = AnsiStripper::new();
+        let mut out = Vec::new();
+
+        stripper.feed(b"hello \x1b[3", &mut out);
+        stripper.feed(b"1mred\x1b[0m\x1b]133;A", &mut out);
+        stripper.feed(b"\x07 world\n", &mut out);
+
+        assert_eq!(out, b"hello red world\n");
+    }
+
+    fn surface_info(id: u8, title: &str) -> peer_proto::v1::SurfaceInfo {
+        peer_proto::v1::SurfaceInfo {
+            surface_id: vec![id; 16],
+            workspace_name: "workspace".into(),
+            title: title.into(),
+            cols: 120,
+            rows: 40,
+            surface_type: "terminal".into(),
+            attachable: true,
+            cwd: "/tmp".into(),
+            branch: "develop".into(),
+        }
+    }
+
+    #[test]
+    fn select_surface_resolves_exact_id_title_and_default_without_ambiguity() {
+        let alpha = surface_info(0x11, "alpha");
+        let beta = surface_info(0x22, "beta");
+        let surfaces = vec![alpha.clone(), beta.clone()];
+
+        assert_eq!(select_surface(&surfaces, None, None).unwrap().surface_id, alpha.surface_id);
+        assert_eq!(
+            select_surface(&surfaces, Some("beta"), None)
+                .unwrap()
+                .surface_id,
+            beta.surface_id
+        );
+        assert_eq!(
+            select_surface(&surfaces, None, Some(&hex_full(&beta.surface_id)))
+                .unwrap()
+                .title,
+            "beta"
+        );
+        assert!(select_surface(&surfaces, None, Some("deadbeef")).is_err());
+        assert!(select_surface(&surfaces, Some("missing"), None).is_err());
     }
 
     #[test]
