@@ -368,11 +368,22 @@ class GhosttyApp {
             // CLI agent can act on. That path is meaningless on a peer, so when
             // THIS pane is remote the bytes are sent across first and the peer's
             // path is pasted instead. A local pane keeps the local path even
-            // while a relay is open — the pane decides, not the app. Off the
-            // main thread and completed later — ghostty keeps the request alive
-            // because we returned true — so a multi-megabyte screenshot does not
-            // freeze the UI. The clipboard callback already runs on the main
-            // actor, which is where the pane graph lives; only the copy moves off it.
+            // while a relay is open — the pane decides, not the app. The copy
+            // runs off the main thread and completes later so a multi-megabyte
+            // screenshot does not freeze the UI. The clipboard callback already
+            // runs on the main actor, which is where the pane graph lives; only
+            // the copy moves off it.
+            //
+            // Returning true keeps only the *request* allocation alive.
+            // libghostty does NOT keep the surface alive: `ghostty_surface_free`
+            // destroys it synchronously with no pending-request drain, and
+            // `ghostty_surface_complete_clipboard_request` dereferences the
+            // pointer unconditionally (ghostty src/apprt/embedded.zig). Closing
+            // the pane mid-transfer would therefore complete onto freed memory,
+            // so the completion below re-checks that the pane still owns this
+            // exact surface. There is no exported way to release an abandoned
+            // request, so skipping it leaks ghostty's small request allocation —
+            // the correct trade against a use-after-free.
             if let localPath = RemotePasteTransfer.localPath(from: value),
                let target = MainActor.assumeIsolated({
                    RemotePasteTransfer.destination(for: callbackContext)
@@ -385,6 +396,17 @@ class GhosttyApp {
                     let pasted = RemotePasteTransfer.send(localPath: localPath, to: target) ?? value
                     DispatchQueue.main.async {
                         transferIndicator?.endRemotePasteTransfer()
+                        // `terminalSurface` is weak and its `surface` is cleared
+                        // before the free, so a surviving identical pointer means
+                        // the pane still owns this surface.
+                        guard let liveSurface = callbackContext.runtimeSurface,
+                              liveSurface == surface
+                        else {
+                            #if DEBUG
+                            dlog("clipboard.complete.skipped surface=gone")
+                            #endif
+                            return
+                        }
                         pasted.withCString { ptr in
                             ghostty_surface_complete_clipboard_request(surface, ptr, state, false)
                         }
