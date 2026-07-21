@@ -283,6 +283,25 @@ final class TerminalSurface: Identifiable, ObservableObject {
     /// Coordinates deferred ghostty_surface_free with active read leases.
     /// Created once per TerminalSurface; outlives the object when leases are held.
     let surfaceFreeCoordinator = SurfaceFreeCoordinator()
+    /// True while the viewport sits far enough above the bottom that a
+    /// scroll-to-bottom affordance is worth showing (see
+    /// `GhosttySurfaceScrollView.scrollToBottomRowThreshold`).
+    ///
+    /// Deliberately a Bool rather than the raw `GhosttyScrollbar`: the scrollbar
+    /// action arrives on every scroll tick with no throttling, and publishing the
+    /// raw value would re-render the overlay on each one. Only assign when the
+    /// value actually changes — see `handleScrollbarUpdate`.
+    @Published var shouldShowScrollToBottom: Bool = false {
+        didSet {
+            guard oldValue != shouldShowScrollToBottom else { return }
+            // Drive the overlay straight from here rather than through SwiftUI.
+            // The button carries no state the view layer owns, so a round trip
+            // through `updateNSView` would only add re-render churn on a signal
+            // that fires on every scroll tick. `updateNSView` still re-applies
+            // this (portal reattach), which is what repairs the mount.
+            hostedView.setScrollToBottomOverlay(visible: shouldShowScrollToBottom)
+        }
+    }
     @Published var searchState: SearchState? = nil {
 	        didSet {
 	            if let searchState {
@@ -3638,6 +3657,9 @@ struct GhosttyTerminalView: NSViewRepresentable {
         )
         hostedView.setNotificationRing(visible: showsUnreadNotificationRing)
         hostedView.setSearchOverlay(searchState: searchState)
+        // Re-applied on every update so a portal reattach (which rebinds the
+        // hosted view without touching the surface) restores the button.
+        hostedView.setScrollToBottomOverlay(visible: terminalSurface.shouldShowScrollToBottom)
         hostedView.setFocusHandler { onFocus?(terminalSurface.id) }
         hostedView.setTriggerFlashHandler(onTriggerFlash)
         let forwardedDropZone = isVisibleInUI ? paneDropZone : nil
