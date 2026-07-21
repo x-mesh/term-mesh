@@ -45,10 +45,29 @@ const BROADCAST_CAPACITY: usize = 1024;
 /// scrollback store. Overridable at startup via `TERMMESH_PEER_REPLAY_BYTES`
 /// and at runtime via the `peer.replay_capacity` RPC / `tm-agent daemon
 /// replay-capacity --set`.
-const REPLAY_CAPACITY_DEFAULT_BYTES: usize = 1024 * 1024; // 1 MiB
+///
+/// Raised from 1 MiB to 32 MiB (2026-07-21) after a measured bulk-flood
+/// relay run lost ~23 MB of output that had already scrolled out of a 1 MiB
+/// ring before the relay could resume/replay it; 32 MiB comfortably covers
+/// that flood plus headroom. 64 MiB was rejected as the default — it doubles
+/// the standing per-surface cost below for a case 32 MiB already covers.
+///
+/// Standing memory cost: `ReplayBuffer` (below) does NOT eagerly
+/// pre-allocate this many bytes. It is a `VecDeque<PtyChunk>` that grows
+/// lazily as PTY output actually arrives via `push`, trimming from the front
+/// once buffered bytes exceed the capacity — so an idle or low-output
+/// surface costs close to nothing. This constant is a per-surface *upper
+/// bound*: a surface that has produced at least this much output pins up to
+/// this many bytes (plus `PtyChunk`/`VecDeque` overhead) for as long as it
+/// stays attached-replay-eligible, and that cost multiplies by the number of
+/// concurrently live surfaces.
+const REPLAY_CAPACITY_DEFAULT_BYTES: usize = 32 * 1024 * 1024; // 32 MiB
 /// Lower bound accepted for the replay capacity (env or RPC/CLI set).
 const REPLAY_CAPACITY_MIN_BYTES: usize = 4 * 1024; // 4 KiB
 /// Upper bound accepted for the replay capacity (env or RPC/CLI set).
+/// Kept above `REPLAY_CAPACITY_DEFAULT_BYTES` so the default is always a
+/// valid, non-clamped value for `parse_and_clamp_replay_bytes` /
+/// `set_replay_capacity`.
 const REPLAY_CAPACITY_MAX_BYTES: usize = 64 * 1024 * 1024; // 64 MiB
 
 /// Grace window a forced terminate (`shutdown_forcibly`) gives a child to
@@ -131,7 +150,7 @@ pub fn set_replay_capacity(bytes: usize) -> Result<(usize, usize), String> {
     Ok((old, bytes))
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PtyChunk {
     pub seq: u64,
     pub bytes: Vec<u8>,
@@ -165,6 +184,66 @@ impl ReplayBuffer {
 
     fn snapshot(&self) -> Vec<PtyChunk> {
         self.chunks.iter().cloned().collect()
+    }
+
+    /// `snapshot()`, cut to only the bytes at or after `from_seq`.
+    ///
+    /// `from_seq` is on the same absolute scale as `PtyChunk::seq`
+    /// (host-side monotonic byte offset — see `PtySurface::byte_seq`).
+    /// Mapping a wire-side, per-attach-reset seq onto this scale is the
+    /// caller's job (see connection.rs's resume handling); this method only
+    /// knows how to cut the ring it already holds.
+    ///
+    /// - `from_seq == 0` is satisfied by every chunk (`chunk.seq >= 0` is
+    ///   trivially true for `u64`), so this degenerates to `snapshot()` for a
+    ///   fresh attach that has nothing to resume from — callers do not need
+    ///   to special-case "first attach" vs "resume".
+    /// - When `from_seq` falls inside the currently buffered range
+    ///   (`oldest_seq..=end`, where `end` is one past the last buffered
+    ///   byte), only bytes at or after it are returned. A chunk that
+    ///   straddles the cut point is trimmed rather than kept or dropped
+    ///   whole, so no already-seen byte is resent and no buffered byte is
+    ///   skipped.
+    /// - When `from_seq` is outside that range — older than what the ring
+    ///   still holds (the gap between it and the resume point was already
+    ///   evicted, so an exact resume is impossible) or newer than anything
+    ///   ever buffered (seq-space mismatch) — an exact cut can't be honored,
+    ///   so this falls back to the full snapshot. Resending bytes the
+    ///   client may already have is preferable to the silent drop this
+    ///   whole mechanism exists to fix.
+    ///
+    /// All arithmetic saturates instead of panicking on overflow, so a seq
+    /// value near `u64::MAX` (never reached in practice — it would take
+    /// exabytes of PTY output — but defended against here) degrades to a
+    /// safe fallback instead of a panic.
+    fn snapshot_from(&self, from_seq: u64) -> Vec<PtyChunk> {
+        let (Some(first), Some(last)) = (self.chunks.front(), self.chunks.back()) else {
+            return Vec::new();
+        };
+        let oldest_seq = first.seq;
+        let end = last.seq.saturating_add(last.bytes.len() as u64);
+        if from_seq < oldest_seq || from_seq > end {
+            return self.snapshot();
+        }
+        let mut out = Vec::with_capacity(self.chunks.len());
+        for chunk in &self.chunks {
+            let chunk_end = chunk.seq.saturating_add(chunk.bytes.len() as u64);
+            if chunk_end <= from_seq {
+                // Entirely before the resume point — already seen.
+                continue;
+            }
+            if chunk.seq >= from_seq {
+                out.push(chunk.clone());
+            } else {
+                // Straddles the cut point: keep only the unseen tail.
+                let skip = (from_seq - chunk.seq) as usize;
+                out.push(PtyChunk {
+                    seq: from_seq,
+                    bytes: chunk.bytes[skip..].to_vec(),
+                });
+            }
+        }
+        out
     }
 }
 
@@ -568,6 +647,32 @@ impl PtySurface {
             .lock()
             .map(|replay| replay.snapshot())
             .unwrap_or_default()
+    }
+
+    /// `replay_snapshot()`, cut to the tail starting at `from_seq`. See
+    /// `ReplayBuffer::snapshot_from` for the exact cut/fallback semantics
+    /// (in short: `from_seq == 0` matches `replay_snapshot()` exactly; a
+    /// `from_seq` outside the ring's currently buffered range falls back to
+    /// the full snapshot rather than resending nothing).
+    pub fn replay_snapshot_from(&self, from_seq: u64) -> Vec<PtyChunk> {
+        self.replay
+            .lock()
+            .map(|replay| replay.snapshot_from(from_seq))
+            .unwrap_or_default()
+    }
+
+    /// Current value of the surface's monotonic PTY byte-seq counter — the
+    /// absolute `PtyChunk::seq` the NEXT produced chunk will start at.
+    ///
+    /// Used at attach time (`connection.rs`'s AttachSurface handler) to
+    /// compute `AttachResult.initial_seq` when nothing is buffered in the
+    /// replay ring yet: a brand-new surface, or one whose ring capacity was
+    /// set low enough that it's currently empty. In that case the ring has
+    /// no chunk to read a boundary seq off of, but the wire stream's first
+    /// real byte (once one arrives) will be exactly this value — see that
+    /// handler's doc comment for the full wire↔host seq mapping this feeds.
+    pub fn current_byte_seq(&self) -> u64 {
+        self.byte_seq.load(Ordering::Relaxed)
     }
 
     /// Serializes currently-active tracked modes (mouse-tracking DECSET) as
@@ -1801,6 +1906,89 @@ mod tests {
         );
     }
 
+    /// R1 (peer-relay-bulk-loss): `PtySurface::replay_snapshot_from` is a
+    /// thin lock-and-delegate wrapper over `ReplayBuffer::snapshot_from`
+    /// (exhaustively tested above at the `ReplayBuffer` level) — this
+    /// closes the gap by exercising the public surface entry point a
+    /// real `AttachSurface` resume path actually calls, on a real
+    /// `PtySurface` (same pattern as the `modes` tests above: reach past
+    /// the PTY and manipulate the private `replay` buffer directly, since
+    /// no PTY I/O is needed to prove the cut behavior).
+    #[tokio::test]
+    async fn replay_snapshot_from_on_a_real_surface_cuts_at_the_resume_point() {
+        let surface = cat_surface();
+        {
+            let mut replay = surface.replay.lock().unwrap();
+            replay.push(PtyChunk {
+                seq: 0,
+                bytes: b"hello ".to_vec(),
+            });
+            replay.push(PtyChunk {
+                seq: 6,
+                bytes: b"world".to_vec(),
+            });
+        }
+
+        // from_seq == 0 (no resume) still returns everything.
+        assert_eq!(surface.replay_snapshot().len(), 2);
+        assert_eq!(surface.replay_snapshot_from(0), surface.replay_snapshot());
+
+        // A resume point inside the buffered range replays only what the
+        // client hasn't already seen.
+        assert_eq!(
+            surface.replay_snapshot_from(6),
+            vec![PtyChunk {
+                seq: 6,
+                bytes: b"world".to_vec(),
+            }]
+        );
+
+        // Mid-chunk resume trims the straddling chunk instead of resending
+        // whole chunks the client is already partway through.
+        assert_eq!(
+            surface.replay_snapshot_from(8),
+            vec![PtyChunk {
+                seq: 8,
+                bytes: b"rld".to_vec(),
+            }]
+        );
+
+        // Fully caught up: nothing left to replay.
+        assert!(surface.replay_snapshot_from(11).is_empty());
+    }
+
+    /// `current_byte_seq()` is what `AttachResult.initial_seq` falls back to
+    /// when the replay ring is empty (fresh surface, nothing buffered yet)
+    /// — it must track real PTY output as it happens, not just report the
+    /// zero it starts at.
+    #[tokio::test]
+    async fn current_byte_seq_reflects_live_pty_output() {
+        let surface = cat_surface();
+        assert_eq!(
+            surface.current_byte_seq(),
+            0,
+            "fresh surface has produced nothing yet"
+        );
+
+        surface.write_all(b"ping\n").expect("write to /bin/cat's pty");
+
+        // /bin/cat under a PTY echoes the write back on its output side;
+        // wait for the reader task to observe it and advance byte_seq.
+        let advanced = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if surface.current_byte_seq() > 0 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        assert!(
+            advanced.is_ok(),
+            "byte_seq must advance once cat echoes the write"
+        );
+    }
+
     #[tokio::test]
     async fn mode_replay_bytes_empty_after_reset() {
         let surface = cat_surface();
@@ -2698,5 +2886,121 @@ mod tests {
     #[test]
     fn an_unknown_terminal_is_not_claimed_to_exist() {
         assert!(!terminfo_entry_exists("term-mesh-no-such-terminal-xyz"));
+    }
+
+    // -- ReplayBuffer::snapshot_from -----------------------------------
+
+    fn chunk(seq: u64, bytes: &[u8]) -> PtyChunk {
+        PtyChunk {
+            seq,
+            bytes: bytes.to_vec(),
+        }
+    }
+
+    /// Three chunks covering seq ranges [0,4) [4,8) [8,12).
+    fn three_chunk_buffer() -> ReplayBuffer {
+        let mut buf = ReplayBuffer::default();
+        buf.push(chunk(0, b"aaaa"));
+        buf.push(chunk(4, b"bbbb"));
+        buf.push(chunk(8, b"cccc"));
+        buf
+    }
+
+    #[test]
+    fn snapshot_from_empty_buffer_is_empty() {
+        let buf = ReplayBuffer::default();
+        assert!(buf.snapshot_from(0).is_empty());
+        assert!(buf.snapshot_from(999).is_empty());
+    }
+
+    #[test]
+    fn snapshot_from_zero_matches_full_snapshot() {
+        let buf = three_chunk_buffer();
+        assert_eq!(buf.snapshot_from(0), buf.snapshot());
+    }
+
+    #[test]
+    fn snapshot_from_exact_chunk_boundary_drops_earlier_chunks() {
+        let buf = three_chunk_buffer();
+        let out = buf.snapshot_from(4);
+        assert_eq!(out, vec![chunk(4, b"bbbb"), chunk(8, b"cccc")]);
+    }
+
+    #[test]
+    fn snapshot_from_mid_chunk_trims_the_straddling_chunk() {
+        let buf = three_chunk_buffer();
+        let out = buf.snapshot_from(6);
+        assert_eq!(out, vec![chunk(6, b"bb"), chunk(8, b"cccc")]);
+    }
+
+    #[test]
+    fn snapshot_from_last_byte_returns_only_the_tail_byte() {
+        let buf = three_chunk_buffer();
+        let out = buf.snapshot_from(11);
+        assert_eq!(out, vec![chunk(11, b"c")]);
+    }
+
+    /// `from_seq == end` (one past the last buffered byte) means "caller is
+    /// fully caught up" — a legitimate in-range request with nothing new to
+    /// send, not a fallback case.
+    #[test]
+    fn snapshot_from_caught_up_point_is_empty_not_a_fallback() {
+        let buf = three_chunk_buffer();
+        assert!(buf.snapshot_from(12).is_empty());
+    }
+
+    /// Older than anything the ring still holds: the gap was already
+    /// evicted, so an exact resume is impossible. Falls back to resending
+    /// everything still buffered rather than silently dropping bytes.
+    #[test]
+    fn snapshot_from_before_ring_start_falls_back_to_full_snapshot() {
+        // A ring that has evicted its earliest bytes starts later than 0.
+        let mut evicted = ReplayBuffer::default();
+        evicted.push(chunk(100, b"dddd"));
+        evicted.push(chunk(104, b"eeee"));
+        let out = evicted.snapshot_from(50);
+        assert_eq!(
+            out,
+            evicted.snapshot(),
+            "from_seq older than the ring's oldest chunk must fall back to full snapshot"
+        );
+    }
+
+    /// Newer than anything ever buffered (seq-space mismatch or a stale
+    /// caller): also out of range, also falls back rather than returning
+    /// nothing.
+    #[test]
+    fn snapshot_from_past_the_end_falls_back_to_full_snapshot() {
+        let buf = three_chunk_buffer();
+        let out = buf.snapshot_from(999);
+        assert_eq!(out, buf.snapshot());
+    }
+
+    /// Defends the saturating arithmetic: a chunk whose seq sits near
+    /// `u64::MAX` must not panic on overflow, and must still cut correctly.
+    /// Real byte_seq counters never get remotely this large (it would take
+    /// exabytes of PTY output), but the function must not assume that.
+    #[test]
+    fn snapshot_from_near_u64_max_does_not_panic_and_cuts_correctly() {
+        let near_max = u64::MAX - 4;
+        let mut buf = ReplayBuffer::default();
+        buf.push(chunk(near_max, b"wxyz"));
+
+        // In range, mid-chunk: still slices correctly right up to the edge.
+        let out = buf.snapshot_from(near_max + 2);
+        assert_eq!(out, vec![chunk(near_max + 2, b"yz")]);
+
+        // Exactly at the end (one past the last byte) saturates instead of
+        // overflowing, and correctly reads as "caught up" (empty), not a
+        // fallback.
+        let end = near_max.saturating_add(4);
+        assert_eq!(end, u64::MAX);
+        assert!(buf.snapshot_from(end).is_empty());
+
+        // Past `u64::MAX` cannot exist as a `u64` value, so `u64::MAX`
+        // itself is the highest possible from_seq — already covered above.
+        // A from_seq before the chunk still trims normally.
+        let out = buf.snapshot_from(near_max);
+        assert_eq!(out, vec![chunk(near_max, b"wxyz")]);
     }
 }
