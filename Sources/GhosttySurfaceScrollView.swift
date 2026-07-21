@@ -183,6 +183,55 @@ private final class GhosttyFlashOverlayView: NSView {
     }
 }
 
+/// Brief, non-interactive feedback while a pasted image is copied to a peer.
+/// It belongs in the AppKit portal layer so it remains above the Metal terminal
+/// surface, including while the SwiftUI workspace hierarchy is changing.
+private final class RemotePasteTransferIndicator: NSVisualEffectView {
+    private let spinner = NSProgressIndicator()
+    private let label = NSTextField(labelWithString: "Sending image to peer…")
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        material = .hudWindow
+        blendingMode = .withinWindow
+        state = .active
+        wantsLayer = true
+        layer?.cornerRadius = 8
+        layer?.masksToBounds = true
+        isHidden = true
+
+        spinner.style = .spinning
+        spinner.controlSize = .small
+        spinner.startAnimation(nil)
+
+        label.font = .systemFont(ofSize: 12, weight: .medium)
+        label.textColor = .labelColor
+        label.lineBreakMode = .byTruncatingTail
+
+        let stack = NSStackView(views: [spinner, label])
+        stack.orientation = .horizontal
+        stack.alignment = .centerY
+        stack.spacing = 7
+        stack.edgeInsets = NSEdgeInsets(top: 7, left: 10, bottom: 7, right: 11)
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(stack)
+        NSLayoutConstraint.activate([
+            stack.leadingAnchor.constraint(equalTo: leadingAnchor),
+            stack.trailingAnchor.constraint(equalTo: trailingAnchor),
+            stack.topAnchor.constraint(equalTo: topAnchor),
+            stack.bottomAnchor.constraint(equalTo: bottomAnchor),
+        ])
+
+        setAccessibilityElement(true)
+        setAccessibilityRole(.group)
+        setAccessibilityLabel("Sending pasted image to peer")
+    }
+
+    required init?(coder: NSCoder) { fatalError("not used") }
+
+    override func hitTest(_ point: NSPoint) -> NSView? { nil }
+}
+
 final class GhosttySurfaceScrollView: NSView {
     private let backgroundView: NSView
     private let scrollView: GhosttyScrollView
@@ -219,6 +268,8 @@ final class GhosttySurfaceScrollView: NSView {
     }()
     private let flashOverlayView: GhosttyFlashOverlayView
     private let flashLayer: CAShapeLayer
+    private let remotePasteTransferIndicator = RemotePasteTransferIndicator(frame: .zero)
+    private var remotePasteTransferCount = 0
     private var searchOverlayHostingView: NSHostingView<SurfaceSearchOverlay>?
     private var scrollToBottomHostingView: NSHostingView<ScrollToBottomButton>?
     private var imeInputBarHostingView: NSHostingView<IMEInputBar>?
@@ -460,6 +511,8 @@ final class GhosttySurfaceScrollView: NSView {
         flashOverlayView.layer?.addSublayer(flashLayer)
         addSubview(flashOverlayView)
 
+        addSubview(remotePasteTransferIndicator, positioned: .above, relativeTo: nil)
+
         scrollView.contentView.postsBoundsChangedNotifications = true
         observers.append(NotificationCenter.default.addObserver(
             forName: NSView.boundsDidChangeNotification,
@@ -670,6 +723,13 @@ final class GhosttySurfaceScrollView: NSView {
         notificationRingOverlayView.frame = bounds
         peerRingOverlayView.frame = bounds
         flashOverlayView.frame = bounds
+        let transferIndicatorSize = remotePasteTransferIndicator.fittingSize
+        remotePasteTransferIndicator.frame = NSRect(
+            x: terminalBounds.midX - transferIndicatorSize.width / 2,
+            y: terminalBounds.midY - transferIndicatorSize.height / 2,
+            width: transferIndicatorSize.width,
+            height: transferIndicatorSize.height
+        )
         updateNotificationRingPath()
         updatePeerRingPath()
         updateFlashPath()
@@ -724,6 +784,30 @@ final class GhosttySurfaceScrollView: NSView {
         CATransaction.setDisableActions(true)
         layer.backgroundColor = color.cgColor
         CATransaction.commit()
+    }
+
+    // MARK: - Remote paste transfer feedback
+
+    /// Keeps the terminal's input focus intact while a clipboard image is
+    /// copied to the peer. Multiple concurrent paste requests share one
+    /// indicator, which stays visible until every transfer has completed.
+    func beginRemotePasteTransfer() {
+        dispatchPrecondition(condition: .onQueue(.main))
+        remotePasteTransferCount += 1
+        remotePasteTransferIndicator.isHidden = false
+        needsLayout = true
+#if DEBUG
+        dlog("paste.remote.indicator show count=\(remotePasteTransferCount)")
+#endif
+    }
+
+    func endRemotePasteTransfer() {
+        dispatchPrecondition(condition: .onQueue(.main))
+        remotePasteTransferCount = max(0, remotePasteTransferCount - 1)
+        remotePasteTransferIndicator.isHidden = remotePasteTransferCount == 0
+#if DEBUG
+        dlog("paste.remote.indicator hide count=\(remotePasteTransferCount)")
+#endif
     }
 
     // MARK: - Peer disconnect banner (Phase 1 remote pane primitive)

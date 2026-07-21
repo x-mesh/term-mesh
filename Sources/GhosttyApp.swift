@@ -377,9 +377,14 @@ class GhosttyApp {
                let target = MainActor.assumeIsolated({
                    RemotePasteTransfer.destination(for: callbackContext)
                }) {
+                let transferIndicator = MainActor.assumeIsolated {
+                    callbackContext.terminalSurface?.hostedView
+                }
+                transferIndicator?.beginRemotePasteTransfer()
                 DispatchQueue.global(qos: .userInitiated).async {
                     let pasted = RemotePasteTransfer.send(localPath: localPath, to: target) ?? value
                     DispatchQueue.main.async {
+                        transferIndicator?.endRemotePasteTransfer()
                         pasted.withCString { ptr in
                             ghostty_surface_complete_clipboard_request(surface, ptr, state, false)
                         }
