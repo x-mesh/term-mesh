@@ -2445,6 +2445,64 @@ mod tests {
     }
 
     #[test]
+    fn key_bytes_maps_terminal_names_controls_and_literals() {
+        assert_eq!(key_bytes("Enter").unwrap(), b"\r");
+        assert_eq!(key_bytes("PgDn").unwrap(), b"\x1b[6~");
+        assert_eq!(key_bytes("C-c").unwrap(), b"\x03");
+        assert_eq!(key_bytes("한글").unwrap(), "한글".as_bytes());
+        assert!(key_bytes("Ctrl-ab").is_err());
+    }
+
+    #[test]
+    fn ansi_stripper_preserves_text_across_split_csi_and_osc_sequences() {
+        let mut stripper = AnsiStripper::new();
+        let mut out = Vec::new();
+
+        stripper.feed(b"hello \x1b[3", &mut out);
+        stripper.feed(b"1mred\x1b[0m\x1b]133;A", &mut out);
+        stripper.feed(b"\x07 world\n", &mut out);
+
+        assert_eq!(out, b"hello red world\n");
+    }
+
+    fn surface_info(id: u8, title: &str) -> peer_proto::v1::SurfaceInfo {
+        peer_proto::v1::SurfaceInfo {
+            surface_id: vec![id; 16],
+            workspace_name: "workspace".into(),
+            title: title.into(),
+            cols: 120,
+            rows: 40,
+            surface_type: "terminal".into(),
+            attachable: true,
+            cwd: "/tmp".into(),
+            branch: "develop".into(),
+        }
+    }
+
+    #[test]
+    fn select_surface_resolves_exact_id_title_and_default_without_ambiguity() {
+        let alpha = surface_info(0x11, "alpha");
+        let beta = surface_info(0x22, "beta");
+        let surfaces = vec![alpha.clone(), beta.clone()];
+
+        assert_eq!(select_surface(&surfaces, None, None).unwrap().surface_id, alpha.surface_id);
+        assert_eq!(
+            select_surface(&surfaces, Some("beta"), None)
+                .unwrap()
+                .surface_id,
+            beta.surface_id
+        );
+        assert_eq!(
+            select_surface(&surfaces, None, Some(&hex_full(&beta.surface_id)))
+                .unwrap()
+                .title,
+            "beta"
+        );
+        assert!(select_surface(&surfaces, None, Some("deadbeef")).is_err());
+        assert!(select_surface(&surfaces, Some("missing"), None).is_err());
+    }
+
+    #[test]
     fn raw_mode_guard_noop_when_stdin_not_tty() {
         // In cargo test, stdin is a pipe, not a TTY. Enable must be a no-op
         // and Drop must not panic.
