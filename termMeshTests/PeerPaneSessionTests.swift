@@ -369,6 +369,38 @@ final class PeerPaneSessionTests: XCTestCase {
         XCTAssertNil(registry.activeLease(forKey: spec.hostKey))
     }
 
+    /// A caller cancelled *after* the start task already produced a lease must
+    /// not leave that lease unowned: `makeLease` has spawned the tunnel by then,
+    /// and nothing else would ever stop it.
+    @MainActor
+    func test_registry_cancelledAcquireTearsDownInsteadOfOrphaning() async throws {
+        let registry = PeerPaneHostRegistry.shared
+        let sockPath = "/tmp/psp-unit-\(getpid())-cancel.sock"
+        let spec = PeerPaneHostSpec.direct(sockPath: sockPath)
+        let key = spec.hostKey
+        XCTAssertNil(registry.activeLease(forKey: key))
+        let teardownsBefore = registry.teardownCountForTests
+
+        // The test holds the main actor until it awaits, so the cancel always
+        // lands before `acquire` starts running.
+        let acquisition = Task { @MainActor in try await registry.acquire(spec) }
+        acquisition.cancel()
+
+        do {
+            _ = try await acquisition.value
+            XCTFail("a cancelled acquire must not return a lease")
+        } catch is CancellationError {
+            // expected
+        }
+
+        XCTAssertNil(registry.activeLease(forKey: key), "cancelled acquire must leave the pool empty")
+        XCTAssertEqual(
+            registry.teardownCountForTests,
+            teardownsBefore + 1,
+            "the already-created lease must be torn down, not orphaned"
+        )
+    }
+
     @MainActor
     func test_savedRunnerRepeatedLaunchReusesExactEnsuredSurfaceID() async throws {
         // Attaching spawns term-mesh-peer-relay out of the app bundle, and the

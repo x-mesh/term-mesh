@@ -23,3 +23,7 @@ serde_json = "1"
 peer-proto = { path = "../peer-proto" }
 prost = "0.13"
 anyhow = "1"
+
+# Terminal emulator for `peer snapshot` — renders the replay stream into the
+# current screen grid instead of dumping raw output history.
+vt100 = "0.15"

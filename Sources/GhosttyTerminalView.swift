@@ -1128,6 +1128,80 @@ final class TerminalSurface: Identifiable, ObservableObject {
         writeTextData(data, to: surface)
     }
 
+    /// Paste a local Shelf image into this terminal. Remote panes use the same
+    /// one-shot transfer implementation as a normal Ghostty clipboard image;
+    /// text and local images remain on the fast, bracketed-paste path.
+    @MainActor
+    func pasteShelfImage(at localPath: String) {
+        guard FileManager.default.fileExists(atPath: localPath) else { return }
+        guard let callbackContext = surfaceCallbackContext?.takeUnretainedValue(),
+              let target = RemotePasteTransfer.destination(for: callbackContext)
+        else {
+            sendText(localPath)
+            return
+        }
+
+        hostedView.beginRemotePasteTransfer()
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let remotePath = RemotePasteTransfer.send(localPath: localPath, to: target) ?? localPath
+            DispatchQueue.main.async {
+                self?.hostedView.endRemotePasteTransfer()
+                self?.sendText(remotePath)
+            }
+        }
+    }
+
+    /// Swap each Shelf attachment's local path for the copy that landed on the
+    /// peer. Longest local path first, so an attachment path that prefixes
+    /// another one cannot corrupt it mid-rewrite. Pure and nonisolated so the
+    /// rewrite can run on the transfer queue.
+    nonisolated static func rewritingShelfPaths(
+        in text: String,
+        with resolved: [(local: String, remote: String)]
+    ) -> String {
+        resolved
+            .sorted { $0.local.count > $1.local.count }
+            .reduce(text) { $0.replacingOccurrences(of: $1.local, with: $1.remote) }
+    }
+
+    /// IME submission keeps its surrounding text, but replaces every Shelf
+    /// image's local path with its remote path after the transfers complete.
+    @MainActor
+    func sendShelfIMEText(_ text: String, replacing localPaths: [String]) {
+        var seen = Set<String>()
+        let transferable = localPaths.filter { path in
+            seen.insert(path).inserted && FileManager.default.fileExists(atPath: path)
+        }
+        guard !transferable.isEmpty else {
+            sendText(text)
+            sendSurfaceKeyPress(keycode: 0x24, text: "\r")
+            return
+        }
+        guard let callbackContext = surfaceCallbackContext?.takeUnretainedValue(),
+              let target = RemotePasteTransfer.destination(for: callbackContext)
+        else {
+            sendText(text)
+            sendSurfaceKeyPress(keycode: 0x24, text: "\r")
+            return
+        }
+
+        hostedView.beginRemotePasteTransfer()
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            // Every attachment has to be transferred, not just the first: a
+            // path left pointing at the viewer's disk resolves to nothing on
+            // the peer.
+            let resolved = transferable.map { localPath in
+                (local: localPath, remote: RemotePasteTransfer.send(localPath: localPath, to: target) ?? localPath)
+            }
+            let rewritten = Self.rewritingShelfPaths(in: text, with: resolved)
+            DispatchQueue.main.async {
+                self?.hostedView.endRemotePasteTransfer()
+                self?.sendText(rewritten)
+                self?.sendSurfaceKeyPress(keycode: 0x24, text: "\r")
+            }
+        }
+    }
+
     /// Send text + Enter using the same approach as the socket `send_surface` command.
     /// This is the most reliable text delivery path — proven to work for team agent delivery.
     /// Control characters (\r, \n, \t, ESC, DEL) are sent as proper key events.
@@ -2311,7 +2385,12 @@ func pushTargetSurfaceSize(_ size: CGSize) {
     // MARK: - Input Handling
 
     @IBAction func copy(_ sender: Any?) {
-        _ = performBindingAction("copy_to_clipboard")
+        guard performBindingAction("copy_to_clipboard") else { return }
+        DispatchQueue.main.async {
+            // Copy is the explicit capture gesture for Shelf. This deliberately
+            // avoids observing arbitrary clipboard changes from other apps.
+            _ = PasteShelfStore.shared.capture()
+        }
     }
 
     @IBAction func paste(_ sender: Any?) {

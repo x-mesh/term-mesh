@@ -924,30 +924,73 @@ final class BrowserDeveloperToolsConfigurationTests: XCTestCase {
         }
     }
 
-    func testBrowserPanelRefreshesUnderPageBackgroundColorWhenGhosttyBackgroundChanges() {
-        let panel = BrowserPanel(workspaceId: UUID())
-        let updatedColor = NSColor(srgbRed: 0.18, green: 0.29, blue: 0.44, alpha: 1.0)
-        let updatedOpacity = 0.57
+    /// Browser chrome only mirrors the terminal background in dark mode; light
+    /// mode deliberately stays on `windowBackgroundColor` (see `Light mode #258`).
+    /// Both cases pin `NSApp.appearance` so the result does not depend on the
+    /// system setting of whatever machine runs the suite.
+    private func withAppearance(_ name: NSAppearance.Name, _ body: () -> Void) {
+        let previous = NSApp.appearance
+        defer { NSApp.appearance = previous }
+        NSApp.appearance = NSAppearance(named: name)
+        body()
+    }
 
+    private func postGhosttyBackground(_ color: NSColor, opacity: Double) {
         NotificationCenter.default.post(
             name: .ghosttyDefaultBackgroundDidChange,
             object: nil,
             userInfo: [
-                GhosttyNotificationKey.backgroundColor: updatedColor,
-                GhosttyNotificationKey.backgroundOpacity: updatedOpacity
+                GhosttyNotificationKey.backgroundColor: color,
+                GhosttyNotificationKey.backgroundOpacity: opacity
             ]
         )
+    }
 
-        guard let actual = panel.webView.underPageBackgroundColor?.usingColorSpace(.sRGB),
-              let expected = updatedColor.withAlphaComponent(updatedOpacity).usingColorSpace(.sRGB) else {
-            XCTFail("Expected sRGB-convertible under-page background colors")
+    private func assertColor(
+        _ actual: NSColor?,
+        matches expected: NSColor,
+        line: UInt = #line
+    ) {
+        guard let actual = actual?.usingColorSpace(.sRGB),
+              let expected = expected.usingColorSpace(.sRGB) else {
+            XCTFail("Expected sRGB-convertible under-page background colors", line: line)
             return
         }
+        XCTAssertEqual(actual.redComponent, expected.redComponent, accuracy: 0.005, line: line)
+        XCTAssertEqual(actual.greenComponent, expected.greenComponent, accuracy: 0.005, line: line)
+        XCTAssertEqual(actual.blueComponent, expected.blueComponent, accuracy: 0.005, line: line)
+        XCTAssertEqual(actual.alphaComponent, expected.alphaComponent, accuracy: 0.005, line: line)
+    }
 
-        XCTAssertEqual(actual.redComponent, expected.redComponent, accuracy: 0.005)
-        XCTAssertEqual(actual.greenComponent, expected.greenComponent, accuracy: 0.005)
-        XCTAssertEqual(actual.blueComponent, expected.blueComponent, accuracy: 0.005)
-        XCTAssertEqual(actual.alphaComponent, expected.alphaComponent, accuracy: 0.005)
+    func testBrowserPanelRefreshesUnderPageBackgroundColorWhenGhosttyBackgroundChanges() {
+        withAppearance(.darkAqua) {
+            let panel = BrowserPanel(workspaceId: UUID())
+            let updatedColor = NSColor(srgbRed: 0.18, green: 0.29, blue: 0.44, alpha: 1.0)
+            let updatedOpacity = 0.57
+
+            postGhosttyBackground(updatedColor, opacity: updatedOpacity)
+
+            assertColor(
+                panel.webView.underPageBackgroundColor,
+                matches: updatedColor.withAlphaComponent(updatedOpacity)
+            )
+        }
+    }
+
+    func testBrowserPanelKeepsWindowBackgroundInLightModeWhenGhosttyBackgroundChanges() {
+        withAppearance(.aqua) {
+            let panel = BrowserPanel(workspaceId: UUID())
+
+            postGhosttyBackground(
+                NSColor(srgbRed: 0.18, green: 0.29, blue: 0.44, alpha: 1.0),
+                opacity: 0.57
+            )
+
+            assertColor(
+                panel.webView.underPageBackgroundColor,
+                matches: NSColor.windowBackgroundColor
+            )
+        }
     }
 
     func testBrowserPanelStartsAsNewTabWithoutLoadingAboutBlank() {

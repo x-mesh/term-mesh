@@ -133,7 +133,19 @@ final class PeerPaneHostRegistry {
     private var leases: [PeerPaneHostKey: PeerPaneHostLease] = [:]
     /// Coalesces concurrent first-acquires of the same host so exactly
     /// one tunnel is spawned (double-click, multi-pane open, …).
-    private var starting: [PeerPaneHostKey: Task<PeerPaneHostLease, Error>] = [:]
+    private struct StartingLease {
+        let id = UUID()
+        let task: Task<PeerPaneHostLease, Error>
+    }
+
+    private var starting: [PeerPaneHostKey: StartingLease] = [:]
+
+    #if DEBUG
+    /// Test-only: leases torn down so far. A unit test drives `.direct` specs,
+    /// whose `teardown()` stops no real process, so this counter is the only
+    /// way to tell a released lease from an orphaned one.
+    private(set) var teardownCountForTests = 0
+    #endif
 
     /// Acquire a lease for the host (+1 ref). Starts the SSH tunnel on
     /// first acquire; later acquires reuse the live lease.
@@ -143,29 +155,55 @@ final class PeerPaneHostRegistry {
             lease.refCount += 1
             return lease
         }
-        if let task = starting[key] {
-            let lease = try await task.value
-            lease.refCount += 1
-            return lease
+        if let startingLease = starting[key] {
+            let lease = try await startingLease.task.value
+            return try adopt(lease, key: key)
         }
-        let task = Task { try await Self.makeLease(spec: spec) }
-        starting[key] = task
-        defer { starting[key] = nil }
-        do {
-            let lease = try await task.value
-            // A racing acquire may have landed the lease already (both
-            // awaited the same task); pool exactly one instance.
-            if let existing = leases[key] {
-                existing.refCount += 1
-                return existing
+        let startingLease = StartingLease(task: Task { try await Self.makeLease(spec: spec) })
+        starting[key] = startingLease
+        defer {
+            if starting[key]?.id == startingLease.id {
+                starting[key] = nil
             }
+        }
+        let lease = try await startingLease.task.value
+        return try adopt(lease, key: key)
+    }
+
+    /// Pool the lease a coalesced start task produced and take one ref.
+    ///
+    /// Cancellation is honoured only *after* the lease is owned. Checking it
+    /// before pooling orphans an already-spawned tunnel: the lease never
+    /// reaches `leases`, so nothing ever releases it and the helper process
+    /// outlives the pane that asked for it.
+    private func adopt(_ lease: PeerPaneHostLease, key: PeerPaneHostKey) throws -> PeerPaneHostLease {
+        // A racing acquire may have landed a lease already (both awaited the
+        // same task); pool exactly one instance. A *different* pooled instance
+        // makes ours an orphan whose tunnel nobody would ever stop.
+        let pooled: PeerPaneHostLease
+        if let existing = leases[key] {
+            if existing !== lease { teardown(lease) }
+            pooled = existing
+        } else {
             leases[key] = lease
-            lease.refCount += 1
+            pooled = lease
             #if DEBUG
             dlog("peer.pane.lease.up key=\(key)")
             #endif
-            return lease
         }
+        pooled.refCount += 1
+        if Task.isCancelled {
+            release(pooled)
+            throw CancellationError()
+        }
+        return pooled
+    }
+
+    /// Stop an in-flight first acquire without affecting an already-live
+    /// lease, which may be owned by another pane or workspace mirror.
+    func cancelPendingAcquire(for key: PeerPaneHostKey) {
+        guard let startingLease = starting.removeValue(forKey: key) else { return }
+        startingLease.task.cancel()
     }
 
     /// Additional ref on an already-acquired lease (a new pane joining
@@ -180,9 +218,17 @@ final class PeerPaneHostRegistry {
         lease.refCount -= 1
         guard lease.refCount <= 0 else { return }
         leases[lease.key] = nil
-        lease.teardown()
+        teardown(lease)
         #if DEBUG
         dlog("peer.pane.lease.down key=\(lease.key)")
+        #endif
+    }
+
+    /// Single teardown funnel so every path that stops a tunnel is counted.
+    private func teardown(_ lease: PeerPaneHostLease) {
+        lease.teardown()
+        #if DEBUG
+        teardownCountForTests += 1
         #endif
     }
 

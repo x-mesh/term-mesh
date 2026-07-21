@@ -183,6 +183,55 @@ private final class GhosttyFlashOverlayView: NSView {
     }
 }
 
+/// Brief, non-interactive feedback while a pasted image is copied to a peer.
+/// It belongs in the AppKit portal layer so it remains above the Metal terminal
+/// surface, including while the SwiftUI workspace hierarchy is changing.
+private final class RemotePasteTransferIndicator: NSVisualEffectView {
+    private let spinner = NSProgressIndicator()
+    private let label = NSTextField(labelWithString: "Sending image to peer…")
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        material = .hudWindow
+        blendingMode = .withinWindow
+        state = .active
+        wantsLayer = true
+        layer?.cornerRadius = 8
+        layer?.masksToBounds = true
+        isHidden = true
+
+        spinner.style = .spinning
+        spinner.controlSize = .small
+        spinner.startAnimation(nil)
+
+        label.font = .systemFont(ofSize: 12, weight: .medium)
+        label.textColor = .labelColor
+        label.lineBreakMode = .byTruncatingTail
+
+        let stack = NSStackView(views: [spinner, label])
+        stack.orientation = .horizontal
+        stack.alignment = .centerY
+        stack.spacing = 7
+        stack.edgeInsets = NSEdgeInsets(top: 7, left: 10, bottom: 7, right: 11)
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(stack)
+        NSLayoutConstraint.activate([
+            stack.leadingAnchor.constraint(equalTo: leadingAnchor),
+            stack.trailingAnchor.constraint(equalTo: trailingAnchor),
+            stack.topAnchor.constraint(equalTo: topAnchor),
+            stack.bottomAnchor.constraint(equalTo: bottomAnchor),
+        ])
+
+        setAccessibilityElement(true)
+        setAccessibilityRole(.group)
+        setAccessibilityLabel("Sending pasted image to peer")
+    }
+
+    required init?(coder: NSCoder) { fatalError("not used") }
+
+    override func hitTest(_ point: NSPoint) -> NSView? { nil }
+}
+
 final class GhosttySurfaceScrollView: NSView {
     private let backgroundView: NSView
     private let scrollView: GhosttyScrollView
@@ -219,8 +268,13 @@ final class GhosttySurfaceScrollView: NSView {
     }()
     private let flashOverlayView: GhosttyFlashOverlayView
     private let flashLayer: CAShapeLayer
+    private let remotePasteTransferIndicator = RemotePasteTransferIndicator(frame: .zero)
+    private var remotePasteTransferCount = 0
     private var searchOverlayHostingView: NSHostingView<SurfaceSearchOverlay>?
     private var scrollToBottomHostingView: NSHostingView<ScrollToBottomButton>?
+    private var pasteShelfOverlayHostingView: NSHostingView<PasteShelfOverlay>?
+    private let pasteShelfOverlayState = PasteShelfOverlayState()
+    private var pasteShelfKeyMonitor: Any?
     private var imeInputBarHostingView: NSHostingView<IMEInputBar>?
     private var imeBarDragHandle: IMEBarDragHandle?
     private static let imeMinBarHeight: CGFloat = 60
@@ -460,6 +514,8 @@ final class GhosttySurfaceScrollView: NSView {
         flashOverlayView.layer?.addSublayer(flashLayer)
         addSubview(flashOverlayView)
 
+        addSubview(remotePasteTransferIndicator, positioned: .above, relativeTo: nil)
+
         scrollView.contentView.postsBoundsChangedNotifications = true
         observers.append(NotificationCenter.default.addObserver(
             forName: NSView.boundsDidChangeNotification,
@@ -520,6 +576,20 @@ final class GhosttySurfaceScrollView: NSView {
             let cwd = notification.userInfo?["workingDirectory"] as? String
             self.toggleIMEInputBar(workingDirectory: cwd)
         })
+
+        observers.append(NotificationCenter.default.addObserver(
+            forName: .pasteShelfToggleRequested,
+            object: nil,
+            queue: .main
+        ) { [weak self] notification in
+            guard let self,
+                  let terminal = notification.object as? TerminalSurface,
+                  terminal === self.surfaceView.terminalSurface
+            else { return }
+            MainActor.assumeIsolated {
+                self.togglePasteShelfOverlay()
+            }
+        })
     }
 
     required init?(coder: NSCoder) {
@@ -533,6 +603,9 @@ final class GhosttySurfaceScrollView: NSView {
         observers.forEach { NotificationCenter.default.removeObserver($0) }
         windowObservers.forEach { NotificationCenter.default.removeObserver($0) }
         cancelFocusRequest()
+        if let pasteShelfKeyMonitor {
+            NSEvent.removeMonitor(pasteShelfKeyMonitor)
+        }
     }
 
     override var safeAreaInsets: NSEdgeInsets { NSEdgeInsetsZero }
@@ -670,6 +743,13 @@ final class GhosttySurfaceScrollView: NSView {
         notificationRingOverlayView.frame = bounds
         peerRingOverlayView.frame = bounds
         flashOverlayView.frame = bounds
+        let transferIndicatorSize = remotePasteTransferIndicator.fittingSize
+        remotePasteTransferIndicator.frame = NSRect(
+            x: terminalBounds.midX - transferIndicatorSize.width / 2,
+            y: terminalBounds.midY - transferIndicatorSize.height / 2,
+            width: transferIndicatorSize.width,
+            height: transferIndicatorSize.height
+        )
         updateNotificationRingPath()
         updatePeerRingPath()
         updateFlashPath()
@@ -724,6 +804,30 @@ final class GhosttySurfaceScrollView: NSView {
         CATransaction.setDisableActions(true)
         layer.backgroundColor = color.cgColor
         CATransaction.commit()
+    }
+
+    // MARK: - Remote paste transfer feedback
+
+    /// Keeps the terminal's input focus intact while a clipboard image is
+    /// copied to the peer. Multiple concurrent paste requests share one
+    /// indicator, which stays visible until every transfer has completed.
+    func beginRemotePasteTransfer() {
+        dispatchPrecondition(condition: .onQueue(.main))
+        remotePasteTransferCount += 1
+        remotePasteTransferIndicator.isHidden = false
+        needsLayout = true
+#if DEBUG
+        dlog("paste.remote.indicator show count=\(remotePasteTransferCount)")
+#endif
+    }
+
+    func endRemotePasteTransfer() {
+        dispatchPrecondition(condition: .onQueue(.main))
+        remotePasteTransferCount = max(0, remotePasteTransferCount - 1)
+        remotePasteTransferIndicator.isHidden = remotePasteTransferCount == 0
+#if DEBUG
+        dlog("paste.remote.indicator hide count=\(remotePasteTransferCount)")
+#endif
     }
 
     // MARK: - Peer disconnect banner (Phase 1 remote pane primitive)
@@ -955,6 +1059,12 @@ final class GhosttySurfaceScrollView: NSView {
         let rootView = IMEInputBar(
             onSubmit: { [weak self] text -> Bool in
                 guard let self = self else { return false }
+                let shelfImagePaths = self.findIMETextView()?.shelfImageAttachmentPaths() ?? []
+                if !shelfImagePaths.isEmpty,
+                   let surface = self.surfaceView.terminalSurface {
+                    surface.sendShelfIMEText(text, replacing: shelfImagePaths)
+                    return true
+                }
                 // Image paths (from IME paste) must go through bracketed paste
                 // (ghostty_surface_text) so Claude Code recognizes them as images
                 // ([Image #1]) instead of treating the path as typed text.
@@ -1330,6 +1440,123 @@ final class GhosttySurfaceScrollView: NSView {
     func findIMETextView() -> IMETextView? {
         guard let hostingView = imeInputBarHostingView else { return nil }
         return Self.findSubview(of: IMETextView.self, in: hostingView)
+    }
+
+    private func togglePasteShelfOverlay() {
+        if pasteShelfOverlayHostingView != nil {
+            dismissPasteShelfOverlay()
+        } else {
+            showPasteShelfOverlay()
+        }
+    }
+
+    private func showPasteShelfOverlay() {
+        PasteShelfStore.shared.sweepExpired()
+        // Images cannot be selected from a terminal in the same way text can.
+        // Import a freshly copied system image as the user opens Shelf instead.
+        _ = PasteShelfStore.shared.captureImageIfNeeded()
+        pasteShelfOverlayState.reset(
+            itemCount: PasteShelfStore.shared
+                .filteredItems(matching: pasteShelfOverlayState.searchQuery).count
+        )
+        let rootView = PasteShelfOverlay(
+            store: .shared,
+            state: pasteShelfOverlayState,
+            onPaste: { [weak self] item in
+                self?.insertPasteShelfItem(item)
+                self?.dismissPasteShelfOverlay()
+            },
+            onClose: { [weak self] in self?.dismissPasteShelfOverlay() }
+        )
+        let overlay = NSHostingView(rootView: rootView)
+        overlay.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(overlay, positioned: .above, relativeTo: nil)
+        NSLayoutConstraint.activate([
+            overlay.topAnchor.constraint(equalTo: topAnchor),
+            overlay.bottomAnchor.constraint(equalTo: bottomAnchor),
+            overlay.leadingAnchor.constraint(equalTo: leadingAnchor),
+            overlay.trailingAnchor.constraint(equalTo: trailingAnchor),
+        ])
+        pasteShelfOverlayHostingView = overlay
+        installPasteShelfKeyMonitor()
+    }
+
+    private func dismissPasteShelfOverlay() {
+        pasteShelfOverlayHostingView?.removeFromSuperview()
+        pasteShelfOverlayHostingView = nil
+        if let pasteShelfKeyMonitor {
+            NSEvent.removeMonitor(pasteShelfKeyMonitor)
+            self.pasteShelfKeyMonitor = nil
+        }
+    }
+
+    private func installPasteShelfKeyMonitor() {
+        pasteShelfKeyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
+            guard let self,
+                  self.pasteShelfOverlayHostingView != nil,
+                  event.window === self.window
+            else { return event }
+
+            // Let the native text field receive typing, cursor movement, and
+            // deletion while a search query is being edited.
+            if let responder = event.window?.firstResponder as? NSView,
+               let overlay = self.pasteShelfOverlayHostingView,
+               responder.isDescendant(of: overlay) {
+                if event.keyCode == 53 { // Escape
+                    self.dismissPasteShelfOverlay()
+                    return nil
+                }
+                return event
+            }
+
+            let items = PasteShelfStore.shared.filteredItems(matching: self.pasteShelfOverlayState.searchQuery)
+            switch event.keyCode {
+            case 126: // Up
+                self.pasteShelfOverlayState.moveSelection(by: -1, itemCount: items.count)
+            case 125: // Down
+                self.pasteShelfOverlayState.moveSelection(by: 1, itemCount: items.count)
+            case 38 where event.modifierFlags.intersection(.deviceIndependentFlagsMask).isEmpty: // j
+                self.pasteShelfOverlayState.moveSelection(by: 1, itemCount: items.count)
+            case 40 where event.modifierFlags.intersection(.deviceIndependentFlagsMask).isEmpty: // k
+                self.pasteShelfOverlayState.moveSelection(by: -1, itemCount: items.count)
+            case 36: // Return
+                if items.indices.contains(self.pasteShelfOverlayState.selectedIndex) {
+                    self.insertPasteShelfItem(items[self.pasteShelfOverlayState.selectedIndex])
+                    self.dismissPasteShelfOverlay()
+                }
+            case 53: // Escape
+                self.dismissPasteShelfOverlay()
+            case 9 where event.modifierFlags.intersection(.deviceIndependentFlagsMask) == [.command, .shift]: // Cmd+Shift+V
+                self.dismissPasteShelfOverlay()
+            default:
+                return event
+            }
+            return nil
+        }
+    }
+
+    private func insertPasteShelfItem(_ item: PasteShelfStore.Item) {
+        if let imeTextView = findIMETextView() {
+            switch item.kind {
+            case .text:
+                imeTextView.insertShelfText(item.text ?? "")
+            case .image:
+                if let url = PasteShelfStore.shared.imageURL(for: item) {
+                    _ = imeTextView.insertImageAttachment(at: url)
+                }
+            }
+            return
+        }
+
+        guard let terminal = surfaceView.terminalSurface else { return }
+        switch item.kind {
+        case .text:
+            terminal.sendText(item.text ?? "")
+        case .image:
+            if let url = PasteShelfStore.shared.imageURL(for: item) {
+                terminal.pasteShelfImage(at: url.path)
+            }
+        }
     }
 
     private static func findSubview<T: NSView>(of type: T.Type, in view: NSView) -> T? {

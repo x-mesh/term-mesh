@@ -7,6 +7,15 @@ private enum RetrievalDrawerTab: String, CaseIterable {
     case checkpoints = "Checkpoints"
 }
 
+/// Remote Work is mounted directly beside terminal surfaces. Use explicit
+/// AppKit semantic colors rather than materials, which sample the terminal
+/// underneath and can retain a dark tint after a light-mode appearance change.
+private enum RetrievalChromePalette {
+    static var panel: Color { Color(nsColor: .windowBackgroundColor) }
+    static var elevated: Color { Color(nsColor: .controlBackgroundColor) }
+    static var separator: Color { Color(nsColor: .separatorColor) }
+}
+
 struct WorkspaceRetrievalSidebarSection: View {
     @ObservedObject var workspace: Workspace
     @ObservedObject private var store: WorkspaceRetrievalStore
@@ -159,9 +168,9 @@ struct WorkspaceRetrievalChrome<Content: View>: View {
                     }
                     .padding(.horizontal, 8)
                     .frame(height: 34)
-                    .background(.bar)
+                    .background(RetrievalChromePalette.panel)
                     .overlay(alignment: .top) {
-                        Rectangle().fill(.white.opacity(0.12)).frame(height: 1)
+                        Rectangle().fill(RetrievalChromePalette.separator).frame(height: 1)
                     }
                 }
             }
@@ -201,8 +210,8 @@ private struct RetrievalPresentationBar: View {
             presentationButton(.inspector, image: "sidebar.right")
         }
         .padding(3)
-        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 8))
-        .overlay(RoundedRectangle(cornerRadius: 8).stroke(.white.opacity(0.12)))
+        .background(RetrievalChromePalette.elevated, in: RoundedRectangle(cornerRadius: 8))
+        .overlay(RoundedRectangle(cornerRadius: 8).stroke(RetrievalChromePalette.separator))
         .accessibilityElement(children: .contain)
         .accessibilityLabel("Remote Work presentations")
     }
@@ -391,8 +400,8 @@ private struct RetrievalActivityDrawer: View {
             .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         }
         .frame(height: 220)
-        .background(.regularMaterial)
-        .overlay(alignment: .top) { Rectangle().fill(.white.opacity(0.14)).frame(height: 1) }
+        .background(RetrievalChromePalette.panel)
+        .overlay(alignment: .top) { Rectangle().fill(RetrievalChromePalette.separator).frame(height: 1) }
         .accessibilityIdentifier("retrieval.drawer")
     }
 
@@ -616,8 +625,8 @@ private struct RetrievalChangesInspector: View {
                 )
             }
         }
-        .background(.regularMaterial)
-        .overlay(alignment: .leading) { Rectangle().fill(.white.opacity(0.14)).frame(width: 1) }
+        .background(RetrievalChromePalette.panel)
+        .overlay(alignment: .leading) { Rectangle().fill(RetrievalChromePalette.separator).frame(width: 1) }
         .accessibilityIdentifier("retrieval.inspector")
     }
 

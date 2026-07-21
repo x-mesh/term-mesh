@@ -74,7 +74,10 @@ enum PeerFederationSettings {
     }
 
     static var peerIDHex: String {
-        (try? PeerIdentity.loadOrCreate()).map(PeerIdentity.hexString) ?? "unavailable"
+        // Keep the display path aligned with peer handshakes. Calling
+        // loadOrCreate() directly bypasses TERMMESH_PEER_IDENTITY_EPHEMERAL
+        // and can re-open the Keychain prompt in tagged builds.
+        PeerIdentity.hexString(PeerIdentity.defaultPeerID())
     }
 
     // MARK: - Recent SSH hosts

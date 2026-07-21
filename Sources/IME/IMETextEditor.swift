@@ -148,7 +148,7 @@ struct IMETextEditor: NSViewRepresentable {
         if textView.submittableText() != text && !textView.hasMarkedText() {
             // Clear image attachments when text is reset externally (e.g. after submit)
             if text.isEmpty {
-                textView.imageAttachments.removeAll()
+                textView.clearImageAttachments()
             }
             textView.string = text
             textView.setSelectedRange(NSRange(location: textView.string.count, length: 0))
