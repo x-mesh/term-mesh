@@ -16,24 +16,6 @@ import Bonsplit
 import Darwin
 import PeerProto
 
-#if DEBUG
-/// TEMP: byteSeq flow tracer that bypasses dlog's 500/s circuit breaker by
-/// writing straight to a file. Counts frames, total bytes, and gap bytes so a
-/// flood's real shape survives.
-enum PeerRelayByteTrace {
-    private static let queue = DispatchQueue(label: "peer.relay.bytetrace")
-    private static let path = "/tmp/peer-relay-bytetrace.log"
-    nonisolated static func record(byteSeq: UInt64, expected: UInt64?, len: Int) {
-        let gap = expected.map { byteSeq > $0 ? byteSeq - $0 : 0 } ?? 0
-        queue.async {
-            let line = "\(Date().timeIntervalSince1970) seq=\(byteSeq) len=\(len) gap=\(gap)\n"
-            if let fh = FileHandle(forWritingAtPath: path) { fh.seekToEndOfFile(); fh.write(line.data(using: .utf8)!); try? fh.close() }
-            else { FileManager.default.createFile(atPath: path, contents: line.data(using: .utf8)) }
-        }
-    }
-}
-#endif
-
 // ── Frame types (must match relay binary) ───────────────────────────
 
 private let kTypePtyData: UInt8  = 0x01
@@ -359,11 +341,21 @@ private final class RelayFrameReader: @unchecked Sendable {
 // heal logic directly — the trailing-debounce/throttle timing is impractical
 // to verify through the flaky live workspace-mirror path.
 actor RelayResizeCoalescer {
-    private let session: PeerSession
+    // `var`, not `let`: a successful R3 resume-heal reconnect (see
+    // `PeerRelaySession.performResumeHeal`) hands this actor the new
+    // session via `adopt(session:)` so an ordinary resize sent right after
+    // a swap still lands on the live connection instead of the retired one.
+    private var session: PeerSession
     private let surfaceID: Data
     private let delayNs: UInt64
     private var pending: (cols: UInt32, rows: UInt32)?
     private var flushTask: Task<Void, Never>?
+    /// The heal action itself. Owned by `PeerRelaySession`, not this actor:
+    /// R3 replaced the old in-place resize nudge with a resume re-attach,
+    /// which needs `PeerRelaySession`'s session/transport/seq-tracking state
+    /// this actor doesn't (and shouldn't) hold. This actor keeps owning only
+    /// the debounce/throttle *timing* — see the class doc comment.
+    private let onHeal: @Sendable (String) async -> Void
     /// Most recent size seen — the baseline for a P9.2 heal nudge.
     private var lastSize: (cols: UInt32, rows: UInt32)?
     /// The single trailing-debounce task for the current gap episode. Started
@@ -393,13 +385,15 @@ actor RelayResizeCoalescer {
         initialRows: UInt32,
         delayMs: UInt64 = 24,
         healDebounceMs: UInt64 = 400,
-        healMaxWaitSeconds: TimeInterval = 2.0
+        healMaxWaitSeconds: TimeInterval = 2.0,
+        onHeal: @escaping @Sendable (String) async -> Void
     ) {
         self.session = session
         self.surfaceID = surfaceID
         self.delayNs = delayMs * 1_000_000
         self.healDebounceSeconds = TimeInterval(healDebounceMs) / 1000.0
         self.healMaxWait = healMaxWaitSeconds
+        self.onHeal = onHeal
         // Seed so a gap heal always has a size to nudge, even before the
         // relay's first resize frame reaches `submit` — for some mirror panes
         // that resize lags or never arrives, which silently no-op'd the heal
@@ -407,6 +401,19 @@ actor RelayResizeCoalescer {
         if initialCols > 0 && initialRows > 0 {
             self.lastSize = (initialCols, initialRows)
         }
+    }
+
+    /// R3: re-target this actor's normal (non-heal) resize forwarding at a
+    /// session that replaced a retired one via a resume-heal reconnect.
+    func adopt(session: PeerSession) {
+        self.session = session
+    }
+
+    /// The most recently known remote size, so `performResumeHeal` can
+    /// re-attach at the size the pane is actually showing instead of the
+    /// (possibly stale) size captured at the original attach.
+    func snapshotSize() -> (cols: UInt32, rows: UInt32)? {
+        lastSize
     }
 
     func submit(cols: UInt32, rows: UInt32) {
@@ -449,11 +456,19 @@ actor RelayResizeCoalescer {
     // ── P9.2 gap heal ────────────────────────────────────────────────
     //
     // A host broadcast-Lag drop (P9.1) leaves the terminal truncated mid-
-    // stream — a full-screen TUI stays corrupt until it redraws. Nudging the
-    // remote size (shrink 1 col, then restore) makes the host apply
-    // TIOCSWINSZ twice, so the child gets SIGWINCH and redraws its true state.
-    // A shell ignores it. Debounced so a burst of thousands of gaps triggers
-    // exactly one heal, once output settles (no point healing mid-flood).
+    // stream — a full-screen TUI stays corrupt until it redraws, and any
+    // scrolled-off output in the gap is gone from the live stream for good.
+    // R3 (peer-relay-bulk-loss) replaced the original fix — nudging the
+    // remote size (shrink 1 col, then restore) to force a SIGWINCH redraw —
+    // with an actual resume request: `onHeal` (owned by `PeerRelaySession`)
+    // re-attaches the surface with `resume_from_seq` set to the exact point
+    // this pane last processed, so the host's replay ring can stream the
+    // missing bytes back instead of just prompting a redraw of already-
+    // truncated state. This actor still owns the debounce/throttle timing
+    // below — only the *action* moved out.
+    //
+    // Debounced so a burst of thousands of gaps triggers exactly one heal,
+    // once output settles (no point healing mid-flood).
 
     func noteGapForHeal() {
         let now = Date()
@@ -501,17 +516,41 @@ actor RelayResizeCoalescer {
 
     private func performGapHeal(reason: String) async {
         // Update first so the throttle window advances even when there is no
-        // size to nudge yet (avoids a tight retry loop before the first resize).
+        // size to heal with yet (avoids a tight retry loop before the first
+        // resize/attach establishes one).
         lastHealAt = Date()
-        // Need ≥2 columns to nudge (shrink by one, then restore). A 0/1-col size
-        // can't be nudged — and `size.cols - 1` on a UInt32 0 would trap (crash).
-        guard let size = lastSize, size.cols > 1 else { return }
-        let shrunk = size.cols - 1
+        // A resume re-attach still needs a sane size to send as
+        // client_cols/client_rows; a 0-sized pane (e.g. a transient 0-col
+        // resize from the relay) isn't worth reconnecting for.
+        guard let size = lastSize, size.cols > 0, size.rows > 0 else { return }
         #if DEBUG
-        dlog("peer.relay.gap.heal nudge redraw reason=\(reason) cols=\(size.cols) rows=\(size.rows)")
+        dlog("peer.relay.gap.heal reason=\(reason) cols=\(size.cols) rows=\(size.rows)")
         #endif
-        try? await session.sendResize(surfaceID: surfaceID, cols: shrunk, rows: size.rows)
-        try? await session.sendResize(surfaceID: surfaceID, cols: size.cols, rows: size.rows)
+        await onHeal(reason)
+    }
+}
+
+/// R3 (peer-relay-bulk-loss): the last-processed wire `byte_seq` (this
+/// attach's own 0-based space — see `PeerServer.swift`'s wire↔host seq
+/// mapping doc), written by the hot host→relay pump loop on every PtyData
+/// chunk (thousands/sec under load) and read only by the rare resume-heal
+/// path (`PeerRelaySession.performResumeHeal`, at most ~once per
+/// `healMaxWaitSeconds`). A plain `NSLock` box rather than a MainActor
+/// property or an actor: the write side must never pay a cross-context hop.
+private final class WireSeqTracker: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value: UInt64 = 0
+
+    func update(_ newValue: UInt64) {
+        lock.lock()
+        value = newValue
+        lock.unlock()
+    }
+
+    func read() -> UInt64 {
+        lock.lock()
+        defer { lock.unlock() }
+        return value
     }
 }
 
@@ -555,6 +594,30 @@ final class PeerRelaySession {
     private var transport: UnixSocketTransport?
     private var pumpTask: Task<Void, Never>?
     private var isTorndown = false
+    // Stored (not just local to `startPumping`) so `performResumeHeal` can
+    // read the live remote size and re-target its session after a swap.
+    private var resizeCoalescer: RelayResizeCoalescer?
+
+    // ── R3 resume heal (peer-relay-bulk-loss) ─────────────────────────
+    //
+    // Absolute host seq (`PtyChunk.seq` space) that this attach's wire
+    // byte_seq == 0 maps to — see `PeerServer.swift`'s wire↔host seq
+    // mapping doc for the full contract. Together with `wireSeqTracker`
+    // this is everything `performResumeHeal` needs to compute
+    // `resume_from_seq = attachInitialSeq + <last processed wire seq>`.
+    // Updated on the initial attach and on every successful resume
+    // re-attach (the new attach's own wire byte_seq resets to 0).
+    private var attachInitialSeq: UInt64
+    // Whether the live host advertised `replay.ring.v1` at the last
+    // (re)attach. An older host neither reads nor honors
+    // `resume_from_seq`, so this client gates it explicitly rather than
+    // relying on the host silently ignoring an unrecognized field.
+    private var hostSupportsReplayRing: Bool
+    private let wireSeqTracker = WireSeqTracker()
+    // Guards against piling up concurrent reconnect attempts if the
+    // debounce and throttle heal paths both fire before the first one
+    // finishes.
+    private var resumeInFlight = false
 
     // ── Session ownership (P1 narrow session sharing) ────────────────
     //
@@ -746,7 +809,9 @@ final class PeerRelaySession {
             transport: connection.transport,
             ownsSession: true,
             ptyStream: nil,
-            onSharedDetach: nil
+            onSharedDetach: nil,
+            attachInitialSeq: outcome.initialByteSeq,
+            hostSupportsReplayRing: connection.hostCapabilities.has(PeerCapability.replayRingV1)
         )
     }
 
@@ -850,7 +915,15 @@ final class PeerRelaySession {
         demux: PeerSessionDemux,
         hostSockPath: String,
         hostDisplayName: String,
-        surface: Termmesh_Peer_V1_SurfaceInfo
+        surface: Termmesh_Peer_V1_SurfaceInfo,
+        // R3: no caller passes this today (WorkspaceMirror doesn't thread
+        // its handshake's capabilities through here), and the shared path
+        // can't safely resume-reattach on a session it doesn't own anyway
+        // (see `performResumeHeal`'s `ownsSession` fallback) — kept as an
+        // explicit, defaulted parameter rather than hardcoding `false` so a
+        // future caller that DOES have it doesn't have to fight a hidden
+        // assumption.
+        hostCapabilities: PeerCapabilities = PeerCapabilities()
     ) async throws -> PeerRelaySession {
         let surfaceID = surface.surfaceID
         let ptyStream = await demux.register(surfaceID: surfaceID)
@@ -883,7 +956,9 @@ final class PeerRelaySession {
             ptyStream: ptyStream,
             onSharedDetach: { [weak demux] in
                 await demux?.deregister(surfaceID: surfaceID)
-            }
+            },
+            attachInitialSeq: outcome.initialByteSeq,
+            hostSupportsReplayRing: hostCapabilities.has(PeerCapability.replayRingV1)
         )
     }
 
@@ -916,7 +991,9 @@ final class PeerRelaySession {
         transport: UnixSocketTransport?,
         ownsSession: Bool,
         ptyStream: AsyncStream<PeerPtyChunk>?,
-        onSharedDetach: (@Sendable () async -> Void)?
+        onSharedDetach: (@Sendable () async -> Void)?,
+        attachInitialSeq: UInt64,
+        hostSupportsReplayRing: Bool
     ) {
         self.hostSockPath = hostSockPath
         self.hostDisplayName = hostDisplayName
@@ -930,6 +1007,8 @@ final class PeerRelaySession {
         self.ownsSession = ownsSession
         self.ptyStream = ptyStream
         self.onSharedDetach = onSharedDetach
+        self.attachInitialSeq = attachInitialSeq
+        self.hostSupportsReplayRing = hostSupportsReplayRing
         self.relayBinaryPath = Self.findRelayBinary()
     }
 
@@ -1063,41 +1142,48 @@ final class PeerRelaySession {
             listenerFd = -1
         }
         try? FileManager.default.removeItem(atPath: relaySockPath)
-        // App-level heartbeat: detect a remote daemon that has stopped
-        // responding while its TCP socket is still considered alive
-        // (laptop sleep on the remote, deadlocked daemon, etc.). When
-        // the heartbeat declares the session dead we close the transport
-        // so the pump's `receiveNextMessage()` unblocks with an error
-        // and `disconnect()` runs through the normal teardown path
-        // instead of leaving the user staring at a hung terminal.
         // Only the owned-session path drives its own heartbeat. On the
         // shared path the workspace controller owns the subscription
         // session's heartbeat, so a per-pane one would double-ping and,
         // worse, close the shared transport for every sibling on a miss.
         if ownsSession, let session, let transport {
-            let weakTransport = transport
-            await session.startHeartbeat(
-                intervalSeconds: 10,
-                deadAfterSeconds: 30,
-                onFirstMiss: {
-                    #if DEBUG
-                    dlog("peer.relay.heartbeat.firstMiss — pong overdue > 1 interval (output backpressure starving the receive loop?)")
-                    #endif
-                },
-                onMissRecovered: {
-                    #if DEBUG
-                    dlog("peer.relay.heartbeat.recovered")
-                    #endif
-                }
-            ) {
-                #if DEBUG
-                dlog("peer.relay.heartbeat.dead — no pong for 30s, closing transport (this will end hostToRelay with receive-error → pane closes)")
-                #endif
-                RemoteWorkLog.infoOffMain("Host stopped answering for 30s — closing the connection")
-                Task { await weakTransport.close() }
-            }
+            await startHeartbeatMonitoring(session: session, transport: transport)
         }
         startPumping(relay: relay)
+    }
+
+    /// App-level heartbeat: detect a remote daemon that has stopped
+    /// responding while its TCP socket is still considered alive (laptop
+    /// sleep on the remote, deadlocked daemon, etc.). When the heartbeat
+    /// declares the session dead we close the transport so the pump's
+    /// `receiveNextMessage()` unblocks with an error and `disconnect()`
+    /// runs through the normal teardown path instead of leaving the user
+    /// staring at a hung terminal. Owned-session path only (see call
+    /// sites) — shared by `start()`'s initial attach and, since R3, by
+    /// `performResumeHeal`'s resumed re-attach, both of which need the
+    /// exact same monitoring wired onto whichever session is current.
+    private func startHeartbeatMonitoring(session: PeerSession, transport: UnixSocketTransport) async {
+        let weakTransport = transport
+        await session.startHeartbeat(
+            intervalSeconds: 10,
+            deadAfterSeconds: 30,
+            onFirstMiss: {
+                #if DEBUG
+                dlog("peer.relay.heartbeat.firstMiss — pong overdue > 1 interval (output backpressure starving the receive loop?)")
+                #endif
+            },
+            onMissRecovered: {
+                #if DEBUG
+                dlog("peer.relay.heartbeat.recovered")
+                #endif
+            }
+        ) {
+            #if DEBUG
+            dlog("peer.relay.heartbeat.dead — no pong for 30s, closing transport (this will end hostToRelay with receive-error → pane closes)")
+            #endif
+            RemoteWorkLog.infoOffMain("Host stopped answering for 30s — closing the connection")
+            Task { await weakTransport.close() }
+        }
     }
 
     // ── Accept ───────────────────────────────────────────────────────
@@ -1210,14 +1296,24 @@ final class PeerRelaySession {
             session: session,
             surfaceID: surfaceID,
             initialCols: remoteCols,
-            initialRows: remoteRows
+            initialRows: remoteRows,
+            onHeal: { [weak self] reason in
+                await self?.performResumeHeal(reason: reason)
+            }
         )
+        // Stored so `performResumeHeal` (an instance method outside this
+        // closure) can read the live remote size and re-target this actor's
+        // session after a resume-heal swap.
+        self.resizeCoalescer = resizeCoalescer
         // Capture the sharing mode for the detached pumps. On the shared
         // path host→relay bytes arrive pre-demuxed via `ptyStream`; on the
         // owned path this task reads frames itself and filters by surface_id.
         let ptyStream = self.ptyStream
         let ownsSession = self.ownsSession
         let mySurfaceID = surfaceID
+        // R3: plain Sendable reference, captured like `writer`/`reader` above
+        // rather than read via `self.` inside the detached closures below.
+        let wireSeqTracker = self.wireSeqTracker
 
         pumpTask = Task.detached(priority: .userInitiated) {
             // Host → relay: deliver PtyData frames to the relay socket.
@@ -1248,12 +1344,18 @@ final class PeerRelaySession {
                             // 500 gaps keeps a flood from wiping the ring.
                             if gapCount == 1 || gapCount % 500 == 0 {
                                 #if DEBUG
+                                // "peer.relay.gap" is on DebugEventLog's circuit-breaker
+                                // bypass whitelist — a flood that trips the 500 logs/s
+                                // breaker must not also swallow the one line that explains
+                                // why the pane just went blank.
                                 dlog("peer.relay.gap #\(gapCount) dropped=\(gap) totalDropped=\(gapBytesTotal) — shared-path drop (content truncated)")
                                 #endif
-                                // Not DEBUG-only: truncated output is what the
-                                // user actually sees, and until now a release
-                                // build lost every trace of why.
-                                RemoteWorkLog.debugOffMain(
+                                // `.info`, not `.debug`: this must reach the drawer on
+                                // gapCount == 1 regardless of the user's log-level
+                                // setting (default .info drops .debug lines), so the
+                                // very first drop of a flood is seen at least once —
+                                // not just recorded in a file nobody is watching.
+                                RemoteWorkLog.infoOffMain(
                                     "Output dropped on the shared path — \(gap) bytes (\(gapBytesTotal) total over \(gapCount) gaps); the pane is missing content"
                                 )
                             }
@@ -1281,11 +1383,30 @@ final class PeerRelaySession {
                 var expectedByteSeq: UInt64?
                 var gapBytesTotal: UInt64 = 0
                 var gapCount = 0
+                // R3: mutable, not the closure-captured `session` constant —
+                // `performResumeHeal` retires this session (Goodbye + close)
+                // only once its resumed replacement is already live in
+                // `self.session`, so a receive error here can mean either a
+                // real disconnect or a deliberate swap to pump up next.
+                var currentSession = session
                 pumpLoop: while !Task.isCancelled {
                     let msg: PeerIncomingMessage
                     do {
-                        msg = try await session.receiveNextMessage()
+                        msg = try await currentSession.receiveNextMessage()
                     } catch {
+                        if let swapped = await self.session, swapped !== currentSession {
+                            // Deliberate resume-heal swap, not a failure: adopt
+                            // the resumed session and keep pumping. Its wire
+                            // byte_seq restarts at 0, so the gap baseline must
+                            // reset too — otherwise the first post-resume chunk
+                            // reads as a spurious gap against the old session's
+                            // trailing byte_seq.
+                            currentSession = swapped
+                            expectedByteSeq = nil
+                            gapBytesTotal = 0
+                            gapCount = 0
+                            continue pumpLoop
+                        }
                         try? await writer.enqueue(type: kTypeGoodbye, payload: Data("host-error".utf8))
                         endReason = "hostToRelay-receive-error"
                         break pumpLoop
@@ -1296,10 +1417,6 @@ final class PeerRelaySession {
                     // guard makes a shared session's stray frame a drop, not a
                     // mis-echo to the wrong pane's relay) falls to `default`.
                     case .ptyData(let sid, let byteSeq, let data) where sid == mySurfaceID:
-                        #if DEBUG
-                        // TEMP INSTRUMENT: direct file append (dlog circuit-breaks at 500/s and hides floods)
-                        PeerRelayByteTrace.record(byteSeq: byteSeq, expected: expectedByteSeq, len: data.count)
-                        #endif
                         // P9 gap detection: a byte_seq that jumps past the end of
                         // the previous frame means the host's broadcast dropped
                         // (Lagged) the bytes in between under load — the terminal
@@ -1315,9 +1432,18 @@ final class PeerRelaySession {
                             // per 500 gaps is enough to see truncation happening.
                             if gapCount == 1 || gapCount % 500 == 0 {
                                 #if DEBUG
+                                // "peer.relay.gap" is on DebugEventLog's circuit-breaker
+                                // bypass whitelist — a flood that trips the 500 logs/s
+                                // breaker must not also swallow the one line that explains
+                                // why the pane just went blank.
                                 dlog("peer.relay.gap #\(gapCount) dropped=\(gap) totalDropped=\(gapBytesTotal) — host broadcast Lag (content truncated)")
                                 #endif
-                                RemoteWorkLog.debugOffMain(
+                                // `.info`, not `.debug`: this must reach the drawer on
+                                // gapCount == 1 regardless of the user's log-level
+                                // setting (default .info drops .debug lines), so the
+                                // very first drop of a flood is seen at least once —
+                                // not just recorded in a file nobody is watching.
+                                RemoteWorkLog.infoOffMain(
                                     "Host output lagged — \(gap) bytes dropped (\(gapBytesTotal) total over \(gapCount) gaps); the pane is missing content"
                                 )
                             }
@@ -1326,6 +1452,11 @@ final class PeerRelaySession {
                             await resizeCoalescer.noteGapForHeal()
                         }
                         expectedByteSeq = byteSeq + UInt64(data.count)
+                        // R3: `expectedByteSeq` IS "last processed wire seq" —
+                        // the wire position `performResumeHeal` resumes from on
+                        // the next heal. Written every chunk (hot path), so a
+                        // lock-protected box rather than a MainActor hop.
+                        wireSeqTracker.update(expectedByteSeq!)
                         do {
                             try await writer.enqueue(type: kTypePtyData, payload: data)
                         } catch {
@@ -1362,8 +1493,12 @@ final class PeerRelaySession {
                         if Task.isCancelled { break }
                         switch frame.type {
                         case kTypeKeyInput:
+                            // R3: read the CURRENT session, not the one captured
+                            // when pumping started — a resume-heal may have
+                            // swapped it out from under this pane transparently.
+                            guard let current = await self.session else { break }
                             do {
-                                try await session.sendInput(surfaceID: surfaceID, keys: frame.payload)
+                                try await current.sendInput(surfaceID: surfaceID, keys: frame.payload)
                             } catch {
                                 // Don't tear down on a single dropped keystroke, but
                                 // make the loss visible instead of silently swallowing.
@@ -1385,8 +1520,8 @@ final class PeerRelaySession {
                             // subscription session would tear it down for every
                             // sibling pane. On the shared path disconnect() below
                             // just deregisters this surface from the demux.
-                            if ownsSession {
-                                try? await session.sendGoodbye(reason: "relay disconnected")
+                            if ownsSession, let current = await self.session {
+                                try? await current.sendGoodbye(reason: "relay disconnected")
                             }
                             // Tear down now so the sibling hostToRelay task unblocks
                             // immediately instead of hanging until the heartbeat (~30s).
@@ -1410,6 +1545,143 @@ final class PeerRelaySession {
             reader.stop()
             await resizeCoalescer.cancel()
         }
+    }
+
+    // ── R3 resume heal (peer-relay-bulk-loss) ─────────────────────────
+    //
+    // The P9.2 gap-heal action. A host broadcast-Lag drop means bytes are
+    // gone from the live stream for good — nudging the remote PTY size (the
+    // pre-R3 fix) only forces the child to redraw its CURRENT state, so the
+    // truncated scrollback stays lost. This reconnects instead: a fresh
+    // transport + handshake to the same host, then AttachSurface on the
+    // SAME surface_id with `resume_from_seq` set to the exact wire position
+    // this pane last processed (translated into the host's absolute seq
+    // space via `attachInitialSeq` — see `PeerServer.swift`'s wire↔host
+    // mapping doc), so the host's replay ring streams the missing bytes
+    // back before live data resumes.
+    //
+    // Deliberately a NEW session, not a re-attach on the live one: the live
+    // session's `hostToRelay` pump keeps an outstanding `receiveNextMessage`
+    // in flight essentially the whole time (that's how the gap that
+    // triggered this heal was even observed), and `PeerSession.attachSurface`
+    // is a direct-response RPC that rejects a concurrent receive
+    // (`concurrentReceiveOperation`) — see the file header. Racing that
+    // guard, or interrupting the in-flight receive to clear it, tears down
+    // the live session's transport, which is exactly the resource this pane
+    // still needs while the resume attach is in flight. Host-side, this is
+    // safe: `attached` (`connection.rs`) is scoped per TCP connection, not
+    // per surface, so a second connection attaching the same surface_id
+    // never collides with the still-live one — it simply gets its own
+    // subscriber + replay snapshot.
+    private func performResumeHeal(reason: String) async {
+        guard !isTorndown, !resumeInFlight else { return }
+        guard let oldSession = session else { return }
+
+        guard ownsSession else {
+            // Shared (workspace-mirror) session: this pane doesn't own the
+            // transport — WorkspaceMirror does, on behalf of every sibling
+            // pane attached to it — so a resume re-attach isn't reachable
+            // from here without that controller's cooperation (out of R3's
+            // scope; see the task's file-scope note). Fall back to the
+            // pre-R3 resize nudge so mirror panes keep SOME heal instead of
+            // silently losing the one they already had: real bytes stay
+            // lost, but the pane at least redraws its current state.
+            guard let size = await resizeCoalescer?.snapshotSize(), size.cols > 1 else { return }
+            #if DEBUG
+            dlog("peer.relay.gap.heal.sharedFallback nudge redraw reason=\(reason) cols=\(size.cols) rows=\(size.rows)")
+            #endif
+            try? await oldSession.sendResize(surfaceID: surfaceID, cols: size.cols - 1, rows: size.rows)
+            try? await oldSession.sendResize(surfaceID: surfaceID, cols: size.cols, rows: size.rows)
+            return
+        }
+        guard let oldTransport = transport else { return }
+
+        resumeInFlight = true
+        defer { resumeInFlight = false }
+
+        let size = await resizeCoalescer?.snapshotSize() ?? (remoteCols, remoteRows)
+
+        let newConnection: PeerRelayConnection
+        do {
+            newConnection = try await Self.connect(hostSockPath: hostSockPath)
+        } catch {
+            #if DEBUG
+            dlog("peer.relay.gap.heal.resume.connectFailed error=\(error)")
+            #endif
+            return
+        }
+        guard !isTorndown else {
+            await newConnection.cancel()
+            return
+        }
+
+        // Read the resume anchor as late as possible: the old (lagging)
+        // session keeps pumping frames while `connect` is in flight, and
+        // every one it delivers past an anchor read earlier would come back
+        // again in the resume replay as duplicate output. Reading after the
+        // connect round trip shrinks that window to the attach RPC alone.
+        //
+        // Gating: an older host that never advertised replay.ring.v1 has no
+        // replay ring to serve a resume from, so this client doesn't rely on
+        // it silently ignoring the field — 0 asks for the same full-snapshot
+        // attach a fresh connection would get anyway.
+        let lastWireSeq = wireSeqTracker.read()
+        let resumeFromSeq: UInt64 = hostSupportsReplayRing ? (attachInitialSeq + lastWireSeq) : 0
+
+        #if DEBUG
+        dlog("peer.relay.gap.heal.resume reason=\(reason) resumeFromSeq=\(resumeFromSeq) gated=\(hostSupportsReplayRing) cols=\(size.cols) rows=\(size.rows)")
+        #endif
+
+        let outcome: PeerAttachOutcome
+        do {
+            outcome = try await newConnection.session.attachSurface(
+                id: surfaceID,
+                mode: .coWrite,
+                cols: size.cols,
+                rows: size.rows,
+                resumeFromSeq: resumeFromSeq
+            )
+        } catch {
+            #if DEBUG
+            dlog("peer.relay.gap.heal.resume.attachFailed error=\(error)")
+            #endif
+            await newConnection.cancel()
+            return
+        }
+        guard outcome.surfaceID == surfaceID, !isTorndown else {
+            await newConnection.cancel()
+            return
+        }
+
+        // Swap BEFORE retiring the old session: `hostToRelay`'s receive-error
+        // handler adopts the resumed session by re-reading `self.session`, so
+        // it must already be in place by the time the old transport closes
+        // and unblocks that pending receive (see the doc comment above).
+        await oldSession.stopHeartbeat()
+        // Re-check: `stopHeartbeat()` is this method's first suspension point
+        // since the last guard, and MainActor cooperative scheduling means
+        // `disconnect()` (e.g. the user closed the pane mid-reconnect) could
+        // have run and torn everything down while this was suspended. Without
+        // this the mutations below would revive session/transport state right
+        // after teardown nilled them.
+        guard !isTorndown else {
+            await newConnection.cancel()
+            return
+        }
+        session = newConnection.session
+        transport = newConnection.transport
+        attachInitialSeq = outcome.initialByteSeq
+        wireSeqTracker.update(0)
+        hostSupportsReplayRing = newConnection.hostCapabilities.has(PeerCapability.replayRingV1)
+        await resizeCoalescer?.adopt(session: newConnection.session)
+        await startHeartbeatMonitoring(session: newConnection.session, transport: newConnection.transport)
+
+        try? await oldSession.sendGoodbye(reason: "resume-heal reconnect")
+        await oldTransport.close()
+
+        #if DEBUG
+        dlog("peer.relay.gap.heal.resume.swapped newInitialSeq=\(outcome.initialByteSeq)")
+        #endif
     }
 
     private func disconnect(reason: String) {
