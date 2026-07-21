@@ -2105,7 +2105,7 @@ struct SettingsView: View {
 
     private func refreshPeerIdentityDisplay() {
         Task.detached {
-            let result = Result { try PeerIdentity.loadOrCreate() }
+            let result = Result { PeerIdentity.defaultPeerID() }
             await MainActor.run {
                 switch result {
                 case .success(let id):
