@@ -369,6 +369,13 @@ EXTRA_ENV=()
 if [[ "$ALLOW_ALL" -eq 1 ]]; then
   EXTRA_ENV+=(TERMMESH_SOCKET_MODE=allowAll)
 fi
+if [[ -n "${TAG_SLUG:-}" ]]; then
+  # Tagged builds are re-signed every rebuild, so the keychain ACL for the
+  # peer-identity item re-prompts each launch — an unanswered prompt
+  # deadlocks startup (see PeerIdentity.defaultPeerID). Dev tags use an
+  # ephemeral identity instead of the keychain.
+  EXTRA_ENV+=(TERMMESH_PEER_IDENTITY_EPHEMERAL=1)
+fi
 
 if [[ -n "${TAG_SLUG:-}" && -n "${TERMMESH_SOCKET:-}" ]]; then
   # Ensure tag-specific socket paths win even if the caller has TERMMESH_* overrides.

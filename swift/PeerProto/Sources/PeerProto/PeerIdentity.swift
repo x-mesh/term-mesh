@@ -59,6 +59,19 @@ public enum PeerIdentity {
         cacheLock.lock()
         defer { cacheLock.unlock() }
         if let cachedID { return cachedID }
+        // TERMMESH_PEER_IDENTITY_EPHEMERAL=1: skip the keychain entirely and
+        // use a process-lifetime random ID. Tagged dev builds are re-signed
+        // on every rebuild, so the keychain ACL re-prompts each launch — and
+        // an unanswered prompt deadlocks the app (warmUp holds this lock
+        // inside the securityd IPC while the main thread waits on it in a
+        // handshake default argument). Ephemeral identity trades a stable
+        // peer ID for a keychain-free dev loop; production launches never
+        // set the variable.
+        if ProcessInfo.processInfo.environment["TERMMESH_PEER_IDENTITY_EPHEMERAL"] == "1" {
+            let id = (try? makeRandomID()) ?? Data(count: byteCount)
+            cachedID = id
+            return id
+        }
         let id = (try? loadOrCreate()) ?? ((try? makeRandomID()) ?? Data(count: byteCount))
         cachedID = id
         return id
