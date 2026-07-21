@@ -824,7 +824,7 @@ fn list_surfaces(
             payload: Some(Payload::ListSurfaces(ListSurfaces {})),
         },
     )?;
-    let list_reply = read_envelope(read_stream)?;
+    let list_reply = read_reply_envelope(read_stream)?;
     match list_reply.payload {
         Some(Payload::SurfaceList(sl)) => Ok(sl.surfaces),
         other => anyhow::bail!("expected SurfaceList, got {other:?}"),
@@ -1557,7 +1557,7 @@ pub fn attach_cmd(
             })),
         },
     )?;
-    let attach_reply = read_envelope(&mut read_stream)?;
+    let attach_reply = read_reply_envelope(&mut read_stream)?;
     match attach_reply.payload {
         Some(Payload::AttachResult(r)) if r.accepted => {
             eprintln!("[peer] attached; streaming. Ctrl-] to detach.");
@@ -1965,7 +1965,7 @@ fn perform_attach(
             })),
         },
     )?;
-    match read_envelope(read_stream)?.payload {
+    match read_reply_envelope(read_stream)?.payload {
         Some(Payload::AttachResult(r)) if r.accepted => Ok(chosen.surface_id),
         Some(Payload::AttachResult(r)) => anyhow::bail!("attach rejected: {}", r.reason),
         other => anyhow::bail!("expected AttachResult, got {other:?}"),
@@ -2277,6 +2277,27 @@ fn install_sigwinch_pipe() -> io::Result<libc::c_int> {
 }
 
 // ── helpers ───────────────────────────────────────────────────────
+
+/// The next envelope, skipping host-initiated pushes no request asked for.
+///
+/// The host emits `HostStats` on its own schedule (see
+/// `spawn_host_stats_push`), so any reply-shaped read can be handed one
+/// instead of its answer. `list_workspaces` already loops past stray pushes;
+/// the surface listing and the attach replies did not, which made
+/// `peer list` and `peer bench --mode rtt` fail outright against any host
+/// that reports stats — the reply was there, one frame later.
+///
+/// Only stats are skipped, matching the Swift client: an `Error` frame still
+/// reaches the caller.
+fn read_reply_envelope(read_stream: &mut impl std::io::Read) -> anyhow::Result<Envelope> {
+    loop {
+        let env = read_envelope(read_stream)?;
+        if matches!(env.payload, Some(Payload::HostStats(_))) {
+            continue;
+        }
+        return Ok(env);
+    }
+}
 
 fn next_seq(seq: &AtomicU64) -> u64 {
     seq.fetch_add(1, Ordering::Relaxed) + 1

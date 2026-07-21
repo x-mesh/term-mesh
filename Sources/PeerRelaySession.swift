@@ -16,6 +16,24 @@ import Bonsplit
 import Darwin
 import PeerProto
 
+#if DEBUG
+/// TEMP: byteSeq flow tracer that bypasses dlog's 500/s circuit breaker by
+/// writing straight to a file. Counts frames, total bytes, and gap bytes so a
+/// flood's real shape survives.
+enum PeerRelayByteTrace {
+    private static let queue = DispatchQueue(label: "peer.relay.bytetrace")
+    private static let path = "/tmp/peer-relay-bytetrace.log"
+    nonisolated static func record(byteSeq: UInt64, expected: UInt64?, len: Int) {
+        let gap = expected.map { byteSeq > $0 ? byteSeq - $0 : 0 } ?? 0
+        queue.async {
+            let line = "\(Date().timeIntervalSince1970) seq=\(byteSeq) len=\(len) gap=\(gap)\n"
+            if let fh = FileHandle(forWritingAtPath: path) { fh.seekToEndOfFile(); fh.write(line.data(using: .utf8)!); try? fh.close() }
+            else { FileManager.default.createFile(atPath: path, contents: line.data(using: .utf8)) }
+        }
+    }
+}
+#endif
+
 // ── Frame types (must match relay binary) ───────────────────────────
 
 private let kTypePtyData: UInt8  = 0x01
@@ -1278,6 +1296,10 @@ final class PeerRelaySession {
                     // guard makes a shared session's stray frame a drop, not a
                     // mis-echo to the wrong pane's relay) falls to `default`.
                     case .ptyData(let sid, let byteSeq, let data) where sid == mySurfaceID:
+                        #if DEBUG
+                        // TEMP INSTRUMENT: direct file append (dlog circuit-breaks at 500/s and hides floods)
+                        PeerRelayByteTrace.record(byteSeq: byteSeq, expected: expectedByteSeq, len: data.count)
+                        #endif
                         // P9 gap detection: a byte_seq that jumps past the end of
                         // the previous frame means the host's broadcast dropped
                         // (Lagged) the bytes in between under load — the terminal
