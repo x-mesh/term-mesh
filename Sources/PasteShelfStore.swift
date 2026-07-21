@@ -55,10 +55,15 @@ final class PasteShelfStore: ObservableObject {
         load()
     }
 
-    func capture(from pasteboard: NSPasteboard = .general) -> CaptureResult {
+    /// `captureText` defaults to the user setting, resolved per call. Copied
+    /// images are always taken — only the plaintext-on-disk path is opt-out.
+    func capture(
+        from pasteboard: NSPasteboard = .general,
+        captureText: Bool = PasteShelfCaptureSettings.captureTextEnabled()
+    ) -> CaptureResult {
         sweepExpired()
 
-        if let text = pasteboard.string(forType: .string), !text.isEmpty {
+        if captureText, let text = pasteboard.string(forType: .string), !text.isEmpty {
             return addText(text)
         }
         guard let data = imageData(from: pasteboard) else { return .unsupported }

@@ -130,6 +130,8 @@ struct SettingsView: View {
     @AppStorage(BrowserInsecureHTTPSettings.allowlistKey) private var browserInsecureHTTPAllowlist = BrowserInsecureHTTPSettings.defaultAllowlistText
     @AppStorage(NotificationBadgeSettings.dockBadgeEnabledKey) private var notificationDockBadgeEnabled = NotificationBadgeSettings.defaultDockBadgeEnabled
     @AppStorage(QuitWarningSettings.warnBeforeQuitKey) private var warnBeforeQuitShortcut = QuitWarningSettings.defaultWarnBeforeQuit
+    @AppStorage(PasteShelfCaptureSettings.captureTextKey)
+    private var pasteShelfCaptureText = PasteShelfCaptureSettings.defaultCaptureText
     @AppStorage(CommandPaletteRenameSelectionSettings.selectAllOnFocusKey)
     private var commandPaletteRenameSelectAllOnFocus = CommandPaletteRenameSelectionSettings.defaultSelectAllOnFocus
     @AppStorage(WorkspacePlacementSettings.placementKey) private var newWorkspacePlacement = WorkspacePlacementSettings.defaultPlacement.rawValue
@@ -756,6 +758,21 @@ struct SettingsView: View {
                                 : "Cmd+Q quits immediately without confirmation."
                         ) {
                             Toggle("", isOn: $warnBeforeQuitShortcut)
+                                .labelsHidden()
+                                .controlSize(.small)
+                        }
+                        }
+
+                        if settingsMatch("paste", "shelf", "clipboard", "copy", "privacy", "app") {
+                        SettingsCardDivider()
+
+                        SettingsCardRow(
+                            "Save Copied Text to Paste Shelf",
+                            subtitle: pasteShelfCaptureText
+                                ? "Cmd+C in a terminal stores the text on disk for 7 days, unencrypted."
+                                : "Only copied images are stored. Text copies are never written to disk."
+                        ) {
+                            Toggle("", isOn: $pasteShelfCaptureText)
                                 .labelsHidden()
                                 .controlSize(.small)
                         }
@@ -2653,6 +2670,7 @@ struct SettingsView: View {
         browserInsecureHTTPAllowlistDraft = BrowserInsecureHTTPSettings.defaultAllowlistText
         notificationDockBadgeEnabled = NotificationBadgeSettings.defaultDockBadgeEnabled
         warnBeforeQuitShortcut = QuitWarningSettings.defaultWarnBeforeQuit
+        pasteShelfCaptureText = PasteShelfCaptureSettings.defaultCaptureText
         commandPaletteRenameSelectAllOnFocus = CommandPaletteRenameSelectionSettings.defaultSelectAllOnFocus
         newWorkspacePlacement = WorkspacePlacementSettings.defaultPlacement.rawValue
         workspaceAutoReorder = WorkspaceAutoReorderSettings.defaultValue

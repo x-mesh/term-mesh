@@ -213,9 +213,63 @@ final class PasteShelfStoreTests: XCTestCase {
         XCTAssertEqual(state.selectedIndex, 2)
 
         // Search narrowed the list to 3 rows; deleting the selected one leaves 2.
-        state.reset(itemCount: 2)
+        state.clampSelection(itemCount: 2)
 
         XCTAssertEqual(state.selectedIndex, 1, "selection must stay inside the visible rows")
+    }
+
+    /// Reopening the Shelf must not inherit the previous search — a stale query
+    /// can filter to nothing and show the empty state while items exist.
+    @MainActor
+    func test_overlayState_resetForPresentationClearsSearchAndSelection() {
+        let state = PasteShelfOverlayState()
+        state.searchQuery = "deploy"
+        state.moveSelection(by: 3, itemCount: 10)
+        XCTAssertEqual(state.selectedIndex, 3)
+
+        state.resetForPresentation()
+
+        XCTAssertEqual(state.searchQuery, "")
+        XCTAssertEqual(state.selectedIndex, 0)
+    }
+
+    // MARK: - Copied-text capture opt-out
+
+    /// Terminal copies routinely carry tokens, so text capture must be
+    /// disableable — while copied images still reach the Shelf.
+    func testCaptureSkipsTextWhenDisabledButStillTakesImages() {
+        let defaults = UserDefaults(suiteName: "paste-shelf-capture-\(UUID().uuidString)")!
+        defaults.set(false, forKey: PasteShelfCaptureSettings.captureTextKey)
+        XCTAssertFalse(PasteShelfCaptureSettings.captureTextEnabled(defaults: defaults))
+
+        let pasteboard = NSPasteboard(name: NSPasteboard.Name("paste-shelf-test-\(UUID().uuidString)"))
+        pasteboard.clearContents()
+        pasteboard.setString("export TOKEN=secret", forType: .string)
+
+        let store = store()
+        // A text-only pasteboard yields nothing once capture is off.
+        XCTAssertEqual(store.capture(from: pasteboard, captureText: false), .unsupported)
+        XCTAssertTrue(store.items.isEmpty)
+
+        pasteboard.clearContents()
+        pasteboard.setData(onePixelPNG(), forType: .png)
+        guard case .added = store.capture(from: pasteboard, captureText: false) else {
+            return XCTFail("images must still be captured")
+        }
+        XCTAssertEqual(store.items.count, 1)
+        XCTAssertEqual(store.items.first?.kind, .image)
+    }
+
+    func testCaptureStoresTextWhenEnabled() {
+        let pasteboard = NSPasteboard(name: NSPasteboard.Name("paste-shelf-test-\(UUID().uuidString)"))
+        pasteboard.clearContents()
+        pasteboard.setString("hello", forType: .string)
+
+        let store = store()
+        guard case .added = store.capture(from: pasteboard, captureText: true) else {
+            return XCTFail("text must be captured when the setting is on")
+        }
+        XCTAssertEqual(store.items.first?.text, "hello")
     }
 
     private func onePixelPNG() -> Data {

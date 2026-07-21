@@ -11,8 +11,19 @@ final class PasteShelfOverlayState: ObservableObject {
         selectedIndex = min(max(selectedIndex + delta, 0), itemCount - 1)
     }
 
-    func reset(itemCount: Int) {
+    /// Keep the selection inside the rows currently on screen. `itemCount` must
+    /// be the *filtered* count — the list renders filtered rows, so clamping
+    /// against the whole store leaves the selection past the last visible row.
+    func clampSelection(itemCount: Int) {
         selectedIndex = itemCount == 0 ? 0 : min(selectedIndex, itemCount - 1)
+    }
+
+    /// Start a fresh presentation: the Shelf opens on the newest item with no
+    /// search applied. Carrying the previous query over means reopening can
+    /// show an empty Shelf while items exist.
+    func resetForPresentation() {
+        selectedIndex = 0
+        searchQuery = ""
     }
 
     func select(_ index: Int) {
@@ -104,14 +115,14 @@ struct PasteShelfOverlay: View {
             .padding(20)
         }
         .onAppear { store.sweepExpired() }
-        // Both clamp against the *filtered* count — the list renders
-        // `visibleItems`, so clamping against `store.items` would leave the
-        // selection past the last visible row and Enter doing nothing.
+        // Recomputed rather than reusing `visibleItems`: that is the value from
+        // the render pass that installed the handler, which is already stale by
+        // the time the store changes.
         .onChange(of: store.items.count) { _ in
-            state.reset(itemCount: store.filteredItems(matching: state.searchQuery).count)
+            state.clampSelection(itemCount: store.filteredItems(matching: state.searchQuery).count)
         }
         .onChange(of: state.searchQuery) { _ in
-            state.reset(itemCount: store.filteredItems(matching: state.searchQuery).count)
+            state.clampSelection(itemCount: store.filteredItems(matching: state.searchQuery).count)
         }
         .alert("Delete all Shelf items?", isPresented: $isClearConfirmationPresented) {
             Button("Delete All", role: .destructive) {
