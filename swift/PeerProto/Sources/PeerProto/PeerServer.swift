@@ -66,6 +66,17 @@ public struct PeerSurfaceAttachment: Sendable {
     /// Optional initial `WorkspaceUpdate.meta` to push to the client
     /// right after the AttachResult. Mirrors Phase 2.4b on the Rust side.
     public let workspaceMeta: PeerWorkspaceMeta?
+    /// Absolute host seq that this attach's wire `byte_seq == 0` maps to —
+    /// what `PeerServerSession.handleAttach` reports back as
+    /// `AttachResult.initialSeq` (R1, peer-relay-bulk-loss). Defaults to 0,
+    /// which is exactly right for a provider with no persistent replay
+    /// state of its own (`EchoSurfaceProvider`, `StaticSurfaceProvider`):
+    /// their wire and absolute spaces coincide. `GhosttyPaneSurfaceProvider`
+    /// reports its tap hub's real absolute seq here so a client can later
+    /// translate a wire `byte_seq` it observed into the value it must send
+    /// back as `AttachSurface.resumeFromSeq` — see
+    /// `PeerServerSession.handleAttach`'s doc comment for the full mapping.
+    public let initialByteSeq: UInt64
     /// Called by the session when the client detaches, the connection
     /// closes, or the session is shut down. Providers should stop
     /// yielding to `byteStream` and release per-attach resources.
@@ -76,12 +87,14 @@ public struct PeerSurfaceAttachment: Sendable {
         input: @escaping @Sendable (Data) async -> Void,
         resize: @escaping @Sendable (UInt32, UInt32) async -> Void = { _, _ in },
         workspaceMeta: PeerWorkspaceMeta? = nil,
+        initialByteSeq: UInt64 = 0,
         detach: @escaping @Sendable () async -> Void = {}
     ) {
         self.byteStream = byteStream
         self.input = input
         self.resize = resize
         self.workspaceMeta = workspaceMeta
+        self.initialByteSeq = initialByteSeq
         self.detach = detach
     }
 }
@@ -114,10 +127,22 @@ public protocol PeerSurfaceProvider: AnyObject, Sendable {
     /// Return an attachment for `surfaceID`, or `nil` if unknown. The
     /// server sends an `AttachResult(accepted: false)` back to the
     /// client on `nil`.
+    ///
+    /// `resumeFromSeq`, when nonzero, asks the provider to replay only the
+    /// tail of its buffered output starting at that absolute host seq
+    /// instead of a full fresh snapshot (R1, peer-relay-bulk-loss) — see
+    /// `PeerServerSession.handleAttach`'s doc comment for the wire↔host
+    /// seq mapping this value lives in, and `PeerSurfaceAttachment
+    /// .initialByteSeq` for the matching reply half. `handleAttach` has
+    /// already gated this on the `replay.ring.v1` capability and on
+    /// `AttachSurface.resumeFromSeq != 0` before calling — a provider with
+    /// no partial-replay support of its own is free to ignore it and
+    /// always return a full/fallback snapshot.
     func attach(
         surfaceID: Data,
         clientCols: UInt32,
-        clientRows: UInt32
+        clientRows: UInt32,
+        resumeFromSeq: UInt64
     ) async -> PeerSurfaceAttachment?
     /// Layout-preserving discovery: enumerate the host's workspaces
     /// (tabs) plus their split tree. Default implementation returns an
@@ -181,7 +206,8 @@ public actor StaticSurfaceProvider: PeerSurfaceProvider {
     public func attach(
         surfaceID: Data,
         clientCols: UInt32,
-        clientRows: UInt32
+        clientRows: UInt32,
+        resumeFromSeq: UInt64
     ) async -> PeerSurfaceAttachment? {
         nil
     }
@@ -208,8 +234,12 @@ public actor EchoSurfaceProvider: PeerSurfaceProvider {
     public func attach(
         surfaceID: Data,
         clientCols: UInt32,
-        clientRows: UInt32
+        clientRows: UInt32,
+        resumeFromSeq: UInt64
     ) async -> PeerSurfaceAttachment? {
+        // No partial-replay support: the echo path has nothing buffered to
+        // cut a resume tail from, so a resume request just gets the usual
+        // fresh (empty) attachment like any other.
         guard surfaces.contains(where: { $0.surfaceID == surfaceID }) else { return nil }
         let (stream, continuation) = AsyncStream.makeStream(of: PtyTapChunk.self)
         continuations[surfaceID] = continuation
@@ -1132,6 +1162,34 @@ actor PeerServerSession {
 
     // MARK: - attach plumbing
 
+    /// ## The wire↔host seq mapping (R1, peer-relay-bulk-loss)
+    ///
+    /// Mirrors the Rust host's `connection.rs::spawn_attach_relay` doc
+    /// comment exactly — same design, same field pairing, ported to this
+    /// direct (non-daemon) host path:
+    ///
+    /// - **Wire `byte_seq`** (`PtyData.byteSeq`, `pumpByteStream`'s
+    ///   `wireSeq`): reset to 0 at the start of every attach, then advanced
+    ///   by real bytes plus any tap-side drop width — self-consistent
+    ///   within one attach, meaningless across a dead one.
+    /// - **Host absolute seq** (`PtyTapChunk.seq` / `PtyTapHub.tapSeq`): one
+    ///   monotonic counter per surface, shared by every attach — what
+    ///   `PtyTapHub`'s replay ring cuts on.
+    ///
+    /// `AttachSurface.resumeFromSeq` and `AttachResult.initialSeq` both live
+    /// in the **host absolute** space: `initialSeq` tells the client the
+    /// absolute seq its wire `byteSeq == 0` maps to for THIS attach, so any
+    /// wire `byteSeq = w` it later processes translates to `initialSeq + w`
+    /// — computed entirely client-side. A reattach after a gap sends that
+    /// value back as `resumeFromSeq`, and `provider.attach` below can use
+    /// it directly against its own absolute seq space with no further
+    /// conversion.
+    ///
+    /// Gated on `replay.ring.v1`: a peer that never advertised it may
+    /// predate this mapping, so its `resumeFromSeq` is not trusted —
+    /// forced to 0, i.e. a fresh full-snapshot attach exactly like before
+    /// this field had meaning. Old-peer fallback nuance beyond this gate is
+    /// t6's scope.
     private func handleAttach(
         _ req: Termmesh_Peer_V1_AttachSurface,
         correlationID: UInt64
@@ -1147,11 +1205,16 @@ actor PeerServerSession {
             return
         }
 
+        let resumeFromSeq = (req.resumeFromSeq != 0 && hasClientCapability(PeerCapability.replayRingV1))
+            ? req.resumeFromSeq
+            : 0
+
         guard
             let attachment = await provider.attach(
                 surfaceID: req.surfaceID,
                 clientCols: req.clientCols,
-                clientRows: req.clientRows
+                clientRows: req.clientRows,
+                resumeFromSeq: resumeFromSeq
             )
         else {
             try await sendEnvelopeWithCorrelation(correlationID) { inner in
@@ -1175,7 +1238,7 @@ actor PeerServerSession {
             var r = Termmesh_Peer_V1_AttachResult()
             r.accepted = true
             r.surfaceID = req.surfaceID
-            r.initialSeq = 0
+            r.initialSeq = attachment.initialByteSeq
             r.grantedMode = grantedMode
             inner.attachResult = r
         }
