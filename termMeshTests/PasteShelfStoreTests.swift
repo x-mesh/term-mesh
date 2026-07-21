@@ -126,6 +126,57 @@ final class PasteShelfStoreTests: XCTestCase {
         XCTAssertFalse(FileManager.default.fileExists(atPath: imageURL.path))
     }
 
+    // MARK: - Shelf attachment path rewriting (peer submit)
+
+    /// Every attachment must be rewritten, not just the first — a path left
+    /// pointing at the viewer's disk resolves to nothing on the peer.
+    func test_rewritingShelfPaths_rewritesEveryAttachment() {
+        let text = "look at /tmp/a.png and /tmp/b.png"
+        let rewritten = TerminalSurface.rewritingShelfPaths(
+            in: text,
+            with: [
+                (local: "/tmp/a.png", remote: "/remote/a.png"),
+                (local: "/tmp/b.png", remote: "/remote/b.png"),
+            ]
+        )
+
+        XCTAssertEqual(rewritten, "look at /remote/a.png and /remote/b.png")
+    }
+
+    /// One attachment path prefixing another must not corrupt the longer one.
+    /// The transfer names remote files independently, so the remote path does
+    /// not mirror the local one — rewriting the short path first would leave a
+    /// spliced `/remote/x.png.orig` that points at nothing.
+    func test_rewritingShelfPaths_prefixPathDoesNotCorruptLongerPath() {
+        let text = "/tmp/a.png plus /tmp/a.png.orig"
+        let rewritten = TerminalSurface.rewritingShelfPaths(
+            in: text,
+            with: [
+                (local: "/tmp/a.png", remote: "/remote/x.png"),
+                (local: "/tmp/a.png.orig", remote: "/remote/y.png"),
+            ]
+        )
+
+        XCTAssertEqual(rewritten, "/remote/x.png plus /remote/y.png")
+    }
+
+    // MARK: - Overlay selection clamping
+
+    /// The overlay renders filtered items, so the selection has to be clamped
+    /// against the filtered count. Clamping against the full store leaves the
+    /// selection past the last visible row and Enter silently doing nothing.
+    @MainActor
+    func test_overlaySelection_clampsToFilteredCountAfterDelete() {
+        let state = PasteShelfOverlayState()
+        state.moveSelection(by: 2, itemCount: 3)
+        XCTAssertEqual(state.selectedIndex, 2)
+
+        // Search narrowed the list to 3 rows; deleting the selected one leaves 2.
+        state.reset(itemCount: 2)
+
+        XCTAssertEqual(state.selectedIndex, 1, "selection must stay inside the visible rows")
+    }
+
     private func onePixelPNG() -> Data {
         let bitmap = NSBitmapImageRep(
             bitmapDataPlanes: nil,

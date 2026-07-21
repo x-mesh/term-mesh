@@ -1059,9 +1059,10 @@ final class GhosttySurfaceScrollView: NSView {
         let rootView = IMEInputBar(
             onSubmit: { [weak self] text -> Bool in
                 guard let self = self else { return false }
-                if let shelfImagePath = self.findIMETextView()?.shelfImageAttachmentPaths().first,
+                let shelfImagePaths = self.findIMETextView()?.shelfImageAttachmentPaths() ?? []
+                if !shelfImagePaths.isEmpty,
                    let surface = self.surfaceView.terminalSurface {
-                    surface.sendShelfIMEText(text, replacing: shelfImagePath)
+                    surface.sendShelfIMEText(text, replacing: shelfImagePaths)
                     return true
                 }
                 // Image paths (from IME paste) must go through bracketed paste
@@ -1454,7 +1455,10 @@ final class GhosttySurfaceScrollView: NSView {
         // Images cannot be selected from a terminal in the same way text can.
         // Import a freshly copied system image as the user opens Shelf instead.
         _ = PasteShelfStore.shared.captureImageIfNeeded()
-        pasteShelfOverlayState.reset(itemCount: PasteShelfStore.shared.items.count)
+        pasteShelfOverlayState.reset(
+            itemCount: PasteShelfStore.shared
+                .filteredItems(matching: pasteShelfOverlayState.searchQuery).count
+        )
         let rootView = PasteShelfOverlay(
             store: .shared,
             state: pasteShelfOverlayState,

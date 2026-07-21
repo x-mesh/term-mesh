@@ -1151,11 +1151,28 @@ final class TerminalSurface: Identifiable, ObservableObject {
         }
     }
 
-    /// IME submission keeps its surrounding text, but replaces a Shelf image's
-    /// local path with the remote path after the one-shot transfer completes.
+    /// Swap each Shelf attachment's local path for the copy that landed on the
+    /// peer. Longest local path first, so an attachment path that prefixes
+    /// another one cannot corrupt it mid-rewrite. Pure and nonisolated so the
+    /// rewrite can run on the transfer queue.
+    nonisolated static func rewritingShelfPaths(
+        in text: String,
+        with resolved: [(local: String, remote: String)]
+    ) -> String {
+        resolved
+            .sorted { $0.local.count > $1.local.count }
+            .reduce(text) { $0.replacingOccurrences(of: $1.local, with: $1.remote) }
+    }
+
+    /// IME submission keeps its surrounding text, but replaces every Shelf
+    /// image's local path with its remote path after the transfers complete.
     @MainActor
-    func sendShelfIMEText(_ text: String, replacing localPath: String) {
-        guard FileManager.default.fileExists(atPath: localPath) else {
+    func sendShelfIMEText(_ text: String, replacing localPaths: [String]) {
+        var seen = Set<String>()
+        let transferable = localPaths.filter { path in
+            seen.insert(path).inserted && FileManager.default.fileExists(atPath: path)
+        }
+        guard !transferable.isEmpty else {
             sendText(text)
             sendSurfaceKeyPress(keycode: 0x24, text: "\r")
             return
@@ -1170,10 +1187,16 @@ final class TerminalSurface: Identifiable, ObservableObject {
 
         hostedView.beginRemotePasteTransfer()
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            let resolvedPath = RemotePasteTransfer.send(localPath: localPath, to: target) ?? localPath
+            // Every attachment has to be transferred, not just the first: a
+            // path left pointing at the viewer's disk resolves to nothing on
+            // the peer.
+            let resolved = transferable.map { localPath in
+                (local: localPath, remote: RemotePasteTransfer.send(localPath: localPath, to: target) ?? localPath)
+            }
+            let rewritten = Self.rewritingShelfPaths(in: text, with: resolved)
             DispatchQueue.main.async {
                 self?.hostedView.endRemotePasteTransfer()
-                self?.sendText(text.replacingOccurrences(of: localPath, with: resolvedPath))
+                self?.sendText(rewritten)
                 self?.sendSurfaceKeyPress(keycode: 0x24, text: "\r")
             }
         }

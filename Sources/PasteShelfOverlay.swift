@@ -104,7 +104,12 @@ struct PasteShelfOverlay: View {
             .padding(20)
         }
         .onAppear { store.sweepExpired() }
-        .onChange(of: store.items.count) { count in state.reset(itemCount: count) }
+        // Both clamp against the *filtered* count — the list renders
+        // `visibleItems`, so clamping against `store.items` would leave the
+        // selection past the last visible row and Enter doing nothing.
+        .onChange(of: store.items.count) { _ in
+            state.reset(itemCount: store.filteredItems(matching: state.searchQuery).count)
+        }
         .onChange(of: state.searchQuery) { _ in
             state.reset(itemCount: store.filteredItems(matching: state.searchQuery).count)
         }
