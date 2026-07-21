@@ -40,6 +40,47 @@ final class PasteShelfStoreTests: XCTestCase {
         XCTAssertEqual(store.items.first?.text, "newest")
     }
 
+    /// Reloading is not an insertion, so a shelf sitting at exactly capacity
+    /// must survive a relaunch intact — evicting there deletes a saved item and
+    /// its image on every launch.
+    func testReloadAtCapacityKeepsEveryItem() {
+        let first = store()
+        for index in 0..<PasteShelfStore.maximumItems {
+            currentDate = currentDate.addingTimeInterval(1)
+            _ = first.addText("item-\(index)")
+        }
+        guard case let .added(image) = first.addImage(onePixelPNG()),
+              let imageURL = first.imageURL(for: image)
+        else { return XCTFail() }
+        XCTAssertEqual(first.items.count, PasteShelfStore.maximumItems)
+
+        let reloaded = store()
+
+        XCTAssertEqual(reloaded.items.count, PasteShelfStore.maximumItems)
+        XCTAssertTrue(reloaded.items.contains { $0.text == "item-1" }, "oldest surviving item must not be evicted on reload")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: imageURL.path))
+    }
+
+    /// A shelf that is genuinely over capacity — an older build wrote more, or
+    /// the limit shrank — still gets trimmed on load.
+    func testReloadTrimsWhenOverCapacity() {
+        let overflow = (0..<(PasteShelfStore.maximumItems + 3)).map { index in
+            PasteShelfStore.Item(
+                id: UUID(),
+                kind: .text,
+                text: "item-\(index)",
+                imageFilename: nil,
+                createdAt: currentDate.addingTimeInterval(TimeInterval(index)),
+                isPinned: false
+            )
+        }
+        try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        try? JSONEncoder().encode(overflow)
+            .write(to: directory.appendingPathComponent("paste-shelf.json"))
+
+        XCTAssertEqual(store().items.count, PasteShelfStore.maximumItems)
+    }
+
     func testRejectsCaptureWhenEveryItemIsPinned() {
         let store = store()
         for index in 0..<PasteShelfStore.maximumItems {

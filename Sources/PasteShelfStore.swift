@@ -153,12 +153,22 @@ final class PasteShelfStore: ObservableObject {
         return imagesURL.appendingPathComponent(filename)
     }
 
-    private func makeRoom() -> Bool {
-        while items.count >= Self.maximumItems {
+    /// Evict oldest-first until at most `limit` items remain. Returns false
+    /// when only pinned items are left and the limit is still exceeded.
+    @discardableResult
+    private func trim(to limit: Int) -> Bool {
+        while items.count > limit {
             guard let index = items.indices.reversed().first(where: { !items[$0].isPinned }) else { return false }
             remove(items.remove(at: index))
         }
         return true
+    }
+
+    /// Free one slot for an item about to be inserted. Only callers that go on
+    /// to insert may use this — it evicts one item at capacity, so calling it
+    /// without inserting silently drops a saved item and its image.
+    private func makeRoom() -> Bool {
+        trim(to: Self.maximumItems - 1)
     }
 
     private func load() {
@@ -166,7 +176,10 @@ final class PasteShelfStore: ObservableObject {
         guard let data = try? Data(contentsOf: metadataURL), let decoded = try? JSONDecoder().decode([Item].self, from: data) else { return }
         items = decoded.sorted { $0.createdAt > $1.createdAt }
         let countBeforeEviction = items.count
-        _ = makeRoom()
+        // Nothing is being inserted here, so only genuinely over-capacity
+        // items may go. `makeRoom()` would drop one item on every launch that
+        // started at exactly `maximumItems`.
+        trim(to: Self.maximumItems)
         if items.count != countBeforeEviction {
             persist()
         }
