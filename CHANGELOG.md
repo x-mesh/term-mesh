@@ -2,6 +2,15 @@
 
 All notable changes to term-mesh are documented here.
 
+## [0.163.0] - 2026-07-21
+
+### Fixed
+- **로컬 pane에 붙여넣은 파일을 열 수 없던 문제** — 원격 pane을 하나라도 열어두면, 로컬 pane에 이미지나 파일을 붙여넣어도 원격에만 있는 경로가 대신 들어갔다. 로컬에서 도는 CLI 에이전트에게는 없는 파일이라 붙여넣기가 통째로 무용지물이었다. 이제 어느 pane에 붙여넣는지를 보고 판단하므로, 원격 연결을 열어둔 채로도 로컬 붙여넣기가 그대로 동작한다.
+
+### Thanks to 1 contributor!
+
+- [@JINWOO-J](https://github.com/JINWOO-J)
+
 ## [0.162.0] - 2026-07-21
 
 ### Added
