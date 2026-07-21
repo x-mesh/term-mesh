@@ -12,6 +12,7 @@ mod headless;
 mod http;
 mod monitor;
 mod pane_tracker;
+mod paste_cleanup;
 mod peer;
 mod socket;
 mod supervisor;
@@ -114,6 +115,48 @@ async fn main() -> anyhow::Result<()> {
             loop {
                 interval.tick().await;
                 mgr.prune_old_data(PRUNE_TTL_MS);
+            }
+        });
+    }
+
+    // Paste artifacts are copied to remote hosts outside the normal sync
+    // lifecycle. Reclaim only our expired files without blocking the daemon's
+    // async runtime; a failed sweep is logged and retried on the next interval.
+    {
+        tokio::task::spawn_blocking(|| {
+            match paste_cleanup::sweep_paste_artifacts(
+                std::path::Path::new(paste_cleanup::PASTE_DIRECTORY),
+                paste_cleanup::PASTE_TTL,
+            ) {
+                Ok(removed) if removed > 0 => {
+                    tracing::info!("paste cleanup: removed {removed} expired artifact(s)");
+                }
+                Ok(_) => {}
+                Err(error) => tracing::warn!("paste cleanup on startup failed: {error}"),
+            }
+        });
+
+        tokio::spawn(async {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(6 * 3600));
+            interval.tick().await; // startup sweep above owns the first run
+            loop {
+                interval.tick().await;
+                let result = tokio::task::spawn_blocking(|| {
+                    paste_cleanup::sweep_paste_artifacts(
+                        std::path::Path::new(paste_cleanup::PASTE_DIRECTORY),
+                        paste_cleanup::PASTE_TTL,
+                    )
+                })
+                .await;
+
+                match result {
+                    Ok(Ok(removed)) if removed > 0 => {
+                        tracing::info!("paste cleanup: removed {removed} expired artifact(s)");
+                    }
+                    Ok(Ok(_)) => {}
+                    Ok(Err(error)) => tracing::warn!("periodic paste cleanup failed: {error}"),
+                    Err(error) => tracing::warn!("periodic paste cleanup task failed: {error}"),
+                }
             }
         });
     }
