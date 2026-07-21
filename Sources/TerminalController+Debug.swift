@@ -740,13 +740,17 @@ extension TerminalController {
     /// polls — the socket handler must not block on the attach.
     func v2DebugPeerOpenRemotePane(params: [String: Any]) -> V2CallResult {
         let sockPath = v2String(params, "sock_path")
+        let sshTarget = v2String(params, "ssh_target")
+        let remoteSockPath = v2String(params, "remote_sock_path")
         if Thread.isMainThread {
             MainActor.assumeIsolated {
-                PeerClientCoordinator.shared.debugOpenRemotePane(sockPath: sockPath)
+                PeerClientCoordinator.shared.debugOpenRemotePane(
+                    sockPath: sockPath, sshTarget: sshTarget, remoteSockPath: remoteSockPath)
             }
         } else {
             DispatchQueue.main.async {
-                PeerClientCoordinator.shared.debugOpenRemotePane(sockPath: sockPath)
+                PeerClientCoordinator.shared.debugOpenRemotePane(
+                    sockPath: sockPath, sshTarget: sshTarget, remoteSockPath: remoteSockPath)
             }
         }
         return .ok(["ok": true, "started": true])
