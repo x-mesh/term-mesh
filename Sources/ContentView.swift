@@ -472,15 +472,25 @@ struct ContentView: View {
 
     @State private var titlebarLeadingInset: CGFloat = 12
     private var windowIdentifier: String { "term-mesh.main.\(windowId.uuidString)" }
+    /// App chrome follows the chosen appearance, not the terminal's last
+    /// reported background. During a light-mode reload Ghostty can publish a
+    /// new white surface one run-loop before its app-level background update,
+    /// which previously left a black titlebar above an otherwise light window.
+    private var usesLightChrome: Bool {
+        !Self.isEffectivelyDark(appearanceMode)
+    }
     private var fakeTitlebarBackground: Color {
         _ = titlebarThemeGeneration
+        if usesLightChrome {
+            return Color(nsColor: .windowBackgroundColor)
+        }
         let minimumChromeOpacity: CGFloat = theme.isLightBackground ? 0.90 : 0.84
         let chromeOpacity = max(minimumChromeOpacity, theme.backgroundOpacity)
         return Color(nsColor: theme.backgroundColor.withAlphaComponent(chromeOpacity))
     }
     private var fakeTitlebarTextColor: Color {
         _ = titlebarThemeGeneration
-        return theme.isLightBackground
+        return usesLightChrome
             ? Color.black.opacity(0.78)
             : Color.white.opacity(0.82)
     }
@@ -488,7 +498,7 @@ struct ContentView: View {
     /// Adaptive titlebar text color based on actual terminal background, not color scheme.
     private func titlebarColor(opacity: Double) -> Color {
         _ = titlebarThemeGeneration
-        return theme.isLightBackground ? Color.black.opacity(opacity) : Color.white.opacity(opacity)
+        return usesLightChrome ? Color.black.opacity(opacity) : Color.white.opacity(opacity)
     }
     private var fullscreenControls: some View {
         TitlebarControlsView(
