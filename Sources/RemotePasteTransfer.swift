@@ -20,30 +20,47 @@ enum RemotePasteTransfer {
     /// perfectly good cleanup policy.
     static let remoteDirectory = "/tmp/term-mesh-paste"
 
-    /// The peer to send a paste to, or nil when nothing is connected.
+    /// The peer to send a paste to, or nil when the pane is local.
     ///
-    /// A single connected host is the overwhelmingly common case and needs no
-    /// choosing. With several, this cannot tell which pane the paste is aimed
-    /// at from the clipboard callback alone, so it declines rather than
-    /// guessing and shipping a file to the wrong machine.
+    /// The pane being pasted into decides, not the connection roster. Asking
+    /// "is any peer connected" answers a different question and gets the
+    /// common case wrong: with one relay open, a paste into an ordinary local
+    /// pane would be shipped away and pasted back as a path that exists only
+    /// on the peer. A pane knows its own host, so ask the pane.
     @MainActor
-    static func destination() -> String? {
-        let targets = Set(
-            PeerClientCoordinator.shared.activeConnections()
-                .compactMap(\.sshTarget)
-                .filter { !$0.isEmpty }
-        )
-        // Only reported when there IS a choice to get wrong. No peer at all is
-        // an ordinary local paste and saying so on every one would bury the
-        // drawer; several peers means the file is about to be pasted as a path
-        // that resolves nowhere, which looks like the agent being broken.
-        if targets.count > 1 {
-            RemoteWorkLog.info(
-                "Paste not sent: \(targets.count) hosts connected and the pane it is aimed at cannot be told apart — pasting the local path unchanged"
-            )
+    static func destination(for context: GhosttySurfaceCallbackContext) -> String? {
+        // Relay-window panes live outside every tabManager workspace, so the
+        // panel lookup below cannot see them; their host is the window's own
+        // connection. The debug single-pane relay window has no ssh target by
+        // construction, which reads as local — the right fallback, since
+        // there is nowhere to send the bytes.
+        if let window = context.surfaceView?.window {
+            if let controller = window.windowController as? PeerRelayWorkspaceWindowController {
+                return controller.connectionInfo.sshTarget.flatMap { $0.isEmpty ? nil : $0 }
+            }
+            if window.windowController is PeerRelayWindowController { return nil }
         }
-        guard targets.count == 1 else { return nil }
-        return targets.first
+
+        guard let panel = terminalPanel(for: context) else { return nil }
+        guard let target = panel.remoteHostKey?.sshTarget, !target.isEmpty else { return nil }
+        return target
+    }
+
+    /// The panel that owns `context`'s surface, searched across every window.
+    ///
+    /// The surface's tab id is not trusted as an index: moving a pane between
+    /// workspaces leaves the context's cached id behind, and a miss here would
+    /// silently downgrade a remote pane to a local paste. Scanning every
+    /// workspace is a handful of dictionary lookups on a single paste.
+    @MainActor
+    private static func terminalPanel(for context: GhosttySurfaceCallbackContext) -> TerminalPanel? {
+        guard let app = AppDelegate.shared else { return nil }
+        for windowContext in app.mainWindowContexts.values {
+            for workspace in windowContext.tabManager.tabs {
+                if let panel = workspace.terminalPanel(for: context.surfaceId) { return panel }
+            }
+        }
+        return nil
     }
 
     /// Whether `text` is a local file path this machine produced for a paste.
