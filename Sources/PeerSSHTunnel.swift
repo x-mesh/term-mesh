@@ -428,7 +428,16 @@ final class PeerSSHTunnel: @unchecked Sendable {
         let proc = Process()
         proc.executableURL = URL(fileURLWithPath: "/usr/bin/ssh")
         proc.arguments = [
-            "-N", "-T",
+            // `-tt` (forced tty) instead of `-N -T`, with a no-op remote
+            // command below: OpenSSH only sets TCP_NODELAY on sessions
+            // that have a tty, and it has no config option to request it
+            // otherwise (checked through OpenSSH 10.2). Without it the
+            // tunnel's TCP runs with Nagle on, and a keystroke written
+            // while a previous small frame is still unacked is held for
+            // a full extra round trip — measured p50 2×RTT vs 1×RTT on
+            // a 102 ms link for back-to-back small writes, which is
+            // exactly the interactive-typing pattern relay panes produce.
+            "-tt",
             // Managed relay tunnels must be owned by this subprocess.
             // If the user's ssh_config has ControlMaster/ControlPath
             // enabled, ssh can hand the forward to an existing master
@@ -454,6 +463,10 @@ final class PeerSSHTunnel: @unchecked Sendable {
             // validator above.
             "--",
             sshTarget,
+            // The tty session (see `-tt` above) needs a remote command
+            // that produces no output and never exits on its own; the
+            // forwards ride alongside it exactly as they did with `-N`.
+            "exec sleep 2147483647",
         ]
         let errPipe = Pipe()
         let outPipe = Pipe()

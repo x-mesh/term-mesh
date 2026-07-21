@@ -343,6 +343,103 @@ final class PeerServerTests: XCTestCase {
         await transport.close()
         await server.stop()
     }
+
+    /// R6 (peer-relay-bulk-loss, capability gating + old-peer compat): a
+    /// client that never advertised `replay.ring.v1` must have any
+    /// `AttachSurface.resumeFromSeq` ignored by the host — the provider
+    /// only ever sees 0, i.e. a fresh full-snapshot attach, exactly as
+    /// before this field had meaning. A real old client never populates
+    /// the field at all (wire default 0), which already degrades to a
+    /// fresh attach for free; this test additionally covers the
+    /// adversarial/defensive case of a stray nonzero value arriving from a
+    /// peer that never declared the capability, so it can't slip through
+    /// to a provider that would otherwise honor it. Mirrors the Rust
+    /// `resume_is_ignored_without_the_capability` /
+    /// `effective_resume_from_seq` coverage in
+    /// `daemon/term-meshd/src/peer/connection.rs`'s `resume_tests` module,
+    /// but exercises it through the real Swift `PeerServer.handleAttach`
+    /// gate instead of a bare function.
+    func testAttachResumeFromSeqIgnoredWithoutReplayRingCapability() async throws {
+        let sockPath = "/tmp/tm-peer-swift-resume-gate-\(UUID().uuidString.prefix(8)).sock"
+        defer { try? FileManager.default.removeItem(atPath: sockPath) }
+
+        var info = Termmesh_Peer_V1_SurfaceInfo()
+        info.surfaceID = Data(repeating: 0xC6, count: 16)
+        info.title = "resume-gate"
+        info.cols = 80
+        info.rows = 24
+        info.attachable = true
+
+        let provider = RecordingAttachProvider(surfaces: [info])
+        let server = PeerServer(socketPath: sockPath, provider: provider)
+        try await server.start()
+        defer { Task { await server.stop() } }
+
+        let deadline = Date().addingTimeInterval(2)
+        while !FileManager.default.fileExists(atPath: sockPath) {
+            if Date() > deadline { return XCTFail("no socket") }
+            try await Task.sleep(nanoseconds: 50_000_000)
+        }
+
+        let transport = try await UnixSocketTransport.connect(socketPath: sockPath)
+        let session = PeerSession(
+            read: { try await transport.read() },
+            write: { try await transport.write($0) }
+        )
+        var options = PeerSessionOptions()
+        options.capabilities = [] // old client: never advertised replay.ring.v1
+        _ = try await session.handshake(options: options)
+
+        let outcome = try await session.attachSurface(
+            id: info.surfaceID,
+            cols: 80,
+            rows: 24,
+            resumeFromSeq: 999 // stray/adversarial nonzero without the capability
+        )
+        XCTAssertEqual(outcome.surfaceID, info.surfaceID)
+        XCTAssertEqual(outcome.initialByteSeq, 0)
+
+        let recorded = await provider.lastResumeFromSeq
+        XCTAssertEqual(recorded, 0, "provider must never see a resume request from a peer without replay.ring.v1")
+
+        try await session.sendGoodbye(reason: "resume-gate itest done")
+        await transport.close()
+        await server.stop()
+    }
+}
+
+/// Test-only `PeerSurfaceProvider` that records the `resumeFromSeq` it was
+/// called with, to prove `PeerServerSession.handleAttach`'s capability gate
+/// (R6, peer-relay-bulk-loss) actually reaches the provider rather than
+/// just being logically correct in isolation.
+private actor RecordingAttachProvider: PeerSurfaceProvider {
+    private let surfaces: [Termmesh_Peer_V1_SurfaceInfo]
+    private(set) var lastResumeFromSeq: UInt64?
+
+    init(surfaces: [Termmesh_Peer_V1_SurfaceInfo]) {
+        self.surfaces = surfaces
+    }
+
+    func listSurfaces() async -> [Termmesh_Peer_V1_SurfaceInfo] { surfaces }
+
+    func attach(
+        surfaceID: Data,
+        clientCols: UInt32,
+        clientRows: UInt32,
+        resumeFromSeq: UInt64
+    ) async -> PeerSurfaceAttachment? {
+        lastResumeFromSeq = resumeFromSeq
+        guard surfaces.contains(where: { $0.surfaceID == surfaceID }) else { return nil }
+        let (stream, continuation) = AsyncStream.makeStream(of: PtyTapChunk.self)
+        continuation.finish()
+        return PeerSurfaceAttachment(
+            byteStream: stream,
+            input: { _ in },
+            workspaceMeta: nil,
+            initialByteSeq: 0,
+            detach: {}
+        )
+    }
 }
 
 /// Test-only `PeerSurfaceProvider` that records `renameWorkspace`/
@@ -359,7 +456,8 @@ private actor RecordingWorkspaceProvider: PeerSurfaceProvider {
     func attach(
         surfaceID: Data,
         clientCols: UInt32,
-        clientRows: UInt32
+        clientRows: UInt32,
+        resumeFromSeq: UInt64
     ) async -> PeerSurfaceAttachment? { nil }
 
     func renameWorkspace(id workspaceID: Data, title: String) async -> Bool {

@@ -220,6 +220,7 @@ final class GhosttySurfaceScrollView: NSView {
     private let flashOverlayView: GhosttyFlashOverlayView
     private let flashLayer: CAShapeLayer
     private var searchOverlayHostingView: NSHostingView<SurfaceSearchOverlay>?
+    private var scrollToBottomHostingView: NSHostingView<ScrollToBottomButton>?
     private var imeInputBarHostingView: NSHostingView<IMEInputBar>?
     private var imeBarDragHandle: IMEBarDragHandle?
     private static let imeMinBarHeight: CGFloat = 60
@@ -646,6 +647,26 @@ final class GhosttySurfaceScrollView: NSView {
             // same initial animation as direct drop-zone activation.
             setDropZoneOverlay(zone: pending)
         }
+        // Anchored to terminalBounds, not bounds: that rect already excludes the
+        // IME input bar, so the button rides above the bar when it opens instead
+        // of overlapping it. Inset on the right by the scroller width so it sits
+        // just left of the scrollbar — a fixed inset, because the scroller is
+        // `.overlay` style and only appears while scrolling; deriving the inset
+        // from its visibility would make the button jitter.
+        if let scrollToBottom = scrollToBottomHostingView {
+            let size = ScrollToBottomButton.size
+            let margin = ScrollToBottomButton.margin
+            let scrollerInset = NSScroller.scrollerWidth(
+                for: .regular,
+                scrollerStyle: .overlay
+            )
+            scrollToBottom.frame = NSRect(
+                x: terminalBounds.maxX - scrollerInset - size - margin,
+                y: terminalBounds.minY + margin,
+                width: size,
+                height: size
+            )
+        }
         notificationRingOverlayView.frame = bounds
         peerRingOverlayView.frame = bounds
         flashOverlayView.frame = bounds
@@ -814,6 +835,51 @@ final class GhosttySurfaceScrollView: NSView {
             peerCountBadgeLabel.isHidden = true
         }
         CATransaction.commit()
+    }
+
+    /// Mount or remove the bottom-right scroll-to-bottom button.
+    ///
+    /// Mirrors `setSearchOverlay`'s contract: main-thread guard, idempotent
+    /// re-entry (swap `rootView` instead of rebuilding, or the SwiftUI `@State`
+    /// hover flag is lost on every `updateNSView`), and a superview-repair
+    /// branch so the button survives portal reparenting.
+    ///
+    /// Mounted with `positioned: .above, relativeTo: nil` — unlike the search
+    /// overlay, which uses a plain `addSubview` and therefore sits *under*
+    /// anything added later (peer disconnect banner, peer host strip, IME bar).
+    /// Frame is assigned in `synchronizeGeometryAndContent`.
+    func setScrollToBottomOverlay(visible: Bool) {
+        if !Thread.isMainThread {
+            DispatchQueue.main.async { [weak self] in
+                self?.setScrollToBottomOverlay(visible: visible)
+            }
+            return
+        }
+
+        guard visible, let terminalSurface = surfaceView.terminalSurface else {
+            scrollToBottomHostingView?.removeFromSuperview()
+            scrollToBottomHostingView = nil
+            return
+        }
+
+        let rootView = ScrollToBottomButton { [weak terminalSurface] in
+            _ = terminalSurface?.performBindingAction("scroll_to_bottom")
+        }
+
+        if let overlay = scrollToBottomHostingView {
+            overlay.rootView = rootView
+            if overlay.superview !== self {
+                overlay.removeFromSuperview()
+                addSubview(overlay, positioned: .above, relativeTo: nil)
+            }
+            needsLayout = true
+            return
+        }
+
+        let overlay = NSHostingView(rootView: rootView)
+        addSubview(overlay, positioned: .above, relativeTo: nil)
+        scrollToBottomHostingView = overlay
+        needsLayout = true
     }
 
     func setSearchOverlay(searchState: TerminalSurface.SearchState?) {
@@ -2174,7 +2240,36 @@ final class GhosttySurfaceScrollView: NSView {
             return
         }
         surfaceView.scrollbar = scrollbar
+        publishScrollToBottomVisibility(for: scrollbar)
         synchronizeScrollView()
+    }
+
+    /// Rows still below the viewport before a scroll-to-bottom button appears.
+    static let scrollToBottomRowThreshold = 4
+
+    /// Collapse the scrollbar reading to the single Bool the overlay needs.
+    ///
+    /// This runs on every scrollbar action — `handleScrollbarUpdate` is not
+    /// throttled — so the assignment is guarded: re-publishing an unchanged
+    /// value would drive a SwiftUI re-render per scroll tick.
+    private func publishScrollToBottomVisibility(for scrollbar: GhosttyScrollbar) {
+        guard let terminalSurface = surfaceView.terminalSurface else { return }
+        // Stay in UInt64 for the whole comparison. These fields cross the
+        // libghostty ABI as u64, so converting to Int would trap on any value
+        // above Int.max — including a sentinel like UInt64.max from an
+        // uninitialized or error reading, which no scrollback size argument
+        // rules out. The guard also covers the unsigned underflow that
+        // `total - offset - len` would hit when the viewport is taller than
+        // the scrollback.
+        let consumed = scrollbar.offset.addingReportingOverflow(scrollbar.len)
+        let remainingRows: UInt64 =
+            (consumed.overflow || scrollbar.total < consumed.partialValue)
+            ? 0
+            : scrollbar.total - consumed.partialValue
+        let shouldShow = remainingRows >= UInt64(Self.scrollToBottomRowThreshold)
+        if terminalSurface.shouldShowScrollToBottom != shouldShow {
+            terminalSurface.shouldShowScrollToBottom = shouldShow
+        }
     }
 
     private func documentHeight() -> CGFloat {

@@ -115,6 +115,11 @@ public final class DebugEventLog: @unchecked Sendable {
         // markers must survive the portal.* layout spam that trips the breaker.
         "surface.free", "didCloseTab", "deinit Terminal", "deinit Ghostty",
         "surface.renderer.realized",
+        // Peer relay bulk-loss gap markers (already caller-side rate-limited to
+        // ~1-per-500 gaps): a flood heavy enough to trip the breaker is exactly
+        // when the pane is losing output, so the diagnostic must not vanish
+        // along with everything else.
+        "peer.relay.gap",
     ]
 
     private func logInternal(_ msg: String, date: Date) {

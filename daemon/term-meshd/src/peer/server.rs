@@ -145,6 +145,50 @@ async fn serve_with_host(
     }
     shutdown_supervised(&mut connection_tasks, "peer").await;
 
+    // Host surfaces are `$SHELL -l` children of this daemon (surface.rs:8) and
+    // nothing else in the shutdown sequence reaps them: the daemon's own
+    // teardown covers headless agents and agent sessions only. Without this a
+    // whole generation of pane shells survives the daemon, reparents to PID 1
+    // and keeps holding its PTY — enough daemon exits and ptmx runs out.
+    // `shutdown_forcibly` escalates SIGHUP → SIGKILL, which is what a macOS
+    // forkpty session leader that ignores SIGHUP actually needs (surface.rs:432).
+    let surfaces = host.pty.list();
+    if !surfaces.is_empty() {
+        let count = surfaces.len();
+        // Signal everything first, wait ONCE, then force whatever is left.
+        //
+        // Calling `shutdown_forcibly` in a plain loop would pay that call's
+        // grace window per surface (10 × 10ms), so ~50 surfaces alone reach the
+        // 5s budget `main.rs` wraps this task in — the tail of the list would
+        // never be reaped and would orphan exactly as before, and worst of all
+        // it would fail hardest when there are most surfaces to reclaim. One
+        // shared grace window makes the cost flat: a cooperative shell exits
+        // during it, and the second pass only escalates the stragglers (already
+        // exited children return immediately).
+        //
+        // Blocking sleep, so keep it off the async executor — same shape the
+        // daemon uses for agent-session teardown.
+        let joined = tokio::task::spawn_blocking(move || {
+            for surface in &surfaces {
+                surface.hangup();
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            for surface in &surfaces {
+                surface.shutdown_forcibly();
+            }
+        })
+        .await;
+        match joined {
+            Ok(()) => tracing::info!("terminated {count} peer surface(s)"),
+            // Never claim success on a teardown that did not finish: the whole
+            // point of this block is that surviving children become orphans.
+            Err(e) => tracing::warn!(
+                "peer surface teardown did not complete ({e}) — \
+                 up to {count} surface(s) may survive as orphans"
+            ),
+        }
+    }
+
     if Path::new(&path).exists() {
         let _ = std::fs::remove_file(&path);
     }

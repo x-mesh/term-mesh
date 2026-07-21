@@ -33,7 +33,8 @@ use crate::monitor::SystemSnapshot;
 use super::framing::{read_envelope, write_envelope};
 use super::layout::{self, PeerHost};
 use super::surface::{
-    EnsureDisposition, EnsureError, EnsureOutcome, EnsureRestartPolicy, PtySurface, SurfaceSpec,
+    EnsureDisposition, EnsureError, EnsureOutcome, EnsureRestartPolicy, PtyChunk, PtySurface,
+    SurfaceSpec,
 };
 
 pub const PROTOCOL_VERSION: &str = "1.0.0";
@@ -414,6 +415,42 @@ async fn reader_loop(
                         _ => AttachMode::ReadOnly,
                     };
 
+                // R1 (peer-relay-bulk-loss): resolve the resume request and
+                // capture the exact snapshot the relay task below will
+                // stream, in this same synchronous spot — see
+                // `spawn_attach_relay`'s doc comment for the full wire↔host
+                // seq mapping this sets up. `subscribe()` MUST happen before
+                // the replay snapshot is read (not after): any PTY output
+                // produced in between land in both, and `spawn_attach_relay`
+                // dedupes the overlap via `live_min_seq` — reversing the
+                // order would open a window where such bytes land in
+                // neither and are lost.
+                let resume_from_seq =
+                    effective_resume_from_seq(&peer_capabilities, req.resume_from_seq);
+                let subscriber = surface.subscribe();
+                let replay = if resume_from_seq != 0 {
+                    surface.replay_snapshot_from(resume_from_seq)
+                } else {
+                    surface.replay_snapshot()
+                };
+                let mode_prefix = surface.mode_replay_bytes();
+                // Absolute host seq (`PtyChunk::seq` space) that this
+                // attach's wire `byte_seq == 0` maps to, reported back as
+                // `initial_seq` so the client can translate any wire
+                // byte_seq `w` it later observes into that same absolute
+                // space via `initial_seq + w` — the value it must send back
+                // as a future `resume_from_seq`. Not the seq of the first
+                // wire byte itself: `mode_prefix` bytes are synthetic
+                // (re-derived escape codes, never counted in host seq
+                // space) and are prepended ahead of seq 0 the same way
+                // they're prepended ahead of wire byte_seq 0 below, so the
+                // real data's baseline is pushed back by their length.
+                let attach_base = replay
+                    .first()
+                    .map(|chunk| chunk.seq)
+                    .unwrap_or_else(|| surface.current_byte_seq());
+                let initial_seq = attach_base.saturating_sub(mode_prefix.len() as u64);
+
                 let reply = Envelope {
                     seq: next_seq(&seq_counter),
                     correlation_id: env.seq,
@@ -421,7 +458,7 @@ async fn reader_loop(
                         accepted: true,
                         reason: String::new(),
                         surface_id: req.surface_id.clone(),
-                        initial_seq: 0,
+                        initial_seq,
                         granted_mode: granted as i32,
                     })),
                 };
@@ -446,8 +483,14 @@ async fn reader_loop(
                 };
                 send(&outgoing_tx, meta_env).await?;
 
-                let entry =
-                    spawn_attach_relay(surface.clone(), outgoing_tx.clone(), seq_counter.clone());
+                let entry = spawn_attach_relay(
+                    surface.clone(),
+                    outgoing_tx.clone(),
+                    seq_counter.clone(),
+                    subscriber,
+                    replay,
+                    mode_prefix,
+                );
                 attached.insert(req.surface_id, entry);
             }
 
@@ -600,19 +643,64 @@ fn spawn_host_stats_push(
     }))
 }
 
+/// Whether an `AttachSurface.resume_from_seq` should be honored for this
+/// peer, or ignored in favor of a fresh full-snapshot attach.
+///
+/// ## The wire↔host seq mapping (R1, peer-relay-bulk-loss)
+///
+/// Two seq spaces meet at this boundary and must not be confused:
+///
+/// - **Wire `byte_seq`** (`PtyData.byte_seq`, `attach_seq` below): reset to
+///   0 at the start of EVERY attach (see the loop below), then advanced by
+///   real bytes sent AND by any broadcast-`Lagged` gap width — so it stays
+///   a faithful, self-consistent counter for gap detection within one
+///   attach, but a value observed on one attach means nothing on the next.
+/// - **Host absolute seq** (`PtyChunk::seq`, `PtySurface::byte_seq`): a
+///   single monotonic counter for the surface's entire lifetime, shared by
+///   every attach. This is what `ReplayBuffer`/`replay_snapshot_from` cut
+///   on.
+///
+/// `resume_from_seq` and `AttachResult.initial_seq` are defined to live in
+/// the **host absolute** space, not the wire space — this is the missing
+/// half that makes the pairing usable: `initial_seq` tells the client the
+/// absolute seq its wire `byte_seq == 0` corresponds to for THIS attach, so
+/// for any wire `byte_seq = w` it later processes it can compute the
+/// absolute position as `initial_seq + w` — entirely client-side, with no
+/// host state to remember across a dead attach. When the client reattaches
+/// after a gap, it sends that computed absolute value back as
+/// `resume_from_seq`, and the host below can pass it straight to
+/// `replay_snapshot_from` — no further conversion needed, because the
+/// client already did the translation using the seq mapping this attach
+/// establishes.
+///
+/// Gated on `replay.ring.v1`: a peer that never advertised it may predate
+/// this mapping entirely (e.g. it could carry a stale/unrelated value in
+/// the field), so a nonzero `resume_from_seq` from it is ignored rather
+/// than trusted — falls back to a fresh full-snapshot attach, exactly
+/// today's pre-resume behavior. Old-peer fallback nuance beyond this gate
+/// is t6's scope.
+fn effective_resume_from_seq(capabilities: &PeerCapabilities, requested: u64) -> u64 {
+    if requested != 0 && capabilities.has(capability::REPLAY_RING_V1) {
+        requested
+    } else {
+        0
+    }
+}
+
 fn spawn_attach_relay(
     surface: Arc<PtySurface>,
     outgoing_tx: mpsc::Sender<Envelope>,
     seq_counter: Arc<AtomicU64>,
+    mut subscriber: broadcast::Receiver<PtyChunk>,
+    replay: Vec<PtyChunk>,
+    mode_prefix: Vec<u8>,
 ) -> AttachEntry {
     let cancel = Arc::new(Notify::new());
     let cancel_for_task = cancel.clone();
     let surface_for_task = surface.clone();
-    let mut subscriber = surface.subscribe();
 
     let task = tokio::spawn(async move {
         let mut attach_seq = 0u64;
-        let replay = surface_for_task.replay_snapshot();
         let live_min_seq = replay
             .last()
             .map(|chunk| chunk.seq + chunk.bytes.len() as u64)
@@ -622,7 +710,6 @@ fn spawn_attach_relay(
         // snapshot: without this, a viewer attaching after the PTY already turned a
         // mouse mode on never sees the enabling escape and scroll dies on attach.
         // Swift-side counterpart: GhosttyPaneSurfaceProvider.attach's mouse-mode replay.
-        let mode_prefix = surface_for_task.mode_replay_bytes();
         if !mode_prefix.is_empty() {
             let len = mode_prefix.len() as u64;
             let env = Envelope {
@@ -2251,5 +2338,55 @@ mod terminate_tests {
         assert_eq!(stats.memory_percent, 50.0);
 
         task.abort();
+    }
+}
+
+/// R1 (peer-relay-bulk-loss): `effective_resume_from_seq` is the capability
+/// gate for the wire↔host seq mapping — see its doc comment above
+/// `spawn_attach_relay` for the full design. The actual ring-cutting
+/// behavior (`resume_from_seq != 0` replays only what's after that point)
+/// lives one level down and is covered on the real `PtySurface` type in
+/// `surface.rs`'s `replay_snapshot_from_on_a_real_surface_cuts_at_the_resume_point`;
+/// this module covers only the decision of whether to honor the field at
+/// all for a given peer.
+#[cfg(test)]
+mod resume_tests {
+    use peer_proto::{capability, PeerCapabilities};
+
+    use super::effective_resume_from_seq;
+
+    #[test]
+    fn resume_is_honored_when_capability_present_and_seq_nonzero() {
+        let caps = PeerCapabilities::from_hello(vec![capability::REPLAY_RING_V1.to_string()]);
+        assert_eq!(effective_resume_from_seq(&caps, 42), 42);
+    }
+
+    #[test]
+    fn resume_is_ignored_without_the_capability() {
+        // A peer that never advertised replay.ring.v1 (older build, or one
+        // that predates this field's meaning) — its resume_from_seq is not
+        // trusted, matching a fresh full-snapshot attach exactly.
+        let caps = PeerCapabilities::default();
+        assert_eq!(effective_resume_from_seq(&caps, 42), 0);
+    }
+
+    #[test]
+    fn zero_requested_seq_is_a_fresh_attach_regardless_of_capability() {
+        let caps = PeerCapabilities::from_hello(vec![capability::REPLAY_RING_V1.to_string()]);
+        assert_eq!(effective_resume_from_seq(&caps, 0), 0);
+    }
+
+    /// R6 (peer-relay-bulk-loss, capability gating + old-peer compat): the
+    /// realistic old-client shape — an older build's `AttachSurface` never
+    /// populates `resume_from_seq` (the field defaults to 0 on the wire)
+    /// AND never advertised `replay.ring.v1` in `Hello.capabilities`. Both
+    /// facts hold at once here, unlike the two tests above which vary only
+    /// one factor — this is the actual combination an old client produces
+    /// against this (new) host, and it must resolve to a fresh
+    /// full-snapshot attach exactly like every pre-R1 attach did.
+    #[test]
+    fn old_client_default_of_no_capability_and_zero_seq_is_a_fresh_attach() {
+        let caps = PeerCapabilities::default();
+        assert_eq!(effective_resume_from_seq(&caps, 0), 0);
     }
 }

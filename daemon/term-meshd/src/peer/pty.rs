@@ -137,6 +137,28 @@ pub fn spawn(
         }
     }
 
+    // The child of every LATER spawn must not inherit this master. forkpty(3)
+    // hands it back with no close-on-exec flag, so without this each new pane
+    // shell inherits every master opened before it: one surviving orphan then
+    // pins dozens of PTYs instead of its own, and the ptmx table fills up long
+    // after the surfaces themselves are gone.
+    //
+    // This MUST run while FORK_FD_LOCK is still held. The lock serializes the
+    // fork window, so a concurrent spawn cannot fork between forkpty(3)
+    // returning the fd and the flag being set; releasing the lock first would
+    // leave exactly that gap, and a pane opened during it inherits the master
+    // anyway — which is the whole bug. Best-effort otherwise, matching the
+    // ghostty side (ghostty/src/pty.zig:153): a spawn that otherwise succeeded
+    // must not fail because the flag could not be set.
+    if fork_error.is_none() {
+        unsafe {
+            let flags = libc::fcntl(master_fd, libc::F_GETFD, 0);
+            if flags >= 0 {
+                libc::fcntl(master_fd, libc::F_SETFD, flags | libc::FD_CLOEXEC);
+            }
+        }
+    }
+
     #[cfg(not(target_os = "linux"))]
     drop(fork_fd_guard.take());
 
@@ -801,6 +823,68 @@ mod tests {
         }
     }
 
+    /// forkpty(3) returns the master with no close-on-exec flag, so every pane
+    /// spawned later used to inherit every master opened before it: one orphan
+    /// then pinned dozens of PTYs instead of its own and ptmx ran out.
+    ///
+    /// Asserts the outcome, not just the flag: the second child reports whether
+    /// the FIRST child's master is present in its own post-exec fd table.
+    ///
+    /// Sequential spawns only, so this canNOT catch the flag being set too late
+    /// (after the fork lock is released) — that window needs two spawns in
+    /// flight at once. See `concurrent_spawns_do_not_leak_masters_into_children`.
+    #[test]
+    fn master_fd_is_close_on_exec_so_later_children_cannot_inherit_it() {
+        let first = spawn_shell(None, "sleep 1").unwrap();
+        let flags = unsafe { libc::fcntl(first.master_fd, libc::F_GETFD) };
+        assert!(flags >= 0, "F_GETFD on the master fd failed");
+        assert_ne!(
+            flags & libc::FD_CLOEXEC,
+            0,
+            "master fd must be close-on-exec or later pane spawns inherit it"
+        );
+
+        // The probe runs after exec, so it sees exactly what was inherited.
+        let probe = format!(
+            "if [ -e /dev/fd/{fd} ]; then printf INHERITED; else printf CLEAN; fi; sleep 1",
+            fd = first.master_fd
+        );
+        let second = spawn_shell(None, &probe).unwrap();
+
+        let mut report = String::new();
+        for _ in 0..50 {
+            std::thread::sleep(Duration::from_millis(20));
+            let mut buf = [0u8; 128];
+            let n = unsafe {
+                let fl = libc::fcntl(second.master_fd, libc::F_GETFL, 0);
+                libc::fcntl(second.master_fd, libc::F_SETFL, fl | libc::O_NONBLOCK);
+                libc::read(
+                    second.master_fd,
+                    buf.as_mut_ptr() as *mut libc::c_void,
+                    buf.len(),
+                )
+            };
+            if n > 0 {
+                report.push_str(&String::from_utf8_lossy(&buf[..n as usize]));
+            }
+            if report.contains("CLEAN") || report.contains("INHERITED") {
+                break;
+            }
+        }
+
+        teardown(first.master_fd, first.pid);
+        teardown(second.master_fd, second.pid);
+
+        assert!(
+            !report.contains("INHERITED"),
+            "second child inherited the first child's master fd — got: {report:?}"
+        );
+        assert!(
+            report.contains("CLEAN"),
+            "probe never reported; cannot conclude the fd was not inherited — got: {report:?}"
+        );
+    }
+
     #[test]
     fn foreign_write_holder_causes_bounded_timeout_and_child_cleanup() {
         let (read_fd, write_fd) = exec_handshake_pipe().unwrap();
@@ -912,6 +996,89 @@ mod tests {
 
         assert_eq!(failure.error.to_string(), "COMMAND_EXITED(42)");
         assert!(failure.child_reaped);
+    }
+
+    #[test]
+    /// A correctly spawned child holds only its own stdio (0/1/2); anything at
+    /// fd 3+ was inherited from the parent, whatever opened it.
+    ///
+    /// Scope, measured rather than assumed: this does NOT detect FD_CLOEXEC
+    /// being set after FORK_FD_LOCK is released. That regression was tried here
+    /// and this test passed 3/3 — the exposed window is only the few
+    /// microseconds between one spawn dropping the lock and setting the flag,
+    /// and 8 racing threads never landed a fork inside it. Setting the flag
+    /// under the lock removes the window by construction, which is why the code
+    /// does that instead of relying on this test to catch it.
+    #[test]
+    fn concurrent_spawns_do_not_leak_masters_into_children() {
+        const SPAWN_COUNT: usize = 8;
+        let barrier = Arc::new(Barrier::new(SPAWN_COUNT));
+        let (sender, receiver) = mpsc::channel();
+        let mut threads = Vec::with_capacity(SPAWN_COUNT);
+
+        // `[` and `for` are shell builtins, so the probe opens no fd of its own.
+        let probe = "extra=; for fd in 3 4 5 6 7 8 9 10 11 12; do \
+                     if [ -e /dev/fd/$fd ]; then extra=\"$extra $fd\"; fi; done; \
+                     printf 'FDS:%s:END' \"$extra\"; sleep 1";
+
+        for _ in 0..SPAWN_COUNT {
+            let barrier = barrier.clone();
+            let sender = sender.clone();
+            threads.push(thread::spawn(move || {
+                barrier.wait();
+                let report = match spawn_shell(None, probe) {
+                    Ok(child) => {
+                        let mut out = String::new();
+                        for _ in 0..50 {
+                            thread::sleep(Duration::from_millis(20));
+                            let mut buf = [0u8; 256];
+                            let n = unsafe {
+                                let fl = libc::fcntl(child.master_fd, libc::F_GETFL, 0);
+                                libc::fcntl(child.master_fd, libc::F_SETFL, fl | libc::O_NONBLOCK);
+                                libc::read(
+                                    child.master_fd,
+                                    buf.as_mut_ptr() as *mut libc::c_void,
+                                    buf.len(),
+                                )
+                            };
+                            if n > 0 {
+                                out.push_str(&String::from_utf8_lossy(&buf[..n as usize]));
+                            }
+                            if out.contains(":END") {
+                                break;
+                            }
+                        }
+                        teardown(child.master_fd, child.pid);
+                        Ok(out)
+                    }
+                    Err(error) => Err(error.to_string()),
+                };
+                sender.send(report).unwrap();
+            }));
+        }
+        drop(sender);
+
+        let mut reports = Vec::with_capacity(SPAWN_COUNT);
+        for _ in 0..SPAWN_COUNT {
+            reports.push(receiver.recv_timeout(Duration::from_secs(10)).unwrap());
+        }
+        for thread in threads {
+            thread.join().unwrap();
+        }
+
+        for report in &reports {
+            let out = report.as_ref().expect("concurrent spawn failed");
+            let extra = out
+                .split("FDS:")
+                .nth(1)
+                .and_then(|rest| rest.split(":END").next())
+                .unwrap_or_else(|| panic!("probe never reported — got: {out:?}"));
+            assert!(
+                extra.trim().is_empty(),
+                "child inherited fd(s){extra} from a concurrent spawn — \
+                 FD_CLOEXEC must be set before FORK_FD_LOCK is released"
+            );
+        }
     }
 
     #[test]

@@ -1297,10 +1297,21 @@ final class PeerClientCoordinator: NSObject, NSMenuDelegate {
 
     /// Headless remote-pane open: no pickers, no alerts. With a nil
     /// sockPath, brings up the in-app peer server and mirrors one of
-    /// this instance's own surfaces (loopback self-mirror).
-    func debugOpenRemotePane(sockPath: String?) {
+    /// this instance's own surfaces (loopback self-mirror). An sshTarget
+    /// routes through the same ssh-tunnel spec the picker flow uses, so
+    /// socket e2e can exercise a real remote host end to end.
+    func debugOpenRemotePane(sockPath: String?, sshTarget: String? = nil, remoteSockPath: String? = nil) {
         debugLastPaneOpenResult = nil
         Task { @MainActor in
+            let spec: PeerPaneHostSpec
+            if let target = sshTarget, !target.isEmpty {
+                guard let remoteSock = remoteSockPath, !remoteSock.isEmpty else {
+                    self.debugLastPaneOpenResult = ["ok": false, "error": "no_remote_sock_path"]
+                    return
+                }
+                spec = .ssh(target: target, remoteSockPath: remoteSock, port: nil, identityFile: nil)
+                return await debugOpenRemotePaneResolved(spec: spec)
+            }
             var resolvedSock = sockPath
             if resolvedSock == nil {
                 _ = await PeerHostCoordinator.shared.setRunning(true)
@@ -1310,7 +1321,12 @@ final class PeerClientCoordinator: NSObject, NSMenuDelegate {
                 self.debugLastPaneOpenResult = ["ok": false, "error": "no_host_socket"]
                 return
             }
-            let spec = PeerPaneHostSpec.direct(sockPath: hostSock)
+            await debugOpenRemotePaneResolved(spec: .direct(sockPath: hostSock))
+        }
+    }
+
+    @MainActor
+    private func debugOpenRemotePaneResolved(spec: PeerPaneHostSpec) async {
             let registry = PeerPaneHostRegistry.shared
             do {
                 let lease = try await registry.acquire(spec)
@@ -1350,7 +1366,6 @@ final class PeerClientCoordinator: NSObject, NSMenuDelegate {
             } catch {
                 self.debugLastPaneOpenResult = ["ok": false, "error": String(describing: error)]
             }
-        }
     }
 
     /// Test-only headless workspace mirror: no pickers/alerts on the

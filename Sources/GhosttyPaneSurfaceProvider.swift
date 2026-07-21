@@ -90,6 +90,33 @@ private struct ReplayBuffer {
         for i in head..<chunks.count { out.append(chunks[i]) }
         return out
     }
+
+    /// `concatenatedBytes()`, cut to only the bytes at or after `fromSeq` —
+    /// the resume-tail counterpart to the Rust `ReplayBuffer::snapshot_from`
+    /// (`daemon/term-meshd/src/peer/surface.rs`) this type otherwise mirrors.
+    ///
+    /// Unlike the Rust ring, this buffer doesn't retain a `seq` per chunk —
+    /// only the concatenated bytes and a running total — so the absolute
+    /// seq of the OLDEST buffered byte has to be derived here instead of
+    /// read off a chunk: `tapSeqAtCall` (the tap's cumulative counter at
+    /// the moment of the call, one past the newest buffered byte) minus
+    /// `totalBytes` (how many contiguous bytes are behind it). PTY output
+    /// has no internal gaps, so that subtraction is exact.
+    ///
+    /// `fromSeq` outside `[oldest, tapSeqAtCall]` — already evicted, or
+    /// newer than anything buffered (seq-space mismatch) — falls back to
+    /// the full buffer rather than resending nothing, same as the Rust
+    /// side. `fromSeq == tapSeqAtCall` (caught up exactly) returns empty.
+    func concatenatedBytes(from fromSeq: UInt64, tapSeqAtCall: UInt64) -> Data {
+        let oldest = tapSeqAtCall - UInt64(totalBytes)
+        guard fromSeq >= oldest, fromSeq <= tapSeqAtCall else {
+            return concatenatedBytes()
+        }
+        let skip = Int(fromSeq - oldest)
+        let all = concatenatedBytes()
+        guard skip < all.count else { return Data() }
+        return all.suffix(from: all.startIndex + skip)
+    }
 }
 
 /// One Ghostty PTY callback per surface, fan-out to bounded per-peer streams.
@@ -159,24 +186,52 @@ final class PtyTapHub: @unchecked Sendable {
     /// `fallbackSnapshot` must be computed BEFORE calling (it reads
     /// Ghostty's grid on MainActor — never under this lock, which the IO
     /// reader thread contends on).
+    ///
+    /// `resumeFromSeq` (R1, peer-relay-bulk-loss): when nonzero, replay
+    /// only the tail starting at that absolute tap seq instead of the full
+    /// ring — but ONLY when the ring is `isSafeForCompleteReplay`. An
+    /// evicted ring can't honor an exact cut without risking a slice that
+    /// starts mid-escape-sequence, so it falls through to the ordinary
+    /// full-ring-or-fallback-snapshot decision below exactly as if no
+    /// resume had been requested. Callers gate this on the `replay.ring.v1`
+    /// capability before ever passing a nonzero value — see
+    /// `PeerServerSession.handleAttach`'s doc comment for the full wire↔host
+    /// seq mapping.
     func makeStream(
         fallbackSnapshot: Data?,
-        mousePrefix: Data?
+        mousePrefix: Data?,
+        resumeFromSeq: UInt64 = 0
     ) -> (
         attachID: UUID,
         stream: AsyncStream<PtyTapChunk>,
         usedBufferReplay: Bool,
         initialByteCount: Int,
-        replayChunkCount: Int
+        replayChunkCount: Int,
+        initialSeq: UInt64
     ) {
         let attachID = UUID()
         lock.lock()
         let usedBufferReplay = replay.isSafeForCompleteReplay
-        var initial = usedBufferReplay ? replay.concatenatedBytes() : (fallbackSnapshot ?? Data())
+        var initial: Data
+        if resumeFromSeq != 0, usedBufferReplay {
+            initial = replay.concatenatedBytes(from: resumeFromSeq, tapSeqAtCall: tapSeq)
+        } else {
+            initial = usedBufferReplay ? replay.concatenatedBytes() : (fallbackSnapshot ?? Data())
+        }
         if let mousePrefix, !mousePrefix.isEmpty {
             initial = mousePrefix + initial
         }
         let replayChunkCount = replay.chunkCount
+        // Absolute tap seq that this attach's wire byte_seq == 0 maps to —
+        // backdated `initial.count` bytes from the current tap offset.
+        // Ring-replay/resume-tail bytes genuinely ARE the tap stream's last
+        // `initial.count` bytes, so this is exact for them; for the
+        // viewport fallback (and the mouse-mode prefix, always synthetic)
+        // it's a deliberate fiction that still establishes a consistent
+        // baseline — see `PeerServerSession.handleAttach`'s doc comment.
+        // (`&-` may wrap on a fresh hub; the pump only uses chunk END
+        // offsets, and `wrap &+ count` round-trips back to `tapSeq`.)
+        let initialSeq = tapSeq &- UInt64(initial.count)
         let stream = AsyncStream<PtyTapChunk>(bufferingPolicy: .bufferingNewest(256)) { continuation in
             // The build closure runs synchronously inside init — still
             // under the outer lock hold, so registration + initial yield
@@ -184,19 +239,13 @@ final class PtyTapHub: @unchecked Sendable {
             continuations[attachID] = continuation
             if !initial.isEmpty {
                 // Stamp so the chunk's END lands exactly on the current
-                // tap offset: ring-replay bytes genuinely ARE the tap
-                // stream's last `initial.count` bytes; for the viewport
-                // fallback (and the mouse-mode prefix) the stamp is
-                // synthetic but establishes the same baseline — the first
-                // live chunk compares against `tapSeq`, so there is no
-                // false gap. (`&-` may wrap on a fresh hub; the pump only
-                // uses chunk END offsets, and `wrap &+ count` round-trips
-                // back to `tapSeq`.)
-                continuation.yield(PtyTapChunk(bytes: initial, seq: tapSeq &- UInt64(initial.count)))
+                // tap offset — see `initialSeq` above for why this exact
+                // value is correct for every source `initial` can come from.
+                continuation.yield(PtyTapChunk(bytes: initial, seq: initialSeq))
             }
         }
         lock.unlock()
-        return (attachID, stream, usedBufferReplay, initial.count, replayChunkCount)
+        return (attachID, stream, usedBufferReplay, initial.count, replayChunkCount, initialSeq)
     }
 
     func broadcast(_ bytes: Data) {
@@ -336,7 +385,8 @@ final class GhosttyPaneSurfaceProvider: PeerSurfaceProvider {
     func attach(
         surfaceID: Data,
         clientCols: UInt32,
-        clientRows: UInt32
+        clientRows: UInt32,
+        resumeFromSeq: UInt64
     ) async -> PeerSurfaceAttachment? {
         guard let (sfcPtr, ts) = findSurface(id: surfaceID)
         else { return nil }
@@ -401,10 +451,14 @@ final class GhosttyPaneSurfaceProvider: PeerSurfaceProvider {
             ? Data("\u{1b}[?1002h\u{1b}[?1006h".utf8)
             : nil
 
-        let (attachID, stream, usedBufferReplay, initialByteCount, replayChunkCount) =
-            hub.makeStream(fallbackSnapshot: fallbackSnapshot, mousePrefix: mousePrefix)
+        let (attachID, stream, usedBufferReplay, initialByteCount, replayChunkCount, initialSeq) =
+            hub.makeStream(
+                fallbackSnapshot: fallbackSnapshot,
+                mousePrefix: mousePrefix,
+                resumeFromSeq: resumeFromSeq
+            )
         #if DEBUG
-        dlog("peer.replay.attach mode=\(usedBufferReplay ? "buffer" : "snapshot") bytes=\(initialByteCount) chunks=\(replayChunkCount)")
+        dlog("peer.replay.attach mode=\(usedBufferReplay ? "buffer" : "snapshot") bytes=\(initialByteCount) chunks=\(replayChunkCount) resumeFromSeq=\(resumeFromSeq) initialSeq=\(initialSeq)")
         #endif
 
         // Light up the peer-attached ring on the host pane and bump
@@ -537,6 +591,7 @@ final class GhosttyPaneSurfaceProvider: PeerSurfaceProvider {
                 }
             },
             workspaceMeta: meta,
+            initialByteSeq: initialSeq,
             detach: detach
         )
     }
