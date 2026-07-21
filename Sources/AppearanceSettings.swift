@@ -181,6 +181,22 @@ enum CommandPaletteRenameSelectionSettings {
     }
 }
 
+/// Paste Shelf stores captured text as plaintext JSON under Application Support
+/// and keeps it for `PasteShelfStore.unpinnedLifetime`. Terminal copies routinely
+/// contain tokens and keys, so capture is opt-out-able without losing the image
+/// path (⌘⇧V still imports a copied image and pinned items are untouched).
+enum PasteShelfCaptureSettings {
+    static let captureTextKey = "pasteShelf.captureCopiedText"
+    static let defaultCaptureText = true
+
+    static func captureTextEnabled(defaults: UserDefaults = .standard) -> Bool {
+        if defaults.object(forKey: captureTextKey) == nil {
+            return defaultCaptureText
+        }
+        return defaults.bool(forKey: captureTextKey)
+    }
+}
+
 enum ClaudeCodeIntegrationSettings {
     static let hooksEnabledKey = "claudeCodeHooksEnabled"
     static let defaultHooksEnabled = true

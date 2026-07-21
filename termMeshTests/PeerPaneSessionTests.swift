@@ -369,6 +369,45 @@ final class PeerPaneSessionTests: XCTestCase {
         XCTAssertNil(registry.activeLease(forKey: spec.hostKey))
     }
 
+    /// The coalesced start task is shared by every pane waiting on the host, so
+    /// one pane's sidebar Cancel must not abort it — that would kill the other
+    /// panes' connect too. It may only be cancelled by the last waiter.
+    @MainActor
+    func test_cancelPendingAcquire_refusesWhileAnotherPaneIsWaiting() async throws {
+        let registry = PeerPaneHostRegistry.shared
+        let sockPath = "/tmp/psp-unit-\(getpid())-shared-cancel.sock"
+        let spec = PeerPaneHostSpec.direct(sockPath: sockPath)
+        let key = spec.hostKey
+        XCTAssertNil(registry.activeLease(forKey: key))
+
+        var waitersAtCancel = 0
+        var pendingSurvivedCancel = false
+
+        // Queued in order on the main actor: both acquires park on the same
+        // start task before the cancel runs.
+        let paneA = Task { @MainActor in try await registry.acquire(spec) }
+        let paneB = Task { @MainActor in try await registry.acquire(spec) }
+        let sidebarCancel = Task { @MainActor in
+            waitersAtCancel = registry.pendingWaiterCountForTests(for: key)
+            registry.cancelPendingAcquire(for: key)
+            pendingSurvivedCancel = registry.pendingWaiterCountForTests(for: key) > 0
+        }
+
+        _ = await sidebarCancel.value
+        let leaseA = try await paneA.value
+        let leaseB = try await paneB.value
+
+        XCTAssertEqual(waitersAtCancel, 2, "both panes must be parked on one start task")
+        XCTAssertTrue(pendingSurvivedCancel, "a shared start must survive one pane's cancel")
+        XCTAssertTrue(leaseA === leaseB)
+        XCTAssertNotNil(registry.activeLease(forKey: key), "the other pane must keep its lease")
+
+        registry.release(leaseA)
+        registry.release(leaseB)
+        XCTAssertNil(registry.activeLease(forKey: key))
+        XCTAssertEqual(registry.pendingWaiterCountForTests(for: key), 0, "waiter accounting must not leak")
+    }
+
     /// A caller cancelled *after* the start task already produced a lease must
     /// not leave that lease unowned: `makeLease` has spawned the tunnel by then,
     /// and nothing else would ever stop it.

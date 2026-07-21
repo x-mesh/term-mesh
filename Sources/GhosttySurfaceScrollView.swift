@@ -1455,10 +1455,7 @@ final class GhosttySurfaceScrollView: NSView {
         // Images cannot be selected from a terminal in the same way text can.
         // Import a freshly copied system image as the user opens Shelf instead.
         _ = PasteShelfStore.shared.captureImageIfNeeded()
-        pasteShelfOverlayState.reset(
-            itemCount: PasteShelfStore.shared
-                .filteredItems(matching: pasteShelfOverlayState.searchQuery).count
-        )
+        pasteShelfOverlayState.resetForPresentation()
         let rootView = PasteShelfOverlay(
             store: .shared,
             state: pasteShelfOverlayState,
@@ -1497,19 +1494,32 @@ final class GhosttySurfaceScrollView: NSView {
                   event.window === self.window
             else { return event }
 
+            let items = PasteShelfStore.shared.filteredItems(matching: self.pasteShelfOverlayState.searchQuery)
+
             // Let the native text field receive typing, cursor movement, and
-            // deletion while a search query is being edited.
+            // deletion while a search query is being edited — but keep the
+            // navigation keys, so a user can search and then pick a result
+            // with the keyboard, as the footer hint promises. j/k are ordinary
+            // letters here and must reach the field.
             if let responder = event.window?.firstResponder as? NSView,
                let overlay = self.pasteShelfOverlayHostingView,
                responder.isDescendant(of: overlay) {
-                if event.keyCode == 53 { // Escape
+                switch event.keyCode {
+                case 126: // Up
+                    self.pasteShelfOverlayState.moveSelection(by: -1, itemCount: items.count)
+                case 125: // Down
+                    self.pasteShelfOverlayState.moveSelection(by: 1, itemCount: items.count)
+                case 36: // Return
+                    guard items.indices.contains(self.pasteShelfOverlayState.selectedIndex) else { return nil }
+                    self.insertPasteShelfItem(items[self.pasteShelfOverlayState.selectedIndex])
                     self.dismissPasteShelfOverlay()
-                    return nil
+                case 53: // Escape
+                    self.dismissPasteShelfOverlay()
+                default:
+                    return event
                 }
-                return event
+                return nil
             }
-
-            let items = PasteShelfStore.shared.filteredItems(matching: self.pasteShelfOverlayState.searchQuery)
             switch event.keyCode {
             case 126: // Up
                 self.pasteShelfOverlayState.moveSelection(by: -1, itemCount: items.count)

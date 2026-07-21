@@ -136,6 +136,10 @@ final class PeerPaneHostRegistry {
     private struct StartingLease {
         let id = UUID()
         let task: Task<PeerPaneHostLease, Error>
+        /// Callers currently awaiting this coalesced start. Cancelling the task
+        /// aborts it for all of them, so it may only be cancelled while this is
+        /// the last waiter.
+        var waiters = 0
     }
 
     private var starting: [PeerPaneHostKey: StartingLease] = [:]
@@ -156,10 +160,17 @@ final class PeerPaneHostRegistry {
             return lease
         }
         if let startingLease = starting[key] {
+            starting[key]?.waiters += 1
+            defer {
+                if starting[key]?.id == startingLease.id {
+                    starting[key]?.waiters -= 1
+                }
+            }
             let lease = try await startingLease.task.value
             return try adopt(lease, key: key)
         }
-        let startingLease = StartingLease(task: Task { try await Self.makeLease(spec: spec) })
+        var startingLease = StartingLease(task: Task { try await Self.makeLease(spec: spec) })
+        startingLease.waiters = 1
         starting[key] = startingLease
         defer {
             if starting[key]?.id == startingLease.id {
@@ -199,12 +210,34 @@ final class PeerPaneHostRegistry {
         return pooled
     }
 
-    /// Stop an in-flight first acquire without affecting an already-live
-    /// lease, which may be owned by another pane or workspace mirror.
+    /// Stop this caller's in-flight first acquire.
+    ///
+    /// The start task is shared by every pane that coalesced onto the same
+    /// host, so it is only cancelled when this is the last waiter. With others
+    /// still waiting the caller just stops waiting: its own task cancellation
+    /// makes `adopt` pool the lease and release it again, which leaves the
+    /// remaining panes' connect untouched.
+    ///
+    /// An already-live lease is never affected — it may be owned by another
+    /// pane or workspace mirror.
     func cancelPendingAcquire(for key: PeerPaneHostKey) {
-        guard let startingLease = starting.removeValue(forKey: key) else { return }
+        guard let startingLease = starting[key] else { return }
+        guard startingLease.waiters <= 1 else {
+            #if DEBUG
+            dlog("peer.pane.acquire.cancel.shared key=\(key) waiters=\(startingLease.waiters)")
+            #endif
+            return
+        }
+        starting[key] = nil
         startingLease.task.cancel()
     }
+
+    #if DEBUG
+    /// Test-only: callers currently awaiting a coalesced start for this host.
+    func pendingWaiterCountForTests(for key: PeerPaneHostKey) -> Int {
+        starting[key]?.waiters ?? 0
+    }
+    #endif
 
     /// Additional ref on an already-acquired lease (a new pane joining
     /// the host).
