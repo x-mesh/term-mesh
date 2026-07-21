@@ -2254,10 +2254,19 @@ final class GhosttySurfaceScrollView: NSView {
     /// value would drive a SwiftUI re-render per scroll tick.
     private func publishScrollToBottomVisibility(for scrollbar: GhosttyScrollbar) {
         guard let terminalSurface = surfaceView.terminalSurface else { return }
-        // UInt64 arithmetic: widen before subtracting, or a viewport taller than
-        // the scrollback underflows to a huge positive number.
-        let remainingRows = Int(scrollbar.total) - Int(scrollbar.offset) - Int(scrollbar.len)
-        let shouldShow = remainingRows >= Self.scrollToBottomRowThreshold
+        // Stay in UInt64 for the whole comparison. These fields cross the
+        // libghostty ABI as u64, so converting to Int would trap on any value
+        // above Int.max — including a sentinel like UInt64.max from an
+        // uninitialized or error reading, which no scrollback size argument
+        // rules out. The guard also covers the unsigned underflow that
+        // `total - offset - len` would hit when the viewport is taller than
+        // the scrollback.
+        let consumed = scrollbar.offset.addingReportingOverflow(scrollbar.len)
+        let remainingRows: UInt64 =
+            (consumed.overflow || scrollbar.total < consumed.partialValue)
+            ? 0
+            : scrollbar.total - consumed.partialValue
+        let shouldShow = remainingRows >= UInt64(Self.scrollToBottomRowThreshold)
         if terminalSurface.shouldShowScrollToBottom != shouldShow {
             terminalSurface.shouldShowScrollToBottom = shouldShow
         }
