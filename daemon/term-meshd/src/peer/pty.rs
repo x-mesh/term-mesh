@@ -146,6 +146,22 @@ pub fn spawn(
         return Err(error);
     }
 
+    // The child of every LATER spawn must not inherit this master. forkpty(3)
+    // hands it back with no close-on-exec flag, so without this each new pane
+    // shell inherits every master opened before it: one surviving orphan then
+    // pins dozens of PTYs instead of its own, and the ptmx table fills up long
+    // after the surfaces themselves are gone. FORK_FD_LOCK already serializes
+    // the fork window, so setting it here (parent side, post-fork) closes the
+    // leak without widening that lock. Best-effort, matching the ghostty side
+    // (ghostty/src/pty.zig:153): a spawn that otherwise succeeded must not fail
+    // because the flag could not be set.
+    unsafe {
+        let flags = libc::fcntl(master_fd, libc::F_GETFD, 0);
+        if flags >= 0 {
+            libc::fcntl(master_fd, libc::F_SETFD, flags | libc::FD_CLOEXEC);
+        }
+    }
+
     close_fd(exec_write_fd);
     if let Err(failure) = await_startup(
         exec_read_fd,
@@ -799,6 +815,31 @@ mod tests {
             assert_ne!(flags & libc::FD_CLOEXEC, 0);
             close_fd(fd);
         }
+    }
+
+    /// forkpty(3) returns the master with no close-on-exec flag, so every pane
+    /// spawned later used to inherit every master opened before it: one orphan
+    /// then pinned dozens of PTYs instead of its own and ptmx ran out. The
+    /// second child below is the one that would carry the first master.
+    #[test]
+    fn master_fd_is_close_on_exec_so_later_children_cannot_inherit_it() {
+        let first = spawn_shell(None, "sleep 1").unwrap();
+        let flags = unsafe { libc::fcntl(first.master_fd, libc::F_GETFD) };
+        assert!(flags >= 0, "F_GETFD on the master fd failed");
+        assert_ne!(
+            flags & libc::FD_CLOEXEC,
+            0,
+            "master fd must be close-on-exec or later pane spawns inherit it"
+        );
+
+        let second = spawn_shell(None, "sleep 1").unwrap();
+        assert_ne!(
+            first.master_fd, second.master_fd,
+            "each spawn owns a distinct master"
+        );
+
+        teardown(first.master_fd, first.pid);
+        teardown(second.master_fd, second.pid);
     }
 
     #[test]

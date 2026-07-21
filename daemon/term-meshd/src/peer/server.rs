@@ -145,6 +145,27 @@ async fn serve_with_host(
     }
     shutdown_supervised(&mut connection_tasks, "peer").await;
 
+    // Host surfaces are `$SHELL -l` children of this daemon (surface.rs:8) and
+    // nothing else in the shutdown sequence reaps them: the daemon's own
+    // teardown covers headless agents and agent sessions only. Without this a
+    // whole generation of pane shells survives the daemon, reparents to PID 1
+    // and keeps holding its PTY — enough daemon exits and ptmx runs out.
+    // `shutdown_forcibly` escalates SIGHUP → SIGKILL, which is what a macOS
+    // forkpty session leader that ignores SIGHUP actually needs (surface.rs:432).
+    let surfaces = host.pty.list();
+    if !surfaces.is_empty() {
+        let count = surfaces.len();
+        // It sleeps through its grace window, so keep it off the async executor
+        // (same shape the daemon uses for agent-session teardown).
+        let _ = tokio::task::spawn_blocking(move || {
+            for surface in surfaces {
+                surface.shutdown_forcibly();
+            }
+        })
+        .await;
+        tracing::info!("terminated {count} peer surface(s)");
+    }
+
     if Path::new(&path).exists() {
         let _ = std::fs::remove_file(&path);
     }
