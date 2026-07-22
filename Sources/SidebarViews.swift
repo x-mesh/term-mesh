@@ -955,7 +955,16 @@ struct RemoteHostGroupView: View {
     /// success); a connected host just toggles its fold.
     private func handleRowTap() {
         switch host.connectionState {
-        case .saved, .failed:
+        case .failed:
+            if host.sshTarget != nil {
+                // Same reason as the context menu's Retry: a failed attempt can
+                // leave its connect task behind, and connectSavedHost returns
+                // early when it sees one, so tapping the row would do nothing.
+                store.retryConnectingHost(host)
+            } else {
+                withAnimation(.easeInOut(duration: 0.15)) { isExpanded.toggle() }
+            }
+        case .saved:
             if host.sshTarget != nil {
                 store.connectSavedHost(host)
             } else {
@@ -975,12 +984,26 @@ struct RemoteHostGroupView: View {
                     Text(emptyBodyText)
                         .font(.system(size: 10))
                         .foregroundColor(.secondary)
+                    // Inline controls sit where the user is already looking —
+                    // the context menu carries the same actions, but a stuck
+                    // row should not require discovering a right-click.
                     if case .connecting = host.connectionState {
                         Spacer(minLength: 4)
                         Button("Cancel") { store.cancelConnectingHost(host) }
                             .buttonStyle(.borderless)
                             .controlSize(.mini)
                             .help("Cancel connection attempt")
+                        Button("Retry") { store.retryConnectingHost(host) }
+                            .buttonStyle(.borderless)
+                            .controlSize(.mini)
+                            .help("Abandon this attempt and start a new one")
+                    }
+                    if case .failed = host.connectionState, host.sshTarget != nil {
+                        Spacer(minLength: 4)
+                        Button("Retry") { store.retryConnectingHost(host) }
+                            .buttonStyle(.borderless)
+                            .controlSize(.mini)
+                            .help("Try connecting again")
                     }
                 }
                 .padding(.leading, 20)
