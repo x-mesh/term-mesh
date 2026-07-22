@@ -1449,11 +1449,16 @@ final class PeerClientCoordinator: NSObject, NSMenuDelegate {
     func debugPaneStatus() -> [String: Any] {
         [
             "pane_sessions": openPaneSessions.map { session in
-                [
+                var row: [String: Any] = [
                     "host_key": String(describing: session.lease.key),
                     "title": session.surfaceTitle,
                     "torn_down": session.isTorndown,
-                ] as [String: Any]
+                ]
+                // Byte counters, so a blank pane can be adjudicated live
+                // instead of by scraping logs after the fact: received==0
+                // means nothing ever arrived from the host.
+                row["io"] = session.relaySession.ioSnapshot
+                return row
             },
             "lease_count": PeerPaneHostRegistry.shared.activeLeaseCount,
             "last_open_result": debugLastPaneOpenResult ?? NSNull(),

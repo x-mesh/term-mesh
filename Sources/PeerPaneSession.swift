@@ -328,12 +328,7 @@ final class PeerPaneSession {
 
     // Pane-command plumbing for TerminalPanel creation (t2).
     var relayLaunchCommand: String { relaySession.relayLaunchCommand }
-    var relayEnvironment: [String: String] {
-        [
-            "TERMMESH_PEER_RELAY_SOCKET": relaySession.relaySockPath,
-            "TERMMESH_PEER_RELAY_SECRET": relaySession.relaySecret,
-        ]
-    }
+    var relayEnvironment: [String: String] { relaySession.relayEnvironment }
 
     private init(
         lease: PeerPaneHostLease,
