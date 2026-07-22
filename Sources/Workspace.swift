@@ -2227,6 +2227,10 @@ final class Workspace: Identifiable, ObservableObject {
         if !session.surfaceTitle.isEmpty {
             panel.updateTitle(session.surfaceTitle)
         }
+        // Wheel-driven host scrollback browse (grid-snapshot hosts only —
+        // the handler refuses to engage until the host sends a typed
+        // snapshot, so legacy hosts keep plain local scrolling).
+        panel.hostedView.scrollbackBrowseHandler = session.relaySession
         // Always-on host signal: 2pt strip in the host's accent color
         // (the focused-pane titlebar gradient complements this).
         panel.hostedView.setPeerHostStrip(

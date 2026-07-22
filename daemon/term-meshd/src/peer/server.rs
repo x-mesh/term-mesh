@@ -372,7 +372,9 @@ fn peer_uid_matches(_stream: &tokio::net::UnixStream, _expected_uid: u32) -> boo
 mod integration_tests {
     use super::*;
     use peer_proto::v1::envelope::Payload;
-    use peer_proto::v1::{AttachMode, AttachSurface, Auth, Envelope, Hello, Input, ListSurfaces};
+    use peer_proto::v1::{
+        AttachMode, AttachSurface, Auth, Envelope, Hello, Input, ListSurfaces, ScrollbackRequest,
+    };
     use tempfile::TempDir;
     use tokio::net::UnixStream;
 
@@ -620,6 +622,426 @@ mod integration_tests {
         let _ = tokio::time::timeout(std::time::Duration::from_secs(3), server_task).await;
     }
 
+    /// Read PtyData frames until `want` appears, returning everything
+    /// aggregated so far — lets a test assert on what was ABSENT from the
+    /// stream, which `wait_for_marker`'s bool cannot.
+    async fn collect_pty_until_marker(
+        reader: &mut tokio::net::unix::OwnedReadHalf,
+        want: &[u8],
+        timeout: std::time::Duration,
+    ) -> Vec<u8> {
+        let deadline = tokio::time::Instant::now() + timeout;
+        let mut aggregated = Vec::<u8>::new();
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                return aggregated;
+            }
+            let env = match tokio::time::timeout(remaining, read_envelope(reader)).await {
+                Ok(Ok(e)) => e,
+                _ => return aggregated,
+            };
+            if let Some(Payload::PtyData(p)) = env.payload {
+                aggregated.extend_from_slice(&p.payload);
+                if aggregated.windows(want.len()).any(|w| w == want) {
+                    return aggregated;
+                }
+            }
+        }
+    }
+
+    /// Spawn a surface whose visible line was overwritten in place (CR, no
+    /// LF), serve it, attach fresh, and return the aggregated first bytes.
+    async fn attach_overwritten_line_surface(name: &str) -> Vec<u8> {
+        let tmp = TempDir::new().unwrap();
+        let sock_path = tmp.path().join("peer.sock");
+
+        let manager = Arc::new(PtyManager::new());
+        let surface = PtySurface::spawn(
+            surface_id_from_name(name),
+            name.into(),
+            "/bin/sh",
+            &["-c", "printf 'OLDMARKER\\rNEWMARKER99'; sleep 5"],
+            80,
+            24,
+            None,
+        )
+        .expect("spawn overwritten-line surface");
+
+        // Wait until the overwrite has flowed through the reader (ring
+        // holds the raw history including OLDMARKER).
+        for _ in 0..100 {
+            let replay = surface.replay_snapshot();
+            let bytes: Vec<u8> = replay
+                .iter()
+                .flat_map(|chunk| chunk.bytes.iter().copied())
+                .collect();
+            if bytes.windows(11).any(|w| w == b"NEWMARKER99") {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        manager.insert_surface(surface);
+
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let sp_task = sock_path.clone();
+        let server_task = tokio::spawn(async move {
+            serve_with_manager(sp_task, shutdown_rx, manager).await.unwrap();
+        });
+        for _ in 0..50 {
+            if sock_path.exists() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+
+        let (mut reader, writer, _sid) = attach_one(&sock_path, name).await;
+        let got = collect_pty_until_marker(
+            &mut reader,
+            b"NEWMARKER99",
+            std::time::Duration::from_secs(3),
+        )
+        .await;
+
+        drop(reader);
+        drop(writer);
+        shutdown_tx.send(true).unwrap();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(3), server_task).await;
+        got
+    }
+
+    /// Serializes every test that READS OR WRITES
+    /// `TERMMESH_PEER_FRESH_ATTACH_MODE`. Env is process-global: the kill
+    /// switch test setting `=bytes` for its second scenario would otherwise
+    /// race a concurrently-attaching gating test into the bytes path
+    /// (observed: GridSnapshot count 0 under the full parallel suite).
+    static FRESH_MODE_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Drain frames briefly, splitting GridSnapshot payloads from PtyData
+    /// payloads, so a gating test can assert which path carried the screen.
+    async fn collect_typed_and_pty(
+        reader: &mut tokio::net::unix::OwnedReadHalf,
+        want: &[u8],
+        timeout: std::time::Duration,
+    ) -> (Vec<Vec<u8>>, Vec<u8>) {
+        let deadline = tokio::time::Instant::now() + timeout;
+        let mut snapshots: Vec<Vec<u8>> = Vec::new();
+        let mut pty = Vec::<u8>::new();
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                return (snapshots, pty);
+            }
+            let env = match tokio::time::timeout(remaining, read_envelope(reader)).await {
+                Ok(Ok(e)) => e,
+                _ => return (snapshots, pty),
+            };
+            match env.payload {
+                Some(Payload::GridSnapshot(g)) => {
+                    let done = g.ansi.windows(want.len()).any(|w| w == want);
+                    snapshots.push(g.ansi);
+                    if done {
+                        return (snapshots, pty);
+                    }
+                }
+                Some(Payload::PtyData(p)) => {
+                    pty.extend_from_slice(&p.payload);
+                    if pty.windows(want.len()).any(|w| w == want) {
+                        return (snapshots, pty);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// grid.snapshot.v1 gating, both halves that involve the typed path
+    /// (the legacy halves live in `fresh_attach_renders_...` and the
+    /// `effective_resume_from_seq` unit tests):
+    ///
+    /// - An advertising client's FRESH attach receives the screen as a
+    ///   GridSnapshot envelope — rendered state, no overwritten history —
+    ///   and NOT as a PtyData snapshot.
+    /// - The same client's RESUME attach receives no GridSnapshot at all:
+    ///   resume is served from the byte ring, typed or not.
+    #[tokio::test]
+    async fn grid_snapshot_gates_on_capability_and_freshness() {
+        let _env = FRESH_MODE_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let tmp = TempDir::new().unwrap();
+        let sock_path = tmp.path().join("peer.sock");
+
+        let manager = Arc::new(PtyManager::new());
+        let surface = PtySurface::spawn(
+            surface_id_from_name("typed-gate"),
+            "typed-gate".into(),
+            "/bin/sh",
+            &["-c", "printf 'OLDMARKER\\rNEWMARKER99'; sleep 5"],
+            80,
+            24,
+            None,
+        )
+        .expect("spawn typed-gate surface");
+        let sid = surface.surface_id.clone();
+        for _ in 0..100 {
+            let ready = surface
+                .replay_snapshot()
+                .iter()
+                .flat_map(|c| c.bytes.iter().copied())
+                .collect::<Vec<_>>()
+                .windows(11)
+                .any(|w| w == b"NEWMARKER99");
+            if ready {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        manager.insert_surface(surface);
+
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let sp_task = sock_path.clone();
+        let server_task = tokio::spawn(async move {
+            serve_with_manager(sp_task, shutdown_rx, manager).await.unwrap();
+        });
+        for _ in 0..50 {
+            if sock_path.exists() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+
+        // Fresh attach, advertising the capability.
+        let (mut reader, writer, _sid) = attach_full(
+            &sock_path,
+            "typed-fresh",
+            Some(sid.clone()),
+            peer_proto::capability::supported_vec(),
+            0,
+        )
+        .await;
+        let (snapshots, pty) = collect_typed_and_pty(
+            &mut reader,
+            b"NEWMARKER99",
+            std::time::Duration::from_secs(15),
+        )
+        .await;
+        assert_eq!(
+            snapshots.len(),
+            1,
+            "typed fresh attach must carry the screen in exactly one GridSnapshot"
+        );
+        let ansi = &snapshots[0];
+        assert!(ansi.windows(11).any(|w| w == b"NEWMARKER99"));
+        assert!(
+            !ansi.windows(9).any(|w| w == b"OLDMARKER"),
+            "GridSnapshot must be a render, not byte history"
+        );
+        assert!(
+            !pty.windows(11).any(|w| w == b"NEWMARKER99"),
+            "the screen must not ALSO arrive as a PtyData snapshot"
+        );
+        drop(reader);
+        drop(writer);
+
+        // Resume attach from the same advertising client: byte-ring path,
+        // no GridSnapshot.
+        let (mut reader, writer, _sid) = attach_full(
+            &sock_path,
+            "typed-resume",
+            Some(sid.clone()),
+            peer_proto::capability::supported_vec(),
+            1, // any nonzero host seq inside the ring
+        )
+        .await;
+        let (snapshots, pty) = collect_typed_and_pty(
+            &mut reader,
+            b"NEWMARKER99",
+            std::time::Duration::from_secs(15),
+        )
+        .await;
+        assert!(
+            snapshots.is_empty(),
+            "resume must never be served as a GridSnapshot"
+        );
+        assert!(
+            pty.windows(11).any(|w| w == b"NEWMARKER99"),
+            "resume must replay ring bytes as PtyData"
+        );
+        drop(reader);
+        drop(writer);
+
+        shutdown_tx.send(true).unwrap();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(3), server_task).await;
+    }
+
+    /// On-demand scrollback round trip, and its capability gate: an
+    /// advertising client's request renders a past window; a legacy
+    /// client's identical request is silently ignored.
+    #[tokio::test]
+    async fn scrollback_request_round_trips_and_gates_on_capability() {
+        let tmp = TempDir::new().unwrap();
+        let sock_path = tmp.path().join("peer.sock");
+
+        let manager = Arc::new(PtyManager::new());
+        let surface = PtySurface::spawn(
+            surface_id_from_name("sb-gate"),
+            "sb-gate".into(),
+            "/bin/sh",
+            &["-c", "for i in $(seq 1 40); do echo SBLINE-$i; done; sleep 5"],
+            80,
+            24,
+            None,
+        )
+        .expect("spawn sb-gate surface");
+        let sid = surface.surface_id.clone();
+        for _ in 0..150 {
+            if let Some((snap, _)) = surface.screen_snapshot() {
+                if snap.windows(9).any(|w| w == b"SBLINE-40") {
+                    break;
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        manager.insert_surface(surface);
+
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let sp_task = sock_path.clone();
+        let server_task = tokio::spawn(async move {
+            serve_with_manager(sp_task, shutdown_rx, manager).await.unwrap();
+        });
+        for _ in 0..50 {
+            if sock_path.exists() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+
+        async fn request_scrollback(
+            writer: &mut tokio::net::unix::OwnedWriteHalf,
+            sid: &[u8],
+            offset: u32,
+        ) {
+            write_envelope(
+                writer,
+                &Envelope {
+                    seq: 100,
+                    correlation_id: 0,
+                    payload: Some(Payload::ScrollbackRequest(ScrollbackRequest {
+                        surface_id: sid.to_vec(),
+                        offset_rows: offset,
+                    })),
+                },
+            )
+            .await
+            .unwrap();
+        }
+
+        async fn wait_chunk(
+            reader: &mut tokio::net::unix::OwnedReadHalf,
+            timeout: std::time::Duration,
+        ) -> Option<peer_proto::v1::ScrollbackChunk> {
+            let deadline = tokio::time::Instant::now() + timeout;
+            loop {
+                let remaining =
+                    deadline.saturating_duration_since(tokio::time::Instant::now());
+                if remaining.is_zero() {
+                    return None;
+                }
+                match tokio::time::timeout(remaining, read_envelope(reader)).await {
+                    Ok(Ok(env)) => {
+                        if let Some(Payload::ScrollbackChunk(c)) = env.payload {
+                            return Some(c);
+                        }
+                    }
+                    _ => return None,
+                }
+            }
+        }
+
+        // Advertising client: window 10 rows up contains scrolled-out lines.
+        let (mut reader, mut writer, _sid) = attach_full(
+            &sock_path,
+            "sb-typed",
+            Some(sid.clone()),
+            peer_proto::capability::supported_vec(),
+            0,
+        )
+        .await;
+        request_scrollback(&mut writer, &sid, 10).await;
+        let chunk = wait_chunk(&mut reader, std::time::Duration::from_secs(10))
+            .await
+            .expect("advertising client must receive a ScrollbackChunk");
+        assert_eq!(chunk.offset_rows, 10);
+        assert!(chunk.total_scrollback_rows >= 10);
+        assert!(
+            chunk.ansi.windows(9).any(|w| w == b"SBLINE-25")
+                || chunk.ansi.windows(9).any(|w| w == b"SBLINE-30"),
+            "window must contain scrolled-out lines"
+        );
+        drop(reader);
+        drop(writer);
+
+        // Legacy client: same request, no reply.
+        let (mut reader, mut writer, _sid) =
+            attach_surface_by(&sock_path, "sb-legacy", Some(sid.clone())).await;
+        request_scrollback(&mut writer, &sid, 10).await;
+        assert!(
+            wait_chunk(&mut reader, std::time::Duration::from_secs(1))
+                .await
+                .is_none(),
+            "a non-advertising client's scrollback request must be ignored"
+        );
+        drop(reader);
+        drop(writer);
+
+        shutdown_tx.send(true).unwrap();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(3), server_task).await;
+    }
+
+    /// The tmux-model contract, plus its kill switch — one test on purpose:
+    /// `TERMMESH_PEER_FRESH_ATTACH_MODE` is process-global env, and a
+    /// sibling test racing the flag would flake.
+    ///
+    /// Scenario A (default): a fresh attach receives the RENDERED screen.
+    /// A line overwritten in place (CR, no LF) must not resurface — under
+    /// byte replay it always did, which is exactly the "old find scrolls
+    /// past again" bug at 1-line scale.
+    ///
+    /// Scenario B (`=bytes`): the switch restores the byte-history tail,
+    /// so the overwritten text IS present again.
+    #[tokio::test]
+    async fn fresh_attach_renders_screen_and_kill_switch_restores_bytes() {
+        let _env = FRESH_MODE_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // A — snapshot path (default).
+        let got = attach_overwritten_line_surface("snap-fresh").await;
+        assert!(
+            got.windows(11).any(|w| w == b"NEWMARKER99"),
+            "snapshot attach must contain the final screen line"
+        );
+        assert!(
+            !got.windows(9).any(|w| w == b"OLDMARKER"),
+            "snapshot attach must NOT contain the overwritten byte history"
+        );
+        // And it is a real state render: vt100's contents_formatted always
+        // leads with clear+home, so the viewer starts from a clean grid.
+        assert!(
+            got.windows(6).any(|w| w == b"\x1b[H\x1b[J"),
+            "snapshot must begin with vt100's clear+home preamble"
+        );
+
+        // B — kill switch forces the pre-snapshot byte tail.
+        std::env::set_var("TERMMESH_PEER_FRESH_ATTACH_MODE", "bytes");
+        let got = attach_overwritten_line_surface("bytes-fresh").await;
+        std::env::remove_var("TERMMESH_PEER_FRESH_ATTACH_MODE");
+        assert!(
+            got.windows(9).any(|w| w == b"OLDMARKER"),
+            "bytes mode must replay raw history including the overwritten text"
+        );
+    }
+
     #[tokio::test]
     async fn ctrl_c_input_reaches_attached_pty() {
         let tmp = TempDir::new().unwrap();
@@ -706,13 +1128,21 @@ mod integration_tests {
         // for a newline (canonical mode blocks until '\n', and the
         // response has none). If the daemon didn't write the reply,
         // `dd` would block forever and the marker never appears.
+        //
+        // The leading sleep pushes the whole exchange PAST the attach
+        // below, so GOT[...] arrives on the LIVE stream. This test asserts
+        // byte-stream properties (QueryFilter answered locally, stripped
+        // from broadcast); the attach-time grid snapshot would re-render
+        // the screen instead — the echoed ESC[1;1R is consumed by the
+        // emulator as a CPR *response*, never entering the grid — so the
+        // raw marker only exists on the live path.
         let surface = PtySurface::spawn(
             surface_id_from_name("query"),
             "query".into(),
             "/bin/sh",
             &[
                 "-c",
-                "stty -icanon -echo min 1 time 0 2>/dev/null; printf '\\033[6n'; reply=$(dd bs=1 count=6 2>/dev/null); printf 'GOT[%s]\\n' \"$reply\"; sleep 2",
+                "stty -icanon -echo min 1 time 0 2>/dev/null; sleep 0.5; printf '\\033[6n'; reply=$(dd bs=1 count=6 2>/dev/null); printf 'GOT[%s]\\n' \"$reply\"; sleep 2",
             ],
             80,
             24,
@@ -780,9 +1210,68 @@ mod integration_tests {
     /// Drive the full handshake + attach path for one client against
     /// `sock_path`, returning the split stream halves and the chosen
     /// surface_id. Used by the multi-client test below.
+    /// Attach as a LEGACY client: everything current builds support EXCEPT
+    /// grid.snapshot.v1. Most integration tests assert on the raw PtyData
+    /// stream (replay content, mode prefixes, byte ordering), and those
+    /// assertions describe the untyped path — the one a pre-snapshot client
+    /// still exercises. Typed-path behavior has its own explicit tests.
     async fn attach_one(
         sock_path: &std::path::Path,
         display: &str,
+    ) -> (
+        tokio::net::unix::OwnedReadHalf,
+        tokio::net::unix::OwnedWriteHalf,
+        Vec<u8>,
+    ) {
+        attach_with_caps(sock_path, display, None, legacy_caps()).await
+    }
+
+    fn legacy_caps() -> Vec<String> {
+        peer_proto::capability::supported_vec()
+            .into_iter()
+            .filter(|c| c != peer_proto::capability::GRID_SNAPSHOT_V1)
+            .collect()
+    }
+
+    /// `attach_one`, but optionally targeting a KNOWN surface id instead of
+    /// "the first listed one". A surface whose child dies instantly can drop
+    /// out of ListSurfaces before the client's list lands (observed
+    /// deterministically on Linux), and a respawn test doesn't care about
+    /// the roster — it cares that AttachSurface revives the id it names.
+    async fn attach_surface_by(
+        sock_path: &std::path::Path,
+        display: &str,
+        want_id: Option<Vec<u8>>,
+    ) -> (
+        tokio::net::unix::OwnedReadHalf,
+        tokio::net::unix::OwnedWriteHalf,
+        Vec<u8>,
+    ) {
+        attach_with_caps(sock_path, display, want_id, legacy_caps()).await
+    }
+
+    /// The full-control attach: explicit surface targeting AND an explicit
+    /// capability list, so a test can be an old client, a new client, or
+    /// anything in between.
+    async fn attach_with_caps(
+        sock_path: &std::path::Path,
+        display: &str,
+        want_id: Option<Vec<u8>>,
+        caps: Vec<String>,
+    ) -> (
+        tokio::net::unix::OwnedReadHalf,
+        tokio::net::unix::OwnedWriteHalf,
+        Vec<u8>,
+    ) {
+        attach_full(sock_path, display, want_id, caps, 0).await
+    }
+
+    async fn attach_full(
+        sock_path: &std::path::Path,
+        display: &str,
+        want_id: Option<Vec<u8>>,
+        caps: Vec<String>,
+        resume_from_seq: u64,
     ) -> (
         tokio::net::unix::OwnedReadHalf,
         tokio::net::unix::OwnedWriteHalf,
@@ -802,7 +1291,7 @@ mod integration_tests {
                     protocol_version: PROTOCOL_VERSION.into(),
                     peer_id,
                     display_name: display.into(),
-                    capabilities: peer_proto::capability::supported_vec(),
+                    capabilities: caps,
                     app_version: "test".into(),
                 })),
             },
@@ -828,22 +1317,31 @@ mod integration_tests {
         .unwrap();
         let _ = read_envelope(&mut reader).await.unwrap(); // auth result
 
-        write_envelope(
-            &mut writer,
-            &Envelope {
-                seq: 3,
-                correlation_id: 0,
-                payload: Some(Payload::ListSurfaces(ListSurfaces {})),
-            },
-        )
-        .await
-        .unwrap();
-        let list_reply = read_envelope(&mut reader).await.unwrap();
-        let surfaces = match list_reply.payload {
-            Some(Payload::SurfaceList(sl)) => sl.surfaces,
-            other => panic!("{display}: expected SurfaceList, got {other:?}"),
+        let surface_id = match want_id {
+            Some(id) => id,
+            None => {
+                write_envelope(
+                    &mut writer,
+                    &Envelope {
+                        seq: 3,
+                        correlation_id: 0,
+                        payload: Some(Payload::ListSurfaces(ListSurfaces {})),
+                    },
+                )
+                .await
+                .unwrap();
+                let list_reply = read_envelope(&mut reader).await.unwrap();
+                let surfaces = match list_reply.payload {
+                    Some(Payload::SurfaceList(sl)) => sl.surfaces,
+                    other => panic!("{display}: expected SurfaceList, got {other:?}"),
+                };
+                assert!(
+                    !surfaces.is_empty(),
+                    "{display}: host listed no surfaces"
+                );
+                surfaces[0].surface_id.clone()
+            }
         };
-        let surface_id = surfaces[0].surface_id.clone();
 
         write_envelope(
             &mut writer,
@@ -855,7 +1353,7 @@ mod integration_tests {
                     mode: AttachMode::CoWrite as i32,
                     client_cols: 80,
                     client_rows: 24,
-                    resume_from_seq: 0,
+                    resume_from_seq,
                 })),
             },
         )
@@ -1074,7 +1572,8 @@ mod integration_tests {
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
 
-        let (mut reader, _writer, _surface_id) = attach_one(&sock_path, "respawn-test").await;
+        let (mut reader, _writer, _surface_id) =
+            attach_surface_by(&sock_path, "respawn-test", Some(sid.clone())).await;
 
         // After attach, the fresh (respawned) child prints RESPAWN-MARKER.
         let seen = wait_for_marker(
@@ -1773,11 +2272,22 @@ mod integration_tests {
             "marker never arrived after attach"
         );
 
-        let first_payload = first_pty_payload.expect("no PtyData frame arrived after attach");
-        assert!(
-            !first_payload.starts_with(b"\x1b[?"),
-            "unexpected mode-prefix escape on a surface with no active mode: {first_payload:?}"
-        );
+        let _ = first_pty_payload.expect("no PtyData frame arrived after attach");
+        // The grid snapshot legitimately opens with input-mode state
+        // (cursor visibility, keypad, bracketed paste — vt100's
+        // input_mode_formatted), so "starts with ESC[?" no longer means a
+        // mode prefix. What must still never appear on a surface with no
+        // active tracked mode is a mouse-tracking DECSET — the only thing
+        // `mode_replay_bytes` exists to replay.
+        for mode in [1000u16, 1002, 1003, 1005, 1006, 1015, 1016] {
+            let seq = format!("\x1b[?{mode}h");
+            assert!(
+                !aggregated
+                    .windows(seq.as_bytes().len())
+                    .any(|w| w == seq.as_bytes()),
+                "unexpected mouse-mode enable {seq:?} on a surface with no active mode"
+            );
+        }
 
         drop(reader);
         drop(writer);

@@ -534,6 +534,25 @@ public nonisolated struct Termmesh_Peer_V1_Envelope: Sendable {
     set {payload = .dataAck(newValue)}
   }
 
+  /// Gated behind capability "grid.snapshot.v1" (Hello.capabilities) —
+  /// scrollback is part of the grid model: only a client that renders the
+  /// typed snapshot has the empty local scrollback these fill.
+  public var scrollbackRequest: Termmesh_Peer_V1_ScrollbackRequest {
+    get {
+      if case .scrollbackRequest(let v)? = payload {return v}
+      return Termmesh_Peer_V1_ScrollbackRequest()
+    }
+    set {payload = .scrollbackRequest(newValue)}
+  }
+
+  public var scrollbackChunk: Termmesh_Peer_V1_ScrollbackChunk {
+    get {
+      if case .scrollbackChunk(let v)? = payload {return v}
+      return Termmesh_Peer_V1_ScrollbackChunk()
+    }
+    set {payload = .scrollbackChunk(newValue)}
+  }
+
   public var workspaceUpdate: Termmesh_Peer_V1_WorkspaceUpdate {
     get {
       if case .workspaceUpdate(let v)? = payload {return v}
@@ -657,6 +676,11 @@ public nonisolated struct Termmesh_Peer_V1_Envelope: Sendable {
     case resize(Termmesh_Peer_V1_Resize)
     case gridSnapshot(Termmesh_Peer_V1_GridSnapshot)
     case dataAck(Termmesh_Peer_V1_DataAck)
+    /// Gated behind capability "grid.snapshot.v1" (Hello.capabilities) —
+    /// scrollback is part of the grid model: only a client that renders the
+    /// typed snapshot has the empty local scrollback these fill.
+    case scrollbackRequest(Termmesh_Peer_V1_ScrollbackRequest)
+    case scrollbackChunk(Termmesh_Peer_V1_ScrollbackChunk)
     case workspaceUpdate(Termmesh_Peer_V1_WorkspaceUpdate)
     /// Gated behind capability "workspace.lifecycle.v1" (Hello.capabilities).
     case renameWorkspaceRequest(Termmesh_Peer_V1_RenameWorkspaceRequest)
@@ -1630,9 +1654,22 @@ public nonisolated struct Termmesh_Peer_V1_Resize: Sendable {
   public init() {}
 }
 
-/// Periodic visible-screen keyframe. Scrollback is NOT included here;
-/// clients reconnecting within the host ring buffer get bytes replayed,
-/// clients outside accept scrollback loss.
+/// Visible-screen keyframe for a fresh attach (capability
+/// "grid.snapshot.v1"). Scrollback is NOT included here; clients
+/// reconnecting within the host ring buffer get bytes replayed via
+/// `resume_from_seq`, clients outside accept scrollback loss.
+///
+/// The screen travels as an ANSI re-render (`ansi`), not as cells. The
+/// protocol doc's open question ("cells vs ANSI re-render — decide when
+/// prototyping") was settled for ANSI at implementation time: both
+/// encodings would be produced by the same host-side emulator, so cells
+/// add no robustness — but they DO add drift surface (an attrs bitfield
+/// whose layout was never specified, host-resolved palette RGB where the
+/// viewer's theme should decide) and cost 10-20x the bytes of the
+/// equivalent escape stream. The cell fields were designed and codegen'd
+/// but never emitted by any released host, so their numbers are reserved
+/// rather than carried forward; a cell encoding, if ever wanted, claims a
+/// "grid-snapshot-v2" capability per the evolution rules.
 public nonisolated struct Termmesh_Peer_V1_GridSnapshot: Sendable {
   // SwiftProtobuf.Message conformance is added in an extension below. See the
   // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
@@ -1640,7 +1677,11 @@ public nonisolated struct Termmesh_Peer_V1_GridSnapshot: Sendable {
 
   public var surfaceID: Data = Data()
 
-  /// byte_seq this snapshot is consistent with.
+  /// Host-absolute byte_seq this snapshot is consistent with. Equals
+  /// AttachResult.initial_seq for this attach. Snapshot bytes are synthetic
+  /// and spend no wire byte_seq: the first live PtyData after this message
+  /// starts at wire byte_seq 0, so the client resets its wire-gap baseline
+  /// to zero and keeps translating wire positions via initial_seq.
   public var byteSeq: UInt64 = 0
 
   public var cols: UInt32 = 0
@@ -1658,13 +1699,69 @@ public nonisolated struct Termmesh_Peer_V1_GridSnapshot: Sendable {
   /// Clears the value of `cursor`. Subsequent reads from it will return its default value.
   public mutating func clearCursor() {self._cursor = nil}
 
-  public var rowsData: [Termmesh_Peer_V1_GridRow] = []
+  /// The rendered screen: feed to a terminal as-is. Self-contained — leads
+  /// with clear+home, ends with cursor position, includes input-mode state,
+  /// and is prefixed with the alt-screen switch when `alt_screen` is true.
+  public var ansi: Data = Data()
 
   public var unknownFields = SwiftProtobuf.UnknownStorage()
 
   public init() {}
 
   fileprivate var _cursor: Termmesh_Peer_V1_CursorState? = nil
+}
+
+/// Ask the host to render a window of its scrollback (tmux copy-mode
+/// model: scrollback lives on the host and is fetched on demand when the
+/// viewer scrolls to the top of what it has). `offset_rows` counts up from
+/// the live screen's bottom — offset 0 is the live screen itself, so a
+/// first request typically asks for offset = viewport height.
+public nonisolated struct Termmesh_Peer_V1_ScrollbackRequest: Sendable {
+  // SwiftProtobuf.Message conformance is added in an extension below. See the
+  // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
+  // methods supported on all messages.
+
+  public var surfaceID: Data = Data()
+
+  /// How many rows above the live view's bottom the requested window's
+  /// bottom sits. Clamped by the host to what its scrollback actually holds.
+  public var offsetRows: UInt32 = 0
+
+  public var unknownFields = SwiftProtobuf.UnknownStorage()
+
+  public init() {}
+}
+
+/// One rendered scrollback window. `ansi` is a full-screen replacement
+/// render (clear+home first, viewport-sized) at the effective offset — the
+/// client swaps its screen wholesale while browsing, exactly like tmux
+/// copy-mode, and returns to the live screen (offset 0 / a fresh
+/// GridSnapshot) when done.
+public nonisolated struct Termmesh_Peer_V1_ScrollbackChunk: Sendable {
+  // SwiftProtobuf.Message conformance is added in an extension below. See the
+  // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
+  // methods supported on all messages.
+
+  public var surfaceID: Data = Data()
+
+  /// The offset actually rendered, after clamping. Echoing it back lets the
+  /// client detect "I asked for further up than exists".
+  public var offsetRows: UInt32 = 0
+
+  public var ansi: Data = Data()
+
+  /// True when the rendered window is at (or clamped to) the oldest
+  /// scrollback the host still holds — the client should stop asking for
+  /// more on further upward scrolls.
+  public var atTop: Bool = false
+
+  /// Rows of scrollback the host currently holds for this surface, for UI
+  /// hints. 0 both when empty and when the host has scrollback disabled.
+  public var totalScrollbackRows: UInt32 = 0
+
+  public var unknownFields = SwiftProtobuf.UnknownStorage()
+
+  public init() {}
 }
 
 public nonisolated struct Termmesh_Peer_V1_CursorState: Sendable {
@@ -1680,40 +1777,6 @@ public nonisolated struct Termmesh_Peer_V1_CursorState: Sendable {
 
   /// libghostty cursor style enum; mirrors GhosttyKit's value.
   public var style: UInt32 = 0
-
-  public var unknownFields = SwiftProtobuf.UnknownStorage()
-
-  public init() {}
-}
-
-public nonisolated struct Termmesh_Peer_V1_GridRow: Sendable {
-  // SwiftProtobuf.Message conformance is added in an extension below. See the
-  // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
-  // methods supported on all messages.
-
-  public var cells: [Termmesh_Peer_V1_Cell] = []
-
-  public var unknownFields = SwiftProtobuf.UnknownStorage()
-
-  public init() {}
-}
-
-public nonisolated struct Termmesh_Peer_V1_Cell: Sendable {
-  // SwiftProtobuf.Message conformance is added in an extension below. See the
-  // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
-  // methods supported on all messages.
-
-  /// Usually a single grapheme; wide chars occupy one Cell plus a continuation.
-  public var text: String = String()
-
-  public var fgRgba: UInt32 = 0
-
-  public var bgRgba: UInt32 = 0
-
-  /// Bitfield: bold, italic, underline, strike, inverse, dim.
-  public var attrs: UInt32 = 0
-
-  public var isContinuation: Bool = false
 
   public var unknownFields = SwiftProtobuf.UnknownStorage()
 
@@ -2073,7 +2136,7 @@ nonisolated extension Termmesh_Peer_V1_TerminateSurfaceErrorCode: SwiftProtobuf.
 
 nonisolated extension Termmesh_Peer_V1_Envelope: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
   public static let protoMessageName: String = _protobuf_package + ".Envelope"
-  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{1}seq\0\u{3}correlation_id\0\u{2}\u{8}hello\0\u{3}auth_challenge\0\u{1}auth\0\u{3}auth_result\0\u{4}\u{7}list_surfaces\0\u{3}surface_list\0\u{3}attach_surface\0\u{3}attach_result\0\u{3}detach_surface\0\u{3}list_workspaces\0\u{3}workspace_list\0\u{3}workspace_control\0\u{3}create_workspace_request\0\u{3}create_workspace_response\0\u{3}pty_data\0\u{1}input\0\u{1}resize\0\u{3}grid_snapshot\0\u{3}data_ack\0\u{4}\u{6}workspace_update\0\u{3}rename_workspace_request\0\u{3}delete_workspace_request\0\u{3}ensure_surface_request\0\u{3}ensure_surface_response\0\u{3}terminate_surface_request\0\u{3}terminate_surface_response\0\u{3}host_stats\0\u{2}\u{3}ping\0\u{1}pong\0\u{2}\u{9}goodbye\0\u{2}'error\0")
+  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{1}seq\0\u{3}correlation_id\0\u{2}\u{8}hello\0\u{3}auth_challenge\0\u{1}auth\0\u{3}auth_result\0\u{4}\u{7}list_surfaces\0\u{3}surface_list\0\u{3}attach_surface\0\u{3}attach_result\0\u{3}detach_surface\0\u{3}list_workspaces\0\u{3}workspace_list\0\u{3}workspace_control\0\u{3}create_workspace_request\0\u{3}create_workspace_response\0\u{3}pty_data\0\u{1}input\0\u{1}resize\0\u{3}grid_snapshot\0\u{3}data_ack\0\u{3}scrollback_request\0\u{3}scrollback_chunk\0\u{4}\u{4}workspace_update\0\u{3}rename_workspace_request\0\u{3}delete_workspace_request\0\u{3}ensure_surface_request\0\u{3}ensure_surface_response\0\u{3}terminate_surface_request\0\u{3}terminate_surface_response\0\u{3}host_stats\0\u{2}\u{3}ping\0\u{1}pong\0\u{2}\u{9}goodbye\0\u{2}'error\0")
 
   public mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
     while let fieldNumber = try decoder.nextFieldNumber() {
@@ -2330,6 +2393,32 @@ nonisolated extension Termmesh_Peer_V1_Envelope: SwiftProtobuf.Message, SwiftPro
           self.payload = .dataAck(v)
         }
       }()
+      case 35: try {
+        var v: Termmesh_Peer_V1_ScrollbackRequest?
+        var hadOneofValue = false
+        if let current = self.payload {
+          hadOneofValue = true
+          if case .scrollbackRequest(let m) = current {v = m}
+        }
+        try decoder.decodeSingularMessageField(value: &v)
+        if let v = v {
+          if hadOneofValue {try decoder.handleConflictingOneOf()}
+          self.payload = .scrollbackRequest(v)
+        }
+      }()
+      case 36: try {
+        var v: Termmesh_Peer_V1_ScrollbackChunk?
+        var hadOneofValue = false
+        if let current = self.payload {
+          hadOneofValue = true
+          if case .scrollbackChunk(let m) = current {v = m}
+        }
+        try decoder.decodeSingularMessageField(value: &v)
+        if let v = v {
+          if hadOneofValue {try decoder.handleConflictingOneOf()}
+          self.payload = .scrollbackChunk(v)
+        }
+      }()
       case 40: try {
         var v: Termmesh_Peer_V1_WorkspaceUpdate?
         var hadOneofValue = false
@@ -2578,6 +2667,14 @@ nonisolated extension Termmesh_Peer_V1_Envelope: SwiftProtobuf.Message, SwiftPro
     case .dataAck?: try {
       guard case .dataAck(let v)? = self.payload else { preconditionFailure() }
       try visitor.visitSingularMessageField(value: v, fieldNumber: 34)
+    }()
+    case .scrollbackRequest?: try {
+      guard case .scrollbackRequest(let v)? = self.payload else { preconditionFailure() }
+      try visitor.visitSingularMessageField(value: v, fieldNumber: 35)
+    }()
+    case .scrollbackChunk?: try {
+      guard case .scrollbackChunk(let v)? = self.payload else { preconditionFailure() }
+      try visitor.visitSingularMessageField(value: v, fieldNumber: 36)
     }()
     case .workspaceUpdate?: try {
       guard case .workspaceUpdate(let v)? = self.payload else { preconditionFailure() }
@@ -4523,7 +4620,7 @@ nonisolated extension Termmesh_Peer_V1_Resize: SwiftProtobuf.Message, SwiftProto
 
 nonisolated extension Termmesh_Peer_V1_GridSnapshot: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
   public static let protoMessageName: String = _protobuf_package + ".GridSnapshot"
-  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{3}surface_id\0\u{3}byte_seq\0\u{1}cols\0\u{1}rows\0\u{3}alt_screen\0\u{1}cursor\0\u{3}rows_data\0")
+  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{3}surface_id\0\u{3}byte_seq\0\u{1}cols\0\u{1}rows\0\u{3}alt_screen\0\u{1}cursor\0\u{2}\u{2}ansi\0\u{b}rows_data\0\u{c}\u{7}\u{1}")
 
   public mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
     while let fieldNumber = try decoder.nextFieldNumber() {
@@ -4537,7 +4634,7 @@ nonisolated extension Termmesh_Peer_V1_GridSnapshot: SwiftProtobuf.Message, Swif
       case 4: try { try decoder.decodeSingularUInt32Field(value: &self.rows) }()
       case 5: try { try decoder.decodeSingularBoolField(value: &self.altScreen) }()
       case 6: try { try decoder.decodeSingularMessageField(value: &self._cursor) }()
-      case 7: try { try decoder.decodeRepeatedMessageField(value: &self.rowsData) }()
+      case 8: try { try decoder.decodeSingularBytesField(value: &self.ansi) }()
       default: break
       }
     }
@@ -4566,8 +4663,8 @@ nonisolated extension Termmesh_Peer_V1_GridSnapshot: SwiftProtobuf.Message, Swif
     try { if let v = self._cursor {
       try visitor.visitSingularMessageField(value: v, fieldNumber: 6)
     } }()
-    if !self.rowsData.isEmpty {
-      try visitor.visitRepeatedMessageField(value: self.rowsData, fieldNumber: 7)
+    if !self.ansi.isEmpty {
+      try visitor.visitSingularBytesField(value: self.ansi, fieldNumber: 8)
     }
     try unknownFields.traverse(visitor: &visitor)
   }
@@ -4579,7 +4676,92 @@ nonisolated extension Termmesh_Peer_V1_GridSnapshot: SwiftProtobuf.Message, Swif
     if lhs.rows != rhs.rows {return false}
     if lhs.altScreen != rhs.altScreen {return false}
     if lhs._cursor != rhs._cursor {return false}
-    if lhs.rowsData != rhs.rowsData {return false}
+    if lhs.ansi != rhs.ansi {return false}
+    if lhs.unknownFields != rhs.unknownFields {return false}
+    return true
+  }
+}
+
+nonisolated extension Termmesh_Peer_V1_ScrollbackRequest: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
+  public static let protoMessageName: String = _protobuf_package + ".ScrollbackRequest"
+  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{3}surface_id\0\u{3}offset_rows\0")
+
+  public mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
+    while let fieldNumber = try decoder.nextFieldNumber() {
+      // The use of inline closures is to circumvent an issue where the compiler
+      // allocates stack space for every case branch when no optimizations are
+      // enabled. https://github.com/apple/swift-protobuf/issues/1034
+      switch fieldNumber {
+      case 1: try { try decoder.decodeSingularBytesField(value: &self.surfaceID) }()
+      case 2: try { try decoder.decodeSingularUInt32Field(value: &self.offsetRows) }()
+      default: break
+      }
+    }
+  }
+
+  public func traverse<V: SwiftProtobuf.Visitor>(visitor: inout V) throws {
+    if !self.surfaceID.isEmpty {
+      try visitor.visitSingularBytesField(value: self.surfaceID, fieldNumber: 1)
+    }
+    if self.offsetRows != 0 {
+      try visitor.visitSingularUInt32Field(value: self.offsetRows, fieldNumber: 2)
+    }
+    try unknownFields.traverse(visitor: &visitor)
+  }
+
+  public static func ==(lhs: Termmesh_Peer_V1_ScrollbackRequest, rhs: Termmesh_Peer_V1_ScrollbackRequest) -> Bool {
+    if lhs.surfaceID != rhs.surfaceID {return false}
+    if lhs.offsetRows != rhs.offsetRows {return false}
+    if lhs.unknownFields != rhs.unknownFields {return false}
+    return true
+  }
+}
+
+nonisolated extension Termmesh_Peer_V1_ScrollbackChunk: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
+  public static let protoMessageName: String = _protobuf_package + ".ScrollbackChunk"
+  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{3}surface_id\0\u{3}offset_rows\0\u{1}ansi\0\u{3}at_top\0\u{3}total_scrollback_rows\0")
+
+  public mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
+    while let fieldNumber = try decoder.nextFieldNumber() {
+      // The use of inline closures is to circumvent an issue where the compiler
+      // allocates stack space for every case branch when no optimizations are
+      // enabled. https://github.com/apple/swift-protobuf/issues/1034
+      switch fieldNumber {
+      case 1: try { try decoder.decodeSingularBytesField(value: &self.surfaceID) }()
+      case 2: try { try decoder.decodeSingularUInt32Field(value: &self.offsetRows) }()
+      case 3: try { try decoder.decodeSingularBytesField(value: &self.ansi) }()
+      case 4: try { try decoder.decodeSingularBoolField(value: &self.atTop) }()
+      case 5: try { try decoder.decodeSingularUInt32Field(value: &self.totalScrollbackRows) }()
+      default: break
+      }
+    }
+  }
+
+  public func traverse<V: SwiftProtobuf.Visitor>(visitor: inout V) throws {
+    if !self.surfaceID.isEmpty {
+      try visitor.visitSingularBytesField(value: self.surfaceID, fieldNumber: 1)
+    }
+    if self.offsetRows != 0 {
+      try visitor.visitSingularUInt32Field(value: self.offsetRows, fieldNumber: 2)
+    }
+    if !self.ansi.isEmpty {
+      try visitor.visitSingularBytesField(value: self.ansi, fieldNumber: 3)
+    }
+    if self.atTop != false {
+      try visitor.visitSingularBoolField(value: self.atTop, fieldNumber: 4)
+    }
+    if self.totalScrollbackRows != 0 {
+      try visitor.visitSingularUInt32Field(value: self.totalScrollbackRows, fieldNumber: 5)
+    }
+    try unknownFields.traverse(visitor: &visitor)
+  }
+
+  public static func ==(lhs: Termmesh_Peer_V1_ScrollbackChunk, rhs: Termmesh_Peer_V1_ScrollbackChunk) -> Bool {
+    if lhs.surfaceID != rhs.surfaceID {return false}
+    if lhs.offsetRows != rhs.offsetRows {return false}
+    if lhs.ansi != rhs.ansi {return false}
+    if lhs.atTop != rhs.atTop {return false}
+    if lhs.totalScrollbackRows != rhs.totalScrollbackRows {return false}
     if lhs.unknownFields != rhs.unknownFields {return false}
     return true
   }
@@ -4625,86 +4807,6 @@ nonisolated extension Termmesh_Peer_V1_CursorState: SwiftProtobuf.Message, Swift
     if lhs.row != rhs.row {return false}
     if lhs.visible != rhs.visible {return false}
     if lhs.style != rhs.style {return false}
-    if lhs.unknownFields != rhs.unknownFields {return false}
-    return true
-  }
-}
-
-nonisolated extension Termmesh_Peer_V1_GridRow: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
-  public static let protoMessageName: String = _protobuf_package + ".GridRow"
-  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{1}cells\0")
-
-  public mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
-    while let fieldNumber = try decoder.nextFieldNumber() {
-      // The use of inline closures is to circumvent an issue where the compiler
-      // allocates stack space for every case branch when no optimizations are
-      // enabled. https://github.com/apple/swift-protobuf/issues/1034
-      switch fieldNumber {
-      case 1: try { try decoder.decodeRepeatedMessageField(value: &self.cells) }()
-      default: break
-      }
-    }
-  }
-
-  public func traverse<V: SwiftProtobuf.Visitor>(visitor: inout V) throws {
-    if !self.cells.isEmpty {
-      try visitor.visitRepeatedMessageField(value: self.cells, fieldNumber: 1)
-    }
-    try unknownFields.traverse(visitor: &visitor)
-  }
-
-  public static func ==(lhs: Termmesh_Peer_V1_GridRow, rhs: Termmesh_Peer_V1_GridRow) -> Bool {
-    if lhs.cells != rhs.cells {return false}
-    if lhs.unknownFields != rhs.unknownFields {return false}
-    return true
-  }
-}
-
-nonisolated extension Termmesh_Peer_V1_Cell: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
-  public static let protoMessageName: String = _protobuf_package + ".Cell"
-  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{1}text\0\u{3}fg_rgba\0\u{3}bg_rgba\0\u{1}attrs\0\u{3}is_continuation\0")
-
-  public mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
-    while let fieldNumber = try decoder.nextFieldNumber() {
-      // The use of inline closures is to circumvent an issue where the compiler
-      // allocates stack space for every case branch when no optimizations are
-      // enabled. https://github.com/apple/swift-protobuf/issues/1034
-      switch fieldNumber {
-      case 1: try { try decoder.decodeSingularStringField(value: &self.text) }()
-      case 2: try { try decoder.decodeSingularUInt32Field(value: &self.fgRgba) }()
-      case 3: try { try decoder.decodeSingularUInt32Field(value: &self.bgRgba) }()
-      case 4: try { try decoder.decodeSingularUInt32Field(value: &self.attrs) }()
-      case 5: try { try decoder.decodeSingularBoolField(value: &self.isContinuation) }()
-      default: break
-      }
-    }
-  }
-
-  public func traverse<V: SwiftProtobuf.Visitor>(visitor: inout V) throws {
-    if !self.text.isEmpty {
-      try visitor.visitSingularStringField(value: self.text, fieldNumber: 1)
-    }
-    if self.fgRgba != 0 {
-      try visitor.visitSingularUInt32Field(value: self.fgRgba, fieldNumber: 2)
-    }
-    if self.bgRgba != 0 {
-      try visitor.visitSingularUInt32Field(value: self.bgRgba, fieldNumber: 3)
-    }
-    if self.attrs != 0 {
-      try visitor.visitSingularUInt32Field(value: self.attrs, fieldNumber: 4)
-    }
-    if self.isContinuation != false {
-      try visitor.visitSingularBoolField(value: self.isContinuation, fieldNumber: 5)
-    }
-    try unknownFields.traverse(visitor: &visitor)
-  }
-
-  public static func ==(lhs: Termmesh_Peer_V1_Cell, rhs: Termmesh_Peer_V1_Cell) -> Bool {
-    if lhs.text != rhs.text {return false}
-    if lhs.fgRgba != rhs.fgRgba {return false}
-    if lhs.bgRgba != rhs.bgRgba {return false}
-    if lhs.attrs != rhs.attrs {return false}
-    if lhs.isContinuation != rhs.isContinuation {return false}
     if lhs.unknownFields != rhs.unknownFields {return false}
     return true
   }

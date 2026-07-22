@@ -53,6 +53,16 @@ public struct PeerAttachOutcome: Sendable, Equatable {
 /// so callers don't have to handle every oneof variant.
 public enum PeerIncomingMessage: Sendable {
     case ptyData(surfaceID: Data, byteSeq: UInt64, payload: Data)
+    /// Fresh-attach screen keyframe (capability "grid.snapshot.v1"): the
+    /// rendered current screen as ANSI, consistent with `byteSeq`. The
+    /// consumer must reset its wire-gap baseline to `byteSeq` — snapshot
+    /// bytes are synthetic and sit outside the PtyData byte_seq space.
+    case gridSnapshot(surfaceID: Data, byteSeq: UInt64, altScreen: Bool, ansi: Data)
+    /// One rendered scrollback window (tmux copy-mode model): a full-screen
+    /// replacement render at `offsetRows` above the live bottom. `atTop`
+    /// means the host has nothing older; offset 0 is the live screen itself
+    /// (the browse-exit render).
+    case scrollbackChunk(surfaceID: Data, offsetRows: UInt32, ansi: Data, atTop: Bool, totalRows: UInt32)
     case workspaceMeta(cwd: String, branch: String, ports: [UInt32], latestNotification: String)
     case workspaceSurfaceAdded(Termmesh_Peer_V1_SurfaceInfo)
     case workspaceSurfaceRemoved(surfaceID: Data)
@@ -824,6 +834,21 @@ public actor PeerSession {
             return .other
         case .ptyData(let p):
             return .ptyData(surfaceID: p.surfaceID, byteSeq: p.byteSeq, payload: p.payload)
+        case .gridSnapshot(let g):
+            return .gridSnapshot(
+                surfaceID: g.surfaceID,
+                byteSeq: g.byteSeq,
+                altScreen: g.altScreen,
+                ansi: g.ansi
+            )
+        case .scrollbackChunk(let c):
+            return .scrollbackChunk(
+                surfaceID: c.surfaceID,
+                offsetRows: c.offsetRows,
+                ansi: c.ansi,
+                atTop: c.atTop,
+                totalRows: c.totalScrollbackRows
+            )
         case .workspaceUpdate(let wu):
             switch wu.kind {
             case .meta(let m):
@@ -860,6 +885,19 @@ public actor PeerSession {
     /// Send raw keystrokes to an attached surface. `keys` is the bytes the
     /// child would see on its stdin (the caller is responsible for any
     /// terminal escape encoding).
+    /// Ask the host to render the scrollback window whose bottom sits
+    /// `offsetRows` above the live view (0 = the live screen, i.e. the
+    /// browse-exit render). Reply arrives as `.scrollbackChunk`. Gated
+    /// host-side on grid.snapshot.v1 — a legacy host ignores it.
+    public func requestScrollback(surfaceID: Data, offsetRows: UInt32) async throws {
+        try await sendEnvelope { env in
+            var r = Termmesh_Peer_V1_ScrollbackRequest()
+            r.surfaceID = surfaceID
+            r.offsetRows = offsetRows
+            env.scrollbackRequest = r
+        }
+    }
+
     public func sendInput(surfaceID: Data, keys: Data) async throws {
         try await sendEnvelope { env in
             var input = Termmesh_Peer_V1_Input()
