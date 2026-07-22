@@ -1247,7 +1247,12 @@ final class PeerRelaySession {
             try? await Task.sleep(
                 nanoseconds: UInt64(Self.firstByteWatchdogSeconds * 1_000_000_000)
             )
-            guard let self, !self.ioStats.sawFirstByte else { return }
+            // `isTorndown` as well as the byte check: a session that
+            // disconnected before its first byte is still held by the pane
+            // (it renders the disconnect banner), so without this the
+            // watchdog fires on an already-dead connection and tells the
+            // user a closed pane "may render blank".
+            guard let self, !self.ioStats.sawFirstByte, !self.isTorndown else { return }
             #if DEBUG
             dlog("peer.relay.firstByte.timeout — no PtyData \(Int(Self.firstByteWatchdogSeconds))s after accept (\(self.ioSummary))")
             #endif

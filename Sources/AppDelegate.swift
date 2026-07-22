@@ -2474,12 +2474,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         // hardcoded either side of this — the binding is read from
         // `KeyboardShortcutSettings`, so it shows up in Settings and can be
         // rebound. ⌘⇧O is only the default.
-        if matchShortcut(event: event, shortcut: KeyboardShortcutSettings.shortcut(for: .openPeerWorkspace)) {
-            let targetWindow = activeCommandPaletteWindow() ?? event.window ?? NSApp.keyWindow ?? NSApp.mainWindow
-            NotificationCenter.default.post(name: .commandPalettePeersRequested, object: targetWindow)
-            return true
-        }
-
         let isCommandShiftV = normalizedFlags == [.command, .shift] && (chars == "v" || event.keyCode == 9)
         if isCommandShiftV, let terminal = tabManager?.selectedTerminalPanel?.surface {
             NotificationCenter.default.post(name: .pasteShelfToggleRequested, object: terminal)
@@ -2494,6 +2488,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
             configProvider.reloadConfiguration(source: "shortcut.cmd_shift_comma")
             return true
         }
+
+        // AFTER the reserved shortcuts above, not before: this binding is
+        // user-rebindable and the settings recorder does not refuse the
+        // reserved combos, so a user who maps Open Peer Workspace onto ⌘Q
+        // would otherwise lose the ability to quit — the handler would
+        // swallow the event before the quit branch ever sees it. Claiming a
+        // reserved combo now simply does nothing, which is recoverable;
+        // losing quit is not.
+        if matchShortcut(event: event, shortcut: KeyboardShortcutSettings.shortcut(for: .openPeerWorkspace)) {
+            let targetWindow = activeCommandPaletteWindow() ?? event.window ?? NSApp.keyWindow ?? NSApp.mainWindow
+            NotificationCenter.default.post(name: .commandPalettePeersRequested, object: targetWindow)
+            return true
+        }
+
 
         // When the terminal has active IME composition (e.g. Korean, Japanese, Chinese
         // input), don't intercept key events — let them flow through to the input method.
