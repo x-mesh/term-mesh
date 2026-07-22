@@ -919,8 +919,20 @@ final class PeerClientCoordinator: NSObject, NSMenuDelegate {
         live: Bool = true,
         /// `false` from the socket path — see `openRemotePaneHeadless`. The
         /// sidebar keeps selecting, because a click there IS focus intent.
-        select: Bool = true
+        select: Bool = true,
+        /// `false` from the socket path. `showAlert` presents an NSAlert, which
+        /// activates the app — so a failing socket command would steal focus
+        /// from whatever the user is typing in, even with `select: false`.
+        /// Failures go to RemoteWorkLog instead, which the drawer surfaces.
+        alertOnFailure: Bool = true
     ) async {
+        func reportFailure(_ title: String, _ body: String) {
+            if alertOnFailure {
+                self.showAlert(title: title, body: body)
+            } else {
+                RemoteWorkLog.info("\(title): \(body)")
+            }
+        }
         // Live-mirror dedupe: a second live mirror of the same host
         // workspace is meaningless (both would be host-authoritative
         // copies), so re-clicking the sidebar row focuses the existing
@@ -953,7 +965,7 @@ final class PeerClientCoordinator: NSObject, NSMenuDelegate {
         do {
             lease = try await registry.acquire(spec)
         } catch {
-            self.showAlert(title: "Peer Connection Failed", body: String(describing: error))
+            reportFailure("Peer Connection Failed", String(describing: error))
             return
         }
 
@@ -992,7 +1004,7 @@ final class PeerClientCoordinator: NSObject, NSMenuDelegate {
             await conn.cancel()
         } catch {
             registry.release(lease)
-            self.showAlert(title: "Workspace List Failed", body: String(describing: error))
+            reportFailure("Workspace List Failed", String(describing: error))
             return
         }
         guard !workspaces.isEmpty else {
@@ -1019,7 +1031,7 @@ final class PeerClientCoordinator: NSObject, NSMenuDelegate {
 
         guard let tabManager = AppDelegate.shared?.tabManager else {
             registry.release(lease)
-            self.showAlert(title: "No Main Window", body: "Open a term-mesh window first.")
+            reportFailure("No Main Window", "Open a term-mesh window first.")
             return
         }
 
@@ -1036,7 +1048,7 @@ final class PeerClientCoordinator: NSObject, NSMenuDelegate {
         }
         guard let firstLeaf = Self.firstLeafPane(resolved.layout) else {
             registry.release(lease)
-            self.showAlert(title: "Empty Workspace", body: "The chosen workspace has no panes.")
+            reportFailure("Empty Workspace", "The chosen workspace has no panes.")
             return
         }
 
@@ -1050,7 +1062,7 @@ final class PeerClientCoordinator: NSObject, NSMenuDelegate {
             )
         } catch {
             registry.release(lease)
-            self.showAlert(title: "Attach Failed", body: String(describing: error))
+            reportFailure("Attach Failed", String(describing: error))
             return
         }
 
@@ -1072,7 +1084,7 @@ final class PeerClientCoordinator: NSObject, NSMenuDelegate {
         else {
             firstSession.teardown()
             registry.release(lease)
-            self.showAlert(title: "Mirror Failed", body: "New workspace has no terminal panel.")
+            reportFailure("Mirror Failed", "New workspace has no terminal panel.")
             return
         }
         workspace.bindRemotePane(session: firstSession, to: firstPanel)
@@ -1291,7 +1303,11 @@ final class PeerClientCoordinator: NSObject, NSMenuDelegate {
         return info
     }
 
-    #if DEBUG
+    // MARK: - Headless peer open + status
+    //
+    // Not DEBUG-gated: the production `peer.*` socket commands are built on
+    // these. The two raw-socket-path variants below stay test-only — they
+    // bypass RemoteHostStore entirely, so they can observe no sidebar state.
     // MARK: - Remote pane debug hooks (tests_v2 socket e2e)
 
     /// Result of the last `debug.peer.open_remote_pane`, polled via
@@ -1300,6 +1316,7 @@ final class PeerClientCoordinator: NSObject, NSMenuDelegate {
     /// the main thread.
     private(set) var debugLastPaneOpenResult: [String: Any]?
 
+    #if DEBUG
     /// Headless remote-pane open: no pickers, no alerts. With a nil
     /// sockPath, brings up the in-app peer server and mirrors one of
     /// this instance's own surfaces (loopback self-mirror). An sshTarget
@@ -1329,6 +1346,7 @@ final class PeerClientCoordinator: NSObject, NSMenuDelegate {
             await debugOpenRemotePaneResolved(spec: .direct(sockPath: hostSock))
         }
     }
+    #endif
 
     /// Headless open for the `peer.surface.open_pane` socket command: the
     /// sidebar's "Open Surface as Pane…" flow minus the picker, attaching the
@@ -1392,6 +1410,7 @@ final class PeerClientCoordinator: NSObject, NSMenuDelegate {
             }
     }
 
+    #if DEBUG
     /// Test-only headless workspace mirror: no pickers/alerts on the
     /// happy path (first workspace auto-picked). Outcome polled via
     /// `debug.peer.pane_status` — session count reflects mirrored
@@ -1430,6 +1449,7 @@ final class PeerClientCoordinator: NSObject, NSMenuDelegate {
             ]
         }
     }
+    #endif
 
     /// Snapshot of live-mirror state for e2e assertions.
     func debugMirrorStatus() -> [String: Any] {
@@ -1473,7 +1493,7 @@ final class PeerClientCoordinator: NSObject, NSMenuDelegate {
             "last_open_result": debugLastPaneOpenResult ?? NSNull(),
         ]
     }
-    #endif
+
 
     /// Panels with a reconnect currently in flight — repeated banner
     /// clicks must not spawn concurrent reconnect tasks (double panes,

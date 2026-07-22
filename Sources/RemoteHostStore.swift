@@ -509,7 +509,9 @@ final class RemoteHostStore: ObservableObject {
     /// leave `connectTasks[key]` populated — a hung acquire never returns to
     /// clear it, and that leftover entry makes `connectSavedHost` return
     /// immediately, which is what leaves a stuck row with no way forward.
-    func retryConnectingHost(_ host: HostEntry) {
+    /// Returns false when the attempt could not actually be restarted.
+    @discardableResult
+    func retryConnectingHost(_ host: HostEntry) -> Bool {
         let key = host.id
         // Release the sidebar lease first. `connectSavedHost` returns early
         // while one exists, so retrying a row that already holds a lease — a
@@ -523,8 +525,9 @@ final class RemoteHostStore: ObservableObject {
         connectAttemptIDs[key] = nil
         connectTasks[key]?.cancel()
         connectTasks[key] = nil
+        var cancelledPending = true
         if let hostKey = connectingLeaseKeys[key] {
-            PeerPaneHostRegistry.shared.cancelPendingAcquire(for: hostKey)
+            cancelledPending = PeerPaneHostRegistry.shared.cancelPendingAcquire(for: hostKey)
         }
         connectingLeaseKeys[key] = nil
         fetchTasks[key]?.cancel()
@@ -534,10 +537,21 @@ final class RemoteHostStore: ObservableObject {
         hosts[key]?.supportsWorkspaceLifecycle = nil
         hosts[key]?.connectionState = .saved
         #if DEBUG
-        dlog("peer.sidebar.connect retry key=\(key)")
+        dlog("peer.sidebar.connect retry key=\(key) cancelledPending=\(cancelledPending)")
         #endif
+        if !cancelledPending {
+            // A pane or mirror is waiting on the same coalesced start, so it
+            // cannot be cancelled from here. connectSavedHost would rejoin that
+            // very task, leaving the row stuck and the waiter count higher —
+            // say so rather than pretending a fresh attempt began.
+            RemoteWorkLog.info(
+                "Cannot restart \(host.displayName) — another pane is waiting on the same connection attempt; close it first"
+            )
+            return false
+        }
         RemoteWorkLog.info("Retrying connection to \(host.displayName)")
         connectSavedHost(host)
+        return true
     }
 
     /// Close every pane, mirror and relay window opened from this host, then
@@ -799,7 +813,8 @@ final class RemoteHostStore: ObservableObject {
         _ workspace: WorkspaceSummary,
         host: HostEntry,
         live: Bool = true,
-        select: Bool = true
+        select: Bool = true,
+        alertOnFailure: Bool = true
     ) {
         let spec = host.paneHostSpec
         Task {
@@ -807,7 +822,8 @@ final class RemoteHostStore: ObservableObject {
                 spec: spec,
                 workspaceID: workspace.id,
                 live: live,
-                select: select
+                select: select,
+                alertOnFailure: alertOnFailure
             )
         }
     }

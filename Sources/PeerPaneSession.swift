@@ -220,16 +220,23 @@ final class PeerPaneHostRegistry {
     ///
     /// An already-live lease is never affected — it may be owned by another
     /// pane or workspace mirror.
-    func cancelPendingAcquire(for key: PeerPaneHostKey) {
-        guard let startingLease = starting[key] else { return }
+    /// Returns false when a pending start exists but could not be cancelled
+    /// because other panes are waiting on it. Callers that promise the user a
+    /// fresh attempt (sidebar Retry, `peer.host.retry`) must not claim to have
+    /// restarted anything in that case — `connectSavedHost` would simply
+    /// rejoin the same hung task and add one more waiter.
+    @discardableResult
+    func cancelPendingAcquire(for key: PeerPaneHostKey) -> Bool {
+        guard let startingLease = starting[key] else { return true }
         guard startingLease.waiters <= 1 else {
             #if DEBUG
             dlog("peer.pane.acquire.cancel.shared key=\(key) waiters=\(startingLease.waiters)")
             #endif
-            return
+            return false
         }
         starting[key] = nil
         startingLease.task.cancel()
+        return true
     }
 
     #if DEBUG

@@ -104,6 +104,15 @@ extension TerminalController {
             case .connecting:
                 return ["ok": true, "started": false, "state": "connecting"]
             case .saved, .failed:
+                // connectSavedHost bails on a host with no ssh target — an
+                // ad-hoc direct-socket entry left behind by a closed
+                // connection. Reporting started=true there would be a lie.
+                guard let ssh = host.sshTarget, !ssh.isEmpty else {
+                    throw PeerCommandFailure(
+                        code: "not_supported",
+                        message: "\(host.displayName) has no SSH target — direct-socket hosts cannot be reconnected"
+                    )
+                }
                 store.connectSavedHost(host)
                 return ["ok": true, "started": true, "state": "connecting"]
             }
@@ -115,7 +124,21 @@ extension TerminalController {
     /// which is exactly when the caller cannot know the state is still valid.
     func v2PeerHostRetry(params: [String: Any]) -> V2CallResult {
         peerDispatchHostAction(params: params, action: "retry") { store, host in
-            store.retryConnectingHost(host)
+            guard let ssh = host.sshTarget, !ssh.isEmpty else {
+                throw PeerCommandFailure(
+                    code: "not_supported",
+                    message: "\(host.displayName) has no SSH target — direct-socket hosts cannot be reconnected"
+                )
+            }
+            // False when another pane is waiting on the same coalesced start,
+            // which cannot be cancelled from here — reporting started=true
+            // would claim a fresh attempt that never began.
+            guard store.retryConnectingHost(host) else {
+                throw PeerCommandFailure(
+                    code: "conflict",
+                    message: "another pane is waiting on the same connection attempt; close it first"
+                )
+            }
             return ["ok": true, "started": true, "state": "connecting"]
         }
     }
@@ -210,7 +233,9 @@ extension TerminalController {
                     code: "not_found", message: "no such workspace: \(wanted ?? "")"
                 )
             }
-            store.openWorkspaceAsMirror(workspace, host: host, live: live, select: false)
+            store.openWorkspaceAsMirror(
+                workspace, host: host, live: live, select: false, alertOnFailure: false
+            )
             return ["ok": true, "started": true, "workspace": workspace.title, "live": live]
         }
     }
