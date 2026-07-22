@@ -436,10 +436,17 @@ async fn reader_loop(
                 let resume_from_seq =
                     effective_resume_from_seq(&peer_capabilities, req.resume_from_seq);
                 let subscriber = surface.subscribe();
+                // Resume asks for an exact range and must be served from the
+                // full ring; a fresh attach gets only the recent tail. Handing
+                // a fresh attach the whole ring meant re-opening a surface
+                // that had once run something noisy (a large `find`, a build
+                // log) re-streamed up to the entire replay capacity — which
+                // renders as that old command scrolling past again on every
+                // open. See `FRESH_ATTACH_REPLAY_BYTES`.
                 let replay = if resume_from_seq != 0 {
                     surface.replay_snapshot_from(resume_from_seq)
                 } else {
-                    surface.replay_snapshot()
+                    surface.replay_snapshot_fresh()
                 };
                 let mode_prefix = surface.mode_replay_bytes();
                 // Absolute host seq (`PtyChunk::seq` space) that this

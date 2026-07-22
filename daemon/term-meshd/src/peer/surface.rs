@@ -62,6 +62,22 @@ const BROADCAST_CAPACITY: usize = 1024;
 /// stays attached-replay-eligible, and that cost multiplies by the number of
 /// concurrently live surfaces.
 const REPLAY_CAPACITY_DEFAULT_BYTES: usize = 32 * 1024 * 1024; // 32 MiB
+/// Bytes of recent PTY output a *fresh* attach (one that sends no
+/// `resume_from_seq`) is replayed, independent of the ring's capacity above.
+///
+/// These are deliberately two numbers. The capacity is sized for *resume*:
+/// after a bulk-flood gap the client asks for an exact range and the ring must
+/// still hold it, hence 32 MiB. A fresh attach has no such range to ask for —
+/// it only needs enough trailing output to render a sane screen, the "shell
+/// prompt printed before the SSH relay attached" case the capacity doc
+/// describes. Handing it the entire ring instead meant re-opening a surface
+/// that had once run something noisy re-streamed megabytes, which reads on
+/// screen as the old command scrolling past all over again.
+///
+/// 64 KiB matches the macOS host's own replay ring
+/// (`GhosttyPaneSurfaceProvider.swift`'s `replayCapacityBytes`), so the two
+/// host implementations hand a fresh viewer a comparable amount of history.
+const FRESH_ATTACH_REPLAY_BYTES: usize = 64 * 1024; // 64 KiB
 /// Lower bound accepted for the replay capacity (env or RPC/CLI set).
 const REPLAY_CAPACITY_MIN_BYTES: usize = 4 * 1024; // 4 KiB
 /// Upper bound accepted for the replay capacity (env or RPC/CLI set).
@@ -184,6 +200,42 @@ impl ReplayBuffer {
 
     fn snapshot(&self) -> Vec<PtyChunk> {
         self.chunks.iter().cloned().collect()
+    }
+
+    /// The newest `max_bytes`-ish of the ring, as whole chunks.
+    ///
+    /// Exists because the ring's *capacity* and a *fresh attach's* replay
+    /// size are two different requirements that used to share one number.
+    /// `REPLAY_CAPACITY_DEFAULT_BYTES` is sized for resume (see its doc: 32
+    /// MiB so a bulk flood's lost output is still recoverable via
+    /// `snapshot_from`), but a fresh attach has nothing to resume — it just
+    /// needs enough recent output to land on a sane screen. Replaying the
+    /// whole ring there meant every re-open of a surface that had once run
+    /// something noisy (a big `find`, a build log) re-streamed megabytes,
+    /// which renders as the old command appearing to scroll past again.
+    ///
+    /// Cuts on chunk boundaries, never mid-chunk: a chunk is one PTY read,
+    /// so keeping it whole avoids slicing the middle of an escape sequence
+    /// that arrived in a single write. An escape sequence split *across*
+    /// chunks can still be clipped at the cut — the same, already-accepted
+    /// tradeoff `snapshot_from` makes for resume, and a repaint fixes it.
+    ///
+    /// The newest chunk is always included even if it alone exceeds
+    /// `max_bytes`: returning nothing would leave the viewer blank, which is
+    /// strictly worse than one oversized replay. PTY reads are bounded well
+    /// below any sane `max_bytes`, so this is a guard, not a normal path.
+    fn snapshot_tail(&self, max_bytes: usize) -> Vec<PtyChunk> {
+        let mut selected: Vec<PtyChunk> = Vec::new();
+        let mut total: usize = 0;
+        for chunk in self.chunks.iter().rev() {
+            if !selected.is_empty() && total.saturating_add(chunk.bytes.len()) > max_bytes {
+                break;
+            }
+            total = total.saturating_add(chunk.bytes.len());
+            selected.push(chunk.clone());
+        }
+        selected.reverse();
+        selected
     }
 
     /// `snapshot()`, cut to only the bytes at or after `from_seq`.
@@ -651,6 +703,12 @@ impl PtySurface {
         self.broadcast_tx.subscribe()
     }
 
+    /// The ring in full. No production attach path uses this any more —
+    /// resume goes through `replay_snapshot_from` and a fresh attach through
+    /// `replay_snapshot_fresh` — but it stays as the plain "everything
+    /// buffered" accessor the tests assert against, and as the obvious
+    /// counterpart to the two bounded readers below.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn replay_snapshot(&self) -> Vec<PtyChunk> {
         self.replay
             .lock()
@@ -667,6 +725,16 @@ impl PtySurface {
         self.replay
             .lock()
             .map(|replay| replay.snapshot_from(from_seq))
+            .unwrap_or_default()
+    }
+
+    /// `replay_snapshot()`, bounded to the newest `FRESH_ATTACH_REPLAY_BYTES`.
+    /// What a fresh attach (no `resume_from_seq`) gets — see
+    /// `ReplayBuffer::snapshot_tail` for why that is not the whole ring.
+    pub fn replay_snapshot_fresh(&self) -> Vec<PtyChunk> {
+        self.replay
+            .lock()
+            .map(|replay| replay.snapshot_tail(FRESH_ATTACH_REPLAY_BYTES))
             .unwrap_or_default()
     }
 
@@ -3191,5 +3259,80 @@ mod tests {
         // A from_seq before the chunk still trims normally.
         let out = buf.snapshot_from(near_max);
         assert_eq!(out, vec![chunk(near_max, b"wxyz")]);
+    }
+
+    // -- ReplayBuffer::snapshot_tail -----------------------------------
+
+    #[test]
+    fn snapshot_tail_empty_buffer_is_empty() {
+        let buf = ReplayBuffer::default();
+        assert!(buf.snapshot_tail(0).is_empty());
+        assert!(buf.snapshot_tail(64 * 1024).is_empty());
+    }
+
+    /// Budget larger than everything buffered: the tail IS the whole ring,
+    /// so a small surface still replays in full.
+    #[test]
+    fn snapshot_tail_budget_above_total_returns_full_snapshot() {
+        let buf = three_chunk_buffer();
+        assert_eq!(buf.snapshot_tail(64 * 1024), buf.snapshot());
+    }
+
+    /// Budget that fits exactly two of the three chunks: the OLDEST is
+    /// dropped, not the newest — this is a tail, not a head.
+    #[test]
+    fn snapshot_tail_drops_oldest_chunks_first() {
+        let buf = three_chunk_buffer();
+        let out = buf.snapshot_tail(8);
+        assert_eq!(out, vec![chunk(4, b"bbbb"), chunk(8, b"cccc")]);
+    }
+
+    /// A budget that would only partially cover a chunk does NOT split it:
+    /// chunks are whole PTY reads, so the cut lands on the boundary below.
+    #[test]
+    fn snapshot_tail_cuts_on_chunk_boundaries_never_mid_chunk() {
+        let buf = three_chunk_buffer();
+        // 6 bytes of budget spans all of "cccc" plus half of "bbbb"; the
+        // half chunk is dropped whole rather than sliced.
+        let out = buf.snapshot_tail(6);
+        assert_eq!(out, vec![chunk(8, b"cccc")]);
+    }
+
+    /// The newest chunk is kept even when it alone busts the budget — a
+    /// blank pane is strictly worse than one oversized replay.
+    #[test]
+    fn snapshot_tail_always_keeps_the_newest_chunk() {
+        let buf = three_chunk_buffer();
+        assert_eq!(buf.snapshot_tail(0), vec![chunk(8, b"cccc")]);
+        assert_eq!(buf.snapshot_tail(1), vec![chunk(8, b"cccc")]);
+    }
+
+    /// The whole point of the split: the ring stays sized for resume while a
+    /// fresh attach only ever sees `FRESH_ATTACH_REPLAY_BYTES`. A surface
+    /// that produced far more than that must not replay all of it on open.
+    #[test]
+    fn snapshot_tail_bounds_a_ring_far_larger_than_the_fresh_budget() {
+        let mut buf = ReplayBuffer::default();
+        let chunk_len = 4 * 1024usize;
+        let chunk_count = 64; // 256 KiB total — 4x the fresh budget
+        for i in 0..chunk_count {
+            buf.push(chunk(
+                (i * chunk_len) as u64,
+                &vec![b'x'; chunk_len],
+            ));
+        }
+        let total: usize = buf.snapshot().iter().map(|c| c.bytes.len()).sum();
+        assert_eq!(total, chunk_count * chunk_len);
+
+        let tail = buf.snapshot_tail(FRESH_ATTACH_REPLAY_BYTES);
+        let tail_bytes: usize = tail.iter().map(|c| c.bytes.len()).sum();
+        assert!(
+            tail_bytes <= FRESH_ATTACH_REPLAY_BYTES,
+            "fresh-attach replay must stay within its budget, got {tail_bytes}"
+        );
+        assert!(tail_bytes > 0, "fresh attach must not replay nothing");
+        // And it is the NEWEST bytes: the last chunk of the ring is the last
+        // chunk of the tail.
+        assert_eq!(tail.last(), buf.snapshot().last());
     }
 }
