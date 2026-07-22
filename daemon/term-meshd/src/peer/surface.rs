@@ -34,7 +34,7 @@ impl AsRawFd for BorrowedMasterFd {
     }
 }
 
-const READ_BUF_SIZE: usize = 4096;
+const READ_BUF_SIZE: usize = 65536; // EXPERIMENT: was 4096 — coalescing knob #2 (fewer, larger PtyChunks under flood)
 /// Fan-out channel capacity. If a slow subscriber falls behind by this many
 /// chunks, it starts getting `RecvError::Lagged` on `recv()`; the connection
 /// layer handles that as a gap (eventual reconnect will re-snapshot).
