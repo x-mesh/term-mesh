@@ -34,11 +34,23 @@ impl AsRawFd for BorrowedMasterFd {
     }
 }
 
-const READ_BUF_SIZE: usize = 4096;
+// 64 KiB (was 4096): read the PTY master in larger gulps so an output flood
+// produces fewer, larger PtyChunks instead of thousands of tiny ones. Each
+// chunk costs a frame + a relay-writer queue slot + a broadcast send, so this
+// coalescing removes the per-chunk overhead that made post-interrupt drain
+// scale super-linearly (a 3 MB flood took 8–30s to drain after Ctrl+C).
+// Measured: 3.4 MB burst drain ~9s → ~1s, 35 MB → ~3.7s. Interactive latency
+// is unaffected (read returns only what is already available, no batching
+// delay) and peak host RSS rose ~30 MB under a 35 MB flood, reclaimed after.
+const READ_BUF_SIZE: usize = 65536;
 /// Fan-out channel capacity. If a slow subscriber falls behind by this many
 /// chunks, it starts getting `RecvError::Lagged` on `recv()`; the connection
 /// layer handles that as a gap (eventual reconnect will re-snapshot).
-const BROADCAST_CAPACITY: usize = 1024;
+// EXPERIMENT: 64 (was 1024). With READ_BUF now 64 KiB, 1024 chunks let the host
+// buffer up to ~64 MB of unrendered output ahead of a viewer, so a Ctrl+C could
+// still take ~10s while that backlog drained. Capping at 64 chunks keeps the
+// ahead-buffer near the pre-coalescing ~4 MB, bounding post-interrupt drain.
+const BROADCAST_CAPACITY: usize = 64;
 /// Default bytes of recent PTY output replayed to a newly attached relay.
 /// This covers the common "shell prompt printed before the SSH relay
 /// attached" case without turning the daemon into an unbounded terminal
