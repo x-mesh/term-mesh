@@ -1180,20 +1180,69 @@ fn is_usable_shell(path: &str) -> bool {
     }
 }
 
-/// Pick the login shell for a new pane: the candidate (normally `$SHELL`)
-/// when usable, else `/bin/bash`, else `/bin/sh`. The final `/bin/sh`
-/// fallthrough is unconditional — POSIX guarantees its presence, and a
-/// broken pane beats a spawn that never happens.
-pub(crate) fn resolve_login_shell(candidate: Option<&str>) -> String {
-    if let Some(c) = candidate {
-        if is_usable_shell(c) {
-            return c.to_string();
+/// Pick the login shell for a new pane, most-specific first: the process
+/// `$SHELL` (`env_shell`) when usable, then the account's `/etc/passwd`
+/// login shell (`passwd_shell`), then `/bin/bash`, then `/bin/sh`. The
+/// final `/bin/sh` fallthrough is unconditional — POSIX guarantees its
+/// presence, and a broken pane beats a spawn that never happens.
+///
+/// The passwd fallback matters when the daemon inherited no usable `$SHELL`
+/// — systemd units and non-login SSH often carry no `SHELL` at all — but the
+/// account is `chsh`-ed to a real shell (zsh/fish). Without it such hosts
+/// silently drop to `/bin/bash` or `/bin/sh` even though the login shell is
+/// zsh. Both candidates are still gated by `is_usable_shell`, so a
+/// nologin/false passwd entry is skipped like any other blocker.
+pub(crate) fn resolve_login_shell(env_shell: Option<&str>, passwd_shell: Option<&str>) -> String {
+    for candidate in [env_shell, passwd_shell].into_iter().flatten() {
+        if is_usable_shell(candidate) {
+            return candidate.to_string();
         }
     }
     if is_usable_shell("/bin/bash") {
         return "/bin/bash".to_string();
     }
     "/bin/sh".to_string()
+}
+
+/// The current user's login shell from the passwd database (`pw_shell`),
+/// used as a fallback when the daemon process inherited no usable `$SHELL`.
+/// Returns `None` on any lookup failure or an empty shell field. Uses the
+/// thread-safe `getpwuid_r` since the daemon spawns panes off many threads.
+fn passwd_login_shell() -> Option<String> {
+    use std::ffi::CStr;
+    // Safety: standard getpwuid_r idiom — a zeroed `passwd` out-param plus a
+    // caller-owned byte buffer that backs its string fields. We copy
+    // `pw_shell` into an owned String before `buf` is dropped, so no pointer
+    // outlives its backing storage.
+    unsafe {
+        let uid = libc::getuid();
+        let mut buf_len = match libc::sysconf(libc::_SC_GETPW_R_SIZE_MAX) {
+            n if n > 0 => n as usize,
+            _ => 1024,
+        };
+        let mut pwd: libc::passwd = std::mem::zeroed();
+        loop {
+            let mut buf = vec![0u8; buf_len];
+            let mut result: *mut libc::passwd = std::ptr::null_mut();
+            let rc = libc::getpwuid_r(
+                uid,
+                &mut pwd,
+                buf.as_mut_ptr() as *mut libc::c_char,
+                buf.len(),
+                &mut result,
+            );
+            // ERANGE = buffer too small; grow and retry up to a sane ceiling.
+            if rc == libc::ERANGE && buf_len < (1 << 20) {
+                buf_len *= 2;
+                continue;
+            }
+            if rc != 0 || result.is_null() || pwd.pw_shell.is_null() {
+                return None;
+            }
+            let shell = CStr::from_ptr(pwd.pw_shell).to_str().ok()?.to_string();
+            return if shell.is_empty() { None } else { Some(shell) };
+        }
+    }
 }
 
 /// `<shell> -l` command line for a new pane, shared by the startup
@@ -1207,7 +1256,11 @@ pub(crate) fn resolve_login_shell(candidate: Option<&str>) -> String {
 /// pane is (see [`PtySurface::current_cwd`]) would read the wrapper and always
 /// answer with the spawn directory.
 pub(crate) fn login_shell_cmd() -> String {
-    let shell = resolve_login_shell(std::env::var("SHELL").ok().as_deref());
+    let passwd_shell = passwd_login_shell();
+    let shell = resolve_login_shell(
+        std::env::var("SHELL").ok().as_deref(),
+        passwd_shell.as_deref(),
+    );
     format!("exec {shell} -l")
 }
 
@@ -2166,8 +2219,9 @@ mod tests {
     /// two real fallback candidates.
     #[test]
     fn login_shell_falls_back_past_blockers() {
+        // No passwd candidate: pure env → bash → sh chain (systemd/no-SHELL).
         let assert_falls_back = |candidate: Option<&str>| {
-            let result = resolve_login_shell(candidate);
+            let result = resolve_login_shell(candidate, None);
             assert_ne!(
                 Some(result.as_str()),
                 candidate,
@@ -2189,7 +2243,60 @@ mod tests {
         assert_falls_back(None);
         // A usable candidate wins as-is — the one case with an exact
         // expected value, since /bin/sh is universally present.
-        assert_eq!(resolve_login_shell(Some("/bin/sh")), "/bin/sh");
+        assert_eq!(resolve_login_shell(Some("/bin/sh"), None), "/bin/sh");
+    }
+
+    #[test]
+    fn login_shell_uses_passwd_when_env_absent_or_blocked() {
+        // /bin/sh is the one shell universally present in CI/minimal hosts,
+        // so use it as the stand-in for "the account's chsh-ed login shell".
+        let passwd = Some("/bin/sh");
+        // SHELL unset (systemd/non-login SSH) → fall through to passwd shell
+        // instead of bash. This is the exact bug this fallback fixes.
+        assert_eq!(resolve_login_shell(None, passwd), "/bin/sh");
+        // SHELL is a login blocker (service account) → passwd shell still wins.
+        assert_eq!(resolve_login_shell(Some("/usr/sbin/nologin"), passwd), "/bin/sh");
+        // A usable $SHELL still takes precedence over passwd.
+        assert_eq!(resolve_login_shell(Some("/bin/sh"), Some("/no/such/shell")), "/bin/sh");
+        // A blocked/nonexistent passwd shell is skipped like any other → bash|sh.
+        let both_bad = resolve_login_shell(None, Some("/usr/sbin/nologin"));
+        assert!(matches!(both_bad.as_str(), "/bin/bash" | "/bin/sh"), "got {both_bad:?}");
+    }
+
+    // --- Container-only end-to-end checks (see scripts/zsh-login-shell-test/) ---
+    //
+    // These exercise the REAL `getpwuid_r` path, so they only pass on a host
+    // whose account is `chsh`-ed to a known shell. They are `#[ignore]`d so
+    // ordinary `cargo test` skips them; the zsh container harness runs them
+    // with `--ignored` and `EXPECT_PASSWD_SHELL` pointing at the account shell.
+
+    /// The passwd fallback returns the account's actual `/etc/passwd` login
+    /// shell. Set `EXPECT_PASSWD_SHELL` to that path (e.g. `/usr/bin/zsh`).
+    #[test]
+    #[ignore = "requires a host/container with a known passwd login shell"]
+    fn passwd_shell_reads_account_login_shell() {
+        let expect = std::env::var("EXPECT_PASSWD_SHELL")
+            .expect("set EXPECT_PASSWD_SHELL to the account's /etc/passwd login shell");
+        assert_eq!(
+            passwd_login_shell().as_deref(),
+            Some(expect.as_str()),
+            "getpwuid_r should report the account's chsh-ed login shell"
+        );
+    }
+
+    /// With `$SHELL` removed (the systemd / non-login-SSH case), the pane
+    /// login command must resolve to the passwd shell — not silently fall to
+    /// bash/sh. Run under `env -u SHELL` with `EXPECT_PASSWD_SHELL` set.
+    #[test]
+    #[ignore = "requires SHELL unset + a passwd login shell; run in the zsh container"]
+    fn login_shell_cmd_uses_passwd_when_shell_env_absent() {
+        let expect = std::env::var("EXPECT_PASSWD_SHELL")
+            .expect("set EXPECT_PASSWD_SHELL to the account's /etc/passwd login shell");
+        assert!(
+            std::env::var_os("SHELL").is_none(),
+            "run this test with `env -u SHELL` so getpwuid_r is the only source"
+        );
+        assert_eq!(login_shell_cmd(), format!("exec {expect} -l"));
     }
 
     #[test]
