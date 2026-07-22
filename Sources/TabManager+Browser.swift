@@ -1275,6 +1275,7 @@ extension Notification.Name {
     static let commandPaletteRequested = Notification.Name("term-mesh.commandPaletteRequested")
     static let worktreeWorkspaceRequested = Notification.Name("term-mesh.worktreeWorkspaceRequested")
     static let commandPaletteSwitcherRequested = Notification.Name("term-mesh.commandPaletteSwitcherRequested")
+    static let commandPalettePeersRequested = Notification.Name("term-mesh.commandPalettePeersRequested")
     static let commandPaletteRenameTabRequested = Notification.Name("term-mesh.commandPaletteRenameTabRequested")
     static let commandPaletteMoveSelection = Notification.Name("term-mesh.commandPaletteMoveSelection")
     static let commandPaletteRenameInputInteractionRequested = Notification.Name("term-mesh.commandPaletteRenameInputInteractionRequested")

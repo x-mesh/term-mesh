@@ -699,6 +699,18 @@ struct TermMeshApp: App {
                 // Sidebar-first peer UX: connecting/opening lives in the
                 // sidebar; the menu keeps host management. Raw socket
                 // dialogs stay as DEBUG-only tools.
+                //
+                // The palette entry below is the one exception, and it is
+                // discoverability only — no `.keyboardShortcut` here, because
+                // ⌘⇧O is already claimed in AppDelegate's event monitor and
+                // registering it twice would fire the action twice.
+                Button("Open Peer Workspace…") {
+                    NotificationCenter.default.post(
+                        name: .commandPalettePeersRequested,
+                        object: NSApp.keyWindow ?? NSApp.mainWindow
+                    )
+                }
+
                 Button("Add Peer Host…") {
                     PeerClientCoordinator.shared.addRemoteHost(nil)
                 }

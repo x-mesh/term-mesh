@@ -14,6 +14,17 @@ enum CommandPaletteMode {
 enum CommandPaletteListScope: String {
     case commands
     case switcher
+    /// Peer workspaces across every known host, opened as a live mirror.
+    ///
+    /// Deliberately mirror-only, not "everything reachable on a peer". A
+    /// remote *surface* can also be pulled into the current workspace as a
+    /// pane, but the two close differently: a mirror's pane close forwards
+    /// upstream and ends the remote pane, while an adopted pane's close only
+    /// detaches locally (gated by the uncollected-work sheet) and leaves the
+    /// remote running. Listing both here would make Return mean two different
+    /// things depending on which row is selected, so surfaces stay in the
+    /// sidebar's "Open Surface as Pane…", where the choice is explicit.
+    case peers
 }
 
 struct CommandPaletteRenameTarget: Equatable {

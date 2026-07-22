@@ -98,6 +98,11 @@ struct ContentView: View {
     )
     private static let commandPaletteUsageDefaultsKey = "commandPalette.commandUsage.v1"
     private static let commandPaletteCommandsPrefix = ">"
+    /// Peer-workspace scope prefix. Same mechanism as `>` for commands: the
+    /// scope is derived from the query, so ⌘⇧O is just a shortcut that seeds
+    /// this prefix, and typing it by hand inside an already-open palette
+    /// switches scope without reopening.
+    private static let commandPalettePeersPrefix = "@"
     private static let minimumSidebarWidth: CGFloat = 186
     private static let maximumSidebarWidthRatio: CGFloat = 1.0 / 3.0
 
@@ -1620,6 +1625,17 @@ struct ContentView: View {
             openCommandPaletteSwitcher()
         })
 
+        view = AnyView(view.onReceive(NotificationCenter.default.publisher(for: .commandPalettePeersRequested)) { notification in
+            let requestedWindow = notification.object as? NSWindow
+            guard Self.shouldHandleCommandPaletteRequest(
+                observedWindow: observedWindow,
+                requestedWindow: requestedWindow,
+                keyWindow: NSApp.keyWindow,
+                mainWindow: NSApp.mainWindow
+            ) else { return }
+            openCommandPalettePeers()
+        })
+
         view = AnyView(view.onReceive(NotificationCenter.default.publisher(for: .worktreeWorkspaceRequested)) { notification in
             let requestedWindow = notification.object as? NSWindow
             guard Self.shouldHandleCommandPaletteRequest(
@@ -2263,6 +2279,9 @@ struct ContentView: View {
         if commandPaletteQuery.hasPrefix(Self.commandPaletteCommandsPrefix) {
             return .commands
         }
+        if commandPaletteQuery.hasPrefix(Self.commandPalettePeersPrefix) {
+            return .peers
+        }
         return .switcher
     }
 
@@ -2272,6 +2291,8 @@ struct ContentView: View {
             return "Type a command"
         case .switcher:
             return "Search workspaces and tabs"
+        case .peers:
+            return "Search peer workspaces"
         }
     }
 
@@ -2281,6 +2302,8 @@ struct ContentView: View {
             return "No commands match your search."
         case .switcher:
             return "No workspaces or tabs match your search."
+        case .peers:
+            return "No peer workspaces match your search."
         }
     }
 
@@ -2291,6 +2314,9 @@ struct ContentView: View {
             return suffix.trimmingCharacters(in: .whitespacesAndNewlines)
         case .switcher:
             return commandPaletteQuery.trimmingCharacters(in: .whitespacesAndNewlines)
+        case .peers:
+            let suffix = String(commandPaletteQuery.dropFirst(Self.commandPalettePeersPrefix.count))
+            return suffix.trimmingCharacters(in: .whitespacesAndNewlines)
         }
     }
 
@@ -2300,6 +2326,8 @@ struct ContentView: View {
             return commandPaletteCommands()
         case .switcher:
             return commandPaletteSwitcherEntries()
+        case .peers:
+            return commandPalettePeerEntries()
         }
     }
 
@@ -2372,6 +2400,16 @@ struct ContentView: View {
             return CommandPaletteTrailingLabel(text: shortcutHint, style: .shortcut)
         }
 
+        if commandPaletteListScope == .peers {
+            if command.id.hasPrefix("peer.connect.") {
+                return CommandPaletteTrailingLabel(text: "Connect", style: .kind)
+            }
+            if command.id.hasPrefix("peer.workspace.") {
+                return CommandPaletteTrailingLabel(text: "Mirror", style: .kind)
+            }
+            return nil
+        }
+
         guard commandPaletteListScope == .switcher else { return nil }
         if command.id.hasPrefix("switcher.workspace.") {
             return CommandPaletteTrailingLabel(text: "Workspace", style: .kind)
@@ -2380,6 +2418,84 @@ struct ContentView: View {
             return CommandPaletteTrailingLabel(text: "Surface", style: .kind)
         }
         return nil
+    }
+
+    /// Peer workspaces, most-recently-connected host first.
+    ///
+    /// The sidebar deliberately sorts hosts by name so rows don't shuffle
+    /// under the cursor on every reconnect. A palette has the opposite need:
+    /// it is opened to go somewhere, and the place you want is usually the
+    /// place you were last. `lastConnectedAt` is already recorded on every
+    /// successful connect (`PeerHostProfileStore.recordConnection`) and was,
+    /// until now, only read to break ties when deduping profiles.
+    ///
+    /// Hosts that aren't connected still get a row. Requiring the user to
+    /// connect in the sidebar first and only then reach for the palette would
+    /// defeat the point, so their row connects and leaves it at that — the
+    /// workspace roster isn't known until the connection lands, so there is
+    /// nothing to mirror yet.
+    private func commandPalettePeerEntries() -> [CommandPaletteCommand] {
+        let store = RemoteHostStore.shared
+        let lastConnected = Dictionary(
+            PeerHostProfileStore.shared.profiles.compactMap { profile -> (UUID, Date)? in
+                guard let at = profile.lastConnectedAt else { return nil }
+                return (profile.id, at)
+            },
+            uniquingKeysWith: { latest, _ in latest }
+        )
+
+        // `.distantPast` for a host that has never connected: it sorts to the
+        // bottom of its band rather than jumping the queue on a nil.
+        let hosts = store.sortedHosts.sorted { lhs, rhs in
+            let lhsAt = lhs.profileID.flatMap { lastConnected[$0] } ?? .distantPast
+            let rhsAt = rhs.profileID.flatMap { lastConnected[$0] } ?? .distantPast
+            if lhsAt != rhsAt { return lhsAt > rhsAt }
+            return lhs.displayName.localizedCaseInsensitiveCompare(rhs.displayName) == .orderedAscending
+        }
+
+        var entries: [CommandPaletteCommand] = []
+        var nextRank = 0
+
+        for host in hosts {
+            let hostName = host.displayName
+            guard host.isConnected else {
+                entries.append(
+                    CommandPaletteCommand(
+                        id: "peer.connect.\(host.id)",
+                        rank: nextRank,
+                        title: hostName,
+                        subtitle: "Not connected — open to connect",
+                        shortcutHint: nil,
+                        keywords: ["peer", "host", "connect", hostName],
+                        dismissOnRun: true,
+                        action: { RemoteHostStore.shared.connectSavedHost(host) }
+                    )
+                )
+                nextRank += 1
+                continue
+            }
+
+            for workspace in host.workspaces {
+                let paneCount = workspace.paneCount
+                entries.append(
+                    CommandPaletteCommand(
+                        id: "peer.workspace.\(host.id).\(workspace.id.map { String(format: "%02x", $0) }.joined())",
+                        rank: nextRank,
+                        title: "\(hostName) › \(workspace.title)",
+                        subtitle: paneCount == 1 ? "1 pane" : "\(paneCount) panes",
+                        shortcutHint: nil,
+                        keywords: ["peer", "remote", "workspace", "mirror", hostName, workspace.title],
+                        dismissOnRun: true,
+                        action: {
+                            RemoteHostStore.shared.openWorkspaceAsMirror(workspace, host: host, live: true)
+                        }
+                    )
+                )
+                nextRank += 1
+            }
+        }
+
+        return entries
     }
 
     private func commandPaletteSwitcherEntries() -> [CommandPaletteCommand] {
@@ -3993,6 +4109,10 @@ struct ContentView: View {
 
     private func openCommandPaletteSwitcher() {
         toggleCommandPalette(initialQuery: "")
+    }
+
+    private func openCommandPalettePeers() {
+        toggleCommandPalette(initialQuery: Self.commandPalettePeersPrefix)
     }
 
     private func toggleCommandPalette(initialQuery: String) {
