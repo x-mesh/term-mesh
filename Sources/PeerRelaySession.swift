@@ -230,7 +230,7 @@ private actor RelayFrameSlots {
 private final class RelayFrameWriter: @unchecked Sendable {
     private let relay: RelaySocket
     private let queue = DispatchQueue(label: "term-mesh.peer.relay.writer", qos: .userInitiated)
-    private let slots = RelayFrameSlots(limit: 256)
+    private let slots = RelayFrameSlots(limit: 32)  // EXPERIMENT: was 256 — backpressure-tuning knob #1
     private let lock = NSLock()
     private var stopped = false
     private let onFailure: @Sendable (Error) -> Void
