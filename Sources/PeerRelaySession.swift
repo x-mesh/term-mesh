@@ -230,7 +230,13 @@ private actor RelayFrameSlots {
 private final class RelayFrameWriter: @unchecked Sendable {
     private let relay: RelaySocket
     private let queue = DispatchQueue(label: "term-mesh.peer.relay.writer", qos: .userInitiated)
-    private let slots = RelayFrameSlots(limit: 32)  // EXPERIMENT: was 256 — backpressure-tuning knob #1
+    // 32 (was 256): a smaller app→relay writer window pushes backpressure to
+    // the host sooner, so an output flood cannot pile up MBs of stale bytes
+    // that keep rendering after the user hits Ctrl+C. Measured on a jw-server
+    // relay pane: 588 KB burst drain 997ms → 660ms; combined with the host's
+    // larger READ_BUF coalescing, 3.4 MB drain went ~9s → ~1s. No throughput
+    // regression observed (drain stayed linear at ~10 MB/s).
+    private let slots = RelayFrameSlots(limit: 32)
     private let lock = NSLock()
     private var stopped = false
     private let onFailure: @Sendable (Error) -> Void
