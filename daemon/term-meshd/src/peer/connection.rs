@@ -83,6 +83,13 @@ async fn reader_loop(
     let manager = host.pty.clone();
     let mut state = HandshakeState::Init;
     let mut attached: HashMap<Vec<u8>, AttachEntry> = HashMap::new();
+    // This connection's key in each surface's winsize-arbitration map (one
+    // attach per surface per connection, so connection identity is enough).
+    // Every size this client sends goes through `request_size` under this id
+    // and is dropped again on detach/disconnect, so a departing viewer
+    // returns the grid to the survivors instead of leaving its size behind.
+    static NEXT_SIZE_REQUESTER: AtomicU64 = AtomicU64::new(1);
+    let size_requester = NEXT_SIZE_REQUESTER.fetch_add(1, Ordering::Relaxed);
     // Request ids are one-shot for the authenticated connection. Insert before
     // starting work so two back-to-back frames cannot race through ensure.
     let mut lifecycle_request_ids: HashSet<Vec<u8>> = HashSet::new();
@@ -401,10 +408,11 @@ async fn reader_loop(
                     continue;
                 }
 
-                // Apply client-requested size. Multi-client policy beyond
-                // last-writer-wins is deferred to Phase 2.3B-c.
+                // Register the client-requested size with the surface's
+                // winsize arbitration (min across attachers, tmux-style) —
+                // see `PtySurface::request_size`.
                 if let Some((cols, rows)) = clamp_pty_size(req.client_cols, req.client_rows) {
-                    if let Err(e) = surface.resize(cols, rows) {
+                    if let Err(e) = surface.request_size(size_requester, cols, rows) {
                         tracing::warn!("resize on attach failed: {e}");
                     }
                 }
@@ -428,10 +436,17 @@ async fn reader_loop(
                 let resume_from_seq =
                     effective_resume_from_seq(&peer_capabilities, req.resume_from_seq);
                 let subscriber = surface.subscribe();
+                // Resume asks for an exact range and must be served from the
+                // full ring; a fresh attach gets only the recent tail. Handing
+                // a fresh attach the whole ring meant re-opening a surface
+                // that had once run something noisy (a large `find`, a build
+                // log) re-streamed up to the entire replay capacity — which
+                // renders as that old command scrolling past again on every
+                // open. See `FRESH_ATTACH_REPLAY_BYTES`.
                 let replay = if resume_from_seq != 0 {
                     surface.replay_snapshot_from(resume_from_seq)
                 } else {
-                    surface.replay_snapshot()
+                    surface.replay_snapshot_fresh()
                 };
                 let mode_prefix = surface.mode_replay_bytes();
                 // Absolute host seq (`PtyChunk::seq` space) that this
@@ -496,6 +511,7 @@ async fn reader_loop(
 
             (HandshakeState::Ready, Payload::DetachSurface(det)) => {
                 if let Some(entry) = attached.remove(&det.surface_id) {
+                    entry.surface.drop_size_request(size_requester);
                     entry.cancel.notify_one();
                     let _ = entry.task.await;
                 }
@@ -530,7 +546,7 @@ async fn reader_loop(
                     continue;
                 };
                 if let Some((cols, rows)) = clamp_pty_size(r.cols, r.rows) {
-                    if let Err(e) = entry.surface.resize(cols, rows) {
+                    if let Err(e) = entry.surface.request_size(size_requester, cols, rows) {
                         tracing::warn!("resize failed: {e}");
                     }
                 }
@@ -557,6 +573,7 @@ async fn reader_loop(
     }
 
     for (_, entry) in attached.drain() {
+        entry.surface.drop_size_request(size_requester);
         entry.cancel.notify_one();
         let _ = entry.task.await;
     }

@@ -612,3 +612,106 @@ final class PeerPaneSessionTests: XCTestCase {
     }
 
 }
+
+/// Force Disconnect must close a host's mirrors and relay windows before its
+/// panes. While a live mirror owns the workspace,
+/// `Workspace.mirrorForwardsLocalActions` converts every local close into a
+/// forwardClose to the host and returns false, so a pane closed first does not
+/// go away — the host never pushes a layout dropping the last surface in a
+/// workspace, and exactly one pane survives the teardown. Closing mirrors first
+/// flips that predicate off before any pane is asked to close.
+@MainActor
+final class RemoteHostForceDisconnectOrderTests: XCTestCase {
+
+    private func connection(
+        _ kind: PeerRelayConnectionInfo.Kind,
+        title: String
+    ) -> PeerRelayConnectionInfo {
+        PeerRelayConnectionInfo(
+            id: ObjectIdentifier(NSObject()),
+            kind: kind,
+            hostSockPath: "/tmp/tm-peer-test.sock",
+            hostDisplayName: "test-host",
+            sshTarget: "root@test-host",
+            remoteSockPath: "/run/user/0/tm-peer.sock",
+            targetTitle: title,
+            connectedAt: Date()
+        )
+    }
+
+    func test_forceDisconnectOrder_putsPanesLast() {
+        let rows = [
+            connection(.pane, title: "pane-1"),
+            connection(.workspace, title: "mirror"),
+            connection(.pane, title: "pane-2"),
+            connection(.console, title: "console"),
+        ]
+
+        let ordered = RemoteHostStore.forceDisconnectOrder(rows)
+
+        XCTAssertEqual(ordered.map(\.targetTitle),
+                       ["mirror", "console", "pane-1", "pane-2"])
+    }
+
+    /// The regression this guards: no pane may precede a non-pane, or that pane
+    /// gets forwarded to the host instead of closed.
+    func test_forceDisconnectOrder_noPaneBeforeANonPane() {
+        let rows = [
+            connection(.pane, title: "pane-1"),
+            connection(.workspace, title: "mirror"),
+        ]
+
+        let ordered = RemoteHostStore.forceDisconnectOrder(rows)
+        let firstPane = ordered.firstIndex { $0.kind == .pane }
+        let lastNonPane = ordered.lastIndex { $0.kind != .pane }
+
+        XCTAssertNotNil(firstPane)
+        XCTAssertNotNil(lastNonPane)
+        XCTAssertGreaterThan(firstPane!, lastNonPane!)
+    }
+
+    /// A force disconnect that silently dropped a row would leave that
+    /// connection open with no remaining way to reach it.
+    func test_forceDisconnectOrder_preservesEveryRow() {
+        let rows = [
+            connection(.pane, title: "pane-1"),
+            connection(.workspace, title: "mirror"),
+            connection(.pane, title: "pane-2"),
+        ]
+
+        let ordered = RemoteHostStore.forceDisconnectOrder(rows)
+
+        XCTAssertEqual(ordered.count, rows.count)
+        XCTAssertEqual(Set(ordered.map(\.targetTitle)),
+                       Set(rows.map(\.targetTitle)))
+    }
+
+    /// activeConnections is already sorted by connectedAt; the close sequence
+    /// should stay predictable within each group.
+    func test_forceDisconnectOrder_isStableWithinEachGroup() {
+        let rows = [
+            connection(.workspace, title: "mirror-a"),
+            connection(.pane, title: "pane-a"),
+            connection(.workspace, title: "mirror-b"),
+            connection(.pane, title: "pane-b"),
+        ]
+
+        let ordered = RemoteHostStore.forceDisconnectOrder(rows)
+
+        XCTAssertEqual(ordered.map(\.targetTitle),
+                       ["mirror-a", "mirror-b", "pane-a", "pane-b"])
+    }
+
+    func test_forceDisconnectOrder_handlesEmptyAndPaneOnlyInput() {
+        XCTAssertTrue(RemoteHostStore.forceDisconnectOrder([]).isEmpty)
+
+        let panesOnly = [
+            connection(.pane, title: "pane-1"),
+            connection(.pane, title: "pane-2"),
+        ]
+        XCTAssertEqual(
+            RemoteHostStore.forceDisconnectOrder(panesOnly).map(\.targetTitle),
+            ["pane-1", "pane-2"]
+        )
+    }
+}

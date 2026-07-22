@@ -1668,10 +1668,7 @@ final class PeerRelayWorkspaceWindowController: NSWindowController, NSWindowDele
                 context: GHOSTTY_SURFACE_CONTEXT_WINDOW,
                 configTemplate: nil,
                 command: session.relayLaunchCommand,
-                environment: [
-                    "TERMMESH_PEER_RELAY_SOCKET": session.relaySockPath,
-                    "TERMMESH_PEER_RELAY_SECRET": session.relaySecret,
-                ]
+                environment: session.relayEnvironment
             )
         }
 

@@ -140,6 +140,59 @@ tail -f "$(cat /tmp/term-mesh-last-debug-log-path 2>/dev/null || echo /tmp/term-
   - `ime.resignFirstResponder hadMarkedText=true` — normal IME resign on focus loss
   - `ime.ghosttyKey path=accumulated.text keycode=0` — composed text sent via UTF-8 fallback
 
+## Verifying UI behavior yourself (do this instead of asking the user)
+
+A tagged Debug app can be driven over its own socket, so **an agent can
+reproduce and verify a UI bug without a human clicking anything.** Reach for
+this before asking the user to try something — it is faster, repeatable, and
+it separates "the data is wrong" from "the view is stale", which guessing
+never does.
+
+Launch with `--allow-all` so the socket accepts external callers:
+
+```bash
+./scripts/reload.sh --tag <tag> --allow-all
+```
+
+Then speak JSON-RPC to `/tmp/term-mesh-debug-<tag>.sock`:
+
+```bash
+S=/tmp/term-mesh-debug-<tag>.sock
+q(){ printf '%s\n' "$1" | nc -U "$S"; }
+
+W=$(q '{"jsonrpc":"2.0","id":1,"method":"window.list"}' \
+     | python3 -c "import sys,json;print(json.load(sys.stdin)['result']['windows'][0]['id'])")
+
+q '{"jsonrpc":"2.0","id":2,"method":"debug.app.activate"}'
+q '{"jsonrpc":"2.0","id":3,"method":"debug.shortcut.simulate","params":{"combo":"cmd+shift+o"}}'
+q '{"jsonrpc":"2.0","id":4,"method":"debug.type","params":{"text":"jw-server"}}'
+q '{"jsonrpc":"2.0","id":5,"method":"debug.shortcut.simulate","params":{"combo":"return"}}'
+q "{\"jsonrpc\":\"2.0\",\"id\":6,\"method\":\"debug.command_palette.results\",\"params\":{\"window_id\":\"$W\",\"limit\":9}}"
+```
+
+Useful probes (all `#if DEBUG`, see `TerminalController+Debug.swift`):
+`debug.app.activate`, `debug.type`, `debug.shortcut.simulate` (`combo`:
+`down` / `up` / `return` / `cmd+shift+p` …), `debug.command_palette.toggle`,
+`debug.command_palette.visible`, `debug.command_palette.selection`,
+`debug.command_palette.results` (returns `mode`, `query`, `selected_index`,
+and each row's `command_id` / `title` / `trailing_label`).
+
+Rules learned the hard way:
+
+- **Read the pixels too.** `screencapture -x -o <path>` and open the PNG. A
+  debug snapshot can be correct while the rendered view is stale — that gap
+  IS the bug in SwiftUI-hosted surfaces, and only a screenshot shows it.
+- **`debug.type` inserts text literally.** A `\u0008` in the payload lands
+  as a control character, not a delete. To reset a field, close and reopen the surface.
+- **`debug.command_palette.results`' `query` is the prefix-stripped matching
+  string**, not the raw field. Read `mode` to know the real scope.
+- **Instrumentation can kill the instrument.** `dlog` from a computed
+  property runs on every body evaluation and trips DebugEventLog's rate
+  breaker, which then swallows the lines you are looking for. Log only when
+  the value changes.
+- Driving the app calls `debug.app.activate`, which **steals focus from the
+  user**. Batch the probes, and stop once verified.
+
 ## Pitfalls
 
 - **Custom UTTypes** for drag-and-drop must be declared in `Resources/Info.plist` under `UTExportedTypeDeclarations` (e.g. `com.splittabbar.tabtransfer`, `com.termmesh.sidebar-tab-reorder`).

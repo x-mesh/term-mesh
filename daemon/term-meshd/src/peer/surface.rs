@@ -62,6 +62,22 @@ const BROADCAST_CAPACITY: usize = 1024;
 /// stays attached-replay-eligible, and that cost multiplies by the number of
 /// concurrently live surfaces.
 const REPLAY_CAPACITY_DEFAULT_BYTES: usize = 32 * 1024 * 1024; // 32 MiB
+/// Bytes of recent PTY output a *fresh* attach (one that sends no
+/// `resume_from_seq`) is replayed, independent of the ring's capacity above.
+///
+/// These are deliberately two numbers. The capacity is sized for *resume*:
+/// after a bulk-flood gap the client asks for an exact range and the ring must
+/// still hold it, hence 32 MiB. A fresh attach has no such range to ask for —
+/// it only needs enough trailing output to render a sane screen, the "shell
+/// prompt printed before the SSH relay attached" case the capacity doc
+/// describes. Handing it the entire ring instead meant re-opening a surface
+/// that had once run something noisy re-streamed megabytes, which reads on
+/// screen as the old command scrolling past all over again.
+///
+/// 64 KiB matches the macOS host's own replay ring
+/// (`GhosttyPaneSurfaceProvider.swift`'s `replayCapacityBytes`), so the two
+/// host implementations hand a fresh viewer a comparable amount of history.
+const FRESH_ATTACH_REPLAY_BYTES: usize = 64 * 1024; // 64 KiB
 /// Lower bound accepted for the replay capacity (env or RPC/CLI set).
 const REPLAY_CAPACITY_MIN_BYTES: usize = 4 * 1024; // 4 KiB
 /// Upper bound accepted for the replay capacity (env or RPC/CLI set).
@@ -186,6 +202,42 @@ impl ReplayBuffer {
         self.chunks.iter().cloned().collect()
     }
 
+    /// The newest `max_bytes`-ish of the ring, as whole chunks.
+    ///
+    /// Exists because the ring's *capacity* and a *fresh attach's* replay
+    /// size are two different requirements that used to share one number.
+    /// `REPLAY_CAPACITY_DEFAULT_BYTES` is sized for resume (see its doc: 32
+    /// MiB so a bulk flood's lost output is still recoverable via
+    /// `snapshot_from`), but a fresh attach has nothing to resume — it just
+    /// needs enough recent output to land on a sane screen. Replaying the
+    /// whole ring there meant every re-open of a surface that had once run
+    /// something noisy (a big `find`, a build log) re-streamed megabytes,
+    /// which renders as the old command appearing to scroll past again.
+    ///
+    /// Cuts on chunk boundaries, never mid-chunk: a chunk is one PTY read,
+    /// so keeping it whole avoids slicing the middle of an escape sequence
+    /// that arrived in a single write. An escape sequence split *across*
+    /// chunks can still be clipped at the cut — the same, already-accepted
+    /// tradeoff `snapshot_from` makes for resume, and a repaint fixes it.
+    ///
+    /// The newest chunk is always included even if it alone exceeds
+    /// `max_bytes`: returning nothing would leave the viewer blank, which is
+    /// strictly worse than one oversized replay. PTY reads are bounded well
+    /// below any sane `max_bytes`, so this is a guard, not a normal path.
+    fn snapshot_tail(&self, max_bytes: usize) -> Vec<PtyChunk> {
+        let mut selected: Vec<PtyChunk> = Vec::new();
+        let mut total: usize = 0;
+        for chunk in self.chunks.iter().rev() {
+            if !selected.is_empty() && total.saturating_add(chunk.bytes.len()) > max_bytes {
+                break;
+            }
+            total = total.saturating_add(chunk.bytes.len());
+            selected.push(chunk.clone());
+        }
+        selected.reverse();
+        selected
+    }
+
     /// `snapshot()`, cut to only the bytes at or after `from_seq`.
     ///
     /// `from_seq` is on the same absolute scale as `PtyChunk::seq`
@@ -275,6 +327,14 @@ pub struct PtySurface {
     /// Exists for attach-time mode replay: a relay that attaches after the
     /// PTY already toggled mouse reporting on needs to be told so too.
     modes: Mutex<BTreeSet<u16>>,
+    /// Per-attacher requested winsize, keyed by an opaque requester id (one
+    /// per connection). A PTY has a single winsize, so concurrent viewers
+    /// are arbitrated tmux-style: the PTY gets min(cols) × min(rows) across
+    /// all live requests, and a departing attacher's request is dropped so
+    /// the survivors get their size back. Replaces the last-writer-wins
+    /// free-for-all that made two different-sized windows fight over the
+    /// grid.
+    size_requests: Mutex<HashMap<u64, (u16, u16)>>,
     master_fd: RawFd,
     child: Mutex<ChildLifecycle>,
     signal_owners: AtomicUsize,
@@ -335,6 +395,7 @@ impl PtySurface {
             byte_seq: AtomicU64::new(0),
             replay: Mutex::new(ReplayBuffer::default()),
             modes: Mutex::new(BTreeSet::new()),
+            size_requests: Mutex::new(HashMap::new()),
             master_fd: child.master_fd,
             child: Mutex::new(ChildLifecycle {
                 pid: child.pid,
@@ -642,6 +703,12 @@ impl PtySurface {
         self.broadcast_tx.subscribe()
     }
 
+    /// The ring in full. No production attach path uses this any more —
+    /// resume goes through `replay_snapshot_from` and a fresh attach through
+    /// `replay_snapshot_fresh` — but it stays as the plain "everything
+    /// buffered" accessor the tests assert against, and as the obvious
+    /// counterpart to the two bounded readers below.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn replay_snapshot(&self) -> Vec<PtyChunk> {
         self.replay
             .lock()
@@ -658,6 +725,16 @@ impl PtySurface {
         self.replay
             .lock()
             .map(|replay| replay.snapshot_from(from_seq))
+            .unwrap_or_default()
+    }
+
+    /// `replay_snapshot()`, bounded to the newest `FRESH_ATTACH_REPLAY_BYTES`.
+    /// What a fresh attach (no `resume_from_seq`) gets — see
+    /// `ReplayBuffer::snapshot_tail` for why that is not the whole ring.
+    pub fn replay_snapshot_fresh(&self) -> Vec<PtyChunk> {
+        self.replay
+            .lock()
+            .map(|replay| replay.snapshot_tail(FRESH_ATTACH_REPLAY_BYTES))
             .unwrap_or_default()
     }
 
@@ -701,6 +778,48 @@ impl PtySurface {
         self.cols.store(cols as u32, Ordering::Relaxed);
         self.rows.store(rows as u32, Ordering::Relaxed);
         Ok(())
+    }
+
+    /// Record `requester`'s desired winsize and apply the arbitrated
+    /// minimum across all live requests (tmux-style: every viewer sees a
+    /// grid that fits the smallest of them). Callers pair this with
+    /// [`drop_size_request`] on detach; a raw [`resize`] bypasses
+    /// arbitration and is reserved for single-writer paths (spawn).
+    pub fn request_size(&self, requester: u64, cols: u16, rows: u16) -> std::io::Result<()> {
+        let min = {
+            let mut requests = self.size_requests.lock().unwrap();
+            requests.insert(requester, (cols, rows));
+            Self::arbitrated_min(&requests)
+        };
+        match min {
+            Some((c, r)) => self.resize(c, r),
+            None => Ok(()),
+        }
+    }
+
+    /// Forget `requester`'s size request and re-apply the minimum of the
+    /// survivors, so closing a small viewer gives the remaining ones their
+    /// full grid back. No-op on the PTY when no requests remain — the last
+    /// applied size simply persists.
+    pub fn drop_size_request(&self, requester: u64) {
+        let min = {
+            let mut requests = self.size_requests.lock().unwrap();
+            if requests.remove(&requester).is_none() {
+                return;
+            }
+            Self::arbitrated_min(&requests)
+        };
+        if let Some((c, r)) = min {
+            if let Err(e) = self.resize(c, r) {
+                tracing::warn!("post-detach resize failed: {e}");
+            }
+        }
+    }
+
+    fn arbitrated_min(requests: &HashMap<u64, (u16, u16)>) -> Option<(u16, u16)> {
+        let cols = requests.values().map(|&(c, _)| c).min()?;
+        let rows = requests.values().map(|&(_, r)| r).min()?;
+        Some((cols, rows))
     }
 
     /// True when the shell has handed the terminal's foreground process
@@ -1180,20 +1299,69 @@ fn is_usable_shell(path: &str) -> bool {
     }
 }
 
-/// Pick the login shell for a new pane: the candidate (normally `$SHELL`)
-/// when usable, else `/bin/bash`, else `/bin/sh`. The final `/bin/sh`
-/// fallthrough is unconditional — POSIX guarantees its presence, and a
-/// broken pane beats a spawn that never happens.
-pub(crate) fn resolve_login_shell(candidate: Option<&str>) -> String {
-    if let Some(c) = candidate {
-        if is_usable_shell(c) {
-            return c.to_string();
+/// Pick the login shell for a new pane, most-specific first: the process
+/// `$SHELL` (`env_shell`) when usable, then the account's `/etc/passwd`
+/// login shell (`passwd_shell`), then `/bin/bash`, then `/bin/sh`. The
+/// final `/bin/sh` fallthrough is unconditional — POSIX guarantees its
+/// presence, and a broken pane beats a spawn that never happens.
+///
+/// The passwd fallback matters when the daemon inherited no usable `$SHELL`
+/// — systemd units and non-login SSH often carry no `SHELL` at all — but the
+/// account is `chsh`-ed to a real shell (zsh/fish). Without it such hosts
+/// silently drop to `/bin/bash` or `/bin/sh` even though the login shell is
+/// zsh. Both candidates are still gated by `is_usable_shell`, so a
+/// nologin/false passwd entry is skipped like any other blocker.
+pub(crate) fn resolve_login_shell(env_shell: Option<&str>, passwd_shell: Option<&str>) -> String {
+    for candidate in [env_shell, passwd_shell].into_iter().flatten() {
+        if is_usable_shell(candidate) {
+            return candidate.to_string();
         }
     }
     if is_usable_shell("/bin/bash") {
         return "/bin/bash".to_string();
     }
     "/bin/sh".to_string()
+}
+
+/// The current user's login shell from the passwd database (`pw_shell`),
+/// used as a fallback when the daemon process inherited no usable `$SHELL`.
+/// Returns `None` on any lookup failure or an empty shell field. Uses the
+/// thread-safe `getpwuid_r` since the daemon spawns panes off many threads.
+fn passwd_login_shell() -> Option<String> {
+    use std::ffi::CStr;
+    // Safety: standard getpwuid_r idiom — a zeroed `passwd` out-param plus a
+    // caller-owned byte buffer that backs its string fields. We copy
+    // `pw_shell` into an owned String before `buf` is dropped, so no pointer
+    // outlives its backing storage.
+    unsafe {
+        let uid = libc::getuid();
+        let mut buf_len = match libc::sysconf(libc::_SC_GETPW_R_SIZE_MAX) {
+            n if n > 0 => n as usize,
+            _ => 1024,
+        };
+        let mut pwd: libc::passwd = std::mem::zeroed();
+        loop {
+            let mut buf = vec![0u8; buf_len];
+            let mut result: *mut libc::passwd = std::ptr::null_mut();
+            let rc = libc::getpwuid_r(
+                uid,
+                &mut pwd,
+                buf.as_mut_ptr() as *mut libc::c_char,
+                buf.len(),
+                &mut result,
+            );
+            // ERANGE = buffer too small; grow and retry up to a sane ceiling.
+            if rc == libc::ERANGE && buf_len < (1 << 20) {
+                buf_len *= 2;
+                continue;
+            }
+            if rc != 0 || result.is_null() || pwd.pw_shell.is_null() {
+                return None;
+            }
+            let shell = CStr::from_ptr(pwd.pw_shell).to_str().ok()?.to_string();
+            return if shell.is_empty() { None } else { Some(shell) };
+        }
+    }
 }
 
 /// `<shell> -l` command line for a new pane, shared by the startup
@@ -1207,7 +1375,11 @@ pub(crate) fn resolve_login_shell(candidate: Option<&str>) -> String {
 /// pane is (see [`PtySurface::current_cwd`]) would read the wrapper and always
 /// answer with the spawn directory.
 pub(crate) fn login_shell_cmd() -> String {
-    let shell = resolve_login_shell(std::env::var("SHELL").ok().as_deref());
+    let passwd_shell = passwd_login_shell();
+    let shell = resolve_login_shell(
+        std::env::var("SHELL").ok().as_deref(),
+        passwd_shell.as_deref(),
+    );
     format!("exec {shell} -l")
 }
 
@@ -1890,6 +2062,37 @@ mod tests {
         .expect("spawn /bin/cat")
     }
 
+    /// Winsize arbitration: with several attachers the PTY is sized to the
+    /// per-axis minimum (tmux behaviour), and a departing attacher's request
+    /// is dropped so the survivors get their grid back. Requester 1 asks for
+    /// a wide-short grid and requester 2 for a narrow-tall one, so the min
+    /// is a mix of both axes — proving cols and rows arbitrate independently.
+    #[tokio::test]
+    async fn winsize_arbitrates_min_across_attachers() {
+        let surface = cat_surface();
+        let size = |s: &PtySurface| {
+            (
+                s.cols.load(Ordering::Relaxed) as u16,
+                s.rows.load(Ordering::Relaxed) as u16,
+            )
+        };
+
+        surface.request_size(1, 120, 30).expect("first request");
+        assert_eq!(size(&surface), (120, 30), "sole attacher gets its size");
+
+        surface.request_size(2, 80, 40).expect("second request");
+        assert_eq!(size(&surface), (80, 30), "per-axis min of both requests");
+
+        // The smaller-column attacher leaves → survivor gets its grid back.
+        surface.drop_size_request(2);
+        assert_eq!(size(&surface), (120, 30), "survivor size restored");
+
+        // Unknown requester is a no-op; last attacher leaving keeps the size.
+        surface.drop_size_request(99);
+        surface.drop_size_request(1);
+        assert_eq!(size(&surface), (120, 30), "last size persists when empty");
+    }
+
     #[tokio::test]
     async fn mode_replay_bytes_serializes_ascending() {
         let surface = cat_surface();
@@ -2166,8 +2369,9 @@ mod tests {
     /// two real fallback candidates.
     #[test]
     fn login_shell_falls_back_past_blockers() {
+        // No passwd candidate: pure env → bash → sh chain (systemd/no-SHELL).
         let assert_falls_back = |candidate: Option<&str>| {
-            let result = resolve_login_shell(candidate);
+            let result = resolve_login_shell(candidate, None);
             assert_ne!(
                 Some(result.as_str()),
                 candidate,
@@ -2189,7 +2393,60 @@ mod tests {
         assert_falls_back(None);
         // A usable candidate wins as-is — the one case with an exact
         // expected value, since /bin/sh is universally present.
-        assert_eq!(resolve_login_shell(Some("/bin/sh")), "/bin/sh");
+        assert_eq!(resolve_login_shell(Some("/bin/sh"), None), "/bin/sh");
+    }
+
+    #[test]
+    fn login_shell_uses_passwd_when_env_absent_or_blocked() {
+        // /bin/sh is the one shell universally present in CI/minimal hosts,
+        // so use it as the stand-in for "the account's chsh-ed login shell".
+        let passwd = Some("/bin/sh");
+        // SHELL unset (systemd/non-login SSH) → fall through to passwd shell
+        // instead of bash. This is the exact bug this fallback fixes.
+        assert_eq!(resolve_login_shell(None, passwd), "/bin/sh");
+        // SHELL is a login blocker (service account) → passwd shell still wins.
+        assert_eq!(resolve_login_shell(Some("/usr/sbin/nologin"), passwd), "/bin/sh");
+        // A usable $SHELL still takes precedence over passwd.
+        assert_eq!(resolve_login_shell(Some("/bin/sh"), Some("/no/such/shell")), "/bin/sh");
+        // A blocked/nonexistent passwd shell is skipped like any other → bash|sh.
+        let both_bad = resolve_login_shell(None, Some("/usr/sbin/nologin"));
+        assert!(matches!(both_bad.as_str(), "/bin/bash" | "/bin/sh"), "got {both_bad:?}");
+    }
+
+    // --- Container-only end-to-end checks (see scripts/zsh-login-shell-test/) ---
+    //
+    // These exercise the REAL `getpwuid_r` path, so they only pass on a host
+    // whose account is `chsh`-ed to a known shell. They are `#[ignore]`d so
+    // ordinary `cargo test` skips them; the zsh container harness runs them
+    // with `--ignored` and `EXPECT_PASSWD_SHELL` pointing at the account shell.
+
+    /// The passwd fallback returns the account's actual `/etc/passwd` login
+    /// shell. Set `EXPECT_PASSWD_SHELL` to that path (e.g. `/usr/bin/zsh`).
+    #[test]
+    #[ignore = "requires a host/container with a known passwd login shell"]
+    fn passwd_shell_reads_account_login_shell() {
+        let expect = std::env::var("EXPECT_PASSWD_SHELL")
+            .expect("set EXPECT_PASSWD_SHELL to the account's /etc/passwd login shell");
+        assert_eq!(
+            passwd_login_shell().as_deref(),
+            Some(expect.as_str()),
+            "getpwuid_r should report the account's chsh-ed login shell"
+        );
+    }
+
+    /// With `$SHELL` removed (the systemd / non-login-SSH case), the pane
+    /// login command must resolve to the passwd shell — not silently fall to
+    /// bash/sh. Run under `env -u SHELL` with `EXPECT_PASSWD_SHELL` set.
+    #[test]
+    #[ignore = "requires SHELL unset + a passwd login shell; run in the zsh container"]
+    fn login_shell_cmd_uses_passwd_when_shell_env_absent() {
+        let expect = std::env::var("EXPECT_PASSWD_SHELL")
+            .expect("set EXPECT_PASSWD_SHELL to the account's /etc/passwd login shell");
+        assert!(
+            std::env::var_os("SHELL").is_none(),
+            "run this test with `env -u SHELL` so getpwuid_r is the only source"
+        );
+        assert_eq!(login_shell_cmd(), format!("exec {expect} -l"));
     }
 
     #[test]
@@ -3002,5 +3259,80 @@ mod tests {
         // A from_seq before the chunk still trims normally.
         let out = buf.snapshot_from(near_max);
         assert_eq!(out, vec![chunk(near_max, b"wxyz")]);
+    }
+
+    // -- ReplayBuffer::snapshot_tail -----------------------------------
+
+    #[test]
+    fn snapshot_tail_empty_buffer_is_empty() {
+        let buf = ReplayBuffer::default();
+        assert!(buf.snapshot_tail(0).is_empty());
+        assert!(buf.snapshot_tail(64 * 1024).is_empty());
+    }
+
+    /// Budget larger than everything buffered: the tail IS the whole ring,
+    /// so a small surface still replays in full.
+    #[test]
+    fn snapshot_tail_budget_above_total_returns_full_snapshot() {
+        let buf = three_chunk_buffer();
+        assert_eq!(buf.snapshot_tail(64 * 1024), buf.snapshot());
+    }
+
+    /// Budget that fits exactly two of the three chunks: the OLDEST is
+    /// dropped, not the newest — this is a tail, not a head.
+    #[test]
+    fn snapshot_tail_drops_oldest_chunks_first() {
+        let buf = three_chunk_buffer();
+        let out = buf.snapshot_tail(8);
+        assert_eq!(out, vec![chunk(4, b"bbbb"), chunk(8, b"cccc")]);
+    }
+
+    /// A budget that would only partially cover a chunk does NOT split it:
+    /// chunks are whole PTY reads, so the cut lands on the boundary below.
+    #[test]
+    fn snapshot_tail_cuts_on_chunk_boundaries_never_mid_chunk() {
+        let buf = three_chunk_buffer();
+        // 6 bytes of budget spans all of "cccc" plus half of "bbbb"; the
+        // half chunk is dropped whole rather than sliced.
+        let out = buf.snapshot_tail(6);
+        assert_eq!(out, vec![chunk(8, b"cccc")]);
+    }
+
+    /// The newest chunk is kept even when it alone busts the budget — a
+    /// blank pane is strictly worse than one oversized replay.
+    #[test]
+    fn snapshot_tail_always_keeps_the_newest_chunk() {
+        let buf = three_chunk_buffer();
+        assert_eq!(buf.snapshot_tail(0), vec![chunk(8, b"cccc")]);
+        assert_eq!(buf.snapshot_tail(1), vec![chunk(8, b"cccc")]);
+    }
+
+    /// The whole point of the split: the ring stays sized for resume while a
+    /// fresh attach only ever sees `FRESH_ATTACH_REPLAY_BYTES`. A surface
+    /// that produced far more than that must not replay all of it on open.
+    #[test]
+    fn snapshot_tail_bounds_a_ring_far_larger_than_the_fresh_budget() {
+        let mut buf = ReplayBuffer::default();
+        let chunk_len = 4 * 1024usize;
+        let chunk_count = 64; // 256 KiB total — 4x the fresh budget
+        for i in 0..chunk_count {
+            buf.push(chunk(
+                (i * chunk_len) as u64,
+                &vec![b'x'; chunk_len],
+            ));
+        }
+        let total: usize = buf.snapshot().iter().map(|c| c.bytes.len()).sum();
+        assert_eq!(total, chunk_count * chunk_len);
+
+        let tail = buf.snapshot_tail(FRESH_ATTACH_REPLAY_BYTES);
+        let tail_bytes: usize = tail.iter().map(|c| c.bytes.len()).sum();
+        assert!(
+            tail_bytes <= FRESH_ATTACH_REPLAY_BYTES,
+            "fresh-attach replay must stay within its budget, got {tail_bytes}"
+        );
+        assert!(tail_bytes > 0, "fresh attach must not replay nothing");
+        // And it is the NEWEST bytes: the last chunk of the ring is the last
+        // chunk of the tail.
+        assert_eq!(tail.last(), buf.snapshot().last());
     }
 }

@@ -659,6 +659,77 @@ struct TermMeshCLI {
         case "rename-tab":
             try runRenameTab(commandArgs: commandArgs, client: client, jsonOutput: jsonOutput, idFormat: idFormat, windowOverride: windowId)
 
+        case "peer-hosts":
+            let payload = try client.sendV2(method: "peer.host.list")
+            if jsonOutput {
+                print(jsonString(payload))
+            } else {
+                let hosts = payload["hosts"] as? [[String: Any]] ?? []
+                if hosts.isEmpty {
+                    print("No peer hosts")
+                } else {
+                    for host in hosts {
+                        let state = (host["state"] as? String) ?? "?"
+                        let name = (host["display_name"] as? String) ?? ""
+                        let hostId = (host["id"] as? String) ?? ""
+                        // The lease flag is the difference between a row that
+                        // offers Disconnect and one that offers nothing, so it
+                        // earns a column rather than living only in --json.
+                        let lease = (host["has_sidebar_lease"] as? Bool) == true ? "lease" : "-"
+                        let wsCount = (host["workspace_count"] as? Int) ?? 0
+                        var line = "\(state.padding(toLength: 11, withPad: " ", startingAt: 0))"
+                        line += "\(lease.padding(toLength: 6, withPad: " ", startingAt: 0))"
+                        line += "\(wsCount) ws  \(name)  [\(hostId)]"
+                        print(line)
+                        if let reason = host["failure_reason"] as? String, !reason.isEmpty {
+                            print("             \(reason)")
+                        }
+                    }
+                }
+            }
+
+        case "peer-mirror-status":
+            let payload = try client.sendV2(method: "peer.mirror.status")
+            printV2Payload(
+                payload, jsonOutput: jsonOutput, idFormat: idFormat,
+                fallbackText: jsonString(payload["status"] as? [String: Any] ?? [:])
+            )
+
+        case "peer-pane-status":
+            let payload = try client.sendV2(method: "peer.pane.status")
+            printV2Payload(
+                payload, jsonOutput: jsonOutput, idFormat: idFormat,
+                fallbackText: jsonString(payload["status"] as? [String: Any] ?? [:])
+            )
+
+        case "peer-connect", "peer-disconnect", "peer-force-disconnect",
+             "peer-retry", "peer-cancel", "peer-open-pane", "peer-open-mirror":
+            guard let hostArg = optionValue(commandArgs, name: "--host") else {
+                throw CLIError(message: "--host is required (see: term-mesh peer-hosts)")
+            }
+            let method: String = {
+                switch command {
+                case "peer-connect": return "peer.host.connect"
+                case "peer-disconnect": return "peer.host.disconnect"
+                case "peer-force-disconnect": return "peer.host.force_disconnect"
+                case "peer-retry": return "peer.host.retry"
+                case "peer-open-pane": return "peer.surface.open_pane"
+                case "peer-open-mirror": return "peer.workspace.open_mirror"
+                default: return "peer.host.cancel"
+                }
+            }()
+            var peerParams: [String: Any] = ["host": hostArg]
+            if command == "peer-open-mirror", let ws = optionValue(commandArgs, name: "--workspace") {
+                peerParams["workspace"] = ws
+            }
+            let payload = try client.sendV2(method: method, params: peerParams)
+            var summary = "\(command): \(hostArg)"
+            if let state = payload["state"] as? String { summary += " → \(state)" }
+            if let closed = payload["closed"] as? Int { summary += " (closed \(closed))" }
+            printV2Payload(
+                payload, jsonOutput: jsonOutput, idFormat: idFormat, fallbackText: summary
+            )
+
         case "list-workspaces":
             let payload = try client.sendV2(method: "workspace.list")
             if jsonOutput {
@@ -3323,6 +3394,47 @@ struct TermMeshCLI {
               term-mesh rename-tab --tab tab:3 "staging server"
               term-mesh rename-tab --workspace workspace:2 --surface surface:5 --title "agent run"
             """
+        case "peer-hosts", "peer-connect", "peer-disconnect",
+             "peer-force-disconnect", "peer-retry", "peer-cancel",
+             "peer-open-pane", "peer-pane-status",
+             "peer-open-mirror", "peer-mirror-status":
+            return """
+            Usage: term-mesh peer-hosts
+                   term-mesh peer-connect --host <id|name>
+                   term-mesh peer-disconnect --host <id|name>
+                   term-mesh peer-force-disconnect --host <id|name>
+                   term-mesh peer-retry --host <id|name>
+                   term-mesh peer-cancel --host <id|name>
+                   term-mesh peer-open-pane --host <id|name>
+                   term-mesh peer-pane-status
+
+            Drive peer-federation saved hosts — the same actions the sidebar's
+            host context menu offers.
+
+            --host accepts the stable id (e.g. ssh:root@jw-server) or the
+            display name. Run peer-hosts first to see both.
+
+            connect / retry are asynchronous: they return once the attempt is
+            scheduled. Poll peer-hosts for the resulting state (connecting →
+            connected, or failed with a reason).
+
+            disconnect releases the sidebar's lease only. Panes and mirrors
+            opened from the host hold their own connections and stay open by
+            design, which can leave the row back at "connected".
+
+            force-disconnect closes every pane, mirror and relay window opened
+            from the host, then releases the lease. Reports how many
+            connections it closed.
+
+            open-pane attaches the host's first attachable surface as a pane in
+            the current workspace (no picker). Asynchronous like connect: poll
+            peer-pane-status for pane_sessions / lease_count.
+
+            Example:
+              term-mesh peer-hosts
+              term-mesh peer-connect --host jw-server
+              term-mesh --json peer-force-disconnect --host ssh:root@jw-server
+            """
         case "new-workspace":
             return """
             Usage: term-mesh new-workspace
@@ -4996,6 +5108,16 @@ struct TermMeshCLI {
           reorder-workspace --workspace <id|ref|index> (--index <n> | --before <id|ref|index> | --after <id|ref|index>) [--window <id|ref|index>]
           workspace-action --action <name> [--workspace <id|ref|index>] [--title <text>]
           list-workspaces
+          peer-hosts
+          peer-connect --host <id|name>
+          peer-disconnect --host <id|name>
+          peer-force-disconnect --host <id|name>
+          peer-retry --host <id|name>
+          peer-cancel --host <id|name>
+          peer-open-pane --host <id|name>
+          peer-pane-status
+          peer-open-mirror --host <id|name> [--workspace <title>]
+          peer-mirror-status
           new-workspace [--command <text>]
           new-split <left|right|up|down> [--workspace <id|ref>] [--surface <id|ref>] [--panel <id|ref>]
           list-panes [--workspace <id|ref>]

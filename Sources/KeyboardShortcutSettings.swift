@@ -44,6 +44,9 @@ enum KeyboardShortcutSettings {
         case showBrowserJavaScriptConsole
         case toggleDashboard
 
+        // Peer
+        case openPeerWorkspace
+
         var id: String { rawValue }
 
         var label: String {
@@ -78,6 +81,7 @@ enum KeyboardShortcutSettings {
             case .toggleBrowserDeveloperTools: return "Toggle Browser Developer Tools"
             case .showBrowserJavaScriptConsole: return "Show Browser JavaScript Console"
             case .toggleDashboard: return "Toggle Dashboard"
+            case .openPeerWorkspace: return "Open Peer Workspace"
             }
         }
 
@@ -113,6 +117,7 @@ enum KeyboardShortcutSettings {
             case .toggleBrowserDeveloperTools: return "shortcut.toggleBrowserDeveloperTools"
             case .showBrowserJavaScriptConsole: return "shortcut.showBrowserJavaScriptConsole"
             case .toggleDashboard: return "shortcut.toggleDashboard"
+            case .openPeerWorkspace: return "shortcut.openPeerWorkspace"
             }
         }
 
@@ -180,6 +185,8 @@ enum KeyboardShortcutSettings {
                 return StoredShortcut(key: "c", command: true, shift: false, option: true, control: false)
             case .toggleDashboard:
                 return StoredShortcut(key: "d", command: true, shift: true, option: false, control: false)
+            case .openPeerWorkspace:
+                return StoredShortcut(key: "o", command: true, shift: true, option: false, control: false)
             }
         }
 

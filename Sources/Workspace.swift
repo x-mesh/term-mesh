@@ -501,10 +501,11 @@ final class Workspace: Identifiable, ObservableObject {
         // Remote panes carry a host chip in the tab title so mixed
         // workspaces stay legible even for non-focused panes (Phase 1
         // remote pane primitive, always-on signal).
-        if let hostKey = (panels[panelId] as? TerminalPanel)?.remoteHostKey,
-           !base.hasSuffix(" ⌁ \(hostKey.shortLabel)")
-        {
-            return "\(base) ⌁ \(hostKey.shortLabel)"
+        if let hostKey = (panels[panelId] as? TerminalPanel)?.remoteHostKey {
+            let hostLabel = PeerHostProfileStore.shared.displayLabel(for: hostKey)
+            if !base.hasSuffix(" ⌁ \(hostLabel)") {
+                return "\(base) ⌁ \(hostLabel)"
+            }
         }
         return base
     }
@@ -2212,7 +2213,7 @@ final class Workspace: Identifiable, ObservableObject {
                 id: remotePaneID,
                 panelID: panel.id,
                 sessionID: RemoteSessionID(),
-                hostLabel: session.lease.key.shortLabel,
+                hostLabel: PeerHostProfileStore.shared.displayLabel(for: session.lease.key),
                 sshTarget: session.lease.key.sshTarget,
                 title: session.surfaceTitle.isEmpty ? "Remote Terminal" : session.surfaceTitle,
                 remoteRoot: session.originSurface.cwd,

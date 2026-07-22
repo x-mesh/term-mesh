@@ -119,6 +119,7 @@
 		TC0B0002 /* TerminalController+Workspace.swift in Sources */ = {isa = PBXBuildFile; fileRef = TC0F0002 /* TerminalController+Workspace.swift */; };
 		TC0B0003 /* TerminalController+Surface.swift in Sources */ = {isa = PBXBuildFile; fileRef = TC0F0003 /* TerminalController+Surface.swift */; };
 		TC0B0004 /* TerminalController+Pane.swift in Sources */ = {isa = PBXBuildFile; fileRef = TC0F0004 /* TerminalController+Pane.swift */; };
+		TC0B0099 /* TerminalController+Peer.swift in Sources */ = {isa = PBXBuildFile; fileRef = TC0F0099 /* TerminalController+Peer.swift */; };
 		TC0B0005 /* TerminalController+Browser.swift in Sources */ = {isa = PBXBuildFile; fileRef = TC0F0005 /* TerminalController+Browser.swift */; };
 		CVB00024 /* TerminalController+BrowserFind.swift in Sources */ = {isa = PBXBuildFile; fileRef = CVS00024 /* TerminalController+BrowserFind.swift */; };
 		CVB00025 /* TerminalController+BrowserData.swift in Sources */ = {isa = PBXBuildFile; fileRef = CVS00025 /* TerminalController+BrowserData.swift */; };
@@ -383,6 +384,7 @@
 		TC0F0002 /* TerminalController+Workspace.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "TerminalController+Workspace.swift"; sourceTree = "<group>"; };
 		TC0F0003 /* TerminalController+Surface.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "TerminalController+Surface.swift"; sourceTree = "<group>"; };
 		TC0F0004 /* TerminalController+Pane.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "TerminalController+Pane.swift"; sourceTree = "<group>"; };
+		TC0F0099 /* TerminalController+Peer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "TerminalController+Peer.swift"; sourceTree = "<group>"; };
 		TC0F0005 /* TerminalController+Browser.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "TerminalController+Browser.swift"; sourceTree = "<group>"; };
 		CVS00024 /* TerminalController+BrowserFind.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "TerminalController+BrowserFind.swift"; sourceTree = "<group>"; };
 		CVS00025 /* TerminalController+BrowserData.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "TerminalController+BrowserData.swift"; sourceTree = "<group>"; };
@@ -670,6 +672,7 @@
 				TC0F0002 /* TerminalController+Workspace.swift */,
 				TC0F0003 /* TerminalController+Surface.swift */,
 				TC0F0004 /* TerminalController+Pane.swift */,
+				TC0F0099 /* TerminalController+Peer.swift */,
 				TC0F0005 /* TerminalController+Browser.swift */,
 				CVS00024 /* TerminalController+BrowserFind.swift */,
 				CVS00025 /* TerminalController+BrowserData.swift */,
@@ -1045,6 +1048,7 @@
 				TC0B0002 /* TerminalController+Workspace.swift in Sources */,
 				TC0B0003 /* TerminalController+Surface.swift in Sources */,
 				TC0B0004 /* TerminalController+Pane.swift in Sources */,
+				TC0B0099 /* TerminalController+Peer.swift in Sources */,
 				TC0B0005 /* TerminalController+Browser.swift in Sources */,
 				CVB00024 /* TerminalController+BrowserFind.swift in Sources */,
 				CVB00025 /* TerminalController+BrowserData.swift in Sources */,
