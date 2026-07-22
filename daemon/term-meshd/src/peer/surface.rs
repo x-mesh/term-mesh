@@ -299,6 +299,47 @@ impl ReplayBuffer {
     }
 }
 
+/// Per-surface terminal emulator: the host's own model of what the screen
+/// looks like *right now*, fed the same filtered bytes every client sees.
+///
+/// This is what lets a fresh attach receive the current screen instead of a
+/// byte-history replay — the tmux model. The replay ring keeps its scrollback
+/// role; this struct owns the "visible screen" role the ring used to fake by
+/// replaying a tail (`FRESH_ATTACH_REPLAY_BYTES`), which blanked idle TUIs.
+///
+/// Lives behind one `Mutex` together with `fed_through`, so a reader gets an
+/// atomic (screen, seq) pair: a snapshot is meaningless without knowing which
+/// byte position it is consistent with (`GridSnapshot.byte_seq` on the wire).
+struct ScreenModel {
+    parser: vt100::Parser,
+    /// Host-absolute `byte_seq` position this screen has consumed up to: the
+    /// END seq of the last chunk fed (i.e. `chunk.seq + chunk.bytes.len()`).
+    /// An attach that dedupes live chunks below this value will never apply
+    /// a byte the snapshot already contains, and never miss one it doesn't.
+    fed_through: u64,
+}
+
+impl ScreenModel {
+    fn new(cols: u16, rows: u16) -> Self {
+        ScreenModel {
+            // vt100's constructor takes (rows, cols, scrollback) — the
+            // reverse of this repo's (cols, rows) convention everywhere
+            // else. Do not "fix" the argument order.
+            parser: vt100::Parser::new(rows, cols, 0),
+            fed_through: 0,
+        }
+    }
+
+    /// Feed one filtered chunk and advance the consistency watermark.
+    /// Split out as a method (rather than inlining in the reader loop) so a
+    /// future batching layer — accumulate, feed on a tick — can slot in
+    /// without touching the attach path.
+    fn feed(&mut self, bytes: &[u8], end_seq: u64) {
+        self.parser.process(bytes);
+        self.fed_through = end_seq;
+    }
+}
+
 pub struct PtySurface {
     pub surface_id: Vec<u8>,
     pub title: String,
@@ -335,6 +376,10 @@ pub struct PtySurface {
     /// free-for-all that made two different-sized windows fight over the
     /// grid.
     size_requests: Mutex<HashMap<u64, (u16, u16)>>,
+    /// The host-side screen model (see [`ScreenModel`]). Locked briefly by
+    /// the reader loop per chunk and by attach-time snapshot reads; never
+    /// held across an await.
+    screen: Mutex<ScreenModel>,
     master_fd: RawFd,
     child: Mutex<ChildLifecycle>,
     signal_owners: AtomicUsize,
@@ -396,6 +441,7 @@ impl PtySurface {
             replay: Mutex::new(ReplayBuffer::default()),
             modes: Mutex::new(BTreeSet::new()),
             size_requests: Mutex::new(HashMap::new()),
+            screen: Mutex::new(ScreenModel::new(cols, rows)),
             master_fd: child.master_fd,
             child: Mutex::new(ChildLifecycle {
                 pid: child.pid,
@@ -512,6 +558,19 @@ impl PtySurface {
                         let seq = reader_surface
                             .byte_seq
                             .fetch_add(bytes.len() as u64, Ordering::Relaxed);
+                        // Feed the screen model BEFORE the broadcast: the
+                        // attach handler captures its subscriber and then
+                        // reads the snapshot, so any chunk a subscriber can
+                        // observe must already be in the screen — otherwise
+                        // a snapshot could lag `live_min_seq` and the viewer
+                        // would apply a stale screen over newer live bytes.
+                        // Only the FILTERED bytes are fed: `byte_seq`
+                        // advances by `bytes.len()`, not the raw read size,
+                        // so feeding raw would desync `fed_through` from the
+                        // seq space every other consumer lives in.
+                        if let Ok(mut screen) = reader_surface.screen.lock() {
+                            screen.feed(&bytes, seq + bytes.len() as u64);
+                        }
                         let chunk = PtyChunk { seq, bytes };
                         if let Ok(mut replay) = reader_surface.replay.lock() {
                             replay.push(chunk.clone());
@@ -729,13 +788,49 @@ impl PtySurface {
     }
 
     /// `replay_snapshot()`, bounded to the newest `FRESH_ATTACH_REPLAY_BYTES`.
-    /// What a fresh attach (no `resume_from_seq`) gets — see
-    /// `ReplayBuffer::snapshot_tail` for why that is not the whole ring.
+    /// The byte-replay fallback for a fresh attach — used when the screen
+    /// model is unavailable (poisoned lock) or explicitly forced via
+    /// `TERMMESH_PEER_FRESH_ATTACH_MODE=bytes`. The primary fresh-attach
+    /// path is [`PtySurface::screen_snapshot`].
     pub fn replay_snapshot_fresh(&self) -> Vec<PtyChunk> {
         self.replay
             .lock()
             .map(|replay| replay.snapshot_tail(FRESH_ATTACH_REPLAY_BYTES))
             .unwrap_or_default()
+    }
+
+    /// Render the current screen as ANSI bytes, atomically paired with the
+    /// host-absolute `byte_seq` the render is consistent with.
+    ///
+    /// This is the tmux model: a fresh attach gets the ONE current screen —
+    /// cursor, styles, input modes — instead of a replay of recent history
+    /// that either re-streams old output (full ring) or blanks an idle TUI
+    /// (bounded tail). `state_formatted()` covers contents + cursor + input
+    /// modes + title.
+    ///
+    /// Two deliberate additions around vt100's own output:
+    /// - `ESC[?1049h` is prepended when the surface is on the alternate
+    ///   screen. `state_formatted()` renders whichever grid is active but
+    ///   never emits the mode switch itself; without it the viewer would
+    ///   paint a TUI into its primary screen, and the app's eventual
+    ///   `?1049l` would no-op — leaving the TUI on screen forever.
+    /// - The caller still prepends `mode_replay_bytes()` (mouse DECSET):
+    ///   vt100 tracks most input modes but not 1015/1016, which the host's
+    ///   own tracker does. Overlapping DECSETs are idempotent; the
+    ///   snapshot's version wins where both speak.
+    ///
+    /// Returns `None` on a poisoned lock — callers fall back to the byte
+    /// replay path, matching the `.unwrap_or_default()` convention of the
+    /// other snapshot readers.
+    pub fn screen_snapshot(&self) -> Option<(Vec<u8>, u64)> {
+        let screen = self.screen.lock().ok()?;
+        let vt = screen.parser.screen();
+        let mut out = Vec::new();
+        if vt.alternate_screen() {
+            out.extend_from_slice(b"\x1b[?1049h");
+        }
+        out.extend_from_slice(&vt.state_formatted());
+        Some((out, screen.fed_through))
     }
 
     /// Current value of the surface's monotonic PTY byte-seq counter — the
@@ -777,6 +872,12 @@ impl PtySurface {
         pty::resize(self.master_fd, cols, rows)?;
         self.cols.store(cols as u32, Ordering::Relaxed);
         self.rows.store(rows as u32, Ordering::Relaxed);
+        // Keep the screen model at the PTY's size, or every later snapshot
+        // renders at a stale width. vt100's set_size takes (rows, cols) —
+        // the reverse of this function's own signature. Do not swap.
+        if let Ok(mut screen) = self.screen.lock() {
+            screen.parser.set_size(rows, cols);
+        }
         Ok(())
     }
 
@@ -3334,5 +3435,182 @@ mod tests {
         // And it is the NEWEST bytes: the last chunk of the ring is the last
         // chunk of the tail.
         assert_eq!(tail.last(), buf.snapshot().last());
+    }
+
+    // -- ScreenModel / screen_snapshot -----------------------------------
+
+    /// Round-trip: feeding a snapshot into a fresh parser must reproduce
+    /// the screen. This is the core contract the whole grid-snapshot design
+    /// stands on — if state_formatted() can't rebuild its own screen, a
+    /// viewer can't either.
+    #[test]
+    fn screen_model_roundtrip_reproduces_contents() {
+        let mut model = ScreenModel::new(80, 24);
+        model.feed(b"\x1b[31mred\x1b[m plain\r\nline2 \x1b[1mbold\x1b[m\r\n", 0);
+        model.feed(b"\x1b[5;10Hcursor-positioned", 0);
+
+        let mut reparsed = vt100::Parser::new(24, 80, 0);
+        let vt = model.parser.screen();
+        reparsed.process(&vt.state_formatted());
+
+        assert_eq!(
+            reparsed.screen().contents(),
+            vt.contents(),
+            "state_formatted must reproduce the exact screen contents"
+        );
+        assert_eq!(reparsed.screen().cursor_position(), vt.cursor_position());
+    }
+
+    /// An escape sequence split across two feeds (the 4096-byte read
+    /// boundary case) must parse as if it arrived whole — vte is a
+    /// streaming state machine, and this pins that property so a future
+    /// batching layer can't accidentally break it.
+    #[test]
+    fn screen_model_survives_escape_split_across_feeds() {
+        let mut split = ScreenModel::new(80, 24);
+        // Split an SGR + text mid-sequence: ESC [ 3 | 1 m red
+        split.feed(b"\x1b[3", 0);
+        split.feed(b"1mred\x1b[m", 0);
+
+        let mut whole = ScreenModel::new(80, 24);
+        whole.feed(b"\x1b[31mred\x1b[m", 0);
+
+        assert_eq!(
+            split.parser.screen().state_formatted(),
+            whole.parser.screen().state_formatted(),
+            "chunk-split escape must render identically to the unsplit form"
+        );
+    }
+
+    /// Alt-screen: the snapshot must carry ESC[?1049h ahead of vt100's own
+    /// output, or the viewer paints the TUI into its primary screen and the
+    /// app's later ?1049l no-ops (the TUI never goes away).
+    #[tokio::test]
+    async fn screen_snapshot_prefixes_alt_screen_switch() {
+        let surface = PtySurface::spawn(
+            surface_id_from_name("alt-snap"),
+            "alt-snap".into(),
+            "/bin/sh",
+            &["-c", "printf '\\033[?1049halt-content'; sleep 5"],
+            80,
+            24,
+            None,
+        )
+        .expect("spawn alt-snap surface");
+
+        // Poll until the reader has fed the alt-screen switch through.
+        let mut saw_alt = false;
+        for _ in 0..100 {
+            if let Some((bytes, _)) = surface.screen_snapshot() {
+                if bytes.starts_with(b"\x1b[?1049h")
+                    && bytes.windows(11).any(|w| w == b"alt-content")
+                {
+                    saw_alt = true;
+                    break;
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        surface.hangup();
+        assert!(
+            saw_alt,
+            "snapshot of an alt-screen surface must start with ESC[?1049h and contain its content"
+        );
+    }
+
+    /// The watermark must equal the END seq of the last fed chunk, and the
+    /// snapshot/seq pair must be read atomically (both under one lock).
+    #[tokio::test]
+    async fn screen_snapshot_watermark_matches_byte_seq() {
+        const MARKER: &[u8] = b"WATERMARK-SYNC";
+        let surface = PtySurface::spawn(
+            surface_id_from_name("watermark"),
+            "watermark".into(),
+            "/bin/sh",
+            &["-c", "printf WATERMARK-SYNC; sleep 5"],
+            80,
+            24,
+            None,
+        )
+        .expect("spawn watermark surface");
+
+        let mut synced = false;
+        for _ in 0..100 {
+            let (snapshot, fed_through) = match surface.screen_snapshot() {
+                Some(pair) => pair,
+                None => continue,
+            };
+            let contains = snapshot
+                .windows(MARKER.len())
+                .any(|w| w == MARKER);
+            if contains && fed_through == surface.current_byte_seq() {
+                synced = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        surface.hangup();
+        assert!(
+            synced,
+            "once output settles, fed_through must equal the surface's byte_seq"
+        );
+    }
+
+    /// Stress (the done_criteria's 10MB/s case, expressed as throughput):
+    /// feeding 10 MB through the model in read-sized chunks must complete
+    /// promptly — the per-chunk lock hold is a parse, not I/O, and nothing
+    /// about it may block or accumulate.
+    #[test]
+    fn screen_model_stress_ten_megabytes_of_flood() {
+        let mut model = ScreenModel::new(120, 40);
+        let chunk = vec![b'x'; READ_BUF_SIZE];
+        let start = std::time::Instant::now();
+        let mut fed = 0u64;
+        while fed < 10 * 1024 * 1024 {
+            model.feed(&chunk, fed + chunk.len() as u64);
+            fed += chunk.len() as u64;
+        }
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "10MB of plain flood must feed in well under 5s, took {elapsed:?}"
+        );
+        // The screen is still coherent after the flood.
+        assert_eq!(model.fed_through, fed);
+        let rendered = model.parser.screen().state_formatted();
+        assert!(!rendered.is_empty());
+    }
+
+    /// Adversarial: a poisoned screen lock must degrade to None (callers
+    /// fall back to the byte-replay path), never panic the attach handler.
+    #[tokio::test]
+    async fn screen_snapshot_poisoned_lock_returns_none() {
+        let surface = PtySurface::spawn(
+            surface_id_from_name("poison"),
+            "poison".into(),
+            "/bin/cat",
+            &[],
+            80,
+            24,
+            None,
+        )
+        .expect("spawn poison surface");
+
+        // Poison the lock: panic while holding it.
+        {
+            let surface = surface.clone();
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+                let _guard = surface.screen.lock().unwrap();
+                panic!("deliberate poison");
+            }));
+        }
+
+        assert!(
+            surface.screen_snapshot().is_none(),
+            "poisoned lock must yield None, not panic"
+        );
+        // The byte-replay fallback still works.
+        let _ = surface.replay_snapshot_fresh();
+        surface.hangup();
     }
 }

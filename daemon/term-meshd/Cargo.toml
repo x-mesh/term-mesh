@@ -75,6 +75,10 @@ x25519-dalek = { version = "=3.0.0", features = ["static_secrets"] }
 hkdf = "=0.12.4"
 unicode-casefold = "0.2.0"
 unicode-normalization = "0.1"
+# Per-surface terminal emulator for peer grid snapshots. Already in the
+# workspace via term-mesh-cli (same version), so this adds no new
+# transitive dependency or compilation unit to the workspace build.
+vt100 = "0.15"
 quinn = { version = "=0.11.11", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
 rcgen = { version = "=0.14.8", default-features = false, features = ["ring"] }
 

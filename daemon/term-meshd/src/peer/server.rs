@@ -620,6 +620,134 @@ mod integration_tests {
         let _ = tokio::time::timeout(std::time::Duration::from_secs(3), server_task).await;
     }
 
+    /// Read PtyData frames until `want` appears, returning everything
+    /// aggregated so far — lets a test assert on what was ABSENT from the
+    /// stream, which `wait_for_marker`'s bool cannot.
+    async fn collect_pty_until_marker(
+        reader: &mut tokio::net::unix::OwnedReadHalf,
+        want: &[u8],
+        timeout: std::time::Duration,
+    ) -> Vec<u8> {
+        let deadline = tokio::time::Instant::now() + timeout;
+        let mut aggregated = Vec::<u8>::new();
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                return aggregated;
+            }
+            let env = match tokio::time::timeout(remaining, read_envelope(reader)).await {
+                Ok(Ok(e)) => e,
+                _ => return aggregated,
+            };
+            if let Some(Payload::PtyData(p)) = env.payload {
+                aggregated.extend_from_slice(&p.payload);
+                if aggregated.windows(want.len()).any(|w| w == want) {
+                    return aggregated;
+                }
+            }
+        }
+    }
+
+    /// Spawn a surface whose visible line was overwritten in place (CR, no
+    /// LF), serve it, attach fresh, and return the aggregated first bytes.
+    async fn attach_overwritten_line_surface(name: &str) -> Vec<u8> {
+        let tmp = TempDir::new().unwrap();
+        let sock_path = tmp.path().join("peer.sock");
+
+        let manager = Arc::new(PtyManager::new());
+        let surface = PtySurface::spawn(
+            surface_id_from_name(name),
+            name.into(),
+            "/bin/sh",
+            &["-c", "printf 'OLDMARKER\\rNEWMARKER99'; sleep 5"],
+            80,
+            24,
+            None,
+        )
+        .expect("spawn overwritten-line surface");
+
+        // Wait until the overwrite has flowed through the reader (ring
+        // holds the raw history including OLDMARKER).
+        for _ in 0..100 {
+            let replay = surface.replay_snapshot();
+            let bytes: Vec<u8> = replay
+                .iter()
+                .flat_map(|chunk| chunk.bytes.iter().copied())
+                .collect();
+            if bytes.windows(11).any(|w| w == b"NEWMARKER99") {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        manager.insert_surface(surface);
+
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let sp_task = sock_path.clone();
+        let server_task = tokio::spawn(async move {
+            serve_with_manager(sp_task, shutdown_rx, manager).await.unwrap();
+        });
+        for _ in 0..50 {
+            if sock_path.exists() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+
+        let (mut reader, writer, _sid) = attach_one(&sock_path, name).await;
+        let got = collect_pty_until_marker(
+            &mut reader,
+            b"NEWMARKER99",
+            std::time::Duration::from_secs(3),
+        )
+        .await;
+
+        drop(reader);
+        drop(writer);
+        shutdown_tx.send(true).unwrap();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(3), server_task).await;
+        got
+    }
+
+    /// The tmux-model contract, plus its kill switch — one test on purpose:
+    /// `TERMMESH_PEER_FRESH_ATTACH_MODE` is process-global env, and a
+    /// sibling test racing the flag would flake.
+    ///
+    /// Scenario A (default): a fresh attach receives the RENDERED screen.
+    /// A line overwritten in place (CR, no LF) must not resurface — under
+    /// byte replay it always did, which is exactly the "old find scrolls
+    /// past again" bug at 1-line scale.
+    ///
+    /// Scenario B (`=bytes`): the switch restores the byte-history tail,
+    /// so the overwritten text IS present again.
+    #[tokio::test]
+    async fn fresh_attach_renders_screen_and_kill_switch_restores_bytes() {
+        // A — snapshot path (default).
+        let got = attach_overwritten_line_surface("snap-fresh").await;
+        assert!(
+            got.windows(11).any(|w| w == b"NEWMARKER99"),
+            "snapshot attach must contain the final screen line"
+        );
+        assert!(
+            !got.windows(9).any(|w| w == b"OLDMARKER"),
+            "snapshot attach must NOT contain the overwritten byte history"
+        );
+        // And it is a real state render: vt100's contents_formatted always
+        // leads with clear+home, so the viewer starts from a clean grid.
+        assert!(
+            got.windows(6).any(|w| w == b"\x1b[H\x1b[J"),
+            "snapshot must begin with vt100's clear+home preamble"
+        );
+
+        // B — kill switch forces the pre-snapshot byte tail.
+        std::env::set_var("TERMMESH_PEER_FRESH_ATTACH_MODE", "bytes");
+        let got = attach_overwritten_line_surface("bytes-fresh").await;
+        std::env::remove_var("TERMMESH_PEER_FRESH_ATTACH_MODE");
+        assert!(
+            got.windows(9).any(|w| w == b"OLDMARKER"),
+            "bytes mode must replay raw history including the overwritten text"
+        );
+    }
+
     #[tokio::test]
     async fn ctrl_c_input_reaches_attached_pty() {
         let tmp = TempDir::new().unwrap();
@@ -706,13 +834,21 @@ mod integration_tests {
         // for a newline (canonical mode blocks until '\n', and the
         // response has none). If the daemon didn't write the reply,
         // `dd` would block forever and the marker never appears.
+        //
+        // The leading sleep pushes the whole exchange PAST the attach
+        // below, so GOT[...] arrives on the LIVE stream. This test asserts
+        // byte-stream properties (QueryFilter answered locally, stripped
+        // from broadcast); the attach-time grid snapshot would re-render
+        // the screen instead — the echoed ESC[1;1R is consumed by the
+        // emulator as a CPR *response*, never entering the grid — so the
+        // raw marker only exists on the live path.
         let surface = PtySurface::spawn(
             surface_id_from_name("query"),
             "query".into(),
             "/bin/sh",
             &[
                 "-c",
-                "stty -icanon -echo min 1 time 0 2>/dev/null; printf '\\033[6n'; reply=$(dd bs=1 count=6 2>/dev/null); printf 'GOT[%s]\\n' \"$reply\"; sleep 2",
+                "stty -icanon -echo min 1 time 0 2>/dev/null; sleep 0.5; printf '\\033[6n'; reply=$(dd bs=1 count=6 2>/dev/null); printf 'GOT[%s]\\n' \"$reply\"; sleep 2",
             ],
             80,
             24,
@@ -1773,11 +1909,22 @@ mod integration_tests {
             "marker never arrived after attach"
         );
 
-        let first_payload = first_pty_payload.expect("no PtyData frame arrived after attach");
-        assert!(
-            !first_payload.starts_with(b"\x1b[?"),
-            "unexpected mode-prefix escape on a surface with no active mode: {first_payload:?}"
-        );
+        let _ = first_pty_payload.expect("no PtyData frame arrived after attach");
+        // The grid snapshot legitimately opens with input-mode state
+        // (cursor visibility, keypad, bracketed paste — vt100's
+        // input_mode_formatted), so "starts with ESC[?" no longer means a
+        // mode prefix. What must still never appear on a surface with no
+        // active tracked mode is a mouse-tracking DECSET — the only thing
+        // `mode_replay_bytes` exists to replay.
+        for mode in [1000u16, 1002, 1003, 1005, 1006, 1015, 1016] {
+            let seq = format!("\x1b[?{mode}h");
+            assert!(
+                !aggregated
+                    .windows(seq.as_bytes().len())
+                    .any(|w| w == seq.as_bytes()),
+                "unexpected mouse-mode enable {seq:?} on a surface with no active mode"
+            );
+        }
 
         drop(reader);
         drop(writer);

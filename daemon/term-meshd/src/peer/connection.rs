@@ -436,17 +436,43 @@ async fn reader_loop(
                 let resume_from_seq =
                     effective_resume_from_seq(&peer_capabilities, req.resume_from_seq);
                 let subscriber = surface.subscribe();
-                // Resume asks for an exact range and must be served from the
-                // full ring; a fresh attach gets only the recent tail. Handing
-                // a fresh attach the whole ring meant re-opening a surface
-                // that had once run something noisy (a large `find`, a build
-                // log) re-streamed up to the entire replay capacity — which
-                // renders as that old command scrolling past again on every
-                // open. See `FRESH_ATTACH_REPLAY_BYTES`.
+                // Three-way split (tmux model):
+                // - Resume asks for an exact range and is served from the
+                //   full ring — the client already has a screen and wants
+                //   the missing bytes, not a re-render.
+                // - A fresh attach gets the CURRENT SCREEN, rendered by the
+                //   host's own emulator (`screen_snapshot`). Replaying byte
+                //   history here was the root of two bugs at once: the full
+                //   ring re-streamed an old `find` on every open, and the
+                //   bounded 64 KiB tail blanked idle TUIs whose last full
+                //   repaint had scrolled out of the window.
+                // - `TERMMESH_PEER_FRESH_ATTACH_MODE=bytes` (or a poisoned
+                //   screen lock) falls back to the pre-snapshot tail so the
+                //   new path is revertible in the field without a rebuild.
+                //
+                // The snapshot is packaged as a single synthetic `PtyChunk`
+                // whose `seq` is BACKDATED by its own length — the same
+                // wrapping trick the Swift host uses (`tapSeq &- count`,
+                // GhosttyPaneSurfaceProvider). `live_min_seq` (chunk end)
+                // then lands exactly on `snap_seq`, so live-chunk dedup and
+                // `initial_seq` fall out of the existing arithmetic below
+                // with no special cases. May wrap on a young surface; the
+                // client's resume math is wrapping too (`&+`), so the
+                // round-trip stays exact.
                 let replay = if resume_from_seq != 0 {
                     surface.replay_snapshot_from(resume_from_seq)
-                } else {
+                } else if fresh_attach_uses_bytes() {
                     surface.replay_snapshot_fresh()
+                } else {
+                    match surface.screen_snapshot() {
+                        Some((bytes, snap_seq)) if !bytes.is_empty() => {
+                            vec![PtyChunk {
+                                seq: snap_seq.wrapping_sub(bytes.len() as u64),
+                                bytes,
+                            }]
+                        }
+                        _ => surface.replay_snapshot_fresh(),
+                    }
                 };
                 let mode_prefix = surface.mode_replay_bytes();
                 // Absolute host seq (`PtyChunk::seq` space) that this
@@ -696,6 +722,25 @@ fn spawn_host_stats_push(
 /// than trusted — falls back to a fresh full-snapshot attach, exactly
 /// today's pre-resume behavior. Old-peer fallback nuance beyond this gate
 /// is t6's scope.
+/// Kill switch for the grid-snapshot fresh-attach path.
+///
+/// `TERMMESH_PEER_FRESH_ATTACH_MODE=bytes` forces the pre-snapshot behavior
+/// (the bounded ring tail) so a field problem in the screen model can be
+/// reverted without a rebuild — mirroring `TERMMESH_PEER_REPLAY_BYTES`'s
+/// role for ring capacity. Unset, or any other value, selects the snapshot.
+/// Read per attach: attaches are rare, and a restartless toggle would not
+/// survive the daemon's env snapshot anyway.
+fn fresh_attach_uses_bytes() -> bool {
+    fresh_attach_mode_is_bytes(std::env::var("TERMMESH_PEER_FRESH_ATTACH_MODE").ok().as_deref())
+}
+
+/// Pure decision half of [`fresh_attach_uses_bytes`], split for tests: env
+/// mutation is process-global and races parallel tests, so the parsing is
+/// exercised directly instead.
+fn fresh_attach_mode_is_bytes(value: Option<&str>) -> bool {
+    value.is_some_and(|v| v.trim().eq_ignore_ascii_case("bytes"))
+}
+
 fn effective_resume_from_seq(capabilities: &PeerCapabilities, requested: u64) -> u64 {
     if requested != 0 && capabilities.has(capability::REPLAY_RING_V1) {
         requested
@@ -718,9 +763,17 @@ fn spawn_attach_relay(
 
     let task = tokio::spawn(async move {
         let mut attach_seq = 0u64;
+        // `wrapping_add`, not `+`: a fresh-attach grid snapshot is packaged
+        // as one synthetic chunk whose seq is BACKDATED by its own length
+        // (see the attach handler), which on a young surface wraps below
+        // zero. Re-adding the length is the modular inverse that lands
+        // exactly back on the snapshot's consistency seq — the same
+        // arithmetic contract the Swift host documents for its tap seq, and
+        // the same trap (`+` on a wrapped anchor) that crashed the client
+        // in PeerRelaySession.performResumeHeal before it moved to `&+`.
         let live_min_seq = replay
             .last()
-            .map(|chunk| chunk.seq + chunk.bytes.len() as u64)
+            .map(|chunk| chunk.seq.wrapping_add(chunk.bytes.len() as u64))
             .unwrap_or(0);
 
         // Prepend any currently-active mouse-tracking DECSET sequences ahead of the
@@ -769,15 +822,42 @@ fn spawn_attach_relay(
         // discontinuity (P9 drop detection) instead of a seamless-but-corrupt
         // stream. Starts at the end of the replay snapshot.
         let mut last_abs_end = live_min_seq;
+        // Flips when the surface dies. The child's FINAL output can still be
+        // sitting in the broadcast channel at that moment — the reader
+        // broadcasts and only then observes EOF — and the biased arm below
+        // would otherwise win the race against `recv()` and drop it on the
+        // floor. Instead of breaking, switch to draining what is already
+        // queued and exit on Empty, so the last bytes a process wrote before
+        // exiting reach the viewer. (Flaky repro before this existed:
+        // `surface_respawns_after_child_exit`, where the respawned child's
+        // entire lifetime fits inside that race window.)
+        let mut surface_dead = false;
         loop {
-            tokio::select! {
-                biased;
-                _ = cancel_for_task.notified() => break,
-                _ = surface_for_task.dead_notify.notified() => {
-                    tracing::info!("surface died, detaching relay");
-                    break;
+            let res = if surface_dead {
+                match subscriber.try_recv() {
+                    Ok(chunk) => Ok(chunk),
+                    Err(broadcast::error::TryRecvError::Lagged(n)) => {
+                        Err(broadcast::error::RecvError::Lagged(n))
+                    }
+                    Err(_) => {
+                        // Empty or Closed: the backlog is flushed.
+                        tracing::info!("surface died, detaching relay");
+                        break;
+                    }
                 }
-                res = subscriber.recv() => {
+            } else {
+                tokio::select! {
+                    biased;
+                    _ = cancel_for_task.notified() => break,
+                    _ = surface_for_task.dead_notify.notified() => {
+                        surface_dead = true;
+                        continue;
+                    }
+                    res = subscriber.recv() => res,
+                }
+            };
+            {
+                {
                     match res {
                         Ok(chunk) => {
                             if chunk.seq < live_min_seq {

@@ -2481,6 +2481,7 @@ dependencies = [
  "unicode-casefold",
  "unicode-normalization",
  "uuid",
+ "vt100",
  "x25519-dalek",
  "zeroize",
 ]
