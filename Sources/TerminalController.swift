@@ -1234,6 +1234,8 @@ class TerminalController {
             return v2Result(id: id, self.v2DebugFlashCount(params: params))
         case "debug.flash.reset":
             return v2Result(id: id, self.v2DebugResetFlashCounts())
+        case "debug.peer.browse_wheel":
+            return v2Result(id: id, self.v2DebugPeerBrowseWheel(params: params))
         case "debug.peer.inject_input":
             return v2Result(id: id, self.v2DebugPeerInjectInput(params: params))
         case "debug.peer.demux_probe":
