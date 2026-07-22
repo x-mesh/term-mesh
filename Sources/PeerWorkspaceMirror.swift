@@ -99,13 +99,27 @@ final class PeerWorkspaceMirrorController {
     /// Connect the subscription session, reconcile to the freshest host
     /// layout, and start the receive loop. RPCs here run BEFORE the loop
     /// exists, so the single-reader invariant holds.
+    /// Handshake options for every mirror-side session: everything this
+    /// build supports EXCEPT grid.snapshot.v1. The mirror's PtyData reaches
+    /// panes through `PeerSessionDemux`, which carries `PeerPtyChunk` only —
+    /// a typed GridSnapshot would be classified and then dropped on the
+    /// demux floor, leaving every mirrored pane's initial screen blank.
+    /// Not advertising keeps the host on the untyped PtyData snapshot path,
+    /// which the demux forwards like any other bytes. Lift this only
+    /// together with a demux channel for typed frames.
+    private static var mirrorHandshakeOptions: PeerSessionOptions {
+        PeerSessionOptions(
+            capabilities: PeerCapability.supported.filter { $0 != PeerCapability.gridSnapshotV1 }
+        )
+    }
+
     func start() async throws {
         let transport = try await UnixSocketTransport.connect(socketPath: lease.hostSockPath)
         let session = PeerSession(
             read: { try await transport.read() },
             write: { try await transport.write($0) }
         )
-        _ = try await session.handshake()
+        _ = try await session.handshake(options: Self.mirrorHandshakeOptions)
         subscriptionTransport = transport
         subscriptionSession = session
         subscriptionAlive = true
@@ -350,7 +364,7 @@ final class PeerWorkspaceMirrorController {
                 read: { try await transport.read() },
                 write: { try await transport.write($0) }
             )
-            _ = try await oneShot.handshake()
+            _ = try await oneShot.handshake(options: Self.mirrorHandshakeOptions)
             let workspaces = try await oneShot.listWorkspaces()
             try? await oneShot.sendGoodbye(reason: "resync probe")
             await transport.close()
@@ -441,7 +455,7 @@ final class PeerWorkspaceMirrorController {
                 )
                 let workspaces: [Termmesh_Peer_V1_Workspace]
                 do {
-                    _ = try await session.handshake()
+                    _ = try await session.handshake(options: Self.mirrorHandshakeOptions)
                     workspaces = try await session.listWorkspaces()
                 } catch {
                     // Now that a failed attempt can actually fail instead of
