@@ -26,6 +26,17 @@ struct ContentView: View {
     @ObservedObject var updateViewModel: UpdateViewModel
     @ObservedObject private var rainbowBanner = RainbowBannerStore.shared
     @ObservedObject private var teamOrchestrator = TeamOrchestrator.shared
+    /// Bumped whenever `RemoteHostStore` publishes while the peer scope is
+    /// showing, purely to force a body re-evaluation.
+    ///
+    /// `@ObservedObject` on this view is not enough. The palette is not part
+    /// of this view's own hierarchy — it is pushed into a separate
+    /// `NSHostingView` as a `rootView` from the `WindowAccessor` below — so
+    /// the hosted tree only refreshes when something re-runs this body and
+    /// hands it a new snapshot. Query edits did that; a connection completing
+    /// did not, which left a host that had just finished connecting rendered
+    /// with the spinner row it had a second earlier.
+    @State private var peerStoreRevision = 0
     let windowId: UUID
     @EnvironmentObject var tabManager: TabManager
     @EnvironmentObject var notificationStore: TerminalNotificationStore
@@ -98,6 +109,11 @@ struct ContentView: View {
     )
     private static let commandPaletteUsageDefaultsKey = "commandPalette.commandUsage.v1"
     private static let commandPaletteCommandsPrefix = ">"
+    /// Peer-workspace scope prefix. Same mechanism as `>` for commands: the
+    /// scope is derived from the query, so ⌘⇧O is just a shortcut that seeds
+    /// this prefix, and typing it by hand inside an already-open palette
+    /// switches scope without reopening.
+    private static let commandPalettePeersPrefix = "@"
     private static let minimumSidebarWidth: CGFloat = 186
     private static let maximumSidebarWidthRatio: CGFloat = 1.0 / 3.0
 
@@ -1620,6 +1636,31 @@ struct ContentView: View {
             openCommandPaletteSwitcher()
         })
 
+        view = AnyView(view.onReceive(NotificationCenter.default.publisher(for: .commandPalettePeersRequested)) { notification in
+            let requestedWindow = notification.object as? NSWindow
+            guard Self.shouldHandleCommandPaletteRequest(
+                observedWindow: observedWindow,
+                requestedWindow: requestedWindow,
+                keyWindow: NSApp.keyWindow,
+                mainWindow: NSApp.mainWindow
+            ) else { return }
+            openCommandPalettePeers()
+        })
+
+        // Republish the palette when peer state moves under it.
+        //
+        // Deliberately unguarded. Gating this on "the palette is open showing
+        // peers" is self-defeating: the closure captures whatever this body
+        // last saw, and the case that needs the bump is exactly the one where
+        // the body has not re-run — so the guard reads a stale `false`,
+        // returns early, and nothing ever re-renders to refresh the guard. A
+        // counter increment is cheap, and peer state moves rarely (connect,
+        // disconnect, roster arrival), so the unconditional version costs
+        // little and cannot deadlock itself.
+        view = AnyView(view.onReceive(RemoteHostStore.shared.objectWillChange) { _ in
+            peerStoreRevision &+= 1
+        })
+
         view = AnyView(view.onReceive(NotificationCenter.default.publisher(for: .worktreeWorkspaceRequested)) { notification in
             let requestedWindow = notification.object as? NSWindow
             guard Self.shouldHandleCommandPaletteRequest(
@@ -1685,6 +1726,7 @@ struct ContentView: View {
         view = AnyView(view.background(WindowAccessor(dedupeByWindow: false) { window in
             MainActor.assumeIsolated {
                 let overlayController = commandPaletteWindowOverlayController(for: window)
+                _ = peerStoreRevision  // read so this closure re-runs when peer state moves
                 overlayController.update(rootView: AnyView(commandPaletteOverlay), isVisible: isCommandPalettePresented)
             }
         }))
@@ -2072,6 +2114,25 @@ struct ContentView: View {
                                 runCommandPaletteCommand(result.command)
                             } label: {
                                 HStack(spacing: 8) {
+                                    if let leading = result.command.leadingIcon {
+                                        // Fixed 11pt box so titles stay on one
+                                        // left edge whether the glyph is a
+                                        // symbol or a spinner mid-connect.
+                                        Group {
+                                            switch leading.kind {
+                                            case .progress:
+                                                ProgressView()
+                                                    .controlSize(.mini)
+                                            case .symbol(let name):
+                                                Image(systemName: name)
+                                                    .font(.system(size: 10))
+                                                    .foregroundStyle(leading.tint ?? .secondary)
+                                            }
+                                        }
+                                        .frame(width: 11, height: 11)
+                                        .help(leading.help ?? "")
+                                    }
+
                                     commandPaletteHighlightedTitleText(
                                         result.command.title,
                                         matchedIndices: result.titleMatchIndices
@@ -2079,6 +2140,13 @@ struct ContentView: View {
                                         .font(.system(size: 13, weight: .regular))
                                         .lineLimit(1)
                                     Spacer()
+
+                                    if let count = result.command.trailingCount {
+                                        Text(count)
+                                            .font(.system(size: 11, weight: .regular))
+                                            .monospacedDigit()
+                                            .foregroundStyle(.tertiary)
+                                    }
 
                                     if let trailingLabel = commandPaletteTrailingLabel(for: result.command) {
                                         switch trailingLabel.style {
@@ -2117,7 +2185,15 @@ struct ContentView: View {
                 }
                 .scrollTargetLayout()
                 // Force a fresh row tree per query so rendered labels/actions stay in lockstep.
-                .id(commandPaletteQuery)
+                //
+                // The peer revision is part of the identity for the same
+                // reason the query is: peer rows change underneath a query
+                // that never moves. A host finishing its connection replaces
+                // its single "connecting" row with one row per workspace, and
+                // without this the old row's view survived the swap — leaving
+                // a spinner turning forever next to workspaces that had
+                // already arrived.
+                .id("\(commandPaletteQuery)#\(peerStoreRevision)")
             }
             .frame(height: commandPaletteListHeight)
             .scrollPosition(
@@ -2263,6 +2339,9 @@ struct ContentView: View {
         if commandPaletteQuery.hasPrefix(Self.commandPaletteCommandsPrefix) {
             return .commands
         }
+        if commandPaletteQuery.hasPrefix(Self.commandPalettePeersPrefix) {
+            return .peers
+        }
         return .switcher
     }
 
@@ -2272,6 +2351,8 @@ struct ContentView: View {
             return "Type a command"
         case .switcher:
             return "Search workspaces and tabs"
+        case .peers:
+            return "Search peer workspaces"
         }
     }
 
@@ -2281,6 +2362,8 @@ struct ContentView: View {
             return "No commands match your search."
         case .switcher:
             return "No workspaces or tabs match your search."
+        case .peers:
+            return "No peer workspaces match your search."
         }
     }
 
@@ -2291,6 +2374,9 @@ struct ContentView: View {
             return suffix.trimmingCharacters(in: .whitespacesAndNewlines)
         case .switcher:
             return commandPaletteQuery.trimmingCharacters(in: .whitespacesAndNewlines)
+        case .peers:
+            let suffix = String(commandPaletteQuery.dropFirst(Self.commandPalettePeersPrefix.count))
+            return suffix.trimmingCharacters(in: .whitespacesAndNewlines)
         }
     }
 
@@ -2300,6 +2386,8 @@ struct ContentView: View {
             return commandPaletteCommands()
         case .switcher:
             return commandPaletteSwitcherEntries()
+        case .peers:
+            return commandPalettePeerEntries()
         }
     }
 
@@ -2372,6 +2460,19 @@ struct ContentView: View {
             return CommandPaletteTrailingLabel(text: shortcutHint, style: .shortcut)
         }
 
+        if commandPaletteListScope == .peers {
+            if command.id.hasPrefix("peer.connect.") {
+                return CommandPaletteTrailingLabel(text: "Connect", style: .kind)
+            }
+            if command.id.hasPrefix("peer.workspace.") {
+                return CommandPaletteTrailingLabel(text: "Mirror", style: .kind)
+            }
+            // No badge while connecting or waiting on a roster: the leading
+            // spinner/glyph already says what is going on, and a second label
+            // repeating it just adds noise to a row nobody can act on.
+            return nil
+        }
+
         guard commandPaletteListScope == .switcher else { return nil }
         if command.id.hasPrefix("switcher.workspace.") {
             return CommandPaletteTrailingLabel(text: "Workspace", style: .kind)
@@ -2380,6 +2481,167 @@ struct ContentView: View {
             return CommandPaletteTrailingLabel(text: "Surface", style: .kind)
         }
         return nil
+    }
+
+    /// Peer workspaces, most-recently-connected host first.
+    ///
+    /// The sidebar deliberately sorts hosts by name so rows don't shuffle
+    /// under the cursor on every reconnect. A palette has the opposite need:
+    /// it is opened to go somewhere, and the place you want is usually the
+    /// place you were last. `lastConnectedAt` is already recorded on every
+    /// successful connect (`PeerHostProfileStore.recordConnection`) and was,
+    /// until now, only read to break ties when deduping profiles.
+    ///
+    /// Hosts that aren't connected still get a row. Requiring the user to
+    /// connect in the sidebar first and only then reach for the palette would
+    /// defeat the point, so their row connects and leaves it at that — the
+    /// workspace roster isn't known until the connection lands, so there is
+    /// nothing to mirror yet.
+    private func commandPalettePeerEntries() -> [CommandPaletteCommand] {
+        let store = RemoteHostStore.shared
+        let lastConnected = Dictionary(
+            PeerHostProfileStore.shared.profiles.compactMap { profile -> (UUID, Date)? in
+                guard let at = profile.lastConnectedAt else { return nil }
+                return (profile.id, at)
+            },
+            uniquingKeysWith: { latest, _ in latest }
+        )
+
+        // `.distantPast` for a host that has never connected: it sorts to the
+        // bottom of its band rather than jumping the queue on a nil.
+        let hosts = store.sortedHosts.sorted { lhs, rhs in
+            let lhsAt = lhs.profileID.flatMap { lastConnected[$0] } ?? .distantPast
+            let rhsAt = rhs.profileID.flatMap { lastConnected[$0] } ?? .distantPast
+            if lhsAt != rhsAt { return lhsAt > rhsAt }
+            return lhs.displayName.localizedCaseInsensitiveCompare(rhs.displayName) == .orderedAscending
+        }
+
+        var entries: [CommandPaletteCommand] = []
+        var nextRank = 0
+
+        for host in hosts {
+            let hostName = host.displayName
+            let tint = host.colorHex.flatMap { NSColor(hex: $0) }.map { Color(nsColor: $0) }
+
+            // Connecting: a placeholder rather than nothing, so the row the
+            // user just picked doesn't vanish and leave the palette looking
+            // like it swallowed the keystroke. The spinner is the message —
+            // a static "Connecting" badge read as a label, not as progress.
+            if host.connectionState == .connecting {
+                entries.append(
+                    CommandPaletteCommand(
+                        id: "peer.connecting.\(host.id)",
+                        rank: nextRank,
+                        title: hostName,
+                        subtitle: "Connecting…",
+                        shortcutHint: nil,
+                        keywords: ["peer", "host", hostName],
+                        dismissOnRun: false,
+                        action: {},
+                        leadingIcon: CommandPaletteLeadingIcon(kind: .progress)
+                    )
+                )
+                nextRank += 1
+                continue
+            }
+
+            guard host.isConnected else {
+                let failureReason: String? = {
+                    if case .failed(let reason) = host.connectionState { return reason }
+                    return nil
+                }()
+                entries.append(
+                    CommandPaletteCommand(
+                        id: "peer.connect.\(host.id)",
+                        rank: nextRank,
+                        title: hostName,
+                        subtitle: failureReason.map { "Failed — \($0). Open to retry" }
+                            ?? "Not connected — open to connect",
+                        shortcutHint: nil,
+                        keywords: ["peer", "host", "connect", hostName],
+                        dismissOnRun: false,
+                        action: {
+                            RemoteHostStore.shared.connectSavedHost(host)
+                            // Stay open and narrow to this host. Connecting is
+                            // never the goal in itself — the goal is a
+                            // workspace on the far side — and dismissing here
+                            // forced a second ⌘⇧O to see the roster that the
+                            // connect had just fetched. Narrowing also means
+                            // the rows that replace this one are already the
+                            // only rows on screen.
+                            commandPaletteQuery =
+                                Self.commandPalettePeersPrefix + hostName + " "
+                        },
+                        leadingIcon: failureReason.map {
+                            // Reason has no room in a one-line row, so it
+                            // rides the tooltip — same as the sidebar.
+                            CommandPaletteLeadingIcon(
+                                kind: .symbol("exclamationmark.triangle"),
+                                tint: .red,
+                                help: $0
+                            )
+                        } ?? CommandPaletteLeadingIcon(
+                            kind: .symbol(host.symbolName ?? "network.slash"),
+                            tint: .secondary.opacity(0.4)
+                        )
+                    )
+                )
+                nextRank += 1
+                continue
+            }
+
+            // Connected but the roster hasn't arrived (or the host genuinely
+            // has none): again, say so rather than dropping the host out of
+            // the list entirely.
+            if host.workspaces.isEmpty {
+                entries.append(
+                    CommandPaletteCommand(
+                        id: "peer.empty.\(host.id)",
+                        rank: nextRank,
+                        title: hostName,
+                        subtitle: "Connected — no workspaces listed yet",
+                        shortcutHint: nil,
+                        keywords: ["peer", "host", hostName],
+                        dismissOnRun: false,
+                        action: {},
+                        leadingIcon: CommandPaletteLeadingIcon(
+                            kind: .symbol(host.symbolName ?? "network"),
+                            tint: tint
+                        )
+                    )
+                )
+                nextRank += 1
+                continue
+            }
+
+            for workspace in host.workspaces {
+                let paneCount = workspace.paneCount
+                entries.append(
+                    CommandPaletteCommand(
+                        id: "peer.workspace.\(host.id).\(workspace.id.map { String(format: "%02x", $0) }.joined())",
+                        rank: nextRank,
+                        title: "\(hostName) › \(workspace.title)",
+                        subtitle: paneCount == 1 ? "1 pane" : "\(paneCount) panes",
+                        shortcutHint: nil,
+                        keywords: ["peer", "remote", "workspace", "mirror", hostName, workspace.title],
+                        dismissOnRun: true,
+                        action: {
+                            RemoteHostStore.shared.openWorkspaceAsMirror(workspace, host: host, live: true)
+                        },
+                        // The host's own symbol + color, so a row is traceable
+                        // back to the sidebar entry it came from at a glance.
+                        leadingIcon: CommandPaletteLeadingIcon(
+                            kind: .symbol(host.symbolName ?? "network"),
+                            tint: tint
+                        ),
+                        trailingCount: "\(paneCount)p"
+                    )
+                )
+                nextRank += 1
+            }
+        }
+
+        return entries
     }
 
     private func commandPaletteSwitcherEntries() -> [CommandPaletteCommand] {
@@ -3993,6 +4255,10 @@ struct ContentView: View {
 
     private func openCommandPaletteSwitcher() {
         toggleCommandPalette(initialQuery: "")
+    }
+
+    private func openCommandPalettePeers() {
+        toggleCommandPalette(initialQuery: Self.commandPalettePeersPrefix)
     }
 
     private func toggleCommandPalette(initialQuery: String) {

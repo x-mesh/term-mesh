@@ -2465,6 +2465,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
             return true
         }
 
+        // ⌘⇧O — peer workspaces. Monitor-only, like the two palette shortcuts
+        // above: registering the same key in SwiftUI as well would dispatch it
+        // twice (see New Window / workspace jumps in TermMeshApp for the same
+        // deliberate omission).
+        let isCommandShiftO = normalizedFlags == [.command, .shift] && (chars == "o" || event.keyCode == 31)
+        if isCommandShiftO {
+            let targetWindow = activeCommandPaletteWindow() ?? event.window ?? NSApp.keyWindow ?? NSApp.mainWindow
+            NotificationCenter.default.post(name: .commandPalettePeersRequested, object: targetWindow)
+            return true
+        }
+
         let isCommandShiftV = normalizedFlags == [.command, .shift] && (chars == "v" || event.keyCode == 9)
         if isCommandShiftV, let terminal = tabManager?.selectedTerminalPanel?.surface {
             NotificationCenter.default.post(name: .pasteShelfToggleRequested, object: terminal)
