@@ -918,55 +918,40 @@ final class PeerClientCoordinator: NSObject, NSMenuDelegate {
         pickFirstWithoutPrompt: Bool = false,
         live: Bool = true
     ) async {
-        // Live-mirror dedupe: a second live mirror of the same host
-        // workspace is meaningless (both would be host-authoritative
-        // copies), so re-clicking the sidebar row focuses the existing
-        // mirror tab instead of materializing another one. Sidebar click
-        // is explicit user focus intent, so selecting here respects the
-        // socket focus policy.
+        // The window this open lands in: the sidebar row was just clicked, so
+        // the active manager IS the clicking window's. Captured once up front
+        // — the awaits below can change which window is frontmost, and the
+        // workspace must be created where the user clicked, not wherever
+        // focus drifted to.
+        let targetTabManager = AppDelegate.shared?.tabManager
+
+        // Live-mirror dedupe, scoped PER WINDOW: re-clicking the row in the
+        // window that already shows this mirror focuses that tab; a click in
+        // a different window falls through and materializes its own mirror
+        // there. Concurrent mirrors of one host workspace are fine now that
+        // the daemon arbitrates the PTY winsize across attachers (min per
+        // axis, tmux-style) instead of last-writer-wins.
         if live, let workspaceID,
-           let existing = openWorkspaceMirrors.first(where: {
-               !$0.isTornDown
-                   && $0.lease.key == spec.hostKey
-                   && $0.hostWorkspaceID == workspaceID
+           let existing = openWorkspaceMirrors.first(where: { mirror in
+               guard !mirror.isTornDown,
+                     mirror.lease.key == spec.hostKey,
+                     mirror.hostWorkspaceID == workspaceID,
+                     let ws = mirror.workspace else { return false }
+               return AppDelegate.shared?.tabManagerFor(tabId: ws.id) === targetTabManager
            }),
            let mirrorWorkspace = existing.workspace {
-            // The sidebar is a shared singleton, so this row is clickable from
-            // every window — but the mirror lives in exactly one of them.
-            // `selectWorkspace` performs no ownership check, so pointing the
-            // clicking window's manager at a workspace it does not own leaves
-            // it rendering panes bound to the other window's portal: a black
-            // pane, with no mirror created here either (we return below).
-            let app = AppDelegate.shared
-            let owner = app?.tabManagerFor(tabId: mirrorWorkspace.id)
-            let clicked = app?.tabManager
-            if let owner, owner === clicked {
-                // Same window — plain focus, the original dedupe behaviour.
-                owner.selectWorkspace(mirrorWorkspace)
-            } else if let clicked, let selectedTabId = clicked.selectedTabId {
-                // Different window. Raising the owner would yank focus away
-                // from the window the user just clicked in, and selecting here
-                // would black out this one — so touch neither, and say where
-                // the mirror already is. One live mirror per host workspace is
-                // deliberate: two copies would fight over the PTY's single
-                // winsize (the daemon applies resizes last-writer-wins).
-                clicked.notifications.addNotification(
-                    tabId: selectedTabId,
-                    surfaceId: nil,
-                    title: "Already mirrored in another window",
-                    subtitle: PeerHostProfileStore.shared.displayLabel(for: spec.hostKey),
-                    body: "“\(mirrorWorkspace.title)” is live in another window. "
-                        + "A host workspace mirrors into one window at a time — "
-                        + "a second live copy would fight over the terminal size."
-                )
-            }
+            targetTabManager?.selectWorkspace(mirrorWorkspace)
             #if DEBUG
-            dlog("peer.mirror.dedupe host=\(spec.hostKey) owner=\(owner == nil ? "nil" : (owner === clicked ? "sameWindow" : "otherWindow"))")
+            dlog("peer.mirror.dedupe host=\(spec.hostKey) sameWindow=1")
             #endif
             return
         }
 
-        let flowKey = spec.hostKey.description
+        // In-flight guard is per (host, window): the same window double-
+        // clicking must still coalesce, while a second window opening its
+        // own mirror of the same host must not be blocked by the first.
+        let windowKey = targetTabManager.map { String(UInt(bitPattern: ObjectIdentifier($0).hashValue)) } ?? "none"
+        let flowKey = "\(spec.hostKey.description)#\(windowKey)"
         guard !mirrorOpensInFlight.contains(flowKey) else { return }
         mirrorOpensInFlight.insert(flowKey)
         defer { mirrorOpensInFlight.remove(flowKey) }
@@ -1040,7 +1025,9 @@ final class PeerClientCoordinator: NSObject, NSMenuDelegate {
             return
         }
 
-        guard let tabManager = AppDelegate.shared?.tabManager else {
+        // The manager captured at entry — NOT a fresh read of the global,
+        // which by now (post-await) tracks whichever window became frontmost.
+        guard let tabManager = targetTabManager else {
             registry.release(lease)
             self.showAlert(title: "No Main Window", body: "Open a term-mesh window first.")
             return
