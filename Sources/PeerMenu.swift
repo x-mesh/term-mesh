@@ -1325,6 +1325,21 @@ final class PeerClientCoordinator: NSObject, NSMenuDelegate {
         }
     }
 
+    /// Headless open for the `peer.surface.open_pane` socket command: the
+    /// sidebar's "Open Surface as Pane…" flow minus the picker, attaching the
+    /// first attachable surface.
+    ///
+    /// Takes a fully-formed spec rather than `debugOpenRemotePane`'s loose
+    /// ssh arguments, which hardcode `port: nil, identityFile: nil` and so
+    /// silently ignore a saved profile's custom port or key. Outcome lands in
+    /// `debugLastPaneOpenResult`, polled via `peer.pane.status`.
+    func openRemotePaneHeadless(spec: PeerPaneHostSpec) {
+        debugLastPaneOpenResult = nil
+        Task { @MainActor in
+            await debugOpenRemotePaneResolved(spec: spec)
+        }
+    }
+
     @MainActor
     private func debugOpenRemotePaneResolved(spec: PeerPaneHostSpec) async {
             let registry = PeerPaneHostRegistry.shared

@@ -1171,6 +1171,10 @@ class TerminalController {
             return v2Result(id: id, self.v2PeerHostDisconnect(params: params))
         case "peer.host.force_disconnect":
             return v2Result(id: id, self.v2PeerHostForceDisconnect(params: params))
+        case "peer.surface.open_pane":
+            return v2Result(id: id, self.v2PeerSurfaceOpenPane(params: params))
+        case "peer.pane.status":
+            return v2Result(id: id, self.v2PeerPaneStatus(params: params))
 
 #if DEBUG
         // Debug / test-only
@@ -1337,6 +1341,8 @@ class TerminalController {
             "peer.host.cancel",
             "peer.host.disconnect",
             "peer.host.force_disconnect",
+            "peer.surface.open_pane",
+            "peer.pane.status",
             "surface.clear_history",
             "surface.trigger_flash",
             "pane.list",

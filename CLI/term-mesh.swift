@@ -688,8 +688,15 @@ struct TermMeshCLI {
                 }
             }
 
+        case "peer-pane-status":
+            let payload = try client.sendV2(method: "peer.pane.status")
+            printV2Payload(
+                payload, jsonOutput: jsonOutput, idFormat: idFormat,
+                fallbackText: jsonString(payload["status"] as? [String: Any] ?? [:])
+            )
+
         case "peer-connect", "peer-disconnect", "peer-force-disconnect",
-             "peer-retry", "peer-cancel":
+             "peer-retry", "peer-cancel", "peer-open-pane":
             guard let hostArg = optionValue(commandArgs, name: "--host") else {
                 throw CLIError(message: "--host is required (see: term-mesh peer-hosts)")
             }
@@ -699,6 +706,7 @@ struct TermMeshCLI {
                 case "peer-disconnect": return "peer.host.disconnect"
                 case "peer-force-disconnect": return "peer.host.force_disconnect"
                 case "peer-retry": return "peer.host.retry"
+                case "peer-open-pane": return "peer.surface.open_pane"
                 default: return "peer.host.cancel"
                 }
             }()
@@ -3375,7 +3383,8 @@ struct TermMeshCLI {
               term-mesh rename-tab --workspace workspace:2 --surface surface:5 --title "agent run"
             """
         case "peer-hosts", "peer-connect", "peer-disconnect",
-             "peer-force-disconnect", "peer-retry", "peer-cancel":
+             "peer-force-disconnect", "peer-retry", "peer-cancel",
+             "peer-open-pane", "peer-pane-status":
             return """
             Usage: term-mesh peer-hosts
                    term-mesh peer-connect --host <id|name>
@@ -3383,6 +3392,8 @@ struct TermMeshCLI {
                    term-mesh peer-force-disconnect --host <id|name>
                    term-mesh peer-retry --host <id|name>
                    term-mesh peer-cancel --host <id|name>
+                   term-mesh peer-open-pane --host <id|name>
+                   term-mesh peer-pane-status
 
             Drive peer-federation saved hosts — the same actions the sidebar's
             host context menu offers.
@@ -3401,6 +3412,10 @@ struct TermMeshCLI {
             force-disconnect closes every pane, mirror and relay window opened
             from the host, then releases the lease. Reports how many
             connections it closed.
+
+            open-pane attaches the host's first attachable surface as a pane in
+            the current workspace (no picker). Asynchronous like connect: poll
+            peer-pane-status for pane_sessions / lease_count.
 
             Example:
               term-mesh peer-hosts
@@ -5086,6 +5101,8 @@ struct TermMeshCLI {
           peer-force-disconnect --host <id|name>
           peer-retry --host <id|name>
           peer-cancel --host <id|name>
+          peer-open-pane --host <id|name>
+          peer-pane-status
           new-workspace [--command <text>]
           new-split <left|right|up|down> [--workspace <id|ref>] [--surface <id|ref>] [--panel <id|ref>]
           list-panes [--workspace <id|ref>]

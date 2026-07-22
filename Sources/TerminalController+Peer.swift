@@ -161,6 +161,33 @@ extension TerminalController {
         }
     }
 
+    /// Open one of the host's remote surfaces as a pane in the current
+    /// workspace — the sidebar's "Open Surface as Pane…" without the picker.
+    /// Fire-and-forget: the attach is a network round trip, so the outcome is
+    /// polled via `peer.pane.status`.
+    func v2PeerSurfaceOpenPane(params: [String: Any]) -> V2CallResult {
+        peerDispatchHostAction(params: params, action: "open_pane") { _, host in
+            PeerClientCoordinator.shared.openRemotePaneHeadless(spec: host.paneHostSpec)
+            return ["ok": true, "started": true]
+        }
+    }
+
+    /// Remote-pane sessions and host-lease count. The counterpart poll for
+    /// `peer.surface.open_pane`, and what a test asserts against to confirm a
+    /// force disconnect actually tore every pane down.
+    func v2PeerPaneStatus(params _: [String: Any]) -> V2CallResult {
+        var status: [String: Any] = [:]
+        let ok = v2MainExec(timeout: 5) {
+            MainActor.assumeIsolated {
+                status = PeerClientCoordinator.shared.debugPaneStatus()
+            }
+        }
+        guard ok else {
+            return .err(code: "internal_error", message: "peer pane status timed out", data: nil)
+        }
+        return .ok(["ok": true, "status": status])
+    }
+
     /// Shared plumbing: resolve `host`, hop to main, run `body`, return its
     /// dictionary. `body` runs on the MainActor with the store already in hand.
     private func peerDispatchHostAction(
