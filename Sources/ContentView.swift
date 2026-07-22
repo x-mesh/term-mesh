@@ -2241,6 +2241,14 @@ struct ContentView: View {
         .onChange(of: commandPaletteSelectedResultIndex) { _ in
             syncCommandPaletteDebugStateForObservedWindow()
         }
+        .onChange(of: peerStoreRevision) { _ in
+            // Count can hold steady while rows change identity — a connection
+            // row becoming a workspace row, say. The count-keyed sync above
+            // misses that, leaving `debug.command_palette.results` reporting a
+            // row that is no longer on screen, which is precisely the state
+            // the socket-driven UI verification is supposed to catch.
+            syncCommandPaletteDebugStateForObservedWindow()
+        }
     }
 
     private func commandPaletteRenameInputView(target: CommandPaletteRenameTarget) -> some View {
@@ -2507,9 +2515,17 @@ struct ContentView: View {
             uniquingKeysWith: { latest, _ in latest }
         )
 
+        // Recency orders hosts WITHIN a connection band, never across one.
+        // Sorting by date alone discarded `sortedHosts`' live-first grouping,
+        // so a host disconnected a minute ago outranked one connected right
+        // now — and the palette's default selection would then reconnect it.
+        //
         // `.distantPast` for a host that has never connected: it sorts to the
         // bottom of its band rather than jumping the queue on a nil.
         let hosts = store.sortedHosts.sorted { lhs, rhs in
+            let lhsRank = RemoteHostStore.connectionRank(lhs.connectionState)
+            let rhsRank = RemoteHostStore.connectionRank(rhs.connectionState)
+            if lhsRank != rhsRank { return lhsRank < rhsRank }
             let lhsAt = lhs.profileID.flatMap { lastConnected[$0] } ?? .distantPast
             let rhsAt = rhs.profileID.flatMap { lastConnected[$0] } ?? .distantPast
             if lhsAt != rhsAt { return lhsAt > rhsAt }

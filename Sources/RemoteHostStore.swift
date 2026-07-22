@@ -156,13 +156,19 @@ final class RemoteHostStore: ObservableObject {
 
     /// Connected (or connecting) first, then saved/failed; name-sorted
     /// within each band so entries don't shuffle on reconnect.
-    var sortedHosts: [HostEntry] {
-        func rank(_ e: HostEntry) -> Int {
-            switch e.connectionState {
-            case .connected, .connecting: return 0
-            case .saved, .failed: return 1
-            }
+    /// Banding rank: live hosts (connected/connecting) come before idle ones.
+    /// Exposed because any caller that re-sorts `sortedHosts` must preserve
+    /// this grouping — sorting by recency alone floats a just-disconnected
+    /// host above a live one, and whatever lands first gets selected.
+    static func connectionRank(_ state: HostConnectionState) -> Int {
+        switch state {
+        case .connected, .connecting: return 0
+        case .saved, .failed: return 1
         }
+    }
+
+    var sortedHosts: [HostEntry] {
+        func rank(_ e: HostEntry) -> Int { Self.connectionRank(e.connectionState) }
         return hosts.values.sorted {
             if rank($0) != rank($1) { return rank($0) < rank($1) }
             return $0.displayName.localizedCaseInsensitiveCompare($1.displayName) == .orderedAscending
