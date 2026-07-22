@@ -39,6 +39,26 @@ final class PeerHostProfileStore: ObservableObject {
         profiles.first { $0.sshTarget == target }
     }
 
+    /// Preferred human label for a peer host in tab chips, workspace titles,
+    /// and sidebar rows: the user's saved profile name when one exists for
+    /// this host's SSH target (e.g. "builder"), else the host key's raw short
+    /// label (advertised hostname / IP for SSH, socket basename for direct).
+    ///
+    /// This keeps the Workspaces section, tab titles, and the Peer Hosts
+    /// section consistent — the Peer Hosts roster already resolves saved
+    /// names via `effectiveDisplayName`, but tab/chip display historically
+    /// showed the raw SSH target (an IP when the host advertises no name).
+    /// Direct connections carry no profile (profiles are keyed by SSH target)
+    /// so they correctly fall back to `shortLabel`.
+    func displayLabel(for hostKey: PeerPaneHostKey) -> String {
+        if let target = hostKey.sshTarget,
+           let name = profile(forSSHTarget: target)?.displayName,
+           !name.isEmpty {
+            return name
+        }
+        return hostKey.shortLabel
+    }
+
     /// Profiles that have an explicit process recipe. Plain saved hosts stay
     /// on the existing surface-picker path.
     var savedRunnerProfiles: [PeerHostProfile] {
