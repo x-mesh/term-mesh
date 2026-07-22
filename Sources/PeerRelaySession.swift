@@ -1625,8 +1625,19 @@ final class PeerRelaySession {
         // replay ring to serve a resume from, so this client doesn't rely on
         // it silently ignoring the field — 0 asks for the same full-snapshot
         // attach a fresh connection would get anyway.
+        //
+        // `&+`, not `+`: the host derives `initialByteSeq` with a *wrapping*
+        // subtraction (`tapSeq &- initial.count`, see
+        // `GhosttyPaneSurfaceProvider.attach`), so on a fresh hub — where the
+        // replayed snapshot is longer than everything the tap has ever
+        // emitted — `attachInitialSeq` legitimately sits just below
+        // `UInt64.max`. Re-adding the wire offset is the modular inverse that
+        // lands back on the real host seq, so it must wrap too; a trapping `+`
+        // crashed the whole app here (arithmetic overflow) on the first gap
+        // heal of such an attach, and since the heal IS the recovery path, the
+        // pane could never come back.
         let lastWireSeq = wireSeqTracker.read()
-        let resumeFromSeq: UInt64 = hostSupportsReplayRing ? (attachInitialSeq + lastWireSeq) : 0
+        let resumeFromSeq: UInt64 = hostSupportsReplayRing ? (attachInitialSeq &+ lastWireSeq) : 0
 
         #if DEBUG
         dlog("peer.relay.gap.heal.resume reason=\(reason) resumeFromSeq=\(resumeFromSeq) gated=\(hostSupportsReplayRing) cols=\(size.cols) rows=\(size.rows)")
