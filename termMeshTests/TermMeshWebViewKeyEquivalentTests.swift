@@ -2113,6 +2113,126 @@ final class SidebarBranchLayoutSettingsTests: XCTestCase {
     }
 }
 
+final class SidebarPresentationSettingsTests: XCTestCase {
+    func testSeparatedSectionsAreDisabledByDefault() {
+        let suiteName = "SidebarPresentationSettingsTests.Default.\(UUID().uuidString)"
+        guard let defaults = UserDefaults(suiteName: suiteName) else {
+            XCTFail("Failed to create isolated UserDefaults suite")
+            return
+        }
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+
+        XCTAssertNil(defaults.object(forKey: SidebarPresentationSettings.separatedSectionsEnabledKey))
+        XCTAssertFalse(SidebarPresentationSettings.usesSeparatedSections(defaults: defaults))
+    }
+
+    func testStoredPreferencePersistsAcrossDefaultsInstances() {
+        let suiteName = "SidebarPresentationSettingsTests.Stored.\(UUID().uuidString)"
+        guard let writer = UserDefaults(suiteName: suiteName) else {
+            XCTFail("Failed to create isolated UserDefaults suite")
+            return
+        }
+        defer { writer.removePersistentDomain(forName: suiteName) }
+
+        writer.set(true, forKey: SidebarPresentationSettings.separatedSectionsEnabledKey)
+        guard let enabledReader = UserDefaults(suiteName: suiteName) else {
+            XCTFail("Failed to reopen isolated UserDefaults suite")
+            return
+        }
+        XCTAssertTrue(SidebarPresentationSettings.usesSeparatedSections(defaults: enabledReader))
+
+        writer.set(false, forKey: SidebarPresentationSettings.separatedSectionsEnabledKey)
+        guard let disabledReader = UserDefaults(suiteName: suiteName) else {
+            XCTFail("Failed to reopen isolated UserDefaults suite")
+            return
+        }
+        XCTAssertNotNil(disabledReader.object(forKey: SidebarPresentationSettings.separatedSectionsEnabledKey))
+        XCTAssertFalse(SidebarPresentationSettings.usesSeparatedSections(defaults: disabledReader))
+    }
+
+    func testSeparatedPresentationExcludesPeerMirrorsFromLocalWorkspaces() {
+        XCTAssertTrue(SidebarPresentationSettings.includesInLocalWorkspaces(
+            isPeerMirror: false,
+            separatedSectionsEnabled: true
+        ))
+        XCTAssertFalse(SidebarPresentationSettings.includesInLocalWorkspaces(
+            isPeerMirror: true,
+            separatedSectionsEnabled: true
+        ))
+    }
+
+    func testLegacyPresentationKeepsPeerMirrorsInWorkspaceList() {
+        XCTAssertTrue(SidebarPresentationSettings.includesInLocalWorkspaces(
+            isPeerMirror: false,
+            separatedSectionsEnabled: false
+        ))
+        XCTAssertTrue(SidebarPresentationSettings.includesInLocalWorkspaces(
+            isPeerMirror: true,
+            separatedSectionsEnabled: false
+        ))
+    }
+
+    func testSeparatedInteractionScopeExcludesHiddenMirrorFromRangeAndContextTargets() {
+        let localA = UUID()
+        let peerMirror = UUID()
+        let localB = UUID()
+        let candidates = [
+            (id: localA, isPeerMirror: false),
+            (id: peerMirror, isPeerMirror: true),
+            (id: localB, isPeerMirror: false),
+        ]
+
+        let visibleIDs = SidebarPresentationSettings.visibleLocalWorkspaceIDs(
+            from: candidates,
+            separatedSectionsEnabled: true
+        )
+
+        XCTAssertEqual(visibleIDs, [localA, localB])
+        XCTAssertEqual(
+            SidebarPresentationSettings.rangeSelectionIDs(
+                anchorID: localA,
+                targetID: localB,
+                visibleWorkspaceIDs: visibleIDs
+            ),
+            [localA, localB]
+        )
+        XCTAssertEqual(
+            SidebarPresentationSettings.contextTargetIDs(
+                clickedID: localB,
+                selectedIDs: [localA, peerMirror, localB],
+                visibleWorkspaceIDs: visibleIDs
+            ),
+            [localA, localB]
+        )
+    }
+
+    func testLegacyInteractionScopeRetainsMirror() {
+        let localA = UUID()
+        let peerMirror = UUID()
+        let localB = UUID()
+        let candidates = [
+            (id: localA, isPeerMirror: false),
+            (id: peerMirror, isPeerMirror: true),
+            (id: localB, isPeerMirror: false),
+        ]
+
+        let visibleIDs = SidebarPresentationSettings.visibleLocalWorkspaceIDs(
+            from: candidates,
+            separatedSectionsEnabled: false
+        )
+
+        XCTAssertEqual(visibleIDs, [localA, peerMirror, localB])
+        XCTAssertEqual(
+            SidebarPresentationSettings.rangeSelectionIDs(
+                anchorID: localA,
+                targetID: localB,
+                visibleWorkspaceIDs: visibleIDs
+            ),
+            [localA, peerMirror, localB]
+        )
+    }
+}
+
 final class SidebarActiveTabIndicatorSettingsTests: XCTestCase {
     func testDefaultStyleWhenUnset() {
         let suiteName = "SidebarActiveTabIndicatorSettingsTests.Default.\(UUID().uuidString)"
