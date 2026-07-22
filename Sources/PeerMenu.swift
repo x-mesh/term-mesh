@@ -161,7 +161,7 @@ final class PeerClientCoordinator: NSObject, NSMenuDelegate {
             // Closing the workspace tab tears everything down through
             // TabManager.closeWorkspace → panel closes + mirror teardown.
             if let workspace = mirror.workspace,
-               let tabManager = AppDelegate.shared?.tabManager
+               let tabManager = AppDelegate.shared?.tabManagerFor(tabId: workspace.id)
             {
                 tabManager.closeWorkspace(workspace)
             } else {
@@ -785,10 +785,22 @@ final class PeerClientCoordinator: NSObject, NSMenuDelegate {
             return false
         }
 
-        guard let lifetime = await promptForRemotePaneLifetime(surface: chosen) else {
-            registry.release(lease)
-            return false
-        }
+        // No lifetime prompt. It used to sit here as a second modal right after
+        // the surface picker, and it never earned the step: the choice does not
+        // decide whether the remote PTY survives. That is settled on the host,
+        // where the surface dies once its last reference drops (`Drop for
+        // PtySurface` sends SIGHUP), and in a mirrored workspace the local
+        // close forwards upstream long before any lifetime check runs
+        // (`Workspace+BonsplitDelegate`'s `mirrorForwardsLocalActions` branch
+        // returns first).
+        //
+        // What `.temporary` actually buys is the uncollected-changes guard in
+        // `RemotePaneSafetyPolicy.closeAction` — closing such a pane is held
+        // once so the work can be checkpointed. That is worth keeping and is
+        // the right default, so it is now applied silently instead of asked.
+        // A one-shot/container lifetime (mesh) belongs here later as an
+        // explicit option, not as a question on every single open.
+        let lifetime: RemotePaneLifetime = .temporary
 
         guard let workspace = Self.currentWorkspaceForPaneOpen() else {
             registry.release(lease)
@@ -916,29 +928,62 @@ final class PeerClientCoordinator: NSObject, NSMenuDelegate {
         spec: PeerPaneHostSpec,
         workspaceID: Data?,
         pickFirstWithoutPrompt: Bool = false,
-        live: Bool = true
+        live: Bool = true,
+        /// `false` from the socket path — see `openRemotePaneHeadless`. The
+        /// sidebar keeps selecting, because a click there IS focus intent.
+        select: Bool = true,
+        /// `false` from the socket path. `showAlert` presents an NSAlert, which
+        /// activates the app — so a failing socket command would steal focus
+        /// from whatever the user is typing in, even with `select: false`.
+        /// Failures go to RemoteWorkLog instead, which the drawer surfaces.
+        alertOnFailure: Bool = true
     ) async {
-        // Live-mirror dedupe: a second live mirror of the same host
-        // workspace is meaningless (both would be host-authoritative
-        // copies), so re-clicking the sidebar row focuses the existing
-        // mirror tab instead of materializing another one. Sidebar click
-        // is explicit user focus intent, so selecting here respects the
-        // socket focus policy.
+        func reportFailure(_ title: String, _ body: String) {
+            if alertOnFailure {
+                self.showAlert(title: title, body: body)
+            } else {
+                RemoteWorkLog.info("\(title): \(body)")
+            }
+        }
+
+        // The window this open lands in: the sidebar row was just clicked, so
+        // the active manager IS the clicking window's. Captured once up front
+        // — the awaits below can change which window is frontmost, and the
+        // workspace must be created where the user clicked, not wherever
+        // focus drifted to.
+        let targetTabManager = AppDelegate.shared?.tabManager
+
+        // Live-mirror dedupe, scoped PER WINDOW: re-clicking the row in the
+        // window that already shows this mirror focuses that tab; a click in
+        // a different window falls through and materializes its own mirror
+        // there. Concurrent mirrors of one host workspace are fine now that
+        // the daemon arbitrates the PTY winsize across attachers (min per
+        // axis, tmux-style) instead of last-writer-wins.
         if live, let workspaceID,
-           let existing = openWorkspaceMirrors.first(where: {
-               !$0.isTornDown
-                   && $0.lease.key == spec.hostKey
-                   && $0.hostWorkspaceID == workspaceID
+           let existing = openWorkspaceMirrors.first(where: { mirror in
+               guard !mirror.isTornDown,
+                     mirror.lease.key == spec.hostKey,
+                     mirror.hostWorkspaceID == workspaceID,
+                     let ws = mirror.workspace else { return false }
+               return AppDelegate.shared?.tabManagerFor(tabId: ws.id) === targetTabManager
            }),
            let mirrorWorkspace = existing.workspace {
-            AppDelegate.shared?.tabManager?.selectWorkspace(mirrorWorkspace)
+            // Per-window target from develop, gated by `select` so the socket
+            // path still refuses to move the user's focus.
+            if select {
+                targetTabManager?.selectWorkspace(mirrorWorkspace)
+            }
             #if DEBUG
-            dlog("peer.mirror.dedupe focus existing host=\(spec.hostKey)")
+            dlog("peer.mirror.dedupe host=\(spec.hostKey) sameWindow=1")
             #endif
             return
         }
 
-        let flowKey = spec.hostKey.description
+        // In-flight guard is per (host, window): the same window double-
+        // clicking must still coalesce, while a second window opening its
+        // own mirror of the same host must not be blocked by the first.
+        let windowKey = targetTabManager.map { String(UInt(bitPattern: ObjectIdentifier($0).hashValue)) } ?? "none"
+        let flowKey = "\(spec.hostKey.description)#\(windowKey)"
         guard !mirrorOpensInFlight.contains(flowKey) else { return }
         mirrorOpensInFlight.insert(flowKey)
         defer { mirrorOpensInFlight.remove(flowKey) }
@@ -948,7 +993,7 @@ final class PeerClientCoordinator: NSObject, NSMenuDelegate {
         do {
             lease = try await registry.acquire(spec)
         } catch {
-            self.showAlert(title: "Peer Connection Failed", body: String(describing: error))
+            reportFailure("Peer Connection Failed", String(describing: error))
             return
         }
 
@@ -970,9 +1015,9 @@ final class PeerClientCoordinator: NSObject, NSMenuDelegate {
                     ?? "an older term-meshd build"
                 await conn.cancel()
                 registry.release(lease)
-                self.showAlert(
-                    title: "Host Too Old for Live Mirror",
-                    body: "This host is running \(ver), which doesn't support "
+                reportFailure(
+                    "Host Too Old for Live Mirror",
+                    "This host is running \(ver), which doesn't support "
                         + "live workspace mirroring (needs workspace.lifecycle.v1). "
                         + "Update the host's term-meshd and reconnect."
                 )
@@ -987,14 +1032,14 @@ final class PeerClientCoordinator: NSObject, NSMenuDelegate {
             await conn.cancel()
         } catch {
             registry.release(lease)
-            self.showAlert(title: "Workspace List Failed", body: String(describing: error))
+            reportFailure("Workspace List Failed", String(describing: error))
             return
         }
         guard !workspaces.isEmpty else {
             registry.release(lease)
-            self.showAlert(
-                title: "No Workspaces",
-                body: "The host reports no workspaces (older hosts may not expose layouts)."
+            reportFailure(
+                "No Workspaces",
+                "The host reports no workspaces (older hosts may not expose layouts)."
             )
             return
         }
@@ -1012,9 +1057,11 @@ final class PeerClientCoordinator: NSObject, NSMenuDelegate {
             return
         }
 
-        guard let tabManager = AppDelegate.shared?.tabManager else {
+        // The manager captured at entry — NOT a fresh read of the global,
+        // which by now (post-await) tracks whichever window became frontmost.
+        guard let tabManager = targetTabManager else {
             registry.release(lease)
-            self.showAlert(title: "No Main Window", body: "Open a term-mesh window first.")
+            reportFailure("No Main Window", "Open a term-mesh window first.")
             return
         }
 
@@ -1031,7 +1078,7 @@ final class PeerClientCoordinator: NSObject, NSMenuDelegate {
         }
         guard let firstLeaf = Self.firstLeafPane(resolved.layout) else {
             registry.release(lease)
-            self.showAlert(title: "Empty Workspace", body: "The chosen workspace has no panes.")
+            reportFailure("Empty Workspace", "The chosen workspace has no panes.")
             return
         }
 
@@ -1045,16 +1092,16 @@ final class PeerClientCoordinator: NSObject, NSMenuDelegate {
             )
         } catch {
             registry.release(lease)
-            self.showAlert(title: "Attach Failed", body: String(describing: error))
+            reportFailure("Attach Failed", String(describing: error))
             return
         }
 
         let workspace = tabManager.addWorkspace(
-            select: true,
+            select: select,
             command: firstSession.relayLaunchCommand,
             environment: firstSession.relayEnvironment
         )
-        let hostChip = spec.hostKey.shortLabel
+        let hostChip = PeerHostProfileStore.shared.displayLabel(for: spec.hostKey)
         // Distinct sidebar markers per mode — identical titles made the
         // two modes impossible to tell apart (or A/B test) in the tab
         // list: ⌁ = live host-synced mirror, ⧉ = detached layout copy.
@@ -1067,7 +1114,7 @@ final class PeerClientCoordinator: NSObject, NSMenuDelegate {
         else {
             firstSession.teardown()
             registry.release(lease)
-            self.showAlert(title: "Mirror Failed", body: "New workspace has no terminal panel.")
+            reportFailure("Mirror Failed", "New workspace has no terminal panel.")
             return
         }
         workspace.bindRemotePane(session: firstSession, to: firstPanel)
@@ -1099,10 +1146,11 @@ final class PeerClientCoordinator: NSObject, NSMenuDelegate {
                 // surface an actionable error.
                 workspace.peerMirror = nil
                 mirror.teardown()
-                AppDelegate.shared?.tabManager?.closeWorkspace(workspace)
-                self.showAlert(
-                    title: "Live Mirror Failed",
-                    body: "\(String(describing: error))\n\nThe workspace was closed. Reconnect to retry."
+                AppDelegate.shared?.tabManagerFor(tabId: workspace.id)?
+                    .closeWorkspace(workspace)
+                reportFailure(
+                    "Live Mirror Failed",
+                    "\(String(describing: error))\n\nThe workspace was closed. Reconnect to retry."
                 )
                 return
             }
@@ -1286,7 +1334,11 @@ final class PeerClientCoordinator: NSObject, NSMenuDelegate {
         return info
     }
 
-    #if DEBUG
+    // MARK: - Headless peer open + status
+    //
+    // Not DEBUG-gated: the production `peer.*` socket commands are built on
+    // these. The two raw-socket-path variants below stay test-only — they
+    // bypass RemoteHostStore entirely, so they can observe no sidebar state.
     // MARK: - Remote pane debug hooks (tests_v2 socket e2e)
 
     /// Result of the last `debug.peer.open_remote_pane`, polled via
@@ -1295,6 +1347,7 @@ final class PeerClientCoordinator: NSObject, NSMenuDelegate {
     /// the main thread.
     private(set) var debugLastPaneOpenResult: [String: Any]?
 
+    #if DEBUG
     /// Headless remote-pane open: no pickers, no alerts. With a nil
     /// sockPath, brings up the in-app peer server and mirrors one of
     /// this instance's own surfaces (loopback self-mirror). An sshTarget
@@ -1324,9 +1377,29 @@ final class PeerClientCoordinator: NSObject, NSMenuDelegate {
             await debugOpenRemotePaneResolved(spec: .direct(sockPath: hostSock))
         }
     }
+    #endif
+
+    /// Headless open for the `peer.surface.open_pane` socket command: the
+    /// sidebar's "Open Surface as Pane…" flow minus the picker, attaching the
+    /// first attachable surface.
+    ///
+    /// Takes a fully-formed spec rather than `debugOpenRemotePane`'s loose
+    /// ssh arguments, which hardcode `port: nil, identityFile: nil` and so
+    /// silently ignore a saved profile's custom port or key. Outcome lands in
+    /// `debugLastPaneOpenResult`, polled via `peer.pane.status`.
+    /// `focus: false` for the socket path: `peer.surface.open_pane` is not a
+    /// focus-intent method, and the socket focus policy says a non-focus
+    /// command must leave the user's focus where it was — otherwise scripting
+    /// a pane open yanks focus out from under whoever is typing.
+    func openRemotePaneHeadless(spec: PeerPaneHostSpec, focus: Bool = true) {
+        debugLastPaneOpenResult = nil
+        Task { @MainActor in
+            await debugOpenRemotePaneResolved(spec: spec, focus: focus)
+        }
+    }
 
     @MainActor
-    private func debugOpenRemotePaneResolved(spec: PeerPaneHostSpec) async {
+    private func debugOpenRemotePaneResolved(spec: PeerPaneHostSpec, focus: Bool = true) async {
             let registry = PeerPaneHostRegistry.shared
             do {
                 let lease = try await registry.acquire(spec)
@@ -1349,7 +1422,7 @@ final class PeerClientCoordinator: NSObject, NSMenuDelegate {
                         spec: spec
                     )
                     registry.release(lease)
-                    guard let panel = workspace.openRemotePane(session: session) else {
+                    guard let panel = workspace.openRemotePane(session: session, focus: focus) else {
                         session.teardown()
                         self.debugLastPaneOpenResult = ["ok": false, "error": "no_focused_terminal_pane"]
                         return
@@ -1368,6 +1441,7 @@ final class PeerClientCoordinator: NSObject, NSMenuDelegate {
             }
     }
 
+    #if DEBUG
     /// Test-only headless workspace mirror: no pickers/alerts on the
     /// happy path (first workspace auto-picked). Outcome polled via
     /// `debug.peer.pane_status` — session count reflects mirrored
@@ -1406,6 +1480,7 @@ final class PeerClientCoordinator: NSObject, NSMenuDelegate {
             ]
         }
     }
+    #endif
 
     /// Snapshot of live-mirror state for e2e assertions.
     func debugMirrorStatus() -> [String: Any] {
@@ -1434,17 +1509,22 @@ final class PeerClientCoordinator: NSObject, NSMenuDelegate {
     func debugPaneStatus() -> [String: Any] {
         [
             "pane_sessions": openPaneSessions.map { session in
-                [
+                var row: [String: Any] = [
                     "host_key": String(describing: session.lease.key),
                     "title": session.surfaceTitle,
                     "torn_down": session.isTorndown,
-                ] as [String: Any]
+                ]
+                // Byte counters, so a blank pane can be adjudicated live
+                // instead of by scraping logs after the fact: received==0
+                // means nothing ever arrived from the host.
+                row["io"] = session.relaySession.ioSnapshot
+                return row
             },
             "lease_count": PeerPaneHostRegistry.shared.activeLeaseCount,
             "last_open_result": debugLastPaneOpenResult ?? NSNull(),
         ]
     }
-    #endif
+
 
     /// Panels with a reconnect currently in flight — repeated banner
     /// clicks must not spawn concurrent reconnect tasks (double panes,
@@ -1842,31 +1922,6 @@ final class PeerClientCoordinator: NSObject, NSMenuDelegate {
         let idx = popup.indexOfSelectedItem
         guard idx >= 0, idx < surfaces.count else { return nil }
         return surfaces[idx]
-    }
-
-    private func promptForRemotePaneLifetime(
-        surface: Termmesh_Peer_V1_SurfaceInfo
-    ) async -> RemotePaneLifetime? {
-        let alert = NSAlert()
-        alert.messageText = "Open remote pane"
-        alert.informativeText = "Temporary collects changes before close. Keep Alive can be linked into another Workspace and keeps the remote PTY running when removed locally."
-
-        let popup = NSPopUpButton(
-            frame: NSRect(x: 0, y: 0, width: 360, height: 26),
-            pullsDown: false
-        )
-        popup.addItems(withTitles: ["Temporary — collect, then close", "Keep Alive — reusable across Workspaces"])
-        popup.selectItem(at: 0)
-        popup.toolTip = surface.cwd.isEmpty
-            ? "No remote project directory was reported"
-            : "Current Project: \(surface.cwd)"
-        alert.accessoryView = popup
-        alert.addButton(withTitle: "Open")
-        alert.addButton(withTitle: "Cancel")
-
-        let response = await Self.runModalAsSheet(alert)
-        guard response == .alertFirstButtonReturn else { return nil }
-        return popup.indexOfSelectedItem == 1 ? .keepAlive : .temporary
     }
 
     @objc func promptAndRun(_ sender: Any?) {

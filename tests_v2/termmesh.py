@@ -1164,11 +1164,68 @@ class termmesh:
             params["sock_path"] = sock_path
         return dict(self._call("debug.peer.open_remote_pane", params) or {})
 
+    def peer_host_list(self) -> list:
+        """Saved/known peer hosts and their connection state via
+        `peer.host.list`. Each entry: {id, display_name, state,
+        has_sidebar_lease, workspace_count} plus optional ssh_target /
+        remote_sock_path / active_sock_path / failure_reason.
+
+        Unlike the `debug.peer.*` family this drives the same
+        RemoteHostStore the sidebar renders, so it observes exactly what a
+        user would see — including the `.connected` + no-lease combination
+        that used to leave a row with no available action at all."""
+        reply = dict(self._call("peer.host.list", {}) or {})
+        return list(reply.get("hosts") or [])
+
+    def peer_host_connect(self, host: str) -> dict:
+        """Start connecting a saved host (`peer.host.connect`). Asynchronous:
+        returns once the attempt is scheduled — poll `peer_host_list()` for
+        the resulting state. `host` accepts the stable id or display name."""
+        return dict(self._call("peer.host.connect", {"host": host}) or {})
+
+    def peer_host_retry(self, host: str) -> dict:
+        """Abandon the in-flight attempt and start a fresh one
+        (`peer.host.retry`). Valid from any state — this is the escape hatch
+        for a row wedged in `.connecting`."""
+        return dict(self._call("peer.host.retry", {"host": host}) or {})
+
+    def peer_host_cancel(self, host: str) -> dict:
+        """Cancel an in-progress connect (`peer.host.cancel`), returning the
+        row to `saved`. Reports {cancelled: bool, state}."""
+        return dict(self._call("peer.host.cancel", {"host": host}) or {})
+
+    def peer_host_disconnect(self, host: str) -> dict:
+        """Release the sidebar's lease only (`peer.host.disconnect`). Panes
+        and mirrors opened from the host keep their own connections and stay
+        open by design, so the row can end up back at `connected` — the reply
+        reports the state after the fact rather than assuming."""
+        return dict(self._call("peer.host.disconnect", {"host": host}) or {})
+
+    def peer_host_force_disconnect(self, host: str) -> dict:
+        """Close every pane, mirror and relay window opened from the host,
+        then release the lease (`peer.host.force_disconnect`). Reports
+        {closed: N, state, has_sidebar_lease}, where `closed` counts the rows
+        asked to close — window closes land asynchronously, so poll
+        `peer_pane_status()` to observe them actually gone."""
+        return dict(self._call("peer.host.force_disconnect", {"host": host}) or {})
+
+    def peer_open_pane(self, host: str) -> dict:
+        """Attach the host's first attachable surface as a pane in the current
+        workspace (`peer.surface.open_pane`) — the sidebar's "Open Surface as
+        Pane…" without the picker. Fire-and-forget, same polling contract as
+        `peer_open_remote_pane`: watch `peer_pane_status()`."""
+        return dict(self._call("peer.surface.open_pane", {"host": host}) or {})
+
     def peer_pane_status(self) -> dict:
         """Snapshot of remote-pane sessions + host-lease count via
-        `debug.peer.pane_status` (DEBUG-only). Returns the inner status
-        dict: {pane_sessions: [...], lease_count: N, last_open_result}."""
-        reply = dict(self._call("debug.peer.pane_status", {}) or {})
+        `peer.pane.status`. Returns the inner status dict: {pane_sessions:
+        [...], lease_count: N, last_open_result}.
+
+        Deliberately the production endpoint rather than the DEBUG-only
+        `debug.peer.pane_status`: `peer_open_pane()` is a production command,
+        and polling its outcome through a DEBUG-only method would fail with
+        `unknown_method` against a Release app. Both return the same payload."""
+        reply = dict(self._call("peer.pane.status", {}) or {})
         return dict(reply.get("status") or {})
 
     def coalesce_probe(self) -> dict:
