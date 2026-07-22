@@ -1605,6 +1605,39 @@ final class PeerRelaySession {
                             endReason = "hostToRelay-enqueue-failed"
                             break pumpLoop
                         }
+                    case .gridSnapshot(let sid, _, _, let ansi) where sid == mySurfaceID:
+                        // Typed fresh-attach keyframe (grid.snapshot.v1).
+                        // ESC[3J first: repeated attaches used to stack one
+                        // stale screen per open into the viewer's local
+                        // scrollback, and only the typed form can safely
+                        // clear it — an untyped byte stream might be
+                        // mid-escape. Then the rendered screen itself.
+                        var payload = Data([0x1b, 0x5b, 0x33, 0x4a]) // ESC [ 3 J
+                        payload.append(ansi)
+                        // Reset the gap baseline to wire zero, NOT to the
+                        // snapshot's host-absolute byte_seq: `expectedByteSeq`
+                        // lives in the per-attach wire space, and a host on
+                        // the typed path spends no wire seq on the snapshot —
+                        // the first live PtyData after this message starts at
+                        // byte_seq 0 (its host-absolute anchor arrives as
+                        // AttachResult.initial_seq, which equals this
+                        // message's byte_seq). Without the reset every attach
+                        // would read as a jump, fire a spurious gap log, and
+                        // schedule a needless redraw heal.
+                        expectedByteSeq = 0
+                        wireSeqTracker.update(0)
+                        if self.ioStats.noteReceived(payload.count) {
+                            #if DEBUG
+                            dlog("peer.relay.firstByte path=owned-snapshot bytes=\(payload.count)")
+                            #endif
+                        }
+                        do {
+                            try await writer.enqueue(type: kTypePtyData, payload: payload)
+                            self.ioStats.noteEnqueued(payload.count)
+                        } catch {
+                            endReason = "hostToRelay-enqueue-failed"
+                            break pumpLoop
+                        }
                     case .hostStats(let stats):
                         // About the machine, not this pane, so it does not go
                         // to the relay — it lands in the host-keyed store the

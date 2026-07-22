@@ -17,7 +17,8 @@ use peer_proto::v1::envelope::Payload;
 use peer_proto::v1::{
     workspace_update, AttachMode, AttachResult, AuthChallenge, AuthResult, CreateWorkspaceResponse,
     EnsureSurfaceError as WireEnsureError, EnsureSurfaceErrorCode, EnsureSurfaceRequest,
-    EnsureSurfaceResponse, EnsureSurfaceRestartPolicy, EnsureSurfaceResult, Envelope, Error, Hello,
+    EnsureSurfaceResponse, EnsureSurfaceRestartPolicy, EnsureSurfaceResult, Envelope, Error,
+    GridSnapshot, Hello,
     HostStats, Pong, PtyData, SurfaceList, TerminateSurfaceError as WireTerminateError,
     TerminateSurfaceErrorCode, TerminateSurfaceRequest, TerminateSurfaceResponse,
     TerminateSurfaceResult, Workspace, WorkspaceList, WorkspaceMeta, WorkspaceUpdate,
@@ -459,22 +460,55 @@ async fn reader_loop(
                 // with no special cases. May wrap on a young surface; the
                 // client's resume math is wrapping too (`&+`), so the
                 // round-trip stays exact.
-                let replay = if resume_from_seq != 0 {
-                    surface.replay_snapshot_from(resume_from_seq)
+                // A grid.snapshot.v1 client gets the screen as a TYPED
+                // GridSnapshot message instead of untyped PtyData — that is
+                // what lets it clear stale local scrollback (ESC[3J) and
+                // reset its wire-gap baseline, neither of which is safe to
+                // infer from a byte stream. Everyone else gets the same
+                // bytes on the Stage-1 PtyData path.
+                let typed_snapshot_ok =
+                    peer_capabilities.has(capability::GRID_SNAPSHOT_V1);
+                // (untyped ANSI chunks, typed (ansi, snap_seq) — exactly one
+                // of the two carries the fresh screen.)
+                let (replay, typed_snapshot) = if resume_from_seq != 0 {
+                    (surface.replay_snapshot_from(resume_from_seq), None)
                 } else if fresh_attach_uses_bytes() {
-                    surface.replay_snapshot_fresh()
+                    (surface.replay_snapshot_fresh(), None)
                 } else {
                     match surface.screen_snapshot() {
-                        Some((bytes, snap_seq)) if !bytes.is_empty() => {
-                            vec![PtyChunk {
-                                seq: snap_seq.wrapping_sub(bytes.len() as u64),
-                                bytes,
-                            }]
+                        Some((bytes, snap_seq)) if !bytes.is_empty() && typed_snapshot_ok => {
+                            (Vec::new(), Some((bytes, snap_seq)))
                         }
-                        _ => surface.replay_snapshot_fresh(),
+                        Some((bytes, snap_seq)) if !bytes.is_empty() => {
+                            // Untyped path: package as a single synthetic
+                            // PtyChunk whose seq is BACKDATED by its own
+                            // length — the Swift host's wrapping trick — so
+                            // live_min_seq (chunk end) lands exactly on
+                            // snap_seq and dedup/initial_seq fall out of the
+                            // existing arithmetic. May wrap on a young
+                            // surface; the client's resume math wraps too.
+                            (
+                                vec![PtyChunk {
+                                    seq: snap_seq.wrapping_sub(bytes.len() as u64),
+                                    bytes,
+                                }],
+                                None,
+                            )
+                        }
+                        _ => (surface.replay_snapshot_fresh(), None),
                     }
                 };
-                let mode_prefix = surface.mode_replay_bytes();
+                // On the typed path the mode prefix (mouse DECSET 1015/1016,
+                // which vt100 does not model) is folded into the snapshot's
+                // own ANSI instead of riding a separate wire-seq-0 PtyData:
+                // the snapshot already re-establishes every other input mode,
+                // and a typed client starts its wire space at the first LIVE
+                // byte.
+                let mode_prefix = if typed_snapshot.is_some() {
+                    Vec::new()
+                } else {
+                    surface.mode_replay_bytes()
+                };
                 // Absolute host seq (`PtyChunk::seq` space) that this
                 // attach's wire `byte_seq == 0` maps to, reported back as
                 // `initial_seq` so the client can translate any wire
@@ -486,11 +520,19 @@ async fn reader_loop(
                 // space) and are prepended ahead of seq 0 the same way
                 // they're prepended ahead of wire byte_seq 0 below, so the
                 // real data's baseline is pushed back by their length.
-                let attach_base = replay
-                    .first()
-                    .map(|chunk| chunk.seq)
-                    .unwrap_or_else(|| surface.current_byte_seq());
-                let initial_seq = attach_base.saturating_sub(mode_prefix.len() as u64);
+                //
+                // Typed path: the snapshot spends no wire seq at all, so
+                // wire 0 IS the snapshot's consistency point.
+                let initial_seq = match &typed_snapshot {
+                    Some((_, snap_seq)) => *snap_seq,
+                    None => {
+                        let attach_base = replay
+                            .first()
+                            .map(|chunk| chunk.seq)
+                            .unwrap_or_else(|| surface.current_byte_seq());
+                        attach_base.saturating_sub(mode_prefix.len() as u64)
+                    }
+                };
 
                 let reply = Envelope {
                     seq: next_seq(&seq_counter),
@@ -504,6 +546,35 @@ async fn reader_loop(
                     })),
                 };
                 send(&outgoing_tx, reply).await?;
+
+                // Typed keyframe, right after AttachResult and ahead of the
+                // relay task's live stream, so the first thing a
+                // grid.snapshot.v1 client renders is the screen. The mouse
+                // DECSET prefix (1015/1016 — the two modes vt100 does not
+                // model) is folded in ahead of the render; every other input
+                // mode is already inside `state_formatted()`'s output.
+                let snapshot_floor = match &typed_snapshot {
+                    Some((snapshot_bytes, snap_seq)) => {
+                        let mut ansi = surface.mode_replay_bytes();
+                        ansi.extend_from_slice(snapshot_bytes);
+                        let grid_env = Envelope {
+                            seq: next_seq(&seq_counter),
+                            correlation_id: 0,
+                            payload: Some(Payload::GridSnapshot(GridSnapshot {
+                                surface_id: req.surface_id.clone(),
+                                byte_seq: *snap_seq,
+                                cols: surface.cols.load(Ordering::Relaxed),
+                                rows: surface.rows.load(Ordering::Relaxed),
+                                alt_screen: snapshot_bytes.starts_with(b"\x1b[?1049h"),
+                                cursor: None,
+                                ansi,
+                            })),
+                        };
+                        send(&outgoing_tx, grid_env).await?;
+                        *snap_seq
+                    }
+                    None => 0,
+                };
 
                 // Push an initial WorkspaceMeta snapshot so the client can
                 // show the remote surface's cwd / branch immediately. Future
@@ -531,6 +602,7 @@ async fn reader_loop(
                     subscriber,
                     replay,
                     mode_prefix,
+                    snapshot_floor,
                 );
                 attached.insert(req.surface_id, entry);
             }
@@ -756,6 +828,11 @@ fn spawn_attach_relay(
     mut subscriber: broadcast::Receiver<PtyChunk>,
     replay: Vec<PtyChunk>,
     mode_prefix: Vec<u8>,
+    // Live-dedup floor when `replay` carries nothing: on the typed
+    // GridSnapshot path the screen travels outside this task entirely, so
+    // chunks the snapshot already contains (broadcast between subscribe()
+    // and the snapshot read) must still be dropped below this seq.
+    snapshot_floor: u64,
 ) -> AttachEntry {
     let cancel = Arc::new(Notify::new());
     let cancel_for_task = cancel.clone();
@@ -774,7 +851,7 @@ fn spawn_attach_relay(
         let live_min_seq = replay
             .last()
             .map(|chunk| chunk.seq.wrapping_add(chunk.bytes.len() as u64))
-            .unwrap_or(0);
+            .unwrap_or(snapshot_floor);
 
         // Prepend any currently-active mouse-tracking DECSET sequences ahead of the
         // snapshot: without this, a viewer attaching after the PTY already turned a

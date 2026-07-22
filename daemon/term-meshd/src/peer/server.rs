@@ -708,6 +708,171 @@ mod integration_tests {
         got
     }
 
+    /// Serializes every test that READS OR WRITES
+    /// `TERMMESH_PEER_FRESH_ATTACH_MODE`. Env is process-global: the kill
+    /// switch test setting `=bytes` for its second scenario would otherwise
+    /// race a concurrently-attaching gating test into the bytes path
+    /// (observed: GridSnapshot count 0 under the full parallel suite).
+    static FRESH_MODE_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Drain frames briefly, splitting GridSnapshot payloads from PtyData
+    /// payloads, so a gating test can assert which path carried the screen.
+    async fn collect_typed_and_pty(
+        reader: &mut tokio::net::unix::OwnedReadHalf,
+        want: &[u8],
+        timeout: std::time::Duration,
+    ) -> (Vec<Vec<u8>>, Vec<u8>) {
+        let deadline = tokio::time::Instant::now() + timeout;
+        let mut snapshots: Vec<Vec<u8>> = Vec::new();
+        let mut pty = Vec::<u8>::new();
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                return (snapshots, pty);
+            }
+            let env = match tokio::time::timeout(remaining, read_envelope(reader)).await {
+                Ok(Ok(e)) => e,
+                _ => return (snapshots, pty),
+            };
+            match env.payload {
+                Some(Payload::GridSnapshot(g)) => {
+                    let done = g.ansi.windows(want.len()).any(|w| w == want);
+                    snapshots.push(g.ansi);
+                    if done {
+                        return (snapshots, pty);
+                    }
+                }
+                Some(Payload::PtyData(p)) => {
+                    pty.extend_from_slice(&p.payload);
+                    if pty.windows(want.len()).any(|w| w == want) {
+                        return (snapshots, pty);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// grid.snapshot.v1 gating, both halves that involve the typed path
+    /// (the legacy halves live in `fresh_attach_renders_...` and the
+    /// `effective_resume_from_seq` unit tests):
+    ///
+    /// - An advertising client's FRESH attach receives the screen as a
+    ///   GridSnapshot envelope — rendered state, no overwritten history —
+    ///   and NOT as a PtyData snapshot.
+    /// - The same client's RESUME attach receives no GridSnapshot at all:
+    ///   resume is served from the byte ring, typed or not.
+    #[tokio::test]
+    async fn grid_snapshot_gates_on_capability_and_freshness() {
+        let _env = FRESH_MODE_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let tmp = TempDir::new().unwrap();
+        let sock_path = tmp.path().join("peer.sock");
+
+        let manager = Arc::new(PtyManager::new());
+        let surface = PtySurface::spawn(
+            surface_id_from_name("typed-gate"),
+            "typed-gate".into(),
+            "/bin/sh",
+            &["-c", "printf 'OLDMARKER\\rNEWMARKER99'; sleep 5"],
+            80,
+            24,
+            None,
+        )
+        .expect("spawn typed-gate surface");
+        let sid = surface.surface_id.clone();
+        for _ in 0..100 {
+            let ready = surface
+                .replay_snapshot()
+                .iter()
+                .flat_map(|c| c.bytes.iter().copied())
+                .collect::<Vec<_>>()
+                .windows(11)
+                .any(|w| w == b"NEWMARKER99");
+            if ready {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        manager.insert_surface(surface);
+
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let sp_task = sock_path.clone();
+        let server_task = tokio::spawn(async move {
+            serve_with_manager(sp_task, shutdown_rx, manager).await.unwrap();
+        });
+        for _ in 0..50 {
+            if sock_path.exists() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+
+        // Fresh attach, advertising the capability.
+        let (mut reader, writer, _sid) = attach_full(
+            &sock_path,
+            "typed-fresh",
+            Some(sid.clone()),
+            peer_proto::capability::supported_vec(),
+            0,
+        )
+        .await;
+        let (snapshots, pty) = collect_typed_and_pty(
+            &mut reader,
+            b"NEWMARKER99",
+            std::time::Duration::from_secs(15),
+        )
+        .await;
+        assert_eq!(
+            snapshots.len(),
+            1,
+            "typed fresh attach must carry the screen in exactly one GridSnapshot"
+        );
+        let ansi = &snapshots[0];
+        assert!(ansi.windows(11).any(|w| w == b"NEWMARKER99"));
+        assert!(
+            !ansi.windows(9).any(|w| w == b"OLDMARKER"),
+            "GridSnapshot must be a render, not byte history"
+        );
+        assert!(
+            !pty.windows(11).any(|w| w == b"NEWMARKER99"),
+            "the screen must not ALSO arrive as a PtyData snapshot"
+        );
+        drop(reader);
+        drop(writer);
+
+        // Resume attach from the same advertising client: byte-ring path,
+        // no GridSnapshot.
+        let (mut reader, writer, _sid) = attach_full(
+            &sock_path,
+            "typed-resume",
+            Some(sid.clone()),
+            peer_proto::capability::supported_vec(),
+            1, // any nonzero host seq inside the ring
+        )
+        .await;
+        let (snapshots, pty) = collect_typed_and_pty(
+            &mut reader,
+            b"NEWMARKER99",
+            std::time::Duration::from_secs(15),
+        )
+        .await;
+        assert!(
+            snapshots.is_empty(),
+            "resume must never be served as a GridSnapshot"
+        );
+        assert!(
+            pty.windows(11).any(|w| w == b"NEWMARKER99"),
+            "resume must replay ring bytes as PtyData"
+        );
+        drop(reader);
+        drop(writer);
+
+        shutdown_tx.send(true).unwrap();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(3), server_task).await;
+    }
+
     /// The tmux-model contract, plus its kill switch — one test on purpose:
     /// `TERMMESH_PEER_FRESH_ATTACH_MODE` is process-global env, and a
     /// sibling test racing the flag would flake.
@@ -721,6 +886,9 @@ mod integration_tests {
     /// so the overwritten text IS present again.
     #[tokio::test]
     async fn fresh_attach_renders_screen_and_kill_switch_restores_bytes() {
+        let _env = FRESH_MODE_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         // A — snapshot path (default).
         let got = attach_overwritten_line_surface("snap-fresh").await;
         assert!(
@@ -916,6 +1084,11 @@ mod integration_tests {
     /// Drive the full handshake + attach path for one client against
     /// `sock_path`, returning the split stream halves and the chosen
     /// surface_id. Used by the multi-client test below.
+    /// Attach as a LEGACY client: everything current builds support EXCEPT
+    /// grid.snapshot.v1. Most integration tests assert on the raw PtyData
+    /// stream (replay content, mode prefixes, byte ordering), and those
+    /// assertions describe the untyped path — the one a pre-snapshot client
+    /// still exercises. Typed-path behavior has its own explicit tests.
     async fn attach_one(
         sock_path: &std::path::Path,
         display: &str,
@@ -924,7 +1097,14 @@ mod integration_tests {
         tokio::net::unix::OwnedWriteHalf,
         Vec<u8>,
     ) {
-        attach_surface_by(sock_path, display, None).await
+        attach_with_caps(sock_path, display, None, legacy_caps()).await
+    }
+
+    fn legacy_caps() -> Vec<String> {
+        peer_proto::capability::supported_vec()
+            .into_iter()
+            .filter(|c| c != peer_proto::capability::GRID_SNAPSHOT_V1)
+            .collect()
     }
 
     /// `attach_one`, but optionally targeting a KNOWN surface id instead of
@@ -936,6 +1116,36 @@ mod integration_tests {
         sock_path: &std::path::Path,
         display: &str,
         want_id: Option<Vec<u8>>,
+    ) -> (
+        tokio::net::unix::OwnedReadHalf,
+        tokio::net::unix::OwnedWriteHalf,
+        Vec<u8>,
+    ) {
+        attach_with_caps(sock_path, display, want_id, legacy_caps()).await
+    }
+
+    /// The full-control attach: explicit surface targeting AND an explicit
+    /// capability list, so a test can be an old client, a new client, or
+    /// anything in between.
+    async fn attach_with_caps(
+        sock_path: &std::path::Path,
+        display: &str,
+        want_id: Option<Vec<u8>>,
+        caps: Vec<String>,
+    ) -> (
+        tokio::net::unix::OwnedReadHalf,
+        tokio::net::unix::OwnedWriteHalf,
+        Vec<u8>,
+    ) {
+        attach_full(sock_path, display, want_id, caps, 0).await
+    }
+
+    async fn attach_full(
+        sock_path: &std::path::Path,
+        display: &str,
+        want_id: Option<Vec<u8>>,
+        caps: Vec<String>,
+        resume_from_seq: u64,
     ) -> (
         tokio::net::unix::OwnedReadHalf,
         tokio::net::unix::OwnedWriteHalf,
@@ -955,7 +1165,7 @@ mod integration_tests {
                     protocol_version: PROTOCOL_VERSION.into(),
                     peer_id,
                     display_name: display.into(),
-                    capabilities: peer_proto::capability::supported_vec(),
+                    capabilities: caps,
                     app_version: "test".into(),
                 })),
             },
@@ -1017,7 +1227,7 @@ mod integration_tests {
                     mode: AttachMode::CoWrite as i32,
                     client_cols: 80,
                     client_rows: 24,
-                    resume_from_seq: 0,
+                    resume_from_seq,
                 })),
             },
         )

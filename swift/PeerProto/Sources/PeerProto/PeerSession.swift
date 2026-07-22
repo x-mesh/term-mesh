@@ -53,6 +53,11 @@ public struct PeerAttachOutcome: Sendable, Equatable {
 /// so callers don't have to handle every oneof variant.
 public enum PeerIncomingMessage: Sendable {
     case ptyData(surfaceID: Data, byteSeq: UInt64, payload: Data)
+    /// Fresh-attach screen keyframe (capability "grid.snapshot.v1"): the
+    /// rendered current screen as ANSI, consistent with `byteSeq`. The
+    /// consumer must reset its wire-gap baseline to `byteSeq` — snapshot
+    /// bytes are synthetic and sit outside the PtyData byte_seq space.
+    case gridSnapshot(surfaceID: Data, byteSeq: UInt64, altScreen: Bool, ansi: Data)
     case workspaceMeta(cwd: String, branch: String, ports: [UInt32], latestNotification: String)
     case workspaceSurfaceAdded(Termmesh_Peer_V1_SurfaceInfo)
     case workspaceSurfaceRemoved(surfaceID: Data)
@@ -824,6 +829,13 @@ public actor PeerSession {
             return .other
         case .ptyData(let p):
             return .ptyData(surfaceID: p.surfaceID, byteSeq: p.byteSeq, payload: p.payload)
+        case .gridSnapshot(let g):
+            return .gridSnapshot(
+                surfaceID: g.surfaceID,
+                byteSeq: g.byteSeq,
+                altScreen: g.altScreen,
+                ansi: g.ansi
+            )
         case .workspaceUpdate(let wu):
             switch wu.kind {
             case .meta(let m):

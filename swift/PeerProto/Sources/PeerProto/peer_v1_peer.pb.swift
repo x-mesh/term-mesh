@@ -1653,9 +1653,11 @@ public nonisolated struct Termmesh_Peer_V1_GridSnapshot: Sendable {
 
   public var surfaceID: Data = Data()
 
-  /// Host-absolute byte_seq this snapshot is consistent with. The client
-  /// must reset its wire-gap baseline to this value: snapshot bytes are
-  /// synthetic and sit outside the PtyData byte_seq space.
+  /// Host-absolute byte_seq this snapshot is consistent with. Equals
+  /// AttachResult.initial_seq for this attach. Snapshot bytes are synthetic
+  /// and spend no wire byte_seq: the first live PtyData after this message
+  /// starts at wire byte_seq 0, so the client resets its wire-gap baseline
+  /// to zero and keeps translating wire positions via initial_seq.
   public var byteSeq: UInt64 = 0
 
   public var cols: UInt32 = 0
