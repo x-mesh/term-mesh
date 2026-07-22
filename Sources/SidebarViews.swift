@@ -881,6 +881,7 @@ struct RemoteHostGroupView: View {
     @State private var showDeleteConfirm = false
     @State private var showNewWorkspaceAlert = false
     @State private var newWorkspaceTitle = ""
+    @State private var showForceDisconnectConfirm = false
 
     init(host: HostEntry, store: RemoteHostStore,
          onEdit: @escaping (PeerHostEditorContext) -> Void) {
@@ -1066,9 +1067,16 @@ struct RemoteHostGroupView: View {
             .onTapGesture { handleRowTap() }
             .contextMenu {
                 switch host.connectionState {
-                case .saved, .failed:
+                case .saved:
                     if host.sshTarget != nil {
                         Button("Connect") { store.connectSavedHost(host) }
+                    }
+                case .failed:
+                    if host.sshTarget != nil {
+                        // Retry rather than plain Connect: a failed or timed-out
+                        // attempt can leave its connect task behind, and
+                        // connectSavedHost returns immediately when it sees one.
+                        Button("Retry Connection") { store.retryConnectingHost(host) }
                     }
                 case .connected:
                     // Phase 1 remote pane primitive: pick one of this
@@ -1089,8 +1097,19 @@ struct RemoteHostGroupView: View {
                     if store.hasSidebarLease(for: host.id) {
                         Button("Disconnect") { store.disconnectSavedHost(host) }
                     }
+                    // Always offered. Without a sidebar lease the button above
+                    // is hidden, yet panes alone keep syncFromCoordinator
+                    // re-promoting this row to `.connected` — leaving no action
+                    // at all. This is the way out of that state.
+                    Button("Force Disconnect (Close All Panes)…") {
+                        showForceDisconnectConfirm = true
+                    }
                 case .connecting:
                     Button("Cancel Connection") { store.cancelConnectingHost(host) }
+                    // A hung acquire ignores cancellation, and cancelPendingAcquire
+                    // is a no-op while other waiters share the start. Retry drops
+                    // this row's attempt and starts a clean one regardless.
+                    Button("Retry Connection") { store.retryConnectingHost(host) }
                 }
                 profileMenuItems
             }
@@ -1104,6 +1123,17 @@ struct RemoteHostGroupView: View {
                 Button("Cancel", role: .cancel) {}
             } message: {
                 Text("The saved host profile is removed. Open panes and mirrors stay connected.")
+            }
+            .confirmationDialog(
+                "Force disconnect \"\(host.displayName)\"?",
+                isPresented: $showForceDisconnectConfirm
+            ) {
+                Button("Force Disconnect", role: .destructive) {
+                    store.forceDisconnectSavedHost(host)
+                }
+                Button("Cancel", role: .cancel) {}
+            } message: {
+                Text("Closes every pane, mirror and relay window opened from this host. Remote processes keep running on the host.")
             }
             .alert("New Workspace", isPresented: $showNewWorkspaceAlert) {
                 TextField("Workspace name", text: $newWorkspaceTitle)

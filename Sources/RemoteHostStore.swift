@@ -268,31 +268,34 @@ final class RemoteHostStore: ObservableObject {
         }
     }
 
+    /// Derive a stable dedup key per connection.
+    /// SSH tunnels use a unique local socket path per session, so keying by
+    /// hostSockPath would insert a new HostEntry on every reconnect. Instead:
+    ///   SSH connection  → "ssh:<sshTarget>" (stable across reconnects)
+    ///   Direct socket   → hostSockPath (already stable)
+    /// LIMITATION: same sshTarget with different remote sockets collapse into
+    /// one entry; needs remoteSockPath in connectionInfo to distinguish them.
+    private func stableKey(for conn: PeerRelayConnectionInfo) -> String {
+        if let ssh = conn.sshTarget, !ssh.isEmpty { return "ssh:\(ssh)" }
+        // Borrowed-socket connections carry no SSH identity — e.g. a
+        // relay window opened from the sidebar rides an existing
+        // tunnel's local socket (openWorkspaceRelayForSidebar attaches
+        // no tunnel, so connectionInfo.sshTarget is nil). Fold such a
+        // connection into the entry that owns that socket instead of
+        // materializing a doppelgänger keyed by the ephemeral path.
+        if let owner = hosts.values.first(where: {
+            !$0.activeSockPath.isEmpty && $0.activeSockPath == conn.hostSockPath
+        }) {
+            return owner.id
+        }
+        return conn.hostSockPath
+    }
+
     private func syncFromCoordinator() {
         let connections = PeerClientCoordinator.shared.activeConnections()
 
-        // Derive a stable dedup key per connection.
-        // SSH tunnels use a unique local socket path per session, so keying by
-        // hostSockPath would insert a new HostEntry on every reconnect. Instead:
-        //   SSH connection  → "ssh:<sshTarget>" (stable across reconnects)
-        //   Direct socket   → hostSockPath (already stable)
-        // LIMITATION: same sshTarget with different remote sockets collapse into
-        // one entry; needs remoteSockPath in connectionInfo to distinguish them.
-        func stableKey(for conn: PeerRelayConnectionInfo) -> String {
-            if let ssh = conn.sshTarget, !ssh.isEmpty { return "ssh:\(ssh)" }
-            // Borrowed-socket connections carry no SSH identity — e.g. a
-            // relay window opened from the sidebar rides an existing
-            // tunnel's local socket (openWorkspaceRelayForSidebar attaches
-            // no tunnel, so connectionInfo.sshTarget is nil). Fold such a
-            // connection into the entry that owns that socket instead of
-            // materializing a doppelgänger keyed by the ephemeral path.
-            if let owner = hosts.values.first(where: {
-                !$0.activeSockPath.isEmpty && $0.activeSockPath == conn.hostSockPath
-            }) {
-                return owner.id
-            }
-            return conn.hostSockPath
-        }
+        // Key derivation lives in `stableKey(for:)` so Force Disconnect can
+        // resolve the same host identity from a connection row.
 
         var activeKeys = Set<String>()
         for conn in connections {
@@ -360,6 +363,12 @@ final class RemoteHostStore: ObservableObject {
 
     // MARK: - Sidebar connect / disconnect (saved hosts)
 
+    /// Wall-clock budget for a sidebar connect attempt. Nothing below
+    /// `PeerPaneHostRegistry.acquire` carries a deadline of its own — an ssh
+    /// spawn that never reports leaves the row in `.connecting` with no way
+    /// back — so the row gives up here and offers Retry instead.
+    private static let connectTimeoutSeconds: Double = 45
+
     var hasAnySidebarLease: Bool { !sidebarLeases.isEmpty }
 
     func hasSidebarLease(for key: String) -> Bool {
@@ -385,6 +394,30 @@ final class RemoteHostStore: ObservableObject {
         #endif
         connectTasks[key] = Task { [weak self] in
             guard let self else { return }
+            // The acquire below can block indefinitely (a hung ssh spawn is
+            // not cancellation-cooperative), which would strand the row in
+            // `.connecting` where neither Connect nor Disconnect is offered.
+            // The watchdog only moves the row to `.failed` so Retry becomes
+            // reachable — it never touches the in-flight acquire, and the
+            // attemptID guard below still adopts a late success.
+            let watchdog = Task { [weak self] in
+                try? await Task.sleep(
+                    nanoseconds: UInt64(Self.connectTimeoutSeconds * 1_000_000_000)
+                )
+                guard !Task.isCancelled, let self else { return }
+                guard self.connectAttemptIDs[key] == attemptID,
+                      self.hosts[key]?.connectionState == .connecting
+                else { return }
+                self.hosts[key]?.connectionState =
+                    .failed("Timed out after \(Int(Self.connectTimeoutSeconds))s")
+                #if DEBUG
+                dlog("peer.sidebar.connect timeout key=\(key)")
+                #endif
+                RemoteWorkLog.info(
+                    "\(host.displayName) did not answer in \(Int(Self.connectTimeoutSeconds))s — use Retry Connection"
+                )
+            }
+            defer { watchdog.cancel() }
             defer {
                 if self.connectAttemptIDs[key] == attemptID {
                     self.connectTasks[key] = nil
@@ -469,6 +502,75 @@ final class RemoteHostStore: ObservableObject {
         dlog("peer.sidebar.connect cancelled key=\(key)")
         #endif
         RemoteWorkLog.info("Cancelled connection to \(host.displayName)")
+    }
+
+    /// Abandon whatever this row is doing and start a fresh attempt.
+    /// Reachable from `.connecting` and `.failed` alike, because both can
+    /// leave `connectTasks[key]` populated — a hung acquire never returns to
+    /// clear it, and that leftover entry makes `connectSavedHost` return
+    /// immediately, which is what leaves a stuck row with no way forward.
+    func retryConnectingHost(_ host: HostEntry) {
+        let key = host.id
+        connectAttemptIDs[key] = nil
+        connectTasks[key]?.cancel()
+        connectTasks[key] = nil
+        if let hostKey = connectingLeaseKeys[key] {
+            PeerPaneHostRegistry.shared.cancelPendingAcquire(for: hostKey)
+        }
+        connectingLeaseKeys[key] = nil
+        fetchTasks[key]?.cancel()
+        fetchTasks[key] = nil
+        hosts[key]?.workspaces = []
+        hosts[key]?.activeSockPath = ""
+        hosts[key]?.supportsWorkspaceLifecycle = nil
+        hosts[key]?.connectionState = .saved
+        #if DEBUG
+        dlog("peer.sidebar.connect retry key=\(key)")
+        #endif
+        RemoteWorkLog.info("Retrying connection to \(host.displayName)")
+        connectSavedHost(host)
+    }
+
+    /// Close every pane, mirror and relay window opened from this host, then
+    /// release the sidebar lease.
+    ///
+    /// `disconnectSavedHost` deliberately leaves panes running, so a row whose
+    /// only remaining refs are panes has no lease — and with no lease the
+    /// Disconnect button is hidden while `syncFromCoordinator` keeps
+    /// re-promoting the row to `.connected` on every rebuild. That combination
+    /// offers the user no action at all; this is the escape hatch out of it.
+    func forceDisconnectSavedHost(_ host: HostEntry) {
+        let key = host.id
+        let coordinator = PeerClientCoordinator.shared
+        // Resolve ids before clearing activeSockPath: stableKey folds
+        // borrowed-socket connections in by matching that very field.
+        let ids = coordinator.activeConnections()
+            .filter { stableKey(for: $0) == key }
+            .map(\.id)
+        for id in ids {
+            coordinator.disconnect(id: id)
+        }
+        if let lease = sidebarLeases[key] {
+            sidebarLeases[key] = nil
+            PeerPaneHostRegistry.shared.release(lease)
+        }
+        connectAttemptIDs[key] = nil
+        connectTasks[key]?.cancel()
+        connectTasks[key] = nil
+        connectingLeaseKeys[key] = nil
+        fetchTasks[key]?.cancel()
+        fetchTasks[key] = nil
+        hosts[key]?.workspaces = []
+        hosts[key]?.activeSockPath = ""
+        hosts[key]?.supportsWorkspaceLifecycle = nil
+        hosts[key]?.connectionState = .saved
+        #if DEBUG
+        dlog("peer.sidebar.forceDisconnect key=\(key) closed=\(ids.count)")
+        #endif
+        rebuild()
+        RemoteWorkLog.info(
+            "Force-disconnected \(host.displayName) — closed \(ids.count) connection(s)"
+        )
     }
 
     /// Delete the backing profile. Releases the sidebar lease first so
