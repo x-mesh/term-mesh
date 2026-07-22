@@ -924,6 +924,23 @@ mod integration_tests {
         tokio::net::unix::OwnedWriteHalf,
         Vec<u8>,
     ) {
+        attach_surface_by(sock_path, display, None).await
+    }
+
+    /// `attach_one`, but optionally targeting a KNOWN surface id instead of
+    /// "the first listed one". A surface whose child dies instantly can drop
+    /// out of ListSurfaces before the client's list lands (observed
+    /// deterministically on Linux), and a respawn test doesn't care about
+    /// the roster — it cares that AttachSurface revives the id it names.
+    async fn attach_surface_by(
+        sock_path: &std::path::Path,
+        display: &str,
+        want_id: Option<Vec<u8>>,
+    ) -> (
+        tokio::net::unix::OwnedReadHalf,
+        tokio::net::unix::OwnedWriteHalf,
+        Vec<u8>,
+    ) {
         let stream = UnixStream::connect(sock_path).await.unwrap();
         let (mut reader, mut writer) = stream.into_split();
 
@@ -964,22 +981,31 @@ mod integration_tests {
         .unwrap();
         let _ = read_envelope(&mut reader).await.unwrap(); // auth result
 
-        write_envelope(
-            &mut writer,
-            &Envelope {
-                seq: 3,
-                correlation_id: 0,
-                payload: Some(Payload::ListSurfaces(ListSurfaces {})),
-            },
-        )
-        .await
-        .unwrap();
-        let list_reply = read_envelope(&mut reader).await.unwrap();
-        let surfaces = match list_reply.payload {
-            Some(Payload::SurfaceList(sl)) => sl.surfaces,
-            other => panic!("{display}: expected SurfaceList, got {other:?}"),
+        let surface_id = match want_id {
+            Some(id) => id,
+            None => {
+                write_envelope(
+                    &mut writer,
+                    &Envelope {
+                        seq: 3,
+                        correlation_id: 0,
+                        payload: Some(Payload::ListSurfaces(ListSurfaces {})),
+                    },
+                )
+                .await
+                .unwrap();
+                let list_reply = read_envelope(&mut reader).await.unwrap();
+                let surfaces = match list_reply.payload {
+                    Some(Payload::SurfaceList(sl)) => sl.surfaces,
+                    other => panic!("{display}: expected SurfaceList, got {other:?}"),
+                };
+                assert!(
+                    !surfaces.is_empty(),
+                    "{display}: host listed no surfaces"
+                );
+                surfaces[0].surface_id.clone()
+            }
         };
-        let surface_id = surfaces[0].surface_id.clone();
 
         write_envelope(
             &mut writer,
@@ -1210,7 +1236,8 @@ mod integration_tests {
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
 
-        let (mut reader, _writer, _surface_id) = attach_one(&sock_path, "respawn-test").await;
+        let (mut reader, _writer, _surface_id) =
+            attach_surface_by(&sock_path, "respawn-test", Some(sid.clone())).await;
 
         // After attach, the fresh (respawned) child prints RESPAWN-MARKER.
         let seen = wait_for_marker(

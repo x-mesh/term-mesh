@@ -3571,9 +3571,13 @@ mod tests {
             fed += chunk.len() as u64;
         }
         let elapsed = start.elapsed();
+        // Generous bound on purpose: this asserts "a flood terminates
+        // promptly", not a benchmark number — under a full parallel test
+        // run on a loaded box (observed on the Linux peer) 5s flaked while
+        // the single-run time stayed ~100ms.
         assert!(
-            elapsed < std::time::Duration::from_secs(5),
-            "10MB of plain flood must feed in well under 5s, took {elapsed:?}"
+            elapsed < std::time::Duration::from_secs(60),
+            "10MB of plain flood must terminate promptly, took {elapsed:?}"
         );
         // The screen is still coherent after the flood.
         assert_eq!(model.fed_through, fed);
