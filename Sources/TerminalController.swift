@@ -1175,6 +1175,10 @@ class TerminalController {
             return v2Result(id: id, self.v2PeerSurfaceOpenPane(params: params))
         case "peer.pane.status":
             return v2Result(id: id, self.v2PeerPaneStatus(params: params))
+        case "peer.workspace.open_mirror":
+            return v2Result(id: id, self.v2PeerWorkspaceOpenMirror(params: params))
+        case "peer.mirror.status":
+            return v2Result(id: id, self.v2PeerMirrorStatus(params: params))
 
 #if DEBUG
         // Debug / test-only
@@ -1343,6 +1347,8 @@ class TerminalController {
             "peer.host.force_disconnect",
             "peer.surface.open_pane",
             "peer.pane.status",
+            "peer.workspace.open_mirror",
+            "peer.mirror.status",
             "surface.clear_history",
             "surface.trigger_flash",
             "pane.list",

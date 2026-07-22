@@ -688,6 +688,13 @@ struct TermMeshCLI {
                 }
             }
 
+        case "peer-mirror-status":
+            let payload = try client.sendV2(method: "peer.mirror.status")
+            printV2Payload(
+                payload, jsonOutput: jsonOutput, idFormat: idFormat,
+                fallbackText: jsonString(payload["status"] as? [String: Any] ?? [:])
+            )
+
         case "peer-pane-status":
             let payload = try client.sendV2(method: "peer.pane.status")
             printV2Payload(
@@ -696,7 +703,7 @@ struct TermMeshCLI {
             )
 
         case "peer-connect", "peer-disconnect", "peer-force-disconnect",
-             "peer-retry", "peer-cancel", "peer-open-pane":
+             "peer-retry", "peer-cancel", "peer-open-pane", "peer-open-mirror":
             guard let hostArg = optionValue(commandArgs, name: "--host") else {
                 throw CLIError(message: "--host is required (see: term-mesh peer-hosts)")
             }
@@ -707,10 +714,15 @@ struct TermMeshCLI {
                 case "peer-force-disconnect": return "peer.host.force_disconnect"
                 case "peer-retry": return "peer.host.retry"
                 case "peer-open-pane": return "peer.surface.open_pane"
+                case "peer-open-mirror": return "peer.workspace.open_mirror"
                 default: return "peer.host.cancel"
                 }
             }()
-            let payload = try client.sendV2(method: method, params: ["host": hostArg])
+            var peerParams: [String: Any] = ["host": hostArg]
+            if command == "peer-open-mirror", let ws = optionValue(commandArgs, name: "--workspace") {
+                peerParams["workspace"] = ws
+            }
+            let payload = try client.sendV2(method: method, params: peerParams)
             var summary = "\(command): \(hostArg)"
             if let state = payload["state"] as? String { summary += " → \(state)" }
             if let closed = payload["closed"] as? Int { summary += " (closed \(closed))" }
@@ -3384,7 +3396,8 @@ struct TermMeshCLI {
             """
         case "peer-hosts", "peer-connect", "peer-disconnect",
              "peer-force-disconnect", "peer-retry", "peer-cancel",
-             "peer-open-pane", "peer-pane-status":
+             "peer-open-pane", "peer-pane-status",
+             "peer-open-mirror", "peer-mirror-status":
             return """
             Usage: term-mesh peer-hosts
                    term-mesh peer-connect --host <id|name>
@@ -5103,6 +5116,8 @@ struct TermMeshCLI {
           peer-cancel --host <id|name>
           peer-open-pane --host <id|name>
           peer-pane-status
+          peer-open-mirror --host <id|name> [--workspace <title>]
+          peer-mirror-status
           new-workspace [--command <text>]
           new-split <left|right|up|down> [--workspace <id|ref>] [--surface <id|ref>] [--panel <id|ref>]
           list-panes [--workspace <id|ref>]

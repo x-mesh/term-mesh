@@ -172,6 +172,51 @@ extension TerminalController {
         }
     }
 
+    /// Open one of the host's workspaces as a live mirror in the main window.
+    ///
+    /// A live mirror changes the rules for everything else in that workspace —
+    /// `Workspace.mirrorForwardsLocalActions` routes local closes to the host
+    /// and the reconciler owns the layout — so a peer bug that only appears
+    /// alongside a mirror is unreachable without this. `workspace` selects by
+    /// title; omitted, the host's first workspace is used.
+    func v2PeerWorkspaceOpenMirror(params: [String: Any]) -> V2CallResult {
+        let wanted = v2String(params, "workspace")
+        let live = (params["live"] as? Bool) ?? true
+        return peerDispatchHostAction(params: params, action: "open_mirror") { store, host in
+            guard !host.workspaces.isEmpty else {
+                return ["ok": false, "error": "host has no workspaces"]
+            }
+            let chosen: WorkspaceSummary?
+            if let wanted {
+                chosen = host.workspaces.first {
+                    $0.title.caseInsensitiveCompare(wanted) == .orderedSame
+                }
+            } else {
+                chosen = host.workspaces.first
+            }
+            guard let workspace = chosen else {
+                return ["ok": false, "error": "no such workspace: \(wanted ?? "")"]
+            }
+            store.openWorkspaceAsMirror(workspace, host: host, live: live)
+            return ["ok": true, "started": true, "workspace": workspace.title, "live": live]
+        }
+    }
+
+    /// Live-mirror state (subscription health, leaf count, shape hash) — the
+    /// poll counterpart to `peer.workspace.open_mirror`.
+    func v2PeerMirrorStatus(params _: [String: Any]) -> V2CallResult {
+        var status: [String: Any] = [:]
+        let ok = v2MainExec(timeout: 5) {
+            MainActor.assumeIsolated {
+                status = PeerClientCoordinator.shared.debugMirrorStatus()
+            }
+        }
+        guard ok else {
+            return .err(code: "internal_error", message: "peer mirror status timed out", data: nil)
+        }
+        return .ok(["ok": true, "status": status])
+    }
+
     /// Remote-pane sessions and host-lease count. The counterpart poll for
     /// `peer.surface.open_pane`, and what a test asserts against to confirm a
     /// force disconnect actually tore every pane down.
