@@ -89,6 +89,36 @@ struct CommandPaletteTrailingLabel {
     let style: CommandPaletteTrailingLabelStyle
 }
 
+/// Leading status glyph for a palette row.
+///
+/// Only rows that actually carry state get one — today that is the peer
+/// scope, where a host is connecting / reachable / unreachable and the row's
+/// meaning changes with it. Workspace and tab rows have no comparable state,
+/// so they stay text-only rather than growing a decorative icon column.
+///
+/// Shapes and tints deliberately match `SidebarViews`' `hostStatusIcon`: the
+/// same host reads the same way whether it is found in the sidebar or the
+/// palette, which is the whole point of a shared vocabulary.
+struct CommandPaletteLeadingIcon {
+    enum Kind {
+        /// SF Symbol name.
+        case symbol(String)
+        /// Indeterminate work in flight — a real spinner, not a static glyph.
+        case progress
+    }
+
+    let kind: Kind
+    let tint: Color?
+    /// Tooltip, used to carry a failure reason that has no room in the row.
+    let help: String?
+
+    init(kind: Kind, tint: Color? = nil, help: String? = nil) {
+        self.kind = kind
+        self.tint = tint
+        self.help = help
+    }
+}
+
 struct CommandPaletteInputFocusPolicy {
     let focusTarget: CommandPaletteInputFocusTarget
     let selectionBehavior: CommandPaletteTextSelectionBehavior
@@ -108,6 +138,13 @@ struct CommandPaletteCommand: Identifiable {
     let keywords: [String]
     let dismissOnRun: Bool
     let action: () -> Void
+    /// Declared last, defaulted, so the ~100 existing call sites that end at
+    /// `action:` keep compiling untouched.
+    var leadingIcon: CommandPaletteLeadingIcon? = nil
+    /// Compact count shown just before the kind badge (e.g. "2p" for panes).
+    /// The sidebar already abbreviates this way, so the palette does too
+    /// rather than spelling out "2 panes" and eating the row.
+    var trailingCount: String? = nil
 
     var searchableTexts: [String] {
         [title, subtitle] + keywords
