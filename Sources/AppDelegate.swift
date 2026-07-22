@@ -2465,12 +2465,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
             return true
         }
 
-        // ⌘⇧O — peer workspaces. Monitor-only, like the two palette shortcuts
-        // above: registering the same key in SwiftUI as well would dispatch it
-        // twice (see New Window / workspace jumps in TermMeshApp for the same
+        // Peer workspaces. Monitor-only, like the two palette shortcuts above:
+        // registering the same key in SwiftUI as well would dispatch it twice
+        // (see New Window / workspace jumps in TermMeshApp for the same
         // deliberate omission).
-        let isCommandShiftO = normalizedFlags == [.command, .shift] && (chars == "o" || event.keyCode == 31)
-        if isCommandShiftO {
+        //
+        // Unlike ⌘P / ⌘⇧P — which predate the settings table and are still
+        // hardcoded either side of this — the binding is read from
+        // `KeyboardShortcutSettings`, so it shows up in Settings and can be
+        // rebound. ⌘⇧O is only the default.
+        if matchShortcut(event: event, shortcut: KeyboardShortcutSettings.shortcut(for: .openPeerWorkspace)) {
             let targetWindow = activeCommandPaletteWindow() ?? event.window ?? NSApp.keyWindow ?? NSApp.mainWindow
             NotificationCenter.default.post(name: .commandPalettePeersRequested, object: targetWindow)
             return true

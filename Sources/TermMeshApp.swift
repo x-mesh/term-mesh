@@ -30,6 +30,7 @@ struct TermMeshApp: App {
     @AppStorage(KeyboardShortcutSettings.Action.toggleSidebar.defaultsKey) private var toggleSidebarShortcutData = Data()
     @AppStorage(KeyboardShortcutSettings.Action.newTab.defaultsKey) private var newWorkspaceShortcutData = Data()
     @AppStorage(KeyboardShortcutSettings.Action.newWindow.defaultsKey) private var newWindowShortcutData = Data()
+    @AppStorage(KeyboardShortcutSettings.Action.openPeerWorkspace.defaultsKey) private var openPeerWorkspaceShortcutData = Data()
     @AppStorage(KeyboardShortcutSettings.Action.showNotifications.defaultsKey) private var showNotificationsShortcutData = Data()
     @AppStorage(KeyboardShortcutSettings.Action.jumpToUnread.defaultsKey) private var jumpToUnreadShortcutData = Data()
     @AppStorage(KeyboardShortcutSettings.Action.nextSurface.defaultsKey) private var nextSurfaceShortcutData = Data()
@@ -700,11 +701,16 @@ struct TermMeshApp: App {
                 // sidebar; the menu keeps host management. Raw socket
                 // dialogs stay as DEBUG-only tools.
                 //
-                // The palette entry below is the one exception, and it is
-                // discoverability only — no `.keyboardShortcut` here, because
-                // ⌘⇧O is already claimed in AppDelegate's event monitor and
-                // registering it twice would fire the action twice.
-                Button("Open Peer Workspace…") {
+                // The palette entry below is the one exception. It shows the
+                // binding but does not register it (`registerShortcut: false`),
+                // because AppDelegate's event monitor already claims the key —
+                // registering it twice would fire the action twice, the same
+                // reason New Window opts out.
+                splitCommandButton(
+                    title: "Open Peer Workspace…",
+                    shortcut: openPeerWorkspaceMenuShortcut,
+                    registerShortcut: false
+                ) {
                     NotificationCenter.default.post(
                         name: .commandPalettePeersRequested,
                         object: NSApp.keyWindow ?? NSApp.mainWindow
@@ -1173,6 +1179,13 @@ struct TermMeshApp: App {
 
     private var newWindowMenuShortcut: StoredShortcut {
         decodeShortcut(from: newWindowShortcutData, fallback: KeyboardShortcutSettings.Action.newWindow.defaultShortcut)
+    }
+
+    private var openPeerWorkspaceMenuShortcut: StoredShortcut {
+        decodeShortcut(
+            from: openPeerWorkspaceShortcutData,
+            fallback: KeyboardShortcutSettings.Action.openPeerWorkspace.defaultShortcut
+        )
     }
 
     private var showNotificationsMenuShortcut: StoredShortcut {
