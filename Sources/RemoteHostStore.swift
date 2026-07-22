@@ -542,14 +542,22 @@ final class RemoteHostStore: ObservableObject {
     func forceDisconnectSavedHost(_ host: HostEntry) {
         let key = host.id
         let coordinator = PeerClientCoordinator.shared
-        // Resolve ids before clearing activeSockPath: stableKey folds
+        // Resolve rows before clearing activeSockPath: stableKey folds
         // borrowed-socket connections in by matching that very field.
-        let ids = coordinator.activeConnections()
+        let rows = coordinator.activeConnections()
             .filter { stableKey(for: $0) == key }
-            .map(\.id)
-        for id in ids {
-            coordinator.disconnect(id: id)
+        // Mirrors and relay windows first, panes last. While a live mirror
+        // owns the workspace, `Workspace.mirrorForwardsLocalActions` turns
+        // every local close into a forwardClose to the host and returns
+        // false — the pane stays put until the host pushes a layout that
+        // drops it, which it never does for the last surface. Tearing the
+        // mirror down first restores plain local close semantics, so the
+        // panes that follow actually go away.
+        let ordered = rows.filter { $0.kind != .pane } + rows.filter { $0.kind == .pane }
+        for row in ordered {
+            coordinator.disconnect(id: row.id)
         }
+        let ids = ordered.map(\.id)
         if let lease = sidebarLeases[key] {
             sidebarLeases[key] = nil
             PeerPaneHostRegistry.shared.release(lease)
