@@ -1218,9 +1218,14 @@ class termmesh:
 
     def peer_pane_status(self) -> dict:
         """Snapshot of remote-pane sessions + host-lease count via
-        `debug.peer.pane_status` (DEBUG-only). Returns the inner status
-        dict: {pane_sessions: [...], lease_count: N, last_open_result}."""
-        reply = dict(self._call("debug.peer.pane_status", {}) or {})
+        `peer.pane.status`. Returns the inner status dict: {pane_sessions:
+        [...], lease_count: N, last_open_result}.
+
+        Deliberately the production endpoint rather than the DEBUG-only
+        `debug.peer.pane_status`: `peer_open_pane()` is a production command,
+        and polling its outcome through a DEBUG-only method would fail with
+        `unknown_method` against a Release app. Both return the same payload."""
+        reply = dict(self._call("peer.pane.status", {}) or {})
         return dict(reply.get("status") or {})
 
     def coalesce_probe(self) -> dict:

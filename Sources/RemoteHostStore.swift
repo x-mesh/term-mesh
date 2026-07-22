@@ -608,6 +608,13 @@ final class RemoteHostStore: ObservableObject {
         connectAttemptIDs[key] = nil
         connectTasks[key]?.cancel()
         connectTasks[key] = nil
+        // The registry starts the tunnel in a detached Task that does not
+        // inherit the cancel above, so an in-flight — or hung — ssh spawn
+        // would outlive the force disconnect and leak its helper process.
+        // Cancel it before dropping the key that identifies it.
+        if let hostKey = connectingLeaseKeys[key] {
+            PeerPaneHostRegistry.shared.cancelPendingAcquire(for: hostKey)
+        }
         connectingLeaseKeys[key] = nil
         fetchTasks[key]?.cancel()
         fetchTasks[key] = nil

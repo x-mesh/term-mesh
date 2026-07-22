@@ -161,7 +161,7 @@ final class PeerClientCoordinator: NSObject, NSMenuDelegate {
             // Closing the workspace tab tears everything down through
             // TabManager.closeWorkspace → panel closes + mirror teardown.
             if let workspace = mirror.workspace,
-               let tabManager = AppDelegate.shared?.tabManager
+               let tabManager = AppDelegate.shared?.tabManagerFor(tabId: workspace.id)
             {
                 tabManager.closeWorkspace(workspace)
             } else {
@@ -933,29 +933,45 @@ final class PeerClientCoordinator: NSObject, NSMenuDelegate {
                 RemoteWorkLog.info("\(title): \(body)")
             }
         }
-        // Live-mirror dedupe: a second live mirror of the same host
-        // workspace is meaningless (both would be host-authoritative
-        // copies), so re-clicking the sidebar row focuses the existing
-        // mirror tab instead of materializing another one. Sidebar click
-        // is explicit user focus intent, so selecting here respects the
-        // socket focus policy.
+
+        // The window this open lands in: the sidebar row was just clicked, so
+        // the active manager IS the clicking window's. Captured once up front
+        // — the awaits below can change which window is frontmost, and the
+        // workspace must be created where the user clicked, not wherever
+        // focus drifted to.
+        let targetTabManager = AppDelegate.shared?.tabManager
+
+        // Live-mirror dedupe, scoped PER WINDOW: re-clicking the row in the
+        // window that already shows this mirror focuses that tab; a click in
+        // a different window falls through and materializes its own mirror
+        // there. Concurrent mirrors of one host workspace are fine now that
+        // the daemon arbitrates the PTY winsize across attachers (min per
+        // axis, tmux-style) instead of last-writer-wins.
         if live, let workspaceID,
-           let existing = openWorkspaceMirrors.first(where: {
-               !$0.isTornDown
-                   && $0.lease.key == spec.hostKey
-                   && $0.hostWorkspaceID == workspaceID
+           let existing = openWorkspaceMirrors.first(where: { mirror in
+               guard !mirror.isTornDown,
+                     mirror.lease.key == spec.hostKey,
+                     mirror.hostWorkspaceID == workspaceID,
+                     let ws = mirror.workspace else { return false }
+               return AppDelegate.shared?.tabManagerFor(tabId: ws.id) === targetTabManager
            }),
            let mirrorWorkspace = existing.workspace {
+            // Per-window target from develop, gated by `select` so the socket
+            // path still refuses to move the user's focus.
             if select {
-                AppDelegate.shared?.tabManager?.selectWorkspace(mirrorWorkspace)
+                targetTabManager?.selectWorkspace(mirrorWorkspace)
             }
             #if DEBUG
-            dlog("peer.mirror.dedupe focus existing host=\(spec.hostKey)")
+            dlog("peer.mirror.dedupe host=\(spec.hostKey) sameWindow=1")
             #endif
             return
         }
 
-        let flowKey = spec.hostKey.description
+        // In-flight guard is per (host, window): the same window double-
+        // clicking must still coalesce, while a second window opening its
+        // own mirror of the same host must not be blocked by the first.
+        let windowKey = targetTabManager.map { String(UInt(bitPattern: ObjectIdentifier($0).hashValue)) } ?? "none"
+        let flowKey = "\(spec.hostKey.description)#\(windowKey)"
         guard !mirrorOpensInFlight.contains(flowKey) else { return }
         mirrorOpensInFlight.insert(flowKey)
         defer { mirrorOpensInFlight.remove(flowKey) }
@@ -987,9 +1003,9 @@ final class PeerClientCoordinator: NSObject, NSMenuDelegate {
                     ?? "an older term-meshd build"
                 await conn.cancel()
                 registry.release(lease)
-                self.showAlert(
-                    title: "Host Too Old for Live Mirror",
-                    body: "This host is running \(ver), which doesn't support "
+                reportFailure(
+                    "Host Too Old for Live Mirror",
+                    "This host is running \(ver), which doesn't support "
                         + "live workspace mirroring (needs workspace.lifecycle.v1). "
                         + "Update the host's term-meshd and reconnect."
                 )
@@ -1009,9 +1025,9 @@ final class PeerClientCoordinator: NSObject, NSMenuDelegate {
         }
         guard !workspaces.isEmpty else {
             registry.release(lease)
-            self.showAlert(
-                title: "No Workspaces",
-                body: "The host reports no workspaces (older hosts may not expose layouts)."
+            reportFailure(
+                "No Workspaces",
+                "The host reports no workspaces (older hosts may not expose layouts)."
             )
             return
         }
@@ -1029,7 +1045,9 @@ final class PeerClientCoordinator: NSObject, NSMenuDelegate {
             return
         }
 
-        guard let tabManager = AppDelegate.shared?.tabManager else {
+        // The manager captured at entry — NOT a fresh read of the global,
+        // which by now (post-await) tracks whichever window became frontmost.
+        guard let tabManager = targetTabManager else {
             registry.release(lease)
             reportFailure("No Main Window", "Open a term-mesh window first.")
             return
@@ -1071,7 +1089,7 @@ final class PeerClientCoordinator: NSObject, NSMenuDelegate {
             command: firstSession.relayLaunchCommand,
             environment: firstSession.relayEnvironment
         )
-        let hostChip = spec.hostKey.shortLabel
+        let hostChip = PeerHostProfileStore.shared.displayLabel(for: spec.hostKey)
         // Distinct sidebar markers per mode — identical titles made the
         // two modes impossible to tell apart (or A/B test) in the tab
         // list: ⌁ = live host-synced mirror, ⧉ = detached layout copy.
@@ -1116,10 +1134,11 @@ final class PeerClientCoordinator: NSObject, NSMenuDelegate {
                 // surface an actionable error.
                 workspace.peerMirror = nil
                 mirror.teardown()
-                AppDelegate.shared?.tabManager?.closeWorkspace(workspace)
-                self.showAlert(
-                    title: "Live Mirror Failed",
-                    body: "\(String(describing: error))\n\nThe workspace was closed. Reconnect to retry."
+                AppDelegate.shared?.tabManagerFor(tabId: workspace.id)?
+                    .closeWorkspace(workspace)
+                reportFailure(
+                    "Live Mirror Failed",
+                    "\(String(describing: error))\n\nThe workspace was closed. Reconnect to retry."
                 )
                 return
             }
