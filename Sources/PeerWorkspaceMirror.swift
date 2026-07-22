@@ -528,7 +528,7 @@ final class PeerWorkspaceMirrorController {
     private func markHostWorkspaceGone() {
         guard !isTornDown else { return }
         let title = hostWorkspaceTitle.isEmpty ? "Workspace" : hostWorkspaceTitle
-        let hostLabel = spec.hostKey.shortLabel
+        let hostLabel = PeerHostProfileStore.shared.displayLabel(for: spec.hostKey)
         #if DEBUG
         dlog("peer.mirror.hostGone action=autoclose host=\(spec.hostKey) workspace=\(title)")
         #endif
@@ -556,7 +556,7 @@ final class PeerWorkspaceMirrorController {
 
     private func markWorkspaceTitle(suffix: String?) {
         guard let workspace else { return }
-        let base = "\(hostWorkspaceTitle.isEmpty ? "Workspace" : hostWorkspaceTitle) ⌁ \(spec.hostKey.shortLabel)"
+        let base = "\(hostWorkspaceTitle.isEmpty ? "Workspace" : hostWorkspaceTitle) ⌁ \(PeerHostProfileStore.shared.displayLabel(for: spec.hostKey))"
         workspace.title = suffix.map { "\(base) — \($0)" } ?? base
     }
 

@@ -106,7 +106,7 @@ struct TabItemView: View {
                 Circle()
                     .fill(chipColor)
                     .frame(width: 5, height: 5)
-                Text(hostKey.shortLabel)
+                Text(PeerHostProfileStore.shared.displayLabel(for: hostKey))
                     .font(.system(size: 10, weight: usesInvertedActiveForeground ? .medium : .regular, design: .monospaced))
                     .foregroundColor(textColor)
                     .lineLimit(1)

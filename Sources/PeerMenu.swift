@@ -1054,7 +1054,7 @@ final class PeerClientCoordinator: NSObject, NSMenuDelegate {
             command: firstSession.relayLaunchCommand,
             environment: firstSession.relayEnvironment
         )
-        let hostChip = spec.hostKey.shortLabel
+        let hostChip = PeerHostProfileStore.shared.displayLabel(for: spec.hostKey)
         // Distinct sidebar markers per mode — identical titles made the
         // two modes impossible to tell apart (or A/B test) in the tab
         // list: ⌁ = live host-synced mirror, ⧉ = detached layout copy.
