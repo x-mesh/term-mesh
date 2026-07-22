@@ -1155,6 +1155,22 @@ class TerminalController {
         case "surface.read_text":
             return v2Result(id: id, self.v2SurfaceReadText(params: params))
 
+        // Peer-federation saved hosts. Not DEBUG-gated: unlike the
+        // `debug.peer.*` family below (raw socket paths, bypassing
+        // RemoteHostStore), these drive the same store the sidebar does, so
+        // they are the supported way to script a peer host.
+        case "peer.host.list":
+            return v2Result(id: id, self.v2PeerHostList(params: params))
+        case "peer.host.connect":
+            return v2Result(id: id, self.v2PeerHostConnect(params: params))
+        case "peer.host.retry":
+            return v2Result(id: id, self.v2PeerHostRetry(params: params))
+        case "peer.host.cancel":
+            return v2Result(id: id, self.v2PeerHostCancel(params: params))
+        case "peer.host.disconnect":
+            return v2Result(id: id, self.v2PeerHostDisconnect(params: params))
+        case "peer.host.force_disconnect":
+            return v2Result(id: id, self.v2PeerHostForceDisconnect(params: params))
 
 #if DEBUG
         // Debug / test-only
@@ -1315,6 +1331,12 @@ class TerminalController {
             "surface.send_text",
             "surface.send_key",
             "surface.read_text",
+            "peer.host.list",
+            "peer.host.connect",
+            "peer.host.retry",
+            "peer.host.cancel",
+            "peer.host.disconnect",
+            "peer.host.force_disconnect",
             "surface.clear_history",
             "surface.trigger_flash",
             "pane.list",
