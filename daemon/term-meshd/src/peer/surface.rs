@@ -884,12 +884,12 @@ impl PtySurface {
         // Total retained rows: set_scrollback clamps to the deque's actual
         // length, and `Screen::scrollback()` reads the clamped offset back —
         // the only way the total is observable through vt100's public API.
-        screen.parser.set_scrollback(usize::MAX);
+        screen.parser.screen_mut().set_scrollback(usize::MAX);
         let total = screen.parser.screen().scrollback();
-        screen.parser.set_scrollback(offset_rows as usize);
+        screen.parser.screen_mut().set_scrollback(offset_rows as usize);
         let effective = screen.parser.screen().scrollback();
         let ansi = screen.parser.screen().contents_formatted();
-        screen.parser.set_scrollback(0);
+        screen.parser.screen_mut().set_scrollback(0);
         let at_top = effective >= total || (effective as u64) < offset_rows as u64;
         Some((ansi, effective as u32, at_top, total as u32))
     }
@@ -937,7 +937,7 @@ impl PtySurface {
         // renders at a stale width. vt100's set_size takes (rows, cols) —
         // the reverse of this function's own signature. Do not swap.
         if let Ok(mut screen) = self.screen.lock() {
-            screen.parser.set_size(rows, cols);
+            screen.parser.screen_mut().set_size(rows, cols);
         }
         Ok(())
     }
@@ -3706,6 +3706,76 @@ mod tests {
             snap_after.windows(7).any(|w| w == b"LINE-40"),
             "live screen must be untouched after a scrollback browse"
         );
+        surface.hangup();
+    }
+
+    /// Paging regression guard (live-observed 2026-07-22): three successive
+    /// browse windows at growing offsets must render three DIFFERENT slices
+    /// of history, each older than the last. Catches any offset that gets
+    /// applied but not rendered (window content identical to live screen).
+    #[tokio::test]
+    async fn scrollback_render_paging_returns_distinct_older_windows() {
+        let surface = PtySurface::spawn(
+            surface_id_from_name("sb-paging"),
+            "sb-paging".into(),
+            "/bin/sh",
+            &["-c", "for i in $(seq 1 300); do echo SBLINE-$i; done; sleep 5"],
+            80,
+            24,
+            None,
+        )
+        .expect("spawn sb-paging surface");
+
+        let mut ready = false;
+        for _ in 0..250 {
+            if let Some((snap, _)) = surface.screen_snapshot() {
+                if snap.windows(10).any(|w| w == b"SBLINE-300") {
+                    ready = true;
+                    break;
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(ready, "seq output never reached the screen model");
+
+        // Highest SBLINE-<n> number present in a render — a strictly
+        // decreasing sequence across growing offsets proves each window is
+        // genuinely older, not a re-render of the live screen.
+        fn max_line_no(ansi: &[u8]) -> u32 {
+            let text = String::from_utf8_lossy(ansi);
+            text.split("SBLINE-")
+                .skip(1)
+                .filter_map(|rest| {
+                    rest.bytes()
+                        .take_while(|b| b.is_ascii_digit())
+                        .fold(None, |acc: Option<u32>, b| {
+                            Some(acc.unwrap_or(0) * 10 + (b - b'0') as u32)
+                        })
+                })
+                .max()
+                .unwrap_or(0)
+        }
+
+        let mut prev_max = u32::MAX;
+        for offset in [32u32, 64, 96] {
+            let (ansi, effective, at_top, _total) =
+                surface.scrollback_render(offset).expect("render");
+            assert_eq!(effective, offset, "offset {offset} must apply verbatim");
+            assert!(!at_top, "offset {offset} is nowhere near 300 lines of history");
+            let this_max = max_line_no(&ansi);
+            assert!(
+                this_max > 0,
+                "offset {offset}: window contains no SBLINE at all"
+            );
+            assert!(
+                this_max < prev_max,
+                "offset {offset}: window max SBLINE-{this_max} not older than \
+                 previous window's SBLINE-{prev_max} — offset applied but not rendered"
+            );
+            prev_max = this_max;
+        }
+        // And every window is older than the live bottom.
+        assert!(prev_max < 300);
         surface.hangup();
     }
 
