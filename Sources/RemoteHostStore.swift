@@ -539,6 +539,28 @@ final class RemoteHostStore: ObservableObject {
     /// Disconnect button is hidden while `syncFromCoordinator` keeps
     /// re-promoting the row to `.connected` on every rebuild. That combination
     /// offers the user no action at all; this is the escape hatch out of it.
+    /// Close order for a force disconnect: mirrors and relay windows first,
+    /// panes last.
+    ///
+    /// While a live mirror owns the workspace,
+    /// `Workspace.mirrorForwardsLocalActions` turns every local close into a
+    /// forwardClose to the host and returns false — the pane stays put until
+    /// the host pushes a layout that drops it, which it never does for the
+    /// last surface in a workspace, so exactly one pane survives. Tearing the
+    /// mirror down first flips that predicate off and restores plain local
+    /// close semantics for the panes that follow.
+    ///
+    /// Kept order-stable within each group so the close sequence stays
+    /// predictable (activeConnections is already sorted by connectedAt).
+    ///
+    /// `nonisolated` so tests can call it synchronously without the MainActor
+    /// hop, matching the pure-helper pattern in PeerHostProfileStore.
+    nonisolated static func forceDisconnectOrder(
+        _ rows: [PeerRelayConnectionInfo]
+    ) -> [PeerRelayConnectionInfo] {
+        rows.filter { $0.kind != .pane } + rows.filter { $0.kind == .pane }
+    }
+
     func forceDisconnectSavedHost(_ host: HostEntry) {
         let key = host.id
         let coordinator = PeerClientCoordinator.shared
@@ -546,14 +568,7 @@ final class RemoteHostStore: ObservableObject {
         // borrowed-socket connections in by matching that very field.
         let rows = coordinator.activeConnections()
             .filter { stableKey(for: $0) == key }
-        // Mirrors and relay windows first, panes last. While a live mirror
-        // owns the workspace, `Workspace.mirrorForwardsLocalActions` turns
-        // every local close into a forwardClose to the host and returns
-        // false — the pane stays put until the host pushes a layout that
-        // drops it, which it never does for the last surface. Tearing the
-        // mirror down first restores plain local close semantics, so the
-        // panes that follow actually go away.
-        let ordered = rows.filter { $0.kind != .pane } + rows.filter { $0.kind == .pane }
+        let ordered = Self.forceDisconnectOrder(rows)
         for row in ordered {
             coordinator.disconnect(id: row.id)
         }
