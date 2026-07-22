@@ -916,7 +916,10 @@ final class PeerClientCoordinator: NSObject, NSMenuDelegate {
         spec: PeerPaneHostSpec,
         workspaceID: Data?,
         pickFirstWithoutPrompt: Bool = false,
-        live: Bool = true
+        live: Bool = true,
+        /// `false` from the socket path — see `openRemotePaneHeadless`. The
+        /// sidebar keeps selecting, because a click there IS focus intent.
+        select: Bool = true
     ) async {
         // Live-mirror dedupe: a second live mirror of the same host
         // workspace is meaningless (both would be host-authoritative
@@ -931,7 +934,9 @@ final class PeerClientCoordinator: NSObject, NSMenuDelegate {
                    && $0.hostWorkspaceID == workspaceID
            }),
            let mirrorWorkspace = existing.workspace {
-            AppDelegate.shared?.tabManager?.selectWorkspace(mirrorWorkspace)
+            if select {
+                AppDelegate.shared?.tabManager?.selectWorkspace(mirrorWorkspace)
+            }
             #if DEBUG
             dlog("peer.mirror.dedupe focus existing host=\(spec.hostKey)")
             #endif
@@ -1050,7 +1055,7 @@ final class PeerClientCoordinator: NSObject, NSMenuDelegate {
         }
 
         let workspace = tabManager.addWorkspace(
-            select: true,
+            select: select,
             command: firstSession.relayLaunchCommand,
             environment: firstSession.relayEnvironment
         )
@@ -1333,15 +1338,19 @@ final class PeerClientCoordinator: NSObject, NSMenuDelegate {
     /// ssh arguments, which hardcode `port: nil, identityFile: nil` and so
     /// silently ignore a saved profile's custom port or key. Outcome lands in
     /// `debugLastPaneOpenResult`, polled via `peer.pane.status`.
-    func openRemotePaneHeadless(spec: PeerPaneHostSpec) {
+    /// `focus: false` for the socket path: `peer.surface.open_pane` is not a
+    /// focus-intent method, and the socket focus policy says a non-focus
+    /// command must leave the user's focus where it was — otherwise scripting
+    /// a pane open yanks focus out from under whoever is typing.
+    func openRemotePaneHeadless(spec: PeerPaneHostSpec, focus: Bool = true) {
         debugLastPaneOpenResult = nil
         Task { @MainActor in
-            await debugOpenRemotePaneResolved(spec: spec)
+            await debugOpenRemotePaneResolved(spec: spec, focus: focus)
         }
     }
 
     @MainActor
-    private func debugOpenRemotePaneResolved(spec: PeerPaneHostSpec) async {
+    private func debugOpenRemotePaneResolved(spec: PeerPaneHostSpec, focus: Bool = true) async {
             let registry = PeerPaneHostRegistry.shared
             do {
                 let lease = try await registry.acquire(spec)
@@ -1364,7 +1373,7 @@ final class PeerClientCoordinator: NSObject, NSMenuDelegate {
                         spec: spec
                     )
                     registry.release(lease)
-                    guard let panel = workspace.openRemotePane(session: session) else {
+                    guard let panel = workspace.openRemotePane(session: session, focus: focus) else {
                         session.teardown()
                         self.debugLastPaneOpenResult = ["ok": false, "error": "no_focused_terminal_pane"]
                         return

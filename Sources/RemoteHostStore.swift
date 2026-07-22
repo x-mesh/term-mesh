@@ -511,6 +511,15 @@ final class RemoteHostStore: ObservableObject {
     /// immediately, which is what leaves a stuck row with no way forward.
     func retryConnectingHost(_ host: HostEntry) {
         let key = host.id
+        // Release the sidebar lease first. `connectSavedHost` returns early
+        // while one exists, so retrying a row that already holds a lease — a
+        // connected host, or one whose watchdog gave up after the acquire had
+        // in fact succeeded — would report that it started and then do
+        // nothing at all.
+        if let lease = sidebarLeases[key] {
+            sidebarLeases[key] = nil
+            PeerPaneHostRegistry.shared.release(lease)
+        }
         connectAttemptIDs[key] = nil
         connectTasks[key]?.cancel()
         connectTasks[key] = nil
@@ -782,13 +791,23 @@ final class RemoteHostStore: ObservableObject {
     /// the mirror survives the origin relay closing and daemon/network
     /// reconnects (the tunnel's local socket is re-derived per reconnect);
     /// direct hosts fall back to `.direct` on the live socket.
-    func openWorkspaceAsMirror(_ workspace: WorkspaceSummary, host: HostEntry, live: Bool = true) {
+    /// `select: false` from the socket path — `peer.workspace.open_mirror` is
+    /// not a focus-intent method, so it must not pull the user onto the new
+    /// workspace. The sidebar keeps the default, because clicking there is
+    /// explicit focus intent.
+    func openWorkspaceAsMirror(
+        _ workspace: WorkspaceSummary,
+        host: HostEntry,
+        live: Bool = true,
+        select: Bool = true
+    ) {
         let spec = host.paneHostSpec
         Task {
             await PeerClientCoordinator.shared.openRemoteWorkspaceMirror(
                 spec: spec,
                 workspaceID: workspace.id,
-                live: live
+                live: live,
+                select: select
             )
         }
     }

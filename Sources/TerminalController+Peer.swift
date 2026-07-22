@@ -16,6 +16,15 @@ import Foundation
 ///
 /// Per the socket focus policy these commands never activate the app or move
 /// in-app focus; none of them belong in `focusIntentV2Methods`.
+/// Lets a `peerDispatchHostAction` body report a real failure. Returning
+/// `["ok": false, ...]` inside a `.ok` envelope makes `sendV2` treat it as
+/// success, so the CLI prints its fallback line and exits 0 — automation
+/// cannot tell a missing workspace from a completed one.
+private struct PeerCommandFailure: Error {
+    let code: String
+    let message: String
+}
+
 extension TerminalController {
 
     /// Resolve a `--host` argument against the store. Accepts the stable key
@@ -167,7 +176,7 @@ extension TerminalController {
     /// polled via `peer.pane.status`.
     func v2PeerSurfaceOpenPane(params: [String: Any]) -> V2CallResult {
         peerDispatchHostAction(params: params, action: "open_pane") { _, host in
-            PeerClientCoordinator.shared.openRemotePaneHeadless(spec: host.paneHostSpec)
+            PeerClientCoordinator.shared.openRemotePaneHeadless(spec: host.paneHostSpec, focus: false)
             return ["ok": true, "started": true]
         }
     }
@@ -184,7 +193,9 @@ extension TerminalController {
         let live = (params["live"] as? Bool) ?? true
         return peerDispatchHostAction(params: params, action: "open_mirror") { store, host in
             guard !host.workspaces.isEmpty else {
-                return ["ok": false, "error": "host has no workspaces"]
+                throw PeerCommandFailure(
+                    code: "not_found", message: "\(host.displayName) has no workspaces"
+                )
             }
             let chosen: WorkspaceSummary?
             if let wanted {
@@ -195,9 +206,11 @@ extension TerminalController {
                 chosen = host.workspaces.first
             }
             guard let workspace = chosen else {
-                return ["ok": false, "error": "no such workspace: \(wanted ?? "")"]
+                throw PeerCommandFailure(
+                    code: "not_found", message: "no such workspace: \(wanted ?? "")"
+                )
             }
-            store.openWorkspaceAsMirror(workspace, host: host, live: live)
+            store.openWorkspaceAsMirror(workspace, host: host, live: live, select: false)
             return ["ok": true, "started": true, "workspace": workspace.title, "live": live]
         }
     }
@@ -238,13 +251,14 @@ extension TerminalController {
     private func peerDispatchHostAction(
         params: [String: Any],
         action: String,
-        _ body: @escaping @MainActor (RemoteHostStore, HostEntry) -> [String: Any]
+        _ body: @escaping @MainActor (RemoteHostStore, HostEntry) throws -> [String: Any]
     ) -> V2CallResult {
         guard let handle = v2String(params, "host") else {
             return .err(code: "invalid_params", message: "host is required", data: nil)
         }
         var result: [String: Any] = [:]
         var failure: String?
+        var failureCode = "not_found"
         // Generous but bounded: these mutate UI state on main, and a wedged
         // main thread must surface as a timeout rather than hang the client.
         let ok = v2MainExec(timeout: 10) {
@@ -254,7 +268,15 @@ extension TerminalController {
                 case .failure(let message):
                     failure = message
                 case .success(let host):
-                    result = body(store, host)
+                    do {
+                        result = try body(store, host)
+                    } catch let error as PeerCommandFailure {
+                        failureCode = error.code
+                        failure = error.message
+                    } catch {
+                        failureCode = "internal_error"
+                        failure = String(describing: error)
+                    }
                 }
             }
         }
@@ -264,7 +286,7 @@ extension TerminalController {
             )
         }
         if let failure {
-            return .err(code: "not_found", message: failure, data: nil)
+            return .err(code: failureCode, message: failure, data: nil)
         }
         return .ok(result)
     }
