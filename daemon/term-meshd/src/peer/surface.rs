@@ -319,13 +319,38 @@ struct ScreenModel {
     fed_through: u64,
 }
 
+/// Rows of host-side scrollback kept per surface for the on-demand
+/// scrollback path (tmux copy-mode model). Matches tmux's own
+/// `history-limit` default. At 80 cols a row costs ~2.9 KB once actually
+/// scrolled into — ~5.8 MB per busy surface — but allocation is lazy
+/// (vt100 grows the deque as lines scroll out), so idle surfaces pay
+/// nothing.
+const SCROLLBACK_ROWS_DEFAULT: usize = 2000;
+/// Hard ceiling for the env override — scrollback is per-surface memory.
+const SCROLLBACK_ROWS_MAX: usize = 10_000;
+
+/// `TERMMESH_PEER_SCROLLBACK_ROWS`: rows of scrollback per surface. `0`
+/// disables host-side scrollback (requests render nothing). Read at
+/// surface spawn — vt100 fixes the scrollback length at parser
+/// construction, so unlike the replay-ring capacity this cannot change on
+/// a live surface.
+fn scrollback_rows_from_env() -> usize {
+    match std::env::var("TERMMESH_PEER_SCROLLBACK_ROWS") {
+        Ok(raw) => match raw.trim().parse::<usize>() {
+            Ok(n) => n.min(SCROLLBACK_ROWS_MAX),
+            Err(_) => SCROLLBACK_ROWS_DEFAULT,
+        },
+        Err(_) => SCROLLBACK_ROWS_DEFAULT,
+    }
+}
+
 impl ScreenModel {
     fn new(cols: u16, rows: u16) -> Self {
         ScreenModel {
             // vt100's constructor takes (rows, cols, scrollback) — the
             // reverse of this repo's (cols, rows) convention everywhere
             // else. Do not "fix" the argument order.
-            parser: vt100::Parser::new(rows, cols, 0),
+            parser: vt100::Parser::new(rows, cols, scrollback_rows_from_env()),
             fed_through: 0,
         }
     }
@@ -831,6 +856,42 @@ impl PtySurface {
         }
         out.extend_from_slice(&vt.state_formatted());
         Some((out, screen.fed_through))
+    }
+
+    /// Render the scrollback window whose bottom sits `offset_rows` above
+    /// the live view's bottom, as a full-screen replacement (clear+home
+    /// first) — what a `ScrollbackRequest` gets back.
+    ///
+    /// Returns `(ansi, effective_offset, at_top, total_rows)`. The offset is
+    /// clamped to what the scrollback actually holds; `at_top` reports that
+    /// the render hit (or was clamped to) the oldest retained row. On the
+    /// alternate screen the browse is meaningless (vt100's offset is a
+    /// no-op against the alt grid, which never accumulates scrollback — the
+    /// same rule tmux applies), so the render comes back empty with
+    /// `at_top` set.
+    ///
+    /// The offset dance is atomic under the screen lock, and MUST be:
+    /// vt100 auto-follows a nonzero offset when live output scrolls
+    /// (`scrollback_offset + 1` per scrolled line), so an offset left
+    /// dangling would silently pin every later snapshot to the past. The
+    /// restore is to absolute 0, which is immune to that drift. `None` on a
+    /// poisoned lock, like [`PtySurface::screen_snapshot`].
+    pub fn scrollback_render(&self, offset_rows: u32) -> Option<(Vec<u8>, u32, bool, u32)> {
+        let mut screen = self.screen.lock().ok()?;
+        if screen.parser.screen().alternate_screen() {
+            return Some((Vec::new(), 0, true, 0));
+        }
+        // Total retained rows: set_scrollback clamps to the deque's actual
+        // length, and `Screen::scrollback()` reads the clamped offset back —
+        // the only way the total is observable through vt100's public API.
+        screen.parser.set_scrollback(usize::MAX);
+        let total = screen.parser.screen().scrollback();
+        screen.parser.set_scrollback(offset_rows as usize);
+        let effective = screen.parser.screen().scrollback();
+        let ansi = screen.parser.screen().contents_formatted();
+        screen.parser.set_scrollback(0);
+        let at_top = effective >= total || (effective as u64) < offset_rows as u64;
+        Some((ansi, effective as u32, at_top, total as u32))
     }
 
     /// Current value of the surface's monotonic PTY byte-seq counter — the
@@ -3583,6 +3644,103 @@ mod tests {
         assert_eq!(model.fed_through, fed);
         let rendered = model.parser.screen().state_formatted();
         assert!(!rendered.is_empty());
+    }
+
+    /// Scrollback window rendering: content that scrolled off the live
+    /// screen must come back at an offset, clamped at the oldest retained
+    /// row, and the browse must leave the live screen untouched.
+    #[tokio::test]
+    async fn scrollback_render_returns_scrolled_out_content_and_clamps() {
+        let surface = PtySurface::spawn(
+            surface_id_from_name("sb-render"),
+            "sb-render".into(),
+            "/bin/sh",
+            &["-c", "for i in $(seq 1 40); do echo LINE-$i; done; sleep 5"],
+            80,
+            24,
+            None,
+        )
+        .expect("spawn sb-render surface");
+
+        // Wait until the tail line has been fed through the screen model.
+        let mut ready = false;
+        for _ in 0..150 {
+            if let Some((snap, _)) = surface.screen_snapshot() {
+                if snap.windows(7).any(|w| w == b"LINE-40") {
+                    ready = true;
+                    break;
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(ready, "seq output never reached the screen model");
+
+        // 40 lines + prompt on a 24-row screen => 17+ rows of scrollback.
+        // A window 10 rows up must show lines the live screen no longer
+        // holds, as a full replacement render (clear+home preamble).
+        let (ansi, effective, _at_top, total) =
+            surface.scrollback_render(10).expect("render");
+        assert_eq!(effective, 10);
+        assert!(total >= 10, "expected >=10 rows of scrollback, got {total}");
+        assert!(ansi.windows(6).any(|w| w == b"\x1b[H\x1b[J".as_slice())
+            || ansi.windows(6).any(|w| w == b"\x1b[J\x1b[H".as_slice())
+            || ansi.starts_with(b"\x1b[m"),
+            "scrollback window must be a full replacement render");
+        // The window shows OLDER lines than the live bottom.
+        assert!(
+            ansi.windows(7).any(|w| w == b"LINE-30".as_slice())
+                || ansi.windows(7).any(|w| w == b"LINE-25".as_slice()),
+            "scrollback window must contain scrolled-out lines"
+        );
+
+        // Clamp: asking far past the retained history reports at_top and an
+        // effective offset no larger than the total.
+        let (_, effective, at_top, total2) =
+            surface.scrollback_render(1_000_000).expect("render");
+        assert!(at_top);
+        assert!(effective <= total2);
+
+        // Atomicity/restore: the browse must not disturb the live screen.
+        let (snap_after, _) = surface.screen_snapshot().expect("snapshot");
+        assert!(
+            snap_after.windows(7).any(|w| w == b"LINE-40"),
+            "live screen must be untouched after a scrollback browse"
+        );
+        surface.hangup();
+    }
+
+    /// Alt-screen: scrollback browsing is meaningless there (the alt grid
+    /// never accumulates scrollback — same rule as tmux), so the render is
+    /// empty and terminal.
+    #[tokio::test]
+    async fn scrollback_render_on_alt_screen_is_empty_and_terminal() {
+        let surface = PtySurface::spawn(
+            surface_id_from_name("sb-alt"),
+            "sb-alt".into(),
+            "/bin/sh",
+            &["-c", "printf '\\033[?1049halt'; sleep 5"],
+            80,
+            24,
+            None,
+        )
+        .expect("spawn sb-alt surface");
+        let mut on_alt = false;
+        for _ in 0..100 {
+            if let Some((snap, _)) = surface.screen_snapshot() {
+                if snap.starts_with(b"\x1b[?1049h") {
+                    on_alt = true;
+                    break;
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(on_alt);
+        let (ansi, effective, at_top, _total) =
+            surface.scrollback_render(5).expect("render");
+        assert!(ansi.is_empty());
+        assert_eq!(effective, 0);
+        assert!(at_top);
+        surface.hangup();
     }
 
     /// Adversarial: a poisoned screen lock must degrade to None (callers

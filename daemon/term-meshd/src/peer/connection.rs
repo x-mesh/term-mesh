@@ -18,7 +18,7 @@ use peer_proto::v1::{
     workspace_update, AttachMode, AttachResult, AuthChallenge, AuthResult, CreateWorkspaceResponse,
     EnsureSurfaceError as WireEnsureError, EnsureSurfaceErrorCode, EnsureSurfaceRequest,
     EnsureSurfaceResponse, EnsureSurfaceRestartPolicy, EnsureSurfaceResult, Envelope, Error,
-    GridSnapshot, Hello,
+    GridSnapshot, Hello, ScrollbackChunk,
     HostStats, Pong, PtyData, SurfaceList, TerminateSurfaceError as WireTerminateError,
     TerminateSurfaceErrorCode, TerminateSurfaceRequest, TerminateSurfaceResponse,
     TerminateSurfaceResult, Workspace, WorkspaceList, WorkspaceMeta, WorkspaceUpdate,
@@ -605,6 +605,38 @@ async fn reader_loop(
                     snapshot_floor,
                 );
                 attached.insert(req.surface_id, entry);
+            }
+
+            (HandshakeState::Ready, Payload::ScrollbackRequest(req)) => {
+                // Part of the grid model (capability "grid.snapshot.v1"):
+                // only a client that renders the typed snapshot has the
+                // empty local scrollback these windows fill. A request from
+                // anyone else — or for a surface this connection has not
+                // attached — is dropped, matching the Ready-state
+                // unhandled-payload convention rather than erroring.
+                if !peer_capabilities.has(capability::GRID_SNAPSHOT_V1) {
+                    continue;
+                }
+                let Some(entry) = attached.get(&req.surface_id) else {
+                    continue;
+                };
+                let Some((ansi, effective, at_top, total)) =
+                    entry.surface.scrollback_render(req.offset_rows)
+                else {
+                    continue;
+                };
+                let reply = Envelope {
+                    seq: next_seq(&seq_counter),
+                    correlation_id: env.seq,
+                    payload: Some(Payload::ScrollbackChunk(ScrollbackChunk {
+                        surface_id: req.surface_id.clone(),
+                        offset_rows: effective,
+                        ansi,
+                        at_top,
+                        total_scrollback_rows: total,
+                    })),
+                };
+                send(&outgoing_tx, reply).await?;
             }
 
             (HandshakeState::Ready, Payload::DetachSurface(det)) => {
