@@ -598,18 +598,39 @@ message Resize {
   uint32 pixel_height = 5;
 }
 
-// Periodic visible-screen keyframe. Scrollback is NOT included here;
-// clients reconnecting within the host ring buffer get bytes replayed,
-// clients outside accept scrollback loss.
+// Visible-screen keyframe for a fresh attach (capability
+// "grid.snapshot.v1"). Scrollback is NOT included here; clients
+// reconnecting within the host ring buffer get bytes replayed via
+// `resume_from_seq`, clients outside accept scrollback loss.
+//
+// The screen travels as an ANSI re-render (`ansi`), not as cells. The
+// protocol doc's open question ("cells vs ANSI re-render — decide when
+// prototyping") was settled for ANSI at implementation time: both
+// encodings would be produced by the same host-side emulator, so cells
+// add no robustness — but they DO add drift surface (an attrs bitfield
+// whose layout was never specified, host-resolved palette RGB where the
+// viewer's theme should decide) and cost 10-20x the bytes of the
+// equivalent escape stream. The cell fields were designed and codegen'd
+// but never emitted by any released host, so their numbers are reserved
+// rather than carried forward; a cell encoding, if ever wanted, claims a
+// "grid-snapshot-v2" capability per the evolution rules.
 message GridSnapshot {
   bytes surface_id = 1;
-  // byte_seq this snapshot is consistent with.
+  // Host-absolute byte_seq this snapshot is consistent with. The client
+  // must reset its wire-gap baseline to this value: snapshot bytes are
+  // synthetic and sit outside the PtyData byte_seq space.
   uint64 byte_seq = 2;
   uint32 cols = 3;
   uint32 rows = 4;
   bool alt_screen = 5;
   CursorState cursor = 6;
-  repeated GridRow rows_data = 7;
+  // Former `repeated GridRow rows_data`.
+  reserved 7;
+  reserved "rows_data";
+  // The rendered screen: feed to a terminal as-is. Self-contained — leads
+  // with clear+home, ends with cursor position, includes input-mode state,
+  // and is prefixed with the alt-screen switch when `alt_screen` is true.
+  bytes ansi = 8;
 }
 
 message CursorState {
@@ -618,20 +639,6 @@ message CursorState {
   bool visible = 3;
   // libghostty cursor style enum; mirrors GhosttyKit's value.
   uint32 style = 4;
-}
-
-message GridRow {
-  repeated Cell cells = 1;
-}
-
-message Cell {
-  // Usually a single grapheme; wide chars occupy one Cell plus a continuation.
-  string text = 1;
-  uint32 fg_rgba = 2;
-  uint32 bg_rgba = 3;
-  // Bitfield: bold, italic, underline, strike, inverse, dim.
-  uint32 attrs = 4;
-  bool is_continuation = 5;
 }
 
 // Advisory: clients may send periodically for RTT measurement and so the

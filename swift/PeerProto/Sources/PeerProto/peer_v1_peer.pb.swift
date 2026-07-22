@@ -1630,9 +1630,22 @@ public nonisolated struct Termmesh_Peer_V1_Resize: Sendable {
   public init() {}
 }
 
-/// Periodic visible-screen keyframe. Scrollback is NOT included here;
-/// clients reconnecting within the host ring buffer get bytes replayed,
-/// clients outside accept scrollback loss.
+/// Visible-screen keyframe for a fresh attach (capability
+/// "grid.snapshot.v1"). Scrollback is NOT included here; clients
+/// reconnecting within the host ring buffer get bytes replayed via
+/// `resume_from_seq`, clients outside accept scrollback loss.
+///
+/// The screen travels as an ANSI re-render (`ansi`), not as cells. The
+/// protocol doc's open question ("cells vs ANSI re-render — decide when
+/// prototyping") was settled for ANSI at implementation time: both
+/// encodings would be produced by the same host-side emulator, so cells
+/// add no robustness — but they DO add drift surface (an attrs bitfield
+/// whose layout was never specified, host-resolved palette RGB where the
+/// viewer's theme should decide) and cost 10-20x the bytes of the
+/// equivalent escape stream. The cell fields were designed and codegen'd
+/// but never emitted by any released host, so their numbers are reserved
+/// rather than carried forward; a cell encoding, if ever wanted, claims a
+/// "grid-snapshot-v2" capability per the evolution rules.
 public nonisolated struct Termmesh_Peer_V1_GridSnapshot: Sendable {
   // SwiftProtobuf.Message conformance is added in an extension below. See the
   // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
@@ -1640,7 +1653,9 @@ public nonisolated struct Termmesh_Peer_V1_GridSnapshot: Sendable {
 
   public var surfaceID: Data = Data()
 
-  /// byte_seq this snapshot is consistent with.
+  /// Host-absolute byte_seq this snapshot is consistent with. The client
+  /// must reset its wire-gap baseline to this value: snapshot bytes are
+  /// synthetic and sit outside the PtyData byte_seq space.
   public var byteSeq: UInt64 = 0
 
   public var cols: UInt32 = 0
@@ -1658,7 +1673,10 @@ public nonisolated struct Termmesh_Peer_V1_GridSnapshot: Sendable {
   /// Clears the value of `cursor`. Subsequent reads from it will return its default value.
   public mutating func clearCursor() {self._cursor = nil}
 
-  public var rowsData: [Termmesh_Peer_V1_GridRow] = []
+  /// The rendered screen: feed to a terminal as-is. Self-contained — leads
+  /// with clear+home, ends with cursor position, includes input-mode state,
+  /// and is prefixed with the alt-screen switch when `alt_screen` is true.
+  public var ansi: Data = Data()
 
   public var unknownFields = SwiftProtobuf.UnknownStorage()
 
@@ -1680,40 +1698,6 @@ public nonisolated struct Termmesh_Peer_V1_CursorState: Sendable {
 
   /// libghostty cursor style enum; mirrors GhosttyKit's value.
   public var style: UInt32 = 0
-
-  public var unknownFields = SwiftProtobuf.UnknownStorage()
-
-  public init() {}
-}
-
-public nonisolated struct Termmesh_Peer_V1_GridRow: Sendable {
-  // SwiftProtobuf.Message conformance is added in an extension below. See the
-  // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
-  // methods supported on all messages.
-
-  public var cells: [Termmesh_Peer_V1_Cell] = []
-
-  public var unknownFields = SwiftProtobuf.UnknownStorage()
-
-  public init() {}
-}
-
-public nonisolated struct Termmesh_Peer_V1_Cell: Sendable {
-  // SwiftProtobuf.Message conformance is added in an extension below. See the
-  // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
-  // methods supported on all messages.
-
-  /// Usually a single grapheme; wide chars occupy one Cell plus a continuation.
-  public var text: String = String()
-
-  public var fgRgba: UInt32 = 0
-
-  public var bgRgba: UInt32 = 0
-
-  /// Bitfield: bold, italic, underline, strike, inverse, dim.
-  public var attrs: UInt32 = 0
-
-  public var isContinuation: Bool = false
 
   public var unknownFields = SwiftProtobuf.UnknownStorage()
 
@@ -4523,7 +4507,7 @@ nonisolated extension Termmesh_Peer_V1_Resize: SwiftProtobuf.Message, SwiftProto
 
 nonisolated extension Termmesh_Peer_V1_GridSnapshot: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
   public static let protoMessageName: String = _protobuf_package + ".GridSnapshot"
-  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{3}surface_id\0\u{3}byte_seq\0\u{1}cols\0\u{1}rows\0\u{3}alt_screen\0\u{1}cursor\0\u{3}rows_data\0")
+  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{3}surface_id\0\u{3}byte_seq\0\u{1}cols\0\u{1}rows\0\u{3}alt_screen\0\u{1}cursor\0\u{2}\u{2}ansi\0\u{b}rows_data\0\u{c}\u{7}\u{1}")
 
   public mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
     while let fieldNumber = try decoder.nextFieldNumber() {
@@ -4537,7 +4521,7 @@ nonisolated extension Termmesh_Peer_V1_GridSnapshot: SwiftProtobuf.Message, Swif
       case 4: try { try decoder.decodeSingularUInt32Field(value: &self.rows) }()
       case 5: try { try decoder.decodeSingularBoolField(value: &self.altScreen) }()
       case 6: try { try decoder.decodeSingularMessageField(value: &self._cursor) }()
-      case 7: try { try decoder.decodeRepeatedMessageField(value: &self.rowsData) }()
+      case 8: try { try decoder.decodeSingularBytesField(value: &self.ansi) }()
       default: break
       }
     }
@@ -4566,8 +4550,8 @@ nonisolated extension Termmesh_Peer_V1_GridSnapshot: SwiftProtobuf.Message, Swif
     try { if let v = self._cursor {
       try visitor.visitSingularMessageField(value: v, fieldNumber: 6)
     } }()
-    if !self.rowsData.isEmpty {
-      try visitor.visitRepeatedMessageField(value: self.rowsData, fieldNumber: 7)
+    if !self.ansi.isEmpty {
+      try visitor.visitSingularBytesField(value: self.ansi, fieldNumber: 8)
     }
     try unknownFields.traverse(visitor: &visitor)
   }
@@ -4579,7 +4563,7 @@ nonisolated extension Termmesh_Peer_V1_GridSnapshot: SwiftProtobuf.Message, Swif
     if lhs.rows != rhs.rows {return false}
     if lhs.altScreen != rhs.altScreen {return false}
     if lhs._cursor != rhs._cursor {return false}
-    if lhs.rowsData != rhs.rowsData {return false}
+    if lhs.ansi != rhs.ansi {return false}
     if lhs.unknownFields != rhs.unknownFields {return false}
     return true
   }
@@ -4625,86 +4609,6 @@ nonisolated extension Termmesh_Peer_V1_CursorState: SwiftProtobuf.Message, Swift
     if lhs.row != rhs.row {return false}
     if lhs.visible != rhs.visible {return false}
     if lhs.style != rhs.style {return false}
-    if lhs.unknownFields != rhs.unknownFields {return false}
-    return true
-  }
-}
-
-nonisolated extension Termmesh_Peer_V1_GridRow: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
-  public static let protoMessageName: String = _protobuf_package + ".GridRow"
-  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{1}cells\0")
-
-  public mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
-    while let fieldNumber = try decoder.nextFieldNumber() {
-      // The use of inline closures is to circumvent an issue where the compiler
-      // allocates stack space for every case branch when no optimizations are
-      // enabled. https://github.com/apple/swift-protobuf/issues/1034
-      switch fieldNumber {
-      case 1: try { try decoder.decodeRepeatedMessageField(value: &self.cells) }()
-      default: break
-      }
-    }
-  }
-
-  public func traverse<V: SwiftProtobuf.Visitor>(visitor: inout V) throws {
-    if !self.cells.isEmpty {
-      try visitor.visitRepeatedMessageField(value: self.cells, fieldNumber: 1)
-    }
-    try unknownFields.traverse(visitor: &visitor)
-  }
-
-  public static func ==(lhs: Termmesh_Peer_V1_GridRow, rhs: Termmesh_Peer_V1_GridRow) -> Bool {
-    if lhs.cells != rhs.cells {return false}
-    if lhs.unknownFields != rhs.unknownFields {return false}
-    return true
-  }
-}
-
-nonisolated extension Termmesh_Peer_V1_Cell: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
-  public static let protoMessageName: String = _protobuf_package + ".Cell"
-  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{1}text\0\u{3}fg_rgba\0\u{3}bg_rgba\0\u{1}attrs\0\u{3}is_continuation\0")
-
-  public mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
-    while let fieldNumber = try decoder.nextFieldNumber() {
-      // The use of inline closures is to circumvent an issue where the compiler
-      // allocates stack space for every case branch when no optimizations are
-      // enabled. https://github.com/apple/swift-protobuf/issues/1034
-      switch fieldNumber {
-      case 1: try { try decoder.decodeSingularStringField(value: &self.text) }()
-      case 2: try { try decoder.decodeSingularUInt32Field(value: &self.fgRgba) }()
-      case 3: try { try decoder.decodeSingularUInt32Field(value: &self.bgRgba) }()
-      case 4: try { try decoder.decodeSingularUInt32Field(value: &self.attrs) }()
-      case 5: try { try decoder.decodeSingularBoolField(value: &self.isContinuation) }()
-      default: break
-      }
-    }
-  }
-
-  public func traverse<V: SwiftProtobuf.Visitor>(visitor: inout V) throws {
-    if !self.text.isEmpty {
-      try visitor.visitSingularStringField(value: self.text, fieldNumber: 1)
-    }
-    if self.fgRgba != 0 {
-      try visitor.visitSingularUInt32Field(value: self.fgRgba, fieldNumber: 2)
-    }
-    if self.bgRgba != 0 {
-      try visitor.visitSingularUInt32Field(value: self.bgRgba, fieldNumber: 3)
-    }
-    if self.attrs != 0 {
-      try visitor.visitSingularUInt32Field(value: self.attrs, fieldNumber: 4)
-    }
-    if self.isContinuation != false {
-      try visitor.visitSingularBoolField(value: self.isContinuation, fieldNumber: 5)
-    }
-    try unknownFields.traverse(visitor: &visitor)
-  }
-
-  public static func ==(lhs: Termmesh_Peer_V1_Cell, rhs: Termmesh_Peer_V1_Cell) -> Bool {
-    if lhs.text != rhs.text {return false}
-    if lhs.fgRgba != rhs.fgRgba {return false}
-    if lhs.bgRgba != rhs.bgRgba {return false}
-    if lhs.attrs != rhs.attrs {return false}
-    if lhs.isContinuation != rhs.isContinuation {return false}
     if lhs.unknownFields != rhs.unknownFields {return false}
     return true
   }

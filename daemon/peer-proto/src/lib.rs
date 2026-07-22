@@ -55,6 +55,16 @@ pub mod capability {
     /// client is what decides whether it wants the traffic — a host sends
     /// these only to connections that asked.
     pub const HOST_STATS_V1: &str = "host.stats.v1";
+    /// The peer understands the typed `GridSnapshot` message (`ansi` form)
+    /// on a fresh attach. Advertised by the CLIENT — like `host.stats.v1`,
+    /// the client is what decides whether it can consume the typed form. A
+    /// host that sees it sends the fresh-attach screen as a `GridSnapshot`
+    /// envelope; otherwise the same bytes ride an ordinary `PtyData`, so
+    /// every older client keeps working unchanged. The typed form is what
+    /// lets a client clear stale local scrollback (`ESC[3J`) and reset its
+    /// wire-gap baseline to `GridSnapshot.byte_seq` — neither is safe to
+    /// infer from an untyped byte stream.
+    pub const GRID_SNAPSHOT_V1: &str = "grid.snapshot.v1";
 
     /// Every capability this build supports. Single source of truth for
     /// populating outgoing `Hello.capabilities` — callers should use
@@ -67,6 +77,7 @@ pub mod capability {
         SURFACE_ENSURE_V1,
         SURFACE_TERMINATE_V1,
         HOST_STATS_V1,
+        GRID_SNAPSHOT_V1,
     ];
 
     /// `Hello.capabilities` value for an outgoing handshake message.
