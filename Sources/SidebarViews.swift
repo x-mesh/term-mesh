@@ -29,10 +29,19 @@ struct VerticalTabsSidebar: View {
     @State private var dropIndicator: SidebarDropIndicator?
     @AppStorage(SidebarLayoutSettings.localTabsCollapsedKey)
     private var localTabsCollapsed = false
+    @AppStorage(SidebarPresentationSettings.separatedSectionsEnabledKey)
+    private var sidebarSeparatedSectionsEnabled = SidebarPresentationSettings.defaultSeparatedSectionsEnabled
 
     /// Space at top of sidebar for traffic light buttons
     private let trafficLightPadding: CGFloat = 28
     private let tabRowSpacing: CGFloat = 2
+
+    private var visibleLocalWorkspaceIds: [UUID] {
+        SidebarPresentationSettings.visibleLocalWorkspaceIDs(
+            from: tabManager.tabs.map { (id: $0.id, isPeerMirror: $0.isPeerMirror) },
+            separatedSectionsEnabled: sidebarSeparatedSectionsEnabled
+        )
+    }
 
     var body: some View {
         VStack(spacing: 0) {
@@ -43,31 +52,43 @@ struct VerticalTabsSidebar: View {
                         Spacer()
                             .frame(height: trafficLightPadding)
 
-                        SidebarSectionHeader(title: "Workspaces", isCollapsed: $localTabsCollapsed)
-                            .padding(.top, 4)
+                        SidebarSectionHeader(
+                            title: sidebarSeparatedSectionsEnabled ? "Local Workspaces" : "Workspaces",
+                            isCollapsed: $localTabsCollapsed
+                        )
+                        .padding(.top, sidebarSeparatedSectionsEnabled ? 6 : 4)
 
                         if !localTabsCollapsed {
                             LazyVStack(spacing: tabRowSpacing) {
                                 ForEach(Array(tabManager.tabs.enumerated()), id: \.element.id) { index, tab in
-                                    TabItemView(
-                                        tab: tab,
-                                        index: index,
-                                        rowSpacing: tabRowSpacing,
-                                        selection: $selection,
-                                        selectedTabIds: $selectedTabIds,
-                                        lastSidebarSelectionIndex: $lastSidebarSelectionIndex,
-                                        showsCommandShortcutHints: commandKeyMonitor.isCommandPressed,
-                                        dragAutoScrollController: dragAutoScrollController,
-                                        draggedTabId: $draggedTabId,
-                                        dropIndicator: $dropIndicator
-                                    )
+                                    if SidebarPresentationSettings.includesInLocalWorkspaces(
+                                        isPeerMirror: tab.isPeerMirror,
+                                        separatedSectionsEnabled: sidebarSeparatedSectionsEnabled
+                                    ) {
+                                        TabItemView(
+                                            tab: tab,
+                                            index: index,
+                                            visibleTabIds: visibleLocalWorkspaceIds,
+                                            rowSpacing: tabRowSpacing,
+                                            selection: $selection,
+                                            selectedTabIds: $selectedTabIds,
+                                            lastSidebarSelectionIndex: $lastSidebarSelectionIndex,
+                                            showsCommandShortcutHints: commandKeyMonitor.isCommandPressed,
+                                            dragAutoScrollController: dragAutoScrollController,
+                                            draggedTabId: $draggedTabId,
+                                            dropIndicator: $dropIndicator
+                                        )
+                                    }
                                 }
                             }
                             .padding(.bottom, 8)
                             .padding(.top, 2)
                         }
 
-                        SidebarRemoteHostsSection(store: remoteHostStore)
+                        SidebarRemoteHostsSection(
+                            store: remoteHostStore,
+                            usesSeparatedPresentation: sidebarSeparatedSectionsEnabled
+                        )
 
                         if let selectedWorkspace = tabManager.tabs.first(where: { $0.id == tabManager.selectedTabId }) {
                             WorkspaceRetrievalSidebarSection(workspace: selectedWorkspace)
@@ -795,6 +816,7 @@ struct SidebarSectionHeader: View {
 
 struct SidebarRemoteHostsSection: View {
     @ObservedObject var store: RemoteHostStore
+    let usesSeparatedPresentation: Bool
     @AppStorage(SidebarLayoutSettings.remoteHostsCollapsedKey)
     private var isCollapsed = false
     /// Non-nil presents the add/edit sheet.
@@ -804,8 +826,8 @@ struct SidebarRemoteHostsSection: View {
         VStack(spacing: 0) {
             Divider()
                 .padding(.horizontal, 10)
-                .padding(.top, 4)
-                .padding(.bottom, 2)
+                .padding(.top, usesSeparatedPresentation ? 10 : 4)
+                .padding(.bottom, usesSeparatedPresentation ? 5 : 2)
 
             // "Peer Hosts", not "Remote Hosts" — plain "hosts" read as
             // direct-SSH terminal access; these entries are term-mesh
@@ -840,7 +862,11 @@ struct SidebarRemoteHostsSection: View {
                         .padding(.vertical, 4)
                 } else {
                     ForEach(store.sortedHosts) { host in
-                        RemoteHostGroupView(host: host, store: store) { context in
+                        RemoteHostGroupView(
+                            host: host,
+                            store: store,
+                            usesSeparatedPresentation: usesSeparatedPresentation
+                        ) { context in
                             editorContext = context
                         }
                     }
@@ -875,6 +901,7 @@ struct SidebarRemoteHostsSection: View {
 struct RemoteHostGroupView: View {
     let host: HostEntry
     let store: RemoteHostStore
+    let usesSeparatedPresentation: Bool
     /// Opens the shared add/edit sheet (owned by the section view).
     let onEdit: (PeerHostEditorContext) -> Void
     @State private var isExpanded: Bool
@@ -884,9 +911,11 @@ struct RemoteHostGroupView: View {
     @State private var showForceDisconnectConfirm = false
 
     init(host: HostEntry, store: RemoteHostStore,
+         usesSeparatedPresentation: Bool,
          onEdit: @escaping (PeerHostEditorContext) -> Void) {
         self.host = host
         self.store = store
+        self.usesSeparatedPresentation = usesSeparatedPresentation
         self.onEdit = onEdit
         // Fold state persists per stable host key; default is expanded.
         _isExpanded = State(initialValue: !SidebarLayoutSettings.isHostCollapsed(host.id))
@@ -1031,12 +1060,22 @@ struct RemoteHostGroupView: View {
                             .padding(.bottom, 1)
                             .frame(maxWidth: .infinity, alignment: .leading)
                         ForEach(group.items) { workspace in
-                            RemoteWorkspaceRowView(workspace: workspace, host: host, store: store)
+                            RemoteWorkspaceRowView(
+                                workspace: workspace,
+                                host: host,
+                                store: store,
+                                usesSeparatedPresentation: usesSeparatedPresentation
+                            )
                         }
                     }
                 } else {
                     ForEach(host.workspaces) { workspace in
-                        RemoteWorkspaceRowView(workspace: workspace, host: host, store: store)
+                        RemoteWorkspaceRowView(
+                            workspace: workspace,
+                            host: host,
+                            store: store,
+                            usesSeparatedPresentation: usesSeparatedPresentation
+                        )
                     }
                 }
             }
@@ -1181,6 +1220,7 @@ struct RemoteHostGroupView: View {
 }
 
 struct RemoteWorkspaceRowView: View {
+    @EnvironmentObject private var tabManager: TabManager
     let workspace: WorkspaceSummary
     /// The host group this row is rendered under. Passed explicitly so the
     /// mirror open uses THIS host's spec (SSH vs direct) — a workspace.id can
@@ -1188,6 +1228,7 @@ struct RemoteWorkspaceRowView: View {
     /// id-based reverse lookup could pick the wrong (non-SSH) host.
     let host: HostEntry
     let store: RemoteHostStore
+    let usesSeparatedPresentation: Bool
     @State private var isHovering = false
     @State private var isRenaming = false
     @State private var renameTitle = ""
@@ -1195,6 +1236,39 @@ struct RemoteWorkspaceRowView: View {
     @FocusState private var renameFieldFocused: Bool
 
     private var canManage: Bool { host.supportsWorkspaceLifecycle == true }
+
+    private var mirroredWorkspace: Workspace? {
+        PeerClientCoordinator.shared.mirroredWorkspace(
+            forHostKey: host.paneHostSpec.hostKey,
+            hostWorkspaceID: workspace.id,
+            in: tabManager
+        )
+    }
+
+    private var isMirrorOpen: Bool { mirroredWorkspace != nil }
+
+    private var isMirrorSelected: Bool {
+        mirroredWorkspace?.id == tabManager.selectedTabId
+    }
+
+    private var mirrorActionTitle: String {
+        isMirrorOpen ? "미러링 중" : "미러 열기"
+    }
+
+    private var mirrorAccessibilityValue: String {
+        guard isMirrorOpen else { return "열리지 않음" }
+        return isMirrorSelected ? "미러링 중, 선택됨" : "미러링 중"
+    }
+
+    private var mirrorAccessibilityHint: String {
+        if isMirrorSelected {
+            return "현재 mirror workspace가 열려 있습니다."
+        }
+        if isMirrorOpen {
+            return "이미 열린 mirror workspace를 선택합니다."
+        }
+        return "Peer workspace를 현재 window에서 live mirror로 엽니다."
+    }
 
     /// Row fill: an accent wash while renaming (so the mode reads at a
     /// glance), a faint hover highlight otherwise.
@@ -1227,45 +1301,60 @@ struct RemoteWorkspaceRowView: View {
         isRenaming = false
     }
 
-    var body: some View {
+    @ViewBuilder
+    private var workspaceIdentity: some View {
+        Image(systemName: "terminal")
+            .font(.system(size: 9))
+            .foregroundColor(.secondary)
+        if isRenaming {
+            // Finder-style inline edit: Enter commits, Esc cancels,
+            // focus loss commits (matching macOS rename behavior).
+            // Distinct field chrome (filled background + accent ring)
+            // so entering rename reads clearly in both light and dark
+            // — a bare inline field was too easy to miss.
+            TextField("", text: $renameTitle)
+                .textFieldStyle(.plain)
+                .font(.system(size: 11.5))
+                .foregroundColor(.primary)
+                .focused($renameFieldFocused)
+                .padding(.horizontal, 5)
+                .padding(.vertical, 2)
+                .background(
+                    RoundedRectangle(cornerRadius: 4)
+                        .fill(Color(nsColor: .textBackgroundColor))
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 4)
+                                .strokeBorder(Color.accentColor, lineWidth: 1.5)
+                        )
+                )
+                .onSubmit { commitRename() }
+                .onExitCommand { isRenaming = false }   // Esc = cancel
+                .onChange(of: renameFieldFocused) { focused in
+                    if !focused && isRenaming { commitRename() }
+                }
+                .onAppear { renameFieldFocused = true }
+        } else {
+            Text(workspace.title)
+                .font(.system(size: 11.5))
+                .foregroundColor(.primary)
+                .lineLimit(1)
+                .truncationMode(.tail)
+        }
+    }
+
+    @ViewBuilder
+    private var busyIndicator: some View {
+        if workspace.busyCount > 0 {
+            Circle()
+                .fill(Color.orange)
+                .frame(width: 5, height: 5)
+                .help("\(workspace.busyCount) pane\(workspace.busyCount == 1 ? "" : "s") running a command")
+        }
+    }
+
+    private var legacyRow: some View {
         HStack(spacing: 5) {
-            Image(systemName: "terminal")
-                .font(.system(size: 9))
-                .foregroundColor(.secondary)
-            if isRenaming {
-                // Finder-style inline edit: Enter commits, Esc cancels,
-                // focus loss commits (matching macOS rename behavior).
-                // Distinct field chrome (filled background + accent ring)
-                // so entering rename reads clearly in both light and dark
-                // — a bare inline field was too easy to miss.
-                TextField("", text: $renameTitle)
-                    .textFieldStyle(.plain)
-                    .font(.system(size: 11.5))
-                    .foregroundColor(.primary)
-                    .focused($renameFieldFocused)
-                    .padding(.horizontal, 5)
-                    .padding(.vertical, 2)
-                    .background(
-                        RoundedRectangle(cornerRadius: 4)
-                            .fill(Color(nsColor: .textBackgroundColor))
-                            .overlay(
-                                RoundedRectangle(cornerRadius: 4)
-                                    .strokeBorder(Color.accentColor, lineWidth: 1.5)
-                            )
-                    )
-                    .onSubmit { commitRename() }
-                    .onExitCommand { isRenaming = false }   // Esc = cancel
-                    .onChange(of: renameFieldFocused) { focused in
-                        if !focused && isRenaming { commitRename() }
-                    }
-                    .onAppear { renameFieldFocused = true }
-            } else {
-                Text(workspace.title)
-                    .font(.system(size: 11.5))
-                    .foregroundColor(.primary)
-                    .lineLimit(1)
-                    .truncationMode(.tail)
-            }
+            workspaceIdentity
             Spacer()
             // Pane/surface counts + a busy dot — the workspace's live
             // inventory at a glance (hidden mid-rename so the field is
@@ -1277,24 +1366,78 @@ struct RemoteWorkspaceRowView: View {
                     .font(.system(size: 9.5))
                     .monospacedDigit()
                     .foregroundColor(Color.secondary.opacity(0.7))
-                if workspace.busyCount > 0 {
-                    Circle()
-                        .fill(Color.orange)
-                        .frame(width: 5, height: 5)
-                        .help("\(workspace.busyCount) pane\(workspace.busyCount == 1 ? "" : "s") running a command")
-                }
+                busyIndicator
             }
         }
-        .padding(.leading, 20)
-        .padding(.trailing, 10)
-        .padding(.vertical, 5)
-        .background(
-            RoundedRectangle(cornerRadius: 5)
-                .fill(rowBackgroundFill)
-                .padding(.horizontal, 4)
-        )
-        .contentShape(Rectangle())
-        .onTapGesture { handleTap() }
+    }
+
+    private func rowChrome<Content: View>(_ content: Content) -> some View {
+        content
+            .padding(.leading, 20)
+            .padding(.trailing, 10)
+            .padding(.vertical, 5)
+            .background(
+                RoundedRectangle(cornerRadius: 5)
+                    .fill(rowBackgroundFill)
+                    .padding(.horizontal, 4)
+            )
+            .contentShape(Rectangle())
+    }
+
+    @ViewBuilder
+    private var separatedRow: some View {
+        if isRenaming {
+            rowChrome(HStack(spacing: 5) {
+                workspaceIdentity
+                Spacer()
+            })
+        } else {
+            Button(action: handleTap) {
+                rowChrome(HStack(spacing: 5) {
+                    Image(systemName: "terminal")
+                        .font(.system(size: 9))
+                        .foregroundColor(.secondary)
+                    Text(workspace.title)
+                        .font(.system(size: 11.5))
+                        .foregroundColor(.primary)
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+                    Spacer(minLength: 0)
+                    HStack(spacing: 3) {
+                        Image(systemName: isMirrorOpen
+                              ? "checkmark.circle"
+                              : "arrow.triangle.2.circlepath")
+                            .font(.system(size: 8.5, weight: .medium))
+                        Text(mirrorActionTitle)
+                            .font(.system(size: 9.5, weight: .medium))
+                    }
+                    .foregroundColor(
+                        isHovering
+                            ? .accentColor
+                            : (isMirrorOpen ? Color.primary.opacity(0.8) : .secondary)
+                    )
+                    busyIndicator
+                })
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("\(workspace.title), \(mirrorActionTitle)")
+            .accessibilityValue(mirrorAccessibilityValue)
+            .accessibilityHint(mirrorAccessibilityHint)
+            .help(isMirrorOpen
+                  ? "Select the open mirror for \(workspace.title)"
+                  : "Open \(workspace.title) as a live workspace mirror")
+        }
+    }
+
+    var body: some View {
+        Group {
+            if usesSeparatedPresentation {
+                separatedRow
+            } else {
+                rowChrome(legacyRow)
+                    .onTapGesture { handleTap() }
+            }
+        }
         .contextMenu {
             // Live mirror (Phase 2B): host-authoritative layout sync —
             // splits/closes follow the host and local actions forward.

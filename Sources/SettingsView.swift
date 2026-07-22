@@ -80,7 +80,7 @@ enum SettingsSection: String, CaseIterable, Identifiable {
 
     var searchKeywords: [String] {
         switch self {
-        case .app: return ["app", "theme", "appearance", "dark", "light", "workspace", "placement", "session", "restore", "dock", "badge", "quit", "warn", "rename", "sidebar", "branch", "reorder", "notification"]
+        case .app: return ["app", "theme", "appearance", "dark", "light", "workspace", "placement", "session", "restore", "dock", "badge", "quit", "warn", "rename", "sidebar", "branch", "reorder", "notification", "experimental", "mirror", "peer hosts"]
         case .terminal: return ["terminal", "font", "size", "theme", "monospace", "family"]
         case .workspaceColors: return ["workspace", "color", "indicator", "palette", "custom"]
         case .automation: return ["automation", "socket", "claude", "port", "integration", "password"]
@@ -138,6 +138,8 @@ struct SettingsView: View {
     @AppStorage(WorkspaceAutoReorderSettings.key) private var workspaceAutoReorder = WorkspaceAutoReorderSettings.defaultValue
     @AppStorage(SessionRestoreSettings.modeKey) private var sessionRestoreMode = SessionRestoreSettings.defaultMode.rawValue
     @AppStorage(SidebarBranchLayoutSettings.key) private var sidebarBranchVerticalLayout = SidebarBranchLayoutSettings.defaultVerticalLayout
+    @AppStorage(SidebarPresentationSettings.separatedSectionsEnabledKey)
+    private var sidebarSeparatedSectionsEnabled = SidebarPresentationSettings.defaultSeparatedSectionsEnabled
     @AppStorage(SidebarActiveTabIndicatorSettings.styleKey)
     private var sidebarActiveTabIndicatorStyle = SidebarActiveTabIndicatorSettings.defaultStyle.rawValue
     @AppStorage("teamDefaultLeaderMode") private var teamDefaultLeaderMode = "claude"
@@ -808,6 +810,20 @@ struct SettingsView: View {
                             }
                             .labelsHidden()
                             .pickerStyle(.menu)
+                        }
+                        }
+
+                        if settingsMatch("sidebar", "experimental", "local", "peer hosts", "mirror", "app") {
+                        SettingsCardDivider()
+
+                        SettingsCardRow(
+                            "New Sidebar (Experimental)",
+                            subtitle: "Separates local workspaces from Peer Hosts and presents peer workspaces as mirror actions."
+                        ) {
+                            Toggle("", isOn: $sidebarSeparatedSectionsEnabled)
+                                .labelsHidden()
+                                .controlSize(.small)
+                                .accessibilityLabel("Use new sidebar")
                         }
                         }
 
