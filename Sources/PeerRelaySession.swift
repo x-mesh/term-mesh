@@ -556,6 +556,59 @@ private final class WireSeqTracker: @unchecked Sendable {
 
 // ── PeerRelaySession ─────────────────────────────────────────────────
 
+/// Byte accounting for a single relay session, for post-hoc diagnosis of a
+/// pane that opened but never rendered.
+///
+/// Nothing in the host→pane chain counted bytes before this, which left the
+/// two halves of a blank pane indistinguishable: "the host sent nothing" and
+/// "we received bytes and lost them downstream" produced identical logs
+/// (namely, none). `peer.relay.gap` cannot cover the first case — it only
+/// arms once a first frame establishes `expectedByteSeq`, so a session that
+/// receives zero bytes never reports anything at all.
+///
+/// Lock-guarded and deliberately outside the MainActor annotation below: the
+/// counters are written from the pump loop, so an actor hop per chunk would
+/// be a real cost. Same shape as `WireSeqTracker` above.
+private final class RelayIOStats: @unchecked Sendable {
+    private let lock = NSLock()
+    private var received: UInt64 = 0
+    private var enqueued: UInt64 = 0
+    private var chunks: UInt64 = 0
+    private var sawFirst = false
+
+    /// Returns true only for the first chunk, so the caller logs `firstByte`
+    /// exactly once without keeping a second flag. No timestamp is kept here:
+    /// `dlog` already stamps every line, and holding a `Date` would drag this
+    /// type onto the main actor under the project's default isolation.
+    func noteReceived(_ count: Int) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        received += UInt64(count)
+        chunks += 1
+        guard !sawFirst else { return false }
+        sawFirst = true
+        return true
+    }
+
+    func noteEnqueued(_ count: Int) {
+        lock.lock()
+        enqueued += UInt64(count)
+        lock.unlock()
+    }
+
+    var sawFirstByte: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return sawFirst
+    }
+
+    func read() -> (received: UInt64, enqueued: UInt64, chunks: UInt64) {
+        lock.lock()
+        defer { lock.unlock() }
+        return (received, enqueued, chunks)
+    }
+}
+
 /// Manages the full relay lifetime for one remote-pane window.
 /// 1. Creates a listener socket that the relay binary will connect to.
 /// 2. Holds a PeerSession to the remote host.
@@ -563,6 +616,33 @@ private final class WireSeqTracker: @unchecked Sendable {
 @MainActor
 final class PeerRelaySession {
     private static let setupReadTimeoutSeconds: TimeInterval = 10
+    /// How long after `start()` a session may render nothing before it is
+    /// worth a log line. Long enough that a slow shell spawn is not noise,
+    /// short enough that the marker lands while the incident is live.
+    private static let firstByteWatchdogSeconds: TimeInterval = 3
+
+    /// Byte counters for this session. Private like `WireSeqTracker`: the
+    /// project's default isolation pins an internal type to MainActor, and
+    /// these are written from the pump loop. Exposed through `ioSnapshot`.
+    private let ioStats = RelayIOStats()
+
+    /// Counter snapshot for `debugPaneStatus()` — lets a live probe tell
+    /// "nothing ever arrived" from "arrived and was lost downstream".
+    var ioSnapshot: [String: Any] {
+        let c = ioStats.read()
+        return [
+            "bytes_received": c.received,
+            "bytes_enqueued": c.enqueued,
+            "chunks": c.chunks,
+            "saw_first_byte": ioStats.sawFirstByte,
+        ]
+    }
+
+    /// One-line counter summary for the disconnect / watchdog log lines.
+    var ioSummary: String {
+        let c = ioStats.read()
+        return "received=\(c.received) enqueued=\(c.enqueued) chunks=\(c.chunks)"
+    }
 
     // Path the relay binary should connect to.
     let relaySockPath: String
@@ -574,6 +654,26 @@ final class PeerRelaySession {
     // bundle paths contain spaces ("term-mesh DEV <tag>.app"), and
     // Ghostty treats `command` as a shell command rather than argv.
     var relayLaunchCommand: String { Self.shellQuote(relayBinaryPath) }
+
+    /// Environment for the relay helper. Single source for all three spawn
+    /// sites (pane, relay window, workspace-relay window), which previously
+    /// each inlined the same two keys — so a third key had to be remembered
+    /// in three places or it silently applied to only some panes.
+    var relayEnvironment: [String: String] {
+        var env = [
+            "TERMMESH_PEER_RELAY_SOCKET": relaySockPath,
+            "TERMMESH_PEER_RELAY_SECRET": relaySecret,
+        ]
+        #if DEBUG
+        // The helper logs cumulative output and its exit cause with errno,
+        // but `rlog` is inert unless this is set (or a marker file was created
+        // beforehand) — so that instrumentation was dark exactly when it was
+        // needed, after an incident nobody predicted. The helper spans the one
+        // process boundary the app cannot see across.
+        env["TERMMESH_PEER_RELAY_DEBUG"] = "1"
+        #endif
+        return env
+    }
 
     let hostSockPath: String
     let hostDisplayName: String
@@ -1133,6 +1233,28 @@ final class PeerRelaySession {
     func start() async throws {
         let relay = try await acceptRelay()
         self.relaySocket = relay
+        #if DEBUG
+        // A successful accept was previously invisible, which made "the helper
+        // never launched" and "the helper connected but nothing came through"
+        // look identical after the fact.
+        dlog("peer.relay.accept ok sock=\(relaySockPath)")
+        #endif
+        // Watchdog: a pane that attaches and receives nothing produces no log
+        // at all today — `peer.relay.gap` only arms after a first frame sets
+        // `expectedByteSeq`, so the zero-byte case is exactly the one that
+        // stays silent. One deferred line makes it visible.
+        Task { [weak self] in
+            try? await Task.sleep(
+                nanoseconds: UInt64(Self.firstByteWatchdogSeconds * 1_000_000_000)
+            )
+            guard let self, !self.ioStats.sawFirstByte else { return }
+            #if DEBUG
+            dlog("peer.relay.firstByte.timeout — no PtyData \(Int(Self.firstByteWatchdogSeconds))s after accept (\(self.ioSummary))")
+            #endif
+            RemoteWorkLog.infoOffMain(
+                "Remote pane has received no output \(Int(Self.firstByteWatchdogSeconds))s after connecting — it may render blank"
+            )
+        }
         // The listener has done its single job (one relay connection, no
         // reconnect). Release the fd + socket file now instead of holding them
         // until deinit. The accept poll has already resolved, so nothing else
@@ -1362,8 +1484,17 @@ final class PeerRelaySession {
                             await resizeCoalescer.noteGapForHeal()
                         }
                         expectedByteSeq = chunk.byteSeq + UInt64(chunk.payload.count)
+                        if self.ioStats.noteReceived(chunk.payload.count) {
+                            #if DEBUG
+                            // Splits the blank-pane failure space in half: with
+                            // this line the host did send and any loss is
+                            // downstream; without it nothing ever arrived.
+                            dlog("peer.relay.firstByte path=shared bytes=\(chunk.payload.count)")
+                            #endif
+                        }
                         do {
                             try await writer.enqueue(type: kTypePtyData, payload: chunk.payload)
+                            self.ioStats.noteEnqueued(chunk.payload.count)
                         } catch {
                             disconnect("hostToRelay-enqueue-failed")
                             return
@@ -1457,8 +1588,14 @@ final class PeerRelaySession {
                         // the next heal. Written every chunk (hot path), so a
                         // lock-protected box rather than a MainActor hop.
                         wireSeqTracker.update(expectedByteSeq!)
+                        if self.ioStats.noteReceived(data.count) {
+                            #if DEBUG
+                            dlog("peer.relay.firstByte path=owned bytes=\(data.count)")
+                            #endif
+                        }
                         do {
                             try await writer.enqueue(type: kTypePtyData, payload: data)
+                            self.ioStats.noteEnqueued(data.count)
                         } catch {
                             endReason = "hostToRelay-enqueue-failed"
                             break pumpLoop
@@ -1625,8 +1762,19 @@ final class PeerRelaySession {
         // replay ring to serve a resume from, so this client doesn't rely on
         // it silently ignoring the field — 0 asks for the same full-snapshot
         // attach a fresh connection would get anyway.
+        //
+        // `&+`, not `+`: the host derives `initialByteSeq` with a *wrapping*
+        // subtraction (`tapSeq &- initial.count`, see
+        // `GhosttyPaneSurfaceProvider.attach`), so on a fresh hub — where the
+        // replayed snapshot is longer than everything the tap has ever
+        // emitted — `attachInitialSeq` legitimately sits just below
+        // `UInt64.max`. Re-adding the wire offset is the modular inverse that
+        // lands back on the real host seq, so it must wrap too; a trapping `+`
+        // crashed the whole app here (arithmetic overflow) on the first gap
+        // heal of such an attach, and since the heal IS the recovery path, the
+        // pane could never come back.
         let lastWireSeq = wireSeqTracker.read()
-        let resumeFromSeq: UInt64 = hostSupportsReplayRing ? (attachInitialSeq + lastWireSeq) : 0
+        let resumeFromSeq: UInt64 = hostSupportsReplayRing ? (attachInitialSeq &+ lastWireSeq) : 0
 
         #if DEBUG
         dlog("peer.relay.gap.heal.resume reason=\(reason) resumeFromSeq=\(resumeFromSeq) gated=\(hostSupportsReplayRing) cols=\(size.cols) rows=\(size.rows)")
@@ -1695,7 +1843,10 @@ final class PeerRelaySession {
         // "heavy input → truncate → pane closes" investigation: e.g. a
         // `hostToRelay-receive-error` right after a `heartbeat.dead` means
         // the heartbeat starved and killed the session under output load.
-        dlog("peer.relay.disconnect reason=\(reason) ownsSession=\(ownsSession)")
+        // Counters ride along: a disconnect with received=0 says the pane was
+        // blank because nothing ever arrived, while received>0 with
+        // enqueued<received localizes the loss to the writer/semaphore.
+        dlog("peer.relay.disconnect reason=\(reason) ownsSession=\(ownsSession) \(ioSummary)")
         #endif
         // The reason is the whole value here: "heartbeat.dead" and
         // "user closed the pane" produce an identical empty pane, and which

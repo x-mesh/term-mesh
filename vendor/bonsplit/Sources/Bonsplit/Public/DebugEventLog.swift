@@ -99,6 +99,17 @@ public final class DebugEventLog: @unchecked Sendable {
             self.flushToFile()
             let content = self.ringEntries().joined(separator: "\n") + "\n"
             try? content.write(toFile: Self.logPath, atomically: true, encoding: .utf8)
+            // `atomically: true` writes a temp file and renames it into place, so
+            // the path now names a new inode while our persistent handle still
+            // holds the old, unlinked one. Appends kept succeeding but landed in
+            // a file no path could reach — the log looked frozen at the moment of
+            // the dump while the app went on writing into nothing. Note that
+            // flushToFile only re-opens when the handle is nil, and this one is
+            // very much alive, so it cannot recover on its own. Re-point it at
+            // the file that now exists. (rotateIfNeeded already does this.)
+            self.fileHandle?.closeFile()
+            self.fileHandle = nil
+            self.setupFileHandle()
         }
     }
 

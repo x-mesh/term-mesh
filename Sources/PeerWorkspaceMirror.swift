@@ -528,12 +528,16 @@ final class PeerWorkspaceMirrorController {
     private func markHostWorkspaceGone() {
         guard !isTornDown else { return }
         let title = hostWorkspaceTitle.isEmpty ? "Workspace" : hostWorkspaceTitle
-        let hostLabel = spec.hostKey.shortLabel
+        let hostLabel = PeerHostProfileStore.shared.displayLabel(for: spec.hostKey)
         #if DEBUG
         dlog("peer.mirror.hostGone action=autoclose host=\(spec.hostKey) workspace=\(title)")
         #endif
         RemoteWorkLog.infoOffMain("Host deleted the workspace \"\(title)\" on \(spec.hostKey) — closing the mirror here")
-        guard let workspace, let tabManager = AppDelegate.shared?.tabManager else {
+        // Route by owner, not by whichever window happens to be frontmost:
+        // `closeWorkspace` tears down panes, so aiming it at the wrong
+        // manager would kill another window's surfaces.
+        guard let workspace,
+              let tabManager = AppDelegate.shared?.tabManagerFor(tabId: workspace.id) else {
             // No window/TabManager context (headless/test) — just release
             // the layout-sync plane; there's no tab to close or notify.
             teardown()
@@ -556,7 +560,7 @@ final class PeerWorkspaceMirrorController {
 
     private func markWorkspaceTitle(suffix: String?) {
         guard let workspace else { return }
-        let base = "\(hostWorkspaceTitle.isEmpty ? "Workspace" : hostWorkspaceTitle) ⌁ \(spec.hostKey.shortLabel)"
+        let base = "\(hostWorkspaceTitle.isEmpty ? "Workspace" : hostWorkspaceTitle) ⌁ \(PeerHostProfileStore.shared.displayLabel(for: spec.hostKey))"
         workspace.title = suffix.map { "\(base) — \($0)" } ?? base
     }
 
