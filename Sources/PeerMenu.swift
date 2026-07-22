@@ -161,7 +161,7 @@ final class PeerClientCoordinator: NSObject, NSMenuDelegate {
             // Closing the workspace tab tears everything down through
             // TabManager.closeWorkspace → panel closes + mirror teardown.
             if let workspace = mirror.workspace,
-               let tabManager = AppDelegate.shared?.tabManager
+               let tabManager = AppDelegate.shared?.tabManagerFor(tabId: workspace.id)
             {
                 tabManager.closeWorkspace(workspace)
             } else {
@@ -931,9 +931,37 @@ final class PeerClientCoordinator: NSObject, NSMenuDelegate {
                    && $0.hostWorkspaceID == workspaceID
            }),
            let mirrorWorkspace = existing.workspace {
-            AppDelegate.shared?.tabManager?.selectWorkspace(mirrorWorkspace)
+            // The sidebar is a shared singleton, so this row is clickable from
+            // every window — but the mirror lives in exactly one of them.
+            // `selectWorkspace` performs no ownership check, so pointing the
+            // clicking window's manager at a workspace it does not own leaves
+            // it rendering panes bound to the other window's portal: a black
+            // pane, with no mirror created here either (we return below).
+            let app = AppDelegate.shared
+            let owner = app?.tabManagerFor(tabId: mirrorWorkspace.id)
+            let clicked = app?.tabManager
+            if let owner, owner === clicked {
+                // Same window — plain focus, the original dedupe behaviour.
+                owner.selectWorkspace(mirrorWorkspace)
+            } else if let clicked, let selectedTabId = clicked.selectedTabId {
+                // Different window. Raising the owner would yank focus away
+                // from the window the user just clicked in, and selecting here
+                // would black out this one — so touch neither, and say where
+                // the mirror already is. One live mirror per host workspace is
+                // deliberate: two copies would fight over the PTY's single
+                // winsize (the daemon applies resizes last-writer-wins).
+                clicked.notifications.addNotification(
+                    tabId: selectedTabId,
+                    surfaceId: nil,
+                    title: "Already mirrored in another window",
+                    subtitle: PeerHostProfileStore.shared.displayLabel(for: spec.hostKey),
+                    body: "“\(mirrorWorkspace.title)” is live in another window. "
+                        + "A host workspace mirrors into one window at a time — "
+                        + "a second live copy would fight over the terminal size."
+                )
+            }
             #if DEBUG
-            dlog("peer.mirror.dedupe focus existing host=\(spec.hostKey)")
+            dlog("peer.mirror.dedupe host=\(spec.hostKey) owner=\(owner == nil ? "nil" : (owner === clicked ? "sameWindow" : "otherWindow"))")
             #endif
             return
         }
@@ -1099,7 +1127,8 @@ final class PeerClientCoordinator: NSObject, NSMenuDelegate {
                 // surface an actionable error.
                 workspace.peerMirror = nil
                 mirror.teardown()
-                AppDelegate.shared?.tabManager?.closeWorkspace(workspace)
+                AppDelegate.shared?.tabManagerFor(tabId: workspace.id)?
+                    .closeWorkspace(workspace)
                 self.showAlert(
                     title: "Live Mirror Failed",
                     body: "\(String(describing: error))\n\nThe workspace was closed. Reconnect to retry."

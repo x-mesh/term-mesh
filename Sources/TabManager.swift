@@ -916,6 +916,20 @@ class TabManager: ObservableObject {
     }
 
     func closeWorkspace(_ workspace: Workspace) {
+        // Ownership guard. The panel teardown below is deliberately
+        // unconditional, and the `tabs.firstIndex` check that would notice a
+        // foreign workspace only runs *after* it — so a call routed to the
+        // wrong window's manager destroys that window's live surfaces and
+        // then bails, leaving a tab whose panes are all dead. Refuse the
+        // foreign case up front.
+        //
+        // A workspace that no manager owns (already detached from tabs) still
+        // needs its cleanup to run — that path is what the unconditional
+        // teardown exists for — so only a *different* owner returns early.
+        if let owner = AppDelegate.shared?.tabManagerFor(tabId: workspace.id), owner !== self {
+            return
+        }
+
         sentryBreadcrumb("workspace.close", data: ["tabCount": max(0, tabs.count - 1)])
 
         // Live mirror: drop the layout-sync plane first (subscription,

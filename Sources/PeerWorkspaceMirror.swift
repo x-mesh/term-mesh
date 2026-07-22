@@ -533,7 +533,11 @@ final class PeerWorkspaceMirrorController {
         dlog("peer.mirror.hostGone action=autoclose host=\(spec.hostKey) workspace=\(title)")
         #endif
         RemoteWorkLog.infoOffMain("Host deleted the workspace \"\(title)\" on \(spec.hostKey) — closing the mirror here")
-        guard let workspace, let tabManager = AppDelegate.shared?.tabManager else {
+        // Route by owner, not by whichever window happens to be frontmost:
+        // `closeWorkspace` tears down panes, so aiming it at the wrong
+        // manager would kill another window's surfaces.
+        guard let workspace,
+              let tabManager = AppDelegate.shared?.tabManagerFor(tabId: workspace.id) else {
             // No window/TabManager context (headless/test) — just release
             // the layout-sync plane; there's no tab to close or notify.
             teardown()
