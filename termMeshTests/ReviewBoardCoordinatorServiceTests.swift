@@ -151,6 +151,73 @@ final class ReviewBoardCoordinatorServiceTests: XCTestCase {
         XCTAssertEqual(observations.first?.projectRoots, ["/root/demo-project"])
     }
 
+    // MARK: - Remembered projects
+
+    @MainActor
+    func testRememberedProjectsCoverOfflineHostsOnly() {
+        let offline = hostEntry(id: "ssh:mac-sub", state: .saved, paneRoots: [])
+        let connected = hostEntry(
+            id: "ssh:root@jw-server", state: .connected, paneRoots: ["/root/demo-project"]
+        )
+        let knownOffline = knownHost(for: "ssh:mac-sub", roots: ["/srv/app", "/srv/tools"])
+        // The connected host speaks for itself through the peer roster.
+        let knownConnected = knownHost(for: "ssh:root@jw-server", roots: ["/root/demo-project"])
+
+        let remembered = ReviewBoardCoordinatorService.rememberedProjects(
+            knownHosts: [knownOffline, knownConnected],
+            sidebarHosts: [offline, connected],
+            liveIdentities: []
+        )
+
+        XCTAssertEqual(remembered.map(\.identity.label), ["app", "tools"])
+        XCTAssertEqual(remembered.first?.hostKey, "ssh:mac-sub")
+    }
+
+    @MainActor
+    func testRememberedProjectsSkipOnesAlreadyLiveAndUnknownHosts() {
+        let offline = hostEntry(id: "ssh:mac-sub", state: .saved, paneRoots: [])
+        let live = projectIdentity(forWorkingDirectories: ["/srv/app"])
+
+        let remembered = ReviewBoardCoordinatorService.rememberedProjects(
+            knownHosts: [
+                knownHost(for: "ssh:mac-sub", roots: ["/srv/app", "/srv/tools"]),
+                // A host the sidebar no longer knows cannot be acted on.
+                CoordinatorKnownHost(
+                    hostID: "hst_forgotten", projectRoots: ["/srv/ghost"],
+                    isLive: false, observedAtMilliseconds: 0
+                ),
+            ],
+            sidebarHosts: [offline],
+            liveIdentities: [live]
+        )
+
+        XCTAssertEqual(remembered.map(\.identity.label), ["tools"])
+    }
+
+    @MainActor
+    func testRememberedProjectsIgnoreHomeAndSystemRoots() {
+        let offline = hostEntry(id: "ssh:mac-sub", state: .saved, paneRoots: [])
+
+        let remembered = ReviewBoardCoordinatorService.rememberedProjects(
+            knownHosts: [knownHost(for: "ssh:mac-sub", roots: ["/root", "/Users/jinwoo", "/"])],
+            sidebarHosts: [offline],
+            liveIdentities: []
+        )
+
+        XCTAssertTrue(remembered.isEmpty)
+    }
+
+    private func knownHost(for hostKey: String, roots: [String]) -> CoordinatorKnownHost {
+        CoordinatorKnownHost(
+            hostID: CoordinatorHostObservation(
+                hostKey: hostKey, projectRoots: [], isLive: true
+            ).coordinatorHostID,
+            projectRoots: roots,
+            isLive: false,
+            observedAtMilliseconds: 1_784_800_000_000
+        )
+    }
+
     private func hostEntry(
         id: String,
         state: HostConnectionState,

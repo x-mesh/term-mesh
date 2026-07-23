@@ -83,9 +83,17 @@ async fn handle_connection(api: Arc<Api>, stream: UnixStream) -> Result<()> {
             return Ok(());
         }
         let id = req.id.clone();
-        let result = api
-            .handle(&req.method, req.params)
-            .map_err(|e| e.to_string());
+        // JSON-RPC lets a caller omit `params` entirely, and handlers whose
+        // fields are all optional (task.list) would otherwise reject the
+        // request with "invalid type: null". One failing call sinks a whole
+        // client snapshot, which is how a perfectly healthy coordinator ended
+        // up reported as offline.
+        let params = if req.params.is_null() {
+            Value::Object(Default::default())
+        } else {
+            req.params
+        };
+        let result = api.handle(&req.method, params).map_err(|e| e.to_string());
         write_response(&mut writer, id, result).await?;
     }
 }

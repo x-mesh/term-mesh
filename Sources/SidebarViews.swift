@@ -1087,6 +1087,7 @@ private struct SidebarPeerProjectGroup: Identifiable {
 /// lifecycle (connect, retry, edit, delete) lives in the Host view alone.
 private struct SidebarPeerProjectsView: View {
     @EnvironmentObject private var tabManager: TabManager
+    @ObservedObject private var coordinator = ReviewBoardCoordinatorService.shared
     let hosts: [HostEntry]
     let store: RemoteHostStore
     let usesSeparatedPresentation: Bool
@@ -1259,9 +1260,72 @@ private struct SidebarPeerProjectsView: View {
                 }
             }
 
+            let remembered = ReviewBoardCoordinatorService.rememberedProjects(
+                knownHosts: coordinator.knownHosts,
+                sidebarHosts: hosts,
+                liveIdentities: Set(grouped.projects.map(\.identity))
+            )
+            ForEach(remembered, id: \.identity) { project in
+                rememberedProjectRow(project)
+            }
+
             if !grouped.unassigned.isEmpty {
                 unassignedSection(grouped.unassigned)
             }
+        }
+    }
+
+    /// A project the coordinator remembers on a host that is currently off.
+    /// Dimmed, and not expandable — there is no live workspace to expand —
+    /// but clicking reconnects the machine it was last seen on, which is the
+    /// only useful action here.
+    private func rememberedProjectRow(
+        _ project: ReviewBoardCoordinatorService.RememberedProject
+    ) -> some View {
+        VStack(spacing: 4) {
+            HStack(spacing: 5) {
+                Text(project.identity.label)
+                    .font(.system(size: 9, weight: .semibold))
+                    .foregroundColor(Color.secondary.opacity(0.55))
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+                Image(systemName: "clock.arrow.circlepath")
+                    .font(.system(size: 8))
+                    .foregroundColor(Color.secondary.opacity(0.45))
+                Spacer(minLength: 0)
+            }
+            .padding(.leading, 16)
+            .padding(.trailing, 12)
+            .padding(.top, 4)
+            .padding(.bottom, 1)
+
+            Button {
+                if let host = hosts.first(where: { $0.id == project.hostKey }) {
+                    store.connectSavedHost(host)
+                }
+            } label: {
+                HStack(spacing: 6) {
+                    Image(systemName: "bolt.horizontal.circle")
+                        .font(.system(size: 9))
+                    VStack(alignment: .leading, spacing: 1) {
+                        Text(project.hostDisplayName)
+                            .font(.system(size: 11))
+                            .lineLimit(1)
+                        Text("Last seen · not connected")
+                            .font(.system(size: 9))
+                            .lineLimit(1)
+                    }
+                    Spacer(minLength: 4)
+                }
+                .foregroundColor(Color.secondary.opacity(0.7))
+                .padding(.horizontal, 8)
+                .padding(.vertical, 4)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .padding(.horizontal, usesSeparatedPresentation ? 10 : 8)
+            .help("Reconnect \(project.hostDisplayName) to open \(project.identity.label)")
+            .accessibilityLabel("\(project.identity.label) on \(project.hostDisplayName), not connected")
         }
     }
 

@@ -115,6 +115,33 @@ struct CoordinatorHostObservation: Equatable {
     }
 }
 
+/// A host as the coordinator remembers it — including one that is not
+/// connected right now. This is the whole point of keeping a coordinator:
+/// the peer roster only describes what is reachable this instant, while the
+/// coordinator can still say which project lived on a machine that is off.
+struct CoordinatorKnownHost: Equatable {
+    let hostID: String
+    let projectRoots: [String]
+    let isLive: Bool
+    let observedAtMilliseconds: Double
+
+    init?(dictionary: [String: Any]) {
+        guard let hostID = dictionary["host_id"] as? String else { return nil }
+        self.hostID = hostID
+        self.projectRoots = (dictionary["project_roots"] as? [String] ?? [])
+            .filter { !$0.isEmpty }
+        self.isLive = dictionary["live"] as? Bool ?? false
+        self.observedAtMilliseconds = (dictionary["observed_at_ms"] as? NSNumber)?.doubleValue ?? 0
+    }
+
+    init(hostID: String, projectRoots: [String], isLive: Bool, observedAtMilliseconds: Double) {
+        self.hostID = hostID
+        self.projectRoots = projectRoots
+        self.isLive = isLive
+        self.observedAtMilliseconds = observedAtMilliseconds
+    }
+}
+
 enum ReviewBoardCoordinatorError: Error, Equatable {
     case disabled
     case socketPathTooLong
@@ -197,6 +224,17 @@ final class ReviewBoardCoordinatorClient: @unchecked Sendable {
 #endif
             }
         }
+    }
+
+    func fetchKnownHosts() async throws -> [CoordinatorKnownHost] {
+        let response = try await request(method: "host.list")
+        let rows: [[String: Any]]
+        if let object = response as? [String: Any], let hosts = object["hosts"] as? [[String: Any]] {
+            rows = hosts
+        } else {
+            rows = response as? [[String: Any]] ?? []
+        }
+        return rows.compactMap(CoordinatorKnownHost.init(dictionary:))
     }
 
     func subscribeEvents(onEvent: @escaping @Sendable () -> Void) {
@@ -390,6 +428,9 @@ final class ReviewBoardCoordinatorService: ObservableObject {
     static let shared = ReviewBoardCoordinatorService()
 
     @Published private(set) var snapshot = ReviewBoardSnapshot.empty
+    /// Hosts the coordinator remembers, live or not. Empty whenever the
+    /// integration is off, so every consumer degrades to peer-roster-only.
+    @Published private(set) var knownHosts: [CoordinatorKnownHost] = []
 
     private var client: ReviewBoardCoordinatorClient?
     private var process: Process?
@@ -434,6 +475,7 @@ final class ReviewBoardCoordinatorService: ObservableObject {
         hostSyncTask?.cancel()
         hostSyncTask = nil
         lastReportedObservations = []
+        knownHosts = []
         subscriptionStarted = false
         client = nil
         process?.terminate()
@@ -482,6 +524,59 @@ final class ReviewBoardCoordinatorService: ObservableObject {
         }
     }
 
+    /// A project the coordinator remembers on a host that is NOT connected
+    /// right now — the peer roster cannot produce these, since it only
+    /// describes what is reachable this instant.
+    struct RememberedProject: Equatable {
+        let identity: PeerProjectIdentity
+        let hostKey: String
+        let hostDisplayName: String
+        let projectRoot: String
+        let observedAtMilliseconds: Double
+    }
+
+    /// Match remembered hosts back to sidebar entries. The coordinator stores
+    /// a hashed host id, so the only way back to a name is to re-derive the
+    /// hash from the hosts we know — which works for exactly the hosts still
+    /// saved in the sidebar, and those are the ones a user can act on.
+    static func rememberedProjects(
+        knownHosts: [CoordinatorKnownHost],
+        sidebarHosts: [HostEntry],
+        liveIdentities: Set<PeerProjectIdentity>
+    ) -> [RememberedProject] {
+        var hostsByCoordinatorID: [String: HostEntry] = [:]
+        for host in sidebarHosts {
+            let id = CoordinatorHostObservation(
+                hostKey: host.id, projectRoots: [], isLive: true
+            ).coordinatorHostID
+            hostsByCoordinatorID[id] = host
+        }
+
+        var seen: Set<PeerProjectIdentity> = liveIdentities
+        var remembered: [RememberedProject] = []
+        for known in knownHosts {
+            guard let host = hostsByCoordinatorID[known.hostID] else { continue }
+            // A connected host is already speaking for itself through the
+            // roster; repeating it from memory would double every project.
+            guard !host.isConnected else { continue }
+            for root in known.projectRoots {
+                let identity = projectIdentity(forWorkingDirectories: [root])
+                guard !identity.isUnknown, !seen.contains(identity) else { continue }
+                seen.insert(identity)
+                remembered.append(RememberedProject(
+                    identity: identity,
+                    hostKey: host.id,
+                    hostDisplayName: host.displayName,
+                    projectRoot: root,
+                    observedAtMilliseconds: known.observedAtMilliseconds
+                ))
+            }
+        }
+        return remembered.sorted {
+            $0.identity.label.localizedCaseInsensitiveCompare($1.identity.label) == .orderedAscending
+        }
+    }
+
     /// Only connected hosts carry a workspace roster, so only they can report
     /// project roots; a saved-but-offline host would contribute an empty list
     /// that reads as "this machine has no projects" rather than "unknown".
@@ -515,7 +610,13 @@ final class ReviewBoardCoordinatorService: ObservableObject {
         return snapshot
     }
 
-    func refresh() {
+    /// A coordinator we just spawned needs a moment before it binds, and one
+    /// we are reusing may be mid-restart. Without a retry the very first
+    /// failed read is final — the app reports "offline" forever while a
+    /// perfectly healthy coordinator answers every other client.
+    private static let onlineRetryDelays: [Double] = [0.3, 0.7, 1.5, 3.0]
+
+    func refresh(attempt: Int = 0) {
         guard let client else { return }
         refreshTask?.cancel()
         refreshTask = Task.detached { [weak self, client] in
@@ -532,10 +633,31 @@ final class ReviewBoardCoordinatorService: ObservableObject {
                     fencedZombie: false
                 )
             }
+            // Failing to read the host table is not a reason to forget it —
+            // "last seen" is precisely what survives a coordinator hiccup.
+            let hosts = (try? await client.fetchKnownHosts())
             await MainActor.run {
                 self?.snapshot = next
+                if let hosts { self?.knownHosts = hosts }
                 NotificationCenter.default.post(name: .reviewBoardSnapshotDidChange, object: nil)
+                if !next.coordinatorOnline, attempt < Self.onlineRetryDelays.count {
+                    self?.scheduleOnlineRetry(attempt: attempt)
+                }
             }
+        }
+    }
+
+    private func scheduleOnlineRetry(attempt: Int) {
+        let delay = Self.onlineRetryDelays[attempt]
+#if DEBUG
+        dlog("coordinator.refresh offline — retry \(attempt + 1) in \(delay)s")
+#endif
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+            guard let self, self.client != nil else { return }
+            self.refresh(attempt: attempt + 1)
+            // A coordinator that came up late has host state to hear about.
+            self.lastReportedObservations = []
+            self.syncHostObservations()
         }
     }
 
