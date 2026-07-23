@@ -73,6 +73,9 @@ message Envelope {
     // Gated behind capability "team.roster.v1" (Hello.capabilities).
     ListTeams list_teams = 48;
     TeamList team_list = 49;
+    // Gated behind capability "team.call.v1" (Hello.capabilities).
+    TeamCallRequest team_call_request = 52;
+    TeamCallResponse team_call_response = 53;
 
     Ping ping = 50;
     Pong pong = 51;
@@ -821,6 +824,38 @@ message Team {
   string project_root = 4;
   repeated string agent_names = 5;
   uint64 created_at_unix_secs = 6;
+}
+
+// ============================================================
+// Team calls (capability "team.call.v1")
+// ============================================================
+//
+// Reaching a team on another machine. Unlike the roster above, this
+// CHANGES things, so the surface is deliberately narrow: the host runs
+// only methods on its own allow-list, and every one of them acts inside a
+// team it already owns. Nothing here names a path, spawns a process, or
+// creates and destroys teams — that is the difference between "drive the
+// agents on that machine" and "run whatever you like on that machine".
+//
+// One request, one response. Long-running work (waiting on an agent) is
+// the caller's job to poll for: a streaming reply would have to survive
+// reconnects, and nothing here needs it yet.
+
+message TeamCallRequest {
+  // A `team.*` method name. Rejected unless it is on the host's allow-list.
+  string method = 1;
+  // JSON object of the method's parameters, verbatim.
+  string params_json = 2;
+}
+
+message TeamCallResponse {
+  bool ok = 1;
+  // JSON of the method's result on success.
+  string result_json = 2;
+  // Set when `ok` is false. `method_not_allowed` means the allow-list
+  // refused it — distinct from the method failing on its own terms.
+  string error_code = 3;
+  string error_message = 4;
 }
 
 // ============================================================

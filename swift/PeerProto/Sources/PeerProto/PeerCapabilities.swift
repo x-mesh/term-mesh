@@ -47,10 +47,15 @@ public enum PeerCapability {
     /// is not derivable from the layout tree.
     public static let teamRosterV1 = "team.roster.v1"
 
+    /// The host runs allow-listed `team.*` methods on behalf of a client.
+    /// Advertised by the HOST. Unlike the roster, this CHANGES things, so
+    /// the allow-list — not the capability — is what bounds it.
+    public static let teamCallV1 = "team.call.v1"
+
     /// Every capability this build supports. Single source of truth for
     /// populating outgoing `Hello.capabilities` — don't hand-roll the list
     /// at each call site.
-    public static let supported: [String] = [ptyDataCoalesceV1, replayRingV1, workspaceLifecycleV1, surfaceEnsureV1, surfaceTerminateV1, hostStatsV1, gridSnapshotV1, teamRosterV1]
+    public static let supported: [String] = [ptyDataCoalesceV1, replayRingV1, workspaceLifecycleV1, surfaceEnsureV1, surfaceTerminateV1, hostStatsV1, gridSnapshotV1, teamRosterV1, teamCallV1]
 }
 
 /// The other side's advertised feature flags, parsed once out of its

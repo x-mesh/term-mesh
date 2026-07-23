@@ -1989,6 +1989,18 @@ class TerminalController {
     /// Bridge: sync socket thread waits on semaphore while Task runs cooperatively.
     /// Unlike DispatchQueue.main.sync, `await MainActor.run` is cooperative —
     /// it doesn't block the main thread's run loop, preventing IME deadlocks.
+    /// Run one `team.*` method for a peer and return the JSON-RPC response
+    /// string, exactly as the local socket would produce it.
+    ///
+    /// Deliberately the SAME dispatcher: a second path would be a second
+    /// place for the team surface to drift, and a peer must never reach
+    /// something the local caller cannot. The allow-list that decides which
+    /// methods get here lives in `PeerTeamCall` and is enforced by the peer
+    /// server before this is called.
+    func peerTeamCommand(method: String, params: [String: Any]) -> String {
+        dispatchTeamCommandAsync(method: method, params: params, id: 1)
+    }
+
     private func dispatchTeamCommandAsync(method: String, params: [String: Any], id: Any?) -> String {
         // Fast path: data-only commands don't need async bridge at all
         if Self.teamDataCommands.contains(method) {

@@ -387,6 +387,31 @@ public actor PeerSession {
         return list.teams
     }
 
+    /// Run one allow-listed `team.*` method on the host and get its JSON
+    /// result. Same single-reader contract as `listTeams()`.
+    ///
+    /// A refusal comes back as a normal response with `ok == false` and
+    /// `error_code == method_not_allowed`, not as a transport error: the
+    /// host declining is information, not a broken connection.
+    public func callTeam(
+        method: String,
+        paramsJSON: String
+    ) async throws -> Termmesh_Peer_V1_TeamCallResponse {
+        try beginDirectResponseRPC()
+        defer { directResponseRPCInFlight = false }
+        try await sendEnvelope { env in
+            var request = Termmesh_Peer_V1_TeamCallRequest()
+            request.method = method
+            request.paramsJson = paramsJSON
+            env.teamCallRequest = request
+        }
+        let reply = try await readFrame()
+        guard case .teamCallResponse(let response) = reply.payload else {
+            throw PeerSessionError.unexpectedMessage(String(describing: reply.payload))
+        }
+        return response
+    }
+
     // MARK: - Workspace lifecycle (create / rename / delete)
 
     /// Ask the host to create a new, initially pane-less workspace and

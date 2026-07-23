@@ -392,6 +392,57 @@ final class GhosttyPaneSurfaceProvider: PeerSurfaceProvider {
         }
     }
 
+    /// Run an allow-listed `team.*` method for a peer. Routed through the
+    /// app's own team dispatcher — the same one the local control socket
+    /// uses — so a peer can never reach a method the local caller cannot,
+    /// and the two can never drift apart.
+    func callTeamMethod(
+        _ method: String,
+        paramsJSON: String
+    ) async -> Result<String, PeerTeamCallFailure>? {
+        var params: [String: Any] = [:]
+        if !paramsJSON.isEmpty {
+            guard let data = paramsJSON.data(using: .utf8),
+                  let object = try? JSONSerialization.jsonObject(with: data),
+                  let dictionary = object as? [String: Any] else {
+                return .failure(PeerTeamCallFailure(
+                    code: PeerTeamCall.ErrorCode.invalidParams,
+                    message: "params_json must be a JSON object"
+                ))
+            }
+            params = dictionary
+        }
+
+        let response = await MainActor.run {
+            TerminalController.shared.peerTeamCommand(method: method, params: params)
+        }
+
+        // The dispatcher answers in JSON-RPC; unwrap it so the peer sees the
+        // method's own result rather than a nested envelope.
+        guard let data = response.data(using: .utf8),
+              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            return .failure(PeerTeamCallFailure(
+                code: PeerTeamCall.ErrorCode.hostError,
+                message: "team dispatcher returned a non-JSON response"
+            ))
+        }
+        if let error = object["error"] as? [String: Any] {
+            return .failure(PeerTeamCallFailure(
+                code: error["code"] as? String ?? PeerTeamCall.ErrorCode.hostError,
+                message: error["message"] as? String ?? "team call failed"
+            ))
+        }
+        let result = object["result"] ?? [:]
+        guard let resultData = try? JSONSerialization.data(withJSONObject: result),
+              let resultJSON = String(data: resultData, encoding: .utf8) else {
+            return .failure(PeerTeamCallFailure(
+                code: PeerTeamCall.ErrorCode.hostError,
+                message: "team result was not serializable"
+            ))
+        }
+        return .success(resultJSON)
+    }
+
     func handleWorkspaceControl(_ control: Termmesh_Peer_V1_WorkspaceControl) async {
         await MainActor.run { applyWorkspaceControl(control) }
     }

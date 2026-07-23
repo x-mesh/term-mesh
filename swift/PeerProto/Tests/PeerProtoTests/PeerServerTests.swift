@@ -407,6 +407,65 @@ final class PeerServerTests: XCTestCase {
         await server.stop()
     }
 
+    /// The allow-list is the security boundary of team.call.v1: everything
+    /// on it acts inside a team the host already owns, and the refusal has
+    /// to happen in the server, not in each provider.
+    func testTeamCallRunsAllowedMethodAndRefusesTheRest() async throws {
+        let sockPath = "/tmp/tm-peer-swift-call-\(UUID().uuidString.prefix(8)).sock"
+        defer { try? FileManager.default.removeItem(atPath: sockPath) }
+
+        let provider = TeamCallProvider()
+        let server = PeerServer(socketPath: sockPath, provider: provider)
+        try await server.start()
+        defer { Task { await server.stop() } }
+
+        let deadline = Date().addingTimeInterval(2)
+        while !FileManager.default.fileExists(atPath: sockPath) {
+            if Date() > deadline { return XCTFail("no socket") }
+            try await Task.sleep(nanoseconds: 50_000_000)
+        }
+
+        let transport = try await UnixSocketTransport.connect(socketPath: sockPath)
+        let session = PeerSession(
+            read: { try await transport.read() },
+            write: { try await transport.write($0) }
+        )
+        _ = try await session.handshake()
+
+        let allowed = try await session.callTeam(
+            method: "team.send",
+            paramsJSON: #"{"agent":"explorer","text":"hi"}"#
+        )
+        XCTAssertTrue(allowed.ok)
+        XCTAssertEqual(allowed.resultJson, #"{"sent":true}"#)
+        let seen = await provider.lastCall
+        XCTAssertEqual(seen?.method, "team.send")
+
+        // Creating a team takes a working directory and spawns processes —
+        // exactly what a peer must not be able to reach.
+        let refused = try await session.callTeam(method: "team.create", paramsJSON: "{}")
+        XCTAssertFalse(refused.ok)
+        XCTAssertEqual(refused.errorCode, PeerTeamCall.ErrorCode.methodNotAllowed)
+        // The provider must never even see a refused method.
+        let afterRefusal = await provider.lastCall
+        XCTAssertEqual(afterRefusal?.method, "team.send")
+    }
+
+    func testTeamCallAllowListExcludesLifecycleAndSpawn() {
+        for method in [
+            "team.create", "team.destroy", "team.attach", "team.detach",
+            "team.add_agent", "team.restart", "headless.spawn",
+        ] {
+            XCTAssertFalse(
+                PeerTeamCall.isAllowed(method),
+                "\(method) must not be reachable from a peer"
+            )
+        }
+        for method in ["team.send", "team.delegate", "team.read", "team.status"] {
+            XCTAssertTrue(PeerTeamCall.isAllowed(method))
+        }
+    }
+
     /// A Mac host is where a team leader usually sits, so its roster is the
     /// answer to "where does this project's leader run" — and it only exists
     /// on the wire, never in the layout tree.
@@ -553,5 +612,32 @@ private actor TeamRosterProvider: PeerSurfaceProvider {
             team.projectRoot = root
             return team
         }
+    }
+}
+
+private actor TeamCallProvider: PeerSurfaceProvider {
+    private(set) var lastCall: (method: String, paramsJSON: String)?
+
+    func listSurfaces() async -> [Termmesh_Peer_V1_SurfaceInfo] { [] }
+
+    func attach(
+        surfaceID: Data,
+        clientCols: UInt32,
+        clientRows: UInt32,
+        resumeFromSeq: UInt64
+    ) async -> PeerSurfaceAttachment? { nil }
+
+    func listTeams() async -> [Termmesh_Peer_V1_Team] {
+        var team = Termmesh_Peer_V1_Team()
+        team.name = "live-team"
+        return [team]
+    }
+
+    func callTeamMethod(
+        _ method: String,
+        paramsJSON: String
+    ) async -> Result<String, PeerTeamCallFailure>? {
+        lastCall = (method, paramsJSON)
+        return .success(#"{"sent":true}"#)
     }
 }

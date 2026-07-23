@@ -186,6 +186,25 @@ public protocol PeerSurfaceProvider: AnyObject, Sendable {
     /// default empty list is what a provider with no teams reports, and
     /// such a host never advertises the capability.
     func listTeams() async -> [Termmesh_Peer_V1_Team]
+
+    /// Run one allow-listed `team.*` method and return its JSON result.
+    /// The server checks `PeerTeamCall.isAllowed` BEFORE calling this, so a
+    /// provider never sees a method outside the list — but a provider that
+    /// reaches further than its own teams would defeat that check, so keep
+    /// implementations routed through the same handler the local socket uses.
+    /// Returning nil means the host has no team subsystem at all.
+    func callTeamMethod(_ method: String, paramsJSON: String) async -> Result<String, PeerTeamCallFailure>?
+}
+
+/// Why a team call failed on the host side.
+public struct PeerTeamCallFailure: Error, Sendable, Equatable {
+    public let code: String
+    public let message: String
+
+    public init(code: String, message: String) {
+        self.code = code
+        self.message = message
+    }
 }
 
 public extension PeerSurfaceProvider {
@@ -194,6 +213,10 @@ public extension PeerSurfaceProvider {
     func deleteWorkspace(id workspaceID: Data) async -> Bool { false }
     func handleWorkspaceControl(_ control: Termmesh_Peer_V1_WorkspaceControl) async {}
     func listTeams() async -> [Termmesh_Peer_V1_Team] { [] }
+    func callTeamMethod(
+        _ method: String,
+        paramsJSON: String
+    ) async -> Result<String, PeerTeamCallFailure>? { nil }
 }
 
 /// Provider for the list-only case: static surfaces, no attach support.
@@ -1056,8 +1079,9 @@ actor PeerServerSession {
             // the roster capability — otherwise the flag invites a question
             // this host cannot answer. Resolved before building the Hello,
             // since the envelope builder is synchronous.
+            let teamCapabilities = [PeerCapability.teamRosterV1, PeerCapability.teamCallV1]
             let advertisedCapabilities = await provider.listTeams().isEmpty
-                ? PeerCapability.supported.filter { $0 != PeerCapability.teamRosterV1 }
+                ? PeerCapability.supported.filter { !teamCapabilities.contains($0) }
                 : PeerCapability.supported
             try await sendEnvelope { env in
                 var h = Termmesh_Peer_V1_Hello()
@@ -1122,6 +1146,42 @@ actor PeerServerSession {
                 var list = Termmesh_Peer_V1_TeamList()
                 list.teams = teams
                 inner.teamList = list
+            }
+
+        case (.ready, .teamCallRequest(let request)):
+            // The allow-list is checked HERE, before the provider is reached:
+            // a refusal must not depend on every provider remembering to
+            // implement it.
+            guard PeerTeamCall.isAllowed(request.method) else {
+                try await sendEnvelopeWithCorrelation(env.seq) { inner in
+                    var response = Termmesh_Peer_V1_TeamCallResponse()
+                    response.ok = false
+                    response.errorCode = PeerTeamCall.ErrorCode.methodNotAllowed
+                    response.errorMessage = "\(request.method) is not callable by a peer"
+                    inner.teamCallResponse = response
+                }
+                return
+            }
+            let outcome = await provider.callTeamMethod(
+                request.method,
+                paramsJSON: request.paramsJson
+            )
+            try await sendEnvelopeWithCorrelation(env.seq) { inner in
+                var response = Termmesh_Peer_V1_TeamCallResponse()
+                switch outcome {
+                case .some(.success(let json)):
+                    response.ok = true
+                    response.resultJson = json
+                case .some(.failure(let failure)):
+                    response.ok = false
+                    response.errorCode = failure.code
+                    response.errorMessage = failure.message
+                case .none:
+                    response.ok = false
+                    response.errorCode = PeerTeamCall.ErrorCode.hostError
+                    response.errorMessage = "host has no team subsystem"
+                }
+                inner.teamCallResponse = response
             }
 
         case (.ready, .workspaceControl(let ctl)):
