@@ -690,5 +690,10 @@ final class PeerWorkspaceMirrorController {
 
     func recordApplied(_ layout: Termmesh_Peer_V1_WorkspaceLayout) {
         lastAppliedLayout = layout
+        RemoteHostStore.shared.recordLiveMirrorLayout(
+            layout,
+            hostKey: lease.key,
+            workspaceIDs: hostWorkspaceIDAliases
+        )
     }
 }

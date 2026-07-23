@@ -814,6 +814,59 @@ struct SidebarSectionHeader: View {
 
 // MARK: - Remote Hosts Sidebar
 
+struct PeerPaneExpansionCommand: Equatable {
+    let isExpanded: Bool
+    let generation: Int
+}
+
+private enum PeerSidebarPaletteRole {
+    case hostExpanded
+    case hostCollapsed
+    case hostBusy
+    case workspaceConnected
+    case workspaceWorking
+
+    func components(for colorScheme: ColorScheme) -> (saturation: CGFloat, brightness: CGFloat) {
+        let isDark = colorScheme == .dark
+        switch self {
+        case .hostExpanded: return isDark ? (0.48, 0.27) : (0.22, 0.97)
+        case .hostCollapsed: return isDark ? (0.58, 0.35) : (0.34, 0.94)
+        case .hostBusy: return isDark ? (0.68, 0.48) : (0.50, 0.90)
+        case .workspaceConnected: return isDark ? (0.65, 0.42) : (0.42, 0.95)
+        case .workspaceWorking: return isDark ? (0.72, 0.58) : (0.70, 0.87)
+        }
+    }
+}
+
+private enum PeerSidebarPalette {
+    static func colors(
+        from sourceColors: [NSColor],
+        role: PeerSidebarPaletteRole,
+        colorScheme: ColorScheme
+    ) -> [Color] {
+        let components = role.components(for: colorScheme)
+        return sourceColors.map { sourceColor in
+            let rgb = sourceColor.usingColorSpace(.deviceRGB) ?? sourceColor
+            var hue: CGFloat = 0
+            var saturation: CGFloat = 0
+            var brightness: CGFloat = 0
+            var alpha: CGFloat = 0
+            rgb.getHue(
+                &hue,
+                saturation: &saturation,
+                brightness: &brightness,
+                alpha: &alpha
+            )
+            return Color(nsColor: NSColor(
+                hue: hue,
+                saturation: components.saturation,
+                brightness: components.brightness,
+                alpha: 1
+            ))
+        }
+    }
+}
+
 struct SidebarRemoteHostsSection: View {
     @ObservedObject var store: RemoteHostStore
     let usesSeparatedPresentation: Bool
@@ -821,6 +874,25 @@ struct SidebarRemoteHostsSection: View {
     private var isCollapsed = false
     /// Non-nil presents the add/edit sheet.
     @State private var editorContext: PeerHostEditorContext?
+    @State private var areAllPaneDetailsExpanded = false
+    @State private var paneExpansionCommand = PeerPaneExpansionCommand(
+        isExpanded: false,
+        generation: 0
+    )
+
+    private var hasPeerPaneDetails: Bool {
+        store.sortedHosts.contains { host in
+            host.workspaces.contains { !$0.panes.isEmpty }
+        }
+    }
+
+    private func toggleAllPaneDetails() {
+        areAllPaneDetailsExpanded.toggle()
+        paneExpansionCommand = PeerPaneExpansionCommand(
+            isExpanded: areAllPaneDetailsExpanded,
+            generation: paneExpansionCommand.generation + 1
+        )
+    }
 
     var body: some View {
         VStack(spacing: 0) {
@@ -834,21 +906,43 @@ struct SidebarRemoteHostsSection: View {
             // peer daemons (Peer menu / Peer Connections vocabulary).
             SidebarSectionHeader(title: "Peer Hosts", isCollapsed: $isCollapsed)
                 .overlay(alignment: .trailing) {
-                    Button {
-                        editorContext = PeerHostEditorContext(
-                            profile: PeerHostProfile(sshTarget: ""),
-                            isNew: true
-                        )
-                    } label: {
-                        Image(systemName: "plus")
-                            .font(.system(size: 9, weight: .semibold))
-                            .foregroundColor(.secondary)
-                            .frame(width: 18, height: 18)
-                            .contentShape(Rectangle())
+                    HStack(spacing: 2) {
+                        if !isCollapsed, hasPeerPaneDetails {
+                            Button(action: toggleAllPaneDetails) {
+                                Image(systemName: areAllPaneDetailsExpanded
+                                      ? "chevron.up"
+                                      : "chevron.down")
+                                    .font(.system(size: 8, weight: .semibold))
+                                    .foregroundColor(.secondary)
+                                    .frame(width: 18, height: 18)
+                                    .contentShape(Rectangle())
+                            }
+                            .buttonStyle(.plain)
+                            .accessibilityLabel(areAllPaneDetailsExpanded
+                                                ? "Collapse all peer pane details"
+                                                : "Expand all peer pane details")
+                            .help(areAllPaneDetailsExpanded
+                                  ? "Collapse all peer pane details"
+                                  : "Expand all peer pane details")
+                        }
+
+                        Button {
+                            editorContext = PeerHostEditorContext(
+                                profile: PeerHostProfile(sshTarget: ""),
+                                isNew: true
+                            )
+                        } label: {
+                            Image(systemName: "plus")
+                                .font(.system(size: 9, weight: .semibold))
+                                .foregroundColor(.secondary)
+                                .frame(width: 18, height: 18)
+                                .contentShape(Rectangle())
+                        }
+                        .buttonStyle(.plain)
+                        .accessibilityLabel("Add Peer Host")
+                        .help("Add Peer Host…")
                     }
-                    .buttonStyle(.plain)
                     .padding(.trailing, 12)
-                    .help("Add Peer Host…")
                 }
 
             if !isCollapsed {
@@ -861,13 +955,16 @@ struct SidebarRemoteHostsSection: View {
                         .padding(.horizontal, 16)
                         .padding(.vertical, 4)
                 } else {
-                    ForEach(store.sortedHosts) { host in
-                        RemoteHostGroupView(
-                            host: host,
-                            store: store,
-                            usesSeparatedPresentation: usesSeparatedPresentation
-                        ) { context in
-                            editorContext = context
+                    VStack(spacing: usesSeparatedPresentation ? 8 : 0) {
+                        ForEach(store.sortedHosts) { host in
+                            RemoteHostGroupView(
+                                host: host,
+                                store: store,
+                                usesSeparatedPresentation: usesSeparatedPresentation,
+                                paneExpansionCommand: paneExpansionCommand
+                            ) { context in
+                                editorContext = context
+                            }
                         }
                     }
                 }
@@ -899,9 +996,11 @@ struct SidebarRemoteHostsSection: View {
 }
 
 struct RemoteHostGroupView: View {
+    @Environment(\.colorScheme) private var colorScheme
     let host: HostEntry
     let store: RemoteHostStore
     let usesSeparatedPresentation: Bool
+    let paneExpansionCommand: PeerPaneExpansionCommand
     /// Opens the shared add/edit sheet (owned by the section view).
     let onEdit: (PeerHostEditorContext) -> Void
     @State private var isExpanded: Bool
@@ -912,10 +1011,12 @@ struct RemoteHostGroupView: View {
 
     init(host: HostEntry, store: RemoteHostStore,
          usesSeparatedPresentation: Bool,
+         paneExpansionCommand: PeerPaneExpansionCommand,
          onEdit: @escaping (PeerHostEditorContext) -> Void) {
         self.host = host
         self.store = store
         self.usesSeparatedPresentation = usesSeparatedPresentation
+        self.paneExpansionCommand = paneExpansionCommand
         self.onEdit = onEdit
         // Fold state persists per stable host key; default is expanded.
         _isExpanded = State(initialValue: !SidebarLayoutSettings.isHostCollapsed(host.id))
@@ -951,10 +1052,63 @@ struct RemoteHostGroupView: View {
         }
     }
 
-    /// Profile tag color, resolved through the failable NSColor hex
-    /// initializer used elsewhere in the app.
-    private var hostTint: Color? {
-        host.colorHex.flatMap { NSColor(hex: $0) }.map { Color(nsColor: $0) }
+    private var peerAccentNSColors: [NSColor] {
+        PeerHostAccent.colors(for: host.paneHostSpec.hostKey)
+    }
+
+    private var peerAccentPrimary: Color {
+        Color(nsColor: PeerHostAccent.primaryColor(for: host.paneHostSpec.hostKey))
+    }
+
+    private var peerAccentGradient: LinearGradient {
+        LinearGradient(
+            colors: peerAccentNSColors.map { Color(nsColor: $0) },
+            startPoint: .leading,
+            endPoint: .trailing
+        )
+    }
+
+    private var hostBusyCount: Int {
+        host.workspaces.reduce(0) { $0 + $1.busyCount }
+    }
+
+    private var isCollapsedHostBusy: Bool {
+        host.isConnected && !isExpanded && hostBusyCount > 0
+    }
+
+    private var peerHeaderPaletteRole: PeerSidebarPaletteRole {
+        if isCollapsedHostBusy { return .hostBusy }
+        return isExpanded ? .hostExpanded : .hostCollapsed
+    }
+
+    private var peerHeaderBackground: AnyShapeStyle {
+        guard host.isConnected else { return AnyShapeStyle(Color.clear) }
+        return AnyShapeStyle(LinearGradient(
+            colors: PeerSidebarPalette.colors(
+                from: peerAccentNSColors,
+                role: peerHeaderPaletteRole,
+                colorScheme: colorScheme
+            ),
+            startPoint: .leading,
+            endPoint: .trailing
+        ))
+    }
+
+    private var hostAccessibilityValue: String {
+        switch host.connectionState {
+        case .connected:
+            if isCollapsedHostBusy {
+                return "Connected, collapsed, work in progress"
+            }
+            return isExpanded ? "Connected, expanded" : "Connected, collapsed"
+        case .connecting: return "Connecting"
+        case .saved: return "Not connected"
+        case .failed: return "Connection failed"
+        }
+    }
+
+    private var hostAccessibilityLabel: String {
+        isCollapsedHostBusy ? "\(host.displayName), work in progress" : host.displayName
     }
 
     @ViewBuilder
@@ -967,7 +1121,7 @@ struct RemoteHostGroupView: View {
         case .connected:
             Image(systemName: host.symbolName ?? "network")
                 .font(.system(size: 9))
-                .foregroundColor(hostTint ?? .secondary)
+                .foregroundColor(peerAccentPrimary)
         case .saved:
             Image(systemName: host.symbolName ?? "network.slash")
                 .font(.system(size: 9))
@@ -1006,48 +1160,159 @@ struct RemoteHostGroupView: View {
         }
     }
 
-    var body: some View {
-        DisclosureGroup(isExpanded: $isExpanded) {
-            if host.workspaces.isEmpty {
-                HStack(spacing: 8) {
-                    Text(emptyBodyText)
-                        .font(.system(size: 10))
-                        .foregroundColor(.secondary)
-                    // Inline controls sit where the user is already looking —
-                    // the context menu carries the same actions, but a stuck
-                    // row should not require discovering a right-click.
-                    if case .connecting = host.connectionState {
-                        Spacer(minLength: 4)
-                        Button("Cancel") { store.cancelConnectingHost(host) }
-                            .buttonStyle(.borderless)
-                            .controlSize(.mini)
-                            .help("Cancel connection attempt")
-                        Button("Retry") { store.retryConnectingHost(host) }
-                            .buttonStyle(.borderless)
-                            .controlSize(.mini)
-                            .help("Abandon this attempt and start a new one")
+    private var hostHeader: some View {
+        HStack(spacing: 2) {
+            Button(action: handleRowTap) {
+                HStack(spacing: 3) {
+                    if host.isConnected {
+                        RoundedRectangle(cornerRadius: 1.5)
+                            .fill(peerAccentGradient)
+                            .frame(width: 3, height: 12)
+                            .accessibilityHidden(true)
                     }
-                    if case .failed = host.connectionState, host.sshTarget != nil {
-                        Spacer(minLength: 4)
-                        Button("Retry") { store.retryConnectingHost(host) }
-                            .buttonStyle(.borderless)
-                            .controlSize(.mini)
-                            .help("Try connecting again")
+                    hostStatusIcon
+                    Text(host.displayName)
+                        .font(.system(size: 11, weight: .semibold))
+                        .foregroundColor(host.isConnected ? .primary : .secondary)
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+                    if isCollapsedHostBusy {
+                        Image(systemName: "bolt.fill")
+                            .font(.system(size: 7.5, weight: .semibold))
+                            .foregroundColor(peerAccentPrimary)
+                            .accessibilityHidden(true)
                     }
+                    if host.isConnected, !host.workspaces.isEmpty {
+                        let panes = host.workspaces.reduce(0) { $0 + $1.paneCount }
+                        let busy = host.workspaces.reduce(0) { $0 + $1.busyCount }
+                        Text("(\(host.workspaces.count) · \(panes)p)")
+                            .font(.system(size: 10))
+                            .monospacedDigit()
+                            .foregroundColor(Color.secondary.opacity(0.7))
+                        if busy > 0 {
+                            Circle()
+                                .fill(Color.orange)
+                                .frame(width: 5, height: 5)
+                                .help("\(busy) pane\(busy == 1 ? "" : "s") running a command across this host")
+                        }
+                    }
+                    Spacer(minLength: 4)
                 }
-                .padding(.leading, 20)
-                .padding(.trailing, 8)
-                .padding(.vertical, 4)
+                .contentShape(Rectangle())
                 .frame(maxWidth: .infinity, alignment: .leading)
-            } else {
-                let windowGroups = groupWorkspacesByWindow(
-                    host.workspaces,
-                    windowID: { $0.windowID },
-                    windowTitle: { $0.windowTitle }
-                )
-                // Only surface window sections when the host actually reports
-                // more than one window; a single-window host (or a legacy host
-                // with empty windowID) keeps the flat list it always had.
+            }
+            .frame(maxWidth: .infinity)
+            .buttonStyle(.plain)
+            .accessibilityLabel(hostAccessibilityLabel)
+            .accessibilityValue(hostAccessibilityValue)
+
+            Button {
+                withAnimation(.easeInOut(duration: 0.15)) { isExpanded.toggle() }
+            } label: {
+                Image(systemName: "chevron.right")
+                    .font(.system(size: 8, weight: .semibold))
+                    .foregroundColor(.secondary)
+                    .rotationEffect(.degrees(isExpanded ? 90 : 0))
+                    .frame(width: 16, height: 16)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel(isExpanded ? "Collapse \(host.displayName)" : "Expand \(host.displayName)")
+            .help(isExpanded ? "Collapse \(host.displayName)" : "Expand \(host.displayName)")
+
+            if host.isConnected, host.supportsWorkspaceLifecycle == true {
+                Button {
+                    newWorkspaceTitle = ""
+                    showNewWorkspaceAlert = true
+                } label: {
+                    Image(systemName: "plus")
+                        .font(.system(size: 8, weight: .semibold))
+                        .foregroundColor(.secondary)
+                        .frame(width: 16, height: 16)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .help("New Workspace…")
+            }
+        }
+        .padding(.leading, host.isConnected ? 2 : 10)
+        .padding(.trailing, 10)
+        .padding(.vertical, 3)
+        .background {
+            RoundedRectangle(cornerRadius: 6)
+                .fill(peerHeaderBackground)
+        }
+        .padding(.horizontal, usesSeparatedPresentation ? 6 : 0)
+        .contextMenu {
+            switch host.connectionState {
+            case .saved:
+                if host.sshTarget != nil {
+                    Button("Connect") { store.connectSavedHost(host) }
+                }
+            case .failed:
+                if host.sshTarget != nil {
+                    Button("Retry Connection") { store.retryConnectingHost(host) }
+                }
+            case .connected:
+                Button("Open Surface as Pane…") {
+                    store.openSurfaceAsPane(host)
+                }
+                Button("New Workspace…") {
+                    newWorkspaceTitle = ""
+                    showNewWorkspaceAlert = true
+                }
+                .disabled(host.supportsWorkspaceLifecycle != true)
+                if store.hasSidebarLease(for: host.id) {
+                    Button("Disconnect") { store.disconnectSavedHost(host) }
+                }
+                Button("Force Disconnect (Close All Panes)…") {
+                    showForceDisconnectConfirm = true
+                }
+            case .connecting:
+                Button("Cancel Connection") { store.cancelConnectingHost(host) }
+                Button("Retry Connection") { store.retryConnectingHost(host) }
+            }
+            profileMenuItems
+        }
+    }
+
+    @ViewBuilder
+    private var hostContent: some View {
+        if host.workspaces.isEmpty {
+            HStack(spacing: 8) {
+                Text(emptyBodyText)
+                    .font(.system(size: 10))
+                    .foregroundColor(.secondary)
+                if case .connecting = host.connectionState {
+                    Spacer(minLength: 4)
+                    Button("Cancel") { store.cancelConnectingHost(host) }
+                        .buttonStyle(.borderless)
+                        .controlSize(.mini)
+                        .help("Cancel connection attempt")
+                    Button("Retry") { store.retryConnectingHost(host) }
+                        .buttonStyle(.borderless)
+                        .controlSize(.mini)
+                        .help("Abandon this attempt and start a new one")
+                }
+                if case .failed = host.connectionState, host.sshTarget != nil {
+                    Spacer(minLength: 4)
+                    Button("Retry") { store.retryConnectingHost(host) }
+                        .buttonStyle(.borderless)
+                        .controlSize(.mini)
+                        .help("Try connecting again")
+                }
+            }
+            .padding(.leading, 20)
+            .padding(.trailing, 8)
+            .padding(.vertical, 4)
+            .frame(maxWidth: .infinity, alignment: .leading)
+        } else {
+            let windowGroups = groupWorkspacesByWindow(
+                host.workspaces,
+                windowID: { $0.windowID },
+                windowTitle: { $0.windowTitle }
+            )
+            VStack(spacing: 4) {
                 if windowGroups.count > 1 {
                     ForEach(windowGroups, id: \.windowID) { group in
                         Text(peerWindowLabel(title: group.windowTitle, id: group.windowID))
@@ -1064,7 +1329,8 @@ struct RemoteHostGroupView: View {
                                 workspace: workspace,
                                 host: host,
                                 store: store,
-                                usesSeparatedPresentation: usesSeparatedPresentation
+                                usesSeparatedPresentation: usesSeparatedPresentation,
+                                paneExpansionCommand: paneExpansionCommand
                             )
                         }
                     }
@@ -1074,142 +1340,57 @@ struct RemoteHostGroupView: View {
                             workspace: workspace,
                             host: host,
                             store: store,
-                            usesSeparatedPresentation: usesSeparatedPresentation
+                            usesSeparatedPresentation: usesSeparatedPresentation,
+                            paneExpansionCommand: paneExpansionCommand
                         )
                     }
                 }
             }
-        } label: {
-            HStack(spacing: 5) {
-                hostStatusIcon
-                Text(host.displayName)
-                    .font(.system(size: 11, weight: .semibold))
-                    .foregroundColor(host.isConnected ? .primary : .secondary)
-                    .lineLimit(1)
-                    .truncationMode(.tail)
-                // Workspace count, shown once connected and known —
-                // "jw-server (3)". Hidden while saved/connecting so the
-                // row doesn't flash a stale/zero count.
-                if host.isConnected, !host.workspaces.isEmpty {
-                    let panes = host.workspaces.reduce(0) { $0 + $1.paneCount }
-                    let busy = host.workspaces.reduce(0) { $0 + $1.busyCount }
-                    Text("(\(host.workspaces.count) · \(panes)p)")
-                        .font(.system(size: 10))
-                        .monospacedDigit()
-                        .foregroundColor(Color.secondary.opacity(0.7))
-                    if busy > 0 {
-                        Circle()
-                            .fill(Color.orange)
-                            .frame(width: 5, height: 5)
-                            .help("\(busy) pane\(busy == 1 ? "" : "s") running a command across this host")
-                    }
-                }
-                // Inline "+" = New Workspace…, mirroring the section
-                // header's add-host affordance. Only rendered when the
-                // connected host actually supports workspace CRUD.
-                if host.isConnected, host.supportsWorkspaceLifecycle == true {
-                    Spacer(minLength: 4)
-                    Button {
-                        newWorkspaceTitle = ""
-                        showNewWorkspaceAlert = true
-                    } label: {
-                        Image(systemName: "plus")
-                            .font(.system(size: 8, weight: .semibold))
-                            .foregroundColor(.secondary)
-                            .frame(width: 16, height: 16)
-                            .contentShape(Rectangle())
-                    }
-                    .buttonStyle(.plain)
-                    .help("New Workspace…")
-                }
-            }
-            .padding(.horizontal, 10)
-            .padding(.vertical, 3)
-            .contentShape(Rectangle())
-            .onTapGesture { handleRowTap() }
-            .contextMenu {
-                switch host.connectionState {
-                case .saved:
-                    if host.sshTarget != nil {
-                        Button("Connect") { store.connectSavedHost(host) }
-                    }
-                case .failed:
-                    if host.sshTarget != nil {
-                        // Retry rather than plain Connect: a failed or timed-out
-                        // attempt can leave its connect task behind, and
-                        // connectSavedHost returns immediately when it sees one.
-                        Button("Retry Connection") { store.retryConnectingHost(host) }
-                    }
-                case .connected:
-                    // Phase 1 remote pane primitive: pick one of this
-                    // host's surfaces and open it as a pane in the
-                    // current workspace.
-                    Button("Open Surface as Pane…") {
-                        store.openSurfaceAsPane(host)
-                    }
-                    // Gated on the host's negotiated capability — always
-                    // shown so the menu shape is stable, but disabled
-                    // (not hidden) when the host build predates
-                    // workspace CRUD or the capability isn't known yet.
-                    Button("New Workspace…") {
-                        newWorkspaceTitle = ""
-                        showNewWorkspaceAlert = true
-                    }
-                    .disabled(host.supportsWorkspaceLifecycle != true)
-                    if store.hasSidebarLease(for: host.id) {
-                        Button("Disconnect") { store.disconnectSavedHost(host) }
-                    }
-                    // Always offered. Without a sidebar lease the button above
-                    // is hidden, yet panes alone keep syncFromCoordinator
-                    // re-promoting this row to `.connected` — leaving no action
-                    // at all. This is the way out of that state.
-                    Button("Force Disconnect (Close All Panes)…") {
-                        showForceDisconnectConfirm = true
-                    }
-                case .connecting:
-                    Button("Cancel Connection") { store.cancelConnectingHost(host) }
-                    // A hung acquire ignores cancellation, and cancelPendingAcquire
-                    // is a no-op while other waiters share the start. Retry drops
-                    // this row's attempt and starts a clean one regardless.
-                    Button("Retry Connection") { store.retryConnectingHost(host) }
-                }
-                profileMenuItems
-            }
-            .confirmationDialog(
-                "Delete \"\(host.displayName)\"?",
-                isPresented: $showDeleteConfirm
-            ) {
-                Button("Delete", role: .destructive) {
-                    store.deleteProfile(for: host)
-                }
-                Button("Cancel", role: .cancel) {}
-            } message: {
-                Text("The saved host profile is removed. Open panes and mirrors stay connected.")
-            }
-            .confirmationDialog(
-                "Force disconnect \"\(host.displayName)\"?",
-                isPresented: $showForceDisconnectConfirm
-            ) {
-                Button("Force Disconnect", role: .destructive) {
-                    store.forceDisconnectSavedHost(host)
-                }
-                Button("Cancel", role: .cancel) {}
-            } message: {
-                Text("Closes every pane, mirror and relay window opened from this host. Remote processes keep running on the host.")
-            }
-            .alert("New Workspace", isPresented: $showNewWorkspaceAlert) {
-                TextField("Workspace name", text: $newWorkspaceTitle)
-                Button("Create") {
-                    let title = newWorkspaceTitle.trimmingCharacters(in: .whitespacesAndNewlines)
-                    guard !title.isEmpty else { return }
-                    store.createWorkspace(host: host, title: title)
-                }
-                Button("Cancel", role: .cancel) {}
-            } message: {
-                Text("Creates a new workspace on \"\(host.displayName)\".")
+        }
+    }
+
+    var body: some View {
+        VStack(spacing: 0) {
+            hostHeader
+            if isExpanded {
+                hostContent
+                    .padding(.top, 4)
             }
         }
-        .padding(.horizontal, 6)
+        .confirmationDialog(
+            "Delete \"\(host.displayName)\"?",
+            isPresented: $showDeleteConfirm
+        ) {
+            Button("Delete", role: .destructive) {
+                store.deleteProfile(for: host)
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("The saved host profile is removed. Open panes and mirrors stay connected.")
+        }
+        .confirmationDialog(
+            "Force disconnect \"\(host.displayName)\"?",
+            isPresented: $showForceDisconnectConfirm
+        ) {
+            Button("Force Disconnect", role: .destructive) {
+                store.forceDisconnectSavedHost(host)
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("Closes every pane, mirror and relay window opened from this host. Remote processes keep running on the host.")
+        }
+        .alert("New Workspace", isPresented: $showNewWorkspaceAlert) {
+            TextField("Workspace name", text: $newWorkspaceTitle)
+            Button("Create") {
+                let title = newWorkspaceTitle.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !title.isEmpty else { return }
+                store.createWorkspace(host: host, title: title)
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("Creates a new workspace on \"\(host.displayName)\".")
+        }
+        .padding(.horizontal, usesSeparatedPresentation ? 0 : 6)
         .onChange(of: isExpanded) { newValue in
             SidebarLayoutSettings.setHostCollapsed(host.id, !newValue)
         }
@@ -1220,6 +1401,14 @@ struct RemoteHostGroupView: View {
 }
 
 struct RemoteWorkspaceRowView: View {
+    private enum MirrorVisualState {
+        case closed
+        case connected
+        case working
+        case viewing
+    }
+
+    @Environment(\.colorScheme) private var colorScheme
     @EnvironmentObject private var tabManager: TabManager
     let workspace: WorkspaceSummary
     /// The host group this row is rendered under. Passed explicitly so the
@@ -1229,10 +1418,13 @@ struct RemoteWorkspaceRowView: View {
     let host: HostEntry
     let store: RemoteHostStore
     let usesSeparatedPresentation: Bool
+    let paneExpansionCommand: PeerPaneExpansionCommand
     @State private var isHovering = false
     @State private var isRenaming = false
     @State private var renameTitle = ""
     @State private var showDeleteConfirm = false
+    @State private var panesExpanded = false
+    @State private var manuallyCollapsedWhileSelected = false
     @FocusState private var renameFieldFocused: Bool
 
     private var canManage: Bool { host.supportsWorkspaceLifecycle == true }
@@ -1251,8 +1443,81 @@ struct RemoteWorkspaceRowView: View {
         mirroredWorkspace?.id == tabManager.selectedTabId
     }
 
+    private var mirrorVisualState: MirrorVisualState {
+        if isMirrorSelected { return .viewing }
+        if isMirrorOpen, workspace.busyCount > 0 { return .working }
+        if isMirrorOpen { return .connected }
+        return .closed
+    }
+
     private var mirrorActionTitle: String {
-        isMirrorOpen ? "미러링 중" : "미러 열기"
+        switch mirrorVisualState {
+        case .closed: return "미러 열기"
+        case .connected: return "연결됨"
+        case .working: return "작업 중"
+        case .viewing: return "보고 있음"
+        }
+    }
+
+    private var mirrorStatusIcon: String {
+        switch mirrorVisualState {
+        case .closed: return "arrow.triangle.2.circlepath"
+        case .connected: return "link"
+        case .working: return "bolt.fill"
+        case .viewing: return "eye.fill"
+        }
+    }
+
+    private var peerAccentNSColors: [NSColor] {
+        PeerHostAccent.colors(for: host.paneHostSpec.hostKey)
+    }
+
+    private var originalPeerGradient: LinearGradient {
+        LinearGradient(
+            colors: peerAccentNSColors.map { Color(nsColor: $0) },
+            startPoint: .leading,
+            endPoint: .trailing
+        )
+    }
+
+    private func peerTintGradient(role: PeerSidebarPaletteRole) -> LinearGradient {
+        LinearGradient(
+            colors: PeerSidebarPalette.colors(
+                from: peerAccentNSColors,
+                role: role,
+                colorScheme: colorScheme
+            ),
+            startPoint: .leading,
+            endPoint: .trailing
+        )
+    }
+
+    private var usesInvertedMirrorForeground: Bool {
+        switch mirrorVisualState {
+        case .working, .viewing: return true
+        case .closed, .connected: return false
+        }
+    }
+
+    private var mirrorPrimaryColor: Color {
+        usesInvertedMirrorForeground ? .white : .primary
+    }
+
+    private func mirrorSecondaryColor(_ opacity: Double = 0.75) -> Color {
+        switch mirrorVisualState {
+        case .working, .viewing: return .white.opacity(opacity)
+        case .connected: return .primary.opacity(opacity)
+        case .closed: return .secondary.opacity(opacity)
+        }
+    }
+
+    private var separatedCardBackground: AnyShapeStyle {
+        switch mirrorVisualState {
+        case .closed: return AnyShapeStyle(rowBackgroundFill)
+        case .connected: return AnyShapeStyle(peerTintGradient(role: .workspaceConnected))
+        case .working: return AnyShapeStyle(peerTintGradient(role: .workspaceWorking))
+        case .viewing: return AnyShapeStyle(originalPeerGradient)
+        }
     }
 
     private var mirrorAccessibilityValue: String {
@@ -1275,6 +1540,19 @@ struct RemoteWorkspaceRowView: View {
     private var rowBackgroundFill: Color {
         if isRenaming { return Color.accentColor.opacity(0.12) }
         return isHovering ? Color.primary.opacity(0.07) : Color.clear
+    }
+
+    @ViewBuilder
+    private var mirrorStatus: some View {
+        HStack(spacing: 3) {
+            Image(systemName: mirrorStatusIcon)
+                .font(.system(size: 8.5, weight: .semibold))
+            Text(mirrorActionTitle)
+                .font(.system(size: 9.5, weight: .medium))
+                .lineLimit(1)
+                .fixedSize(horizontal: true, vertical: false)
+        }
+        .foregroundColor(mirrorSecondaryColor(0.9))
     }
 
     /// Enter Finder-style inline rename: swap the label for a focused,
@@ -1371,9 +1649,12 @@ struct RemoteWorkspaceRowView: View {
         }
     }
 
-    private func rowChrome<Content: View>(_ content: Content) -> some View {
+    private func rowChrome<Content: View>(
+        leadingPadding: CGFloat = 20,
+        _ content: Content
+    ) -> some View {
         content
-            .padding(.leading, 20)
+            .padding(.leading, leadingPadding)
             .padding(.trailing, 10)
             .padding(.vertical, 5)
             .background(
@@ -1384,6 +1665,60 @@ struct RemoteWorkspaceRowView: View {
             .contentShape(Rectangle())
     }
 
+    private var paneDetails: some View {
+        VStack(spacing: 3) {
+            ForEach(workspace.panes) { pane in
+                VStack(spacing: 1) {
+                    HStack(spacing: 5) {
+                        Circle()
+                            .fill(
+                                pane.isBusy
+                                    ? (usesInvertedMirrorForeground ? Color.white : Color.orange)
+                                    : mirrorSecondaryColor(0.45)
+                            )
+                            .frame(width: 5, height: 5)
+                        Text(pane.title)
+                            .font(.system(size: 10.5, weight: .medium))
+                            .foregroundColor(mirrorPrimaryColor)
+                            .lineLimit(1)
+                            .truncationMode(.tail)
+                        Spacer(minLength: 4)
+                        if pane.columns > 0, pane.rows > 0 {
+                            Text("\(pane.columns)×\(pane.rows)")
+                                .font(.system(size: 9))
+                                .monospacedDigit()
+                                .foregroundColor(mirrorSecondaryColor(0.65))
+                        }
+                    }
+                    HStack(spacing: 4) {
+                        if let directory = pane.workingDirectoryName {
+                            Image(systemName: "folder")
+                                .font(.system(size: 8))
+                            Text(directory)
+                                .lineLimit(1)
+                                .truncationMode(.middle)
+                        }
+                        if pane.workingDirectoryName != nil {
+                            Text("·")
+                        }
+                        Text("\(pane.tabCount) tab\(pane.tabCount == 1 ? "" : "s")")
+                    }
+                    .font(.system(size: 9))
+                    .foregroundColor(mirrorSecondaryColor(0.75))
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.leading, 10)
+                }
+                .padding(.vertical, 2)
+            }
+        }
+        .padding(.leading, 33)
+        .padding(.trailing, 11)
+        .padding(.bottom, 5)
+        .contentShape(Rectangle())
+        .onTapGesture { handleTap() }
+        .transition(.opacity)
+    }
+
     @ViewBuilder
     private var separatedRow: some View {
         if isRenaming {
@@ -1392,40 +1727,64 @@ struct RemoteWorkspaceRowView: View {
                 Spacer()
             })
         } else {
-            Button(action: handleTap) {
-                rowChrome(HStack(spacing: 5) {
-                    Image(systemName: "terminal")
-                        .font(.system(size: 9))
-                        .foregroundColor(.secondary)
-                    Text(workspace.title)
-                        .font(.system(size: 11.5))
-                        .foregroundColor(.primary)
-                        .lineLimit(1)
-                        .truncationMode(.tail)
-                    Spacer(minLength: 0)
-                    HStack(spacing: 3) {
-                        Image(systemName: isMirrorOpen
-                              ? "checkmark.circle"
-                              : "arrow.triangle.2.circlepath")
-                            .font(.system(size: 8.5, weight: .medium))
-                        Text(mirrorActionTitle)
-                            .font(.system(size: 9.5, weight: .medium))
+            VStack(spacing: 0) {
+                HStack(spacing: 0) {
+                    if !workspace.panes.isEmpty {
+                        Button {
+                            withAnimation(.easeInOut(duration: 0.15)) {
+                                panesExpanded.toggle()
+                                manuallyCollapsedWhileSelected = isMirrorSelected && !panesExpanded
+                            }
+                        } label: {
+                            Image(systemName: "chevron.right")
+                                .font(.system(size: 8, weight: .semibold))
+                                .rotationEffect(.degrees(panesExpanded ? 90 : 0))
+                                .foregroundColor(mirrorSecondaryColor(0.8))
+                                .frame(width: 20, height: 24)
+                                .contentShape(Rectangle())
+                        }
+                        .buttonStyle(.plain)
+                        .accessibilityLabel(panesExpanded
+                                            ? "Hide pane details for \(workspace.title)"
+                                            : "Show pane details for \(workspace.title)")
+                        .padding(.leading, 8)
+                        .help(panesExpanded ? "Hide pane details" : "Show pane details")
                     }
-                    .foregroundColor(
-                        isHovering
-                            ? .accentColor
-                            : (isMirrorOpen ? Color.primary.opacity(0.8) : .secondary)
-                    )
-                    busyIndicator
-                })
+                    Button(action: handleTap) {
+                        HStack(spacing: 5) {
+                            Image(systemName: "terminal")
+                                .font(.system(size: 9))
+                                .foregroundColor(mirrorSecondaryColor(0.85))
+                            Text(workspace.title)
+                                .font(.system(size: 11.5))
+                                .foregroundColor(mirrorPrimaryColor)
+                                .lineLimit(1)
+                                .truncationMode(.tail)
+                            Spacer(minLength: 0)
+                            mirrorStatus
+                        }
+                        .padding(.leading, workspace.panes.isEmpty ? 10 : 0)
+                        .padding(.trailing, 10)
+                        .padding(.vertical, 8)
+                        .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel("\(workspace.title), \(mirrorActionTitle)")
+                    .accessibilityValue(mirrorAccessibilityValue)
+                    .accessibilityHint(mirrorAccessibilityHint)
+                    .help(isMirrorOpen
+                          ? "Select the open mirror for \(workspace.title)"
+                          : "Open \(workspace.title) as a live workspace mirror")
+                }
+                if panesExpanded {
+                    paneDetails
+                }
             }
-            .buttonStyle(.plain)
-            .accessibilityLabel("\(workspace.title), \(mirrorActionTitle)")
-            .accessibilityValue(mirrorAccessibilityValue)
-            .accessibilityHint(mirrorAccessibilityHint)
-            .help(isMirrorOpen
-                  ? "Select the open mirror for \(workspace.title)"
-                  : "Open \(workspace.title) as a live workspace mirror")
+            .background(
+                RoundedRectangle(cornerRadius: 6)
+                    .fill(separatedCardBackground)
+            )
+            .padding(.horizontal, 6)
         }
     }
 
@@ -1476,6 +1835,28 @@ struct RemoteWorkspaceRowView: View {
             .disabled(!canManage || host.workspaces.count <= 1)
         }
         .onHover { isHovering = $0 }
+        .onAppear {
+            if isMirrorSelected, !manuallyCollapsedWhileSelected {
+                panesExpanded = true
+            }
+        }
+        .onChange(of: isMirrorSelected) { isSelected in
+            if isSelected {
+                if !manuallyCollapsedWhileSelected {
+                    withAnimation(.easeInOut(duration: 0.15)) {
+                        panesExpanded = true
+                    }
+                }
+            } else {
+                manuallyCollapsedWhileSelected = false
+            }
+        }
+        .onChange(of: paneExpansionCommand) { command in
+            withAnimation(.easeInOut(duration: 0.15)) {
+                panesExpanded = command.isExpanded
+                manuallyCollapsedWhileSelected = isMirrorSelected && !command.isExpanded
+            }
+        }
         .confirmationDialog(
             "Delete \"\(workspace.title)\"?",
             isPresented: $showDeleteConfirm
