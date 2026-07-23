@@ -14,6 +14,7 @@
 //! Replaces both tm-rpc (agent-side) and team.py (leader-side).
 //! ~1-3ms per call for all commands.
 
+mod orchestrator;
 mod peer;
 mod prompts;
 
@@ -55,6 +56,56 @@ mod project_sync_cli_tests {
         let conflict =
             Cli::try_parse_from(["tm-agent", "conflict", "resolve", "00", "c1", "local"]).unwrap();
         assert!(matches!(conflict.command, Commands::Conflict(_)));
+    }
+
+    #[test]
+    fn parses_orchestrator_command_group_without_team_socket_flags() {
+        let parsed = Cli::try_parse_from([
+            "tm-agent",
+            "orchestrator",
+            "--json",
+            "task",
+            "create",
+            "--request-id",
+            "req-1",
+            "--project-id",
+            "prj_abc",
+            "Implement slice",
+            "--body",
+            "details",
+        ])
+        .unwrap();
+        assert!(matches!(parsed.command, Commands::Orchestrator(_)));
+
+        let subscribe =
+            Cli::try_parse_from(["tm-agent", "orchestrator", "events", "subscribe"]).unwrap();
+        assert!(matches!(subscribe.command, Commands::Orchestrator(_)));
+
+        let suspect = Cli::try_parse_from([
+            "tm-agent",
+            "orchestrator",
+            "task",
+            "suspect",
+            "--request-id",
+            "suspect-1",
+            "tsk_abc",
+            "--reason",
+            "heartbeat stale",
+        ])
+        .unwrap();
+        assert!(matches!(suspect.command, Commands::Orchestrator(_)));
+
+        let quarantine = Cli::try_parse_from([
+            "tm-agent",
+            "orchestrator",
+            "task",
+            "quarantine",
+            "--request-id",
+            "quarantine-1",
+            "tsk_abc",
+        ])
+        .unwrap();
+        assert!(matches!(quarantine.command, Commands::Orchestrator(_)));
     }
 
     #[test]
@@ -972,6 +1023,12 @@ enum Commands {
     /// Daemon-local diagnostics/configuration (talks directly to the
     /// term-meshd socket — no team/app socket required).
     Daemon(DaemonCommands),
+
+    /// Distributed workspace coordinator control-plane operations.
+    ///
+    /// Talks directly to TERMMESH_COORDINATOR_UNIX_PATH or the default
+    /// tm-coordinator.sock, never through the app/team socket.
+    Orchestrator(orchestrator::OrchestratorCommands),
 }
 
 #[derive(clap::Args)]
@@ -3425,8 +3482,9 @@ fn run_project_sync_command(sock: &PathBuf, command: &Commands) -> Result<Value,
                 // verbatim (file path, or `-` for stdin).
                 let raw = if descriptor == "-" {
                     let mut buf = String::new();
-                    std::io::Read::read_to_string(&mut std::io::stdin(), &mut buf)
-                        .map_err(|error| format!("failed to read descriptor from stdin: {error}"))?;
+                    std::io::Read::read_to_string(&mut std::io::stdin(), &mut buf).map_err(
+                        |error| format!("failed to read descriptor from stdin: {error}"),
+                    )?;
                     buf
                 } else {
                     std::fs::read_to_string(descriptor).map_err(|error| {
@@ -4891,6 +4949,10 @@ fn main() {
     if let Commands::Runbook(ref runbook_cmd) = cli.command {
         print_result(run_runbook_command(runbook_cmd));
         return;
+    }
+
+    if let Commands::Orchestrator(ref orchestrator_cmd) = cli.command {
+        process::exit(orchestrator::run(orchestrator_cmd));
     }
 
     if matches!(
@@ -6474,6 +6536,9 @@ fn main() {
         | Commands::Sync(_)
         | Commands::Conflict(_)
         | Commands::Gc(_) => unreachable!("project sync commands return before app socket routing"),
+        Commands::Orchestrator(_) => {
+            unreachable!("orchestrator commands return before app socket routing")
+        }
     };
 
     print_result(result);
