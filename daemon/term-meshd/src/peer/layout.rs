@@ -76,6 +76,57 @@ fn hex_prefix(id: &[u8]) -> String {
     id.iter().take(4).map(|b| format!("{b:02x}")).collect()
 }
 
+/// Nearest ancestor of `cwd` holding a `.git` entry, or empty when the pane
+/// is not inside a repository. Only the host can answer this — a client
+/// staring at `/srv/app/backend` cannot tell a project root from one of its
+/// subdirectories — so it rides the layout snapshot the wire already builds.
+///
+/// Memoized per cwd: a pane's directory changes rarely while layout
+/// snapshots fire on every split, resize and tab switch, and the walk costs
+/// one `exists()` per ancestor. The map is bounded and cleared wholesale
+/// when it fills, since a stale entry only outlives an actual `git init`
+/// (or a repo being deleted) under that exact path.
+fn project_root_for(cwd: &str) -> String {
+    const MAX_CACHED: usize = 512;
+    static CACHE: Mutex<Option<HashMap<String, String>>> = Mutex::new(None);
+
+    if cwd.is_empty() {
+        return String::new();
+    }
+    if let Ok(mut guard) = CACHE.lock() {
+        let cache = guard.get_or_insert_with(HashMap::new);
+        if let Some(hit) = cache.get(cwd) {
+            return hit.clone();
+        }
+        let resolved = walk_to_git_root(cwd);
+        if cache.len() >= MAX_CACHED {
+            cache.clear();
+        }
+        cache.insert(cwd.to_string(), resolved.clone());
+        return resolved;
+    }
+    // Poisoned lock: answering without the cache beats poisoning the wire.
+    walk_to_git_root(cwd)
+}
+
+fn walk_to_git_root(cwd: &str) -> String {
+    let mut dir = PathBuf::from(cwd);
+    if !dir.is_absolute() {
+        return String::new();
+    }
+    loop {
+        // `.git` is a directory in a normal clone and a FILE in a worktree
+        // or submodule, so test for existence rather than for a directory —
+        // term-mesh's own worktrees would otherwise report no project.
+        if dir.join(".git").exists() {
+            return dir.to_string_lossy().into_owned();
+        }
+        if !dir.pop() {
+            return String::new();
+        }
+    }
+}
+
 #[derive(Debug)]
 pub enum LayoutNode {
     Split {
@@ -449,6 +500,7 @@ impl LayoutStore {
                     meta_map.get(sid).cloned().unwrap_or_default()
                 };
                 let (title, cols, rows, cwd, busy) = meta(active);
+                let project_root = project_root_for(&cwd);
                 WorkspaceLayout {
                     node: Some(workspace_layout::Node::Pane(WorkspacePane {
                         surface_id: active.clone(),
@@ -464,6 +516,7 @@ impl LayoutStore {
                             })
                             .collect(),
                         busy,
+                        project_root,
                     })),
                 }
             }
@@ -1660,6 +1713,44 @@ mod tests {
 
     fn sid(name: &str) -> SurfaceId {
         surface_id_from_name(name)
+    }
+
+    #[test]
+    fn project_root_walks_up_to_the_repo() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let repo = tmp.path().join("myproject");
+        let nested = repo.join("daemon").join("src");
+        std::fs::create_dir_all(&nested).expect("mkdir");
+        std::fs::create_dir(repo.join(".git")).expect("mkdir .git");
+
+        assert_eq!(walk_to_git_root(nested.to_str().unwrap()), repo.to_string_lossy());
+        assert_eq!(walk_to_git_root(repo.to_str().unwrap()), repo.to_string_lossy());
+    }
+
+    #[test]
+    fn project_root_accepts_a_git_file_for_worktrees() {
+        // A linked worktree (and a submodule) has `.git` as a FILE.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let worktree = tmp.path().join("feature-branch");
+        std::fs::create_dir_all(worktree.join("Sources")).expect("mkdir");
+        std::fs::write(worktree.join(".git"), "gitdir: /elsewhere\n").expect("write");
+
+        assert_eq!(
+            walk_to_git_root(worktree.join("Sources").to_str().unwrap()),
+            worktree.to_string_lossy()
+        );
+    }
+
+    #[test]
+    fn project_root_is_empty_outside_a_repo_and_for_bad_input() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let plain = tmp.path().join("no-repo-here");
+        std::fs::create_dir_all(&plain).expect("mkdir");
+
+        // tempdir lives under /tmp (or /var/folders); neither is a repo.
+        assert_eq!(walk_to_git_root(plain.to_str().unwrap()), "");
+        assert_eq!(walk_to_git_root("relative/path"), "");
+        assert_eq!(project_root_for(""), "");
     }
 
     /// Build a store with N single-tab panes without spawning PTYs.

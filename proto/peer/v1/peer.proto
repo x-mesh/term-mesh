@@ -426,6 +426,14 @@ message WorkspacePane {
   // Field-additive and backward compatible: hosts that predate this leave
   // it false, which clients render as idle.
   bool busy = 7;
+  // Absolute path of the project this pane works inside — the nearest
+  // ancestor of `cwd` holding a `.git` entry — or empty when the pane is
+  // not inside a repository. Clients group workspaces by project, and `cwd`
+  // alone cannot answer that: `/srv/app/backend` is indistinguishable from
+  // a project root without asking the filesystem, which only the host can
+  // do. Field-additive: hosts that predate this leave it empty and clients
+  // fall back to guessing from `cwd`.
+  string project_root = 8;
 }
 
 message PaneTab {

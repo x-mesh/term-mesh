@@ -48,12 +48,17 @@ final class PeerWorkspaceMirrorTests: XCTestCase {
         return workspace
     }
 
-    private func remotePane(_ id: UInt8, cwd: String?) -> RemotePaneSummary {
+    private func remotePane(
+        _ id: UInt8,
+        cwd: String?,
+        projectRoot: String? = nil
+    ) -> RemotePaneSummary {
         RemotePaneSummary(
             id: Data([id]),
             title: "pane-\(id)",
             workingDirectoryPath: cwd,
             workingDirectoryName: cwd.flatMap { ($0 as NSString).lastPathComponent },
+            projectRootPath: projectRoot,
             tabCount: 1,
             columns: 80,
             rows: 24,
@@ -120,13 +125,48 @@ final class PeerWorkspaceMirrorTests: XCTestCase {
         XCTAssertFalse(identity.isUnknown)
     }
 
-    /// Known limitation: a single pane sitting in a subdirectory names that
-    /// subdirectory, because cwd alone cannot locate the project root. Only
-    /// the host's git root can, and the peer protocol does not carry it yet.
+    /// Without a reported root, cwd alone cannot locate the project, so a
+    /// lone pane in a subdirectory names that subdirectory. This is the
+    /// fallback path for hosts predating `project_root`.
     func test_peerProjectIdentity_loneSubdirectoryPaneNamesTheSubdirectory() {
         let identity = peerProjectIdentity(for: [remotePane(1, cwd: "/root/term-mesh/daemon")])
 
         XCTAssertEqual(identity.label, "daemon")
+    }
+
+    func test_peerProjectIdentity_reportedRootBeatsTheCwdGuess() {
+        let identity = peerProjectIdentity(for: [
+            remotePane(1, cwd: "/root/term-mesh/daemon", projectRoot: "/root/term-mesh"),
+        ])
+
+        XCTAssertEqual(identity.label, "term-mesh")
+        XCTAssertFalse(identity.isUnknown)
+    }
+
+    func test_peerProjectIdentity_rootedPanesInUnrelatedTreesDoNotCollapse() {
+        // Without roots these two would share only `/root` and go unassigned.
+        let identity = peerProjectIdentity(for: [
+            remotePane(1, cwd: "/root/term-mesh/Sources", projectRoot: "/root/term-mesh"),
+            remotePane(2, cwd: "/root/term-mesh/daemon", projectRoot: "/root/term-mesh"),
+            remotePane(3, cwd: "/root/x-kit", projectRoot: "/root/x-kit"),
+        ])
+
+        XCTAssertEqual(identity.label, "term-mesh")
+    }
+
+    func test_peerProjectIdentity_rootTieGoesToTheFirstPane() {
+        let identity = peerProjectIdentity(for: [
+            remotePane(1, cwd: "/root/x-kit", projectRoot: "/root/x-kit"),
+            remotePane(2, cwd: "/root/term-mesh", projectRoot: "/root/term-mesh"),
+        ])
+
+        XCTAssertEqual(identity.label, "x-kit")
+    }
+
+    func test_peerProjectIdentity_paneOutsideARepoFallsBackToCwd() {
+        // Host reported no root for this pane (empty → nil), so the cwd
+        // heuristic still applies and a bare home stays unassigned.
+        XCTAssertEqual(peerProjectIdentity(for: [remotePane(1, cwd: "/root")]), .unknown)
     }
 
     /// The local axis feeds raw panel directories through the same entry

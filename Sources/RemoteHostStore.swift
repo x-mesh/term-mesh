@@ -34,6 +34,10 @@ struct RemotePaneSummary: Identifiable, Equatable {
     let title: String
     let workingDirectoryPath: String?
     let workingDirectoryName: String?
+    /// Repository root the host resolved for this pane, when it reported one.
+    /// nil on hosts predating the field — project grouping then falls back to
+    /// guessing from the cwd.
+    let projectRootPath: String?
     let tabCount: Int
     let columns: Int
     let rows: Int
@@ -60,6 +64,7 @@ func peerPaneSummaries(
                 title: pane.title.isEmpty ? "Shell" : pane.title,
                 workingDirectoryPath: pane.cwd.isEmpty ? nil : pane.cwd,
                 workingDirectoryName: shortDirectoryName(pane.cwd),
+                projectRootPath: pane.projectRoot.isEmpty ? nil : pane.projectRoot,
                 tabCount: max(pane.tabs.count, 1),
                 columns: Int(pane.cols),
                 rows: Int(pane.rows),
@@ -172,7 +177,31 @@ enum PeerSidebarGroupingSettings {
 }
 
 func peerProjectIdentity(for panes: [RemotePaneSummary]) -> PeerProjectIdentity {
-    projectIdentity(forWorkingDirectories: panes.compactMap(\.workingDirectoryPath))
+    // A reported repo root is an answer, not a guess, so it wins outright.
+    // With real roots in hand a majority vote is meaningful: panes in two
+    // repos genuinely put the workspace in the one it mostly works on,
+    // whereas voting on cwds would be voting on subdirectory names.
+    let roots = panes.compactMap(\.projectRootPath)
+    if let winner = mostCommonProjectRoot(roots) {
+        return projectIdentity(forWorkingDirectories: [winner])
+    }
+    return projectIdentity(forWorkingDirectories: panes.compactMap(\.workingDirectoryPath))
+}
+
+/// The repo root most panes report, ties going to the leftmost pane.
+/// nil when no pane reported one (a host predating `project_root`).
+private func mostCommonProjectRoot(_ roots: [String]) -> String? {
+    var counts: [String: Int] = [:]
+    var order: [String] = []
+    for root in roots.compactMap(peerNormalizeRemotePath) {
+        if counts[root] == nil { order.append(root) }
+        counts[root, default: 0] += 1
+    }
+    guard var best = order.first else { return nil }
+    for root in order.dropFirst() where counts[root, default: 0] > counts[best, default: 0] {
+        best = root
+    }
+    return best
 }
 
 /// Project identity for a set of working directories, whatever produced them

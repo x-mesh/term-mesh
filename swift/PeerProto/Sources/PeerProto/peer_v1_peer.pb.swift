@@ -1265,6 +1265,15 @@ public nonisolated struct Termmesh_Peer_V1_WorkspacePane: Sendable {
   /// it false, which clients render as idle.
   public var busy: Bool = false
 
+  /// Absolute path of the project this pane works inside — the nearest
+  /// ancestor of `cwd` holding a `.git` entry — or empty when the pane is
+  /// not inside a repository. Clients group workspaces by project, and `cwd`
+  /// alone cannot answer that: `/srv/app/backend` is indistinguishable from
+  /// a project root without asking the filesystem, which only the host can
+  /// do. Field-additive: hosts that predate this leave it empty and clients
+  /// fall back to guessing from `cwd`.
+  public var projectRoot: String = String()
+
   public var unknownFields = SwiftProtobuf.UnknownStorage()
 
   public init() {}
@@ -3766,7 +3775,7 @@ nonisolated extension Termmesh_Peer_V1_WorkspaceSplit: SwiftProtobuf.Message, Sw
 
 nonisolated extension Termmesh_Peer_V1_WorkspacePane: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
   public static let protoMessageName: String = _protobuf_package + ".WorkspacePane"
-  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{3}surface_id\0\u{1}title\0\u{1}cols\0\u{1}rows\0\u{1}cwd\0\u{1}tabs\0\u{1}busy\0")
+  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{3}surface_id\0\u{1}title\0\u{1}cols\0\u{1}rows\0\u{1}cwd\0\u{1}tabs\0\u{1}busy\0\u{3}project_root\0")
 
   public mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
     while let fieldNumber = try decoder.nextFieldNumber() {
@@ -3781,6 +3790,7 @@ nonisolated extension Termmesh_Peer_V1_WorkspacePane: SwiftProtobuf.Message, Swi
       case 5: try { try decoder.decodeSingularStringField(value: &self.cwd) }()
       case 6: try { try decoder.decodeRepeatedMessageField(value: &self.tabs) }()
       case 7: try { try decoder.decodeSingularBoolField(value: &self.busy) }()
+      case 8: try { try decoder.decodeSingularStringField(value: &self.projectRoot) }()
       default: break
       }
     }
@@ -3808,6 +3818,9 @@ nonisolated extension Termmesh_Peer_V1_WorkspacePane: SwiftProtobuf.Message, Swi
     if self.busy != false {
       try visitor.visitSingularBoolField(value: self.busy, fieldNumber: 7)
     }
+    if !self.projectRoot.isEmpty {
+      try visitor.visitSingularStringField(value: self.projectRoot, fieldNumber: 8)
+    }
     try unknownFields.traverse(visitor: &visitor)
   }
 
@@ -3819,6 +3832,7 @@ nonisolated extension Termmesh_Peer_V1_WorkspacePane: SwiftProtobuf.Message, Swi
     if lhs.cwd != rhs.cwd {return false}
     if lhs.tabs != rhs.tabs {return false}
     if lhs.busy != rhs.busy {return false}
+    if lhs.projectRoot != rhs.projectRoot {return false}
     if lhs.unknownFields != rhs.unknownFields {return false}
     return true
   }
