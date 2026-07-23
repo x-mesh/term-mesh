@@ -80,7 +80,7 @@ enum SettingsSection: String, CaseIterable, Identifiable {
 
     var searchKeywords: [String] {
         switch self {
-        case .app: return ["app", "theme", "appearance", "dark", "light", "workspace", "placement", "session", "restore", "dock", "badge", "quit", "warn", "rename", "sidebar", "branch", "reorder", "notification", "experimental", "mirror", "peer hosts"]
+        case .app: return ["app", "theme", "appearance", "dark", "light", "workspace", "placement", "session", "restore", "dock", "badge", "quit", "warn", "rename", "sidebar", "branch", "reorder", "notification", "experimental", "mirror", "peer hosts", "distributed", "coordinator", "review board"]
         case .terminal: return ["terminal", "font", "size", "theme", "monospace", "family"]
         case .workspaceColors: return ["workspace", "color", "indicator", "palette", "custom"]
         case .automation: return ["automation", "socket", "claude", "port", "integration", "password"]
@@ -142,6 +142,15 @@ struct SettingsView: View {
     private var sidebarSeparatedSectionsEnabled = SidebarPresentationSettings.defaultSeparatedSectionsEnabled
     @AppStorage(SidebarActiveTabIndicatorSettings.styleKey)
     private var sidebarActiveTabIndicatorStyle = SidebarActiveTabIndicatorSettings.defaultStyle.rawValue
+    // The two UserDefaults halves of the coordinator gate. The env half
+    // (TERMMESH_COORDINATOR_ENABLED) is intentionally NOT here: a release
+    // build never sets it, so flipping this toggle in a shipped app enables
+    // the cross-host UI without ever launching a coordinator — safe until the
+    // feature is ready to ship on by itself.
+    @AppStorage(ReviewBoardCoordinatorSettings.distributedFeatureKey)
+    private var distributedWorkspacesEnabled = false
+    @AppStorage(ReviewBoardSettings.enabledKey)
+    private var reviewBoardEnabled = false
     @AppStorage("teamDefaultLeaderMode") private var teamDefaultLeaderMode = "claude"
     @AppStorage("teamDefaultModel") private var teamDefaultModel = "sonnet"
     @AppStorage("teamDefaultWorkingDirectory") private var teamDefaultWorkingDirectory = ""
@@ -827,7 +836,44 @@ struct SettingsView: View {
                         }
                         }
 
+                        if settingsMatch("distributed", "coordinator", "experimental", "review board", "peer hosts") {
+                        SettingsCardDivider()
+
+                        SettingsCardRow(
+                            "Distributed Workspaces (Experimental)",
+                            subtitle: distributedWorkspacesActive
+                                ? "Tracks projects, hosts, and team leaders across machines via the coordinator."
+                                : "Tracks projects and team leaders across machines. Needs TERMMESH_COORDINATOR_ENABLED=1 in the environment to actually launch the coordinator."
+                        ) {
+                            Toggle("", isOn: distributedWorkspacesBinding)
+                                .labelsHidden()
+                                .controlSize(.small)
+                                .accessibilityLabel("Enable distributed workspaces")
+                        }
+                        }
+
         }
+    }
+
+    /// Both UserDefaults halves of the coordinator gate, flipped as one — the
+    /// gate is an AND of the two, so a single switch is the honest control.
+    private var distributedWorkspacesBinding: Binding<Bool> {
+        // Reading the @AppStorage vars keeps the toggle reactive; writing
+        // goes through the shared setter so the two-keys-as-one rule lives in
+        // one place (and is unit-tested there).
+        Binding(
+            get: { distributedWorkspacesEnabled && reviewBoardEnabled },
+            set: { on in
+                distributedWorkspacesEnabled = on
+                reviewBoardEnabled = on
+            }
+        )
+    }
+
+    /// Whether the gate is fully open — the env half is out of the UI's
+    /// hands, so the subtitle tells the user when the toggle is not enough.
+    private var distributedWorkspacesActive: Bool {
+        ReviewBoardCoordinatorSettings.isIntegrationEnabled()
     }
 
     // MARK: - Section: Terminal

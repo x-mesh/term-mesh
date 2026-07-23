@@ -42,6 +42,27 @@ final class ReviewBoardCoordinatorServiceTests: XCTestCase {
         )
     }
 
+    /// The experimental toggle owns both halves of the gate. It reads on only
+    /// when both are set, writes both together, and a half-set state left by
+    /// an older build reads as off.
+    func testDistributedWorkspacesToggleMovesBothGateKeys() {
+        let defaults = UserDefaults(suiteName: "DistributedToggleTests.\(UUID().uuidString)")!
+
+        XCTAssertFalse(ReviewBoardCoordinatorSettings.distributedWorkspacesToggleOn(defaults: defaults))
+
+        ReviewBoardCoordinatorSettings.setDistributedWorkspacesToggle(true, defaults: defaults)
+        XCTAssertTrue(defaults.bool(forKey: ReviewBoardCoordinatorSettings.distributedFeatureKey))
+        XCTAssertTrue(defaults.bool(forKey: ReviewBoardSettings.enabledKey))
+        XCTAssertTrue(ReviewBoardCoordinatorSettings.distributedWorkspacesToggleOn(defaults: defaults))
+
+        ReviewBoardCoordinatorSettings.setDistributedWorkspacesToggle(false, defaults: defaults)
+        XCTAssertFalse(ReviewBoardCoordinatorSettings.distributedWorkspacesToggleOn(defaults: defaults))
+
+        // Half-set (one key on) must not read as on — the gate is an AND.
+        defaults.set(true, forKey: ReviewBoardCoordinatorSettings.distributedFeatureKey)
+        XCTAssertFalse(ReviewBoardCoordinatorSettings.distributedWorkspacesToggleOn(defaults: defaults))
+    }
+
     /// A coordinator launched without a working event log exits immediately
     /// with `mem_mesh_unavailable`, which the app can only observe as "never
     /// online" — so the local journal has to be on by default.

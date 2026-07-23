@@ -40,6 +40,20 @@ enum ReviewBoardCoordinatorSettings {
             && defaults.bool(forKey: ReviewBoardSettings.enabledKey)
     }
 
+    /// The two UserDefaults halves of the gate, read and written as one.
+    /// The gate is an AND, so the toggle is "on" only when BOTH are set, and
+    /// flipping it moves both together — a half-set state (one key on, one
+    /// off) can only come from an older build and must read as off.
+    static func distributedWorkspacesToggleOn(defaults: UserDefaults = .standard) -> Bool {
+        defaults.bool(forKey: distributedFeatureKey)
+            && defaults.bool(forKey: ReviewBoardSettings.enabledKey)
+    }
+
+    static func setDistributedWorkspacesToggle(_ on: Bool, defaults: UserDefaults = .standard) {
+        defaults.set(on, forKey: distributedFeatureKey)
+        defaults.set(on, forKey: ReviewBoardSettings.enabledKey)
+    }
+
     static func socketPath(
         environment: [String: String] = ProcessInfo.processInfo.environment,
         bundleIdentifier: String? = Bundle.main.bundleIdentifier,
