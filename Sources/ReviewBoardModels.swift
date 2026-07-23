@@ -27,6 +27,7 @@ enum ReviewBoardSettings {
 
 extension Notification.Name {
     static let reviewBoardTaskSelected = Notification.Name("termMesh.reviewBoard.taskSelected")
+    static let reviewBoardSnapshotDidChange = Notification.Name("termMesh.reviewBoard.snapshotDidChange")
 }
 
 enum ReviewBoardStatus: String, CaseIterable, Equatable, Sendable {

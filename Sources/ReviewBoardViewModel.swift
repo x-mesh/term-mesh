@@ -5,7 +5,7 @@ final class ReviewBoardViewModel: ObservableObject {
     @Published private(set) var snapshot: ReviewBoardSnapshot
     @Published var selectedTaskID: String?
 
-    private let snapshotProvider: @MainActor () -> ReviewBoardSnapshot
+    private var snapshotProvider: @MainActor () -> ReviewBoardSnapshot
 
     init(
         initialSnapshot: ReviewBoardSnapshot = .empty,
@@ -45,6 +45,11 @@ final class ReviewBoardViewModel: ObservableObject {
     func refresh() {
         snapshot = snapshotProvider()
         keepSelectionValid()
+    }
+
+    func setSnapshotProvider(_ provider: @escaping @MainActor () -> ReviewBoardSnapshot) {
+        snapshotProvider = provider
+        refresh()
     }
 
     func selectTask(id: String) {

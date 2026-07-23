@@ -27,6 +27,7 @@ final class ServiceContainer {
     let daemon: any DaemonService
     let notifications: TerminalNotificationStore
     let browserHistory: any BrowserHistoryService
+    let reviewBoardCoordinator: ReviewBoardCoordinatorService
 
     // MARK: - Init
 
@@ -34,12 +35,25 @@ final class ServiceContainer {
         config: (any GhosttyConfigProvider)? = nil,
         daemon: (any DaemonService)? = nil,
         notifications: TerminalNotificationStore? = nil,
-        browserHistory: (any BrowserHistoryService)? = nil
+        browserHistory: (any BrowserHistoryService)? = nil,
+        reviewBoardCoordinator: ReviewBoardCoordinatorService? = nil
     ) {
         self.config = config ?? GhosttyApp.shared
         self.daemon = daemon ?? TermMeshDaemon.shared
         self.notifications = notifications ?? TerminalNotificationStore.shared
         self.browserHistory = browserHistory ?? BrowserHistoryStore.shared
+        self.reviewBoardCoordinator = reviewBoardCoordinator ?? ReviewBoardCoordinatorService.shared
+    }
+}
+
+private struct ReviewBoardCoordinatorEnvironmentKey: EnvironmentKey {
+    static let defaultValue: ReviewBoardCoordinatorService? = nil
+}
+
+extension EnvironmentValues {
+    var reviewBoardCoordinatorService: ReviewBoardCoordinatorService? {
+        get { self[ReviewBoardCoordinatorEnvironmentKey.self] }
+        set { self[ReviewBoardCoordinatorEnvironmentKey.self] = newValue }
     }
 }
 
@@ -53,5 +67,6 @@ extension View {
             .environment(\.daemonService, container.daemon)
             .environment(\.notificationService, container.notifications)
             .environment(\.browserHistoryService, container.browserHistory)
+            .environment(\.reviewBoardCoordinatorService, container.reviewBoardCoordinator)
     }
 }
