@@ -42,6 +42,29 @@ final class ReviewBoardCoordinatorServiceTests: XCTestCase {
         )
     }
 
+    /// A coordinator launched without a working event log exits immediately
+    /// with `mem_mesh_unavailable`, which the app can only observe as "never
+    /// online" — so the local journal has to be on by default.
+    func testLaunchEnvironmentEnablesTheLocalJournalAndSocketPath() {
+        let environment = ReviewBoardCoordinatorSettings.launchEnvironment(
+            base: ["PATH": "/usr/bin"],
+            socketPath: "/tmp/tm-coordinator-test.sock"
+        )
+
+        XCTAssertEqual(environment[ReviewBoardCoordinatorSettings.socketPathEnvironmentKey], "/tmp/tm-coordinator-test.sock")
+        XCTAssertEqual(environment[ReviewBoardCoordinatorSettings.localJournalEnvironmentKey], "1")
+        XCTAssertEqual(environment["PATH"], "/usr/bin")
+    }
+
+    func testLaunchEnvironmentKeepsAnExplicitJournalChoice() {
+        let environment = ReviewBoardCoordinatorSettings.launchEnvironment(
+            base: [ReviewBoardCoordinatorSettings.localJournalEnvironmentKey: "0"],
+            socketPath: "/tmp/tm-coordinator-test.sock"
+        )
+
+        XCTAssertEqual(environment[ReviewBoardCoordinatorSettings.localJournalEnvironmentKey], "0")
+    }
+
     func testClientParsesFakeUDSSnapshotAndSanitizesDisplayData() async throws {
         let socketPath = "/tmp/tm-coordinator-test-\(getpid())-\(UUID().uuidString.prefix(8)).sock"
         let server = FakeCoordinatorServer(socketPath: socketPath)

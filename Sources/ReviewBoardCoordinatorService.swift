@@ -5,7 +5,29 @@ enum ReviewBoardCoordinatorSettings {
     static let enabledEnvironmentKey = "TERMMESH_COORDINATOR_ENABLED"
     static let socketPathEnvironmentKey = "TERMMESH_COORDINATOR_UNIX_PATH"
     static let binaryPathEnvironmentKey = "TERMMESH_COORDINATOR_BINARY"
+    static let localJournalEnvironmentKey = "TERMMESH_COORDINATOR_LOCAL_JOURNAL"
     static let distributedFeatureKey = "distributedWorkspaces.enabled"
+
+    /// Environment for a coordinator we launch ourselves.
+    ///
+    /// The coordinator refuses to start without an event log that guarantees
+    /// ordered append/read, and mem-mesh does not offer that contract (it
+    /// exposes memory search/add, not a canonical log), so its local journal
+    /// is the only backing store that actually works today. Without this the
+    /// process exits immediately on `mem_mesh_unavailable` and the app just
+    /// sees a coordinator that is never online. An explicit value from the
+    /// launcher still wins, so switching backends stays possible.
+    static func launchEnvironment(
+        base: [String: String],
+        socketPath: String
+    ) -> [String: String] {
+        var environment = base
+        environment[socketPathEnvironmentKey] = socketPath
+        if environment[localJournalEnvironmentKey] == nil {
+            environment[localJournalEnvironmentKey] = "1"
+        }
+        return environment
+    }
 
     static func isIntegrationEnabled(
         environment: [String: String] = ProcessInfo.processInfo.environment,
@@ -379,9 +401,10 @@ final class ReviewBoardCoordinatorService: ObservableObject {
             ? URL(fileURLWithPath: binary)
             : URL(fileURLWithPath: "/usr/bin/env")
         process.arguments = binary.contains("/") ? [] : [binary]
-        var processEnvironment = environment
-        processEnvironment[ReviewBoardCoordinatorSettings.socketPathEnvironmentKey] = socketPath
-        process.environment = processEnvironment
+        process.environment = ReviewBoardCoordinatorSettings.launchEnvironment(
+            base: environment,
+            socketPath: socketPath
+        )
         process.standardOutput = FileHandle.nullDevice
         process.standardError = FileHandle.nullDevice
         do {
