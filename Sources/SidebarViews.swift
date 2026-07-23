@@ -1015,9 +1015,7 @@ struct SidebarRemoteHostsSection: View {
                                 store: store,
                                 usesSeparatedPresentation: usesSeparatedPresentation,
                                 paneExpansionCommand: paneExpansionCommand
-                            ) { context in
-                                editorContext = context
-                            }
+                            )
                         }
                     }
                 }
@@ -1064,19 +1062,18 @@ private struct SidebarPeerProjectGroup: Identifiable {
     var id: String { identity.id }
 }
 
+/// Project-axis rendering of the peer section. Deliberately shows NOTHING but
+/// projects: a host that contributes no workspace has no place on this axis,
+/// and listing it here just reproduced the Host view one toggle away. Host
+/// lifecycle (connect, retry, edit, delete) lives in the Host view alone.
 private struct SidebarPeerProjectsView: View {
     let hosts: [HostEntry]
     let store: RemoteHostStore
     let usesSeparatedPresentation: Bool
     let paneExpansionCommand: PeerPaneExpansionCommand
-    let onEdit: (PeerHostEditorContext) -> Void
 
     private var connectedHosts: [HostEntry] {
         hosts.filter { $0.isConnected && !$0.workspaces.isEmpty }
-    }
-
-    private var otherHosts: [HostEntry] {
-        hosts.filter { !$0.isConnected || $0.workspaces.isEmpty }
     }
 
     private var projectGroups: [SidebarPeerProjectGroup] {
@@ -1107,14 +1104,18 @@ private struct SidebarPeerProjectsView: View {
 
     var body: some View {
         VStack(spacing: usesSeparatedPresentation ? 8 : 0) {
-            if projectGroups.isEmpty, !otherHosts.isEmpty {
+            if projectGroups.isEmpty {
                 VStack(alignment: .leading, spacing: 2) {
-                    Text("No projects discovered")
+                    Text("No projects yet")
                         .font(.system(size: 10, weight: .semibold))
                         .foregroundColor(.secondary)
-                    Text("Connect a peer to group its workspaces by project.")
+                    // The empty state is the only place this view mentions
+                    // hosts at all — without it a peerless Project view would
+                    // be a dead end with no route to connecting one.
+                    Text("Connect a peer in the Host view to see its projects.")
                         .font(.system(size: 9))
                         .foregroundColor(Color.secondary.opacity(0.72))
+                        .fixedSize(horizontal: false, vertical: true)
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .padding(.horizontal, 16)
@@ -1148,25 +1149,6 @@ private struct SidebarPeerProjectsView: View {
                 }
             }
 
-            if !otherHosts.isEmpty, !projectGroups.isEmpty {
-                Text("Offline peers")
-                    .font(.system(size: 9, weight: .semibold))
-                    .foregroundColor(Color.secondary.opacity(0.75))
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .padding(.leading, 16)
-                    .padding(.top, 6)
-                    .padding(.bottom, 1)
-            }
-
-            ForEach(otherHosts) { host in
-                RemoteHostGroupView(
-                    host: host,
-                    store: store,
-                    usesSeparatedPresentation: usesSeparatedPresentation,
-                    paneExpansionCommand: paneExpansionCommand,
-                    onEdit: onEdit
-                )
-            }
         }
     }
 }
