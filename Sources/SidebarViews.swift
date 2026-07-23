@@ -872,6 +872,10 @@ struct SidebarRemoteHostsSection: View {
     let usesSeparatedPresentation: Bool
     @AppStorage(SidebarLayoutSettings.remoteHostsCollapsedKey)
     private var isCollapsed = false
+    @AppStorage(PeerSidebarGroupingSettings.featureFlagKey)
+    private var isGroupingControlEnabled = false
+    @AppStorage(PeerSidebarGroupingSettings.selectedModeKey)
+    private var selectedGroupingMode = PeerSidebarGroupingSettings.defaultMode.rawValue
     /// Non-nil presents the add/edit sheet.
     @State private var editorContext: PeerHostEditorContext?
     @State private var areAllPaneDetailsExpanded = false
@@ -884,6 +888,11 @@ struct SidebarRemoteHostsSection: View {
         store.sortedHosts.contains { host in
             host.workspaces.contains { !$0.panes.isEmpty }
         }
+    }
+
+    private var groupingMode: PeerSidebarGroupingMode {
+        guard isGroupingControlEnabled else { return .host }
+        return PeerSidebarGroupingSettings.mode(from: selectedGroupingMode)
     }
 
     private func toggleAllPaneDetails() {
@@ -907,6 +916,19 @@ struct SidebarRemoteHostsSection: View {
             SidebarSectionHeader(title: "Peer Hosts", isCollapsed: $isCollapsed)
                 .overlay(alignment: .trailing) {
                     HStack(spacing: 2) {
+                        if !isCollapsed, isGroupingControlEnabled {
+                            Picker("", selection: $selectedGroupingMode) {
+                                ForEach(PeerSidebarGroupingMode.allCases) { mode in
+                                    Text(mode.title).tag(mode.rawValue)
+                                }
+                            }
+                            .pickerStyle(.segmented)
+                            .controlSize(.mini)
+                            .frame(width: 104)
+                            .accessibilityLabel("Peer hosts grouping")
+                            .help("Group peer hosts by host or project")
+                        }
+
                         if !isCollapsed, hasPeerPaneDetails {
                             Button(action: toggleAllPaneDetails) {
                                 Image(systemName: areAllPaneDetailsExpanded
@@ -956,9 +978,21 @@ struct SidebarRemoteHostsSection: View {
                         .padding(.vertical, 4)
                 } else {
                     VStack(spacing: usesSeparatedPresentation ? 8 : 0) {
-                        ForEach(store.sortedHosts) { host in
-                            RemoteHostGroupView(
-                                host: host,
+                        switch groupingMode {
+                        case .host:
+                            ForEach(store.sortedHosts) { host in
+                                RemoteHostGroupView(
+                                    host: host,
+                                    store: store,
+                                    usesSeparatedPresentation: usesSeparatedPresentation,
+                                    paneExpansionCommand: paneExpansionCommand
+                                ) { context in
+                                    editorContext = context
+                                }
+                            }
+                        case .project:
+                            SidebarPeerProjectsView(
+                                hosts: store.sortedHosts,
                                 store: store,
                                 usesSeparatedPresentation: usesSeparatedPresentation,
                                 paneExpansionCommand: paneExpansionCommand
@@ -991,6 +1025,104 @@ struct SidebarRemoteHostsSection: View {
                 profile: PeerHostProfile(sshTarget: ""),
                 isNew: true
             )
+        }
+    }
+}
+
+private struct SidebarPeerProjectGroup: Identifiable {
+    struct WorkspaceItem: Identifiable {
+        let host: HostEntry
+        let workspace: WorkspaceSummary
+
+        var id: String {
+            "\(host.id):\(workspace.id.base64EncodedString())"
+        }
+    }
+
+    let identity: PeerProjectIdentity
+    var items: [WorkspaceItem]
+
+    var id: String { identity.id }
+}
+
+private struct SidebarPeerProjectsView: View {
+    let hosts: [HostEntry]
+    let store: RemoteHostStore
+    let usesSeparatedPresentation: Bool
+    let paneExpansionCommand: PeerPaneExpansionCommand
+    let onEdit: (PeerHostEditorContext) -> Void
+
+    private var connectedHosts: [HostEntry] {
+        hosts.filter { $0.isConnected && !$0.workspaces.isEmpty }
+    }
+
+    private var otherHosts: [HostEntry] {
+        hosts.filter { !$0.isConnected || $0.workspaces.isEmpty }
+    }
+
+    private var projectGroups: [SidebarPeerProjectGroup] {
+        var indexes: [PeerProjectIdentity: Int] = [:]
+        var groups: [SidebarPeerProjectGroup] = []
+        for host in connectedHosts {
+            for workspace in host.workspaces {
+                let identity = peerProjectIdentity(for: workspace.panes)
+                let item = SidebarPeerProjectGroup.WorkspaceItem(
+                    host: host,
+                    workspace: workspace
+                )
+                if let index = indexes[identity] {
+                    groups[index].items.append(item)
+                } else {
+                    indexes[identity] = groups.count
+                    groups.append(SidebarPeerProjectGroup(identity: identity, items: [item]))
+                }
+            }
+        }
+        return groups.sorted {
+            if $0.identity.isUnknown != $1.identity.isUnknown {
+                return !$0.identity.isUnknown
+            }
+            return $0.identity.label.localizedCaseInsensitiveCompare($1.identity.label) == .orderedAscending
+        }
+    }
+
+    var body: some View {
+        VStack(spacing: usesSeparatedPresentation ? 8 : 0) {
+            ForEach(projectGroups) { group in
+                VStack(spacing: 4) {
+                    Text(group.identity.label)
+                        .font(.system(size: 9, weight: .semibold))
+                        .foregroundColor(Color.secondary.opacity(0.75))
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+                        .padding(.leading, 16)
+                        .padding(.top, 4)
+                        .padding(.bottom, 1)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .accessibilityLabel(group.identity.isUnknown
+                                            ? "Unknown Project"
+                                            : "Project \(group.identity.label)")
+                    ForEach(group.items) { item in
+                        RemoteWorkspaceRowView(
+                            workspace: item.workspace,
+                            host: item.host,
+                            store: store,
+                            usesSeparatedPresentation: usesSeparatedPresentation,
+                            paneExpansionCommand: paneExpansionCommand
+                        )
+                    }
+                }
+            }
+
+            ForEach(otherHosts) { host in
+                RemoteHostGroupView(
+                    host: host,
+                    store: store,
+                    usesSeparatedPresentation: usesSeparatedPresentation,
+                    paneExpansionCommand: paneExpansionCommand,
+                    onEdit: onEdit
+                )
+            }
         }
     }
 }

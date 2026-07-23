@@ -48,6 +48,54 @@ final class PeerWorkspaceMirrorTests: XCTestCase {
         return workspace
     }
 
+    private func remotePane(_ id: UInt8, cwd: String?) -> RemotePaneSummary {
+        RemotePaneSummary(
+            id: Data([id]),
+            title: "pane-\(id)",
+            workingDirectoryPath: cwd,
+            workingDirectoryName: cwd.flatMap { ($0 as NSString).lastPathComponent },
+            tabCount: 1,
+            columns: 80,
+            rows: 24,
+            isBusy: false
+        )
+    }
+
+    // MARK: - peerProjectIdentity
+
+    func test_peerProjectIdentity_usesCommonAncestorForSiblingPaneDirectories() {
+        let identity = peerProjectIdentity(for: [
+            remotePane(1, cwd: "/Users/jinwoo/work/project/term-mesh/Sources"),
+            remotePane(2, cwd: "/Users/jinwoo/work/project/term-mesh/termMeshTests"),
+        ])
+
+        XCTAssertEqual(identity.label, "term-mesh")
+        XCTAssertFalse(identity.isUnknown)
+    }
+
+    func test_peerProjectIdentity_normalizesTrailingSlashesAndCaseForKey() {
+        let a = peerProjectIdentity(for: [
+            remotePane(1, cwd: "/Users/jinwoo/work/project/Term-Mesh///Sources"),
+            remotePane(2, cwd: "/Users/jinwoo/work/project/Term-Mesh/Tests"),
+        ])
+        let b = peerProjectIdentity(for: [
+            remotePane(3, cwd: "/users/jinwoo/work/project/term-mesh/src"),
+            remotePane(4, cwd: "/users/jinwoo/work/project/term-mesh/tests"),
+        ])
+
+        XCTAssertEqual(a.key, b.key)
+        XCTAssertEqual(a.label, "Term-Mesh")
+    }
+
+    func test_peerProjectIdentity_fallsBackToUnknownWithoutCwd() {
+        let identity = peerProjectIdentity(for: [
+            remotePane(1, cwd: nil),
+            remotePane(2, cwd: ""),
+        ])
+
+        XCTAssertEqual(identity, .unknown)
+    }
+
     // MARK: - preorderLeaves / shapeHash
 
     func test_preorderLeaves_ordersDepthFirst() {

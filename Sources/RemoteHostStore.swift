@@ -32,6 +32,7 @@ struct WorkspaceSummary: Identifiable, Equatable {
 struct RemotePaneSummary: Identifiable, Equatable {
     let id: Data
     let title: String
+    let workingDirectoryPath: String?
     let workingDirectoryName: String?
     let tabCount: Int
     let columns: Int
@@ -57,6 +58,7 @@ func peerPaneSummaries(
             return [RemotePaneSummary(
                 id: pane.surfaceID,
                 title: pane.title.isEmpty ? "Shell" : pane.title,
+                workingDirectoryPath: pane.cwd.isEmpty ? nil : pane.cwd,
                 workingDirectoryName: shortDirectoryName(pane.cwd),
                 tabCount: max(pane.tabs.count, 1),
                 columns: Int(pane.cols),
@@ -129,6 +131,83 @@ func groupWorkspacesByWindow<T>(
         }
     }
     return groups
+}
+
+struct PeerProjectIdentity: Identifiable, Equatable, Hashable {
+    let key: String
+    let label: String
+    let isUnknown: Bool
+
+    var id: String { key }
+
+    static let unknown = PeerProjectIdentity(
+        key: "unknown",
+        label: "Unknown Project",
+        isUnknown: true
+    )
+}
+
+enum PeerSidebarGroupingMode: String, CaseIterable, Identifiable {
+    case host
+    case project
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .host: return "Host"
+        case .project: return "Project"
+        }
+    }
+}
+
+enum PeerSidebarGroupingSettings {
+    static let featureFlagKey = "sidebar.peerHosts.groupingControl.enabled"
+    static let selectedModeKey = "sidebar.peerHosts.groupingMode"
+    static let defaultMode = PeerSidebarGroupingMode.host
+
+    static func mode(from raw: String) -> PeerSidebarGroupingMode {
+        PeerSidebarGroupingMode(rawValue: raw) ?? defaultMode
+    }
+}
+
+func peerProjectIdentity(for panes: [RemotePaneSummary]) -> PeerProjectIdentity {
+    let paths = panes.compactMap { pane in
+        pane.workingDirectoryPath.flatMap(peerNormalizeRemotePath)
+    }
+    guard !paths.isEmpty else { return .unknown }
+
+    let root = peerCommonProjectPath(paths)
+    guard let name = root.split(separator: "/").last.map(String.init), !name.isEmpty else {
+        return .unknown
+    }
+    return PeerProjectIdentity(
+        key: "path:\(root.lowercased())",
+        label: name,
+        isUnknown: false
+    )
+}
+
+private func peerNormalizeRemotePath(_ path: String) -> String? {
+    let trimmed = path.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !trimmed.isEmpty else { return nil }
+    let unified = trimmed.replacingOccurrences(of: "\\", with: "/")
+    let parts = unified
+        .split(separator: "/", omittingEmptySubsequences: true)
+        .map(String.init)
+        .filter { $0 != "." }
+    guard !parts.isEmpty else { return "/" }
+    return "/" + parts.joined(separator: "/")
+}
+
+private func peerCommonProjectPath(_ paths: [String]) -> String {
+    guard var common = paths.first?.split(separator: "/").map(String.init) else { return "/" }
+    for path in paths.dropFirst() {
+        let parts = path.split(separator: "/").map(String.init)
+        common = Array(zip(common, parts).prefix { $0 == $1 }.map { $0.0 })
+        if common.isEmpty { return "/" }
+    }
+    return "/" + common.joined(separator: "/")
 }
 
 /// Sidebar-visible lifecycle of a host entry. `saved` covers both a
