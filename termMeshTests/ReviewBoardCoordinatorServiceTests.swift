@@ -65,6 +65,131 @@ final class ReviewBoardCoordinatorServiceTests: XCTestCase {
         XCTAssertEqual(environment[ReviewBoardCoordinatorSettings.localJournalEnvironmentKey], "0")
     }
 
+    /// A dead coordinator leaves its socket path behind; treating that file as
+    /// proof of life strands the app on a socket nothing listens to.
+    func testSocketLivenessIgnoresLeftoverFiles() throws {
+        let directory = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("coordinator-liveness-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let stalePath = directory.appendingPathComponent("stale.sock").path
+        FileManager.default.createFile(atPath: stalePath, contents: Data())
+
+        XCTAssertTrue(FileManager.default.fileExists(atPath: stalePath))
+        XCTAssertFalse(ReviewBoardCoordinatorClient.isSocketAlive(stalePath))
+        XCTAssertFalse(ReviewBoardCoordinatorClient.isSocketAlive(
+            directory.appendingPathComponent("never-existed.sock").path
+        ))
+    }
+
+    // MARK: - Host observations
+
+    func testHostObservationIDIsStableAndRequestIDTracksContent() {
+        let first = CoordinatorHostObservation(
+            hostKey: "ssh:root@jw-server",
+            projectRoots: ["/root/demo-project"],
+            isLive: true
+        )
+        // Same host, roots reported in a different order — same observation.
+        let reordered = CoordinatorHostObservation(
+            hostKey: "ssh:root@jw-server",
+            projectRoots: ["/root/demo-project"],
+            isLive: true
+        )
+        let changed = CoordinatorHostObservation(
+            hostKey: "ssh:root@jw-server",
+            projectRoots: ["/root/demo-project", "/root/x-kit"],
+            isLive: true
+        )
+        let otherHost = CoordinatorHostObservation(
+            hostKey: "ssh:jinwoo-macmini",
+            projectRoots: ["/root/demo-project"],
+            isLive: true
+        )
+
+        XCTAssertTrue(first.coordinatorHostID.hasPrefix("hst_"))
+        XCTAssertEqual(first.coordinatorHostID, reordered.coordinatorHostID)
+        // The host id must survive a reconnect, so content changes must NOT
+        // move it — only the request id may change.
+        XCTAssertEqual(first.coordinatorHostID, changed.coordinatorHostID)
+        XCTAssertNotEqual(first.coordinatorHostID, otherHost.coordinatorHostID)
+
+        XCTAssertEqual(first.requestID, reordered.requestID)
+        XCTAssertNotEqual(first.requestID, changed.requestID)
+    }
+
+    func testHostObservationParamsNeverClaimCapacity() {
+        let params = CoordinatorHostObservation(
+            hostKey: "ssh:root@jw-server",
+            projectRoots: ["/root/x-kit", "/root/demo-project"],
+            isLive: true
+        ).rpcParams
+
+        XCTAssertEqual(params["total_slots"] as? Int, 0)
+        XCTAssertEqual(params["used_slots"] as? Int, 0)
+        XCTAssertEqual(params["live"] as? Bool, true)
+        XCTAssertEqual(params["project_roots"] as? [String], ["/root/demo-project", "/root/x-kit"])
+        XCTAssertEqual(params["host_id"] as? String, CoordinatorHostObservation(
+            hostKey: "ssh:root@jw-server", projectRoots: [], isLive: true
+        ).coordinatorHostID)
+    }
+
+    @MainActor
+    func testOnlyConnectedHostsAreReportedAndRootsAreDeduped() {
+        let connected = hostEntry(
+            id: "ssh:root@jw-server",
+            state: .connected,
+            paneRoots: ["/root/demo-project", "/root/demo-project", nil]
+        )
+        let offline = hostEntry(id: "ssh:mac-sub", state: .saved, paneRoots: ["/srv/app"])
+
+        let observations = ReviewBoardCoordinatorService.hostObservations(from: [connected, offline])
+
+        XCTAssertEqual(observations.count, 1)
+        XCTAssertEqual(observations.first?.hostKey, "ssh:root@jw-server")
+        XCTAssertEqual(observations.first?.projectRoots, ["/root/demo-project"])
+    }
+
+    private func hostEntry(
+        id: String,
+        state: HostConnectionState,
+        paneRoots: [String?]
+    ) -> HostEntry {
+        let panes = paneRoots.enumerated().map { index, root in
+            RemotePaneSummary(
+                id: Data([UInt8(index)]),
+                title: "pane",
+                workingDirectoryPath: root,
+                workingDirectoryName: nil,
+                projectRootPath: root,
+                tabCount: 1,
+                columns: 80,
+                rows: 24,
+                isBusy: false
+            )
+        }
+        let workspace = WorkspaceSummary(
+            id: Data([1]),
+            title: "default",
+            hostSockPath: "/tmp/sock",
+            windowID: Data(),
+            windowTitle: "",
+            isDefault: true,
+            paneCount: panes.count,
+            surfaceCount: panes.count,
+            busyCount: 0,
+            panes: panes
+        )
+        return HostEntry(
+            id: id,
+            displayName: id,
+            connectionState: state,
+            workspaces: [workspace],
+            activeSockPath: "/tmp/sock"
+        )
+    }
+
     func testClientParsesFakeUDSSnapshotAndSanitizesDisplayData() async throws {
         let socketPath = "/tmp/tm-coordinator-test-\(getpid())-\(UUID().uuidString.prefix(8)).sock"
         let server = FakeCoordinatorServer(socketPath: socketPath)

@@ -1,3 +1,5 @@
+import Bonsplit
+import Combine
 import Foundation
 import Darwin
 
@@ -61,6 +63,58 @@ enum ReviewBoardCoordinatorSettings {
     }
 }
 
+/// One peer host as the coordinator should see it. The coordinator is the
+/// only place that can answer cross-host questions ("which machine holds
+/// this project"), and it learns nothing on its own — the app is what
+/// actually watches the peers, so it reports what it sees.
+struct CoordinatorHostObservation: Equatable {
+    /// The sidebar's stable host key (e.g. `ssh:root@jw-server`).
+    let hostKey: String
+    let projectRoots: [String]
+    let isLive: Bool
+
+    /// Derived from the host key so a reconnect — or an app restart — keeps
+    /// reporting the SAME host instead of minting a new one each time.
+    var coordinatorHostID: String {
+        "hst_" + Self.stableDigest(hostKey)
+    }
+
+    /// Deterministic in the observation's content: re-reporting an unchanged
+    /// host hits the coordinator's idempotency check instead of appending a
+    /// duplicate event, so an idle peer costs nothing in journal growth.
+    var requestID: String {
+        let roots = projectRoots.sorted().joined(separator: "\u{1F}")
+        return "host-observe:" + Self.stableDigest("\(hostKey)\u{1E}\(roots)\u{1E}\(isLive)")
+    }
+
+    var rpcParams: [String: Any] {
+        [
+            "request_id": requestID,
+            "host_id": coordinatorHostID,
+            // The peer handshake does not carry platform details yet, and
+            // inventing them would be worse than reporting none.
+            "os": "",
+            "arch": "",
+            "load": 0,
+            // Scheduling slots are a coordinator-side concept the app has no
+            // basis to fill; 0/0 keeps it from being read as free capacity.
+            "total_slots": 0,
+            "used_slots": 0,
+            "project_roots": projectRoots.sorted(),
+            "live": isLive,
+        ]
+    }
+
+    private static func stableDigest(_ value: String) -> String {
+        var hash: UInt64 = 0xcbf2_9ce4_8422_2325
+        for byte in Array(value.utf8) {
+            hash ^= UInt64(byte)
+            hash = hash &* 0x0000_0100_0000_01b3
+        }
+        return String(format: "%016lx", hash)
+    }
+}
+
 enum ReviewBoardCoordinatorError: Error, Equatable {
     case disabled
     case socketPathTooLong
@@ -72,6 +126,14 @@ enum ReviewBoardCoordinatorError: Error, Equatable {
 final class ReviewBoardCoordinatorClient: @unchecked Sendable {
     private let socketPath: String
     private let queue = DispatchQueue(label: "com.termmesh.review-board.coordinator", qos: .utility)
+    /// The event subscription blocks on its socket for the connection's whole
+    /// lifetime. Sharing `queue` with it would mean the first subscribe
+    /// starves every later request forever — no snapshot refresh, no host
+    /// observation — so it gets a queue of its own.
+    private let subscriptionQueue = DispatchQueue(
+        label: "com.termmesh.review-board.coordinator.events",
+        qos: .utility
+    )
     private var nextID = 1
 
     init(socketPath: String) {
@@ -120,8 +182,25 @@ final class ReviewBoardCoordinatorClient: @unchecked Sendable {
         )
     }
 
+    func observeHosts(_ observations: [CoordinatorHostObservation]) async {
+        for observation in observations {
+            // One failing host must not stop the rest: the coordinator may be
+            // mid-restart, and the next sync re-reports everything anyway.
+            do {
+                _ = try await request(method: "host.observe", params: observation.rpcParams)
+#if DEBUG
+                dlog("coordinator.observeHost ok key=\(observation.hostKey) roots=\(observation.projectRoots.count)")
+#endif
+            } catch {
+#if DEBUG
+                dlog("coordinator.observeHost FAILED sock=\(socketPath) key=\(observation.hostKey) error=\(error)")
+#endif
+            }
+        }
+    }
+
     func subscribeEvents(onEvent: @escaping @Sendable () -> Void) {
-        queue.async { [socketPath] in
+        subscriptionQueue.async { [socketPath] in
             guard let fd = try? Self.connect(socketPath: socketPath) else { return }
             defer { Darwin.close(fd) }
             let request: [String: Any] = [
@@ -182,6 +261,15 @@ final class ReviewBoardCoordinatorClient: @unchecked Sendable {
         let id = nextID
         nextID += 1
         return id
+    }
+
+    /// Whether something is actually accepting on `socketPath`. A socket FILE
+    /// proves nothing — a coordinator that died leaves its path behind — so
+    /// this is what "already running" has to mean.
+    static func isSocketAlive(_ socketPath: String) -> Bool {
+        guard let fd = try? connect(socketPath: socketPath) else { return false }
+        Darwin.close(fd)
+        return true
     }
 
     private static func connect(socketPath: String) throws -> Int32 {
@@ -308,12 +396,21 @@ final class ReviewBoardCoordinatorService: ObservableObject {
     private var refreshTask: Task<Void, Never>?
     private var eventRefreshWorkItem: DispatchWorkItem?
     private var subscriptionStarted = false
+    private var hostObservationCancellable: AnyCancellable?
+    private var hostSyncTask: Task<Void, Never>?
+    private var lastReportedObservations: [CoordinatorHostObservation] = []
 
     func startIfNeeded(
         environment: [String: String] = ProcessInfo.processInfo.environment,
         defaults: UserDefaults = .standard
     ) {
-        guard ReviewBoardCoordinatorSettings.isIntegrationEnabled(environment: environment, defaults: defaults) else {
+        let gateOpen = ReviewBoardCoordinatorSettings.isIntegrationEnabled(
+            environment: environment, defaults: defaults
+        )
+#if DEBUG
+        dlog("coordinator.startIfNeeded gate=\(gateOpen)")
+#endif
+        guard gateOpen else {
             stop()
             return
         }
@@ -324,6 +421,7 @@ final class ReviewBoardCoordinatorService: ObservableObject {
         startProcessIfNeeded(socketPath: socketPath, environment: environment)
         refresh()
         startSubscriptionIfNeeded()
+        startHostObservationIfNeeded()
     }
 
     func stop() {
@@ -331,11 +429,79 @@ final class ReviewBoardCoordinatorService: ObservableObject {
         refreshTask = nil
         eventRefreshWorkItem?.cancel()
         eventRefreshWorkItem = nil
+        hostObservationCancellable?.cancel()
+        hostObservationCancellable = nil
+        hostSyncTask?.cancel()
+        hostSyncTask = nil
+        lastReportedObservations = []
         subscriptionStarted = false
         client = nil
         process?.terminate()
         process = nil
         snapshot = .empty
+    }
+
+    /// Mirror the peer roster into the coordinator. Nothing else populates it
+    /// — the app is what watches the peers — so without this the coordinator
+    /// runs with an empty host table and can answer no cross-host question.
+    private func startHostObservationIfNeeded(
+        store: RemoteHostStore = .shared
+    ) {
+        guard hostObservationCancellable == nil else { return }
+        hostObservationCancellable = store.objectWillChange
+        // objectWillChange fires BEFORE the mutation lands, and peer state
+        // churns in bursts (connect → roster → layout), so settle first and
+        // then read; the debounce doubles as burst coalescing.
+            .debounce(for: .milliseconds(400), scheduler: DispatchQueue.main)
+            .sink { [weak self] _ in
+                self?.syncHostObservations(store: store)
+            }
+        syncHostObservations(store: store)
+    }
+
+    func syncHostObservations(store: RemoteHostStore = .shared) {
+        guard let client else {
+#if DEBUG
+            dlog("coordinator.syncHosts skipped: no client")
+#endif
+            return
+        }
+        let observations = Self.hostObservations(from: store.sortedHosts)
+        // The coordinator dedupes by request_id anyway; skipping here saves
+        // the round trip entirely when nothing about the peers changed.
+        // Logging only real changes keeps peer churn from tripping the debug
+        // log's rate breaker and burying what we came to read.
+        guard observations != lastReportedObservations else { return }
+#if DEBUG
+        dlog("coordinator.syncHosts hosts=\(store.sortedHosts.count) observations=\(observations.count)")
+#endif
+        lastReportedObservations = observations
+        hostSyncTask?.cancel()
+        hostSyncTask = Task.detached { [client] in
+            await client.observeHosts(observations)
+        }
+    }
+
+    /// Only connected hosts carry a workspace roster, so only they can report
+    /// project roots; a saved-but-offline host would contribute an empty list
+    /// that reads as "this machine has no projects" rather than "unknown".
+    static func hostObservations(from hosts: [HostEntry]) -> [CoordinatorHostObservation] {
+        hosts.compactMap { host in
+            guard host.isConnected else { return nil }
+            var roots: Set<String> = []
+            for workspace in host.workspaces {
+                for pane in workspace.panes {
+                    if let root = pane.projectRootPath, !root.isEmpty {
+                        roots.insert(root)
+                    }
+                }
+            }
+            return CoordinatorHostObservation(
+                hostKey: host.id,
+                projectRoots: Array(roots),
+                isLive: true
+            )
+        }
     }
 
     func providerSnapshot() -> ReviewBoardSnapshot {
@@ -393,8 +559,14 @@ final class ReviewBoardCoordinatorService: ObservableObject {
     }
 
     private func startProcessIfNeeded(socketPath: String, environment: [String: String]) {
-        guard process == nil else { return }
-        guard access(socketPath, F_OK) != 0 else { return }
+        if let process, process.isRunning { return }
+        self.process = nil
+        // Someone else's live coordinator (another window, a manual run) is
+        // fine to reuse; a leftover socket file from a dead one is not, and
+        // testing only for the file's existence strands the app forever on a
+        // path nothing listens to.
+        if ReviewBoardCoordinatorClient.isSocketAlive(socketPath) { return }
+        try? FileManager.default.removeItem(atPath: socketPath)
         let binary = environment[ReviewBoardCoordinatorSettings.binaryPathEnvironmentKey] ?? "tm-coordinator"
         let process = Process()
         process.executableURL = binary.contains("/")
