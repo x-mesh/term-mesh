@@ -913,59 +913,78 @@ struct SidebarRemoteHostsSection: View {
             // "Peer Hosts", not "Remote Hosts" — plain "hosts" read as
             // direct-SSH terminal access; these entries are term-mesh
             // peer daemons (Peer menu / Peer Connections vocabulary).
-            SidebarSectionHeader(title: "Peer Hosts", isCollapsed: $isCollapsed)
-                .overlay(alignment: .trailing) {
-                    HStack(spacing: 2) {
-                        if !isCollapsed, isGroupingControlEnabled {
-                            Picker("", selection: $selectedGroupingMode) {
-                                ForEach(PeerSidebarGroupingMode.allCases) { mode in
-                                    Text(mode.title).tag(mode.rawValue)
-                                }
-                            }
-                            .pickerStyle(.segmented)
-                            .controlSize(.mini)
-                            .frame(width: 104)
-                            .accessibilityLabel("Peer hosts grouping")
-                            .help("Group peer hosts by host or project")
-                        }
-
-                        if !isCollapsed, hasPeerPaneDetails {
-                            Button(action: toggleAllPaneDetails) {
-                                Image(systemName: areAllPaneDetailsExpanded
-                                      ? "chevron.up"
-                                      : "chevron.down")
-                                    .font(.system(size: 8, weight: .semibold))
-                                    .foregroundColor(.secondary)
-                                    .frame(width: 18, height: 18)
-                                    .contentShape(Rectangle())
-                            }
-                            .buttonStyle(.plain)
-                            .accessibilityLabel(areAllPaneDetailsExpanded
-                                                ? "Collapse all peer pane details"
-                                                : "Expand all peer pane details")
-                            .help(areAllPaneDetailsExpanded
-                                  ? "Collapse all peer pane details"
-                                  : "Expand all peer pane details")
-                        }
-
-                        Button {
-                            editorContext = PeerHostEditorContext(
-                                profile: PeerHostProfile(sshTarget: ""),
-                                isNew: true
-                            )
-                        } label: {
-                            Image(systemName: "plus")
-                                .font(.system(size: 9, weight: .semibold))
-                                .foregroundColor(.secondary)
-                                .frame(width: 18, height: 18)
-                                .contentShape(Rectangle())
-                        }
-                        .buttonStyle(.plain)
-                        .accessibilityLabel("Add Peer Host")
-                        .help("Add Peer Host…")
+            HStack(spacing: 6) {
+                Button {
+                    withAnimation(.easeInOut(duration: 0.15)) { isCollapsed.toggle() }
+                } label: {
+                    HStack(spacing: 4) {
+                        Image(systemName: "chevron.right")
+                            .font(.system(size: 8, weight: .semibold))
+                            .rotationEffect(.degrees(isCollapsed ? 0 : 90))
+                            .foregroundColor(Color.secondary.opacity(0.7))
+                        Text("Peer Hosts")
+                            .font(.system(size: 10, weight: .semibold))
+                            .foregroundColor(.secondary)
+                            .lineLimit(1)
                     }
-                    .padding(.trailing, 12)
+                    .frame(minWidth: 0, maxWidth: .infinity, alignment: .leading)
+                    .contentShape(Rectangle())
                 }
+                .buttonStyle(.plain)
+                .accessibilityLabel("Peer Hosts")
+
+                if !isCollapsed, isGroupingControlEnabled {
+                    Picker("", selection: $selectedGroupingMode) {
+                        ForEach(PeerSidebarGroupingMode.allCases) { mode in
+                            Text(mode.title).tag(mode.rawValue)
+                        }
+                    }
+                    .pickerStyle(.segmented)
+                    .controlSize(.mini)
+                    .frame(width: 104)
+                    .layoutPriority(1)
+                    .accessibilityLabel("Peer hosts grouping")
+                    .help("Group peer hosts by host or project")
+                }
+
+                if !isCollapsed, hasPeerPaneDetails {
+                    Button(action: toggleAllPaneDetails) {
+                        Image(systemName: areAllPaneDetailsExpanded
+                              ? "chevron.up"
+                              : "chevron.down")
+                            .font(.system(size: 8, weight: .semibold))
+                            .foregroundColor(.secondary)
+                            .frame(width: 18, height: 18)
+                            .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel(areAllPaneDetailsExpanded
+                                        ? "Collapse all peer pane details"
+                                        : "Expand all peer pane details")
+                    .help(areAllPaneDetailsExpanded
+                          ? "Collapse all peer pane details"
+                          : "Expand all peer pane details")
+                }
+
+                Button {
+                    editorContext = PeerHostEditorContext(
+                        profile: PeerHostProfile(sshTarget: ""),
+                        isNew: true
+                    )
+                } label: {
+                    Image(systemName: "plus")
+                        .font(.system(size: 9, weight: .semibold))
+                        .foregroundColor(.secondary)
+                        .frame(width: 18, height: 18)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("Add Peer Host")
+                .help("Add Peer Host…")
+            }
+            .padding(.leading, 16)
+            .padding(.trailing, 12)
+            .padding(.vertical, 4)
 
             if !isCollapsed {
                 if store.sortedHosts.isEmpty {
@@ -1088,6 +1107,21 @@ private struct SidebarPeerProjectsView: View {
 
     var body: some View {
         VStack(spacing: usesSeparatedPresentation ? 8 : 0) {
+            if projectGroups.isEmpty, !otherHosts.isEmpty {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("No projects discovered")
+                        .font(.system(size: 10, weight: .semibold))
+                        .foregroundColor(.secondary)
+                    Text("Connect a peer to group its workspaces by project.")
+                        .font(.system(size: 9))
+                        .foregroundColor(Color.secondary.opacity(0.72))
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.horizontal, 16)
+                .padding(.top, 6)
+                .padding(.bottom, 4)
+            }
+
             ForEach(projectGroups) { group in
                 VStack(spacing: 4) {
                     Text(group.identity.label)
@@ -1112,6 +1146,16 @@ private struct SidebarPeerProjectsView: View {
                         )
                     }
                 }
+            }
+
+            if !otherHosts.isEmpty, !projectGroups.isEmpty {
+                Text("Offline peers")
+                    .font(.system(size: 9, weight: .semibold))
+                    .foregroundColor(Color.secondary.opacity(0.75))
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.leading, 16)
+                    .padding(.top, 6)
+                    .padding(.bottom, 1)
             }
 
             ForEach(otherHosts) { host in
