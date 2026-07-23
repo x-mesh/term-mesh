@@ -1787,6 +1787,30 @@ impl HeadlessManager {
         })
     }
 
+    /// Seed a team without spawning any agent process. Test-only: the peer
+    /// roster path needs a manager holding a team, and standing up real CLI
+    /// children to assert a read-only RPC would test the spawner instead.
+    #[cfg(test)]
+    pub fn insert_team_for_tests(
+        &mut self,
+        name: &str,
+        team_uuid: &str,
+        working_directory: &str,
+        agents: Vec<String>,
+    ) {
+        self.teams.insert(
+            name.to_string(),
+            HeadlessTeam {
+                name: name.to_string(),
+                team_uuid: team_uuid.to_string(),
+                agents,
+                working_directory: working_directory.to_string(),
+                leader_session_id: String::new(),
+                created_at: 0,
+            },
+        );
+    }
+
     pub fn list_teams(&self) -> Vec<&HeadlessTeam> {
         self.teams.values().collect()
     }

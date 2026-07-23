@@ -410,6 +410,120 @@ mod integration_tests {
     /// Attach to a long-lived `/bin/cat` PTY; send keystrokes as Input and
     /// verify they come back through PtyData. This exercises the full
     /// bidirectional path plus AsyncFd's cancellation behavior at test end.
+    /// A team is invisible in the layout tree, so a client can only learn
+    /// where a project's leader sits by asking. This drives the real wire:
+    /// handshake, auth, then ListTeams against a host wired to a team
+    /// manager holding one team.
+    #[tokio::test]
+    async fn list_teams_reports_the_hosts_teams_over_the_wire() {
+        let tmp = TempDir::new().unwrap();
+        let sock_path = tmp.path().join("peer.sock");
+        // A real repository, so the host resolves a project root for it.
+        let repo = tmp.path().join("demo-project");
+        std::fs::create_dir_all(repo.join("src")).unwrap();
+        std::fs::create_dir(repo.join(".git")).unwrap();
+
+        let manager = cat_manager();
+        let host = Arc::new(PeerHost::new(manager));
+        let teams = Arc::new(tokio::sync::Mutex::new(
+            crate::headless::HeadlessManager::new(),
+        ));
+        teams.lock().await.insert_team_for_tests(
+            "remote-demo",
+            "uuid-remote-demo",
+            repo.join("src").to_str().unwrap(),
+            vec!["explorer".to_string()],
+        );
+        host.set_teams(teams);
+
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let sock_path_task = sock_path.clone();
+        let host_task = host.clone();
+        let server_task = tokio::spawn(async move {
+            serve_with_host(sock_path_task, shutdown_rx, host_task)
+                .await
+                .unwrap();
+        });
+        for _ in 0..50 {
+            if sock_path.exists() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+
+        let stream = UnixStream::connect(&sock_path).await.unwrap();
+        let (mut reader, mut writer) = stream.into_split();
+        write_envelope(
+            &mut writer,
+            &Envelope {
+                seq: 1,
+                correlation_id: 0,
+                payload: Some(Payload::Hello(Hello {
+                    protocol_version: PROTOCOL_VERSION.into(),
+                    peer_id: vec![0x11; 16],
+                    display_name: "integration-test".into(),
+                    capabilities: peer_proto::capability::supported_vec(),
+                    app_version: "test".into(),
+                })),
+            },
+        )
+        .await
+        .unwrap();
+        let host_hello = read_envelope(&mut reader).await.unwrap();
+        // The capability is what tells a client it may ask at all.
+        match host_hello.payload {
+            Some(Payload::Hello(h)) => assert!(
+                h.capabilities
+                    .iter()
+                    .any(|c| c == peer_proto::capability::TEAM_ROSTER_V1),
+                "host with a team manager must advertise team.roster.v1"
+            ),
+            other => panic!("expected Hello, got {other:?}"),
+        }
+        let _ = read_envelope(&mut reader).await.unwrap();
+        write_envelope(
+            &mut writer,
+            &Envelope {
+                seq: 2,
+                correlation_id: 0,
+                payload: Some(Payload::Auth(Auth {
+                    method: "ssh-passthrough".into(),
+                    token_id: vec![],
+                    signature: vec![],
+                })),
+            },
+        )
+        .await
+        .unwrap();
+        let _ = read_envelope(&mut reader).await.unwrap();
+
+        write_envelope(
+            &mut writer,
+            &Envelope {
+                seq: 3,
+                correlation_id: 0,
+                payload: Some(Payload::ListTeams(peer_proto::v1::ListTeams {})),
+            },
+        )
+        .await
+        .unwrap();
+        let reply = read_envelope(&mut reader).await.unwrap();
+        let listed = match reply.payload {
+            Some(Payload::TeamList(tl)) => tl.teams,
+            other => panic!("expected TeamList, got {other:?}"),
+        };
+
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].name, "remote-demo");
+        assert_eq!(listed[0].agent_names, vec!["explorer".to_string()]);
+        // The host resolves the repo root itself — a client staring at the
+        // working directory could not tell it from a subdirectory.
+        assert_eq!(listed[0].project_root, repo.to_string_lossy());
+
+        let _ = shutdown_tx.send(true);
+        server_task.abort();
+    }
+
     #[tokio::test]
     async fn pty_surface_round_trips_input() {
         let tmp = TempDir::new().unwrap();
