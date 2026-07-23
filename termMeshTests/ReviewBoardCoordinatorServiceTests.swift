@@ -151,6 +151,54 @@ final class ReviewBoardCoordinatorServiceTests: XCTestCase {
         XCTAssertEqual(observations.first?.projectRoots, ["/root/demo-project"])
     }
 
+    // MARK: - Leader placement
+
+    @MainActor
+    func testLocalObservationCarriesLeaderProjectsAndPeersDoNot() {
+        let peer = hostEntry(
+            id: "ssh:root@jw-server", state: .connected, paneRoots: ["/root/demo-project"]
+        )
+
+        let observations = ReviewBoardCoordinatorService.hostObservations(
+            from: [peer],
+            localProjectRoots: ["/Users/jinwoo/work/term-mesh", "/Users/jinwoo/work/x-kit"],
+            localLeaderProjectRoots: ["/Users/jinwoo/work/term-mesh"]
+        )
+
+        let local = observations.first { $0.hostKey == CoordinatorHostObservation.localHostKey }
+        XCTAssertEqual(local?.leaderProjectRoots, ["/Users/jinwoo/work/term-mesh"])
+        // A peer's team state never crosses the wire, so claiming to know its
+        // leader would be a guess.
+        let remote = observations.first { $0.hostKey == "ssh:root@jw-server" }
+        XCTAssertEqual(remote?.leaderProjectRoots, [])
+    }
+
+    func testLeaderProjectsAreAlwaysASubsetOfHostedProjects() {
+        let params = CoordinatorHostObservation(
+            hostKey: CoordinatorHostObservation.localHostKey,
+            projectRoots: ["/repo/alpha"],
+            leaderProjectRoots: ["/repo/alpha", "/repo/never-hosted"],
+            isLive: true
+        ).rpcParams
+
+        XCTAssertEqual(params["leader_projects"] as? [String], ["/repo/alpha"])
+    }
+
+    func testLeaderRequestIDChangesWhenLeadershipMoves() {
+        let withoutLeader = CoordinatorHostObservation(
+            hostKey: "local:this-mac", projectRoots: ["/repo/alpha"], isLive: true
+        )
+        let withLeader = CoordinatorHostObservation(
+            hostKey: "local:this-mac",
+            projectRoots: ["/repo/alpha"],
+            leaderProjectRoots: ["/repo/alpha"],
+            isLive: true
+        )
+
+        XCTAssertNotEqual(withoutLeader.requestID, withLeader.requestID)
+        XCTAssertEqual(withoutLeader.coordinatorHostID, withLeader.coordinatorHostID)
+    }
+
     // MARK: - Remembered projects
 
     @MainActor

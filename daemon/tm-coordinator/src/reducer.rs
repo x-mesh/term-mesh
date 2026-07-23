@@ -92,6 +92,7 @@ impl Reducer {
                 total_slots INTEGER NOT NULL,
                 used_slots INTEGER NOT NULL,
                 project_roots_json TEXT NOT NULL,
+                leader_projects_json TEXT NOT NULL DEFAULT '[]',
                 live INTEGER NOT NULL,
                 quarantined INTEGER NOT NULL,
                 observed_at_ms INTEGER NOT NULL
@@ -129,6 +130,15 @@ impl Reducer {
             );
             "#,
         )?;
+        // `CREATE TABLE IF NOT EXISTS` never widens a table that already
+        // exists, so a database written before a column was added keeps the
+        // old shape and every query naming the new column fails. There is no
+        // schema-version ledger here yet; adding the column and ignoring the
+        // "duplicate column" error is the whole migration.
+        let _ = self.conn.execute(
+            "ALTER TABLE hosts ADD COLUMN leader_projects_json TEXT NOT NULL DEFAULT '[]'",
+            [],
+        );
         Ok(())
     }
 
@@ -257,7 +267,7 @@ impl Reducer {
 
     pub fn hosts(&self) -> Result<Vec<HostObservation>> {
         let mut stmt = self.conn.prepare(
-            "SELECT host_id,os,arch,load,total_slots,used_slots,project_roots_json,live,quarantined,observed_at_ms
+            "SELECT host_id,os,arch,load,total_slots,used_slots,project_roots_json,leader_projects_json,live,quarantined,observed_at_ms
              FROM hosts ORDER BY host_id",
         )?;
         let rows = stmt.query_map([], row_to_host)?;
@@ -520,10 +530,11 @@ impl Reducer {
     fn reduce_host_observed(&self, event: &IntentEvent) -> Result<()> {
         let observation: HostObservation = serde_json::from_value(event.payload.clone())?;
         self.conn.execute(
-            "INSERT INTO hosts(host_id,os,arch,load,total_slots,used_slots,project_roots_json,live,quarantined,observed_at_ms)
-             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)
+            "INSERT INTO hosts(host_id,os,arch,load,total_slots,used_slots,project_roots_json,leader_projects_json,live,quarantined,observed_at_ms)
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)
              ON CONFLICT(host_id) DO UPDATE SET os=excluded.os, arch=excluded.arch, load=excluded.load,
              total_slots=excluded.total_slots, used_slots=excluded.used_slots, project_roots_json=excluded.project_roots_json,
+             leader_projects_json=excluded.leader_projects_json,
              live=excluded.live, quarantined=excluded.quarantined, observed_at_ms=excluded.observed_at_ms",
             params![
                 observation.host_id.as_str(),
@@ -533,6 +544,7 @@ impl Reducer {
                 observation.total_slots,
                 observation.used_slots,
                 serde_json::to_string(&observation.project_roots)?,
+                serde_json::to_string(&observation.leader_projects)?,
                 observation.live as i64,
                 observation.quarantined as i64,
                 observation.observed_at_ms as i64,
@@ -883,9 +895,10 @@ fn row_to_host(row: &rusqlite::Row<'_>) -> rusqlite::Result<HostObservation> {
         total_slots: row.get::<_, i64>(4)? as u32,
         used_slots: row.get::<_, i64>(5)? as u32,
         project_roots: serde_json::from_str(&row.get::<_, String>(6)?).map_err(to_sql_err)?,
-        live: row.get::<_, i64>(7)? != 0,
-        quarantined: row.get::<_, i64>(8)? != 0,
-        observed_at_ms: row.get::<_, i64>(9)? as u64,
+        leader_projects: serde_json::from_str(&row.get::<_, String>(7)?).map_err(to_sql_err)?,
+        live: row.get::<_, i64>(8)? != 0,
+        quarantined: row.get::<_, i64>(9)? != 0,
+        observed_at_ms: row.get::<_, i64>(10)? as u64,
     })
 }
 

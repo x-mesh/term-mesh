@@ -1207,9 +1207,20 @@ private struct SidebarPeerProjectsView: View {
                 Image(systemName: "rectangle.inset.filled")
                     .accessibilityLabel("Has peer workspaces")
             }
+            // A leader on a peer machine can only be known through the
+            // coordinator; the local row's own star covers the local case.
+            if !group.spansLocal, coordinatorLeaderIdentities.contains(group.identity) {
+                Image(systemName: "star.fill")
+                    .foregroundColor(.orange)
+                    .accessibilityLabel("Team leader runs on a peer host")
+            }
         }
         .font(.system(size: 8))
         .foregroundColor(Color.secondary.opacity(0.6))
+    }
+
+    private var coordinatorLeaderIdentities: Set<PeerProjectIdentity> {
+        coordinator.leaderProjectIdentities
     }
 
     var body: some View {

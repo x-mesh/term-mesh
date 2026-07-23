@@ -284,6 +284,63 @@ fn observe_host(
     host_id
 }
 
+/// Which machine holds a project's leader is the first question once a
+/// project spans hosts, and no single machine can answer it alone.
+#[test]
+fn leader_projects_round_trip_and_must_be_hosted_projects() {
+    let dir = tempdir().unwrap();
+    let log: Arc<dyn EventLog> =
+        Arc::new(LocalJournalEventLog::new(dir.path().join("events.ndjson")));
+    let api = Api::for_tests(log).unwrap();
+
+    api.handle(
+        "host.observe",
+        json!({
+            "request_id": "obs-leader",
+            "host_id": "hst_leader",
+            "os": "macos", "arch": "arm64", "load": 0.0,
+            "total_slots": 0, "used_slots": 0,
+            "project_roots": ["/repo/alpha", "/repo/beta"],
+            "leader_projects": ["/repo/beta"],
+            "live": true
+        }),
+    )
+    .unwrap();
+
+    let hosts = api.handle("host.list", json!({})).unwrap();
+    let row = &hosts["hosts"][0];
+    assert_eq!(row["leader_projects"], json!(["/repo/beta"]));
+
+    // A host cannot lead a project it does not even have.
+    let stray = api.handle(
+        "host.observe",
+        json!({
+            "request_id": "obs-stray",
+            "host_id": "hst_leader",
+            "os": "macos", "arch": "arm64", "load": 0.0,
+            "total_slots": 0, "used_slots": 0,
+            "project_roots": ["/repo/alpha"],
+            "leader_projects": ["/repo/gamma"],
+            "live": true
+        }),
+    );
+    assert!(stray.is_err(), "stray leader project should be rejected");
+
+    // Observations recorded before the field existed must still replay.
+    let legacy = api.handle(
+        "host.observe",
+        json!({
+            "request_id": "obs-legacy",
+            "host_id": "hst_legacy",
+            "os": "linux", "arch": "x86_64", "load": 0.0,
+            "total_slots": 0, "used_slots": 0,
+            "project_roots": ["/repo/alpha"],
+            "live": true
+        }),
+    );
+    assert!(legacy.is_ok(), "omitted leader_projects must default to empty");
+}
+
 #[test]
 fn placement_policy_prefers_repo_local_capacity_then_load_and_supports_manual_override() {
     let (api, _project_id, task_id) = api_with_project_task();

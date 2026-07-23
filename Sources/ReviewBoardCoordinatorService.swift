@@ -68,10 +68,16 @@ enum ReviewBoardCoordinatorSettings {
 /// this project"), and it learns nothing on its own — the app is what
 /// actually watches the peers, so it reports what it sees.
 struct CoordinatorHostObservation: Equatable {
-    /// The sidebar's stable host key (e.g. `ssh:root@jw-server`).
+    /// The sidebar's stable host key (e.g. `ssh:root@jw-server`), or
+    /// `local:` for this machine — which has to appear in the table too, or
+    /// the coordinator's view of a project stops at the network boundary.
     let hostKey: String
     let projectRoots: [String]
+    /// Subset of `projectRoots` whose team leader runs on this host.
+    var leaderProjectRoots: [String] = []
     let isLive: Bool
+
+    static let localHostKey = "local:this-mac"
 
     /// Derived from the host key so a reconnect — or an app restart — keeps
     /// reporting the SAME host instead of minting a new one each time.
@@ -84,7 +90,10 @@ struct CoordinatorHostObservation: Equatable {
     /// duplicate event, so an idle peer costs nothing in journal growth.
     var requestID: String {
         let roots = projectRoots.sorted().joined(separator: "\u{1F}")
-        return "host-observe:" + Self.stableDigest("\(hostKey)\u{1E}\(roots)\u{1E}\(isLive)")
+        let leaders = leaderProjectRoots.sorted().joined(separator: "\u{1F}")
+        return "host-observe:" + Self.stableDigest(
+            "\(hostKey)\u{1E}\(roots)\u{1E}\(leaders)\u{1E}\(isLive)"
+        )
     }
 
     var rpcParams: [String: Any] {
@@ -101,6 +110,9 @@ struct CoordinatorHostObservation: Equatable {
             "total_slots": 0,
             "used_slots": 0,
             "project_roots": projectRoots.sorted(),
+            // The coordinator rejects a leader project the host does not
+            // report hosting, so keep this a strict subset.
+            "leader_projects": leaderProjectRoots.filter(projectRoots.contains).sorted(),
             "live": isLive,
         ]
     }
@@ -122,6 +134,7 @@ struct CoordinatorHostObservation: Equatable {
 struct CoordinatorKnownHost: Equatable {
     let hostID: String
     let projectRoots: [String]
+    let leaderProjectRoots: [String]
     let isLive: Bool
     let observedAtMilliseconds: Double
 
@@ -130,13 +143,22 @@ struct CoordinatorKnownHost: Equatable {
         self.hostID = hostID
         self.projectRoots = (dictionary["project_roots"] as? [String] ?? [])
             .filter { !$0.isEmpty }
+        self.leaderProjectRoots = (dictionary["leader_projects"] as? [String] ?? [])
+            .filter { !$0.isEmpty }
         self.isLive = dictionary["live"] as? Bool ?? false
         self.observedAtMilliseconds = (dictionary["observed_at_ms"] as? NSNumber)?.doubleValue ?? 0
     }
 
-    init(hostID: String, projectRoots: [String], isLive: Bool, observedAtMilliseconds: Double) {
+    init(
+        hostID: String,
+        projectRoots: [String],
+        leaderProjectRoots: [String] = [],
+        isLive: Bool,
+        observedAtMilliseconds: Double
+    ) {
         self.hostID = hostID
         self.projectRoots = projectRoots
+        self.leaderProjectRoots = leaderProjectRoots
         self.isLive = isLive
         self.observedAtMilliseconds = observedAtMilliseconds
     }
@@ -432,6 +454,20 @@ final class ReviewBoardCoordinatorService: ObservableObject {
     /// integration is off, so every consumer degrades to peer-roster-only.
     @Published private(set) var knownHosts: [CoordinatorKnownHost] = []
 
+    /// Projects whose leader the coordinator has been told about, by
+    /// identity. This is the only path by which a leader on ANOTHER machine
+    /// can ever be shown here — a peer's team state never crosses the wire.
+    var leaderProjectIdentities: Set<PeerProjectIdentity> {
+        var identities: Set<PeerProjectIdentity> = []
+        for host in knownHosts {
+            for root in host.leaderProjectRoots {
+                let identity = projectIdentity(forWorkingDirectories: [root])
+                if !identity.isUnknown { identities.insert(identity) }
+            }
+        }
+        return identities
+    }
+
     private var client: ReviewBoardCoordinatorClient?
     private var process: Process?
     private var refreshTask: Task<Void, Never>?
@@ -490,14 +526,21 @@ final class ReviewBoardCoordinatorService: ObservableObject {
         store: RemoteHostStore = .shared
     ) {
         guard hostObservationCancellable == nil else { return }
-        hostObservationCancellable = store.objectWillChange
-        // objectWillChange fires BEFORE the mutation lands, and peer state
-        // churns in bursts (connect → roster → layout), so settle first and
-        // then read; the debounce doubles as burst coalescing.
-            .debounce(for: .milliseconds(400), scheduler: DispatchQueue.main)
-            .sink { [weak self] _ in
-                self?.syncHostObservations(store: store)
-            }
+        // Peer state is only half of it: creating a team moves a leader
+        // without touching the peer roster at all, and that is exactly the
+        // fact the coordinator exists to record.
+        hostObservationCancellable = Publishers.Merge(
+            store.objectWillChange.map { _ in () },
+            TeamOrchestrator.shared.objectWillChange.map { _ in () }
+        )
+        // objectWillChange fires BEFORE the mutation lands, and both sides
+        // churn in bursts (connect → roster → layout; team create → panes),
+        // so settle first and then read; the debounce doubles as burst
+        // coalescing.
+        .debounce(for: .milliseconds(400), scheduler: DispatchQueue.main)
+        .sink { [weak self] _ in
+            self?.syncHostObservations(store: store)
+        }
         syncHostObservations(store: store)
     }
 
@@ -508,7 +551,22 @@ final class ReviewBoardCoordinatorService: ObservableObject {
 #endif
             return
         }
-        let observations = Self.hostObservations(from: store.sortedHosts)
+        // Every window contributes: a project can be open in one window while
+        // its team leader sits in another.
+        let workspaces = (AppDelegate.shared?.mainWindowContexts.values ?? [:].values)
+            .flatMap(\.tabManager.tabs)
+        let leaderWorkspaceIDs = Set(TeamOrchestrator.shared.teams.values.map {
+            $0.leaderWorkspaceId ?? $0.workspaceId
+        })
+        let local = Self.localProjectState(
+            workspaces: workspaces,
+            leaderWorkspaceIDs: leaderWorkspaceIDs
+        )
+        let observations = Self.hostObservations(
+            from: store.sortedHosts,
+            localProjectRoots: local.roots,
+            localLeaderProjectRoots: local.leaderRoots
+        )
         // The coordinator dedupes by request_id anyway; skipping here saves
         // the round trip entirely when nothing about the peers changed.
         // Logging only real changes keeps peer churn from tripping the debug
@@ -522,6 +580,32 @@ final class ReviewBoardCoordinatorService: ObservableObject {
         hostSyncTask = Task.detached { [client] in
             await client.observeHosts(observations)
         }
+    }
+
+    /// This machine's project roots, and which of them hold a team leader.
+    /// Peer mirrors are skipped for the same reason the sidebar skips them:
+    /// they are a view onto someone else's workspace, and counting them would
+    /// report a remote project as living here.
+    static func localProjectState(
+        workspaces: [Workspace],
+        leaderWorkspaceIDs: Set<UUID>
+    ) -> (roots: [String], leaderRoots: [String]) {
+        var roots: Set<String> = []
+        var leaderRoots: Set<String> = []
+
+        for workspace in workspaces where !workspace.isPeerMirror {
+            let directories = workspace.panelDirectories.values.filter { !$0.isEmpty }
+            let candidates = directories.isEmpty
+                ? [workspace.currentDirectory].filter { !$0.isEmpty }
+                : Array(directories)
+            let identity = projectIdentity(forWorkingDirectories: candidates)
+            guard !identity.isUnknown, let root = candidates.first else { continue }
+            roots.insert(root)
+            if leaderWorkspaceIDs.contains(workspace.id) {
+                leaderRoots.insert(root)
+            }
+        }
+        return (Array(roots), Array(leaderRoots))
     }
 
     /// A project the coordinator remembers on a host that is NOT connected
@@ -580,9 +664,27 @@ final class ReviewBoardCoordinatorService: ObservableObject {
     /// Only connected hosts carry a workspace roster, so only they can report
     /// project roots; a saved-but-offline host would contribute an empty list
     /// that reads as "this machine has no projects" rather than "unknown".
-    static func hostObservations(from hosts: [HostEntry]) -> [CoordinatorHostObservation] {
-        hosts.compactMap { host in
-            guard host.isConnected else { return nil }
+    ///
+    /// Leaders are reported for THIS machine only. A peer's team state never
+    /// crosses the wire — the peer protocol carries panes and workspaces, not
+    /// teams — so claiming to know a remote host's leader would be a guess.
+    static func hostObservations(
+        from hosts: [HostEntry],
+        localProjectRoots: [String] = [],
+        localLeaderProjectRoots: [String] = []
+    ) -> [CoordinatorHostObservation] {
+        var observations: [CoordinatorHostObservation] = []
+
+        if !localProjectRoots.isEmpty {
+            observations.append(CoordinatorHostObservation(
+                hostKey: CoordinatorHostObservation.localHostKey,
+                projectRoots: Array(Set(localProjectRoots)),
+                leaderProjectRoots: Array(Set(localLeaderProjectRoots)),
+                isLive: true
+            ))
+        }
+
+        for host in hosts where host.isConnected {
             var roots: Set<String> = []
             for workspace in host.workspaces {
                 for pane in workspace.panes {
@@ -591,12 +693,13 @@ final class ReviewBoardCoordinatorService: ObservableObject {
                     }
                 }
             }
-            return CoordinatorHostObservation(
+            observations.append(CoordinatorHostObservation(
                 hostKey: host.id,
                 projectRoots: Array(roots),
                 isLive: true
-            )
+            ))
         }
+        return observations
     }
 
     func providerSnapshot() -> ReviewBoardSnapshot {

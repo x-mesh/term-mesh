@@ -182,6 +182,12 @@ pub struct HostObservation {
     pub total_slots: u32,
     pub used_slots: u32,
     pub project_roots: Vec<String>,
+    /// Project roots whose team leader runs on THIS host. Once a project
+    /// spans machines, "where does its leader sit" is the first thing anyone
+    /// needs, and no single machine can answer it from its own state.
+    /// Defaulted so observations recorded before this field replay cleanly.
+    #[serde(default)]
+    pub leader_projects: Vec<String>,
     pub live: bool,
     pub quarantined: bool,
     pub observed_at_ms: u64,

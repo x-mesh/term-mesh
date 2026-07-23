@@ -209,6 +209,8 @@ impl Api {
             total_slots: u32,
             used_slots: u32,
             project_roots: Vec<String>,
+            #[serde(default)]
+            leader_projects: Vec<String>,
             live: Option<bool>,
             quarantined: Option<bool>,
             observed_at_ms: Option<u64>,
@@ -216,6 +218,16 @@ impl Api {
         let p: Params = serde_json::from_value(params)?;
         if p.used_slots > p.total_slots {
             bail!("INVALID_PARAMS: used_slots exceeds total_slots");
+        }
+        // A leader has to sit in a project this host actually hosts —
+        // otherwise the table would claim a machine leads work it does not
+        // even have a checkout of.
+        if let Some(stray) = p
+            .leader_projects
+            .iter()
+            .find(|root| !p.project_roots.contains(root))
+        {
+            bail!("INVALID_PARAMS: leader project {stray} is not among project_roots");
         }
         let observation = HostObservation {
             host_id: p.host_id.unwrap_or_else(HostId::new_random),
@@ -225,6 +237,7 @@ impl Api {
             total_slots: p.total_slots,
             used_slots: p.used_slots,
             project_roots: p.project_roots,
+            leader_projects: p.leader_projects,
             live: p.live.unwrap_or(true),
             quarantined: p.quarantined.unwrap_or(false),
             observed_at_ms: p.observed_at_ms.unwrap_or_else(now_ms),
