@@ -591,8 +591,14 @@ final class ReviewBoardCoordinatorService: ObservableObject {
 #endif
         lastReportedObservations = observations
         hostSyncTask?.cancel()
-        hostSyncTask = Task.detached { [client] in
+        hostSyncTask = Task.detached { [weak self, client] in
             await client.observeHosts(observations)
+            // Read our own writes back. The event subscription is meant to do
+            // this, but relying on it alone left the sidebar showing a leader
+            // the app itself had just reported — the write reached the
+            // coordinator while this client's own knownHosts stayed stale. A
+            // refresh right after the write closes that loop deterministically.
+            await self?.refresh()
         }
     }
 
