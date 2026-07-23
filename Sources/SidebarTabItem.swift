@@ -80,6 +80,9 @@ struct TabItemView: View {
     @Environment(\.colorScheme) private var colorScheme
     @ObservedObject var tab: Tab
     let index: Int
+    /// Tabs that are actually rendered in this section, in presentation
+    /// order. Experimental mode excludes peer-mirror backing workspaces.
+    let visibleTabIds: [UUID]
     let rowSpacing: CGFloat
     @Binding var selection: SidebarSelection
     @Binding var selectedTabIds: Set<UUID>
@@ -213,6 +216,10 @@ struct TabItemView: View {
 
     private var showsWorkspaceShortcutHint: Bool {
         (showsCommandShortcutHints || alwaysShowShortcutHints) && workspaceShortcutLabel != nil
+    }
+
+    private var visibleIndex: Int? {
+        visibleTabIds.firstIndex(of: tab.id)
     }
 
     private func updateCachedSlotWidth() {
@@ -612,12 +619,12 @@ struct TabItemView: View {
             Button("Move Up") {
                 moveBy(-1)
             }
-            .disabled(index == 0)
+            .disabled(visibleIndex == 0)
 
             Button("Move Down") {
                 moveBy(1)
             }
-            .disabled(index >= tabManager.tabs.count - 1)
+            .disabled(visibleIndex.map { $0 >= visibleTabIds.count - 1 } ?? true)
 
             Button("Move to Top") {
                 tabManager.moveTabsToTop(Set(targetIds))
@@ -643,17 +650,17 @@ struct TabItemView: View {
             Button("Close Other Workspaces") {
                 closeOtherTabs(targetIds)
             }
-            .disabled(tabManager.tabs.count <= 1 || targetIds.count == tabManager.tabs.count)
+            .disabled(visibleTabIds.count <= 1 || targetIds.count == visibleTabIds.count)
 
             Button("Close Workspaces Below") {
                 closeTabsBelow(tabId: tab.id)
             }
-            .disabled(index >= tabManager.tabs.count - 1)
+            .disabled(visibleIndex.map { $0 >= visibleTabIds.count - 1 } ?? true)
 
             Button("Close Workspaces Above") {
                 closeTabsAbove(tabId: tab.id)
             }
-            .disabled(index == 0)
+            .disabled(visibleIndex == 0)
 
             Divider()
 
@@ -772,13 +779,17 @@ struct TabItemView: View {
     }
 
     private var accessibilityTitle: String {
-        "\(tab.title), workspace \(index + 1) of \(tabManager.tabs.count)"
+        let position = (visibleIndex ?? index) + 1
+        return "\(tab.title), workspace \(position) of \(visibleTabIds.count)"
     }
 
     private func moveBy(_ delta: Int) {
-        let targetIndex = index + delta
-        guard targetIndex >= 0, targetIndex < tabManager.tabs.count else { return }
-        guard tabManager.reorderWorkspace(tabId: tab.id, toIndex: targetIndex) else { return }
+        guard let currentVisibleIndex = visibleIndex else { return }
+        let targetVisibleIndex = currentVisibleIndex + delta
+        guard targetVisibleIndex >= 0, targetVisibleIndex < visibleTabIds.count else { return }
+        let targetID = visibleTabIds[targetVisibleIndex]
+        guard let targetRawIndex = tabManager.tabs.firstIndex(where: { $0.id == targetID }) else { return }
+        guard tabManager.reorderWorkspace(tabId: tab.id, toIndex: targetRawIndex) else { return }
         selectedTabIds = [tab.id]
         lastSidebarSelectionIndex = tabManager.tabs.firstIndex { $0.id == tab.id }
         tabManager.selectTab(tab)
@@ -798,11 +809,25 @@ struct TabItemView: View {
         let modifiers = NSEvent.modifierFlags
         let isCommand = modifiers.contains(.command)
         let isShift = modifiers.contains(.shift)
+        let visibleIDSet = Set(visibleTabIds)
+        selectedTabIds.formIntersection(visibleIDSet)
 
-        if isShift, let lastIndex = lastSidebarSelectionIndex {
-            let lower = min(lastIndex, index)
-            let upper = max(lastIndex, index)
-            let rangeIds = tabManager.tabs[lower...upper].map { $0.id }
+        if isShift,
+           let lastIndex = lastSidebarSelectionIndex,
+           tabManager.tabs.indices.contains(lastIndex) {
+            let anchorID = tabManager.tabs[lastIndex].id
+            let rangeIds = SidebarPresentationSettings.rangeSelectionIDs(
+                anchorID: anchorID,
+                targetID: tab.id,
+                visibleWorkspaceIDs: visibleTabIds
+            )
+            guard !rangeIds.isEmpty else {
+                selectedTabIds = [tab.id]
+                lastSidebarSelectionIndex = index
+                tabManager.selectTab(tab)
+                selection = .tabs
+                return
+            }
             if isCommand {
                 selectedTabIds.formUnion(rangeIds)
             } else {
@@ -824,8 +849,11 @@ struct TabItemView: View {
     }
 
     private func contextTargetIds() -> [UUID] {
-        let baseIds: Set<UUID> = selectedTabIds.contains(tab.id) ? selectedTabIds : [tab.id]
-        return tabManager.tabs.compactMap { baseIds.contains($0.id) ? $0.id : nil }
+        SidebarPresentationSettings.contextTargetIDs(
+            clickedID: tab.id,
+            selectedIDs: selectedTabIds,
+            visibleWorkspaceIDs: visibleTabIds
+        )
     }
 
     private func closeTabs(_ targetIds: [UUID], allowPinned: Bool) {
@@ -844,19 +872,19 @@ struct TabItemView: View {
 
     private func closeOtherTabs(_ targetIds: [UUID]) {
         let keepIds = Set(targetIds)
-        let idsToClose = tabManager.tabs.compactMap { keepIds.contains($0.id) ? nil : $0.id }
+        let idsToClose = visibleTabIds.filter { !keepIds.contains($0) }
         closeTabs(idsToClose, allowPinned: false)
     }
 
     private func closeTabsBelow(tabId: UUID) {
-        guard let anchorIndex = tabManager.tabs.firstIndex(where: { $0.id == tabId }) else { return }
-        let idsToClose = tabManager.tabs.suffix(from: anchorIndex + 1).map { $0.id }
+        guard let anchorIndex = visibleTabIds.firstIndex(of: tabId) else { return }
+        let idsToClose = Array(visibleTabIds.suffix(from: anchorIndex + 1))
         closeTabs(idsToClose, allowPinned: false)
     }
 
     private func closeTabsAbove(tabId: UUID) {
-        guard let anchorIndex = tabManager.tabs.firstIndex(where: { $0.id == tabId }) else { return }
-        let idsToClose = tabManager.tabs.prefix(upTo: anchorIndex).map { $0.id }
+        guard let anchorIndex = visibleTabIds.firstIndex(of: tabId) else { return }
+        let idsToClose = Array(visibleTabIds.prefix(upTo: anchorIndex))
         closeTabs(idsToClose, allowPinned: false)
     }
 
@@ -883,13 +911,19 @@ struct TabItemView: View {
     }
 
     private func syncSelectionAfterMutation() {
-        let existingIds = Set(tabManager.tabs.map { $0.id })
+        let existingIds = Set(tabManager.tabs.map(\.id)).intersection(visibleTabIds)
         selectedTabIds = selectedTabIds.filter { existingIds.contains($0) }
-        if selectedTabIds.isEmpty, let selectedId = tabManager.selectedTabId {
+        if selectedTabIds.isEmpty,
+           let selectedId = tabManager.selectedTabId,
+           existingIds.contains(selectedId) {
             selectedTabIds = [selectedId]
         }
-        if let selectedId = tabManager.selectedTabId {
-            lastSidebarSelectionIndex = tabManager.tabs.firstIndex { $0.id == selectedId }
+        let anchorID = tabManager.selectedTabId.flatMap { existingIds.contains($0) ? $0 : nil }
+            ?? visibleTabIds.first(where: { selectedTabIds.contains($0) })
+        if let anchorID {
+            lastSidebarSelectionIndex = tabManager.tabs.firstIndex { $0.id == anchorID }
+        } else {
+            lastSidebarSelectionIndex = nil
         }
     }
 

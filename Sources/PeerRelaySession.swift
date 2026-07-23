@@ -230,7 +230,13 @@ private actor RelayFrameSlots {
 private final class RelayFrameWriter: @unchecked Sendable {
     private let relay: RelaySocket
     private let queue = DispatchQueue(label: "term-mesh.peer.relay.writer", qos: .userInitiated)
-    private let slots = RelayFrameSlots(limit: 256)
+    // 32 (was 256): a smaller app→relay writer window pushes backpressure to
+    // the host sooner, so an output flood cannot pile up MBs of stale bytes
+    // that keep rendering after the user hits Ctrl+C. Measured on a jw-server
+    // relay pane: 588 KB burst drain 997ms → 660ms; combined with the host's
+    // larger READ_BUF coalescing, 3.4 MB drain went ~9s → ~1s. No throughput
+    // regression observed (drain stayed linear at ~10 MB/s).
+    private let slots = RelayFrameSlots(limit: 32)
     private let lock = NSLock()
     private var stopped = false
     private let onFailure: @Sendable (Error) -> Void
@@ -554,6 +560,127 @@ private final class WireSeqTracker: @unchecked Sendable {
     }
 }
 
+/// tmux-copy-mode-style scrollback browse state, shared between the
+/// MainActor (wheel events enter/steer the browse) and the pump task
+/// (which must suppress live PtyData while a past window is on screen —
+/// otherwise live output paints over the browsed history). Same
+/// NSLock-box shape as `WireSeqTracker`, for the same reason: the pump
+/// touches this per chunk and must not pay a MainActor hop.
+private final class ScrollbackBrowse: @unchecked Sendable {
+    private let lock = NSLock()
+    /// Rows above the live bottom currently displayed. nil = live screen.
+    private var offset: UInt32?
+    /// The host said the last rendered window is its oldest history.
+    private var atTop = false
+    /// One request on the wire at a time; wheel steps meanwhile land in
+    /// `pending` and are re-requested when the current chunk arrives.
+    private var inFlight = false
+    private var pending: UInt32?
+
+    var isBrowsing: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return offset != nil
+    }
+
+    /// Turn a wheel step into the offset that should be requested now, or
+    /// nil when nothing should be sent (mid-flight steps park in
+    /// `pending`; upward steps at the top are dropped).
+    func requestForWheel(up: Bool, step: UInt32, atLocalTop: Bool) -> UInt32? {
+        lock.lock()
+        defer { lock.unlock() }
+        switch offset {
+        case nil:
+            // Enter only on an upward step when the local scrollback is
+            // already exhausted — downward wheel on the live screen is
+            // none of our business.
+            guard up && atLocalTop else { return nil }
+            return stage(step)
+        case .some(let current):
+            if up {
+                guard !atTop else { return nil }
+                return stage(current &+ step)
+            }
+            // Downward: toward (and at 0, back onto) the live screen.
+            return stage(current > step ? current - step : 0)
+        }
+    }
+
+    /// The exit request (offset 0 = the live render). nil when not browsing.
+    func requestForExit() -> UInt32? {
+        lock.lock()
+        defer { lock.unlock() }
+        guard offset != nil else { return nil }
+        return stage(0)
+    }
+
+    /// Must be called with the lock held.
+    private func stage(_ wanted: UInt32) -> UInt32? {
+        if inFlight {
+            pending = wanted
+            return nil
+        }
+        inFlight = true
+        return wanted
+    }
+
+    /// Record an arrived chunk. Returns the parked follow-up request to
+    /// send, if any. `browsingAfter` is false once the live screen (offset
+    /// 0) is back on display.
+    func noteChunk(effectiveOffset: UInt32, atTop: Bool) -> (followUp: UInt32?, browsingAfter: Bool) {
+        lock.lock()
+        defer { lock.unlock() }
+        inFlight = false
+        self.atTop = atTop
+        offset = effectiveOffset == 0 ? nil : effectiveOffset
+        if let next = pending, next != effectiveOffset {
+            pending = nil
+            inFlight = true
+            return (next, offset != nil)
+        }
+        pending = nil
+        return (nil, offset != nil)
+    }
+
+    /// The host proved itself grid-snapshot-capable (sent a typed
+    /// GridSnapshot). Requests to an older host would just be dropped, so
+    /// the browse refuses to engage until this flips — the wheel then
+    /// stays on the local scrollback, which still holds replayed bytes on
+    /// the legacy path.
+    private var hostCapable = false
+
+    func markHostCapable() {
+        lock.lock()
+        hostCapable = true
+        lock.unlock()
+    }
+
+    var isHostCapable: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return hostCapable
+    }
+
+    /// Hard reset (session teardown / reconnect).
+    func reset() {
+        lock.lock()
+        offset = nil
+        atTop = false
+        inFlight = false
+        pending = nil
+        lock.unlock()
+    }
+}
+
+/// Adopted by `PeerRelaySession`; consumed by the pane's scroll-view
+/// wrapper so wheel events can steer a scrollback browse instead of the
+/// local (empty-above-the-snapshot) Ghostty scrollback.
+@MainActor
+protocol PeerScrollbackBrowseHandling: AnyObject {
+    /// Returns true when the event was consumed by the browse.
+    func handleBrowseWheel(up: Bool, atLocalTop: Bool) -> Bool
+}
+
 // ── PeerRelaySession ─────────────────────────────────────────────────
 
 /// Byte accounting for a single relay session, for post-hoc diagnosis of a
@@ -714,6 +841,10 @@ final class PeerRelaySession {
     // relying on the host silently ignoring an unrecognized field.
     private var hostSupportsReplayRing: Bool
     private let wireSeqTracker = WireSeqTracker()
+    /// Scrollback browse state (tmux copy-mode model). Shared with the
+    /// pump task, hence a lock box rather than MainActor state.
+    private let scrollbackBrowse = ScrollbackBrowse()
+
     // Guards against piling up concurrent reconnect attempts if the
     // debounce and throttle heal paths both fire before the first one
     // finishes.
@@ -1441,6 +1572,7 @@ final class PeerRelaySession {
         // R3: plain Sendable reference, captured like `writer`/`reader` above
         // rather than read via `self.` inside the detached closures below.
         let wireSeqTracker = self.wireSeqTracker
+        let scrollbackBrowse = self.scrollbackBrowse
 
         pumpTask = Task.detached(priority: .userInitiated) {
             // Host → relay: deliver PtyData frames to the relay socket.
@@ -1598,12 +1730,83 @@ final class PeerRelaySession {
                             dlog("peer.relay.firstByte path=owned bytes=\(data.count)")
                             #endif
                         }
+                        // While a scrollback window is on display, live
+                        // bytes must not paint over it. They are DROPPED,
+                        // not buffered: the browse-exit render (offset 0)
+                        // is the host's own current screen, so nothing is
+                        // lost — the same contract tmux's copy-mode has.
+                        // Seq accounting above stays live either way.
+                        if scrollbackBrowse.isBrowsing {
+                            break
+                        }
                         do {
                             try await writer.enqueue(type: kTypePtyData, payload: data)
                             self.ioStats.noteEnqueued(data.count)
                         } catch {
                             endReason = "hostToRelay-enqueue-failed"
                             break pumpLoop
+                        }
+                    case .gridSnapshot(let sid, _, _, let ansi) where sid == mySurfaceID:
+                        // The host just proved it speaks the grid model —
+                        // scrollback browsing may engage from here on.
+                        scrollbackBrowse.markHostCapable()
+                        // Typed fresh-attach keyframe (grid.snapshot.v1).
+                        // ESC[3J first: repeated attaches used to stack one
+                        // stale screen per open into the viewer's local
+                        // scrollback, and only the typed form can safely
+                        // clear it — an untyped byte stream might be
+                        // mid-escape. Then the rendered screen itself.
+                        var payload = Data([0x1b, 0x5b, 0x33, 0x4a]) // ESC [ 3 J
+                        payload.append(ansi)
+                        // Reset the gap baseline to wire zero, NOT to the
+                        // snapshot's host-absolute byte_seq: `expectedByteSeq`
+                        // lives in the per-attach wire space, and a host on
+                        // the typed path spends no wire seq on the snapshot —
+                        // the first live PtyData after this message starts at
+                        // byte_seq 0 (its host-absolute anchor arrives as
+                        // AttachResult.initial_seq, which equals this
+                        // message's byte_seq). Without the reset every attach
+                        // would read as a jump, fire a spurious gap log, and
+                        // schedule a needless redraw heal.
+                        expectedByteSeq = 0
+                        wireSeqTracker.update(0)
+                        if self.ioStats.noteReceived(payload.count) {
+                            #if DEBUG
+                            dlog("peer.relay.firstByte path=owned-snapshot bytes=\(payload.count)")
+                            #endif
+                        }
+                        do {
+                            try await writer.enqueue(type: kTypePtyData, payload: payload)
+                            self.ioStats.noteEnqueued(payload.count)
+                        } catch {
+                            endReason = "hostToRelay-enqueue-failed"
+                            break pumpLoop
+                        }
+                    case .scrollbackChunk(let sid, let effOffset, let ansi, let atTop, _) where sid == mySurfaceID:
+                        // One browse window (or, at offset 0, the live
+                        // screen again). The render is a full replacement —
+                        // clear+home first — so it goes down the same relay
+                        // byte pipe as everything else.
+                        let (followUp, browsing) = scrollbackBrowse.noteChunk(
+                            effectiveOffset: effOffset,
+                            atTop: atTop
+                        )
+                        do {
+                            try await writer.enqueue(type: kTypePtyData, payload: ansi)
+                        } catch {
+                            endReason = "hostToRelay-enqueue-failed"
+                            break pumpLoop
+                        }
+                        #if DEBUG
+                        dlog("peer.relay.scrollback offset=\(effOffset) atTop=\(atTop) browsing=\(browsing)")
+                        #endif
+                        // A wheel step that landed mid-flight parked its
+                        // target; chase it now that the wire is free.
+                        if let next = followUp {
+                            try? await session.requestScrollback(
+                                surfaceID: mySurfaceID,
+                                offsetRows: next
+                            )
                         }
                     case .hostStats(let stats):
                         // About the machine, not this pane, so it does not go
@@ -1639,6 +1842,17 @@ final class PeerRelaySession {
                             // when pumping started — a resume-heal may have
                             // swapped it out from under this pane transparently.
                             guard let current = await self.session else { break }
+                            // Typing while browsing scrollback exits the
+                            // browse first (offset-0 render restores the
+                            // live screen), then the key goes through — the
+                            // same "any input snaps back to live" rule as
+                            // tmux copy-mode's q.
+                            if let exit = scrollbackBrowse.requestForExit() {
+                                try? await current.requestScrollback(
+                                    surfaceID: surfaceID,
+                                    offsetRows: exit
+                                )
+                            }
                             do {
                                 try await current.sendInput(surfaceID: surfaceID, keys: frame.payload)
                             } catch {
@@ -1886,5 +2100,33 @@ final class PeerRelaySession {
 
     func stop() async {
         disconnect(reason: "stop")
+    }
+}
+
+
+// ── Scrollback browse (tmux copy-mode model) ─────────────────────────
+
+extension PeerRelaySession: PeerScrollbackBrowseHandling {
+    /// Wheel steps arrive from the pane's scroll-view wrapper. Page-sized
+    /// steps (the remote viewport height) keep request volume low — the
+    /// same granularity tmux's PageUp browsing has.
+    func handleBrowseWheel(up: Bool, atLocalTop: Bool) -> Bool {
+        guard scrollbackBrowse.isHostCapable else { return false }
+        let step = max(3, remoteRows)
+        guard let offset = scrollbackBrowse.requestForWheel(
+            up: up,
+            step: step,
+            atLocalTop: atLocalTop
+        ) else {
+            // Consumed silently while browsing (a parked mid-flight step),
+            // untouched otherwise (let the local scrollback scroll).
+            return scrollbackBrowse.isBrowsing
+        }
+        guard let session else { return false }
+        let surfaceID = self.surfaceID
+        Task {
+            try? await session.requestScrollback(surfaceID: surfaceID, offsetRows: offset)
+        }
+        return true
     }
 }

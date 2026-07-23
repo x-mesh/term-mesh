@@ -476,6 +476,36 @@ extension TerminalController {
     /// `peerPendingInputTail` (the vim ESC + ":wq!" freeze regression) without a
     /// live peer server. params: `surface_id`, `bytes_hex` (hex of raw bytes,
     /// e.g. "1b3a777121" = ESC ':wq!').
+    /// Test-only: drive the peer scrollback browse exactly where the wheel
+    /// does — through the pane's scroll-view browse handler — so socket e2e
+    /// can walk enter → page-up → page-down → exit without synthesizing
+    /// NSEvents. `up` steps into history, `at_local_top` stands in for the
+    /// "local scrollback exhausted" precondition the real wheel path reads
+    /// off the Ghostty scrollbar. Pair with `debug.peer.read_grid` to
+    /// assert what the swapped screen actually shows.
+    func v2DebugPeerBrowseWheel(params: [String: Any]) -> V2CallResult {
+        guard let surfaceArg = v2String(params, "surface_id") else {
+            return .err(code: "invalid_params", message: "Missing surface_id", data: nil)
+        }
+        let up = (params["up"] as? Bool) ?? true
+        let atLocalTop = (params["at_local_top"] as? Bool) ?? true
+        var result: V2CallResult = .err(code: "not_found", message: "Surface not found", data: nil)
+        _ = v2MainExec(timeout: 5) {
+            guard let surface = self.resolveGridSurface(surfaceArg) else {
+                return
+            }
+            guard let handler = surface.hostedView.scrollbackBrowseHandler else {
+                result = .ok(["ok": false, "error": "no_browse_handler"])
+                return
+            }
+            let consumed = MainActor.assumeIsolated {
+                handler.handleBrowseWheel(up: up, atLocalTop: atLocalTop)
+            }
+            result = .ok(["ok": true, "consumed": consumed])
+        }
+        return result
+    }
+
     func v2DebugPeerInjectInput(params: [String: Any]) -> V2CallResult {
         guard let surfaceArg = v2String(params, "surface_id") else {
             return .err(code: "invalid_params", message: "Missing surface_id", data: nil)

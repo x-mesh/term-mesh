@@ -100,11 +100,30 @@ private final class IMEBarDragHandle: NSView {
 
 private final class GhosttyScrollView: NSScrollView {
     weak var surfaceView: GhosttyNSView?
+    /// Set on peer relay panes (see `bindRemotePane`): lets the wheel
+    /// steer a host-side scrollback browse once the local scrollback is
+    /// exhausted, instead of dead-ending at the top of the snapshot.
+    weak var scrollbackBrowseHandler: (any PeerScrollbackBrowseHandling)?
 
     override func scrollWheel(with event: NSEvent) {
         guard let surfaceView else {
             super.scrollWheel(with: event)
             return
+        }
+
+        // Peer scrollback browse — before mouse-capture routing on
+        // purpose: while a browse window is displayed the wheel navigates
+        // HOST history (tmux copy-mode), never the local view. Entry only
+        // happens at the top of the local scrollback, so ordinary
+        // scrolling is untouched until there is nowhere further to go.
+        if let handler = scrollbackBrowseHandler, event.scrollingDeltaY != 0 {
+            let atLocalTop = surfaceView.scrollbar.map { $0.offset == 0 } ?? false
+            if handler.handleBrowseWheel(
+                up: event.scrollingDeltaY > 0,
+                atLocalTop: atLocalTop
+            ) {
+                return
+            }
         }
 
         if let surface = surfaceView.terminalSurface?.surface,
@@ -235,6 +254,13 @@ private final class RemotePasteTransferIndicator: NSVisualEffectView {
 final class GhosttySurfaceScrollView: NSView {
     private let backgroundView: NSView
     private let scrollView: GhosttyScrollView
+
+    /// Peer relay panes only (wired by `bindRemotePane`): the session that
+    /// steers the tmux-style scrollback browse for this pane's wheel.
+    var scrollbackBrowseHandler: (any PeerScrollbackBrowseHandling)? {
+        get { scrollView.scrollbackBrowseHandler }
+        set { scrollView.scrollbackBrowseHandler = newValue }
+    }
     private let documentView: NSView
     private let surfaceView: GhosttyNSView
     private let inactiveOverlayView: GhosttyFlashOverlayView

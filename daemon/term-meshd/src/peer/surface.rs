@@ -34,11 +34,23 @@ impl AsRawFd for BorrowedMasterFd {
     }
 }
 
-const READ_BUF_SIZE: usize = 4096;
+// 64 KiB (was 4096): read the PTY master in larger gulps so an output flood
+// produces fewer, larger PtyChunks instead of thousands of tiny ones. Each
+// chunk costs a frame + a relay-writer queue slot + a broadcast send, so this
+// coalescing removes the per-chunk overhead that made post-interrupt drain
+// scale super-linearly (a 3 MB flood took 8–30s to drain after Ctrl+C).
+// Measured: 3.4 MB burst drain ~9s → ~1s, 35 MB → ~3.7s. Interactive latency
+// is unaffected (read returns only what is already available, no batching
+// delay) and peak host RSS rose ~30 MB under a 35 MB flood, reclaimed after.
+const READ_BUF_SIZE: usize = 65536;
 /// Fan-out channel capacity. If a slow subscriber falls behind by this many
 /// chunks, it starts getting `RecvError::Lagged` on `recv()`; the connection
 /// layer handles that as a gap (eventual reconnect will re-snapshot).
-const BROADCAST_CAPACITY: usize = 1024;
+// EXPERIMENT: 64 (was 1024). With READ_BUF now 64 KiB, 1024 chunks let the host
+// buffer up to ~64 MB of unrendered output ahead of a viewer, so a Ctrl+C could
+// still take ~10s while that backlog drained. Capping at 64 chunks keeps the
+// ahead-buffer near the pre-coalescing ~4 MB, bounding post-interrupt drain.
+const BROADCAST_CAPACITY: usize = 64;
 /// Default bytes of recent PTY output replayed to a newly attached relay.
 /// This covers the common "shell prompt printed before the SSH relay
 /// attached" case without turning the daemon into an unbounded terminal
@@ -299,6 +311,72 @@ impl ReplayBuffer {
     }
 }
 
+/// Per-surface terminal emulator: the host's own model of what the screen
+/// looks like *right now*, fed the same filtered bytes every client sees.
+///
+/// This is what lets a fresh attach receive the current screen instead of a
+/// byte-history replay — the tmux model. The replay ring keeps its scrollback
+/// role; this struct owns the "visible screen" role the ring used to fake by
+/// replaying a tail (`FRESH_ATTACH_REPLAY_BYTES`), which blanked idle TUIs.
+///
+/// Lives behind one `Mutex` together with `fed_through`, so a reader gets an
+/// atomic (screen, seq) pair: a snapshot is meaningless without knowing which
+/// byte position it is consistent with (`GridSnapshot.byte_seq` on the wire).
+struct ScreenModel {
+    parser: vt100::Parser,
+    /// Host-absolute `byte_seq` position this screen has consumed up to: the
+    /// END seq of the last chunk fed (i.e. `chunk.seq + chunk.bytes.len()`).
+    /// An attach that dedupes live chunks below this value will never apply
+    /// a byte the snapshot already contains, and never miss one it doesn't.
+    fed_through: u64,
+}
+
+/// Rows of host-side scrollback kept per surface for the on-demand
+/// scrollback path (tmux copy-mode model). Matches tmux's own
+/// `history-limit` default. At 80 cols a row costs ~2.9 KB once actually
+/// scrolled into — ~5.8 MB per busy surface — but allocation is lazy
+/// (vt100 grows the deque as lines scroll out), so idle surfaces pay
+/// nothing.
+const SCROLLBACK_ROWS_DEFAULT: usize = 2000;
+/// Hard ceiling for the env override — scrollback is per-surface memory.
+const SCROLLBACK_ROWS_MAX: usize = 10_000;
+
+/// `TERMMESH_PEER_SCROLLBACK_ROWS`: rows of scrollback per surface. `0`
+/// disables host-side scrollback (requests render nothing). Read at
+/// surface spawn — vt100 fixes the scrollback length at parser
+/// construction, so unlike the replay-ring capacity this cannot change on
+/// a live surface.
+fn scrollback_rows_from_env() -> usize {
+    match std::env::var("TERMMESH_PEER_SCROLLBACK_ROWS") {
+        Ok(raw) => match raw.trim().parse::<usize>() {
+            Ok(n) => n.min(SCROLLBACK_ROWS_MAX),
+            Err(_) => SCROLLBACK_ROWS_DEFAULT,
+        },
+        Err(_) => SCROLLBACK_ROWS_DEFAULT,
+    }
+}
+
+impl ScreenModel {
+    fn new(cols: u16, rows: u16) -> Self {
+        ScreenModel {
+            // vt100's constructor takes (rows, cols, scrollback) — the
+            // reverse of this repo's (cols, rows) convention everywhere
+            // else. Do not "fix" the argument order.
+            parser: vt100::Parser::new(rows, cols, scrollback_rows_from_env()),
+            fed_through: 0,
+        }
+    }
+
+    /// Feed one filtered chunk and advance the consistency watermark.
+    /// Split out as a method (rather than inlining in the reader loop) so a
+    /// future batching layer — accumulate, feed on a tick — can slot in
+    /// without touching the attach path.
+    fn feed(&mut self, bytes: &[u8], end_seq: u64) {
+        self.parser.process(bytes);
+        self.fed_through = end_seq;
+    }
+}
+
 pub struct PtySurface {
     pub surface_id: Vec<u8>,
     pub title: String,
@@ -335,6 +413,10 @@ pub struct PtySurface {
     /// free-for-all that made two different-sized windows fight over the
     /// grid.
     size_requests: Mutex<HashMap<u64, (u16, u16)>>,
+    /// The host-side screen model (see [`ScreenModel`]). Locked briefly by
+    /// the reader loop per chunk and by attach-time snapshot reads; never
+    /// held across an await.
+    screen: Mutex<ScreenModel>,
     master_fd: RawFd,
     child: Mutex<ChildLifecycle>,
     signal_owners: AtomicUsize,
@@ -396,6 +478,7 @@ impl PtySurface {
             replay: Mutex::new(ReplayBuffer::default()),
             modes: Mutex::new(BTreeSet::new()),
             size_requests: Mutex::new(HashMap::new()),
+            screen: Mutex::new(ScreenModel::new(cols, rows)),
             master_fd: child.master_fd,
             child: Mutex::new(ChildLifecycle {
                 pid: child.pid,
@@ -512,6 +595,19 @@ impl PtySurface {
                         let seq = reader_surface
                             .byte_seq
                             .fetch_add(bytes.len() as u64, Ordering::Relaxed);
+                        // Feed the screen model BEFORE the broadcast: the
+                        // attach handler captures its subscriber and then
+                        // reads the snapshot, so any chunk a subscriber can
+                        // observe must already be in the screen — otherwise
+                        // a snapshot could lag `live_min_seq` and the viewer
+                        // would apply a stale screen over newer live bytes.
+                        // Only the FILTERED bytes are fed: `byte_seq`
+                        // advances by `bytes.len()`, not the raw read size,
+                        // so feeding raw would desync `fed_through` from the
+                        // seq space every other consumer lives in.
+                        if let Ok(mut screen) = reader_surface.screen.lock() {
+                            screen.feed(&bytes, seq + bytes.len() as u64);
+                        }
                         let chunk = PtyChunk { seq, bytes };
                         if let Ok(mut replay) = reader_surface.replay.lock() {
                             replay.push(chunk.clone());
@@ -729,13 +825,85 @@ impl PtySurface {
     }
 
     /// `replay_snapshot()`, bounded to the newest `FRESH_ATTACH_REPLAY_BYTES`.
-    /// What a fresh attach (no `resume_from_seq`) gets — see
-    /// `ReplayBuffer::snapshot_tail` for why that is not the whole ring.
+    /// The byte-replay fallback for a fresh attach — used when the screen
+    /// model is unavailable (poisoned lock) or explicitly forced via
+    /// `TERMMESH_PEER_FRESH_ATTACH_MODE=bytes`. The primary fresh-attach
+    /// path is [`PtySurface::screen_snapshot`].
     pub fn replay_snapshot_fresh(&self) -> Vec<PtyChunk> {
         self.replay
             .lock()
             .map(|replay| replay.snapshot_tail(FRESH_ATTACH_REPLAY_BYTES))
             .unwrap_or_default()
+    }
+
+    /// Render the current screen as ANSI bytes, atomically paired with the
+    /// host-absolute `byte_seq` the render is consistent with.
+    ///
+    /// This is the tmux model: a fresh attach gets the ONE current screen —
+    /// cursor, styles, input modes — instead of a replay of recent history
+    /// that either re-streams old output (full ring) or blanks an idle TUI
+    /// (bounded tail). `state_formatted()` covers contents + cursor + input
+    /// modes + title.
+    ///
+    /// Two deliberate additions around vt100's own output:
+    /// - `ESC[?1049h` is prepended when the surface is on the alternate
+    ///   screen. `state_formatted()` renders whichever grid is active but
+    ///   never emits the mode switch itself; without it the viewer would
+    ///   paint a TUI into its primary screen, and the app's eventual
+    ///   `?1049l` would no-op — leaving the TUI on screen forever.
+    /// - The caller still prepends `mode_replay_bytes()` (mouse DECSET):
+    ///   vt100 tracks most input modes but not 1015/1016, which the host's
+    ///   own tracker does. Overlapping DECSETs are idempotent; the
+    ///   snapshot's version wins where both speak.
+    ///
+    /// Returns `None` on a poisoned lock — callers fall back to the byte
+    /// replay path, matching the `.unwrap_or_default()` convention of the
+    /// other snapshot readers.
+    pub fn screen_snapshot(&self) -> Option<(Vec<u8>, u64)> {
+        let screen = self.screen.lock().ok()?;
+        let vt = screen.parser.screen();
+        let mut out = Vec::new();
+        if vt.alternate_screen() {
+            out.extend_from_slice(b"\x1b[?1049h");
+        }
+        out.extend_from_slice(&vt.state_formatted());
+        Some((out, screen.fed_through))
+    }
+
+    /// Render the scrollback window whose bottom sits `offset_rows` above
+    /// the live view's bottom, as a full-screen replacement (clear+home
+    /// first) — what a `ScrollbackRequest` gets back.
+    ///
+    /// Returns `(ansi, effective_offset, at_top, total_rows)`. The offset is
+    /// clamped to what the scrollback actually holds; `at_top` reports that
+    /// the render hit (or was clamped to) the oldest retained row. On the
+    /// alternate screen the browse is meaningless (vt100's offset is a
+    /// no-op against the alt grid, which never accumulates scrollback — the
+    /// same rule tmux applies), so the render comes back empty with
+    /// `at_top` set.
+    ///
+    /// The offset dance is atomic under the screen lock, and MUST be:
+    /// vt100 auto-follows a nonzero offset when live output scrolls
+    /// (`scrollback_offset + 1` per scrolled line), so an offset left
+    /// dangling would silently pin every later snapshot to the past. The
+    /// restore is to absolute 0, which is immune to that drift. `None` on a
+    /// poisoned lock, like [`PtySurface::screen_snapshot`].
+    pub fn scrollback_render(&self, offset_rows: u32) -> Option<(Vec<u8>, u32, bool, u32)> {
+        let mut screen = self.screen.lock().ok()?;
+        if screen.parser.screen().alternate_screen() {
+            return Some((Vec::new(), 0, true, 0));
+        }
+        // Total retained rows: set_scrollback clamps to the deque's actual
+        // length, and `Screen::scrollback()` reads the clamped offset back —
+        // the only way the total is observable through vt100's public API.
+        screen.parser.screen_mut().set_scrollback(usize::MAX);
+        let total = screen.parser.screen().scrollback();
+        screen.parser.screen_mut().set_scrollback(offset_rows as usize);
+        let effective = screen.parser.screen().scrollback();
+        let ansi = screen.parser.screen().contents_formatted();
+        screen.parser.screen_mut().set_scrollback(0);
+        let at_top = effective >= total || (effective as u64) < offset_rows as u64;
+        Some((ansi, effective as u32, at_top, total as u32))
     }
 
     /// Current value of the surface's monotonic PTY byte-seq counter — the
@@ -777,6 +945,12 @@ impl PtySurface {
         pty::resize(self.master_fd, cols, rows)?;
         self.cols.store(cols as u32, Ordering::Relaxed);
         self.rows.store(rows as u32, Ordering::Relaxed);
+        // Keep the screen model at the PTY's size, or every later snapshot
+        // renders at a stale width. vt100's set_size takes (rows, cols) —
+        // the reverse of this function's own signature. Do not swap.
+        if let Ok(mut screen) = self.screen.lock() {
+            screen.parser.screen_mut().set_size(rows, cols);
+        }
         Ok(())
     }
 
@@ -3334,5 +3508,353 @@ mod tests {
         // And it is the NEWEST bytes: the last chunk of the ring is the last
         // chunk of the tail.
         assert_eq!(tail.last(), buf.snapshot().last());
+    }
+
+    // -- ScreenModel / screen_snapshot -----------------------------------
+
+    /// Round-trip: feeding a snapshot into a fresh parser must reproduce
+    /// the screen. This is the core contract the whole grid-snapshot design
+    /// stands on — if state_formatted() can't rebuild its own screen, a
+    /// viewer can't either.
+    #[test]
+    fn screen_model_roundtrip_reproduces_contents() {
+        let mut model = ScreenModel::new(80, 24);
+        model.feed(b"\x1b[31mred\x1b[m plain\r\nline2 \x1b[1mbold\x1b[m\r\n", 0);
+        model.feed(b"\x1b[5;10Hcursor-positioned", 0);
+
+        let mut reparsed = vt100::Parser::new(24, 80, 0);
+        let vt = model.parser.screen();
+        reparsed.process(&vt.state_formatted());
+
+        assert_eq!(
+            reparsed.screen().contents(),
+            vt.contents(),
+            "state_formatted must reproduce the exact screen contents"
+        );
+        assert_eq!(reparsed.screen().cursor_position(), vt.cursor_position());
+    }
+
+    /// An escape sequence split across two feeds (the 4096-byte read
+    /// boundary case) must parse as if it arrived whole — vte is a
+    /// streaming state machine, and this pins that property so a future
+    /// batching layer can't accidentally break it.
+    #[test]
+    fn screen_model_survives_escape_split_across_feeds() {
+        let mut split = ScreenModel::new(80, 24);
+        // Split an SGR + text mid-sequence: ESC [ 3 | 1 m red
+        split.feed(b"\x1b[3", 0);
+        split.feed(b"1mred\x1b[m", 0);
+
+        let mut whole = ScreenModel::new(80, 24);
+        whole.feed(b"\x1b[31mred\x1b[m", 0);
+
+        assert_eq!(
+            split.parser.screen().state_formatted(),
+            whole.parser.screen().state_formatted(),
+            "chunk-split escape must render identically to the unsplit form"
+        );
+    }
+
+    /// Alt-screen: the snapshot must carry ESC[?1049h ahead of vt100's own
+    /// output, or the viewer paints the TUI into its primary screen and the
+    /// app's later ?1049l no-ops (the TUI never goes away).
+    #[tokio::test]
+    async fn screen_snapshot_prefixes_alt_screen_switch() {
+        let surface = PtySurface::spawn(
+            surface_id_from_name("alt-snap"),
+            "alt-snap".into(),
+            "/bin/sh",
+            &["-c", "printf '\\033[?1049halt-content'; sleep 5"],
+            80,
+            24,
+            None,
+        )
+        .expect("spawn alt-snap surface");
+
+        // Poll until the reader has fed the alt-screen switch through.
+        let mut saw_alt = false;
+        for _ in 0..100 {
+            if let Some((bytes, _)) = surface.screen_snapshot() {
+                if bytes.starts_with(b"\x1b[?1049h")
+                    && bytes.windows(11).any(|w| w == b"alt-content")
+                {
+                    saw_alt = true;
+                    break;
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        surface.hangup();
+        assert!(
+            saw_alt,
+            "snapshot of an alt-screen surface must start with ESC[?1049h and contain its content"
+        );
+    }
+
+    /// The watermark must equal the END seq of the last fed chunk, and the
+    /// snapshot/seq pair must be read atomically (both under one lock).
+    #[tokio::test]
+    async fn screen_snapshot_watermark_matches_byte_seq() {
+        const MARKER: &[u8] = b"WATERMARK-SYNC";
+        let surface = PtySurface::spawn(
+            surface_id_from_name("watermark"),
+            "watermark".into(),
+            "/bin/sh",
+            &["-c", "printf WATERMARK-SYNC; sleep 5"],
+            80,
+            24,
+            None,
+        )
+        .expect("spawn watermark surface");
+
+        let mut synced = false;
+        for _ in 0..100 {
+            let (snapshot, fed_through) = match surface.screen_snapshot() {
+                Some(pair) => pair,
+                None => continue,
+            };
+            let contains = snapshot
+                .windows(MARKER.len())
+                .any(|w| w == MARKER);
+            if contains && fed_through == surface.current_byte_seq() {
+                synced = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        surface.hangup();
+        assert!(
+            synced,
+            "once output settles, fed_through must equal the surface's byte_seq"
+        );
+    }
+
+    /// Stress (the done_criteria's 10MB/s case, expressed as throughput):
+    /// feeding 10 MB through the model in read-sized chunks must complete
+    /// promptly — the per-chunk lock hold is a parse, not I/O, and nothing
+    /// about it may block or accumulate.
+    #[test]
+    fn screen_model_stress_ten_megabytes_of_flood() {
+        let mut model = ScreenModel::new(120, 40);
+        let chunk = vec![b'x'; READ_BUF_SIZE];
+        let start = std::time::Instant::now();
+        let mut fed = 0u64;
+        while fed < 10 * 1024 * 1024 {
+            model.feed(&chunk, fed + chunk.len() as u64);
+            fed += chunk.len() as u64;
+        }
+        let elapsed = start.elapsed();
+        // Generous bound on purpose: this asserts "a flood terminates
+        // promptly", not a benchmark number — under a full parallel test
+        // run on a loaded box (observed on the Linux peer) 5s flaked while
+        // the single-run time stayed ~100ms.
+        assert!(
+            elapsed < std::time::Duration::from_secs(60),
+            "10MB of plain flood must terminate promptly, took {elapsed:?}"
+        );
+        // The screen is still coherent after the flood.
+        assert_eq!(model.fed_through, fed);
+        let rendered = model.parser.screen().state_formatted();
+        assert!(!rendered.is_empty());
+    }
+
+    /// Scrollback window rendering: content that scrolled off the live
+    /// screen must come back at an offset, clamped at the oldest retained
+    /// row, and the browse must leave the live screen untouched.
+    #[tokio::test]
+    async fn scrollback_render_returns_scrolled_out_content_and_clamps() {
+        let surface = PtySurface::spawn(
+            surface_id_from_name("sb-render"),
+            "sb-render".into(),
+            "/bin/sh",
+            &["-c", "for i in $(seq 1 40); do echo LINE-$i; done; sleep 5"],
+            80,
+            24,
+            None,
+        )
+        .expect("spawn sb-render surface");
+
+        // Wait until the tail line has been fed through the screen model.
+        let mut ready = false;
+        for _ in 0..150 {
+            if let Some((snap, _)) = surface.screen_snapshot() {
+                if snap.windows(7).any(|w| w == b"LINE-40") {
+                    ready = true;
+                    break;
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(ready, "seq output never reached the screen model");
+
+        // 40 lines + prompt on a 24-row screen => 17+ rows of scrollback.
+        // A window 10 rows up must show lines the live screen no longer
+        // holds, as a full replacement render (clear+home preamble).
+        let (ansi, effective, _at_top, total) =
+            surface.scrollback_render(10).expect("render");
+        assert_eq!(effective, 10);
+        assert!(total >= 10, "expected >=10 rows of scrollback, got {total}");
+        assert!(ansi.windows(6).any(|w| w == b"\x1b[H\x1b[J".as_slice())
+            || ansi.windows(6).any(|w| w == b"\x1b[J\x1b[H".as_slice())
+            || ansi.starts_with(b"\x1b[m"),
+            "scrollback window must be a full replacement render");
+        // The window shows OLDER lines than the live bottom.
+        assert!(
+            ansi.windows(7).any(|w| w == b"LINE-30".as_slice())
+                || ansi.windows(7).any(|w| w == b"LINE-25".as_slice()),
+            "scrollback window must contain scrolled-out lines"
+        );
+
+        // Clamp: asking far past the retained history reports at_top and an
+        // effective offset no larger than the total.
+        let (_, effective, at_top, total2) =
+            surface.scrollback_render(1_000_000).expect("render");
+        assert!(at_top);
+        assert!(effective <= total2);
+
+        // Atomicity/restore: the browse must not disturb the live screen.
+        let (snap_after, _) = surface.screen_snapshot().expect("snapshot");
+        assert!(
+            snap_after.windows(7).any(|w| w == b"LINE-40"),
+            "live screen must be untouched after a scrollback browse"
+        );
+        surface.hangup();
+    }
+
+    /// Paging regression guard (live-observed 2026-07-22): three successive
+    /// browse windows at growing offsets must render three DIFFERENT slices
+    /// of history, each older than the last. Catches any offset that gets
+    /// applied but not rendered (window content identical to live screen).
+    #[tokio::test]
+    async fn scrollback_render_paging_returns_distinct_older_windows() {
+        let surface = PtySurface::spawn(
+            surface_id_from_name("sb-paging"),
+            "sb-paging".into(),
+            "/bin/sh",
+            &["-c", "for i in $(seq 1 300); do echo SBLINE-$i; done; sleep 5"],
+            80,
+            24,
+            None,
+        )
+        .expect("spawn sb-paging surface");
+
+        let mut ready = false;
+        for _ in 0..250 {
+            if let Some((snap, _)) = surface.screen_snapshot() {
+                if snap.windows(10).any(|w| w == b"SBLINE-300") {
+                    ready = true;
+                    break;
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(ready, "seq output never reached the screen model");
+
+        // Highest SBLINE-<n> number present in a render — a strictly
+        // decreasing sequence across growing offsets proves each window is
+        // genuinely older, not a re-render of the live screen.
+        fn max_line_no(ansi: &[u8]) -> u32 {
+            let text = String::from_utf8_lossy(ansi);
+            text.split("SBLINE-")
+                .skip(1)
+                .filter_map(|rest| {
+                    rest.bytes()
+                        .take_while(|b| b.is_ascii_digit())
+                        .fold(None, |acc: Option<u32>, b| {
+                            Some(acc.unwrap_or(0) * 10 + (b - b'0') as u32)
+                        })
+                })
+                .max()
+                .unwrap_or(0)
+        }
+
+        let mut prev_max = u32::MAX;
+        for offset in [32u32, 64, 96] {
+            let (ansi, effective, at_top, _total) =
+                surface.scrollback_render(offset).expect("render");
+            assert_eq!(effective, offset, "offset {offset} must apply verbatim");
+            assert!(!at_top, "offset {offset} is nowhere near 300 lines of history");
+            let this_max = max_line_no(&ansi);
+            assert!(
+                this_max > 0,
+                "offset {offset}: window contains no SBLINE at all"
+            );
+            assert!(
+                this_max < prev_max,
+                "offset {offset}: window max SBLINE-{this_max} not older than \
+                 previous window's SBLINE-{prev_max} — offset applied but not rendered"
+            );
+            prev_max = this_max;
+        }
+        // And every window is older than the live bottom.
+        assert!(prev_max < 300);
+        surface.hangup();
+    }
+
+    /// Alt-screen: scrollback browsing is meaningless there (the alt grid
+    /// never accumulates scrollback — same rule as tmux), so the render is
+    /// empty and terminal.
+    #[tokio::test]
+    async fn scrollback_render_on_alt_screen_is_empty_and_terminal() {
+        let surface = PtySurface::spawn(
+            surface_id_from_name("sb-alt"),
+            "sb-alt".into(),
+            "/bin/sh",
+            &["-c", "printf '\\033[?1049halt'; sleep 5"],
+            80,
+            24,
+            None,
+        )
+        .expect("spawn sb-alt surface");
+        let mut on_alt = false;
+        for _ in 0..100 {
+            if let Some((snap, _)) = surface.screen_snapshot() {
+                if snap.starts_with(b"\x1b[?1049h") {
+                    on_alt = true;
+                    break;
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(on_alt);
+        let (ansi, effective, at_top, _total) =
+            surface.scrollback_render(5).expect("render");
+        assert!(ansi.is_empty());
+        assert_eq!(effective, 0);
+        assert!(at_top);
+        surface.hangup();
+    }
+
+    /// Adversarial: a poisoned screen lock must degrade to None (callers
+    /// fall back to the byte-replay path), never panic the attach handler.
+    #[tokio::test]
+    async fn screen_snapshot_poisoned_lock_returns_none() {
+        let surface = PtySurface::spawn(
+            surface_id_from_name("poison"),
+            "poison".into(),
+            "/bin/cat",
+            &[],
+            80,
+            24,
+            None,
+        )
+        .expect("spawn poison surface");
+
+        // Poison the lock: panic while holding it.
+        {
+            let surface = surface.clone();
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+                let _guard = surface.screen.lock().unwrap();
+                panic!("deliberate poison");
+            }));
+        }
+
+        assert!(
+            surface.screen_snapshot().is_none(),
+            "poisoned lock must yield None, not panic"
+        );
+        // The byte-replay fallback still works.
+        let _ = surface.replay_snapshot_fresh();
+        surface.hangup();
     }
 }

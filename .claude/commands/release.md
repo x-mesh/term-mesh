@@ -13,7 +13,11 @@ Prepare a new release for term-mesh. This command updates the changelog, bumps t
      `git fetch origin main`
    - Detect the current branch: `BRANCH=$(git rev-parse --abbrev-ref HEAD)`
    - **If on `main`:** fast-forward to `origin/main` (`git merge --ff-only origin/main`), then cut the release branch from it.
-   - **If NOT on `main`** (e.g. a feature branch like `fix/memory-leak`): the current branch's work is **folded into the release PR** and squash-merged to main together with the version bump. Before cutting the branch, run these guards:
+   - **If on `develop`: do NOT release from here.** `develop` is this repo's integration branch — it mirrors `main` between releases (see the merge-PR history: #106, #108, #112). Releasing from it squashes every accumulated commit into the single `Bump version` commit, so main loses the individual history AND the same changes end up under two different SHAs — after which `develop` and `main` have permanently diverged and every later release fights conflicts. Instead:
+     1. Open a `develop → main` PR and merge it **with a merge commit, not squash** (`gh pr merge <N> --merge`). The commits are preserved.
+     2. `git checkout main && git merge --ff-only origin/main`
+     3. Re-run `/release` from `main`. The release PR then carries only the version bump, which is safe to squash.
+   - **If NOT on `main` or `develop`** (e.g. a feature branch like `fix/memory-leak`): the current branch's work is **folded into the release PR** and squash-merged to main together with the version bump. Before cutting the branch, run these guards:
      - **Clean tree:** `git status --porcelain` must be empty. Uncommitted changes are NOT included — commit or stash first.
      - **Not behind main:** `git rev-list --count HEAD..origin/main` must be `0`. If non-zero, rebase or merge `origin/main` into the branch and resolve conflicts before continuing — otherwise the release PR will conflict.
      - **Confirm the fold-in set with the user:** `git log --oneline origin/main..HEAD` — every one of these commits gets **squashed into the single `Bump version to X.Y.Z` commit** on main (history is flattened by the squash-merge in step 9). If the user wants the feature commits preserved as a distinct change, stop and merge the feature branch to main on its own PR first, then re-run `/release` from main.
@@ -103,9 +107,10 @@ Prepare a new release for term-mesh. This command updates the changelog, bumps t
 
 12. **Upload dSYM debug symbols to Sentry**
     - Build Release and upload: `./scripts/upload-dsym.sh --build` (runs from the tag's working tree, so the dSYM UUID matches the released binary)
-    - **Version check:** the script prints `dSYM version: X.Y.Z (N)` — confirm it matches the tag. If it shows an older version, abort and investigate (usually means step 11 was skipped or the tag points at a pre-bump commit).
+    - The script enforces its own correctness and **exits non-zero** rather than uploading a mismatch — it resolves the dSYM from `xcodebuild -showBuildSettings` (never a filesystem search), then refuses if the built app's version differs from the project's, or if the dSYM UUID does not match the app binary. A successful run prints `UUID verified: <uuid>`.
+    - **Do not paper over a failure here.** The failure modes it catches all look like success from the outside: Sentry accepts wrong symbols happily, and the damage only surfaces months later as a stack trace that resolves to the wrong lines. If it refuses, fix the cause (usually step 11 was skipped, or a second DerivedData directory exists for this project) and re-run.
     - Required for crash symbolication on issues like `EXC_BAD_ACCESS` in Sentry.
-    - If upload fails (non-zero exit), the release is still valid — just re-run `./scripts/upload-dsym.sh` (no rebuild) once sentry-cli auth is fixed.
+    - If the *upload itself* fails (sentry-cli auth, network), the release is still valid — re-run `./scripts/upload-dsym.sh` without `--build` once fixed.
 
 13. **Build the distributable DMG and publish the GitHub Release**
     - While still on the tag's detached HEAD (from step 11), run `make dmg` — produces `term-mesh-macos-X.Y.Z.dmg` with the ad-hoc signed bundle and bundled Rust binaries.

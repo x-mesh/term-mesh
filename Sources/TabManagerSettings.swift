@@ -128,6 +128,64 @@ enum SidebarBranchLayoutSettings {
     }
 }
 
+enum SidebarPresentationSettings {
+    static let separatedSectionsEnabledKey = "sidebar.presentation.separatedSections.enabled"
+    static let defaultSeparatedSectionsEnabled = false
+
+    static func usesSeparatedSections(defaults: UserDefaults = .standard) -> Bool {
+        guard defaults.object(forKey: separatedSectionsEnabledKey) != nil else {
+            return defaultSeparatedSectionsEnabled
+        }
+        return defaults.bool(forKey: separatedSectionsEnabledKey)
+    }
+
+    /// The experimental presentation treats a live peer mirror as a remote
+    /// action owned by Peer Hosts, even though its backing Workspace remains
+    /// in TabManager for selection and lifecycle management.
+    static func includesInLocalWorkspaces(
+        isPeerMirror: Bool,
+        separatedSectionsEnabled: Bool
+    ) -> Bool {
+        !separatedSectionsEnabled || !isPeerMirror
+    }
+
+    static func visibleLocalWorkspaceIDs(
+        from workspaces: [(id: UUID, isPeerMirror: Bool)],
+        separatedSectionsEnabled: Bool
+    ) -> [UUID] {
+        workspaces.compactMap { workspace in
+            includesInLocalWorkspaces(
+                isPeerMirror: workspace.isPeerMirror,
+                separatedSectionsEnabled: separatedSectionsEnabled
+            ) ? workspace.id : nil
+        }
+    }
+
+    /// Returns a contiguous range in presentation order. A hidden or stale
+    /// anchor produces no range rather than reaching through a peer mirror.
+    static func rangeSelectionIDs(
+        anchorID: UUID,
+        targetID: UUID,
+        visibleWorkspaceIDs: [UUID]
+    ) -> [UUID] {
+        guard let anchorIndex = visibleWorkspaceIDs.firstIndex(of: anchorID),
+              let targetIndex = visibleWorkspaceIDs.firstIndex(of: targetID)
+        else { return [] }
+        let lower = min(anchorIndex, targetIndex)
+        let upper = max(anchorIndex, targetIndex)
+        return Array(visibleWorkspaceIDs[lower...upper])
+    }
+
+    static func contextTargetIDs(
+        clickedID: UUID,
+        selectedIDs: Set<UUID>,
+        visibleWorkspaceIDs: [UUID]
+    ) -> [UUID] {
+        let baseIDs = selectedIDs.contains(clickedID) ? selectedIDs : [clickedID]
+        return visibleWorkspaceIDs.filter { baseIDs.contains($0) }
+    }
+}
+
 enum SidebarActiveTabIndicatorStyle: String, CaseIterable, Identifiable {
     case leftRail
     case solidFill
@@ -622,4 +680,3 @@ func termMeshVsyncIOSurfaceTimelineCallback(
     return kCVReturnSuccess
 }
 #endif
-

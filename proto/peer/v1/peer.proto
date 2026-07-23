@@ -51,6 +51,11 @@ message Envelope {
     Resize resize = 32;
     GridSnapshot grid_snapshot = 33;
     DataAck data_ack = 34;
+    // Gated behind capability "grid.snapshot.v1" (Hello.capabilities) —
+    // scrollback is part of the grid model: only a client that renders the
+    // typed snapshot has the empty local scrollback these fill.
+    ScrollbackRequest scrollback_request = 35;
+    ScrollbackChunk scrollback_chunk = 36;
 
     WorkspaceUpdate workspace_update = 40;
 
@@ -598,18 +603,73 @@ message Resize {
   uint32 pixel_height = 5;
 }
 
-// Periodic visible-screen keyframe. Scrollback is NOT included here;
-// clients reconnecting within the host ring buffer get bytes replayed,
-// clients outside accept scrollback loss.
+// Visible-screen keyframe for a fresh attach (capability
+// "grid.snapshot.v1"). Scrollback is NOT included here; clients
+// reconnecting within the host ring buffer get bytes replayed via
+// `resume_from_seq`, clients outside accept scrollback loss.
+//
+// The screen travels as an ANSI re-render (`ansi`), not as cells. The
+// protocol doc's open question ("cells vs ANSI re-render — decide when
+// prototyping") was settled for ANSI at implementation time: both
+// encodings would be produced by the same host-side emulator, so cells
+// add no robustness — but they DO add drift surface (an attrs bitfield
+// whose layout was never specified, host-resolved palette RGB where the
+// viewer's theme should decide) and cost 10-20x the bytes of the
+// equivalent escape stream. The cell fields were designed and codegen'd
+// but never emitted by any released host, so their numbers are reserved
+// rather than carried forward; a cell encoding, if ever wanted, claims a
+// "grid-snapshot-v2" capability per the evolution rules.
 message GridSnapshot {
   bytes surface_id = 1;
-  // byte_seq this snapshot is consistent with.
+  // Host-absolute byte_seq this snapshot is consistent with. Equals
+  // AttachResult.initial_seq for this attach. Snapshot bytes are synthetic
+  // and spend no wire byte_seq: the first live PtyData after this message
+  // starts at wire byte_seq 0, so the client resets its wire-gap baseline
+  // to zero and keeps translating wire positions via initial_seq.
   uint64 byte_seq = 2;
   uint32 cols = 3;
   uint32 rows = 4;
   bool alt_screen = 5;
   CursorState cursor = 6;
-  repeated GridRow rows_data = 7;
+  // Former `repeated GridRow rows_data`.
+  reserved 7;
+  reserved "rows_data";
+  // The rendered screen: feed to a terminal as-is. Self-contained — leads
+  // with clear+home, ends with cursor position, includes input-mode state,
+  // and is prefixed with the alt-screen switch when `alt_screen` is true.
+  bytes ansi = 8;
+}
+
+// Ask the host to render a window of its scrollback (tmux copy-mode
+// model: scrollback lives on the host and is fetched on demand when the
+// viewer scrolls to the top of what it has). `offset_rows` counts up from
+// the live screen's bottom — offset 0 is the live screen itself, so a
+// first request typically asks for offset = viewport height.
+message ScrollbackRequest {
+  bytes surface_id = 1;
+  // How many rows above the live view's bottom the requested window's
+  // bottom sits. Clamped by the host to what its scrollback actually holds.
+  uint32 offset_rows = 2;
+}
+
+// One rendered scrollback window. `ansi` is a full-screen replacement
+// render (clear+home first, viewport-sized) at the effective offset — the
+// client swaps its screen wholesale while browsing, exactly like tmux
+// copy-mode, and returns to the live screen (offset 0 / a fresh
+// GridSnapshot) when done.
+message ScrollbackChunk {
+  bytes surface_id = 1;
+  // The offset actually rendered, after clamping. Echoing it back lets the
+  // client detect "I asked for further up than exists".
+  uint32 offset_rows = 2;
+  bytes ansi = 3;
+  // True when the rendered window is at (or clamped to) the oldest
+  // scrollback the host still holds — the client should stop asking for
+  // more on further upward scrolls.
+  bool at_top = 4;
+  // Rows of scrollback the host currently holds for this surface, for UI
+  // hints. 0 both when empty and when the host has scrollback disabled.
+  uint32 total_scrollback_rows = 5;
 }
 
 message CursorState {
@@ -618,20 +678,6 @@ message CursorState {
   bool visible = 3;
   // libghostty cursor style enum; mirrors GhosttyKit's value.
   uint32 style = 4;
-}
-
-message GridRow {
-  repeated Cell cells = 1;
-}
-
-message Cell {
-  // Usually a single grapheme; wide chars occupy one Cell plus a continuation.
-  string text = 1;
-  uint32 fg_rgba = 2;
-  uint32 bg_rgba = 3;
-  // Bitfield: bold, italic, underline, strike, inverse, dim.
-  uint32 attrs = 4;
-  bool is_continuation = 5;
 }
 
 // Advisory: clients may send periodically for RTT measurement and so the

@@ -23,6 +23,55 @@ struct WorkspaceSummary: Identifiable, Equatable {
     /// Leaf panes whose active surface is busy (a foreground command is
     /// running). 0 on hosts that predate the `busy` field.
     let busyCount: Int
+    /// Left-to-right pane inventory for the sidebar's expandable detail.
+    /// Only the final cwd component is retained so the UI never exposes a
+    /// remote host's full path.
+    let panes: [RemotePaneSummary]
+}
+
+struct RemotePaneSummary: Identifiable, Equatable {
+    let id: Data
+    let title: String
+    let workingDirectoryName: String?
+    let tabCount: Int
+    let columns: Int
+    let rows: Int
+    let isBusy: Bool
+}
+
+/// Flatten a peer layout into the compact pane details shown by the sidebar.
+/// Pre-order traversal matches the visual left-to-right/top-to-bottom layout.
+func peerPaneSummaries(
+    _ layout: Termmesh_Peer_V1_WorkspaceLayout?
+) -> [RemotePaneSummary] {
+    func shortDirectoryName(_ path: String) -> String? {
+        guard !path.isEmpty else { return nil }
+        if path == "/" { return "/" }
+        let name = (path as NSString).lastPathComponent
+        return name.isEmpty ? nil : name
+    }
+
+    func walk(_ node: Termmesh_Peer_V1_WorkspaceLayout) -> [RemotePaneSummary] {
+        switch node.node {
+        case .pane(let pane):
+            return [RemotePaneSummary(
+                id: pane.surfaceID,
+                title: pane.title.isEmpty ? "Shell" : pane.title,
+                workingDirectoryName: shortDirectoryName(pane.cwd),
+                tabCount: max(pane.tabs.count, 1),
+                columns: Int(pane.cols),
+                rows: Int(pane.rows),
+                isBusy: pane.busy
+            )]
+        case .split(let split):
+            return walk(split.first) + walk(split.second)
+        case .none:
+            return []
+        }
+    }
+
+    guard let layout else { return [] }
+    return walk(layout)
 }
 
 /// Fold a peer workspace layout tree into (panes, surfaces, busy panes).
@@ -728,7 +777,8 @@ final class RemoteHostStore: ObservableObject {
                     return
                 }
                 let summaries = workspaces.map { ws -> WorkspaceSummary in
-                    let counts = peerLayoutCounts(ws.hasLayout ? ws.layout : nil)
+                    let layout = ws.hasLayout ? ws.layout : nil
+                    let counts = peerLayoutCounts(layout)
                     return WorkspaceSummary(
                         id: ws.workspaceID,
                         title: ws.title.isEmpty ? "<workspace>" : ws.title,
@@ -738,7 +788,8 @@ final class RemoteHostStore: ObservableObject {
                         isDefault: ws.isDefault,
                         paneCount: counts.panes,
                         surfaceCount: counts.surfaces,
-                        busyCount: counts.busy
+                        busyCount: counts.busy,
+                        panes: peerPaneSummaries(layout)
                     )
                 }
                 self.hosts[key]?.workspaces = summaries
@@ -746,6 +797,38 @@ final class RemoteHostStore: ObservableObject {
                 // Host disconnected between detection and fetch — ignore.
             }
         }
+    }
+
+    /// Keep sidebar pane details and busy state in lockstep with an open live
+    /// mirror. The mirror already receives each host layout push, so reuse it
+    /// instead of adding a second poll or RPC on the main actor.
+    func recordLiveMirrorLayout(
+        _ layout: Termmesh_Peer_V1_WorkspaceLayout,
+        hostKey: PeerPaneHostKey,
+        workspaceIDs: Set<Data>
+    ) {
+        guard let hostID = hosts.values.first(where: {
+            $0.paneHostSpec.hostKey == hostKey
+        })?.id,
+        let index = hosts[hostID]?.workspaces.firstIndex(where: {
+            workspaceIDs.contains($0.id)
+        }),
+        let current = hosts[hostID]?.workspaces[index]
+        else { return }
+
+        let counts = peerLayoutCounts(layout)
+        hosts[hostID]?.workspaces[index] = WorkspaceSummary(
+            id: current.id,
+            title: current.title,
+            hostSockPath: current.hostSockPath,
+            windowID: current.windowID,
+            windowTitle: current.windowTitle,
+            isDefault: current.isDefault,
+            paneCount: counts.panes,
+            surfaceCount: counts.surfaces,
+            busyCount: counts.busy,
+            panes: peerPaneSummaries(layout)
+        )
     }
 
     /// `host` is the sidebar group the row was rendered under — used for
