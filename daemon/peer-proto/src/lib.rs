@@ -73,6 +73,12 @@ pub mod capability {
     /// answer; a client asks a host that did not advertise it nothing.
     pub const TEAM_ROSTER_V1: &str = "team.roster.v1";
 
+    /// The host runs allow-listed `team.*` methods on behalf of a client.
+    /// Advertised by the HOST. Unlike the roster this CHANGES things, so the
+    /// allow-list — not the capability — is what bounds it. Kept in lockstep
+    /// with the Swift host's `PeerTeamCall` allow-list.
+    pub const TEAM_CALL_V1: &str = "team.call.v1";
+
     /// Every capability this build supports. Single source of truth for
     /// populating outgoing `Hello.capabilities` — callers should use
     /// [`supported_vec`] rather than hand-rolling the list.
@@ -86,6 +92,7 @@ pub mod capability {
         HOST_STATS_V1,
         GRID_SNAPSHOT_V1,
         TEAM_ROSTER_V1,
+        TEAM_CALL_V1,
     ];
 
     /// `Hello.capabilities` value for an outgoing handshake message.

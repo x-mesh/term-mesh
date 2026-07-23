@@ -410,6 +410,145 @@ mod integration_tests {
     /// Attach to a long-lived `/bin/cat` PTY; send keystrokes as Input and
     /// verify they come back through PtyData. This exercises the full
     /// bidirectional path plus AsyncFd's cancellation behavior at test end.
+    /// team.call.v1 over the real wire: the allow-list refuses lifecycle,
+    /// the shared vocabulary translates to headless terms, and a method that
+    /// is allowed but not a single daemon op is reported honestly.
+    #[tokio::test]
+    async fn team_call_enforces_allow_list_and_translates_over_the_wire() {
+        let tmp = TempDir::new().unwrap();
+        let sock_path = tmp.path().join("peer.sock");
+
+        let manager = cat_manager();
+        let host = Arc::new(PeerHost::new(manager));
+        let teams = Arc::new(tokio::sync::Mutex::new(
+            crate::headless::HeadlessManager::new(),
+        ));
+        teams
+            .lock()
+            .await
+            .insert_team_for_tests("remote-demo", "uuid-1", "/root/demo", vec![]);
+        host.set_teams(teams);
+
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let sock_path_task = sock_path.clone();
+        let host_task = host.clone();
+        let server_task = tokio::spawn(async move {
+            serve_with_host(sock_path_task, shutdown_rx, host_task)
+                .await
+                .unwrap();
+        });
+        for _ in 0..50 {
+            if sock_path.exists() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+
+        let stream = UnixStream::connect(&sock_path).await.unwrap();
+        let (mut reader, mut writer) = stream.into_split();
+        write_envelope(
+            &mut writer,
+            &Envelope {
+                seq: 1,
+                correlation_id: 0,
+                payload: Some(Payload::Hello(Hello {
+                    protocol_version: PROTOCOL_VERSION.into(),
+                    peer_id: vec![0x11; 16],
+                    display_name: "integration-test".into(),
+                    capabilities: peer_proto::capability::supported_vec(),
+                    app_version: "test".into(),
+                })),
+            },
+        )
+        .await
+        .unwrap();
+        let host_hello = read_envelope(&mut reader).await.unwrap();
+        match host_hello.payload {
+            Some(Payload::Hello(h)) => assert!(
+                h.capabilities
+                    .iter()
+                    .any(|c| c == peer_proto::capability::TEAM_CALL_V1),
+                "host with a team manager must advertise team.call.v1"
+            ),
+            other => panic!("expected Hello, got {other:?}"),
+        }
+        let _ = read_envelope(&mut reader).await.unwrap();
+        write_envelope(
+            &mut writer,
+            &Envelope {
+                seq: 2,
+                correlation_id: 0,
+                payload: Some(Payload::Auth(Auth {
+                    method: "ssh-passthrough".into(),
+                    token_id: vec![],
+                    signature: vec![],
+                })),
+            },
+        )
+        .await
+        .unwrap();
+        let _ = read_envelope(&mut reader).await.unwrap();
+
+        async fn team_call(
+            reader: &mut (impl tokio::io::AsyncRead + Unpin),
+            writer: &mut (impl tokio::io::AsyncWrite + Unpin),
+            seq: u64,
+            method: &str,
+            params_json: &str,
+        ) -> peer_proto::v1::TeamCallResponse {
+            write_envelope(
+                writer,
+                &Envelope {
+                    seq,
+                    correlation_id: 0,
+                    payload: Some(Payload::TeamCallRequest(
+                        peer_proto::v1::TeamCallRequest {
+                            method: method.into(),
+                            params_json: params_json.into(),
+                        },
+                    )),
+                },
+            )
+            .await
+            .unwrap();
+            match read_envelope(reader).await.unwrap().payload {
+                Some(Payload::TeamCallResponse(r)) => r,
+                other => panic!("expected TeamCallResponse, got {other:?}"),
+            }
+        }
+
+        // Refused: creating a team spawns processes and takes a directory.
+        let refused = team_call(&mut reader, &mut writer, 3, "team.create", "{}").await;
+        assert!(!refused.ok);
+        assert_eq!(refused.error_code, "method_not_allowed");
+
+        // Translated: team.list maps to the headless roster.
+        let listed = team_call(&mut reader, &mut writer, 4, "team.list", "{}").await;
+        assert!(listed.ok, "team.list failed: {}", listed.error_message);
+        assert!(listed.result_json.contains("remote-demo"));
+
+        // Translated but the agent does not exist — a host error, not a
+        // refusal: the method was allowed, the target was simply absent.
+        let missing = team_call(
+            &mut reader,
+            &mut writer,
+            5,
+            "team.send",
+            r#"{"team_name":"remote-demo","agent_name":"ghost","text":"hi"}"#,
+        )
+        .await;
+        assert!(!missing.ok);
+        assert_eq!(missing.error_code, "host_error");
+
+        // Allowed in vocabulary, not a single daemon op.
+        let unsupported = team_call(&mut reader, &mut writer, 6, "team.collect", "{}").await;
+        assert!(!unsupported.ok);
+        assert_eq!(unsupported.error_code, "unsupported_on_host");
+
+        let _ = shutdown_tx.send(true);
+        server_task.abort();
+    }
+
     /// A team is invisible in the layout tree, so a client can only learn
     /// where a project's leader sits by asking. This drives the real wire:
     /// handshake, auth, then ListTeams against a host wired to a team

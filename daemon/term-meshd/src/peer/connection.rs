@@ -21,8 +21,8 @@ use peer_proto::v1::{
     GridSnapshot, Hello, ScrollbackChunk,
     HostStats, Pong, PtyData, SurfaceList, TerminateSurfaceError as WireTerminateError,
     TerminateSurfaceErrorCode, TerminateSurfaceRequest, TerminateSurfaceResponse,
-    Team, TeamList, TerminateSurfaceResult, Workspace, WorkspaceList, WorkspaceMeta,
-    WorkspaceUpdate,
+    Team, TeamCallResponse, TeamList, TerminateSurfaceResult, Workspace, WorkspaceList,
+    WorkspaceMeta, WorkspaceUpdate,
 };
 use peer_proto::{capability, PeerCapabilities};
 use sha2::{Digest, Sha256};
@@ -309,6 +309,41 @@ async fn reader_loop(
                     seq: next_seq(&seq_counter),
                     correlation_id: env.seq,
                     payload: Some(Payload::TeamList(TeamList { teams })),
+                };
+                send(&outgoing_tx, reply).await?;
+            }
+
+            (HandshakeState::Ready, Payload::TeamCallRequest(request)) => {
+                // The allow-list is the security boundary of team.call.v1,
+                // uniform across host types (mirror of the Swift host's
+                // PeerTeamCall). It is checked HERE, before anything touches
+                // the manager: a refusal must not depend on the translation
+                // below being reached.
+                let response = if !team_call_allowed(&request.method) {
+                    TeamCallResponse {
+                        ok: false,
+                        result_json: String::new(),
+                        error_code: "method_not_allowed".to_string(),
+                        error_message: format!(
+                            "{} is not callable by a peer",
+                            request.method
+                        ),
+                    }
+                } else if let Some(manager) = host.team_manager() {
+                    run_headless_team_call(&manager, &request.method, &request.params_json)
+                        .await
+                } else {
+                    TeamCallResponse {
+                        ok: false,
+                        result_json: String::new(),
+                        error_code: "host_error".to_string(),
+                        error_message: "host has no team subsystem".to_string(),
+                    }
+                };
+                let reply = Envelope {
+                    seq: next_seq(&seq_counter),
+                    correlation_id: env.seq,
+                    payload: Some(Payload::TeamCallResponse(response)),
                 };
                 send(&outgoing_tx, reply).await?;
             }
@@ -1061,6 +1096,137 @@ fn spawn_attach_relay(
     }
 }
 
+/// Mirror of the Swift host's `PeerTeamCall.allowedMethods`
+/// (swift/PeerProto/Sources/PeerProto/PeerTeamCall.swift). The two MUST stay
+/// in lockstep: this is the security boundary of team.call.v1, and it has to
+/// mean the same thing whichever host answers. Everything here acts inside a
+/// team the host already owns — nothing spawns a process, names a path, or
+/// creates/destroys a team.
+fn team_call_allowed(method: &str) -> bool {
+    matches!(
+        method,
+        "team.status"
+            | "team.list"
+            | "team.read"
+            | "team.collect"
+            | "team.reports"
+            | "team.inbox"
+            | "team.message.list"
+            | "team.send"
+            | "team.broadcast"
+            | "team.delegate"
+            | "team.message.post"
+            | "team.task.list"
+            | "team.task.get"
+            | "team.task.create"
+            | "team.task.update"
+    )
+}
+
+/// Run one allow-listed `team.*` method against a headless team manager.
+///
+/// The peer speaks one vocabulary (`team.*`) regardless of host type, so a
+/// headless host translates each call into its own `headless.*` terms. Only
+/// the methods that ARE single daemon operations are implemented; the rest of
+/// the allow-list is app-composed (delegate fans out sends; collect gathers
+/// many reads) and is honestly reported as unsupported here rather than faked.
+async fn run_headless_team_call(
+    manager: &Arc<tokio::sync::Mutex<crate::headless::HeadlessManager>>,
+    method: &str,
+    params_json: &str,
+) -> TeamCallResponse {
+    fn ok(result: serde_json::Value) -> TeamCallResponse {
+        TeamCallResponse {
+            ok: true,
+            result_json: result.to_string(),
+            error_code: String::new(),
+            error_message: String::new(),
+        }
+    }
+    fn err(code: &str, message: String) -> TeamCallResponse {
+        TeamCallResponse {
+            ok: false,
+            result_json: String::new(),
+            error_code: code.to_string(),
+            error_message: message,
+        }
+    }
+
+    let params: serde_json::Value = if params_json.trim().is_empty() {
+        serde_json::json!({})
+    } else {
+        match serde_json::from_str(params_json) {
+            Ok(v) => v,
+            Err(e) => return err("invalid_params", format!("params_json: {e}")),
+        }
+    };
+    let team = params.get("team_name").and_then(|v| v.as_str());
+    let agent = params.get("agent_name").and_then(|v| v.as_str());
+
+    match method {
+        "team.list" => {
+            let mgr = manager.lock().await;
+            ok(serde_json::json!({ "teams": mgr.list_teams() }))
+        }
+        "team.send" => {
+            let (Some(team), Some(agent)) = (team, agent) else {
+                return err("invalid_params", "team.send needs team_name and agent_name".into());
+            };
+            let Some(text) = params.get("text").and_then(|v| v.as_str()) else {
+                return err("invalid_params", "team.send needs text".into());
+            };
+            let mut mgr = manager.lock().await;
+            let Some(agent_id) = mgr.resolve_agent_id(team, agent) else {
+                return err("host_error", format!("no such agent: {team}/{agent}"));
+            };
+            match mgr.send_message(&agent_id, &format!("{text}\n")).await {
+                Ok(()) => ok(serde_json::json!({ "status": "ok" })),
+                Err(e) => err("host_error", e),
+            }
+        }
+        "team.read" => {
+            let (Some(team), Some(agent)) = (team, agent) else {
+                return err("invalid_params", "team.read needs team_name and agent_name".into());
+            };
+            let lines = params
+                .get("lines")
+                .and_then(|v| v.as_u64())
+                .map(|n| n as usize)
+                .unwrap_or(50);
+            let mut mgr = manager.lock().await;
+            let Some(agent_id) = mgr.resolve_agent_id(team, agent) else {
+                return err("host_error", format!("no such agent: {team}/{agent}"));
+            };
+            match mgr.read_output(&agent_id, lines).await {
+                Ok(rows) => ok(serde_json::json!({ "lines": rows })),
+                Err(e) => err("host_error", e),
+            }
+        }
+        "team.status" => {
+            let (Some(team), Some(agent)) = (team, agent) else {
+                return err("invalid_params", "team.status needs team_name and agent_name".into());
+            };
+            let mut mgr = manager.lock().await;
+            let Some(agent_id) = mgr.resolve_agent_id(team, agent) else {
+                return err("host_error", format!("no such agent: {team}/{agent}"));
+            };
+            match mgr.status(&agent_id).await {
+                Ok(info) => match serde_json::to_value(info) {
+                    Ok(value) => ok(value),
+                    Err(e) => err("host_error", e.to_string()),
+                },
+                Err(e) => err("host_error", e),
+            }
+        }
+        // Allowed in the shared vocabulary, but not a single daemon op — the
+        // app composes these from many sends/reads. Honest beats faked.
+        other => err(
+            "unsupported_on_host",
+            format!("{other} is not implemented by a headless host"),
+        ),
+    }
+}
+
 fn host_hello(seq_counter: &AtomicU64, has_teams: bool) -> Envelope {
     let display = std::env::var(HOST_DISPLAY_NAME_ENV)
         .or_else(|_| std::env::var("HOSTNAME"))
@@ -1078,7 +1244,11 @@ fn host_hello(seq_counter: &AtomicU64, has_teams: bool) -> Envelope {
             // ask a question this process cannot answer.
             capabilities: capability::supported_vec()
                 .into_iter()
-                .filter(|c| has_teams || c != capability::TEAM_ROSTER_V1)
+                .filter(|c| {
+                    has_teams
+                        || (c != capability::TEAM_ROSTER_V1
+                            && c != capability::TEAM_CALL_V1)
+                })
                 .collect(),
             app_version: env!("CARGO_PKG_VERSION").into(),
         })),
