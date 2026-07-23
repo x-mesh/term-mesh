@@ -46,6 +46,7 @@ struct ContentView: View {
     @Environment(\.daemonService) private var daemonService
     @Environment(\.configProvider) private var configProvider
     @Environment(\.browserHistoryService) private var browserHistory
+    @Environment(\.reviewBoardCoordinatorService) private var reviewBoardCoordinator
     // Live width stays @State (avoids a defaults write per drag frame);
     // the persisted value is read once here and committed on drag end.
     @State private var sidebarWidth: CGFloat = SidebarLayoutSettings.loadWidth() ?? 200
@@ -1511,6 +1512,11 @@ struct ContentView: View {
             }
             updateTitlebarText()
             reviewBoardWidth = ReviewBoardSettings.loadWidth()
+            let coordinator = reviewBoardCoordinator ?? ReviewBoardCoordinatorService.shared
+            coordinator.startIfNeeded()
+            reviewBoardViewModel.setSnapshotProvider {
+                coordinator.providerSnapshot()
+            }
             reviewBoardViewModel.refresh()
         })
 
@@ -1727,6 +1733,15 @@ struct ContentView: View {
             if isReviewBoardEnabled {
                 isReviewBoardClosed = false
             }
+        })
+
+        view = AnyView(view.onReceive(NotificationCenter.default.publisher(for: .reviewBoardSnapshotDidChange)) { _ in
+            reviewBoardViewModel.refresh()
+        })
+
+        view = AnyView(view.onChange(of: isReviewBoardEnabled) { _ in
+            (reviewBoardCoordinator ?? ReviewBoardCoordinatorService.shared).startIfNeeded()
+            reviewBoardViewModel.refresh()
         })
 
         view = AnyView(view.onReceive(NotificationCenter.default.publisher(for: .worktreeWorkspaceRequested)) { notification in
