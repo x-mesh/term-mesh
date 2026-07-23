@@ -213,6 +213,27 @@ final class PeerClientCoordinator: NSObject, NSMenuDelegate {
         openWorkspaceMirrors.first { $0.workspace?.id == id }
     }
 
+    /// Resolve an open live mirror by its host-owned identity within one
+    /// window. Sidebar presentation uses this to show remote state without
+    /// treating the backing Workspace as a local card.
+    func mirroredWorkspace(
+        forHostKey hostKey: PeerPaneHostKey,
+        hostWorkspaceID: Data,
+        in tabManager: TabManager?
+    ) -> Workspace? {
+        openWorkspaceMirrors.first { mirror in
+            guard !mirror.isTornDown,
+                  mirror.lease.key == hostKey,
+                  mirror.matchesHostWorkspaceID(hostWorkspaceID),
+                  let workspace = mirror.workspace else { return false }
+            return AppDelegate.shared?.tabManagerFor(tabId: workspace.id) === tabManager
+        }?.workspace
+    }
+
+    func workspaceMirrorIdentityDidChange() {
+        postRelaysChanged()
+    }
+
     fileprivate func postRelaysChanged() {
 #if DEBUG
         dlog("peer.connections.post consoles=\(openConsoles.count) relays=\(openRelays.count) workspaces=\(openWorkspaceRelays.count)")
@@ -960,14 +981,11 @@ final class PeerClientCoordinator: NSObject, NSMenuDelegate {
         // the daemon arbitrates the PTY winsize across attachers (min per
         // axis, tmux-style) instead of last-writer-wins.
         if live, let workspaceID,
-           let existing = openWorkspaceMirrors.first(where: { mirror in
-               guard !mirror.isTornDown,
-                     mirror.lease.key == spec.hostKey,
-                     mirror.hostWorkspaceID == workspaceID,
-                     let ws = mirror.workspace else { return false }
-               return AppDelegate.shared?.tabManagerFor(tabId: ws.id) === targetTabManager
-           }),
-           let mirrorWorkspace = existing.workspace {
+           let mirrorWorkspace = mirroredWorkspace(
+               forHostKey: spec.hostKey,
+               hostWorkspaceID: workspaceID,
+               in: targetTabManager
+           ) {
             // Per-window target from develop, gated by `select` so the socket
             // path still refuses to move the user's focus.
             if select {

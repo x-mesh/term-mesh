@@ -31,7 +31,16 @@ final class PeerWorkspaceMirrorController {
     weak var workspace: Workspace?
     let lease: PeerPaneHostLease
     let spec: PeerPaneHostSpec
-    let hostWorkspaceID: Data
+    /// Current host-owned identity. A single-workspace host may mint a new ID
+    /// after daemon restart; reconnect adoption updates this value so inbound
+    /// routing, outbound controls, sidebar state, and open dedupe stay aligned.
+    private(set) var hostWorkspaceID: Data
+    /// Every host-owned identity observed for this mirror. A direct host keeps
+    /// the same socket path across daemon restarts, so RemoteHostStore may
+    /// temporarily rebuild the sidebar from a cached summary carrying an older
+    /// workspace ID. Keep those IDs as lookup aliases while wire routing uses
+    /// only `hostWorkspaceID` above.
+    private(set) var hostWorkspaceIDAliases: Set<Data>
     let hostWorkspaceTitle: String
     let connectedAt = Date()
 
@@ -91,6 +100,7 @@ final class PeerWorkspaceMirrorController {
         self.lease = lease
         self.spec = spec
         self.hostWorkspaceID = hostWorkspaceID
+        self.hostWorkspaceIDAliases = [hostWorkspaceID]
         self.hostWorkspaceTitle = hostWorkspaceTitle
     }
 
@@ -148,7 +158,7 @@ final class PeerWorkspaceMirrorController {
         }
 
         let workspaces = try await session.listWorkspaces()
-        guard let target = Self.matchWorkspace(workspaces, id: hostWorkspaceID) else {
+        guard let target = matchAndAdoptWorkspace(workspaces) else {
             throw RelayError.ioError("host workspace not found")
         }
         try await reconcile(target: target.layout)
@@ -369,7 +379,7 @@ final class PeerWorkspaceMirrorController {
             try? await oneShot.sendGoodbye(reason: "resync probe")
             await transport.close()
             guard !isTornDown else { return }
-            guard let target = Self.matchWorkspace(workspaces, id: hostWorkspaceID) else {
+            guard let target = matchAndAdoptWorkspace(workspaces) else {
                 markHostWorkspaceGone()
                 return
             }
@@ -464,7 +474,7 @@ final class PeerWorkspaceMirrorController {
                     await transport.close()
                     throw error
                 }
-                guard let target = Self.matchWorkspace(workspaces, id: hostWorkspaceID) else {
+                guard let target = matchAndAdoptWorkspace(workspaces) else {
                     await transport.close()
                     markHostWorkspaceGone()
                     return
@@ -623,6 +633,44 @@ final class PeerWorkspaceMirrorController {
             ?? (workspaces.count == 1 ? workspaces[0] : nil)
     }
 
+    static func matchedWorkspaceIdentity(
+        _ workspaces: [Termmesh_Peer_V1_Workspace],
+        currentID: Data
+    ) -> (workspace: Termmesh_Peer_V1_Workspace, adoptedID: Data)? {
+        guard let workspace = matchWorkspace(workspaces, id: currentID) else { return nil }
+        return (workspace, workspace.workspaceID)
+    }
+
+    func matchesHostWorkspaceID(_ candidateID: Data) -> Bool {
+        Self.matchesHostWorkspaceID(candidateID, aliases: hostWorkspaceIDAliases)
+    }
+
+    static func matchesHostWorkspaceID(_ candidateID: Data, aliases: Set<Data>) -> Bool {
+        aliases.contains(candidateID)
+    }
+
+    static func workspaceIDAliases(_ aliases: Set<Data>, adopting adoptedID: Data) -> Set<Data> {
+        aliases.union([adoptedID])
+    }
+
+    private func matchAndAdoptWorkspace(
+        _ workspaces: [Termmesh_Peer_V1_Workspace]
+    ) -> Termmesh_Peer_V1_Workspace? {
+        guard let match = Self.matchedWorkspaceIdentity(
+            workspaces,
+            currentID: hostWorkspaceID
+        ) else { return nil }
+        if hostWorkspaceID != match.adoptedID {
+            hostWorkspaceIDAliases = Self.workspaceIDAliases(
+                hostWorkspaceIDAliases,
+                adopting: match.adoptedID
+            )
+            hostWorkspaceID = match.adoptedID
+            PeerClientCoordinator.shared.workspaceMirrorIdentityDidChange()
+        }
+        return match.workspace
+    }
+
     /// Run `body` with the remote-application flag set; used by the
     /// reconciler so every delegate hook can tell "remote apply" from
     /// "local user action".
@@ -642,5 +690,10 @@ final class PeerWorkspaceMirrorController {
 
     func recordApplied(_ layout: Termmesh_Peer_V1_WorkspaceLayout) {
         lastAppliedLayout = layout
+        RemoteHostStore.shared.recordLiveMirrorLayout(
+            layout,
+            hostKey: lease.key,
+            workspaceIDs: hostWorkspaceIDAliases
+        )
     }
 }

@@ -41,6 +41,13 @@ final class PeerWorkspaceMirrorTests: XCTestCase {
         return node
     }
 
+    private func workspace(_ id: UInt8) -> Termmesh_Peer_V1_Workspace {
+        var workspace = Termmesh_Peer_V1_Workspace()
+        workspace.workspaceID = Data([id])
+        workspace.layout = leaf(id)
+        return workspace
+    }
+
     // MARK: - preorderLeaves / shapeHash
 
     func test_preorderLeaves_ordersDepthFirst() {
@@ -137,6 +144,59 @@ final class PeerWorkspaceMirrorTests: XCTestCase {
     func test_allTargetLeavesMapped_trueForEmptyLeaves() {
         XCTAssertTrue(
             PeerWorkspaceMirrorController.allTargetLeavesMapped([], panelBySurfaceID: [:])
+        )
+    }
+
+    // MARK: - reconnect workspace identity adoption
+
+    @MainActor
+    func test_matchedWorkspaceIdentity_adoptsChangedIDForSingleWorkspaceReconnect() {
+        let match = PeerWorkspaceMirrorController.matchedWorkspaceIdentity(
+            [workspace(9)],
+            currentID: Data([1])
+        )
+
+        XCTAssertEqual(match?.workspace.workspaceID, Data([9]))
+        XCTAssertEqual(match?.adoptedID, Data([9]))
+    }
+
+    @MainActor
+    func test_matchedWorkspaceIdentity_doesNotAdoptForeignIDWithMultipleWorkspaces() {
+        let match = PeerWorkspaceMirrorController.matchedWorkspaceIdentity(
+            [workspace(8), workspace(9)],
+            currentID: Data([1])
+        )
+
+        XCTAssertNil(match)
+    }
+
+    @MainActor
+    func test_workspaceIDAliases_preservesOldIDWhenAdoptingReconnectID() {
+        let oldID = Data([1])
+        let newID = Data([9])
+
+        let aliases = PeerWorkspaceMirrorController.workspaceIDAliases(
+            [oldID],
+            adopting: newID
+        )
+
+        XCTAssertEqual(aliases, [oldID, newID])
+    }
+
+    @MainActor
+    func test_matchesHostWorkspaceID_acceptsCachedAndCurrentIDsForDedupe() {
+        let oldID = Data([1])
+        let currentID = Data([9])
+        let aliases: Set<Data> = [oldID, currentID]
+
+        XCTAssertTrue(
+            PeerWorkspaceMirrorController.matchesHostWorkspaceID(oldID, aliases: aliases)
+        )
+        XCTAssertTrue(
+            PeerWorkspaceMirrorController.matchesHostWorkspaceID(currentID, aliases: aliases)
+        )
+        XCTAssertFalse(
+            PeerWorkspaceMirrorController.matchesHostWorkspaceID(Data([8]), aliases: aliases)
         )
     }
 
