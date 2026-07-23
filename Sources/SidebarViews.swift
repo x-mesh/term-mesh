@@ -873,7 +873,7 @@ struct SidebarRemoteHostsSection: View {
     @AppStorage(SidebarLayoutSettings.remoteHostsCollapsedKey)
     private var isCollapsed = false
     @AppStorage(PeerSidebarGroupingSettings.featureFlagKey)
-    private var isGroupingControlEnabled = false
+    private var isGroupingControlEnabled = true
     @AppStorage(PeerSidebarGroupingSettings.selectedModeKey)
     private var selectedGroupingMode = PeerSidebarGroupingSettings.defaultMode.rawValue
     /// Non-nil presents the add/edit sheet.
