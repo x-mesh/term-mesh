@@ -49,6 +49,8 @@ struct ContentView: View {
     // Live width stays @State (avoids a defaults write per drag frame);
     // the persisted value is read once here and committed on drag end.
     @State private var sidebarWidth: CGFloat = SidebarLayoutSettings.loadWidth() ?? 200
+    @State private var reviewBoardWidth: CGFloat = ReviewBoardSettings.loadWidth()
+    @State private var reviewBoardDragStartWidth: CGFloat?
     @State private var lastClampedWidth: CGFloat = 0
     @State private var hoveredResizerHandles: Set<SidebarResizerHandle> = []
     @State private var isResizerDragging = false
@@ -102,6 +104,7 @@ struct ContentView: View {
     private var commandPaletteRenameSelectAllOnFocus = CommandPaletteRenameSelectionSettings.defaultSelectAllOnFocus
     @FocusState private var isCommandPaletteSearchFocused: Bool
     @FocusState private var isCommandPaletteRenameFocused: Bool
+    @StateObject private var reviewBoardViewModel = ReviewBoardViewModel()
 
     private static let fixedSidebarResizeCursor = NSCursor(
         image: NSCursor.resizeLeftRight.image,
@@ -475,7 +478,60 @@ struct ContentView: View {
             }
     }
 
+    private var terminalContentWithReviewBoard: some View {
+        HStack(spacing: 0) {
+            terminalContentWithSidebarDropOverlay
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            if isReviewBoardEnabled && !isReviewBoardClosed {
+                reviewBoardResizer
+                ReviewBoardPanelView(
+                    viewModel: reviewBoardViewModel,
+                    onClose: { isReviewBoardClosed = true }
+                )
+                .frame(width: reviewBoardWidth)
+                .transition(.move(edge: .trailing).combined(with: .opacity))
+            }
+        }
+        .animation(.easeOut(duration: 0.16), value: isReviewBoardEnabled && !isReviewBoardClosed)
+    }
+
+    private var reviewBoardResizer: some View {
+        Rectangle()
+            .fill(Color(nsColor: .separatorColor))
+            .frame(width: 1)
+            .overlay {
+                Color.clear
+                    .frame(width: 9)
+                    .contentShape(Rectangle())
+                    .onHover { hovering in
+                        hovering ? Self.fixedSidebarResizeCursor.set() : NSCursor.arrow.set()
+                    }
+                    .gesture(
+                        DragGesture(minimumDistance: 0, coordinateSpace: .global)
+                            .onChanged { value in
+                                if reviewBoardDragStartWidth == nil {
+                                    reviewBoardDragStartWidth = reviewBoardWidth
+                                }
+                                let startWidth = reviewBoardDragStartWidth ?? reviewBoardWidth
+                                withTransaction(Transaction(animation: nil)) {
+                                    reviewBoardWidth = ReviewBoardSettings.clampedWidth(startWidth - value.translation.width)
+                                }
+                                Self.fixedSidebarResizeCursor.set()
+                            }
+                            .onEnded { _ in
+                                reviewBoardDragStartWidth = nil
+                                ReviewBoardSettings.saveWidth(reviewBoardWidth)
+                                NSCursor.arrow.set()
+                            }
+                    )
+                    .accessibilityLabel("Review Board resizer")
+                    .accessibilityIdentifier("ReviewBoardResizer")
+            }
+    }
+
     @AppStorage("sidebarBlendMode") private var sidebarBlendMode = SidebarBlendModeOption.withinWindow.rawValue
+    @AppStorage(ReviewBoardSettings.enabledKey) private var isReviewBoardEnabled = false
+    @AppStorage(ReviewBoardSettings.isClosedKey) private var isReviewBoardClosed = false
     @AppStorage("hideWelcomeScreen") private var hideWelcomeScreen: Bool = false
     @AppStorage("showStatusBar") private var showStatusBar: Bool = true
     @AppStorage(AppearanceSettings.appearanceModeKey) private var appearanceMode = AppearanceSettings.defaultMode.rawValue
@@ -1383,7 +1439,7 @@ struct ContentView: View {
             // This allows withinWindow blur to see the terminal content
             layout = AnyView(
                 ZStack(alignment: .leading) {
-                    terminalContentWithSidebarDropOverlay
+                    terminalContentWithReviewBoard
                         .padding(.leading, sidebarState.isVisible ? sidebarWidth : 0)
                     if sidebarState.isVisible {
                         sidebarView
@@ -1397,7 +1453,7 @@ struct ContentView: View {
                     if sidebarState.isVisible {
                         sidebarView
                     }
-                    terminalContentWithSidebarDropOverlay
+                    terminalContentWithReviewBoard
                 }
             )
         }
@@ -1454,6 +1510,8 @@ struct ContentView: View {
                 lastSidebarSelectionIndex = tabManager.tabs.firstIndex { $0.id == selectedId }
             }
             updateTitlebarText()
+            reviewBoardWidth = ReviewBoardSettings.loadWidth()
+            reviewBoardViewModel.refresh()
         })
 
         view = AnyView(view.onChange(of: tabManager.selectedTabId) { newValue in
@@ -1659,6 +1717,16 @@ struct ContentView: View {
         // little and cannot deadlock itself.
         view = AnyView(view.onReceive(RemoteHostStore.shared.objectWillChange) { _ in
             peerStoreRevision &+= 1
+        })
+
+        view = AnyView(view.onReceive(NotificationCenter.default.publisher(for: .reviewBoardTaskSelected)) { notification in
+            reviewBoardViewModel.refresh()
+            if let taskID = notification.userInfo?["task_id"] as? String {
+                reviewBoardViewModel.selectTask(id: ReviewBoardText.safeIdentifier(taskID))
+            }
+            if isReviewBoardEnabled {
+                isReviewBoardClosed = false
+            }
         })
 
         view = AnyView(view.onReceive(NotificationCenter.default.publisher(for: .worktreeWorkspaceRequested)) { notification in
