@@ -177,15 +177,43 @@ func peerProjectIdentity(for panes: [RemotePaneSummary]) -> PeerProjectIdentity 
     }
     guard !paths.isEmpty else { return .unknown }
 
+    // Panes working in unrelated trees collapse the common ancestor up to a
+    // home or a system root, which is NOT a project — a peer shelling in
+    // `/root` would otherwise surface a bogus "root" project grouping every
+    // one of its workspaces. Refusing to name it leaves the workspace
+    // unassigned, which is the honest answer: cwd alone cannot tell us where
+    // the project root is (that needs the host's git root — see `docs/`).
     let root = peerCommonProjectPath(paths)
-    guard let name = root.split(separator: "/").last.map(String.init), !name.isEmpty else {
+    guard peerPathNamesProject(root),
+          let name = root.split(separator: "/").last.map(String.init),
+          !name.isEmpty else {
         return .unknown
     }
+    // Keyed by folder name, not by absolute path: the same project checked
+    // out at `~/work/project/term-mesh` locally and `/root/term-mesh` on a
+    // peer is ONE project, and a path key would split it in two.
     return PeerProjectIdentity(
-        key: "path:\(root.lowercased())",
+        key: "name:\(name.lowercased())",
         label: name,
         isUnknown: false
     )
+}
+
+/// Path prefixes that only ever contain homes or system state, so their
+/// direct children name a user or a mount rather than a project.
+/// `/root/term-mesh` still qualifies — `root` here IS the home, not a prefix.
+private let peerNonProjectPrefixes: Set<String> = [
+    "Users", "home", "private", "var", "tmp", "mnt", "media", "Volumes",
+]
+
+/// Whether a normalized absolute path's last component can stand for a
+/// project. Rejects `/`, any bare top-level directory (`/root`, `/tmp`), and
+/// a home directory itself (`/Users/jinwoo`, `/home/ubuntu`).
+private func peerPathNamesProject(_ path: String) -> Bool {
+    let parts = path.split(separator: "/").map(String.init)
+    guard parts.count >= 2 else { return false }
+    if parts.count == 2, peerNonProjectPrefixes.contains(parts[0]) { return false }
+    return true
 }
 
 private func peerNormalizeRemotePath(_ path: String) -> String? {
