@@ -753,6 +753,9 @@ enum SidebarLayoutSettings {
     static let localTabsCollapsedKey = "sidebar.section.localTabs.collapsed"
     static let remoteHostsCollapsedKey = "sidebar.section.remoteHosts.collapsed"
     static let collapsedHostKeysKey = "sidebar.remoteHost.collapsedKeys"
+    /// Folded by default: unassigned workspaces are the exception on a
+    /// project axis, so they stay out of the way until asked for.
+    static let unassignedWorkspacesExpandedKey = "sidebar.peerProjects.unassigned.expanded"
 
     /// Last user-committed sidebar width (saved on drag end only, so
     /// transient window-resize clamps never overwrite user intent).
@@ -1071,14 +1074,26 @@ private struct SidebarPeerProjectsView: View {
     let store: RemoteHostStore
     let usesSeparatedPresentation: Bool
     let paneExpansionCommand: PeerPaneExpansionCommand
+    @AppStorage(SidebarLayoutSettings.unassignedWorkspacesExpandedKey)
+    private var isUnassignedExpanded = false
 
     private var connectedHosts: [HostEntry] {
         hosts.filter { $0.isConnected && !$0.workspaces.isEmpty }
     }
 
-    private var projectGroups: [SidebarPeerProjectGroup] {
+    /// Split the connected roster into named projects and the leftovers.
+    /// A workspace whose panes do not name a project (a shell sitting in the
+    /// home directory, panes spread across unrelated trees) is NOT given a
+    /// group header — calling it a project would be a lie — but it is not
+    /// dropped either, since this view is the only route to it while the
+    /// Project axis is selected.
+    private var groupedWorkspaces: (
+        projects: [SidebarPeerProjectGroup],
+        unassigned: [SidebarPeerProjectGroup.WorkspaceItem]
+    ) {
         var indexes: [PeerProjectIdentity: Int] = [:]
         var groups: [SidebarPeerProjectGroup] = []
+        var unassigned: [SidebarPeerProjectGroup.WorkspaceItem] = []
         for host in connectedHosts {
             for workspace in host.workspaces {
                 let identity = peerProjectIdentity(for: workspace.panes)
@@ -1086,6 +1101,10 @@ private struct SidebarPeerProjectsView: View {
                     host: host,
                     workspace: workspace
                 )
+                guard !identity.isUnknown else {
+                    unassigned.append(item)
+                    continue
+                }
                 if let index = indexes[identity] {
                     groups[index].items.append(item)
                 } else {
@@ -1094,25 +1113,40 @@ private struct SidebarPeerProjectsView: View {
                 }
             }
         }
-        return groups.sorted {
-            if $0.identity.isUnknown != $1.identity.isUnknown {
-                return !$0.identity.isUnknown
-            }
-            return $0.identity.label.localizedCaseInsensitiveCompare($1.identity.label) == .orderedAscending
+        let sorted = groups.sorted {
+            $0.identity.label.localizedCaseInsensitiveCompare($1.identity.label) == .orderedAscending
         }
+        return (sorted, unassigned)
+    }
+
+    private func workspaceRow(
+        _ item: SidebarPeerProjectGroup.WorkspaceItem
+    ) -> some View {
+        RemoteWorkspaceRowView(
+            workspace: item.workspace,
+            host: item.host,
+            store: store,
+            usesSeparatedPresentation: usesSeparatedPresentation,
+            paneExpansionCommand: paneExpansionCommand
+        )
     }
 
     var body: some View {
-        VStack(spacing: usesSeparatedPresentation ? 8 : 0) {
-            if projectGroups.isEmpty {
+        let grouped = groupedWorkspaces
+        return VStack(spacing: usesSeparatedPresentation ? 8 : 0) {
+            if grouped.projects.isEmpty {
                 VStack(alignment: .leading, spacing: 2) {
                     Text("No projects yet")
                         .font(.system(size: 10, weight: .semibold))
                         .foregroundColor(.secondary)
                     // The empty state is the only place this view mentions
                     // hosts at all — without it a peerless Project view would
-                    // be a dead end with no route to connecting one.
-                    Text("Connect a peer in the Host view to see its projects.")
+                    // be a dead end with no route to connecting one. Once a
+                    // peer IS connected the advice changes: the workspaces
+                    // exist, they just are not in a project folder.
+                    Text(grouped.unassigned.isEmpty
+                         ? "Connect a peer in the Host view to see its projects."
+                         : "No connected workspace is working inside a project folder.")
                         .font(.system(size: 9))
                         .foregroundColor(Color.secondary.opacity(0.72))
                         .fixedSize(horizontal: false, vertical: true)
@@ -1123,7 +1157,7 @@ private struct SidebarPeerProjectsView: View {
                 .padding(.bottom, 4)
             }
 
-            ForEach(projectGroups) { group in
+            ForEach(grouped.projects) { group in
                 VStack(spacing: 4) {
                     Text(group.identity.label)
                         .font(.system(size: 9, weight: .semibold))
@@ -1134,21 +1168,54 @@ private struct SidebarPeerProjectsView: View {
                         .padding(.top, 4)
                         .padding(.bottom, 1)
                         .frame(maxWidth: .infinity, alignment: .leading)
-                        .accessibilityLabel(group.identity.isUnknown
-                                            ? "Unknown Project"
-                                            : "Project \(group.identity.label)")
+                        .accessibilityLabel("Project \(group.identity.label)")
                     ForEach(group.items) { item in
-                        RemoteWorkspaceRowView(
-                            workspace: item.workspace,
-                            host: item.host,
-                            store: store,
-                            usesSeparatedPresentation: usesSeparatedPresentation,
-                            paneExpansionCommand: paneExpansionCommand
-                        )
+                        workspaceRow(item)
                     }
                 }
             }
 
+            if !grouped.unassigned.isEmpty {
+                unassignedSection(grouped.unassigned)
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func unassignedSection(
+        _ items: [SidebarPeerProjectGroup.WorkspaceItem]
+    ) -> some View {
+        VStack(spacing: 4) {
+            Button {
+                withAnimation(.easeInOut(duration: 0.15)) {
+                    isUnassignedExpanded.toggle()
+                }
+            } label: {
+                HStack(spacing: 4) {
+                    Image(systemName: "chevron.right")
+                        .font(.system(size: 8, weight: .semibold))
+                        .rotationEffect(.degrees(isUnassignedExpanded ? 90 : 0))
+                        .foregroundColor(Color.secondary.opacity(0.7))
+                    Text("Unassigned (\(items.count))")
+                        .font(.system(size: 9, weight: .semibold))
+                        .foregroundColor(Color.secondary.opacity(0.75))
+                        .lineLimit(1)
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .padding(.leading, 16)
+            .padding(.top, 6)
+            .padding(.bottom, 1)
+            .accessibilityLabel("Unassigned workspaces")
+            .help("Workspaces whose working directory does not name a project")
+
+            if isUnassignedExpanded {
+                ForEach(items) { item in
+                    workspaceRow(item)
+                }
+            }
         }
     }
 }
