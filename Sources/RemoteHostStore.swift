@@ -24,8 +24,8 @@ struct WorkspaceSummary: Identifiable, Equatable {
     /// running). 0 on hosts that predate the `busy` field.
     let busyCount: Int
     /// Left-to-right pane inventory for the sidebar's expandable detail.
-    /// Only the final cwd component is retained so the UI never exposes a
-    /// remote host's full path.
+    /// Retains the full remote cwd for project grouping while the visible
+    /// pane detail label stays shortened to the final path component.
     let panes: [RemotePaneSummary]
 }
 
