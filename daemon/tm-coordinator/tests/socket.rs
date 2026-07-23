@@ -1,4 +1,5 @@
-use std::sync::Arc;
+use std::path::Path;
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use serde_json::json;
 use tempfile::tempdir;
@@ -7,8 +8,29 @@ use tm_coordinator::{socket, Api, EventLog};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 
+static SOCKET_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+fn socket_test_lock() -> MutexGuard<'static, ()> {
+    SOCKET_TEST_LOCK.lock().unwrap()
+}
+
+async fn connect_when_ready(sock: &Path) -> UnixStream {
+    let mut last_error = None;
+    for _ in 0..100 {
+        match UnixStream::connect(sock).await {
+            Ok(stream) => return stream,
+            Err(error) => {
+                last_error = Some(error);
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        }
+    }
+    panic!("socket did not become ready: {:?}", last_error);
+}
+
 #[tokio::test]
 async fn uds_json_rpc_accepts_project_add_and_status() {
+    let _guard = socket_test_lock();
     let dir = tempdir().unwrap();
     let sock = dir.path().join("coord.sock");
     let log: Arc<dyn EventLog> =
@@ -20,14 +42,7 @@ async fn uds_json_rpc_accepts_project_add_and_status() {
         let _ = socket::serve(server_api, &server_sock).await;
     });
 
-    for _ in 0..100 {
-        if sock.exists() {
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-    }
-
-    let mut stream = UnixStream::connect(&sock).await.unwrap();
+    let mut stream = connect_when_ready(&sock).await;
     stream
         .write_all(
             serde_json::to_string(&json!({
@@ -53,6 +68,7 @@ async fn uds_json_rpc_accepts_project_add_and_status() {
 
 #[tokio::test]
 async fn events_subscribe_acks_then_streams_live_events() {
+    let _guard = socket_test_lock();
     let dir = tempdir().unwrap();
     let sock = dir.path().join("coord.sock");
     let log: Arc<dyn EventLog> =
@@ -64,14 +80,7 @@ async fn events_subscribe_acks_then_streams_live_events() {
         let _ = socket::serve(server_api, &server_sock).await;
     });
 
-    for _ in 0..100 {
-        if sock.exists() {
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-    }
-
-    let mut subscriber = UnixStream::connect(&sock).await.unwrap();
+    let mut subscriber = connect_when_ready(&sock).await;
     subscriber
         .write_all(
             serde_json::to_string(&json!({
@@ -108,6 +117,7 @@ async fn events_subscribe_acks_then_streams_live_events() {
 
 #[tokio::test]
 async fn oversized_no_newline_request_is_rejected_without_unbounded_read() {
+    let _guard = socket_test_lock();
     let dir = tempdir().unwrap();
     let sock = dir.path().join("coord.sock");
     let log: Arc<dyn EventLog> =
@@ -119,14 +129,7 @@ async fn oversized_no_newline_request_is_rejected_without_unbounded_read() {
         let _ = socket::serve(server_api, &server_sock).await;
     });
 
-    for _ in 0..100 {
-        if sock.exists() {
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-    }
-
-    let mut stream = UnixStream::connect(&sock).await.unwrap();
+    let mut stream = connect_when_ready(&sock).await;
     stream.write_all(&vec![b'a'; 64 * 1024 + 1]).await.unwrap();
 
     let mut reader = BufReader::new(stream);

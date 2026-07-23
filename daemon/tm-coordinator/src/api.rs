@@ -1,5 +1,9 @@
 use crate::event_log::{EventLog, LocalJournalEventLog, MemMeshUnavailableEventLog};
-use crate::model::{AttemptId, FencingToken, IntentEvent, ProjectId, TaskId, TaskStatus};
+use crate::model::{
+    now_ms, Attempt, AttemptId, FencingToken, HostId, HostObservation, IntentEvent, MergeQueueId,
+    MergeQueueItem, MergeQueueStatus, PaneRef, Placement, ProjectId, ReviewFileSummary,
+    ReviewSnapshot, ReviewSnapshotId, TaskId, TaskStatus,
+};
 use crate::reducer::Reducer;
 use anyhow::{bail, Result};
 use serde::Deserialize;
@@ -123,11 +127,22 @@ impl Api {
             "orchestration.status" => self.status(),
             "project.list" => self.project_list(),
             "project.add" => self.project_add(params),
+            "host.list" => self.host_list(),
+            "host.observe" => self.host_observe(params),
             "task.list" => self.task_list(params),
             "task.get" => self.task_get(params),
             "task.create" => self.task_create(params),
+            "task.place" => self.task_place(params),
+            "task.reassign" => self.task_reassign(params),
+            "task.suspect" => self.task_suspect(params),
+            "task.quarantine" => self.task_quarantine(params),
             "attempt.list" => self.attempt_list(params),
             "fence" => self.fence(params),
+            "review.snapshot" => self.review_snapshot(params),
+            "approve" => self.approve(params),
+            "reject" => self.reject(params),
+            "merge.queue" => self.merge_queue(params),
+            "merge.queue.transition" => self.merge_queue_transition(params),
             _ => bail!("METHOD_NOT_FOUND: {method}"),
         }
     }
@@ -139,8 +154,8 @@ impl Api {
             "socket_path": self.config.socket_path,
             "reducer_watermark": reducer.watermark()?,
             "mem_mesh": self.event_log.health(),
-            "known_host_count": 0,
-            "pending_merge_count": 0,
+            "known_host_count": reducer.hosts()?.len(),
+            "pending_merge_count": reducer.merge_queue(None, Some(MergeQueueStatus::Queued))?.len(),
             "feature_flags": {
                 "enabled": self.config.enabled,
                 "remote_hosts": false,
@@ -178,6 +193,50 @@ impl Api {
         )
     }
 
+    fn host_list(&self) -> Result<Value> {
+        let reducer = self.reducer.lock().expect("reducer mutex poisoned");
+        Ok(json!({ "hosts": reducer.hosts()? }))
+    }
+
+    fn host_observe(&self, params: Value) -> Result<Value> {
+        #[derive(Deserialize)]
+        struct Params {
+            request_id: String,
+            host_id: Option<HostId>,
+            os: String,
+            arch: String,
+            load: f64,
+            total_slots: u32,
+            used_slots: u32,
+            project_roots: Vec<String>,
+            live: Option<bool>,
+            quarantined: Option<bool>,
+            observed_at_ms: Option<u64>,
+        }
+        let p: Params = serde_json::from_value(params)?;
+        if p.used_slots > p.total_slots {
+            bail!("INVALID_PARAMS: used_slots exceeds total_slots");
+        }
+        let observation = HostObservation {
+            host_id: p.host_id.unwrap_or_else(HostId::new_random),
+            os: p.os,
+            arch: p.arch,
+            load: p.load,
+            total_slots: p.total_slots,
+            used_slots: p.used_slots,
+            project_roots: p.project_roots,
+            live: p.live.unwrap_or(true),
+            quarantined: p.quarantined.unwrap_or(false),
+            observed_at_ms: p.observed_at_ms.unwrap_or_else(now_ms),
+        };
+        self.mutate(
+            &p.request_id,
+            "host_observed",
+            None,
+            serde_json::to_value(observation)?,
+        )
+    }
+
     fn task_list(&self, params: Value) -> Result<Value> {
         #[derive(Deserialize)]
         struct Params {
@@ -201,8 +260,16 @@ impl Api {
         let reducer = self.reducer.lock().expect("reducer mutex poisoned");
         let task = reducer.task(&p.task_id)?;
         let attempts = reducer.attempts(&p.task_id)?;
+        let latest_review_snapshot = reducer.latest_review_snapshot(&p.task_id)?;
+        let merge_queue = match &task {
+            Some(task) => reducer.merge_queue(Some(&task.project_id), None)?,
+            None => Vec::new(),
+        }
+        .into_iter()
+        .filter(|item| item.task_id == p.task_id)
+        .collect::<Vec<_>>();
         Ok(
-            json!({ "task": task, "attempts": attempts, "latest_review_snapshot": null, "merge_queue": null }),
+            json!({ "task": task, "attempts": attempts, "latest_review_snapshot": latest_review_snapshot, "merge_queue": merge_queue }),
         )
     }
 
@@ -243,6 +310,170 @@ impl Api {
         Ok(json!({ "attempts": reducer.attempts(&p.task_id)? }))
     }
 
+    fn task_place(&self, params: Value) -> Result<Value> {
+        #[derive(Deserialize)]
+        struct Params {
+            request_id: String,
+            task_id: TaskId,
+            host_id: Option<HostId>,
+            mode: Option<String>,
+            agent_name: Option<String>,
+            ttl_ms: Option<u64>,
+        }
+        let p: Params = serde_json::from_value(params)?;
+        let request_id = p.request_id.clone();
+        self.mutate_checked(&request_id, "task_placed", None, |reducer| {
+            let task = reducer
+                .task(&p.task_id)?
+                .ok_or_else(|| anyhow::anyhow!("task not found"))?;
+            if !task.status.can_transition_to(&TaskStatus::Placed) {
+                bail!("invalid task transition {:?} -> placed", task.status);
+            }
+            let host = reducer.choose_host(&task.project_id, p.host_id.as_ref())?;
+            let attempt_id = AttemptId::new_random();
+            let token = FencingToken::new_random();
+            let pane_ref = p.agent_name.as_ref().map(|agent_name| PaneRef {
+                host_id: host.host_id.clone(),
+                app_socket_path: None,
+                workspace_id: None,
+                panel_id: None,
+                agent_name: Some(agent_name.clone()),
+            });
+            let placement = Placement {
+                host_id: host.host_id.clone(),
+                pane_ref: pane_ref.clone(),
+                mode: p.mode.clone().unwrap_or_else(|| "headless".to_string()),
+            };
+            let attempt = Attempt {
+                attempt_id: attempt_id.clone(),
+                task_id: task.task_id.clone(),
+                project_id: task.project_id.clone(),
+                status: "created".to_string(),
+                host_id: host.host_id,
+                pane_ref,
+                worktree_path: None,
+                base_ref: None,
+                head_ref: None,
+                head_sha: None,
+                fencing_token: Some(token.clone()),
+                created_at_ms: now_ms(),
+                updated_at_ms: now_ms(),
+            };
+            Ok(json!({
+                "task_id": task.task_id,
+                "attempt_id": attempt_id,
+                "attempt": attempt,
+                "placement": placement,
+                "holder": "coordinator",
+                "token": token,
+                "expires_at_ms": p.ttl_ms.map(|ttl| now_ms().saturating_add(ttl))
+            }))
+        })
+    }
+
+    fn task_reassign(&self, params: Value) -> Result<Value> {
+        #[derive(Deserialize)]
+        struct Params {
+            request_id: String,
+            task_id: TaskId,
+            host_id: Option<HostId>,
+            mode: Option<String>,
+            agent_name: Option<String>,
+            reason: Option<String>,
+            ttl_ms: Option<u64>,
+        }
+        let p: Params = serde_json::from_value(params)?;
+        let request_id = p.request_id.clone();
+        self.mutate_checked(&request_id, "task_reassigned", None, |reducer| {
+            let task = reducer
+                .task(&p.task_id)?
+                .ok_or_else(|| anyhow::anyhow!("task not found"))?;
+            if !task.status.can_transition_to(&TaskStatus::Reassigned) {
+                bail!("invalid task transition {:?} -> reassigned", task.status);
+            }
+            let host = reducer.choose_host(&task.project_id, p.host_id.as_ref())?;
+            let attempt_id = AttemptId::new_random();
+            let token = FencingToken::new_random();
+            let pane_ref = p.agent_name.as_ref().map(|agent_name| PaneRef {
+                host_id: host.host_id.clone(),
+                app_socket_path: None,
+                workspace_id: None,
+                panel_id: None,
+                agent_name: Some(agent_name.clone()),
+            });
+            let placement = Placement {
+                host_id: host.host_id.clone(),
+                pane_ref: pane_ref.clone(),
+                mode: p.mode.clone().unwrap_or_else(|| "headless".to_string()),
+            };
+            let attempt = Attempt {
+                attempt_id: attempt_id.clone(),
+                task_id: task.task_id.clone(),
+                project_id: task.project_id.clone(),
+                status: "created".to_string(),
+                host_id: host.host_id,
+                pane_ref,
+                worktree_path: None,
+                base_ref: None,
+                head_ref: None,
+                head_sha: None,
+                fencing_token: Some(token.clone()),
+                created_at_ms: now_ms(),
+                updated_at_ms: now_ms(),
+            };
+            Ok(json!({
+                "task_id": task.task_id,
+                "attempt_id": attempt_id,
+                "attempt": attempt,
+                "placement": placement,
+                "holder": "coordinator",
+                "token": token,
+                "reason": p.reason,
+                "expires_at_ms": p.ttl_ms.map(|ttl| now_ms().saturating_add(ttl))
+            }))
+        })
+    }
+
+    fn task_suspect(&self, params: Value) -> Result<Value> {
+        #[derive(Deserialize)]
+        struct Params {
+            request_id: String,
+            task_id: TaskId,
+            reason: Option<String>,
+        }
+        let p: Params = serde_json::from_value(params)?;
+        let request_id = p.request_id.clone();
+        self.mutate_checked(&request_id, "task_suspected", None, |reducer| {
+            let task = reducer
+                .task(&p.task_id)?
+                .ok_or_else(|| anyhow::anyhow!("task not found"))?;
+            if !task.status.can_transition_to(&TaskStatus::Suspect) {
+                bail!("invalid task transition {:?} -> suspect", task.status);
+            }
+            Ok(json!({"task_id": p.task_id, "reason": p.reason}))
+        })
+    }
+
+    fn task_quarantine(&self, params: Value) -> Result<Value> {
+        #[derive(Deserialize)]
+        struct Params {
+            request_id: String,
+            task_id: TaskId,
+            reason: Option<String>,
+        }
+        let p: Params = serde_json::from_value(params)?;
+        let request_id = p.request_id.clone();
+        self.mutate_checked(&request_id, "task_quarantined", None, |reducer| {
+            let task = reducer
+                .task(&p.task_id)?
+                .ok_or_else(|| anyhow::anyhow!("task not found"))?;
+            if !task.status.can_transition_to(&TaskStatus::Quarantined) {
+                bail!("invalid task transition {:?} -> quarantined", task.status);
+            }
+            Ok(json!({"task_id": p.task_id, "reason": p.reason}))
+        })
+    }
+
     fn fence(&self, params: Value) -> Result<Value> {
         #[derive(Deserialize)]
         struct Params {
@@ -268,6 +499,167 @@ impl Api {
                 "expires_at_ms": expires_at_ms
             }),
         )
+    }
+
+    fn review_snapshot(&self, params: Value) -> Result<Value> {
+        #[derive(Deserialize)]
+        struct Params {
+            request_id: String,
+            task_id: TaskId,
+            attempt_id: AttemptId,
+            fencing_token: FencingToken,
+            base_sha: String,
+            head_sha: String,
+            diff_digest: String,
+            summary: Option<String>,
+            files: Option<Vec<ReviewFileSummary>>,
+        }
+        let p: Params = serde_json::from_value(params)?;
+        let request_id = p.request_id.clone();
+        self.mutate_checked(
+            &request_id,
+            "review_snapshot_recorded",
+            project_for_task(&p.task_id, self)?,
+            |reducer| {
+                require_current_attempt_and_fence(
+                    reducer,
+                    &p.task_id,
+                    &p.attempt_id,
+                    &p.fencing_token,
+                )?;
+                validate_sha_digest(&p.base_sha, &p.head_sha, &p.diff_digest)?;
+                let snapshot = ReviewSnapshot {
+                    snapshot_id: ReviewSnapshotId::new_random(),
+                    task_id: p.task_id.clone(),
+                    attempt_id: p.attempt_id.clone(),
+                    base_sha: p.base_sha.clone(),
+                    head_sha: p.head_sha.clone(),
+                    diff_digest: p.diff_digest.clone(),
+                    summary: p.summary.clone().unwrap_or_default(),
+                    files: p.files.clone().unwrap_or_default(),
+                    created_at_ms: now_ms(),
+                };
+                Ok(serde_json::to_value(snapshot)?)
+            },
+        )
+    }
+
+    fn approve(&self, params: Value) -> Result<Value> {
+        #[derive(Deserialize)]
+        struct Params {
+            request_id: String,
+            task_id: TaskId,
+            attempt_id: AttemptId,
+            fencing_token: FencingToken,
+            reviewer: String,
+            snapshot_id: ReviewSnapshotId,
+            head_sha: String,
+            diff_digest: String,
+        }
+        let p: Params = serde_json::from_value(params)?;
+        let request_id = p.request_id.clone();
+        self.mutate_checked(&request_id, "attempt_approved", None, |reducer| {
+            require_current_attempt_and_fence(
+                reducer,
+                &p.task_id,
+                &p.attempt_id,
+                &p.fencing_token,
+            )?;
+            let snapshot = reducer
+                .review_snapshot(p.snapshot_id.as_str())?
+                .ok_or_else(|| anyhow::anyhow!("review snapshot not found"))?;
+            if snapshot.task_id != p.task_id
+                || snapshot.attempt_id != p.attempt_id
+                || snapshot.head_sha != p.head_sha
+                || snapshot.diff_digest != p.diff_digest
+            {
+                bail!("snapshot evidence mismatch");
+            }
+            let task = reducer
+                .task(&p.task_id)?
+                .ok_or_else(|| anyhow::anyhow!("task not found"))?;
+            let item = MergeQueueItem {
+                queue_id: MergeQueueId::new_random(),
+                project_id: task.project_id,
+                task_id: p.task_id.clone(),
+                attempt_id: p.attempt_id.clone(),
+                status: MergeQueueStatus::Queued,
+                approved_by: p.reviewer.clone(),
+                approved_at_ms: now_ms(),
+                last_error: None,
+            };
+            Ok(json!({
+                "task_id": p.task_id,
+                "attempt_id": p.attempt_id,
+                "snapshot_id": p.snapshot_id,
+                "reviewer": p.reviewer,
+                "merge_queue_item": item
+            }))
+        })
+    }
+
+    fn reject(&self, params: Value) -> Result<Value> {
+        #[derive(Deserialize)]
+        struct Params {
+            request_id: String,
+            task_id: TaskId,
+            attempt_id: AttemptId,
+            fencing_token: FencingToken,
+            reviewer: String,
+            reason: String,
+        }
+        let p: Params = serde_json::from_value(params)?;
+        let request_id = p.request_id.clone();
+        self.mutate_checked(&request_id, "attempt_rejected", None, |reducer| {
+            require_current_attempt_and_fence(
+                reducer,
+                &p.task_id,
+                &p.attempt_id,
+                &p.fencing_token,
+            )?;
+            Ok(json!({
+                "task_id": p.task_id,
+                "attempt_id": p.attempt_id,
+                "reviewer": p.reviewer,
+                "reason": p.reason
+            }))
+        })
+    }
+
+    fn merge_queue(&self, params: Value) -> Result<Value> {
+        #[derive(Deserialize)]
+        struct Params {
+            project_id: Option<ProjectId>,
+            status: Option<MergeQueueStatus>,
+        }
+        let p: Params = serde_json::from_value(params)?;
+        let reducer = self.reducer.lock().expect("reducer mutex poisoned");
+        Ok(json!({ "items": reducer.merge_queue(p.project_id.as_ref(), p.status)? }))
+    }
+
+    fn merge_queue_transition(&self, params: Value) -> Result<Value> {
+        #[derive(Deserialize)]
+        struct Params {
+            request_id: String,
+            queue_id: MergeQueueId,
+            status: MergeQueueStatus,
+            last_error: Option<String>,
+        }
+        let p: Params = serde_json::from_value(params)?;
+        let request_id = p.request_id.clone();
+        self.mutate_checked(&request_id, "merge_queue_transitioned", None, |reducer| {
+            let item = reducer
+                .merge_queue_item(&p.queue_id)?
+                .ok_or_else(|| anyhow::anyhow!("merge queue item not found"))?;
+            if !item.status.can_transition_to(&p.status) {
+                bail!(
+                    "invalid merge queue transition {:?} -> {:?}",
+                    item.status,
+                    p.status
+                );
+            }
+            Ok(json!({"queue_id": p.queue_id, "status": p.status, "last_error": p.last_error}))
+        })
     }
 
     fn mutate(
@@ -297,6 +689,37 @@ impl Api {
         Ok(result)
     }
 
+    fn mutate_checked<F>(
+        &self,
+        request_id: &str,
+        kind: &str,
+        project_id: Option<ProjectId>,
+        build_payload: F,
+    ) -> Result<Value>
+    where
+        F: FnOnce(&Reducer) -> Result<Value>,
+    {
+        if request_id.trim().is_empty() {
+            bail!("INVALID_PARAMS: request_id is required");
+        }
+        let (result, event_to_publish) = {
+            let reducer = self.reducer.lock().expect("reducer mutex poisoned");
+            if let Some(existing) = reducer.event_by_request_id(request_id)? {
+                return Ok(json!({ "accepted": true, "idempotent": true, "event": existing }));
+            }
+            let payload = build_payload(&reducer)?;
+            let event = IntentEvent::new(kind, Some(request_id.to_string()), project_id, payload);
+            self.event_log.append(&event)?;
+            reducer.apply(&event)?;
+            (
+                json!({ "accepted": true, "idempotent": false, "event": event }),
+                event,
+            )
+        };
+        let _ = self.event_tx.send(event_to_publish);
+        Ok(result)
+    }
+
     pub fn is_current_fence(
         &self,
         task_id: &str,
@@ -312,4 +735,37 @@ impl Api {
         let reducer = self.reducer.lock().expect("reducer mutex poisoned");
         reducer.is_current_fence(&task_id, attempt_id.as_ref(), &token)
     }
+}
+
+fn require_current_attempt_and_fence(
+    reducer: &Reducer,
+    task_id: &TaskId,
+    attempt_id: &AttemptId,
+    token: &FencingToken,
+) -> Result<()> {
+    let task = reducer
+        .task(task_id)?
+        .ok_or_else(|| anyhow::anyhow!("task not found"))?;
+    if task.current_attempt_id.as_ref() != Some(attempt_id) {
+        bail!("stale_attempt_reported");
+    }
+    if !reducer.is_current_fence(task_id, Some(attempt_id), token)? {
+        bail!("stale_fencing_token");
+    }
+    Ok(())
+}
+
+fn validate_sha_digest(base_sha: &str, head_sha: &str, diff_digest: &str) -> Result<()> {
+    if base_sha.trim().is_empty() || head_sha.trim().is_empty() {
+        bail!("INVALID_PARAMS: base_sha and head_sha are required");
+    }
+    if !diff_digest.starts_with("sha256:") || diff_digest.len() <= "sha256:".len() {
+        bail!("INVALID_PARAMS: diff_digest must start with sha256:");
+    }
+    Ok(())
+}
+
+fn project_for_task(task_id: &TaskId, api: &Api) -> Result<Option<ProjectId>> {
+    let reducer = api.reducer.lock().expect("reducer mutex poisoned");
+    Ok(reducer.task(task_id)?.map(|task| task.project_id))
 }

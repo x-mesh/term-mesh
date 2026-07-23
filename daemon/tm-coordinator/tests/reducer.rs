@@ -5,7 +5,7 @@ use anyhow::{bail, Result};
 use serde_json::json;
 use tempfile::tempdir;
 use tm_coordinator::event_log::LocalJournalEventLog;
-use tm_coordinator::model::{FencingToken, IntentEvent, ProjectId, TaskId};
+use tm_coordinator::model::{FencingToken, HostId, IntentEvent, ProjectId, TaskId};
 use tm_coordinator::{Api, Config, EventLog, Reducer};
 
 struct FailingReadLog;
@@ -231,4 +231,373 @@ fn expired_fence_token_is_not_current() {
     assert!(!api
         .is_current_fence(task_id.as_str(), None, token.as_str())
         .unwrap());
+}
+
+fn api_with_project_task() -> (Arc<Api>, ProjectId, TaskId) {
+    let dir = tempdir().unwrap();
+    let log: Arc<dyn EventLog> =
+        Arc::new(LocalJournalEventLog::new(dir.path().join("events.ndjson")));
+    let api = Api::for_tests(log).unwrap();
+    let project = api
+        .handle(
+            "project.add",
+            json!({"request_id": "project", "root_path": "/tmp/repo", "name": "repo"}),
+        )
+        .unwrap();
+    let project_id: ProjectId =
+        serde_json::from_value(project["event"]["project_id"].clone()).unwrap();
+    let task = api
+        .handle(
+            "task.create",
+            json!({"request_id": "task", "project_id": project_id, "title": "slice", "body": ""}),
+        )
+        .unwrap();
+    let task_id: TaskId =
+        serde_json::from_value(task["event"]["payload"]["task_id"].clone()).unwrap();
+    (api, project_id, task_id)
+}
+
+fn observe_host(
+    api: &Api,
+    request_id: &str,
+    host: &str,
+    load: f64,
+    used_slots: u32,
+    roots: Vec<&str>,
+) -> HostId {
+    let host_id = HostId::try_from(host.to_string()).unwrap();
+    api.handle(
+        "host.observe",
+        json!({
+            "request_id": request_id,
+            "host_id": host_id,
+            "os": "macos",
+            "arch": "arm64",
+            "load": load,
+            "total_slots": 4,
+            "used_slots": used_slots,
+            "project_roots": roots,
+            "live": true
+        }),
+    )
+    .unwrap();
+    host_id
+}
+
+#[test]
+fn placement_policy_prefers_repo_local_capacity_then_load_and_supports_manual_override() {
+    let (api, _project_id, task_id) = api_with_project_task();
+    let h1 = observe_host(&api, "h1", "hst_aaaa", 0.1, 1, vec!["/tmp/repo"]);
+    let h2 = observe_host(&api, "h2", "hst_bbbb", 0.9, 0, vec!["/tmp/repo"]);
+    observe_host(&api, "h3", "hst_cccc", 0.0, 0, vec!["/other"]);
+
+    let placed = api
+        .handle(
+            "task.place",
+            json!({"request_id": "place", "task_id": task_id}),
+        )
+        .unwrap();
+    assert_eq!(
+        placed["event"]["payload"]["placement"]["host_id"],
+        h2.as_str()
+    );
+
+    let task2 = api
+        .handle(
+            "task.create",
+            json!({"request_id": "task2", "project_id": placed["event"]["payload"]["attempt"]["project_id"], "title": "manual", "body": ""}),
+        )
+        .unwrap();
+    let task2_id: TaskId =
+        serde_json::from_value(task2["event"]["payload"]["task_id"].clone()).unwrap();
+    let manual = api
+        .handle(
+            "task.place",
+            json!({"request_id": "manual", "task_id": task2_id, "host_id": h1}),
+        )
+        .unwrap();
+    assert_eq!(
+        manual["event"]["payload"]["placement"]["host_id"],
+        "hst_aaaa"
+    );
+}
+
+#[test]
+fn suspect_quarantine_reassign_rotates_fence_and_cancels_old_attempt() {
+    let (api, _project_id, task_id) = api_with_project_task();
+    let h1 = observe_host(&api, "h1", "hst_1111", 0.1, 0, vec!["/tmp/repo"]);
+    let h2 = observe_host(&api, "h2", "hst_2222", 0.2, 0, vec!["/tmp/repo"]);
+    let first = api
+        .handle(
+            "task.place",
+            json!({"request_id": "place", "task_id": task_id, "host_id": h1}),
+        )
+        .unwrap();
+    let first_attempt = first["event"]["payload"]["attempt_id"].clone();
+    let first_token = first["event"]["payload"]["token"].clone();
+
+    api.handle(
+        "task.suspect",
+        json!({"request_id": "suspect", "task_id": task_id, "reason": "heartbeat stale"}),
+    )
+    .unwrap();
+    api.handle(
+        "task.quarantine",
+        json!({"request_id": "quarantine", "task_id": task_id, "reason": "zombie"}),
+    )
+    .unwrap();
+    let reassigned = api
+        .handle(
+            "task.reassign",
+            json!({"request_id": "reassign", "task_id": task_id, "host_id": h2, "reason": "move"}),
+        )
+        .unwrap();
+    assert_ne!(reassigned["event"]["payload"]["attempt_id"], first_attempt);
+    assert_ne!(reassigned["event"]["payload"]["token"], first_token);
+
+    let attempts = api
+        .handle("attempt.list", json!({"task_id": task_id}))
+        .unwrap();
+    assert_eq!(attempts["attempts"][0]["status"], "cancelled");
+    assert_eq!(attempts["attempts"][1]["status"], "created");
+}
+
+#[test]
+fn stale_attempt_cannot_record_review_snapshot() {
+    let (api, _project_id, task_id) = api_with_project_task();
+    let h1 = observe_host(&api, "h1", "hst_3333", 0.1, 0, vec!["/tmp/repo"]);
+    let h2 = observe_host(&api, "h2", "hst_4444", 0.2, 0, vec!["/tmp/repo"]);
+    let first = api
+        .handle(
+            "task.place",
+            json!({"request_id": "place", "task_id": task_id, "host_id": h1}),
+        )
+        .unwrap();
+    let first_attempt = first["event"]["payload"]["attempt_id"].clone();
+    let first_token = first["event"]["payload"]["token"].clone();
+    api.handle(
+        "task.suspect",
+        json!({"request_id": "suspect", "task_id": task_id}),
+    )
+    .unwrap();
+    api.handle(
+        "task.reassign",
+        json!({"request_id": "reassign", "task_id": task_id, "host_id": h2}),
+    )
+    .unwrap();
+
+    let err = api
+        .handle(
+            "review.snapshot",
+            json!({
+                "request_id": "stale-review",
+                "task_id": task_id,
+                "attempt_id": first_attempt,
+                "fencing_token": first_token,
+                "base_sha": "base",
+                "head_sha": "head",
+                "diff_digest": "sha256:abc"
+            }),
+        )
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("stale_attempt_reported"));
+}
+
+#[test]
+fn review_approve_enqueues_merge_and_validates_snapshot_evidence() {
+    let (api, _project_id, task_id) = api_with_project_task();
+    let host = observe_host(&api, "h1", "hst_5555", 0.1, 0, vec!["/tmp/repo"]);
+    let placed = api
+        .handle(
+            "task.place",
+            json!({"request_id": "place", "task_id": task_id, "host_id": host}),
+        )
+        .unwrap();
+    let attempt_id = placed["event"]["payload"]["attempt_id"].clone();
+    let token = placed["event"]["payload"]["token"].clone();
+    let snapshot = api
+        .handle(
+            "review.snapshot",
+            json!({
+                "request_id": "snapshot",
+                "task_id": task_id,
+                "attempt_id": attempt_id,
+                "fencing_token": token,
+                "base_sha": "base",
+                "head_sha": "head",
+                "diff_digest": "sha256:good",
+                "summary": "ready",
+                "files": [{"path":"daemon/x","kind":"modified","add":1,"del":0}]
+            }),
+        )
+        .unwrap();
+    let snapshot_id = snapshot["event"]["payload"]["snapshot_id"].clone();
+    let mismatch = api
+        .handle(
+            "approve",
+            json!({
+                "request_id": "bad-approve",
+                "task_id": task_id,
+                "attempt_id": attempt_id,
+                "fencing_token": token,
+                "reviewer": "reviewer",
+                "snapshot_id": snapshot_id,
+                "head_sha": "other",
+                "diff_digest": "sha256:good"
+            }),
+        )
+        .unwrap_err()
+        .to_string();
+    assert!(mismatch.contains("snapshot evidence mismatch"));
+
+    api.handle(
+        "approve",
+        json!({
+            "request_id": "approve",
+            "task_id": task_id,
+            "attempt_id": attempt_id,
+            "fencing_token": token,
+            "reviewer": "reviewer",
+            "snapshot_id": snapshot_id,
+            "head_sha": "head",
+            "diff_digest": "sha256:good"
+        }),
+    )
+    .unwrap();
+    let queue = api.handle("merge.queue", json!({})).unwrap();
+    assert_eq!(queue["items"][0]["status"], "queued");
+}
+
+fn approved_queue_fixture(
+    suffix: &str,
+) -> (Arc<Api>, TaskId, serde_json::Value, serde_json::Value) {
+    let (api, _project_id, task_id) = api_with_project_task();
+    let host = observe_host(
+        &api,
+        &format!("host-{suffix}"),
+        &format!("hst_{suffix}"),
+        0.1,
+        0,
+        vec!["/tmp/repo"],
+    );
+    let placed = api
+        .handle(
+            "task.place",
+            json!({"request_id": format!("place-{suffix}"), "task_id": task_id, "host_id": host}),
+        )
+        .unwrap();
+    let attempt_id = placed["event"]["payload"]["attempt_id"].clone();
+    let token = placed["event"]["payload"]["token"].clone();
+    let snapshot = api
+        .handle(
+            "review.snapshot",
+            json!({"request_id":format!("snapshot-{suffix}"),"task_id":task_id,"attempt_id":attempt_id,"fencing_token":token,"base_sha":"base","head_sha":"head","diff_digest":format!("sha256:{suffix}")}),
+        )
+        .unwrap();
+    let snapshot_id = snapshot["event"]["payload"]["snapshot_id"].clone();
+    api.handle(
+        "approve",
+        json!({"request_id":format!("approve-{suffix}"),"task_id":task_id,"attempt_id":attempt_id,"fencing_token":token,"reviewer":"reviewer","snapshot_id":snapshot_id,"head_sha":"head","diff_digest":format!("sha256:{suffix}")}),
+    )
+    .unwrap();
+    let queue = api.handle("merge.queue", json!({})).unwrap();
+    (
+        api,
+        task_id,
+        attempt_id,
+        queue["items"][0]["queue_id"].clone(),
+    )
+}
+
+#[test]
+fn merge_queue_transitions_are_serialized_and_state_checked() {
+    let (api, _project_id, task_id) = api_with_project_task();
+    let host = observe_host(&api, "h1", "hst_6666", 0.1, 0, vec!["/tmp/repo"]);
+    let placed = api
+        .handle(
+            "task.place",
+            json!({"request_id": "place", "task_id": task_id, "host_id": host}),
+        )
+        .unwrap();
+    let attempt_id = placed["event"]["payload"]["attempt_id"].clone();
+    let token = placed["event"]["payload"]["token"].clone();
+    let snapshot = api
+        .handle(
+            "review.snapshot",
+            json!({"request_id":"snapshot","task_id":task_id,"attempt_id":attempt_id,"fencing_token":token,"base_sha":"base","head_sha":"head","diff_digest":"sha256:q"}),
+        )
+        .unwrap();
+    let snapshot_id = snapshot["event"]["payload"]["snapshot_id"].clone();
+    api.handle(
+        "approve",
+        json!({"request_id":"approve","task_id":task_id,"attempt_id":attempt_id,"fencing_token":token,"reviewer":"reviewer","snapshot_id":snapshot_id,"head_sha":"head","diff_digest":"sha256:q"}),
+    )
+    .unwrap();
+    let queue = api.handle("merge.queue", json!({})).unwrap();
+    let queue_id = queue["items"][0]["queue_id"].clone();
+
+    api.handle(
+        "merge.queue.transition",
+        json!({"request_id":"running","queue_id":queue_id,"status":"running"}),
+    )
+    .unwrap();
+    api.handle(
+        "merge.queue.transition",
+        json!({"request_id":"merged","queue_id":queue_id,"status":"merged"}),
+    )
+    .unwrap();
+    let invalid = api
+        .handle(
+            "merge.queue.transition",
+            json!({"request_id":"again","queue_id":queue_id,"status":"running"}),
+        )
+        .unwrap_err()
+        .to_string();
+    assert!(invalid.contains("invalid merge queue transition"));
+}
+
+#[test]
+fn running_to_failed_updates_task_and_attempt_projection() {
+    let (api, task_id, _attempt_id, queue_id) = approved_queue_fixture("7777");
+
+    api.handle(
+        "merge.queue.transition",
+        json!({"request_id":"running-failed","queue_id":queue_id,"status":"running"}),
+    )
+    .unwrap();
+    api.handle(
+        "merge.queue.transition",
+        json!({"request_id":"failed","queue_id":queue_id,"status":"failed","last_error":"merge failed"}),
+    )
+    .unwrap();
+
+    let task = api.handle("task.get", json!({"task_id": task_id})).unwrap();
+    assert_eq!(task["task"]["status"], "failed");
+    assert_eq!(task["attempts"][0]["status"], "failed");
+    let queue = api.handle("merge.queue", json!({})).unwrap();
+    assert_eq!(queue["items"][0]["status"], "failed");
+    assert_eq!(queue["items"][0]["last_error"], "merge failed");
+}
+
+#[test]
+fn running_to_cancelled_updates_task_and_attempt_projection() {
+    let (api, task_id, _attempt_id, queue_id) = approved_queue_fixture("8888");
+
+    api.handle(
+        "merge.queue.transition",
+        json!({"request_id":"running-cancelled","queue_id":queue_id,"status":"running"}),
+    )
+    .unwrap();
+    api.handle(
+        "merge.queue.transition",
+        json!({"request_id":"cancelled","queue_id":queue_id,"status":"cancelled"}),
+    )
+    .unwrap();
+
+    let task = api.handle("task.get", json!({"task_id": task_id})).unwrap();
+    assert_eq!(task["task"]["status"], "cancelled");
+    assert_eq!(task["attempts"][0]["status"], "cancelled");
+    let queue = api.handle("merge.queue", json!({})).unwrap();
+    assert_eq!(queue["items"][0]["status"], "cancelled");
 }

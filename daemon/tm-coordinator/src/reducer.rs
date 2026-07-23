@@ -1,7 +1,8 @@
 use crate::fence::FenceRecord;
 use crate::model::{
-    now_ms, Attempt, AttemptId, FencingToken, HostId, IntentEvent, Project, ProjectId,
-    ProjectState, Task, TaskId, TaskStatus,
+    now_ms, Attempt, AttemptId, FencingToken, HostId, HostObservation, IntentEvent, MergeQueueId,
+    MergeQueueItem, MergeQueueStatus, Placement, Project, ProjectId, ProjectState, ReviewSnapshot,
+    Task, TaskId, TaskStatus,
 };
 use anyhow::{bail, Result};
 use rusqlite::{params, Connection, OptionalExtension};
@@ -83,6 +84,18 @@ impl Reducer {
                 created_at_ms INTEGER NOT NULL,
                 updated_at_ms INTEGER NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS hosts(
+                host_id TEXT PRIMARY KEY,
+                os TEXT NOT NULL,
+                arch TEXT NOT NULL,
+                load REAL NOT NULL,
+                total_slots INTEGER NOT NULL,
+                used_slots INTEGER NOT NULL,
+                project_roots_json TEXT NOT NULL,
+                live INTEGER NOT NULL,
+                quarantined INTEGER NOT NULL,
+                observed_at_ms INTEGER NOT NULL
+            );
             CREATE TABLE IF NOT EXISTS fences(
                 task_id TEXT NOT NULL,
                 attempt_key TEXT NOT NULL,
@@ -92,6 +105,27 @@ impl Reducer {
                 generation INTEGER NOT NULL,
                 expires_at_ms INTEGER,
                 PRIMARY KEY(task_id, attempt_key)
+            );
+            CREATE TABLE IF NOT EXISTS review_snapshots(
+                snapshot_id TEXT PRIMARY KEY,
+                task_id TEXT NOT NULL,
+                attempt_id TEXT NOT NULL,
+                base_sha TEXT NOT NULL,
+                head_sha TEXT NOT NULL,
+                diff_digest TEXT NOT NULL,
+                summary TEXT NOT NULL,
+                files_json TEXT NOT NULL,
+                created_at_ms INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS merge_queue(
+                queue_id TEXT PRIMARY KEY,
+                project_id TEXT NOT NULL,
+                task_id TEXT NOT NULL,
+                attempt_id TEXT NOT NULL,
+                status TEXT NOT NULL,
+                approved_by TEXT NOT NULL,
+                approved_at_ms INTEGER NOT NULL,
+                last_error TEXT
             );
             "#,
         )?;
@@ -148,6 +182,15 @@ impl Reducer {
             "task_created" => self.reduce_task_created(event),
             "task_status_changed" => self.reduce_task_status_changed(event),
             "attempt_created" => self.reduce_attempt_created(event),
+            "host_observed" => self.reduce_host_observed(event),
+            "task_placed" => self.reduce_task_placed(event, TaskStatus::Placed),
+            "task_reassigned" => self.reduce_task_placed(event, TaskStatus::Reassigned),
+            "task_suspected" => self.reduce_task_lifecycle(event, TaskStatus::Suspect),
+            "task_quarantined" => self.reduce_task_lifecycle(event, TaskStatus::Quarantined),
+            "review_snapshot_recorded" => self.reduce_review_snapshot_recorded(event),
+            "attempt_approved" => self.reduce_attempt_approved(event),
+            "attempt_rejected" => self.reduce_attempt_rejected(event),
+            "merge_queue_transitioned" => self.reduce_merge_queue_transitioned(event),
             "fence_issued" => self.reduce_fence_issued(event),
             _ => Ok(()),
         }
@@ -210,6 +253,108 @@ impl Reducer {
         let rows = stmt.query_map(params![task_id.as_str()], row_to_attempt)?;
         rows.collect::<std::result::Result<Vec<_>, _>>()
             .map_err(Into::into)
+    }
+
+    pub fn hosts(&self) -> Result<Vec<HostObservation>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT host_id,os,arch,load,total_slots,used_slots,project_roots_json,live,quarantined,observed_at_ms
+             FROM hosts ORDER BY host_id",
+        )?;
+        let rows = stmt.query_map([], row_to_host)?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    }
+
+    pub fn project_root(&self, project_id: &ProjectId) -> Result<Option<String>> {
+        self.conn
+            .query_row(
+                "SELECT root_path FROM projects WHERE project_id=?1",
+                params![project_id.as_str()],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    pub fn choose_host(
+        &self,
+        project_id: &ProjectId,
+        manual_host_id: Option<&HostId>,
+    ) -> Result<HostObservation> {
+        let root_path = self
+            .project_root(project_id)?
+            .ok_or_else(|| anyhow::anyhow!("project not found"))?;
+        let mut eligible: Vec<HostObservation> = self
+            .hosts()?
+            .into_iter()
+            .filter(|host| host.is_eligible_for(&root_path))
+            .collect();
+        if let Some(host_id) = manual_host_id {
+            return eligible
+                .into_iter()
+                .find(|host| &host.host_id == host_id)
+                .ok_or_else(|| anyhow::anyhow!("manual host override is not eligible"));
+        }
+        eligible.sort_by(|a, b| {
+            b.available_slots()
+                .cmp(&a.available_slots())
+                .then_with(|| {
+                    a.load
+                        .partial_cmp(&b.load)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
+                .then_with(|| a.host_id.as_str().cmp(b.host_id.as_str()))
+        });
+        eligible
+            .into_iter()
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("no eligible host"))
+    }
+
+    pub fn latest_review_snapshot(&self, task_id: &TaskId) -> Result<Option<ReviewSnapshot>> {
+        self.conn
+            .query_row(
+                "SELECT snapshot_id,task_id,attempt_id,base_sha,head_sha,diff_digest,summary,files_json,created_at_ms
+                 FROM review_snapshots WHERE task_id=?1 ORDER BY created_at_ms DESC LIMIT 1",
+                params![task_id.as_str()],
+                row_to_review_snapshot,
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    pub fn review_snapshot(&self, snapshot_id: &str) -> Result<Option<ReviewSnapshot>> {
+        self.conn
+            .query_row(
+                "SELECT snapshot_id,task_id,attempt_id,base_sha,head_sha,diff_digest,summary,files_json,created_at_ms
+                 FROM review_snapshots WHERE snapshot_id=?1",
+                params![snapshot_id],
+                row_to_review_snapshot,
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    pub fn merge_queue(
+        &self,
+        project_id: Option<&ProjectId>,
+        status: Option<MergeQueueStatus>,
+    ) -> Result<Vec<MergeQueueItem>> {
+        let mut items = self.all_merge_queue()?;
+        if let Some(project_id) = project_id {
+            items.retain(|item| &item.project_id == project_id);
+        }
+        if let Some(status) = status {
+            items.retain(|item| item.status == status);
+        }
+        Ok(items)
+    }
+
+    pub fn merge_queue_item(&self, queue_id: &MergeQueueId) -> Result<Option<MergeQueueItem>> {
+        Ok(self
+            .all_merge_queue()?
+            .into_iter()
+            .find(|item| &item.queue_id == queue_id))
     }
 
     pub fn current_fence(
@@ -372,7 +517,216 @@ impl Reducer {
         Ok(())
     }
 
+    fn reduce_host_observed(&self, event: &IntentEvent) -> Result<()> {
+        let observation: HostObservation = serde_json::from_value(event.payload.clone())?;
+        self.conn.execute(
+            "INSERT INTO hosts(host_id,os,arch,load,total_slots,used_slots,project_roots_json,live,quarantined,observed_at_ms)
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)
+             ON CONFLICT(host_id) DO UPDATE SET os=excluded.os, arch=excluded.arch, load=excluded.load,
+             total_slots=excluded.total_slots, used_slots=excluded.used_slots, project_roots_json=excluded.project_roots_json,
+             live=excluded.live, quarantined=excluded.quarantined, observed_at_ms=excluded.observed_at_ms",
+            params![
+                observation.host_id.as_str(),
+                observation.os,
+                observation.arch,
+                observation.load,
+                observation.total_slots,
+                observation.used_slots,
+                serde_json::to_string(&observation.project_roots)?,
+                observation.live as i64,
+                observation.quarantined as i64,
+                observation.observed_at_ms as i64,
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn reduce_task_placed(&self, event: &IntentEvent, status: TaskStatus) -> Result<()> {
+        let attempt: Attempt = serde_json::from_value(
+            event
+                .payload
+                .get("attempt")
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("missing attempt"))?,
+        )?;
+        let placement: Placement = serde_json::from_value(
+            event
+                .payload
+                .get("placement")
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("missing placement"))?,
+        )?;
+        let task = self
+            .task(&attempt.task_id)?
+            .ok_or_else(|| anyhow::anyhow!("task not found"))?;
+        if !task.status.can_transition_to(&status) {
+            bail!("invalid task transition {:?} -> {:?}", task.status, status);
+        }
+        if matches!(status, TaskStatus::Reassigned) {
+            self.conn.execute(
+                "UPDATE attempts SET status='cancelled', updated_at_ms=?1 WHERE task_id=?2 AND attempt_id<>?3 AND status NOT IN ('merged','failed','cancelled')",
+                params![event.ts_ms as i64, attempt.task_id.as_str(), attempt.attempt_id.as_str()],
+            )?;
+        }
+        self.insert_attempt(&attempt)?;
+        self.conn.execute(
+            "UPDATE tasks SET status=?1,current_attempt_id=?2,placement_json=?3,updated_at_ms=?4 WHERE task_id=?5",
+            params![
+                status_string(&status)?,
+                attempt.attempt_id.as_str(),
+                serde_json::to_string(&placement)?,
+                event.ts_ms as i64,
+                attempt.task_id.as_str()
+            ],
+        )?;
+        self.upsert_fence_from_payload(event)?;
+        Ok(())
+    }
+
+    fn reduce_task_lifecycle(&self, event: &IntentEvent, status: TaskStatus) -> Result<()> {
+        let task_id = TaskId::from_str(required_str(&event.payload, "task_id")?)
+            .map_err(|e| anyhow::anyhow!(e))?;
+        let task = self
+            .task(&task_id)?
+            .ok_or_else(|| anyhow::anyhow!("task not found"))?;
+        if !task.status.can_transition_to(&status) {
+            bail!("invalid task transition {:?} -> {:?}", task.status, status);
+        }
+        self.conn.execute(
+            "UPDATE tasks SET status=?1, updated_at_ms=?2 WHERE task_id=?3",
+            params![
+                status_string(&status)?,
+                event.ts_ms as i64,
+                task_id.as_str()
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn reduce_review_snapshot_recorded(&self, event: &IntentEvent) -> Result<()> {
+        let snapshot: ReviewSnapshot = serde_json::from_value(event.payload.clone())?;
+        self.conn.execute(
+            "INSERT OR IGNORE INTO review_snapshots(snapshot_id,task_id,attempt_id,base_sha,head_sha,diff_digest,summary,files_json,created_at_ms)
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+            params![
+                snapshot.snapshot_id.as_str(),
+                snapshot.task_id.as_str(),
+                snapshot.attempt_id.as_str(),
+                snapshot.base_sha,
+                snapshot.head_sha,
+                snapshot.diff_digest,
+                snapshot.summary,
+                serde_json::to_string(&snapshot.files)?,
+                snapshot.created_at_ms as i64
+            ],
+        )?;
+        self.conn.execute(
+            "UPDATE tasks SET status='review_ready', updated_at_ms=?1 WHERE task_id=?2",
+            params![event.ts_ms as i64, snapshot.task_id.as_str()],
+        )?;
+        self.conn.execute(
+            "UPDATE attempts SET status='review_ready', head_sha=?1, updated_at_ms=?2 WHERE attempt_id=?3",
+            params![snapshot.head_sha, event.ts_ms as i64, snapshot.attempt_id.as_str()],
+        )?;
+        Ok(())
+    }
+
+    fn reduce_attempt_approved(&self, event: &IntentEvent) -> Result<()> {
+        let queue: MergeQueueItem = serde_json::from_value(
+            event
+                .payload
+                .get("merge_queue_item")
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("missing merge_queue_item"))?,
+        )?;
+        let task = self
+            .task(&queue.task_id)?
+            .ok_or_else(|| anyhow::anyhow!("task not found"))?;
+        if !task.status.can_transition_to(&TaskStatus::Approved) {
+            bail!("invalid task transition {:?} -> approved", task.status);
+        }
+        self.conn.execute(
+            "UPDATE tasks SET status='queued_for_merge', updated_at_ms=?1 WHERE task_id=?2",
+            params![event.ts_ms as i64, queue.task_id.as_str()],
+        )?;
+        self.conn.execute(
+            "UPDATE attempts SET status='approved', updated_at_ms=?1 WHERE attempt_id=?2",
+            params![event.ts_ms as i64, queue.attempt_id.as_str()],
+        )?;
+        self.insert_merge_queue(&queue)
+    }
+
+    fn reduce_attempt_rejected(&self, event: &IntentEvent) -> Result<()> {
+        let task_id = TaskId::from_str(required_str(&event.payload, "task_id")?)
+            .map_err(|e| anyhow::anyhow!(e))?;
+        let attempt_id = AttemptId::from_str(required_str(&event.payload, "attempt_id")?)
+            .map_err(|e| anyhow::anyhow!(e))?;
+        let task = self
+            .task(&task_id)?
+            .ok_or_else(|| anyhow::anyhow!("task not found"))?;
+        if !task.status.can_transition_to(&TaskStatus::Rejected) {
+            bail!("invalid task transition {:?} -> rejected", task.status);
+        }
+        self.conn.execute(
+            "UPDATE tasks SET status='rejected', updated_at_ms=?1 WHERE task_id=?2",
+            params![event.ts_ms as i64, task_id.as_str()],
+        )?;
+        self.conn.execute(
+            "UPDATE attempts SET status='rejected', updated_at_ms=?1 WHERE attempt_id=?2",
+            params![event.ts_ms as i64, attempt_id.as_str()],
+        )?;
+        Ok(())
+    }
+
+    fn reduce_merge_queue_transitioned(&self, event: &IntentEvent) -> Result<()> {
+        let queue_id = MergeQueueId::from_str(required_str(&event.payload, "queue_id")?)
+            .map_err(|e| anyhow::anyhow!(e))?;
+        let next: MergeQueueStatus = serde_json::from_value(
+            event
+                .payload
+                .get("status")
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("missing status"))?,
+        )?;
+        let item = self
+            .merge_queue_item(&queue_id)?
+            .ok_or_else(|| anyhow::anyhow!("merge queue item not found"))?;
+        if !item.status.can_transition_to(&next) {
+            bail!(
+                "invalid merge queue transition {:?} -> {:?}",
+                item.status,
+                next
+            );
+        }
+        let last_error = event.payload.get("last_error").and_then(|v| v.as_str());
+        self.conn.execute(
+            "UPDATE merge_queue SET status=?1,last_error=?2 WHERE queue_id=?3",
+            params![status_string(&next)?, last_error, queue_id.as_str()],
+        )?;
+        let terminal_status = match next {
+            MergeQueueStatus::Merged => Some("merged"),
+            MergeQueueStatus::Failed => Some("failed"),
+            MergeQueueStatus::Cancelled => Some("cancelled"),
+            MergeQueueStatus::Queued | MergeQueueStatus::Running => None,
+        };
+        if let Some(status) = terminal_status {
+            self.conn.execute(
+                "UPDATE tasks SET status=?1, updated_at_ms=?2 WHERE task_id=?3",
+                params![status, event.ts_ms as i64, item.task_id.as_str()],
+            )?;
+            self.conn.execute(
+                "UPDATE attempts SET status=?1, updated_at_ms=?2 WHERE attempt_id=?3",
+                params![status, event.ts_ms as i64, item.attempt_id.as_str()],
+            )?;
+        }
+        Ok(())
+    }
+
     fn reduce_fence_issued(&self, event: &IntentEvent) -> Result<()> {
+        self.upsert_fence_from_payload(event)
+    }
+
+    fn upsert_fence_from_payload(&self, event: &IntentEvent) -> Result<()> {
         let task_id = TaskId::from_str(required_str(&event.payload, "task_id")?)
             .map_err(|e| anyhow::anyhow!(e))?;
         let attempt_id = event
@@ -406,6 +760,57 @@ impl Reducer {
             ],
         )?;
         Ok(())
+    }
+
+    fn insert_attempt(&self, attempt: &Attempt) -> Result<()> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO attempts(attempt_id,task_id,project_id,status,host_id,pane_ref_json,worktree_path,base_ref,head_ref,head_sha,fencing_token,created_at_ms,updated_at_ms)
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
+            params![
+                attempt.attempt_id.as_str(),
+                attempt.task_id.as_str(),
+                attempt.project_id.as_str(),
+                attempt.status,
+                attempt.host_id.as_str(),
+                attempt.pane_ref.as_ref().map(serde_json::to_string).transpose()?,
+                attempt.worktree_path,
+                attempt.base_ref,
+                attempt.head_ref,
+                attempt.head_sha,
+                attempt.fencing_token.as_ref().map(|t| t.to_string()),
+                attempt.created_at_ms as i64,
+                attempt.updated_at_ms as i64
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn insert_merge_queue(&self, item: &MergeQueueItem) -> Result<()> {
+        self.conn.execute(
+            "INSERT OR IGNORE INTO merge_queue(queue_id,project_id,task_id,attempt_id,status,approved_by,approved_at_ms,last_error)
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
+            params![
+                item.queue_id.as_str(),
+                item.project_id.as_str(),
+                item.task_id.as_str(),
+                item.attempt_id.as_str(),
+                status_string(&item.status)?,
+                item.approved_by,
+                item.approved_at_ms as i64,
+                item.last_error
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn all_merge_queue(&self) -> Result<Vec<MergeQueueItem>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT queue_id,project_id,task_id,attempt_id,status,approved_by,approved_at_ms,last_error
+             FROM merge_queue ORDER BY approved_at_ms",
+        )?;
+        let rows = stmt.query_map([], row_to_merge_queue_item)?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(Into::into)
     }
 }
 
@@ -467,6 +872,58 @@ fn row_to_attempt(row: &rusqlite::Row<'_>) -> rusqlite::Result<Attempt> {
         created_at_ms: row.get::<_, i64>(11)? as u64,
         updated_at_ms: row.get::<_, i64>(12)? as u64,
     })
+}
+
+fn row_to_host(row: &rusqlite::Row<'_>) -> rusqlite::Result<HostObservation> {
+    Ok(HostObservation {
+        host_id: HostId::from_str(&row.get::<_, String>(0)?).map_err(to_sql_err)?,
+        os: row.get(1)?,
+        arch: row.get(2)?,
+        load: row.get(3)?,
+        total_slots: row.get::<_, i64>(4)? as u32,
+        used_slots: row.get::<_, i64>(5)? as u32,
+        project_roots: serde_json::from_str(&row.get::<_, String>(6)?).map_err(to_sql_err)?,
+        live: row.get::<_, i64>(7)? != 0,
+        quarantined: row.get::<_, i64>(8)? != 0,
+        observed_at_ms: row.get::<_, i64>(9)? as u64,
+    })
+}
+
+fn row_to_review_snapshot(row: &rusqlite::Row<'_>) -> rusqlite::Result<ReviewSnapshot> {
+    Ok(ReviewSnapshot {
+        snapshot_id: crate::model::ReviewSnapshotId::from_str(&row.get::<_, String>(0)?)
+            .map_err(to_sql_err)?,
+        task_id: TaskId::from_str(&row.get::<_, String>(1)?).map_err(to_sql_err)?,
+        attempt_id: AttemptId::from_str(&row.get::<_, String>(2)?).map_err(to_sql_err)?,
+        base_sha: row.get(3)?,
+        head_sha: row.get(4)?,
+        diff_digest: row.get(5)?,
+        summary: row.get(6)?,
+        files: serde_json::from_str(&row.get::<_, String>(7)?).map_err(to_sql_err)?,
+        created_at_ms: row.get::<_, i64>(8)? as u64,
+    })
+}
+
+fn row_to_merge_queue_item(row: &rusqlite::Row<'_>) -> rusqlite::Result<MergeQueueItem> {
+    let status: MergeQueueStatus =
+        serde_json::from_str(&format!("\"{}\"", row.get::<_, String>(4)?)).map_err(to_sql_err)?;
+    Ok(MergeQueueItem {
+        queue_id: MergeQueueId::from_str(&row.get::<_, String>(0)?).map_err(to_sql_err)?,
+        project_id: ProjectId::from_str(&row.get::<_, String>(1)?).map_err(to_sql_err)?,
+        task_id: TaskId::from_str(&row.get::<_, String>(2)?).map_err(to_sql_err)?,
+        attempt_id: AttemptId::from_str(&row.get::<_, String>(3)?).map_err(to_sql_err)?,
+        status,
+        approved_by: row.get(5)?,
+        approved_at_ms: row.get::<_, i64>(6)? as u64,
+        last_error: row.get(7)?,
+    })
+}
+
+fn status_string<T: serde::Serialize>(value: &T) -> Result<String> {
+    serde_json::to_value(value)?
+        .as_str()
+        .map(|s| s.to_string())
+        .ok_or_else(|| anyhow::anyhow!("status did not serialize as string"))
 }
 
 fn to_sql_err<E: std::fmt::Display>(err: E) -> rusqlite::Error {

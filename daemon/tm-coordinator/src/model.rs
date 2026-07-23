@@ -60,6 +60,8 @@ typed_id!(AttemptId, "att_");
 typed_id!(HostId, "hst_");
 typed_id!(FencingToken, "fen_");
 typed_id!(EventId, "evt_");
+typed_id!(ReviewSnapshotId, "rev_");
+typed_id!(MergeQueueId, "mrq_");
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PaneRef {
@@ -104,7 +106,10 @@ pub enum TaskStatus {
     Placed,
     Assigned,
     InProgress,
+    Suspect,
     Blocked,
+    Quarantined,
+    Reassigned,
     ReviewReady,
     Approved,
     Rejected,
@@ -118,15 +123,23 @@ impl TaskStatus {
     pub fn can_transition_to(&self, next: &TaskStatus) -> bool {
         use TaskStatus::*;
         match (self, next) {
-            (Pending, Placed | Assigned | Blocked | Cancelled) => true,
-            (Placed, Assigned | InProgress | Blocked | Cancelled) => true,
-            (Assigned, InProgress | Blocked | Cancelled) => true,
-            (InProgress, Blocked | ReviewReady | Failed | Cancelled) => true,
-            (Blocked, Assigned | InProgress | Cancelled | Failed) => true,
+            (Pending, Placed | Assigned | Suspect | Blocked | Quarantined | Cancelled) => true,
+            (
+                Placed,
+                Assigned | InProgress | Suspect | Blocked | Quarantined | ReviewReady | Cancelled,
+            ) => true,
+            (Assigned, InProgress | Suspect | Blocked | Quarantined | Cancelled) => true,
+            (InProgress, Suspect | Blocked | ReviewReady | Failed | Cancelled) => true,
+            (Suspect, Reassigned | Quarantined | Blocked | Cancelled) => true,
+            (Blocked, Reassigned | Assigned | InProgress | Quarantined | Cancelled | Failed) => {
+                true
+            }
+            (Quarantined, Reassigned | Cancelled | Failed) => true,
+            (Reassigned, Placed | Assigned | InProgress | Blocked | Cancelled) => true,
             (ReviewReady, Approved | Rejected | Blocked | Cancelled) => true,
             (Approved, QueuedForMerge | Merged | Failed) => true,
             (QueuedForMerge, Merged | Failed | Cancelled) => true,
-            (Rejected, Assigned | Cancelled) => true,
+            (Rejected, Reassigned | Assigned | Cancelled) => true,
             (Merged | Failed | Cancelled, _) => false,
             (a, b) if a == b => true,
             _ => false,
@@ -158,6 +171,33 @@ pub struct Placement {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pane_ref: Option<PaneRef>,
     pub mode: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct HostObservation {
+    pub host_id: HostId,
+    pub os: String,
+    pub arch: String,
+    pub load: f64,
+    pub total_slots: u32,
+    pub used_slots: u32,
+    pub project_roots: Vec<String>,
+    pub live: bool,
+    pub quarantined: bool,
+    pub observed_at_ms: u64,
+}
+
+impl HostObservation {
+    pub fn available_slots(&self) -> u32 {
+        self.total_slots.saturating_sub(self.used_slots)
+    }
+
+    pub fn is_eligible_for(&self, root_path: &str) -> bool {
+        self.live
+            && !self.quarantined
+            && self.available_slots() > 0
+            && self.project_roots.iter().any(|root| root == root_path)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -199,6 +239,63 @@ pub struct Attempt {
     pub fencing_token: Option<FencingToken>,
     pub created_at_ms: u64,
     pub updated_at_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MergeQueueStatus {
+    Queued,
+    Running,
+    Merged,
+    Failed,
+    Cancelled,
+}
+
+impl MergeQueueStatus {
+    pub fn can_transition_to(&self, next: &MergeQueueStatus) -> bool {
+        use MergeQueueStatus::*;
+        match (self, next) {
+            (Queued, Running | Cancelled) => true,
+            (Running, Merged | Failed | Cancelled) => true,
+            (Merged | Failed | Cancelled, _) => false,
+            (a, b) if a == b => true,
+            _ => false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReviewFileSummary {
+    pub path: String,
+    pub kind: String,
+    pub add: i64,
+    pub del: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReviewSnapshot {
+    pub snapshot_id: ReviewSnapshotId,
+    pub task_id: TaskId,
+    pub attempt_id: AttemptId,
+    pub base_sha: String,
+    pub head_sha: String,
+    pub diff_digest: String,
+    pub summary: String,
+    pub files: Vec<ReviewFileSummary>,
+    pub created_at_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MergeQueueItem {
+    pub queue_id: MergeQueueId,
+    pub project_id: ProjectId,
+    pub task_id: TaskId,
+    pub attempt_id: AttemptId,
+    pub status: MergeQueueStatus,
+    pub approved_by: String,
+    pub approved_at_ms: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
