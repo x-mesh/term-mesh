@@ -370,6 +370,28 @@ final class GhosttyPaneSurfaceProvider: PeerSurfaceProvider {
         return await MainActor.run { collectWorkspaces() }
     }
 
+    /// The GUI teams this Mac is running, as a peer client would see them.
+    /// A team is invisible in the layout tree, so a client asking where a
+    /// project's leader sits has no other way to find out — and on a Mac
+    /// host the leader usually IS here, which is what makes the answer
+    /// worth carrying.
+    func listTeams() async -> [Termmesh_Peer_V1_Team] {
+        await MainActor.run {
+            TeamOrchestrator.shared.teams.values.map { team in
+                var wire = Termmesh_Peer_V1_Team()
+                wire.name = team.id
+                wire.teamUuid = team.teamUuid ?? ""
+                wire.workingDirectory = team.workingDirectory
+                // Resolve the repo root here: a client staring at the working
+                // directory cannot tell it from one of its subdirectories.
+                wire.projectRoot = team.gitRepoRoot ?? ""
+                wire.agentNames = team.agents.map(\.name)
+                wire.createdAtUnixSecs = UInt64(max(0, team.createdAt.timeIntervalSince1970))
+                return wire
+            }
+        }
+    }
+
     func handleWorkspaceControl(_ control: Termmesh_Peer_V1_WorkspaceControl) async {
         await MainActor.run { applyWorkspaceControl(control) }
     }

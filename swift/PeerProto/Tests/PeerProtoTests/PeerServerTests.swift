@@ -406,6 +406,66 @@ final class PeerServerTests: XCTestCase {
         await transport.close()
         await server.stop()
     }
+
+    /// A Mac host is where a team leader usually sits, so its roster is the
+    /// answer to "where does this project's leader run" — and it only exists
+    /// on the wire, never in the layout tree.
+    func testTeamRosterIsServedAndGatedByCapability() async throws {
+        let sockPath = "/tmp/tm-peer-swift-teams-\(UUID().uuidString.prefix(8)).sock"
+        defer { try? FileManager.default.removeItem(atPath: sockPath) }
+
+        let provider = TeamRosterProvider(teams: [("live-team", "/Users/x/work/demo")])
+        let server = PeerServer(socketPath: sockPath, provider: provider)
+        try await server.start()
+        defer { Task { await server.stop() } }
+
+        let deadline = Date().addingTimeInterval(2)
+        while !FileManager.default.fileExists(atPath: sockPath) {
+            if Date() > deadline { return XCTFail("no socket") }
+            try await Task.sleep(nanoseconds: 50_000_000)
+        }
+
+        let transport = try await UnixSocketTransport.connect(socketPath: sockPath)
+        let session = PeerSession(
+            read: { try await transport.read() },
+            write: { try await transport.write($0) }
+        )
+        let hello = try await session.handshake()
+        XCTAssertTrue(
+            hello.hasHostCapability(PeerCapability.teamRosterV1),
+            "a host with teams must advertise the roster capability"
+        )
+
+        let teams = try await session.listTeams()
+        XCTAssertEqual(teams.count, 1)
+        XCTAssertEqual(teams[0].name, "live-team")
+        XCTAssertEqual(teams[0].projectRoot, "/Users/x/work/demo")
+    }
+
+    /// A host with no teams must not advertise the capability, or a client
+    /// would ask a question it cannot usefully answer.
+    func testHostWithoutTeamsDoesNotAdvertiseRoster() async throws {
+        let sockPath = "/tmp/tm-peer-swift-noteams-\(UUID().uuidString.prefix(8)).sock"
+        defer { try? FileManager.default.removeItem(atPath: sockPath) }
+
+        let server = PeerServer(socketPath: sockPath, provider: TeamRosterProvider(teams: []))
+        try await server.start()
+        defer { Task { await server.stop() } }
+
+        let deadline = Date().addingTimeInterval(2)
+        while !FileManager.default.fileExists(atPath: sockPath) {
+            if Date() > deadline { return XCTFail("no socket") }
+            try await Task.sleep(nanoseconds: 50_000_000)
+        }
+
+        let transport = try await UnixSocketTransport.connect(socketPath: sockPath)
+        let session = PeerSession(
+            read: { try await transport.read() },
+            write: { try await transport.write($0) }
+        )
+        let hello = try await session.handshake()
+        XCTAssertFalse(hello.hasHostCapability(PeerCapability.teamRosterV1))
+    }
 }
 
 /// Test-only `PeerSurfaceProvider` that records the `resumeFromSeq` it was
@@ -440,6 +500,7 @@ private actor RecordingAttachProvider: PeerSurfaceProvider {
             detach: {}
         )
     }
+
 }
 
 /// Test-only `PeerSurfaceProvider` that records `renameWorkspace`/
@@ -468,5 +529,29 @@ private actor RecordingWorkspaceProvider: PeerSurfaceProvider {
     func deleteWorkspace(id workspaceID: Data) async -> Bool {
         deleted = workspaceID
         return true
+    }
+}
+
+private actor TeamRosterProvider: PeerSurfaceProvider {
+    private let teams: [(String, String)]
+
+    init(teams: [(String, String)]) { self.teams = teams }
+
+    func listSurfaces() async -> [Termmesh_Peer_V1_SurfaceInfo] { [] }
+
+    func attach(
+        surfaceID: Data,
+        clientCols: UInt32,
+        clientRows: UInt32,
+        resumeFromSeq: UInt64
+    ) async -> PeerSurfaceAttachment? { nil }
+
+    func listTeams() async -> [Termmesh_Peer_V1_Team] {
+        teams.map { name, root in
+            var team = Termmesh_Peer_V1_Team()
+            team.name = name
+            team.projectRoot = root
+            return team
+        }
     }
 }

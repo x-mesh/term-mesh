@@ -177,6 +177,15 @@ public protocol PeerSurfaceProvider: AnyObject, Sendable {
     /// "workspace.lifecycle.v1". Default no-op for providers with no
     /// real workspace tree.
     func deleteWorkspace(id workspaceID: Data) async -> Bool
+
+    /// The agent teams running on this host. A team is invisible in the
+    /// layout tree — which pane leads which work is not a fact about how
+    /// panes are arranged — so a client asking "where does this project's
+    /// leader sit" has no other way to find out. Read-only: no command
+    /// crosses this call. Gated behind capability "team.roster.v1"; the
+    /// default empty list is what a provider with no teams reports, and
+    /// such a host never advertises the capability.
+    func listTeams() async -> [Termmesh_Peer_V1_Team]
 }
 
 public extension PeerSurfaceProvider {
@@ -184,6 +193,7 @@ public extension PeerSurfaceProvider {
     func renameWorkspace(id workspaceID: Data, title: String) async -> Bool { false }
     func deleteWorkspace(id workspaceID: Data) async -> Bool { false }
     func handleWorkspaceControl(_ control: Termmesh_Peer_V1_WorkspaceControl) async {}
+    func listTeams() async -> [Termmesh_Peer_V1_Team] { [] }
 }
 
 /// Provider for the list-only case: static surfaces, no attach support.
@@ -1042,13 +1052,20 @@ actor PeerServerSession {
                 return
             }
             clientCapabilities = PeerCapabilities(clientHello.capabilities)
+            // Only a provider that can actually answer ListTeams advertises
+            // the roster capability — otherwise the flag invites a question
+            // this host cannot answer. Resolved before building the Hello,
+            // since the envelope builder is synchronous.
+            let advertisedCapabilities = await provider.listTeams().isEmpty
+                ? PeerCapability.supported.filter { $0 != PeerCapability.teamRosterV1 }
+                : PeerCapability.supported
             try await sendEnvelope { env in
                 var h = Termmesh_Peer_V1_Hello()
                 h.protocolVersion = self.config.protocolVersion
                 h.displayName = self.config.hostDisplayName
                 h.appVersion = self.config.hostAppVersion
                 h.peerID = randomPeerBytes(count: 16)
-                h.capabilities = PeerCapability.supported
+                h.capabilities = advertisedCapabilities
                 env.hello = h
             }
             try await sendEnvelope { env in
@@ -1097,6 +1114,14 @@ actor PeerServerSession {
                 var list = Termmesh_Peer_V1_WorkspaceList()
                 list.workspaces = workspaces
                 inner.workspaceList = list
+            }
+
+        case (.ready, .listTeams):
+            let teams = await provider.listTeams()
+            try await sendEnvelopeWithCorrelation(env.seq) { inner in
+                var list = Termmesh_Peer_V1_TeamList()
+                list.teams = teams
+                inner.teamList = list
             }
 
         case (.ready, .workspaceControl(let ctl)):
