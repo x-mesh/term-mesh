@@ -32,6 +32,7 @@ pub async fn serve(
     path: PathBuf,
     shutdown_rx: watch::Receiver<bool>,
     monitor_rx: watch::Receiver<Option<crate::monitor::SystemSnapshot>>,
+    teams: Arc<tokio::sync::Mutex<crate::headless::HeadlessManager>>,
 ) -> anyhow::Result<()> {
     let manager = Arc::new(PtyManager::new());
     manager.spawn_from_config();
@@ -51,6 +52,9 @@ pub async fn serve(
     // Only the daemon has a monitor; the test/embedder constructors below
     // leave the host without one and simply never push HostStats.
     host.set_monitor(monitor_rx);
+    // Only the daemon has agent teams; without this the host answers no
+    // ListTeams and never advertises team.roster.v1.
+    host.set_teams(teams);
     serve_with_host(path, shutdown_rx, host).await
 }
 

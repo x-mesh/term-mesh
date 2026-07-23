@@ -665,9 +665,10 @@ final class ReviewBoardCoordinatorService: ObservableObject {
     /// project roots; a saved-but-offline host would contribute an empty list
     /// that reads as "this machine has no projects" rather than "unknown".
     ///
-    /// Leaders are reported for THIS machine only. A peer's team state never
-    /// crosses the wire — the peer protocol carries panes and workspaces, not
-    /// teams — so claiming to know a remote host's leader would be a guess.
+    /// A peer's leaders come from its team roster (`team.roster.v1`), which
+    /// is the only thing that can answer it — a team is not visible in the
+    /// layout tree. Hosts that do not report one contribute no leaders rather
+    /// than a guess.
     static func hostObservations(
         from hosts: [HostEntry],
         localProjectRoots: [String] = [],
@@ -693,9 +694,19 @@ final class ReviewBoardCoordinatorService: ObservableObject {
                     }
                 }
             }
+            // A team's own project root counts as hosted even when no pane
+            // happens to sit in it right now — the leader is there either way,
+            // and the coordinator rejects a leader outside project_roots.
+            var leaderRoots: Set<String> = []
+            for team in host.teams {
+                guard let root = team.projectRootPath, !root.isEmpty else { continue }
+                roots.insert(root)
+                leaderRoots.insert(root)
+            }
             observations.append(CoordinatorHostObservation(
                 hostKey: host.id,
                 projectRoots: Array(roots),
+                leaderProjectRoots: Array(leaderRoots),
                 isLive: true
             ))
         }

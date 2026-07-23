@@ -66,6 +66,13 @@ pub mod capability {
     /// infer from an untyped byte stream.
     pub const GRID_SNAPSHOT_V1: &str = "grid.snapshot.v1";
 
+    /// The host answers `ListTeams` with the agent teams it is running.
+    /// A team is not visible in the layout tree — knowing which machine
+    /// holds a project's leader needs a team-level read, and this is it.
+    /// Advertised by the HOST, since only a host with a team manager can
+    /// answer; a client asks a host that did not advertise it nothing.
+    pub const TEAM_ROSTER_V1: &str = "team.roster.v1";
+
     /// Every capability this build supports. Single source of truth for
     /// populating outgoing `Hello.capabilities` — callers should use
     /// [`supported_vec`] rather than hand-rolling the list.
@@ -78,6 +85,7 @@ pub mod capability {
         SURFACE_TERMINATE_V1,
         HOST_STATS_V1,
         GRID_SNAPSHOT_V1,
+        TEAM_ROSTER_V1,
     ];
 
     /// `Hello.capabilities` value for an outgoing handshake message.

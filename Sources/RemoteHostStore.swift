@@ -29,6 +29,22 @@ struct WorkspaceSummary: Identifiable, Equatable {
     let panes: [RemotePaneSummary]
 }
 
+/// An agent team running on a peer host. A team is invisible in the layout
+/// tree — which pane leads which work is not a fact about how panes are
+/// arranged — so this arrives over its own RPC and is the only way to know
+/// where a project's leader sits on a machine that is not this one.
+struct RemoteTeamSummary: Identifiable, Equatable {
+    let name: String
+    let teamUUID: String
+    let workingDirectory: String
+    /// Repository root the host resolved for `workingDirectory`, empty when
+    /// the team was not created inside one.
+    let projectRootPath: String?
+    let agentNames: [String]
+
+    var id: String { teamUUID.isEmpty ? name : teamUUID }
+}
+
 struct RemotePaneSummary: Identifiable, Equatable {
     let id: Data
     let title: String
@@ -289,6 +305,9 @@ struct HostEntry: Identifiable {
     var displayName: String
     var connectionState: HostConnectionState
     var workspaces: [WorkspaceSummary]
+    /// Agent teams the host reported, empty on hosts predating
+    /// `team.roster.v1` or running none.
+    var teams: [RemoteTeamSummary] = []
     /// The most-recently-used ephemeral sock path. Updated on each reconnect so
     /// that fetchWorkspaces always connects over the current live tunnel.
     var activeSockPath: String
@@ -911,6 +930,24 @@ final class RemoteHostStore: ObservableObject {
                     await conn.cancel()
                     return
                 }
+                // Same connection, same round trip: a team roster is only
+                // meaningful next to the workspaces it leads, and opening a
+                // second connection to ask would race the first one's teardown.
+                // Hosts predating team.roster.v1 are never asked.
+                var teams: [RemoteTeamSummary] = []
+                if conn.hostCapabilities.has(PeerCapability.teamRosterV1) {
+                    if let reported = try? await conn.session.listTeams() {
+                        teams = reported.map { team in
+                            RemoteTeamSummary(
+                                name: team.name,
+                                teamUUID: team.teamUuid,
+                                workingDirectory: team.workingDirectory,
+                                projectRootPath: team.projectRoot.isEmpty ? nil : team.projectRoot,
+                                agentNames: team.agentNames
+                            )
+                        }
+                    }
+                }
                 await conn.cancel()
                 // Stale-path guard: a reconnect may have superseded this fetch with a
                 // newer ephemeral path. Drop the result if this task was cancelled or the
@@ -935,6 +972,7 @@ final class RemoteHostStore: ObservableObject {
                     )
                 }
                 self.hosts[key]?.workspaces = summaries
+                self.hosts[key]?.teams = teams
             } catch {
                 // Host disconnected between detection and fetch — ignore.
             }

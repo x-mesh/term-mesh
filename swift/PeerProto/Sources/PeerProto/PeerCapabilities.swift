@@ -42,6 +42,11 @@ public enum PeerCapability {
     /// wire-gap baseline. Mirrors `GRID_SNAPSHOT_V1` on the Rust side.
     public static let gridSnapshotV1 = "grid.snapshot.v1"
 
+    /// The host answers `ListTeams` with the agent teams it runs. Advertised
+    /// by the HOST — only a host with a team manager can answer, and a team
+    /// is not derivable from the layout tree.
+    public static let teamRosterV1 = "team.roster.v1"
+
     /// Every capability this build supports. Single source of truth for
     /// populating outgoing `Hello.capabilities` — don't hand-roll the list
     /// at each call site.

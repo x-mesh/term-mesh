@@ -365,6 +365,28 @@ public actor PeerSession {
         return list.workspaces
     }
 
+    /// The agent teams this host is running, when it advertised
+    /// `team.roster.v1`. A team is invisible in the layout tree — which pane
+    /// leads which work is not a fact about how panes are arranged — so this
+    /// is the only way to learn where a project's leader sits on a machine
+    /// that is not this one.
+    ///
+    /// Same single-reader contract as `listWorkspaces()`: it reads exactly
+    /// one reply frame, so never call it on a session whose receive loop is
+    /// already running.
+    public func listTeams() async throws -> [Termmesh_Peer_V1_Team] {
+        try beginDirectResponseRPC()
+        defer { directResponseRPCInFlight = false }
+        try await sendEnvelope { env in
+            env.listTeams = Termmesh_Peer_V1_ListTeams()
+        }
+        let reply = try await readFrame()
+        guard case .teamList(let list) = reply.payload else {
+            throw PeerSessionError.unexpectedMessage(String(describing: reply.payload))
+        }
+        return list.teams
+    }
+
     // MARK: - Workspace lifecycle (create / rename / delete)
 
     /// Ask the host to create a new, initially pane-less workspace and

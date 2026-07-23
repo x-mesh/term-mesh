@@ -70,6 +70,9 @@ message Envelope {
     TerminateSurfaceResponse terminate_surface_response = 46;
     // Host-pushed, gated behind capability "host.stats.v1" (Hello.capabilities).
     HostStats host_stats = 47;
+    // Gated behind capability "team.roster.v1" (Hello.capabilities).
+    ListTeams list_teams = 48;
+    TeamList team_list = 49;
 
     Ping ping = 50;
     Pong pong = 51;
@@ -789,6 +792,35 @@ message HostStats {
   uint64 net_tx_bytes_per_sec = 9;
   double load_5m = 10;
   double load_15m = 11;
+}
+
+// ============================================================
+// Team roster (capability "team.roster.v1")
+// ============================================================
+//
+// A project can span machines, and the first question anyone asks about
+// such a project is where its leader sits. Panes and workspaces alone
+// cannot answer it: a leader is a team-level fact, invisible in the
+// layout tree. This is a READ of that fact — no command crosses here.
+
+message ListTeams {}
+
+message TeamList {
+  repeated Team teams = 1;
+}
+
+message Team {
+  string name = 1;
+  // Stable across a leader restart; the on-disk metadata key.
+  string team_uuid = 2;
+  // Where the team was created — the directory its leader drives.
+  string working_directory = 3;
+  // Repository root containing `working_directory`, empty when it is not
+  // inside one. Clients group by project, and only the host can resolve
+  // this (same reasoning as WorkspacePane.project_root).
+  string project_root = 4;
+  repeated string agent_names = 5;
+  uint64 created_at_unix_secs = 6;
 }
 
 // ============================================================

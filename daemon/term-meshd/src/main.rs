@@ -330,7 +330,14 @@ async fn main() -> anyhow::Result<()> {
             .ok()
             .filter(|s| !s.is_empty())
             .map(std::path::PathBuf::from)
-            .map(|path| tokio::spawn(peer::serve(path, shutdown_rx.clone(), monitor_rx.clone())));
+            .map(|path| {
+                tokio::spawn(peer::serve(
+                    path,
+                    shutdown_rx.clone(),
+                    monitor_rx.clone(),
+                    headless_manager.clone(),
+                ))
+            });
     if peer_task.is_some() {
         tracing::info!("peer-federation server enabled");
     }

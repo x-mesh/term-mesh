@@ -167,10 +167,36 @@ final class ReviewBoardCoordinatorServiceTests: XCTestCase {
 
         let local = observations.first { $0.hostKey == CoordinatorHostObservation.localHostKey }
         XCTAssertEqual(local?.leaderProjectRoots, ["/Users/jinwoo/work/term-mesh"])
-        // A peer's team state never crosses the wire, so claiming to know its
-        // leader would be a guess.
+        // The peer reported no team roster, so it contributes no leader.
         let remote = observations.first { $0.hostKey == "ssh:root@jw-server" }
         XCTAssertEqual(remote?.leaderProjectRoots, [])
+    }
+
+    /// A peer that DOES report a team roster is the only way a leader on
+    /// another machine can ever be known.
+    @MainActor
+    func testPeerTeamRosterContributesRemoteLeaders() {
+        var peer = hostEntry(
+            id: "ssh:root@jw-server", state: .connected, paneRoots: ["/root/demo-project"]
+        )
+        peer.teams = [RemoteTeamSummary(
+            name: "live-team",
+            teamUUID: "uuid-1",
+            workingDirectory: "/root/other-project/sub",
+            projectRootPath: "/root/other-project",
+            agentNames: ["explorer"]
+        )]
+
+        let observations = ReviewBoardCoordinatorService.hostObservations(from: [peer])
+        let remote = observations.first { $0.hostKey == "ssh:root@jw-server" }
+
+        XCTAssertEqual(remote?.leaderProjectRoots, ["/root/other-project"])
+        // The team's project counts as hosted even though no pane sits in it,
+        // or the coordinator would reject the leader as unhosted.
+        XCTAssertEqual(
+            remote?.projectRoots.sorted(),
+            ["/root/demo-project", "/root/other-project"]
+        )
     }
 
     func testLeaderProjectsAreAlwaysASubsetOfHostedProjects() {

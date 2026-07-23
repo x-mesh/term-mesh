@@ -86,7 +86,7 @@ fn hex_prefix(id: &[u8]) -> String {
 /// one `exists()` per ancestor. The map is bounded and cleared wholesale
 /// when it fills, since a stale entry only outlives an actual `git init`
 /// (or a repo being deleted) under that exact path.
-fn project_root_for(cwd: &str) -> String {
+pub(super) fn project_root_for(cwd: &str) -> String {
     const MAX_CACHED: usize = 512;
     static CACHE: Mutex<Option<HashMap<String, String>>> = Mutex::new(None);
 
@@ -805,6 +805,11 @@ pub struct PeerHost {
     /// sees when talking to a daemon too old to have it. Set by
     /// `server::serve` right after construction, mirroring `persist_path`.
     monitor: Mutex<Option<watch::Receiver<Option<SystemSnapshot>>>>,
+    /// The daemon's agent-team manager, when one was wired in. `None` for
+    /// every host built without it (tests, embedders), which is exactly what
+    /// a client sees from a daemon too old to answer `ListTeams` — so the
+    /// capability is advertised only when this is set.
+    teams: Mutex<Option<Arc<tokio::sync::Mutex<crate::headless::HeadlessManager>>>>,
 }
 
 /// Debounce window for layout pushes. Mirrors the Swift host's 120 ms
@@ -915,6 +920,7 @@ impl PeerHost {
             workspace_persistence: Mutex::new(()),
             surface_lifecycle: Mutex::new(HashMap::new()),
             monitor: Mutex::new(None),
+            teams: Mutex::new(None),
         }
     }
 
@@ -952,6 +958,18 @@ impl PeerHost {
     /// gate already gives an older client.
     pub fn set_monitor(&self, monitor: watch::Receiver<Option<SystemSnapshot>>) {
         *self.monitor.lock().unwrap() = Some(monitor);
+    }
+
+    pub fn set_teams(&self, teams: Arc<tokio::sync::Mutex<crate::headless::HeadlessManager>>) {
+        *self.teams.lock().unwrap() = Some(teams);
+    }
+
+    /// The team manager, if one was wired in. Cloned out of the lock so the
+    /// caller can await on the manager's own mutex without holding this one.
+    pub fn team_manager(
+        &self,
+    ) -> Option<Arc<tokio::sync::Mutex<crate::headless::HeadlessManager>>> {
+        self.teams.lock().unwrap().clone()
     }
 
     /// A receiver for the live system stats, if a monitor was wired in.

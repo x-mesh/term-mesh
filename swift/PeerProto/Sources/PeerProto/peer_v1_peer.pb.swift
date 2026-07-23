@@ -621,6 +621,23 @@ public nonisolated struct Termmesh_Peer_V1_Envelope: Sendable {
     set {payload = .hostStats(newValue)}
   }
 
+  /// Gated behind capability "team.roster.v1" (Hello.capabilities).
+  public var listTeams: Termmesh_Peer_V1_ListTeams {
+    get {
+      if case .listTeams(let v)? = payload {return v}
+      return Termmesh_Peer_V1_ListTeams()
+    }
+    set {payload = .listTeams(newValue)}
+  }
+
+  public var teamList: Termmesh_Peer_V1_TeamList {
+    get {
+      if case .teamList(let v)? = payload {return v}
+      return Termmesh_Peer_V1_TeamList()
+    }
+    set {payload = .teamList(newValue)}
+  }
+
   public var ping: Termmesh_Peer_V1_Ping {
     get {
       if case .ping(let v)? = payload {return v}
@@ -693,6 +710,9 @@ public nonisolated struct Termmesh_Peer_V1_Envelope: Sendable {
     case terminateSurfaceResponse(Termmesh_Peer_V1_TerminateSurfaceResponse)
     /// Host-pushed, gated behind capability "host.stats.v1" (Hello.capabilities).
     case hostStats(Termmesh_Peer_V1_HostStats)
+    /// Gated behind capability "team.roster.v1" (Hello.capabilities).
+    case listTeams(Termmesh_Peer_V1_ListTeams)
+    case teamList(Termmesh_Peer_V1_TeamList)
     case ping(Termmesh_Peer_V1_Ping)
     case pong(Termmesh_Peer_V1_Pong)
     case goodbye(Termmesh_Peer_V1_Goodbye)
@@ -2060,6 +2080,55 @@ public nonisolated struct Termmesh_Peer_V1_HostStats: Sendable {
   public init() {}
 }
 
+public nonisolated struct Termmesh_Peer_V1_ListTeams: Sendable {
+  // SwiftProtobuf.Message conformance is added in an extension below. See the
+  // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
+  // methods supported on all messages.
+
+  public var unknownFields = SwiftProtobuf.UnknownStorage()
+
+  public init() {}
+}
+
+public nonisolated struct Termmesh_Peer_V1_TeamList: Sendable {
+  // SwiftProtobuf.Message conformance is added in an extension below. See the
+  // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
+  // methods supported on all messages.
+
+  public var teams: [Termmesh_Peer_V1_Team] = []
+
+  public var unknownFields = SwiftProtobuf.UnknownStorage()
+
+  public init() {}
+}
+
+public nonisolated struct Termmesh_Peer_V1_Team: Sendable {
+  // SwiftProtobuf.Message conformance is added in an extension below. See the
+  // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
+  // methods supported on all messages.
+
+  public var name: String = String()
+
+  /// Stable across a leader restart; the on-disk metadata key.
+  public var teamUuid: String = String()
+
+  /// Where the team was created — the directory its leader drives.
+  public var workingDirectory: String = String()
+
+  /// Repository root containing `working_directory`, empty when it is not
+  /// inside one. Clients group by project, and only the host can resolve
+  /// this (same reasoning as WorkspacePane.project_root).
+  public var projectRoot: String = String()
+
+  public var agentNames: [String] = []
+
+  public var createdAtUnixSecs: UInt64 = 0
+
+  public var unknownFields = SwiftProtobuf.UnknownStorage()
+
+  public init() {}
+}
+
 public nonisolated struct Termmesh_Peer_V1_Ping: Sendable {
   // SwiftProtobuf.Message conformance is added in an extension below. See the
   // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
@@ -2145,7 +2214,7 @@ nonisolated extension Termmesh_Peer_V1_TerminateSurfaceErrorCode: SwiftProtobuf.
 
 nonisolated extension Termmesh_Peer_V1_Envelope: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
   public static let protoMessageName: String = _protobuf_package + ".Envelope"
-  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{1}seq\0\u{3}correlation_id\0\u{2}\u{8}hello\0\u{3}auth_challenge\0\u{1}auth\0\u{3}auth_result\0\u{4}\u{7}list_surfaces\0\u{3}surface_list\0\u{3}attach_surface\0\u{3}attach_result\0\u{3}detach_surface\0\u{3}list_workspaces\0\u{3}workspace_list\0\u{3}workspace_control\0\u{3}create_workspace_request\0\u{3}create_workspace_response\0\u{3}pty_data\0\u{1}input\0\u{1}resize\0\u{3}grid_snapshot\0\u{3}data_ack\0\u{3}scrollback_request\0\u{3}scrollback_chunk\0\u{4}\u{4}workspace_update\0\u{3}rename_workspace_request\0\u{3}delete_workspace_request\0\u{3}ensure_surface_request\0\u{3}ensure_surface_response\0\u{3}terminate_surface_request\0\u{3}terminate_surface_response\0\u{3}host_stats\0\u{2}\u{3}ping\0\u{1}pong\0\u{2}\u{9}goodbye\0\u{2}'error\0")
+  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{1}seq\0\u{3}correlation_id\0\u{2}\u{8}hello\0\u{3}auth_challenge\0\u{1}auth\0\u{3}auth_result\0\u{4}\u{7}list_surfaces\0\u{3}surface_list\0\u{3}attach_surface\0\u{3}attach_result\0\u{3}detach_surface\0\u{3}list_workspaces\0\u{3}workspace_list\0\u{3}workspace_control\0\u{3}create_workspace_request\0\u{3}create_workspace_response\0\u{3}pty_data\0\u{1}input\0\u{1}resize\0\u{3}grid_snapshot\0\u{3}data_ack\0\u{3}scrollback_request\0\u{3}scrollback_chunk\0\u{4}\u{4}workspace_update\0\u{3}rename_workspace_request\0\u{3}delete_workspace_request\0\u{3}ensure_surface_request\0\u{3}ensure_surface_response\0\u{3}terminate_surface_request\0\u{3}terminate_surface_response\0\u{3}host_stats\0\u{3}list_teams\0\u{3}team_list\0\u{1}ping\0\u{1}pong\0\u{2}\u{9}goodbye\0\u{2}'error\0")
 
   public mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
     while let fieldNumber = try decoder.nextFieldNumber() {
@@ -2532,6 +2601,32 @@ nonisolated extension Termmesh_Peer_V1_Envelope: SwiftProtobuf.Message, SwiftPro
           self.payload = .hostStats(v)
         }
       }()
+      case 48: try {
+        var v: Termmesh_Peer_V1_ListTeams?
+        var hadOneofValue = false
+        if let current = self.payload {
+          hadOneofValue = true
+          if case .listTeams(let m) = current {v = m}
+        }
+        try decoder.decodeSingularMessageField(value: &v)
+        if let v = v {
+          if hadOneofValue {try decoder.handleConflictingOneOf()}
+          self.payload = .listTeams(v)
+        }
+      }()
+      case 49: try {
+        var v: Termmesh_Peer_V1_TeamList?
+        var hadOneofValue = false
+        if let current = self.payload {
+          hadOneofValue = true
+          if case .teamList(let m) = current {v = m}
+        }
+        try decoder.decodeSingularMessageField(value: &v)
+        if let v = v {
+          if hadOneofValue {try decoder.handleConflictingOneOf()}
+          self.payload = .teamList(v)
+        }
+      }()
       case 50: try {
         var v: Termmesh_Peer_V1_Ping?
         var hadOneofValue = false
@@ -2716,6 +2811,14 @@ nonisolated extension Termmesh_Peer_V1_Envelope: SwiftProtobuf.Message, SwiftPro
     case .hostStats?: try {
       guard case .hostStats(let v)? = self.payload else { preconditionFailure() }
       try visitor.visitSingularMessageField(value: v, fieldNumber: 47)
+    }()
+    case .listTeams?: try {
+      guard case .listTeams(let v)? = self.payload else { preconditionFailure() }
+      try visitor.visitSingularMessageField(value: v, fieldNumber: 48)
+    }()
+    case .teamList?: try {
+      guard case .teamList(let v)? = self.payload else { preconditionFailure() }
+      try visitor.visitSingularMessageField(value: v, fieldNumber: 49)
     }()
     case .ping?: try {
       guard case .ping(let v)? = self.payload else { preconditionFailure() }
@@ -5311,6 +5414,110 @@ nonisolated extension Termmesh_Peer_V1_HostStats: SwiftProtobuf.Message, SwiftPr
     if lhs.netTxBytesPerSec != rhs.netTxBytesPerSec {return false}
     if lhs.load5M != rhs.load5M {return false}
     if lhs.load15M != rhs.load15M {return false}
+    if lhs.unknownFields != rhs.unknownFields {return false}
+    return true
+  }
+}
+
+nonisolated extension Termmesh_Peer_V1_ListTeams: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
+  public static let protoMessageName: String = _protobuf_package + ".ListTeams"
+  public static let _protobuf_nameMap = SwiftProtobuf._NameMap()
+
+  public mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
+    // Load everything into unknown fields
+    while try decoder.nextFieldNumber() != nil {}
+  }
+
+  public func traverse<V: SwiftProtobuf.Visitor>(visitor: inout V) throws {
+    try unknownFields.traverse(visitor: &visitor)
+  }
+
+  public static func ==(lhs: Termmesh_Peer_V1_ListTeams, rhs: Termmesh_Peer_V1_ListTeams) -> Bool {
+    if lhs.unknownFields != rhs.unknownFields {return false}
+    return true
+  }
+}
+
+nonisolated extension Termmesh_Peer_V1_TeamList: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
+  public static let protoMessageName: String = _protobuf_package + ".TeamList"
+  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{1}teams\0")
+
+  public mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
+    while let fieldNumber = try decoder.nextFieldNumber() {
+      // The use of inline closures is to circumvent an issue where the compiler
+      // allocates stack space for every case branch when no optimizations are
+      // enabled. https://github.com/apple/swift-protobuf/issues/1034
+      switch fieldNumber {
+      case 1: try { try decoder.decodeRepeatedMessageField(value: &self.teams) }()
+      default: break
+      }
+    }
+  }
+
+  public func traverse<V: SwiftProtobuf.Visitor>(visitor: inout V) throws {
+    if !self.teams.isEmpty {
+      try visitor.visitRepeatedMessageField(value: self.teams, fieldNumber: 1)
+    }
+    try unknownFields.traverse(visitor: &visitor)
+  }
+
+  public static func ==(lhs: Termmesh_Peer_V1_TeamList, rhs: Termmesh_Peer_V1_TeamList) -> Bool {
+    if lhs.teams != rhs.teams {return false}
+    if lhs.unknownFields != rhs.unknownFields {return false}
+    return true
+  }
+}
+
+nonisolated extension Termmesh_Peer_V1_Team: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
+  public static let protoMessageName: String = _protobuf_package + ".Team"
+  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{1}name\0\u{3}team_uuid\0\u{3}working_directory\0\u{3}project_root\0\u{3}agent_names\0\u{3}created_at_unix_secs\0")
+
+  public mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
+    while let fieldNumber = try decoder.nextFieldNumber() {
+      // The use of inline closures is to circumvent an issue where the compiler
+      // allocates stack space for every case branch when no optimizations are
+      // enabled. https://github.com/apple/swift-protobuf/issues/1034
+      switch fieldNumber {
+      case 1: try { try decoder.decodeSingularStringField(value: &self.name) }()
+      case 2: try { try decoder.decodeSingularStringField(value: &self.teamUuid) }()
+      case 3: try { try decoder.decodeSingularStringField(value: &self.workingDirectory) }()
+      case 4: try { try decoder.decodeSingularStringField(value: &self.projectRoot) }()
+      case 5: try { try decoder.decodeRepeatedStringField(value: &self.agentNames) }()
+      case 6: try { try decoder.decodeSingularUInt64Field(value: &self.createdAtUnixSecs) }()
+      default: break
+      }
+    }
+  }
+
+  public func traverse<V: SwiftProtobuf.Visitor>(visitor: inout V) throws {
+    if !self.name.isEmpty {
+      try visitor.visitSingularStringField(value: self.name, fieldNumber: 1)
+    }
+    if !self.teamUuid.isEmpty {
+      try visitor.visitSingularStringField(value: self.teamUuid, fieldNumber: 2)
+    }
+    if !self.workingDirectory.isEmpty {
+      try visitor.visitSingularStringField(value: self.workingDirectory, fieldNumber: 3)
+    }
+    if !self.projectRoot.isEmpty {
+      try visitor.visitSingularStringField(value: self.projectRoot, fieldNumber: 4)
+    }
+    if !self.agentNames.isEmpty {
+      try visitor.visitRepeatedStringField(value: self.agentNames, fieldNumber: 5)
+    }
+    if self.createdAtUnixSecs != 0 {
+      try visitor.visitSingularUInt64Field(value: self.createdAtUnixSecs, fieldNumber: 6)
+    }
+    try unknownFields.traverse(visitor: &visitor)
+  }
+
+  public static func ==(lhs: Termmesh_Peer_V1_Team, rhs: Termmesh_Peer_V1_Team) -> Bool {
+    if lhs.name != rhs.name {return false}
+    if lhs.teamUuid != rhs.teamUuid {return false}
+    if lhs.workingDirectory != rhs.workingDirectory {return false}
+    if lhs.projectRoot != rhs.projectRoot {return false}
+    if lhs.agentNames != rhs.agentNames {return false}
+    if lhs.createdAtUnixSecs != rhs.createdAtUnixSecs {return false}
     if lhs.unknownFields != rhs.unknownFields {return false}
     return true
   }

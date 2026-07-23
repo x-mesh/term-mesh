@@ -21,7 +21,8 @@ use peer_proto::v1::{
     GridSnapshot, Hello, ScrollbackChunk,
     HostStats, Pong, PtyData, SurfaceList, TerminateSurfaceError as WireTerminateError,
     TerminateSurfaceErrorCode, TerminateSurfaceRequest, TerminateSurfaceResponse,
-    TerminateSurfaceResult, Workspace, WorkspaceList, WorkspaceMeta, WorkspaceUpdate,
+    Team, TeamList, TerminateSurfaceResult, Workspace, WorkspaceList, WorkspaceMeta,
+    WorkspaceUpdate,
 };
 use peer_proto::{capability, PeerCapabilities};
 use sha2::{Digest, Sha256};
@@ -168,7 +169,11 @@ async fn reader_loop(
                     peer_capabilities.has(capability::REPLAY_RING_V1)
                 );
 
-                send(&outgoing_tx, host_hello(&seq_counter)).await?;
+                send(
+                    &outgoing_tx,
+                    host_hello(&seq_counter, host.team_manager().is_some()),
+                )
+                .await?;
                 let challenge = Envelope {
                     seq: next_seq(&seq_counter),
                     correlation_id: 0,
@@ -269,6 +274,43 @@ async fn reader_loop(
                     terminate_worker.clone(),
                 )
                 .await?;
+            }
+
+            (HandshakeState::Ready, Payload::ListTeams(_)) => {
+                // A team is invisible in the layout tree — it is a fact about
+                // which pane leads which work, not about how panes are
+                // arranged — so a client that wants to know where a project's
+                // leader sits has no way to derive it from workspaces alone.
+                // This answers that and nothing else: no command crosses here.
+                let teams = match host.team_manager() {
+                    Some(manager) => {
+                        let guard = manager.lock().await;
+                        guard
+                            .list_teams()
+                            .into_iter()
+                            .map(|team| Team {
+                                name: team.name.clone(),
+                                team_uuid: team.team_uuid.clone(),
+                                working_directory: team.working_directory.clone(),
+                                project_root: super::layout::project_root_for(
+                                    &team.working_directory,
+                                ),
+                                agent_names: team.agents.clone(),
+                                created_at_unix_secs: team.created_at,
+                            })
+                            .collect()
+                    }
+                    // A host built without a team manager advertises no
+                    // team.roster.v1, so this is only reachable from a client
+                    // that asked anyway; an empty roster is the honest answer.
+                    None => Vec::new(),
+                };
+                let reply = Envelope {
+                    seq: next_seq(&seq_counter),
+                    correlation_id: env.seq,
+                    payload: Some(Payload::TeamList(TeamList { teams })),
+                };
+                send(&outgoing_tx, reply).await?;
             }
 
             (HandshakeState::Ready, Payload::ListWorkspaces(_)) => {
@@ -1019,7 +1061,7 @@ fn spawn_attach_relay(
     }
 }
 
-fn host_hello(seq_counter: &AtomicU64) -> Envelope {
+fn host_hello(seq_counter: &AtomicU64, has_teams: bool) -> Envelope {
     let display = std::env::var(HOST_DISPLAY_NAME_ENV)
         .or_else(|_| std::env::var("HOSTNAME"))
         .unwrap_or_else(|_| "term-mesh-host".into());
@@ -1031,7 +1073,13 @@ fn host_hello(seq_counter: &AtomicU64) -> Envelope {
             protocol_version: PROTOCOL_VERSION.into(),
             peer_id,
             display_name: display,
-            capabilities: capability::supported_vec(),
+            // Only a host that actually has a team manager can answer
+            // ListTeams; advertising it otherwise would invite a client to
+            // ask a question this process cannot answer.
+            capabilities: capability::supported_vec()
+                .into_iter()
+                .filter(|c| has_teams || c != capability::TEAM_ROSTER_V1)
+                .collect(),
             app_version: env!("CARGO_PKG_VERSION").into(),
         })),
     }
