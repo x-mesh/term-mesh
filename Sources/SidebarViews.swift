@@ -1312,11 +1312,21 @@ private struct SidebarPeerProjectsView: View {
 /// and select it.
 private struct SidebarProjectLocalRowView: View {
     @EnvironmentObject private var tabManager: TabManager
+    @ObservedObject private var orchestrator = TeamOrchestrator.shared
     @ObservedObject var workspace: Workspace
     let usesSeparatedPresentation: Bool
     @State private var isHovering = false
 
     private var isSelected: Bool { tabManager.selectedTabId == workspace.id }
+
+    /// The team whose leader pane lives in THIS workspace. In adopted mode the
+    /// leader sits in its own workspace, apart from the agents, so the leader
+    /// workspace takes precedence over the agent one.
+    private var ledTeamName: String? {
+        orchestrator.teams.values.first {
+            ($0.leaderWorkspaceId ?? $0.workspaceId) == workspace.id
+        }?.id
+    }
 
     private var directoryName: String? {
         let path = workspace.currentDirectory
@@ -1337,11 +1347,23 @@ private struct SidebarProjectLocalRowView: View {
                 .foregroundColor(isSelected ? .primary : .secondary)
                 .accessibilityLabel("Local workspace")
             VStack(alignment: .leading, spacing: 1) {
-                Text(workspace.title)
-                    .font(.system(size: 11.5))
-                    .foregroundColor(.primary)
-                    .lineLimit(1)
-                    .truncationMode(.tail)
+                HStack(spacing: 4) {
+                    Text(workspace.title)
+                        .font(.system(size: 11.5))
+                        .foregroundColor(.primary)
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+                    // Where the leader sits is the first thing you need when a
+                    // project spans machines. Only local teams can be answered
+                    // today — a peer-hosted leader has no reporting path yet.
+                    if let ledTeamName {
+                        Image(systemName: "star.fill")
+                            .font(.system(size: 7))
+                            .foregroundColor(.orange)
+                            .help("Team leader: \(ledTeamName)")
+                            .accessibilityLabel("Team leader for \(ledTeamName)")
+                    }
+                }
                 if let directoryName {
                     HStack(spacing: 4) {
                         Image(systemName: "folder")
