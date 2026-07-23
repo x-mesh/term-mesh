@@ -129,6 +129,21 @@ final class PeerWorkspaceMirrorTests: XCTestCase {
         XCTAssertEqual(identity.label, "daemon")
     }
 
+    /// The local axis feeds raw panel directories through the same entry
+    /// point, so both sides must agree on what counts as a project.
+    func test_projectIdentity_localPanelDirectoriesUseTheSameRules() {
+        let local = projectIdentity(forWorkingDirectories: [
+            "/Users/jinwoo/work/project/term-mesh",
+            "/Users/jinwoo/work/project/term-mesh/daemon",
+        ])
+        let peer = peerProjectIdentity(for: [remotePane(1, cwd: "/root/term-mesh")])
+
+        XCTAssertEqual(local.label, "term-mesh")
+        XCTAssertEqual(local.key, peer.key)
+        XCTAssertEqual(projectIdentity(forWorkingDirectories: ["/Users/jinwoo"]), .unknown)
+        XCTAssertEqual(projectIdentity(forWorkingDirectories: []), .unknown)
+    }
+
     func test_peerProjectIdentity_sameProjectAcrossHostsSharesKey() {
         // Local checkout and a peer checkout of one project must land in the
         // same group even though their absolute paths differ.

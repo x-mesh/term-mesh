@@ -1050,12 +1050,24 @@ struct SidebarRemoteHostsSection: View {
 }
 
 private struct SidebarPeerProjectGroup: Identifiable {
-    struct WorkspaceItem: Identifiable {
-        let host: HostEntry
-        let workspace: WorkspaceSummary
+    /// A project is a place work happens, not a place work is hosted, so the
+    /// same group holds workspaces from either side of the wire.
+    enum WorkspaceItem: Identifiable {
+        case local(Workspace)
+        case peer(host: HostEntry, workspace: WorkspaceSummary)
 
         var id: String {
-            "\(host.id):\(workspace.id.base64EncodedString())"
+            switch self {
+            case .local(let workspace):
+                return "local:\(workspace.id.uuidString)"
+            case .peer(let host, let workspace):
+                return "\(host.id):\(workspace.id.base64EncodedString())"
+            }
+        }
+
+        var isLocal: Bool {
+            if case .local = self { return true }
+            return false
         }
     }
 
@@ -1063,6 +1075,10 @@ private struct SidebarPeerProjectGroup: Identifiable {
     var items: [WorkspaceItem]
 
     var id: String { identity.id }
+
+    /// Which sides of the wire this project spans — drives the header badges.
+    var spansLocal: Bool { items.contains { $0.isLocal } }
+    var spansPeer: Bool { items.contains { !$0.isLocal } }
 }
 
 /// Project-axis rendering of the peer section. Deliberately shows NOTHING but
@@ -1070,6 +1086,7 @@ private struct SidebarPeerProjectGroup: Identifiable {
 /// and listing it here just reproduced the Host view one toggle away. Host
 /// lifecycle (connect, retry, edit, delete) lives in the Host view alone.
 private struct SidebarPeerProjectsView: View {
+    @EnvironmentObject private var tabManager: TabManager
     let hosts: [HostEntry]
     let store: RemoteHostStore
     let usesSeparatedPresentation: Bool
@@ -1079,6 +1096,31 @@ private struct SidebarPeerProjectsView: View {
 
     private var connectedHosts: [HostEntry] {
         hosts.filter { $0.isConnected && !$0.workspaces.isEmpty }
+    }
+
+    /// Local workspaces that actually take part in a project. A peer mirror
+    /// is excluded on purpose: it is a view onto someone else's workspace,
+    /// already represented by that peer's own row, and counting it here would
+    /// list one remote workspace twice. Matches the rule the Local Workspaces
+    /// section already applies (`SidebarPresentationSettings`).
+    private var localProjectMembers: [(Workspace, PeerProjectIdentity)] {
+        tabManager.tabs.compactMap { workspace in
+            guard !workspace.isPeerMirror else { return nil }
+            let identity = projectIdentity(
+                forWorkingDirectories: localWorkingDirectories(workspace)
+            )
+            // Unlike a peer workspace, a local one that names no project is
+            // simply left out — the Local Workspaces section above is still
+            // its home, so nothing becomes unreachable.
+            guard !identity.isUnknown else { return nil }
+            return (workspace, identity)
+        }
+    }
+
+    private func localWorkingDirectories(_ workspace: Workspace) -> [String] {
+        let panelPaths = workspace.panelDirectories.values.filter { !$0.isEmpty }
+        if !panelPaths.isEmpty { return Array(panelPaths) }
+        return workspace.currentDirectory.isEmpty ? [] : [workspace.currentDirectory]
     }
 
     /// Split the connected roster into named projects and the leftovers.
@@ -1094,10 +1136,25 @@ private struct SidebarPeerProjectsView: View {
         var indexes: [PeerProjectIdentity: Int] = [:]
         var groups: [SidebarPeerProjectGroup] = []
         var unassigned: [SidebarPeerProjectGroup.WorkspaceItem] = []
+
+        func append(_ item: SidebarPeerProjectGroup.WorkspaceItem, to identity: PeerProjectIdentity) {
+            if let index = indexes[identity] {
+                groups[index].items.append(item)
+            } else {
+                indexes[identity] = groups.count
+                groups.append(SidebarPeerProjectGroup(identity: identity, items: [item]))
+            }
+        }
+
+        // Local first so a project the user is working on locally leads its
+        // own group instead of trailing the peers that joined it.
+        for (workspace, identity) in localProjectMembers {
+            append(.local(workspace), to: identity)
+        }
         for host in connectedHosts {
             for workspace in host.workspaces {
                 let identity = peerProjectIdentity(for: workspace.panes)
-                let item = SidebarPeerProjectGroup.WorkspaceItem(
+                let item = SidebarPeerProjectGroup.WorkspaceItem.peer(
                     host: host,
                     workspace: workspace
                 )
@@ -1105,12 +1162,7 @@ private struct SidebarPeerProjectsView: View {
                     unassigned.append(item)
                     continue
                 }
-                if let index = indexes[identity] {
-                    groups[index].items.append(item)
-                } else {
-                    indexes[identity] = groups.count
-                    groups.append(SidebarPeerProjectGroup(identity: identity, items: [item]))
-                }
+                append(item, to: identity)
             }
         }
         let sorted = groups.sorted {
@@ -1119,16 +1171,44 @@ private struct SidebarPeerProjectsView: View {
         return (sorted, unassigned)
     }
 
+    @ViewBuilder
     private func workspaceRow(
         _ item: SidebarPeerProjectGroup.WorkspaceItem
     ) -> some View {
-        RemoteWorkspaceRowView(
-            workspace: item.workspace,
-            host: item.host,
-            store: store,
-            usesSeparatedPresentation: usesSeparatedPresentation,
-            paneExpansionCommand: paneExpansionCommand
-        )
+        switch item {
+        case .local(let workspace):
+            SidebarProjectLocalRowView(
+                workspace: workspace,
+                usesSeparatedPresentation: usesSeparatedPresentation
+            )
+        case .peer(let host, let workspace):
+            RemoteWorkspaceRowView(
+                workspace: workspace,
+                host: host,
+                store: store,
+                usesSeparatedPresentation: usesSeparatedPresentation,
+                paneExpansionCommand: paneExpansionCommand
+            )
+        }
+    }
+
+    /// `⌂` / `▣` badges telling, at a glance, whether a project lives here,
+    /// out there, or both — the question the Host axis used to answer by
+    /// nesting workspaces under a host.
+    @ViewBuilder
+    private func spanBadges(_ group: SidebarPeerProjectGroup) -> some View {
+        HStack(spacing: 3) {
+            if group.spansLocal {
+                Image(systemName: "house")
+                    .accessibilityLabel("Has local workspaces")
+            }
+            if group.spansPeer {
+                Image(systemName: "rectangle.inset.filled")
+                    .accessibilityLabel("Has peer workspaces")
+            }
+        }
+        .font(.system(size: 8))
+        .foregroundColor(Color.secondary.opacity(0.6))
     }
 
     var body: some View {
@@ -1159,16 +1239,20 @@ private struct SidebarPeerProjectsView: View {
 
             ForEach(grouped.projects) { group in
                 VStack(spacing: 4) {
-                    Text(group.identity.label)
-                        .font(.system(size: 9, weight: .semibold))
-                        .foregroundColor(Color.secondary.opacity(0.75))
-                        .lineLimit(1)
-                        .truncationMode(.tail)
-                        .padding(.leading, 16)
-                        .padding(.top, 4)
-                        .padding(.bottom, 1)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .accessibilityLabel("Project \(group.identity.label)")
+                    HStack(spacing: 5) {
+                        Text(group.identity.label)
+                            .font(.system(size: 9, weight: .semibold))
+                            .foregroundColor(Color.secondary.opacity(0.75))
+                            .lineLimit(1)
+                            .truncationMode(.tail)
+                            .accessibilityLabel("Project \(group.identity.label)")
+                        spanBadges(group)
+                        Spacer(minLength: 0)
+                    }
+                    .padding(.leading, 16)
+                    .padding(.trailing, 12)
+                    .padding(.top, 4)
+                    .padding(.bottom, 1)
                     ForEach(group.items) { item in
                         workspaceRow(item)
                     }
@@ -1217,6 +1301,73 @@ private struct SidebarPeerProjectsView: View {
                 }
             }
         }
+    }
+}
+
+/// A local workspace as it appears on the project axis. Deliberately NOT
+/// `TabItemView`: that row carries the local list's drag-reorder, multi-select
+/// and index bookkeeping, none of which mean anything under a project header
+/// (reordering across projects would be reordering across hosts). This row
+/// does the two things that do make sense here — show where it is working,
+/// and select it.
+private struct SidebarProjectLocalRowView: View {
+    @EnvironmentObject private var tabManager: TabManager
+    @ObservedObject var workspace: Workspace
+    let usesSeparatedPresentation: Bool
+    @State private var isHovering = false
+
+    private var isSelected: Bool { tabManager.selectedTabId == workspace.id }
+
+    private var directoryName: String? {
+        let path = workspace.currentDirectory
+        guard !path.isEmpty else { return nil }
+        let name = (path as NSString).lastPathComponent
+        return name.isEmpty ? nil : name
+    }
+
+    private var background: Color {
+        if isSelected { return Color.accentColor.opacity(0.22) }
+        return isHovering ? Color.secondary.opacity(0.12) : Color.clear
+    }
+
+    var body: some View {
+        HStack(spacing: 6) {
+            Image(systemName: "house")
+                .font(.system(size: 9))
+                .foregroundColor(isSelected ? .primary : .secondary)
+                .accessibilityLabel("Local workspace")
+            VStack(alignment: .leading, spacing: 1) {
+                Text(workspace.title)
+                    .font(.system(size: 11.5))
+                    .foregroundColor(.primary)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+                if let directoryName {
+                    HStack(spacing: 4) {
+                        Image(systemName: "folder")
+                            .font(.system(size: 8))
+                        Text(directoryName)
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                    }
+                    .font(.system(size: 9))
+                    .foregroundColor(Color.secondary.opacity(0.75))
+                }
+            }
+            Spacer(minLength: 4)
+        }
+        .padding(.horizontal, 8)
+        .padding(.vertical, 4)
+        .background(
+            RoundedRectangle(cornerRadius: 6).fill(background)
+        )
+        .padding(.horizontal, usesSeparatedPresentation ? 10 : 8)
+        .contentShape(Rectangle())
+        .onHover { isHovering = $0 }
+        .onTapGesture { tabManager.selectedTabId = workspace.id }
+        .help(workspace.currentDirectory)
+        .accessibilityElement(children: .combine)
+        .accessibilityAddTraits(isSelected ? [.isButton, .isSelected] : .isButton)
     }
 }
 

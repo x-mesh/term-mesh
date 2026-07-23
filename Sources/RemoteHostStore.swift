@@ -172,9 +172,15 @@ enum PeerSidebarGroupingSettings {
 }
 
 func peerProjectIdentity(for panes: [RemotePaneSummary]) -> PeerProjectIdentity {
-    let paths = panes.compactMap { pane in
-        pane.workingDirectoryPath.flatMap(peerNormalizeRemotePath)
-    }
+    projectIdentity(forWorkingDirectories: panes.compactMap(\.workingDirectoryPath))
+}
+
+/// Project identity for a set of working directories, whatever produced them
+/// — peer pane cwds off the wire, or a local workspace's panel directories.
+/// Both axes must agree on what counts as a project, or the same checkout
+/// would group differently depending on which side reported it.
+func projectIdentity(forWorkingDirectories rawPaths: [String]) -> PeerProjectIdentity {
+    let paths = rawPaths.compactMap(peerNormalizeRemotePath)
     guard !paths.isEmpty else { return .unknown }
 
     // Panes working in unrelated trees collapse the common ancestor up to a
