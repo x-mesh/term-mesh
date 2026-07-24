@@ -70,13 +70,24 @@ final class AutoReplyDetector {
     }
 
     private func pushLine(_ rawLine: String, at now: Date) {
-        let line = Self.stripAnsi(rawLine).trimmingCharactersAtEnd(in: .whitespaces)
+        // Leading whitespace is trimmed as well as trailing. Agent TUIs indent
+        // their output — Claude's puts the reply under a bullet — so the line
+        // arrives as `  STATUS: DONE`, and a prefix check against `STATUS:`
+        // missed every one of them. The header was reaching the detector and
+        // being dropped a character short.
+        let line = Self.stripAnsi(rawLine).trimmingCharacters(in: .whitespaces)
         if lineBuffer.count >= Self.bufferCap {
             lineBuffer.removeFirst()
         }
         lineBuffer.append(line)
         lastInputAt = now
-        if line.hasPrefix("STATUS:") {
+        // A STATUS line that still lists the choices is the instruction being
+        // echoed back, not an answer — the capsule prints
+        // `STATUS: DONE|BLOCKED|NEEDS_REVIEW` and agent panes redraw it.
+        // Trimming leading space (above) made those echoes look like real
+        // headers, so the alternation is what tells them apart: a reported
+        // status is one word.
+        if line.hasPrefix("STATUS:"), !line.contains("|") {
             statusSeenAt = now
             committed = false
         }
