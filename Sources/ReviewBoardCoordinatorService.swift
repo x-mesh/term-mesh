@@ -968,10 +968,16 @@ final class ReviewBoardCoordinatorService: ObservableObject {
         var merged = local
         merged.coordinatorOnline = snapshot.coordinatorOnline
         guard snapshot.coordinatorOnline else { return merged }
-        // Only what the local view could not already know: work placed on
-        // another machine, and the merge queue, which has no local equivalent.
-        let known = Set(local.tasks.map(\.rawID))
-        merged.tasks += snapshot.tasks.filter { !known.contains($0.rawID) }
+        // Both sides now key on the same id, so a task either side knows about
+        // is the same work rather than a second copy of it. Where both speak,
+        // their accounts are merged into one row; where only the coordinator
+        // does, the work is running on another machine and is added as is.
+        var byID: [String: ReviewBoardTask] = [:]
+        for task in snapshot.tasks { byID[task.rawID] = task }
+        merged.tasks = local.tasks.map { task in
+            byID.removeValue(forKey: task.rawID).map(task.merging(coordinator:)) ?? task
+        }
+        merged.tasks += byID.values
         merged.mergeQueue = snapshot.mergeQueue
         merged.memMeshAvailable = snapshot.memMeshAvailable
         merged.suspectHost = local.suspectHost || snapshot.suspectHost

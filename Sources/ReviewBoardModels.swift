@@ -262,6 +262,58 @@ struct ReviewBoardTask: Identifiable, Equatable, Sendable {
     }
 }
 
+extension ReviewBoardTask {
+    /// Phases only the coordinator can know about. The team task board tracks
+    /// execution — a task is assigned, running, blocked, done — and knows
+    /// nothing of fencing, review approval or the merge queue. When the
+    /// coordinator reports one of these it is saying something the team
+    /// vocabulary cannot express, so it wins.
+    ///
+    /// `placed` is deliberately not here: it is what the coordinator says
+    /// before the agent has it, and the team board is already further along by
+    /// the time anyone is looking.
+    static let coordinatorOnlyPhases: Set<String> = [
+        "suspect",
+        "quarantined",
+        "approved",
+        "rejected",
+        "queued_for_merge",
+        "merged",
+    ]
+
+    /// One row for one piece of work, now that both sides key on the same id.
+    ///
+    /// Neither side is simply right: agents move the task through execution,
+    /// the coordinator moves it through placement and merge. So the status
+    /// comes from whichever is speaking about a phase the other cannot see,
+    /// and the facts each holds alone are filled in rather than dropped.
+    func merging(coordinator other: ReviewBoardTask) -> ReviewBoardTask {
+        ReviewBoardTask(
+            id: rawID,
+            teamName: teamName == "Unknown team" ? other.teamName : teamName,
+            title: title.isEmpty ? other.title : title,
+            status: Self.coordinatorOnlyPhases.contains(other.status) ? other.status : status,
+            // Where it runs is the coordinator's to say; who holds it is the
+            // team's. Prefer the agent, because that is what a person looks for.
+            assignee: assignee ?? other.assignee,
+            priority: priority,
+            labels: labels,
+            dependsOn: dependsOn.isEmpty ? other.dependsOn : dependsOn,
+            blockedReason: blockedReason ?? other.blockedReason,
+            reviewSummary: reviewSummary ?? other.reviewSummary,
+            result: result ?? other.result,
+            resultPath: resultPath ?? other.resultPath,
+            worktreeBranch: worktreeBranch,
+            worktreeParent: worktreeParent,
+            worktreeFinishMode: worktreeFinishMode,
+            worktreeRemoved: worktreeRemoved,
+            isStale: isStale,
+            staleSeconds: staleSeconds,
+            updatedAt: [updatedAt, other.updatedAt].compactMap { $0 }.max()
+        )
+    }
+}
+
 /// The names a person recognises, keyed by the ids the coordinator uses.
 struct CoordinatorDisplayNames: Equatable, Sendable {
     var projects: [String: String]

@@ -226,3 +226,65 @@ final class ReviewBoardViewModelTests: XCTestCase {
         XCTAssertEqual(ReviewBoardSettings.loadWidth(defaults: defaults), ReviewBoardSettings.maximumWidth)
     }
 }
+
+final class ReviewBoardTaskMergeTests: XCTestCase {
+    private func team(status: String, blockedReason: String? = nil) -> ReviewBoardTask {
+        ReviewBoardTask(
+            id: "c259ab1f",
+            teamName: "x-backup",
+            title: "이 저장소를 요약",
+            status: status,
+            assignee: "executor",
+            blockedReason: blockedReason,
+            updatedAt: "2026-07-24T13:00:00Z"
+        )
+    }
+
+    private func coordinator(status: String, reason: String? = nil) -> ReviewBoardTask {
+        ReviewBoardTask(
+            id: "c259ab1f",
+            teamName: "Unknown team",
+            title: "이 저장소를 요약",
+            status: status,
+            assignee: "jw-server",
+            blockedReason: reason,
+            updatedAt: "2026-07-24T13:05:00Z"
+        )
+    }
+
+    /// Execution is the team's to describe. The coordinator saying `placed`
+    /// is what it knew before the agent had the work at all.
+    func testExecutionStatusComesFromTheTeam() {
+        let merged = team(status: "in_progress").merging(coordinator: coordinator(status: "placed"))
+        XCTAssertEqual(merged.status, "in_progress")
+    }
+
+    /// Review and merge are phases the team vocabulary cannot express, so
+    /// when the coordinator reports one it is saying something new.
+    func testMergePhaseComesFromTheCoordinator() {
+        for phase in ["queued_for_merge", "approved", "merged", "quarantined", "suspect"] {
+            let merged = team(status: "completed").merging(coordinator: coordinator(status: phase))
+            XCTAssertEqual(merged.status, phase, "\(phase) should win over a team status")
+        }
+    }
+
+    /// Facts either side holds alone are filled in, not dropped — the whole
+    /// point of one id was that the two accounts describe the same work.
+    func testEachSideFillsTheOthersGaps() {
+        let merged = team(status: "blocked")
+            .merging(coordinator: coordinator(status: "suspect", reason: "no team is running in x-backup"))
+
+        XCTAssertEqual(merged.blockedReason, "no team is running in x-backup")
+        XCTAssertEqual(merged.assignee, "executor", "the agent holding it beats the host it runs on")
+        XCTAssertEqual(merged.teamName, "x-backup")
+        XCTAssertEqual(merged.updatedAt, "2026-07-24T13:05:00Z", "the later of the two")
+    }
+
+    /// A reason the team already recorded is not overwritten by the
+    /// coordinator's.
+    func testTheTeamsOwnReasonWins() {
+        let merged = team(status: "blocked", blockedReason: "build failed")
+            .merging(coordinator: coordinator(status: "suspect", reason: "heartbeat stale"))
+        XCTAssertEqual(merged.blockedReason, "build failed")
+    }
+}
