@@ -157,7 +157,10 @@ final class ReviewBoardViewModelTests: XCTestCase {
         ))
 
         XCTAssertEqual(model.statusBadges(for: task), [.mergeFailed])
-        XCTAssertEqual(model.digest(for: task).mergeQueue, "No merge queue entry reported")
+        // No entry and no panel run means nothing to say about the queue, and
+        // nothing to say is now said by drawing no row rather than by a row
+        // that says nothing.
+        XCTAssertNil(model.digest(for: task).mergeQueue)
     }
 
     @MainActor
