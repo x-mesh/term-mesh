@@ -67,7 +67,8 @@ impl Reducer {
                 created_at_ms INTEGER NOT NULL,
                 updated_at_ms INTEGER NOT NULL,
                 current_attempt_id TEXT,
-                placement_json TEXT
+                placement_json TEXT,
+                last_reason TEXT
             );
             CREATE TABLE IF NOT EXISTS attempts(
                 attempt_id TEXT PRIMARY KEY,
@@ -139,6 +140,9 @@ impl Reducer {
             "ALTER TABLE hosts ADD COLUMN leader_projects_json TEXT NOT NULL DEFAULT '[]'",
             [],
         );
+        let _ = self
+            .conn
+            .execute("ALTER TABLE tasks ADD COLUMN last_reason TEXT", []);
         // `total_slots` had to become nullable so "capacity unknown" stops
         // reading as "capacity zero", and no `ALTER TABLE` can relax a NOT
         // NULL. Recreating is safe here in a way it would not be for a table
@@ -452,7 +456,7 @@ impl Reducer {
 
     fn all_tasks(&self) -> Result<Vec<Task>> {
         let mut stmt = self.conn.prepare(
-            "SELECT task_id,project_id,title,body,status,priority,depends_on_json,created_by,created_at_ms,updated_at_ms,current_attempt_id,placement_json
+            "SELECT task_id,project_id,title,body,status,priority,depends_on_json,created_by,created_at_ms,updated_at_ms,current_attempt_id,placement_json,last_reason
              FROM tasks ORDER BY priority DESC, created_at_ms",
         )?;
         let rows = stmt.query_map([], row_to_task)?;
@@ -644,12 +648,21 @@ impl Reducer {
         if !task.status.can_transition_to(&status) {
             bail!("invalid task transition {:?} -> {:?}", task.status, status);
         }
+        // Every one of these transitions is something going wrong, and each
+        // carries a reason the caller went to the trouble of writing. Keeping
+        // it only in the event means a client reading the task board sees a
+        // task stop dead with nothing to explain it — which is exactly how it
+        // read before: a status of `suspect` and eight rows of "not reported".
+        // A later reason replaces an earlier one; the current state is what a
+        // board asks about, and the history is in the journal either way.
         self.conn.execute(
-            "UPDATE tasks SET status=?1, updated_at_ms=?2 WHERE task_id=?3",
+            "UPDATE tasks SET status=?1, updated_at_ms=?2, last_reason=COALESCE(?4, last_reason)
+             WHERE task_id=?3",
             params![
                 status_string(&status)?,
                 event.ts_ms as i64,
-                task_id.as_str()
+                task_id.as_str(),
+                event.payload.get("reason").and_then(|v| v.as_str())
             ],
         )?;
         Ok(())
@@ -719,9 +732,16 @@ impl Reducer {
         if !task.status.can_transition_to(&TaskStatus::Rejected) {
             bail!("invalid task transition {:?} -> rejected", task.status);
         }
+        // A reviewer's reason is the most useful sentence on the whole board;
+        // it has to survive onto the task like every other stop reason.
         self.conn.execute(
-            "UPDATE tasks SET status='rejected', updated_at_ms=?1 WHERE task_id=?2",
-            params![event.ts_ms as i64, task_id.as_str()],
+            "UPDATE tasks SET status='rejected', updated_at_ms=?1,
+             last_reason=COALESCE(?3, last_reason) WHERE task_id=?2",
+            params![
+                event.ts_ms as i64,
+                task_id.as_str(),
+                event.payload.get("reason").and_then(|v| v.as_str())
+            ],
         )?;
         self.conn.execute(
             "UPDATE attempts SET status='rejected', updated_at_ms=?1 WHERE attempt_id=?2",
@@ -899,6 +919,7 @@ fn row_to_task(row: &rusqlite::Row<'_>) -> rusqlite::Result<Task> {
             .get::<_, Option<String>>(11)?
             .map(|v| serde_json::from_str(&v).map_err(to_sql_err))
             .transpose()?,
+        last_reason: row.get::<_, Option<String>>(12)?,
     })
 }
 

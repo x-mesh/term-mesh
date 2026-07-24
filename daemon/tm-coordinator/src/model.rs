@@ -240,6 +240,12 @@ pub struct Task {
     pub current_attempt_id: Option<AttemptId>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub placement: Option<Placement>,
+    /// Why the task last stopped — the reason given when it was suspected,
+    /// blocked, quarantined or rejected. Held on the task and not only in the
+    /// event that caused it, because a board reads the board: without this a
+    /// task simply stops, and the client has nothing to show but the status.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
