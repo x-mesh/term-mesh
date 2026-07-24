@@ -2167,8 +2167,10 @@ class TerminalController {
         guard let teamName = params["team_name"] as? String, !teamName.isEmpty else {
             return v2Error(id: id, code: "invalid_params", message: "Missing team_name")
         }
-        guard let agentsParam = params["agents"] as? [[String: Any]], !agentsParam.isEmpty else {
-            return v2Error(id: id, code: "invalid_params", message: "Missing or empty agents array")
+        // Empty means a team of its leader alone; missing means the caller
+        // forgot the parameter. Same distinction as the sync path above.
+        guard let agentsParam = params["agents"] as? [[String: Any]] else {
+            return v2Error(id: id, code: "invalid_params", message: "Missing agents array")
         }
         // Parse all params off-main
         let workingDirectory = params["working_directory"] as? String ?? FileManager.default.currentDirectoryPath
@@ -4375,8 +4377,12 @@ class TerminalController {
         guard let teamName = params["team_name"] as? String, !teamName.isEmpty else {
             return .err(code: "invalid_params", message: "Missing team_name", data: nil)
         }
-        guard let agentsParam = params["agents"] as? [[String: Any]], !agentsParam.isEmpty else {
-            return .err(code: "invalid_params", message: "Missing or empty agents array", data: nil)
+        // An empty array is a team of its leader alone — the normal opening
+        // state for someone entering a project, who then adds whoever the work
+        // turns out to need. A missing array is still an error: that is a
+        // caller who forgot the parameter, not one who meant none.
+        guard let agentsParam = params["agents"] as? [[String: Any]] else {
+            return .err(code: "invalid_params", message: "Missing agents array", data: nil)
         }
 
         let workingDirectory = params["working_directory"] as? String ?? FileManager.default.currentDirectoryPath

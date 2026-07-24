@@ -163,9 +163,23 @@ struct ReviewBoardPanelView: View {
                         .font(.system(size: 12, weight: .medium))
                         .lineLimit(2)
                     Spacer(minLength: 4)
-                    Text(task.status.replacingOccurrences(of: "_", with: " "))
-                        .font(.system(size: 10, weight: .medium))
-                        .foregroundColor(.secondary)
+                    // "working" beats the board's own word when the agent's
+                    // pane is printing: `assigned` is true but says nothing
+                    // about whether anything is happening.
+                    if viewModel.isWorking(task) {
+                        HStack(spacing: 3) {
+                            Circle()
+                                .fill(Color.green)
+                                .frame(width: 5, height: 5)
+                            Text("working")
+                        }
+                        .font(.system(size: 10, weight: .semibold))
+                        .foregroundColor(.green)
+                    } else {
+                        Text(task.status.replacingOccurrences(of: "_", with: " "))
+                            .font(.system(size: 10, weight: .medium))
+                            .foregroundColor(.secondary)
+                    }
                 }
                 HStack(spacing: 6) {
                     Text(task.teamName)
@@ -197,14 +211,52 @@ struct ReviewBoardPanelView: View {
         let digest = viewModel.digest(for: task)
         return VStack(alignment: .leading, spacing: 12) {
             statusPills(viewModel.statusBadges(for: task))
-            factSection("Attempt Lineage", systemImage: "point.3.connected.trianglepath.dotted", text: digest.attemptLineage)
-            factSection("Ahead/Behind", systemImage: "arrow.left.arrow.right", text: digest.aheadBehind)
-            factSection("Commit/Push", systemImage: "arrow.up.doc", text: digest.commitPush)
-            factSection("Platform Checks", systemImage: "macwindow", text: digest.platformChecks)
-            factSection("PR/Checks", systemImage: "checkmark.rectangle.stack", text: digest.pullRequestChecks)
-            factSection("Overlapping Files", systemImage: "square.stack.3d.down.forward", text: digest.overlappingFiles)
-            factSection("Rejection Reason", systemImage: "xmark.octagon", text: digest.rejectionReason)
-            factSection("Merge Queue", systemImage: "arrow.triangle.merge", text: digest.mergeQueue)
+            // Directly under the badges, because it is the answer to the
+            // question the badges raise. Buried among eight "not reported"
+            // rows it read as though nothing had happened at all.
+            if let reason = task.blockedReason, !reason.isEmpty {
+                HStack(alignment: .firstTextBaseline, spacing: 6) {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .font(.system(size: 10))
+                        .foregroundColor(.orange)
+                        .accessibilityHidden(true)
+                    Text(reason)
+                        .font(.system(size: 11, weight: .medium))
+                        .foregroundColor(.primary)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .textSelection(.enabled)
+                    Spacer(minLength: 0)
+                }
+                .padding(9)
+                .background(Color.orange.opacity(0.12))
+                .clipShape(RoundedRectangle(cornerRadius: 7))
+                .accessibilityLabel("Stopped because: \(reason)")
+                .accessibilityIdentifier("reviewBoard.task.reason")
+            }
+            // The instruction in full. The row above truncates it to a line,
+            // and for work delegated from a pane the instruction IS the task —
+            // there is no separate description to fall back on.
+            if !task.title.isEmpty {
+                Text(task.title)
+                    .font(.system(size: 11))
+                    .foregroundColor(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .textSelection(.enabled)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+
+            let facts = digest.presentFacts
+            if facts.isEmpty {
+                // Said once, plainly, instead of eight times in eight boxes.
+                Text("Nothing reported yet — the agent has not filed a result.")
+                    .font(.system(size: 11))
+                    .foregroundColor(Color.secondary.opacity(0.75))
+                    .fixedSize(horizontal: false, vertical: true)
+            } else {
+                ForEach(facts, id: \.title) { fact in
+                    factSection(fact.title, systemImage: fact.systemImage, text: fact.text)
+                }
+            }
         }
     }
 

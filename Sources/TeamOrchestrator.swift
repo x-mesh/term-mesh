@@ -340,7 +340,11 @@ final class TeamOrchestrator: ObservableObject {
     var daemon: any DaemonService = TermMeshDaemon.shared
 
     private(set) var messages: [String: [TeamMessage]] = [:]   // team_name → messages
-    private(set) var taskBoards: [String: [TeamTask]] = [:]    // team_name → tasks
+    /// Published because the board reads it. Without this a task could be
+    /// created, assigned, worked and finished while every view showing the
+    /// task board sat unchanged — the data was right and nothing was ever told
+    /// to look at it again.
+    @Published private(set) var taskBoards: [String: [TeamTask]] = [:]    // team_name → tasks
     /// Maximum messages retained per team. Oldest messages are pruned on insert.
     private let maxMessagesPerTeam = 500
     private var heartbeats: [String: [String: (at: Date, summary: String?)]] = [:]
@@ -785,7 +789,17 @@ final class TeamOrchestrator: ObservableObject {
         agentResumeSessionIds: [String: String]? = nil,
         tabManager: TabManager
     ) -> Team? {
-        guard !agents.isEmpty else { return nil }
+        // A team may start with no agents but its leader. That is the normal
+        // opening state when someone enters a project to work in it: they talk
+        // to the leader, and the leader adds whoever the work turns out to
+        // need. Requiring agents up front forced a guess about the work before
+        // anyone had described it — and left an idle pane burning context when
+        // the guess was wrong.
+        //
+        // Adopted mode is the exception: it contributes no pane of its own, so
+        // a team with neither a leader pane nor an agent would have nothing in
+        // it at all.
+        guard !agents.isEmpty || leaderMode != "adopted" else { return nil }
 
         // Pair = `/watch` entry point. When the GUI selects a pair CLI,
         // prepend a watcher-role agent at index 0 so the existing grid
@@ -860,8 +874,11 @@ final class TeamOrchestrator: ObservableObject {
             select: true
         )
         if executionMode == "headless" {
-            workspace.customTitle = "[\(name)] \(agents.count) headless"
-            workspace.title = "[\(name)] \(agents.count) headless"
+            // "0 headless" would be a strange thing to read on a tab; a team
+            // that is only its leader is described by its name alone.
+            let suffix = agents.isEmpty ? "" : " \(agents.count) headless"
+            workspace.customTitle = "[\(name)]\(suffix)"
+            workspace.title = "[\(name)]\(suffix)"
         } else {
             workspace.customTitle = "[\(name)]"
             workspace.title = "[\(name)]"
@@ -3782,9 +3799,21 @@ final class TeamOrchestrator: ObservableObject {
 
     private func daemonPayload() -> [String: Any] {
         let teamData = listTeams()
+        // Tasks live in TeamDataStore — that is where `tm-agent`, the socket
+        // handlers and the agents themselves write, and what `team.task.list`
+        // and `team.status` read back. This used to read the orchestrator's own
+        // `taskBoards`, which nothing on those paths writes, so every view fed
+        // by `fleetState` — the review board above all — showed an empty task
+        // list while work was being created, assigned and finished.
+        //
+        // `taskBoards` is still consulted for anything recorded through the
+        // orchestrator directly, and duplicates are dropped by id.
         let teamTasks = teamData.flatMap { team -> [[String: Any]] in
             guard let teamName = team["team_name"] as? String else { return [] }
-            return listTasks(teamName: teamName).map { task in
+            var seen = Set<String>()
+            let stored = TeamDataStore.shared.listTasks(teamName: teamName)
+            return (stored + listTasks(teamName: teamName)).compactMap { task in
+                guard seen.insert(task.id).inserted else { return nil }
                 var dict = taskDictionary(task)
                 dict["team_name"] = teamName
                 return dict
@@ -5835,7 +5864,18 @@ final class TeamOrchestrator: ObservableObject {
         if TeamDataStore.shared.isAgentParked(teamName: teamName, agentName: agentName) {
             return "parked"
         }
-        guard let task = activeTask(for: teamName, agentName: agentName) else { return "idle" }
+        // A pane that is printing is working, whatever the board says. A task
+        // stays `assigned` from hand-off until the agent files a result, so on
+        // the board alone an agent halfway through the work and an agent that
+        // never started are the same thing — and the board showed both as
+        // idle while the pane beside it scrolled.
+        let paneIsWorking = teams[teamName]?
+            .agents.first { $0.name == agentName }?
+            .panelId
+            .map { AutoReplyPoller.shared.isPaneActive(panelId: $0) } ?? false
+        guard let task = activeTask(for: teamName, agentName: agentName) else {
+            return paneIsWorking ? "running" : "idle"
+        }
         // Phase E Wave 1: an assigned/queued task that has gone stale past the
         // threshold surfaces as `assigned_stale` so the sidebar can render an
         // amber/⏳ indicator. Daemon may also push the same label via an
@@ -5852,7 +5892,7 @@ final class TeamOrchestrator: ObservableObject {
         case "failed":
             return "error"
         case "queued", "assigned":
-            return "idle"
+            return paneIsWorking ? "running" : "idle"
         case "parked":
             return "parked"
         default:

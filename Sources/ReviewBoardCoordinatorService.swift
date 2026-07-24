@@ -227,7 +227,7 @@ final class ReviewBoardCoordinatorClient: @unchecked Sendable {
         self.socketPath = socketPath
     }
 
-    func fetchSnapshot() async throws -> ReviewBoardSnapshot {
+    func fetchSnapshot(names: CoordinatorDisplayNames = .empty) async throws -> ReviewBoardSnapshot {
         async let statusResponse = request(method: "orchestration.status")
         async let taskResponse = request(method: "task.list")
         async let mergeQueueResponse = request(method: "merge.queue")
@@ -257,7 +257,9 @@ final class ReviewBoardCoordinatorClient: @unchecked Sendable {
         // Coordinator rows, read with the coordinator's vocabulary. Parsed
         // with the team board's they all failed the `id` guard and the board
         // showed nothing at all.
-        let reviewTasks = taskRows.compactMap(ReviewBoardTask.init(coordinatorDictionary:))
+        let reviewTasks = taskRows.compactMap {
+            ReviewBoardTask(coordinatorDictionary: $0, names: names)
+        }
         let panelRuns = (statusObject["panel_runs"] as? [[String: Any]] ?? [])
             .compactMap(ReviewBoardPanelRun.init(dictionary:))
         let memMeshAvailable = statusObject["mem_mesh_available"] as? Bool
@@ -297,6 +299,24 @@ final class ReviewBoardCoordinatorClient: @unchecked Sendable {
             roots[id] = root
         }
         return (rows, roots)
+    }
+
+    /// Project id to the name it was registered under.
+    func fetchProjectNames() async throws -> [String: String] {
+        let projects = (try await request(method: "project.list") as? [String: Any])?["projects"]
+            as? [[String: Any]] ?? []
+        var names: [String: String] = [:]
+        for project in projects {
+            guard let id = project["project_id"] as? String else { continue }
+            // A project always has a root even when it was registered without
+            // a name, and its folder is what the sidebar calls it.
+            let name = (project["name"] as? String).flatMap { $0.isEmpty ? nil : $0 }
+                ?? (project["root_path"] as? String).map {
+                    URL(fileURLWithPath: $0).lastPathComponent
+                }
+            names[id] = name ?? "Unknown project"
+        }
+        return names
     }
 
     /// Say a dispatch failed, in the coordinator's own vocabulary, so the
@@ -641,6 +661,7 @@ final class ReviewBoardCoordinatorService: ObservableObject {
     private var eventRefreshWorkItem: DispatchWorkItem?
     private var subscriptionStarted = false
     private var hostObservationCancellable: AnyCancellable?
+    private var hostObservationTicker: Timer?
     private var hostSyncTask: Task<Void, Never>?
     private var lastReportedObservations: [CoordinatorHostObservation] = []
 
@@ -675,6 +696,8 @@ final class ReviewBoardCoordinatorService: ObservableObject {
         eventRefreshWorkItem = nil
         hostObservationCancellable?.cancel()
         hostObservationCancellable = nil
+        hostObservationTicker?.invalidate()
+        hostObservationTicker = nil
         hostSyncTask?.cancel()
         hostSyncTask = nil
         lastReportedObservations = []
@@ -712,6 +735,24 @@ final class ReviewBoardCoordinatorService: ObservableObject {
             self?.syncHostObservations(store: store)
         }
         syncHostObservations(store: store)
+
+        // This machine's project roots come from pane working directories,
+        // which arrive from the shell a moment after launch — after the sync
+        // above has already run and found nothing, and through a tab manager
+        // that is per-window and so not in the merge. The app therefore stayed
+        // invisible to its own coordinator until something unrelated happened
+        // to churn one of the publishers above, and a delegation in that window
+        // failed with "no eligible host".
+        //
+        // A tick rather than more subscriptions: the report is deduped against
+        // the last one, so a quiet app pays for a comparison and nothing else,
+        // and it cannot be defeated by picking the wrong publisher.
+        hostObservationTicker?.invalidate()
+        let ticker = Timer(timeInterval: 2, repeats: true) { [weak self] _ in
+            Task { @MainActor in self?.syncHostObservations(store: store) }
+        }
+        RunLoop.main.add(ticker, forMode: .common)
+        hostObservationTicker = ticker
     }
 
     func syncHostObservations(store: RemoteHostStore = .shared) {
@@ -889,15 +930,29 @@ final class ReviewBoardCoordinatorService: ObservableObject {
         return observations
     }
 
+    /// What the panes are doing, plus whatever only the coordinator knows.
+    ///
+    /// This used to *replace* the local view with the coordinator's, so
+    /// turning the coordinator on made the board stop showing the work
+    /// happening in front of you — a leader delegating locally produced
+    /// nothing on the board at all. The teams are the subject; the coordinator
+    /// is a second source about the same subject, not a different one.
     func providerSnapshot() -> ReviewBoardSnapshot {
         let local = TeamDataStoreReviewBoardSnapshotProvider().snapshot()
         guard ReviewBoardCoordinatorSettings.isIntegrationEnabled() else { return local }
-        guard snapshot.coordinatorOnline else {
-            var offline = local
-            offline.coordinatorOnline = false
-            return offline
-        }
-        return snapshot
+        var merged = local
+        merged.coordinatorOnline = snapshot.coordinatorOnline
+        guard snapshot.coordinatorOnline else { return merged }
+        // Only what the local view could not already know: work placed on
+        // another machine, and the merge queue, which has no local equivalent.
+        let known = Set(local.tasks.map(\.rawID))
+        merged.tasks += snapshot.tasks.filter { !known.contains($0.rawID) }
+        merged.mergeQueue = snapshot.mergeQueue
+        merged.memMeshAvailable = snapshot.memMeshAvailable
+        merged.suspectHost = local.suspectHost || snapshot.suspectHost
+        merged.fencedZombie = local.fencedZombie || snapshot.fencedZombie
+        if merged.panelRuns.isEmpty { merged.panelRuns = snapshot.panelRuns }
+        return merged
     }
 
     /// A coordinator we just spawned needs a moment before it binds, and one
@@ -908,11 +963,16 @@ final class ReviewBoardCoordinatorService: ObservableObject {
 
     func refresh(attempt: Int = 0) {
         guard let client else { return }
+        // Resolved on the main actor before the read, because the host names
+        // come from the sidebar's own store.
+        let hostNames = hostsByCoordinatorID().mapValues(\.displayName)
         refreshTask?.cancel()
         refreshTask = Task.detached { [weak self, client] in
+            let projectNames = (try? await client.fetchProjectNames()) ?? [:]
+            let names = CoordinatorDisplayNames(projects: projectNames, hosts: hostNames)
             let next: ReviewBoardSnapshot
             do {
-                next = try await client.fetchSnapshot()
+                next = try await client.fetchSnapshot(names: names)
             } catch {
                 next = ReviewBoardSnapshot(
                     tasks: [],
@@ -1160,11 +1220,29 @@ final class CoordinatorPlacementDispatcher {
             }
             let project = projectIdentity(forWorkingDirectories: [root])
             let isLocal = placement.hostID == localHostID
-            guard let teamName = teamName(
+            var resolvedTeam = teamName(
                 forProject: project,
                 host: isLocal ? nil : hostsByCoordinatorID[placement.hostID]
-            ) else {
-                await report(placement, "no team is running in \(project.label)")
+            )
+            // No team yet, and the work is for this machine: make one. The
+            // point of this whole path is that a person can watch an agent
+            // work in a pane — reporting "no team is running" instead leaves
+            // them with a status string and nothing to look at, which is the
+            // opposite of what the terminal is for.
+            //
+            // Only locally. Creating a team spawns processes in a working
+            // directory, and the peer allow-list refuses that on purpose;
+            // a remote project without a team is told so, not worked around.
+            if resolvedTeam == nil, isLocal {
+                resolvedTeam = createTeam(forProject: project, root: root)
+            }
+            guard let teamName = resolvedTeam else {
+                await report(
+                    placement,
+                    isLocal
+                        ? "could not start a team in \(project.label)"
+                        : "no team is running in \(project.label) on that host — create one there first"
+                )
                 continue
             }
             if isLocal {
@@ -1186,6 +1264,53 @@ final class CoordinatorPlacementDispatcher {
             }
             await dispatchToPeer(placement, host: host, teamName: teamName, report: report)
         }
+    }
+
+    /// Start a team in the project so there is a pane to watch. One executor,
+    /// because the placement asks for one piece of work — more agents is a
+    /// choice for the person to make afterwards, not something delegation
+    /// should decide on their behalf.
+    private func createTeam(forProject project: PeerProjectIdentity, root: String) -> String? {
+        guard let tabManager = TerminalController.shared.tabManager else { return nil }
+        let name = teamNameCandidate(for: project)
+        let team = TeamOrchestrator.shared.createTeam(
+            name: name,
+            agents: [(
+                name: "executor",
+                cli: "claude",
+                model: "sonnet",
+                agentType: "executor",
+                color: "",
+                instructions: "",
+                customInstructions: ""
+            )],
+            workingDirectory: root,
+            leaderSessionId: UUID().uuidString,
+            tabManager: tabManager
+        )
+        if team != nil {
+            RemoteWorkLog.info("Started team \(name) in \(project.label) to run delegated work")
+        }
+        return team.map { _ in name }
+    }
+
+    /// Team names are an identifier elsewhere in the app, so keep it to what a
+    /// team name is allowed to be, and keep it recognisably the project's.
+    private func teamNameCandidate(for project: PeerProjectIdentity) -> String {
+        let allowed = CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "-_"))
+        let slug = String(
+            project.label.unicodeScalars.map { allowed.contains($0) ? Character($0) : "-" }
+        )
+        .lowercased()
+        .trimmingCharacters(in: CharacterSet(charactersIn: "-"))
+        let base = slug.isEmpty ? "project" : slug
+        let existing = Set(
+            TeamOrchestrator.shared.listTeams().compactMap { $0["team_name"] as? String }
+        )
+        guard existing.contains(base) else { return base }
+        var suffix = 2
+        while existing.contains("\(base)-\(suffix)") { suffix += 1 }
+        return "\(base)-\(suffix)"
     }
 
     /// The team a placement lands in. A placement names a host and an agent but

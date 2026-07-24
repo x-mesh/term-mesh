@@ -1,3 +1,4 @@
+import Combine
 import Foundation
 
 @MainActor
@@ -6,6 +7,8 @@ final class ReviewBoardViewModel: ObservableObject {
     @Published var selectedTaskID: String?
 
     private var snapshotProvider: @MainActor () -> ReviewBoardSnapshot
+    private var teamCancellable: AnyCancellable?
+    private var activityTicker: Timer?
 
     init(
         initialSnapshot: ReviewBoardSnapshot = .empty,
@@ -22,6 +25,66 @@ final class ReviewBoardViewModel: ObservableObject {
         } else {
             keepSelectionValid()
         }
+        observeTeams()
+    }
+
+    /// The board reads the teams, so it listens to the teams. It used to be
+    /// refreshed only by the coordinator's event stream and by appearing on
+    /// screen, which meant that with the coordinator off — its normal state —
+    /// the board was a single snapshot taken at launch, when nothing had
+    /// happened yet. Work would run to completion in a pane beside a board
+    /// that still said there was none.
+    private func observeTeams() {
+        // Both stores, because the board reads both: teams and agents live in
+        // the orchestrator, tasks in the data store, and a change to either is
+        // a change to what the board shows.
+        teamCancellable = Publishers.Merge(
+            TeamOrchestrator.shared.objectWillChange.map { _ in () },
+            TeamDataStore.shared.$taskRevision.map { _ in () }
+        )
+        // Team state churns in bursts (add agent → panes → task assigned), and
+        // objectWillChange fires before the change lands, so settle then read.
+        .debounce(for: .milliseconds(400), scheduler: DispatchQueue.main)
+        .sink { [weak self] _ in
+            self?.refresh()
+        }
+
+        // Whether an agent is printing changes without either store changing,
+        // so nothing above fires while work is under way — the very moment the
+        // board most needs to be moving. A short tick covers it; the refresh
+        // is a read of state already in memory.
+        activityTicker?.invalidate()
+        let ticker = Timer(timeInterval: 2, repeats: true) { [weak self] _ in
+            Task { @MainActor in self?.refreshWhileWorkIsRunning() }
+        }
+        RunLoop.main.add(ticker, forMode: .common)
+        activityTicker = ticker
+    }
+
+    /// Idle boards cost nothing: with no tasks there is nothing to animate.
+    private func refreshWhileWorkIsRunning() {
+        guard !snapshot.tasks.isEmpty else { return }
+        refresh()
+    }
+
+    /// Agent names that are printing right now, by the task they hold. The
+    /// board's own status comes from the task board, which cannot tell work in
+    /// progress from work not yet begun; this is what closes that gap.
+    var workingAssignees: Set<String> {
+        var working: Set<String> = []
+        for team in TeamOrchestrator.shared.listTeams() {
+            for agent in team["agents"] as? [[String: Any]] ?? [] {
+                guard (agent["agent_state"] as? String) == "running",
+                      let name = agent["name"] as? String else { continue }
+                working.insert(name)
+            }
+        }
+        return working
+    }
+
+    func isWorking(_ task: ReviewBoardTask) -> Bool {
+        guard let assignee = task.assignee else { return false }
+        return workingAssignees.contains(assignee)
     }
 
     var tasks: [ReviewBoardTask] {

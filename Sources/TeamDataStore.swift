@@ -43,6 +43,20 @@ final class TeamDataStore: ObservableObject, @unchecked Sendable {
     /// map under the assumption it changes on the main thread.
     @Published var agentUsage: [String: [String: AgentUsageSnapshot]] = [:]
 
+    /// Bumped whenever a team's task board changes. The board views read the
+    /// tasks through `listTasks`, which is lock-guarded and therefore cannot
+    /// be `@Published` itself; this is the change signal they subscribe to.
+    /// Without it a task could be created, assigned and finished while every
+    /// view of the task board sat exactly as it was at launch.
+    @Published private(set) var taskRevision: Int = 0
+
+    /// Safe to call with the store's lock held: the bump is dispatched.
+    func noteTasksChanged() {
+        DispatchQueue.main.async { [weak self] in
+            self?.taskRevision &+= 1
+        }
+    }
+
     // Team registry: name → agent names (synced from TeamOrchestrator on create/destroy)
     private var teamRegistry: [String: [String]] = [:]
 
@@ -304,6 +318,7 @@ final class TeamDataStore: ObservableObject, @unchecked Sendable {
 
         lock.lock()
         taskBoards[teamName] = restored
+        noteTasksChanged()
         if !context.isEmpty {
             contextStore[teamName] = context
         }
@@ -531,12 +546,14 @@ final class TeamDataStore: ObservableObject, @unchecked Sendable {
             lastProgressAt: nil
         )
         taskBoards[teamName, default: []].append(task)
+        noteTasksChanged()
         if let parentTaskId,
            var tasks = taskBoards[teamName],
            let parentIdx = tasks.firstIndex(where: { $0.id == parentTaskId }) {
             tasks[parentIdx].childTaskIds.append(task.id)
             tasks[parentIdx].updatedAt = now
             taskBoards[teamName] = tasks
+            noteTasksChanged()
         }
         notifyChanged()
         return task
@@ -642,6 +659,7 @@ final class TeamDataStore: ObservableObject, @unchecked Sendable {
         }
         tasks[idx].updatedAt = now
         taskBoards[teamName] = tasks
+        noteTasksChanged()
         notifyChanged()
         return tasks[idx]
     }
@@ -671,6 +689,7 @@ final class TeamDataStore: ObservableObject, @unchecked Sendable {
             tasks[idx].reassignmentCount += 1
         }
         taskBoards[teamName] = tasks
+        noteTasksChanged()
         notifyChanged()
         return tasks[idx]
     }
@@ -719,6 +738,7 @@ final class TeamDataStore: ObservableObject, @unchecked Sendable {
         tasks[idx].updatedAt = now
         tasks[idx].lastProgressAt = now
         taskBoards[teamName] = tasks
+        noteTasksChanged()
         notifyChanged()
         return tasks[idx]
     }
@@ -741,6 +761,7 @@ final class TeamDataStore: ObservableObject, @unchecked Sendable {
         tasks[idx].updatedAt = now
         tasks[idx].lastProgressAt = now
         taskBoards[teamName] = tasks
+        noteTasksChanged()
         notifyChanged()
         return tasks[idx]
     }
@@ -828,6 +849,7 @@ final class TeamDataStore: ObservableObject, @unchecked Sendable {
            let idx = tasks.firstIndex(where: { $0.assignee == agentName && nonTerminalStatuses.contains($0.status) }) {
             tasks[idx].lastProgressAt = now
             taskBoards[teamName] = tasks
+            noteTasksChanged()
         }
         lock.unlock()
         notifyChanged()

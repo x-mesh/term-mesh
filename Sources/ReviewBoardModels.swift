@@ -227,25 +227,47 @@ struct ReviewBoardTask: Identifiable, Equatable, Sendable {
     /// Two producers get two parsers rather than one that guesses: a single
     /// init reading `id ?? task_id` would keep working while quietly filling
     /// unrelated fields from the wrong schema.
-    init?(coordinatorDictionary dictionary: [String: Any]) {
+    /// `names` turns the coordinator's identifiers into the words a person
+    /// uses — a project id into the project's name, a host id into the machine
+    /// it stands for. Showing the raw ones is worse than terse: a project id is
+    /// long enough that the scrubber replaces it with `<token>`, so the row
+    /// read `<token> · hst_529b6dae74912ffc` and named nothing at all.
+    init?(
+        coordinatorDictionary dictionary: [String: Any],
+        names: CoordinatorDisplayNames = .empty
+    ) {
         guard let taskID = dictionary["task_id"] as? String,
               let title = dictionary["title"] as? String else {
             return nil
         }
+        let projectID = dictionary["project_id"] as? String
+        let hostID = (dictionary["placement"] as? [String: Any])?["host_id"] as? String
         // Coordinator statuses are kept verbatim. Folding `queued_for_merge`
         // into `queued` would read fine and lose the one distinction the
         // merge queue exists to show.
         self.init(
             id: taskID,
-            teamName: dictionary["project_id"] as? String ?? "Unknown project",
+            teamName: projectID.flatMap { names.projects[$0] } ?? "Unknown project",
             title: title,
             status: dictionary["status"] as? String ?? "pending",
-            assignee: (dictionary["placement"] as? [String: Any])?["host_id"] as? String,
+            assignee: hostID.flatMap { names.hosts[$0] },
             priority: (dictionary["priority"] as? Int) ?? 0,
             dependsOn: dictionary["depends_on"] as? [String] ?? [],
+            // Why the task stopped. Without it the board showed a task go
+            // `suspect` and then eight rows of "not reported" — every one of
+            // which was true, and none of which was the answer.
+            blockedReason: dictionary["last_reason"] as? String,
             updatedAt: (dictionary["updated_at_ms"] as? UInt64).map(ReviewBoardText.timestamp(fromUnixMilliseconds:))
         )
     }
+}
+
+/// The names a person recognises, keyed by the ids the coordinator uses.
+struct CoordinatorDisplayNames: Equatable, Sendable {
+    var projects: [String: String]
+    var hosts: [String: String]
+
+    static let empty = CoordinatorDisplayNames(projects: [:], hosts: [:])
 }
 
 /// One row of the coordinator's merge queue. The board used to describe merge
@@ -315,15 +337,37 @@ struct ReviewBoardPanelRun: Identifiable, Equatable, Sendable {
     }
 }
 
+/// What is actually known about a task. Every field is optional because most
+/// of them are unknown for most of a task's life, and a row reading "not
+/// reported" is worse than no row: eight of them in a column buried the one
+/// line that had something to say, and made a task that was running look like
+/// a task that had gone nowhere.
 struct ReviewBoardTaskDigest: Equatable, Sendable {
-    let attemptLineage: String
-    let aheadBehind: String
-    let commitPush: String
-    let platformChecks: String
-    let pullRequestChecks: String
-    let overlappingFiles: String
-    let rejectionReason: String
-    let mergeQueue: String
+    let attemptLineage: String?
+    let aheadBehind: String?
+    let commitPush: String?
+    let platformChecks: String?
+    let pullRequestChecks: String?
+    let overlappingFiles: String?
+    let rejectionReason: String?
+    let mergeQueue: String?
+
+    /// In display order, skipping everything nothing is known about.
+    var presentFacts: [(title: String, systemImage: String, text: String)] {
+        [
+            ("Merge Queue", "arrow.triangle.merge", mergeQueue),
+            ("Rejection Reason", "xmark.octagon", rejectionReason),
+            ("Commit/Push", "arrow.up.doc", commitPush),
+            ("Ahead/Behind", "arrow.left.arrow.right", aheadBehind),
+            ("PR/Checks", "checkmark.rectangle.stack", pullRequestChecks),
+            ("Platform Checks", "macwindow", platformChecks),
+            ("Overlapping Files", "square.stack.3d.down.forward", overlappingFiles),
+            ("Attempt Lineage", "point.3.connected.trianglepath.dotted", attemptLineage),
+        ].compactMap { title, image, text in
+            guard let text, !text.isEmpty else { return nil }
+            return (title, image, text)
+        }
+    }
 
     static func make(
         for task: ReviewBoardTask,
@@ -338,20 +382,16 @@ struct ReviewBoardTaskDigest: Equatable, Sendable {
 
         return ReviewBoardTaskDigest(
             attemptLineage: task.dependsOn.isEmpty
-                ? "No predecessor task reported"
+                ? nil
                 : "Depends on \(task.dependsOn.joined(separator: ", "))",
-            aheadBehind: firstLine(containingAny: ["ahead", "behind"], in: haystack) ?? "Ahead/behind not reported",
+            aheadBehind: firstLine(containingAny: ["ahead", "behind"], in: haystack),
             commitPush: firstLine(containingAny: ["commit", "push"], in: haystack)
                 ?? fallbackCommitPush(task),
-            platformChecks: firstLine(containingAny: ["xcodebuild", "test", "platform", "macos"], in: haystack)
-                ?? "Platform checks not reported",
-            pullRequestChecks: firstLine(containingAny: ["pr", "check", "ci"], in: haystack)
-                ?? "PR/check state not reported",
-            overlappingFiles: firstLine(containingAny: ["overlap", "conflict"], in: haystack)
-                ?? "No overlapping files reported",
+            platformChecks: firstLine(containingAny: ["xcodebuild", "test", "platform", "macos"], in: haystack),
+            pullRequestChecks: firstLine(containingAny: ["pr", "check", "ci"], in: haystack),
+            overlappingFiles: firstLine(containingAny: ["overlap", "conflict"], in: haystack),
             rejectionReason: task.blockedReason
-                ?? firstLine(containingAny: ["reject", "rejected", "blocked"], in: haystack)
-                ?? "No rejection reason reported",
+                ?? firstLine(containingAny: ["reject", "rejected", "blocked"], in: haystack),
             // The coordinator's own record when it has one. What stood here
             // before was a panel run — a review panel, not a merge — with a
             // last resort of "the word merge appears in this task's text",
@@ -360,13 +400,12 @@ struct ReviewBoardTaskDigest: Equatable, Sendable {
             // failing. Panel runs stay as a fallback because a board fed by
             // the local team store has no queue to read.
             mergeQueue: mergeQueueItem.map(\.summary)
-                ?? activeRun.map { "No queue entry · panel run: \($0.title) (\($0.phase))" }
-                ?? lastRun.map { "No queue entry · last panel run: \($0.title) (\($0.phase))" }
-                ?? "No merge queue entry reported"
+                ?? activeRun.map { "Panel run: \($0.title) (\($0.phase))" }
+                ?? lastRun.map { "Last panel run: \($0.title) (\($0.phase))" }
         )
     }
 
-    private static func fallbackCommitPush(_ task: ReviewBoardTask) -> String {
+    private static func fallbackCommitPush(_ task: ReviewBoardTask) -> String? {
         var parts: [String] = []
         if let branch = task.worktreeBranch {
             parts.append("branch \(branch)")
@@ -380,7 +419,7 @@ struct ReviewBoardTaskDigest: Equatable, Sendable {
         if let resultPath = task.resultPath {
             parts.append("report \(resultPath)")
         }
-        return parts.isEmpty ? "Commit/push not reported" : parts.joined(separator: ", ")
+        return parts.isEmpty ? nil : parts.joined(separator: ", ")
     }
 
     private static func firstLine(containingAny needles: [String], in text: String) -> String? {

@@ -50,6 +50,25 @@ final class AutoReplyPoller {
         var lastScrollbackText: String = ""
         var lastFiredHash: UInt64?
         weak var panel: TerminalPanel?
+        /// When this pane last printed anything.
+        var lastOutputAt: Date?
+    }
+
+    /// How recently a pane must have printed to count as working. The poll runs
+    /// every 500ms and an agent thinking between tool calls goes quiet for a
+    /// few seconds at a time, so this is deliberately longer than one tick.
+    static let activityWindow: TimeInterval = 6
+
+    /// Whether this pane has printed recently enough to call it busy.
+    ///
+    /// The task board cannot answer this: a task sits at `assigned` from the
+    /// moment it is handed over until the agent files a result, so an agent
+    /// halfway through the work and an agent that never started look exactly
+    /// alike there. The pane is the one place the difference is visible, and
+    /// this poller is already reading it every half second.
+    func isPaneActive(panelId: UUID, now: Date = Date()) -> Bool {
+        guard let last = perPanel[panelId]?.lastOutputAt else { return false }
+        return now.timeIntervalSince(last) <= Self.activityWindow
     }
 
     private init() {
@@ -272,7 +291,17 @@ final class AutoReplyPoller {
             // FIX 2: keep only the tail so per-panel state stays bounded.
             // trimToTailBytes operates in UTF-8 byte space (not character count)
             // so the cap is a true byte bound, not a potentially-larger char bound.
-            state.lastScrollbackText = Self.trimToTailBytes(snap, byteLimit: Self.lastScrollbackCapBytes)
+            let trimmed = Self.trimToTailBytes(snap, byteLimit: Self.lastScrollbackCapBytes)
+            // Any change on screen means the agent is doing something, and the
+            // screen changing is not the same as text being appended: `delta`
+            // carries only what was added at the end, which a CLI that redraws
+            // in place — every agent TUI — leaves empty while its display moves
+            // constantly. Comparing the whole snapshot is what actually tracks
+            // whether a pane is alive.
+            if trimmed != state.lastScrollbackText {
+                state.lastOutputAt = now
+            }
+            state.lastScrollbackText = trimmed
         }
         if !delta.isEmpty, let data = delta.data(using: .utf8) {
             if let ev = state.detector.pushBytes(data, at: now) {
