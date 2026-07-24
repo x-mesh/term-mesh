@@ -864,3 +864,149 @@ struct CoordinatorReviewBoardSnapshotProvider {
         ReviewBoardCoordinatorService.shared.providerSnapshot()
     }
 }
+
+/// One placement the coordinator decided and nobody has carried out yet.
+struct CoordinatorPlacement: Equatable {
+    let taskID: String
+    let attemptID: String
+    let hostID: String
+    let agentName: String?
+    let title: String
+    let body: String
+
+    /// A coordinator task row is a placement worth acting on only once it has
+    /// been placed AND has an attempt to act under. An attempt id is what
+    /// makes a dispatch identifiable, so without one there is nothing to
+    /// avoid doing twice.
+    init?(taskRow: [String: Any]) {
+        guard let taskID = taskRow["task_id"] as? String,
+              taskRow["status"] as? String == "placed",
+              let attemptID = taskRow["current_attempt_id"] as? String,
+              let placement = taskRow["placement"] as? [String: Any],
+              let hostID = placement["host_id"] as? String else {
+            return nil
+        }
+        self.taskID = taskID
+        self.attemptID = attemptID
+        self.hostID = hostID
+        self.agentName = (placement["pane_ref"] as? [String: Any])?["agent_name"] as? String
+        self.title = taskRow["title"] as? String ?? ""
+        self.body = taskRow["body"] as? String ?? ""
+    }
+}
+
+/// Carries the coordinator's placement decisions out to real panes.
+///
+/// The coordinator does not do this itself because it cannot: its whole
+/// dependency list is sqlite, serde and tokio — it is a unix-socket *server*
+/// that never dials anything. The app already holds every peer connection and
+/// the local team dispatcher, so putting the actuator anywhere else would mean
+/// building a second peer client next to the one that already exists.
+///
+/// Reconciliation is level-triggered on purpose. Acting on the event stream
+/// alone would mean a dropped frame or a reconnect silently loses a placement
+/// forever; instead every wake-up re-reads what is placed and acts on whatever
+/// has not been acted on yet.
+@MainActor
+final class CoordinatorPlacementDispatcher {
+    static let shared = CoordinatorPlacementDispatcher()
+
+    /// Attempt ids already carried out, or being carried out right now. An
+    /// attempt is the unit because the coordinator mints a fresh one per
+    /// placement — a reassigned task is a new attempt and must dispatch again.
+    private var handledAttempts: Set<String> = []
+
+    /// The one thing here the product decides rather than the plumbing: what a
+    /// placement actually asks for. Everything above and below this line —
+    /// resolving the host, not repeating a dispatch, reporting a failure — is
+    /// the same whatever the answer turns out to be.
+    static func instruction(for placement: CoordinatorPlacement) -> String {
+        placement.body.isEmpty
+            ? placement.title
+            : "\(placement.title)\n\n\(placement.body)"
+    }
+
+    func reconcile(
+        taskRows: [[String: Any]],
+        hostsByCoordinatorID: [String: HostEntry],
+        localHostID: String,
+        report: @escaping (CoordinatorPlacement, String) async -> Void
+    ) async {
+        for placement in taskRows.compactMap(CoordinatorPlacement.init(taskRow:)) {
+            guard !handledAttempts.contains(placement.attemptID) else { continue }
+            handledAttempts.insert(placement.attemptID)
+
+            guard let teamName = teamName(for: placement) else {
+                await report(placement, "no team is running for this project")
+                continue
+            }
+            if placement.hostID == localHostID {
+                let delivered = TeamOrchestrator.shared.sendToAgentAutoLocate(
+                    teamName: teamName,
+                    agentName: placement.agentName ?? "executor",
+                    text: Self.instruction(for: placement)
+                )
+                if !delivered {
+                    await report(placement, "local agent did not accept the instruction")
+                }
+                continue
+            }
+            guard let host = hostsByCoordinatorID[placement.hostID] else {
+                // The coordinator remembers hosts this app has never connected
+                // to. Saying so beats dispatching into nothing.
+                await report(placement, "host is not connected to this app")
+                continue
+            }
+            await dispatchToPeer(placement, host: host, teamName: teamName, report: report)
+        }
+    }
+
+    /// The team a placement lands in. A placement names a host and an agent but
+    /// not a team, so the team has to come from what is actually running.
+    private func teamName(for placement: CoordinatorPlacement) -> String? {
+        TeamOrchestrator.shared.listTeams()
+            .compactMap { $0["name"] as? String }
+            .first
+    }
+
+    private func dispatchToPeer(
+        _ placement: CoordinatorPlacement,
+        host: HostEntry,
+        teamName: String,
+        report: @escaping (CoordinatorPlacement, String) async -> Void
+    ) async {
+        let path = host.activeSockPath
+        guard !path.isEmpty else {
+            await report(placement, "\(host.displayName) has no active connection")
+            return
+        }
+        let params: [String: Any] = [
+            "team": teamName,
+            "agent": placement.agentName ?? "executor",
+            "text": Self.instruction(for: placement),
+        ]
+        guard let data = try? JSONSerialization.data(withJSONObject: params),
+              let paramsJSON = String(data: data, encoding: .utf8) else {
+            await report(placement, "could not encode the instruction")
+            return
+        }
+        do {
+            let conn = try await PeerRelaySession.connect(hostSockPath: path)
+            defer { Task { await conn.cancel() } }
+            let response = try await conn.session.callTeam(
+                method: "team.delegate",
+                paramsJSON: paramsJSON
+            )
+            if !response.ok {
+                // A refusal is information, not a broken link — the host's own
+                // wording is the most useful thing to pass on.
+                await report(
+                    placement,
+                    "\(host.displayName) refused: \(response.errorCode) \(response.errorMessage)"
+                )
+            }
+        } catch {
+            await report(placement, "\(host.displayName): \(error.localizedDescription)")
+        }
+    }
+}
