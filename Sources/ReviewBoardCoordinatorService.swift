@@ -1300,7 +1300,11 @@ extension ReviewBoardCoordinatorService {
             agentName: "executor",
             text: instruction,
             taskTitle: title,
-            tabManager: tabManager
+            tabManager: tabManager,
+            // `submit: false` is for the CLI, which sends Return itself once
+            // the paste is acknowledged. Nothing does that for an in-app
+            // caller, so the capsule sat in the prompt unsent.
+            submit: true
         ) else { return nil }
         return (result.task.id, result.textDelivered)
     }
@@ -1386,8 +1390,23 @@ final class CoordinatorPlacementDispatcher {
         report: @escaping (CoordinatorPlacement, String) async -> Void,
         started: @escaping (CoordinatorPlacement) async -> Void = { _ in }
     ) async {
+        // A task the team board already holds was delivered by whoever put it
+        // there; the coordinator's copy going through `placed` is bookkeeping,
+        // not a second request. Without this the dispatcher raced the delegate
+        // path and sent the same work twice — once as a capsule, once as bare
+        // text — and the bare one won because it was the one that submitted.
+        let alreadyWithATeam = Set(
+            TeamOrchestrator.shared.listTeams()
+                .compactMap { $0["team_name"] as? String }
+                .flatMap { TeamDataStore.shared.listTasks(teamName: $0) }
+                .map(\.id)
+        )
         for placement in taskRows.compactMap(CoordinatorPlacement.init(taskRow:)) {
             guard !handledAttempts.contains(placement.attemptID) else { continue }
+            guard !alreadyWithATeam.contains(placement.taskID) else {
+                handledAttempts.insert(placement.attemptID)
+                continue
+            }
             handledAttempts.insert(placement.attemptID)
 
             guard let root = projectRoots[placement.projectID] else {

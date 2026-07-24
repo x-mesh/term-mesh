@@ -2795,25 +2795,18 @@ final class TeamOrchestrator: ObservableObject {
 
     private func formatDelegateInstruction(task: TeamTask, text: String, context: String? = nil) -> String {
         let taskId = task.id
-        // Top-of-prompt mandatory step: agents (especially TUI CLIs like Claude/Codex)
-        // often print the STATUS header in their response but never run the actual
-        // shell command, leaving the task stuck in "assigned" and wait timing out.
-        // Putting the explicit command literal at the top + closing reminder reduces
-        // the miss rate. The scrollback auto-detector (Phase B) is the safety net
-        // for cases where the command is still omitted.
+        // The goal comes last and the reporting rule sits right after it,
+        // because an agent reads a wall of protocol, finds a one-line ask at
+        // the bottom, answers it and stops — which is exactly what happened
+        // when the whole preamble came first.
+        //
+        // And printing the header IS enough: the scrollback detector
+        // (AutoReplyDetector) watches every agent pane for it and completes
+        // the task. The capsule used to say the opposite — "printing is NOT
+        // enough" — which talked agents out of the one thing that reliably
+        // works. Running the command is still offered, because it is exact,
+        // but it is no longer presented as the only way.
         var lines: [String] = [
-            "[REQUIRED FINAL STEP — you MUST run this shell command before stopping]",
-            "```",
-            "tm-agent reply 'STATUS: DONE|BLOCKED|NEEDS_REVIEW",
-            "FILES: <changed paths, space-separated, or none>",
-            "VERIFY: <single shell command to verify result, or n/a>",
-            "NEXT: <one-line action for leader, or NONE>",
-            "FULL_REPORT: <path to full result file, or n/a>",
-            "",
-            "<concise summary body here>'",
-            "```",
-            "Without running this command the leader cannot detect completion — the task hangs and wait times out. Printing the header text in your response is NOT enough; you must invoke the `tm-agent reply` shell command yourself.",
-            "",
             "## Task Capsule",
             "TASK_ID: \(taskId)",
             "TASK_TITLE: \(task.title)",
@@ -2842,9 +2835,22 @@ final class TeamOrchestrator: ObservableObject {
             "[GOAL]",
             text.trimmingCharacters(in: .whitespacesAndNewlines),
             "[/GOAL]",
+            "",
+            "[HOW TO REPORT — required]",
+            "End your reply with exactly these lines. term-mesh reads them off",
+            "your pane and closes the task; without them it stays open and the",
+            "leader waits.",
+            "",
+            "STATUS: DONE|BLOCKED|NEEDS_REVIEW",
+            "FILES: <changed paths, space-separated, or none>",
+            "VERIFY: <single shell command to verify the result, or n/a>",
+            "NEXT: <one-line action for the leader, or NONE>",
+            "FULL_REPORT: <path to a full result file, or n/a>",
+            "",
+            "Running `tm-agent reply '<the same header>'` as a shell command",
+            "does the same thing and is exact — either is fine.",
         ])
-        let body = lines.joined(separator: "\n")
-        return body + "\n\n[REMINDER] Finish by actually running the `tm-agent reply '...'` shell command shown at the top — not by printing the header in your reply."
+        return lines.joined(separator: "\n")
     }
 
     private func formatTaskDispatchInstruction(task: TeamTask) -> String {
