@@ -1162,9 +1162,72 @@ extension ReviewBoardCoordinatorService {
             throw ReviewBoardCoordinatorError.disabled
         }
         let projectID = try await client.ensureProject(rootPath: projectRoot, name: projectName)
-        try await client.delegate(projectID: projectID, title: title, body: body)
+
+        // Hand the work to the team first. That is what makes it real: the
+        // team task is what the agent starts, reports against and finishes,
+        // and the capsule that goes with it carries the reply protocol. The
+        // coordinator then records placement against that same id rather than
+        // opening a second file on the same job.
+        let project = projectIdentity(forWorkingDirectories: [projectRoot])
+        let handed = handToTeam(project: project, root: projectRoot, title: title, body: body)
+
+        try await client.delegate(
+            projectID: projectID,
+            title: title,
+            body: body,
+            taskID: handed?.taskID
+        )
+        if let handed, handed.delivered {
+            // The agent already has it, so the dispatcher must not send it a
+            // second time — it only acts on work still sitting at `placed`.
+            await client.reportPlacementStatus(
+                taskID: handed.taskID,
+                attemptID: handed.taskID,
+                status: "in_progress"
+            )
+        }
         // Placement lands on the next read, and the board is what shows it.
         refresh()
+    }
+
+    /// Create (or find) the project's team, delegate through it, and return the
+    /// task id the team minted. Returns nil when no team can be started here —
+    /// the coordinator still records the work, and the dispatcher will report
+    /// why nothing picked it up.
+    @MainActor
+    private func handToTeam(
+        project: PeerProjectIdentity,
+        root: String,
+        title: String,
+        body: String
+    ) -> (taskID: String, delivered: Bool)? {
+        guard !project.isUnknown else { return nil }
+        let dispatcher = CoordinatorPlacementDispatcher.shared
+        let existing = dispatcher.teamName(forProject: project, host: nil)
+        guard let team = existing
+            ?? dispatcher.createTeam(forProject: project, root: root) else { return nil }
+        // A team that was just created is only its leader; the delegation
+        // needs an agent to land on.
+        if TeamOrchestrator.shared.teams[team]?.agents.isEmpty ?? true {
+            _ = TeamOrchestrator.shared.addAgentToTeam(
+                teamName: team,
+                agentType: "executor",
+                agentName: "executor",
+                agentModel: "sonnet",
+                agentCli: "claude"
+            )
+        }
+        guard let tabManager = TeamOrchestrator.shared.resolveTabManager(teamName: team)
+            ?? TerminalController.shared.tabManager else { return nil }
+        let instruction = body.isEmpty ? title : "\(title)\n\n\(body)"
+        guard let result = TeamOrchestrator.shared.delegateToAgent(
+            teamName: team,
+            agentName: "executor",
+            text: instruction,
+            taskTitle: title,
+            tabManager: tabManager
+        ) else { return nil }
+        return (result.task.id, result.textDelivered)
     }
 }
 
@@ -1350,7 +1413,7 @@ final class CoordinatorPlacementDispatcher {
     /// because the placement asks for one piece of work — more agents is a
     /// choice for the person to make afterwards, not something delegation
     /// should decide on their behalf.
-    private func createTeam(forProject project: PeerProjectIdentity, root: String) -> String? {
+    func createTeam(forProject project: PeerProjectIdentity, root: String) -> String? {
         guard let tabManager = TerminalController.shared.tabManager else { return nil }
         let name = teamNameCandidate(for: project)
         let team = TeamOrchestrator.shared.createTeam(
@@ -1376,7 +1439,7 @@ final class CoordinatorPlacementDispatcher {
 
     /// Team names are an identifier elsewhere in the app, so keep it to what a
     /// team name is allowed to be, and keep it recognisably the project's.
-    private func teamNameCandidate(for project: PeerProjectIdentity) -> String {
+    func teamNameCandidate(for project: PeerProjectIdentity) -> String {
         let allowed = CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "-_"))
         let slug = String(
             project.label.unicodeScalars.map { allowed.contains($0) ? Character($0) : "-" }
@@ -1400,7 +1463,7 @@ final class CoordinatorPlacementDispatcher {
     /// `project_root` over `team.roster.v1`. Both are put through the very
     /// same identity function the sidebar groups by, so a team lands in the
     /// project the user sees it under and nowhere else.
-    private func teamName(
+    func teamName(
         forProject project: PeerProjectIdentity,
         host: HostEntry?
     ) -> String? {

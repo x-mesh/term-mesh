@@ -460,6 +460,24 @@ extension TerminalController {
         return resp == "OK" ? .ok([:]) : .err(code: "internal_error", message: resp, data: nil)
     }
 
+    func v2DebugReviewBoardDelegate(params: [String: Any]) -> V2CallResult {
+        guard let root = params["root"] as? String, !root.isEmpty,
+              let title = params["title"] as? String, !title.isEmpty else {
+            return .err(code: "invalid_params", message: "root and title are required", data: nil)
+        }
+        let name = params["name"] as? String ?? URL(fileURLWithPath: root).lastPathComponent
+        let body = params["body"] as? String ?? ""
+        Task { @MainActor in
+            try? await ReviewBoardCoordinatorService.shared.delegate(
+                projectRoot: root,
+                projectName: name,
+                title: title,
+                body: body
+            )
+        }
+        return .ok(["started": true])
+    }
+
     func v2DebugFocusNotification(params: [String: Any]) -> V2CallResult {
         guard let wsId = v2String(params, "workspace_id") else {
             return .err(code: "invalid_params", message: "Missing workspace_id", data: nil)

@@ -1230,6 +1230,11 @@ class TerminalController {
             return v2Result(id: id, self.v2DebugResetEmptyPanelCount())
         case "debug.notification.focus":
             return v2Result(id: id, self.v2DebugFocusNotification(params: params))
+        // The delegate sheet is a SwiftUI action, so calling what the sheet
+        // calls is the only way to exercise the whole path — team, capsule,
+        // coordinator registration, placement — without a person clicking.
+        case "debug.reviewboard.delegate":
+            return v2Result(id: id, self.v2DebugReviewBoardDelegate(params: params))
         case "debug.flash.count":
             return v2Result(id: id, self.v2DebugFlashCount(params: params))
         case "debug.flash.reset":
