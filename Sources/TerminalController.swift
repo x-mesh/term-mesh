@@ -1235,6 +1235,8 @@ class TerminalController {
         // coordinator registration, placement — without a person clicking.
         case "debug.reviewboard.delegate":
             return v2Result(id: id, self.v2DebugReviewBoardDelegate(params: params))
+        case "debug.reviewboard.reveal":
+            return v2Result(id: id, self.v2DebugReviewBoardReveal(params: params))
         case "debug.flash.count":
             return v2Result(id: id, self.v2DebugFlashCount(params: params))
         case "debug.flash.reset":

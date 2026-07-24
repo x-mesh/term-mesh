@@ -203,6 +203,11 @@ struct ReviewBoardPanelView: View {
             .clipShape(RoundedRectangle(cornerRadius: 7))
         }
         .buttonStyle(.plain)
+        // One click picks the task, two go to it — the same pair of meanings
+        // a file list has, so nothing has to be explained.
+        .simultaneousGesture(TapGesture(count: 2).onEnded {
+            viewModel.revealPane(for: task)
+        })
         .accessibilityLabel("\(task.title), \(task.status), priority \(task.priority)")
         .accessibilityIdentifier("reviewBoard.task.\(task.id)")
     }
@@ -211,6 +216,32 @@ struct ReviewBoardPanelView: View {
         let digest = viewModel.digest(for: task)
         return VStack(alignment: .leading, spacing: 12) {
             statusPills(viewModel.statusBadges(for: task))
+
+            // The way across to where the work is actually happening. Only
+            // offered when there is a local pane to go to — work on a peer is
+            // real, but not something this window can show.
+            if let assignee = task.assignee, viewModel.paneLocation(for: task) != nil {
+                Button {
+                    viewModel.revealPane(for: task)
+                } label: {
+                    HStack(spacing: 5) {
+                        Image(systemName: "arrow.right.to.line")
+                            .font(.system(size: 9, weight: .semibold))
+                        Text("Show \(assignee)'s pane")
+                            .font(.system(size: 11, weight: .medium))
+                        Spacer(minLength: 0)
+                    }
+                    .foregroundColor(.accentColor)
+                    .padding(.horizontal, 9)
+                    .padding(.vertical, 6)
+                    .background(Color.accentColor.opacity(0.1))
+                    .clipShape(RoundedRectangle(cornerRadius: 7))
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .accessibilityIdentifier("reviewBoard.task.showPane")
+                .help("Switch to the pane running this task")
+            }
             // Directly under the badges, because it is the answer to the
             // question the badges raise. Buried among eight "not reported"
             // rows it read as though nothing had happened at all.

@@ -171,6 +171,29 @@ final class ReviewBoardViewModel: ObservableObject {
             ?? "Task \(item.taskDisplayID)"
     }
 
+    /// The pane this task is running in, when it is running on this machine.
+    /// Work placed on a peer has no local pane — the coordinator knows it is
+    /// out there, but there is nothing here to look at.
+    func paneLocation(for task: ReviewBoardTask) -> (workspaceID: UUID, panelID: UUID)? {
+        guard let assignee = task.assignee,
+              let team = TeamOrchestrator.shared.teams[task.teamName],
+              let agent = team.agents.first(where: { $0.name == assignee }),
+              let panelID = agent.panelId else { return nil }
+        return (agent.workspaceId, panelID)
+    }
+
+    /// Go to the work. The board is an index of what is happening; the pane is
+    /// where it is actually happening, and without a way across, the index
+    /// leaves you to hunt the sidebar for the workspace it was talking about.
+    @discardableResult
+    func revealPane(for task: ReviewBoardTask) -> Bool {
+        guard let assignee = task.assignee else { return false }
+        return TeamOrchestrator.shared.revealAgentPane(
+            teamName: task.teamName,
+            agentName: assignee
+        )
+    }
+
     func digest(for task: ReviewBoardTask) -> ReviewBoardTaskDigest {
         ReviewBoardTaskDigest.make(
             for: task,

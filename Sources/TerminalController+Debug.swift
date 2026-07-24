@@ -460,6 +460,20 @@ extension TerminalController {
         return resp == "OK" ? .ok([:]) : .err(code: "internal_error", message: resp, data: nil)
     }
 
+    /// Exercises exactly what the board row's "show pane" does.
+    func v2DebugReviewBoardReveal(params: [String: Any]) -> V2CallResult {
+        guard let team = params["team_name"] as? String,
+              let agent = params["agent_name"] as? String else {
+            return .err(code: "invalid_params", message: "team_name and agent_name are required", data: nil)
+        }
+        var revealed = false
+        let completed = v2MainExec(timeout: 2) {
+            revealed = TeamOrchestrator.shared.revealAgentPane(teamName: team, agentName: agent)
+        }
+        if !completed { return .err(code: "timeout", message: "Main thread busy", data: nil) }
+        return .ok(["revealed": revealed])
+    }
+
     func v2DebugReviewBoardDelegate(params: [String: Any]) -> V2CallResult {
         guard let root = params["root"] as? String, !root.isEmpty,
               let title = params["title"] as? String, !title.isEmpty else {
