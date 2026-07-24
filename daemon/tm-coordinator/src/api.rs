@@ -147,22 +147,52 @@ impl Api {
         }
     }
 
+    /// The board's single read of "how is the control plane doing". Every
+    /// key below is consumed by a client, and the ones a client reads to
+    /// decide what to *show* are flat booleans on purpose: a badge that has
+    /// to parse prose out of `mem_mesh.status` is a badge that silently
+    /// stops working the day the prose changes.
     fn status(&self) -> Result<Value> {
         let reducer = self.reducer.lock().expect("reducer mutex poisoned");
+        let hosts = reducer.hosts()?;
+        // Existence, not a census — one row is enough to raise the badge, so
+        // stop the scan there rather than paying for every task on the board.
+        let suspect_host = !reducer.tasks(None, Some(TaskStatus::Suspect), 1)?.is_empty();
+        let fenced_zombie = !reducer
+            .tasks(None, Some(TaskStatus::Quarantined), 1)?
+            .is_empty();
         Ok(json!({
             "version": env!("CARGO_PKG_VERSION"),
             "socket_path": self.config.socket_path,
             "reducer_watermark": reducer.watermark()?,
             "mem_mesh": self.event_log.health(),
-            "known_host_count": reducer.hosts()?.len(),
+            // The machine-readable half of `mem_mesh`. Without it a client
+            // that cannot find this key has to assume the log is fine, and
+            // assuming "fine" is exactly wrong for a health signal: the
+            // default backend fails every append.
+            "mem_mesh_available": self.event_log.is_available(),
+            "known_host_count": hosts.len(),
             "pending_merge_count": reducer.merge_queue(None, Some(MergeQueueStatus::Queued))?.len(),
+            "suspect_host": suspect_host,
+            "fenced_zombie": fenced_zombie,
+            // Panel runs are mirrored onto the team task board, not here.
+            // Reported as an explicit empty list so a client can tell "this
+            // coordinator has none" from "this coordinator is too old to
+            // know the key" — the two want different fallbacks.
+            "panel_runs": [],
             "feature_flags": {
                 "enabled": self.config.enabled,
-                "remote_hosts": false,
-                "app_socket_adapter": false,
-                "daemon_adapter": false
-            },
-            "focus_adapter_calls": 0
+                // Whether host observations actually reach the reducer, not
+                // whether the code that sends them was compiled in. A flag
+                // that cannot go false never reports a broken feed.
+                "remote_hosts": !hosts.is_empty(),
+                // Named but never built: the coordinator records a placement
+                // and stops there — nothing dispatches it to a pane. Stated
+                // as a string so it cannot be mistaken for a disabled
+                // feature that a flag could turn on.
+                "app_socket_adapter": "not_implemented",
+                "daemon_adapter": "not_implemented"
+            }
         }))
     }
 

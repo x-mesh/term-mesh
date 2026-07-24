@@ -9,6 +9,14 @@ pub trait EventLog: Send + Sync {
     fn append(&self, event: &IntentEvent) -> Result<()>;
     fn read_all(&self) -> Result<Vec<IntentEvent>>;
     fn health(&self) -> serde_json::Value;
+
+    /// Whether this log can append and read at all. A backend that fails
+    /// every call is not a degraded log, it is an absent one, and a client
+    /// has to be able to say so out loud: every mutation the coordinator
+    /// accepts is written here first, so an unavailable log means nothing
+    /// can be recorded. `health()` carries the same fact, but only as prose
+    /// a client would have to pattern-match on — this is the machine answer.
+    fn is_available(&self) -> bool;
 }
 
 pub struct MemMeshUnavailableEventLog;
@@ -27,6 +35,10 @@ impl EventLog for MemMeshUnavailableEventLog {
             "status": "mem_mesh_unavailable",
             "reason": "verified MCP/config exposes memory search/add tools, not canonical ordered append/read event log"
         })
+    }
+
+    fn is_available(&self) -> bool {
+        false
     }
 }
 
@@ -90,5 +102,13 @@ impl EventLog for LocalJournalEventLog {
             "canonical": false,
             "path": self.path
         })
+    }
+
+    /// Available but not canonical: a single machine's file cannot be the
+    /// shared ordering several machines agree on. Availability answers "can
+    /// the coordinator record anything at all", which this backend can —
+    /// `health().canonical` is where the weaker guarantee is stated.
+    fn is_available(&self) -> bool {
+        true
     }
 }

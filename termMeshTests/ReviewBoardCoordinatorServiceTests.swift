@@ -579,6 +579,13 @@ private final class FakeCoordinatorServer: @unchecked Sendable {
         }
         let result: Any
         switch method {
+        // These keys are a contract with the coordinator, not a fixture this
+        // file is free to invent: a fake that answers whatever the parser
+        // happens to read stays green while the real coordinator sends
+        // something else, which is exactly how `mem_mesh_available` went
+        // unsent for the whole of its life while both sides had tests. The
+        // other half is pinned in daemon/tm-coordinator/tests/status.rs —
+        // change one and change the other.
         case "orchestration.status":
             result = [
                 "mem_mesh_available": false,

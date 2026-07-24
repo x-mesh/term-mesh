@@ -22,6 +22,10 @@ impl EventLog for FailingReadLog {
     fn health(&self) -> serde_json::Value {
         json!({"status": "test"})
     }
+
+    fn is_available(&self) -> bool {
+        true
+    }
 }
 
 struct SlowCountingLog {
@@ -41,6 +45,10 @@ impl EventLog for SlowCountingLog {
 
     fn health(&self) -> serde_json::Value {
         json!({"status": "test"})
+    }
+
+    fn is_available(&self) -> bool {
+        true
     }
 }
 
