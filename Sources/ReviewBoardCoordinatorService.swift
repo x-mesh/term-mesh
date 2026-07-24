@@ -687,6 +687,7 @@ final class ReviewBoardCoordinatorService: ObservableObject {
     private var subscriptionStarted = false
     private var hostObservationCancellable: AnyCancellable?
     private var hostObservationTicker: Timer?
+    private var teamMirrorCancellable: AnyCancellable?
     private var hostSyncTask: Task<Void, Never>?
     private var lastReportedObservations: [CoordinatorHostObservation] = []
 
@@ -712,6 +713,23 @@ final class ReviewBoardCoordinatorService: ObservableObject {
         refresh()
         startSubscriptionIfNeeded()
         startHostObservationIfNeeded()
+        startTeamMirrorIfNeeded()
+    }
+
+    /// Refresh when the team side moves, not only when the coordinator does.
+    ///
+    /// An agent finishing a task changes the team board and nothing else; the
+    /// coordinator emits no event for it, so the read that would have carried
+    /// the news back never happened and the coordinator sat on `in_progress`
+    /// while the work was long done.
+    private func startTeamMirrorIfNeeded() {
+        guard teamMirrorCancellable == nil else { return }
+        teamMirrorCancellable = TeamDataStore.shared.$taskRevision
+            // Task changes arrive in bursts as an agent works through one.
+            .debounce(for: .milliseconds(500), scheduler: DispatchQueue.main)
+            .sink { [weak self] _ in
+                self?.refresh()
+            }
     }
 
     func stop() {
@@ -723,6 +741,8 @@ final class ReviewBoardCoordinatorService: ObservableObject {
         hostObservationCancellable = nil
         hostObservationTicker?.invalidate()
         hostObservationTicker = nil
+        teamMirrorCancellable?.cancel()
+        teamMirrorCancellable = nil
         hostSyncTask?.cancel()
         hostSyncTask = nil
         lastReportedObservations = []
@@ -1038,11 +1058,66 @@ final class ReviewBoardCoordinatorService: ObservableObject {
         }
     }
 
+    /// What a team status means in the coordinator's vocabulary.
+    ///
+    /// There is no `completed`: the coordinator's shape is work, then a review
+    /// snapshot, then approval, then merge. So an agent finishing lands on
+    /// `review_ready` — the work is done and waiting on a person, which is
+    /// exactly what a finished team task means.
+    private static let coordinatorStatusForTeamStatus: [String: String] = [
+        "in_progress": "in_progress",
+        "completed": "review_ready",
+        "done": "review_ready",
+        "review": "review_ready",
+        "review_ready": "review_ready",
+        "failed": "failed",
+        "blocked": "blocked",
+        "cancelled": "cancelled",
+        "abandoned": "cancelled",
+    ]
+
+    /// Carry the team's account of a task forward to the coordinator.
+    ///
+    /// The agent moves the task on the team board — starts it, blocks it,
+    /// finishes it — and the coordinator, which decided where it should run,
+    /// would otherwise never hear how it went. Now that both sides key on the
+    /// same id, saying so is a lookup rather than a guess.
+    @MainActor
+    private func mirrorTeamStatuses(
+        coordinatorRows: [[String: Any]],
+        client: ReviewBoardCoordinatorClient
+    ) async {
+        var coordinatorStatus: [String: String] = [:]
+        for row in coordinatorRows {
+            guard let id = row["task_id"] as? String,
+                  let status = row["status"] as? String else { continue }
+            coordinatorStatus[id] = status
+        }
+        guard !coordinatorStatus.isEmpty else { return }
+
+        for team in TeamOrchestrator.shared.listTeams() {
+            guard let name = team["team_name"] as? String else { continue }
+            for task in TeamDataStore.shared.listTasks(teamName: name) {
+                guard let current = coordinatorStatus[task.id],
+                      let wanted = Self.coordinatorStatusForTeamStatus[task.status],
+                      wanted != current else { continue }
+                // The coordinator checks the transition itself and refuses an
+                // illegal one, so this only has to avoid repeating itself.
+                await client.reportPlacementStatus(
+                    taskID: task.id,
+                    attemptID: "\(task.id):\(wanted)",
+                    status: wanted
+                )
+            }
+        }
+    }
+
     @MainActor
     private func dispatchPlacements(
         _ inputs: (rows: [[String: Any]], roots: [String: String]),
         client: ReviewBoardCoordinatorClient
     ) async {
+        await mirrorTeamStatuses(coordinatorRows: inputs.rows, client: client)
         await CoordinatorPlacementDispatcher.shared.reconcile(
             taskRows: inputs.rows,
             projectRoots: inputs.roots,
