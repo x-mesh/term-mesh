@@ -168,7 +168,13 @@ struct PeerProjectIdentity: Identifiable, Equatable, Hashable {
     )
 }
 
-enum PeerSidebarGroupingMode: String, CaseIterable, Identifiable {
+/// What the whole sidebar is organised by. This began as a grouping control
+/// inside the Peer Hosts section, which is why the stored key still says so —
+/// but a control that only regrouped peers while the local sections stayed put
+/// read as a global switch and behaved as a local one. The two are now
+/// alternative views of everything: Host answers "which machine is this on",
+/// Project answers "what is this work part of".
+enum SidebarAxis: String, CaseIterable, Identifiable {
     case host
     case project
 
@@ -180,15 +186,27 @@ enum PeerSidebarGroupingMode: String, CaseIterable, Identifiable {
         case .project: return "Project"
         }
     }
+
+    var accessibilityDescription: String {
+        switch self {
+        case .host: return "Group the sidebar by machine"
+        case .project: return "Group the sidebar by project"
+        }
+    }
 }
 
-enum PeerSidebarGroupingSettings {
+enum SidebarAxisSettings {
+    /// Off pins the sidebar to Host and hides the switch entirely — the
+    /// escape hatch from when the Project view was new.
     static let featureFlagKey = "sidebar.peerHosts.groupingControl.enabled"
-    static let selectedModeKey = "sidebar.peerHosts.groupingMode"
-    static let defaultMode = PeerSidebarGroupingMode.host
+    /// Deliberately still the old key: the stored values (`host` / `project`)
+    /// did not change, and renaming it would silently reset every existing
+    /// install to the default for no gain.
+    static let selectedAxisKey = "sidebar.peerHosts.groupingMode"
+    static let defaultAxis = SidebarAxis.host
 
-    static func mode(from raw: String) -> PeerSidebarGroupingMode {
-        PeerSidebarGroupingMode(rawValue: raw) ?? defaultMode
+    static func axis(from raw: String) -> SidebarAxis {
+        SidebarAxis(rawValue: raw) ?? defaultAxis
     }
 }
 

@@ -31,10 +31,21 @@ struct VerticalTabsSidebar: View {
     private var localTabsCollapsed = false
     @AppStorage(SidebarPresentationSettings.separatedSectionsEnabledKey)
     private var sidebarSeparatedSectionsEnabled = SidebarPresentationSettings.defaultSeparatedSectionsEnabled
+    @AppStorage(SidebarAxisSettings.featureFlagKey)
+    private var isAxisControlEnabled = true
+    @AppStorage(SidebarAxisSettings.selectedAxisKey)
+    private var selectedAxisRaw = SidebarAxisSettings.defaultAxis.rawValue
 
     /// Space at top of sidebar for traffic light buttons
     private let trafficLightPadding: CGFloat = 28
     private let tabRowSpacing: CGFloat = 2
+
+    /// With the switch turned off there is no way to reach the Project view,
+    /// so the axis has to read as Host no matter what was stored.
+    private var axis: SidebarAxis {
+        guard isAxisControlEnabled else { return .host }
+        return SidebarAxisSettings.axis(from: selectedAxisRaw)
+    }
 
     private var visibleLocalWorkspaceIds: [UUID] {
         SidebarPresentationSettings.visibleLocalWorkspaceIDs(
@@ -52,43 +63,62 @@ struct VerticalTabsSidebar: View {
                         Spacer()
                             .frame(height: trafficLightPadding)
 
-                        SidebarSectionHeader(
-                            title: sidebarSeparatedSectionsEnabled ? "Local Workspaces" : "Workspaces",
-                            isCollapsed: $localTabsCollapsed
-                        )
-                        .padding(.top, sidebarSeparatedSectionsEnabled ? 6 : 4)
-
-                        if !localTabsCollapsed {
-                            LazyVStack(spacing: tabRowSpacing) {
-                                ForEach(Array(tabManager.tabs.enumerated()), id: \.element.id) { index, tab in
-                                    if SidebarPresentationSettings.includesInLocalWorkspaces(
-                                        isPeerMirror: tab.isPeerMirror,
-                                        separatedSectionsEnabled: sidebarSeparatedSectionsEnabled
-                                    ) {
-                                        TabItemView(
-                                            tab: tab,
-                                            index: index,
-                                            visibleTabIds: visibleLocalWorkspaceIds,
-                                            rowSpacing: tabRowSpacing,
-                                            selection: $selection,
-                                            selectedTabIds: $selectedTabIds,
-                                            lastSidebarSelectionIndex: $lastSidebarSelectionIndex,
-                                            showsCommandShortcutHints: commandKeyMonitor.isCommandPressed,
-                                            dragAutoScrollController: dragAutoScrollController,
-                                            draggedTabId: $draggedTabId,
-                                            dropIndicator: $dropIndicator
-                                        )
-                                    }
-                                }
-                            }
-                            .padding(.bottom, 8)
-                            .padding(.top, 2)
+                        if isAxisControlEnabled {
+                            SidebarAxisPicker(selection: $selectedAxisRaw)
+                                .padding(.top, 2)
+                                .padding(.bottom, 2)
                         }
 
-                        SidebarRemoteHostsSection(
-                            store: remoteHostStore,
-                            usesSeparatedPresentation: sidebarSeparatedSectionsEnabled
-                        )
+                        // The two axes are alternatives, not layers. Leaving
+                        // Local Workspaces mounted under the Project view was
+                        // the whole complaint: the switch appeared to change
+                        // what the sidebar was about while the section above
+                        // it — selection highlight and all — never moved.
+                        switch axis {
+                        case .host:
+                            SidebarSectionHeader(
+                                title: sidebarSeparatedSectionsEnabled ? "Local Workspaces" : "Workspaces",
+                                isCollapsed: $localTabsCollapsed
+                            )
+                            .padding(.top, sidebarSeparatedSectionsEnabled ? 6 : 4)
+
+                            if !localTabsCollapsed {
+                                LazyVStack(spacing: tabRowSpacing) {
+                                    ForEach(Array(tabManager.tabs.enumerated()), id: \.element.id) { index, tab in
+                                        if SidebarPresentationSettings.includesInLocalWorkspaces(
+                                            isPeerMirror: tab.isPeerMirror,
+                                            separatedSectionsEnabled: sidebarSeparatedSectionsEnabled
+                                        ) {
+                                            TabItemView(
+                                                tab: tab,
+                                                index: index,
+                                                visibleTabIds: visibleLocalWorkspaceIds,
+                                                rowSpacing: tabRowSpacing,
+                                                selection: $selection,
+                                                selectedTabIds: $selectedTabIds,
+                                                lastSidebarSelectionIndex: $lastSidebarSelectionIndex,
+                                                showsCommandShortcutHints: commandKeyMonitor.isCommandPressed,
+                                                dragAutoScrollController: dragAutoScrollController,
+                                                draggedTabId: $draggedTabId,
+                                                dropIndicator: $dropIndicator
+                                            )
+                                        }
+                                    }
+                                }
+                                .padding(.bottom, 8)
+                                .padding(.top, 2)
+                            }
+
+                            SidebarRemoteHostsSection(
+                                store: remoteHostStore,
+                                usesSeparatedPresentation: sidebarSeparatedSectionsEnabled
+                            )
+                        case .project:
+                            SidebarProjectsSection(
+                                store: remoteHostStore,
+                                usesSeparatedPresentation: sidebarSeparatedSectionsEnabled
+                            )
+                        }
 
                         if let selectedWorkspace = tabManager.tabs.first(where: { $0.id == tabManager.selectedTabId }) {
                             WorkspaceRetrievalSidebarSection(workspace: selectedWorkspace)
@@ -870,15 +900,115 @@ private enum PeerSidebarPalette {
     }
 }
 
+/// The sidebar's top-level switch. It sits above every section on purpose:
+/// as a control tucked inside the Peer Hosts header it looked like it governed
+/// the sidebar but only regrouped one section of it.
+struct SidebarAxisPicker: View {
+    @Binding var selection: String
+
+    var body: some View {
+        Picker("", selection: $selection) {
+            ForEach(SidebarAxis.allCases) { axis in
+                Text(axis.title)
+                    .accessibilityLabel(axis.accessibilityDescription)
+                    .tag(axis.rawValue)
+            }
+        }
+        .pickerStyle(.segmented)
+        .controlSize(.small)
+        .labelsHidden()
+        .padding(.horizontal, 12)
+        .accessibilityIdentifier("sidebar.axis")
+        .accessibilityLabel("Sidebar grouping")
+        .help("Group the sidebar by host or by project")
+    }
+}
+
+/// The Project axis: every workspace this app can see, local and peer, grouped
+/// by the project it works inside.
+struct SidebarProjectsSection: View {
+    @EnvironmentObject private var tabManager: TabManager
+    @ObservedObject var store: RemoteHostStore
+    let usesSeparatedPresentation: Bool
+    @AppStorage(SidebarLayoutSettings.localTabsCollapsedKey)
+    private var isCollapsed = false
+
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack(spacing: 6) {
+                Button {
+                    withAnimation(.easeInOut(duration: 0.15)) { isCollapsed.toggle() }
+                } label: {
+                    HStack(spacing: 4) {
+                        Image(systemName: "chevron.right")
+                            .font(.system(size: 8, weight: .semibold))
+                            .rotationEffect(.degrees(isCollapsed ? 0 : 90))
+                            .foregroundColor(Color.secondary.opacity(0.7))
+                        Text("Projects")
+                            .font(.system(size: 10, weight: .semibold))
+                            .foregroundColor(.secondary)
+                            .lineLimit(1)
+                    }
+                    .frame(minWidth: 0, maxWidth: .infinity, alignment: .leading)
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("Projects")
+
+                // Under the Host axis this same corner adds a peer host. Here
+                // it has to add a project, which is what the button's position
+                // promises — a project is not a thing to register, though, it
+                // is where work happens, so opening a folder is how one starts
+                // existing.
+                Button(action: openFolderAsWorkspace) {
+                    Image(systemName: "plus")
+                        .font(.system(size: 9, weight: .semibold))
+                        .foregroundColor(.secondary)
+                        .frame(width: 18, height: 18)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .accessibilityIdentifier("sidebar.projects.add")
+                .accessibilityLabel("Open Folder as Workspace")
+                .help("Open a folder as a new workspace…")
+            }
+            .padding(.leading, 16)
+            .padding(.trailing, 12)
+            .padding(.vertical, 4)
+
+            if !isCollapsed {
+                SidebarPeerProjectsView(
+                    hosts: store.sortedHosts,
+                    store: store,
+                    usesSeparatedPresentation: usesSeparatedPresentation,
+                    paneExpansionCommand: PeerPaneExpansionCommand(isExpanded: false, generation: 0)
+                )
+            }
+        }
+        .padding(.bottom, 4)
+    }
+
+    /// A folder becomes a workspace; the project it belongs to is then derived
+    /// from its git root exactly as it is for every other workspace. Nothing
+    /// here writes a project record — that would create a second, competing
+    /// notion of what a project is.
+    private func openFolderAsWorkspace() {
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = false
+        panel.canChooseDirectories = true
+        panel.allowsMultipleSelection = false
+        panel.prompt = "Open"
+        panel.message = "Choose a folder to open as a workspace"
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        _ = tabManager.addWorkspace(workingDirectory: url.path)
+    }
+}
+
 struct SidebarRemoteHostsSection: View {
     @ObservedObject var store: RemoteHostStore
     let usesSeparatedPresentation: Bool
     @AppStorage(SidebarLayoutSettings.remoteHostsCollapsedKey)
     private var isCollapsed = false
-    @AppStorage(PeerSidebarGroupingSettings.featureFlagKey)
-    private var isGroupingControlEnabled = true
-    @AppStorage(PeerSidebarGroupingSettings.selectedModeKey)
-    private var selectedGroupingMode = PeerSidebarGroupingSettings.defaultMode.rawValue
     /// Non-nil presents the add/edit sheet.
     @State private var editorContext: PeerHostEditorContext?
     @State private var areAllPaneDetailsExpanded = false
@@ -891,11 +1021,6 @@ struct SidebarRemoteHostsSection: View {
         store.sortedHosts.contains { host in
             host.workspaces.contains { !$0.panes.isEmpty }
         }
-    }
-
-    private var groupingMode: PeerSidebarGroupingMode {
-        guard isGroupingControlEnabled else { return .host }
-        return PeerSidebarGroupingSettings.mode(from: selectedGroupingMode)
     }
 
     private func toggleAllPaneDetails() {
@@ -935,20 +1060,6 @@ struct SidebarRemoteHostsSection: View {
                 }
                 .buttonStyle(.plain)
                 .accessibilityLabel("Peer Hosts")
-
-                if !isCollapsed, isGroupingControlEnabled {
-                    Picker("", selection: $selectedGroupingMode) {
-                        ForEach(PeerSidebarGroupingMode.allCases) { mode in
-                            Text(mode.title).tag(mode.rawValue)
-                        }
-                    }
-                    .pickerStyle(.segmented)
-                    .controlSize(.mini)
-                    .frame(width: 104)
-                    .layoutPriority(1)
-                    .accessibilityLabel("Peer hosts grouping")
-                    .help("Group peer hosts by host or project")
-                }
 
                 if !isCollapsed, hasPeerPaneDetails {
                     Button(action: toggleAllPaneDetails) {
@@ -999,26 +1110,18 @@ struct SidebarRemoteHostsSection: View {
                         .padding(.horizontal, 16)
                         .padding(.vertical, 4)
                 } else {
+                    // Hosts only. Grouping by project is now the sidebar's own
+                    // axis, chosen above this section rather than inside it.
                     VStack(spacing: usesSeparatedPresentation ? 8 : 0) {
-                        switch groupingMode {
-                        case .host:
-                            ForEach(store.sortedHosts) { host in
-                                RemoteHostGroupView(
-                                    host: host,
-                                    store: store,
-                                    usesSeparatedPresentation: usesSeparatedPresentation,
-                                    paneExpansionCommand: paneExpansionCommand
-                                ) { context in
-                                    editorContext = context
-                                }
-                            }
-                        case .project:
-                            SidebarPeerProjectsView(
-                                hosts: store.sortedHosts,
+                        ForEach(store.sortedHosts) { host in
+                            RemoteHostGroupView(
+                                host: host,
                                 store: store,
                                 usesSeparatedPresentation: usesSeparatedPresentation,
                                 paneExpansionCommand: paneExpansionCommand
-                            )
+                            ) { context in
+                                editorContext = context
+                            }
                         }
                     }
                 }
@@ -1099,22 +1202,25 @@ private struct SidebarPeerProjectsView: View {
         hosts.filter { $0.isConnected && !$0.workspaces.isEmpty }
     }
 
-    /// Local workspaces that actually take part in a project. A peer mirror
-    /// is excluded on purpose: it is a view onto someone else's workspace,
-    /// already represented by that peer's own row, and counting it here would
-    /// list one remote workspace twice. Matches the rule the Local Workspaces
-    /// section already applies (`SidebarPresentationSettings`).
-    private var localProjectMembers: [(Workspace, PeerProjectIdentity)] {
+    /// Every local workspace, paired with the project it belongs to — or an
+    /// unknown identity when it belongs to none. A peer mirror is excluded on
+    /// purpose: it is a view onto someone else's workspace, already
+    /// represented by that peer's own row, and counting it here would list one
+    /// remote workspace twice. Matches the rule the Local Workspaces section
+    /// applies (`SidebarPresentationSettings`).
+    ///
+    /// A local workspace naming no project used to be dropped, on the grounds
+    /// that the Local Workspaces section above was still its home. Under the
+    /// Project axis that section is not mounted at all, so dropping it made
+    /// the workspace unreachable without switching axes. It joins Unassigned
+    /// now, the same as a peer workspace in the same position.
+    private var localMembers: [(Workspace, PeerProjectIdentity)] {
         tabManager.tabs.compactMap { workspace in
             guard !workspace.isPeerMirror else { return nil }
-            let identity = projectIdentity(
-                forWorkingDirectories: localWorkingDirectories(workspace)
+            return (
+                workspace,
+                projectIdentity(forWorkingDirectories: localWorkingDirectories(workspace))
             )
-            // Unlike a peer workspace, a local one that names no project is
-            // simply left out — the Local Workspaces section above is still
-            // its home, so nothing becomes unreachable.
-            guard !identity.isUnknown else { return nil }
-            return (workspace, identity)
         }
     }
 
@@ -1149,8 +1255,13 @@ private struct SidebarPeerProjectsView: View {
 
         // Local first so a project the user is working on locally leads its
         // own group instead of trailing the peers that joined it.
-        for (workspace, identity) in localProjectMembers {
-            append(.local(workspace), to: identity)
+        for (workspace, identity) in localMembers {
+            let item = SidebarPeerProjectGroup.WorkspaceItem.local(workspace)
+            guard !identity.isUnknown else {
+                unassigned.append(item)
+                continue
+            }
+            append(item, to: identity)
         }
         for host in connectedHosts {
             for workspace in host.workspaces {
@@ -1237,8 +1348,8 @@ private struct SidebarPeerProjectsView: View {
                     // peer IS connected the advice changes: the workspaces
                     // exist, they just are not in a project folder.
                     Text(grouped.unassigned.isEmpty
-                         ? "Connect a peer in the Host view to see its projects."
-                         : "No connected workspace is working inside a project folder.")
+                         ? "Click + to open a folder as a workspace, or connect a peer in the Host view."
+                         : "No workspace is working inside a project folder yet.")
                         .font(.system(size: 9))
                         .foregroundColor(Color.secondary.opacity(0.72))
                         .fixedSize(horizontal: false, vertical: true)
