@@ -188,9 +188,29 @@ enum ReviewBoardCoordinatorError: Error, Equatable {
     case syscall(String, Int32)
 }
 
+/// Whether a subscription loop should still be running. Kept as its own
+/// object so the loop's life is decided by `stop()` and nothing else — tying
+/// it to the client's lifetime instead means a caller who does not happen to
+/// retain the client gets a subscription that never runs at all.
+private final class CoordinatorSubscriptionToken: @unchecked Sendable {
+    private let lock = NSLock()
+    private var stopped = false
+
+    var isRunning: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return !stopped
+    }
+
+    func stop() {
+        lock.lock()
+        stopped = true
+        lock.unlock()
+    }
+}
+
 final class ReviewBoardCoordinatorClient: @unchecked Sendable {
-    private let subscriptionLock = NSLock()
-    private var subscriptionStopped = false
+    private let subscriptionToken = CoordinatorSubscriptionToken()
     private let socketPath: String
     private let queue = DispatchQueue(label: "com.termmesh.review-board.coordinator", qos: .utility)
     /// The event subscription blocks on its socket for the connection's whole
@@ -384,9 +404,9 @@ final class ReviewBoardCoordinatorClient: @unchecked Sendable {
     /// The same loop covers a coordinator that restarts later: the stream ends,
     /// and the next pass dials again.
     func subscribeEvents(onEvent: @escaping @Sendable () -> Void) {
-        subscriptionQueue.async { [socketPath, weak self] in
+        subscriptionQueue.async { [socketPath, subscriptionToken] in
             var backoff = 0.25
-            while self?.shouldKeepSubscribing ?? false {
+            while subscriptionToken.isRunning {
                 let connected = Self.pumpEvents(socketPath: socketPath, onEvent: onEvent)
                 // A connection that carried frames is a healthy one that ended;
                 // start the next attempt eagerly. One that never opened means
@@ -427,16 +447,8 @@ final class ReviewBoardCoordinatorClient: @unchecked Sendable {
         return true
     }
 
-    private var shouldKeepSubscribing: Bool {
-        subscriptionLock.lock()
-        defer { subscriptionLock.unlock() }
-        return !subscriptionStopped
-    }
-
     func stopSubscribing() {
-        subscriptionLock.lock()
-        subscriptionStopped = true
-        subscriptionLock.unlock()
+        subscriptionToken.stop()
     }
 
     private func request(method: String, params: [String: Any]? = nil) async throws -> Any {

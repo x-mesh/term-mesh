@@ -482,6 +482,40 @@ final class ReviewBoardCoordinatorServiceTests: XCTestCase {
         )
     }
 
+    /// The app spawns the coordinator and subscribes moments later, so the
+    /// first connection routinely lands before it is listening. That used to
+    /// end the subscription for the life of the process — silently, and with
+    /// it everything the coordinator would have told the app. The subscription
+    /// has to survive being early.
+    func testSubscribeEventsKeepsTryingUntilTheCoordinatorIsListening() throws {
+        let socketPath = "/tmp/tm-coordinator-late-\(getpid())-\(UUID().uuidString.prefix(8)).sock"
+        let client = ReviewBoardCoordinatorClient(socketPath: socketPath)
+        defer { client.stopSubscribing() }
+
+        let expectation = expectation(description: "events after a late start")
+        expectation.expectedFulfillmentCount = 1
+        expectation.assertForOverFulfill = false
+
+        // Subscribe against nothing at all.
+        client.subscribeEvents { expectation.fulfill() }
+
+        // The coordinator turns up afterwards, as it does in practice.
+        let server = FakeCoordinatorEventServer(socketPath: socketPath)
+        var task: Task<Void, Error>?
+        DispatchQueue.global().asyncAfter(deadline: .now() + 0.6) {
+            task = try? server.start(lines: [
+                #"{"jsonrpc":"2.0","id":1,"result":{"subscribed":true}}"#,
+                #"{"kind":"task_created","task_id":"task-late"}"#,
+            ])
+        }
+        defer {
+            server.stop()
+            task?.cancel()
+        }
+
+        wait(for: [expectation], timeout: 10)
+    }
+
     func testSubscribeEventsConsumesRawJSONLStreamAndIgnoresAckKeepalive() throws {
         let socketPath = "/tmp/tm-coordinator-events-\(getpid())-\(UUID().uuidString.prefix(8)).sock"
         let server = FakeCoordinatorEventServer(socketPath: socketPath)
