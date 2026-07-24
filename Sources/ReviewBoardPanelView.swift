@@ -276,13 +276,39 @@ struct ReviewBoardPanelView: View {
                     .frame(maxWidth: .infinity, alignment: .leading)
             }
 
+            // What the agent reported comes first and in its own words. The
+            // digest under it is a reading of the task for merge and CI facts,
+            // which for work that ends in an answer rather than a pull request
+            // finds nothing — so a finished task with its result stored still
+            // said "nothing reported yet".
+            let report = ReviewBoardAgentReport(result: task.result)
+            if let report, !report.isEmpty {
+                VStack(alignment: .leading, spacing: 8) {
+                    if let body = report.body {
+                        Text(body)
+                            .font(.system(size: 11))
+                            .foregroundColor(.primary)
+                            .lineLimit(6)
+                            .textSelection(.enabled)
+                            .fixedSize(horizontal: false, vertical: true)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                    ForEach(report.presentFields, id: \.title) { field in
+                        factSection(field.title, systemImage: field.systemImage, text: field.text)
+                    }
+                }
+                .accessibilityIdentifier("reviewBoard.task.report")
+            }
+
             let facts = digest.presentFacts
             if facts.isEmpty {
-                // Said once, plainly, instead of eight times in eight boxes.
-                Text("Nothing reported yet — the agent has not filed a result.")
-                    .font(.system(size: 11))
-                    .foregroundColor(Color.secondary.opacity(0.75))
-                    .fixedSize(horizontal: false, vertical: true)
+                if report == nil || report?.isEmpty == true {
+                    // Said once, plainly, instead of eight times in eight boxes.
+                    Text("Nothing reported yet — the agent has not filed a result.")
+                        .font(.system(size: 11))
+                        .foregroundColor(Color.secondary.opacity(0.75))
+                        .fixedSize(horizontal: false, vertical: true)
+                }
             } else {
                 ForEach(facts, id: \.title) { fact in
                     factSection(fact.title, systemImage: fact.systemImage, text: fact.text)

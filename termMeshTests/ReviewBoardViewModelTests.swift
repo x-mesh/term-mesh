@@ -288,3 +288,78 @@ final class ReviewBoardTaskMergeTests: XCTestCase {
         XCTAssertEqual(merged.blockedReason, "build failed")
     }
 }
+
+final class ReviewBoardAgentReportTests: XCTestCase {
+    func test_reads_the_five_fields_and_the_summary_under_them() {
+        let report = ReviewBoardAgentReport(result: """
+        STATUS: DONE
+        FILES: none
+        VERIFY: find . -maxdepth 1 -type f | wc -l
+        NEXT: NONE
+        FULL_REPORT: n/a
+
+        저장소 최상위 파일은 9개입니다.
+        ✻ Crunched for 6s
+        """)
+        XCTAssertEqual(report?.status, "DONE")
+        XCTAssertEqual(report?.verify, "find . -maxdepth 1 -type f | wc -l")
+        // `none`, `NONE` and `n/a` are the protocol saying "nothing here".
+        XCTAssertNil(report?.files)
+        XCTAssertNil(report?.next)
+        XCTAssertNil(report?.fullReport)
+        // The spinner line is the agent's decoration, not its answer.
+        XCTAssertEqual(report?.body, "저장소 최상위 파일은 9개입니다.")
+    }
+
+    func test_no_header_means_no_report() {
+        XCTAssertNil(ReviewBoardAgentReport(result: "just some output\n"))
+        XCTAssertNil(ReviewBoardAgentReport(result: nil))
+    }
+
+    func test_a_report_of_only_chrome_is_empty_not_shown() {
+        let report = ReviewBoardAgentReport(result: "STATUS: DONE\nFILES: none\nNEXT: NONE\n✻ Brewed for 6s\n")
+        XCTAssertNotNil(report)
+        XCTAssertTrue(report?.isEmpty == true, "nothing worth showing must not push out the empty-state line")
+    }
+
+    func test_no_summary_shows_nothing_rather_than_the_pane() {
+        // The agent answered above the header, which is not captured, so there
+        // is no summary. What follows the header is all terminal.
+        let report = ReviewBoardAgentReport(result: """
+        STATUS: DONE
+        VERIFY: ls
+
+        ✻ Cogitated for 9s
+
+        ──────────────────────────── @executor ──
+        ❯
+        """)
+        XCTAssertNil(report?.body, "a rule with an agent name in it is not a result")
+        XCTAssertEqual(report?.verify, "ls")
+    }
+
+    func test_stops_at_the_pane_below_the_reply() {
+        // What the poller captures runs to the bottom of the screen: the
+        // status bar, a rule, the prompt. None of it is the agent's answer.
+        let report = ReviewBoardAgentReport(result: """
+        STATUS: DONE
+        NEXT: NONE
+
+        최상위 파일 개수는 9개.
+
+        ✻ Crunched for 5s
+
+
+        ◉ xhigh · /effort
+        ──────────────────────────── @executor ──
+        ❯
+        jinwoo@host:~/work/project/x-backup (main)
+        """)
+        XCTAssertEqual(report?.body, "최상위 파일 개수는 9개.")
+    }
+
+    func test_an_asterisk_sentence_survives() {
+        let report = ReviewBoardAgentReport(result: "STATUS: DONE\nNEXT: NONE\n\n* rebuilt the xcframework\n")
+        XCTAssertEqual(report?.body, "* rebuilt the xcframework")
+    }
+}

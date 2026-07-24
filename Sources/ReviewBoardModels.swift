@@ -394,6 +394,126 @@ struct ReviewBoardPanelRun: Identifiable, Equatable, Sendable {
 /// reported" is worse than no row: eight of them in a column buried the one
 /// line that had something to say, and made a task that was running look like
 /// a task that had gone nowhere.
+/// What the agent said, as it said it.
+///
+/// The digest below reads a task for merge and CI facts, which is the right
+/// summary for work that ends in a pull request and no summary at all for work
+/// that ends in an answer. A task could finish, store the agent's report, and
+/// the board would still say nothing had been reported — the one thing a person
+/// opens it to find out.
+///
+/// The reply protocol guarantees these five fields, so they are read straight
+/// off the stored result rather than pattern-matched.
+struct ReviewBoardAgentReport: Equatable, Sendable {
+    let status: String?
+    let files: String?
+    let verify: String?
+    let next: String?
+    let fullReport: String?
+    /// Whatever the agent wrote under the header.
+    let body: String?
+
+    private static let fieldOrder = ["STATUS", "FILES", "VERIFY", "NEXT", "FULL_REPORT"]
+
+    /// Where the reply stops and the terminal starts.
+    ///
+    /// Claude closes a turn with a spinner line — `✻ Crunched for 6s` — and
+    /// below it the pane paints its own furniture: a rule with the agent name
+    /// welded into it, an effort indicator, the prompt, the shell's own line.
+    /// All of it sits under the header, so all of it read as the agent's
+    /// answer.
+    private static let spinnerGlyphs: Set<Character> = ["✻", "✽", "✢", "✳", "✶", "✷", "✸", "✹", "✺", "·", "⏺", "*"]
+    private static let ruleCharacters: Set<Character> = ["─", "━", "═", "—", "-", "_"]
+    private static let promptPrefixes: [Character] = ["❯", "›", "$", "%", "◉", "⏵", "▶"]
+
+    static func isPaneChrome(_ line: String) -> Bool {
+        if let first = line.first, promptPrefixes.contains(first) { return true }
+        // A rule, whether or not it has a label in the middle.
+        if line.filter({ ruleCharacters.contains($0) }).count >= 8 { return true }
+        // A shell prompt: user@host:/some/path.
+        if line.contains("@"), line.contains(":"), line.contains("/") { return true }
+        guard let first = line.first, spinnerGlyphs.contains(first) else { return false }
+        let rest = String(line.dropFirst()).trimmingCharacters(in: .whitespaces)
+        // `<Gerund> for 6s` and `<Gerund>…` are the two shapes it takes. An
+        // asterisk-bulleted sentence the agent actually wrote matches neither,
+        // so it survives.
+        if rest.hasSuffix("…") { return true }
+        let words = rest.split(separator: " ")
+        return words.count == 3
+            && words[1] == "for"
+            && words[2].hasSuffix("s")
+            && words[2].dropLast().allSatisfy(\.isNumber)
+    }
+
+    /// Nil when the text holds no header at all — there is nothing to show in a
+    /// shape the view can label, and the raw text is better left to the caller.
+    init?(result: String?) {
+        guard let result, !result.isEmpty else { return nil }
+        var fields: [String: String] = [:]
+        var bodyLines: [String] = []
+        var seenHeader = false
+
+        for rawLine in result.split(separator: "\n", omittingEmptySubsequences: false) {
+            let line = rawLine.trimmingCharacters(in: .whitespaces)
+            if let name = Self.fieldOrder.first(where: { line.hasPrefix("\($0):") }) {
+                let value = line
+                    .dropFirst(name.count + 1)
+                    .trimmingCharacters(in: .whitespaces)
+                // A repeated header means a second report scrolled in; the
+                // later one is the current answer.
+                fields[name] = value
+                seenHeader = true
+                continue
+            }
+            if seenHeader { bodyLines.append(line) }
+        }
+        guard seenHeader else { return nil }
+
+        func value(_ name: String) -> String? {
+            guard let raw = fields[name], !raw.isEmpty else { return nil }
+            // `n/a` and `NONE` are the protocol's way of saying "nothing here",
+            // and showing a field whose content is "nothing" is just noise.
+            let placeholder = ["n/a", "none", "-"]
+            return placeholder.contains(raw.lowercased()) ? nil : raw
+        }
+
+        status = value("STATUS")
+        files = value("FILES")
+        verify = value("VERIFY")
+        next = value("NEXT")
+        fullReport = value("FULL_REPORT")
+
+        // Only what the agent wrote under the header, and only up to the point
+        // where the pane takes over. What gets captured is a screen: the reply,
+        // then a spinner line, then a rule, the status bar, the prompt, the
+        // shell's own line. Reading to the end put all of that on the board;
+        // stepping over the chrome instead of stopping at it just moved the
+        // problem to the next line down. So the first of those ends the body —
+        // and when the agent wrote no summary at all, the body is empty, which
+        // is the truthful answer rather than a rule with an agent name in it.
+        let body = bodyLines
+            .drop { $0.isEmpty }
+            .prefix { !$0.isEmpty && !Self.isPaneChrome($0) }
+            .joined(separator: "\n")
+        self.body = body.isEmpty ? nil : body
+    }
+
+    /// In display order, skipping what the agent left empty.
+    var presentFields: [(title: String, systemImage: String, text: String)] {
+        [
+            ("Verify", "terminal", verify),
+            ("Next", "arrow.turn.down.right", next),
+            ("Files", "doc.text", files),
+            ("Full Report", "doc.richtext", fullReport),
+        ].compactMap { title, image, text in
+            guard let text, !text.isEmpty else { return nil }
+            return (title, image, text)
+        }
+    }
+
+    var isEmpty: Bool { presentFields.isEmpty && body == nil }
+}
+
 struct ReviewBoardTaskDigest: Equatable, Sendable {
     let attemptLineage: String?
     let aheadBehind: String?
