@@ -392,9 +392,14 @@ impl Api {
             body: String,
             priority: Option<i64>,
             depends_on: Option<Vec<TaskId>>,
+            /// The id this work already has. Pass the team task's id so the
+            /// coordinator records placement *against that work* rather than
+            /// inventing a second task for the same thing — two ids for one
+            /// job is how their statuses came to disagree.
+            task_id: Option<TaskId>,
         }
         let p: Params = serde_json::from_value(params)?;
-        let task_id = TaskId::new_random();
+        let task_id = p.task_id.unwrap_or_else(TaskId::new_random);
         self.mutate(
             &p.request_id,
             "task_created",

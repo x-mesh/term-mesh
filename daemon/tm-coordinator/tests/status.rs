@@ -165,3 +165,58 @@ fn unbuilt_adapters_say_so_instead_of_reporting_a_disabled_flag() {
         "focus_adapter_calls counts calls through adapters that do not exist"
     );
 }
+
+/// Work delegated from a pane already has an identity — the team task board's
+/// — and the coordinator's half of the story (which host, which attempt,
+/// where in the merge queue) is an attribute of that work. Minting a second
+/// id here made one job into two records whose statuses drifted apart.
+#[test]
+fn a_task_can_keep_the_id_the_work_already_has() {
+    let (_dir, api) = api_with_working_log();
+    let project = api
+        .handle(
+            "project.add",
+            json!({"request_id": "prj", "root_path": "/tmp/repo", "name": "repo"}),
+        )
+        .unwrap();
+    let project_id = project["event"]["project_id"].as_str().unwrap().to_string();
+
+    // A team task id: no `tsk_` prefix, because the team board does not use one.
+    let adopted = api
+        .handle(
+            "task.create",
+            json!({
+                "request_id": "adopt",
+                "project_id": project_id,
+                "title": "work that already exists",
+                "body": "",
+                "task_id": "c259ab1f"
+            }),
+        )
+        .unwrap();
+    assert_eq!(adopted["event"]["payload"]["task_id"], "c259ab1f");
+
+    // And it is reachable by that id, so placement and status land on the
+    // same work the agent is reporting against.
+    let fetched = api
+        .handle("task.get", json!({"task_id": "c259ab1f"}))
+        .unwrap();
+    assert_eq!(fetched["task"]["title"], "work that already exists");
+
+    // Without one, the coordinator still names the task itself.
+    let minted = api
+        .handle(
+            "task.create",
+            json!({
+                "request_id": "mint",
+                "project_id": project_id,
+                "title": "work that starts here",
+                "body": ""
+            }),
+        )
+        .unwrap();
+    assert!(minted["event"]["payload"]["task_id"]
+        .as_str()
+        .unwrap()
+        .starts_with("tsk_"));
+}

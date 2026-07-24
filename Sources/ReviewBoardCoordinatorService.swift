@@ -380,17 +380,25 @@ final class ReviewBoardCoordinatorClient: @unchecked Sendable {
     /// Create a task in a project and immediately ask for it to be placed.
     /// Creating without placing would leave work the coordinator never picks a
     /// host for — it schedules on request, not on a timer.
-    func delegate(projectID: String, title: String, body: String) async throws {
+    /// `taskID` is the id this work already has on the team task board. The
+    /// coordinator records placement against it instead of minting a second
+    /// id, so there is one piece of work with one identity rather than two
+    /// records whose statuses drift apart.
+    func delegate(
+        projectID: String,
+        title: String,
+        body: String,
+        taskID: String? = nil
+    ) async throws {
         let requestID = "delegate:\(UUID().uuidString)"
-        let created = try await request(
-            method: "task.create",
-            params: [
-                "request_id": "\(requestID):create",
-                "project_id": projectID,
-                "title": title,
-                "body": body,
-            ]
-        )
+        var createParams: [String: Any] = [
+            "request_id": "\(requestID):create",
+            "project_id": projectID,
+            "title": title,
+            "body": body,
+        ]
+        if let taskID { createParams["task_id"] = taskID }
+        let created = try await request(method: "task.create", params: createParams)
         guard let event = (created as? [String: Any])?["event"] as? [String: Any],
               let payload = event["payload"] as? [String: Any],
               let taskID = payload["task_id"] as? String else {

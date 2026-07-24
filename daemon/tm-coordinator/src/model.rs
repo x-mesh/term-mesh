@@ -55,7 +55,61 @@ macro_rules! typed_id {
 }
 
 typed_id!(ProjectId, "prj_");
-typed_id!(TaskId, "tsk_");
+/// A task's identity comes from wherever the task was created, which for
+/// anything a person actually delegates is the team task board — the record
+/// agents start, report against and finish. Minting a second id here made one
+/// piece of work into two records with two statuses that drifted apart, and
+/// the coordinator's half of the story (which host, which attempt, where in
+/// the merge queue) is an attribute of that work, not a different task.
+///
+/// So the prefix is accepted, not required: `tsk_…` for tasks the coordinator
+/// created itself, and the team's own id for everything else.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub struct TaskId(String);
+
+impl TaskId {
+    pub fn new_random() -> Self {
+        Self(format!("tsk_{}", Uuid::new_v4().simple()))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl TryFrom<String> for TaskId {
+    type Error = String;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        let trimmed = value.trim();
+        if trimmed.is_empty() {
+            Err("task id must not be empty".to_string())
+        } else {
+            Ok(Self(trimmed.to_string()))
+        }
+    }
+}
+
+impl From<TaskId> for String {
+    fn from(value: TaskId) -> Self {
+        value.0
+    }
+}
+
+impl FromStr for TaskId {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Self::try_from(value.to_string())
+    }
+}
+
+impl fmt::Display for TaskId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
 typed_id!(AttemptId, "att_");
 typed_id!(HostId, "hst_");
 typed_id!(FencingToken, "fen_");
