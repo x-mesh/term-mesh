@@ -355,7 +355,7 @@ final class ReviewBoardCoordinatorServiceTests: XCTestCase {
     func testClientParsesFakeUDSSnapshotAndSanitizesDisplayData() async throws {
         let socketPath = "/tmp/tm-coordinator-test-\(getpid())-\(UUID().uuidString.prefix(8)).sock"
         let server = FakeCoordinatorServer(socketPath: socketPath)
-        let task = try server.start(expectedRequests: 3)
+        let task = try server.start(expectedRequests: 4)
         defer {
             server.stop()
             task.cancel()
@@ -368,17 +368,66 @@ final class ReviewBoardCoordinatorServiceTests: XCTestCase {
         XCTAssertFalse(snapshot.memMeshAvailable)
         XCTAssertTrue(snapshot.suspectHost)
         XCTAssertTrue(snapshot.fencedZombie)
+
+        // A coordinator row has to survive parsing at all — every one of them
+        // used to be dropped, leaving a board that reported "No review tasks"
+        // no matter what the coordinator held.
         XCTAssertEqual(snapshot.tasks.count, 1)
-        XCTAssertEqual(snapshot.tasks.first?.id, "task-123")
-        XCTAssertEqual(snapshot.tasks.first?.resultPath, "…/secret.txt")
-        XCTAssertFalse(snapshot.tasks.first?.result?.contains("/Users/jinwoo") ?? true)
+        let parsed = try XCTUnwrap(snapshot.tasks.first)
+        XCTAssertEqual(parsed.rawID, "tsk_8d144b235ec342019a6d2bf39ef65296")
+        XCTAssertEqual(parsed.id, "tsk_8d14", "display id is shortened")
+        XCTAssertEqual(parsed.status, "queued_for_merge", "coordinator statuses are kept verbatim")
+        XCTAssertFalse(parsed.title.contains("/Users/jinwoo"), "paths are still scrubbed")
+        XCTAssertEqual(parsed.updatedAt, ReviewBoardText.timestamp(fromUnixMilliseconds: 1_784_882_974_390))
+
+        XCTAssertEqual(snapshot.mergeQueue.count, 1)
+        let entry = try XCTUnwrap(snapshot.mergeQueue.first)
+        XCTAssertTrue(entry.isFailed)
+        XCTAssertEqual(entry.approvedBy, "reviewer")
+        XCTAssertFalse(entry.lastError?.contains("/Users/jinwoo") ?? true, "queue errors are scrubbed too")
+
+        // The join is the point: an entry names a task by untruncated id.
+        XCTAssertEqual(snapshot.mergeQueueItem(for: parsed)?.id, entry.id)
+
         XCTAssertEqual(snapshot.panelRuns.first?.title, "Review run")
+    }
+
+    /// The team board is the board's other producer and still speaks `id` /
+    /// `result` / `result_path`. Its scrubbing used to be covered through the
+    /// coordinator client, which never carried those fields — so the coverage
+    /// moves here, to the parser that actually sees them.
+    func testTeamBoardTaskParserKeepsScrubbingResultPaths() throws {
+        let parsed = try XCTUnwrap(ReviewBoardTask(dictionary: [
+            "id": "task-123",
+            "team_name": "ws",
+            "title": "Review /Users/jinwoo/private/repo",
+            "status": "review_ready",
+            "priority": 1,
+            "labels": ["merge-failed"],
+            "result": "see /Users/jinwoo/private/repo/token.txt abcdefabcdefabcdefabcdefabcdefabcdef",
+            "result_path": "/Users/jinwoo/private/repo/secret.txt",
+        ]))
+
+        XCTAssertEqual(parsed.id, "task-123")
+        XCTAssertEqual(parsed.rawID, "task-123", "short ids are not shortened further")
+        XCTAssertEqual(parsed.resultPath, "…/secret.txt")
+        XCTAssertFalse(parsed.result?.contains("/Users/jinwoo") ?? true)
+    }
+
+    /// A coordinator row read by the team board's parser is not a partial
+    /// read, it is no read at all — the guard rejects it. Pinned so the two
+    /// parsers cannot quietly be collapsed into one that guesses.
+    func testTeamBoardParserRejectsACoordinatorRow() {
+        XCTAssertNil(ReviewBoardTask(dictionary: [
+            "task_id": "tsk_8d144b235ec342019a6d2bf39ef65296",
+            "title": "Wire the merge queue",
+        ]))
     }
 
     func testRequestThrowsForJSONRPCErrorBeforeResult() async throws {
         let socketPath = "/tmp/tm-coordinator-error-\(getpid())-\(UUID().uuidString.prefix(8)).sock"
         let server = FakeCoordinatorServer(socketPath: socketPath, errorMethods: ["orchestration.status"])
-        let task = try server.start(expectedRequests: 3)
+        let task = try server.start(expectedRequests: 4)
         defer {
             server.stop()
             task.cancel()
@@ -595,18 +644,39 @@ private final class FakeCoordinatorServer: @unchecked Sendable {
                     ["run": "abcdefabcdefabcdefabcdefabcdefab", "title": "Review run", "phase": "checks", "terminal": false],
                 ],
             ]
+        // Field-for-field what a live coordinator returns — captured from
+        // `task.list` over its own socket, not from what the parser wanted to
+        // see. The board reads `task_id`, `project_id` and `updated_at_ms`;
+        // there is no `id`, no `team_name`, no `result`.
         case "task.list":
             result = [
                 "tasks": [
                     [
-                        "id": "task-123",
-                        "team_name": "ws",
+                        "task_id": "tsk_8d144b235ec342019a6d2bf39ef65296",
+                        "project_id": "prj_819413b3d02d4b319374d6004a68628d",
                         "title": "Review /Users/jinwoo/private/repo",
-                        "status": "review_ready",
+                        "body": "",
+                        "status": "queued_for_merge",
                         "priority": 1,
-                        "labels": ["merge-failed"],
-                        "result": "see /Users/jinwoo/private/repo/token.txt abcdefabcdefabcdefabcdefabcdefabcdef",
-                        "result_path": "/Users/jinwoo/private/repo/secret.txt",
+                        "depends_on": [],
+                        "created_by": "leader",
+                        "created_at_ms": 1_784_882_974_390,
+                        "updated_at_ms": 1_784_882_974_390,
+                    ],
+                ],
+            ]
+        case "merge.queue":
+            result = [
+                "items": [
+                    [
+                        "queue_id": "mrq_2f1c4d5e6a7b8c9d0e1f2a3b4c5d6e7f",
+                        "project_id": "prj_819413b3d02d4b319374d6004a68628d",
+                        "task_id": "tsk_8d144b235ec342019a6d2bf39ef65296",
+                        "attempt_id": "att_9a8b7c6d5e4f3a2b1c0d9e8f7a6b5c4d",
+                        "status": "failed",
+                        "approved_by": "reviewer",
+                        "approved_at_ms": 1_784_882_974_390,
+                        "last_error": "rebase onto /Users/jinwoo/private/repo failed",
                     ],
                 ],
             ]

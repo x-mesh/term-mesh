@@ -70,20 +70,50 @@ final class ReviewBoardViewModel: ObservableObject {
         if labels.contains("mem-mesh-unavailable") { badges.append(.memMeshUnavailable) }
         if labels.contains("suspect-host") || task.isStale { badges.append(.suspectHost) }
         if labels.contains("fenced-zombie") { badges.append(.fencedZombie) }
-        if task.status == "blocked" { badges.append(.blocked) }
+        if task.status == "blocked" || task.status == "quarantined" { badges.append(.blocked) }
         if task.status == "review_ready" { badges.append(.reviewReady) }
-        if task.status == "failed" && mergeText(for: task).contains("merge") {
-            badges.append(.mergeFailed)
-        }
-        if labels.contains("merge-failed") {
-            badges.append(.mergeFailed)
+        // A real queue entry outranks the guesses below it: when the
+        // coordinator says this task's merge failed, nothing else needs to be
+        // inferred. Only when there is no entry do we fall back to reading
+        // the task's own text, which is all a locally-backed board has.
+        if let item = snapshot.mergeQueueItem(for: task) {
+            if item.isFailed { badges.append(.mergeFailed) }
+        } else {
+            if task.status == "failed" && mergeText(for: task).contains("merge") {
+                badges.append(.mergeFailed)
+            }
+            if labels.contains("merge-failed") {
+                badges.append(.mergeFailed)
+            }
         }
 
         return ReviewBoardStatus.allCases.filter { badges.contains($0) }
     }
 
+    /// Entries still waiting on the queue, newest approval first. Finished
+    /// ones are dropped: a merged entry is history, and the panel is for what
+    /// still needs attention — except failures, which need it most of all.
+    var pendingMergeQueue: [ReviewBoardMergeQueueItem] {
+        snapshot.mergeQueue
+            .filter { $0.isPending || $0.isFailed }
+            .sorted { ($0.approvedAt ?? "") > ($1.approvedAt ?? "") }
+    }
+
+    /// A queue entry names a task by id, which is not a thing to show a
+    /// person. Falls back to the shortened id when the task is not in the
+    /// list — the queue is project-wide and the task list is capped, so an
+    /// entry can outlive its row.
+    func taskTitle(forMergeQueueItem item: ReviewBoardMergeQueueItem) -> String {
+        snapshot.tasks.first { $0.rawID == item.taskRawID }?.title
+            ?? "Task \(item.taskDisplayID)"
+    }
+
     func digest(for task: ReviewBoardTask) -> ReviewBoardTaskDigest {
-        ReviewBoardTaskDigest.make(for: task, panelRuns: snapshot.panelRuns)
+        ReviewBoardTaskDigest.make(
+            for: task,
+            panelRuns: snapshot.panelRuns,
+            mergeQueueItem: snapshot.mergeQueueItem(for: task)
+        )
     }
 
     private func keepSelectionValid() {
@@ -99,15 +129,23 @@ final class ReviewBoardViewModel: ObservableObject {
             .lowercased()
     }
 
+    /// Needs-attention first. Both vocabularies are ranked here — the team
+    /// board's and the coordinator's — because either producer can fill the
+    /// list, and an unranked status sinks to the bottom where a blocked task
+    /// would go unseen.
     private func statusRank(_ status: String) -> Int {
         switch status {
-        case "blocked": return 0
-        case "failed": return 1
+        case "blocked", "quarantined": return 0
+        case "failed", "rejected": return 1
         case "review_ready": return 2
-        case "in_progress": return 3
-        case "assigned", "queued": return 4
-        case "completed": return 5
-        default: return 6
+        case "queued_for_merge", "approved": return 3
+        case "in_progress": return 4
+        case "suspect": return 5
+        case "assigned", "queued", "placed", "reassigned": return 6
+        case "pending": return 7
+        case "completed", "merged": return 8
+        case "cancelled": return 9
+        default: return 10
         }
     }
 }

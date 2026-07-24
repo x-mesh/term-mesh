@@ -80,14 +80,38 @@ enum ReviewBoardStatus: String, CaseIterable, Equatable, Sendable {
 struct ReviewBoardSnapshot: Equatable, Sendable {
     var tasks: [ReviewBoardTask]
     var panelRuns: [ReviewBoardPanelRun]
+    var mergeQueue: [ReviewBoardMergeQueueItem]
     var coordinatorOnline: Bool
     var memMeshAvailable: Bool
     var suspectHost: Bool
     var fencedZombie: Bool
 
+    init(
+        tasks: [ReviewBoardTask],
+        panelRuns: [ReviewBoardPanelRun],
+        mergeQueue: [ReviewBoardMergeQueueItem] = [],
+        coordinatorOnline: Bool,
+        memMeshAvailable: Bool,
+        suspectHost: Bool,
+        fencedZombie: Bool
+    ) {
+        self.tasks = tasks
+        self.panelRuns = panelRuns
+        self.mergeQueue = mergeQueue
+        self.coordinatorOnline = coordinatorOnline
+        self.memMeshAvailable = memMeshAvailable
+        self.suspectHost = suspectHost
+        self.fencedZombie = fencedZombie
+    }
+
+    func mergeQueueItem(for task: ReviewBoardTask) -> ReviewBoardMergeQueueItem? {
+        mergeQueue.first { $0.taskRawID == task.rawID }
+    }
+
     static let empty = ReviewBoardSnapshot(
         tasks: [],
         panelRuns: [],
+        mergeQueue: [],
         coordinatorOnline: false,
         memMeshAvailable: false,
         suspectHost: false,
@@ -97,6 +121,12 @@ struct ReviewBoardSnapshot: Equatable, Sendable {
 
 struct ReviewBoardTask: Identifiable, Equatable, Sendable {
     let id: String
+    /// The identifier as the producer wrote it. `id` is shortened for display,
+    /// and a coordinator task id is a 36-character `tsk_<uuid>` that shortens
+    /// to four distinguishing hex digits — fine to read, far too collision
+    /// prone to join a merge queue entry on. Anything matching rows across
+    /// two payloads uses this; anything shown to a person uses `id`.
+    let rawID: String
     let teamName: String
     let title: String
     let status: String
@@ -138,6 +168,7 @@ struct ReviewBoardTask: Identifiable, Equatable, Sendable {
         updatedAt: String? = nil
     ) {
         self.id = ReviewBoardText.safeIdentifier(id)
+        self.rawID = id.trimmingCharacters(in: .whitespacesAndNewlines)
         self.teamName = ReviewBoardText.safeLabel(teamName)
         self.title = ReviewBoardText.safeLabel(title)
         self.status = status
@@ -185,6 +216,86 @@ struct ReviewBoardTask: Identifiable, Equatable, Sendable {
             updatedAt: dictionary["updated_at"] as? String
         )
     }
+
+    /// The coordinator writes its own domain's vocabulary — `task_id`, no
+    /// team, millisecond timestamps — and the board used to read only the
+    /// team board's (`id`, `team_name`, `updated_at`). Every coordinator row
+    /// therefore failed the `id` guard above and vanished, so a board backed
+    /// by a healthy coordinator showed "No review tasks" no matter how much
+    /// work it held.
+    ///
+    /// Two producers get two parsers rather than one that guesses: a single
+    /// init reading `id ?? task_id` would keep working while quietly filling
+    /// unrelated fields from the wrong schema.
+    init?(coordinatorDictionary dictionary: [String: Any]) {
+        guard let taskID = dictionary["task_id"] as? String,
+              let title = dictionary["title"] as? String else {
+            return nil
+        }
+        // Coordinator statuses are kept verbatim. Folding `queued_for_merge`
+        // into `queued` would read fine and lose the one distinction the
+        // merge queue exists to show.
+        self.init(
+            id: taskID,
+            teamName: dictionary["project_id"] as? String ?? "Unknown project",
+            title: title,
+            status: dictionary["status"] as? String ?? "pending",
+            assignee: (dictionary["placement"] as? [String: Any])?["host_id"] as? String,
+            priority: (dictionary["priority"] as? Int) ?? 0,
+            dependsOn: dictionary["depends_on"] as? [String] ?? [],
+            updatedAt: (dictionary["updated_at_ms"] as? UInt64).map(ReviewBoardText.timestamp(fromUnixMilliseconds:))
+        )
+    }
+}
+
+/// One row of the coordinator's merge queue. The board used to describe merge
+/// state by searching task prose for the word "merge"; these are the actual
+/// records the coordinator gates a merge on.
+struct ReviewBoardMergeQueueItem: Identifiable, Equatable, Sendable {
+    let id: String
+    /// Untruncated, to join against `ReviewBoardTask.rawID`.
+    let taskRawID: String
+    let taskDisplayID: String
+    let attemptID: String
+    /// `queued` | `running` | `merged` | `failed` | `cancelled`.
+    let status: String
+    let approvedBy: String
+    let approvedAt: String?
+    let lastError: String?
+
+    var isFailed: Bool { status == "failed" }
+
+    /// Still waiting on the queue, as opposed to finished one way or another.
+    var isPending: Bool { status == "queued" || status == "running" }
+
+    init?(dictionary: [String: Any]) {
+        guard let queueID = dictionary["queue_id"] as? String,
+              let taskID = dictionary["task_id"] as? String else {
+            return nil
+        }
+        id = ReviewBoardText.safeIdentifier(queueID)
+        taskRawID = taskID.trimmingCharacters(in: .whitespacesAndNewlines)
+        taskDisplayID = ReviewBoardText.safeIdentifier(taskID)
+        attemptID = ReviewBoardText.safeIdentifier(dictionary["attempt_id"] as? String ?? "")
+        status = dictionary["status"] as? String ?? "queued"
+        approvedBy = ReviewBoardText.safeLabel(dictionary["approved_by"] as? String ?? "unknown")
+        approvedAt = (dictionary["approved_at_ms"] as? UInt64)
+            .map(ReviewBoardText.timestamp(fromUnixMilliseconds:))
+        lastError = (dictionary["last_error"] as? String).map { ReviewBoardText.safeBody($0) }
+    }
+
+    /// What the task's Merge Queue fact says. Reads as a sentence because it
+    /// lands in a text row, not a table.
+    var summary: String {
+        var line = "\(status) · approved by \(approvedBy)"
+        if let approvedAt {
+            line += " at \(approvedAt)"
+        }
+        if let lastError {
+            line += " — \(lastError)"
+        }
+        return line
+    }
 }
 
 struct ReviewBoardPanelRun: Identifiable, Equatable, Sendable {
@@ -214,11 +325,14 @@ struct ReviewBoardTaskDigest: Equatable, Sendable {
     let rejectionReason: String
     let mergeQueue: String
 
-    static func make(for task: ReviewBoardTask, panelRuns: [ReviewBoardPanelRun]) -> ReviewBoardTaskDigest {
+    static func make(
+        for task: ReviewBoardTask,
+        panelRuns: [ReviewBoardPanelRun],
+        mergeQueueItem: ReviewBoardMergeQueueItem? = nil
+    ) -> ReviewBoardTaskDigest {
         let haystack = ([task.title, task.blockedReason, task.reviewSummary, task.result] + task.labels)
             .compactMap { $0 }
             .joined(separator: "\n")
-        let lower = haystack.lowercased()
         let activeRun = panelRuns.first { !$0.isTerminal }
         let lastRun = panelRuns.first
 
@@ -238,9 +352,17 @@ struct ReviewBoardTaskDigest: Equatable, Sendable {
             rejectionReason: task.blockedReason
                 ?? firstLine(containingAny: ["reject", "rejected", "blocked"], in: haystack)
                 ?? "No rejection reason reported",
-            mergeQueue: activeRun.map { "Running: \($0.title) (\($0.phase))" }
-                ?? lastRun.map { "Last run: \($0.title) (\($0.phase))" }
-                ?? (lower.contains("merge") ? "Merge activity reported" : "No merge queue entry reported")
+            // The coordinator's own record when it has one. What stood here
+            // before was a panel run — a review panel, not a merge — with a
+            // last resort of "the word merge appears in this task's text",
+            // which reported merge activity for a task that merely mentioned
+            // it and reported none for a queue entry that was actively
+            // failing. Panel runs stay as a fallback because a board fed by
+            // the local team store has no queue to read.
+            mergeQueue: mergeQueueItem.map(\.summary)
+                ?? activeRun.map { "No queue entry · panel run: \($0.title) (\($0.phase))" }
+                ?? lastRun.map { "No queue entry · last panel run: \($0.title) (\($0.phase))" }
+                ?? "No merge queue entry reported"
         )
     }
 
@@ -285,6 +407,19 @@ enum ReviewBoardText {
 
     static func safeLabel(_ value: String) -> String {
         safeBody(value, limit: 120)
+    }
+
+    private static let timestampFormatter: ISO8601DateFormatter = {
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime]
+        return formatter
+    }()
+
+    /// The coordinator stamps events in Unix milliseconds; the board sorts and
+    /// shows ISO-8601 strings. Converting at the parser keeps every consumer
+    /// downstream working in one representation.
+    static func timestamp(fromUnixMilliseconds milliseconds: UInt64) -> String {
+        timestampFormatter.string(from: Date(timeIntervalSince1970: Double(milliseconds) / 1000))
     }
 
     static func safeBody(_ value: String, limit: Int = 240) -> String {

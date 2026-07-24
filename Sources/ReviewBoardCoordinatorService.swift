@@ -206,10 +206,15 @@ final class ReviewBoardCoordinatorClient: @unchecked Sendable {
     func fetchSnapshot() async throws -> ReviewBoardSnapshot {
         async let statusResponse = request(method: "orchestration.status")
         async let taskResponse = request(method: "task.list")
+        async let mergeQueueResponse = request(method: "merge.queue")
         async let eventResponse = request(method: "events.subscribe", params: ["scope": "review_board", "replay": false])
 
         let statusObject = try await statusResponse as? [String: Any] ?? [:]
         let taskObject = try await taskResponse
+        // The queue is additive to the board: losing it should grey out one
+        // section, not sink the whole snapshot and report a live coordinator
+        // as offline.
+        let mergeQueueObject = try? await mergeQueueResponse
         _ = try? await eventResponse
 
         let taskRows: [[String: Any]]
@@ -222,7 +227,13 @@ final class ReviewBoardCoordinatorClient: @unchecked Sendable {
             taskRows = []
         }
 
-        let reviewTasks = taskRows.compactMap(ReviewBoardTask.init(dictionary:))
+        let mergeQueueRows = (mergeQueueObject as? [String: Any])?["items"] as? [[String: Any]] ?? []
+        let mergeQueue = mergeQueueRows.compactMap(ReviewBoardMergeQueueItem.init(dictionary:))
+
+        // Coordinator rows, read with the coordinator's vocabulary. Parsed
+        // with the team board's they all failed the `id` guard and the board
+        // showed nothing at all.
+        let reviewTasks = taskRows.compactMap(ReviewBoardTask.init(coordinatorDictionary:))
         let panelRuns = (statusObject["panel_runs"] as? [[String: Any]] ?? [])
             .compactMap(ReviewBoardPanelRun.init(dictionary:))
         let memMeshAvailable = statusObject["mem_mesh_available"] as? Bool
@@ -238,6 +249,7 @@ final class ReviewBoardCoordinatorClient: @unchecked Sendable {
         return ReviewBoardSnapshot(
             tasks: reviewTasks,
             panelRuns: panelRuns,
+            mergeQueue: mergeQueue,
             coordinatorOnline: true,
             memMeshAvailable: memMeshAvailable,
             suspectHost: suspectHost,

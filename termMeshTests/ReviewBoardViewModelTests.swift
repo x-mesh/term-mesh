@@ -32,6 +32,107 @@ final class ReviewBoardViewModelTests: XCTestCase {
         )
     }
 
+    /// A real queue entry replaces the guessing. The task below carries none
+    /// of the hints the old path relied on — its status is not `failed` and
+    /// it has no `merge-failed` label — so the badge can only come from the
+    /// coordinator's own record.
+    @MainActor
+    func testMergeFailedBadgeComesFromTheQueueEntryNotTaskProse() throws {
+        let task = ReviewBoardTask(
+            id: "tsk_8d144b235ec342019a6d2bf39ef65296",
+            teamName: "prj_819413b3",
+            title: "Wire the merge queue",
+            status: "queued_for_merge"
+        )
+        let entry = try XCTUnwrap(ReviewBoardMergeQueueItem(dictionary: [
+            "queue_id": "mrq_2f1c4d5e6a7b8c9d0e1f2a3b4c5d6e7f",
+            "task_id": "tsk_8d144b235ec342019a6d2bf39ef65296",
+            "attempt_id": "att_9a8b7c6d5e4f3a2b1c0d9e8f7a6b5c4d",
+            "status": "failed",
+            "approved_by": "reviewer",
+            "approved_at_ms": 1_784_882_974_390,
+            "last_error": "rebase conflict",
+        ]))
+        let model = ReviewBoardViewModel(initialSnapshot: ReviewBoardSnapshot(
+            tasks: [task],
+            panelRuns: [],
+            mergeQueue: [entry],
+            coordinatorOnline: true,
+            memMeshAvailable: true,
+            suspectHost: false,
+            fencedZombie: false
+        ))
+
+        XCTAssertEqual(model.statusBadges(for: task), [.mergeFailed])
+        XCTAssertEqual(model.pendingMergeQueue.map(\.id), [entry.id])
+        XCTAssertEqual(model.taskTitle(forMergeQueueItem: entry), "Wire the merge queue")
+
+        // The Merge Queue fact is the record, not a panel run or a keyword.
+        let digest = model.digest(for: task)
+        XCTAssertTrue(digest.mergeQueue.contains("failed"), digest.mergeQueue)
+        XCTAssertTrue(digest.mergeQueue.contains("reviewer"), digest.mergeQueue)
+        XCTAssertTrue(digest.mergeQueue.contains("rebase conflict"), digest.mergeQueue)
+    }
+
+    /// Merged and cancelled entries are history; the panel lists what still
+    /// needs a person. Failures stay, because they need one most.
+    @MainActor
+    func testPendingMergeQueueDropsSettledEntriesButKeepsFailures() {
+        func entry(_ queueID: String, _ status: String) -> ReviewBoardMergeQueueItem {
+            ReviewBoardMergeQueueItem(dictionary: [
+                "queue_id": queueID,
+                "task_id": "tsk_\(queueID)",
+                "status": status,
+                "approved_by": "reviewer",
+            ])!
+        }
+        let model = ReviewBoardViewModel(initialSnapshot: ReviewBoardSnapshot(
+            tasks: [],
+            panelRuns: [],
+            mergeQueue: [
+                entry("queued01", "queued"),
+                entry("running1", "running"),
+                entry("merged01", "merged"),
+                entry("failed01", "failed"),
+                entry("cancel01", "cancelled"),
+            ],
+            coordinatorOnline: true,
+            memMeshAvailable: true,
+            suspectHost: false,
+            fencedZombie: false
+        ))
+
+        XCTAssertEqual(
+            Set(model.pendingMergeQueue.map(\.taskRawID)),
+            ["tsk_queued01", "tsk_running1", "tsk_failed01"]
+        )
+    }
+
+    /// Without a queue entry the board still has to say something, and the
+    /// old text-scanning path is what a locally-backed board falls back to.
+    @MainActor
+    func testWithoutAQueueEntryTheOldTaskProsePathStillApplies() {
+        let task = ReviewBoardTask(
+            id: "task-123",
+            teamName: "ws",
+            title: "Merge failed on host",
+            status: "failed",
+            labels: ["merge-failed"]
+        )
+        let model = ReviewBoardViewModel(initialSnapshot: ReviewBoardSnapshot(
+            tasks: [task],
+            panelRuns: [],
+            mergeQueue: [],
+            coordinatorOnline: true,
+            memMeshAvailable: true,
+            suspectHost: false,
+            fencedZombie: false
+        ))
+
+        XCTAssertEqual(model.statusBadges(for: task), [.mergeFailed])
+        XCTAssertEqual(model.digest(for: task).mergeQueue, "No merge queue entry reported")
+    }
+
     @MainActor
     func testReviewReadyAndBlockedTaskStates() {
         let blocked = ReviewBoardTask(id: "blocked", teamName: "ws", title: "Blocked", status: "blocked")

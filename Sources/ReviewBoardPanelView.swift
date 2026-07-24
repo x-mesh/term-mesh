@@ -9,12 +9,20 @@ struct ReviewBoardPanelView: View {
         VStack(alignment: .leading, spacing: 0) {
             header
             Divider()
-            if viewModel.tasks.isEmpty {
+            if viewModel.tasks.isEmpty && viewModel.pendingMergeQueue.isEmpty {
                 emptyState
             } else {
                 ScrollView {
                     VStack(alignment: .leading, spacing: 12) {
-                        taskList
+                        // Above the tasks: the queue is what gates work
+                        // actually landing, so it should not need scrolling
+                        // past a long task list to find.
+                        if !viewModel.pendingMergeQueue.isEmpty {
+                            mergeQueueList
+                        }
+                        if !viewModel.tasks.isEmpty {
+                            taskList
+                        }
                         if let task = viewModel.selectedTask {
                             taskDetails(task)
                         }
@@ -70,6 +78,69 @@ struct ReviewBoardPanelView: View {
         .padding(12)
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         .accessibilityLabel("No review tasks")
+    }
+
+    private var mergeQueueList: some View {
+        let items = viewModel.pendingMergeQueue
+        return VStack(alignment: .leading, spacing: 7) {
+            sectionTitle("Merge Queue (\(items.count))")
+            ForEach(items) { item in
+                mergeQueueRow(item)
+            }
+        }
+        .accessibilityIdentifier("reviewBoard.mergeQueue")
+    }
+
+    private func mergeQueueRow(_ item: ReviewBoardMergeQueueItem) -> some View {
+        // Selecting the queue entry selects the task it gates — the entry
+        // carries no detail of its own worth a second detail pane.
+        Button {
+            viewModel.selectTask(id: item.taskDisplayID)
+        } label: {
+            VStack(alignment: .leading, spacing: 5) {
+                HStack(spacing: 6) {
+                    Image(systemName: item.isFailed ? "arrow.triangle.merge" : "clock")
+                        .foregroundColor(item.isFailed ? .red : .secondary)
+                        .accessibilityHidden(true)
+                    Text(viewModel.taskTitle(forMergeQueueItem: item))
+                        .font(.system(size: 12, weight: .medium))
+                        .lineLimit(1)
+                    Spacer(minLength: 4)
+                    Text(item.status)
+                        .font(.system(size: 10, weight: .medium))
+                        .foregroundColor(item.isFailed ? .red : .secondary)
+                }
+                if let lastError = item.lastError {
+                    Text(lastError)
+                        .font(.system(size: 10))
+                        .foregroundColor(.red)
+                        .lineLimit(2)
+                }
+                HStack(spacing: 6) {
+                    Text("approved by \(item.approvedBy)")
+                    if let approvedAt = item.approvedAt {
+                        Text("·")
+                        Text(approvedAt)
+                    }
+                    Spacer(minLength: 4)
+                }
+                .font(.system(size: 10))
+                .foregroundColor(.secondary)
+            }
+            .padding(8)
+            .background(Color(nsColor: .controlBackgroundColor))
+            .overlay(
+                RoundedRectangle(cornerRadius: 7)
+                    .stroke(
+                        item.isFailed ? Color.red.opacity(0.5) : Color(nsColor: .separatorColor),
+                        lineWidth: 1
+                    )
+            )
+            .clipShape(RoundedRectangle(cornerRadius: 7))
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel("Merge queue entry, \(item.status), approved by \(item.approvedBy)")
+        .accessibilityIdentifier("reviewBoard.mergeQueue.\(item.id)")
     }
 
     private var taskList: some View {
