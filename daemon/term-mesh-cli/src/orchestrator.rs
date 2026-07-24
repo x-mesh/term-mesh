@@ -134,10 +134,13 @@ enum HostCommand {
         arch: String,
         #[arg(long)]
         load: f64,
+        /// Omit when the caller cannot say. Absent means "unknown capacity",
+        /// which stays schedulable; `0` means the host is full and blocks
+        /// placement.
         #[arg(long)]
-        total_slots: u32,
+        total_slots: Option<u32>,
         #[arg(long)]
-        used_slots: u32,
+        used_slots: Option<u32>,
         #[arg(long = "project-root", num_args = 1..)]
         project_roots: Vec<String>,
         #[arg(long, default_value_t = true)]

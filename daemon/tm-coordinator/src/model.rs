@@ -179,7 +179,15 @@ pub struct HostObservation {
     pub os: String,
     pub arch: String,
     pub load: f64,
-    pub total_slots: u32,
+    /// `None` when the reporter cannot say how much work this host can take.
+    /// The app is in exactly that position — it mirrors a peer roster and has
+    /// no basis for a slot count — and reporting `0` to mean "unknown" made
+    /// every host it observed permanently unplaceable, because `0` already
+    /// means "full". Absent and zero are different answers and only one of
+    /// them should block scheduling.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total_slots: Option<u32>,
+    #[serde(default)]
     pub used_slots: u32,
     pub project_roots: Vec<String>,
     /// Project roots whose team leader runs on THIS host. Once a project
@@ -194,14 +202,24 @@ pub struct HostObservation {
 }
 
 impl HostObservation {
-    pub fn available_slots(&self) -> u32 {
-        self.total_slots.saturating_sub(self.used_slots)
+    /// `None` propagates: an unknown total cannot yield a known remainder.
+    pub fn available_slots(&self) -> Option<u32> {
+        self.total_slots
+            .map(|total| total.saturating_sub(self.used_slots))
     }
 
+    pub fn has_known_capacity(&self) -> bool {
+        self.total_slots.is_some()
+    }
+
+    /// Only a *known* zero disqualifies a host. An unknown capacity is a gap
+    /// in what the reporter could tell us, not a statement that the machine
+    /// is busy, so it stays a candidate — ranked behind every host that did
+    /// report capacity, so a guess never outbids a fact.
     pub fn is_eligible_for(&self, root_path: &str) -> bool {
         self.live
             && !self.quarantined
-            && self.available_slots() > 0
+            && self.available_slots() != Some(0)
             && self.project_roots.iter().any(|root| root == root_path)
     }
 }

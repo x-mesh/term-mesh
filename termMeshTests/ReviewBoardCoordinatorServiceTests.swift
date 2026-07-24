@@ -140,15 +140,19 @@ final class ReviewBoardCoordinatorServiceTests: XCTestCase {
         XCTAssertNotEqual(first.requestID, changed.requestID)
     }
 
-    func testHostObservationParamsNeverClaimCapacity() {
+    /// Omitting the slot counts is the point, and this test used to pin the
+    /// opposite: it asserted the app sends `0/0`, which the coordinator reads
+    /// as "this host is full" — so every host the app reported was refused
+    /// for placement, by hand and automatically. Absent means unknown.
+    func testHostObservationParamsOmitCapacityRatherThanClaimingZero() {
         let params = CoordinatorHostObservation(
             hostKey: "ssh:root@jw-server",
             projectRoots: ["/root/x-kit", "/root/demo-project"],
             isLive: true
         ).rpcParams
 
-        XCTAssertEqual(params["total_slots"] as? Int, 0)
-        XCTAssertEqual(params["used_slots"] as? Int, 0)
+        XCTAssertNil(params["total_slots"], "a zero here reads as 'full', not 'unknown'")
+        XCTAssertNil(params["used_slots"])
         XCTAssertEqual(params["live"] as? Bool, true)
         XCTAssertEqual(params["project_roots"] as? [String], ["/root/demo-project", "/root/x-kit"])
         XCTAssertEqual(params["host_id"] as? String, CoordinatorHostObservation(

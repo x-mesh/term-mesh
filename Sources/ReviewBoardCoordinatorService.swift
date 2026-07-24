@@ -119,10 +119,12 @@ struct CoordinatorHostObservation: Equatable {
             "os": "",
             "arch": "",
             "load": 0,
-            // Scheduling slots are a coordinator-side concept the app has no
-            // basis to fill; 0/0 keeps it from being read as free capacity.
-            "total_slots": 0,
-            "used_slots": 0,
+            // Slots are omitted, not zeroed. The app mirrors a peer roster
+            // and has no basis for a capacity number, and `0` is not the way
+            // to say so: the coordinator reads a known zero as "this host is
+            // full" and refused to place work on any host the app reported,
+            // by hand or automatically. An absent count means "unknown",
+            // which stays schedulable and simply ranks last.
             "project_roots": projectRoots.sorted(),
             // The coordinator rejects a leader project the host does not
             // report hosting, so keep this a strict subset.

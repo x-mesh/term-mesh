@@ -236,8 +236,13 @@ impl Api {
             os: String,
             arch: String,
             load: f64,
-            total_slots: u32,
-            used_slots: u32,
+            // Omit both to say "I cannot tell you". A reporter that knows
+            // sends them; one that does not must not be forced to invent a
+            // number that reads as "this host is full".
+            #[serde(default)]
+            total_slots: Option<u32>,
+            #[serde(default)]
+            used_slots: Option<u32>,
             project_roots: Vec<String>,
             #[serde(default)]
             leader_projects: Vec<String>,
@@ -246,8 +251,14 @@ impl Api {
             observed_at_ms: Option<u64>,
         }
         let p: Params = serde_json::from_value(params)?;
-        if p.used_slots > p.total_slots {
-            bail!("INVALID_PARAMS: used_slots exceeds total_slots");
+        // Only checkable when the reporter gave a total. `Option > Option`
+        // would compare `Some(n) > None` as true and reject every host that
+        // reported usage without a total.
+        let used_slots = p.used_slots.unwrap_or(0);
+        if let Some(total) = p.total_slots {
+            if used_slots > total {
+                bail!("INVALID_PARAMS: used_slots exceeds total_slots");
+            }
         }
         // A leader has to sit in a project this host actually hosts —
         // otherwise the table would claim a machine leads work it does not
@@ -265,7 +276,7 @@ impl Api {
             arch: p.arch,
             load: p.load,
             total_slots: p.total_slots,
-            used_slots: p.used_slots,
+            used_slots,
             project_roots: p.project_roots,
             leader_projects: p.leader_projects,
             live: p.live.unwrap_or(true),

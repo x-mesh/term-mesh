@@ -89,7 +89,7 @@ impl Reducer {
                 os TEXT NOT NULL,
                 arch TEXT NOT NULL,
                 load REAL NOT NULL,
-                total_slots INTEGER NOT NULL,
+                total_slots INTEGER,
                 used_slots INTEGER NOT NULL,
                 project_roots_json TEXT NOT NULL,
                 leader_projects_json TEXT NOT NULL DEFAULT '[]',
@@ -139,6 +139,41 @@ impl Reducer {
             "ALTER TABLE hosts ADD COLUMN leader_projects_json TEXT NOT NULL DEFAULT '[]'",
             [],
         );
+        // `total_slots` had to become nullable so "capacity unknown" stops
+        // reading as "capacity zero", and no `ALTER TABLE` can relax a NOT
+        // NULL. Recreating is safe here in a way it would not be for a table
+        // holding originals: `hosts` is a pure projection, and every row is
+        // rebuilt by replaying the event log at open.
+        let legacy_not_null = self
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('hosts')
+                 WHERE name = 'total_slots' AND \"notnull\" = 1",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap_or(0)
+            > 0;
+        if legacy_not_null {
+            self.conn.execute_batch(
+                r#"
+                DROP TABLE hosts;
+                CREATE TABLE hosts(
+                    host_id TEXT PRIMARY KEY,
+                    os TEXT NOT NULL,
+                    arch TEXT NOT NULL,
+                    load REAL NOT NULL,
+                    total_slots INTEGER,
+                    used_slots INTEGER NOT NULL,
+                    project_roots_json TEXT NOT NULL,
+                    leader_projects_json TEXT NOT NULL DEFAULT '[]',
+                    live INTEGER NOT NULL,
+                    quarantined INTEGER NOT NULL,
+                    observed_at_ms INTEGER NOT NULL
+                );
+                "#,
+            )?;
+        }
         Ok(())
     }
 
@@ -306,8 +341,13 @@ impl Reducer {
                 .ok_or_else(|| anyhow::anyhow!("manual host override is not eligible"));
         }
         eligible.sort_by(|a, b| {
-            b.available_slots()
-                .cmp(&a.available_slots())
+            // Hosts that reported capacity come first, and only then by how
+            // much: a host that never said outranking one that said "three
+            // free" would let a guess beat a fact. Within the unknown group
+            // load and id decide, so the order stays deterministic.
+            b.has_known_capacity()
+                .cmp(&a.has_known_capacity())
+                .then_with(|| b.available_slots().cmp(&a.available_slots()))
                 .then_with(|| {
                     a.load
                         .partial_cmp(&b.load)
@@ -892,7 +932,7 @@ fn row_to_host(row: &rusqlite::Row<'_>) -> rusqlite::Result<HostObservation> {
         os: row.get(1)?,
         arch: row.get(2)?,
         load: row.get(3)?,
-        total_slots: row.get::<_, i64>(4)? as u32,
+        total_slots: row.get::<_, Option<i64>>(4)?.map(|slots| slots as u32),
         used_slots: row.get::<_, i64>(5)? as u32,
         project_roots: serde_json::from_str(&row.get::<_, String>(6)?).map_err(to_sql_err)?,
         leader_projects: serde_json::from_str(&row.get::<_, String>(7)?).map_err(to_sql_err)?,
