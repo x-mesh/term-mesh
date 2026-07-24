@@ -189,6 +189,8 @@ enum ReviewBoardCoordinatorError: Error, Equatable {
 }
 
 final class ReviewBoardCoordinatorClient: @unchecked Sendable {
+    private let subscriptionLock = NSLock()
+    private var subscriptionStopped = false
     private let socketPath: String
     private let queue = DispatchQueue(label: "com.termmesh.review-board.coordinator", qos: .utility)
     /// The event subscription blocks on its socket for the connection's whole
@@ -259,6 +261,90 @@ final class ReviewBoardCoordinatorClient: @unchecked Sendable {
         )
     }
 
+    /// Raw task rows, plus each project's root path. The board's parsed tasks
+    /// deliberately drop `placement` and `current_attempt_id` — the two fields
+    /// a dispatcher needs — so this reads them separately rather than widening
+    /// `ReviewBoardTask` with fields no view shows.
+    func fetchPlacementInputs() async throws -> (rows: [[String: Any]], roots: [String: String]) {
+        async let taskResponse = request(method: "task.list")
+        async let projectResponse = request(method: "project.list")
+        let rows = (try await taskResponse as? [String: Any])?["tasks"] as? [[String: Any]] ?? []
+        let projects = (try await projectResponse as? [String: Any])?["projects"] as? [[String: Any]] ?? []
+        var roots: [String: String] = [:]
+        for project in projects {
+            guard let id = project["project_id"] as? String,
+                  let root = project["root_path"] as? String else { continue }
+            roots[id] = root
+        }
+        return (rows, roots)
+    }
+
+    /// Say a dispatch failed, in the coordinator's own vocabulary, so the
+    /// board shows it instead of the work sitting placed-and-silent forever.
+    /// The request id is derived from the attempt so a retry of the same
+    /// failure is idempotent rather than a second journal entry.
+    func reportPlacementFailure(taskID: String, attemptID: String, reason: String) async {
+        _ = try? await request(
+            method: "task.suspect",
+            params: [
+                "request_id": "dispatch-failed:\(attemptID)",
+                "task_id": taskID,
+                "reason": reason,
+            ]
+        )
+    }
+
+    /// Register a project root and return its coordinator id, reusing the
+    /// existing record when the root is already known. Delegating work to a
+    /// project the coordinator has never heard of has to create it, and doing
+    /// so here keeps that out of the sidebar's hands.
+    func ensureProject(rootPath: String, name: String) async throws -> String {
+        let projects = (try await request(method: "project.list") as? [String: Any])?["projects"]
+            as? [[String: Any]] ?? []
+        if let existing = projects.first(where: { $0["root_path"] as? String == rootPath }),
+           let id = existing["project_id"] as? String {
+            return id
+        }
+        let added = try await request(
+            method: "project.add",
+            params: [
+                "request_id": "project-add:\(rootPath)",
+                "root_path": rootPath,
+                "name": name,
+            ]
+        )
+        guard let event = (added as? [String: Any])?["event"] as? [String: Any],
+              let id = event["project_id"] as? String else {
+            throw ReviewBoardCoordinatorError.invalidResponse
+        }
+        return id
+    }
+
+    /// Create a task in a project and immediately ask for it to be placed.
+    /// Creating without placing would leave work the coordinator never picks a
+    /// host for — it schedules on request, not on a timer.
+    func delegate(projectID: String, title: String, body: String) async throws {
+        let requestID = "delegate:\(UUID().uuidString)"
+        let created = try await request(
+            method: "task.create",
+            params: [
+                "request_id": "\(requestID):create",
+                "project_id": projectID,
+                "title": title,
+                "body": body,
+            ]
+        )
+        guard let event = (created as? [String: Any])?["event"] as? [String: Any],
+              let payload = event["payload"] as? [String: Any],
+              let taskID = payload["task_id"] as? String else {
+            throw ReviewBoardCoordinatorError.invalidResponse
+        }
+        _ = try await request(
+            method: "task.place",
+            params: ["request_id": "\(requestID):place", "task_id": taskID]
+        )
+    }
+
     func observeHosts(_ observations: [CoordinatorHostObservation]) async {
         for observation in observations {
             // One failing host must not stop the rest: the coordinator may be
@@ -287,29 +373,70 @@ final class ReviewBoardCoordinatorClient: @unchecked Sendable {
         return rows.compactMap(CoordinatorKnownHost.init(dictionary:))
     }
 
+    /// Reconnecting, because the first attempt is made moments after the app
+    /// spawns the coordinator and routinely lands before it is listening. This
+    /// used to give up there — silently, and for the life of the process, so
+    /// nothing the coordinator did ever reached the app again. The refresh
+    /// path already learned this lesson and got a backoff; the subscription
+    /// did not, and a subscription that dies once is worse than one that never
+    /// starts, because everything downstream of it simply stops happening.
+    ///
+    /// The same loop covers a coordinator that restarts later: the stream ends,
+    /// and the next pass dials again.
     func subscribeEvents(onEvent: @escaping @Sendable () -> Void) {
-        subscriptionQueue.async { [socketPath] in
-            guard let fd = try? Self.connect(socketPath: socketPath) else { return }
-            defer { Darwin.close(fd) }
-            let request: [String: Any] = [
-                "jsonrpc": "2.0",
-                "id": 1,
-                "method": "events.subscribe",
-                "params": ["scope": "review_board"],
-            ]
-            guard let data = try? JSONSerialization.data(withJSONObject: request),
-                  Self.writeLine(fd: fd, data: data) else {
-                return
-            }
-            while let line = Self.readLine(fd: fd) {
-                switch Self.eventFrame(from: line) {
-                case .relevant, .gap:
-                    onEvent()
-                case .keepalive, .ack, .ignored:
-                    continue
-                }
+        subscriptionQueue.async { [socketPath, weak self] in
+            var backoff = 0.25
+            while self?.shouldKeepSubscribing ?? false {
+                let connected = Self.pumpEvents(socketPath: socketPath, onEvent: onEvent)
+                // A connection that carried frames is a healthy one that ended;
+                // start the next attempt eagerly. One that never opened means
+                // the coordinator is still not there, so ease off.
+                backoff = connected ? 0.25 : min(backoff * 2, 5)
+                Thread.sleep(forTimeInterval: backoff)
             }
         }
+    }
+
+    /// Runs one subscription connection to completion. Returns whether it ever
+    /// got as far as subscribing, which is what tells the caller apart a
+    /// coordinator that is absent from one that closed the stream.
+    private static func pumpEvents(
+        socketPath: String,
+        onEvent: @escaping @Sendable () -> Void
+    ) -> Bool {
+        guard let fd = try? connect(socketPath: socketPath) else { return false }
+        defer { Darwin.close(fd) }
+        let request: [String: Any] = [
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "events.subscribe",
+            "params": ["scope": "review_board"],
+        ]
+        guard let data = try? JSONSerialization.data(withJSONObject: request),
+              writeLine(fd: fd, data: data) else {
+            return false
+        }
+        while let line = readLine(fd: fd) {
+            switch eventFrame(from: line) {
+            case .relevant, .gap:
+                onEvent()
+            case .keepalive, .ack, .ignored:
+                continue
+            }
+        }
+        return true
+    }
+
+    private var shouldKeepSubscribing: Bool {
+        subscriptionLock.lock()
+        defer { subscriptionLock.unlock() }
+        return !subscriptionStopped
+    }
+
+    func stopSubscribing() {
+        subscriptionLock.lock()
+        subscriptionStopped = true
+        subscriptionLock.unlock()
     }
 
     private func request(method: String, params: [String: Any]? = nil) async throws -> Any {
@@ -541,6 +668,9 @@ final class ReviewBoardCoordinatorService: ObservableObject {
         lastReportedObservations = []
         knownHosts = []
         subscriptionStarted = false
+        // The subscription loop outlives the reference: dropping the client is
+        // not what ends it, telling it to stop is.
+        client?.stopSubscribing()
         client = nil
         process?.terminate()
         process = nil
@@ -784,6 +914,9 @@ final class ReviewBoardCoordinatorService: ObservableObject {
             // Failing to read the host table is not a reason to forget it —
             // "last seen" is precisely what survives a coordinator hiccup.
             let hosts = (try? await client.fetchKnownHosts())
+            let placementInputs = next.coordinatorOnline
+                ? try? await client.fetchPlacementInputs()
+                : nil
             await MainActor.run {
                 self?.snapshot = next
                 if let hosts { self?.knownHosts = hosts }
@@ -792,7 +925,55 @@ final class ReviewBoardCoordinatorService: ObservableObject {
                     self?.scheduleOnlineRetry(attempt: attempt)
                 }
             }
+            // Every refresh re-reads what is placed and carries out whatever
+            // has not been carried out yet. Riding the refresh rather than the
+            // event stream is what makes a dropped frame or a reconnect cost
+            // nothing: the next read sees the same placement still waiting.
+            if let placementInputs {
+                await self?.dispatchPlacements(placementInputs, client: client)
+            }
         }
+    }
+
+    @MainActor
+    private func dispatchPlacements(
+        _ inputs: (rows: [[String: Any]], roots: [String: String]),
+        client: ReviewBoardCoordinatorClient
+    ) async {
+        await CoordinatorPlacementDispatcher.shared.reconcile(
+            taskRows: inputs.rows,
+            projectRoots: inputs.roots,
+            hostsByCoordinatorID: hostsByCoordinatorID(),
+            localHostID: CoordinatorHostObservation(
+                hostKey: CoordinatorHostObservation.localHostKey,
+                projectRoots: [],
+                isLive: true
+            ).coordinatorHostID
+        ) { placement, reason in
+            RemoteWorkLog.info("Could not start \"\(placement.title)\": \(reason)")
+            await client.reportPlacementFailure(
+                taskID: placement.taskID,
+                attemptID: placement.attemptID,
+                reason: reason
+            )
+        }
+    }
+
+    /// Coordinator host ids are a hash of the sidebar's own host key, so the
+    /// app can turn them back into the host it knows — the same reverse map
+    /// the remembered-projects row uses.
+    @MainActor
+    private func hostsByCoordinatorID() -> [String: HostEntry] {
+        var map: [String: HostEntry] = [:]
+        for host in RemoteHostStore.shared.sortedHosts {
+            let id = CoordinatorHostObservation(
+                hostKey: host.id,
+                projectRoots: [],
+                isLive: host.isConnected
+            ).coordinatorHostID
+            map[id] = host
+        }
+        return map
     }
 
     private func scheduleOnlineRetry(attempt: Int) {
@@ -858,6 +1039,26 @@ final class ReviewBoardCoordinatorService: ObservableObject {
     }
 }
 
+extension ReviewBoardCoordinatorService {
+    /// Register the project if it is new, create the work, and ask for it to
+    /// be placed — the three calls a person means by "delegate this".
+    @MainActor
+    func delegate(
+        projectRoot: String,
+        projectName: String,
+        title: String,
+        body: String
+    ) async throws {
+        guard let client else {
+            throw ReviewBoardCoordinatorError.disabled
+        }
+        let projectID = try await client.ensureProject(rootPath: projectRoot, name: projectName)
+        try await client.delegate(projectID: projectID, title: title, body: body)
+        // Placement lands on the next read, and the board is what shows it.
+        refresh()
+    }
+}
+
 struct CoordinatorReviewBoardSnapshotProvider {
     @MainActor
     func snapshot() -> ReviewBoardSnapshot {
@@ -878,14 +1079,18 @@ struct CoordinatorPlacement: Equatable {
     /// been placed AND has an attempt to act under. An attempt id is what
     /// makes a dispatch identifiable, so without one there is nothing to
     /// avoid doing twice.
+    let projectID: String
+
     init?(taskRow: [String: Any]) {
         guard let taskID = taskRow["task_id"] as? String,
+              let projectID = taskRow["project_id"] as? String,
               taskRow["status"] as? String == "placed",
               let attemptID = taskRow["current_attempt_id"] as? String,
               let placement = taskRow["placement"] as? [String: Any],
               let hostID = placement["host_id"] as? String else {
             return nil
         }
+        self.projectID = projectID
         self.taskID = taskID
         self.attemptID = attemptID
         self.hostID = hostID
@@ -928,6 +1133,7 @@ final class CoordinatorPlacementDispatcher {
 
     func reconcile(
         taskRows: [[String: Any]],
+        projectRoots: [String: String],
         hostsByCoordinatorID: [String: HostEntry],
         localHostID: String,
         report: @escaping (CoordinatorPlacement, String) async -> Void
@@ -936,11 +1142,20 @@ final class CoordinatorPlacementDispatcher {
             guard !handledAttempts.contains(placement.attemptID) else { continue }
             handledAttempts.insert(placement.attemptID)
 
-            guard let teamName = teamName(for: placement) else {
-                await report(placement, "no team is running for this project")
+            guard let root = projectRoots[placement.projectID] else {
+                await report(placement, "the coordinator has no root path for this project")
                 continue
             }
-            if placement.hostID == localHostID {
+            let project = projectIdentity(forWorkingDirectories: [root])
+            let isLocal = placement.hostID == localHostID
+            guard let teamName = teamName(
+                forProject: project,
+                host: isLocal ? nil : hostsByCoordinatorID[placement.hostID]
+            ) else {
+                await report(placement, "no team is running in \(project.label)")
+                continue
+            }
+            if isLocal {
                 let delivered = TeamOrchestrator.shared.sendToAgentAutoLocate(
                     teamName: teamName,
                     agentName: placement.agentName ?? "executor",
@@ -962,11 +1177,31 @@ final class CoordinatorPlacementDispatcher {
     }
 
     /// The team a placement lands in. A placement names a host and an agent but
-    /// not a team, so the team has to come from what is actually running.
-    private func teamName(for placement: CoordinatorPlacement) -> String? {
-        TeamOrchestrator.shared.listTeams()
-            .compactMap { $0["name"] as? String }
-            .first
+    /// never a team, so the team has to come from what is actually running —
+    /// and the honest link is the project, which teams already report. A local
+    /// team reports its `working_directory`; a peer team reports
+    /// `project_root` over `team.roster.v1`. Both are put through the very
+    /// same identity function the sidebar groups by, so a team lands in the
+    /// project the user sees it under and nowhere else.
+    private func teamName(
+        forProject project: PeerProjectIdentity,
+        host: HostEntry?
+    ) -> String? {
+        guard !project.isUnknown else { return nil }
+        guard let host else {
+            return TeamOrchestrator.shared.listTeams().first { team in
+                guard let directory = team["working_directory"] as? String,
+                      !directory.isEmpty else { return false }
+                return projectIdentity(forWorkingDirectories: [directory]) == project
+            }?["team_name"] as? String
+        }
+        return host.teams.first { team in
+            let directories = [team.projectRootPath, team.workingDirectory]
+                .compactMap { $0 }
+                .filter { !$0.isEmpty }
+            guard !directories.isEmpty else { return false }
+            return projectIdentity(forWorkingDirectories: directories) == project
+        }?.name
     }
 
     private func dispatchToPeer(

@@ -1152,6 +1152,113 @@ struct SidebarRemoteHostsSection: View {
     }
 }
 
+struct SidebarProjectDelegateTarget: Identifiable {
+    let label: String
+    let rootPath: String?
+    var id: String { rootPath ?? label }
+}
+
+/// Hand a project some work. The coordinator picks which machine runs it, so
+/// this asks for the work and nothing about where — choosing a host here would
+/// re-decide, by hand and with less information, the one thing the coordinator
+/// exists to decide.
+struct SidebarProjectDelegateSheet: View {
+    let target: SidebarProjectDelegateTarget
+    let onClose: () -> Void
+
+    @State private var title = ""
+    @State private var body_ = ""
+    @State private var failure: String?
+    @State private var isSending = false
+    @FocusState private var titleFocused: Bool
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            VStack(alignment: .leading, spacing: 3) {
+                Text("Delegate Work")
+                    .font(.system(size: 14, weight: .semibold))
+                Text(target.label)
+                    .font(.system(size: 11))
+                    .foregroundColor(.secondary)
+            }
+
+            VStack(alignment: .leading, spacing: 5) {
+                Text("What needs doing")
+                    .font(.system(size: 10, weight: .semibold))
+                    .foregroundColor(.secondary)
+                TextField("Add a retry to the peer reconnect", text: $title)
+                    .textFieldStyle(.roundedBorder)
+                    .focused($titleFocused)
+            }
+
+            VStack(alignment: .leading, spacing: 5) {
+                Text("Detail (optional)")
+                    .font(.system(size: 10, weight: .semibold))
+                    .foregroundColor(.secondary)
+                TextEditor(text: $body_)
+                    .font(.system(size: 12))
+                    .frame(height: 110)
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 5)
+                            .stroke(Color(nsColor: .separatorColor), lineWidth: 1)
+                    )
+            }
+
+            if let failure {
+                Text(failure)
+                    .font(.system(size: 11))
+                    .foregroundColor(.red)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            HStack {
+                Text("A host is chosen for you.")
+                    .font(.system(size: 10))
+                    .foregroundColor(Color.secondary.opacity(0.8))
+                Spacer()
+                Button("Cancel", action: onClose)
+                    .keyboardShortcut(.cancelAction)
+                Button(isSending ? "Sending…" : "Delegate", action: send)
+                    .keyboardShortcut(.defaultAction)
+                    .disabled(isSending || title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+            }
+        }
+        .padding(18)
+        .frame(width: 420)
+        .onAppear { titleFocused = true }
+        .accessibilityIdentifier("sidebar.project.delegate")
+    }
+
+    private func send() {
+        guard let rootPath = target.rootPath else {
+            failure = "This project has no folder on this machine to delegate into."
+            return
+        }
+        isSending = true
+        failure = nil
+        Task {
+            do {
+                let coordinator = ReviewBoardCoordinatorService.shared
+                try await coordinator.delegate(
+                    projectRoot: rootPath,
+                    projectName: target.label,
+                    title: title.trimmingCharacters(in: .whitespacesAndNewlines),
+                    body: body_
+                )
+                await MainActor.run { onClose() }
+            } catch {
+                await MainActor.run {
+                    isSending = false
+                    // Placement fails for a reason worth reading — no host has
+                    // the project checked out, every host is full — so the
+                    // coordinator's own words go straight through.
+                    failure = error.localizedDescription
+                }
+            }
+        }
+    }
+}
+
 private struct SidebarPeerProjectGroup: Identifiable {
     /// A project is a place work happens, not a place work is hosted, so the
     /// same group holds workspaces from either side of the wire.
@@ -1197,6 +1304,8 @@ private struct SidebarPeerProjectsView: View {
     let paneExpansionCommand: PeerPaneExpansionCommand
     @AppStorage(SidebarLayoutSettings.unassignedWorkspacesExpandedKey)
     private var isUnassignedExpanded = false
+    /// Non-nil presents the delegate sheet.
+    @State private var delegateTarget: SidebarProjectDelegateTarget?
 
     private var connectedHosts: [HostEntry] {
         hosts.filter { $0.isConnected && !$0.workspaces.isEmpty }
@@ -1334,6 +1443,20 @@ private struct SidebarPeerProjectsView: View {
         coordinator.leaderProjectIdentities
     }
 
+    /// The absolute path the coordinator will register this project under.
+    /// A project the sidebar groups purely from peer panes has no path this
+    /// machine can name, so delegation is offered only where one exists.
+    private func delegateRootPath(for group: SidebarPeerProjectGroup) -> String? {
+        for item in group.items {
+            guard case .local(let workspace) = item else { continue }
+            let directories = localWorkingDirectories(workspace)
+            if let root = directories.first(where: { !$0.isEmpty }) {
+                return root
+            }
+        }
+        return nil
+    }
+
     var body: some View {
         let grouped = groupedWorkspaces
         return VStack(spacing: usesSeparatedPresentation ? 8 : 0) {
@@ -1376,6 +1499,19 @@ private struct SidebarPeerProjectsView: View {
                     .padding(.trailing, 12)
                     .padding(.top, 4)
                     .padding(.bottom, 1)
+                    // Delegating from the project's own row means the target
+                    // is already chosen — nothing to pick again, nothing to
+                    // pick wrongly.
+                    .contentShape(Rectangle())
+                    .contextMenu {
+                        Button("Delegate Work to \(group.identity.label)…") {
+                            delegateTarget = SidebarProjectDelegateTarget(
+                                label: group.identity.label,
+                                rootPath: delegateRootPath(for: group)
+                            )
+                        }
+                        .disabled(delegateRootPath(for: group) == nil)
+                    }
                     ForEach(group.items) { item in
                         workspaceRow(item)
                     }
@@ -1394,6 +1530,9 @@ private struct SidebarPeerProjectsView: View {
             if !grouped.unassigned.isEmpty {
                 unassignedSection(grouped.unassigned)
             }
+        }
+        .sheet(item: $delegateTarget) { target in
+            SidebarProjectDelegateSheet(target: target) { delegateTarget = nil }
         }
     }
 
