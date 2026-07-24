@@ -2837,8 +2837,8 @@ final class TeamOrchestrator: ObservableObject {
             "[/GOAL]",
             "",
             "[HOW TO REPORT — required]",
-            "End your reply with exactly these lines. term-mesh reads them off",
-            "your pane and closes the task; without them it stays open and the",
+            "Close your reply with these lines. term-mesh reads them off your",
+            "pane and closes the task; without them it stays open and the",
             "leader waits.",
             "",
             "STATUS: DONE|BLOCKED|NEEDS_REVIEW",
@@ -2846,6 +2846,13 @@ final class TeamOrchestrator: ObservableObject {
             "VERIFY: <single shell command to verify the result, or n/a>",
             "NEXT: <one-line action for the leader, or NONE>",
             "FULL_REPORT: <path to a full result file, or n/a>",
+            "",
+            // Anything written above the header is not captured — the reply is
+            // read from STATUS onward — so an answer put before it is lost to
+            // everything but the pane. Asking for it after the header is what
+            // puts the outcome on the board next to the task.
+            "Then one last line: the answer or outcome in a sentence. Put it",
+            "after the header, not before — text above STATUS is not captured.",
             "",
             "Running `tm-agent reply '<the same header>'` as a shell command",
             "does the same thing and is exact — either is fine.",
