@@ -1227,9 +1227,16 @@ final class CoordinatorPlacementDispatcher {
             await report(placement, "\(host.displayName) has no active connection")
             return
         }
+        // `team.send`, not `team.delegate`. Delegate is a fan-out the app
+        // composes out of several calls, so a headless host answers it with
+        // `unsupported_on_host` — allowed, but not something it can do in one
+        // operation. Send is the one primitive every host kind implements, and
+        // carrying an instruction to a named agent is all this needs.
+        //
+        // Key names are the host's, not the CLI's: `team_name` / `agent_name`.
         let params: [String: Any] = [
-            "team": teamName,
-            "agent": placement.agentName ?? "executor",
+            "team_name": teamName,
+            "agent_name": placement.agentName ?? "executor",
             "text": Self.instruction(for: placement),
         ]
         guard let data = try? JSONSerialization.data(withJSONObject: params),
@@ -1241,7 +1248,7 @@ final class CoordinatorPlacementDispatcher {
             let conn = try await PeerRelaySession.connect(hostSockPath: path)
             defer { Task { await conn.cancel() } }
             let response = try await conn.session.callTeam(
-                method: "team.delegate",
+                method: "team.send",
                 paramsJSON: paramsJSON
             )
             if !response.ok {
