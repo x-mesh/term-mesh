@@ -2,7 +2,7 @@ import Foundation
 
 // Swift port of `daemon/term-meshd/src/auto_reply.rs` (Phase B1, Fix D).
 //
-// Sliding window approach: keeps the last 30 ANSI-stripped lines in a buffer.
+// Sliding window approach: keeps the last `bufferCap` ANSI-stripped lines.
 // On tick(), scans for STATUS (mandatory) + FILES/VERIFY/NEXT/FULL_REPORT
 // (optional, default "n/a"). Commits when:
 //   - all 5 present + idleDebounce elapsed, or
@@ -39,7 +39,13 @@ struct AutoReplyDetectorConfig {
 }
 
 final class AutoReplyDetector {
-    private static let bufferCap = 30
+    // Wide enough to hold a whole terminal screen. 30 lines was sized for an
+    // append-only delta — a handful of freshly printed lines — but an agent TUI
+    // redraws in place, so the poller now feeds the full screen whenever the
+    // diff comes back empty. At 30 the five header lines were pushed straight
+    // back out by everything rendered below them, and the detector went looking
+    // for a STATUS line it had just been handed.
+    private static let bufferCap = 300
     private static let headerPrefixes = ["STATUS:", "FILES:", "VERIFY:", "NEXT:", "FULL_REPORT:"]
 
     private let config: AutoReplyDetectorConfig

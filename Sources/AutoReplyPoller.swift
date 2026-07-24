@@ -287,6 +287,7 @@ final class AutoReplyPoller {
     private func applyResult(panelId: UUID, teamName: String, agentName: String,
                               snapshot: String?, delta: String, at now: Date) {
         guard let state = perPanel[panelId] else { return }  // panel GC'd between read and apply
+        let previousText = state.lastScrollbackText
         if let snap = snapshot {
             // FIX 2: keep only the tail so per-panel state stays bounded.
             // trimToTailBytes operates in UTF-8 byte space (not character count)
@@ -303,7 +304,20 @@ final class AutoReplyPoller {
             }
             state.lastScrollbackText = trimmed
         }
-        if !delta.isEmpty, let data = delta.data(using: .utf8) {
+        // An empty delta is not the same as nothing happening. `computeDelta`
+        // assumes append-only scrollback, and an agent TUI is the opposite: it
+        // redraws its screen in place, so the new snapshot routinely contains
+        // the old one as a *suffix* rather than a prefix, and the anchor search
+        // then matches at the very end and returns "". The reply header was
+        // being computed away before the detector ever saw it — the pane read
+        // was right, the diff was wrong. When the screen changed but the diff
+        // came back empty, feed the screen: the detector is line-anchored and
+        // duplicate emits are already blocked by `lastFiredHash`.
+        var feed = delta
+        if feed.isEmpty, state.lastScrollbackText != previousText {
+            feed = state.lastScrollbackText
+        }
+        if !feed.isEmpty, let data = feed.data(using: .utf8) {
             if let ev = state.detector.pushBytes(data, at: now) {
                 tryEmit(panelId: panelId, state: state, event: ev,
                         teamName: teamName, agentName: agentName)
