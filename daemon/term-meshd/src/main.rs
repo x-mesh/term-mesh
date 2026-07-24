@@ -360,10 +360,29 @@ async fn main() -> anyhow::Result<()> {
         shutdown_rx,
     ));
 
-    // 6. Wait for shutdown signal (Ctrl-C or SIGTERM)
+    // 6. Wait for a shutdown signal — OR for the control socket to die.
+    // `socket::serve` loops forever on success, so if it ever RETURNS, it
+    // failed. Dropping its JoinHandle (the previous behavior) meant the
+    // daemon kept running with a dead control plane, answering nothing while
+    // still looking alive: the exact shape a corrupt sync DB produced. Select
+    // on it too, so control-socket death is a clean, logged exit instead of a
+    // silent zombie.
     let shutdown_reason = tokio::select! {
         _ = tokio::signal::ctrl_c() => "SIGINT (Ctrl-C)",
         _ = sigterm() => "SIGTERM",
+        result = socket_task => {
+            match result {
+                Ok(Ok(())) => "control socket closed",
+                Ok(Err(error)) => {
+                    tracing::error!("control socket server failed: {error:?}");
+                    "control socket server error"
+                }
+                Err(join_error) => {
+                    tracing::error!("control socket task panicked: {join_error}");
+                    "control socket task panic"
+                }
+            }
+        }
     };
     tracing::info!("received {shutdown_reason}, initiating graceful shutdown...");
 
@@ -391,10 +410,11 @@ async fn main() -> anyhow::Result<()> {
         tracing::info!("resumed {resumed} stopped process(es)");
     }
 
-    // d. Wait for servers to finish (with timeout)
+    // d. Wait for servers to finish (with timeout). `socket_task` was already
+    // consumed by the select above (that is how control-socket death is
+    // observed), so only the remaining servers are joined here.
     let timeout = tokio::time::Duration::from_secs(5);
     match tokio::time::timeout(timeout, async {
-        let _ = socket_task.await;
         let _ = http_task.await;
         if let Some(t) = peer_task {
             let _ = t.await;

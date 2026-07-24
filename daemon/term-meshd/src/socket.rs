@@ -229,6 +229,48 @@ pub struct Context {
     pub operation_manager: crate::sync::OperationManager,
 }
 
+/// Open the project registry, recovering from a quarantined (corrupt or
+/// schema-incompatible) database instead of taking the whole control socket
+/// down with it.
+///
+/// This ran with a `?` that aborted `serve` AFTER the socket was already
+/// bound — leaving a socket FILE with no listener behind it, so the control
+/// plane looked present but answered nothing (a corrupt sync DB silently
+/// killed headless, team, and surface commands that never touch the
+/// registry). "Quarantined" is the registry's own word for "move it aside":
+/// so do that, then open a fresh one. The daemon comes up with sync starting
+/// from empty rather than with no control plane at all.
+fn open_project_registry_recovering(
+    path: PathBuf,
+) -> anyhow::Result<crate::sync::ProjectRegistry> {
+    match crate::sync::ProjectRegistry::open(&path) {
+        Ok(registry) => Ok(registry),
+        Err(crate::sync::RegistryError::Quarantined { reason, .. }) => {
+            let stamp = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            tracing::error!(
+                "project registry at {} is unusable ({reason}); quarantining and recreating",
+                path.display()
+            );
+            // Move the DB and its WAL/SHM sidecars together, or a stale WAL
+            // would corrupt the fresh database on the next open.
+            for suffix in ["", "-wal", "-shm"] {
+                let from = PathBuf::from(format!("{}{suffix}", path.display()));
+                if from.exists() {
+                    let to = PathBuf::from(format!("{}.quarantined-{stamp}{suffix}", path.display()));
+                    if let Err(error) = std::fs::rename(&from, &to) {
+                        tracing::error!("could not move {} aside: {error}", from.display());
+                    }
+                }
+            }
+            crate::sync::ProjectRegistry::open(&path).map_err(Into::into)
+        }
+        Err(other) => Err(other.into()),
+    }
+}
+
 pub fn default_socket_path() -> PathBuf {
     // Honor explicit socket path for tagged/isolated builds
     if let Ok(p) = std::env::var("TERMMESH_DAEMON_UNIX_PATH") {
@@ -270,14 +312,9 @@ pub async fn serve(
     let owner_uid = current_uid();
     let (event_tx, _) = tokio::sync::broadcast::channel(256);
     let pane_tracker = PaneTracker::new().start();
-    let project_registry = Arc::new(
-        crate::sync::ProjectRegistry::open(crate::sync::default_registry_db_path()).map_err(
-            |error| {
-                tracing::error!("project registry open failed: {error:?}");
-                error
-            },
-        )?,
-    );
+    let project_registry = Arc::new(open_project_registry_recovering(
+        crate::sync::default_registry_db_path(),
+    )?);
     let operation_manager = build_sync_operation_manager(project_registry.clone())
         .map_err(|error| {
             tracing::error!("sync operation manager setup failed: {error:?}");
@@ -4254,6 +4291,57 @@ async fn query_gui_team_workers(app_socket: &str, team_id: &str) -> Vec<String> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A corrupt registry used to abort `serve` AFTER the socket was bound,
+    /// leaving a listener-less socket file — the control plane looked up but
+    /// answered nothing. Reproduces the real incident (a valid DB with the
+    /// wrong application_id) and asserts recovery moves it aside and returns a
+    /// working registry so the socket actually serves.
+    #[test]
+    fn quarantined_registry_is_moved_aside_and_recreated() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        // SecureSqlite refuses a parent that is not 0700 owned by us.
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let db = dir.path().join("sync_projects.db");
+
+        // Create a genuine registry (correct application_id), then tamper only
+        // the application_id — exactly the "unexpected application_id 0" state
+        // the daemon hit. DELETE journal mode leaves no -wal/-shm behind to
+        // trip SecureSqlite's strict per-file checks on the recovery open.
+        crate::sync::ProjectRegistry::open(&db).expect("seed a valid registry");
+        {
+            let conn = rusqlite::Connection::open(&db).unwrap();
+            conn.pragma_update(None, "journal_mode", "DELETE").unwrap();
+            conn.pragma_update(None, "application_id", 0i64).unwrap();
+        }
+        std::fs::set_permissions(&db, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        // Sanity: the tampered DB really is rejected now.
+        assert!(matches!(
+            crate::sync::ProjectRegistry::open(&db),
+            Err(crate::sync::RegistryError::Quarantined { .. })
+        ));
+
+        let registry =
+            open_project_registry_recovering(db.clone()).expect("recovery must yield a registry");
+        assert!(registry.path().exists());
+        assert!(db.exists(), "a fresh DB should sit at the original path");
+
+        // The corrupt DB was moved aside, and reopening the fresh one succeeds
+        // (proving it is genuinely usable, not the rejected file).
+        let quarantined_count = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().contains(".quarantined-"))
+            .count();
+        assert!(quarantined_count >= 1, "the corrupt DB must be quarantined");
+        assert!(
+            crate::sync::ProjectRegistry::open(&db).is_ok(),
+            "the recreated registry must open cleanly"
+        );
+    }
 
     #[tokio::test]
     async fn bounded_line_reader_drains_oversized_envelopes_without_allocating_them() {
