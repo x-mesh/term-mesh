@@ -139,8 +139,12 @@ fn concurrent_duplicate_request_id_serializes_append_and_reduce() {
     assert_eq!(log.read_all().unwrap().len(), 1);
 }
 
+/// An unreadable log used to abort the open, which killed the process and
+/// left a client staring at a missing socket — reported as "Coordinator
+/// Offline", the one diagnosis that hides the actual cause. It now starts
+/// degraded so the cause can be read off `orchestration.status`.
 #[test]
-fn api_open_propagates_event_log_read_errors() {
+fn api_open_survives_an_unreadable_event_log_and_says_why() {
     let dir = tempdir().unwrap();
     let config = Config {
         enabled: true,
@@ -150,12 +154,95 @@ fn api_open_propagates_event_log_read_errors() {
         use_local_journal: true,
     };
 
-    let err = match Api::open_with_event_log(config, Arc::new(FailingReadLog)) {
-        Ok(_) => panic!("Api::open_with_event_log unexpectedly succeeded"),
-        Err(err) => err.to_string(),
+    let api = Api::open_with_event_log(config, Arc::new(FailingReadLog))
+        .expect("an unreadable log must not stop the coordinator from serving");
+
+    let status = api.handle("orchestration.status", json!({})).unwrap();
+    assert_eq!(status["mem_mesh_available"], false);
+    assert!(
+        status["mem_mesh"]["degraded_reason"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("read_all failed"),
+        "the reason has to reach the client: {status}"
+    );
+
+    // Reads answer; writes are refused under one name rather than whatever
+    // the backend happened to say at its own failure point.
+    assert!(api.handle("task.list", json!({})).is_ok());
+    assert!(api.handle("host.list", json!({})).is_ok());
+    let refused = api
+        .handle(
+            "project.add",
+            json!({"request_id": "p1", "root_path": "/tmp/repo", "name": "repo"}),
+        )
+        .unwrap_err()
+        .to_string();
+    assert!(refused.contains("EVENT_LOG_UNAVAILABLE"), "{refused}");
+}
+
+/// The reducer is persisted, so a degraded start must not answer from the
+/// state a previous healthy run left on disk — that is data this process
+/// cannot justify from the log it just failed to read. The file itself has to
+/// survive, though, so a later healthy start still recovers it.
+#[test]
+fn a_degraded_start_serves_nothing_it_cannot_justify_and_keeps_the_file() {
+    let dir = tempdir().unwrap();
+    let reducer_path = dir.path().join("reducer.sqlite");
+    let journal_path = dir.path().join("events.ndjson");
+    let config = |use_local: bool| Config {
+        enabled: true,
+        socket_path: dir.path().join("coord.sock"),
+        reducer_path: reducer_path.clone(),
+        journal_path: Some(journal_path.clone()),
+        use_local_journal: use_local,
     };
 
-    assert!(err.contains("read_all failed"));
+    // A healthy run that records one project.
+    let healthy = Api::open_with_event_log(
+        config(true),
+        Arc::new(LocalJournalEventLog::new(journal_path.clone())),
+    )
+    .unwrap();
+    healthy
+        .handle(
+            "project.add",
+            json!({"request_id": "p1", "root_path": "/tmp/repo", "name": "repo"}),
+        )
+        .unwrap();
+    assert_eq!(
+        healthy.handle("project.list", json!({})).unwrap()["projects"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    drop(healthy);
+
+    let degraded = Api::open_with_event_log(config(true), Arc::new(FailingReadLog)).unwrap();
+    assert!(
+        degraded.handle("project.list", json!({})).unwrap()["projects"]
+            .as_array()
+            .unwrap()
+            .is_empty(),
+        "a degraded start must not serve the previous run's projection"
+    );
+
+    // Recovery: the same on-disk state is back once the log can be read.
+    drop(degraded);
+    let recovered = Api::open_with_event_log(
+        config(true),
+        Arc::new(LocalJournalEventLog::new(journal_path.clone())),
+    )
+    .unwrap();
+    assert_eq!(
+        recovered.handle("project.list", json!({})).unwrap()["projects"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1,
+        "the degraded run must not have destroyed the projection"
+    );
 }
 
 #[test]

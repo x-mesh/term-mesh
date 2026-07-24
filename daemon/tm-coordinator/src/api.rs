@@ -65,6 +65,10 @@ pub struct Api {
     reducer: Mutex<Reducer>,
     event_log: Arc<dyn EventLog>,
     event_tx: broadcast::Sender<IntentEvent>,
+    /// Why the log could not be replayed at open, when it could not be. The
+    /// coordinator still serves — see `open_with_event_log` — but everything
+    /// that would write is refused and `orchestration.status` says so.
+    degraded_reason: Option<String>,
 }
 
 impl Api {
@@ -79,26 +83,58 @@ impl Api {
         Self::open_with_event_log(config, event_log)
     }
 
+    /// An unreadable log used to end the process. That reads to a client as
+    /// "no coordinator", which is the one thing it is not: the socket is gone,
+    /// so the app reports `Coordinator Offline` and the actual cause — the log
+    /// — never reaches anyone. Refusing to start also refused to explain.
+    ///
+    /// So it starts, serves reads, refuses every write, and names the reason
+    /// in `orchestration.status`. Serving reads needs care: the reducer is a
+    /// projection persisted in sqlite, so the file on disk still holds the
+    /// state of a *previous*, successful run. Answering from it would hand out
+    /// data this process cannot justify from the log it just failed to read.
+    /// The degraded path therefore answers from an empty in-memory reducer —
+    /// and leaves the file untouched, so a later healthy start still recovers.
     pub fn open_with_event_log(config: Config, event_log: Arc<dyn EventLog>) -> Result<Arc<Self>> {
-        let reducer = if std::env::var("TERMMESH_COORDINATOR_REDUCER_RESET")
+        if std::env::var("TERMMESH_COORDINATOR_REDUCER_RESET")
             .ok()
             .as_deref()
             == Some("1")
         {
             let _ = std::fs::remove_file(&config.reducer_path);
-            Reducer::open(&config.reducer_path)?
-        } else {
-            Reducer::open(&config.reducer_path)?
-        };
-        for event in event_log.read_all()? {
-            reducer.apply(&event)?;
         }
+        let reducer = Reducer::open(&config.reducer_path)?;
+        let degraded_reason = match event_log.read_all() {
+            Ok(events) => {
+                let mut replay_error = None;
+                for event in &events {
+                    if let Err(error) = reducer.apply(event) {
+                        replay_error = Some(format!("replaying {}: {error}", event.kind));
+                        break;
+                    }
+                }
+                replay_error
+            }
+            Err(error) => Some(error.to_string()),
+        };
+        let reducer = match &degraded_reason {
+            None => reducer,
+            Some(reason) => {
+                tracing::error!(
+                    reason = %reason,
+                    "event log unusable; serving reads from an empty projection and refusing writes"
+                );
+                drop(reducer);
+                Reducer::in_memory()?
+            }
+        };
         let (event_tx, _) = broadcast::channel(256);
         Ok(Arc::new(Self {
             config,
             reducer: Mutex::new(reducer),
             event_log,
             event_tx,
+            degraded_reason,
         }))
     }
 
@@ -115,6 +151,7 @@ impl Api {
             reducer: Mutex::new(Reducer::in_memory()?),
             event_log,
             event_tx,
+            degraded_reason: None,
         }))
     }
 
@@ -161,16 +198,34 @@ impl Api {
         let fenced_zombie = !reducer
             .tasks(None, Some(TaskStatus::Quarantined), 1)?
             .is_empty();
+        // The backend's own health, plus why this process could not use it.
+        // Kept inside `mem_mesh` so everything about the log reads together.
+        let mut mem_mesh_health = self.event_log.health();
+        if let (Some(object), Some(reason)) = (
+            mem_mesh_health.as_object_mut(),
+            self.degraded_reason.as_ref(),
+        ) {
+            object.insert("degraded_reason".to_string(), json!(reason));
+        }
         Ok(json!({
             "version": env!("CARGO_PKG_VERSION"),
             "socket_path": self.config.socket_path,
             "reducer_watermark": reducer.watermark()?,
-            "mem_mesh": self.event_log.health(),
+            "mem_mesh": mem_mesh_health,
             // The machine-readable half of `mem_mesh`. Without it a client
             // that cannot find this key has to assume the log is fine, and
             // assuming "fine" is exactly wrong for a health signal: the
             // default backend fails every append.
-            "mem_mesh_available": self.event_log.is_available(),
+            //
+            // A backend can also be nominally available and still have failed
+            // to replay — a truncated journal line, say — so both have to be
+            // false before this is true.
+            //
+            // This doubles as "writes are refused": a log this process cannot
+            // use is the only thing that stops them, so a second key saying so
+            // would be the same fact under another name — and the refusal
+            // already names itself (`EVENT_LOG_UNAVAILABLE`).
+            "mem_mesh_available": self.event_log.is_available() && self.degraded_reason.is_none(),
             "known_host_count": hosts.len(),
             "pending_merge_count": reducer.merge_queue(None, Some(MergeQueueStatus::Queued))?.len(),
             "suspect_host": suspect_host,
@@ -716,6 +771,17 @@ impl Api {
         })
     }
 
+    /// Every mutation is written to the log before it touches the reducer, so
+    /// a dead log already stops writes on its own. This says so up front and
+    /// with one name, rather than surfacing whichever message the backend
+    /// happened to produce at the point the append failed.
+    fn refuse_when_degraded(&self) -> Result<()> {
+        if let Some(reason) = &self.degraded_reason {
+            bail!("EVENT_LOG_UNAVAILABLE: {reason}");
+        }
+        Ok(())
+    }
+
     fn mutate(
         &self,
         request_id: &str,
@@ -723,6 +789,7 @@ impl Api {
         project_id: Option<ProjectId>,
         payload: Value,
     ) -> Result<Value> {
+        self.refuse_when_degraded()?;
         if request_id.trim().is_empty() {
             bail!("INVALID_PARAMS: request_id is required");
         }
@@ -753,6 +820,7 @@ impl Api {
     where
         F: FnOnce(&Reducer) -> Result<Value>,
     {
+        self.refuse_when_degraded()?;
         if request_id.trim().is_empty() {
             bail!("INVALID_PARAMS: request_id is required");
         }
