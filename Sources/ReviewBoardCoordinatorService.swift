@@ -404,9 +404,20 @@ final class ReviewBoardCoordinatorClient: @unchecked Sendable {
               let taskID = payload["task_id"] as? String else {
             throw ReviewBoardCoordinatorError.invalidResponse
         }
+        try await place(taskID: taskID, requestID: "\(requestID):place")
+    }
+
+    /// Ask the coordinator to pick a host for a task that has none.
+    ///
+    /// Separate from `delegate` because placing is not a one-shot: it fails
+    /// whenever no host has reported the project yet, and the machine that is
+    /// about to run the work may only become eligible moments later — when the
+    /// pane it opened turns up in the next host observation. The caller retries
+    /// off the refresh loop.
+    func place(taskID: String, requestID: String) async throws {
         _ = try await request(
             method: "task.place",
-            params: ["request_id": "\(requestID):place", "task_id": taskID]
+            params: ["request_id": requestID, "task_id": taskID]
         )
     }
 
@@ -1012,6 +1023,34 @@ final class ReviewBoardCoordinatorService: ObservableObject {
     /// perfectly healthy coordinator answers every other client.
     private static let onlineRetryDelays: [Double] = [0.3, 0.7, 1.5, 3.0]
 
+    /// Give every task still waiting for a host another chance at one.
+    ///
+    /// Delegating places the task immediately, and at that moment the machine
+    /// that is about to do the work may not be a candidate yet: it becomes
+    /// eligible when the pane it just opened shows up in a host observation,
+    /// which is a couple of seconds behind. That single attempt used to be the
+    /// only one, so a task that lost the race sat at `pending` forever — no
+    /// host, no reason, no retry, while the agent beside it finished the job.
+    /// Placement is idempotent (the coordinator rejects the transition once a
+    /// task is placed), so re-offering costs a local socket call and converges
+    /// as soon as any host can take it.
+    private static func placeUnplacedTasks(
+        _ rows: [[String: Any]],
+        client: ReviewBoardCoordinatorClient
+    ) async {
+        for row in rows {
+            guard row["status"] as? String == "pending",
+                  let taskID = row["task_id"] as? String else { continue }
+            do {
+                try await client.place(taskID: taskID, requestID: "reconcile:place:\(taskID)")
+            } catch {
+                // Expected while no host reports the project. The next refresh
+                // asks again; there is nothing to do until one does.
+                continue
+            }
+        }
+    }
+
     func refresh(attempt: Int = 0) {
         guard let client else { return }
         // Resolved on the main actor before the read, because the host names
@@ -1053,6 +1092,7 @@ final class ReviewBoardCoordinatorService: ObservableObject {
             // event stream is what makes a dropped frame or a reconnect cost
             // nothing: the next read sees the same placement still waiting.
             if let placementInputs {
+                await Self.placeUnplacedTasks(placementInputs.rows, client: client)
                 await self?.dispatchPlacements(placementInputs, client: client)
             }
         }
