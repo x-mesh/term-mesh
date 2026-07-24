@@ -1246,7 +1246,7 @@ final class CoordinatorPlacementDispatcher {
                 continue
             }
             if isLocal {
-                let delivered = TeamOrchestrator.shared.sendToAgentAutoLocate(
+                let delivered = await deliverLocally(
                     teamName: teamName,
                     agentName: placement.agentName ?? "executor",
                     text: Self.instruction(for: placement)
@@ -1263,6 +1263,37 @@ final class CoordinatorPlacementDispatcher {
                 continue
             }
             await dispatchToPeer(placement, host: host, teamName: teamName, report: report)
+        }
+    }
+
+    /// Hand the instruction to a local agent and wait for the answer that
+    /// actually means something.
+    ///
+    /// The synchronous return of a send is not that answer: a pane still
+    /// spawning fails the first attempt and the send retries behind the
+    /// scenes, so the immediate `false` says "not yet", not "no". Reporting it
+    /// as failure marked work suspect that was about to run — and did run,
+    /// while the board said it had not started.
+    private func deliverLocally(teamName: String, agentName: String, text: String) async -> Bool {
+        guard let tabManager = TeamOrchestrator.shared.resolveTabManager(teamName: teamName)
+            ?? TerminalController.shared.tabManager else { return false }
+        return await withCheckedContinuation { continuation in
+            var resumed = false
+            let finish: (Bool) -> Void = { delivered in
+                guard !resumed else { return }
+                resumed = true
+                continuation.resume(returning: delivered)
+            }
+            // The retry ladder inside the send is bounded, but nothing here
+            // should hang on it for ever.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 15) { finish(false) }
+            _ = TeamOrchestrator.shared.sendToAgent(
+                teamName: teamName,
+                agentName: agentName,
+                text: text,
+                tabManager: tabManager,
+                completion: finish
+            )
         }
     }
 
