@@ -26,6 +26,46 @@ final class AutoReplyDetectorTests: XCTestCase {
         XCTAssertEqual(ev?.body, "fix landed")
     }
 
+    // MARK: - What an agent pane actually renders
+
+    func test_bulleted_and_indented_header_commits() {
+        // Claude renders the reply as a list item: a bullet on the first line
+        // and the rest merely indented. Both used to miss `hasPrefix`.
+        let input = """
+        ● STATUS: DONE
+          FILES: (none — read-only)
+          VERIFY: find . -maxdepth 1 -type f | wc -l
+          NEXT: NONE
+          FULL_REPORT: n/a
+
+        """
+        let d = AutoReplyDetector()
+        let t = t0()
+        d.pushBytes(bytes(input), at: t)
+        let ev = drain(d, at: t)
+        XCTAssertEqual(ev?.status, "DONE")
+        XCTAssertEqual(ev?.files, "(none — read-only)")
+    }
+
+    func test_capsule_echo_is_not_a_result() {
+        // The capsule prints the template, and agent panes redraw it. A status
+        // that still lists the choices is the instruction coming back.
+        let input = "STATUS: DONE|BLOCKED|NEEDS_REVIEW\nFILES: <changed paths>\nVERIFY: <cmd>\n"
+        let d = AutoReplyDetector()
+        let t = t0()
+        d.pushBytes(bytes(input), at: t)
+        XCTAssertNil(drain(d, at: t), "the echoed template must not close a task")
+    }
+
+    func test_prose_keeps_its_dash() {
+        // Marker stripping applies only when a header follows it.
+        let input = "STATUS: DONE\nFILES: none\nVERIFY: n/a\nNEXT: NONE\nFULL_REPORT: n/a\n\n- kept the dash\n"
+        let d = AutoReplyDetector()
+        let t = t0()
+        d.pushBytes(bytes(input), at: t)
+        XCTAssertEqual(drain(d, at: t)?.body, "- kept the dash")
+    }
+
     func test_out_of_order_still_commits() {
         // Fix D: sliding window tolerates out-of-order headers
         let input = "NEXT: NONE\nFILES: src/foo.rs\nFULL_REPORT: n/a\nVERIFY: cargo test\nSTATUS: DONE\n"

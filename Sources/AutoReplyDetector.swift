@@ -47,6 +47,11 @@ final class AutoReplyDetector {
     // for a STATUS line it had just been handed.
     private static let bufferCap = 300
     private static let headerPrefixes = ["STATUS:", "FILES:", "VERIFY:", "NEXT:", "FULL_REPORT:"]
+    /// Glyphs agent CLIs use to bullet a reply. Claude uses ●; the rest are
+    /// here because the next CLI will pick a different one.
+    private static let listMarkers: Set<Character> = [
+        "●", "•", "◦", "○", "⏺", "▪", "▸", "▶", "·", "*", "-", "+", ">", "│", "┃", "|",
+    ]
 
     private let config: AutoReplyDetectorConfig
     private var lineBuffer: [String] = []
@@ -81,7 +86,7 @@ final class AutoReplyDetector {
         // arrives as `  STATUS: DONE`, and a prefix check against `STATUS:`
         // missed every one of them. The header was reaching the detector and
         // being dropped a character short.
-        let line = Self.stripAnsi(rawLine).trimmingCharacters(in: .whitespaces)
+        let line = Self.unmarked(Self.stripAnsi(rawLine).trimmingCharacters(in: .whitespaces))
         if lineBuffer.count >= Self.bufferCap {
             lineBuffer.removeFirst()
         }
@@ -97,6 +102,21 @@ final class AutoReplyDetector {
             statusSeenAt = now
             committed = false
         }
+    }
+
+    /// Drop the list marker an agent TUI puts in front of the first line of a
+    /// reply. Claude renders the header as `● STATUS: DONE` and leaves the
+    /// four lines under it merely indented, so trimming whitespace rescued
+    /// FILES/VERIFY/NEXT/FULL_REPORT while STATUS — the one field the detector
+    /// requires — stayed hidden behind a bullet.
+    ///
+    /// The marker comes off only when a header follows it, so a line of prose
+    /// that opens with a dash keeps its dash.
+    private static func unmarked(_ line: String) -> String {
+        guard let first = line.first, Self.listMarkers.contains(first) else { return line }
+        let rest = String(line.dropFirst()).trimmingCharacters(in: .whitespaces)
+        guard Self.headerPrefixes.contains(where: { rest.hasPrefix($0) }) else { return line }
+        return rest
     }
 
     func tick(at now: Date) -> AutoReplyEvent? {
