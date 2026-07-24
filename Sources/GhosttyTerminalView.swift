@@ -1365,6 +1365,7 @@ final class TerminalSurface: Identifiable, ObservableObject {
     /// Marked @atomic via NSLock for strict ordering on weakly-ordered hosts.
     private var _hasReceivedPtyOutput: Bool = false
     private var _ptyOutputFirstAt: TimeInterval = 0
+    private var _ptyOutputLastAt: TimeInterval = 0
     private var _ptyOutputTotalBytes: Int = 0
     private let ptyOutputLock = NSLock()
     var hasReceivedPtyOutput: Bool {
@@ -1387,12 +1388,22 @@ final class TerminalSurface: Identifiable, ObservableObject {
         ptyOutputLock.lock(); defer { ptyOutputLock.unlock() }
         return _ptyOutputTotalBytes
     }
+    /// How long the pty has been silent, in seconds. A TUI that has finished
+    /// painting its startup screen and is sitting at its prompt stops writing;
+    /// one still booting does not. Returns nil before any output.
+    var ptyOutputQuietFor: TimeInterval? {
+        ptyOutputLock.lock(); defer { ptyOutputLock.unlock() }
+        guard _hasReceivedPtyOutput else { return nil }
+        return ProcessInfo.processInfo.systemUptime - _ptyOutputLastAt
+    }
     fileprivate func recordPtyOutput(byteCount: Int) {
         ptyOutputLock.lock(); defer { ptyOutputLock.unlock() }
+        let now = ProcessInfo.processInfo.systemUptime
         if !_hasReceivedPtyOutput {
             _hasReceivedPtyOutput = true
-            _ptyOutputFirstAt = ProcessInfo.processInfo.systemUptime
+            _ptyOutputFirstAt = now
         }
+        _ptyOutputLastAt = now
         _ptyOutputTotalBytes &+= byteCount
     }
     private static let maxPasteQueueDepth = 16
@@ -1535,12 +1546,25 @@ final class TerminalSurface: Identifiable, ObservableObject {
         // Cadence: 100 ms polls, capped at 40 attempts (~4 s) so a silent
         // startup doesn't deadlock paste forever — but the cap is rare;
         // typical Claude/Codex hits 500 bytes well within 1.5 s.
+        // Fourth condition: the pty has gone quiet. Age and bytes both measure
+        // that a TUI *started* talking, and Claude Code clears both within a
+        // second or so of launch — its banner streams immediately while the
+        // composer is still coming up. Pasting into that window put the text
+        // in the prompt and let the Return fall on the floor: ghostty reports
+        // the key as handled, so every retry below sees success while nothing
+        // was submitted. A TUI that has finished painting and is waiting on
+        // input stops writing, and that silence is the part that actually
+        // means ready.
         let coldSettleSeconds: TimeInterval = 1.5
         let coldByteThreshold = 500
+        let coldQuietSeconds: TimeInterval = 0.6
         let coldDeferCap = 40
         let coldReady: Bool = {
             guard let age = ptyOutputAge else { return false }
-            return age >= coldSettleSeconds && ptyOutputBytes >= coldByteThreshold
+            guard let quiet = ptyOutputQuietFor else { return false }
+            return age >= coldSettleSeconds
+                && ptyOutputBytes >= coldByteThreshold
+                && quiet >= coldQuietSeconds
         }()
         if !hasCompletedPaste, !coldReady, p.tuiReadyDeferCount < coldDeferCap {
             pasteInFlight = false  // unlock the queue so drain can re-enter
@@ -1563,9 +1587,9 @@ final class TerminalSurface: Identifiable, ObservableObject {
             let ageMs = (ptyOutputAge ?? 0) * 1000
             let bytes = ptyOutputBytes
             if coldReady {
-                dlog("paste.cold.ready panel=\(id.uuidString.prefix(8)) defers=\(p.tuiReadyDeferCount) ptyAgeMs=\(Int(ageMs)) ptyBytes=\(bytes) textLen=\(p.text.count)")
+                dlog("paste.cold.ready panel=\(id.uuidString.prefix(8)) defers=\(p.tuiReadyDeferCount) ptyAgeMs=\(Int(ageMs)) ptyBytes=\(bytes) quietMs=\(Int((ptyOutputQuietFor ?? 0) * 1000)) textLen=\(p.text.count)")
             } else {
-                dlog("paste.cold.fallback panel=\(id.uuidString.prefix(8)) defers=\(p.tuiReadyDeferCount) ptyAgeMs=\(Int(ageMs)) ptyBytes=\(bytes) textLen=\(p.text.count) (deadline reached, proceeding)")
+                dlog("paste.cold.fallback panel=\(id.uuidString.prefix(8)) defers=\(p.tuiReadyDeferCount) ptyAgeMs=\(Int(ageMs)) ptyBytes=\(bytes) quietMs=\(Int((ptyOutputQuietFor ?? 0) * 1000)) textLen=\(p.text.count) (deadline reached, proceeding)")
             }
         }
         #endif
