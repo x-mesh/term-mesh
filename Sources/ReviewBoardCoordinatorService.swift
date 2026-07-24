@@ -319,6 +319,23 @@ final class ReviewBoardCoordinatorClient: @unchecked Sendable {
         return names
     }
 
+    /// Move a task along in the coordinator's own vocabulary. Idempotent on
+    /// the attempt so a repeated report is the same event, not a second one.
+    func reportPlacementStatus(
+        taskID: String,
+        attemptID: String,
+        status: String
+    ) async {
+        _ = try? await request(
+            method: "task.update",
+            params: [
+                "request_id": "dispatch-\(status):\(attemptID)",
+                "task_id": taskID,
+                "status": status,
+            ]
+        )
+    }
+
     /// Say a dispatch failed, in the coordinator's own vocabulary, so the
     /// board shows it instead of the work sitting placed-and-silent forever.
     /// The request id is derived from the attempt so a retry of the same
@@ -1028,6 +1045,12 @@ final class ReviewBoardCoordinatorService: ObservableObject {
                 attemptID: placement.attemptID,
                 reason: reason
             )
+        } started: { placement in
+            await client.reportPlacementStatus(
+                taskID: placement.taskID,
+                attemptID: placement.attemptID,
+                status: "in_progress"
+            )
         }
     }
 
@@ -1208,7 +1231,8 @@ final class CoordinatorPlacementDispatcher {
         projectRoots: [String: String],
         hostsByCoordinatorID: [String: HostEntry],
         localHostID: String,
-        report: @escaping (CoordinatorPlacement, String) async -> Void
+        report: @escaping (CoordinatorPlacement, String) async -> Void,
+        started: @escaping (CoordinatorPlacement) async -> Void = { _ in }
     ) async {
         for placement in taskRows.compactMap(CoordinatorPlacement.init(taskRow:)) {
             guard !handledAttempts.contains(placement.attemptID) else { continue }
@@ -1251,7 +1275,12 @@ final class CoordinatorPlacementDispatcher {
                     agentName: placement.agentName ?? "executor",
                     text: Self.instruction(for: placement)
                 )
-                if !delivered {
+                if delivered {
+                    // The agent has the work. Saying so is the difference
+                    // between a board that tracks progress and one that shows
+                    // the same word from hand-off to finish.
+                    await started(placement)
+                } else {
                     await report(placement, "local agent did not accept the instruction")
                 }
                 continue
@@ -1262,7 +1291,13 @@ final class CoordinatorPlacementDispatcher {
                 await report(placement, "host is not connected to this app")
                 continue
             }
-            await dispatchToPeer(placement, host: host, teamName: teamName, report: report)
+            await dispatchToPeer(
+                placement,
+                host: host,
+                teamName: teamName,
+                report: report,
+                started: started
+            )
         }
     }
 
@@ -1376,7 +1411,8 @@ final class CoordinatorPlacementDispatcher {
         _ placement: CoordinatorPlacement,
         host: HostEntry,
         teamName: String,
-        report: @escaping (CoordinatorPlacement, String) async -> Void
+        report: @escaping (CoordinatorPlacement, String) async -> Void,
+        started: @escaping (CoordinatorPlacement) async -> Void
     ) async {
         let path = host.activeSockPath
         guard !path.isEmpty else {
@@ -1407,7 +1443,9 @@ final class CoordinatorPlacementDispatcher {
                 method: "team.send",
                 paramsJSON: paramsJSON
             )
-            if !response.ok {
+            if response.ok {
+                await started(placement)
+            } else {
                 // A refusal is information, not a broken link — the host's own
                 // wording is the most useful thing to pass on.
                 await report(

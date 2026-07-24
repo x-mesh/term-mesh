@@ -170,6 +170,7 @@ impl Api {
             "task.get" => self.task_get(params),
             "task.create" => self.task_create(params),
             "task.place" => self.task_place(params),
+            "task.update" => self.task_update(params),
             "task.reassign" => self.task_reassign(params),
             "task.suspect" => self.task_suspect(params),
             "task.quarantine" => self.task_quarantine(params),
@@ -478,6 +479,49 @@ impl Api {
                 "expires_at_ms": p.ttl_ms.map(|ttl| now_ms().saturating_add(ttl))
             }))
         })
+    }
+
+    /// Move a task along. The reducer has always known how to apply
+    /// `task_status_changed` and the state machine has always allowed
+    /// `assigned → in_progress → review_ready`, but nothing emitted the event,
+    /// so a placed task stayed placed for ever: work would start, finish and
+    /// be answered in a pane while the board showed it as never begun.
+    ///
+    /// Deliberately not a free-form write — the transition is checked against
+    /// the same table every other path uses, and an invalid one is refused
+    /// rather than recorded.
+    fn task_update(&self, params: Value) -> Result<Value> {
+        #[derive(Deserialize)]
+        struct Params {
+            request_id: String,
+            task_id: TaskId,
+            status: TaskStatus,
+            reason: Option<String>,
+        }
+        let p: Params = serde_json::from_value(params)?;
+        let request_id = p.request_id.clone();
+        self.mutate_checked(
+            &request_id,
+            "task_status_changed",
+            project_for_task(&p.task_id, self)?,
+            |reducer| {
+                let task = reducer
+                    .task(&p.task_id)?
+                    .ok_or_else(|| anyhow::anyhow!("task not found"))?;
+                if !task.status.can_transition_to(&p.status) {
+                    bail!(
+                        "invalid task transition {:?} -> {:?}",
+                        task.status,
+                        p.status
+                    );
+                }
+                Ok(json!({
+                    "task_id": p.task_id,
+                    "status": p.status,
+                    "reason": p.reason
+                }))
+            },
+        )
     }
 
     fn task_reassign(&self, params: Value) -> Result<Value> {

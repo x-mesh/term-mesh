@@ -537,11 +537,13 @@ impl Reducer {
             bail!("invalid task transition {:?} -> {:?}", current.status, next);
         }
         self.conn.execute(
-            "UPDATE tasks SET status=?1, updated_at_ms=?2 WHERE task_id=?3",
+            "UPDATE tasks SET status=?1, updated_at_ms=?2,
+             last_reason=COALESCE(?4, last_reason) WHERE task_id=?3",
             params![
                 serde_json::to_value(next)?.as_str().unwrap(),
                 event.ts_ms as i64,
-                task_id.as_str()
+                task_id.as_str(),
+                event.payload.get("reason").and_then(|v| v.as_str())
             ],
         )?;
         Ok(())
