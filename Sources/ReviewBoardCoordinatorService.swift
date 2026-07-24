@@ -1244,7 +1244,7 @@ extension ReviewBoardCoordinatorService {
         // coordinator then records placement against that same id rather than
         // opening a second file on the same job.
         let project = projectIdentity(forWorkingDirectories: [projectRoot])
-        let handed = handToTeam(project: project, root: projectRoot, title: title, body: body)
+        let handed = await handToTeam(project: project, root: projectRoot, title: title, body: body)
 
         try await client.delegate(
             projectID: projectID,
@@ -1275,7 +1275,7 @@ extension ReviewBoardCoordinatorService {
         root: String,
         title: String,
         body: String
-    ) -> (taskID: String, delivered: Bool)? {
+    ) async -> (taskID: String, delivered: Bool)? {
         guard !project.isUnknown else { return nil }
         let dispatcher = CoordinatorPlacementDispatcher.shared
         let existing = dispatcher.teamName(forProject: project, host: nil)
@@ -1283,6 +1283,7 @@ extension ReviewBoardCoordinatorService {
             ?? dispatcher.createTeam(forProject: project, root: root) else { return nil }
         // A team that was just created is only its leader; the delegation
         // needs an agent to land on.
+        var spawnedNow = false
         if TeamOrchestrator.shared.teams[team]?.agents.isEmpty ?? true {
             _ = TeamOrchestrator.shared.addAgentToTeam(
                 teamName: team,
@@ -1291,6 +1292,17 @@ extension ReviewBoardCoordinatorService {
                 agentModel: "sonnet",
                 agentCli: "claude"
             )
+            spawnedNow = true
+        }
+        // A pane that was spawned a moment ago is still starting its CLI, and
+        // text that arrives during the boot lands in the composer while the
+        // Return is swallowed by whatever is on screen at the time. The
+        // capsule then sits at the prompt unsent: the agent never begins, the
+        // task stays `assigned` forever, and the only STATUS lines in the
+        // scrollback are the capsule's own echo. Wait for the pane to print —
+        // that is the CLI coming up — before handing it anything.
+        if spawnedNow {
+            await waitForAgentPaneToStart(teamName: team, agentName: "executor")
         }
         guard let tabManager = TeamOrchestrator.shared.resolveTabManager(teamName: team)
             ?? TerminalController.shared.tabManager else { return nil }
@@ -1307,6 +1319,31 @@ extension ReviewBoardCoordinatorService {
             submit: true
         ) else { return nil }
         return (result.task.id, result.textDelivered)
+    }
+
+    /// Give a freshly spawned agent pane time to bring its CLI up.
+    ///
+    /// Readiness is read from the pane rather than assumed from a fixed sleep:
+    /// the poller already watches every agent pane, and a pane that has
+    /// printed is a CLI that has started. The settle afterwards covers the gap
+    /// between the first frame and a composer that accepts a submit.
+    @MainActor
+    private func waitForAgentPaneToStart(
+        teamName: String,
+        agentName: String,
+        timeout: TimeInterval = 20
+    ) async {
+        AutoReplyPoller.shared.ensureRunning()
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            if let panelID = TeamOrchestrator.shared.teams[teamName]?
+                .agents.first(where: { $0.name == agentName })?.panelId,
+               AutoReplyPoller.shared.isPaneActive(panelId: panelID) {
+                break
+            }
+            try? await Task.sleep(nanoseconds: 300_000_000)
+        }
+        try? await Task.sleep(nanoseconds: 1_500_000_000)
     }
 }
 
