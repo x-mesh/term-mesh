@@ -69,9 +69,36 @@ final class ReviewBoardViewModelTests: XCTestCase {
 
         // The Merge Queue fact is the record, not a panel run or a keyword.
         let digest = model.digest(for: task)
-        XCTAssertTrue(digest.mergeQueue.contains("failed"), digest.mergeQueue)
-        XCTAssertTrue(digest.mergeQueue.contains("reviewer"), digest.mergeQueue)
-        XCTAssertTrue(digest.mergeQueue.contains("rebase conflict"), digest.mergeQueue)
+        let mergeQueue = try XCTUnwrap(digest.mergeQueue)
+        XCTAssertTrue(mergeQueue.contains("failed"), mergeQueue)
+        XCTAssertTrue(mergeQueue.contains("reviewer"), mergeQueue)
+        XCTAssertTrue(mergeQueue.contains("rebase conflict"), mergeQueue)
+
+        // And it is the only thing known, so it is the only row drawn. Facts
+        // with nothing to report used to render as "not reported" — eight of
+        // them, burying the one line that had something to say.
+        XCTAssertEqual(digest.presentFacts.map(\.title), ["Merge Queue"])
+    }
+
+    /// A task nobody has reported on yet draws no fact rows at all.
+    @MainActor
+    func testATaskWithNothingReportedHasNoFacts() {
+        let task = ReviewBoardTask(
+            id: "tsk_quiet",
+            teamName: "x-backup",
+            title: "이 저장소를 요약",
+            status: "assigned"
+        )
+        let model = ReviewBoardViewModel(initialSnapshot: ReviewBoardSnapshot(
+            tasks: [task],
+            panelRuns: [],
+            coordinatorOnline: true,
+            memMeshAvailable: true,
+            suspectHost: false,
+            fencedZombie: false
+        ))
+
+        XCTAssertTrue(model.digest(for: task).presentFacts.isEmpty)
     }
 
     /// Merged and cancelled entries are history; the panel lists what still
