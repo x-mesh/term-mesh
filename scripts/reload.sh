@@ -12,6 +12,7 @@ DERIVED_SET=0
 TAG=""
 TERMMESH_DEBUG_LOG=""
 ALLOW_ALL=0
+USER_ENV=()
 
 usage() {
   cat <<'EOF'
@@ -24,6 +25,11 @@ Options:
   --bundle-id <id>       Override bundle identifier.
   --derived-data <path>  Override derived data path.
   --allow-all            Set TERMMESH_SOCKET_MODE=allowAll (for external socket access).
+  --env KEY=VAL          Pass an environment variable to the launched app. Repeatable.
+                         Prefixing this script with KEY=VAL does NOT work: the app is
+                         started through `open` from a scrubbed subshell, so it inherits
+                         only what is handed to it here. Env-gated features (e.g.
+                         TERMMESH_COORDINATOR_ENABLED=1) are unreachable without this.
   -h, --help             Show this help.
 EOF
 }
@@ -132,6 +138,14 @@ while [[ $# -gt 0 ]]; do
         exit 1
       fi
       DERIVED_SET=1
+      shift 2
+      ;;
+    --env)
+      if [[ -z "${2:-}" || "$2" != *=* ]]; then
+        echo "error: --env requires KEY=VAL" >&2
+        exit 1
+      fi
+      USER_ENV+=("$2")
       shift 2
       ;;
     --allow-all)
@@ -368,6 +382,9 @@ open_clean() {
 EXTRA_ENV=()
 if [[ "$ALLOW_ALL" -eq 1 ]]; then
   EXTRA_ENV+=(TERMMESH_SOCKET_MODE=allowAll)
+fi
+if [[ ${#USER_ENV[@]} -gt 0 ]]; then
+  EXTRA_ENV+=("${USER_ENV[@]}")
 fi
 if [[ -n "${TAG_SLUG:-}" ]]; then
   # Tagged builds are re-signed every rebuild, so the keychain ACL for the
