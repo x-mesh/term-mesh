@@ -1162,6 +1162,165 @@ struct SidebarProjectDelegateTarget: Identifiable {
 /// this asks for the work and nothing about where — choosing a host here would
 /// re-decide, by hand and with less information, the one thing the coordinator
 /// exists to decide.
+/// Which project is getting a member, and where that member should run.
+struct SidebarRemoteAgentTarget: Identifiable {
+    let projectLabel: String
+    /// The team the member joins. Nil when the project has no team here, which
+    /// is the one case this cannot serve — a member needs teammates.
+    let teamName: String?
+    var id: String { projectLabel }
+}
+
+/// Put a member of this project's team on another machine.
+///
+/// The delegate sheet beside this one deliberately asks nothing about where —
+/// the coordinator picks a host, and choosing one by hand would re-decide with
+/// less information. This is the opposite case, and the reason both exist: the
+/// machine IS the request. Tests want the Mac; a build may want the Linux box.
+///
+/// The directory is asked for rather than inferred. Two machines rarely lay a
+/// checkout out the same way, so the local path is not an answer; what the host
+/// reports about itself is, and that is what prefills the field.
+struct SidebarRemoteAgentSheet: View {
+    let target: SidebarRemoteAgentTarget
+    let onClose: () -> Void
+
+    @ObservedObject private var store = RemoteHostStore.shared
+    @State private var hostKey: String = ""
+    @State private var directory: String = ""
+    @State private var role: String = "executor"
+    @State private var failure: String?
+    @State private var isAdding = false
+
+    private var connectedHosts: [HostEntry] {
+        store.sortedHosts.filter(\.isConnected)
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            VStack(alignment: .leading, spacing: 3) {
+                Text("Add Agent on Another Machine")
+                    .font(.system(size: 14, weight: .semibold))
+                Text(target.projectLabel)
+                    .font(.system(size: 11))
+                    .foregroundColor(.secondary)
+            }
+
+            if connectedHosts.isEmpty {
+                Text("No peer is connected. Connect one from the Host list first.")
+                    .font(.system(size: 11))
+                    .foregroundColor(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            } else {
+                VStack(alignment: .leading, spacing: 5) {
+                    Text("Machine")
+                        .font(.system(size: 10, weight: .semibold))
+                        .foregroundColor(.secondary)
+                    Picker("", selection: $hostKey) {
+                        ForEach(connectedHosts, id: \.id) { host in
+                            Text(host.displayName).tag(host.id)
+                        }
+                    }
+                    .labelsHidden()
+                    .onChange(of: hostKey) { _, _ in prefillDirectory() }
+                }
+
+                VStack(alignment: .leading, spacing: 5) {
+                    Text("Working directory on that machine")
+                        .font(.system(size: 10, weight: .semibold))
+                        .foregroundColor(.secondary)
+                    TextField("/root/project", text: $directory)
+                        .textFieldStyle(.roundedBorder)
+                }
+
+                VStack(alignment: .leading, spacing: 5) {
+                    Text("Role")
+                        .font(.system(size: 10, weight: .semibold))
+                        .foregroundColor(.secondary)
+                    TextField("executor", text: $role)
+                        .textFieldStyle(.roundedBorder)
+                }
+            }
+
+            if let failure {
+                Text(failure)
+                    .font(.system(size: 11))
+                    .foregroundColor(.red)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            HStack {
+                Text("The pane opens here, beside its team.")
+                    .font(.system(size: 10))
+                    .foregroundColor(Color.secondary.opacity(0.8))
+                Spacer()
+                Button("Cancel", action: onClose)
+                    .keyboardShortcut(.cancelAction)
+                Button(isAdding ? "Adding…" : "Add", action: add)
+                    .keyboardShortcut(.defaultAction)
+                    .disabled(isAdding || !isReady)
+            }
+        }
+        .padding(18)
+        .frame(width: 420)
+        .onAppear {
+            if hostKey.isEmpty { hostKey = connectedHosts.first?.id ?? "" }
+            prefillDirectory()
+        }
+        .accessibilityIdentifier("sidebar.project.addRemoteAgent")
+    }
+
+    private var isReady: Bool {
+        target.teamName != nil
+            && !hostKey.isEmpty
+            && !directory.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            && !role.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    /// Offer what the machine says about itself, preferring a folder named the
+    /// same as this project. A wrong guess here is cheap — the field is right
+    /// there — but a blank one makes the person go and look it up.
+    private func prefillDirectory() {
+        guard let host = connectedHosts.first(where: { $0.id == hostKey }) else { return }
+        var roots = host.workspaces
+            .flatMap(\.panes)
+            .compactMap(\.projectRootPath)
+            .filter { !$0.isEmpty }
+        roots.append(contentsOf: host.teams.compactMap(\.projectRootPath).filter { !$0.isEmpty })
+        let byName = roots.first {
+            URL(fileURLWithPath: $0).lastPathComponent == target.projectLabel
+        }
+        directory = byName ?? roots.first ?? ""
+    }
+
+    private func add() {
+        guard let teamName = target.teamName else {
+            failure = "This project has no team here to join."
+            return
+        }
+        isAdding = true
+        failure = nil
+        let name = role.trimmingCharacters(in: .whitespacesAndNewlines)
+        let dir = directory.trimmingCharacters(in: .whitespacesAndNewlines)
+        let key = hostKey
+        Task { @MainActor in
+            do {
+                _ = try await TeamOrchestrator.shared.attachRemoteAgent(
+                    teamName: teamName,
+                    agentName: name,
+                    hostKey: key,
+                    workingDirectory: dir,
+                    agentType: name
+                )
+                onClose()
+            } catch {
+                isAdding = false
+                failure = String(describing: error)
+            }
+        }
+    }
+}
+
 struct SidebarProjectDelegateSheet: View {
     let target: SidebarProjectDelegateTarget
     let onClose: () -> Void
@@ -1306,6 +1465,8 @@ private struct SidebarPeerProjectsView: View {
     private var isUnassignedExpanded = false
     /// Non-nil presents the delegate sheet.
     @State private var delegateTarget: SidebarProjectDelegateTarget?
+    /// Non-nil presents the remote-agent sheet.
+    @State private var remoteAgentTarget: SidebarRemoteAgentTarget?
 
     private var connectedHosts: [HostEntry] {
         hosts.filter { $0.isConnected && !$0.workspaces.isEmpty }
@@ -1446,6 +1607,20 @@ private struct SidebarPeerProjectsView: View {
     /// The absolute path the coordinator will register this project under.
     /// A project the sidebar groups purely from peer panes has no path this
     /// machine can name, so delegation is offered only where one exists.
+    /// The team running in this project on this machine, if there is one.
+    /// A remote member joins an existing team — there is no such thing as a
+    /// team with only a member somewhere else.
+    private func teamName(for group: SidebarPeerProjectGroup) -> String? {
+        let workspaceIDs = Set(group.items.compactMap { item -> UUID? in
+            guard case .local(let workspace) = item else { return nil }
+            return workspace.id
+        })
+        guard !workspaceIDs.isEmpty else { return nil }
+        return TeamOrchestrator.shared.teams.values
+            .first { workspaceIDs.contains($0.workspaceId) }?
+            .id
+    }
+
     private func delegateRootPath(for group: SidebarPeerProjectGroup) -> String? {
         for item in group.items {
             guard case .local(let workspace) = item else { continue }
@@ -1511,6 +1686,17 @@ private struct SidebarPeerProjectsView: View {
                             )
                         }
                         .disabled(delegateRootPath(for: group) == nil)
+                        // Sits under the delegate item because it answers the
+                        // other half of the same question: that one asks what
+                        // needs doing and lets the coordinator pick a machine,
+                        // this one is for when the machine is the point.
+                        Button("Add Agent on Another Machine…") {
+                            remoteAgentTarget = SidebarRemoteAgentTarget(
+                                projectLabel: group.identity.label,
+                                teamName: teamName(for: group)
+                            )
+                        }
+                        .disabled(teamName(for: group) == nil)
                     }
                     ForEach(group.items) { item in
                         workspaceRow(item)
@@ -1533,6 +1719,9 @@ private struct SidebarPeerProjectsView: View {
         }
         .sheet(item: $delegateTarget) { target in
             SidebarProjectDelegateSheet(target: target) { delegateTarget = nil }
+        }
+        .sheet(item: $remoteAgentTarget) { target in
+            SidebarRemoteAgentSheet(target: target) { remoteAgentTarget = nil }
         }
     }
 
