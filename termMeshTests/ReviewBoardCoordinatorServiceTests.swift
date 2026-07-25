@@ -831,3 +831,43 @@ private final class FakeCoordinatorEventServer: @unchecked Sendable {
         lock.unlock()
     }
 }
+
+@MainActor
+final class CoordinatorRemoteReadbackTests: XCTestCase {
+    func test_extracts_agent_text_from_stream_json() {
+        let lines = [
+            #"{"type":"system","subtype":"init","cwd":"/root/remote-demo"}"#,
+            #"{"type":"assistant","message":{"content":[{"type":"text","text":"3\n\nSTATUS: DONE"}]}}"#,
+            #"{"is_error":false,"num_turns":2}"#,
+        ]
+        let text = CoordinatorPlacementDispatcher.plainText(fromHostOutput: lines)
+        XCTAssertEqual(text, "3\n\nSTATUS: DONE")
+    }
+
+    func test_passes_through_non_json_lines() {
+        let text = CoordinatorPlacementDispatcher.plainText(fromHostOutput: ["STATUS: DONE", "answer"])
+        XCTAssertEqual(text, "STATUS: DONE\nanswer")
+    }
+
+    func test_summary_keeps_an_answer_written_above_the_header() {
+        // Agents put the answer first however the instruction is worded. A
+        // remote reply is the agent's whole turn, so text above the header is
+        // still the agent's — unlike a pane read, where it is scrollback.
+        let summary = CoordinatorPlacementDispatcher.summary(fromRemoteReply: """
+        3
+
+        STATUS: DONE
+        FILES: none
+        VERIFY: wc -l < data.txt
+        NEXT: NONE
+        FULL_REPORT: n/a
+        """)
+        XCTAssertEqual(summary, "3")
+    }
+
+    func test_summary_is_nil_when_only_a_header_was_sent() {
+        XCTAssertNil(CoordinatorPlacementDispatcher.summary(
+            fromRemoteReply: "STATUS: DONE\nNEXT: NONE\n"
+        ))
+    }
+}
