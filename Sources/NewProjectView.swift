@@ -15,18 +15,22 @@ import SwiftUI
 /// places that present it — because the moment there are two, they drift, and
 /// today they did.
 struct NewProjectView: View {
-    let onCreate: (_ name: String, _ directory: String, _ rows: [TeamAgentRow]) -> Void
+    /// `localDirectory` is where the window opens here; `rows` already carry
+    /// the machine and path each member actually works in.
+    let onCreate: (_ name: String, _ localDirectory: String, _ rows: [TeamAgentRow]) -> Void
     let onClose: () -> Void
 
     @State private var directory: String = ""
     @State private var name: String = ""
     @State private var nameEdited = false
     @State private var agents: [TeamAgentRow] = []
-    /// Where the team runs. Only this machine for now: putting a team on a
-    /// peer means asking that peer to start processes, which its allow-list
-    /// refuses on purpose. The choice is shown rather than hidden so the
-    /// answer to "can the leader live on the always-on box" is visible, and
-    /// visibly not yet.
+    /// The machine this project lives on.
+    ///
+    /// Asked first because everything after it depends on the answer. A folder
+    /// on this Mac is chosen with a file panel; a folder on another machine is
+    /// a path typed against that machine's own conventions, and no panel here
+    /// can browse it. Getting this backwards meant offering a local picker for
+    /// a directory that was never going to be local.
     @State private var runsOnHostKey: String?
 
     @ObservedObject private var presetManager = AgentRolePresetManager.shared
@@ -81,11 +85,34 @@ struct NewProjectView: View {
     private var projectFields: some View {
         Grid(alignment: .leading, horizontalSpacing: 12, verticalSpacing: 10) {
             GridRow {
-                Text("Folder")
+                Text("Runs on")
+                HStack(spacing: 8) {
+                    Picker("", selection: $runsOnHostKey) {
+                        Text("This Mac").tag(String?.none)
+                        ForEach(connectedPeers, id: \.id) { host in
+                            Text(host.displayName).tag(String?.some(host.id))
+                        }
+                    }
+                    .labelsHidden()
+                    .frame(width: 180)
+                    if connectedPeers.isEmpty {
+                        Text("connect a peer to run a project elsewhere")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+            }
+            GridRow {
+                Text(runsOnHostKey == nil ? "Folder" : "Folder on that machine")
                 HStack(spacing: 6) {
-                    TextField("~/work/project", text: $directory)
+                    TextField(folderPlaceholder, text: $directory)
                         .textFieldStyle(.roundedBorder)
-                    Button("Choose…", action: chooseFolder)
+                    // No panel for a remote path: this Mac cannot browse that
+                    // machine's disk, and a picker that quietly shows the
+                    // wrong filesystem is worse than none.
+                    if runsOnHostKey == nil {
+                        Button("Choose…", action: chooseFolder)
+                    }
                 }
             }
             GridRow {
@@ -102,41 +129,78 @@ struct NewProjectView: View {
                 )
                 .textFieldStyle(.roundedBorder)
             }
-            GridRow {
-                Text("Runs on")
-                HStack(spacing: 8) {
-                    Picker("", selection: $runsOnHostKey) {
-                        Text("This Mac").tag(String?.none)
-                        ForEach(hostStore.sortedHosts.filter(\.isConnected), id: \.id) { host in
-                            Text(host.displayName).tag(String?.some(host.id))
-                        }
-                    }
-                    .labelsHidden()
-                    .frame(width: 180)
-                    .disabled(true)
-                    Text("individual agents can still run elsewhere")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
-            }
         }
         .onChange(of: directory) { _, newValue in
             guard !nameEdited else { return }
             name = URL(fileURLWithPath: newValue.trimmingCharacters(in: .whitespacesAndNewlines))
                 .lastPathComponent
         }
+        .onChange(of: runsOnHostKey) { _, newHost in
+            applyRunsOn(newHost)
+        }
+    }
+
+    private var connectedPeers: [HostEntry] {
+        hostStore.sortedHosts.filter(\.isConnected)
+    }
+
+    private var folderPlaceholder: String {
+        guard let runsOnHostKey,
+              let profile = PeerHostProfileStore.shared.profiles
+                .first(where: { $0.stableKey == runsOnHostKey }),
+              let root = profile.projectRootPath, !root.isEmpty
+        else { return runsOnHostKey == nil ? "~/work/project" : "/path/on/that/machine" }
+        return (root as NSString).appendingPathComponent("project")
+    }
+
+    /// Move the whole form to the chosen machine.
+    ///
+    /// The folder starts from that machine's own convention rather than being
+    /// cleared: a path someone can correct beats an empty field they have to
+    /// go and look up. The agents follow, because a project running over there
+    /// with its members here is not what anyone picked this for — and each row
+    /// can still be moved back individually.
+    private func applyRunsOn(_ hostKey: String?) {
+        guard let hostKey else {
+            for i in agents.indices {
+                agents[i].hostKey = nil
+                agents[i].hostDirectory = ""
+            }
+            directory = ""
+            return
+        }
+        let leaf = effectiveName.isEmpty ? "project" : effectiveName
+        let predicted = PeerHostProfileStore.shared.profiles
+            .first { $0.stableKey == hostKey }?
+            .predictedProjectPath(forProjectNamed: leaf)
+        directory = predicted ?? RemoteProjectPaths.shared.anyPath(host: hostKey) ?? ""
+        for i in agents.indices {
+            agents[i].hostKey = hostKey
+            agents[i].hostDirectory = directory
+        }
     }
 
     private var footer: some View {
         HStack {
-            Text("The team is created in this folder alongside the project.")
-                .font(.caption)
-                .foregroundStyle(.secondary)
+            Text(
+                runsOnHostKey == nil
+                    ? "The team is created in this folder alongside the project."
+                    : "The agents work on that machine; their panes open here."
+            )
+            .font(.caption)
+            .foregroundStyle(.secondary)
             Spacer()
             Button("Cancel", action: onClose)
                 .keyboardShortcut(.cancelAction)
             Button("Create") {
-                onCreate(effectiveName, trimmedDirectory, agents)
+                // A project living on another machine still needs somewhere
+                // here for its window to open. The remote path is not that
+                // place — nothing local would be able to enter it — so the
+                // panes start at home and the members carry the real one.
+                let localDirectory = runsOnHostKey == nil
+                    ? trimmedDirectory
+                    : FileManager.default.homeDirectoryForCurrentUser.path
+                onCreate(effectiveName, localDirectory, agents)
                 onClose()
             }
             .keyboardShortcut(.defaultAction)
