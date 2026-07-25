@@ -663,6 +663,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         }
     }
 
+    /// Give agents on other machines a moment to be told the app is leaving.
+    ///
+    /// Only when there are any, and never for longer than `quitGrace` — a
+    /// tidy exit is worth a second, not a quit that hangs because a peer
+    /// stopped answering.
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        guard TeamOrchestrator.shared.releaseAllRemoteAgentsForQuit() else {
+            return .terminateNow
+        }
+#if DEBUG
+        dlog("[app.shouldTerminate] waiting on remote agent shutdown")
+#endif
+        DispatchQueue.main.asyncAfter(
+            deadline: .now() + TeamOrchestrator.quitGrace
+        ) {
+            NSApp.reply(toApplicationShouldTerminate: true)
+        }
+        return .terminateLater
+    }
+
     func applicationWillTerminate(_ notification: Notification) {
         #if DEBUG
         dlog("[app.willTerminate] fired — archiving live pane teams before daemon shutdown")

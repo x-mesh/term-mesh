@@ -252,6 +252,47 @@ extension TeamOrchestrator {
         }
     }
 
+    /// Tell every agent running on a peer to quit, because this app is.
+    ///
+    /// A local agent dies with the app: its process lives in a pane, and the
+    /// pane goes when the process hosting it does. An agent on another machine
+    /// does not — it keeps running, holding its session, with nobody left who
+    /// knows it exists. Teams do not survive a restart, so nothing would ever
+    /// come back for it, and the next agent added to that host would find the
+    /// surface occupied by a ghost. Every restart would leave one more.
+    ///
+    /// Returns whether anything was asked to quit, so the caller knows whether
+    /// it is worth delaying the quit at all.
+    @MainActor
+    @discardableResult
+    func releaseAllRemoteAgentsForQuit() -> Bool {
+        let remote = teams.values.flatMap(\.agents).filter { $0.hostKey != nil }
+        guard !remote.isEmpty else { return false }
+        for agent in remote {
+            guard let panelId = agent.panelId,
+                  let located = AppDelegate.shared?.locateSurface(surfaceId: panelId),
+                  let workspace = located.tabManager.tabs.first(where: { $0.id == located.workspaceId }),
+                  let panel = workspace.terminalPanel(for: panelId) else { continue }
+            _ = panel.surface.sendIMEText(Self.quitCommand(cli: agent.cli), withReturn: false)
+            DispatchQueue.main.asyncAfter(deadline: .now() + Self.quitReturnGap) {
+                TerminalController.shared.sendNamedKeyWithRetry(
+                    on: panel.surface, keyName: "return"
+                ) { _, _ in }
+            }
+        }
+        return true
+    }
+
+    /// Room for the quit command to reach the far machine before the Return
+    /// chasing it. Same reason as every other remote send, on a shorter fuse
+    /// because a quit is waiting on it.
+    static let quitReturnGap: TimeInterval = 1.0
+
+    /// How long the app will wait for those quits before leaving anyway. A
+    /// tidy exit is worth a second or two; it is not worth a quit that hangs
+    /// because a peer stopped answering.
+    static let quitGrace: TimeInterval = 2.5
+
     /// How to ask a CLI to quit.
     ///
     /// Typed rather than signalled: Ctrl+C and Ctrl+D both arrive at the pane
