@@ -69,15 +69,22 @@ struct ReviewBoardPanelView: View {
     private var emptyState: some View {
         VStack(alignment: .leading, spacing: 10) {
             statusPills(viewModel.statusBadges(for: nil))
-            Text("No review tasks")
+            Text("Nothing assigned yet")
                 .font(.system(size: 13, weight: .medium))
-            Text("Task board data has not reported review work yet.")
+            // What it used to say — "Task board data has not reported review
+            // work yet" — described the plumbing and left the reader to guess
+            // whether something was broken. Nothing is: the board shows work
+            // that has been handed to someone, and on a new project nobody has
+            // been handed anything. Say where the rows come from.
+            Text("Rows appear here when the leader gives an agent a task. "
+                 + "Ask it in the leader pane, or run `tm-agent delegate` yourself.")
                 .font(.system(size: 12))
                 .foregroundColor(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
         }
         .padding(12)
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-        .accessibilityLabel("No review tasks")
+        .accessibilityLabel("No review tasks yet")
     }
 
     private var mergeQueueList: some View {

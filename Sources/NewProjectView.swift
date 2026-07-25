@@ -175,6 +175,15 @@ struct NewProjectView: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
+            // Said out loud because the row above says the project runs
+            // elsewhere and this one does not follow it. The leader commands
+            // the team through this app's socket, which only exists here, so
+            // it stays on this Mac while its members work on the far machine.
+            if runsOnHostKey != nil {
+                Text("runs on this Mac")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
         }
     }
 

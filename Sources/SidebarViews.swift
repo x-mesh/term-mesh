@@ -998,6 +998,15 @@ struct SidebarProjectsSection: View {
             NewProjectView(
                 onCreate: { name, directory, rows, source, leader in
                     Task { @MainActor in
+                        // A name already in use means the project is open, not
+                        // that something failed. Creating one silently returned
+                        // nil and the sheet just closed, which reads as the
+                        // button not working — so go to the one that is there.
+                        if let existing = TeamOrchestrator.shared.teams[name],
+                           let workspace = tabManager.tabs.first(where: { $0.id == existing.workspaceId }) {
+                            tabManager.selectWorkspace(workspace)
+                            return
+                        }
                         // The checkouts have to exist before anyone is sent to
                         // work in them: an agent whose directory is not there
                         // starts in a shell that failed to `cd` and looks
