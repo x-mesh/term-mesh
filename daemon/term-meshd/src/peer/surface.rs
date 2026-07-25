@@ -1385,6 +1385,18 @@ pub struct PtyManager {
     /// that was just closed must not be resurrectable by a raw
     /// `AttachSurface` for the same id while the daemon keeps running.
     ephemeral_specs: RwLock<std::collections::HashSet<Vec<u8>>>,
+    /// How many peers are currently attached to each surface.
+    ///
+    /// A surface this host spawned on request exists for whoever asked for it.
+    /// When they all go — cleanly, or because their app died — nothing else
+    /// refers to it, and the shell inside would otherwise run until the daemon
+    /// does. Machines were found carrying login shells eleven days old this
+    /// way, one per client crash, each still holding whatever had been started
+    /// in it.
+    ///
+    /// Declared surfaces are not counted against: the operator published those
+    /// for anyone to attach to, and an empty one is simply idle.
+    attachers: Mutex<HashMap<Vec<u8>, usize>>,
     /// Desired-state metadata for surfaces created by `ensure`. Lifecycle
     /// persistence/registration is intentionally left to the next layer.
     ensured: RwLock<HashMap<Vec<u8>, EnsuredRecord>>,
@@ -1567,6 +1579,7 @@ impl PtyManager {
             surfaces: RwLock::new(HashMap::new()),
             specs: RwLock::new(HashMap::new()),
             ephemeral_specs: RwLock::new(std::collections::HashSet::new()),
+            attachers: Mutex::new(HashMap::new()),
             ensured: RwLock::new(HashMap::new()),
             ensured_persist_path: RwLock::new(None),
             ensured_persist_lock: Mutex::new(()),
@@ -1909,6 +1922,50 @@ impl PtyManager {
     /// dead-watcher) — so a `split`/`new_tab`-spawned pane cannot be
     /// resurrected by a raw `AttachSurface` for the same id after it was
     /// closed. Use for panes created outside `TERMMESH_PEER_SURFACES`.
+    /// Whether this surface was created on a peer's request rather than
+    /// declared by the operator.
+    pub fn is_ephemeral(&self, surface_id: &[u8]) -> bool {
+        self.ephemeral_specs
+            .read()
+            .map(|set| set.contains(surface_id))
+            .unwrap_or(false)
+    }
+
+    /// Record that a peer attached.
+    pub fn note_attached(&self, surface_id: &[u8]) {
+        if let Ok(mut map) = self.attachers.lock() {
+            *map.entry(surface_id.to_vec()).or_insert(0) += 1;
+        }
+    }
+
+    /// Record that a peer detached, and report how many remain. Saturating at
+    /// zero: a detach without a matching attach is a bug worth surviving, not
+    /// one worth panicking over.
+    pub fn note_detached(&self, surface_id: &[u8]) -> usize {
+        let Ok(mut map) = self.attachers.lock() else {
+            return usize::MAX;
+        };
+        let remaining = map
+            .get(surface_id)
+            .copied()
+            .unwrap_or(0)
+            .saturating_sub(1);
+        if remaining == 0 {
+            map.remove(surface_id);
+        } else {
+            map.insert(surface_id.to_vec(), remaining);
+        }
+        remaining
+    }
+
+    /// How many peers are attached right now.
+    pub fn attacher_count(&self, surface_id: &[u8]) -> usize {
+        self.attachers
+            .lock()
+            .map(|map| map.get(surface_id).copied().unwrap_or(0))
+            .unwrap_or(0)
+    }
+
     pub fn register_and_spawn_ephemeral(&self, surface_id: Vec<u8>, spec: SpawnSpec) {
         self.register_and_spawn_inner(surface_id, spec, true);
     }

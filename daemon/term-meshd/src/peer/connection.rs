@@ -681,6 +681,7 @@ async fn reader_loop(
                     mode_prefix,
                     snapshot_floor,
                 );
+                host.pty.note_attached(&req.surface_id);
                 attached.insert(req.surface_id, entry);
             }
 
@@ -718,6 +719,7 @@ async fn reader_loop(
 
             (HandshakeState::Ready, Payload::DetachSurface(det)) => {
                 if let Some(entry) = attached.remove(&det.surface_id) {
+                    reap_if_abandoned(&host, &det.surface_id);
                     entry.surface.drop_size_request(size_requester);
                     entry.cancel.notify_one();
                     let _ = entry.task.await;
@@ -779,10 +781,13 @@ async fn reader_loop(
         }
     }
 
-    for (_, entry) in attached.drain() {
+    for (surface_id, entry) in attached.drain() {
         entry.surface.drop_size_request(size_requester);
         entry.cancel.notify_one();
         let _ = entry.task.await;
+        // Whether the peer said goodbye or its process vanished, this
+        // connection is no longer holding the surface.
+        reap_if_abandoned(&host, &surface_id);
     }
     // Aborted rather than awaited: it is parked on the monitor's next
     // sample, which is seconds away, and it holds nothing that needs
@@ -1102,6 +1107,66 @@ fn spawn_attach_relay(
 /// mean the same thing whichever host answers. Everything here acts inside a
 /// team the host already owns — nothing spawns a process, names a path, or
 /// creates/destroys a team.
+/// How long an abandoned surface is kept before it is reclaimed.
+///
+/// Long enough that a client reconnecting — a dropped link, an app restart —
+/// finds its pane still there. Short enough that a client which is never
+/// coming back does not leave a shell running for days.
+fn abandoned_surface_grace() -> std::time::Duration {
+    // Overridable so a test can watch a reap happen instead of asserting that
+    // a timer was set. Operators get the default; nothing documents the knob.
+    std::env::var("TERMMESH_PEER_ABANDONED_GRACE_MS")
+        .ok()
+        .and_then(|raw| raw.parse::<u64>().ok())
+        .map(std::time::Duration::from_millis)
+        .unwrap_or(std::time::Duration::from_secs(60))
+}
+
+/// Reclaim a surface this host spawned once nobody is attached to it.
+///
+/// A surface created on a peer's request exists for whoever asked. When they
+/// all go, nothing refers to it, and until now the shell inside ran until the
+/// daemon did — one per client crash, each still holding whatever had been
+/// started in it. Declared surfaces are left alone: the operator published
+/// those for anyone to attach to, and an empty one is simply idle.
+///
+/// The wait matters as much as the reap. Detaching is not the same as leaving
+/// for good, and killing on the last detach would take the pane away from
+/// someone whose network hiccuped. The count is checked again at the end of
+/// it, so a reconnect inside the grace cancels the whole thing.
+pub(crate) fn reap_if_abandoned(host: &Arc<PeerHost>, surface_id: &[u8]) {
+    if host.pty.attacher_count(surface_id) > 0 {
+        return;
+    }
+    if !host.pty.is_ephemeral(surface_id) {
+        return;
+    }
+    let host = Arc::downgrade(host);
+    let sid = surface_id.to_vec();
+    let grace = abandoned_surface_grace();
+    tokio::spawn(async move {
+        tokio::time::sleep(grace).await;
+        let Some(host) = host.upgrade() else { return };
+        if host.pty.attacher_count(&sid) > 0 {
+            return;
+        }
+        if !host.pty.is_ephemeral(&sid) {
+            return;
+        }
+        tracing::info!(
+            "reclaiming abandoned surface {:?} — no peer attached for {:?}",
+            &sid[..sid.len().min(4)],
+            grace
+        );
+        // Killing the process is the whole job: its death wakes the ephemeral
+        // watcher already parked on it, which takes the surface out of the
+        // workspace tree, the roster and the reverse index, and pushes the new
+        // layout. Doing any of that here would be a second implementation of
+        // the same cleanup, racing the first.
+        host.pty.remove(&sid);
+    });
+}
+
 fn team_call_allowed(method: &str) -> bool {
     matches!(
         method,

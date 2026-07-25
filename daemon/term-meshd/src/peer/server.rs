@@ -375,6 +375,82 @@ fn peer_uid_matches(_stream: &tokio::net::UnixStream, _expected_uid: u32) -> boo
 #[cfg(test)]
 mod integration_tests {
     use super::*;
+    /// A surface the host made on request goes away once nobody holds it, and
+    /// one the operator declared does not.
+    ///
+    /// The distinction is the whole point: a spawned shell exists for whoever
+    /// asked, and when their app dies nothing else refers to it — that is how
+    /// a machine ends up carrying login shells days old, one per crash. A
+    /// declared surface is published for anyone, and an empty one is idle.
+    #[tokio::test]
+    async fn reaps_a_spawned_surface_once_nobody_is_attached() {
+        std::env::set_var("TERMMESH_PEER_ABANDONED_GRACE_MS", "150");
+        let manager = Arc::new(crate::peer::surface::PtyManager::new());
+        let declared = b"declared-surface".to_vec();
+        let spawned = b"spawned-surface".to_vec();
+        let spec = |title: &str| crate::peer::surface::SpawnSpec {
+            title: title.into(),
+            command: "/bin/cat".into(),
+            args: vec![],
+            cols: 80,
+            rows: 24,
+            cwd: None,
+        };
+        manager.register_and_spawn(declared.clone(), spec("declared"));
+        manager.register_and_spawn_ephemeral(spawned.clone(), spec("spawned"));
+        let host = Arc::new(PeerHost::new(manager.clone()));
+
+        for id in [&declared, &spawned] {
+            manager.note_attached(id);
+            assert_eq!(manager.note_detached(id), 0);
+            crate::peer::connection::reap_if_abandoned(&host, id);
+        }
+
+        tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+        let alive = |id: &[u8]| manager.list().iter().any(|s| s.surface_id == id);
+        assert!(
+            alive(&declared),
+            "a declared surface is the operator's, not ours to reclaim"
+        );
+        assert!(
+            !alive(&spawned),
+            "a surface we asked the host to make must not outlive the asking"
+        );
+        std::env::remove_var("TERMMESH_PEER_ABANDONED_GRACE_MS");
+    }
+
+    /// Detaching is not leaving for good. A client that comes back inside the
+    /// grace — a dropped link, a restart — finds its pane still there.
+    #[tokio::test]
+    async fn a_reconnect_inside_the_grace_saves_the_surface() {
+        std::env::set_var("TERMMESH_PEER_ABANDONED_GRACE_MS", "300");
+        let manager = Arc::new(crate::peer::surface::PtyManager::new());
+        let sid = b"rejoined-surface".to_vec();
+        manager.register_and_spawn_ephemeral(
+            sid.clone(),
+            crate::peer::surface::SpawnSpec {
+                title: "rejoined".into(),
+                command: "/bin/cat".into(),
+                args: vec![],
+                cols: 80,
+                rows: 24,
+                cwd: None,
+            },
+        );
+        let host = Arc::new(PeerHost::new(manager.clone()));
+        manager.note_attached(&sid);
+        assert_eq!(manager.note_detached(&sid), 0);
+        crate::peer::connection::reap_if_abandoned(&host, &sid);
+        manager.note_attached(&sid);
+
+        tokio::time::sleep(std::time::Duration::from_millis(700)).await;
+        assert!(
+            manager.list().iter().any(|s| s.surface_id == sid),
+            "a reconnect inside the grace must cancel the reap"
+        );
+        std::env::remove_var("TERMMESH_PEER_ABANDONED_GRACE_MS");
+    }
+
     use peer_proto::v1::envelope::Payload;
     use peer_proto::v1::{
         AttachMode, AttachSurface, Auth, Envelope, Hello, Input, ListSurfaces, ScrollbackRequest,
