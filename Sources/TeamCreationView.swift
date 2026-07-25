@@ -354,6 +354,11 @@ struct TeamCreationView: View {
     @Environment(\.dismiss) private var dismiss
     @ObservedObject var presetManager = AgentRolePresetManager.shared
     @ObservedObject private var hostStore = RemoteHostStore.shared
+    /// The machine and path the "Apply to All" beside them writes into every
+    /// row. Composing a team that runs on one peer meant typing its path once
+    /// per member, which is the same answer asked three times.
+    @State private var bulkHostKey: String?
+    @State private var bulkHostDirectory: String = ""
 
     /// Peers that could take a member right now.
     private var connectedPeers: [HostEntry] {
@@ -1660,6 +1665,27 @@ struct TeamCreationView: View {
                         }
                     }
                     .frame(width: 130)
+
+                    if !connectedPeers.isEmpty {
+                        Button(action: applyHostToAll) {
+                            Label("Machine", systemImage: "arrow.triangle.2.circlepath")
+                                .font(.caption)
+                        }
+                        .buttonStyle(.borderless)
+                        .help("Put every agent on this machine, at this path")
+                        Picker("", selection: $bulkHostKey) {
+                            Text("Here").tag(String?.none)
+                            ForEach(connectedPeers, id: \.id) { host in
+                                Text(host.displayName).tag(String?.some(host.id))
+                            }
+                        }
+                        .frame(width: 110)
+                        if bulkHostKey != nil {
+                            TextField("/path/on/that/machine", text: $bulkHostDirectory)
+                                .textFieldStyle(.roundedBorder)
+                                .frame(width: 160)
+                        }
+                    }
                 }
 
                 Text("\(agents.count)")
@@ -1789,7 +1815,11 @@ struct TeamCreationView: View {
                 if !connectedPeers.isEmpty {
                     Picker("", selection: Binding(
                         get: { agents[index].hostKey },
-                        set: { agents[index].hostKey = $0 }
+                        set: { newHost in
+                            agents[index].hostKey = newHost
+                            agents[index].hostDirectory = newHost
+                                .map { defaultDirectory(forHost: $0, excluding: index) } ?? ""
+                        }
                     )) {
                         Text("Here").tag(String?.none)
                         ForEach(connectedPeers, id: \.id) { host in
@@ -2553,6 +2583,40 @@ struct TeamCreationView: View {
             agents[i].preset.cli = leaderMode
         }
         persistSelectedSmartPresetOverride()
+    }
+
+    /// A path to start from when a row is moved to a machine.
+    ///
+    /// Another row already on that machine wins: a team usually works on one
+    /// checkout, and the person answering for the second member has already
+    /// answered for the first. Otherwise what the machine reports about
+    /// itself, preferring a folder named like this project — a guess, but one
+    /// sitting in an editable field rather than acted on silently.
+    private func defaultDirectory(forHost hostKey: String, excluding index: Int) -> String {
+        if let sibling = agents.enumerated().first(where: { offset, row in
+            offset != index && row.hostKey == hostKey && !row.hostDirectory.isEmpty
+        })?.element.hostDirectory {
+            return sibling
+        }
+        guard let host = connectedPeers.first(where: { $0.id == hostKey }) else { return "" }
+        var roots = host.workspaces.flatMap(\.panes).compactMap(\.projectRootPath).filter { !$0.isEmpty }
+        roots.append(contentsOf: host.teams.compactMap(\.projectRootPath).filter { !$0.isEmpty })
+        let leaf = URL(fileURLWithPath: workingDirectory).lastPathComponent
+        return roots.first { URL(fileURLWithPath: $0).lastPathComponent == leaf } ?? roots.first ?? ""
+    }
+
+    /// Put every agent on the chosen machine, at the chosen path.
+    ///
+    /// Scoped to both together because a path only means anything on the
+    /// machine it is a path on — applying one without the other would leave
+    /// rows pointing at a directory that is not theirs.
+    private func applyHostToAll() {
+        for i in agents.indices {
+            agents[i].hostKey = bulkHostKey
+            agents[i].hostDirectory = bulkHostKey == nil
+                ? ""
+                : bulkHostDirectory.trimmingCharacters(in: .whitespacesAndNewlines)
+        }
     }
 
     private func applyModelToAll() {
