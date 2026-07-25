@@ -608,6 +608,17 @@ enum Commands {
         /// Auto-recycle this agent every N completed tasks. 0 = disabled.
         #[arg(long)]
         auto_recycle: Option<u32>,
+        /// Run this agent on a connected peer instead of here, named as the
+        /// sidebar shows it ("jw-server") or as it is stored
+        /// ("ssh:root@jw-server"). The pane still opens beside its team; only
+        /// the shell behind it is remote.
+        #[arg(long)]
+        host: Option<String>,
+        /// Working directory on that host. Needed when the host has not
+        /// reported a project of its own; two machines rarely lay a checkout
+        /// out the same way, so this is not guessed from the local path.
+        #[arg(long, requires = "host")]
+        dir: Option<String>,
     },
     /// Attach an agent pane to the current workspace's team.
     ///
@@ -5862,6 +5873,8 @@ fn main() {
             cli,
             no_auto_watch,
             auto_recycle,
+            host,
+            dir,
         } => {
             let agent_name = name.unwrap_or_else(|| agent_type.clone());
 
@@ -5901,6 +5914,8 @@ fn main() {
                 &cli,
                 no_auto_watch,
                 auto_recycle,
+                host.as_deref(),
+                dir.as_deref(),
             );
             return;
         }
@@ -8382,11 +8397,19 @@ fn run_add_gui(
     cli: &str,
     no_auto_watch: bool,
     auto_recycle: Option<u32>,
+    host: Option<&str>,
+    dir: Option<&str>,
 ) {
-    eprintln!(
-        "Adding agent '{}' (type={}, cli={}, model={}) to GUI team '{}'...",
-        agent_name, agent_type, cli, model, team_name
-    );
+    match host {
+        Some(h) => eprintln!(
+            "Adding agent '{}' (type={}, cli={}, model={}) to GUI team '{}' on host '{}'...",
+            agent_name, agent_type, cli, model, team_name, h
+        ),
+        None => eprintln!(
+            "Adding agent '{}' (type={}, cli={}, model={}) to GUI team '{}'...",
+            agent_name, agent_type, cli, model, team_name
+        ),
+    }
 
     let mut params = json!({
         "team_name": team_name,
@@ -8397,6 +8420,12 @@ fn run_add_gui(
     });
     if let Some(n) = auto_recycle {
         params["auto_recycle_every"] = json!(n);
+    }
+    if let Some(h) = host {
+        params["host"] = json!(h);
+    }
+    if let Some(d) = dir {
+        params["directory"] = json!(d);
     }
 
     let resp = match rpc_call_timeout(sock, "team.add_agent", params, 10) {

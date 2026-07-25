@@ -378,6 +378,7 @@ pending→in_progress→completed/blocked). leader는 `.xm/…/status.json` 폴�
 /team add reviewer         # attach default claude/sonnet reviewer
 /team add executor --model opus  # attach with opus model
 /team add reviewer --cli codex   # attach codex-backed reviewer
+/team add builder --host jw-server --dir /root/build  # run this member on a peer
 /team remove writer        # detach writer
 /team swap executor opus   # change executor model
 /team ensure reviewer security  # idempotent — add only if missing
@@ -404,10 +405,18 @@ tm-agent runbook install --tool claude|codex|opencode|all [--agent <role>] [--dr
 
 # Team-scoped add/remove (works for headless AND GUI teams — no workspace ID required)
 tm-agent add <role> [--name N] [--model M] [--cli claude|codex|kiro|gemini]
+tm-agent add <role> --host <peer> [--dir <remote path>]   # member runs on a peer
 tm-agent remove <agent_name> [--force]
 # Examples:
 #   tm-agent add reviewer                   # add reviewer to current team (any team type)
 #   tm-agent add executor --model opus      # add executor with opus model
+#   tm-agent add builder --host jw-server --dir /root/build
+#     A mixed team: the pane opens here beside its teammates, the shell behind
+#     it belongs to the peer. `--host` takes the sidebar's name (jw-server) or
+#     the stored key (ssh:root@jw-server). `--dir` says where on that machine —
+#     needed unless the host reports a project of its own, since two machines
+#     rarely lay a checkout out the same way. Delegating, reading the reply and
+#     revealing the pane all work exactly as they do for a local member.
 #   tm-agent remove reviewer               # remove agent from team (--force default: true)
 # `add` routes to team.add_agent Swift RPC; rejects duplicate name within team.
 # `remove` routes to team.detach Swift RPC; team-name–scoped (not workspace-panel–scoped).

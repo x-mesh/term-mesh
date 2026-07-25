@@ -2555,6 +2555,95 @@ class TerminalController {
     ///   - name       (optional): display name; defaults to agent_type if omitted
     ///   - model      (optional): CLI model string; defaults to "sonnet"
     ///   - cli        (optional): CLI binary; defaults to "claude"
+    /// `team.add_agent` with a `host`: the member runs on a peer.
+    ///
+    /// Named by whatever the person would say — the sidebar's label
+    /// (`jw-server`) as readily as the key it is stored under
+    /// (`ssh:root@jw-server`), because one of those is what they see and the
+    /// other is what the config holds.
+    private func asyncTeamAddRemoteAgent(
+        teamName: String,
+        agentType: String,
+        agentName: String,
+        agentModel: String,
+        agentCli: String,
+        host: String,
+        directory: String?,
+        id: Any?
+    ) async -> String {
+        enum Resolution {
+            case ok(key: String, directory: String)
+            case noSuchHost
+            case noDirectory(host: String)
+        }
+        let resolution: Resolution = await MainActor.run {
+            let hosts = RemoteHostStore.shared.sortedHosts
+            let match = hosts.first { $0.id == host }
+                ?? hosts.first { $0.displayName.caseInsensitiveCompare(host) == .orderedSame }
+                ?? hosts.first { $0.sshTarget?.caseInsensitiveCompare(host) == .orderedSame }
+            guard let match else { return .noSuchHost }
+            // An explicit directory wins, because the caller is the only one
+            // who can know where a project lives on a machine that has not
+            // said. Two machines rarely lay a checkout out the same way, so
+            // reusing the team's own path would be a guess dressed as a fact.
+            if let directory, !directory.isEmpty {
+                return .ok(key: match.id, directory: directory)
+            }
+            // Otherwise take what the host reports, preferring the project the
+            // team is already in — matched by folder name, which is all two
+            // machines are likely to agree on.
+            let leafName = URL(
+                fileURLWithPath: TeamOrchestrator.shared.teams[teamName]?.workingDirectory ?? ""
+            ).lastPathComponent
+            var roots = match.workspaces
+                .flatMap(\.panes)
+                .compactMap(\.projectRootPath)
+                .filter { !$0.isEmpty }
+            roots.append(contentsOf: match.teams.compactMap(\.projectRootPath).filter { !$0.isEmpty })
+            let byName = roots.first { URL(fileURLWithPath: $0).lastPathComponent == leafName }
+            guard let picked = byName ?? roots.first else { return .noDirectory(host: match.displayName) }
+            return .ok(key: match.id, directory: picked)
+        }
+        let resolved: (key: String, directory: String)
+        switch resolution {
+        case .ok(let key, let dir):
+            resolved = (key, dir)
+        case .noSuchHost:
+            return v2Error(id: id, code: "not_found", message: "no connected host named \(host)")
+        case .noDirectory(let name):
+            return v2Error(
+                id: id,
+                code: "invalid_params",
+                message: "\(name) reports no project to work in — pass a directory to say where"
+            )
+        }
+        do {
+            let member = try await TeamOrchestrator.shared.attachRemoteAgent(
+                teamName: teamName,
+                agentName: agentName,
+                hostKey: resolved.key,
+                workingDirectory: resolved.directory,
+                agentType: agentType,
+                model: agentModel,
+                cli: agentCli
+            )
+            var payload: [String: Any] = [
+                "team_name": teamName,
+                "agent_name": member.name,
+                "agent_id": member.id,
+                "agent_type": member.agentType,
+                "cli": member.cli,
+                "model": member.model,
+                "host": resolved.key,
+                "working_directory": resolved.directory,
+            ]
+            if let pid = member.panelId { payload["panel_id"] = pid.uuidString }
+            return v2Result(id: id, .ok(payload))
+        } catch {
+            return v2Error(id: id, code: "add_failed", message: String(describing: error))
+        }
+    }
+
     private func asyncTeamAddAgent(params: [String: Any], id: Any?) async -> String {
         guard let teamName = params["team_name"] as? String, !teamName.isEmpty else {
             return v2Error(id: id, code: "invalid_params", message: "Missing team_name")
@@ -2570,6 +2659,25 @@ class TerminalController {
         let customInstructions = params["custom_instructions"] as? String
 
         let autoRecycleEvery = params["auto_recycle_every"] as? Int
+
+        // `--host` sends the agent somewhere else. The pane is still opened
+        // here, beside its team; only the shell behind it belongs to the peer.
+        let hostParam = (params["host"] as? String)?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        if !hostParam.isEmpty {
+            return await asyncTeamAddRemoteAgent(
+                teamName: teamName,
+                agentType: agentType,
+                agentName: agentName,
+                agentModel: agentModel,
+                agentCli: agentCli,
+                host: hostParam,
+                directory: (params["directory"] as? String)
+                    ?? (params["working_directory"] as? String),
+                id: id
+            )
+        }
+
         let result: V2CallResult = await MainActor.run {
             let outcome = TeamOrchestrator.shared.addAgentToTeam(
                 teamName: teamName,
