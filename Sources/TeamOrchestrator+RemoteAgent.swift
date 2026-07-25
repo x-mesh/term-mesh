@@ -252,6 +252,43 @@ extension TeamOrchestrator {
         }
     }
 
+    /// Say that work on this host has stopped, because the host has.
+    ///
+    /// An unreachable machine leaves its tasks looking exactly like tasks
+    /// nobody has got to yet: `assigned`, no reason, no end. The agent reads
+    /// `idle` too, which is worse than wrong — idle means available. Someone
+    /// looking at the board sees a healthy team with one task that never
+    /// moves, and nothing anywhere connects that to the machine having gone
+    /// away.
+    ///
+    /// Blocking is not a guess about the work. The agent may well have
+    /// finished; the point is that this side can no longer find out, and a
+    /// task that cannot be observed is not in progress in any useful sense.
+    /// Reconnecting is what resolves it, and the reason says so.
+    @MainActor
+    func markRemoteAgentsUnreachable(hostKey: String, reason: String) {
+        for team in teams.values {
+            let names = Set(team.agents.filter { $0.hostKey == hostKey }.map(\.name))
+            guard !names.isEmpty else { continue }
+            for task in TeamDataStore.shared.listTasks(teamName: team.id)
+            where names.contains(task.assignee ?? "") && Self.unfinishedStatuses.contains(task.status) {
+                _ = TeamDataStore.shared.updateTask(
+                    teamName: team.id,
+                    taskId: task.id,
+                    status: "blocked",
+                    blockedReason: "\(hostKey) \(reason) — reconnect the host to pick this up again"
+                )
+            }
+        }
+    }
+
+    /// Statuses that mean the work has not reached an end. A task already
+    /// finished or already blocked is left alone: the first is history and the
+    /// second already says something more specific than this would.
+    private static let unfinishedStatuses: Set<String> = [
+        "pending", "queued", "assigned", "in_progress", "reassigned",
+    ]
+
     /// Tell every agent running on a peer to quit, because this app is.
     ///
     /// A local agent dies with the app: its process lives in a pane, and the

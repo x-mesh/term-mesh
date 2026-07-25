@@ -995,10 +995,37 @@ final class RemoteHostStore: ObservableObject {
                 self.hosts[key]?.workspaces = summaries
                 self.hosts[key]?.teams = teams
             } catch {
-                // Host disconnected between detection and fetch — ignore.
+                // A refresh that cannot open a connection has learned
+                // something, and dropping it on the floor was how a host could
+                // sit there reading `connected` with nothing at the other end.
+                // Everything downstream believes that word: the sidebar shows
+                // the machine as fine, its agents as idle rather than
+                // unreachable, and their tasks stay assigned with no reason
+                // given. Say it instead.
+                //
+                // Only for a host this app currently believes is up, and only
+                // when it is still the same connection — a fetch racing a
+                // deliberate disconnect must not resurrect a state the user
+                // just changed.
+                if !Task.isCancelled,
+                   self.hosts[key]?.activeSockPath == path,
+                   self.hosts[key]?.isConnected == true {
+                    self.hosts[key]?.connectionState = .failed(Self.unreachableReason)
+                    self.hosts[key]?.workspaces = []
+                    self.hosts[key]?.teams = []
+                    TeamOrchestrator.shared.markRemoteAgentsUnreachable(
+                        hostKey: key,
+                        reason: Self.unreachableReason
+                    )
+                }
             }
         }
     }
+
+    /// What a host is told to say when a refresh cannot reach it. Its own
+    /// wording would be a socket error, which describes the plumbing rather
+    /// than the situation.
+    static let unreachableReason = "stopped responding"
 
     /// Hosts whose roster is being read right now. A refresh cancels the fetch
     /// before it, which is right when the user just did something and wrong on
