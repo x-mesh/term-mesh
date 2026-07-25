@@ -2620,6 +2620,15 @@ struct TeamCreationView: View {
         if let named = roots.first(where: { URL(fileURLWithPath: $0).lastPathComponent == leaf }) {
             return named
         }
+        // Where the machine's own convention says it would go. Ahead of the
+        // unrelated directories below because a prediction about this project
+        // beats a fact about a different one — and it answers on the first
+        // run, when there is nothing yet to remember or report.
+        if let predicted = PeerHostProfileStore.shared.profiles
+            .first(where: { $0.stableKey == hostKey })?
+            .predictedProjectPath(forProjectNamed: leaf) {
+            return predicted
+        }
         // Failing everything specific, somewhere on the right machine — enough
         // to correct rather than compose from nothing.
         return roots.first ?? RemoteProjectPaths.shared.anyPath(host: hostKey) ?? ""

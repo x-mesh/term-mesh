@@ -2610,7 +2610,12 @@ class TerminalController {
                 .filter { !$0.isEmpty }
             roots.append(contentsOf: match.teams.compactMap(\.projectRootPath).filter { !$0.isEmpty })
             let byName = roots.first { URL(fileURLWithPath: $0).lastPathComponent == leafName }
-            guard let picked = byName ?? roots.first else { return .noDirectory(host: match.displayName) }
+            let predicted = PeerHostProfileStore.shared.profiles
+                .first { $0.stableKey == match.id }?
+                .predictedProjectPath(forProjectNamed: leafName)
+            guard let picked = byName ?? predicted ?? roots.first else {
+                return .noDirectory(host: match.displayName)
+            }
             return .ok(key: match.id, directory: picked)
         }
         let resolved: (key: String, directory: String)

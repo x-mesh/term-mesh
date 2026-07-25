@@ -193,6 +193,15 @@ struct PeerHostEditorView: View {
                     TextField("leave empty to auto-detect", text: $profile.remoteSocket)
                 }
                 GridRow {
+                    Text("Projects Under")
+                    // Where this machine keeps its checkouts. With it, a
+                    // project's directory over there is predictable — the root
+                    // and the project's own folder name — which is the same
+                    // guess a person makes, and it answers the first time,
+                    // before there is anything to remember.
+                    TextField("/app/projects — optional", text: optionalBinding(\.projectRootPath))
+                }
+                GridRow {
                     Text("Color")
                     colorSwatches
                 }

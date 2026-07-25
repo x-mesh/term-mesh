@@ -112,6 +112,15 @@ struct PeerHostProfile: Codable, Identifiable, Equatable {
     var colorHex: String?
     /// SF Symbol shown for this host while connected. nil = "network".
     var symbolName: String?
+    /// Where this machine keeps its projects, e.g. `/app/term-mesh-prj`.
+    ///
+    /// A project's directory over there is predictable when the machine has a
+    /// convention: the root, then the project's own folder name. That is a
+    /// guess, but it is the same guess a person makes, and it answers the
+    /// question the first time — before there is anything to remember. Empty
+    /// means this machine has no convention and the path has to come from
+    /// somewhere else.
+    var projectRootPath: String?
     /// Optional deterministic runner recipe. nil keeps this profile as a
     /// normal browse/picker-only peer host.
     var savedRunner: PeerSavedRunnerProfile?
@@ -127,6 +136,7 @@ struct PeerHostProfile: Codable, Identifiable, Equatable {
         identityFile: String? = nil,
         colorHex: String? = nil,
         symbolName: String? = nil,
+        projectRootPath: String? = nil,
         savedRunner: PeerSavedRunnerProfile? = nil,
         lastConnectedAt: Date? = nil,
         createdAt: Date = Date()
@@ -139,6 +149,7 @@ struct PeerHostProfile: Codable, Identifiable, Equatable {
         self.identityFile = identityFile
         self.colorHex = colorHex
         self.symbolName = symbolName
+        self.projectRootPath = projectRootPath
         self.savedRunner = savedRunner
         self.lastConnectedAt = lastConnectedAt
         self.createdAt = createdAt
@@ -146,6 +157,16 @@ struct PeerHostProfile: Codable, Identifiable, Equatable {
 
     var effectiveDisplayName: String {
         displayName.isEmpty ? sshTarget : displayName
+    }
+
+    /// Where a project with this folder name would live on this machine.
+    ///
+    /// Nil when the machine has no convention set — a predicted path is worth
+    /// offering, an invented one is not.
+    func predictedProjectPath(forProjectNamed name: String) -> String? {
+        guard let root = projectRootPath?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !root.isEmpty, !name.isEmpty else { return nil }
+        return (root as NSString).appendingPathComponent(name)
     }
 
     /// Stable key aligning this profile with live sidebar entries —
