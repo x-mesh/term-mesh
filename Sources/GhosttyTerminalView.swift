@@ -1555,16 +1555,30 @@ final class TerminalSurface: Identifiable, ObservableObject {
         // was submitted. A TUI that has finished painting and is waiting on
         // input stops writing, and that silence is the part that actually
         // means ready.
+        // The byte threshold assumes a CLI booting into this pane: Claude
+        // streams a banner over several hundred bytes before its stdin reader
+        // is up, so "a lot has been printed and then it stopped" is what ready
+        // looks like. A pane attached to a shell that is ALREADY running —
+        // every peer agent pane — never looks like that. It prints one prompt,
+        // about 170 bytes, and waits, which is as ready as anything gets. The
+        // gate could only ever time out on it, and a paste that goes out on a
+        // timer rather than a signal is the enter-swallow this exists to
+        // prevent, just with the odds moved.
+        //
+        // So a long enough silence stands in for the volume. It cannot fire
+        // early on a booting CLI that is mid-banner, because mid-banner is not
+        // silent; and it is still well inside the deferral cap, so the worst
+        // it can do is send what the cap would have sent anyway, sooner.
         let coldSettleSeconds: TimeInterval = 1.5
         let coldByteThreshold = 500
         let coldQuietSeconds: TimeInterval = 0.6
+        let coldQuietStandsInAfter: TimeInterval = 2.0
         let coldDeferCap = 40
         let coldReady: Bool = {
             guard let age = ptyOutputAge else { return false }
             guard let quiet = ptyOutputQuietFor else { return false }
-            return age >= coldSettleSeconds
-                && ptyOutputBytes >= coldByteThreshold
-                && quiet >= coldQuietSeconds
+            guard age >= coldSettleSeconds, quiet >= coldQuietSeconds else { return false }
+            return ptyOutputBytes >= coldByteThreshold || quiet >= coldQuietStandsInAfter
         }()
         if !hasCompletedPaste, !coldReady, p.tuiReadyDeferCount < coldDeferCap {
             pasteInFlight = false  // unlock the queue so drain can re-enter
