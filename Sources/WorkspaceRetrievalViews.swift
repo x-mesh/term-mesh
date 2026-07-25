@@ -453,7 +453,7 @@ private struct RetrievalActivityDrawer: View {
             LazyVStack(alignment: .leading, spacing: 2) {
                 ForEach(store.activity.prefix(200)) { event in
                     HStack(alignment: .firstTextBaseline, spacing: 8) {
-                        Text(event.occurredAt, style: .time)
+                        Text(event.occurredAt.formatted(date: .omitted, time: .standard))
                             .font(.system(size: 10).monospacedDigit())
                             .foregroundStyle(.secondary)
                         Text(event.message)
@@ -508,7 +508,7 @@ private struct RetrievalActivityDrawer: View {
                             .font(.system(size: 10))
                             .foregroundStyle(.secondary)
                         Spacer()
-                        Text(checkpoint.createdAt, style: .time)
+                        Text(checkpoint.createdAt.formatted(date: .omitted, time: .standard))
                             .font(.system(size: 10).monospacedDigit())
                             .foregroundStyle(.secondary)
                     }
