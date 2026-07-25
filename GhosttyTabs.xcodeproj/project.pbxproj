@@ -112,6 +112,7 @@
 		ARD00002 /* AutoReplyDetector.swift in Sources */ = {isa = PBXBuildFile; fileRef = ARD00001 /* AutoReplyDetector.swift */; };
 		ARE00002 /* AutoReplyEmit.swift in Sources */ = {isa = PBXBuildFile; fileRef = ARE00001 /* AutoReplyEmit.swift */; };
 		ARP00002 /* AutoReplyPoller.swift in Sources */ = {isa = PBXBuildFile; fileRef = ARP00001 /* AutoReplyPoller.swift */; };
+		PHR00002 /* PeerHostReadiness.swift in Sources */ = {isa = PBXBuildFile; fileRef = PHR00001 /* PeerHostReadiness.swift */; };
 		RPP00002 /* RemoteProjectPaths.swift in Sources */ = {isa = PBXBuildFile; fileRef = RPP00001 /* RemoteProjectPaths.swift */; };
 		ASP00002 /* AgentStartupPrompt.swift in Sources */ = {isa = PBXBuildFile; fileRef = ASP00001 /* AgentStartupPrompt.swift */; };
 		TORA0002 /* TeamOrchestrator+RemoteAgent.swift in Sources */ = {isa = PBXBuildFile; fileRef = TORA0001 /* TeamOrchestrator+RemoteAgent.swift */; };
@@ -385,6 +386,7 @@
 		ARD00001 /* AutoReplyDetector.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AutoReplyDetector.swift; sourceTree = "<group>"; };
 		ARE00001 /* AutoReplyEmit.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AutoReplyEmit.swift; sourceTree = "<group>"; };
 		ARP00001 /* AutoReplyPoller.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AutoReplyPoller.swift; sourceTree = "<group>"; };
+		PHR00001 /* PeerHostReadiness.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PeerHostReadiness.swift; sourceTree = "<group>"; };
 		RPP00001 /* RemoteProjectPaths.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RemoteProjectPaths.swift; sourceTree = "<group>"; };
 		ASP00001 /* AgentStartupPrompt.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AgentStartupPrompt.swift; sourceTree = "<group>"; };
 		TORA0001 /* TeamOrchestrator+RemoteAgent.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "TeamOrchestrator+RemoteAgent.swift"; sourceTree = "<group>"; };
@@ -714,6 +716,7 @@
 				ARD00001 /* AutoReplyDetector.swift */,
 				ARE00001 /* AutoReplyEmit.swift */,
 				ARP00001 /* AutoReplyPoller.swift */,
+				PHR00001 /* PeerHostReadiness.swift */,
 				RPP00001 /* RemoteProjectPaths.swift */,
 				ASP00001 /* AgentStartupPrompt.swift */,
 				TORA0001 /* TeamOrchestrator+RemoteAgent.swift */,
@@ -1100,6 +1103,7 @@
 				ARD00002 /* AutoReplyDetector.swift in Sources */,
 				ARE00002 /* AutoReplyEmit.swift in Sources */,
 				ARP00002 /* AutoReplyPoller.swift in Sources */,
+				PHR00002 /* PeerHostReadiness.swift in Sources */,
 				RPP00002 /* RemoteProjectPaths.swift in Sources */,
 				ASP00002 /* AgentStartupPrompt.swift in Sources */,
 				TORA0002 /* TeamOrchestrator+RemoteAgent.swift in Sources */,

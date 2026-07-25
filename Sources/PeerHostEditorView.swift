@@ -101,6 +101,10 @@ struct PeerHostEditorView: View {
     /// fresher state (SwiftUI state writes alone can't prevent an
     /// already-in-flight Task from waking up later and writing anyway).
     @State private var doctorGeneration = 0
+    @State private var readiness: PeerHostReadiness?
+    @State private var readinessError: String?
+    @State private var isCheckingReadiness = false
+    @State private var isCreatingProjectRoot = false
     /// True for exactly as long as the remote install/update SSH script
     /// is actually running — from `runInstall()`'s launch of
     /// `PeerHostDoctor.install` until that call returns, success or
@@ -199,7 +203,17 @@ struct PeerHostEditorView: View {
                     // and the project's own folder name — which is the same
                     // guess a person makes, and it answers the first time,
                     // before there is anything to remember.
-                    TextField("/app/projects — optional", text: optionalBinding(\.projectRootPath))
+                    VStack(alignment: .leading, spacing: 6) {
+                        HStack(spacing: 6) {
+                            TextField("/app/projects — optional", text: optionalBinding(\.projectRootPath))
+                            Button(isCheckingReadiness ? "Checking…" : "Check Host") {
+                                Task { await checkReadiness() }
+                            }
+                            .disabled(isCheckingReadiness || profile.sshTarget.isEmpty)
+                            .help("Ask the machine whether this directory exists and which agent CLIs it has")
+                        }
+                        readinessSummary
+                    }
                 }
                 GridRow {
                     Text("Color")
@@ -477,6 +491,92 @@ struct PeerHostEditorView: View {
     /// there is no automatic remote-update button (see
     /// `showsUpdateButton`) — a secondary hint pointing at the manual
     /// `brew upgrade --cask term-mesh` path.
+    /// What the machine said, in the order it matters: the directory an agent
+    /// would work in, then what it could be run with.
+    @ViewBuilder
+    private var readinessSummary: some View {
+        if let readinessError {
+            Label(readinessError, systemImage: "exclamationmark.triangle")
+                .font(.caption)
+                .foregroundStyle(.orange)
+                .fixedSize(horizontal: false, vertical: true)
+        } else if let readiness {
+            VStack(alignment: .leading, spacing: 4) {
+                HStack(spacing: 6) {
+                    if readiness.projectRootExists {
+                        Label("\(readiness.projectRoot) exists", systemImage: "checkmark.circle")
+                            .font(.caption)
+                            .foregroundStyle(.green)
+                    } else {
+                        Label("\(readiness.projectRoot) is not there", systemImage: "questionmark.circle")
+                            .font(.caption)
+                            .foregroundStyle(.orange)
+                        // Offered rather than done. This side may be wrong
+                        // about which machine it is talking to, and mkdir is
+                        // not the kind of thing to do on a hunch.
+                        Button(isCreatingProjectRoot ? "Creating…" : "Create it") {
+                            Task { await createProjectRoot() }
+                        }
+                        .disabled(isCreatingProjectRoot)
+                    }
+                }
+                if readiness.installedCLIs.isEmpty {
+                    Label(
+                        "no agent CLI found — an agent started here would have nothing to run",
+                        systemImage: "exclamationmark.triangle"
+                    )
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+                    .fixedSize(horizontal: false, vertical: true)
+                } else {
+                    Label(
+                        "agents: \(readiness.installedCLIs.joined(separator: ", "))"
+                            + (readiness.missingCLIs.isEmpty
+                                ? ""
+                                : "  ·  missing: \(readiness.missingCLIs.joined(separator: ", "))"),
+                        systemImage: "terminal"
+                    )
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+        }
+    }
+
+    private func checkReadiness() async {
+        isCheckingReadiness = true
+        readinessError = nil
+        defer { isCheckingReadiness = false }
+        do {
+            readiness = try await PeerHostReadinessChecker.check(
+                sshTarget: profile.sshTarget,
+                port: profile.sshPort,
+                identityFile: profile.identityFile,
+                projectRoot: profile.projectRootPath ?? ""
+            )
+        } catch {
+            readiness = nil
+            readinessError = String(describing: error)
+        }
+    }
+
+    private func createProjectRoot() async {
+        isCreatingProjectRoot = true
+        defer { isCreatingProjectRoot = false }
+        do {
+            try await PeerHostReadinessChecker.createProjectRoot(
+                sshTarget: profile.sshTarget,
+                port: profile.sshPort,
+                identityFile: profile.identityFile,
+                projectRoot: profile.projectRootPath ?? ""
+            )
+            await checkReadiness()
+        } catch {
+            readinessError = String(describing: error)
+        }
+    }
+
     @ViewBuilder
     private func doctorMessageWithMacHint(_ text: String, systemImage: String) -> some View {
         VStack(alignment: .leading, spacing: 2) {
