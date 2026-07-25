@@ -2591,12 +2591,19 @@ class TerminalController {
             if let directory, !directory.isEmpty {
                 return .ok(key: match.id, directory: directory)
             }
+            // What worked last time this project ran on that machine. Asked
+            // once, then never again — the field existed to be told, not to be
+            // asked.
+            let teamRoot = TeamOrchestrator.shared.teams[teamName]?.workingDirectory ?? ""
+            if let remembered = RemoteProjectPaths.shared.path(
+                host: match.id, localRoot: teamRoot
+            ) {
+                return .ok(key: match.id, directory: remembered)
+            }
             // Otherwise take what the host reports, preferring the project the
             // team is already in — matched by folder name, which is all two
             // machines are likely to agree on.
-            let leafName = URL(
-                fileURLWithPath: TeamOrchestrator.shared.teams[teamName]?.workingDirectory ?? ""
-            ).lastPathComponent
+            let leafName = URL(fileURLWithPath: teamRoot).lastPathComponent
             var roots = match.workspaces
                 .flatMap(\.panes)
                 .compactMap(\.projectRootPath)

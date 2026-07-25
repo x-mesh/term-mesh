@@ -157,6 +157,13 @@ extension TeamOrchestrator {
         guard adoptAgentMember(member, teamName: teamName) else {
             throw RemoteAgentError.duplicateName(agentName)
         }
+        // Remembered on success rather than on typing, so a path that turned
+        // out to be wrong is not the one offered next time.
+        RemoteProjectPaths.shared.remember(
+            host: hostKey,
+            localRoot: team.workingDirectory,
+            path: workingDirectory
+        )
         AutoReplyPoller.shared.ensureRunning()
 
         // Start the CLI once the remote shell is actually reading. The same

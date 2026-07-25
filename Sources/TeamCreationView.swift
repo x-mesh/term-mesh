@@ -1668,12 +1668,19 @@ struct TeamCreationView: View {
 
                     if !connectedPeers.isEmpty {
                         Button(action: applyHostToAll) {
-                            Label("Machine", systemImage: "arrow.triangle.2.circlepath")
+                            Label("Apply to All", systemImage: "arrow.triangle.2.circlepath")
                                 .font(.caption)
                         }
                         .buttonStyle(.borderless)
                         .help("Put every agent on this machine, at this path")
-                        Picker("", selection: $bulkHostKey) {
+                        Picker("", selection: Binding(
+                            get: { bulkHostKey },
+                            set: { newHost in
+                                bulkHostKey = newHost
+                                bulkHostDirectory = newHost
+                                    .map { defaultDirectory(forHost: $0, excluding: -1) } ?? ""
+                            }
+                        )) {
                             Text("Here").tag(String?.none)
                             ForEach(connectedPeers, id: \.id) { host in
                                 Text(host.displayName).tag(String?.some(host.id))
@@ -2598,11 +2605,24 @@ struct TeamCreationView: View {
         })?.element.hostDirectory {
             return sibling
         }
+        // What worked last time this project ran on that machine. Being told
+        // once is reasonable; being asked again every time is the same answer
+        // typed forever.
+        if let remembered = RemoteProjectPaths.shared.path(
+            host: hostKey, localRoot: workingDirectory
+        ) {
+            return remembered
+        }
         guard let host = connectedPeers.first(where: { $0.id == hostKey }) else { return "" }
         var roots = host.workspaces.flatMap(\.panes).compactMap(\.projectRootPath).filter { !$0.isEmpty }
         roots.append(contentsOf: host.teams.compactMap(\.projectRootPath).filter { !$0.isEmpty })
         let leaf = URL(fileURLWithPath: workingDirectory).lastPathComponent
-        return roots.first { URL(fileURLWithPath: $0).lastPathComponent == leaf } ?? roots.first ?? ""
+        if let named = roots.first(where: { URL(fileURLWithPath: $0).lastPathComponent == leaf }) {
+            return named
+        }
+        // Failing everything specific, somewhere on the right machine — enough
+        // to correct rather than compose from nothing.
+        return roots.first ?? RemoteProjectPaths.shared.anyPath(host: hostKey) ?? ""
     }
 
     /// Put every agent on the chosen machine, at the chosen path.
