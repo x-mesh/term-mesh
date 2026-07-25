@@ -2569,6 +2569,7 @@ final class TeamOrchestrator: ObservableObject {
         activeSends[teamAgentKey, default: 0] += 1
         if !withReturn, let identity = agentIdentity(for: agent) {
             pendingReturnTargets[teamAgentKey] = identity
+            scheduleOwedReturn(teamName: teamName, agentName: agentName, panelId: pid)
         }
         return sendTextToPanel(
             workspaceId: agent.workspaceId,
@@ -2603,6 +2604,7 @@ final class TeamOrchestrator: ObservableObject {
            let agent = team.agents.first(where: { $0.panelId == panelId && $0.name == agentName }),
            let identity = agentIdentity(for: agent) {
             pendingReturnTargets["\(teamName)/\(agentName)"] = identity
+            scheduleOwedReturn(teamName: teamName, agentName: agentName, panelId: panelId)
         }
         // When an agentName is provided (panel-targeted send/delegate, incl. /tm
         // fan-out), mirror sendToAgent's in-flight accounting so a concurrent
@@ -3170,6 +3172,47 @@ final class TeamOrchestrator: ObservableObject {
 
     func pendingReturnTarget(teamName: String, agentName: String) -> AgentPaneIdentity? {
         pendingReturnTargets["\(teamName)/\(agentName)"]
+    }
+
+    /// How long a paste may sit unsubmitted before this side presses Return.
+    ///
+    /// Generous on purpose: the CLI's own follow-up lands in about a tenth of
+    /// a second, so this never races it — it only catches the case where the
+    /// second half never comes at all.
+    private static let owedReturnGrace: TimeInterval = 4.0
+
+    /// Press Return on a paste nobody came back to submit.
+    ///
+    /// `team.send`/`team.delegate` paste without Return by design: the CLI
+    /// sends it separately once the paste is acknowledged, because firing it
+    /// early truncates a long instruction. That makes submitting the work a
+    /// two-party contract, and the second party is a different process. When
+    /// it does not come — a caller that speaks the socket directly, a CLI that
+    /// dies between the two calls — the capsule sits in the composer, the
+    /// agent never starts, and the board shows `assigned` forever with no
+    /// error anywhere. It has cost this project the same afternoon more than
+    /// once.
+    ///
+    /// So the promise is kept from this side too. The owed Return is already
+    /// recorded; this just gives it a deadline.
+    private func scheduleOwedReturn(teamName: String, agentName: String, panelId: UUID) {
+        let key = "\(teamName)/\(agentName)"
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.owedReturnGrace) { [weak self] in
+            guard let self else { return }
+            // Someone kept the promise, or the pane moved on to another paste.
+            guard let owed = self.pendingReturnTargets[key], owed.panelId == panelId else { return }
+            guard let located = AppDelegate.shared?.locateSurface(surfaceId: panelId),
+                  let workspace = located.tabManager.tabs.first(where: { $0.id == located.workspaceId }),
+                  let panel = workspace.terminalPanel(for: panelId) else {
+                self.pendingReturnTargets.removeValue(forKey: key)
+                return
+            }
+            self.pendingReturnTargets.removeValue(forKey: key)
+#if DEBUG
+            dlog("owedReturn.fire team=\(teamName) agent=\(agentName) panel=\(panelId.uuidString.prefix(8))")
+#endif
+            _ = panel.surface.sendIMEText("", withReturn: true)
+        }
     }
 
     func clearPendingReturnTarget(teamName: String, agentName: String, panelId: UUID? = nil) {
