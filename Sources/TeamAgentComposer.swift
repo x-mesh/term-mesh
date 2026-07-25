@@ -42,9 +42,12 @@ struct TeamAgentComposer: View {
     @State private var bulkHostKey: String?
     @State private var bulkHostDirectory: String = ""
 
-    /// Peers that could take a member right now.
-    private var connectedPeers: [HostEntry] {
-        hostStore.sortedHosts.filter(\.isConnected)
+    /// Every machine that has been configured, connected or not.
+    ///
+    /// A peer that is merely idle is still a place to put a member; hiding it
+    /// made the list shorter than the settings with nothing saying why.
+    private var selectablePeers: [HostEntry] {
+        hostStore.sortedHosts.filter { !($0.sshTarget ?? "").isEmpty }
     }
 
     var body: some View {
@@ -127,7 +130,7 @@ struct TeamAgentComposer: View {
                     }
                     .frame(width: 130)
 
-                    if !connectedPeers.isEmpty {
+                    if !selectablePeers.isEmpty {
                         Button(action: applyHostToAll) {
                             Label("Apply to All", systemImage: "arrow.triangle.2.circlepath")
                                 .font(.caption)
@@ -143,7 +146,7 @@ struct TeamAgentComposer: View {
                             }
                         )) {
                             Text("Here").tag(String?.none)
-                            ForEach(connectedPeers, id: \.id) { host in
+                            ForEach(selectablePeers, id: \.id) { host in
                                 Text(host.displayName).tag(String?.some(host.id))
                             }
                         }
@@ -280,7 +283,7 @@ struct TeamAgentComposer: View {
                 // Which machine. Only offered when there is a peer to offer —
                 // on a single-machine setup the choice would be a control with
                 // one option and a question nobody asked.
-                if !connectedPeers.isEmpty {
+                if !selectablePeers.isEmpty {
                     Picker("", selection: Binding(
                         get: { agents[index].hostKey },
                         set: { newHost in
@@ -290,11 +293,12 @@ struct TeamAgentComposer: View {
                         }
                     )) {
                         Text("Here").tag(String?.none)
-                        ForEach(connectedPeers, id: \.id) { host in
-                            Text(host.displayName).tag(String?.some(host.id))
+                        ForEach(selectablePeers, id: \.id) { host in
+                            Text(host.isConnected ? host.displayName : "\(host.displayName) — offline")
+                                .tag(String?.some(host.id))
                         }
                     }
-                    .frame(width: 120)
+                    .frame(width: 150)
                     if agents[index].hostKey != nil {
                         TextField("/path/on/that/machine", text: Binding(
                             get: { agents[index].hostDirectory },
@@ -463,7 +467,7 @@ struct TeamAgentComposer: View {
         ) {
             return remembered
         }
-        guard let host = connectedPeers.first(where: { $0.id == hostKey }) else { return "" }
+        guard let host = selectablePeers.first(where: { $0.id == hostKey }) else { return "" }
         var roots = host.workspaces.flatMap(\.panes).compactMap(\.projectRootPath).filter { !$0.isEmpty }
         roots.append(contentsOf: host.teams.compactMap(\.projectRootPath).filter { !$0.isEmpty })
         let leaf = URL(fileURLWithPath: workingDirectory).lastPathComponent

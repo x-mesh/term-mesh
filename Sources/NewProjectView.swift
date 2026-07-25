@@ -89,14 +89,21 @@ struct NewProjectView: View {
                 HStack(spacing: 8) {
                     Picker("", selection: $runsOnHostKey) {
                         Text("This Mac").tag(String?.none)
-                        ForEach(connectedPeers, id: \.id) { host in
-                            Text(host.displayName).tag(String?.some(host.id))
+                        ForEach(selectablePeers, id: \.id) { host in
+                            Text(host.isConnected ? host.displayName : "\(host.displayName) — offline")
+                                .tag(String?.some(host.id))
                         }
                     }
                     .labelsHidden()
-                    .frame(width: 180)
-                    if connectedPeers.isEmpty {
-                        Text("connect a peer to run a project elsewhere")
+                    .frame(width: 220)
+                    if selectablePeers.isEmpty {
+                        Text("add a peer in Settings to run a project elsewhere")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    } else if let runsOnHostKey,
+                              let host = selectablePeers.first(where: { $0.id == runsOnHostKey }),
+                              !host.isConnected {
+                        Label("connecting…", systemImage: "arrow.triangle.2.circlepath")
                             .font(.caption)
                             .foregroundStyle(.secondary)
                     }
@@ -140,8 +147,15 @@ struct NewProjectView: View {
         }
     }
 
-    private var connectedPeers: [HostEntry] {
-        hostStore.sortedHosts.filter(\.isConnected)
+    /// Every machine that has been configured, connected or not.
+    ///
+    /// Filtering to the connected ones hid machines the person had already set
+    /// up and meant to use — the list simply had fewer entries than the
+    /// settings did, with nothing saying why. A peer that is merely idle is
+    /// still the answer to "where does this project live"; connecting is
+    /// something to do about it, not a reason to pretend it is not there.
+    private var selectablePeers: [HostEntry] {
+        hostStore.sortedHosts.filter { !($0.sshTarget ?? "").isEmpty }
     }
 
     private var folderPlaceholder: String {
@@ -168,6 +182,12 @@ struct NewProjectView: View {
             }
             directory = ""
             return
+        }
+        // Picking a machine is as good as saying "use that one", so the
+        // connection is started here rather than left as a step to discover
+        // at Create time when the agents fail to attach.
+        if let host = selectablePeers.first(where: { $0.id == hostKey }), !host.isConnected {
+            hostStore.connectSavedHost(host)
         }
         let leaf = effectiveName.isEmpty ? "project" : effectiveName
         let predicted = PeerHostProfileStore.shared.profiles
