@@ -474,6 +474,34 @@ extension TerminalController {
         return .ok(["revealed": revealed])
     }
 
+    func v2DebugTeamAttachRemote(params: [String: Any]) -> V2CallResult {
+        guard let team = params["team"] as? String, !team.isEmpty,
+              let host = params["host"] as? String, !host.isEmpty,
+              let dir = params["dir"] as? String, !dir.isEmpty else {
+            return .err(code: "invalid_params", message: "team, host and dir are required", data: nil)
+        }
+        let name = params["name"] as? String ?? "remote"
+        let model = params["model"] as? String ?? "sonnet"
+        let cli = params["cli"] as? String ?? "claude"
+        Task { @MainActor in
+            do {
+                _ = try await TeamOrchestrator.shared.attachRemoteAgent(
+                    teamName: team,
+                    agentName: name,
+                    hostKey: host,
+                    workingDirectory: dir,
+                    model: model,
+                    cli: cli
+                )
+            } catch {
+                #if DEBUG
+                dlog("attachRemoteAgent failed: \(error)")
+                #endif
+            }
+        }
+        return .ok(["started": true])
+    }
+
     func v2DebugReviewBoardDelegate(params: [String: Any]) -> V2CallResult {
         guard let root = params["root"] as? String, !root.isEmpty,
               let title = params["title"] as? String, !title.isEmpty else {

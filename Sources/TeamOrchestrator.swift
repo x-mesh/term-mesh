@@ -39,6 +39,17 @@ final class TeamOrchestrator: ObservableObject {
         var worktreeName: String?
         var worktreePath: String?
         var worktreeBranch: String?
+        /// The peer this agent's pane runs on (`ssh:root@jw-server`), or nil
+        /// when it runs here.
+        ///
+        /// A team was implicitly one machine's: an agent had a workspace and a
+        /// panel, both local, and nothing to say otherwise. But the machine an
+        /// agent needs is a property of the work — tests want the Mac, a build
+        /// may want the Linux box — so it belongs to the member rather than to
+        /// the team. The pane is local either way: a peer pane is attached
+        /// into this workspace, so `panelId` still addresses it and everything
+        /// keyed on that (send, scrollback, reveal) is unchanged.
+        var hostKey: String?
         /// Full CLI invocation captured at spawn time (binary + model flag + system
         /// prompt + agent-type flags). Retyped on soft restart to recover original
         /// agent context rather than the bare binary name. nil for headless agents
@@ -3135,6 +3146,22 @@ final class TeamOrchestrator: ObservableObject {
         migratingAgents.contains("\(teamName)/\(agentName)")
     }
 
+    /// Add a member to a team that already exists.
+    ///
+    /// `teams` stays `private(set)` — a roster that anything can assign to is
+    /// how two views of a team drift apart. This is the one seam, so every
+    /// addition also registers with the data store and the daemon, which a
+    /// direct write would quietly skip.
+    func adoptAgentMember(_ member: AgentMember, teamName: String) -> Bool {
+        guard var team = teams[teamName] else { return false }
+        guard !team.agents.contains(where: { $0.name == member.name }) else { return false }
+        team.agents.append(member)
+        teams[teamName] = team
+        TeamDataStore.shared.registerTeam(teamName, agentNames: team.agents.map(\.name))
+        syncTeamStateToDaemon()
+        return true
+    }
+
     func agentIdentity(teamName: String, agentName: String) -> AgentPaneIdentity? {
         guard let team = teams[teamName],
               let agent = team.agents.first(where: { $0.name == agentName }) else { return nil }
@@ -5009,7 +5036,7 @@ final class TeamOrchestrator: ObservableObject {
         return parts.joined(separator: " ")
     }
 
-    private static func colorEmoji(_ color: String) -> String {
+    static func colorEmoji(_ color: String) -> String {
         switch color {
         case "green":   return "🟢"
         case "blue":    return "🔵"

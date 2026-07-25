@@ -1233,6 +1233,8 @@ class TerminalController {
         // The delegate sheet is a SwiftUI action, so calling what the sheet
         // calls is the only way to exercise the whole path — team, capsule,
         // coordinator registration, placement — without a person clicking.
+        case "debug.team.attach_remote":
+            return v2Result(id: id, self.v2DebugTeamAttachRemote(params: params))
         case "debug.reviewboard.delegate":
             return v2Result(id: id, self.v2DebugReviewBoardDelegate(params: params))
         case "debug.reviewboard.reveal":

@@ -111,6 +111,7 @@
 		ARD00002 /* AutoReplyDetector.swift in Sources */ = {isa = PBXBuildFile; fileRef = ARD00001 /* AutoReplyDetector.swift */; };
 		ARE00002 /* AutoReplyEmit.swift in Sources */ = {isa = PBXBuildFile; fileRef = ARE00001 /* AutoReplyEmit.swift */; };
 		ARP00002 /* AutoReplyPoller.swift in Sources */ = {isa = PBXBuildFile; fileRef = ARP00001 /* AutoReplyPoller.swift */; };
+		TORA0002 /* TeamOrchestrator+RemoteAgent.swift in Sources */ = {isa = PBXBuildFile; fileRef = TORA0001 /* TeamOrchestrator+RemoteAgent.swift */; };
 		A5001702 /* DashboardController.swift in Sources */ = {isa = PBXBuildFile; fileRef = A5001703 /* DashboardController.swift */; };
 		A5001704 /* dashboard in Resources */ = {isa = PBXBuildFile; fileRef = A5001705 /* dashboard */; };
 		ARB00002 /* AgentRunbookService.swift in Sources */ = {isa = PBXBuildFile; fileRef = ARB00001 /* AgentRunbookService.swift */; };
@@ -380,6 +381,7 @@
 		ARD00001 /* AutoReplyDetector.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AutoReplyDetector.swift; sourceTree = "<group>"; };
 		ARE00001 /* AutoReplyEmit.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AutoReplyEmit.swift; sourceTree = "<group>"; };
 		ARP00001 /* AutoReplyPoller.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AutoReplyPoller.swift; sourceTree = "<group>"; };
+		TORA0001 /* TeamOrchestrator+RemoteAgent.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "TeamOrchestrator+RemoteAgent.swift"; sourceTree = "<group>"; };
 		A5001703 /* DashboardController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DashboardController.swift; sourceTree = "<group>"; };
 		A5001705 /* dashboard */ = {isa = PBXFileReference; lastKnownFileType = folder; path = dashboard; sourceTree = "<group>"; };
 		ARB00001 /* AgentRunbookService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AgentRunbookService.swift; sourceTree = "<group>"; };
@@ -706,6 +708,7 @@
 				ARD00001 /* AutoReplyDetector.swift */,
 				ARE00001 /* AutoReplyEmit.swift */,
 				ARP00001 /* AutoReplyPoller.swift */,
+				TORA0001 /* TeamOrchestrator+RemoteAgent.swift */,
 				ARB00001 /* AgentRunbookService.swift */,
 				ARB00003 /* AgentRunbookSettingsView.swift */,
 				CPF00001 /* CliProfile.swift */,
@@ -1088,6 +1091,7 @@
 				ARD00002 /* AutoReplyDetector.swift in Sources */,
 				ARE00002 /* AutoReplyEmit.swift in Sources */,
 				ARP00002 /* AutoReplyPoller.swift in Sources */,
+				TORA0002 /* TeamOrchestrator+RemoteAgent.swift in Sources */,
 				ARB00002 /* AgentRunbookService.swift in Sources */,
 				ARB00004 /* AgentRunbookSettingsView.swift in Sources */,
 				CPF00002 /* CliProfile.swift in Sources */,
