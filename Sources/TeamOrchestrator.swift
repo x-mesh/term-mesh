@@ -49,6 +49,11 @@ final class TeamOrchestrator: ObservableObject {
         /// the first one's shell: same pane, same directory, two agents typing
         /// over each other. What this side attached, this side can remember.
         var remoteSurfaceID: Data?
+        /// Whether this side asked the host to create that surface. A borrowed
+        /// surface is the operator's — one of the shells the host publishes —
+        /// and closing it would take away something they offered to everyone.
+        /// One we asked for is ours to clean up.
+        var remoteSurfaceSpawned: Bool = false
         /// The peer this agent's pane runs on (`ssh:root@jw-server`), or nil
         /// when it runs here.
         ///
@@ -1856,8 +1861,14 @@ final class TeamOrchestrator: ObservableObject {
         // has already been closed (user-initiated or otherwise), which we
         // treat as successful detach.
         // TODO: when force=false, check daemon task state for agent_busy before closing
-        if let workspace = tabManager.tabs.first(where: { $0.id == team.workspaceId }),
-           let pid = agent.panelId {
+        let workspace = tabManager.tabs.first { $0.id == team.workspaceId }
+        if agent.hostKey != nil {
+            // A remote agent leaves a process behind on someone else's
+            // machine, and the only way to reach it is through the pane — so
+            // the pane has to outlive the interrupt. `releaseRemoteAgent`
+            // closes it once that is done.
+            releaseRemoteAgent(agent, closing: workspace)
+        } else if let workspace, let pid = agent.panelId {
             _ = workspace.closePanel(pid, force: force)
         }
 

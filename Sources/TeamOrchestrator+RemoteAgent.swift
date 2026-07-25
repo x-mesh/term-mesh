@@ -80,6 +80,7 @@ extension TeamOrchestrator {
         let lease = try await registry.acquire(host.paneHostSpec)
         let panel: TerminalPanel
         let attachedSurfaceID: Data
+        var spawnedSurface = false
         do {
             let surfaces = try await PeerPaneSession.listSurfaces(on: lease)
             // A host publishes a fixed roster of surfaces and each can be
@@ -100,6 +101,7 @@ extension TeamOrchestrator {
             var chosen = surfaces.first { $0.attachable && !taken.contains($0.surfaceID) }
             if chosen == nil, let source = surfaces.first?.surfaceID {
                 chosen = try await PeerPaneSession.spawnSurface(on: lease, splitting: source)
+                spawnedSurface = chosen != nil
             }
             guard let chosen else {
                 registry.release(lease)
@@ -149,6 +151,7 @@ extension TeamOrchestrator {
             panelId: panel.id,
             createdAt: Date(),
             remoteSurfaceID: attachedSurfaceID,
+            remoteSurfaceSpawned: spawnedSurface,
             hostKey: hostKey
         )
         guard adoptAgentMember(member, teamName: teamName) else {
@@ -181,6 +184,84 @@ extension TeamOrchestrator {
 
         return member
     }
+
+    /// Stop what this agent left running on the other machine, then close its
+    /// pane.
+    ///
+    /// Detaching closes the local pane, which is the whole story for a local
+    /// agent — the process lives in that pane and dies with it. A remote pane
+    /// is a window onto a process on another machine, so closing it reaches
+    /// nothing: the CLI kept running on the peer, still holding a session,
+    /// still occupying the surface, and the next agent added to that host
+    /// quietly landed in the abandoned one's shell.
+    ///
+    /// The keystrokes have to outlive the window they travel through, which is
+    /// why this owns the close rather than racing it. Then the surface, but
+    /// only one this side asked the host to make — a shell the operator
+    /// published is theirs, and we merely borrowed it.
+    @MainActor
+    func releaseRemoteAgent(_ agent: AgentMember, closing workspace: Workspace?) {
+        let hostSockPath = agent.hostKey
+            .flatMap { key in RemoteHostStore.shared.sortedHosts.first { $0.id == key } }
+            .map(\.activeSockPath)
+            .flatMap { $0.isEmpty ? nil : $0 }
+        let panelId = agent.panelId
+        let panel = panelId.flatMap { id -> TerminalPanel? in
+            guard let located = AppDelegate.shared?.locateSurface(surfaceId: id),
+                  let ws = located.tabManager.tabs.first(where: { $0.id == located.workspaceId })
+            else { return nil }
+            return ws.terminalPanel(for: id)
+        }
+
+        if let panel {
+            TerminalController.shared.sendNamedKeyWithRetry(on: panel.surface, keyName: "ctrl-c") { _, _ in }
+        }
+        let surfaceID = agent.remoteSurfaceSpawned ? agent.remoteSurfaceID : nil
+        let quit = Self.quitCommand(cli: agent.cli)
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+            if let panel {
+                // Its own word for quitting, typed. Ctrl+C and Ctrl+D both
+                // reach the remote pane and both are ignored there — measured,
+                // twice — because an agent CLI treats them as editing keys,
+                // not as the door.
+                // Text and Return separately, with room between them. The
+                // inline form puts 5ms between the two, which is generous for
+                // a local PTY and nothing at all for a pane whose composer is
+                // on another machine: the Return arrives before the word does
+                // and submits an empty prompt. Measured — `/exit` typed this
+                // way ends the CLI, the same string sent inline does not.
+                _ = panel.surface.sendIMEText(quit, withReturn: false)
+                DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
+                    TerminalController.shared.sendNamedKeyWithRetry(
+                        on: panel.surface, keyName: "return"
+                    ) { _, _ in }
+                }
+            }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 4.5) {
+                if let workspace, let panelId {
+                    _ = workspace.closePanel(panelId, force: true)
+                }
+                guard let surfaceID, let hostSockPath else { return }
+                Task.detached {
+                    guard let conn = try? await PeerRelaySession.connect(hostSockPath: hostSockPath) else { return }
+                    try? await conn.session.requestClosePane(paneID: surfaceID)
+                    await conn.cancel()
+                }
+            }
+        }
+    }
+
+    /// How to ask a CLI to quit.
+    ///
+    /// Typed rather than signalled: Ctrl+C and Ctrl+D both arrive at the pane
+    /// and neither ends an agent CLI, which reads them as editing keys —
+    /// measured on a live remote pane, twice, before believing it.
+    ///
+    /// Every CLI term-mesh runs spells it `/exit` today. This takes the CLI
+    /// name so the day one of them does not, the answer has a place to live
+    /// rather than a literal needing to be found.
+    static func quitCommand(cli: String) -> String { "/exit" }
 
     /// The one line typed into the remote shell to become an agent.
     ///
