@@ -527,7 +527,8 @@ extension TerminalController {
                     "templates_available": manager.templates.map(\.name),
                 ]
                 if let template {
-                    let agents = template.agents.map { slot in
+                    let remoteSlots = template.agents.filter { ($0.hostKey ?? "").isEmpty == false }
+                    let agents = template.agents.filter { ($0.hostKey ?? "").isEmpty }.map { slot in
                         (
                             name: slot.roleName,
                             cli: slot.cli,
@@ -550,6 +551,24 @@ extension TerminalController {
                     payload["template"] = template.name
                     payload["team"] = team?.id ?? ""
                     payload["workspace_id"] = team?.workspaceId.uuidString ?? ""
+                    if let team {
+                        payload["remote_slots"] = remoteSlots.map(\.roleName)
+                        for slot in remoteSlots {
+                            guard let hostKey = slot.hostKey else { continue }
+                            let dir = slot.hostDirectory ?? ""
+                            Task { @MainActor in
+                                _ = try? await TeamOrchestrator.shared.attachRemoteAgent(
+                                    teamName: team.id,
+                                    agentName: slot.roleName,
+                                    hostKey: hostKey,
+                                    workingDirectory: dir.isEmpty ? directory : dir,
+                                    agentType: slot.roleName,
+                                    model: slot.model,
+                                    cli: slot.cli
+                                )
+                            }
+                        }
+                    }
                 }
                 result = .ok(payload)
             }

@@ -1048,6 +1048,11 @@ struct SavedTeamTemplate: Identifiable, Codable, Equatable {
         var cli: String             // "claude", "kiro", "codex", or "gemini"
         var model: String
         var customInstructions: String
+        /// The peer this member runs on, or nil for this machine. Optional so
+        /// templates saved before mixed teams existed still decode.
+        var hostKey: String?
+        /// Where on that machine, when it is not this one.
+        var hostDirectory: String?
     }
 
     init(id: UUID = UUID(), name: String, leaderMode: String = "repl", agents: [AgentSlot]) {

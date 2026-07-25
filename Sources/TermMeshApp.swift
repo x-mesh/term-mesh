@@ -248,7 +248,14 @@ struct TermMeshApp: App {
         let (defaultDir, defaultSource) = resolveDefaultWorkingDirectory(activeTabManager: activeTabManager)
         return TeamCreationView(
             onCreate: { teamName, leaderMode, leaderModel, agents, worktreeMode, executionMode, resumeSessionId, pairMode, pairModel, pairSpec, workingDirectory in
-                let agentTuples: [(name: String, cli: String, model: String, agentType: String, color: String, instructions: String, customInstructions: String)] = agents.map { row in
+                // Members bound to a peer are attached after the team exists —
+                // a remote pane is a peer surface pulled into this workspace,
+                // which needs the workspace and the team to already be there.
+                // They are held out of `createTeam` rather than spawned
+                // locally and moved, which would start the CLI on the wrong
+                // machine and then close it.
+                let remoteRows = agents.filter { $0.hostKey != nil }
+                let agentTuples: [(name: String, cli: String, model: String, agentType: String, color: String, instructions: String, customInstructions: String)] = agents.filter { $0.hostKey == nil }.map { row in
                     let customInstructions = row.customInstructions == row.preset.instructions
                         ? ""
                         : row.customInstructions
@@ -288,7 +295,33 @@ struct TermMeshApp: App {
                     executionMode: executionMode,
                     tabManager: activeTabManager
                 )
-                return team != nil
+                guard let team else { return false }
+                for row in remoteRows {
+                    guard let hostKey = row.hostKey else { continue }
+                    let directory = row.hostDirectory.trimmingCharacters(in: .whitespacesAndNewlines)
+                    Task { @MainActor in
+                        do {
+                            _ = try await TeamOrchestrator.shared.attachRemoteAgent(
+                                teamName: team.id,
+                                agentName: row.preset.name,
+                                hostKey: hostKey,
+                                // Its own path when one was given; the team's
+                                // otherwise, which is right when both machines
+                                // lay the project out the same way and visibly
+                                // wrong when they do not.
+                                workingDirectory: directory.isEmpty ? workingDirectory : directory,
+                                agentType: row.preset.name,
+                                model: row.preset.model,
+                                cli: row.preset.cli
+                            )
+                        } catch {
+                            RemoteWorkLog.info(
+                                "Could not start \(row.preset.name) on \(hostKey): \(error)"
+                            )
+                        }
+                    }
+                }
+                return true
             },
             onResume: { (result: [String: Any]) in
                 // The picker tags pane-mode resumes so we route to a separate

@@ -172,6 +172,16 @@ struct TeamAgentRow: Identifiable, Equatable {
     var preset: AgentRolePreset
     var customInstructions: String  // overrides preset instructions if non-empty
     var providerBadge: ProviderBadge = .none
+    /// The peer this agent runs on, or nil for this machine.
+    ///
+    /// A team is often more than one machine's: tests want the Mac, a build
+    /// may want the Linux box. That is a property of the member rather than of
+    /// the team, so it is chosen per row — and it belongs in the form that
+    /// composes the team, not only in a command typed afterwards.
+    var hostKey: String?
+    /// Where on that machine. Two machines rarely lay a checkout out the same
+    /// way, so the local path is not an answer for the remote one.
+    var hostDirectory: String = ""
 
     enum ProviderBadge: Equatable {
         case none
@@ -343,6 +353,12 @@ struct ResumableTeam: Identifiable, Hashable {
 struct TeamCreationView: View {
     @Environment(\.dismiss) private var dismiss
     @ObservedObject var presetManager = AgentRolePresetManager.shared
+    @ObservedObject private var hostStore = RemoteHostStore.shared
+
+    /// Peers that could take a member right now.
+    private var connectedPeers: [HostEntry] {
+        hostStore.sortedHosts.filter(\.isConnected)
+    }
     @ObservedObject var savedTemplateManager = SavedTeamTemplateManager.shared
     @ObservedObject var teamTemplateManager = TeamTemplateManager.shared
     @ObservedObject var providerDetector = ProviderDetector.shared
@@ -1766,6 +1782,30 @@ struct TeamCreationView: View {
                     }
                 }
                 .frame(width: 130)
+
+                // Which machine. Only offered when there is a peer to offer —
+                // on a single-machine setup the choice would be a control with
+                // one option and a question nobody asked.
+                if !connectedPeers.isEmpty {
+                    Picker("", selection: Binding(
+                        get: { agents[index].hostKey },
+                        set: { agents[index].hostKey = $0 }
+                    )) {
+                        Text("Here").tag(String?.none)
+                        ForEach(connectedPeers, id: \.id) { host in
+                            Text(host.displayName).tag(String?.some(host.id))
+                        }
+                    }
+                    .frame(width: 120)
+                    if agents[index].hostKey != nil {
+                        TextField("/path/on/that/machine", text: Binding(
+                            get: { agents[index].hostDirectory },
+                            set: { agents[index].hostDirectory = $0 }
+                        ))
+                        .textFieldStyle(.roundedBorder)
+                        .frame(width: 170)
+                    }
+                }
 
                 // Provider badge
                 switch agent.providerBadge {
