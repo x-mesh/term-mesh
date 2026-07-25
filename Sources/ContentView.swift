@@ -487,7 +487,7 @@ struct ContentView: View {
                 reviewBoardResizer
                 ReviewBoardPanelView(
                     viewModel: reviewBoardViewModel,
-                    onClose: { isReviewBoardClosed = true }
+                    onClose: { ReviewBoardSettings.setVisible(false) }
                 )
                 .frame(width: reviewBoardWidth)
                 .transition(.move(edge: .trailing).combined(with: .opacity))

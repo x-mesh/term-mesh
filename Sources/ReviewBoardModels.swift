@@ -6,6 +6,31 @@ enum ReviewBoardSettings {
     static let widthKey = "reviewBoard.width"
     static let isClosedKey = "reviewBoard.isClosed"
     static let selectedTaskIDKey = "reviewBoard.selectedTaskID"
+
+    /// Whether the board is on screen right now.
+    ///
+    /// Two keys decide it, and they mean different things: `enabled` is
+    /// "this window has a board at all", `isClosed` is "I dismissed it". The
+    /// close button only ever set the second, and nothing cleared it — so
+    /// closing the board was a one-way door. Neither the Settings toggle nor
+    /// anything else could bring it back, because flipping `enabled` leaves
+    /// `isClosed` standing.
+    ///
+    /// One place decides now, and it writes both.
+    static var isVisible: Bool {
+        let defaults = UserDefaults.standard
+        return defaults.bool(forKey: enabledKey) && !defaults.bool(forKey: isClosedKey)
+    }
+
+    static func setVisible(_ visible: Bool) {
+        let defaults = UserDefaults.standard
+        defaults.set(visible, forKey: enabledKey)
+        defaults.set(!visible, forKey: isClosedKey)
+    }
+
+    static func toggleVisible() {
+        setVisible(!isVisible)
+    }
     static let defaultWidth: CGFloat = 380
     static let minimumWidth: CGFloat = 320
     static let maximumWidth: CGFloat = 560

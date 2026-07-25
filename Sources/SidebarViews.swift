@@ -1015,11 +1015,8 @@ struct SidebarProjectsSection: View {
                         )
                         guard team != nil else { return }
                         // A project with agents in it is what the board is
-                        // for, so making one turns it on. Closing it afterwards
-                        // sticks — this only overrides the default of never
-                        // having been asked.
-                        UserDefaults.standard.set(true, forKey: ReviewBoardSettings.enabledKey)
-                        UserDefaults.standard.set(false, forKey: ReviewBoardSettings.isClosedKey)
+                        // for, so making one puts it up.
+                        ReviewBoardSettings.setVisible(true)
                     }
                 },
                 onClose: { isCreatingProject = false }

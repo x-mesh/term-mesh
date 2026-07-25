@@ -717,6 +717,11 @@ struct TermMeshApp: App {
             }
 
             CommandMenu("Remote Work") {
+                Button("Toggle Review Board") {
+                    ReviewBoardSettings.toggleVisible()
+                }
+                .keyboardShortcut("b", modifiers: [.command, .control])
+
                 Button("Toggle Activity Drawer") {
                     AppDelegate.shared?.tabManager?.selectedWorkspace?
                         .retrievalStore.togglePresentation(.drawer)

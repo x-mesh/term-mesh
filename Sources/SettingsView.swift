@@ -866,6 +866,10 @@ struct SettingsView: View {
             set: { on in
                 distributedWorkspacesEnabled = on
                 reviewBoardEnabled = on
+                // Turning it on here has to actually show it. Writing only
+                // `enabled` left a board that had been dismissed still
+                // dismissed, so the switch read as broken.
+                ReviewBoardSettings.setVisible(on)
             }
         )
     }
