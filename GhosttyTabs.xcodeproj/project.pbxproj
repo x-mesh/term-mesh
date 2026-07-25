@@ -25,6 +25,7 @@
 		SMRT00000000000000003 /* StrayMouseReportTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = SMRT00000000000000006 /* StrayMouseReportTests.swift */; };
 		PPPT00000000000000003 /* PredictedProjectPathTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = PPPT00000000000000006 /* PredictedProjectPathTests.swift */; };
 		WPNT00000000000000003 /* WorkspaceProjectNamesTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = WPNT00000000000000006 /* WorkspaceProjectNamesTests.swift */; };
+		RBVT00000000000000003 /* ReviewBoardVisibilityTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = RBVT00000000000000006 /* ReviewBoardVisibilityTests.swift */; };
 		ASPT000000000000000003 /* AgentStartupPromptTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = ASPT000000000000000006 /* AgentStartupPromptTests.swift */; };
 		A17000000000000000000001 /* ReviewBoardModels.swift in Sources */ = {isa = PBXBuildFile; fileRef = A17000000000000000000005 /* ReviewBoardModels.swift */; };
 		A17000000000000000000002 /* ReviewBoardViewModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = A17000000000000000000006 /* ReviewBoardViewModel.swift */; };
@@ -310,6 +311,7 @@
 			SMRT00000000000000006 /* StrayMouseReportTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StrayMouseReportTests.swift; sourceTree = "<group>"; };
 			PPPT00000000000000006 /* PredictedProjectPathTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PredictedProjectPathTests.swift; sourceTree = "<group>"; };
 			WPNT00000000000000006 /* WorkspaceProjectNamesTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WorkspaceProjectNamesTests.swift; sourceTree = "<group>"; };
+			RBVT00000000000000006 /* ReviewBoardVisibilityTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ReviewBoardVisibilityTests.swift; sourceTree = "<group>"; };
 			ASPT000000000000000006 /* AgentStartupPromptTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AgentStartupPromptTests.swift; sourceTree = "<group>"; };
 			A17000000000000000000005 /* ReviewBoardModels.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ReviewBoardModels.swift; sourceTree = "<group>"; };
 			A17000000000000000000006 /* ReviewBoardViewModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ReviewBoardViewModel.swift; sourceTree = "<group>"; };
@@ -868,6 +870,7 @@
 				SMRT00000000000000006 /* StrayMouseReportTests.swift */,
 				PPPT00000000000000006 /* PredictedProjectPathTests.swift */,
 				WPNT00000000000000006 /* WorkspaceProjectNamesTests.swift */,
+				RBVT00000000000000006 /* ReviewBoardVisibilityTests.swift */,
 				ASPT000000000000000006 /* AgentStartupPromptTests.swift */,
 				A17000000000000000000008 /* ReviewBoardViewModelTests.swift */,
 				A17100000000000000000004 /* ReviewBoardCoordinatorServiceTests.swift */,
@@ -1235,6 +1238,7 @@
 				SMRT00000000000000003 /* StrayMouseReportTests.swift in Sources */,
 				PPPT00000000000000003 /* PredictedProjectPathTests.swift in Sources */,
 				WPNT00000000000000003 /* WorkspaceProjectNamesTests.swift in Sources */,
+				RBVT00000000000000003 /* ReviewBoardVisibilityTests.swift in Sources */,
 				ASPT000000000000000003 /* AgentStartupPromptTests.swift in Sources */,
 				A17000000000000000000004 /* ReviewBoardViewModelTests.swift in Sources */,
 				A17100000000000000000002 /* ReviewBoardCoordinatorServiceTests.swift in Sources */,
