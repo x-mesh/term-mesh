@@ -17,7 +17,12 @@ import SwiftUI
 struct NewProjectView: View {
     /// `localDirectory` is where the window opens here; `rows` already carry
     /// the machine and path each member actually works in.
-    let onCreate: (_ name: String, _ localDirectory: String, _ rows: [TeamAgentRow]) -> Void
+    let onCreate: (
+        _ name: String,
+        _ localDirectory: String,
+        _ rows: [TeamAgentRow],
+        _ source: ProjectSource
+    ) -> Void
     let onClose: () -> Void
 
     @State private var directory: String = ""
@@ -32,6 +37,16 @@ struct NewProjectView: View {
     /// can browse it. Getting this backwards meant offering a local picker for
     /// a directory that was never going to be local.
     @State private var runsOnHostKey: String?
+    /// Where the project comes from. A folder that is already there, or a
+    /// repository to clone onto that machine.
+    @State private var gitURL: String = ""
+    /// Whether each agent gets its own checkout.
+    ///
+    /// On by default because agents sharing one directory collide in every way
+    /// that matters — one branch between them, one set of files, one
+    /// dependency tree with several writers — and the collision is quiet until
+    /// it is expensive.
+    @State private var isolateAgents = true
 
     @ObservedObject private var presetManager = AgentRolePresetManager.shared
     @ObservedObject private var hostStore = RemoteHostStore.shared
@@ -123,6 +138,27 @@ struct NewProjectView: View {
                 }
             }
             GridRow {
+                Text("Clone from")
+                TextField("git@github.com:org/repo.git — optional", text: $gitURL)
+                    .textFieldStyle(.roundedBorder)
+            }
+            GridRow {
+                Text("Isolation")
+                HStack(spacing: 8) {
+                    Picker("", selection: $isolateAgents) {
+                        Text("Each agent gets its own checkout").tag(true)
+                        Text("All agents share one").tag(false)
+                    }
+                    .labelsHidden()
+                    .frame(width: 260)
+                    if isolateAgents {
+                        Text(isolationHint)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+            }
+            GridRow {
                 Text("Name")
                 // Follows the folder until someone disagrees with it, then
                 // stops following — a field that keeps overwriting what you
@@ -156,6 +192,22 @@ struct NewProjectView: View {
     /// something to do about it, not a reason to pretend it is not there.
     private var selectablePeers: [HostEntry] {
         hostStore.sortedHosts.filter { !($0.sshTarget ?? "").isEmpty }
+    }
+
+    /// What the isolation choice will actually produce, named.
+    private var isolationHint: String {
+        let plan = PeerProjectBootstrap.plan(
+            projectRoot: trimmedDirectory.isEmpty ? "…" : parentOf(trimmedDirectory),
+            projectName: effectiveName.isEmpty ? "project" : effectiveName,
+            agents: agents.map(\.preset.name),
+            isolateAgents: true
+        )
+        guard let first = plan.agentCheckouts.first else { return "" }
+        return "\(URL(fileURLWithPath: first.path).lastPathComponent) on \(first.branch)"
+    }
+
+    private func parentOf(_ path: String) -> String {
+        (path as NSString).deletingLastPathComponent
     }
 
     private var folderPlaceholder: String {
@@ -220,7 +272,17 @@ struct NewProjectView: View {
                 let localDirectory = runsOnHostKey == nil
                     ? trimmedDirectory
                     : FileManager.default.homeDirectoryForCurrentUser.path
-                onCreate(effectiveName, localDirectory, agents)
+                onCreate(
+                    effectiveName,
+                    localDirectory,
+                    agents,
+                    ProjectSource(
+                        hostKey: runsOnHostKey,
+                        projectPath: trimmedDirectory,
+                        gitURL: gitURL.trimmingCharacters(in: .whitespacesAndNewlines),
+                        isolateAgents: isolateAgents
+                    )
+                )
                 onClose()
             }
             .keyboardShortcut(.defaultAction)

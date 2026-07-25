@@ -99,6 +99,21 @@ enum PeerHostReadinessChecker {
         )
     }
 
+    /// One shell command on the far machine, for callers outside this file.
+    @discardableResult
+    static func runScript(
+        sshTarget: String,
+        port: Int?,
+        identityFile: String?,
+        script: String,
+        timeoutSeconds: TimeInterval = 60
+    ) async throws -> String {
+        try await run(
+            sshTarget: sshTarget, port: port, identityFile: identityFile,
+            script: script, timeoutSeconds: timeoutSeconds
+        )
+    }
+
     /// One shell command on the far machine.
     ///
     /// The ssh posture mirrors `PeerSocketProber`: no ControlMaster, no

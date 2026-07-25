@@ -516,6 +516,53 @@ extension TerminalController {
                 // Mirrors what New Project's Create does: rows in, one
                 // workspace and one team out.
                 if let roles = (params["roles"] as? [String]), !roles.isEmpty {
+                    // Mirrors New Project's Create for a remote project too:
+                    // prepare the checkouts, then create the team pointed at
+                    // what was made.
+                    if let hostKey = params["host"] as? String,
+                       let remotePath = params["remote_path"] as? String,
+                       let host = RemoteHostStore.shared.sortedHosts.first(where: { $0.id == hostKey }),
+                       let sshTarget = host.sshTarget {
+                        let plan = PeerProjectBootstrap.plan(
+                            projectRoot: (remotePath as NSString).deletingLastPathComponent,
+                            projectName: (remotePath as NSString).lastPathComponent,
+                            agents: roles,
+                            isolateAgents: (params["isolate"] as? Bool) ?? true
+                        )
+                        let gitURL = params["git_url"] as? String
+                        let presets = AgentRolePresetManager.shared.presets
+                        guard let tabManager = self.tabManager else {
+                            result = .err(code: "unavailable", message: "no TabManager", data: nil)
+                            return
+                        }
+                        Task { @MainActor in
+                            try? await PeerProjectBootstrap.run(
+                                sshTarget: sshTarget, port: host.sshPort,
+                                identityFile: host.identityFile,
+                                plan: plan, gitURL: (gitURL?.isEmpty ?? true) ? nil : gitURL
+                            )
+                            let rows: [TeamAgentRow] = plan.agentCheckouts.compactMap { checkout in
+                                guard let preset = presets.first(where: { $0.name == checkout.agent })
+                                else { return nil }
+                                var row = TeamAgentRow(preset: preset, customInstructions: "")
+                                row.hostKey = hostKey
+                                row.hostDirectory = checkout.path
+                                return row
+                            }
+                            TeamOrchestrator.shared.createTeam(
+                                named: URL(fileURLWithPath: directory).lastPathComponent,
+                                rows: rows,
+                                workingDirectory: directory,
+                                leaderMode: "repl",
+                                tabManager: tabManager
+                            )
+                        }
+                        result = .ok([
+                            "primary": plan.primaryPath,
+                            "checkouts": plan.agentCheckouts.map { ["agent": $0.agent, "path": $0.path, "branch": $0.branch] },
+                        ])
+                        return
+                    }
                     let presets = AgentRolePresetManager.shared.presets
                     let rows: [TeamAgentRow] = roles.compactMap { role in
                         guard let preset = presets.first(where: { $0.name == role }) else { return nil }

@@ -996,20 +996,77 @@ struct SidebarProjectsSection: View {
         .padding(.bottom, 4)
         .sheet(isPresented: $isCreatingProject) {
             NewProjectView(
-                onCreate: { name, directory, rows in
-                    TeamOrchestrator.shared.createTeam(
-                        named: name,
-                        rows: rows,
-                        workingDirectory: directory,
-                        leaderMode: "repl",
-                        tabManager: tabManager
-                    )
+                onCreate: { name, directory, rows, source in
+                    Task { @MainActor in
+                        // The checkouts have to exist before anyone is sent to
+                        // work in them: an agent whose directory is not there
+                        // starts in a shell that failed to `cd` and looks
+                        // attached while being nothing of the kind.
+                        let prepared = await prepareRemoteCheckouts(
+                            name: name, rows: rows, source: source
+                        )
+                        TeamOrchestrator.shared.createTeam(
+                            named: name,
+                            rows: prepared,
+                            workingDirectory: directory,
+                            leaderMode: "repl",
+                            tabManager: tabManager
+                        )
+                    }
                 },
                 onClose: { isCreatingProject = false }
             )
         }
     }
 
+
+    /// Clone the project and each member's copy of it on the far machine, and
+    /// point the rows at what was made.
+    ///
+    /// Returns the rows unchanged when the project is local or nothing needs
+    /// preparing — the caller should not have to know which case it is in.
+    @MainActor
+    private func prepareRemoteCheckouts(
+        name: String,
+        rows: [TeamAgentRow],
+        source: ProjectSource
+    ) async -> [TeamAgentRow] {
+        guard let hostKey = source.hostKey,
+              let host = RemoteHostStore.shared.sortedHosts.first(where: { $0.id == hostKey }),
+              let sshTarget = host.sshTarget, !sshTarget.isEmpty,
+              !source.projectPath.isEmpty
+        else { return rows }
+
+        let plan = PeerProjectBootstrap.plan(
+            projectRoot: (source.projectPath as NSString).deletingLastPathComponent,
+            projectName: (source.projectPath as NSString).lastPathComponent,
+            agents: rows.map(\.preset.name),
+            isolateAgents: source.isolateAgents
+        )
+        do {
+            try await PeerProjectBootstrap.run(
+                sshTarget: sshTarget,
+                port: host.sshPort,
+                identityFile: host.identityFile,
+                plan: plan,
+                gitURL: source.gitURL.isEmpty ? nil : source.gitURL
+            )
+        } catch {
+            // Said out loud and then attempted anyway: the directories may
+            // already be right, and refusing here would turn a warning into a
+            // project that was never created.
+            RemoteWorkLog.info("Could not prepare \(name) on \(host.displayName): \(error)")
+        }
+
+        var prepared = rows
+        for checkout in plan.agentCheckouts {
+            guard let i = prepared.firstIndex(where: { $0.preset.name == checkout.agent })
+            else { continue }
+            prepared[i].hostKey = hostKey
+            prepared[i].hostDirectory = checkout.path
+        }
+        return prepared
+    }
 }
 
 
@@ -1638,6 +1695,7 @@ private struct SidebarPeerProjectsView: View {
         }
         .disabled(teamName(for: group) == nil)
     }
+
 
     /// The team running in this project on this machine, if there is one.
     /// A remote member joins an existing team — there is no such thing as a
