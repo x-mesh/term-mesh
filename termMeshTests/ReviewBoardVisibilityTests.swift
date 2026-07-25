@@ -48,6 +48,27 @@ final class ReviewBoardVisibilityTests: XCTestCase {
         XCTAssertFalse(ReviewBoardSettings.isVisible)
     }
 
+    /// How narrow the board may get.
+    ///
+    /// The bound is the whole feature here: a board that will not go below a
+    /// second column's width is a board you close instead of keeping.
+    func testTheBoardCanBeDraggedNarrow() {
+        XCTAssertEqual(ReviewBoardSettings.clampedWidth(200), 200)
+        XCTAssertEqual(ReviewBoardSettings.clampedWidth(120), ReviewBoardSettings.minimumWidth)
+        XCTAssertLessThanOrEqual(ReviewBoardSettings.minimumWidth, 200)
+        XCTAssertLessThanOrEqual(ReviewBoardSettings.defaultWidth, 320)
+    }
+
+    /// A width saved under the old, wider floor is not forced back up.
+    func testAStoredNarrowWidthSurvivesAReload() {
+        let defaults = UserDefaults.standard
+        let saved = defaults.double(forKey: ReviewBoardSettings.widthKey)
+        defer { defaults.set(saved, forKey: ReviewBoardSettings.widthKey) }
+
+        ReviewBoardSettings.saveWidth(210, defaults: defaults)
+        XCTAssertEqual(ReviewBoardSettings.loadWidth(defaults: defaults), 210)
+    }
+
     /// The exact stuck state users could reach: dismissed, then switched on.
     func testEnablingClearsAPriorDismissal() {
         UserDefaults.standard.set(true, forKey: ReviewBoardSettings.enabledKey)

@@ -31,8 +31,16 @@ enum ReviewBoardSettings {
     static func toggleVisible() {
         setVisible(!isVisible)
     }
-    static let defaultWidth: CGFloat = 380
-    static let minimumWidth: CGFloat = 320
+    static let defaultWidth: CGFloat = 320
+    /// How narrow the board may be dragged.
+    ///
+    /// It was 320 — wide enough that the board was never a strip you keep at
+    /// the edge, only a second column you make room for. Nothing in the panel
+    /// needs that: no content sets a horizontal size, so titles and summaries
+    /// wrap the whole way down. What survives at 200 is the part worth keeping
+    /// at a glance — which task, whose, and its state — and anyone who wants
+    /// the detail drags it back out.
+    static let minimumWidth: CGFloat = 200
     static let maximumWidth: CGFloat = 560
 
     static func clampedWidth(_ width: CGFloat) -> CGFloat {
