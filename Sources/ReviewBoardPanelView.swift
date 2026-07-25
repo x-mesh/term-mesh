@@ -282,6 +282,23 @@ struct ReviewBoardPanelView: View {
             // finds nothing — so a finished task with its result stored still
             // said "nothing reported yet".
             let report = ReviewBoardAgentReport(result: task.result)
+            // A result with no header is still a result. Work carried back
+            // from a peer arrives as the agent's summary alone — the header it
+            // reported with was consumed getting it here — and requiring one
+            // to render anything left the board saying nothing was reported
+            // while holding the answer.
+            if report == nil,
+               let plain = task.result?.trimmingCharacters(in: .whitespacesAndNewlines),
+               !plain.isEmpty {
+                Text(plain)
+                    .font(.system(size: 11))
+                    .foregroundColor(.primary)
+                    .lineLimit(6)
+                    .textSelection(.enabled)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .accessibilityIdentifier("reviewBoard.task.report")
+            }
             if let report, !report.isEmpty {
                 VStack(alignment: .leading, spacing: 8) {
                     if let body = report.body {
@@ -302,7 +319,9 @@ struct ReviewBoardPanelView: View {
 
             let facts = digest.presentFacts
             if facts.isEmpty {
-                if report == nil || report?.isEmpty == true {
+                let showedSomething = (report.map { !$0.isEmpty } ?? false)
+                    || (report == nil && !(task.result ?? "").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                if !showedSomething {
                     // Said once, plainly, instead of eight times in eight boxes.
                     Text("Nothing reported yet — the agent has not filed a result.")
                         .font(.system(size: 11))

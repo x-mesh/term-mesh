@@ -245,18 +245,28 @@ struct ReviewBoardTask: Identifiable, Equatable, Sendable {
         // Coordinator statuses are kept verbatim. Folding `queued_for_merge`
         // into `queued` would read fine and lose the one distinction the
         // merge queue exists to show.
+        let status = dictionary["status"] as? String ?? "pending"
+        // `last_reason` is whatever the coordinator recorded alongside the
+        // task's latest status, which is a reason only when the task stopped.
+        // For work that ran to a result on a peer it holds the agent's own
+        // summary — the only copy of it on this machine, since a remote task
+        // has no local team row — and putting that in the blocked-reason box
+        // would announce a finished job as a failure.
+        let note = dictionary["last_reason"] as? String
+        let stopped = Self.stoppedPhases.contains(status)
         self.init(
             id: taskID,
             teamName: projectID.flatMap { names.projects[$0] } ?? "Unknown project",
             title: title,
-            status: dictionary["status"] as? String ?? "pending",
+            status: status,
             assignee: hostID.flatMap { names.hosts[$0] },
             priority: (dictionary["priority"] as? Int) ?? 0,
             dependsOn: dictionary["depends_on"] as? [String] ?? [],
             // Why the task stopped. Without it the board showed a task go
             // `suspect` and then eight rows of "not reported" — every one of
             // which was true, and none of which was the answer.
-            blockedReason: dictionary["last_reason"] as? String,
+            blockedReason: stopped ? note : nil,
+            result: stopped ? nil : note,
             updatedAt: (dictionary["updated_at_ms"] as? UInt64).map(ReviewBoardText.timestamp(fromUnixMilliseconds:))
         )
     }
@@ -272,6 +282,17 @@ extension ReviewBoardTask {
     /// `placed` is deliberately not here: it is what the coordinator says
     /// before the agent has it, and the team board is already further along by
     /// the time anyone is looking.
+    /// Phases where the coordinator's note explains a stop rather than
+    /// reporting an outcome.
+    static let stoppedPhases: Set<String> = [
+        "suspect",
+        "quarantined",
+        "rejected",
+        "blocked",
+        "failed",
+        "cancelled",
+    ]
+
     static let coordinatorOnlyPhases: Set<String> = [
         "suspect",
         "quarantined",
