@@ -1005,7 +1005,7 @@ struct SidebarProjectsSection: View {
                         let prepared = await prepareRemoteCheckouts(
                             name: name, rows: rows, source: source
                         )
-                        TeamOrchestrator.shared.createTeam(
+                        let team = TeamOrchestrator.shared.createTeam(
                             named: name,
                             rows: prepared,
                             workingDirectory: directory,
@@ -1013,6 +1013,13 @@ struct SidebarProjectsSection: View {
                             leaderModel: leader.model,
                             tabManager: tabManager
                         )
+                        guard team != nil else { return }
+                        // A project with agents in it is what the board is
+                        // for, so making one turns it on. Closing it afterwards
+                        // sticks — this only overrides the default of never
+                        // having been asked.
+                        UserDefaults.standard.set(true, forKey: ReviewBoardSettings.enabledKey)
+                        UserDefaults.standard.set(false, forKey: ReviewBoardSettings.isClosedKey)
                     }
                 },
                 onClose: { isCreatingProject = false }
@@ -1554,9 +1561,13 @@ private struct SidebarPeerProjectsView: View {
     private var localMembers: [(Workspace, PeerProjectIdentity)] {
         tabManager.tabs.compactMap { workspace in
             guard !workspace.isPeerMirror else { return nil }
+            // A project that named itself is not up for reinterpretation. Only
+            // workspaces nobody declared fall through to the path rule.
+            let declared = WorkspaceProjectNames.shared.identity(for: workspace.id)
             return (
                 workspace,
-                projectIdentity(forWorkingDirectories: localWorkingDirectories(workspace))
+                declared
+                    ?? projectIdentity(forWorkingDirectories: localWorkingDirectories(workspace))
             )
         }
     }

@@ -899,6 +899,13 @@ final class TeamOrchestrator: ObservableObject {
             workingDirectory: workingDirectory,
             select: true
         )
+        // The workspace is this team's, and the team's name is the project's.
+        // Declared here rather than at the New Project sheet because every
+        // route that makes a team makes the same fact — and because the
+        // sidebar's other way of knowing, reading the panes' directories,
+        // cannot see a project whose work is on another machine.
+        WorkspaceProjectNames.shared.declare(workspaceId: workspace.id, projectName: name)
+
         if executionMode == "headless" {
             // "0 headless" would be a strange thing to read on a tab; a team
             // that is only its leader is described by its name alone.
