@@ -521,9 +521,9 @@ extension TerminalController {
                     result = .err(code: "unavailable", message: "no TabManager", data: nil)
                     return
                 }
-                let workspace = tabManager.addWorkspace(workingDirectory: directory)
+                // `createTeam` opens the workspace itself. Opening one here
+                // too is what left an orphan beside every project.
                 var payload: [String: Any] = [
-                    "workspace_id": workspace.id.uuidString,
                     "templates_available": manager.templates.map(\.name),
                 ]
                 if let template {
@@ -545,11 +545,11 @@ extension TerminalController {
                         workingDirectory: directory,
                         leaderSessionId: UUID().uuidString,
                         leaderMode: template.leaderMode,
-                        adoptedLeaderSurfaceId: workspace.focusedPanelId,
                         tabManager: tabManager
                     )
                     payload["template"] = template.name
                     payload["team"] = team?.id ?? ""
+                    payload["workspace_id"] = team?.workspaceId.uuidString ?? ""
                 }
                 result = .ok(payload)
             }

@@ -932,7 +932,6 @@ struct SidebarProjectsSection: View {
     let usesSeparatedPresentation: Bool
     @AppStorage(SidebarLayoutSettings.localTabsCollapsedKey)
     private var isCollapsed = false
-    @State private var isCreatingProject = false
 
     var body: some View {
         VStack(spacing: 0) {
@@ -961,7 +960,17 @@ struct SidebarProjectsSection: View {
                 // promises — a project is not a thing to register, though, it
                 // is where work happens, so opening a folder is how one starts
                 // existing.
-                Button { isCreatingProject = true } label: {
+                Button {
+                    // The New Agent Team sheet already is this: it takes a
+                    // working directory, composes as many agents as the
+                    // project needs from the role presets, and creates the
+                    // workspace and the team together. Opening a second,
+                    // lesser version of it here made two workspaces per
+                    // project — one with the team in it and one orphan — and
+                    // could only ever offer the agents somebody had already
+                    // saved a template for.
+                    NotificationCenter.default.post(name: .teamCreationRequested, object: nil)
+                } label: {
                     Image(systemName: "plus")
                         .font(.system(size: 9, weight: .semibold))
                         .foregroundColor(.secondary)
@@ -987,54 +996,10 @@ struct SidebarProjectsSection: View {
             }
         }
         .padding(.bottom, 4)
-        .sheet(isPresented: $isCreatingProject) {
-            SidebarNewProjectSheet(
-                onCreate: { directory, template in
-                    createProject(directory: directory, template: template)
-                },
-                onClose: { isCreatingProject = false }
-            )
-        }
     }
 
-    /// Open the folder, and put the team in it that was asked for.
-    ///
-    /// A folder becomes a workspace; the project it belongs to is derived from
-    /// its git root exactly as it is for every other workspace. Nothing here
-    /// writes a project record — that would create a second, competing notion
-    /// of what a project is.
-    ///
-    /// A workspace on its own is inert — everything that acts on a project
-    /// needs a team, and until now making one was a separate errand nothing on
-    /// screen mentioned.
-    private func createProject(directory: String, template: SavedTeamTemplate?) {
-        let workspace = tabManager.addWorkspace(workingDirectory: directory)
-        guard let template else { return }
-        let agents = template.agents.map { slot in
-            (
-                name: slot.roleName,
-                cli: slot.cli,
-                model: slot.model,
-                agentType: slot.roleName,
-                color: AgentRolePresetManager.shared.presets
-                    .first { $0.name == slot.roleName }?.color ?? "green",
-                instructions: "",
-                customInstructions: slot.customInstructions
-            )
-        }
-        // The workspace's own first pane leads: the team is made in the place
-        // just opened, not in a second window beside it.
-        _ = TeamOrchestrator.shared.createTeam(
-            name: URL(fileURLWithPath: directory).lastPathComponent,
-            agents: agents,
-            workingDirectory: directory,
-            leaderSessionId: UUID().uuidString,
-            leaderMode: template.leaderMode,
-            adoptedLeaderSurfaceId: workspace.focusedPanelId,
-            tabManager: tabManager
-        )
-    }
 }
+
 
 struct SidebarRemoteHostsSection: View {
     @ObservedObject var store: RemoteHostStore
