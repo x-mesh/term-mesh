@@ -1607,6 +1607,29 @@ private struct SidebarPeerProjectsView: View {
     /// The absolute path the coordinator will register this project under.
     /// A project the sidebar groups purely from peer panes has no path this
     /// machine can name, so delegation is offered only where one exists.
+    /// What can be done to a project, wherever it is right-clicked.
+    @ViewBuilder
+    private func projectActions(for group: SidebarPeerProjectGroup) -> some View {
+        Button("Delegate Work to \(group.identity.label)…") {
+            delegateTarget = SidebarProjectDelegateTarget(
+                label: group.identity.label,
+                rootPath: delegateRootPath(for: group)
+            )
+        }
+        .disabled(delegateRootPath(for: group) == nil)
+        // Under the delegate item because it answers the other half of the
+        // same question: that one asks what needs doing and lets the
+        // coordinator pick a machine, this one is for when the machine is
+        // the point.
+        Button("Add Agent on Another Machine…") {
+            remoteAgentTarget = SidebarRemoteAgentTarget(
+                projectLabel: group.identity.label,
+                teamName: teamName(for: group)
+            )
+        }
+        .disabled(teamName(for: group) == nil)
+    }
+
     /// The team running in this project on this machine, if there is one.
     /// A remote member joins an existing team — there is no such thing as a
     /// team with only a member somewhere else.
@@ -1678,28 +1701,17 @@ private struct SidebarPeerProjectsView: View {
                     // is already chosen — nothing to pick again, nothing to
                     // pick wrongly.
                     .contentShape(Rectangle())
-                    .contextMenu {
-                        Button("Delegate Work to \(group.identity.label)…") {
-                            delegateTarget = SidebarProjectDelegateTarget(
-                                label: group.identity.label,
-                                rootPath: delegateRootPath(for: group)
-                            )
-                        }
-                        .disabled(delegateRootPath(for: group) == nil)
-                        // Sits under the delegate item because it answers the
-                        // other half of the same question: that one asks what
-                        // needs doing and lets the coordinator pick a machine,
-                        // this one is for when the machine is the point.
-                        Button("Add Agent on Another Machine…") {
-                            remoteAgentTarget = SidebarRemoteAgentTarget(
-                                projectLabel: group.identity.label,
-                                teamName: teamName(for: group)
-                            )
-                        }
-                        .disabled(teamName(for: group) == nil)
-                    }
+                    .contextMenu { projectActions(for: group) }
                     ForEach(group.items) { item in
+                        // The same two actions on the rows themselves. They
+                        // were on the group's header alone, which is a thin
+                        // grey label that does not read as a row — so the
+                        // menu was on the one thing nobody right-clicks,
+                        // while the workspace beneath it, which is what
+                        // people actually aim at, had nothing to say about
+                        // its own project.
                         workspaceRow(item)
+                            .contextMenu { projectActions(for: group) }
                     }
                 }
             }
