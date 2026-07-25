@@ -83,25 +83,37 @@ extension TeamOrchestrator {
         var spawnedSurface = false
         do {
             let surfaces = try await PeerPaneSession.listSurfaces(on: lease)
-            // A host publishes a fixed roster of surfaces and each can be
-            // attached once, so a second agent on the same machine finds
-            // nothing free — usually the first one took the only shell. Ask
-            // for another rather than refusing: a host that can run one agent
-            // can run two, and the roster is a publishing detail, not a
-            // statement about capacity.
-            // Surfaces this app's agents already sit in. The host cannot tell
-            // us — a second attach is legal, so a busy surface looks exactly
-            // like a free one — but every one of them was attached from here.
+            // Ask for a shell of our own rather than taking one of the
+            // host's published surfaces.
+            //
+            // An agent's first act is to type a launch command, which only
+            // means anything at a shell prompt. Whether a listed surface is at
+            // one cannot be known from the listing: `SurfaceInfo` says a
+            // surface is attachable, not that it is idle, and attaching twice
+            // is legal — so a shell running someone else's agent looks exactly
+            // like a free one. Reusing it types `mkdir … && claude …` into
+            // that agent's prompt, which answers in prose about how it cannot
+            // run shell commands. The pane looks attached and nothing started.
+            //
+            // Tracking which surfaces our own agents hold only covers the ones
+            // this app knows about, and the ones that cause this are the
+            // others: a previous run, a crash, another machine's term-mesh.
+            // Spawning is the only way to be sure, and abandoned surfaces are
+            // reaped by the host, so asking for one costs nothing lasting.
             let taken = Set(
                 teams.values
                     .flatMap(\.agents)
                     .filter { $0.hostKey == hostKey }
                     .compactMap(\.remoteSurfaceID)
             )
+            // The fallback for a host that will not spawn — an older one, or
+            // one at its ceiling: a surface nobody here holds is the best
+            // guess left, and a guess is all it is.
             var chosen = surfaces.first { $0.attachable && !taken.contains($0.surfaceID) }
-            if chosen == nil, let source = surfaces.first?.surfaceID {
-                chosen = try await PeerPaneSession.spawnSurface(on: lease, splitting: source)
-                spawnedSurface = chosen != nil
+            if let source = surfaces.first?.surfaceID,
+               let fresh = try await PeerPaneSession.spawnSurface(on: lease, splitting: source) {
+                chosen = fresh
+                spawnedSurface = true
             }
             guard let chosen else {
                 registry.release(lease)
