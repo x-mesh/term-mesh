@@ -324,16 +324,19 @@ final class ReviewBoardCoordinatorClient: @unchecked Sendable {
     func reportPlacementStatus(
         taskID: String,
         attemptID: String,
-        status: String
+        status: String,
+        reason: String? = nil
     ) async {
-        _ = try? await request(
-            method: "task.update",
-            params: [
-                "request_id": "dispatch-\(status):\(attemptID)",
-                "task_id": taskID,
-                "status": status,
-            ]
-        )
+        var params: [String: Any] = [
+            "request_id": "dispatch-\(status):\(attemptID)",
+            "task_id": taskID,
+            "status": status,
+        ]
+        // What the agent said, carried with the status. A remote task has no
+        // local team row to hold its result, so without this the board would
+        // show it finish and still have nothing to show for it.
+        if let reason, !reason.isEmpty { params["reason"] = reason }
+        _ = try? await request(method: "task.update", params: params)
     }
 
     /// Say a dispatch failed, in the coordinator's own vocabulary, so the
@@ -698,6 +701,17 @@ final class ReviewBoardCoordinatorService: ObservableObject {
     private var subscriptionStarted = false
     private var hostObservationCancellable: AnyCancellable?
     private var hostObservationTicker: Timer?
+    private var outstandingWorkTicker: Timer?
+
+    /// Whether anything is still on its way to an answer. A board with nothing
+    /// running costs one set comparison per tick and no socket traffic.
+    private var hasOutstandingWork: Bool {
+        snapshot.tasks.contains { Self.outstandingPhases.contains($0.status) }
+    }
+
+    private static let outstandingPhases: Set<String> = [
+        "pending", "queued", "placed", "assigned", "in_progress", "reassigned",
+    ]
     private var teamMirrorCancellable: AnyCancellable?
     private var hostSyncTask: Task<Void, Never>?
     private var lastReportedObservations: [CoordinatorHostObservation] = []
@@ -752,6 +766,8 @@ final class ReviewBoardCoordinatorService: ObservableObject {
         hostObservationCancellable = nil
         hostObservationTicker?.invalidate()
         hostObservationTicker = nil
+        outstandingWorkTicker?.invalidate()
+        outstandingWorkTicker = nil
         teamMirrorCancellable?.cancel()
         teamMirrorCancellable = nil
         hostSyncTask?.cancel()
@@ -809,6 +825,25 @@ final class ReviewBoardCoordinatorService: ObservableObject {
         }
         RunLoop.main.add(ticker, forMode: .common)
         hostObservationTicker = ticker
+
+        // Work running on a peer finishes silently. Nothing on that machine can
+        // tell this one it is done — the dispatch is a `team.send`, not a task
+        // the host tracks — so the answer has to be asked for, and asking once
+        // right after handing the work over is asking before there is one.
+        //
+        // The refresh loop that reads results only ran when the host table
+        // changed, so a delegation to a peer got exactly that single early
+        // look and then nothing: the agent replied seconds later to no one.
+        // While work is outstanding, keep asking.
+        outstandingWorkTicker?.invalidate()
+        let pump = Timer(timeInterval: 5, repeats: true) { [weak self] _ in
+            Task { @MainActor in
+                guard let self, self.hasOutstandingWork else { return }
+                self.refresh()
+            }
+        }
+        RunLoop.main.add(pump, forMode: .common)
+        outstandingWorkTicker = pump
     }
 
     func syncHostObservations(store: RemoteHostStore = .shared) {
@@ -1181,6 +1216,26 @@ final class ReviewBoardCoordinatorService: ObservableObject {
                 status: "in_progress"
             )
         }
+        // Work sent to a peer has no way of telling us it finished, so the
+        // same pass that hands work out also asks after the work already out
+        // there.
+        await CoordinatorPlacementDispatcher.shared.collectRemoteResults(
+            taskRows: inputs.rows,
+            projectRoots: inputs.roots,
+            hostsByCoordinatorID: hostsByCoordinatorID(),
+            localHostID: CoordinatorHostObservation(
+                hostKey: CoordinatorHostObservation.localHostKey,
+                projectRoots: [],
+                isLive: true
+            ).coordinatorHostID
+        ) { taskID, attemptID, summary in
+            await client.reportPlacementStatus(
+                taskID: taskID,
+                attemptID: attemptID,
+                status: "review_ready",
+                reason: summary
+            )
+        }
     }
 
     /// Coordinator host ids are a hash of the sidebar's own host key, so the
@@ -1317,6 +1372,25 @@ extension ReviewBoardCoordinatorService {
         body: String
     ) async -> (taskID: String, delivered: Bool)? {
         guard !project.isUnknown else { return nil }
+        // Only take work this machine actually holds. A project root that lives
+        // on a peer does not exist here, and starting a team in it anyway gave
+        // the pane no directory to open — so it fell back to whatever the app's
+        // own working directory was. The agent then answered confidently about
+        // the wrong repository and the board showed that as completed: asked
+        // for the first line of a README on jw-server, it returned the first
+        // line of a README on this Mac.
+        //
+        // Declining is what lets the rest work. The coordinator has already
+        // been told about the project, so it places the task on a host that
+        // does have it and the dispatcher carries it there.
+        var isDirectory: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: root, isDirectory: &isDirectory),
+              isDirectory.boolValue else {
+#if DEBUG
+            dlog("coordinator.handToTeam declined: \(root) is not on this machine")
+#endif
+            return nil
+        }
         let dispatcher = CoordinatorPlacementDispatcher.shared
         let existing = dispatcher.teamName(forProject: project, host: nil)
         guard let team = existing
@@ -1448,15 +1522,42 @@ final class CoordinatorPlacementDispatcher {
     /// attempt is the unit because the coordinator mints a fresh one per
     /// placement — a reassigned task is a new attempt and must dispatch again.
     private var handledAttempts: Set<String> = []
+    /// Attempts whose remote result has already been carried back, so a
+    /// finished task is reported once rather than on every refresh.
+    private var collectedAttempts: Set<String> = []
 
     /// The one thing here the product decides rather than the plumbing: what a
     /// placement actually asks for. Everything above and below this line —
     /// resolving the host, not repeating a dispatch, reporting a failure — is
     /// the same whatever the answer turns out to be.
+    ///
+    /// The reporting header goes with it. A local delegation gets the capsule
+    /// from `formatDelegateInstruction`; a remote one came through here with
+    /// the bare title, so the peer agent answered in prose — "3" — with no
+    /// STATUS line for the host's auto-reply to catch, and the task sat at
+    /// `in_progress` while the work was long done. The remote agent needs the
+    /// same contract as the local one, and this is the only place that speaks
+    /// to it.
     static func instruction(for placement: CoordinatorPlacement) -> String {
-        placement.body.isEmpty
+        let ask = placement.body.isEmpty
             ? placement.title
             : "\(placement.title)\n\n\(placement.body)"
+        return """
+        \(ask)
+
+        [HOW TO REPORT — required]
+        Close your reply with these lines so the task is recorded as done;
+        without them it stays open.
+
+        STATUS: DONE|BLOCKED|NEEDS_REVIEW
+        FILES: <changed paths, space-separated, or none>
+        VERIFY: <single shell command to verify the result, or n/a>
+        NEXT: <one-line action for the leader, or NONE>
+        FULL_REPORT: <path to a full result file, or n/a>
+
+        Then one last line: the answer or outcome in a sentence, after the
+        header — text above STATUS is not captured.
+        """
     }
 
     func reconcile(
@@ -1547,6 +1648,133 @@ final class CoordinatorPlacementDispatcher {
                 started: started
             )
         }
+    }
+
+    /// Ask the peers whether the work they were handed is finished.
+    ///
+    /// Dispatching to a peer said `in_progress` and then stopped asking. The
+    /// remote agent did the job, printed the reply header and went idle, and
+    /// the task stayed `in_progress` forever — the work was done and the only
+    /// place that said so was a machine nobody was looking at.
+    ///
+    /// Nothing pushes that back: the host has no task of its own to complete
+    /// (the dispatch is a `team.send`, not a task), and there is no event
+    /// channel from a peer's agents to this coordinator. So the answer is read
+    /// rather than awaited, on the same refresh that dispatches — one
+    /// `team.read` per outstanding remote task.
+    func collectRemoteResults(
+        taskRows: [[String: Any]],
+        projectRoots: [String: String],
+        hostsByCoordinatorID: [String: HostEntry],
+        localHostID: String,
+        finished: @escaping (_ taskID: String, _ attemptID: String, _ summary: String?) async -> Void
+    ) async {
+        for row in taskRows {
+            guard row["status"] as? String == "in_progress",
+                  let taskID = row["task_id"] as? String,
+                  let attemptID = row["current_attempt_id"] as? String,
+                  let projectID = row["project_id"] as? String,
+                  let placement = row["placement"] as? [String: Any],
+                  let hostID = placement["host_id"] as? String,
+                  hostID != localHostID,
+                  let host = hostsByCoordinatorID[hostID],
+                  let root = projectRoots[projectID] else { continue }
+            // Already reported once; the coordinator has moved on.
+            guard !collectedAttempts.contains(attemptID) else { continue }
+            let project = projectIdentity(forWorkingDirectories: [root])
+            guard let teamName = teamName(forProject: project, host: host) else { continue }
+            let agentName = (placement["pane_ref"] as? [String: Any])?["agent_name"] as? String
+                ?? "executor"
+            guard let text = await readFromPeer(
+                host: host, teamName: teamName, agentName: agentName
+            ) else { continue }
+            guard let report = ReviewBoardAgentReport(result: text), report.status != nil else {
+                continue
+            }
+            collectedAttempts.insert(attemptID)
+            await finished(
+                taskID,
+                attemptID,
+                Self.summary(fromRemoteReply: text) ?? report.body ?? report.status
+            )
+        }
+    }
+
+    /// Read one remote agent's recent output.
+    ///
+    /// A headless host answers in stream-json — one JSON object per line — so
+    /// the agent's own words have to be dug out of it. Lines that are not
+    /// stream-json are passed through as-is, which is what a host backed by
+    /// panes returns.
+    private func readFromPeer(
+        host: HostEntry,
+        teamName: String,
+        agentName: String
+    ) async -> String? {
+        let path = host.activeSockPath
+        guard !path.isEmpty else { return nil }
+        let params: [String: Any] = [
+            "team_name": teamName,
+            "agent_name": agentName,
+            "lines": 200,
+        ]
+        guard let data = try? JSONSerialization.data(withJSONObject: params),
+              let paramsJSON = String(data: data, encoding: .utf8) else { return nil }
+        do {
+            let conn = try await PeerRelaySession.connect(hostSockPath: path)
+            defer { Task { await conn.cancel() } }
+            let response = try await conn.session.callTeam(
+                method: "team.read",
+                paramsJSON: paramsJSON
+            )
+            guard response.ok,
+                  let resultData = response.resultJson.data(using: .utf8),
+                  let result = try? JSONSerialization.jsonObject(with: resultData) as? [String: Any],
+                  let lines = result["lines"] as? [String] else { return nil }
+            return Self.plainText(fromHostOutput: lines)
+        } catch {
+            return nil
+        }
+    }
+
+    /// What a remote agent said, minus the header it was asked to end with.
+    ///
+    /// A local reply is read off a screen, so only the lines below the header
+    /// can be trusted to be the agent's — above it is scrollback. A remote one
+    /// arrives as the agent's own turn, nothing else in it, so text on either
+    /// side of the header is the answer. That matters because agents put the
+    /// answer first however the instruction is worded: asked to count lines,
+    /// this one replied "3" and then the header, and taking only what followed
+    /// left the board reporting the word DONE.
+    static func summary(fromRemoteReply text: String) -> String? {
+        let headers = ["STATUS:", "FILES:", "VERIFY:", "NEXT:", "FULL_REPORT:"]
+        let kept = text
+            .split(separator: "\n", omittingEmptySubsequences: false)
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .filter { line in
+                !line.isEmpty && !headers.contains(where: { line.hasPrefix($0) })
+            }
+        return kept.isEmpty ? nil : kept.joined(separator: "\n")
+    }
+
+    /// The agent's text, out of whatever the host reports.
+    static func plainText(fromHostOutput lines: [String]) -> String {
+        var out: [String] = []
+        for line in lines {
+            guard let data = line.data(using: .utf8),
+                  let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+                out.append(line)
+                continue
+            }
+            // Claude's stream-json: only assistant turns carry the reply.
+            guard object["type"] as? String == "assistant",
+                  let message = object["message"] as? [String: Any],
+                  let content = message["content"] as? [[String: Any]] else { continue }
+            for part in content where part["type"] as? String == "text" {
+                if let text = part["text"] as? String { out.append(text) }
+            }
+        }
+        return out.joined(separator: "\n")
     }
 
     /// Hand the instruction to a local agent and wait for the answer that
