@@ -327,10 +327,17 @@ extension TeamOrchestrator {
             tabManager: tabManager
         ) else { return nil }
 
-        for row in remoteRows {
-            guard let hostKey = row.hostKey else { continue }
-            let directory = row.hostDirectory.trimmingCharacters(in: .whitespacesAndNewlines)
-            Task { @MainActor in
+        // One at a time. Choosing a surface reads which ones this app's agents
+        // already hold, so two attaches running at once both look at a roster
+        // that does not have the other in it yet, both pick the same free
+        // shell, and both type their launch command into it — the commands
+        // interleave character by character and neither CLI starts. Seen as
+        // `--dangerously-skip-permissionsskip-permissions` and a `mkdir` that
+        // the shell could not find.
+        Task { @MainActor in
+            for row in remoteRows {
+                guard let hostKey = row.hostKey else { continue }
+                let directory = row.hostDirectory.trimmingCharacters(in: .whitespacesAndNewlines)
                 do {
                     _ = try await self.attachRemoteAgent(
                         teamName: team.id,
