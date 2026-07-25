@@ -32,6 +32,10 @@ struct NewProjectView: View {
     /// Whether the folder has been typed into directly, which stops the name
     /// from moving it.
     @State private var folderEdited = false
+    /// How many members there were last time this was checked, so a row that
+    /// has just been added can be told apart from one deliberately set to run
+    /// on this Mac.
+    @State private var knownAgentCount = 0
     @State private var agents: [TeamAgentRow] = []
     /// The machine this project lives on.
     ///
@@ -102,7 +106,13 @@ struct NewProjectView: View {
             footer
         }
         .frame(width: 860, height: 620)
-        .onAppear(perform: seedFirstAgent)
+        .onAppear {
+            seedFirstAgent()
+            adoptProjectMachineForNewRows()
+        }
+        .onChange(of: agents.count) { _, _ in
+            adoptProjectMachineForNewRows()
+        }
         .accessibilityIdentifier("newProject.sheet")
     }
 
@@ -267,6 +277,9 @@ struct NewProjectView: View {
             guard !parent.isEmpty else { return }
             directory = (parent as NSString)
                 .appendingPathComponent(typed.isEmpty ? Self.placeholderProjectName : typed)
+            for i in agents.indices where agents[i].hostKey == runsOnHostKey {
+                agents[i].hostDirectory = directory
+            }
         }
         .onChange(of: runsOnHostKey) { _, newHost in
             applyRunsOn(newHost)
@@ -313,6 +326,26 @@ struct NewProjectView: View {
         return (root as NSString).appendingPathComponent("project")
     }
 
+    /// A member added after the machine was chosen belongs to the same
+    /// machine.
+    ///
+    /// Adding one produced a row set to "Here" with no folder field at all —
+    /// on a form whose every other answer said the project lives on a peer.
+    /// The member was then created locally while its teammates worked on the
+    /// far machine, which is a team that cannot see each other's files.
+    ///
+    /// Only rows that have just appeared, so someone who deliberately moves a
+    /// member back to this Mac is not overruled on the next redraw. Nothing is
+    /// counted as new when the list shrinks.
+    private func adoptProjectMachineForNewRows() {
+        defer { knownAgentCount = agents.count }
+        guard let runsOnHostKey, agents.count > knownAgentCount else { return }
+        for i in knownAgentCount..<agents.count where agents[i].hostKey == nil {
+            agents[i].hostKey = runsOnHostKey
+            agents[i].hostDirectory = trimmedDirectory
+        }
+    }
+
     /// Move the whole form to the chosen machine.
     ///
     /// The folder starts from that machine's own convention rather than being
@@ -349,6 +382,7 @@ struct NewProjectView: View {
             agents[i].hostKey = hostKey
             agents[i].hostDirectory = directory
         }
+        knownAgentCount = agents.count
     }
 
     private var footer: some View {
