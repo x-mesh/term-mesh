@@ -52,6 +52,9 @@ final class AutoReplyPoller {
         weak var panel: TerminalPanel?
         /// When this pane last printed anything.
         var lastOutputAt: Date?
+        /// Whether a first-run prompt has already been answered here. Once
+        /// only: a CLI asking twice is not a first run.
+        var answeredStartupPrompt = false
     }
 
     /// How recently a pane must have printed to count as working. The poll runs
@@ -303,6 +306,7 @@ final class AutoReplyPoller {
                 state.lastOutputAt = now
             }
             state.lastScrollbackText = trimmed
+            answerStartupPromptIfNeeded(panelId: panelId, state: state, text: trimmed, agentName: agentName)
         }
         // An empty delta is not the same as nothing happening. `computeDelta`
         // assumes append-only scrollback, and an agent TUI is the opposite: it
@@ -326,6 +330,44 @@ final class AutoReplyPoller {
         if let ev = state.detector.tick(at: now) {
             tryEmit(panelId: panelId, state: state, event: ev,
                     teamName: teamName, agentName: agentName)
+        }
+    }
+
+    // MARK: - Startup prompts
+
+    /// Answer a first-run question the CLI is holding the pane on.
+    ///
+    /// This poller is already reading every agent pane once a second, which
+    /// makes it the one place that can see a prompt nobody is sitting in front
+    /// of. Answered at most once per pane: if the CLI asks again, something
+    /// other than a first run is going on and a person should look.
+    private func answerStartupPromptIfNeeded(
+        panelId: UUID,
+        state: PanelState,
+        text: String,
+        agentName: String
+    ) {
+        guard !state.answeredStartupPrompt else { return }
+        guard let prompt = AgentStartupPrompt.detect(in: text) else { return }
+        guard let located = AppDelegate.shared?.locateSurface(surfaceId: panelId),
+              let workspace = located.tabManager.tabs.first(where: { $0.id == located.workspaceId }),
+              let panel = workspace.terminalPanel(for: panelId) else { return }
+        state.answeredStartupPrompt = true
+        NSLog("[auto-reply] answered startup prompt agent=%@ prompt=%@",
+              agentName, String(describing: prompt))
+#if DEBUG
+        dlog("startupPrompt.answered agent=\(agentName) panel=\(panelId.uuidString.prefix(8)) prompt=\(prompt)")
+#endif
+        // A key event, not text. The prompt is a TUI selection list waiting on
+        // Return; writing a carriage return into the composer looks like
+        // typing and does not commit it. This is the same retrying path the
+        // socket's `surface.send_key` uses.
+        TerminalController.shared.sendNamedKeyWithRetry(
+            on: panel.surface,
+            keyName: prompt.answerKey
+        ) { delivered, reason in
+            guard !delivered else { return }
+            NSLog("[auto-reply] startup prompt answer not delivered: %@", reason)
         }
     }
 

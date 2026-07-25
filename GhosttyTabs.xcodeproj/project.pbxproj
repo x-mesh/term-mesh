@@ -21,6 +21,7 @@
 		A14000000000000000000001 /* ProjectSyncViewModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = A14000000000000000000004 /* ProjectSyncViewModel.swift */; };
 		A14000000000000000000002 /* ProjectSyncPanelView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A14000000000000000000005 /* ProjectSyncPanelView.swift */; };
 		A14000000000000000000003 /* ProjectSyncViewModelTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A14000000000000000000006 /* ProjectSyncViewModelTests.swift */; };
+		ASPT000000000000000003 /* AgentStartupPromptTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = ASPT000000000000000006 /* AgentStartupPromptTests.swift */; };
 		A17000000000000000000001 /* ReviewBoardModels.swift in Sources */ = {isa = PBXBuildFile; fileRef = A17000000000000000000005 /* ReviewBoardModels.swift */; };
 		A17000000000000000000002 /* ReviewBoardViewModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = A17000000000000000000006 /* ReviewBoardViewModel.swift */; };
 		A17000000000000000000003 /* ReviewBoardPanelView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A17000000000000000000007 /* ReviewBoardPanelView.swift */; };
@@ -111,6 +112,7 @@
 		ARD00002 /* AutoReplyDetector.swift in Sources */ = {isa = PBXBuildFile; fileRef = ARD00001 /* AutoReplyDetector.swift */; };
 		ARE00002 /* AutoReplyEmit.swift in Sources */ = {isa = PBXBuildFile; fileRef = ARE00001 /* AutoReplyEmit.swift */; };
 		ARP00002 /* AutoReplyPoller.swift in Sources */ = {isa = PBXBuildFile; fileRef = ARP00001 /* AutoReplyPoller.swift */; };
+		ASP00002 /* AgentStartupPrompt.swift in Sources */ = {isa = PBXBuildFile; fileRef = ASP00001 /* AgentStartupPrompt.swift */; };
 		TORA0002 /* TeamOrchestrator+RemoteAgent.swift in Sources */ = {isa = PBXBuildFile; fileRef = TORA0001 /* TeamOrchestrator+RemoteAgent.swift */; };
 		A5001702 /* DashboardController.swift in Sources */ = {isa = PBXBuildFile; fileRef = A5001703 /* DashboardController.swift */; };
 		A5001704 /* dashboard in Resources */ = {isa = PBXBuildFile; fileRef = A5001705 /* dashboard */; };
@@ -294,6 +296,7 @@
 			A14000000000000000000004 /* ProjectSyncViewModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ProjectSyncViewModel.swift; sourceTree = "<group>"; };
 			A14000000000000000000005 /* ProjectSyncPanelView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ProjectSyncPanelView.swift; sourceTree = "<group>"; };
 			A14000000000000000000006 /* ProjectSyncViewModelTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ProjectSyncViewModelTests.swift; sourceTree = "<group>"; };
+			ASPT000000000000000006 /* AgentStartupPromptTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AgentStartupPromptTests.swift; sourceTree = "<group>"; };
 			A17000000000000000000005 /* ReviewBoardModels.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ReviewBoardModels.swift; sourceTree = "<group>"; };
 			A17000000000000000000006 /* ReviewBoardViewModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ReviewBoardViewModel.swift; sourceTree = "<group>"; };
 			A17000000000000000000007 /* ReviewBoardPanelView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ReviewBoardPanelView.swift; sourceTree = "<group>"; };
@@ -381,6 +384,7 @@
 		ARD00001 /* AutoReplyDetector.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AutoReplyDetector.swift; sourceTree = "<group>"; };
 		ARE00001 /* AutoReplyEmit.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AutoReplyEmit.swift; sourceTree = "<group>"; };
 		ARP00001 /* AutoReplyPoller.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AutoReplyPoller.swift; sourceTree = "<group>"; };
+		ASP00001 /* AgentStartupPrompt.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AgentStartupPrompt.swift; sourceTree = "<group>"; };
 		TORA0001 /* TeamOrchestrator+RemoteAgent.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "TeamOrchestrator+RemoteAgent.swift"; sourceTree = "<group>"; };
 		A5001703 /* DashboardController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DashboardController.swift; sourceTree = "<group>"; };
 		A5001705 /* dashboard */ = {isa = PBXFileReference; lastKnownFileType = folder; path = dashboard; sourceTree = "<group>"; };
@@ -708,6 +712,7 @@
 				ARD00001 /* AutoReplyDetector.swift */,
 				ARE00001 /* AutoReplyEmit.swift */,
 				ARP00001 /* AutoReplyPoller.swift */,
+				ASP00001 /* AgentStartupPrompt.swift */,
 				TORA0001 /* TeamOrchestrator+RemoteAgent.swift */,
 				ARB00001 /* AgentRunbookService.swift */,
 				ARB00003 /* AgentRunbookSettingsView.swift */,
@@ -833,6 +838,7 @@
 				FD000001A1B2C3D4E5F60718 /* PeerDaemonVersionTests.swift */,
 				FE000001A1B2C3D4E5F60718 /* PeerHostProfileDedupeTests.swift */,
 				A14000000000000000000006 /* ProjectSyncViewModelTests.swift */,
+				ASPT000000000000000006 /* AgentStartupPromptTests.swift */,
 				A17000000000000000000008 /* ReviewBoardViewModelTests.swift */,
 				A17100000000000000000004 /* ReviewBoardCoordinatorServiceTests.swift */,
 				A15000000000000000000004 /* WorkspaceRemoteRetrievalModelsTests.swift */,
@@ -1091,6 +1097,7 @@
 				ARD00002 /* AutoReplyDetector.swift in Sources */,
 				ARE00002 /* AutoReplyEmit.swift in Sources */,
 				ARP00002 /* AutoReplyPoller.swift in Sources */,
+				ASP00002 /* AgentStartupPrompt.swift in Sources */,
 				TORA0002 /* TeamOrchestrator+RemoteAgent.swift in Sources */,
 				ARB00002 /* AgentRunbookService.swift in Sources */,
 				ARB00004 /* AgentRunbookSettingsView.swift in Sources */,
@@ -1188,6 +1195,7 @@
 				FD000000A1B2C3D4E5F60718 /* PeerDaemonVersionTests.swift in Sources */,
 				FE000000A1B2C3D4E5F60718 /* PeerHostProfileDedupeTests.swift in Sources */,
 				A14000000000000000000003 /* ProjectSyncViewModelTests.swift in Sources */,
+				ASPT000000000000000003 /* AgentStartupPromptTests.swift in Sources */,
 				A17000000000000000000004 /* ReviewBoardViewModelTests.swift in Sources */,
 				A17100000000000000000002 /* ReviewBoardCoordinatorServiceTests.swift in Sources */,
 				A15000000000000000000002 /* WorkspaceRemoteRetrievalModelsTests.swift in Sources */,
