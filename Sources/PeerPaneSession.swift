@@ -369,6 +369,44 @@ final class PeerPaneSession {
         return surfaces
     }
 
+    /// Ask the host for one more shell, and return it once it exists.
+    ///
+    /// A host publishes a fixed roster of surfaces (`TERMMESH_PEER_SURFACES`),
+    /// and a surface can be attached once, so that roster is a hard ceiling on
+    /// how many agents can run there — usually one. The host can already make
+    /// more: splitting a pane forks a login shell in the source pane's
+    /// directory, which is how a person adds one from a mirrored window. This
+    /// asks for the same thing without the window.
+    ///
+    /// The request is fire-and-forget, so the new surface is waited for rather
+    /// than returned. `source` is the pane to split — an existing surface on
+    /// that host, whose directory the new shell inherits.
+    static func spawnSurface(
+        on lease: PeerPaneHostLease,
+        splitting source: Data,
+        timeout: TimeInterval = 10
+    ) async throws -> Termmesh_Peer_V1_SurfaceInfo? {
+        let before = Set(try await listSurfaces(on: lease).map(\.surfaceID))
+        let conn = try await PeerRelaySession.connect(hostSockPath: lease.hostSockPath)
+        do {
+            try await conn.session.requestSplitPane(paneID: source, orientation: "vertical")
+        } catch {
+            await conn.cancel()
+            throw error
+        }
+        await conn.cancel()
+
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            try? await Task.sleep(nanoseconds: 400_000_000)
+            let now = try await listSurfaces(on: lease)
+            if let fresh = now.first(where: { !before.contains($0.surfaceID) && $0.attachable }) {
+                return fresh
+            }
+        }
+        return nil
+    }
+
     // ── Attach ───────────────────────────────────────────────────────
 
     /// Open one pane session on the host: fresh owned connection +

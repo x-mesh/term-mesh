@@ -79,9 +79,29 @@ extension TeamOrchestrator {
         let registry = PeerPaneHostRegistry.shared
         let lease = try await registry.acquire(host.paneHostSpec)
         let panel: TerminalPanel
+        let attachedSurfaceID: Data
         do {
             let surfaces = try await PeerPaneSession.listSurfaces(on: lease)
-            guard let chosen = surfaces.first(where: { $0.attachable }) else {
+            // A host publishes a fixed roster of surfaces and each can be
+            // attached once, so a second agent on the same machine finds
+            // nothing free — usually the first one took the only shell. Ask
+            // for another rather than refusing: a host that can run one agent
+            // can run two, and the roster is a publishing detail, not a
+            // statement about capacity.
+            // Surfaces this app's agents already sit in. The host cannot tell
+            // us — a second attach is legal, so a busy surface looks exactly
+            // like a free one — but every one of them was attached from here.
+            let taken = Set(
+                teams.values
+                    .flatMap(\.agents)
+                    .filter { $0.hostKey == hostKey }
+                    .compactMap(\.remoteSurfaceID)
+            )
+            var chosen = surfaces.first { $0.attachable && !taken.contains($0.surfaceID) }
+            if chosen == nil, let source = surfaces.first?.surfaceID {
+                chosen = try await PeerPaneSession.spawnSurface(on: lease, splitting: source)
+            }
+            guard let chosen else {
                 registry.release(lease)
                 throw RemoteAgentError.noAttachableSurface(host.displayName)
             }
@@ -102,6 +122,7 @@ extension TeamOrchestrator {
                 throw RemoteAgentError.paneCreationFailed
             }
             panel = opened
+            attachedSurfaceID = chosen.surfaceID
         } catch {
             registry.release(lease)
             throw error
@@ -127,6 +148,7 @@ extension TeamOrchestrator {
             workspaceId: workspace.id,
             panelId: panel.id,
             createdAt: Date(),
+            remoteSurfaceID: attachedSurfaceID,
             hostKey: hostKey
         )
         guard adoptAgentMember(member, teamName: teamName) else {

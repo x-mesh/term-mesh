@@ -39,6 +39,16 @@ final class TeamOrchestrator: ObservableObject {
         var worktreeName: String?
         var worktreePath: String?
         var worktreeBranch: String?
+        /// The remote surface this agent's pane is attached to, when it runs
+        /// on a peer.
+        ///
+        /// A host's surface list says whether a surface *may* be attached, not
+        /// whether one already is — attaching twice is allowed on purpose, so
+        /// two people can watch the same terminal. That makes it indistinguishable
+        /// from a free one over the wire, and a second agent quietly landed in
+        /// the first one's shell: same pane, same directory, two agents typing
+        /// over each other. What this side attached, this side can remember.
+        var remoteSurfaceID: Data?
         /// The peer this agent's pane runs on (`ssh:root@jw-server`), or nil
         /// when it runs here.
         ///
