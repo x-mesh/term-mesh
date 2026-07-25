@@ -3080,6 +3080,27 @@ final class TeamOrchestrator: ObservableObject {
             ) { _, _ in }
         }
 
+        // A remote pane's composer is on another machine, and the inline form
+        // puts 5ms between the text and the Return — generous for a local PTY,
+        // nothing at all across a network. The Return arrives first and submits
+        // an empty prompt while the words are still in flight. It happened to
+        // work often enough to look fine, which is the worst way for a race to
+        // behave. Same two keystrokes, far enough apart to arrive in order.
+        if withReturn, panel.remoteHostKey != nil {
+            let delivered = sendTextToPanel(
+                workspaceId: workspaceId, panelId: panelId, text: text,
+                tabManager: tabManager, withReturn: false, retryCount: retryCount
+            ) { sent in
+                guard sent else { completion?(false); return }
+                DispatchQueue.main.asyncAfter(deadline: .now() + Self.remoteReturnGap) {
+                    TerminalController.shared.sendNamedKeyWithRetry(
+                        on: panel.surface, keyName: "return"
+                    ) { ok, _ in completion?(ok) }
+                }
+            }
+            return delivered
+        }
+
         // Normalize and send text via sendIMEText.
         // Note: when withReturn=false (team.delegate), only text is pasted — the Rust
         // CLI sends Return separately via team.send_key RPC using the reliable
@@ -3212,6 +3233,11 @@ final class TeamOrchestrator: ObservableObject {
     func pendingReturnTarget(teamName: String, agentName: String) -> AgentPaneIdentity? {
         pendingReturnTargets["\(teamName)/\(agentName)"]
     }
+
+    /// How long to leave between text and Return on a remote pane, so they
+    /// arrive in that order. Well past a peer round trip, well under the
+    /// unsubmitted-paste deadline below.
+    private static let remoteReturnGap: TimeInterval = 1.5
 
     /// How long a paste may sit unsubmitted before this side presses Return.
     ///
