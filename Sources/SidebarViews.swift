@@ -996,7 +996,7 @@ struct SidebarProjectsSection: View {
         .padding(.bottom, 4)
         .sheet(isPresented: $isCreatingProject) {
             NewProjectView(
-                onCreate: { name, directory, rows, source in
+                onCreate: { name, directory, rows, source, leader in
                     Task { @MainActor in
                         // The checkouts have to exist before anyone is sent to
                         // work in them: an agent whose directory is not there
@@ -1009,7 +1009,8 @@ struct SidebarProjectsSection: View {
                             named: name,
                             rows: prepared,
                             workingDirectory: directory,
-                            leaderMode: "repl",
+                            leaderMode: leader.mode,
+                            leaderModel: leader.model,
                             tabManager: tabManager
                         )
                     }

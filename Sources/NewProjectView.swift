@@ -21,7 +21,8 @@ struct NewProjectView: View {
         _ name: String,
         _ localDirectory: String,
         _ rows: [TeamAgentRow],
-        _ source: ProjectSource
+        _ source: ProjectSource,
+        _ leader: ProjectLeader
     ) -> Void
     let onClose: () -> Void
 
@@ -50,6 +51,15 @@ struct NewProjectView: View {
     /// dependency tree with several writers — and the collision is quiet until
     /// it is expensive.
     @State private var isolateAgents = true
+    /// Who runs the project.
+    ///
+    /// An agent CLI, not the manual console. A project's leader is the thing
+    /// that reads the work and decides who does what — that is the job of a
+    /// model, and the REPL is a keyboard shortcut list for a person driving by
+    /// hand. It stays on the menu for anyone who wants it and it is not what
+    /// starting a project means.
+    @State private var leaderCli = "claude"
+    @State private var leaderModel = AgentRolePreset.defaultModel(for: "claude")
 
     @ObservedObject private var presetManager = AgentRolePresetManager.shared
     @ObservedObject private var hostStore = RemoteHostStore.shared
@@ -79,6 +89,7 @@ struct NewProjectView: View {
                 VStack(alignment: .leading, spacing: 16) {
                     projectFields
                     Divider()
+                    leaderRow
                     TeamAgentComposer(
                         agents: $agents,
                         workingDirectory: trimmedDirectory,
@@ -105,6 +116,56 @@ struct NewProjectView: View {
         }
         .padding(.horizontal, 20)
         .padding(.vertical, 14)
+    }
+
+    private var leaderRow: some View {
+        HStack(spacing: 8) {
+            Text("Leader")
+                .font(.subheadline.bold())
+            Spacer()
+            Picker("", selection: Binding(
+                get: { leaderCli },
+                set: { newCli in
+                    let old = leaderCli
+                    leaderCli = newCli
+                    if AgentRolePreset.models(for: old) != AgentRolePreset.models(for: newCli) {
+                        leaderModel = AgentRolePreset.defaultModel(for: newCli)
+                    }
+                }
+            )) {
+                ForEach(AgentRolePreset.supportedCLIs, id: \.self) { cli in
+                    Text(cli.capitalized).tag(cli)
+                }
+                Text("REPL (manual)").tag("repl")
+            }
+            .labelsHidden()
+            .fixedSize()
+
+            if leaderCli != "repl" {
+                Picker("", selection: Binding(
+                    get: {
+                        let options = AgentRolePreset.models(for: leaderCli)
+                        guard options.contains(leaderModel) else {
+                            let fallback = AgentRolePreset.defaultModel(for: leaderCli)
+                            DispatchQueue.main.async { leaderModel = fallback }
+                            return fallback
+                        }
+                        return leaderModel
+                    },
+                    set: { leaderModel = $0 }
+                )) {
+                    ForEach(AgentRolePreset.models(for: leaderCli), id: \.self) { m in
+                        Text(AgentRolePreset.modelDisplayLabel(m, for: leaderCli)).tag(m)
+                    }
+                }
+                .labelsHidden()
+                .fixedSize()
+            } else {
+                Text("a console you drive by hand — no model")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+        }
     }
 
     private var projectFields: some View {
@@ -319,7 +380,8 @@ struct NewProjectView: View {
                         projectPath: trimmedDirectory,
                         gitURL: gitURL.trimmingCharacters(in: .whitespacesAndNewlines),
                         isolateAgents: isolateAgents
-                    )
+                    ),
+                    ProjectLeader(mode: leaderCli, model: leaderModel)
                 )
                 onClose()
             }

@@ -141,3 +141,12 @@ struct ProjectSource: Equatable {
     /// Whether each member gets its own checkout.
     var isolateAgents: Bool
 }
+
+/// What runs the project's leader pane.
+///
+/// `mode` is an agent CLI name (`claude`, `codex`, …) or `repl` for the manual
+/// console. `model` is meaningless for `repl` and ignored there.
+struct ProjectLeader: Equatable {
+    var mode: String
+    var model: String
+}
