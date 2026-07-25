@@ -1062,7 +1062,21 @@ final class TeamOrchestrator: ObservableObject {
             switch leaderMode {
             case "repl":
                 let scriptPath = leaderScriptPath(mode: "repl", workingDirectory: workingDirectory)
-                leaderCommand = scriptPath.map { "\($0) \(socketPath) \(name)" }
+                // Quoted, because all three parts can contain a space and this
+                // string is handed to a shell. The app bundle is the one that
+                // bites: `term-mesh DEV.app` splits into `…/Debug/term-mesh`
+                // plus arguments — and that path is a real file, the CLI, so
+                // the shell runs it, it prints `Unknown command: DEV`, and
+                // exits. The leader pane dies half a second after opening.
+                //
+                // A team with agent panes survives that, which is why it went
+                // unnoticed: the workspace still has something in it. A team
+                // whose members are all on another machine has nothing else
+                // yet, so the workspace closes with the leader and the team
+                // has nowhere to attach to.
+                leaderCommand = scriptPath.map {
+                    "\(Self.shellQuoted($0)) \(Self.shellQuoted(socketPath)) \(Self.shellQuoted(name))"
+                }
             case "claude":
                 if let claudePath = agentBinaryPath(cli: "claude") {
                     // Build system prompt from input agent specs (available before panes are created)
@@ -2100,6 +2114,11 @@ final class TeamOrchestrator: ObservableObject {
                 }
             }
         }
+    }
+
+    /// A string a shell will read back as exactly one argument.
+    static func shellQuoted(_ value: String) -> String {
+        "'" + value.replacingOccurrences(of: "'", with: "'\\''") + "'"
     }
 
     /// Find the leader script for the given mode.
