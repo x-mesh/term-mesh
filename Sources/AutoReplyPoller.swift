@@ -55,6 +55,9 @@ final class AutoReplyPoller {
         /// Whether a first-run prompt has already been answered here. Once
         /// only: a CLI asking twice is not a first run.
         var answeredStartupPrompt = false
+        /// When stray mouse reports were last cleared here, so a pane whose
+        /// scrollback still holds the old evidence is not reset every tick.
+        var healedMouseModesAt: Date?
     }
 
     /// How recently a pane must have printed to count as working. The poll runs
@@ -340,6 +343,7 @@ final class AutoReplyPoller {
             }
             state.lastScrollbackText = trimmed
             answerStartupPromptIfNeeded(panelId: panelId, state: state, text: trimmed, agentName: agentName)
+            healStrayMouseReportsIfNeeded(state: state, text: trimmed, agentName: agentName, at: now)
         }
         // An empty delta is not the same as nothing happening. `computeDelta`
         // assumes append-only scrollback, and an agent TUI is the opposite: it
@@ -363,6 +367,137 @@ final class AutoReplyPoller {
         if let ev = state.detector.tick(at: now) {
             tryEmit(panelId: panelId, state: state, event: ev,
                     teamName: teamName, agentName: agentName)
+        }
+    }
+
+    // MARK: - Stray mouse reports
+
+    /// Turn mouse reporting back off when the far end is visibly choking on it.
+    ///
+    /// An agent TUI asks this terminal to report mouse movement and asks it to
+    /// stop when it exits. An agent that does not exit — a crash, a `kill -9`,
+    /// a link dropped mid-run — never gets to ask, and the request stands. What
+    /// is left is a plain shell on the far side and a terminal here that sends
+    /// it `ESC [ < 35;47;44M` for every pixel the pointer crosses. The shell's
+    /// line editor swallows the escape it does not know and keeps the digits,
+    /// so a mouse dragged across the pane arrives over there as commands:
+    /// `35: command not found`, once per sample, indefinitely.
+    ///
+    /// Detected rather than predicted. The lifecycle points term-mesh can see —
+    /// attaching, releasing, losing a host — are already handled, and this is
+    /// the case it cannot see: the pane is fine, the link is fine, the program
+    /// that set the mode is gone. But the failure writes its own evidence into
+    /// the scrollback this poller is reading anyway, so the condition itself is
+    /// the trigger, and correcting it needs no theory about how the CLI died.
+    private func healStrayMouseReportsIfNeeded(
+        state: PanelState,
+        text: String,
+        agentName: String,
+        at now: Date
+    ) {
+        // Only where these bytes are ours to take back: on a peer pane this
+        // terminal holds the mode and the far shell merely suffers it. A local
+        // pane's modes belong to a process on this machine.
+        guard let panel = state.panel, panel.remoteHostKey != nil else { return }
+        if let last = state.healedMouseModesAt,
+           now.timeIntervalSince(last) < Self.mouseHealCooldown { return }
+        // Only the bottom of the screen, because `readScrollback` returns the
+        // whole history and the evidence stays in it long after the fact. Left
+        // unbounded, a pane that once had this would be reset every window
+        // forever — and the reset would eventually land on a *working* agent
+        // that had relaunched in the same pane and legitimately asked for the
+        // mouse. What makes the tail the right bound is that this failure only
+        // happens at a live prompt: a running TUI paints over the bottom of the
+        // screen, so its own display is what is found there instead.
+        guard Self.showsStrayMouseReports(inPaneText: Self.screenBottom(of: text)) else { return }
+        state.healedMouseModesAt = now
+        panel.surface.resetTerminal()
+        #if DEBUG
+        dlog("autoreply.mouse_modes_reset agent=\(agentName)")
+        #endif
+    }
+
+    /// The evidence stays on screen after the fix, so re-reading it must not
+    /// re-fire forever. One clearing per window is enough for a mode that only
+    /// gets set again by a program that also knows how to unset it.
+    private static let mouseHealCooldown: TimeInterval = 30
+
+    /// Whether this pane is showing mouse reports being run as commands.
+    ///
+    /// A shell reporting a *bare number* as an unknown command is the part that
+    /// cannot be anything else: it says the reports are arriving as input, not
+    /// merely appearing in output. Nothing fires without at least one, which is
+    /// what keeps a terminal that legitimately wants the mouse from having it
+    /// taken away.
+    ///
+    /// One alone is still a typo someone could plausibly make, so it needs
+    /// corroboration, and the two shapes this failure takes supply it
+    /// differently. Where the far shell reads each report as its own line the
+    /// evidence is a run of rejected numbers; where a drag arrives faster than
+    /// the prompt redraws, the reports run together on one line and the shell
+    /// only rejects the first. So: several rejected numbers, or one plus the
+    /// `<button>;<x>;<y>M` bodies behind it.
+    ///
+    /// English-only, and deliberately so: a shell in another language simply
+    /// fails this test and keeps its mode, which is the safe way to be wrong
+    /// about a pane that might be working.
+    nonisolated static func showsStrayMouseReports(inPaneText text: String) -> Bool {
+        var reportBodies = 0
+        var rejectedNumbers = 0
+        for line in text.split(separator: "\n", omittingEmptySubsequences: false) {
+            reportBodies += countMouseReportBodies(in: line)
+            if line.contains("command not found"), mentionsBareNumberCommand(String(line)) {
+                rejectedNumbers += 1
+            }
+        }
+        if rejectedNumbers >= 2 { return true }
+        return rejectedNumbers >= 1 && reportBodies >= 3
+    }
+
+    /// The last lines of a pane, roughly what is on screen now.
+    nonisolated static func screenBottom(of text: String, lines: Int = 40) -> String {
+        let all = text.split(separator: "\n", omittingEmptySubsequences: false)
+        guard all.count > lines else { return text }
+        return all.suffix(lines).joined(separator: "\n")
+    }
+
+    /// `35;47;44M` — three unsigned numbers and a trailing M or m, not part of
+    /// a longer number on either side.
+    nonisolated private static func countMouseReportBodies(in line: Substring) -> Int {
+        var count = 0
+        let chars = Array(line)
+        var i = 0
+        while i < chars.count {
+            guard chars[i].isNumber else { i += 1; continue }
+            if i > 0, chars[i - 1].isNumber || chars[i - 1] == ";" { i += 1; continue }
+            var j = i
+            var fields = 0
+            while j < chars.count {
+                var digits = 0
+                while j < chars.count, chars[j].isNumber { j += 1; digits += 1 }
+                guard digits > 0, digits <= 4 else { break }
+                fields += 1
+                if j < chars.count, chars[j] == ";" { j += 1; continue }
+                break
+            }
+            if fields == 3, j < chars.count, chars[j] == "M" || chars[j] == "m" {
+                count += 1
+                i = j + 1
+            } else {
+                i = max(j, i + 1)
+            }
+        }
+        return count
+    }
+
+    /// Whether a "command not found" line names a number rather than a program.
+    /// Covers both dialects: `bash: 35: command not found` and zsh's
+    /// `zsh: command not found: 35`.
+    nonisolated private static func mentionsBareNumberCommand(_ line: String) -> Bool {
+        let fields = line.split(whereSeparator: { $0 == ":" })
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+        return fields.contains { field in
+            !field.isEmpty && field.allSatisfy(\.isNumber)
         }
     }
 

@@ -1873,6 +1873,28 @@ final class TerminalSurface: Identifiable, ObservableObject {
         }
     }
 
+    /// Put a terminal left in a program's modes back to a plain one.
+    ///
+    /// A TUI turns on mouse reporting, the alternate screen and bracketed
+    /// paste, and turns them off again when it exits. A program that does not
+    /// exit — a crash, a `kill -9`, a link dropped mid-run — never gets to ask,
+    /// and the request stands. What is left on a peer pane is a plain shell at
+    /// the far end and a terminal here still reporting: every movement of the
+    /// pointer across the pane is sent over as `ESC [ < 35;47;44M`, the far
+    /// shell's line editor swallows the escape it does not know and keeps the
+    /// digits, and a mouse dragged across the pane arrives there as commands.
+    /// `35: command not found`, once per sample, for as long as it is stuck.
+    ///
+    /// The modes are held *here*, so this is a local repair — nothing is sent
+    /// to the far end, which has its own state and is not the thing that is
+    /// wrong. Ghostty's own action, the one behind the `reset` command: it
+    /// clears the mode set along with the screen, which is what makes it safe
+    /// to run more than once.
+    @discardableResult
+    func resetTerminal() -> Bool {
+        performBindingAction("reset")
+    }
+
     func hasSelection() -> Bool {
         guard let surface = surface else { return false }
         return ghostty_surface_has_selection(surface)

@@ -125,6 +125,10 @@ extension TeamOrchestrator {
             }
             panel = opened
             attachedSurfaceID = chosen.surfaceID
+            // The shell being attached to may have been left in a TUI's modes
+            // by whoever had it last — mouse reporting especially, which turns
+            // every movement over this pane into a command at the far prompt.
+            opened.surface.resetTerminal()
         } catch {
             registry.release(lease)
             throw error
@@ -246,6 +250,9 @@ extension TeamOrchestrator {
                 }
             }
             DispatchQueue.main.asyncAfter(deadline: .now() + 4.5) {
+                // Hand the shell back plain. The CLI restores these itself on
+                // a clean exit, and this is for every other kind.
+                panel?.surface.resetTerminal()
                 if let workspace, let panelId {
                     _ = workspace.closePanel(panelId, force: true)
                 }
