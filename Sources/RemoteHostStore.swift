@@ -429,6 +429,7 @@ final class RemoteHostStore: ObservableObject {
             }
         // Catch connections that opened before the sidebar first rendered.
         rebuild()
+        startRosterRefreshTicker()
     }
 
     deinit {
@@ -930,8 +931,10 @@ final class RemoteHostStore: ObservableObject {
     private func fetchWorkspaces(for hostSockPath: String, key: String) {
         fetchTasks[key]?.cancel()
         let path = hostSockPath
+        fetchInFlight.insert(key)
         // Task inherits @MainActor; await suspensions yield main without blocking it.
         fetchTasks[key] = Task {
+            defer { self.fetchInFlight.remove(key) }
             do {
                 let conn = try await PeerRelaySession.connect(hostSockPath: path)
                 // Record capability regardless of what listWorkspaces below does —
@@ -996,6 +999,48 @@ final class RemoteHostStore: ObservableObject {
             }
         }
     }
+
+    /// Hosts whose roster is being read right now. A refresh cancels the fetch
+    /// before it, which is right when the user just did something and wrong on
+    /// a timer: over a slow link the next tick would keep restarting a fetch
+    /// that never gets to finish.
+    private var fetchInFlight: Set<String> = []
+
+    /// How often to re-read what the connected peers are running.
+    ///
+    /// The roster was read on connect and whenever this app changed a
+    /// workspace itself, which covers everything except the thing that
+    /// actually happens: someone works on the peer. A team started over there,
+    /// a pane moved into a project — none of it appeared until the connection
+    /// was torn down and made again. Adding a remote agent kept offering an
+    /// empty directory for exactly this reason.
+    ///
+    /// A poll, because there is nothing to subscribe to: the host pushes
+    /// workspace changes only to attached mirror sessions, and the team roster
+    /// it does not push at all. Twenty seconds is chosen against what it costs
+    /// — a connect and two calls per host, over ssh — rather than against how
+    /// fresh it could be.
+    private static let rosterRefreshInterval: TimeInterval = 20
+
+    /// Re-read the roster of every connected host.
+    func refreshConnectedRosters() {
+        for host in hosts.values where host.isConnected {
+            let path = host.activeSockPath
+            guard !path.isEmpty, !fetchInFlight.contains(host.id) else { continue }
+            fetchWorkspaces(for: path, key: host.id)
+        }
+    }
+
+    private func startRosterRefreshTicker() {
+        rosterRefreshTicker?.invalidate()
+        let ticker = Timer(timeInterval: Self.rosterRefreshInterval, repeats: true) { [weak self] _ in
+            Task { @MainActor in self?.refreshConnectedRosters() }
+        }
+        RunLoop.main.add(ticker, forMode: .common)
+        rosterRefreshTicker = ticker
+    }
+
+    private var rosterRefreshTicker: Timer?
 
     /// Keep sidebar pane details and busy state in lockstep with an open live
     /// mirror. The mirror already receives each host layout push, so reuse it
