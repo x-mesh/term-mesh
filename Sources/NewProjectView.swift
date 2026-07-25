@@ -28,6 +28,9 @@ struct NewProjectView: View {
     @State private var directory: String = ""
     @State private var name: String = ""
     @State private var nameEdited = false
+    /// Whether the folder has been typed into directly, which stops the name
+    /// from moving it.
+    @State private var folderEdited = false
     @State private var agents: [TeamAgentRow] = []
     /// The machine this project lives on.
     ///
@@ -58,6 +61,13 @@ struct NewProjectView: View {
     private var effectiveName: String {
         let typed = name.trimmingCharacters(in: .whitespacesAndNewlines)
         if !typed.isEmpty { return typed }
+        // Empty in, empty out. `URL(fileURLWithPath: "")` resolves against the
+        // process directory and hands back "/" as its last component, which
+        // then appends to a project root as nothing at all — the predicted
+        // folder came out as the root itself, the name was read back off it,
+        // and every agent checkout landed as a sibling of the root rather than
+        // inside the project.
+        guard !trimmedDirectory.isEmpty else { return "" }
         return URL(fileURLWithPath: trimmedDirectory).lastPathComponent
     }
 
@@ -127,8 +137,14 @@ struct NewProjectView: View {
             GridRow {
                 Text(runsOnHostKey == nil ? "Folder" : "Folder on that machine")
                 HStack(spacing: 6) {
-                    TextField(folderPlaceholder, text: $directory)
-                        .textFieldStyle(.roundedBorder)
+                    TextField(
+                        folderPlaceholder,
+                        text: Binding(
+                            get: { directory },
+                            set: { directory = $0; folderEdited = true }
+                        )
+                    )
+                    .textFieldStyle(.roundedBorder)
                     // No panel for a remote path: this Mac cannot browse that
                     // machine's disk, and a picker that quietly shows the
                     // wrong filesystem is worse than none.
@@ -175,13 +191,30 @@ struct NewProjectView: View {
         }
         .onChange(of: directory) { _, newValue in
             guard !nameEdited else { return }
-            name = URL(fileURLWithPath: newValue.trimmingCharacters(in: .whitespacesAndNewlines))
-                .lastPathComponent
+            let trimmed = newValue.trimmingCharacters(in: .whitespacesAndNewlines)
+            let leaf = trimmed.isEmpty ? "" : URL(fileURLWithPath: trimmed).lastPathComponent
+            name = leaf == Self.placeholderProjectName ? "" : leaf
+        }
+        .onChange(of: name) { _, newName in
+            // Typing the name moves the folder with it, so `<root>/<name>` stays
+            // true without anyone having to edit the path by hand. Stops the
+            // moment the folder is edited directly — at that point the person
+            // has said where it goes and the name is not entitled to argue.
+            guard !folderEdited, !directory.isEmpty else { return }
+            let typed = newName.trimmingCharacters(in: .whitespacesAndNewlines)
+            let parent = (directory as NSString).deletingLastPathComponent
+            guard !parent.isEmpty else { return }
+            directory = (parent as NSString)
+                .appendingPathComponent(typed.isEmpty ? Self.placeholderProjectName : typed)
         }
         .onChange(of: runsOnHostKey) { _, newHost in
             applyRunsOn(newHost)
         }
     }
+
+    /// Stands in for a project name that has not been given yet, so the
+    /// predicted folder is a real path rather than the bare root.
+    static let placeholderProjectName = "new-project"
 
     /// Every machine that has been configured, connected or not.
     ///
@@ -227,6 +260,7 @@ struct NewProjectView: View {
     /// with its members here is not what anyone picked this for — and each row
     /// can still be moved back individually.
     private func applyRunsOn(_ hostKey: String?) {
+        folderEdited = false
         guard let hostKey else {
             for i in agents.indices {
                 agents[i].hostKey = nil
@@ -241,7 +275,11 @@ struct NewProjectView: View {
         if let host = selectablePeers.first(where: { $0.id == hostKey }), !host.isConnected {
             hostStore.connectSavedHost(host)
         }
-        let leaf = effectiveName.isEmpty ? "project" : effectiveName
+        // The folder is a machine's project root plus this project's name, and
+        // at this moment there is no name yet — nobody types one before saying
+        // where the project goes. So a placeholder stands in and the folder
+        // follows the name as it is typed, below.
+        let leaf = effectiveName.isEmpty ? Self.placeholderProjectName : effectiveName
         let predicted = PeerHostProfileStore.shared.profiles
             .first { $0.stableKey == hostKey }?
             .predictedProjectPath(forProjectNamed: leaf)
