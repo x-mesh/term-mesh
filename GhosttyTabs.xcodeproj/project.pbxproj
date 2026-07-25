@@ -22,6 +22,7 @@
 		A14000000000000000000002 /* ProjectSyncPanelView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A14000000000000000000005 /* ProjectSyncPanelView.swift */; };
 		A14000000000000000000003 /* ProjectSyncViewModelTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A14000000000000000000006 /* ProjectSyncViewModelTests.swift */; };
 		PPBT00000000000000003 /* PeerProjectBootstrapTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = PPBT00000000000000006 /* PeerProjectBootstrapTests.swift */; };
+		SMRT00000000000000003 /* StrayMouseReportTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = SMRT00000000000000006 /* StrayMouseReportTests.swift */; };
 		ASPT000000000000000003 /* AgentStartupPromptTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = ASPT000000000000000006 /* AgentStartupPromptTests.swift */; };
 		A17000000000000000000001 /* ReviewBoardModels.swift in Sources */ = {isa = PBXBuildFile; fileRef = A17000000000000000000005 /* ReviewBoardModels.swift */; };
 		A17000000000000000000002 /* ReviewBoardViewModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = A17000000000000000000006 /* ReviewBoardViewModel.swift */; };
@@ -303,6 +304,7 @@
 			A14000000000000000000005 /* ProjectSyncPanelView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ProjectSyncPanelView.swift; sourceTree = "<group>"; };
 			A14000000000000000000006 /* ProjectSyncViewModelTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ProjectSyncViewModelTests.swift; sourceTree = "<group>"; };
 			PPBT00000000000000006 /* PeerProjectBootstrapTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PeerProjectBootstrapTests.swift; sourceTree = "<group>"; };
+			SMRT00000000000000006 /* StrayMouseReportTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StrayMouseReportTests.swift; sourceTree = "<group>"; };
 			ASPT000000000000000006 /* AgentStartupPromptTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AgentStartupPromptTests.swift; sourceTree = "<group>"; };
 			A17000000000000000000005 /* ReviewBoardModels.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ReviewBoardModels.swift; sourceTree = "<group>"; };
 			A17000000000000000000006 /* ReviewBoardViewModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ReviewBoardViewModel.swift; sourceTree = "<group>"; };
@@ -856,6 +858,7 @@
 				FE000001A1B2C3D4E5F60718 /* PeerHostProfileDedupeTests.swift */,
 				A14000000000000000000006 /* ProjectSyncViewModelTests.swift */,
 				PPBT00000000000000006 /* PeerProjectBootstrapTests.swift */,
+				SMRT00000000000000006 /* StrayMouseReportTests.swift */,
 				ASPT000000000000000006 /* AgentStartupPromptTests.swift */,
 				A17000000000000000000008 /* ReviewBoardViewModelTests.swift */,
 				A17100000000000000000004 /* ReviewBoardCoordinatorServiceTests.swift */,
@@ -1219,6 +1222,7 @@
 				FE000000A1B2C3D4E5F60718 /* PeerHostProfileDedupeTests.swift in Sources */,
 				A14000000000000000000003 /* ProjectSyncViewModelTests.swift in Sources */,
 				PPBT00000000000000003 /* PeerProjectBootstrapTests.swift in Sources */,
+				SMRT00000000000000003 /* StrayMouseReportTests.swift in Sources */,
 				ASPT000000000000000003 /* AgentStartupPromptTests.swift in Sources */,
 				A17000000000000000000004 /* ReviewBoardViewModelTests.swift in Sources */,
 				A17100000000000000000002 /* ReviewBoardCoordinatorServiceTests.swift in Sources */,
