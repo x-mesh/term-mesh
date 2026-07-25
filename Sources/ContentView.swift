@@ -851,8 +851,38 @@ struct ContentView: View {
             Text(Self.appVersion)
                 .font(.system(size: 11, design: .monospaced))
                 .foregroundColor(titlebarColor(opacity: 0.4))
+
+            // Somewhere to click. The board's close button was the only
+            // control it had and closing was one-way; a menu item and a
+            // shortcut fix that for anyone who goes looking, which is not how
+            // a person finds their way back to a panel they dismissed by
+            // accident.
+            //
+            // Last in the row, on the same side as the panel it opens, and
+            // not inside the agent-rendering cluster where it would read as
+            // another thing about agents. Shown whether or not a team exists,
+            // because someone who closed the board needs the way back
+            // regardless of what is running.
+            titlebarInfoSeparator
+            Button(action: { ReviewBoardSettings.toggleVisible() }) {
+                Image(systemName: isReviewBoardShowing ? "sidebar.right" : "sidebar.squares.right")
+                    .font(.system(size: 11))
+                    .foregroundColor(isReviewBoardShowing
+                        ? .accentColor.opacity(0.9)
+                        : titlebarColor(opacity: 0.5))
+            }
+            .buttonStyle(.plain)
+            .help(isReviewBoardShowing ? "Hide Review Board (⌃⌘B)" : "Show Review Board (⌃⌘B)")
+            .accessibilityIdentifier("titlebar.reviewBoardToggle")
         }
         .lineLimit(1)
+    }
+
+    /// Whether the board is on screen, read from the same two keys
+    /// `ReviewBoardSettings` writes, so the button's look never disagrees with
+    /// what is actually showing.
+    private var isReviewBoardShowing: Bool {
+        isReviewBoardEnabled && !isReviewBoardClosed
     }
 
     private static let appVersion: String = {
