@@ -259,6 +259,101 @@ extension TeamOrchestrator {
         }
     }
 
+    /// Create a team from composed rows, wherever they run.
+    ///
+    /// The one place that turns `TeamAgentRow`s into a live team, because the
+    /// two callers that need it — the New Agent Team sheet and New Project —
+    /// would otherwise each carry their own copy of the same three subtleties:
+    /// composing the runbook instructions, holding remote members out of
+    /// `createTeam`, and attaching them once the workspace and team exist.
+    /// The first duplicate of this cost a workspace per project earlier today.
+    @discardableResult
+    func createTeam(
+        named teamName: String,
+        rows: [TeamAgentRow],
+        workingDirectory: String,
+        leaderMode: String,
+        leaderModel: String = "sonnet",
+        worktreeMode: String = "off",
+        executionMode: String = "pane",
+        resumeSessionId: String? = nil,
+        pairMode: String = "none",
+        pairModel: String = "",
+        pairSpec: String = "",
+        tabManager: TabManager
+    ) -> Team? {
+        // A remote pane is a peer surface pulled into this workspace, so it
+        // needs the workspace and the team to already exist. Spawning these
+        // locally and moving them would start each CLI on the wrong machine
+        // and then close it.
+        let remoteRows = rows.filter { $0.hostKey != nil }
+        let localTuples = rows.filter { $0.hostKey == nil }.map { row in
+            let customInstructions = row.customInstructions == row.preset.instructions
+                ? ""
+                : row.customInstructions
+            let effectiveInstructions = AgentRunbookService.shared.composeInstructions(
+                roleName: row.preset.name,
+                presetInstructions: row.preset.instructions,
+                customInstructions: customInstructions,
+                workingDirectory: workingDirectory,
+                mode: .digest
+            )
+            return (
+                name: row.preset.name,
+                cli: row.preset.cli,
+                model: row.preset.model,
+                agentType: row.preset.name,
+                color: row.preset.color,
+                // The custom instructions are composed into `instructions`
+                // above; passing them again would append the same spec twice.
+                instructions: effectiveInstructions,
+                customInstructions: ""
+            )
+        }
+
+        guard let team = createTeam(
+            name: teamName,
+            agents: localTuples,
+            workingDirectory: workingDirectory,
+            leaderSessionId: UUID().uuidString,
+            leaderMode: leaderMode,
+            leaderModel: leaderModel,
+            pairMode: pairMode,
+            pairModel: pairModel,
+            pairSpec: pairSpec,
+            resumeSessionId: resumeSessionId,
+            worktreeMode: worktreeMode,
+            executionMode: executionMode,
+            tabManager: tabManager
+        ) else { return nil }
+
+        for row in remoteRows {
+            guard let hostKey = row.hostKey else { continue }
+            let directory = row.hostDirectory.trimmingCharacters(in: .whitespacesAndNewlines)
+            Task { @MainActor in
+                do {
+                    _ = try await self.attachRemoteAgent(
+                        teamName: team.id,
+                        agentName: row.preset.name,
+                        hostKey: hostKey,
+                        // Its own path when one was given; the team's
+                        // otherwise, which is right when both machines lay the
+                        // project out the same way and visibly wrong when not.
+                        workingDirectory: directory.isEmpty ? workingDirectory : directory,
+                        agentType: row.preset.name,
+                        model: row.preset.model,
+                        cli: row.preset.cli
+                    )
+                } catch {
+                    RemoteWorkLog.info(
+                        "Could not start \(row.preset.name) on \(hostKey): \(error)"
+                    )
+                }
+            }
+        }
+        return team
+    }
+
     /// Say that work on this host has stopped, because the host has.
     ///
     /// An unreachable machine leaves its tasks looking exactly like tasks

@@ -932,6 +932,7 @@ struct SidebarProjectsSection: View {
     let usesSeparatedPresentation: Bool
     @AppStorage(SidebarLayoutSettings.localTabsCollapsedKey)
     private var isCollapsed = false
+    @State private var isCreatingProject = false
 
     var body: some View {
         VStack(spacing: 0) {
@@ -961,15 +962,12 @@ struct SidebarProjectsSection: View {
                 // is where work happens, so opening a folder is how one starts
                 // existing.
                 Button {
-                    // The New Agent Team sheet already is this: it takes a
-                    // working directory, composes as many agents as the
-                    // project needs from the role presets, and creates the
-                    // workspace and the team together. Opening a second,
-                    // lesser version of it here made two workspaces per
-                    // project — one with the team in it and one orphan — and
-                    // could only ever offer the agents somebody had already
-                    // saved a template for.
-                    NotificationCenter.default.post(name: .teamCreationRequested, object: nil)
+                    // A project's own questions, and the same agent composer
+                    // the team sheet uses for the rest. Pointing this at the
+                    // team sheet was closer than the duplicate before it, but
+                    // it still asked about pair mode and worktree isolation of
+                    // someone who had not chosen a folder yet.
+                    isCreatingProject = true
                 } label: {
                     Image(systemName: "plus")
                         .font(.system(size: 9, weight: .semibold))
@@ -996,6 +994,20 @@ struct SidebarProjectsSection: View {
             }
         }
         .padding(.bottom, 4)
+        .sheet(isPresented: $isCreatingProject) {
+            NewProjectView(
+                onCreate: { name, directory, rows in
+                    TeamOrchestrator.shared.createTeam(
+                        named: name,
+                        rows: rows,
+                        workingDirectory: directory,
+                        leaderMode: "repl",
+                        tabManager: tabManager
+                    )
+                },
+                onClose: { isCreatingProject = false }
+            )
+        }
     }
 
 }

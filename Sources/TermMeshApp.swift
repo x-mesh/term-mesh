@@ -248,80 +248,20 @@ struct TermMeshApp: App {
         let (defaultDir, defaultSource) = resolveDefaultWorkingDirectory(activeTabManager: activeTabManager)
         return TeamCreationView(
             onCreate: { teamName, leaderMode, leaderModel, agents, worktreeMode, executionMode, resumeSessionId, pairMode, pairModel, pairSpec, workingDirectory in
-                // Members bound to a peer are attached after the team exists —
-                // a remote pane is a peer surface pulled into this workspace,
-                // which needs the workspace and the team to already be there.
-                // They are held out of `createTeam` rather than spawned
-                // locally and moved, which would start the CLI on the wrong
-                // machine and then close it.
-                let remoteRows = agents.filter { $0.hostKey != nil }
-                let agentTuples: [(name: String, cli: String, model: String, agentType: String, color: String, instructions: String, customInstructions: String)] = agents.filter { $0.hostKey == nil }.map { row in
-                    let customInstructions = row.customInstructions == row.preset.instructions
-                        ? ""
-                        : row.customInstructions
-                    let effectiveInstructions = AgentRunbookService.shared.composeInstructions(
-                        roleName: row.preset.name,
-                        presetInstructions: row.preset.instructions,
-                        customInstructions: customInstructions,
-                        workingDirectory: workingDirectory,
-                        mode: .digest
-                    )
-                    return (
-                        name: row.preset.name,
-                        cli: row.preset.cli,
-                        model: row.preset.model,
-                        agentType: row.preset.name,
-                        color: row.preset.color,
-                        // GUI composes the custom instructions into `instructions`
-                        // above; pass empty here so createTeam's compose step does
-                        // not append the same spec a second time.
-                        instructions: effectiveInstructions,
-                        customInstructions: ""
-                    )
-                }
-                let leaderSessionId = UUID().uuidString
-                let team = TeamOrchestrator.shared.createTeam(
-                    name: teamName,
-                    agents: agentTuples,
+                TeamOrchestrator.shared.createTeam(
+                    named: teamName,
+                    rows: agents,
                     workingDirectory: workingDirectory,
-                    leaderSessionId: leaderSessionId,
                     leaderMode: leaderMode,
                     leaderModel: leaderModel,
+                    worktreeMode: worktreeMode,
+                    executionMode: executionMode,
+                    resumeSessionId: resumeSessionId,
                     pairMode: pairMode,
                     pairModel: pairModel,
                     pairSpec: pairSpec,
-                    resumeSessionId: resumeSessionId,
-                    worktreeMode: worktreeMode,
-                    executionMode: executionMode,
                     tabManager: activeTabManager
-                )
-                guard let team else { return false }
-                for row in remoteRows {
-                    guard let hostKey = row.hostKey else { continue }
-                    let directory = row.hostDirectory.trimmingCharacters(in: .whitespacesAndNewlines)
-                    Task { @MainActor in
-                        do {
-                            _ = try await TeamOrchestrator.shared.attachRemoteAgent(
-                                teamName: team.id,
-                                agentName: row.preset.name,
-                                hostKey: hostKey,
-                                // Its own path when one was given; the team's
-                                // otherwise, which is right when both machines
-                                // lay the project out the same way and visibly
-                                // wrong when they do not.
-                                workingDirectory: directory.isEmpty ? workingDirectory : directory,
-                                agentType: row.preset.name,
-                                model: row.preset.model,
-                                cli: row.preset.cli
-                            )
-                        } catch {
-                            RemoteWorkLog.info(
-                                "Could not start \(row.preset.name) on \(hostKey): \(error)"
-                            )
-                        }
-                    }
-                }
-                return true
+                ) != nil
             },
             onResume: { (result: [String: Any]) in
                 // The picker tags pane-mode resumes so we route to a separate

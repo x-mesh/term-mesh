@@ -513,6 +513,32 @@ extension TerminalController {
         var result: V2CallResult = .err(code: "internal_error", message: "not run", data: nil)
         _ = v2MainExec(timeout: 20) {
             MainActor.assumeIsolated {
+                // Mirrors what New Project's Create does: rows in, one
+                // workspace and one team out.
+                if let roles = (params["roles"] as? [String]), !roles.isEmpty {
+                    let presets = AgentRolePresetManager.shared.presets
+                    let rows: [TeamAgentRow] = roles.compactMap { role in
+                        guard let preset = presets.first(where: { $0.name == role }) else { return nil }
+                        return TeamAgentRow(preset: preset, customInstructions: "")
+                    }
+                    guard let tabManager = self.tabManager else {
+                        result = .err(code: "unavailable", message: "no TabManager", data: nil)
+                        return
+                    }
+                    let team = TeamOrchestrator.shared.createTeam(
+                        named: URL(fileURLWithPath: directory).lastPathComponent,
+                        rows: rows,
+                        workingDirectory: directory,
+                        leaderMode: "repl",
+                        tabManager: tabManager
+                    )
+                    result = .ok([
+                        "team": team?.id ?? "",
+                        "workspace_id": team?.workspaceId.uuidString ?? "",
+                        "rows": rows.map(\.preset.name),
+                    ])
+                    return
+                }
                 let manager = SavedTeamTemplateManager.shared
                 let template: SavedTeamTemplate? = templateName.flatMap { name in
                     manager.templates.first { $0.name == name }
