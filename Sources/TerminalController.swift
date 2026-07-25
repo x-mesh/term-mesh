@@ -1235,6 +1235,8 @@ class TerminalController {
         // coordinator registration, placement — without a person clicking.
         case "debug.team.attach_remote":
             return v2Result(id: id, self.v2DebugTeamAttachRemote(params: params))
+        case "debug.project.create":
+            return v2Result(id: id, self.v2DebugProjectCreate(params: params))
         case "debug.reviewboard.delegate":
             return v2Result(id: id, self.v2DebugReviewBoardDelegate(params: params))
         case "debug.reviewboard.reveal":

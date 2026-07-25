@@ -112,6 +112,7 @@
 		ARD00002 /* AutoReplyDetector.swift in Sources */ = {isa = PBXBuildFile; fileRef = ARD00001 /* AutoReplyDetector.swift */; };
 		ARE00002 /* AutoReplyEmit.swift in Sources */ = {isa = PBXBuildFile; fileRef = ARE00001 /* AutoReplyEmit.swift */; };
 		ARP00002 /* AutoReplyPoller.swift in Sources */ = {isa = PBXBuildFile; fileRef = ARP00001 /* AutoReplyPoller.swift */; };
+		SNPS0002 /* SidebarNewProjectSheet.swift in Sources */ = {isa = PBXBuildFile; fileRef = SNPS0001 /* SidebarNewProjectSheet.swift */; };
 		ASP00002 /* AgentStartupPrompt.swift in Sources */ = {isa = PBXBuildFile; fileRef = ASP00001 /* AgentStartupPrompt.swift */; };
 		TORA0002 /* TeamOrchestrator+RemoteAgent.swift in Sources */ = {isa = PBXBuildFile; fileRef = TORA0001 /* TeamOrchestrator+RemoteAgent.swift */; };
 		A5001702 /* DashboardController.swift in Sources */ = {isa = PBXBuildFile; fileRef = A5001703 /* DashboardController.swift */; };
@@ -384,6 +385,7 @@
 		ARD00001 /* AutoReplyDetector.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AutoReplyDetector.swift; sourceTree = "<group>"; };
 		ARE00001 /* AutoReplyEmit.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AutoReplyEmit.swift; sourceTree = "<group>"; };
 		ARP00001 /* AutoReplyPoller.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AutoReplyPoller.swift; sourceTree = "<group>"; };
+		SNPS0001 /* SidebarNewProjectSheet.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SidebarNewProjectSheet.swift; sourceTree = "<group>"; };
 		ASP00001 /* AgentStartupPrompt.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AgentStartupPrompt.swift; sourceTree = "<group>"; };
 		TORA0001 /* TeamOrchestrator+RemoteAgent.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "TeamOrchestrator+RemoteAgent.swift"; sourceTree = "<group>"; };
 		A5001703 /* DashboardController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DashboardController.swift; sourceTree = "<group>"; };
@@ -712,6 +714,7 @@
 				ARD00001 /* AutoReplyDetector.swift */,
 				ARE00001 /* AutoReplyEmit.swift */,
 				ARP00001 /* AutoReplyPoller.swift */,
+				SNPS0001 /* SidebarNewProjectSheet.swift */,
 				ASP00001 /* AgentStartupPrompt.swift */,
 				TORA0001 /* TeamOrchestrator+RemoteAgent.swift */,
 				ARB00001 /* AgentRunbookService.swift */,
@@ -1097,6 +1100,7 @@
 				ARD00002 /* AutoReplyDetector.swift in Sources */,
 				ARE00002 /* AutoReplyEmit.swift in Sources */,
 				ARP00002 /* AutoReplyPoller.swift in Sources */,
+				SNPS0002 /* SidebarNewProjectSheet.swift in Sources */,
 				ASP00002 /* AgentStartupPrompt.swift in Sources */,
 				TORA0002 /* TeamOrchestrator+RemoteAgent.swift in Sources */,
 				ARB00002 /* AgentRunbookService.swift in Sources */,

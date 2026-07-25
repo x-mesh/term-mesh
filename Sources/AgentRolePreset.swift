@@ -1071,7 +1071,35 @@ class SavedTeamTemplateManager: ObservableObject {
         return dir.appendingPathComponent("team-templates.json")
     }()
 
-    init() { load() }
+    init() {
+        load()
+        if templates.isEmpty {
+            templates = Self.builtInTemplates
+            save()
+        }
+    }
+
+    /// What a project gets when nobody has said otherwise.
+    ///
+    /// The list started empty, which made "choose a team" a choice between
+    /// nothing and nothing — and a new project inert, since every action on
+    /// one needs a team. A default is the whole point of offering the choice:
+    /// one executor on the CLI and model this app uses everywhere else, which
+    /// is what almost every project wants and what anyone wanting more will
+    /// edit rather than invent.
+    static let builtInTemplates: [SavedTeamTemplate] = [
+        SavedTeamTemplate(
+            name: "Default",
+            agents: [
+                SavedTeamTemplate.AgentSlot(
+                    roleName: "executor",
+                    cli: "claude",
+                    model: "sonnet",
+                    customInstructions: ""
+                )
+            ]
+        )
+    ]
 
     func save() {
         if let data = try? JSONEncoder().encode(templates) {

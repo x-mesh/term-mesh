@@ -502,6 +502,61 @@ extension TerminalController {
         return .ok(["started": true])
     }
 
+    /// Drive what the New Project sheet's Create button does, without the
+    /// sheet. The interesting half is the wiring — a workspace opened and a
+    /// team standing in it — and that is unreachable from a socket otherwise.
+    func v2DebugProjectCreate(params: [String: Any]) -> V2CallResult {
+        guard let directory = params["directory"] as? String, !directory.isEmpty else {
+            return .err(code: "invalid_params", message: "directory is required", data: nil)
+        }
+        let templateName = params["template"] as? String
+        var result: V2CallResult = .err(code: "internal_error", message: "not run", data: nil)
+        _ = v2MainExec(timeout: 20) {
+            MainActor.assumeIsolated {
+                let manager = SavedTeamTemplateManager.shared
+                let template: SavedTeamTemplate? = templateName.flatMap { name in
+                    manager.templates.first { $0.name == name }
+                } ?? manager.templates.first
+                guard let tabManager = self.tabManager else {
+                    result = .err(code: "unavailable", message: "no TabManager", data: nil)
+                    return
+                }
+                let workspace = tabManager.addWorkspace(workingDirectory: directory)
+                var payload: [String: Any] = [
+                    "workspace_id": workspace.id.uuidString,
+                    "templates_available": manager.templates.map(\.name),
+                ]
+                if let template {
+                    let agents = template.agents.map { slot in
+                        (
+                            name: slot.roleName,
+                            cli: slot.cli,
+                            model: slot.model,
+                            agentType: slot.roleName,
+                            color: AgentRolePresetManager.shared.presets
+                                .first { $0.name == slot.roleName }?.color ?? "green",
+                            instructions: "",
+                            customInstructions: slot.customInstructions
+                        )
+                    }
+                    let team = TeamOrchestrator.shared.createTeam(
+                        name: URL(fileURLWithPath: directory).lastPathComponent,
+                        agents: agents,
+                        workingDirectory: directory,
+                        leaderSessionId: UUID().uuidString,
+                        leaderMode: template.leaderMode,
+                        adoptedLeaderSurfaceId: workspace.focusedPanelId,
+                        tabManager: tabManager
+                    )
+                    payload["template"] = template.name
+                    payload["team"] = team?.id ?? ""
+                }
+                result = .ok(payload)
+            }
+        }
+        return result
+    }
+
     func v2DebugReviewBoardDelegate(params: [String: Any]) -> V2CallResult {
         guard let root = params["root"] as? String, !root.isEmpty,
               let title = params["title"] as? String, !title.isEmpty else {
