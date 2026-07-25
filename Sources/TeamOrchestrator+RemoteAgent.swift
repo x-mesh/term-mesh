@@ -456,11 +456,17 @@ extension TeamOrchestrator {
         workingDirectory: String
     ) -> String {
         let quotedDir = workingDirectory.replacingOccurrences(of: "'", with: "'\\''")
+        // `mkdir -p` before `cd`, because a project on another machine has
+        // usually not been made there yet. Without it `cd` failed, the `&&`
+        // short-circuited, and the CLI never started — leaving a pane that
+        // looked attached and was a dead shell, with the reason one scroll up.
+        // Idempotent, so an existing directory costs nothing.
+        let enter = "mkdir -p '\(quotedDir)' && cd '\(quotedDir)'"
         switch cli {
         case "codex":
-            return "cd '\(quotedDir)' && codex --model \(model)"
+            return "\(enter) && codex --model \(model)"
         default:
-            return "cd '\(quotedDir)' && claude --model \(model) --dangerously-skip-permissions"
+            return "\(enter) && claude --model \(model) --dangerously-skip-permissions"
         }
     }
 
