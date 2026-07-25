@@ -176,6 +176,8 @@ extension TerminalController {
             return sendKeyEvent(surface: surface, keycode: UInt32(kVK_ANSI_C), mods: GHOSTTY_MODS_CTRL)
         case "ctrl-d", "ctrl+d", "eof":
             return sendKeyEvent(surface: surface, keycode: UInt32(kVK_ANSI_D), mods: GHOSTTY_MODS_CTRL)
+        case "ctrl-u", "ctrl+u", "kill-line":
+            return sendKeyEvent(surface: surface, keycode: UInt32(kVK_ANSI_U), mods: GHOSTTY_MODS_CTRL)
         case "ctrl-z", "ctrl+z", "sigtstp":
             return sendKeyEvent(surface: surface, keycode: UInt32(kVK_ANSI_Z), mods: GHOSTTY_MODS_CTRL)
         case "ctrl-\\", "ctrl+\\", "sigquit":

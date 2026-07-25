@@ -74,6 +74,39 @@ final class AutoReplyPoller {
         return now.timeIntervalSince(last) <= Self.activityWindow
     }
 
+    /// Text a person has typed into this agent's composer and not sent.
+    ///
+    /// An agent pane is a terminal, and people use it — they ask the agent
+    /// something directly, or start typing and stop. A capsule pasted on top
+    /// of that lands *after* their words, and what gets submitted is the two
+    /// mashed together: the person's half-thought and the leader's task, one
+    /// garbled prompt. The agent answers something nobody asked, prints a
+    /// header for it, and the task it was actually given never closes.
+    ///
+    /// Read from the snapshot this poller already holds, so asking costs
+    /// nothing. Nil when the pane is not being watched or the composer is
+    /// empty — and nil on a CLI whose composer this does not recognise, which
+    /// is the safe way to be wrong.
+    func composerDraft(panelId: UUID) -> String? {
+        guard let text = perPanel[panelId]?.lastScrollbackText else { return nil }
+        return Self.composerDraft(inPaneText: text)
+    }
+
+    /// Prompt markers agent CLIs put in front of their input line.
+    private static let composerMarkers: [Character] = ["❯", "›", "»", ">"]
+
+    static func composerDraft(inPaneText text: String) -> String? {
+        // The last line that looks like a composer wins: the pane is redrawn
+        // in place, so earlier ones are history.
+        for raw in text.split(separator: "\n", omittingEmptySubsequences: false).reversed() {
+            let line = raw.trimmingCharacters(in: .whitespaces)
+            guard let first = line.first, composerMarkers.contains(first) else { continue }
+            let draft = String(line.dropFirst()).trimmingCharacters(in: .whitespaces)
+            return draft.isEmpty ? nil : draft
+        }
+        return nil
+    }
+
     private init() {
         self.enabled = Self.computeEnabled()
     }

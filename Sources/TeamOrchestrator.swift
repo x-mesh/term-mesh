@@ -3051,6 +3051,24 @@ final class TeamOrchestrator: ObservableObject {
             return false
         }
 
+        // Someone's unsent words are in the way. Pasting over them makes one
+        // garbled prompt out of two thoughts, so the draft goes first — and
+        // is said out loud, because it was a person's and it is being thrown
+        // away. Ctrl+U only goes out when there is something to clear, which
+        // keeps a stray control character off the normal path.
+        if let draft = AutoReplyPoller.shared.composerDraft(panelId: panelId) {
+            Logger.team.warning(
+                "[sendTextToPanel] discarding unsent composer draft in \(panelId.uuidString.prefix(8), privacy: .public): \(draft, privacy: .public)"
+            )
+#if DEBUG
+            dlog("composer.cleared panel=\(panelId.uuidString.prefix(8)) draft=\(draft.prefix(60).debugDescription)")
+#endif
+            TerminalController.shared.sendNamedKeyWithRetry(
+                on: panel.surface,
+                keyName: "ctrl-u"
+            ) { _, _ in }
+        }
+
         // Normalize and send text via sendIMEText.
         // Note: when withReturn=false (team.delegate), only text is pasted — the Rust
         // CLI sends Return separately via team.send_key RPC using the reliable

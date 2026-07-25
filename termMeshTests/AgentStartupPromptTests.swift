@@ -39,3 +39,41 @@ final class AgentStartupPromptTests: XCTestCase {
         XCTAssertNil(AgentStartupPrompt.detect(in: "STATUS: DONE\nFILES: none\n"))
     }
 }
+
+
+@MainActor
+final class ComposerDraftTests: XCTestCase {
+    private func pane(_ composer: String) -> String {
+        """
+          STATUS: DONE
+          FILES: none
+
+        ✻ Worked for 4s
+
+        ────────────────────────────────
+        ❯ \(composer)
+        ────────────────────────────────
+          root@jw-server:~/remote-demo (master) Sonnet 5
+        """
+    }
+
+    func test_finds_what_a_person_typed_and_did_not_send() {
+        XCTAssertEqual(
+            AutoReplyPoller.composerDraft(inPaneText: pane("data.txt 내용도 보여줘")),
+            "data.txt 내용도 보여줘"
+        )
+    }
+
+    func test_an_empty_composer_is_not_a_draft() {
+        XCTAssertNil(AutoReplyPoller.composerDraft(inPaneText: pane("")))
+    }
+
+    func test_takes_the_last_composer_because_the_pane_redraws() {
+        let text = "❯ old thought\n────\n❯ current thought"
+        XCTAssertEqual(AutoReplyPoller.composerDraft(inPaneText: text), "current thought")
+    }
+
+    func test_a_pane_with_no_composer_reports_nothing() {
+        XCTAssertNil(AutoReplyPoller.composerDraft(inPaneText: "STATUS: DONE\nFILES: none\n"))
+    }
+}
