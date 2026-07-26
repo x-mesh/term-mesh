@@ -366,6 +366,108 @@ final class AgentSessionTests: XCTestCase {
         XCTAssertNil(seen[1])
     }
 
+    // MARK: - The instruction the agent is given
+
+    /// The block exists for one reason, and its own comment in the CLI says
+    /// so: the pane path cannot detect completion, so the agent is told to
+    /// announce it by running a shell command. Held natively the turn
+    /// announces its own end and the task is closed before the agent could run
+    /// anything — measured, it ran the command anyway and got `no_active_task`
+    /// back, a guaranteed-failing tool call on every turn.
+    func testTheShellCommandDemandIsDroppedForANativeAgent() {
+        let instruction = """
+            Write about 150 words on tangerines.
+
+            [REQUIRED FINAL STEP — you MUST run this shell command before stopping]
+            ```
+            tm-agent reply 'STATUS: DONE|BLOCKED|NEEDS_REVIEW
+            FILES: <changed paths or none>
+
+            <concise summary body>'
+            ```
+            Without running this shell command the leader cannot detect completion — the task hangs and wait times out.
+
+            ## Task Capsule
+            TASK_ID: e82188a0
+            """
+        let cleaned = TeamOrchestrator.withoutTerminalProtocol(instruction)
+
+        XCTAssertFalse(cleaned.contains("tm-agent reply"),
+                       "the command cannot succeed and its failure is noise")
+        XCTAssertFalse(cleaned.contains("cannot detect completion"),
+                       "and it is not true here")
+        // What the header is for still matters — the verdict is the agent's
+        // and nothing else can supply it — so the block is replaced, not cut.
+        XCTAssertTrue(cleaned.contains("STATUS: DONE|BLOCKED|NEEDS_REVIEW"))
+        XCTAssertTrue(cleaned.contains("FULL_REPORT:"))
+        // Everything around it survives, including the capsule that names the
+        // task the reply will close.
+        XCTAssertTrue(cleaned.contains("Write about 150 words on tangerines."))
+        XCTAssertTrue(cleaned.contains("TASK_ID: e82188a0"))
+    }
+
+    /// The capsule closes by repeating the demand, and its wording — "not by
+    /// printing the header in your reply" — is now the exact opposite of what
+    /// this path wants, since printing it is the only thing that is read.
+    func testTheClosingReminderGoesToo() {
+        let instruction = """
+            [REQUIRED FINAL STEP — you MUST run this shell command before stopping]
+            ```
+            tm-agent reply 'STATUS: DONE'
+            ```
+            Without running this shell command the leader cannot detect completion.
+
+            ## Task Capsule
+            TASK_ID: e82188a0
+
+            [REMINDER] Finish by actually running the `tm-agent reply '...'` shell command shown at the top — not by printing the header in your reply.
+            """
+        let cleaned = TeamOrchestrator.withoutTerminalProtocol(instruction)
+        XCTAssertFalse(cleaned.contains("[REMINDER]"))
+        XCTAssertFalse(cleaned.contains("tm-agent reply"))
+        XCTAssertTrue(cleaned.contains("TASK_ID: e82188a0"))
+        XCTAssertTrue(cleaned.contains("STATUS: DONE|BLOCKED|NEEDS_REVIEW"))
+    }
+
+    /// The CLI has three copies of this block and they do not agree word for
+    /// word, so it is read by shape. This is the `broadcast` wording.
+    func testEveryWordingOfTheBlockIsRecognised() {
+        let broadcast = """
+            do the thing
+
+            [REQUIRED FINAL STEP — every recipient MUST run this shell command before stopping]
+            ```
+            tm-agent reply 'STATUS: DONE'
+            ```
+            Without running this shell command the leader cannot detect completion.
+
+            tail
+            """
+        let cleaned = TeamOrchestrator.withoutTerminalProtocol(broadcast)
+        XCTAssertFalse(cleaned.contains("tm-agent reply"))
+        XCTAssertTrue(cleaned.contains("do the thing"))
+        XCTAssertTrue(cleaned.contains("tail"))
+    }
+
+    /// A plain instruction is untouched — most turns never carry the block.
+    func testAnInstructionWithoutTheBlockIsUnchanged() {
+        let plain = "have a look at the build and tell me what broke"
+        XCTAssertEqual(TeamOrchestrator.withoutTerminalProtocol(plain), plain)
+    }
+
+    /// A truncated block is left alone rather than half-removed. Cutting from
+    /// a marker to the end of the text would take the task capsule with it.
+    func testAnUnterminatedBlockIsLeftAlone() {
+        let broken = """
+            do the thing
+
+            [REQUIRED FINAL STEP — you MUST run this shell command before stopping]
+            ```
+            tm-agent reply 'STATUS: DONE
+            """
+        XCTAssertEqual(TeamOrchestrator.withoutTerminalProtocol(broken), broken)
+    }
+
     // MARK: - The wire
 
     func testATurnGoesOutAsOneLineOfNdjson() throws {

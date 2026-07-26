@@ -763,6 +763,8 @@ final class TeamOrchestrator: ObservableObject {
             // The turn states its own end and carries its final text, so the
             // reply is read from that rather than scraped off a screen.
             agentPanel.session.onTurnEnd = { [teamName, agentName] final, _, taskId in
+                Self.fileReport(teamName: teamName, agentName: agentName,
+                                taskId: taskId, text: final)
                 AutoReplyEmit.emit(
                     teamName: teamName,
                     agentName: agentName,
@@ -2655,20 +2657,8 @@ final class TeamOrchestrator: ObservableObject {
         // terminal fork after it would type at nothing.
         if let panelId = agent.panelId,
            let agentPanel = nativeAgentPanel(workspaceId: agent.workspaceId, panelId: panelId) {
-            do {
-                _ = try agentPanel.session.send(text, from: .leader)
-                #if DEBUG
-                dlog("agent.native.deliver agent=\(agent.id) chars=\(text.count)")
-                #endif
-                completion?(true)
-                return true
-            } catch {
-                #if DEBUG
-                dlog("agent.native.deliver.FAILED agent=\(agent.id) err=\(error)")
-                #endif
-                completion?(false)
-                return false
-            }
+            return deliverNatively(agentPanel, agentId: agent.id, text: text,
+                                   completion: completion)
         }
         if AgentPipeTransport.isDriven(agentId: agent.id) {
             do {
@@ -2755,6 +2745,10 @@ final class TeamOrchestrator: ObservableObject {
         // in-flight accounting to keep a restart from cutting a paste in half.
         // Those exist to get text through a terminal intact; a write to a FIFO
         // either lands whole or reports why it did not.
+        if let native = nativeAgentPanel(workspaceId: workspaceId, panelId: panelId) {
+            return deliverNatively(native, agentId: native.agentName, text: text,
+                                   completion: completion)
+        }
         if let agent = pipeDrivenAgent(teamName: teamName, panelId: panelId) {
             do {
                 AgentPipeCompletion.shared.expect(agentId: agent.id, instruction: text)
@@ -3112,6 +3106,111 @@ final class TeamOrchestrator: ObservableObject {
     /// Exponential backoff delays (ms) for surface-nil retry in sendTextToPanel.
     /// 4 attempts: 50 → 150 → 400 → 800 ms (total ~1.4 s before final failure).
     private static let sendTextRetryDelaysMs: [Double] = [50, 150, 400, 800]
+
+    /// Hand a turn to an agent this side is holding.
+    ///
+    /// Both entry points need it. `team.send` resolves by name; broadcast and
+    /// panel-targeted delegate resolve by panel — and only the first had this,
+    /// so the others fell through to the pipe fork, found no FIFO, waited out
+    /// the readiness timeout and failed.
+    private func deliverNatively(_ panel: AgentPanel, agentId: String, text: String,
+                                 completion: ((Bool) -> Void)?) -> Bool {
+        do {
+            _ = try panel.session.send(Self.withoutTerminalProtocol(text), from: .leader)
+            #if DEBUG
+            dlog("agent.native.deliver agent=\(agentId) chars=\(text.count)")
+            #endif
+            completion?(true)
+            return true
+        } catch {
+            #if DEBUG
+            dlog("agent.native.deliver.FAILED agent=\(agentId) err=\(error)")
+            #endif
+            completion?(false)
+            return false
+        }
+    }
+
+    /// Drop the "you MUST run `tm-agent reply`" block from an instruction.
+    ///
+    /// That block exists for one reason, and its own comment says so: the pane
+    /// path cannot detect completion, so the agent is told to announce it by
+    /// running a shell command. Here the turn announces its own end and the
+    /// task is already closed by the time the agent could run anything —
+    /// measured, the agent ran it anyway and got `no_active_task` back, a
+    /// guaranteed-failing tool call on every single turn.
+    ///
+    /// It is not merely noise, it is false: it tells the agent the leader
+    /// cannot see it finish. What the header is *for* still matters, so the
+    /// block is replaced rather than deleted — the verdict is the agent's and
+    /// nothing else can supply it.
+    static func withoutTerminalProtocol(_ text: String) -> String {
+        var lines = text.components(separatedBy: "\n")
+        guard let start = lines.firstIndex(where: {
+            $0.hasPrefix("[REQUIRED FINAL STEP")
+        }) else { return text }
+
+        // A bracketed line, a fenced example, then one paragraph of prose about
+        // why the command matters. Read by shape rather than by matching the
+        // wording, because there are three copies of it — two in the Rust CLI,
+        // one here — and they do not agree word for word.
+        var end = start + 1
+        var fences = 0
+        while end < lines.count, fences < 2 {
+            if lines[end].hasPrefix("```") { fences += 1 }
+            end += 1
+        }
+        guard fences == 2 else { return text }
+        while end < lines.count,
+              !lines[end].trimmingCharacters(in: .whitespaces).isEmpty {
+            end += 1
+        }
+
+        lines.replaceSubrange(start..<end, with: [
+            "[FINAL LINE — end your reply with this header]",
+            "STATUS: DONE|BLOCKED|NEEDS_REVIEW",
+            "FILES: <changed paths or none>",
+            "VERIFY: <single shell command or n/a>",
+            "NEXT: <action or NONE>",
+            "FULL_REPORT: <result file path or n/a>",
+        ])
+        // The capsule closes by repeating the demand — "not by printing the
+        // header in your reply" — which is now the opposite of what is wanted.
+        lines.removeAll { $0.hasPrefix("[REMINDER]") && $0.contains("tm-agent reply") }
+        return lines.joined(separator: "\n")
+    }
+
+    /// File a turn's full text where the leader looks for it.
+    ///
+    /// Written by the CLI until now, as a side effect of the agent running
+    /// `tm-agent reply`. Dropping that command from the instruction — because
+    /// it can only fail here — took the file with it, and the leader's
+    /// documented way to read a full report is `cat
+    /// ~/.term-mesh/results/<team>/<task_id>.md`. Replies are truncated to
+    /// 1500 characters over the socket, so without the file a long report is
+    /// simply gone.
+    ///
+    /// Both names, as the CLI writes them: the task's, and the agent's latest.
+    static func fileReport(teamName: String, agentName: String,
+                           taskId: String?, text: String) {
+        let dir = URL(fileURLWithPath: NSHomeDirectory())
+            .appendingPathComponent(".term-mesh/results", isDirectory: true)
+            .appendingPathComponent(safeFilename(teamName), isDirectory: true)
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        var names = ["\(safeFilename(agentName))-reply.md"]
+        if let taskId, !taskId.isEmpty { names.append("\(safeFilename(taskId)).md") }
+        for name in names {
+            try? text.write(to: dir.appendingPathComponent(name),
+                            atomically: true, encoding: .utf8)
+        }
+    }
+
+    /// Same character set the CLI allows, so a name written by one side is
+    /// found by the other.
+    private static func safeFilename(_ value: String) -> String {
+        let safe = value.filter { $0.isLetter || $0.isNumber || $0 == "-" || $0 == "_" || $0 == "." }
+        return safe.isEmpty ? "unknown" : safe
+    }
 
     /// Whether a turn to this agent still needs a Return pressed after it.
     ///
