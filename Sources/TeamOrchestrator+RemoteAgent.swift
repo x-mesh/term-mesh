@@ -66,7 +66,13 @@ extension TeamOrchestrator {
         do {
             let surfaces = try await PeerPaneSession.listSurfaces(on: lease)
             var chosen = surfaces.first(where: \.attachable)
-            if let source = surfaces.first?.surfaceID,
+            // A project leader needs one remote surface, not a transient
+            // shell followed by a second relay surface. Reuse an attachable
+            // surface first; only split when the host has none left. The
+            // local placeholder is replaced in place below and stays the
+            // project's relay pane until the project closes.
+            if chosen == nil,
+               let source = surfaces.first?.surfaceID,
                let fresh = try await PeerPaneSession.spawnSurface(on: lease, splitting: source) {
                 chosen = fresh
             }
