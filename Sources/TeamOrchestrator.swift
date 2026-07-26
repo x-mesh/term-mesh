@@ -688,6 +688,25 @@ final class TeamOrchestrator: ObservableObject {
             }
         }
 
+        // A CLI that has to be spoken to rather than written at runs behind the
+        // bridge, which owns its stdio, speaks its protocol, and emits claude's
+        // event shape so nothing upstream has to learn a second vocabulary.
+        if AgentPipeTransport.canDrive(cli: agentCli),
+           AgentPipeTransport.needsBridge(cli: agentCli),
+           let bridge = AgentPipeTransport.bridgePath(workingDirectory: agentWorkDir) {
+            AgentPipeTransport.prepareDirectory()
+            agentCommand = AgentPipeTransport.bridgeLaunchCommand(
+                cli: agentCli,
+                fifoPath: AgentPipeTransport.fifoPath(agentId: agentId),
+                model: agentModel,
+                bridgePath: bridge,
+                rendererPath: AgentPipeTransport.rendersOutput
+                    ? AgentPipeTransport.rendererPath(workingDirectory: agentWorkDir)
+                    : nil,
+                workingDirectory: agentWorkDir
+            )
+        }
+
         // Wrap so the terminal stays open (drops to shell) if the CLI exits.
         // When a worktree is active, build a login-shell invocation with explicit
         // `cd` to guarantee the agent CLI starts in the worktree directory.

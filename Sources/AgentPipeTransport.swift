@@ -30,12 +30,32 @@ enum AgentPipeTransport {
         UserDefaults.standard.bool(forKey: enabledKey)
     }
 
-    /// Only claude has been measured. The others have channels of their own —
-    /// codex `app-server`, kiro `acp`, cursor `--resume` — and each speaks a
-    /// different vocabulary, so each needs its own adapter and its own
-    /// measurement before it is claimed to work.
+    /// Which CLIs have been measured taking turns this way.
+    ///
+    /// Claude is one-directional — a line of NDJSON on stdin is the whole
+    /// delivery — so it needs nothing but the FIFO. Codex and Kiro are
+    /// request/response: `thread/start` hands back an id every later
+    /// `turn/start` must carry, `session/new` the same for `session/prompt`.
+    /// Delivering a turn means reading the replies, which a one-way pipe
+    /// cannot do, so those two run behind a bridge that owns the child's stdio
+    /// and speaks for it.
+    ///
+    /// Cursor is absent on purpose: it has no stdio channel at all. A turn is
+    /// a process there, resumed by a session id it hands back — a third shape,
+    /// and not this one.
     static func supports(cli: String) -> Bool {
-        cli == "claude"
+        cli == "claude" || needsBridge(cli: cli)
+    }
+
+    /// CLIs whose protocol has to be spoken, not just written to.
+    static func needsBridge(cli: String) -> Bool {
+        cli == "codex" || cli == "kiro"
+    }
+
+    /// The bridge, found next to the app or in the repo it was built from.
+    static func bridgePath(workingDirectory: String) -> String? {
+        script(named: "scripts/spike/tm-agent-bridge.py",
+               workingDirectory: workingDirectory)
     }
 
     static func canDrive(cli: String) -> Bool {
@@ -61,13 +81,49 @@ enum AgentPipeTransport {
 
     /// The filter, found next to the app or in the repo it was built from.
     static func rendererPath(workingDirectory: String) -> String? {
-        let name = "scripts/spike/tm-render-claude.py"
+        script(named: "scripts/spike/tm-render-claude.py",
+               workingDirectory: workingDirectory)
+    }
+
+    private static func script(named name: String, workingDirectory: String) -> String? {
         var candidates: [String] = []
         if let res = Bundle.main.resourcePath {
             candidates.append((res as NSString).appendingPathComponent(name))
         }
         candidates.append((workingDirectory as NSString).appendingPathComponent(name))
         return candidates.first { FileManager.default.isReadableFile(atPath: $0) }
+    }
+
+    /// The launch line for a CLI that has to be spoken to rather than written
+    /// at. The bridge holds the FIFO, the protocol and the normalising, and
+    /// emits claude's event shape — so everything upstream, including the
+    /// renderer and the completion watcher, stays single-vocabulary.
+    static func bridgeLaunchCommand(
+        cli: String,
+        fifoPath: String,
+        model: String,
+        bridgePath: String,
+        rendererPath: String?,
+        workingDirectory: String
+    ) -> String {
+        var run = "/usr/bin/env python3 \(quoted(bridgePath))"
+            + " --cli \(quoted(cli))"
+            + " --fifo \(quoted(fifoPath))"
+            + " --events \(quoted(fifoPath + ".events"))"
+            + " --cwd \(quoted(workingDirectory))"
+        if !model.isEmpty { run += " --model \(quoted(model))" }
+        if let rendererPath {
+            run += " 2>&1 | /usr/bin/env python3 \(quoted(rendererPath))"
+        }
+        let f = quoted(fifoPath)
+        let chain = [
+            "rm -f \(f)",
+            "mkdir -p \(quoted((fifoPath as NSString).deletingLastPathComponent))",
+            "mkfifo -m 600 \(f)",
+            run,
+        ].joined(separator: " && ")
+        let shell = ProcessInfo.processInfo.environment["SHELL"] ?? "/bin/zsh"
+        return "\(quoted(shell)) -c \(quoted(chain))"
     }
 
     // MARK: - Where the pipe lives
