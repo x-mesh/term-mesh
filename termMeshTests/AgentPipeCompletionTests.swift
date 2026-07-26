@@ -80,6 +80,35 @@ final class AgentPipeCompletionTests: XCTestCase {
         XCTAssertEqual(event.status, "BLOCKED")
     }
 
+    /// The failure a real codex turn produced.
+    ///
+    /// It answered `STATUS: DONE|FILES: none|VERIFY: n/a|NEXT: NONE|
+    /// FULL_REPORT: n/a` on one line, and a line-based parser reads that status
+    /// as everything after "DONE". The cause was the template writing
+    /// `DONE|BLOCKED|NEEDS_REVIEW`, where the bar means "pick one" — codex read
+    /// it as the separator. That wording is fixed; this is the safety net,
+    /// because models improvise.
+    func testAHeaderPackedOntoOneLineStillParses() {
+        let event = AgentPipeCompletion.headerEvent(
+            from: "내 CLI는 Codex CLI입니다.\n\nSTATUS: DONE|FILES: none|VERIFY: n/a|NEXT: NONE|FULL_REPORT: n/a")
+        XCTAssertEqual(event.status, "DONE")
+        XCTAssertEqual(event.files, "none")
+        XCTAssertEqual(event.next, "NONE")
+    }
+
+    /// A pipeline in a VERIFY command is not a packed header. Splitting on
+    /// every bar would cut the command in half.
+    func testAPipeInsideAFieldIsNotASeparator() {
+        let event = AgentPipeCompletion.headerEvent(from: """
+            STATUS: DONE
+            FILES: none
+            VERIFY: swift build 2>&1 | grep error
+            NEXT: NONE
+            FULL_REPORT: n/a
+            """)
+        XCTAssertEqual(event.verify, "swift build 2>&1 | grep error")
+    }
+
     // MARK: - Which task the answer belongs to
 
     /// The correlation the scrollback path can never make.

@@ -745,7 +745,12 @@ final class TeamOrchestrator: ObservableObject {
         // shell inside a PTY inside it. Everything below — the shell wrapper,
         // the pane env, the FIFO — is what a terminal host needs; a native pane
         // needs a process and somewhere to draw it.
-        if AgentPipeTransport.canHoldNatively(cli: agentCli),
+        // A bridged CLI with no bridge script on disk cannot be held here, and
+        // falling through to the terminal is the right answer rather than
+        // opening a pane with nothing in it.
+        let bridgeReady = !AgentPipeTransport.needsBridge(cli: agentCli)
+            || AgentPipeTransport.bridgePath(workingDirectory: agentWorkDir) != nil
+        if AgentPipeTransport.canHoldNatively(cli: agentCli), bridgeReady,
            let agentPanel = workspace.newAgentSplit(
                from: splitFrom,
                orientation: orientation,
@@ -754,12 +759,20 @@ final class TeamOrchestrator: ObservableObject {
                teamName: teamName,
                workingDirectory: agentWorkDir
            ) {
-            agentPanel.start(
-                claudePath: cliPath,
-                model: Self.resolveClaudeModelArg(agentModel),
-                instructions: agentInstructions,
-                extraArgs: extraArgs
-            )
+            if AgentPipeTransport.needsBridge(cli: agentCli),
+               let bridge = AgentPipeTransport.bridgePath(workingDirectory: agentWorkDir) {
+                agentPanel.start(
+                    bridgedCli: agentCli, bridgePath: bridge,
+                    model: Self.bridgeModelArg(cli: agentCli, model: agentModel)
+                )
+            } else {
+                agentPanel.start(
+                    claudePath: cliPath,
+                    model: Self.resolveClaudeModelArg(agentModel),
+                    instructions: agentInstructions,
+                    extraArgs: extraArgs
+                )
+            }
             // The turn states its own end and carries its final text, so the
             // reply is read from that rather than scraped off a screen.
             agentPanel.session.onTurnEnd = { [teamName, agentName] final, _, taskId in
@@ -3146,9 +3159,38 @@ final class TeamOrchestrator: ObservableObject {
     /// nothing else can supply it.
     static func withoutTerminalProtocol(_ text: String) -> String {
         var lines = text.components(separatedBy: "\n")
+
+        // The runbook says the same thing in prose rather than in a block —
+        // "CRITICAL: … you MUST invoke `tm-agent reply` … the leader cannot
+        // detect completion and the team stalls" — and it reaches the agent in
+        // its very first turn. Same falsehood, different shape, so it is
+        // corrected rather than dropped: the requirement is real, the shell
+        // command is not.
+        for i in lines.indices where lines[i].hasPrefix("CRITICAL:")
+            && lines[i].contains("tm-agent reply") {
+            lines[i] = "CRITICAL: End every reply with the 5-field header "
+                + "(STATUS/FILES/VERIFY/NEXT/FULL_REPORT), one field per line. "
+                + "The leader reads it directly — do not run a shell command to send it."
+        }
+
+        // The digest mandates the same command in three more places, which now
+        // contradicts the line above — and an agent told both will do both,
+        // which is how the failing call got measured in the first place. The
+        // mandates go; the corrected line is left as the only authority.
+        lines.removeAll { line in
+            guard line.contains("tm-agent reply") else { return false }
+            return line.contains("When done") || line.contains("Finish with")
+        }
+        // This one is about the header's *shape*, which is still wanted — only
+        // the command it hangs off is gone.
+        for i in lines.indices {
+            lines[i] = lines[i].replacingOccurrences(
+                of: "`tm-agent reply` body", with: "reply")
+        }
+
         guard let start = lines.firstIndex(where: {
             $0.hasPrefix("[REQUIRED FINAL STEP")
-        }) else { return text }
+        }) else { return lines.joined(separator: "\n") }
 
         // A bracketed line, a fenced example, then one paragraph of prose about
         // why the command matters. Read by shape rather than by matching the
@@ -3167,8 +3209,12 @@ final class TeamOrchestrator: ObservableObject {
         }
 
         lines.replaceSubrange(start..<end, with: [
-            "[FINAL LINE — end your reply with this header]",
-            "STATUS: DONE|BLOCKED|NEEDS_REVIEW",
+            "[FINAL LINE — end your reply with this header, one field per line]",
+            // Not `DONE|BLOCKED|NEEDS_REVIEW`: measured, codex read the
+            // alternation bar as a field separator and answered with the whole
+            // header on one line — `STATUS: DONE|FILES: none|…` — which parses
+            // the status as everything after it.
+            "STATUS: <DONE, BLOCKED, or NEEDS_REVIEW>",
             "FILES: <changed paths or none>",
             "VERIFY: <single shell command or n/a>",
             "NEXT: <action or NONE>",
@@ -5209,6 +5255,25 @@ final class TeamOrchestrator: ObservableObject {
         parts += extraArgs.map { shellQuote($0) }
 
         return parts.joined(separator: " ")
+    }
+
+    /// The model name a bridged CLI will actually accept.
+    ///
+    /// Team models are stored as claude's tiers — sonnet, opus, haiku — because
+    /// that is what the picker offers for every CLI. The pane path translates
+    /// per CLI on the way into the launch line; the native path was handing the
+    /// tier straight through, and measured, codex took `--model sonnet`,
+    /// accepted the turn, and ended it having said nothing.
+    ///
+    /// Reasoning effort is *not* carried, so the three tiers collapse to one
+    /// model here. The pane path differentiates them with a codex-specific
+    /// effort flag, and inventing that param on `turn/start` without measuring
+    /// it would be a guess.
+    static func bridgeModelArg(cli: String, model: String) -> String {
+        switch cli {
+        case "codex": return codexModelName(model)
+        default: return model
+        }
     }
 
     /// Map short model names to Codex CLI model identifiers.

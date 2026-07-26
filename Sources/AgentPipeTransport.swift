@@ -133,11 +133,15 @@ enum AgentPipeTransport {
         isEnabled && UserDefaults.standard.bool(forKey: nativePanelKey)
     }
 
-    /// Which CLIs can be held without a terminal. Only the one measured that
-    /// way — the others go through the bridge, which is a process this side
-    /// would still have to host, and that is a separate question.
+    /// Which CLIs can be held without a terminal.
+    ///
+    /// Claude directly; the rest through the bridge, which is just another
+    /// process to host — the objection that stopped this at claude was that
+    /// hosting it was a separate question, and it turned out to be the same
+    /// question. Making the bridge read turns on stdin rather than a FIFO is
+    /// the whole of it, and then one `Process` serves every CLI here.
     static func canHoldNatively(cli: String) -> Bool {
-        usesNativePanel && cli == "claude"
+        usesNativePanel && supports(cli: cli)
     }
 
     /// Draw the session instead of showing its wire format.

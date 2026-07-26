@@ -45,7 +45,13 @@ import time
 
 
 def log(msg: str) -> None:
-    print(f"\033[38;5;244m[bridge] {msg}\033[0m", flush=True)
+    # Colour only for a terminal. When the app hosts this there is nothing to
+    # interpret the escapes, and they would arrive as literal garbage in a view
+    # that draws text rather than cells.
+    if sys.stdout.isatty():
+        print(f"\033[38;5;244m[bridge] {msg}\033[0m", flush=True)
+    else:
+        print(f"[bridge] {msg}", flush=True)
 
 
 class Child:
@@ -563,11 +569,13 @@ class CodexBridge:
 # ── kiro: ACP — initialize → session/new → session/prompt … stopReason ──────
 
 class AcpBridge:
-    def __init__(self, argv: list[str], cwd: str, emitter: Emitter):
+    def __init__(self, argv: list[str], cwd: str, emitter: Emitter,
+                 model: str | None = None):
         self.child = Child(argv, cwd)
         self.rpc = JsonRpc(self.child, emitter)
         self.out = emitter
         self.cwd = cwd
+        self.model = model
         self.session: str | None = None
 
     def start(self) -> bool:
@@ -583,7 +591,11 @@ class AcpBridge:
         if not self.session:
             log(f"acp session/new failed: {json.dumps(new)[:220] if new else 'no reply'}")
             return False
-        self.out.emit({"type": "system", "subtype": "init", "cwd": self.cwd, "tools": []})
+        # ACP's handshake reports capabilities, not a model name, so the one we
+        # were told to ask for is the only thing there is to say. Without it the
+        # pane header has nothing but the agent's own name.
+        self.out.emit({"type": "system", "subtype": "init", "cwd": self.cwd,
+                       "model": self.model or "", "tools": []})
         return True
 
     def turn(self, text: str, timeout: float) -> None:
@@ -632,7 +644,10 @@ def main() -> int:
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--cli", required=True,
                     choices=["codex", "kiro", "gemini", "cursor", "agy"])
-    ap.add_argument("--fifo", required=True, help="turns arrive here, one per line")
+    # A FIFO when a terminal hosts this and the writer is another process; plain
+    # stdin when the app hosts it directly, which makes this a drop-in for the
+    # same `Process` that runs claude — same NDJSON in, same events out.
+    ap.add_argument("--fifo", help="turns arrive here; omit to read them from stdin")
     ap.add_argument("--events", help="normalised events are appended here too")
     ap.add_argument("--cwd", default=None)
     ap.add_argument("--model", default=None)
@@ -650,41 +665,47 @@ def main() -> int:
         # `kiro-cli acp`, NOT `kiro-cli chat acp`: both parse and only the first
         # is a server. The second starts the interactive chat agent, which reads
         # the handshake as a user message and answers it in prose.
-        bridge = AcpBridge(["kiro-cli", "acp", "--trust-all-tools"], cwd, out)
+        bridge = AcpBridge(["kiro-cli", "acp", "--trust-all-tools"], cwd, out,
+                           model=args.model)
     else:
-        bridge = AcpBridge(["gemini", "--acp", "--yolo"], cwd, out)
+        bridge = AcpBridge(["gemini", "--acp", "--yolo"], cwd, out, model=args.model)
 
     if not bridge.start():
         out.result("", stop="startup_failed", failed=True)
         bridge.stop()
         return 1
-    log(f"{args.cli} ready — waiting for turns on {args.fifo}")
+    log(f"{args.cli} ready — turns on {args.fifo or 'stdin'}")
+
+    def take(line: str) -> None:
+        line = line.strip()
+        if not line:
+            return
+        # Turns arrive in claude's envelope whoever wrote them, so the caller
+        # never has to know which CLI is behind this.
+        try:
+            obj = json.loads(line)
+            text = obj.get("message", {}).get("content", "")
+            if isinstance(text, list):
+                text = "".join(b.get("text", "") for b in text if isinstance(b, dict))
+        except json.JSONDecodeError:
+            text = line
+        if text:
+            bridge.turn(text, args.turn_timeout)
 
     try:
-        while True:
-            # Reopening blocks until a writer arrives, which is what keeps this
-            # idle between turns without spinning.
-            with open(args.fifo, encoding="utf-8") as fifo:
-                for line in fifo:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    # Turns arrive in claude's envelope, so the caller does not
-                    # need to know which CLI is behind this.
-                    try:
-                        obj = json.loads(line)
-                        text = obj.get("message", {}).get("content", "")
-                        if isinstance(text, list):
-                            text = "".join(b.get("text", "") for b in text
-                                           if isinstance(b, dict))
-                    except json.JSONDecodeError:
-                        text = line
-                    if not text:
-                        continue
-                    bridge.turn(text, args.turn_timeout)
-            if not bridge.alive:
-                log("agent exited")
-                break
+        if args.fifo:
+            while True:
+                # Reopening blocks until a writer arrives, which is what keeps
+                # this idle between turns without spinning.
+                with open(args.fifo, encoding="utf-8") as fifo:
+                    for line in fifo:
+                        take(line)
+                if not bridge.alive:
+                    log("agent exited")
+                    break
+        else:
+            for line in sys.stdin:
+                take(line)
     except KeyboardInterrupt:
         pass
     finally:

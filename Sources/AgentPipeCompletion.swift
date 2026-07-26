@@ -164,11 +164,32 @@ final class AgentPipeCompletion {
     /// the agent stated no verdict, and inventing the good one is the worst
     /// available guess. NEEDS_REVIEW says what is true: it is finished and
     /// nobody has said whether it worked.
+    static let headerKeys = ["STATUS", "FILES", "VERIFY", "NEXT", "FULL_REPORT"]
+
+    /// Split a line that packed several fields onto it.
+    ///
+    /// Measured: codex answered `STATUS: DONE|FILES: none|VERIFY: n/a|…` all on
+    /// one line, which a line-based parser reads as a status of "DONE|FILES:
+    /// none|…". The cause was the template writing `DONE|BLOCKED|NEEDS_REVIEW`
+    /// and the bar being read as a separator rather than a choice; that wording
+    /// is fixed, but models improvise and the parser should survive it.
+    ///
+    /// Only splits when the line really does carry more than one field, so a
+    /// `VERIFY: a | b` pipeline is left intact.
+    static func headerLines(in text: String) -> [String] {
+        text.components(separatedBy: "\n").flatMap { raw -> [String] in
+            let line = raw.trimmingCharacters(in: .whitespaces)
+            let packed = headerKeys.filter { line.contains($0 + ":") }.count
+            guard packed > 1, line.contains("|") else { return [line] }
+            return line.components(separatedBy: "|")
+                .map { $0.trimmingCharacters(in: .whitespaces) }
+        }
+    }
+
     static func headerEvent(from text: String) -> AutoReplyEvent {
         var fields: [String: String] = [:]
-        for raw in text.components(separatedBy: "\n") {
-            let line = raw.trimmingCharacters(in: .whitespaces)
-            for key in ["STATUS", "FILES", "VERIFY", "NEXT", "FULL_REPORT"] {
+        for line in headerLines(in: text) {
+            for key in headerKeys {
                 let prefix = key + ":"
                 guard line.hasPrefix(prefix), fields[key] == nil else { continue }
                 fields[key] = String(line.dropFirst(prefix.count))

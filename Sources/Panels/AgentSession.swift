@@ -153,6 +153,32 @@ final class AgentSession: ObservableObject {
                       workingDirectory: workingDirectory, environment: environment)
     }
 
+    /// The launch line for a CLI the bridge has to run on our behalf.
+    ///
+    /// The bridge already emits claude's events; making its *input* symmetric —
+    /// turns on stdin rather than a FIFO — is what makes it a drop-in here.
+    /// Same `Process`, same NDJSON written to stdin, same events parsed back:
+    /// this side does not learn that codex speaks JSON-RPC or that kiro speaks
+    /// ACP, and it does not learn that a turn is a process for cursor and agy.
+    ///
+    /// No `--events` and no `--fifo`: both exist for a terminal host, where
+    /// something else has to write the turns and read the results out of a
+    /// file. Here the process is right here.
+    static func bridgeLaunch(
+        cli: String,
+        bridgePath: String,
+        model: String,
+        workingDirectory: String,
+        environment: [String: String] = ProcessInfo.processInfo.environment
+    ) -> Launch {
+        var args = [bridgePath, "--cli", cli, "--cwd", workingDirectory]
+        if !model.isEmpty { args += ["--model", model] }
+        return Launch(executable: "/usr/bin/env",
+                      arguments: ["python3"] + args,
+                      workingDirectory: workingDirectory,
+                      environment: environment)
+    }
+
     func start(_ launch: Launch) {
         guard process == nil else { return }
         let p = Process()
@@ -185,7 +211,9 @@ final class AgentSession: ObservableObject {
                       .trimmingCharacters(in: .whitespacesAndNewlines),
                   !text.isEmpty
             else { return }
-            Task { @MainActor in self?.append(.notice(id: UUID(), text)) }
+            Task { @MainActor in
+                self?.append(.notice(id: UUID(), AgentSession.withoutAnsi(text)))
+            }
         }
         p.terminationHandler = { [weak self] proc in
             Task { @MainActor in self?.finish(code: proc.terminationStatus) }
@@ -322,7 +350,9 @@ final class AgentSession: ObservableObject {
         else {
             // Not every line is ours — a CLI may write a warning to stdout.
             // Showing it beats swallowing it.
-            append(.notice(id: UUID(), line))
+            // A CLI colours its warnings whether or not anything can interpret
+            // the escapes. Nothing here can — this draws text, not cells.
+            append(.notice(id: UUID(), Self.withoutAnsi(line)))
             return
         }
         switch obj["type"] as? String {
@@ -523,6 +553,14 @@ final class AgentSession: ObservableObject {
         if entries.count > Self.maxEntries {
             entries.removeFirst(entries.count - Self.maxEntries)
         }
+    }
+
+    /// Escape sequences are for a grid of cells; there is not one here.
+    static func withoutAnsi(_ text: String) -> String {
+        text.replacingOccurrences(
+            of: "\u{001B}\\[[0-9;?]*[a-zA-Z]",
+            with: "", options: .regularExpression
+        )
     }
 
     private static let maxEntries = 2_000

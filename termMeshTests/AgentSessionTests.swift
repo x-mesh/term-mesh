@@ -398,8 +398,12 @@ final class AgentSessionTests: XCTestCase {
                        "and it is not true here")
         // What the header is for still matters — the verdict is the agent's
         // and nothing else can supply it — so the block is replaced, not cut.
-        XCTAssertTrue(cleaned.contains("STATUS: DONE|BLOCKED|NEEDS_REVIEW"))
+        XCTAssertTrue(cleaned.contains("STATUS: <DONE, BLOCKED, or NEEDS_REVIEW>"))
         XCTAssertTrue(cleaned.contains("FULL_REPORT:"))
+        // Not `DONE|BLOCKED|NEEDS_REVIEW`: measured, codex read the alternation
+        // bar as a field separator and packed the whole header onto one line.
+        XCTAssertFalse(cleaned.contains("DONE|BLOCKED"),
+                       "a bar meaning \"pick one\" gets read as \"separator\"")
         // Everything around it survives, including the capsule that names the
         // task the reply will close.
         XCTAssertTrue(cleaned.contains("Write about 150 words on tangerines."))
@@ -426,7 +430,48 @@ final class AgentSessionTests: XCTestCase {
         XCTAssertFalse(cleaned.contains("[REMINDER]"))
         XCTAssertFalse(cleaned.contains("tm-agent reply"))
         XCTAssertTrue(cleaned.contains("TASK_ID: e82188a0"))
-        XCTAssertTrue(cleaned.contains("STATUS: DONE|BLOCKED|NEEDS_REVIEW"))
+        XCTAssertTrue(cleaned.contains("STATUS: <DONE, BLOCKED, or NEEDS_REVIEW>"))
+    }
+
+    /// The runbook says the same thing in prose, and it reaches the agent in
+    /// its very first turn — before any task exists. Same falsehood, different
+    /// shape.
+    func testTheRunbookProseIsCorrectedToo() {
+        let initPrompt = """
+            You are a team agent named "explorer".
+
+            CRITICAL: When tasks complete you MUST invoke `tm-agent reply '<5-line header plus result>'` as a shell command. Printing the header text in your response is NOT enough — the leader cannot detect completion and the team stalls.
+            Respond with "Agent explorer ready." to confirm.
+            """
+        let cleaned = TeamOrchestrator.withoutTerminalProtocol(initPrompt)
+        XCTAssertFalse(cleaned.contains("tm-agent reply"))
+        XCTAssertFalse(cleaned.contains("cannot detect completion"))
+        // The requirement is real even though the shell command is not.
+        XCTAssertTrue(cleaned.contains("STATUS/FILES/VERIFY/NEXT/FULL_REPORT"))
+        XCTAssertTrue(cleaned.contains("Respond with \"Agent explorer ready.\""),
+                      "everything else in the prompt survives")
+        XCTAssertTrue(cleaned.contains("You are a team agent"))
+    }
+
+    /// The digest mandates the command in three more places. An agent told both
+    /// "run it" and "do not run it" will do both — which is how the failing
+    /// call got measured in the first place.
+    func testNoLineIsLeftMandatingTheCommand() {
+        let digest = """
+            ## Runbook Digest
+            5. When done: `tm-agent reply '<full result>'` — this auto-reports and completes your active task.
+            - Finish with one `tm-agent reply '<5-line header plus concise result>'`; it auto-reports and completes your active task.
+            Begin every `tm-agent reply` body with this 5-line header (use n/a when not applicable):
+            STATUS: <DONE, BLOCKED, or NEEDS_REVIEW>
+            """
+        let cleaned = TeamOrchestrator.withoutTerminalProtocol(digest)
+        for line in cleaned.components(separatedBy: "\n") {
+            XCTAssertFalse(line.contains("tm-agent reply"), "still mandated: \(line)")
+        }
+        // What the header is and where it goes survives.
+        XCTAssertTrue(cleaned.contains("Begin every reply with this 5-line header"))
+        XCTAssertTrue(cleaned.contains("STATUS: <DONE, BLOCKED, or NEEDS_REVIEW>"))
+        XCTAssertTrue(cleaned.contains("## Runbook Digest"))
     }
 
     /// The CLI has three copies of this block and they do not agree word for
@@ -466,6 +511,28 @@ final class AgentSessionTests: XCTestCase {
             tm-agent reply 'STATUS: DONE
             """
         XCTAssertEqual(TeamOrchestrator.withoutTerminalProtocol(broken), broken)
+    }
+
+    // MARK: - The model a bridged CLI will take
+
+    /// Team models are stored as claude's tiers, because that is what the
+    /// picker offers for every CLI. Measured: codex took `--model sonnet`,
+    /// accepted the turn, and ended it having said nothing — the empty-turn
+    /// guard caught it, but the cause was here.
+    func testATierNameIsTranslatedBeforeItReachesCodex() {
+        XCTAssertEqual(TeamOrchestrator.bridgeModelArg(cli: "codex", model: "sonnet"),
+                       "gpt-5.5")
+        XCTAssertEqual(TeamOrchestrator.bridgeModelArg(cli: "codex", model: "haiku"),
+                       "gpt-5.5")
+        // A name the user typed themselves is theirs, not a tier to remap.
+        XCTAssertEqual(TeamOrchestrator.bridgeModelArg(cli: "codex", model: "gpt-5.2-codex"),
+                       "gpt-5.2-codex")
+    }
+
+    /// Kiro's picker offers the same tier names and its CLI takes them.
+    func testACliThatTakesTierNamesIsLeftAlone() {
+        XCTAssertEqual(TeamOrchestrator.bridgeModelArg(cli: "kiro", model: "sonnet"),
+                       "sonnet")
     }
 
     // MARK: - The wire
