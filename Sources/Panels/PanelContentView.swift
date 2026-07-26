@@ -31,6 +31,15 @@ struct PanelContentView: View {
                     onTriggerFlash: onTriggerFlash
                 )
             }
+        case .agent:
+            if let agentPanel = panel as? AgentPanel {
+                AgentPanelView(
+                    panel: agentPanel,
+                    isFocused: isFocused,
+                    appearance: appearance,
+                    onFocus: onFocus
+                )
+            }
         case .browser:
             if let browserPanel = panel as? BrowserPanel {
                 BrowserPanelView(

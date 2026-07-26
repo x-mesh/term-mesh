@@ -112,6 +112,34 @@ enum AgentPipeTransport {
         driven.remove(agentId)
     }
 
+    /// Drop the terminal entirely and hold the agent in a native pane.
+    ///
+    /// Measured: `claude --print` with plain pipes — no PTY, no shell, no FIFO
+    /// — takes turn after turn and keeps its context. Everything
+    /// terminal-shaped below exists because the *host* is a terminal, not
+    /// because the agent needs one, so with a native pane it all goes: the FIFO
+    /// becomes `stdin.write`, `/dev/tty` becomes a text field, and the ANSI
+    /// renderer becomes a view over a model.
+    ///
+    /// What that buys is what a grid of cells cannot hold. The events say what
+    /// each part *is* — this is a tool call, this is its result, this failed,
+    /// this turn cost $0.31 — so a tool result can be folded, an answer stays
+    /// selectable, and a turn's facts are laid out rather than printed.
+    ///
+    /// Claude only, and off by default: the pane path is the product.
+    static let nativePanelKey = "agentPipeTransport.nativePanel"
+
+    static var usesNativePanel: Bool {
+        isEnabled && UserDefaults.standard.bool(forKey: nativePanelKey)
+    }
+
+    /// Which CLIs can be held without a terminal. Only the one measured that
+    /// way — the others go through the bridge, which is a process this side
+    /// would still have to host, and that is a separate question.
+    static func canHoldNatively(cli: String) -> Bool {
+        usesNativePanel && cli == "claude"
+    }
+
     /// Draw the session instead of showing its wire format.
     ///
     /// `--print` is the non-interactive mode, so nothing renders the stream:

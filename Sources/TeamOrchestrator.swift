@@ -741,6 +741,61 @@ final class TeamOrchestrator: ObservableObject {
             paneEnv.merge(extraEnv) { _, new in new }
         }
 
+        // No terminal at all: the agent is held in the pane, not run inside a
+        // shell inside a PTY inside it. Everything below — the shell wrapper,
+        // the pane env, the FIFO — is what a terminal host needs; a native pane
+        // needs a process and somewhere to draw it.
+        if AgentPipeTransport.canHoldNatively(cli: agentCli),
+           let agentPanel = workspace.newAgentSplit(
+               from: splitFrom,
+               orientation: orientation,
+               insertFirst: insertFirst,
+               agentName: agentName,
+               teamName: teamName,
+               workingDirectory: agentWorkDir
+           ) {
+            agentPanel.start(
+                claudePath: cliPath,
+                model: Self.resolveClaudeModelArg(agentModel),
+                instructions: agentInstructions,
+                extraArgs: extraArgs
+            )
+            // The turn states its own end and carries its final text, so the
+            // reply is read from that rather than scraped off a screen.
+            agentPanel.session.onTurnEnd = { [teamName, agentName] final, _ in
+                AutoReplyEmit.emit(
+                    teamName: teamName,
+                    agentName: agentName,
+                    event: AgentPipeCompletion.headerEvent(from: final),
+                    preferredTaskId: nil
+                )
+            }
+            let colorEmoji = Self.colorEmoji(agentColor)
+            workspace.setPanelCustomTitle(panelId: agentPanel.id,
+                                          title: "\(colorEmoji) \(agentName)")
+            return AgentMember(
+                id: agentId,
+                name: agentName,
+                teamName: teamName,
+                cli: agentCli,
+                launchCommand: Self.defaultLaunchCommand(for: agentCli),
+                model: agentModel,
+                agentType: agentType,
+                color: agentColor,
+                instructions: agentInstructions,
+                workspaceId: workspace.id,
+                panelId: agentPanel.id,
+                parentSessionId: leaderSessionId,
+                claudeSessionId: nil,
+                createdAt: Date(),
+                worktreeName: worktreeName,
+                worktreePath: worktreePath,
+                worktreeBranch: worktreeBranch,
+                originalSpawnCommand: agentCommand,
+                originalAgentWorkDir: agentWorkDir
+            )
+        }
+
         // Spawn the split pane. `insertFirst` lets hard-restart respawn into the
         // exact slot the dead pane occupied within its parent split.
         guard let panel = workspace.newTerminalSplit(
@@ -2594,6 +2649,27 @@ final class TeamOrchestrator: ObservableObject {
         // turn there. Both entry points need it — `team.send` resolves by name
         // and never reaches the panel-targeted one, so wiring only that left
         // delivery quietly on the typing path while reporting success.
+        // A natively-held agent has no pipe and no pane to type into: the
+        // process is right here, so the turn is a write to its stdin. This has
+        // to come first — the FIFO fork below would find no FIFO and the
+        // terminal fork after it would type at nothing.
+        if let panelId = agent.panelId,
+           let agentPanel = nativeAgentPanel(workspaceId: agent.workspaceId, panelId: panelId) {
+            do {
+                _ = try agentPanel.session.send(text, from: .leader)
+                #if DEBUG
+                dlog("agent.native.deliver agent=\(agent.id) chars=\(text.count)")
+                #endif
+                completion?(true)
+                return true
+            } catch {
+                #if DEBUG
+                dlog("agent.native.deliver.FAILED agent=\(agent.id) err=\(error)")
+                #endif
+                completion?(false)
+                return false
+            }
+        }
         if AgentPipeTransport.isDriven(agentId: agent.id) {
             do {
                 AgentPipeCompletion.shared.expect(agentId: agent.id, instruction: text)
@@ -3036,6 +3112,23 @@ final class TeamOrchestrator: ObservableObject {
     /// Exponential backoff delays (ms) for surface-nil retry in sendTextToPanel.
     /// 4 attempts: 50 → 150 → 400 → 800 ms (total ~1.4 s before final failure).
     private static let sendTextRetryDelaysMs: [Double] = [50, 150, 400, 800]
+
+    /// The panel behind a natively-held agent, if that is what it is.
+    ///
+    /// Same two-step lookup `sendTextToPanel` uses: the agent's own workspace
+    /// first, then a global surface lookup, because a broadcast can reach a
+    /// team whose panes live in another window.
+    private func nativeAgentPanel(workspaceId: UUID, panelId: UUID) -> AgentPanel? {
+        if let tabManager = AppDelegate.shared?.tabManagerFor(tabId: workspaceId),
+           let workspace = tabManager.tabs.first(where: { $0.id == workspaceId }),
+           let panel = workspace.agentPanel(for: panelId) {
+            return panel
+        }
+        guard let located = AppDelegate.shared?.locateSurface(surfaceId: panelId),
+              let workspace = located.tabManager.tabs.first(where: { $0.id == located.workspaceId })
+        else { return nil }
+        return workspace.agentPanel(for: panelId)
+    }
 
     private func sendTextToPanel(workspaceId: UUID, panelId: UUID, text: String, tabManager: TabManager, withReturn: Bool = true, retryCount: Int = 0, completion: ((Bool) -> Void)? = nil) -> Bool {
         // Try the provided tabManager first, then fall back to global surface lookup

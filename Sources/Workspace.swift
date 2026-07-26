@@ -157,6 +157,7 @@ final class Workspace: Identifiable, ObservableObject {
     enum SurfaceKind {
         static let terminal = "terminal"
         static let browser = "browser"
+        static let agent = "agent"
     }
 
     // MARK: - Initialization
@@ -485,6 +486,8 @@ final class Workspace: Identifiable, ObservableObject {
             return SurfaceKind.terminal
         case .browser:
             return SurfaceKind.browser
+        case .agent:
+            return SurfaceKind.agent
         }
     }
 
@@ -1407,6 +1410,77 @@ final class Workspace: Identifiable, ObservableObject {
         installBrowserPanelSubscription(browserPanel)
 
         return browserPanel
+    }
+
+    /// Split off a pane that holds an agent directly, with no terminal in it.
+    ///
+    /// Deliberately the browser path with the browser parts removed: the split
+    /// tree only needs a panel and a tab kind, which is the point — a pane's
+    /// content has never been the tree's business.
+    func newAgentSplit(
+        from panelId: UUID,
+        orientation: SplitOrientation,
+        insertFirst: Bool = false,
+        agentName: String,
+        teamName: String,
+        workingDirectory: String,
+        focus: Bool = false
+    ) -> AgentPanel? {
+        guard let sourceTabId = surfaceIdFromPanelId(panelId) else { return nil }
+        var sourcePaneId: PaneID?
+        for paneId in bonsplitController.allPaneIds
+        where bonsplitController.tabs(inPane: paneId).contains(where: { $0.id == sourceTabId }) {
+            sourcePaneId = paneId
+            break
+        }
+        guard let paneId = sourcePaneId else { return nil }
+
+        let agentPanel = AgentPanel(agentName: agentName, teamName: teamName,
+                                    workingDirectory: workingDirectory)
+        panels[agentPanel.id] = agentPanel
+        panelTitles[agentPanel.id] = agentPanel.displayTitle
+
+        let newTab = Bonsplit.Tab(
+            title: agentPanel.displayTitle,
+            icon: agentPanel.displayIcon,
+            kind: SurfaceKind.agent,
+            isDirty: false,
+            isLoading: false,
+            isPinned: false
+        )
+        surfaceIdToPanelId[newTab.id] = agentPanel.id
+        let previousFocusedPanelId = focusedPanelId
+
+        // Programmatic, so didSplitPane does not also conjure a terminal.
+        isProgrammaticSplit = true
+        defer { isProgrammaticSplit = false }
+        guard bonsplitController.splitPane(paneId, orientation: orientation,
+                                           withTab: newTab, insertFirst: insertFirst) != nil else {
+            surfaceIdToPanelId.removeValue(forKey: newTab.id)
+            panels.removeValue(forKey: agentPanel.id)
+            panelTitles.removeValue(forKey: agentPanel.id)
+            return nil
+        }
+
+        let previousHostedView = focusedTerminalPanel?.hostedView
+        if focus {
+            previousHostedView?.suppressReparentFocus()
+            focusPanel(agentPanel.id)
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
+                previousHostedView?.clearSuppressReparentFocus()
+            }
+        } else {
+            preserveFocusAfterNonFocusSplit(
+                preferredPanelId: previousFocusedPanelId,
+                splitPanelId: agentPanel.id,
+                previousHostedView: previousHostedView
+            )
+        }
+        return agentPanel
+    }
+
+    func agentPanel(for panelId: UUID) -> AgentPanel? {
+        panels[panelId] as? AgentPanel
     }
 
     /// Create a new browser surface in the specified pane.
