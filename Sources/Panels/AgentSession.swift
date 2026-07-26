@@ -81,7 +81,7 @@ final class AgentSession: ObservableObject {
 
     /// Called when a turn ends, with the agent's final text. The task-board
     /// side reads its own header out of this; the session does not interpret it.
-    var onTurnEnd: ((String, TurnEnd) -> Void)?
+    var onTurnEnd: ((String, TurnEnd, String?) -> Void)?
 
     private var process: Process?
     private var stdin: FileHandle?
@@ -212,17 +212,66 @@ final class AgentSession: ObservableObject {
     /// terminal path costs: an instruction reshaped to survive its own delivery.
     @discardableResult
     func send(_ text: String, from speaker: Speaker) throws -> Int {
+        guard isRunning else { throw SendError.notRunning }
+        if speaker == .leader, turnInFlight {
+            queued.append((text, Self.taskId(in: text)))
+            return 0
+        }
+        return try write(text, from: speaker, taskId: Self.taskId(in: text))
+    }
+
+    @discardableResult
+    private func write(_ text: String, from speaker: Speaker, taskId: String?) throws -> Int {
         guard let stdin, isRunning else { throw SendError.notRunning }
         let payload = try Self.encode(text: text)
         try stdin.write(contentsOf: payload)
         // Shown from the receipt (`isReplay`) rather than from here, so what is
         // drawn is what the agent confirmed receiving — not what was hoped for.
         pendingSpeaker = speaker
+        if speaker == .leader {
+            turnInFlight = true
+            currentTaskId = taskId
+        }
         isThinking = true
         return payload.count
     }
 
+    /// The task this turn is answering, named by the capsule that carried it.
+    ///
+    /// The screen path could never make this correlation — an answer on a
+    /// screen has nothing tying it to a request — so it guessed, and a reply
+    /// was measured closing an unrelated blocked task. Here the instruction
+    /// says which task it is, and this side is the one that wrote it.
+    private(set) var currentTaskId: String?
+
+    static func taskId(in text: String) -> String? {
+        for raw in text.components(separatedBy: "\n") {
+            let line = raw.trimmingCharacters(in: .whitespaces)
+            guard line.hasPrefix("TASK_ID:") else { continue }
+            let id = String(line.dropFirst("TASK_ID:".count))
+                .trimmingCharacters(in: .whitespaces)
+            return id.isEmpty ? nil : id
+        }
+        return nil
+    }
+
     private var pendingSpeaker: Speaker = .leader
+
+    /// Leader turns waiting for the one in flight to finish.
+    ///
+    /// Measured: five messages sent back to back arrived byte for byte — zero
+    /// lost — but came out as three turns, because claude queues whatever
+    /// arrives mid-turn and joins it into the next one. For a person typing a
+    /// follow-up that is the right behaviour and the same thing Claude Code
+    /// does. For the leader it is not: two delegated tasks merged into one turn
+    /// produce one `result`, so the second task never gets its completion and
+    /// the board waits forever.
+    ///
+    /// So leader turns are serialised — one instruction, one turn, one result —
+    /// and a person's message still goes straight in, joining the turn already
+    /// running, which is what makes interrupting useful.
+    private var queued: [(text: String, taskId: String?)] = []
+    private var turnInFlight = false
 
     static func encode(text: String) throws -> Data {
         var data = try JSONSerialization.data(withJSONObject: [
@@ -353,11 +402,20 @@ final class AgentSession: ObservableObject {
         )
         append(.turnEnded(id: UUID(), end))
         isThinking = false
+        turnInFlight = false
         // `result` carries the final answer as a clean string — the boundary is
         // stated rather than inferred from a screen going quiet.
         let final = o["result"] as? String ?? saidThisTurn.joined(separator: "\n")
         saidThisTurn.removeAll()
-        onTurnEnd?(final, end)
+        let answered = currentTaskId
+        currentTaskId = nil
+        onTurnEnd?(final, end, answered)
+
+        // The next leader turn only now, so it gets a turn of its own.
+        if !queued.isEmpty {
+            let next = queued.removeFirst()
+            try? write(next.text, from: .leader, taskId: next.taskId)
+        }
     }
 
     private func append(_ entry: Entry) {
@@ -379,5 +437,11 @@ final class AgentSession: ObservableObject {
 
     /// Who the next receipt belongs to, without a process to send through.
     func noteSenderForTesting(_ speaker: Speaker) { pendingSpeaker = speaker }
+
+    /// A leader turn in flight, without a process to write it to.
+    func beginTurnForTesting(taskId: String?) {
+        turnInFlight = true
+        currentTaskId = taskId
+    }
     #endif
 }

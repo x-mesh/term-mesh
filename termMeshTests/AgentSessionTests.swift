@@ -137,7 +137,7 @@ final class AgentSessionTests: XCTestCase {
     func testATurnEndsWithItsOwnFacts() throws {
         var reported: (String, AgentSession.TurnEnd)?
         let s = AgentSession()
-        s.onTurnEnd = { reported = ($0, $1) }
+        s.onTurnEnd = { text, end, _ in reported = (text, end) }
         s.ingestForTesting(event([
             "type": "result", "stop_reason": "end_turn", "is_error": false,
             "result": "STATUS: DONE", "total_cost_usd": 0.4096,
@@ -192,6 +192,54 @@ final class AgentSessionTests: XCTestCase {
             return XCTFail("expected a notice")
         }
         XCTAssertEqual(text, "npm warn: something")
+    }
+
+    // MARK: - One instruction, one turn
+
+    /// The behaviour this serialisation exists for, measured live.
+    ///
+    /// Five messages sent back to back arrived byte for byte — nothing was
+    /// lost — and came out as **three** turns: claude queues whatever arrives
+    /// mid-turn and joins it into the next one with a newline. For a person
+    /// typing a follow-up that is right, and it is what Claude Code itself
+    /// does. For the leader it is not: two delegated tasks merged into one turn
+    /// produce one `result`, so the second task never gets its completion and
+    /// the board waits on it forever.
+    func testATurnCarriesTheTaskTheInstructionNamed() throws {
+        let capsule = """
+            ## Task Capsule
+            TASK_ID: e82188a0
+            [GOAL] do the thing [/GOAL]
+            """
+        XCTAssertEqual(AgentSession.taskId(in: capsule), "e82188a0")
+        XCTAssertNil(AgentSession.taskId(in: "just have a look"))
+        XCTAssertNil(AgentSession.taskId(in: "TASK_ID:"))
+    }
+
+    /// The correlation the screen path could never make. An answer on a screen
+    /// has nothing tying it to a request, so that path guessed — and a reply
+    /// was measured closing an unrelated blocked task.
+    func testTheAnsweredTaskIsHandedToTheReply() throws {
+        var answered: [String?] = []
+        let s = AgentSession()
+        s.onTurnEnd = { _, _, task in answered.append(task) }
+        s.beginTurnForTesting(taskId: "e82188a0")
+        s.ingestForTesting(event(["type": "result", "stop_reason": "end_turn",
+                                  "result": "STATUS: DONE"]))
+        XCTAssertEqual(answered, ["e82188a0"])
+    }
+
+    /// And it is cleared, so the next turn cannot inherit it.
+    func testATaskIsAnsweredOnlyOnce() throws {
+        var seen: [String?] = []
+        let s = AgentSession()
+        s.onTurnEnd = { _, _, task in seen.append(task) }
+        s.beginTurnForTesting(taskId: "e82188a0")
+        s.ingestForTesting(event(["type": "result", "result": "one"]))
+        s.ingestForTesting(event(["type": "result", "result": "two"]))
+        XCTAssertEqual(seen.count, 2)
+        XCTAssertEqual(seen[0], "e82188a0")
+        XCTAssertNil(seen[1])
     }
 
     // MARK: - The wire

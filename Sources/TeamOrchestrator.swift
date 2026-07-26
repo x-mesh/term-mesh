@@ -762,12 +762,12 @@ final class TeamOrchestrator: ObservableObject {
             )
             // The turn states its own end and carries its final text, so the
             // reply is read from that rather than scraped off a screen.
-            agentPanel.session.onTurnEnd = { [teamName, agentName] final, _ in
+            agentPanel.session.onTurnEnd = { [teamName, agentName] final, _, taskId in
                 AutoReplyEmit.emit(
                     teamName: teamName,
                     agentName: agentName,
                     event: AgentPipeCompletion.headerEvent(from: final),
-                    preferredTaskId: nil
+                    preferredTaskId: taskId
                 )
             }
             let colorEmoji = Self.colorEmoji(agentColor)
