@@ -3113,6 +3113,26 @@ final class TeamOrchestrator: ObservableObject {
     /// 4 attempts: 50 → 150 → 400 → 800 ms (total ~1.4 s before final failure).
     private static let sendTextRetryDelaysMs: [Double] = [50, 150, 400, 800]
 
+    /// Whether a turn to this agent still needs a Return pressed after it.
+    ///
+    /// It never did for the agent's sake — the Return is there because the
+    /// transport is a terminal and a TUI composer submits on one. An agent held
+    /// natively has no composer: the write to its stdin *is* the turn, complete
+    /// the moment it lands.
+    ///
+    /// Asked when the Return arrives rather than announced with the text: the
+    /// CLI's first attempt is already a round trip, so answering it there is
+    /// one mechanism instead of two, and it covers every caller — including the
+    /// ones that never learn about a new response field.
+    func agentNeedsReturn(teamName: String, agentName: String) -> Bool {
+        guard let team = teams[teamName],
+              let agent = selectAgent(in: team.agents, name: agentName),
+              let panelId = agent.panelId,
+              nativeAgentPanel(workspaceId: agent.workspaceId, panelId: panelId) != nil
+        else { return true }
+        return false
+    }
+
     /// The panel behind a natively-held agent, if that is what it is.
     ///
     /// Same two-step lookup `sendTextToPanel` uses: the agent's own workspace
