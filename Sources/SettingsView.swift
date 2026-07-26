@@ -143,6 +143,13 @@ struct SettingsView: View {
     @AppStorage(SidebarActiveTabIndicatorSettings.styleKey)
     private var sidebarActiveTabIndicatorStyle = SidebarActiveTabIndicatorSettings.defaultStyle.rawValue
     @AppStorage("teamDefaultLeaderMode") private var teamDefaultLeaderMode = "claude"
+
+    /// Whether agents get a pane the app draws instead of a terminal.
+    ///
+    /// Stored under the pane key; the transport key is written alongside it,
+    /// because a native pane *is* the pipe transport with no terminal around
+    /// it and turning on one without the other does nothing.
+    @AppStorage(AgentPipeTransport.nativePanelKey) private var agentNativePanes = false
     @AppStorage("teamDefaultModel") private var teamDefaultModel = "sonnet"
     @AppStorage("teamDefaultWorkingDirectory") private var teamDefaultWorkingDirectory = ""
     @AppStorage("agentRenderingInterval") private var agentRenderingInterval = 3
@@ -1251,6 +1258,32 @@ struct SettingsView: View {
     @ViewBuilder
     private var sectionAgentTeams: some View {
         SettingsCard {
+                        if settingsMatch("agent", "pane", "native", "terminal",
+                                         "surface", "stream", "team") {
+                        SettingsCardRow(
+                            "Agent Panes",
+                            subtitle: agentNativePanes
+                                ? "Agents run in the app and are drawn by it — streamed text, tool calls that fold, a message box. No terminal."
+                                : "Agents run a CLI inside a terminal pane, as they always have.",
+                            controlWidth: pickerColumnWidth
+                        ) {
+                            Picker("", selection: $agentNativePanes) {
+                                Text("Terminal").tag(false)
+                                Text("Native").tag(true)
+                            }
+                            .labelsHidden()
+                            .pickerStyle(.segmented)
+                        }
+                        // Two keys, one decision: the native pane is the pipe
+                        // transport without a terminal around it, and turning
+                        // on the pane alone would do nothing at all.
+                        .onChange(of: agentNativePanes) { _, on in
+                            UserDefaults.standard.set(on, forKey: AgentPipeTransport.enabledKey)
+                        }
+
+                        SettingsCardDivider()
+                        }
+
                         if settingsMatch("leader", "mode", "repl", "claude", "agent", "team") {
                         SettingsCardRow(
                             "Default Leader Mode",
