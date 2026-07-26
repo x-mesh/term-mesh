@@ -1610,6 +1610,44 @@ class TeamTemplateManager: ObservableObject {
         return customId
     }
 
+    /// Create a complete Smart preset in one write.
+    ///
+    /// New Project uses this instead of creating a blank and patching it in a
+    /// second step so cancelling or crashing cannot leave an abandoned entry
+    /// in the preset catalog.
+    @discardableResult
+    func createSmartPreset(
+        name: String,
+        leaderMode: String,
+        leaderModel: String?,
+        agents: [ProviderPreference]
+    ) -> TemplateID {
+        let displayName = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        let customId = TemplateID(
+            category: .smart,
+            slug: nextAvailableSlug(category: .smart, base: displayName.isEmpty ? "new-preset" : displayName)
+        )
+        let preset = SmartTeamPreset(
+            id: customId.slug,
+            name: displayName,
+            icon: "person.3",
+            description: "\(agents.count) agent\(agents.count == 1 ? "" : "s")",
+            leaderMode: leaderMode,
+            leaderModel: leaderModel,
+            agents: agents
+        )
+        store.customs.append(TeamTemplate(
+            id: customId,
+            origin: .custom,
+            name: displayName,
+            payload: .smart(preset)
+        ))
+        store.lastSelectedId = customId
+        save()
+        rebuildTemplates()
+        return customId
+    }
+
     func deleteCustom(id: TemplateID) throws {
         guard let index = store.customs.firstIndex(where: { $0.id == id && $0.origin == .custom }) else {
             throw TeamTemplateManagerError.customNotFound(id)
@@ -1994,6 +2032,9 @@ struct ProviderPreference: Codable, Equatable {
     var fallbackCli: String
     var fallbackModel: String?  // nil = use CLI default
     var reason: String          // why this provider is optimal for this role
+    /// Optional so schema-1 built-ins and existing user presets continue to
+    /// decode. Placement is deliberately not part of a team preset.
+    var customInstructions: String? = nil
 }
 
 /// Resolved agent slot after provider detection.
@@ -2003,6 +2044,7 @@ struct ResolvedAgent {
     let model: String
     let status: Status
     let reason: String
+    let customInstructions: String
 
     enum Status: Equatable {
         case normal                     // primary == fallback (no badge)
@@ -2018,6 +2060,8 @@ struct SmartTeamPreset: Identifiable, Codable, Equatable {
     var icon: String
     var description: String
     var leaderMode: String
+    /// The leader model was not part of schema 1. nil means the CLI default.
+    var leaderModel: String? = nil
     var agents: [ProviderPreference]
 
     /// Resolve all agent slots against detected providers.
@@ -2042,7 +2086,8 @@ struct SmartTeamPreset: Identifiable, Codable, Equatable {
 
             return ResolvedAgent(
                 role: pref.role, cli: usedCli, model: usedModel,
-                status: status, reason: pref.reason
+                status: status, reason: pref.reason,
+                customInstructions: pref.customInstructions ?? ""
             )
         }
     }

@@ -2173,7 +2173,10 @@ struct TeamCreationView: View {
         selectedSmartPresetId = effectivePreset.id
         selectedWorkflowName = nil
         leaderMode = effectivePreset.leaderMode
-        if !AgentRolePreset.models(for: effectivePreset.leaderMode).contains(leaderModel) {
+        if let presetLeaderModel = effectivePreset.leaderModel,
+           AgentRolePreset.models(for: effectivePreset.leaderMode).contains(presetLeaderModel) {
+            leaderModel = presetLeaderModel
+        } else if !AgentRolePreset.models(for: effectivePreset.leaderMode).contains(leaderModel) {
             leaderModel = AgentRolePreset.defaultModel(for: effectivePreset.leaderMode)
         }
         try? TeamTemplateManager.shared.setLastSelected(id: templateId)
@@ -2193,7 +2196,11 @@ struct TeamCreationView: View {
             case .normal:
                 badge = .none
             }
-            return TeamAgentRow(preset: rolePreset, customInstructions: "", providerBadge: badge)
+            return TeamAgentRow(
+                preset: rolePreset,
+                customInstructions: agent.customInstructions,
+                providerBadge: badge
+            )
         }
 
         if teamName == "my-team" || teamName.isEmpty {
@@ -2342,7 +2349,8 @@ struct TeamCreationView: View {
                 primaryModel: row.preset.model,
                 fallbackCli: row.preset.cli,
                 fallbackModel: row.preset.model,
-                reason: "Inline edit"
+                reason: "Inline edit",
+                customInstructions: row.customInstructions.nonEmpty
             )
         }
     }
@@ -2352,6 +2360,7 @@ struct TeamCreationView: View {
             for: TemplateID(category: .smart, slug: presetId)
         )?.payload else { return nil }
         preset.leaderMode = leaderMode
+        preset.leaderModel = leaderMode == "repl" ? nil : leaderModel
         preset.agents = liveProviderPreferences()
         return preset
     }

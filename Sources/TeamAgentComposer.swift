@@ -31,6 +31,13 @@ struct TeamAgentComposer: View {
     var onMaxCost: (() -> Void)?
     var onBalanced: (() -> Void)?
     var onMinCost: (() -> Void)?
+    /// New Project has a transient default machine that members can inherit.
+    /// Other callers leave this off and retain the original explicit host UI.
+    var supportsDefaultPlacement = false
+    var defaultHostKey: String?
+    var defaultHostDirectory = ""
+    var inheritedAgentIDs: Set<UUID> = []
+    var onAgentPlacementChanged: (_ agentID: UUID, _ inheritsDefault: Bool) -> Void = { _, _ in }
 
     @ObservedObject private var presetManager = AgentRolePresetManager.shared
     @ObservedObject private var hostStore = RemoteHostStore.shared
@@ -41,6 +48,18 @@ struct TeamAgentComposer: View {
     @State private var bulkModel: String = AgentRolePreset.defaultModel(for: "claude")
     @State private var bulkHostKey: String?
     @State private var bulkHostDirectory: String = ""
+    @State private var bulkUsesDefaultPlacement = true
+
+    private static let defaultPlacementTag = "__term_mesh_default__"
+    private static let localPlacementTag = "__term_mesh_local__"
+
+    private var defaultMachineLabel: String {
+        guard let defaultHostKey,
+              let host = selectablePeers.first(where: { $0.id == defaultHostKey }) else {
+            return "This Mac"
+        }
+        return host.displayName
+    }
 
     /// Every machine that has been configured, connected or not.
     ///
@@ -138,20 +157,36 @@ struct TeamAgentComposer: View {
                         .buttonStyle(.borderless)
                         .help("Put every agent on this machine, at this path")
                         Picker("", selection: Binding(
-                            get: { bulkHostKey },
-                            set: { newHost in
-                                bulkHostKey = newHost
-                                bulkHostDirectory = newHost
-                                    .map { defaultDirectory(forHost: $0, excluding: -1) } ?? ""
+                            get: {
+                                if supportsDefaultPlacement && bulkUsesDefaultPlacement {
+                                    return Self.defaultPlacementTag
+                                }
+                                return bulkHostKey ?? Self.localPlacementTag
+                            },
+                            set: { selection in
+                                if selection == Self.defaultPlacementTag {
+                                    bulkUsesDefaultPlacement = true
+                                    bulkHostKey = defaultHostKey
+                                    bulkHostDirectory = defaultHostDirectory
+                                } else {
+                                    bulkUsesDefaultPlacement = false
+                                    bulkHostKey = selection == Self.localPlacementTag ? nil : selection
+                                    bulkHostDirectory = bulkHostKey
+                                        .map { defaultDirectory(forHost: $0, excluding: -1) } ?? ""
+                                }
                             }
                         )) {
-                            Text("Here").tag(String?.none)
+                            if supportsDefaultPlacement {
+                                Text("Default · \(defaultMachineLabel)")
+                                    .tag(Self.defaultPlacementTag)
+                            }
+                            Text("This Mac").tag(Self.localPlacementTag)
                             ForEach(selectablePeers, id: \.id) { host in
-                                Text(host.displayName).tag(String?.some(host.id))
+                                Text(host.displayName).tag(host.id)
                             }
                         }
                         .frame(width: 110)
-                        if bulkHostKey != nil {
+                        if bulkHostKey != nil && !bulkUsesDefaultPlacement {
                             TextField("/path/on/that/machine", text: $bulkHostDirectory)
                                 .textFieldStyle(.roundedBorder)
                                 .frame(width: 160)
@@ -285,24 +320,44 @@ struct TeamAgentComposer: View {
                 // one option and a question nobody asked.
                 if !selectablePeers.isEmpty {
                     Picker("", selection: Binding(
-                        get: { agents[index].hostKey },
-                        set: { newHost in
-                            agents[index].hostKey = newHost
-                            agents[index].hostDirectory = newHost
-                                .map { defaultDirectory(forHost: $0, excluding: index) } ?? ""
+                        get: {
+                            if supportsDefaultPlacement && inheritedAgentIDs.contains(agent.id) {
+                                return Self.defaultPlacementTag
+                            }
+                            return agents[index].hostKey ?? Self.localPlacementTag
+                        },
+                        set: { selection in
+                            if selection == Self.defaultPlacementTag {
+                                agents[index].hostKey = defaultHostKey
+                                agents[index].hostDirectory = defaultHostKey == nil ? "" : defaultHostDirectory
+                                onAgentPlacementChanged(agent.id, true)
+                            } else {
+                                let newHost = selection == Self.localPlacementTag ? nil : selection
+                                agents[index].hostKey = newHost
+                                agents[index].hostDirectory = newHost
+                                    .map { defaultDirectory(forHost: $0, excluding: index) } ?? ""
+                                onAgentPlacementChanged(agent.id, false)
+                            }
                         }
                     )) {
-                        Text("Here").tag(String?.none)
+                        if supportsDefaultPlacement {
+                            Text("Default · \(defaultMachineLabel)")
+                                .tag(Self.defaultPlacementTag)
+                        }
+                        Text("This Mac").tag(Self.localPlacementTag)
                         ForEach(selectablePeers, id: \.id) { host in
                             Text(host.isConnected ? host.displayName : "\(host.displayName) — offline")
-                                .tag(String?.some(host.id))
+                                .tag(host.id)
                         }
                     }
                     .frame(width: 150)
                     if agents[index].hostKey != nil {
                         TextField("/path/on/that/machine", text: Binding(
                             get: { agents[index].hostDirectory },
-                            set: { agents[index].hostDirectory = $0 }
+                            set: {
+                                agents[index].hostDirectory = $0
+                                onAgentPlacementChanged(agent.id, false)
+                            }
                         ))
                         .textFieldStyle(.roundedBorder)
                         .frame(width: 170)
@@ -446,10 +501,17 @@ struct TeamAgentComposer: View {
 
     private func applyHostToAll() {
         for i in agents.indices {
-            agents[i].hostKey = bulkHostKey
-            agents[i].hostDirectory = bulkHostKey == nil
-                ? ""
-                : bulkHostDirectory.trimmingCharacters(in: .whitespacesAndNewlines)
+            if supportsDefaultPlacement && bulkUsesDefaultPlacement {
+                agents[i].hostKey = defaultHostKey
+                agents[i].hostDirectory = defaultHostKey == nil ? "" : defaultHostDirectory
+                onAgentPlacementChanged(agents[i].id, true)
+            } else {
+                agents[i].hostKey = bulkHostKey
+                agents[i].hostDirectory = bulkHostKey == nil
+                    ? ""
+                    : bulkHostDirectory.trimmingCharacters(in: .whitespacesAndNewlines)
+                onAgentPlacementChanged(agents[i].id, false)
+            }
         }
     }
 

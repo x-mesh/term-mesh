@@ -32,10 +32,10 @@ struct NewProjectView: View {
     /// Whether the folder has been typed into directly, which stops the name
     /// from moving it.
     @State private var folderEdited = false
-    /// How many members there were last time this was checked, so a row that
-    /// has just been added can be told apart from one deliberately set to run
-    /// on this Mac.
-    @State private var knownAgentCount = 0
+    /// Placement inheritance is transient form state. TeamAgentRow keeps the
+    /// resolved host for the existing creation API.
+    @State private var knownAgentIDs: Set<UUID> = []
+    @State private var inheritedAgentIDs: Set<UUID> = []
     @State private var agents: [TeamAgentRow] = []
     /// The machine this project lives on.
     ///
@@ -64,12 +64,56 @@ struct NewProjectView: View {
     /// starting a project means.
     @State private var leaderCli = "claude"
     @State private var leaderModel = AgentRolePreset.defaultModel(for: "claude")
-    /// Independent of `runsOnHostKey`: the project and its leader do not have
-    /// to live on the same machine.
-    @State private var leaderHostKey: String?
+    @State private var selectedTeamPresetId: TemplateID?
+    @State private var appliedTeamSignature: TeamSignature?
+    @State private var showingSavePreset = false
+    @State private var showingManagePresets = false
+    @State private var savePresetName = ""
+    @State private var presetError: String?
+    /// Where the leader runs: following this project's Default machine, or
+    /// somewhere the user pointed it on purpose.
+    ///
+    /// Modeled as inheritance rather than a copied host key so "still
+    /// following the default" and "coincidentally on the same machine" can
+    /// never be confused with each other — the earlier design copied
+    /// `runsOnHostKey` into a second field and the two silently drifted
+    /// apart the moment either one changed alone.
+    @State private var leaderPlacement: HostPlacement = .inherited
+
+    /// A place something in this form runs: the project's Default machine,
+    /// or an explicit override of it (`nil` inside `.explicit` means "This
+    /// Mac", stated on purpose rather than left blank).
+    enum HostPlacement: Hashable {
+        case inherited
+        case explicit(String?)
+    }
+
+    /// The leader's effective host, resolving `leaderPlacement` against the
+    /// current Default machine. Read-only: set `leaderPlacement`, not this.
+    private var leaderHostKey: String? {
+        switch leaderPlacement {
+        case .inherited: return runsOnHostKey
+        case .explicit(let hostKey): return hostKey
+        }
+    }
 
     @ObservedObject private var presetManager = AgentRolePresetManager.shared
+    @ObservedObject private var teamTemplateManager = TeamTemplateManager.shared
+    @ObservedObject private var providerDetector = ProviderDetector.shared
     @ObservedObject private var hostStore = RemoteHostStore.shared
+
+    private struct TeamSignature: Equatable {
+        struct Agent: Equatable {
+            let role: String
+            let cli: String
+            let model: String
+            let instructions: String
+        }
+
+        let leaderCli: String
+        let leaderModel: String?
+        let agents: [Agent]
+    }
 
     private var trimmedDirectory: String {
         directory.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -96,11 +140,24 @@ struct NewProjectView: View {
                 VStack(alignment: .leading, spacing: 16) {
                     projectFields
                     Divider()
+                    teamPresetRow
                     leaderRow
                     TeamAgentComposer(
                         agents: $agents,
                         workingDirectory: trimmedDirectory,
-                        defaultModel: AgentRolePreset.defaultModel(for: "claude")
+                        onComposionChanged: {},
+                        defaultModel: AgentRolePreset.defaultModel(for: "claude"),
+                        supportsDefaultPlacement: true,
+                        defaultHostKey: runsOnHostKey,
+                        defaultHostDirectory: trimmedDirectory,
+                        inheritedAgentIDs: inheritedAgentIDs,
+                        onAgentPlacementChanged: { id, inheritsDefault in
+                            if inheritsDefault {
+                                inheritedAgentIDs.insert(id)
+                            } else {
+                                inheritedAgentIDs.remove(id)
+                            }
+                        }
                     )
                 }
                 .padding(20)
@@ -110,11 +167,28 @@ struct NewProjectView: View {
         }
         .frame(width: 860, height: 620)
         .onAppear {
-            seedFirstAgent()
+            applyInitialTeamPreset()
             adoptProjectMachineForNewRows()
         }
-        .onChange(of: agents.count) { _, _ in
+        .onChange(of: agents.map(\.id)) { _, _ in
             adoptProjectMachineForNewRows()
+        }
+        .sheet(isPresented: $showingSavePreset) {
+            savePresetSheet
+        }
+        .sheet(isPresented: $showingManagePresets) {
+            TeamPresetManagerSheet(
+                manager: teamTemplateManager,
+                selectedId: $selectedTeamPresetId
+            )
+        }
+        .alert("Preset could not be saved", isPresented: Binding(
+            get: { presetError != nil },
+            set: { if !$0 { presetError = nil } }
+        )) {
+            Button("OK", role: .cancel) {}
+        } message: {
+            Text(presetError ?? "")
         }
         .accessibilityIdentifier("newProject.sheet")
     }
@@ -131,78 +205,75 @@ struct NewProjectView: View {
         .padding(.vertical, 14)
     }
 
+    /// A single row: who leads, and where — folded together because showing
+    /// this next to `Runs on` / `Agent = jw-server` as three separate answers
+    /// read as three different opinions about where the project lives, when
+    /// they were meant to be the same one until someone said otherwise.
     private var leaderRow: some View {
         Grid(alignment: .leading, horizontalSpacing: 12, verticalSpacing: 10) {
             GridRow {
                 Text("Leader")
                     .font(.subheadline.bold())
                 HStack(spacing: 8) {
-            Picker("", selection: Binding(
-                get: { leaderCli },
-                set: { newCli in
-                    let old = leaderCli
-                    leaderCli = newCli
-                    if AgentRolePreset.models(for: old) != AgentRolePreset.models(for: newCli) {
-                        leaderModel = AgentRolePreset.defaultModel(for: newCli)
-                    }
-                }
-            )) {
-                ForEach(AgentRolePreset.supportedCLIs, id: \.self) { cli in
-                    Text(cli.capitalized).tag(cli)
-                }
-                Text("REPL (manual)").tag("repl")
-            }
-            .labelsHidden()
-            .fixedSize()
-
-            if leaderCli != "repl" {
-                Picker("", selection: Binding(
-                    get: {
-                        let options = AgentRolePreset.models(for: leaderCli)
-                        guard options.contains(leaderModel) else {
-                            let fallback = AgentRolePreset.defaultModel(for: leaderCli)
-                            DispatchQueue.main.async { leaderModel = fallback }
-                            return fallback
+                    Picker("", selection: Binding(
+                        get: { leaderCli },
+                        set: { newCli in
+                            let old = leaderCli
+                            leaderCli = newCli
+                            if AgentRolePreset.models(for: old) != AgentRolePreset.models(for: newCli) {
+                                leaderModel = AgentRolePreset.defaultModel(for: newCli)
+                            }
                         }
-                        return leaderModel
-                    },
-                    set: { leaderModel = $0 }
-                )) {
-                    ForEach(AgentRolePreset.models(for: leaderCli), id: \.self) { m in
-                        Text(AgentRolePreset.modelDisplayLabel(m, for: leaderCli)).tag(m)
+                    )) {
+                        ForEach(AgentRolePreset.supportedCLIs, id: \.self) { cli in
+                            Text(cli.capitalized).tag(cli)
+                        }
+                        Text("REPL (manual)").tag("repl")
                     }
-                }
-                .labelsHidden()
-                .fixedSize()
-            } else {
-                Text("a console you drive by hand — no model")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            }
-                }
-            }
-            GridRow {
-                Text("Leader host")
-                HStack(spacing: 8) {
-                    Picker("", selection: $leaderHostKey) {
-                        Text("This Mac").tag(String?.none)
+                    .labelsHidden()
+                    .fixedSize()
+
+                    if leaderCli != "repl" {
+                        Picker("", selection: Binding(
+                            get: {
+                                let options = AgentRolePreset.models(for: leaderCli)
+                                let normalized = AgentRolePreset.normalizeModel(leaderModel, for: leaderCli)
+                                guard options.contains(normalized) else {
+                                    let fallback = AgentRolePreset.defaultModel(for: leaderCli)
+                                    DispatchQueue.main.async { leaderModel = fallback }
+                                    return fallback
+                                }
+                                if normalized != leaderModel {
+                                    DispatchQueue.main.async { leaderModel = normalized }
+                                }
+                                return normalized
+                            },
+                            set: { leaderModel = $0 }
+                        )) {
+                            ForEach(AgentRolePreset.models(for: leaderCli), id: \.self) { m in
+                                Text(AgentRolePreset.modelDisplayLabel(m, for: leaderCli)).tag(m)
+                            }
+                        }
+                        .labelsHidden()
+                        .fixedSize()
+                    } else {
+                        Text("a console you drive by hand — no model")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+
+                    Divider().frame(height: 16)
+
+                    Picker("", selection: $leaderPlacement) {
+                        Text(defaultPlacementLabel).tag(HostPlacement.inherited)
+                        Text("This Mac").tag(HostPlacement.explicit(nil))
                         ForEach(connectedPeers, id: \.id) { host in
-                            Text(host.displayName).tag(String?.some(host.id))
+                            Text(host.displayName).tag(HostPlacement.explicit(host.id))
                         }
                     }
                     .labelsHidden()
-                    .frame(width: 220)
+                    .frame(width: 170)
                     .accessibilityIdentifier("newProject.leaderHost")
-                    if connectedPeers.isEmpty {
-                        Text("connect a peer to place the leader remotely")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                    } else if let leaderHostKey,
-                              let host = connectedPeers.first(where: { $0.id == leaderHostKey }) {
-                        Text("leader runs on \(host.displayName)")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                    }
                 }
             }
         }
@@ -211,7 +282,7 @@ struct NewProjectView: View {
     private var projectFields: some View {
         Grid(alignment: .leading, horizontalSpacing: 12, verticalSpacing: 10) {
             GridRow {
-                Text("Runs on")
+                Text("Default machine")
                 HStack(spacing: 8) {
                     Picker("", selection: $runsOnHostKey) {
                         Text("This Mac").tag(String?.none)
