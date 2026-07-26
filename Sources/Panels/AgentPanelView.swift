@@ -97,9 +97,7 @@ struct AgentPanelView: View {
     /// banner that scrolls away cannot answer the first one.
     private var banner: some View {
         HStack(alignment: .top, spacing: 10) {
-            Text(Self.mark(for: panel.cli))
-                .font(.system(size: 20, weight: .semibold, design: .monospaced))
-                .foregroundStyle(accent)
+            Mascot(rows: Self.mascot(for: panel.cli), accent: accent)
             VStack(alignment: .leading, spacing: 2) {
                 Text(panel.agentName)
                     .font(.system(size: 15, weight: .bold))
@@ -125,17 +123,45 @@ struct AgentPanelView: View {
         .overlay(RoundedRectangle(cornerRadius: 8).strokeBorder(accent.opacity(0.35)))
     }
 
-    /// A mark per CLI. Letters, not invented logos — the complaint was not
-    /// being able to tell panes apart, and a symbol that has to be decoded
-    /// first is not an answer to that.
-    private static func mark(for cli: String) -> String {
+    /// A mascot per CLI, in block characters, all nine columns wide so they
+    /// read as one family rather than six unrelated doodles.
+    ///
+    /// Claude's is its own welcome banner. The rest are silhouettes taken from
+    /// what the thing is called — codex a knot of code, kiro a cut gem, cursor
+    /// a pointer, agy (Antigravity) something lifting off, gemini a pair of
+    /// sparks. Deliberately not imitations of anyone's logo: the pane says the
+    /// CLI's name beside the mascot, so the drawing never has to be decoded to
+    /// answer "which one is this".
+    static func mascot(for cli: String) -> [String] {
         switch cli {
-        case "claude": return "✳"
-        case "codex":  return "◇"
-        case "kiro":   return "◈"
-        case "cursor": return "▸"
-        case "agy":    return "◆"
-        default:       return "●"
+        case "claude":
+            return [" ▐▛███▜▌ ",
+                    "▝▜█████▛▘",
+                    "  ▘▘ ▝▝  "]
+        case "codex":
+            return [" ▗▄▟█▙▄▖ ",
+                    "▐█▛▘ ▝▜█▌",
+                    " ▝▀▜█▛▀▘ "]
+        case "kiro":
+            return ["   ▗▄▖   ",
+                    "  ▟███▙  ",
+                    "  ▝▀▀▀▘  "]
+        case "cursor":
+            return ["  ▙▖     ",
+                    "  ▐█▙▖   ",
+                    "  ▐███▙▖ "]
+        case "agy":
+            return ["   ▗▖    ",
+                    "  ▟██▙   ",
+                    " ▘▘  ▝▝  "]
+        case "gemini":
+            return ["  ▗▄▖▗▖  ",
+                    " ▝█████▘ ",
+                    "  ▘▝▀▘▝  "]
+        default:
+            return ["  ▗▄▄▄▖  ",
+                    " ▐█████▌ ",
+                    "  ▝▀▀▀▘  "]
         }
     }
 
@@ -287,6 +313,29 @@ struct AgentPanelView: View {
             // exists to stop making.
             NSSound.beep()
         }
+    }
+}
+
+/// Block characters drawn tight enough to be a shape.
+///
+/// A `Text` holding all three rows would space them by the font's line height
+/// and the blocks would not meet — the drawing only reads as one if the rows
+/// touch, so each is its own row with the leading pulled out.
+private struct Mascot: View {
+    let rows: [String]
+    let accent: Color
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            ForEach(Array(rows.enumerated()), id: \.offset) { _, row in
+                Text(row)
+                    .font(.system(size: 11, design: .monospaced))
+                    .lineSpacing(0)
+                    .fixedSize()
+            }
+        }
+        .foregroundStyle(accent)
+        .accessibilityHidden(true)
     }
 }
 

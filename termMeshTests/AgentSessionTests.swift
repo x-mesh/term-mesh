@@ -548,6 +548,28 @@ final class AgentSessionTests: XCTestCase {
         XCTAssertEqual(TeamOrchestrator.withoutTerminalProtocol(broken), broken)
     }
 
+    // MARK: - The mascots
+
+    /// They only read as one family if they line up, and a stray space is the
+    /// easiest thing in the world to leave in.
+    func testEveryMascotIsThreeRowsOfTheSameWidth() {
+        for cli in ["claude", "codex", "kiro", "cursor", "agy", "gemini", "unknown"] {
+            let rows = AgentPanelView.mascot(for: cli)
+            XCTAssertEqual(rows.count, 3, cli)
+            for row in rows {
+                XCTAssertEqual(row.count, 9, "\(cli): \(row)")
+            }
+        }
+    }
+
+    /// Each CLI gets its own; a repeat would defeat the whole point of drawing
+    /// them.
+    func testNoTwoCliShareAMascot() {
+        let clis = ["claude", "codex", "kiro", "cursor", "agy", "gemini"]
+        let drawn = Set(clis.map { AgentPanelView.mascot(for: $0).joined() })
+        XCTAssertEqual(drawn.count, clis.count)
+    }
+
     // MARK: - Which CLIs a picker may offer
 
     private func withNativePanel(_ on: Bool, _ body: () -> Void) {
