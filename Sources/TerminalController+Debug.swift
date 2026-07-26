@@ -510,6 +510,14 @@ extension TerminalController {
             return .err(code: "invalid_params", message: "directory is required", data: nil)
         }
         let templateName = params["template"] as? String
+        let leaderMode = params["leader_cli"] as? String ?? "claude"
+        let leaderModel = params["leader_model"] as? String ?? AgentRolePreset.defaultModel(for: leaderMode)
+        let leaderEndpoint: LeaderEndpoint = if let hostKey = params["leader_host"] as? String,
+                                                !hostKey.isEmpty {
+            .peer(hostKey: hostKey)
+        } else {
+            .local
+        }
         var result: V2CallResult = .err(code: "internal_error", message: "not run", data: nil)
         _ = v2MainExec(timeout: 20) {
             MainActor.assumeIsolated {
@@ -553,7 +561,9 @@ extension TerminalController {
                                 named: URL(fileURLWithPath: directory).lastPathComponent,
                                 rows: rows,
                                 workingDirectory: directory,
-                                leaderMode: "repl",
+                                leaderMode: leaderMode,
+                                leaderModel: leaderModel,
+                                leaderEndpoint: leaderEndpoint,
                                 tabManager: tabManager
                             )
                         }
@@ -576,7 +586,9 @@ extension TerminalController {
                         named: URL(fileURLWithPath: directory).lastPathComponent,
                         rows: rows,
                         workingDirectory: directory,
-                        leaderMode: "repl",
+                        leaderMode: leaderMode,
+                        leaderModel: leaderModel,
+                        leaderEndpoint: leaderEndpoint,
                         tabManager: tabManager
                     )
                     result = .ok([

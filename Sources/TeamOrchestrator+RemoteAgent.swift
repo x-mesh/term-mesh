@@ -125,18 +125,16 @@ extension TeamOrchestrator {
         // submit the export+exec line while echo is disabled. The grant is
         // already short-lived and remains only in the launched CLI process.
         let prepare = Self.remoteLeaderPrepareCommand()
-        guard sendToAgentByPanel(
+        guard await sendRemoteLeaderStage(
             teamName: teamName,
             panelId: panel.id,
             workspaceId: workspace.id,
             text: prepare,
-            tabManager: tabManager,
-            withReturn: true
+            tabManager: tabManager
         ) else {
             _ = workspace.closePanel(panel.id, force: true)
             throw RemoteAgentError.paneCreationFailed
         }
-        try? await Task.sleep(nanoseconds: 200_000_000)
 
         let command = Self.remoteLeaderCommand(
             cli: cli,
@@ -145,13 +143,12 @@ extension TeamOrchestrator {
             workingDirectory: workingDirectory,
             grant: grantResponse.grant
         )
-        let launched = sendToAgentByPanel(
+        let launched = await sendRemoteLeaderStage(
             teamName: teamName,
             panelId: panel.id,
             workspaceId: workspace.id,
             text: command,
-            tabManager: tabManager,
-            withReturn: true
+            tabManager: tabManager
         )
         if !launched {
             // Best-effort recovery for the only stage that can leave a shell
@@ -179,6 +176,42 @@ extension TeamOrchestrator {
             endpoint: .peer(hostKey: hostKey)
         )
         _ = workspace.closePanel(oldLeaderPanelID, force: true)
+    }
+
+    /// Send one remote-leader bootstrap line and wait until both its paste and
+    /// delayed Return have completed. `sendToAgentByPanel` returns when the
+    /// paste is merely queued; starting the grant-bearing line at that point
+    /// concatenates it with the preceding `stty -echo` line on a peer pane.
+    /// The shell then runs `stty -echoexport ...; exec ...`: the CLI launches,
+    /// but none of the scoped leader environment reaches it.
+    @MainActor
+    private func sendRemoteLeaderStage(
+        teamName: String,
+        panelId: UUID,
+        workspaceId: UUID,
+        text: String,
+        tabManager: TabManager
+    ) async -> Bool {
+        await withCheckedContinuation { continuation in
+            var resumed = false
+            let finish: (Bool) -> Void = { delivered in
+                guard !resumed else { return }
+                resumed = true
+                continuation.resume(returning: delivered)
+            }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 12.0) {
+                finish(false)
+            }
+            _ = sendToAgentByPanel(
+                teamName: teamName,
+                panelId: panelId,
+                workspaceId: workspaceId,
+                text: text,
+                tabManager: tabManager,
+                withReturn: true,
+                completion: finish
+            )
+        }
     }
 
     /// Attach an agent to this team that runs on `hostKey`.
