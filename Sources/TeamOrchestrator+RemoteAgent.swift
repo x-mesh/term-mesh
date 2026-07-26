@@ -62,7 +62,7 @@ extension TeamOrchestrator {
         }
 
         let lease = try await PeerPaneHostRegistry.shared.acquire(host.paneHostSpec)
-        let panel: TerminalPanel
+        let session: PeerPaneSession
         do {
             let surfaces = try await PeerPaneSession.listSurfaces(on: lease)
             var chosen = surfaces.first(where: \.attachable)
@@ -71,31 +71,19 @@ extension TeamOrchestrator {
                 chosen = fresh
             }
             guard let chosen else {
-                PeerPaneHostRegistry.shared.release(lease)
                 throw RemoteAgentError.noAttachableSurface(host.displayName)
             }
-            let session = try await PeerPaneSession.attach(
+            session = try await PeerPaneSession.attach(
                 lease: lease,
                 surface: chosen,
                 title: "Leader",
                 spec: host.paneHostSpec
             )
-            PeerPaneHostRegistry.shared.release(lease)
-            guard let opened = workspace.openRemotePane(
-                session: session,
-                orientation: .horizontal,
-                focus: false,
-                from: team.leaderPanelId
-            ) else {
-                session.teardown()
-                throw RemoteAgentError.paneCreationFailed
-            }
-            panel = opened
-            panel.surface.resetTerminal()
         } catch {
             PeerPaneHostRegistry.shared.release(lease)
             throw error
         }
+        PeerPaneHostRegistry.shared.release(lease)
 
         var bootstrap = Termmesh_Peer_V1_TeamLeaderBootstrapRequest()
         bootstrap.projectID = "name:\(teamName)"
@@ -110,9 +98,19 @@ extension TeamOrchestrator {
             projectID == "name:\(teamName)" ? teamUUID : nil
         }
         guard grantResponse.ok else {
-            _ = workspace.closePanel(panel.id, force: true)
+            session.teardown()
             throw RemoteAgentError.paneCreationFailed
         }
+
+        guard let panel = workspace.replaceTerminalPaneWithRemote(
+            panelId: team.leaderPanelId,
+            session: session
+        ) else {
+            session.teardown()
+            throw RemoteAgentError.paneCreationFailed
+        }
+        replaceLeaderAnchorPanel(teamName: teamName, panelID: panel.id)
+        panel.surface.resetTerminal()
 
         workspace.setPanelCustomTitle(
             panelId: panel.id,
@@ -132,7 +130,6 @@ extension TeamOrchestrator {
             text: prepare,
             tabManager: tabManager
         ) else {
-            _ = workspace.closePanel(panel.id, force: true)
             throw RemoteAgentError.paneCreationFailed
         }
 
@@ -161,21 +158,17 @@ extension TeamOrchestrator {
                 tabManager: tabManager,
                 withReturn: true
             )
-            _ = workspace.closePanel(panel.id, force: true)
             throw RemoteAgentError.paneCreationFailed
         }
 
-        // Do not publish `.peer` or retire the local leader until the remote
-        // pane has accepted its launch command. An attach/bootstrap/launch
-        // failure then leaves the still-running local leader as the truthful
-        // endpoint shown by the sidebar and team status.
-        let oldLeaderPanelID = team.leaderPanelId
+        // Publish the peer endpoint only after the remote pane accepts its
+        // launch command. Until then the same pane remains visibly pending,
+        // without creating or removing a transient split.
         replaceLeaderEndpoint(
             teamName: teamName,
             panelID: panel.id,
             endpoint: .peer(hostKey: hostKey)
         )
-        _ = workspace.closePanel(oldLeaderPanelID, force: true)
     }
 
     /// Send one remote-leader bootstrap line and wait until both its paste and

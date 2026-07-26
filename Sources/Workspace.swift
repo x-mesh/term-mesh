@@ -2192,6 +2192,89 @@ final class Workspace: Identifiable, ObservableObject {
         return panel
     }
 
+    /// Replace an existing terminal panel in-place with a remote relay panel.
+    ///
+    /// The Bonsplit tab and pane identities stay unchanged, so callers that
+    /// are turning a connection placeholder into a remote terminal do not
+    /// flash a second split and then collapse the first one.
+    func replaceTerminalPaneWithRemote(
+        panelId: UUID,
+        session: PeerPaneSession,
+        lifetime: RemotePaneLifetime = .temporary,
+        bindingRole: PaneBindingRole = .owned
+    ) -> TerminalPanel? {
+        guard let oldPanel = panels[panelId] as? TerminalPanel,
+              let tabId = surfaceIdFromPanelId(panelId),
+              let paneId = paneId(forPanelId: panelId)
+        else { return nil }
+
+        let inheritedConfig = inheritedTerminalConfig(
+            preferredPanelId: panelId,
+            inPane: paneId
+        )
+        let replacement = TerminalPanel(
+            workspaceId: id,
+            context: GHOSTTY_SURFACE_CONTEXT_TAB,
+            configTemplate: inheritedConfig,
+            portOrdinal: portOrdinal,
+            command: session.relayLaunchCommand,
+            environment: session.relayEnvironment
+        )
+
+        panels[replacement.id] = replacement
+        panelTitles[replacement.id] = replacement.displayTitle
+        seedTerminalInheritanceFontPoints(
+            panelId: replacement.id,
+            configTemplate: inheritedConfig
+        )
+        surfaceIdToPanelId[tabId] = replacement.id
+        bonsplitController.updateTab(
+            tabId,
+            title: replacement.displayTitle,
+            icon: .some(replacement.displayIcon),
+            iconImageData: .some(nil),
+            kind: .some(SurfaceKind.terminal),
+            hasCustomTitle: false,
+            isDirty: replacement.isDirty,
+            showsNotificationBadge: false,
+            isLoading: false,
+            isPinned: false
+        )
+
+        AutoReplyPoller.shared.forget(panelId: panelId)
+        PeerHostCoordinator.shared.invalidateTapHub(forSurfaceId: panelId)
+        TerminalController.shared.v2CleanupSurface(panelId)
+        retrievalStore.removeBinding(panelID: panelId)
+        panels.removeValue(forKey: panelId)
+        panelDirectories.removeValue(forKey: panelId)
+        panelGitBranches.removeValue(forKey: panelId)
+        panelTitles.removeValue(forKey: panelId)
+        panelCustomTitles.removeValue(forKey: panelId)
+        pinnedPanelIds.remove(panelId)
+        manualUnreadPanelIds.remove(panelId)
+        manualUnreadMarkedAt.removeValue(forKey: panelId)
+        panelSubscriptions.removeValue(forKey: panelId)
+        surfaceTTYNames.removeValue(forKey: panelId)
+        surfaceListeningPorts.removeValue(forKey: panelId)
+        PortScanner.shared.unregisterPanel(workspaceId: id, panelId: panelId)
+        terminalInheritanceFontPointsByPanelId.removeValue(forKey: panelId)
+        if lastTerminalConfigInheritancePanelId == panelId {
+            lastTerminalConfigInheritancePanelId = nil
+        }
+        oldPanel.close()
+
+        bindRemotePane(
+            session: session,
+            to: replacement,
+            lifetime: lifetime,
+            bindingRole: bindingRole
+        )
+        if bonsplitController.selectedTab(inPane: paneId)?.id == tabId {
+            applyTabSelection(tabId: tabId, inPane: paneId)
+        }
+        return replacement
+    }
+
     /// Wire a remote session to a panel whose Ghostty surface was
     /// created with the session's relay command/env: session ownership,
     /// host signals, disconnect banner, and relay start. Split out of

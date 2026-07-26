@@ -151,8 +151,8 @@ final class TeamOrchestrator: ObservableObject {
 
     @Published private(set) var teams: [String: Team] = [:]
 
-    /// Install the pane that replaced a temporary local leader. Kept on the
-    /// owning type because `teams` is intentionally read-only to extensions.
+    /// Install the remote pane that replaced the pending leader anchor. Kept
+    /// on the owning type because `teams` is intentionally read-only to extensions.
     func replaceLeaderEndpoint(
         teamName: String,
         panelID: UUID,
@@ -164,6 +164,14 @@ final class TeamOrchestrator: ObservableObject {
         team.leaderEndpoint = endpoint
         team.leaderReady = true
         team.leaderFailureDescription = nil
+        teams[teamName] = team
+        syncTeamStateToDaemon()
+    }
+
+    func replaceLeaderAnchorPanel(teamName: String, panelID: UUID) {
+        guard var team = teams[teamName] else { return }
+        team.leaderPanelId = panelID
+        team.leaderWorkspaceId = nil
         teams[teamName] = team
         syncTeamStateToDaemon()
     }
