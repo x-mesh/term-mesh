@@ -97,6 +97,14 @@ class Renderer:
         self.hooks_seen = 0
         self.tools_open: dict[str, str] = {}
         self.opened = False
+        # A block being written right now: printed as it arrives rather than
+        # held until it is finished, so the pane shows work happening instead
+        # of going quiet and then producing a paragraph.
+        self.streaming: str | None = None
+        self.at_line_start = True
+        # Whether this message was already drawn as it arrived, so the whole
+        # copy that follows is not drawn again underneath it.
+        self.streamed_message = False
         # Turns this pane typed itself, so the replay can say who spoke. The
         # pane cannot otherwise tell a leader's task from a person's question,
         # and after the fact that is the more useful of the two labels.
@@ -185,11 +193,15 @@ class Renderer:
         for block in o.get("message", {}).get("content") or []:
             bt = block.get("type")
             if bt == "text":
+                if self.streamed_message:
+                    continue
                 text = block.get("text", "")
                 if text.strip():
                     self.emit(rule("claude", GREEN))
                     self.emit(wrap(text))
             elif bt == "thinking":
+                if self.streamed_message:
+                    continue
                 # Extended thinking arrives redacted — a signature and an empty
                 # string. Showing "(thinking)" is honest; showing nothing hides
                 # that time passed here.
@@ -207,12 +219,51 @@ class Renderer:
                             or args.get("description") or "")
                 self.emit(f"  {YELLOW}▸ {name}{OFF} {GREY}{brief(headline, 160)}{OFF}")
 
+    def _stream_event(self, o: dict) -> None:
+        """The same block/delta shape whoever produced it.
+
+        Claude emits it under `--include-partial-messages`; the bridge
+        translates codex's `item/agentMessage/delta` and kiro's ACP
+        `agent_message_chunk` into it. One vocabulary, so this stays one
+        renderer.
+        """
+        e = o.get("event") or {}
+        kind = e.get("type")
+        if kind == "message_start":
+            self.streaming = None
+            return
+        if kind == "content_block_start":
+            block = (e.get("content_block") or {}).get("type")
+            if block == "text":
+                self.streaming = "text"
+                self.emit(rule("claude", GREEN))
+            elif block == "thinking" and self.show_thinking:
+                self.streaming = "thinking"
+                sys.stdout.write(f"{DIM}  ✻ ")
+                sys.stdout.flush()
+            return
+        if kind == "content_block_delta" and self.streaming:
+            d = e.get("delta") or {}
+            text = d.get("text") if self.streaming == "text" else d.get("thinking")
+            if text:
+                # No newline: this is the middle of a sentence.
+                sys.stdout.write(("  " if self.at_line_start else "") + text.replace("\n", "\n  "))
+                self.at_line_start = text.endswith("\n")
+                sys.stdout.flush()
+            return
+        if kind == "content_block_stop" and self.streaming:
+            sys.stdout.write(f"{OFF}\n")
+            sys.stdout.flush()
+            self.streaming = None
+            self.streamed_message = True
+
     def _rate_limit_event(self, o: dict) -> None:
         info = o.get("rate_limit_info") or {}
         if info.get("status") not in (None, "allowed"):
             self.emit(f"  {YELLOW}rate limit: {info.get('status')}{OFF}")
 
     def _result(self, o: dict) -> None:
+        self.streamed_message = False
         usage = o.get("usage") or {}
         cost = o.get("total_cost_usd")
         secs = (o.get("duration_ms") or 0) / 1000

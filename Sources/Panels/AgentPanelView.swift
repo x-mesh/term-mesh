@@ -51,7 +51,13 @@ struct AgentPanelView: View {
                     .truncationMode(.middle)
             }
             Spacer()
+            // Two different facts, and the pane path could show neither: the
+            // turn is open, and something is arriving right now. A turn can be
+            // open and silent for a minute while a tool runs.
             if session.isThinking {
+                Text(session.streamingIds.isEmpty ? "working" : "writing")
+                    .font(.system(size: 10))
+                    .foregroundStyle(.secondary)
                 ProgressView().controlSize(.small).scaleEffect(0.6)
             }
         }
@@ -90,15 +96,15 @@ struct AgentPanelView: View {
         switch entry {
         case .said(_, let speaker, let text):
             said(speaker, text)
-        case .answered(_, let text):
+        case .answered(let id, let text):
             // Selectable, because the reason to read an agent's answer is
-            // usually to take something out of it.
-            Text(text)
-                .font(.system(size: 12))
-                .textSelection(.enabled)
-                .fixedSize(horizontal: false, vertical: true)
-        case .thought(_, let body):
-            label("✻", body ?? "thinking", muted: true)
+            // usually to take something out of it. The caret says the row is
+            // still being written — a terminal can only show characters
+            // arriving and leave "did it stop there?" to be guessed.
+            Answer(text: text, streaming: session.streamingIds.contains(id))
+        case .thought(let id, let body):
+            label("✻", (body?.isEmpty == false ? body! : "thinking"),
+                  muted: true, streaming: session.streamingIds.contains(id))
         case .tool(_, let call):
             ToolRow(call: call)
         case .turnEnded(_, let end):
@@ -123,10 +129,17 @@ struct AgentPanelView: View {
         .background(Color.primary.opacity(0.05), in: RoundedRectangle(cornerRadius: 6))
     }
 
-    private func label(_ glyph: String, _ text: String, muted: Bool) -> some View {
+    private func label(_ glyph: String, _ text: String, muted: Bool,
+                       streaming: Bool = false) -> some View {
         HStack(alignment: .top, spacing: 6) {
             Text(glyph).font(.system(size: 11))
-            Text(text).font(.system(size: 11)).lineLimit(muted ? 2 : nil)
+            // Thinking streams too, and it is the part that runs longest with
+            // nothing else to show. Pinned to the tail so a long reasoning
+            // block does not push the pane around while it is written.
+            Text(streaming ? String(text.suffix(120)) : text)
+                .font(.system(size: 11))
+                .lineLimit(muted ? 2 : nil)
+            if streaming { Caret() }
         }
         .foregroundStyle(muted ? AnyShapeStyle(.secondary) : AnyShapeStyle(Color.orange))
     }
@@ -199,6 +212,42 @@ struct AgentPanelView: View {
             // exists to stop making.
             NSSound.beep()
         }
+    }
+}
+
+/// An answer, with a caret while it is still being written.
+private struct Answer: View {
+    let text: String
+    let streaming: Bool
+
+    var body: some View {
+        Text(text)
+            .font(.system(size: 12))
+            .textSelection(.enabled)
+            .fixedSize(horizontal: false, vertical: true)
+            .overlay(alignment: .bottomTrailing) {
+                if streaming { Caret().alignmentGuide(.bottom) { $0[.bottom] } }
+            }
+    }
+}
+
+/// The blink that says a row is still open.
+private struct Caret: View {
+    @State private var on = true
+
+    var body: some View {
+        RoundedRectangle(cornerRadius: 1)
+            .fill(.tint)
+            .frame(width: 6, height: 12)
+            .opacity(on ? 1 : 0.15)
+            .onAppear {
+                withAnimation(.easeInOut(duration: 0.55).repeatForever(autoreverses: true)) {
+                    on = false
+                }
+            }
+            // A blinking rectangle is exactly what a screen reader should not
+            // be asked to announce.
+            .accessibilityHidden(true)
     }
 }
 

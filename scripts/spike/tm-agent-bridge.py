@@ -124,6 +124,46 @@ class Emitter:
         self.emit({"type": "user", "message": {"content": [
             {"type": "tool_result", "content": body, "is_error": failed}]}})
 
+    # ── streaming ──────────────────────────────────────────────────────
+    #
+    # Every CLI here streams, and each calls it something else: claude emits
+    # the Anthropic block/delta shape wrapped in `stream_event`, codex sends
+    # `item/agentMessage/delta` with a bare `delta` string, kiro sends ACP
+    # `agent_message_chunk`. Measured on one 60-word answer: codex, 163 deltas.
+    #
+    # So the bridge speaks claude's shape here too, and everything upstream —
+    # the renderer, the native pane — learns one vocabulary instead of three.
+    # `message_start` matters more than it looks: it is what tells a reader a
+    # new message is beginning, so a complete message arriving after a streamed
+    # one is not drawn twice.
+
+    def turn_begins(self) -> None:
+        self.emit({"type": "stream_event", "event": {"type": "message_start",
+                                                     "message": {"role": "assistant"}}})
+        self._open = False
+
+    def delta(self, text: str, thinking: bool = False) -> None:
+        if not text:
+            return
+        if not getattr(self, "_open", False):
+            self.emit({"type": "stream_event", "event": {
+                "type": "content_block_start", "index": 0,
+                "content_block": {"type": "thinking" if thinking else "text"}}})
+            self._open = True
+        key = "thinking" if thinking else "text"
+        self.emit({"type": "stream_event", "event": {
+            "type": "content_block_delta", "index": 0,
+            "delta": {"type": f"{key}_delta", key: text}}})
+
+    def block_done(self) -> None:
+        if getattr(self, "_open", False):
+            self.emit({"type": "stream_event",
+                       "event": {"type": "content_block_stop", "index": 0}})
+            self._open = False
+
+    def streamed(self) -> bool:
+        return getattr(self, "_streamed_any", False)
+
     def sent(self, s: str) -> None:
         self.emit({"type": "user", "message": {"role": "user", "content": s},
                    "isReplay": True})
@@ -441,15 +481,29 @@ class CodexBridge:
 
     def turn(self, text: str, timeout: float) -> None:
         self.out.sent(text)
+        self.out.turn_begins()
         said: list[str] = []
+        streamed = [False]
 
         def notify(o: dict) -> None:
             m = o.get("method", "")
             p = o.get("params") or {}
+            if m == "item/agentMessage/delta":
+                chunk = p.get("delta") or ""
+                if chunk:
+                    streamed[0] = True
+                    said.append(chunk)
+                    self.out.delta(chunk)
+                return
             if m == "item/completed":
                 item = p.get("item") or {}
                 kind = item.get("type") or item.get("itemType")
                 if kind in ("agentMessage", "assistant_message", "message"):
+                    # Already drawn delta by delta; the completed item is the
+                    # same text arriving whole.
+                    if streamed[0]:
+                        self.out.block_done()
+                        return
                     body = item.get("text") or item.get("content") or ""
                     if isinstance(body, list):
                         body = "".join(b.get("text", "") for b in body if isinstance(b, dict))
@@ -486,7 +540,8 @@ class CodexBridge:
 
         done = self.rpc.pump(until_id=None, timeout=timeout,
                              on_notify=notify, until_method="turn/completed")
-        final = "\n".join(said)
+        self.out.block_done()
+        final = ("" if streamed[0] else "\n").join(said)
         if done and not final.strip():
             # Ended without saying anything. Reporting that as a success is how
             # an empty answer becomes a completed task.
@@ -533,6 +588,7 @@ class AcpBridge:
 
     def turn(self, text: str, timeout: float) -> None:
         self.out.sent(text)
+        self.out.turn_begins()
         said: list[str] = []
 
         def notify(o: dict) -> None:
@@ -541,8 +597,11 @@ class AcpBridge:
             u = (o.get("params") or {}).get("update") or {}
             kind = u.get("sessionUpdate")
             if kind == "agent_message_chunk":
-                # Chunks, so they are joined rather than each printed as a line.
-                said.append((u.get("content") or {}).get("text", ""))
+                # These were always chunks. Joining them and showing the result
+                # at the end threw away the one thing they were good for.
+                chunk = (u.get("content") or {}).get("text", "")
+                said.append(chunk)
+                self.out.delta(chunk)
             elif kind == "tool_call":
                 self.out.tool(u.get("title") or u.get("kind") or "tool",
                               str(u.get("rawInput") or "")[:200])
@@ -555,8 +614,8 @@ class AcpBridge:
         resp = self.rpc.request("session/prompt", {
             "sessionId": self.session,
             "prompt": [{"type": "text", "text": text}]}, timeout, on_notify=notify)
+        self.out.block_done()
         final = "".join(said)
-        self.out.text(final)
         stop = ((resp or {}).get("result") or {}).get("stopReason") or "timeout"
         self.out.result(final, stop=stop)
 

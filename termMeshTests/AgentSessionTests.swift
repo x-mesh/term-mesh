@@ -127,6 +127,130 @@ final class AgentSessionTests: XCTestCase {
         XCTAssertFalse(call.failed)
     }
 
+    // MARK: - Streaming
+
+    private func delta(_ index: Int, _ text: String, thinking: Bool = false) -> String {
+        let key = thinking ? "thinking" : "text"
+        return event(["type": "stream_event", "event": [
+            "type": "content_block_delta", "index": index,
+            "delta": ["type": "\(key)_delta", key: text]]])
+    }
+
+    private func blockStart(_ index: Int, _ type: String) -> String {
+        event(["type": "stream_event", "event": [
+            "type": "content_block_start", "index": index,
+            "content_block": ["type": type]]])
+    }
+
+    private func blockStop(_ index: Int) -> String {
+        event(["type": "stream_event",
+               "event": ["type": "content_block_stop", "index": index]])
+    }
+
+    /// One row, grown. Not a row per fragment — measured on a real answer,
+    /// codex sent 163 deltas for sixty words.
+    func testDeltasBuildOneRowRatherThanMany() throws {
+        let s = session([blockStart(0, "text"), delta(0, "Tange"),
+                         delta(0, "rines "), delta(0, "are small."), blockStop(0)])
+        XCTAssertEqual(s.entries.count, 1)
+        guard case .answered(_, let text) = try XCTUnwrap(s.entries.first) else {
+            return XCTFail("expected an answer")
+        }
+        XCTAssertEqual(text, "Tangerines are small.")
+    }
+
+    /// A message interleaves thinking and text, addressed by index. A delta
+    /// that appended to whatever was last would put reasoning in the answer.
+    func testADeltaFindsItsOwnRow() throws {
+        let s = session([
+            blockStart(0, "thinking"), blockStart(1, "text"),
+            delta(1, "the answer"), delta(0, "the reasoning", thinking: true),
+            blockStop(0), blockStop(1),
+        ])
+        XCTAssertEqual(s.entries.count, 2)
+        guard case .thought(_, let thought) = s.entries[0],
+              case .answered(_, let answer) = s.entries[1] else {
+            return XCTFail("expected a thought then an answer")
+        }
+        XCTAssertEqual(thought, "the reasoning")
+        XCTAssertEqual(answer, "the answer")
+    }
+
+    /// A delta whose type does not match its block is dropped rather than
+    /// forced in — reasoning must not end up inside the answer.
+    func testADeltaOfTheWrongKindIsDropped() throws {
+        let s = session([blockStart(0, "thinking"), delta(0, "not reasoning")])
+        guard case .thought(_, let body) = try XCTUnwrap(s.entries.first) else {
+            return XCTFail("expected a thought")
+        }
+        XCTAssertEqual(body, "")
+    }
+
+    /// Under `--include-partial-messages` a message arrives twice: once as
+    /// deltas, then whole. Both drawn is the same paragraph printed twice.
+    func testAStreamedMessageIsNotDrawnAgainWhenItArrivesWhole() throws {
+        let s = session([
+            event(["type": "stream_event", "event": ["type": "message_start",
+                                                     "message": ["role": "assistant"]]]),
+            blockStart(0, "text"), delta(0, "hello"), blockStop(0),
+            event(["type": "assistant", "message": ["content": [
+                ["type": "text", "text": "hello"]]]]),
+        ])
+        XCTAssertEqual(s.entries.count, 1, "the whole copy is the same content")
+    }
+
+    /// And a message that was *not* streamed still draws — the bridge's CLIs
+    /// stream, but a turn can end before a block ever opens.
+    func testAMessageThatNeverStreamedIsStillDrawn() {
+        let s = session([
+            event(["type": "stream_event", "event": ["type": "message_start",
+                                                     "message": ["role": "assistant"]]]),
+            event(["type": "assistant", "message": ["content": [
+                ["type": "text", "text": "hello"]]]]),
+        ])
+        XCTAssertEqual(s.entries.count, 1)
+    }
+
+    /// The caret is the only thing that says "still writing"; a terminal can
+    /// only show characters arriving and leave the rest to be guessed.
+    func testTheOpenRowIsMarkedWhileItIsWritten() throws {
+        let s = session([blockStart(0, "text"), delta(0, "half a sen")])
+        let id = try XCTUnwrap(s.entries.first).id
+        XCTAssertTrue(s.streamingIds.contains(id))
+        s.ingestForTesting(blockStop(0))
+        XCTAssertFalse(s.streamingIds.contains(id))
+    }
+
+    /// A turn can end with a block still open — an error, a stop, a killed
+    /// process. A caret left on says "still writing" forever.
+    func testATurnEndingMidStreamStopsTheCaret() {
+        let s = session([blockStart(0, "text"), delta(0, "cut off"),
+                         event(["type": "result", "is_error": true, "result": ""])])
+        XCTAssertTrue(s.streamingIds.isEmpty)
+    }
+
+    /// Streamed text is the turn's answer, so a CLI that sends no `result`
+    /// text still reports what it said.
+    func testStreamedTextCountsAsWhatWasSaid() throws {
+        var final: String?
+        let s = AgentSession()
+        s.onTurnEnd = { text, _, _ in final = text }
+        for line in [blockStart(0, "text"), delta(0, "streamed only"), blockStop(0),
+                     event(["type": "result", "stop_reason": "end_turn"])] {
+            s.ingestForTesting(line)
+        }
+        XCTAssertEqual(final, "streamed only")
+    }
+
+    /// The launch has to ask for deltas, or a turn appears all at once when it
+    /// is already over.
+    func testTheLaunchAsksForPartialMessages() {
+        let launch = AgentSession.claudeLaunch(
+            claudePath: "/usr/local/bin/claude", model: "haiku",
+            instructions: "", extraArgs: [], workingDirectory: "/tmp")
+        XCTAssertTrue(launch.arguments.contains("--include-partial-messages"))
+    }
+
     // MARK: - The end of a turn
 
     /// Stated, not inferred.

@@ -79,6 +79,14 @@ final class AgentSession: ObservableObject {
     /// What the CLI announced about itself, shown once rather than per turn.
     @Published private(set) var summary: String?
 
+    /// Rows still being written, so the view can show a caret on them.
+    ///
+    /// Nothing else can say this. A terminal shows characters arriving and
+    /// leaves "is it still coming, or did it stop there?" to be inferred from
+    /// whether more shows up — which is the same inference the completion
+    /// detector had to make, one layer down.
+    @Published private(set) var streamingIds: Set<UUID> = []
+
     /// Called when a turn ends, with the agent's final text. The task-board
     /// side reads its own header out of this; the session does not interpret it.
     var onTurnEnd: ((String, TurnEnd, String?) -> Void)?
@@ -91,6 +99,16 @@ final class AgentSession: ObservableObject {
     /// Assistant text for the turn in flight, so `result` can be trusted to
     /// carry the final answer without the model having to be reassembled.
     private var saidThisTurn: [String] = []
+
+    /// Content blocks being streamed, keyed by the index the events use, held
+    /// as positions in `entries` so a delta lands on the row it belongs to.
+    ///
+    /// A message arrives twice under `--include-partial-messages`: once as
+    /// deltas, then again whole. Both would draw it, so the second is skipped
+    /// for whatever the first already built — but only for that, since tool
+    /// calls only ever arrive complete.
+    private var streamOpen: [Int: Int] = [:]
+    private var streamedThisMessage = false
 
     // MARK: - Running
 
@@ -121,6 +139,11 @@ final class AgentSession: ObservableObject {
             "--output-format", "stream-json",
             "--verbose",
             "--replay-user-messages",
+            // Without this a turn appears all at once when it is already over.
+            // The events are the Anthropic block/delta shape wrapped in
+            // `stream_event`, which is also what the bridge emits for the CLIs
+            // that stream differently — so this side learns one vocabulary.
+            "--include-partial-messages",
             "--dangerously-skip-permissions",
         ]
         if !model.isEmpty { args += ["--model", model] }
@@ -306,6 +329,7 @@ final class AgentSession: ObservableObject {
         case "system":  system(obj)
         case "user":    user(obj)
         case "assistant": assistant(obj)
+        case "stream_event": streamEvent(obj["event"] as? [String: Any] ?? [:])
         case "result":  result(obj)
         default:        break
         }
@@ -343,12 +367,16 @@ final class AgentSession: ObservableObject {
         for block in message["content"] as? [[String: Any]] ?? [] {
             switch block["type"] as? String {
             case "text":
+                // Already drawn as it was written; the whole message is the
+                // same content arriving a second time.
+                if streamedThisMessage { continue }
                 let text = block["text"] as? String ?? ""
                 if !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                     saidThisTurn.append(text)
                     append(.answered(id: UUID(), text))
                 }
             case "thinking":
+                if streamedThisMessage { continue }
                 // Extended thinking arrives redacted — a signature and an empty
                 // string. Saying "it thought here" is honest; saying nothing
                 // hides that time passed.
@@ -360,6 +388,72 @@ final class AgentSession: ObservableObject {
             default:
                 break
             }
+        }
+    }
+
+    // MARK: - Streaming
+
+    /// A message as it is written, rather than once it is finished.
+    ///
+    /// `content_block_start` opens a row, `content_block_delta` extends it,
+    /// `content_block_stop` closes it. Blocks are addressed by `index` — one
+    /// message interleaves thinking and text — so a delta has to find its own
+    /// row rather than append to whatever is last.
+    private func streamEvent(_ event: [String: Any]) {
+        switch event["type"] as? String {
+        case "message_start":
+            streamOpen.removeAll()
+            streamedThisMessage = false
+
+        case "content_block_start":
+            guard let index = event["index"] as? Int,
+                  let block = event["content_block"] as? [String: Any]
+            else { return }
+            switch block["type"] as? String {
+            case "text":
+                entries.append(.answered(id: UUID(), ""))
+            case "thinking":
+                entries.append(.thought(id: UUID(), ""))
+            default:
+                // Tool calls arrive complete, with their arguments already
+                // parsed. Assembling them from `input_json_delta` would mean
+                // parsing half a JSON document to show a headline sooner.
+                return
+            }
+            streamOpen[index] = entries.count - 1
+            streamedThisMessage = true
+            streamingIds.insert(entries[entries.count - 1].id)
+
+        case "content_block_delta":
+            guard let index = event["index"] as? Int,
+                  let position = streamOpen[index], position < entries.count,
+                  let delta = event["delta"] as? [String: Any]
+            else { return }
+            switch delta["type"] as? String {
+            case "text_delta":
+                guard case .answered(let id, let text) = entries[position],
+                      let more = delta["text"] as? String else { return }
+                entries[position] = .answered(id: id, text + more)
+            case "thinking_delta":
+                guard case .thought(let id, let text) = entries[position],
+                      let more = delta["thinking"] as? String else { return }
+                entries[position] = .thought(id: id, (text ?? "") + more)
+            default:
+                return  // signature deltas carry no text to show
+            }
+
+        case "content_block_stop":
+            guard let index = event["index"] as? Int,
+                  let position = streamOpen.removeValue(forKey: index),
+                  position < entries.count
+            else { return }
+            streamingIds.remove(entries[position].id)
+            if case .answered(_, let text) = entries[position] {
+                saidThisTurn.append(text)
+            }
+
+        default:
+            return
         }
     }
 
@@ -400,6 +494,10 @@ final class AgentSession: ObservableObject {
             tokensIn: usage["input_tokens"] as? Int,
             tokensOut: usage["output_tokens"] as? Int
         )
+        // A turn can end with blocks still open — an error, a stop, a killed
+        // process. Leaving their carets on would say "still writing" forever.
+        streamOpen.removeAll()
+        streamingIds.removeAll()
         append(.turnEnded(id: UUID(), end))
         isThinking = false
         turnInFlight = false
