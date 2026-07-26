@@ -251,18 +251,7 @@ struct AgentPanelView: View {
     }
 
     private func said(_ speaker: AgentSession.Speaker, _ text: String) -> some View {
-        VStack(alignment: .leading, spacing: 3) {
-            Text(speaker == .person ? "you" : "leader")
-                .font(.system(size: 10, weight: .semibold))
-                .foregroundStyle(.tint)
-            Text(text)
-                .font(.system(size: 12))
-                .textSelection(.enabled)
-                .fixedSize(horizontal: false, vertical: true)
-        }
-        .padding(8)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .background(Color.primary.opacity(0.05), in: RoundedRectangle(cornerRadius: 6))
+        Instruction(speaker: speaker, read: AgentSession.read(instruction: text))
     }
 
     private func label(_ glyph: String, _ text: String, muted: Bool,
@@ -281,18 +270,7 @@ struct AgentPanelView: View {
     }
 
     private func turnEnd(_ end: AgentSession.TurnEnd) -> some View {
-        HStack(spacing: 8) {
-            Rectangle().fill(.quaternary).frame(height: 1)
-            // Stated by the agent, not inferred from the screen going quiet —
-            // which is the whole reason the pane path needed a timer here.
-            Text(facts(end))
-                .font(.system(size: 10).monospacedDigit())
-                .foregroundStyle(end.failed ? AnyShapeStyle(Color.red) : AnyShapeStyle(.secondary))
-                // One line between two rules. Left to wrap, it breaks the rule
-                // in half and reads as two unrelated things.
-                .fixedSize()
-            Rectangle().fill(.quaternary).frame(height: 1)
-        }
+        TurnFooter(end: end, facts: facts(end))
     }
 
     private func facts(_ end: AgentSession.TurnEnd) -> String {
@@ -347,6 +325,113 @@ struct AgentPanelView: View {
             // nowhere while reporting success is the failure this whole path
             // exists to stop making.
             NSSound.beep()
+        }
+    }
+}
+
+/// What was asked, with the protocol it travelled in folded away.
+///
+/// Measured on a real transcript: sixteen lines, nine of them scaffold, the
+/// intent one line inside `[GOAL]`. The bubble was showing the envelope and
+/// burying the letter. The envelope is still there for anyone who needs it.
+private struct Instruction: View {
+    let speaker: AgentSession.Speaker
+    let read: AgentSession.Instruction
+    @State private var expanded = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack(spacing: 6) {
+                Text(speaker == .person ? "you" : "leader")
+                    .font(.system(size: 10, weight: .semibold))
+                    .foregroundStyle(.tint)
+                if let id = read.taskId {
+                    Text(id.prefix(8))
+                        .font(.system(size: 9).monospaced())
+                        .foregroundStyle(.tertiary)
+                }
+                Spacer(minLength: 0)
+                if read.hasMore {
+                    Button(expanded ? "less" : "protocol") { expanded.toggle() }
+                        .buttonStyle(.plain)
+                        .font(.system(size: 9))
+                        .foregroundStyle(.tint)
+                }
+            }
+            Text(expanded ? read.full : read.headline)
+                .font(.system(size: 12))
+                .textSelection(.enabled)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .padding(8)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Color.primary.opacity(0.05), in: RoundedRectangle(cornerRadius: 6))
+    }
+}
+
+/// The end of a turn: the agent's verdict, and what the turn cost.
+///
+/// The five header fields used to be five lines of body text after every
+/// answer — 83% of the most-read element on screen. They are values, so they
+/// are laid out as values, and the ones the agent filled in with "none" are
+/// not worth a row of their own.
+private struct TurnFooter: View {
+    let end: AgentSession.TurnEnd
+    let facts: String
+    @State private var expanded = false
+
+    private var verdictColor: Color {
+        guard let v = end.verdict else { return end.failed ? .red : .secondary }
+        if end.failed || v.isBlocked { return .red }
+        return v.isDone ? .green : .orange
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack(spacing: 6) {
+                if let v = end.verdict, !v.status.isEmpty {
+                    Text(v.status)
+                        .font(.system(size: 9, weight: .bold))
+                        .padding(.horizontal, 5)
+                        .padding(.vertical, 1.5)
+                        .background(verdictColor.opacity(0.18), in: Capsule())
+                        .foregroundStyle(verdictColor)
+                }
+                // Stated by the agent, not inferred from the screen going
+                // quiet — the whole reason the pane path needed a timer here.
+                // Allowed to truncate rather than run off the edge: in a narrow
+                // pane it was being clipped mid-number.
+                Text(facts)
+                    .font(.system(size: 10).monospacedDigit())
+                    .foregroundStyle(end.failed ? AnyShapeStyle(Color.red) : AnyShapeStyle(.secondary))
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+                    .layoutPriority(1)
+                Rectangle().fill(.quaternary).frame(height: 1)
+                if end.verdict?.details.isEmpty == false {
+                    Button(expanded ? "less" : "details") { expanded.toggle() }
+                        .buttonStyle(.plain)
+                        .font(.system(size: 9))
+                        .foregroundStyle(.tint)
+                }
+            }
+            if expanded, let v = end.verdict {
+                VStack(alignment: .leading, spacing: 2) {
+                    ForEach(v.details, id: \.0) { field, value in
+                        HStack(alignment: .top, spacing: 6) {
+                            Text(field)
+                                .font(.system(size: 9, weight: .semibold).monospaced())
+                                .foregroundStyle(.tertiary)
+                                .frame(width: 76, alignment: .leading)
+                            Text(value)
+                                .font(.system(size: 10).monospaced())
+                                .textSelection(.enabled)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
+                    }
+                }
+                .padding(.leading, 2)
+            }
         }
     }
 }

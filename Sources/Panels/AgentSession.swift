@@ -69,6 +69,128 @@ final class AgentSession: ObservableObject {
         let duration: TimeInterval?
         let tokensIn: Int?
         let tokensOut: Int?
+        /// What the agent said about how it went, parsed rather than printed.
+        var verdict: Verdict?
+    }
+
+    /// The 5-field header, held as fields.
+    ///
+    /// Measured on a real transcript: an agent's answer was six lines, five of
+    /// them this header — 83% of the most-read element on screen was protocol.
+    /// And the app was already parsing it to close the task, so it was being
+    /// shown raw *and* read structurally. Only one of those is necessary.
+    struct Verdict: Equatable {
+        var status: String
+        var files: String
+        var verify: String
+        var next: String
+        var fullReport: String
+
+        static let keys = ["STATUS", "FILES", "VERIFY", "NEXT", "FULL_REPORT"]
+
+        var isDone: Bool { status.uppercased().hasPrefix("DONE") }
+        var isBlocked: Bool { status.uppercased().hasPrefix("BLOCKED") }
+
+        /// The fields worth a second look. `none` / `n/a` / `NONE` are the
+        /// agent saying "nothing here", and showing five of those is worse
+        /// than showing none.
+        var details: [(String, String)] {
+            [("FILES", files), ("VERIFY", verify), ("NEXT", next),
+             ("FULL_REPORT", fullReport)]
+                .filter { !["", "none", "n/a", "none.", "nothing"].contains($0.1.lowercased()) }
+        }
+    }
+
+    /// Pull the header out of an answer, and hand back the answer without it.
+    static func splitVerdict(from text: String) -> (body: String, verdict: Verdict?) {
+        var fields: [String: String] = [:]
+        var kept: [String] = []
+        for raw in text.components(separatedBy: "\n") {
+            let line = raw.trimmingCharacters(in: .whitespaces)
+            let key = Verdict.keys.first {
+                line.hasPrefix($0 + ":") && fields[$0] == nil
+            }
+            if let key {
+                fields[key] = String(line.dropFirst(key.count + 1))
+                    .trimmingCharacters(in: .whitespaces)
+            } else {
+                kept.append(raw)
+            }
+        }
+        guard fields["STATUS"] != nil else { return (text, nil) }
+        let body = kept.joined(separator: "\n")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return (body, Verdict(status: fields["STATUS"] ?? "",
+                              files: fields["FILES"] ?? "",
+                              verify: fields["VERIFY"] ?? "",
+                              next: fields["NEXT"] ?? "",
+                              fullReport: fields["FULL_REPORT"] ?? ""))
+    }
+
+    /// What an instruction actually asks for, separated from the protocol it
+    /// travels in.
+    ///
+    /// Measured: sixteen lines, nine of them scaffold, the intent one line
+    /// inside `[GOAL]`. The bubble was showing the envelope and burying the
+    /// letter.
+    struct Instruction: Equatable {
+        var headline: String
+        var taskId: String?
+        var full: String
+        var hasMore: Bool { headline.count < full.trimmingCharacters(in: .whitespacesAndNewlines).count }
+    }
+
+    static func read(instruction text: String) -> Instruction {
+        let taskId = Self.taskId(in: text)
+        let lines = text.components(separatedBy: "\n")
+
+        // A capsule names its goal outright; nothing else needs guessing.
+        if let open = lines.firstIndex(where: { $0.trimmingCharacters(in: .whitespaces) == "[GOAL]" }),
+           let close = lines.firstIndex(where: { $0.trimmingCharacters(in: .whitespaces) == "[/GOAL]" }),
+           close > open {
+            let goal = lines[(open + 1)..<close].joined(separator: "\n")
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            if !goal.isEmpty {
+                return Instruction(headline: goal, taskId: taskId, full: text)
+            }
+        }
+
+        // Only a capsule gets folded. Everything else is shown whole.
+        //
+        // Filtering by line prefix alone ate two real lines out of a runbook
+        // digest — its `VERIFY:` and `OUTPUT:` rows, which say what the role
+        // must do — because those prefixes are also header keys. Hiding what
+        // the leader actually said is worse than showing an envelope.
+        let isCapsule = lines.contains {
+            let l = $0.trimmingCharacters(in: .whitespaces)
+            return l.hasPrefix("## Task Capsule") || l.hasPrefix("[FINAL LINE")
+                || l.hasPrefix("[REQUIRED FINAL STEP")
+        }
+        guard isCapsule else {
+            return Instruction(headline: text, taskId: taskId, full: text)
+        }
+
+        // Otherwise drop the lines that are unmistakably protocol and keep
+        // what a person wrote.
+        var fenced = false
+        var kept: [String] = []
+        for raw in lines {
+            let line = raw.trimmingCharacters(in: .whitespaces)
+            if line.hasPrefix("```") { fenced.toggle(); continue }
+            if fenced { continue }
+            if line.hasPrefix("[FINAL LINE") || line.hasPrefix("[REQUIRED FINAL STEP")
+                || line.hasPrefix("[REMINDER]") || line.hasPrefix("## Task Capsule")
+                || line.hasPrefix("TASK_") || line.hasPrefix("PROTOCOL:")
+                || line.hasPrefix("OUTPUT:")
+                || Verdict.keys.contains(where: { line.hasPrefix($0 + ":") }) {
+                continue
+            }
+            kept.append(raw)
+        }
+        let headline = kept.joined(separator: "\n")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return Instruction(headline: headline.isEmpty ? text : headline,
+                           taskId: taskId, full: text)
     }
 
     // MARK: - State
@@ -541,7 +663,7 @@ final class AgentSession: ObservableObject {
     private func result(_ o: [String: Any]) {
         let usage = o["usage"] as? [String: Any] ?? [:]
         let failed = o["is_error"] as? Bool ?? false
-        let end = TurnEnd(
+        var end = TurnEnd(
             stop: o["stop_reason"] as? String ?? o["subtype"] as? String ?? "?",
             failed: failed,
             cost: o["total_cost_usd"] as? Double,
@@ -549,6 +671,10 @@ final class AgentSession: ObservableObject {
             tokensIn: usage["input_tokens"] as? Int,
             tokensOut: usage["output_tokens"] as? Int
         )
+        // The header moves out of the prose and into the turn, where it is a
+        // value the footer can render as a verdict. Shown raw *and* parsed was
+        // paying for the same five lines twice.
+        end.verdict = stripVerdictFromThisTurn()
         // A turn can end with blocks still open — an error, a stop, a killed
         // process. Leaving their carets on would say "still writing" forever.
         streamOpen.removeAll()
@@ -581,6 +707,30 @@ final class AgentSession: ObservableObject {
             let next = queued.removeFirst()
             try? write(next.text, from: .leader, taskId: next.taskId)
         }
+    }
+
+    /// Take the header out of the answers this turn produced, and return it.
+    ///
+    /// Walks back only as far as the previous turn's end, so an earlier
+    /// answer's header is never re-read.
+    private func stripVerdictFromThisTurn() -> Verdict? {
+        var found: Verdict?
+        var index = entries.count - 1
+        while index >= 0 {
+            if case .turnEnded = entries[index] { break }
+            if case .answered(let id, let text) = entries[index] {
+                let (body, verdict) = Self.splitVerdict(from: text)
+                if let verdict {
+                    found = found ?? verdict
+                    // An answer that was *only* a header leaves an empty row;
+                    // drop it rather than show a blank one.
+                    if body.isEmpty { entries.remove(at: index) }
+                    else { entries[index] = .answered(id: id, body) }
+                }
+            }
+            index -= 1
+        }
+        return found
     }
 
     private func append(_ entry: Entry) {

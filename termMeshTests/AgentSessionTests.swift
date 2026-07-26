@@ -270,6 +270,136 @@ final class AgentSessionTests: XCTestCase {
         XCTAssertTrue(launch.arguments.contains("--include-partial-messages"))
     }
 
+    // MARK: - The header is a value, not prose
+
+    /// Measured on a real transcript: an answer was six lines, five of them
+    /// this header. And the app was already parsing it to close the task — so
+    /// it was shown raw *and* read structurally, and only one of those is
+    /// necessary.
+    func testTheHeaderLeavesTheProseAndBecomesAVerdict() throws {
+        var ended: AgentSession.TurnEnd?
+        let s = AgentSession()
+        s.onTurnEnd = { _, end, _ in ended = end }
+        s.ingestForTesting(event(["type": "assistant", "message": ["content": [
+            ["type": "text", "text": """
+                OK3
+
+                STATUS: DONE
+                FILES: none
+                VERIFY: n/a
+                NEXT: NONE
+                FULL_REPORT: n/a
+                """]]]]))
+        s.ingestForTesting(event(["type": "result", "stop_reason": "end_turn"]))
+
+        guard case .answered(_, let body) = try XCTUnwrap(s.entries.first) else {
+            return XCTFail("expected an answer")
+        }
+        XCTAssertEqual(body, "OK3", "five of six lines were protocol")
+        let verdict = try XCTUnwrap(ended?.verdict)
+        XCTAssertEqual(verdict.status, "DONE")
+        XCTAssertTrue(verdict.isDone)
+    }
+
+    /// Four "none"s in a row is worse than no detail at all.
+    func testOnlyTheFieldsTheAgentFilledInAreWorthShowing() {
+        let (_, v) = AgentSession.splitVerdict(from: """
+            STATUS: DONE
+            FILES: none
+            VERIFY: swift build
+            NEXT: NONE
+            FULL_REPORT: n/a
+            """)
+        XCTAssertEqual(v?.details.map(\.0), ["VERIFY"])
+    }
+
+    /// An answer that was only a header leaves an empty row behind.
+    func testAnAnswerThatWasOnlyAHeaderLeavesNoEmptyRow() {
+        let s = session([
+            event(["type": "assistant", "message": ["content": [
+                ["type": "text", "text": "STATUS: DONE\nFILES: none"]]]]),
+            event(["type": "result", "stop_reason": "end_turn"]),
+        ])
+        XCTAssertFalse(s.entries.contains { if case .answered = $0 { return true } else { return false } })
+    }
+
+    /// Prose with no header is left exactly as it is.
+    func testAnAnswerWithNoHeaderIsUntouched() {
+        let (body, v) = AgentSession.splitVerdict(from: "just some prose\nover two lines")
+        XCTAssertEqual(body, "just some prose\nover two lines")
+        XCTAssertNil(v)
+    }
+
+    // MARK: - An instruction is not its envelope
+
+    /// Measured: sixteen lines, nine of them scaffold, the intent one line
+    /// inside `[GOAL]`. The bubble was showing the envelope and burying the
+    /// letter.
+    func testTheGoalIsWhatTheBubbleShows() {
+        let capsule = """
+            [FINAL LINE — end your reply with this header, one field per line]
+            STATUS: <DONE, BLOCKED, or NEEDS_REVIEW>
+            FILES: <changed paths or none>
+
+            ## Task Capsule
+            TASK_ID: cca01f9c
+            TASK_TITLE: Reply with exactly: OK1.
+            PROTOCOL: TM-PROTOCOL-v1
+            OUTPUT: STATUS/FILES/VERIFY/NEXT/FULL_REPORT header plus concise summary
+
+            [GOAL]
+            Reply with exactly: OK1. Nothing else, no tools.
+            [/GOAL]
+            """
+        let read = AgentSession.read(instruction: capsule)
+        XCTAssertEqual(read.headline, "Reply with exactly: OK1. Nothing else, no tools.")
+        XCTAssertEqual(read.taskId, "cca01f9c")
+        XCTAssertTrue(read.hasMore, "the envelope is still reachable")
+        XCTAssertEqual(read.full, capsule)
+    }
+
+    /// A plain message has no envelope to fold, so nothing is hidden and no
+    /// disclosure appears.
+    func testAPlainMessageShowsWholeAndOffersNothingToUnfold() {
+        let read = AgentSession.read(instruction: "have a look at the build")
+        XCTAssertEqual(read.headline, "have a look at the build")
+        XCTAssertFalse(read.hasMore)
+        XCTAssertNil(read.taskId)
+    }
+
+    /// Without a capsule the protocol lines still go, and what a person wrote
+    /// stays.
+    func testProtocolLinesGoEvenWithoutAGoalBlock() {
+        let read = AgentSession.read(instruction: """
+            Reply with the word TANGO.
+
+            [FINAL LINE — end your reply with this header, one field per line]
+            STATUS: <DONE, BLOCKED, or NEEDS_REVIEW>
+            FULL_REPORT: <result file path or n/a>
+            """)
+        XCTAssertEqual(read.headline, "Reply with the word TANGO.")
+    }
+
+    /// The bug the screenshot caught.
+    ///
+    /// Filtering by line prefix alone ate two real lines out of a runbook
+    /// digest — its `VERIFY:` and `OUTPUT:` rows, which say what the role must
+    /// do — because those prefixes are also header keys. Only a capsule is
+    /// folded now; anything else is shown exactly as sent.
+    func testARunbookIsNotMistakenForAnEnvelope() {
+        let digest = """
+            ## Runbook Digest
+            ROLE: explorer
+            WHEN: The task asks where something is defined.
+            VERIFY: Include the exact search command you used.
+            OUTPUT: STATUS/FILES/VERIFY/NEXT/FULL_REPORT
+            FULL: /repo/.agent-runbooks/explorer.md
+            """
+        let read = AgentSession.read(instruction: digest)
+        XCTAssertEqual(read.headline, digest, "nothing the leader sent may vanish")
+        XCTAssertFalse(read.hasMore)
+    }
+
     // MARK: - Following the bottom
 
     /// A view that follows the bottom cannot key on `entries.count`.
