@@ -1228,7 +1228,10 @@ struct TeamCreationView: View {
                             DispatchQueue.main.async { leaderModel = fallback }
                             return fallback
                         },
-                        set: { leaderModel = $0 }
+                        set: {
+                            leaderModel = $0
+                            persistSelectedSmartPresetOverride()
+                        }
                     )) {
                         ForEach(AgentRolePreset.models(for: leaderMode), id: \.self) { m in
                             Text(AgentRolePreset.modelDisplayLabel(m, for: leaderMode)).tag(m)
@@ -2147,7 +2150,7 @@ struct TeamCreationView: View {
             : template.payload
         switch payload {
         case .smart(let preset):
-            applySmartPreset(preset)
+            applySmartPreset(preset, resolveProviders: template.origin == .builtIn)
         case .workflow(let preset):
             applyWorkflowPreset(preset)
         case .quick(let preset):
@@ -2159,7 +2162,11 @@ struct TeamCreationView: View {
         _ = template
     }
 
-    private func applySmartPreset(_ preset: SmartTeamPreset, useEffectivePayload: Bool = true) {
+    private func applySmartPreset(
+        _ preset: SmartTeamPreset,
+        useEffectivePayload: Bool = true,
+        resolveProviders: Bool = true
+    ) {
         let available = presetManager.presets
         let templateId = TemplateID(category: .smart, slug: preset.id)
         let effectivePreset: SmartTeamPreset
@@ -2169,7 +2176,9 @@ struct TeamCreationView: View {
         } else {
             effectivePreset = preset
         }
-        let resolved = effectivePreset.resolve(with: providerDetector)
+        let resolved = resolveProviders
+            ? effectivePreset.resolve(with: providerDetector)
+            : effectivePreset.resolveExactly()
         selectedSmartPresetId = effectivePreset.id
         selectedWorkflowName = nil
         leaderMode = effectivePreset.leaderMode
@@ -2326,6 +2335,7 @@ struct TeamCreationView: View {
             // agents + leaderMode are overwritten.
             guard case .smart(var preset) = template.payload else { return }
             preset.leaderMode = leaderMode
+            preset.leaderModel = leaderMode == "repl" ? nil : leaderModel
             preset.agents = liveProviderPreferences()
             var updated = template
             updated.payload = .smart(preset)

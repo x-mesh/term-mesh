@@ -411,13 +411,27 @@ struct NewProjectView: View {
                     Picker("", selection: $leaderPlacement) {
                         Text(defaultPlacementLabel).tag(HostPlacement.inherited)
                         Text("This Mac").tag(HostPlacement.explicit(nil))
-                        ForEach(connectedPeers, id: \.id) { host in
-                            Text(host.displayName).tag(HostPlacement.explicit(host.id))
+                        ForEach(selectablePeers, id: \.id) { host in
+                            Text(host.isConnected ? host.displayName : "\(host.displayName) — offline")
+                                .tag(HostPlacement.explicit(host.id))
                         }
                     }
                     .labelsHidden()
                     .frame(width: 170)
                     .accessibilityIdentifier("newProject.leaderHost")
+                    .onChange(of: leaderPlacement) { _, placement in
+                        guard case .explicit(let hostKey?) = placement,
+                              let host = selectablePeers.first(where: { $0.id == hostKey }),
+                              !host.isConnected else { return }
+                        hostStore.connectSavedHost(host)
+                    }
+                    if let leaderHostKey,
+                       let host = selectablePeers.first(where: { $0.id == leaderHostKey }),
+                       !host.isConnected {
+                        Label("connecting…", systemImage: "arrow.triangle.2.circlepath")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
                 }
             }
         }
@@ -544,14 +558,6 @@ struct NewProjectView: View {
     /// something to do about it, not a reason to pretend it is not there.
     private var selectablePeers: [HostEntry] {
         hostStore.sortedHosts.filter { !($0.sshTarget ?? "").isEmpty }
-    }
-
-    /// A remote leader is a live control endpoint, not a future SSH wish.
-    /// Unlike the project location picker, this list intentionally excludes
-    /// offline peers: selecting one must not create a local leader while the
-    /// UI says it is remote.
-    private var connectedPeers: [HostEntry] {
-        selectablePeers.filter(\.isConnected)
     }
 
     private var defaultPlacementLabel: String {
@@ -687,10 +693,15 @@ struct NewProjectView: View {
                 onClose()
             }
             .keyboardShortcut(.defaultAction)
-            .disabled(trimmedDirectory.isEmpty || effectiveName.isEmpty)
+            .disabled(trimmedDirectory.isEmpty || effectiveName.isEmpty || !leaderEndpointIsReady)
         }
         .padding(.horizontal, 20)
         .padding(.vertical, 14)
+    }
+
+    private var leaderEndpointIsReady: Bool {
+        guard let leaderHostKey else { return true }
+        return selectablePeers.first(where: { $0.id == leaderHostKey })?.isConnected == true
     }
 
     private func applyInitialTeamPreset() {
@@ -731,7 +742,10 @@ struct NewProjectView: View {
                 : AgentRolePreset.defaultModel(for: leaderCli)
         }
 
-        let rows = preset.resolve(with: providerDetector).compactMap { resolved -> TeamAgentRow? in
+        let resolvedAgents = template.origin == .custom
+            ? preset.resolveExactly()
+            : preset.resolve(with: providerDetector)
+        let rows = resolvedAgents.compactMap { resolved -> TeamAgentRow? in
             guard var role = presetManager.presets.first(where: { $0.name == resolved.role })
                     ?? presetManager.presets.first(where: { $0.name == "executor" })
                     ?? presetManager.presets.first else { return nil }

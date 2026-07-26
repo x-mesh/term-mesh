@@ -2075,6 +2075,25 @@ struct SmartTeamPreset: Identifiable, Codable, Equatable {
     var leaderModel: String? = nil
     var agents: [ProviderPreference]
 
+    /// Restore a user-authored snapshot without provider substitution.
+    ///
+    /// Custom presets are exact configurations. If a selected CLI is missing,
+    /// the form should still show what was saved so the user can install it or
+    /// edit it; silently changing CLI while retaining that CLI's model creates
+    /// an invalid pair and makes Save/Load lossy.
+    func resolveExactly() -> [ResolvedAgent] {
+        agents.map { pref in
+            ResolvedAgent(
+                role: pref.role,
+                cli: pref.primaryCli,
+                model: pref.primaryModel ?? AgentRolePreset.defaultModel(for: pref.primaryCli),
+                status: .normal,
+                reason: pref.reason,
+                customInstructions: pref.customInstructions ?? ""
+            )
+        }
+    }
+
     /// Resolve all agent slots against detected providers.
     func resolve(with detector: ProviderDetector) -> [ResolvedAgent] {
         agents.map { pref in
