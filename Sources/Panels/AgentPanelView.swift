@@ -692,7 +692,11 @@ private struct WorkingMark: View {
                 }
             }
         }
-        .opacity(0.28)
+        // Faint made sense when this sat over the transcript; in the composer
+        // row it sits over nothing, so the reason is gone. Still a step under
+        // the stop button beside it — that one is the thing to press, this one
+        // is only the thing to notice.
+        .opacity(0.85)
         // A grid of squares keeping time is not something to announce; the
         // header already says "working" in words.
         .accessibilityHidden(true)
