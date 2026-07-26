@@ -115,7 +115,13 @@ struct AgentPanelView: View {
         }
         .padding(.horizontal, 10)
         .padding(.vertical, 7)
-        .background(accent.opacity(isFocused ? 0.12 : 0.05))
+        .background {
+            WorkingHeaderBackground(
+                accent: accent,
+                isWorking: session.isThinking,
+                isFocused: isFocused
+            )
+        }
     }
 
     // MARK: - The banner
@@ -457,6 +463,66 @@ private struct Instruction: View {
         .padding(8)
         .frame(maxWidth: .infinity, alignment: .leading)
         .background(Color.primary.opacity(0.05), in: RoundedRectangle(cornerRadius: 6))
+    }
+}
+
+/// The header's working state moves in the same direction as reading: a quiet
+/// band travels left to right behind the identity and status. It complements
+/// the persistent composer spinner without replacing it.
+private struct WorkingHeaderBackground: View {
+    let accent: Color
+    let isWorking: Bool
+    let isFocused: Bool
+
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
+    private static let cycle: Double = 1.8
+
+    var body: some View {
+        ZStack {
+            accent.opacity(isFocused ? 0.12 : 0.05)
+
+            if isWorking {
+                if reduceMotion {
+                    LinearGradient(
+                        colors: [
+                            accent.opacity(0.04),
+                            accent.opacity(0.14),
+                            accent.opacity(0.04),
+                        ],
+                        startPoint: .leading,
+                        endPoint: .trailing
+                    )
+                } else {
+                    TimelineView(.animation(minimumInterval: 1.0 / 30)) { timeline in
+                        GeometryReader { geometry in
+                            let time = timeline.date.timeIntervalSinceReferenceDate
+                            let phase = time.truncatingRemainder(dividingBy: Self.cycle)
+                                / Self.cycle
+                            let width = geometry.size.width
+                            let bandWidth = max(90, width * 0.48)
+
+                            LinearGradient(
+                                colors: [
+                                    .clear,
+                                    accent.opacity(0.05),
+                                    accent.opacity(0.18),
+                                    accent.opacity(0.05),
+                                    .clear,
+                                ],
+                                startPoint: .leading,
+                                endPoint: .trailing
+                            )
+                            .frame(width: bandWidth)
+                            .offset(x: -bandWidth + CGFloat(phase) * (width + bandWidth))
+                        }
+                    }
+                }
+            }
+        }
+        .clipped()
+        .allowsHitTesting(false)
+        .accessibilityHidden(true)
     }
 }
 
