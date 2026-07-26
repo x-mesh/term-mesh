@@ -400,6 +400,73 @@ final class AgentSessionTests: XCTestCase {
         XCTAssertFalse(read.hasMore)
     }
 
+    // MARK: - A turn is one thing
+
+    private var say: AgentSession.Entry { .said(id: UUID(), .leader, "do it") }
+    private var think: AgentSession.Entry { .thought(id: UUID(), "hm") }
+    private var toolRow: AgentSession.Entry {
+        .tool(id: UUID(), .init(name: "Bash", headline: "ls"))
+    }
+    private var answer: AgentSession.Entry { .answered(id: UUID(), "done") }
+    private var footer: AgentSession.Entry {
+        .turnEnded(id: UUID(), .init(stop: "end_turn", failed: false, cost: nil,
+                                     duration: nil, tokensIn: nil, tokensOut: nil))
+    }
+
+    /// At one gap for everything, a turn's five parts read as five unrelated
+    /// rows. Tight inside a turn, open between them.
+    func testATurnIsSpacedAsOneThing() {
+        let inside = AgentPanelView.gap(before: answer, after: think)
+        let footerGap = AgentPanelView.gap(before: footer, after: answer)
+        let between = AgentPanelView.gap(before: say, after: footer)
+
+        XCTAssertLessThan(footerGap, inside, "a footer closes the answer above it")
+        XCTAssertGreaterThan(between, inside, "a new turn needs room")
+        // Reasoning and the tools it drives are one train of thought.
+        XCTAssertLessThanOrEqual(AgentPanelView.gap(before: toolRow, after: think), 4)
+        XCTAssertLessThanOrEqual(AgentPanelView.gap(before: toolRow, after: toolRow), 4)
+    }
+
+    /// A new instruction starts a turn wherever it lands, even mid-stream.
+    func testAnInstructionAlwaysStartsATurn() {
+        XCTAssertEqual(AgentPanelView.gap(before: say, after: answer),
+                       AgentPanelView.gap(before: say, after: footer))
+    }
+
+    // MARK: - Stopping a turn
+
+    /// Not a signal and not a restart. Measured: claude reads
+    /// `control_request`/`interrupt` on the same stdin its turns arrive on,
+    /// the turn ends in half a second, the process lives, and the next turn
+    /// answers with its context intact.
+    func testOnlyAMeasuredCliOffersToStopATurn() {
+        let claude = AgentSession.claudeLaunch(
+            claudePath: "/usr/local/bin/claude", model: "haiku",
+            instructions: "", extraArgs: [], workingDirectory: "/tmp")
+        XCTAssertTrue(claude.interruptible)
+
+        // The bridged CLIs have their own cancel verbs and none of them have
+        // been measured, so their panes do not offer a button that might do
+        // something else.
+        let bridged = AgentSession.bridgeLaunch(
+            cli: "codex", bridgePath: "/repo/bridge.py", model: "gpt-5.5",
+            workingDirectory: "/tmp")
+        XCTAssertFalse(bridged.interruptible)
+    }
+
+    /// A turn stopped on purpose is not a failure, and should not be labelled
+    /// with claude's own word for it, `error_during_execution`.
+    func testAStoppedTurnReadsAsStoppedRatherThanFailed() {
+        let s = session([event(["type": "result", "subtype": "error_during_execution",
+                                "is_error": true, "result": ""])])
+        guard case .turnEnded(_, let end) = try? XCTUnwrap(s.entries.last) else {
+            return XCTFail("expected a turn end")
+        }
+        // Without a stop request it is exactly what claude called it.
+        XCTAssertEqual(end.stop, "error_during_execution")
+        XCTAssertTrue(end.failed)
+    }
+
     // MARK: - Markdown
 
     /// The pane was showing `## Heading` and `**bold**` as literal characters,

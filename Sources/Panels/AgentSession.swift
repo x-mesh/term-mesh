@@ -222,6 +222,9 @@ final class AgentSession: ObservableObject {
     /// What the CLI announced about itself, shown once rather than per turn.
     @Published private(set) var summary: String?
 
+    /// Whether this agent's turn can be stopped. See `Launch.interruptible`.
+    @Published private(set) var canInterrupt = false
+
     /// Rows still being written, so the view can show a caret on them.
     ///
     /// Nothing else can say this. A terminal shows characters arriving and
@@ -260,6 +263,15 @@ final class AgentSession: ObservableObject {
         let arguments: [String]
         let workingDirectory: String
         let environment: [String: String]
+        /// Whether a turn can be cancelled without killing the session.
+        ///
+        /// Claude takes `control_request` / `interrupt` on the same stdin as
+        /// its turns — measured: the turn ends in half a second, the process
+        /// lives, and the next turn still answers with its context intact. The
+        /// bridged CLIs have their own cancel verbs and none of them have been
+        /// measured, so their panes do not offer a button that might do
+        /// something else.
+        var interruptible = false
     }
 
     /// The arguments that make claude take turns on a pipe.
@@ -293,7 +305,8 @@ final class AgentSession: ObservableObject {
         if !instructions.isEmpty { args += ["--append-system-prompt", instructions] }
         args += extraArgs
         return Launch(executable: claudePath, arguments: args,
-                      workingDirectory: workingDirectory, environment: environment)
+                      workingDirectory: workingDirectory, environment: environment,
+                      interruptible: true)
     }
 
     /// The launch line for a CLI the bridge has to run on our behalf.
@@ -375,6 +388,7 @@ final class AgentSession: ObservableObject {
         process = p
         stdin = input.fileHandleForWriting
         isRunning = true
+        canInterrupt = launch.interruptible
     }
 
     func stop() {
@@ -479,6 +493,29 @@ final class AgentSession: ObservableObject {
         data.append(0x0A)
         return data
     }
+
+    /// Stop the turn in flight, keeping the session.
+    ///
+    /// Not a signal and not a restart: claude reads this on the same stdin its
+    /// turns arrive on, ends the turn, and carries on. Measured — half a
+    /// second to `result`, process alive, next turn answered normally.
+    func interrupt() {
+        guard canInterrupt, turnInFlight || isThinking, let stdin else { return }
+        let control: [String: Any] = [
+            "type": "control_request",
+            "request_id": UUID().uuidString,
+            "request": ["subtype": "interrupt"],
+        ]
+        guard var data = try? JSONSerialization.data(withJSONObject: control) else { return }
+        data.append(0x0A)
+        try? stdin.write(contentsOf: data)
+        stopRequested = true
+    }
+
+    /// Set when the stop came from here, so the turn that ends a moment later
+    /// can say "stopped" rather than `error_during_execution` — which is what
+    /// claude calls it, and which reads like something went wrong.
+    private var stopRequested = false
 
     // MARK: - Reading the stream
 
@@ -662,9 +699,11 @@ final class AgentSession: ObservableObject {
 
     private func result(_ o: [String: Any]) {
         let usage = o["usage"] as? [String: Any] ?? [:]
-        let failed = o["is_error"] as? Bool ?? false
+        // A turn we stopped on purpose is not a failure.
+        let failed = stopRequested ? false : (o["is_error"] as? Bool ?? false)
+        let reason = o["stop_reason"] as? String ?? o["subtype"] as? String ?? "?"
         var end = TurnEnd(
-            stop: o["stop_reason"] as? String ?? o["subtype"] as? String ?? "?",
+            stop: stopRequested ? "stopped" : reason,
             failed: failed,
             cost: o["total_cost_usd"] as? Double,
             duration: (o["duration_ms"] as? Double).map { $0 / 1000 },
@@ -694,6 +733,7 @@ final class AgentSession: ObservableObject {
         append(.turnEnded(id: UUID(), end))
         isThinking = false
         turnInFlight = false
+        stopRequested = false
         // `result` carries the final answer as a clean string — the boundary is
         // stated rather than inferred from a screen going quiet.
         let final = o["result"] as? String ?? saidThisTurn.joined(separator: "\n")

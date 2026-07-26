@@ -86,6 +86,17 @@ struct AgentPanelView: View {
                     .font(.system(size: 10))
                     .foregroundStyle(.secondary)
                 ProgressView().controlSize(.small).scaleEffect(0.6)
+                if session.canInterrupt {
+                    // Stops the turn, not the session: claude reads this on the
+                    // same stdin its turns arrive on, and the next turn still
+                    // has its context.
+                    Button(action: session.interrupt) {
+                        Image(systemName: "stop.fill").font(.system(size: 9))
+                    }
+                    .buttonStyle(.plain)
+                    .foregroundStyle(.secondary)
+                    .help("Stop this turn")
+                }
             }
         }
         .padding(.horizontal, 10)
@@ -176,10 +187,18 @@ struct AgentPanelView: View {
     private var transcript: some View {
         ScrollViewReader { proxy in
             ScrollView {
-                LazyVStack(alignment: .leading, spacing: 10) {
+                // Spacing is uniform no longer: a turn runs instruction →
+                // thinking → tools → answer → footer, and at one gap for
+                // everything those five read as five unrelated rows. Tight
+                // inside a turn, open between them.
+                LazyVStack(alignment: .leading, spacing: 0) {
                     banner
-                    ForEach(session.entries) { entry in
-                        row(entry).id(entry.id)
+                    if session.entries.isEmpty { emptyState }
+                    ForEach(Array(session.entries.enumerated()), id: \.element.id) { index, entry in
+                        row(entry)
+                            .padding(.top, Self.gap(before: entry,
+                                                    after: index > 0 ? session.entries[index - 1] : nil))
+                            .id(entry.id)
                     }
                     // Anchors the auto-scroll, and doubles as the test for
                     // whether the bottom is on screen at all.
@@ -226,6 +245,42 @@ struct AgentPanelView: View {
     }
 
     private static let bottom = "bottom"
+
+    /// How much air a row needs above it, given what came before.
+    ///
+    /// The footer belongs to the answer it closes, so it sits close. A new
+    /// instruction, or anything after a footer, starts a turn and gets room.
+    static func gap(before entry: AgentSession.Entry,
+                    after previous: AgentSession.Entry?) -> CGFloat {
+        guard let previous else { return 12 }
+        if case .turnEnded = previous { return 20 }
+        if case .said = entry { return 20 }
+        if case .turnEnded = entry { return 6 }
+        switch (previous, entry) {
+        // Reasoning and the tools it drives are one train of thought.
+        case (.thought, .tool), (.tool, .thought), (.tool, .tool): return 4
+        default: return 8
+        }
+    }
+
+    /// What a pane says before anything has happened in it.
+    ///
+    /// "Nothing here" teaches nothing. A fresh pane's real question is "what is
+    /// this and what do I do", and it has two answers worth one line each.
+    private var emptyState: some View {
+        VStack(alignment: .leading, spacing: 3) {
+            Text("Waiting for the leader.")
+                .font(.system(size: 12, weight: .medium))
+            Text("Instructions from the leader appear here. "
+                 + "You can also type below to talk to \(panel.agentName) yourself; "
+                 + "it cannot tell the difference.")
+                .font(.system(size: 11))
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .padding(.top, 14)
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
 
     @ViewBuilder
     private func row(_ entry: AgentSession.Entry) -> some View {
