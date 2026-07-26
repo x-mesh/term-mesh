@@ -179,7 +179,10 @@ struct NewProjectView: View {
         .sheet(isPresented: $showingManagePresets) {
             TeamPresetManagerSheet(
                 manager: teamTemplateManager,
-                selectedId: $selectedTeamPresetId
+                selectedId: $selectedTeamPresetId,
+                onDeleteSelected: {
+                    appliedTeamSignature = nil
+                }
             )
         }
         .alert("Preset could not be saved", isPresented: Binding(
@@ -324,7 +327,7 @@ struct NewProjectView: View {
     }
 
     private var isTeamCustomized: Bool {
-        guard let appliedTeamSignature else { return false }
+        guard let appliedTeamSignature else { return !agents.isEmpty }
         return appliedTeamSignature != currentTeamSignature
     }
 
@@ -696,9 +699,8 @@ struct NewProjectView: View {
            pinnedId.category == .smart,
            let template = teamTemplateManager.template(for: pinnedId) {
             applyTemplate(template)
-        } else {
-            applyDefaultTeam()
         }
+        if agents.isEmpty { applyDefaultTeam() }
     }
 
     private func applyDefaultTeam() {
@@ -822,6 +824,7 @@ struct NewProjectView: View {
 private struct TeamPresetManagerSheet: View {
     @ObservedObject var manager: TeamTemplateManager
     @Binding var selectedId: TemplateID?
+    let onDeleteSelected: () -> Void
     @Environment(\.dismiss) private var dismiss
 
     private var smartTemplates: [TeamTemplate] {
@@ -856,7 +859,10 @@ private struct TeamPresetManagerSheet: View {
                             }
                         },
                         onDelete: template.origin == .custom ? {
-                            if selectedId == template.id { selectedId = nil }
+                            if selectedId == template.id {
+                                selectedId = nil
+                                onDeleteSelected()
+                            }
                             try? manager.deleteCustom(id: template.id)
                         } : nil
                     )
