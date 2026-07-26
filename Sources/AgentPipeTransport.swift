@@ -112,7 +112,7 @@ enum AgentPipeTransport {
         parts += extraArgs.map(quoted)
 
         let f = quoted(fifoPath)
-        return [
+        let chain = [
             "rm -f \(f)",
             "mkdir -p \(quoted((fifoPath as NSString).deletingLastPathComponent))",
             "mkfifo -m 600 \(f)",
@@ -120,6 +120,15 @@ enum AgentPipeTransport {
             "exec 3<>\(f)",
             parts.joined(separator: " ") + " <&3",
         ].joined(separator: " && ")
+
+        // Handed back as one command, not a chain, because the caller may
+        // prefix it with `exec` — it does exactly that when the agent works in
+        // a worktree. `exec` takes only the first word, so `exec rm -f … && …`
+        // replaced the pane's shell with `rm`, which did its one job and left.
+        // The pane then closed half a second after opening, with the launch it
+        // never reached nowhere to be seen.
+        let shell = ProcessInfo.processInfo.environment["SHELL"] ?? "/bin/zsh"
+        return "\(quoted(shell)) -c \(quoted(chain))"
     }
 
     // MARK: - Delivering a turn

@@ -2554,6 +2554,29 @@ final class TeamOrchestrator: ObservableObject {
             #endif
             completion?(false); return false
         }
+        // Same fork as the panel-targeted path: an agent on a pipe takes its
+        // turn there. Both entry points need it — `team.send` resolves by name
+        // and never reaches the panel-targeted one, so wiring only that left
+        // delivery quietly on the typing path while reporting success.
+        if AgentPipeTransport.isEnabled,
+           AgentPipeTransport.supports(cli: agent.cli),
+           FileManager.default.fileExists(
+               atPath: AgentPipeTransport.fifoPath(agentId: agent.id)) {
+            do {
+                let n = try AgentPipeTransport.deliver(text: text, agentId: agent.id)
+                #if DEBUG
+                dlog("agent.pipe.deliver agent=\(agent.id) bytes=\(n) via=name")
+                #endif
+                completion?(true)
+                return true
+            } catch {
+                #if DEBUG
+                dlog("agent.pipe.deliver.FAILED agent=\(agent.id) err=\(error)")
+                #endif
+                completion?(false)
+                return false
+            }
+        }
         let teamAgentKey = "\(teamName)/\(agentName)"
         if migratingAgents.contains(teamAgentKey) {
             #if DEBUG
