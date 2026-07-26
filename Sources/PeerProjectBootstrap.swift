@@ -149,4 +149,93 @@ struct ProjectSource: Equatable {
 struct ProjectLeader: Equatable {
     var mode: String
     var model: String
+    /// The machine that owns the leader pane.  This is deliberately distinct
+    /// from `ProjectSource.hostKey`: a project can live on one peer while its
+    /// leader is local, or the leader can be on another connected peer.
+    ///
+    /// Keeping the endpoint in the project request means later bootstrap
+    /// stages never need to infer locality from a pane UUID (which is only
+    /// unique within its creating host).
+    var endpoint: LeaderEndpoint = .local
+}
+
+/// A leader's address before (and after) it has a pane.  A remote pane ID is
+/// not available when New Project is submitted, so host identity is the
+/// durable part of the endpoint; the bootstrap protocol supplies its remote
+/// surface reference later.
+///
+/// The explicit `.local` default is the migration path for every existing
+/// in-memory/local team that predates peer-hosted leaders.
+enum LeaderEndpoint: Hashable, Codable, Sendable {
+    case local
+    case peer(hostKey: String)
+
+    private enum CodingKeys: String, CodingKey { case kind, hostKey }
+    private enum Kind: String, Codable { case local, peer }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        switch try container.decode(Kind.self, forKey: .kind) {
+        case .local:
+            self = .local
+        case .peer:
+            self = .peer(hostKey: try container.decode(String.self, forKey: .hostKey))
+        }
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        switch self {
+        case .local:
+            try container.encode(Kind.local, forKey: .kind)
+        case let .peer(hostKey):
+            try container.encode(Kind.peer, forKey: .kind)
+            try container.encode(hostKey, forKey: .hostKey)
+        }
+    }
+
+    var hostKey: String? {
+        guard case let .peer(hostKey) = self else { return nil }
+        return hostKey
+    }
+}
+
+/// A surface owned by another peer.  A bare surface UUID is not enough here:
+/// UUIDs are only unique inside the peer that created them, and using one as a
+/// local pane identifier lets a relay pane accidentally be published again by
+/// the next host it passes through.
+struct RemoteRef: Hashable, Codable, Sendable {
+    /// Stable peer identity, not an SSH target or a transient tunnel path.
+    let hostPeerID: String
+    let workspaceID: UUID
+    /// nil means the remote workspace itself; a value addresses one leaf.
+    let surfaceID: UUID?
+
+    init(hostPeerID: String, workspaceID: UUID, surfaceID: UUID? = nil) {
+        self.hostPeerID = hostPeerID
+        self.workspaceID = workspaceID
+        self.surfaceID = surfaceID
+    }
+}
+
+/// A UI selection can point at a local pane or an address in a peer's
+/// namespace.  Keeping the two cases distinct prevents callers from dropping
+/// the host component while forwarding a selection across a peer boundary.
+enum SelectionTarget: Hashable, Sendable {
+    case local(workspaceID: UUID, surfaceID: UUID)
+    case remote(RemoteRef)
+
+    var workspaceID: UUID {
+        switch self {
+        case let .local(workspaceID, _): workspaceID
+        case let .remote(ref): ref.workspaceID
+        }
+    }
+
+    var surfaceID: UUID? {
+        switch self {
+        case let .local(_, surfaceID): surfaceID
+        case let .remote(ref): ref.surfaceID
+        }
+    }
 }

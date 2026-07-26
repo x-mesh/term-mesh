@@ -731,6 +731,18 @@ final class PeerClientCoordinator: NSObject, NSMenuDelegate {
     /// be scoped after the fact.
     @discardableResult
     private func openRemotePaneFlow(spec: PeerPaneHostSpec, workspaceID: Data? = nil) async -> Bool {
+        // A direct connection back into this app is not a remote pane.  Apart
+        // from wasting a relay, it creates a self-attach loop whose output is
+        // fed back into the same Ghostty surface.  Cross-host re-export is
+        // blocked at the provider as well; this catches the local fast path
+        // before a connection is even opened.
+        guard !spec.targetsLocalPeerServer else {
+            self.showAlert(
+                title: "Cannot Attach Local Peer",
+                body: "Choose a different peer host; a terminal cannot be attached to itself."
+            )
+            return false
+        }
         let lease: PeerPaneHostLease
         do {
             lease = try await PeerPaneHostRegistry.shared.acquire(spec)

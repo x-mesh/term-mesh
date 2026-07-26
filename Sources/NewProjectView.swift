@@ -64,6 +64,9 @@ struct NewProjectView: View {
     /// starting a project means.
     @State private var leaderCli = "claude"
     @State private var leaderModel = AgentRolePreset.defaultModel(for: "claude")
+    /// Independent of `runsOnHostKey`: the project and its leader do not have
+    /// to live on the same machine.
+    @State private var leaderHostKey: String?
 
     @ObservedObject private var presetManager = AgentRolePresetManager.shared
     @ObservedObject private var hostStore = RemoteHostStore.shared
@@ -129,10 +132,11 @@ struct NewProjectView: View {
     }
 
     private var leaderRow: some View {
-        HStack(spacing: 8) {
-            Text("Leader")
-                .font(.subheadline.bold())
-            Spacer()
+        Grid(alignment: .leading, horizontalSpacing: 12, verticalSpacing: 10) {
+            GridRow {
+                Text("Leader")
+                    .font(.subheadline.bold())
+                HStack(spacing: 8) {
             Picker("", selection: Binding(
                 get: { leaderCli },
                 set: { newCli in
@@ -175,14 +179,31 @@ struct NewProjectView: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
-            // Said out loud because the row above says the project runs
-            // elsewhere and this one does not follow it. The leader commands
-            // the team through this app's socket, which only exists here, so
-            // it stays on this Mac while its members work on the far machine.
-            if runsOnHostKey != nil {
-                Text("runs on this Mac")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+                }
+            }
+            GridRow {
+                Text("Leader host")
+                HStack(spacing: 8) {
+                    Picker("", selection: $leaderHostKey) {
+                        Text("This Mac").tag(String?.none)
+                        ForEach(connectedPeers, id: \.id) { host in
+                            Text(host.displayName).tag(String?.some(host.id))
+                        }
+                    }
+                    .labelsHidden()
+                    .frame(width: 220)
+                    .accessibilityIdentifier("newProject.leaderHost")
+                    if connectedPeers.isEmpty {
+                        Text("connect a peer to place the leader remotely")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    } else if let leaderHostKey,
+                              let host = connectedPeers.first(where: { $0.id == leaderHostKey }) {
+                        Text("leader runs on \(host.displayName)")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                }
             }
         }
     }
@@ -310,6 +331,14 @@ struct NewProjectView: View {
         hostStore.sortedHosts.filter { !($0.sshTarget ?? "").isEmpty }
     }
 
+    /// A remote leader is a live control endpoint, not a future SSH wish.
+    /// Unlike the project location picker, this list intentionally excludes
+    /// offline peers: selecting one must not create a local leader while the
+    /// UI says it is remote.
+    private var connectedPeers: [HostEntry] {
+        selectablePeers.filter(\.isConnected)
+    }
+
     /// What the isolation choice will actually produce, named.
     private var isolationHint: String {
         let plan = PeerProjectBootstrap.plan(
@@ -424,7 +453,11 @@ struct NewProjectView: View {
                         gitURL: gitURL.trimmingCharacters(in: .whitespacesAndNewlines),
                         isolateAgents: isolateAgents
                     ),
-                    ProjectLeader(mode: leaderCli, model: leaderModel)
+                    ProjectLeader(
+                        mode: leaderCli,
+                        model: leaderModel,
+                        endpoint: leaderHostKey.map { .peer(hostKey: $0) } ?? .local
+                    )
                 )
                 onClose()
             }

@@ -87,8 +87,11 @@ final class TeamOrchestrator: ObservableObject {
         let leaderMode: String    // "repl", "claude", "kiro", "codex", "gemini", "adopted"
         let leaderModel: String   // e.g. "sonnet", "opus", "haiku"
         let leaderCli: String?    // detected CLI for adopted leader; nil otherwise
-        let leaderPanelId: UUID   // leader pane for sending instructions
-        let leaderWorkspaceId: UUID?  // only set in "adopted" mode (leader lives in a separate workspace)
+        var leaderPanelId: UUID   // leader pane for sending instructions
+        var leaderWorkspaceId: UUID?  // only set in "adopted" mode (leader lives in a separate workspace)
+        /// The leader's host namespace.  Older teams did not carry this
+        /// field; its default preserves their established local behaviour.
+        var leaderEndpoint: LeaderEndpoint = .local
         let workingDirectory: String
         let workspaceId: UUID     // agent workspace (may differ from leader workspace in "adopted" mode)
         var agents: [AgentMember]
@@ -142,6 +145,20 @@ final class TeamOrchestrator: ObservableObject {
     }
 
     @Published private(set) var teams: [String: Team] = [:]
+
+    /// Install the pane that replaced a temporary local leader. Kept on the
+    /// owning type because `teams` is intentionally read-only to extensions.
+    func replaceLeaderEndpoint(
+        teamName: String,
+        panelID: UUID,
+        endpoint: LeaderEndpoint
+    ) {
+        guard var team = teams[teamName] else { return }
+        team.leaderPanelId = panelID
+        team.leaderWorkspaceId = nil
+        team.leaderEndpoint = endpoint
+        teams[teamName] = team
+    }
     // Round-robin counter per "teamName/agentName" key — cycles across duplicate-named agents.
     private var agentSendRoundRobin: [String: Int] = [:]
     // Last paste target awaiting a separate Return, keyed by "teamName/agentName".
@@ -807,6 +824,7 @@ final class TeamOrchestrator: ObservableObject {
         resumeSessionId: String? = nil,
         worktreeMode: String = "off",
         executionMode: String = "pane",
+        leaderEndpoint: LeaderEndpoint = .local,
         adoptedLeaderSurfaceId: UUID? = nil,
         skipRunbookPromptForInteractiveAgents: Bool = false,
         /// Phase 2 (pane-mode resume): agent name → claude session id, used to
@@ -1336,6 +1354,7 @@ final class TeamOrchestrator: ObservableObject {
                 leaderCli: detectedLeaderCli,
                 leaderPanelId: leaderPanelId,
                 leaderWorkspaceId: leaderWorkspaceId,
+                leaderEndpoint: leaderEndpoint,
                 workingDirectory: workingDirectory,
                 workspaceId: workspace.id,
                 agents: headlessMembers,
@@ -1516,6 +1535,7 @@ final class TeamOrchestrator: ObservableObject {
             leaderCli: detectedLeaderCli,
             leaderPanelId: leaderPanelId,
             leaderWorkspaceId: leaderWorkspaceId,
+            leaderEndpoint: leaderEndpoint,
             workingDirectory: workingDirectory,
             workspaceId: workspace.id,
             agents: members,
@@ -3940,6 +3960,12 @@ final class TeamOrchestrator: ObservableObject {
     func listTeams() -> [[String: Any]] {
         teams.values.map { team in
             let teamInbox = inboxItems(teamName: team.id)
+            let leaderEndpoint: [String: Any] = switch team.leaderEndpoint {
+            case .local:
+                ["kind": "local"]
+            case let .peer(hostKey):
+                ["kind": "peer", "host_key": hostKey]
+            }
             return [
                 "team_name": team.id,
                 "leader_session_id": team.leaderSessionId,
@@ -3982,7 +4008,8 @@ final class TeamOrchestrator: ObservableObject {
                 // usage-tick broadcaster can attribute token usage to the leader
                 // (the leader is intentionally NOT part of the `agents` array).
                 "leader_cli": team.leaderMode,
-                "leader_panel_id": team.leaderPanelId.uuidString
+                "leader_panel_id": team.leaderPanelId.uuidString,
+                "leader_endpoint": leaderEndpoint,
             ] as [String: Any]
         }
     }
@@ -4813,6 +4840,15 @@ final class TeamOrchestrator: ObservableObject {
                 return row
             },
         ]
+        // Keep the requested host placement in the live snapshot. The remote
+        // bootstrap layer can attach its pane reference later without ever
+        // guessing that a peer leader belongs to this Mac.
+        payload["leader_endpoint"] = switch team.leaderEndpoint {
+        case .local:
+            ["kind": "local"]
+        case let .peer(hostKey):
+            ["kind": "peer", "host_key": hostKey]
+        }
         if let root = team.gitRepoRoot?.nilIfBlank
             ?? TermMeshDaemon.shared.findGitRoot(from: team.workingDirectory) {
             payload["git_root"] = root

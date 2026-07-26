@@ -3387,7 +3387,137 @@ fn rpc_call(sock: &PathBuf, method: &str, params: Value) -> Result<Value, String
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
         .unwrap_or(6);
+    if remote_leader_route().is_some() && remote_leader_method_allowed(method) {
+        return remote_leader_rpc_call(sock, method, params, timeout);
+    }
     rpc_call_timeout(sock, method, params, timeout)
+}
+
+#[derive(Clone)]
+struct RemoteLeaderRoute {
+    grant_id_hex: String,
+    project_id: String,
+    team_uuid: String,
+    expires_at_unix_secs: u64,
+    target_peer_id_hex: String,
+}
+
+fn remote_leader_route() -> Option<RemoteLeaderRoute> {
+    let grant_id_hex = env::var("TERMMESH_LEADER_GRANT_ID").ok()?;
+    let project_id = env::var("TERMMESH_LEADER_PROJECT_ID").ok()?;
+    let team_uuid = env::var("TERMMESH_LEADER_TEAM_UUID").ok()?;
+    let expires_at_unix_secs = env::var("TERMMESH_LEADER_EXPIRES_AT").ok()?.parse().ok()?;
+    let target_peer_id_hex = env::var("TERMMESH_LEADER_PEER_ID").ok()?;
+    if grant_id_hex.len() != 64
+        || target_peer_id_hex.len() != 32
+        || project_id.is_empty()
+        || team_uuid.is_empty()
+    {
+        return None;
+    }
+    Some(RemoteLeaderRoute {
+        grant_id_hex,
+        project_id,
+        team_uuid,
+        expires_at_unix_secs,
+        target_peer_id_hex,
+    })
+}
+
+fn remote_leader_method_allowed(method: &str) -> bool {
+    matches!(
+        method,
+        "team.status"
+            | "team.read"
+            | "team.collect"
+            | "team.reports"
+            | "team.inbox"
+            | "team.message.list"
+            | "team.send"
+            | "team.broadcast"
+            | "team.delegate"
+            | "team.message.post"
+            | "team.task.list"
+            | "team.task.get"
+            | "team.task.create"
+            | "team.task.update"
+    )
+}
+
+fn remote_leader_request_id_hex() -> String {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos() as u64;
+    let tail =
+        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) ^ ((process::id() as u64) << 32);
+    format!("{now:016x}{tail:016x}")
+}
+
+fn remote_leader_rpc_call(
+    sock: &PathBuf,
+    method: &str,
+    params: Value,
+    timeout: u64,
+) -> Result<Value, String> {
+    let route = remote_leader_route().ok_or_else(|| "invalid remote leader route".to_string())?;
+    let request_id_hex = remote_leader_request_id_hex();
+    let proxy_params = remote_leader_proxy_params(&route, method, params, &request_id_hex)?;
+
+    // A dropped local daemon response may be retried, but the opaque request
+    // id stays fixed so the viewer returns its cached outcome and never
+    // inserts text or presses Return twice.
+    let first = rpc_call_timeout(sock, "peer.leader.call", proxy_params.clone(), timeout);
+    let outer = match first {
+        Ok(value) => value,
+        Err(_) => rpc_call_timeout(sock, "peer.leader.call", proxy_params, timeout)?,
+    };
+    let proxied = decode_daemon_response(outer)?;
+    if !proxied["ok"].as_bool().unwrap_or(false) {
+        return Err("remote leader proxy returned non-ok".into());
+    }
+    Ok(json!({
+        "ok": true,
+        "result": proxied["result"].clone(),
+        "remote_leader_proxy": true,
+        "cached": proxied["cached"].clone(),
+    }))
+}
+
+/// A scoped remote-leader delegate commits paste + Return in the authoritative
+/// control plane, rather than through this daemon.  Never issue the legacy
+/// follow-up `team.send_key` after either form of that acknowledgement: doing
+/// so would submit the same prompt a second time.
+fn delegate_return_already_submitted(response: &Value) -> bool {
+    response["remote_leader_proxy"].as_bool().unwrap_or(false)
+        || response["result"]["return_submitted"]
+            .as_bool()
+            .unwrap_or(false)
+}
+
+fn remote_leader_proxy_params(
+    route: &RemoteLeaderRoute,
+    method: &str,
+    mut params: Value,
+    request_id_hex: &str,
+) -> Result<Value, String> {
+    if method == "team.delegate" {
+        // The authoritative dispatcher must commit paste + Return as one
+        // request-id-deduplicated operation. Local delegates keep the legacy
+        // two-RPC path; only this scoped route asks the server to submit.
+        params["submit_return"] = json!(true);
+    }
+    Ok(json!({
+        "grant_id_hex": &route.grant_id_hex,
+        "project_id": &route.project_id,
+        "team_uuid": &route.team_uuid,
+        "expires_at_unix_secs": route.expires_at_unix_secs,
+        "target_peer_id_hex": &route.target_peer_id_hex,
+        "request_id_hex": request_id_hex,
+        "method": method,
+        "params_json": serde_json::to_string(&params).map_err(|e| e.to_string())?,
+    }))
 }
 
 fn daemon_result(sock: &PathBuf, method: &str, params: Value) -> Result<Value, String> {
@@ -9190,14 +9320,16 @@ fn run_delegate_result(
                         let mut patched = v.clone();
                         patched["result"]["text_delivered"] = json!(true);
                         text_delivered = true;
-                        let _ = send_return_key_with_retry(
-                            sock,
-                            team,
-                            target,
-                            text_delivered,
-                            "team.delegate.retry",
-                            panel_id,
-                        );
+                        if !delegate_return_already_submitted(&v) {
+                            let _ = send_return_key_with_retry(
+                                sock,
+                                team,
+                                target,
+                                text_delivered,
+                                "team.delegate.retry",
+                                panel_id,
+                            );
+                        }
                         return Ok(patched);
                     }
                     _ => {
@@ -9230,6 +9362,13 @@ fn run_delegate_result(
                 return Err(format!(
                     "delivery failed; task blocked: {reason} (task_id={task_id})"
                 ));
+            }
+
+            // Remote leader proxy asked the authoritative dispatcher to
+            // commit paste + Return inside the same deduplicated request.
+            // Sending another key here would submit the prompt twice.
+            if delegate_return_already_submitted(&v) {
+                return Ok(v);
             }
 
             // Send Return key separately via team.send_key RPC.
@@ -13814,5 +13953,86 @@ mod auto_watch_tests {
                 watcher_model: "sonnet".to_string(),
             }
         );
+    }
+
+    #[test]
+    fn remote_leader_route_allows_only_scoped_non_lifecycle_team_methods() {
+        for method in [
+            "team.send",
+            "team.delegate",
+            "team.task.create",
+            "team.task.update",
+            "team.task.list",
+        ] {
+            assert!(remote_leader_method_allowed(method), "{method}");
+        }
+        for method in [
+            "team.create",
+            "team.destroy",
+            "team.attach",
+            "team.add_agent",
+            "team.restart",
+            "surface.send_key",
+        ] {
+            assert!(!remote_leader_method_allowed(method), "{method}");
+        }
+    }
+
+    #[test]
+    fn remote_leader_request_ids_are_opaque_fixed_width_and_unique() {
+        let first = remote_leader_request_id_hex();
+        let second = remote_leader_request_id_hex();
+        assert_eq!(first.len(), 32);
+        assert_eq!(second.len(), 32);
+        assert_ne!(first, second);
+        assert!(first.bytes().all(|byte| byte.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn remote_leader_delegate_proxy_submits_return_and_retry_reuses_request_id() {
+        let route = RemoteLeaderRoute {
+            grant_id_hex: "ab".repeat(32),
+            project_id: "name:demo".to_string(),
+            team_uuid: "team-uuid".to_string(),
+            expires_at_unix_secs: u64::MAX,
+            target_peer_id_hex: "cd".repeat(16),
+        };
+        let request_id = "41".repeat(16);
+        let original = json!({
+            "agent_name": "executor",
+            "text": "inspect relay",
+            "submit_return": false,
+        });
+
+        let first =
+            remote_leader_proxy_params(&route, "team.delegate", original.clone(), &request_id)
+                .expect("first proxy payload");
+        let retry = remote_leader_proxy_params(&route, "team.delegate", original, &request_id)
+            .expect("retry proxy payload");
+
+        assert_eq!(first, retry, "retry must reuse the entire scoped request");
+        assert_eq!(first["request_id_hex"], request_id);
+        assert_eq!(first["target_peer_id_hex"], "cd".repeat(16));
+        assert_eq!(first["method"], "team.delegate");
+        let inner: Value = serde_json::from_str(first["params_json"].as_str().unwrap()).unwrap();
+        assert_eq!(inner["text"], "inspect relay");
+        assert_eq!(
+            inner["submit_return"], true,
+            "remote delegate must commit text + one Return inside the deduped request"
+        );
+    }
+
+    #[test]
+    fn remote_leader_delegate_ack_suppresses_legacy_followup_return() {
+        assert!(delegate_return_already_submitted(&json!({
+            "remote_leader_proxy": true,
+            "result": { "return_submitted": false },
+        })));
+        assert!(delegate_return_already_submitted(&json!({
+            "result": { "return_submitted": true },
+        })));
+        assert!(!delegate_return_already_submitted(&json!({
+            "result": { "return_submitted": false },
+        })));
     }
 }

@@ -3,6 +3,75 @@ import Foundation
 import AppKit
 import Bonsplit
 
+/// Resolves the selected main-content target explicitly.
+///
+/// Peer mirrors use the same Bonsplit portal contract as local workspaces,
+/// but their panes and live layout remain host-authoritative. Keeping the
+/// branch here provides a stable remote-renderer bridge point and makes it
+/// impossible for a remote selection to fall back to a separate `NSWindow`.
+struct SelectedWorkspaceContentView: View {
+    @ObservedObject var workspace: Workspace
+    let isWorkspaceVisible: Bool
+    let isWorkspaceInputActive: Bool
+    let workspacePortalPriority: Int
+    let onThemeRefreshRequest: ((
+        _ reason: String,
+        _ backgroundEventId: UInt64?,
+        _ backgroundSource: String?,
+        _ notificationPayloadHex: String?
+    ) -> Void)?
+
+    @ViewBuilder
+    var body: some View {
+        if workspace.isPeerMirror {
+            PeerMirrorMainContentView(
+                workspace: workspace,
+                isWorkspaceVisible: isWorkspaceVisible,
+                isWorkspaceInputActive: isWorkspaceInputActive,
+                workspacePortalPriority: workspacePortalPriority,
+                onThemeRefreshRequest: onThemeRefreshRequest
+            )
+        } else {
+            WorkspaceContentView(
+                workspace: workspace,
+                isWorkspaceVisible: isWorkspaceVisible,
+                isWorkspaceInputActive: isWorkspaceInputActive,
+                workspacePortalPriority: workspacePortalPriority,
+                onThemeRefreshRequest: onThemeRefreshRequest
+            )
+        }
+    }
+}
+
+/// Main-window presentation for a selected remote workspace.
+///
+/// This layer deliberately performs no activation, selection or
+/// first-responder mutation. Those remain limited to the explicit sidebar
+/// click, preserving the socket focus policy for background roster/layout
+/// updates.
+private struct PeerMirrorMainContentView: View {
+    @ObservedObject var workspace: Workspace
+    let isWorkspaceVisible: Bool
+    let isWorkspaceInputActive: Bool
+    let workspacePortalPriority: Int
+    let onThemeRefreshRequest: ((
+        _ reason: String,
+        _ backgroundEventId: UInt64?,
+        _ backgroundSource: String?,
+        _ notificationPayloadHex: String?
+    ) -> Void)?
+
+    var body: some View {
+        WorkspaceContentView(
+            workspace: workspace,
+            isWorkspaceVisible: isWorkspaceVisible,
+            isWorkspaceInputActive: isWorkspaceInputActive,
+            workspacePortalPriority: workspacePortalPriority,
+            onThemeRefreshRequest: onThemeRefreshRequest
+        )
+    }
+}
+
 /// View that renders a Workspace's content using BonsplitView
 struct WorkspaceContentView: View {
     @ObservedObject var workspace: Workspace

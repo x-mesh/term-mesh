@@ -23,6 +23,8 @@ public enum PeerSessionError: Error, Equatable {
     case attachRejected(reason: String)
     case createWorkspaceRejected(reason: String)
     case invalidEnsureRequest(String)
+    case invalidTeamLeaderBootstrap(String)
+    case invalidTeamLeaderCommand(String)
     case duplicateEnsureRequestID
     case malformedEnsureResponse(String)
     case sessionClosed(reason: String)
@@ -71,10 +73,22 @@ public enum PeerIncomingMessage: Sendable {
     /// Pushed when a workspace itself (not a pane inside one) was deleted
     /// on the host. Gated behind capability "workspace.lifecycle.v1".
     case workspaceRemoved(workspaceID: Data)
+    /// Complete sidebar roster snapshot delivered after
+    /// `subscribeWorkspaceList()` and whenever the host's roster changes.
+    /// Consumers replace (rather than merge) their cached rows so a tunnel
+    /// reconnect cannot leave a removed workspace behind.
+    case workspaceListChanged([Termmesh_Peer_V1_Workspace])
     /// How loaded the host machine is, pushed on the host's own sampling
     /// cadence. Gated behind capability "host.stats.v1", so a host that
     /// predates it simply never sends one.
     case hostStats(Termmesh_Peer_V1_HostStats)
+    /// Reverse request emitted by a remote host's local `tm-agent` proxy.
+    /// `correlationID` is the host envelope sequence and must be echoed by
+    /// `sendTeamLeaderCommandResponse`.
+    case teamLeaderCommandRequest(
+        Termmesh_Peer_V1_TeamLeaderCommandRequest,
+        correlationID: UInt64
+    )
     case error(code: UInt32, message: String)
     case goodbye(reason: String)
     case other
@@ -365,6 +379,16 @@ public actor PeerSession {
         return list.workspaces
     }
 
+    /// Opt into host-pushed complete workspace rosters. This is deliberately
+    /// write-only: the first `WorkspaceListChanged` arrives on the normal
+    /// receive stream, preserving the session's single-reader invariant.
+    /// Call only after `handshake()` and before starting the receive loop.
+    public func subscribeWorkspaceList() async throws {
+        try await sendEnvelope { env in
+            env.subscribeWorkspaceList = Termmesh_Peer_V1_SubscribeWorkspaceList()
+        }
+    }
+
     /// The agent teams this host is running, when it advertised
     /// `team.roster.v1`. A team is invisible in the layout tree — which pane
     /// leads which work is not a fact about how panes are arranged — so this
@@ -407,6 +431,78 @@ public actor PeerSession {
         }
         let reply = try await readFrame()
         guard case .teamCallResponse(let response) = reply.payload else {
+            throw PeerSessionError.unexpectedMessage(String(describing: reply.payload))
+        }
+        return response
+    }
+
+    /// Request project-bound leader bootstrap from the authoritative host.
+    ///
+    /// The signature mirrors the wire contract on purpose: callers cannot
+    /// supply a cwd, executable, CLI, arguments or environment. The host
+    /// resolves all of those from its registered `projectID`.
+    public func bootstrapTeamLeader(
+        projectID: String,
+        placement: Termmesh_Peer_V1_TeamLeaderPlacement,
+        requestID: Data
+    ) async throws -> Termmesh_Peer_V1_TeamLeaderBootstrapResponse {
+        var request = Termmesh_Peer_V1_TeamLeaderBootstrapRequest()
+        request.projectID = projectID
+        request.leaderPlacement = placement
+        request.requestID = requestID
+        guard case .success = PeerTeamLeader.validateBootstrap(request) else {
+            throw PeerSessionError.invalidTeamLeaderBootstrap(
+                "project_id, leader_placement or request_id is invalid"
+            )
+        }
+
+        try beginDirectResponseRPC()
+        defer { directResponseRPCInFlight = false }
+        try await sendEnvelope { env in
+            env.teamLeaderBootstrapRequest = request
+        }
+        let reply = try await readFrame()
+        guard case .teamLeaderBootstrapResponse(let response) = reply.payload else {
+            throw PeerSessionError.unexpectedMessage(String(describing: reply.payload))
+        }
+        return response
+    }
+
+    /// Send one grant-scoped command back to the authoritative team owner.
+    /// The request cannot name a cwd, process or leader lifecycle method.
+    public func callTeamLeader(
+        grant: Termmesh_Peer_V1_TeamLeaderGrant,
+        teamUUID: String,
+        requestID: Data,
+        method: String,
+        paramsJSON: String
+    ) async throws -> Termmesh_Peer_V1_TeamLeaderCommandResponse {
+        var request = Termmesh_Peer_V1_TeamLeaderCommandRequest()
+        request.grant = grant
+        request.teamUuid = teamUUID
+        request.requestID = requestID
+        request.method = method
+        request.paramsJson = paramsJSON
+        let encodedBytes = (try? request.serializedData().count)
+            ?? (PeerTeamLeader.maxCommandPayloadBytes + 1)
+        guard case .success = PeerTeamLeader.validateCommand(
+            request,
+            registeredGrant: grant,
+            encodedBytes: encodedBytes,
+            nowUnixSeconds: UInt64(Date().timeIntervalSince1970)
+        ) else {
+            throw PeerSessionError.invalidTeamLeaderCommand(
+                "grant, team_uuid, request_id, method or params_json is invalid"
+            )
+        }
+
+        try beginDirectResponseRPC()
+        defer { directResponseRPCInFlight = false }
+        try await sendEnvelope { env in
+            env.teamLeaderCommandRequest = request
+        }
+        let reply = try await readFrame()
+        guard case .teamLeaderCommandResponse(let response) = reply.payload else {
             throw PeerSessionError.unexpectedMessage(String(describing: reply.payload))
         }
         return response
@@ -918,8 +1014,12 @@ public actor PeerSession {
             default:
                 return .other
             }
+        case .workspaceListChanged(let changed):
+            return .workspaceListChanged(changed.workspaces)
         case .hostStats(let s):
             return .hostStats(s)
+        case .teamLeaderCommandRequest(let request):
+            return .teamLeaderCommandRequest(request, correlationID: env.seq)
         case .error(let e):
             return .error(code: e.code, message: e.message)
         case .goodbye(let g):
@@ -952,6 +1052,25 @@ public actor PeerSession {
             input.kind = .keys(keys)
             env.input = input
         }
+    }
+
+    /// Answer a reverse scoped-leader request on the same authenticated peer
+    /// session. This does not expose an app socket to the remote process.
+    public func sendTeamLeaderCommandResponse(
+        _ response: Termmesh_Peer_V1_TeamLeaderCommandResponse,
+        correlationID: UInt64
+    ) async throws {
+        var env = Termmesh_Peer_V1_Envelope()
+        env.seq = nextSeq()
+        env.correlationID = correlationID
+        env.teamLeaderCommandResponse = response
+        let frame: Data
+        do {
+            frame = try encodeFrame(env)
+        } catch let err as PeerFramingError {
+            throw PeerSessionError.framing(err)
+        }
+        try await write(frame)
     }
 
     /// Paste a block of text as a single Input frame.

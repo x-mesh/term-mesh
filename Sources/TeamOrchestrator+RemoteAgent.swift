@@ -1,4 +1,5 @@
 import Foundation
+import PeerProto
 
 // An agent that runs on another machine, in a pane you can watch.
 //
@@ -35,6 +36,149 @@ extension TeamOrchestrator {
             case .duplicateName(let name): return "the team already has an agent named \(name)"
             }
         }
+    }
+
+    /// Replace the temporary local leader pane with a pane whose process runs
+    /// on `hostKey`. The remote process receives only an expiring scoped
+    /// grant and its own daemon socket; the viewer's TERMMESH_SOCKET is never
+    /// copied across the peer boundary.
+    @MainActor
+    func attachRemoteLeader(
+        teamName: String,
+        hostKey: String,
+        workingDirectory: String,
+        cli: String,
+        model: String
+    ) async throws {
+        guard let team = teams[teamName] else { throw RemoteAgentError.teamNotFound(teamName) }
+        guard let teamUUID = team.teamUuid else { throw RemoteAgentError.teamNotFound(teamName) }
+        guard let host = RemoteHostStore.shared.sortedHosts.first(where: { $0.id == hostKey }) else {
+            throw RemoteAgentError.hostNotFound(hostKey)
+        }
+        guard host.isConnected else { throw RemoteAgentError.hostNotConnected(host.displayName) }
+        guard let tabManager = AppDelegate.shared?.tabManagerFor(tabId: team.workspaceId),
+              let workspace = tabManager.tabs.first(where: { $0.id == team.workspaceId }) else {
+            throw RemoteAgentError.workspaceGone
+        }
+
+        let lease = try await PeerPaneHostRegistry.shared.acquire(host.paneHostSpec)
+        let panel: TerminalPanel
+        do {
+            let surfaces = try await PeerPaneSession.listSurfaces(on: lease)
+            var chosen = surfaces.first(where: \.attachable)
+            if let source = surfaces.first?.surfaceID,
+               let fresh = try await PeerPaneSession.spawnSurface(on: lease, splitting: source) {
+                chosen = fresh
+            }
+            guard let chosen else {
+                PeerPaneHostRegistry.shared.release(lease)
+                throw RemoteAgentError.noAttachableSurface(host.displayName)
+            }
+            let session = try await PeerPaneSession.attach(
+                lease: lease,
+                surface: chosen,
+                title: "Leader",
+                spec: host.paneHostSpec
+            )
+            PeerPaneHostRegistry.shared.release(lease)
+            guard let opened = workspace.openRemotePane(
+                session: session,
+                orientation: .horizontal,
+                focus: false,
+                from: team.leaderPanelId
+            ) else {
+                session.teardown()
+                throw RemoteAgentError.paneCreationFailed
+            }
+            panel = opened
+            panel.surface.resetTerminal()
+        } catch {
+            PeerPaneHostRegistry.shared.release(lease)
+            throw error
+        }
+
+        var bootstrap = Termmesh_Peer_V1_TeamLeaderBootstrapRequest()
+        bootstrap.projectID = "name:\(teamName)"
+        bootstrap.leaderPlacement = .peer
+        var requestUUID = UUID().uuid
+        bootstrap.requestID = withUnsafeBytes(of: &requestUUID) { Data($0) }
+        let grantResponse = await PeerTeamLeaderControlPlane.shared.bootstrap(
+            bootstrap,
+            encodedBytes: (try? bootstrap.serializedData().count) ?? 513,
+            audiencePeerID: PeerIdentity.defaultPeerID()
+        ) { projectID in
+            projectID == "name:\(teamName)" ? teamUUID : nil
+        }
+        guard grantResponse.ok else {
+            _ = workspace.closePanel(panel.id, force: true)
+            throw RemoteAgentError.paneCreationFailed
+        }
+
+        workspace.setPanelCustomTitle(
+            panelId: panel.id,
+            title: "👑 Leader (\(cli.capitalized)) @\(host.displayName)"
+        )
+        await Self.waitForPaneToStart(panelId: panel.id)
+
+        // Do not paste the bearer grant into the terminal's visible scrollback
+        // or history. First disable echo and history without any secret, then
+        // submit the export+exec line while echo is disabled. The grant is
+        // already short-lived and remains only in the launched CLI process.
+        let prepare = Self.remoteLeaderPrepareCommand()
+        guard sendToAgentByPanel(
+            teamName: teamName,
+            panelId: panel.id,
+            workspaceId: workspace.id,
+            text: prepare,
+            tabManager: tabManager,
+            withReturn: true
+        ) else {
+            _ = workspace.closePanel(panel.id, force: true)
+            throw RemoteAgentError.paneCreationFailed
+        }
+        try? await Task.sleep(nanoseconds: 200_000_000)
+
+        let command = Self.remoteLeaderCommand(
+            cli: cli,
+            model: model,
+            teamName: teamName,
+            workingDirectory: workingDirectory,
+            grant: grantResponse.grant
+        )
+        let launched = sendToAgentByPanel(
+            teamName: teamName,
+            panelId: panel.id,
+            workspaceId: workspace.id,
+            text: command,
+            tabManager: tabManager,
+            withReturn: true
+        )
+        if !launched {
+            // Best-effort recovery for the only stage that can leave a shell
+            // with echo disabled. This command carries no credential either.
+            _ = sendToAgentByPanel(
+                teamName: teamName,
+                panelId: panel.id,
+                workspaceId: workspace.id,
+                text: "stty echo",
+                tabManager: tabManager,
+                withReturn: true
+            )
+            _ = workspace.closePanel(panel.id, force: true)
+            throw RemoteAgentError.paneCreationFailed
+        }
+
+        // Do not publish `.peer` or retire the local leader until the remote
+        // pane has accepted its launch command. An attach/bootstrap/launch
+        // failure then leaves the still-running local leader as the truthful
+        // endpoint shown by the sidebar and team status.
+        let oldLeaderPanelID = team.leaderPanelId
+        replaceLeaderEndpoint(
+            teamName: teamName,
+            panelID: panel.id,
+            endpoint: .peer(hostKey: hostKey)
+        )
+        _ = workspace.closePanel(oldLeaderPanelID, force: true)
     }
 
     /// Attach an agent to this team that runs on `hostKey`.
@@ -293,6 +437,7 @@ extension TeamOrchestrator {
         workingDirectory: String,
         leaderMode: String,
         leaderModel: String = "sonnet",
+        leaderEndpoint: LeaderEndpoint = .local,
         worktreeMode: String = "off",
         executionMode: String = "pane",
         resumeSessionId: String? = nil,
@@ -301,6 +446,13 @@ extension TeamOrchestrator {
         pairSpec: String = "",
         tabManager: TabManager
     ) -> Team? {
+        // Peer attachment is asynchronous. Keep the newly-created local
+        // leader as the stored endpoint until `attachRemoteLeader` commits
+        // its replacement; otherwise a detached failure is displayed as a
+        // healthy remote leader.
+        let initialLeaderEndpoint = Self.initialLeaderEndpoint(
+            forRequestedEndpoint: leaderEndpoint
+        )
         // A remote pane is a peer surface pulled into this workspace, so it
         // needs the workspace and the team to already exist. Spawning these
         // locally and moving them would start each CLI on the wrong machine
@@ -343,6 +495,7 @@ extension TeamOrchestrator {
             resumeSessionId: resumeSessionId,
             worktreeMode: worktreeMode,
             executionMode: executionMode,
+            leaderEndpoint: initialLeaderEndpoint,
             tabManager: tabManager
         ) else { return nil }
 
@@ -354,6 +507,21 @@ extension TeamOrchestrator {
         // `--dangerously-skip-permissionsskip-permissions` and a `mkdir` that
         // the shell could not find.
         Task { @MainActor in
+            if case let .peer(hostKey) = leaderEndpoint {
+                do {
+                    try await self.attachRemoteLeader(
+                        teamName: team.id,
+                        hostKey: hostKey,
+                        workingDirectory: workingDirectory,
+                        cli: leaderMode,
+                        model: leaderModel
+                    )
+                } catch {
+                    RemoteWorkLog.info(
+                        "Could not start remote leader on \(hostKey): \(error)"
+                    )
+                }
+            }
             for row in remoteRows {
                 guard let hostKey = row.hostKey else { continue }
                 let directory = row.hostDirectory.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -378,6 +546,17 @@ extension TeamOrchestrator {
             }
         }
         return team
+    }
+
+    /// The requested peer endpoint becomes durable only after a remote pane
+    /// is attached and launched. This pure seam also guards the failure path.
+    static func initialLeaderEndpoint(
+        forRequestedEndpoint endpoint: LeaderEndpoint
+    ) -> LeaderEndpoint {
+        switch endpoint {
+        case .local, .peer(_):
+            .local
+        }
     }
 
     /// Say that work on this host has stopped, because the host has.
@@ -494,6 +673,45 @@ extension TeamOrchestrator {
         default:
             return "\(enter) && claude --model \(model) --dangerously-skip-permissions"
         }
+    }
+
+    static func remoteLeaderCommand(
+        cli: String,
+        model: String,
+        teamName: String,
+        workingDirectory: String,
+        grant: Termmesh_Peer_V1_TeamLeaderGrant
+    ) -> String {
+        let hexGrant = grant.grantID.map { String(format: "%02x", $0) }.joined()
+        let exports = [
+            "TERMMESH_LEADER_GRANT_ID=\(shellQuoted(hexGrant))",
+            "TERMMESH_LEADER_PROJECT_ID=\(shellQuoted(grant.projectID))",
+            "TERMMESH_LEADER_TEAM_UUID=\(shellQuoted(grant.teamUuid))",
+            "TERMMESH_LEADER_EXPIRES_AT=\(grant.expiresAtUnixSecs)",
+            "TERMMESH_LEADER_PEER_ID=\(shellQuoted(PeerIdentity.hexString(PeerIdentity.defaultPeerID())))",
+            "TERMMESH_TEAM=\(shellQuoted(teamName))",
+        ].joined(separator: " ")
+        let launch = remoteAgentCommand(
+            cli: cli,
+            model: model,
+            agentName: "leader",
+            teamName: teamName,
+            workingDirectory: workingDirectory
+        )
+        // `export` applies to the final CLI, unlike a shell assignment prefix
+        // before `mkdir`, which would have scoped the grant to that one setup
+        // command only.
+        // Replace the interactive shell after exporting. That drops the grant
+        // as soon as the CLI exits instead of leaving it in a resumed shell.
+        return "export \(exports); exec /bin/sh -lc \(shellQuoted(launch))"
+    }
+
+    /// Secret-free first stage for remote leader launch. The next command is
+    /// sent only after this Return, while terminal echo and shell history are
+    /// disabled, so the scoped bearer grant is not rendered or retained by the
+    /// interactive shell.
+    static func remoteLeaderPrepareCommand() -> String {
+        "unset HISTFILE; stty -echo"
     }
 
     /// Wait for a freshly attached pane to stop painting before typing into it.

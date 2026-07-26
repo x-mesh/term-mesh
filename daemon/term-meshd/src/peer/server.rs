@@ -40,6 +40,7 @@ pub async fn serve(
     let default_name_fallback = connection::hostname_or(DAEMON_WORKSPACE);
     let entries = persist::boot(&workspaces_path, &default_name_fallback);
     let host = Arc::new(PeerHost::with_workspaces(manager, entries));
+    super::install_remote_leader_router(&host.clients);
     // Restored non-default workspaces come back with an empty tree
     // (only {id, name} is persisted — shells are daemon children). Seed
     // each a first pane so every workspace is immediately attachable,
@@ -86,6 +87,7 @@ async fn serve_with_host(
     mut shutdown_rx: watch::Receiver<bool>,
     host: Arc<PeerHost>,
 ) -> anyhow::Result<()> {
+    super::install_remote_leader_router(&host.clients);
     if path.exists() {
         std::fs::remove_file(&path)?;
     }

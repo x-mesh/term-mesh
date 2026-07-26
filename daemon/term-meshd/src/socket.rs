@@ -2462,6 +2462,123 @@ async fn dispatch(req: &Request, ctx: &Context) -> Response {
             }
         }
 
+        // Scoped reverse route used by tm-agent inside a daemon-owned peer
+        // pane. The local daemon forwards only the already-limited
+        // team.leader.v1 message; it never receives or exposes the viewer's
+        // TERMMESH_SOCKET.
+        "peer.leader.call" => {
+            #[derive(Deserialize)]
+            struct P {
+                grant_id_hex: String,
+                project_id: String,
+                team_uuid: String,
+                expires_at_unix_secs: u64,
+                target_peer_id_hex: String,
+                request_id_hex: String,
+                method: String,
+                params_json: String,
+            }
+            fn decode_hex(value: &str, expected: usize) -> Result<Vec<u8>, String> {
+                if value.len() != expected * 2 {
+                    return Err("invalid hex length".into());
+                }
+                (0..expected)
+                    .map(|i| {
+                        u8::from_str_radix(&value[i * 2..i * 2 + 2], 16)
+                            .map_err(|_| "invalid hex".to_string())
+                    })
+                    .collect()
+            }
+            match serde_json::from_value::<P>(req.params.clone()) {
+                Ok(p) => {
+                    if p.method == "team.list"
+                        || !crate::peer::connection::team_call_allowed(&p.method)
+                    {
+                        Err(format!("method_not_allowed: {}", p.method))
+                    } else if serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(
+                        &p.params_json,
+                    )
+                    .is_err()
+                    {
+                        Err("params_json must be a JSON object".into())
+                    } else {
+                        let grant_id = decode_hex(
+                            &p.grant_id_hex,
+                            peer_proto::team_leader::GRANT_ID_BYTES,
+                        );
+                        let request_id = decode_hex(
+                            &p.request_id_hex,
+                            peer_proto::team_leader::REQUEST_ID_BYTES,
+                        );
+                        let target_peer_id = decode_hex(&p.target_peer_id_hex, 16);
+                        match (grant_id, request_id, target_peer_id) {
+                            (Ok(grant_id), Ok(request_id), Ok(target_peer_id)) => {
+                                let grant = peer_proto::v1::TeamLeaderGrant {
+                                    grant_id,
+                                    project_id: p.project_id,
+                                    team_uuid: p.team_uuid.clone(),
+                                    role: peer_proto::v1::TeamLeaderRole::Leader as i32,
+                                    expires_at_unix_secs: p.expires_at_unix_secs,
+                                };
+                                let now = std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .unwrap_or_default()
+                                    .as_secs();
+                                if let Err(error) = peer_proto::team_leader::validate_grant(
+                                    &grant,
+                                    Some(&grant),
+                                    &grant.project_id,
+                                    &p.team_uuid,
+                                    now,
+                                ) {
+                                    Err(format!("invalid leader grant: {error:?}"))
+                                } else {
+                                    let request = peer_proto::v1::TeamLeaderCommandRequest {
+                                        grant: Some(grant),
+                                        team_uuid: p.team_uuid,
+                                        request_id,
+                                        method: p.method,
+                                        params_json: p.params_json,
+                                    };
+                                    match crate::peer::call_remote_team_leader(
+                                        request,
+                                        &target_peer_id,
+                                    )
+                                    .await
+                                    {
+                                        Ok(response) if response.ok => {
+                                            let result = serde_json::from_str(
+                                                &response.result_json,
+                                            )
+                                            .unwrap_or_else(|_| {
+                                                serde_json::json!({
+                                                    "raw": response.result_json
+                                                })
+                                            });
+                                            Ok(serde_json::json!({
+                                                "ok": true,
+                                                "cached": response.cached,
+                                                "result": result,
+                                            }))
+                                        }
+                                        Ok(response) => Err(format!(
+                                            "{}: {}",
+                                            response.error_code, response.error_message
+                                        )),
+                                        Err(error) => Err(error),
+                                    }
+                                }
+                            }
+                            (Err(error), _, _)
+                            | (_, Err(error), _)
+                            | (_, _, Err(error)) => Err(error),
+                        }
+                    }
+                }
+                Err(error) => Err(format!("invalid params: {error}")),
+            }
+        }
+
         // --- Pending Input (PTY injection via Swift polling) ---
         "input.enqueue" => {
             #[derive(Deserialize)]

@@ -23,10 +23,11 @@ use std::time::Duration;
 
 use peer_proto::v1::{
     envelope::Payload, workspace_control, workspace_layout, workspace_update, Envelope, PaneTab,
-    WorkspaceControl, WorkspaceLayout, WorkspaceLayoutChanged, WorkspacePane, WorkspaceRemoved,
-    WorkspaceSplit, WorkspaceUpdate,
+    Workspace, WorkspaceControl, WorkspaceLayout, WorkspaceLayoutChanged, WorkspaceListChanged,
+    WorkspacePane, WorkspaceRemoved,
+    TeamLeaderCommandRequest, TeamLeaderCommandResponse, WorkspaceSplit, WorkspaceUpdate,
 };
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{mpsc, oneshot, watch};
 
 use crate::monitor::SystemSnapshot;
 use super::persist::PersistedWorkspace;
@@ -653,14 +654,22 @@ pub const DAEMON_WORKSPACE: &str = "term-meshd";
 pub struct Broadcaster {
     clients: Mutex<HashMap<u64, RegisteredClient>>,
     next_id: AtomicU64,
+    leader_pending: Mutex<HashMap<Vec<u8>, PendingLeaderResponse>>,
 }
 
 #[derive(Clone)]
 struct RegisteredClient {
     tx: mpsc::Sender<Envelope>,
+    peer_id: Vec<u8>,
     /// The connection's own outgoing seq counter — pushes must continue
     /// each connection's monotonic sequence, not share a global one.
     seq: Arc<AtomicU64>,
+}
+
+struct PendingLeaderResponse {
+    connection_id: u64,
+    correlation_id: u64,
+    sender: oneshot::Sender<TeamLeaderCommandResponse>,
 }
 
 impl Broadcaster {
@@ -668,6 +677,7 @@ impl Broadcaster {
         Self {
             clients: Mutex::new(HashMap::new()),
             next_id: AtomicU64::new(1),
+            leader_pending: Mutex::new(HashMap::new()),
         }
     }
 
@@ -675,12 +685,13 @@ impl Broadcaster {
         self: &Arc<Self>,
         tx: mpsc::Sender<Envelope>,
         seq: Arc<AtomicU64>,
+        peer_id: Vec<u8>,
     ) -> BroadcastGuard {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         self.clients
             .lock()
             .unwrap()
-            .insert(id, RegisteredClient { tx, seq });
+            .insert(id, RegisteredClient { tx, peer_id, seq });
         BroadcastGuard {
             broadcaster: Arc::clone(self),
             id,
@@ -704,11 +715,103 @@ impl Broadcaster {
             }
         }
     }
+
+    /// Send a scoped remote-leader command to an authenticated viewer and
+    /// wait for its authoritative control-plane response. The request itself
+    /// carries the expiring grant; this router never accepts a lifecycle
+    /// method or a filesystem/process field.
+    pub async fn call_team_leader(
+        &self,
+        request: TeamLeaderCommandRequest,
+        target_peer_id: &[u8],
+    ) -> Result<TeamLeaderCommandResponse, String> {
+        if request.request_id.len() != peer_proto::team_leader::REQUEST_ID_BYTES {
+            return Err("invalid request_id".into());
+        }
+        let target = self
+            .clients
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, client)| client.peer_id == target_peer_id)
+            .max_by_key(|(id, _)| *id)
+            .map(|(id, client)| (*id, client.clone()))
+            .ok_or_else(|| "authorized peer viewer is not connected".to_string())?;
+        let correlation_id = target.1.seq.fetch_add(1, Ordering::Relaxed) + 1;
+        let (tx, rx) = oneshot::channel();
+        {
+            let mut pending = self.leader_pending.lock().unwrap();
+            if pending.contains_key(&request.request_id) {
+                return Err("request_id already in flight".into());
+            }
+            pending.insert(
+                request.request_id.clone(),
+                PendingLeaderResponse {
+                    connection_id: target.0,
+                    correlation_id,
+                    sender: tx,
+                },
+            );
+        }
+        let envelope = Envelope {
+            seq: correlation_id,
+            correlation_id: 0,
+            payload: Some(Payload::TeamLeaderCommandRequest(request.clone())),
+        };
+        if target.1.tx.try_send(envelope).is_err() {
+            self.leader_pending
+                .lock()
+                .unwrap()
+                .remove(&request.request_id);
+            return Err("authorized peer viewer is unavailable".into());
+        }
+        match tokio::time::timeout(Duration::from_secs(15), rx).await {
+            Ok(Ok(response)) => Ok(response),
+            Ok(Err(_)) => Err("peer viewer dropped the command response".into()),
+            Err(_) => {
+                self.leader_pending
+                    .lock()
+                    .unwrap()
+                    .remove(&request.request_id);
+                Err("peer leader command timed out".into())
+            }
+        }
+    }
+
+    /// Complete a pending reverse request. Duplicate responses are expected
+    /// when several attached panes share the same viewer; only the first one
+    /// wins, while the local control-plane's request cache prevents duplicate
+    /// mutation on the viewer side.
+    pub fn resolve_team_leader(
+        &self,
+        connection_id: u64,
+        correlation_id: u64,
+        response: TeamLeaderCommandResponse,
+    ) -> bool {
+        let mut pending = self.leader_pending.lock().unwrap();
+        let Some(expected) = pending.get(&response.request_id) else {
+            return false;
+        };
+        if expected.connection_id != connection_id || expected.correlation_id != correlation_id {
+            return false;
+        }
+        let Some(expected) = pending.remove(&response.request_id) else {
+            return false;
+        };
+        let _ = expected.sender.send(response);
+        true
+    }
 }
 
 pub struct BroadcastGuard {
     broadcaster: Arc<Broadcaster>,
     id: u64,
+}
+
+impl BroadcastGuard {
+    pub fn connection_id(&self) -> u64 {
+        self.id
+    }
 }
 
 impl Drop for BroadcastGuard {
@@ -1170,6 +1273,7 @@ impl PeerHost {
                     workspace_id: workspace_id.to_vec(),
                 })),
             }));
+        self.broadcast_workspace_roster();
         Ok(())
     }
 
@@ -1272,6 +1376,7 @@ impl PeerHost {
         };
         if renamed {
             self.persist_workspaces();
+            self.broadcast_workspace_roster();
         }
         renamed
     }
@@ -1660,7 +1765,34 @@ impl PeerHost {
                 )),
             });
             host.clients.broadcast(&payload);
+            // A roster subscriber needs layout-derived pane metadata too;
+            // publish the complete post-debounce roster alongside the focused
+            // layout delta so it converges after reconnect or missed frames.
+            host.broadcast_workspace_roster();
         });
+    }
+
+    /// Complete workspace roster for `SubscribeWorkspaceList` snapshots and
+    /// change pushes. Reusing `list_workspaces` guarantees the same IDs,
+    /// titles, default flag and layouts as the synchronous discovery RPC.
+    pub fn workspace_roster(&self) -> Vec<Workspace> {
+        self.list_workspaces()
+            .into_iter()
+            .map(|entry| Workspace {
+                workspace_id: entry.id,
+                title: entry.title,
+                layout: entry.layout,
+                window_id: Vec::new(),
+                window_title: String::new(),
+                is_default: entry.is_default,
+            })
+            .collect()
+    }
+
+    pub fn broadcast_workspace_roster(&self) {
+        self.clients.broadcast(&Payload::WorkspaceListChanged(WorkspaceListChanged {
+            workspaces: self.workspace_roster(),
+        }));
     }
 
     /// Wire snapshot of any single workspace's tree by id — the generic
@@ -1731,6 +1863,58 @@ mod tests {
 
     fn sid(name: &str) -> SurfaceId {
         surface_id_from_name(name)
+    }
+
+    #[tokio::test]
+    async fn leader_reverse_route_targets_one_peer_and_rejects_spoofed_response() {
+        let router = Arc::new(Broadcaster::new());
+        let (authorized_tx, mut authorized_rx) = mpsc::channel(4);
+        let (attacker_tx, mut attacker_rx) = mpsc::channel(4);
+        let authorized =
+            router.register(authorized_tx, Arc::new(AtomicU64::new(10)), vec![0xA1; 16]);
+        let attacker = router.register(attacker_tx, Arc::new(AtomicU64::new(20)), vec![0xB1; 16]);
+        let request = TeamLeaderCommandRequest {
+            request_id: vec![0x41; peer_proto::team_leader::REQUEST_ID_BYTES],
+            method: "team.delegate".into(),
+            params_json: r#"{"submit_return":true}"#.into(),
+            ..Default::default()
+        };
+
+        let pending_router = Arc::clone(&router);
+        let pending_request = request.clone();
+        let call = tokio::spawn(async move {
+            pending_router
+                .call_team_leader(pending_request, &[0xA1; 16])
+                .await
+        });
+
+        let envelope = authorized_rx.recv().await.expect("targeted request");
+        assert!(
+            attacker_rx.try_recv().is_err(),
+            "non-target peer must not receive the scoped grant"
+        );
+        let correlation_id = envelope.seq;
+        let response = TeamLeaderCommandResponse {
+            request_id: request.request_id,
+            ok: true,
+            result_json: r#"{"return_submitted":true}"#.into(),
+            ..Default::default()
+        };
+
+        assert!(
+            !router.resolve_team_leader(attacker.connection_id(), correlation_id, response.clone()),
+            "another connection cannot win the response race"
+        );
+        assert!(
+            !router.resolve_team_leader(
+                authorized.connection_id(),
+                correlation_id + 1,
+                response.clone()
+            ),
+            "the target must echo the exact request correlation"
+        );
+        assert!(router.resolve_team_leader(authorized.connection_id(), correlation_id, response));
+        assert!(call.await.unwrap().unwrap().ok);
     }
 
     #[test]
@@ -2796,7 +2980,9 @@ mod tests {
             .insert(sid("extra"), ws2_id.clone());
 
         let (tx, mut rx) = mpsc::channel(8);
-        let guard = host.clients.register(tx, Arc::new(AtomicU64::new(0)));
+        let guard = host
+            .clients
+            .register(tx, Arc::new(AtomicU64::new(0)), vec![0x11; 16]);
 
         assert_eq!(host.remove_workspace(&ws2_id), Ok(()));
 

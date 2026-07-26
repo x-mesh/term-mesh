@@ -47,6 +47,16 @@ enum PeerPaneHostSpec {
             return .ssh(target: target, remoteSockPath: remoteSockPath, port: port)
         }
     }
+
+    /// A direct connection to this app's own peer server would attach the
+    /// viewer to itself.  SSH endpoints deliberately return false: their
+    /// local socket is a tunnel and cannot identify the far peer without a
+    /// completed handshake.
+    var targetsLocalPeerServer: Bool {
+        guard case let .direct(sockPath) = self else { return false }
+        return (sockPath as NSString).standardizingPath
+            == (PeerFederationSettings.socketPath as NSString).standardizingPath
+    }
 }
 
 enum PeerPaneHostKey: Hashable, CustomStringConvertible {

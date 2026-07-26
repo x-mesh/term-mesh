@@ -399,6 +399,10 @@ final class RemoteHostStore: ObservableObject {
 
     private var observer: NSObjectProtocol?
     private var fetchTasks: [String: Task<Void, Never>] = [:]
+    /// One long-lived, receive-only roster stream per sidebar host. It never
+    /// shares a session with a response-waiting RPC: `WorkspaceListChanged`
+    /// frames are pushed asynchronously and PeerSession has one reader.
+    private var rosterSubscriptionTasks: [String: Task<Void, Never>] = [:]
     /// Sidebar-held lease per host key: one ref that keeps the tunnel
     /// alive while the user browses workspaces. Panes/mirrors opened
     /// from here hold their own refs, so a sidebar disconnect never
@@ -429,7 +433,6 @@ final class RemoteHostStore: ObservableObject {
             }
         // Catch connections that opened before the sidebar first rendered.
         rebuild()
-        startRosterRefreshTicker()
     }
 
     deinit {
@@ -723,6 +726,7 @@ final class RemoteHostStore: ObservableObject {
         connectingLeaseKeys[key] = nil
         fetchTasks[key]?.cancel()
         fetchTasks[key] = nil
+        stopWorkspaceSubscription(for: key)
         hosts[key]?.workspaces = []
         hosts[key]?.activeSockPath = ""
         hosts[key]?.supportsWorkspaceLifecycle = nil
@@ -761,6 +765,7 @@ final class RemoteHostStore: ObservableObject {
         connectingLeaseKeys[key] = nil
         fetchTasks[key]?.cancel()
         fetchTasks[key] = nil
+        stopWorkspaceSubscription(for: key)
         hosts[key]?.workspaces = []
         hosts[key]?.activeSockPath = ""
         hosts[key]?.supportsWorkspaceLifecycle = nil
@@ -847,6 +852,7 @@ final class RemoteHostStore: ObservableObject {
         connectingLeaseKeys[key] = nil
         fetchTasks[key]?.cancel()
         fetchTasks[key] = nil
+        stopWorkspaceSubscription(for: key)
         hosts[key]?.workspaces = []
         hosts[key]?.activeSockPath = ""
         hosts[key]?.supportsWorkspaceLifecycle = nil
@@ -904,6 +910,7 @@ final class RemoteHostStore: ObservableObject {
         sidebarLeases[key] = nil
         PeerPaneHostRegistry.shared.release(lease)
         fetchTasks[key]?.cancel()
+        stopWorkspaceSubscription(for: key)
         hosts[key]?.workspaces = []
         hosts[key]?.activeSockPath = ""
         hosts[key]?.supportsWorkspaceLifecycle = nil
@@ -930,6 +937,7 @@ final class RemoteHostStore: ObservableObject {
 
     private func fetchWorkspaces(for hostSockPath: String, key: String) {
         fetchTasks[key]?.cancel()
+        stopWorkspaceSubscription(for: key)
         let path = hostSockPath
         fetchInFlight.insert(key)
         // Task inherits @MainActor; await suspensions yield main without blocking it.
@@ -994,6 +1002,9 @@ final class RemoteHostStore: ObservableObject {
                 }
                 self.hosts[key]?.workspaces = summaries
                 self.hosts[key]?.teams = teams
+                if conn.hostCapabilities.has(PeerCapability.workspaceListSubscribeV1) {
+                    self.startWorkspaceSubscription(for: path, key: key)
+                }
             } catch {
                 // A refresh that cannot open a connection has learned
                 // something, and dropping it on the floor was how a host could
@@ -1033,41 +1044,82 @@ final class RemoteHostStore: ObservableObject {
     /// that never gets to finish.
     private var fetchInFlight: Set<String> = []
 
-    /// How often to re-read what the connected peers are running.
-    ///
-    /// The roster was read on connect and whenever this app changed a
-    /// workspace itself, which covers everything except the thing that
-    /// actually happens: someone works on the peer. A team started over there,
-    /// a pane moved into a project — none of it appeared until the connection
-    /// was torn down and made again. Adding a remote agent kept offering an
-    /// empty directory for exactly this reason.
-    ///
-    /// A poll, because there is nothing to subscribe to: the host pushes
-    /// workspace changes only to attached mirror sessions, and the team roster
-    /// it does not push at all. Twenty seconds is chosen against what it costs
-    /// — a connect and two calls per host, over ssh — rather than against how
-    /// fresh it could be.
-    private static let rosterRefreshInterval: TimeInterval = 20
-
-    /// Re-read the roster of every connected host.
-    func refreshConnectedRosters() {
-        for host in hosts.values where host.isConnected {
-            let path = host.activeSockPath
-            guard !path.isEmpty, !fetchInFlight.contains(host.id) else { continue }
-            fetchWorkspaces(for: path, key: host.id)
+    /// Open one receive-only roster stream. The initial complete snapshot is
+    /// sent by the host immediately after subscription; later snapshots are
+    /// replacement values, which makes tunnel reconnects converge without
+    /// local delta/replay bookkeeping.
+    private func startWorkspaceSubscription(for path: String, key: String) {
+        rosterSubscriptionTasks[key]?.cancel()
+        rosterSubscriptionTasks[key] = Task { [weak self] in
+            guard let self else { return }
+            do {
+                let connection = try await PeerRelaySession.connect(hostSockPath: path)
+                guard connection.hostCapabilities.has(PeerCapability.workspaceListSubscribeV1) else {
+                    await connection.cancel()
+                    return
+                }
+                try await connection.session.subscribeWorkspaceList()
+                while !Task.isCancelled {
+                    let message = try await connection.session.receiveNextMessage()
+                    guard case .workspaceListChanged(let workspaces) = message else { continue }
+                    guard self.hosts[key]?.activeSockPath == path,
+                          self.hosts[key]?.isConnected == true
+                    else { continue }
+                    self.applyWorkspaceRoster(workspaces, hostSockPath: path, key: key)
+                }
+                await connection.cancel()
+            } catch is CancellationError {
+                // Replacement/disconnect owns cleanup; never mark its newer
+                // socket path stale.
+            } catch {
+                self.workspaceSubscriptionLost(key: key, path: path, error: error)
+            }
         }
     }
 
-    private func startRosterRefreshTicker() {
-        rosterRefreshTicker?.invalidate()
-        let ticker = Timer(timeInterval: Self.rosterRefreshInterval, repeats: true) { [weak self] _ in
-            Task { @MainActor in self?.refreshConnectedRosters() }
-        }
-        RunLoop.main.add(ticker, forMode: .common)
-        rosterRefreshTicker = ticker
+    private func stopWorkspaceSubscription(for key: String) {
+        rosterSubscriptionTasks[key]?.cancel()
+        rosterSubscriptionTasks[key] = nil
     }
 
-    private var rosterRefreshTicker: Timer?
+    private func applyWorkspaceRoster(
+        _ workspaces: [Termmesh_Peer_V1_Workspace],
+        hostSockPath: String,
+        key: String
+    ) {
+        hosts[key]?.workspaces = workspaces.map { ws in
+            let layout = ws.hasLayout ? ws.layout : nil
+            let counts = peerLayoutCounts(layout)
+            return WorkspaceSummary(
+                id: ws.workspaceID,
+                title: ws.title.isEmpty ? "<workspace>" : ws.title,
+                hostSockPath: hostSockPath,
+                windowID: ws.windowID,
+                windowTitle: ws.windowTitle,
+                isDefault: ws.isDefault,
+                paneCount: counts.panes,
+                surfaceCount: counts.surfaces,
+                busyCount: counts.busy,
+                panes: peerPaneSummaries(layout)
+            )
+        }
+    }
+
+    /// A dead subscription is a stale sidebar, not an empty remote machine.
+    /// Preserve the latest snapshot for context but surface the row as failed;
+    /// an SSH tunnel reconnect updates activeSockPath through `rebuild()`, at
+    /// which point `fetchWorkspaces` establishes a fresh stream.
+    private func workspaceSubscriptionLost(key: String, path: String, error: Error) {
+        guard hosts[key]?.activeSockPath == path,
+              hosts[key]?.isConnected == true
+        else { return }
+        hosts[key]?.connectionState = .failed(Self.unreachableReason)
+        TeamOrchestrator.shared.markRemoteAgentsUnreachable(
+            hostKey: key,
+            reason: Self.unreachableReason
+        )
+        RemoteWorkLog.info("Workspace roster stream stopped for \(hosts[key]?.displayName ?? key): \(error.localizedDescription)")
+    }
 
     /// Keep sidebar pane details and busy state in lockstep with an open live
     /// mirror. The mirror already receives each host layout push, so reuse it

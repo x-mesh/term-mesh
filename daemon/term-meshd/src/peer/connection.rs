@@ -22,6 +22,7 @@ use peer_proto::v1::{
     HostStats, Pong, PtyData, SurfaceList, TerminateSurfaceError as WireTerminateError,
     TerminateSurfaceErrorCode, TerminateSurfaceRequest, TerminateSurfaceResponse,
     Team, TeamCallResponse, TeamList, TerminateSurfaceResult, Workspace, WorkspaceList,
+    WorkspaceListChanged,
     WorkspaceMeta, WorkspaceUpdate,
 };
 use peer_proto::{capability, PeerCapabilities};
@@ -110,7 +111,7 @@ async fn reader_loop(
     // RAII registration with the layout broadcaster; populated when the
     // handshake reaches Ready, dropped (= unregistered) with this frame.
     // Underscore: the binding exists for its Drop, it is never read.
-    let mut _broadcast_guard: Option<layout::BroadcastGuard> = None;
+    let mut broadcast_guard: Option<layout::BroadcastGuard> = None;
     // Started at Ready for a client that asked for stats; aborted when this
     // loop returns, on every exit path (see the abort below).
     let mut host_stats_task: Option<JoinHandle<()>> = None;
@@ -123,6 +124,7 @@ async fn reader_loop(
     // sending Hello never reaches any arm that would consult it either.
     #[allow(unused_assignments)]
     let mut peer_capabilities = PeerCapabilities::default();
+    let mut peer_id = Vec::new();
 
     loop {
         let env = match read_envelope(&mut reader).await {
@@ -161,6 +163,11 @@ async fn reader_loop(
                     hello.display_name,
                     hello.app_version
                 );
+                if hello.peer_id.len() != 16 {
+                    send_error(&outgoing_tx, 102, "peer_id must be 16 bytes").await;
+                    break;
+                }
+                peer_id = hello.peer_id;
                 peer_capabilities = PeerCapabilities::from_hello(hello.capabilities);
                 tracing::debug!(
                     "peer capabilities: {:?} (ptydata.coalesce.v1={} replay.ring.v1={})",
@@ -219,10 +226,11 @@ async fn reader_loop(
                 // From Ready on, this connection receives layout pushes
                 // triggered by any connection's WorkspaceControl. The guard
                 // unregisters on connection teardown (any exit path).
-                _broadcast_guard = Some(
-                    host.clients
-                        .register(outgoing_tx.clone(), seq_counter.clone()),
-                );
+                broadcast_guard = Some(host.clients.register(
+                    outgoing_tx.clone(),
+                    seq_counter.clone(),
+                    peer_id.clone(),
+                ));
                 // Only for a client that advertised host.stats.v1; everyone
                 // else costs nothing. Aborted on teardown below rather than
                 // left to notice the closed channel on its next sample.
@@ -348,6 +356,23 @@ async fn reader_loop(
                 send(&outgoing_tx, reply).await?;
             }
 
+            (HandshakeState::Ready, Payload::TeamLeaderCommandResponse(response)) => {
+                // Only the exact connection that received the reverse request
+                // may satisfy it, and it must echo that request envelope's seq
+                // as correlation_id. A sibling or hostile viewer cannot win a
+                // request_id race.
+                if let Some(guard) = &broadcast_guard {
+                    let accepted = host.clients.resolve_team_leader(
+                        guard.connection_id(),
+                        env.correlation_id,
+                        response,
+                    );
+                    if !accepted {
+                        tracing::warn!("ignored mismatched peer leader response");
+                    }
+                }
+            }
+
             (HandshakeState::Ready, Payload::ListWorkspaces(_)) => {
                 // A daemon-only host has no bonsplit windows to mirror — it
                 // owns a flat set of forkpty surfaces arranged into one or
@@ -386,6 +411,26 @@ async fn reader_loop(
                     payload: Some(Payload::WorkspaceList(WorkspaceList { workspaces })),
                 };
                 send(&outgoing_tx, reply).await?;
+            }
+
+            (HandshakeState::Ready, Payload::SubscribeWorkspaceList(_)) => {
+                // The first pushed snapshot is the subscription acknowledgement
+                // and authoritative baseline. It avoids a response RPC racing
+                // the receive loop that will consume future pushes.
+                if !peer_capabilities.has(capability::WORKSPACE_LIST_SUBSCRIBE_V1) {
+                    send_error(&outgoing_tx, 106, "workspace roster subscription not negotiated").await;
+                    continue;
+                }
+                let workspaces = host.workspace_roster();
+                send(
+                    &outgoing_tx,
+                    Envelope {
+                        seq: next_seq(&seq_counter),
+                        correlation_id: 0,
+                        payload: Some(Payload::WorkspaceListChanged(WorkspaceListChanged { workspaces })),
+                    },
+                )
+                .await?;
             }
 
             // Gated behind capability "workspace.lifecycle.v1" (see
@@ -1167,7 +1212,7 @@ pub(crate) fn reap_if_abandoned(host: &Arc<PeerHost>, surface_id: &[u8]) {
     });
 }
 
-fn team_call_allowed(method: &str) -> bool {
+pub(crate) fn team_call_allowed(method: &str) -> bool {
     matches!(
         method,
         "team.status"
@@ -1311,8 +1356,7 @@ fn host_hello(seq_counter: &AtomicU64, has_teams: bool) -> Envelope {
                 .into_iter()
                 .filter(|c| {
                     has_teams
-                        || (c != capability::TEAM_ROSTER_V1
-                            && c != capability::TEAM_CALL_V1)
+                        || (c != capability::TEAM_ROSTER_V1 && c != capability::TEAM_CALL_V1)
                 })
                 .collect(),
             app_version: env!("CARGO_PKG_VERSION").into(),
@@ -2877,5 +2921,35 @@ mod resume_tests {
     fn old_client_default_of_no_capability_and_zero_seq_is_a_fresh_attach() {
         let caps = PeerCapabilities::default();
         assert_eq!(effective_resume_from_seq(&caps, 0), 0);
+    }
+}
+
+#[cfg(test)]
+mod team_leader_capability_tests {
+    use std::sync::atomic::AtomicU64;
+
+    use peer_proto::{capability, v1::envelope::Payload};
+
+    use super::host_hello;
+
+    #[test]
+    fn no_team_host_still_advertises_reverse_remote_leader_route() {
+        let hello = host_hello(&AtomicU64::new(0), false);
+        let Some(Payload::Hello(hello)) = hello.payload else {
+            panic!("host hello must contain Hello payload");
+        };
+
+        assert!(
+            hello.capabilities.iter().any(|cap| cap == capability::TEAM_LEADER_V1),
+            "a daemon without a local team manager still routes scoped leader calls back to the viewer"
+        );
+        assert!(!hello
+            .capabilities
+            .iter()
+            .any(|cap| cap == capability::TEAM_ROSTER_V1));
+        assert!(!hello
+            .capabilities
+            .iter()
+            .any(|cap| cap == capability::TEAM_CALL_V1));
     }
 }

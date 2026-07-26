@@ -194,6 +194,20 @@ public protocol PeerSurfaceProvider: AnyObject, Sendable {
     /// implementations routed through the same handler the local socket uses.
     /// Returning nil means the host has no team subsystem at all.
     func callTeamMethod(_ method: String, paramsJSON: String) async -> Result<String, PeerTeamCallFailure>?
+
+    /// Resolve a project identifier to an already-created authoritative
+    /// team UUID. This lookup must not create panes, activate the app or
+    /// accept any executable configuration from the peer.
+    func resolveTeamLeaderProject(_ projectID: String) async -> String?
+
+    /// Dispatch a command after `PeerTeamLeaderControlPlane` validated its
+    /// grant and team UUID. Implementations MUST overwrite any peer-supplied
+    /// team name with the team resolved from `teamUUID`.
+    func callScopedTeamLeaderMethod(
+        _ method: String,
+        paramsJSON: String,
+        teamUUID: String
+    ) async -> Result<String, PeerTeamCallFailure>?
 }
 
 /// Why a team call failed on the host side.
@@ -216,6 +230,12 @@ public extension PeerSurfaceProvider {
     func callTeamMethod(
         _ method: String,
         paramsJSON: String
+    ) async -> Result<String, PeerTeamCallFailure>? { nil }
+    func resolveTeamLeaderProject(_ projectID: String) async -> String? { nil }
+    func callScopedTeamLeaderMethod(
+        _ method: String,
+        paramsJSON: String,
+        teamUUID: String
     ) async -> Result<String, PeerTeamCallFailure>? { nil }
 }
 
@@ -335,6 +355,7 @@ public actor PeerServer {
     public let socketPath: String
     public let config: PeerServerConfig
     private let provider: any PeerSurfaceProvider
+    private let teamLeaderControlPlane: PeerTeamLeaderControlPlane
     private var listenerFd: Int32 = -1
     private var acceptTask: Task<Void, Never>?
     // Internal (not private) so `@testable import PeerProto` tests can
@@ -346,11 +367,13 @@ public actor PeerServer {
     public init(
         socketPath: String,
         provider: any PeerSurfaceProvider,
-        config: PeerServerConfig = PeerServerConfig()
+        config: PeerServerConfig = PeerServerConfig(),
+        teamLeaderControlPlane: PeerTeamLeaderControlPlane = .shared
     ) {
         self.socketPath = socketPath
         self.provider = provider
         self.config = config
+        self.teamLeaderControlPlane = teamLeaderControlPlane
     }
 
     public func start() throws {
@@ -424,9 +447,16 @@ public actor PeerServer {
         listenerFd = fd
         let myConfig = config
         let myProvider = provider
+        let myTeamLeaderControlPlane = teamLeaderControlPlane
         let myFd = fd
         acceptTask = Task { [weak self] in
-            await Self.runAcceptLoop(fd: myFd, config: myConfig, provider: myProvider, server: self)
+            await Self.runAcceptLoop(
+                fd: myFd,
+                config: myConfig,
+                provider: myProvider,
+                teamLeaderControlPlane: myTeamLeaderControlPlane,
+                server: self
+            )
         }
     }
 
@@ -485,6 +515,18 @@ public actor PeerServer {
         }
     }
 
+    /// Publish one complete roster to sidebar-only subscribers. This is kept
+    /// separate from layout pushes: mirror sessions can continue receiving
+    /// their focused layout stream without paying for a full roster on every
+    /// divider drag, while a sidebar sees additions/removals immediately.
+    public func broadcastWorkspaceListChanged(
+        _ workspaces: [Termmesh_Peer_V1_Workspace]
+    ) async {
+        for session in activeSessions {
+            try? await session.pushWorkspaceListChanged(workspaces)
+        }
+    }
+
     fileprivate func register(_ session: PeerServerSession) {
         activeSessions.append(session)
     }
@@ -493,6 +535,7 @@ public actor PeerServer {
         fd: Int32,
         config: PeerServerConfig,
         provider: any PeerSurfaceProvider,
+        teamLeaderControlPlane: PeerTeamLeaderControlPlane,
         server: PeerServer?
     ) async {
         let queue = DispatchQueue(label: "term-mesh.peer.server.accept", qos: .userInitiated)
@@ -539,7 +582,8 @@ public actor PeerServer {
             let session = PeerServerSession(
                 connection: connection,
                 config: config,
-                provider: provider
+                provider: provider,
+                teamLeaderControlPlane: teamLeaderControlPlane
             )
             guard await server.tryRegister(session) else {
                 // Cap reached. Explicit close keeps the fd recovery
@@ -970,16 +1014,26 @@ actor PeerServerSession {
     private let connection: AcceptedUnixConnection
     private let config: PeerServerConfig
     private let provider: any PeerSurfaceProvider
+    private let teamLeaderControlPlane: PeerTeamLeaderControlPlane
     private var state: State = .initial
     private var seq: UInt64 = 0
     private var pendingInbound = Data()
     private var attachments: [Data: PeerSurfaceAttachment] = [:]
     private var relayTasks: [Data: Task<Void, Never>] = [:]
+    /// A roster subscription is intentionally independent of surface
+    /// attachments. The sidebar needs to observe a host before opening a
+    /// workspace, and an attached mirror must not be required merely to keep
+    /// its host row fresh.
+    private var workspaceListSubscribed = false
     /// Parsed once out of the client's Hello and kept for the life of the
     /// session — plumbing only for now (see P3, docs/peer-perf-proposal.md):
     /// nothing branches on it yet, but future wire changes (P8 and later)
     /// need somewhere to ask "does this client support X" before using it.
     private var clientCapabilities = PeerCapabilities()
+    /// Stable identity from this connection's authenticated Hello. Scoped
+    /// leader grants are bound to it so reconnects from the same install work
+    /// while another peer cannot replay a captured grant.
+    private var clientPeerID = Data()
 
     /// Whether the connected client advertised `capability` in its Hello.
     func hasClientCapability(_ capability: String) -> Bool {
@@ -989,11 +1043,13 @@ actor PeerServerSession {
     init(
         connection: AcceptedUnixConnection,
         config: PeerServerConfig,
-        provider: any PeerSurfaceProvider
+        provider: any PeerSurfaceProvider,
+        teamLeaderControlPlane: PeerTeamLeaderControlPlane = .shared
     ) {
         self.connection = connection
         self.config = config
         self.provider = provider
+        self.teamLeaderControlPlane = teamLeaderControlPlane
     }
 
     func run() async {
@@ -1051,6 +1107,21 @@ actor PeerServerSession {
         }
     }
 
+    /// Push a full workspace roster to an explicitly subscribed client. Full
+    /// snapshots make reconnect and deletion convergence idempotent: clients
+    /// replace their cached roster rather than merging deltas from a possibly
+    /// interrupted stream.
+    func pushWorkspaceListChanged(
+        _ workspaces: [Termmesh_Peer_V1_Workspace]
+    ) async throws {
+        guard state == .ready, workspaceListSubscribed else { return }
+        try await sendEnvelope { env in
+            var changed = Termmesh_Peer_V1_WorkspaceListChanged()
+            changed.workspaces = workspaces
+            env.workspaceListChanged = changed
+        }
+    }
+
     private func teardownAttachments() async {
         for (_, task) in relayTasks {
             task.cancel()
@@ -1074,12 +1145,21 @@ actor PeerServerSession {
                 )
                 return
             }
+            guard clientHello.peerID.count == PeerIdentity.byteCount else {
+                try await sendError(code: 102, message: "peer_id must be 16 bytes")
+                return
+            }
             clientCapabilities = PeerCapabilities(clientHello.capabilities)
+            clientPeerID = clientHello.peerID
             // Only a provider that can actually answer ListTeams advertises
             // the roster capability — otherwise the flag invites a question
             // this host cannot answer. Resolved before building the Hello,
             // since the envelope builder is synchronous.
-            let teamCapabilities = [PeerCapability.teamRosterV1, PeerCapability.teamCallV1]
+            let teamCapabilities = [
+                PeerCapability.teamRosterV1,
+                PeerCapability.teamCallV1,
+                PeerCapability.teamLeaderV1,
+            ]
             let advertisedCapabilities = await provider.listTeams().isEmpty
                 ? PeerCapability.supported.filter { !teamCapabilities.contains($0) }
                 : PeerCapability.supported
@@ -1140,6 +1220,16 @@ actor PeerServerSession {
                 inner.workspaceList = list
             }
 
+        case (.ready, .subscribeWorkspaceList):
+            // A legacy client cannot classify WorkspaceListChanged, so only
+            // activate the stream when it explicitly advertised support.
+            guard clientCapabilities.has(PeerCapability.workspaceListSubscribeV1) else {
+                try await sendError(code: 106, message: "workspace roster subscription not negotiated")
+                return
+            }
+            workspaceListSubscribed = true
+            try await pushWorkspaceListChanged(await provider.listWorkspaces())
+
         case (.ready, .listTeams):
             let teams = await provider.listTeams()
             try await sendEnvelopeWithCorrelation(env.seq) { inner in
@@ -1182,6 +1272,49 @@ actor PeerServerSession {
                     response.errorMessage = "host has no team subsystem"
                 }
                 inner.teamCallResponse = response
+            }
+
+        case (.ready, .teamLeaderBootstrapRequest(let request)):
+            guard clientCapabilities.has(PeerCapability.teamLeaderV1) else {
+                try await sendError(code: 106, message: "team leader capability not negotiated")
+                return
+            }
+            let encodedBytes = (try? request.serializedData().count)
+                ?? (PeerTeamLeader.maxBootstrapPayloadBytes + 1)
+            let response = await teamLeaderControlPlane.bootstrap(
+                request,
+                encodedBytes: encodedBytes,
+                audiencePeerID: clientPeerID
+            ) { [provider] projectID in
+                await provider.resolveTeamLeaderProject(projectID)
+            }
+            try await sendEnvelopeWithCorrelation(env.seq) { inner in
+                inner.teamLeaderBootstrapResponse = response
+            }
+
+        case (.ready, .teamLeaderCommandRequest(let request)):
+            guard clientCapabilities.has(PeerCapability.teamLeaderV1) else {
+                try await sendError(code: 106, message: "team leader capability not negotiated")
+                return
+            }
+            let encodedBytes = (try? request.serializedData().count)
+                ?? (PeerTeamLeader.maxCommandPayloadBytes + 1)
+            let response = await teamLeaderControlPlane.execute(
+                request,
+                encodedBytes: encodedBytes,
+                audiencePeerID: clientPeerID
+            ) { [provider] method, paramsJSON, teamUUID in
+                await provider.callScopedTeamLeaderMethod(
+                    method,
+                    paramsJSON: paramsJSON,
+                    teamUUID: teamUUID
+                ) ?? .failure(PeerTeamCallFailure(
+                    code: PeerTeamCall.ErrorCode.hostError,
+                    message: "host has no team subsystem"
+                ))
+            }
+            try await sendEnvelopeWithCorrelation(env.seq) { inner in
+                inner.teamLeaderCommandResponse = response
             }
 
         case (.ready, .workspaceControl(let ctl)):

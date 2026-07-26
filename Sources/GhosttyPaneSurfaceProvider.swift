@@ -443,6 +443,123 @@ final class GhosttyPaneSurfaceProvider: PeerSurfaceProvider {
         return .success(resultJSON)
     }
 
+    /// Resolve only teams already owned by this app. `name:<team>` is the
+    /// project identifier emitted by New Project; accepting the stable team
+    /// UUID as well makes reconnect restore independent of a display-name
+    /// change. Paths are never accepted by the protocol's identifier grammar.
+    func resolveTeamLeaderProject(_ projectID: String) async -> String? {
+        TeamOrchestrator.shared.teams.values.first { team in
+            team.id == projectID
+                || "name:\(team.id)" == projectID
+                || team.teamUuid == projectID
+        }?.teamUuid
+    }
+
+    /// The control-plane actor has already parsed and validated this request.
+    /// Keep the second JSON parse off MainActor, resolve the authoritative
+    /// team name with one minimal hop, and overwrite both accepted spelling
+    /// variants so peer-supplied scope can never win.
+    nonisolated func callScopedTeamLeaderMethod(
+        _ method: String,
+        paramsJSON: String,
+        teamUUID: String
+    ) async -> Result<String, PeerTeamCallFailure>? {
+        guard let data = paramsJSON.data(using: .utf8),
+              let object = try? JSONSerialization.jsonObject(with: data),
+              var params = object as? [String: Any] else {
+            return .failure(PeerTeamCallFailure(
+                code: PeerTeamCall.ErrorCode.invalidParams,
+                message: "params_json must be a JSON object"
+            ))
+        }
+        guard let teamName = await MainActor.run(body: {
+            TeamOrchestrator.shared.teams.values.first(where: {
+                $0.teamUuid == teamUUID
+            })?.id
+        }) else {
+            return .failure(PeerTeamCallFailure(
+                code: "team_not_found",
+                message: "granted team is not owned by this control plane"
+            ))
+        }
+
+        params["team"] = teamName
+        params["team_name"] = teamName
+        let response = await TerminalController.shared.peerTeamCommandAsync(
+            method: method,
+            params: params
+        )
+        return Self.unwrapTeamDispatcherResponse(response)
+    }
+
+    /// Execute a reverse request received on an attached peer session. The
+    /// shared control-plane actor validates the grant, overwrites team scope,
+    /// deduplicates request IDs, and only then reaches the local dispatcher.
+    nonisolated static func handleRemoteLeaderCommand(
+        _ request: Termmesh_Peer_V1_TeamLeaderCommandRequest
+    ) async -> Termmesh_Peer_V1_TeamLeaderCommandResponse {
+        let encodedBytes = (try? request.serializedData().count)
+            ?? (PeerTeamLeader.maxCommandPayloadBytes + 1)
+        return await PeerTeamLeaderControlPlane.shared.execute(
+            request,
+            encodedBytes: encodedBytes,
+            audiencePeerID: PeerIdentity.defaultPeerID()
+        ) { method, paramsJSON, teamUUID in
+            guard let data = paramsJSON.data(using: .utf8),
+                  let object = try? JSONSerialization.jsonObject(with: data),
+                  var params = object as? [String: Any] else {
+                return .failure(PeerTeamCallFailure(
+                    code: PeerTeamCall.ErrorCode.invalidParams,
+                    message: "params_json must be a JSON object"
+                ))
+            }
+            guard let teamName = await MainActor.run(body: {
+                TeamOrchestrator.shared.teams.values.first(where: {
+                    $0.teamUuid == teamUUID
+                })?.id
+            }) else {
+                return .failure(PeerTeamCallFailure(
+                    code: "team_not_found",
+                    message: "granted team is not owned by this control plane"
+                ))
+            }
+            params["team"] = teamName
+            params["team_name"] = teamName
+            let response = await TerminalController.shared.peerTeamCommandAsync(
+                method: method,
+                params: params
+            )
+            return unwrapTeamDispatcherResponse(response)
+        }
+    }
+
+    nonisolated static func unwrapTeamDispatcherResponse(
+        _ response: String
+    ) -> Result<String, PeerTeamCallFailure> {
+        guard let data = response.data(using: .utf8),
+              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            return .failure(PeerTeamCallFailure(
+                code: PeerTeamCall.ErrorCode.hostError,
+                message: "team dispatcher returned a non-JSON response"
+            ))
+        }
+        if let error = object["error"] as? [String: Any] {
+            return .failure(PeerTeamCallFailure(
+                code: error["code"] as? String ?? PeerTeamCall.ErrorCode.hostError,
+                message: error["message"] as? String ?? "team call failed"
+            ))
+        }
+        let result = object["result"] ?? [:]
+        guard let resultData = try? JSONSerialization.data(withJSONObject: result),
+              let resultJSON = String(data: resultData, encoding: .utf8) else {
+            return .failure(PeerTeamCallFailure(
+                code: PeerTeamCall.ErrorCode.hostError,
+                message: "team result was not serializable"
+            ))
+        }
+        return .success(resultJSON)
+    }
+
     func handleWorkspaceControl(_ control: Termmesh_Peer_V1_WorkspaceControl) async {
         await MainActor.run { applyWorkspaceControl(control) }
     }
@@ -956,7 +1073,8 @@ final class GhosttyPaneSurfaceProvider: PeerSurfaceProvider {
         for ctx in allWindowContexts() {
             for workspace in ctx.tabManager.tabs {
                 for (_, panel) in workspace.panels {
-                    guard let terminal = panel as? TerminalPanel else { continue }
+                    guard let terminal = panel as? TerminalPanel,
+                          !terminal.isRemoteOrigin else { continue }
                     let ts = terminal.surface
                     if ts.surface == nil {
                         ts.requestBackgroundSurfaceStartIfNeeded()
@@ -971,7 +1089,8 @@ final class GhosttyPaneSurfaceProvider: PeerSurfaceProvider {
         for ctx in allWindowContexts() {
             for workspace in ctx.tabManager.tabs {
                 for (_, panel) in workspace.panels {
-                    guard let terminal = panel as? TerminalPanel else { continue }
+                    guard let terminal = panel as? TerminalPanel,
+                          !terminal.isRemoteOrigin else { continue }
                     if terminal.surface.surface == nil { return false }
                 }
             }
@@ -1017,6 +1136,7 @@ final class GhosttyPaneSurfaceProvider: PeerSurfaceProvider {
                   let tabUUID = UUID(uuidString: selectedTabIDStr),
                   let panelUUID = workspace.surfaceIdToPanelId[TabID(uuid: tabUUID)],
                   let terminal = workspace.panels[panelUUID] as? TerminalPanel,
+                  !terminal.isRemoteOrigin,
                   let sfcPtr = terminal.surface.surface
             else { return nil }
             let ts = terminal.surface
@@ -1036,6 +1156,7 @@ final class GhosttyPaneSurfaceProvider: PeerSurfaceProvider {
                 guard let tUUID = UUID(uuidString: tab.id),
                       let pUUID = workspace.surfaceIdToPanelId[TabID(uuid: tUUID)],
                       let term = workspace.panels[pUUID] as? TerminalPanel,
+                      !term.isRemoteOrigin,
                       term.surface.surface != nil
                 else { return nil }
                 var t = Termmesh_Peer_V1_PaneTab()
@@ -1080,7 +1201,8 @@ final class GhosttyPaneSurfaceProvider: PeerSurfaceProvider {
         for ctx in allWindowContexts() {
             for workspace in ctx.tabManager.tabs {
                 for (_, panel) in workspace.panels {
-                    guard let terminal = panel as? TerminalPanel else { continue }
+                    guard let terminal = panel as? TerminalPanel,
+                          !terminal.isRemoteOrigin else { continue }
                     let ts = terminal.surface
                     guard let sfcPtr = ts.surface else { continue }
                     var info = Termmesh_Peer_V1_SurfaceInfo()
@@ -1105,7 +1227,8 @@ final class GhosttyPaneSurfaceProvider: PeerSurfaceProvider {
         for ctx in allWindowContexts() {
             for workspace in ctx.tabManager.tabs {
                 for (_, panel) in workspace.panels {
-                    guard let terminal = panel as? TerminalPanel else { continue }
+                    guard let terminal = panel as? TerminalPanel,
+                          !terminal.isRemoteOrigin else { continue }
                     let ts = terminal.surface
                     guard surfaceIDBytes(ts.id) == id else { continue }
                     guard let ptr = ts.surface else { continue }

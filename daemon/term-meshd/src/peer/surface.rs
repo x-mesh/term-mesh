@@ -1148,6 +1148,13 @@ fn pane_environment(surface_id: &[u8]) -> Vec<(String, String)> {
     let id = hex_id(surface_id);
     env.push(("TERMMESH_SURFACE_ID".to_string(), id.clone()));
     env.push(("CMUX_SURFACE_ID".to_string(), id));
+    // This is the daemon socket on THIS host, never the viewer app's socket.
+    // A remote leader with a scoped grant uses it as the first hop of the
+    // reverse team.leader.v1 route.
+    env.push((
+        "TERMMESH_SOCKET".to_string(),
+        crate::socket::default_socket_path().to_string_lossy().into_owned(),
+    ));
     env
 }
 

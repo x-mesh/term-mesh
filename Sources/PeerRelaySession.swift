@@ -1680,6 +1680,24 @@ final class PeerRelaySession {
                         break pumpLoop
                     }
                     switch msg {
+                    case .teamLeaderCommandRequest(let request, let correlationID):
+                        // A tm-agent running inside the remote pane can reach
+                        // only the remote daemon. The daemon sends this scoped
+                        // request back over the already-authenticated peer
+                        // session; answer it here without app activation or a
+                        // local TERMMESH_SOCKET ever crossing machines.
+                        let response = await GhosttyPaneSurfaceProvider
+                            .handleRemoteLeaderCommand(request)
+                        do {
+                            try await currentSession.sendTeamLeaderCommandResponse(
+                                response,
+                                correlationID: correlationID
+                            )
+                        } catch {
+                            endReason = "hostToRelay-leader-response-error"
+                            break pumpLoop
+                        }
+                        continue pumpLoop
                     // Forward only this surface's output. Other-surface PtyData
                     // (never expected on a single-attach owned session, but the
                     // guard makes a shared session's stray frame a drop, not a

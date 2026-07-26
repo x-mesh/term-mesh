@@ -2012,6 +2012,19 @@ class TerminalController {
         dispatchTeamCommandAsync(method: method, params: params, id: 1)
     }
 
+    /// Async peer entry point used by the scoped remote-leader control
+    /// plane. Unlike the legacy synchronous bridge above, this never blocks
+    /// MainActor on a semaphore: data-only work stays on `teamDataQueue`,
+    /// and UI methods cooperatively hop only inside their existing handlers.
+    func peerTeamCommandAsync(method: String, params: [String: Any]) async -> String {
+        if Self.teamDataCommands.contains(method) {
+            return teamDataQueue.sync {
+                dispatchTeamDataCommandDirect(method: method, params: params, id: 1)
+            }
+        }
+        return await processTeamUICommandAsync(method: method, params: params, id: 1)
+    }
+
     private func dispatchTeamCommandAsync(method: String, params: [String: Any], id: Any?) -> String {
         // Fast path: data-only commands don't need async bridge at all
         if Self.teamDataCommands.contains(method) {
@@ -3644,12 +3657,38 @@ class TerminalController {
             return v2Error(id: id, code: "internal_error", message: "Task creation failed for agent '\(agentName)'")
         }
 
+        var returnSubmitted = false
+        if textDelivered, params["submit_return"] as? Bool == true {
+            var keyParams: [String: Any] = [
+                "team": teamName,
+                "agent": agentName,
+                "key": "return",
+            ]
+            if let panelId {
+                keyParams["panel_id"] = panelId.uuidString
+            }
+            let keyResponse = await asyncTeamSendKey(params: keyParams, id: id)
+            if let data = keyResponse.data(using: .utf8),
+               let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+               let result = object["result"] as? [String: Any] {
+                returnSubmitted = result["sent"] as? Bool == true
+            }
+            guard returnSubmitted else {
+                return v2Error(
+                    id: id,
+                    code: "delivery_failed",
+                    message: "Instruction text was delivered but Return submission failed"
+                )
+            }
+        }
+
         // delegateToAgent sends text WITHOUT Return (withReturn: false).
         // The Rust CLI sends Return separately via team.send_key RPC after this ack.
         return v2Ok(id: id, result: [
             "task": store.taskDictionary(delegateResult.task),
             "sent": true,
             "text_delivered": textDelivered,
+            "return_submitted": returnSubmitted,
         ])
     }
 

@@ -76,6 +76,20 @@ message Envelope {
     // Gated behind capability "team.call.v1" (Hello.capabilities).
     TeamCallRequest team_call_request = 52;
     TeamCallResponse team_call_response = 53;
+    // Gated behind capability "team.leader.v1" (Hello.capabilities).
+    TeamLeaderBootstrapRequest team_leader_bootstrap_request = 54;
+    TeamLeaderBootstrapResponse team_leader_bootstrap_response = 55;
+    // Client opts into host-pushed complete workspace rosters. Gated behind
+    // capability "workspace.list.subscribe.v1". The snapshot and every
+    // subsequent change use WorkspaceListChanged so this never races a
+    // response-waiting ListWorkspaces RPC on the same session.
+    SubscribeWorkspaceList subscribe_workspace_list = 56;
+    WorkspaceListChanged workspace_list_changed = 57;
+    // Scoped remote-leader command return route. This is deliberately not
+    // TeamCallRequest: every call carries a project/team grant and an
+    // idempotency key validated by the authoritative control plane.
+    TeamLeaderCommandRequest team_leader_command_request = 58;
+    TeamLeaderCommandResponse team_leader_command_response = 59;
 
     Ping ping = 50;
     Pong pong = 51;
@@ -356,6 +370,17 @@ message TerminateSurfaceResponse {
 message ListWorkspaces {}
 
 message WorkspaceList {
+  repeated Workspace workspaces = 1;
+}
+
+// Subscribe to a complete roster snapshot plus future roster changes. This
+// deliberately has no request/reply acknowledgement: the first
+// WorkspaceListChanged is the authoritative snapshot and starts the stream.
+message SubscribeWorkspaceList {}
+
+// Host-pushed complete roster. A whole snapshot makes reconnect convergence
+// deterministic: removals need no tombstone bookkeeping on the sidebar.
+message WorkspaceListChanged {
   repeated Workspace workspaces = 1;
 }
 
@@ -856,6 +881,78 @@ message TeamCallResponse {
   // refused it — distinct from the method failing on its own terms.
   string error_code = 3;
   string error_message = 4;
+}
+
+// ============================================================
+// Remote team leader bootstrap (capability "team.leader.v1")
+// ============================================================
+//
+// This is intentionally separate from TeamCallRequest. Bootstrap is the one
+// lifecycle operation a peer may request, and its request contains only a
+// registered project id, a placement choice and an idempotency key. The host
+// resolves cwd, executable, CLI profile, arguments and environment from its
+// own project registry. Never add any executable configuration field here.
+
+enum TeamLeaderPlacement {
+  TEAM_LEADER_PLACEMENT_UNSPECIFIED = 0;
+  TEAM_LEADER_PLACEMENT_LOCAL = 1;
+  TEAM_LEADER_PLACEMENT_PEER = 2;
+}
+
+enum TeamLeaderRole {
+  TEAM_LEADER_ROLE_UNSPECIFIED = 0;
+  TEAM_LEADER_ROLE_LEADER = 1;
+  TEAM_LEADER_ROLE_OBSERVER = 2;
+}
+
+message TeamLeaderBootstrapRequest {
+  string project_id = 1;
+  TeamLeaderPlacement leader_placement = 2;
+  // Exactly 16 random bytes. Reusing it for a second bootstrap is rejected.
+  bytes request_id = 3;
+}
+
+message TeamLeaderGrant {
+  // Exactly 32 random bytes, looked up in the host's grant registry.
+  bytes grant_id = 1;
+  string project_id = 2;
+  string team_uuid = 3;
+  TeamLeaderRole role = 4;
+  uint64 expires_at_unix_secs = 5;
+}
+
+message TeamLeaderBootstrapResponse {
+  bool ok = 1;
+  string team_uuid = 2;
+  TeamLeaderGrant grant = 3;
+  string error_code = 4;
+  string error_message = 5;
+}
+
+message TeamLeaderCommandRequest {
+  TeamLeaderGrant grant = 1;
+  // Repeated outside the grant so a forged cross-team route is rejected
+  // before dispatch rather than silently rewritten.
+  string team_uuid = 2;
+  // Exactly 16 opaque bytes. Replays return the cached response and never
+  // repeat a task or pane mutation.
+  bytes request_id = 3;
+  // Must be on the existing PeerTeamCall allow-list. Lifecycle methods stay
+  // forbidden even to a leader grant.
+  string method = 4;
+  // UTF-8 JSON object. The control plane enforces a bounded encoded request
+  // size and parses this before hopping to any UI executor.
+  string params_json = 5;
+}
+
+message TeamLeaderCommandResponse {
+  bytes request_id = 1;
+  bool ok = 2;
+  // True when this response came from the completed/in-flight replay cache.
+  bool cached = 3;
+  string result_json = 4;
+  string error_code = 5;
+  string error_message = 6;
 }
 
 // ============================================================

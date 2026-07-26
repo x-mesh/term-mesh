@@ -366,6 +366,82 @@ public nonisolated enum Termmesh_Peer_V1_TerminateSurfaceErrorCode: SwiftProtobu
 
 }
 
+public nonisolated enum Termmesh_Peer_V1_TeamLeaderPlacement: SwiftProtobuf.Enum, Swift.CaseIterable {
+  public typealias RawValue = Int
+  case unspecified // = 0
+  case local // = 1
+  case peer // = 2
+  case UNRECOGNIZED(Int)
+
+  public init() {
+    self = .unspecified
+  }
+
+  public init?(rawValue: Int) {
+    switch rawValue {
+    case 0: self = .unspecified
+    case 1: self = .local
+    case 2: self = .peer
+    default: self = .UNRECOGNIZED(rawValue)
+    }
+  }
+
+  public var rawValue: Int {
+    switch self {
+    case .unspecified: return 0
+    case .local: return 1
+    case .peer: return 2
+    case .UNRECOGNIZED(let i): return i
+    }
+  }
+
+  // The compiler won't synthesize support with the UNRECOGNIZED case.
+  public static let allCases: [Termmesh_Peer_V1_TeamLeaderPlacement] = [
+    .unspecified,
+    .local,
+    .peer,
+  ]
+
+}
+
+public nonisolated enum Termmesh_Peer_V1_TeamLeaderRole: SwiftProtobuf.Enum, Swift.CaseIterable {
+  public typealias RawValue = Int
+  case unspecified // = 0
+  case leader // = 1
+  case observer // = 2
+  case UNRECOGNIZED(Int)
+
+  public init() {
+    self = .unspecified
+  }
+
+  public init?(rawValue: Int) {
+    switch rawValue {
+    case 0: self = .unspecified
+    case 1: self = .leader
+    case 2: self = .observer
+    default: self = .UNRECOGNIZED(rawValue)
+    }
+  }
+
+  public var rawValue: Int {
+    switch self {
+    case .unspecified: return 0
+    case .leader: return 1
+    case .observer: return 2
+    case .UNRECOGNIZED(let i): return i
+    }
+  }
+
+  // The compiler won't synthesize support with the UNRECOGNIZED case.
+  public static let allCases: [Termmesh_Peer_V1_TeamLeaderRole] = [
+    .unspecified,
+    .leader,
+    .observer,
+  ]
+
+}
+
 /// Every frame on the wire is a length-prefixed Envelope.
 /// Frames larger than 16 MiB must be rejected with ERR_FRAME_TOO_LARGE.
 public nonisolated struct Termmesh_Peer_V1_Envelope: Sendable {
@@ -655,6 +731,62 @@ public nonisolated struct Termmesh_Peer_V1_Envelope: Sendable {
     set {payload = .teamCallResponse(newValue)}
   }
 
+  /// Gated behind capability "team.leader.v1" (Hello.capabilities).
+  public var teamLeaderBootstrapRequest: Termmesh_Peer_V1_TeamLeaderBootstrapRequest {
+    get {
+      if case .teamLeaderBootstrapRequest(let v)? = payload {return v}
+      return Termmesh_Peer_V1_TeamLeaderBootstrapRequest()
+    }
+    set {payload = .teamLeaderBootstrapRequest(newValue)}
+  }
+
+  public var teamLeaderBootstrapResponse: Termmesh_Peer_V1_TeamLeaderBootstrapResponse {
+    get {
+      if case .teamLeaderBootstrapResponse(let v)? = payload {return v}
+      return Termmesh_Peer_V1_TeamLeaderBootstrapResponse()
+    }
+    set {payload = .teamLeaderBootstrapResponse(newValue)}
+  }
+
+  /// Client opts into host-pushed complete workspace rosters. Gated behind
+  /// capability "workspace.list.subscribe.v1". The snapshot and every
+  /// subsequent change use WorkspaceListChanged so this never races a
+  /// response-waiting ListWorkspaces RPC on the same session.
+  public var subscribeWorkspaceList: Termmesh_Peer_V1_SubscribeWorkspaceList {
+    get {
+      if case .subscribeWorkspaceList(let v)? = payload {return v}
+      return Termmesh_Peer_V1_SubscribeWorkspaceList()
+    }
+    set {payload = .subscribeWorkspaceList(newValue)}
+  }
+
+  public var workspaceListChanged: Termmesh_Peer_V1_WorkspaceListChanged {
+    get {
+      if case .workspaceListChanged(let v)? = payload {return v}
+      return Termmesh_Peer_V1_WorkspaceListChanged()
+    }
+    set {payload = .workspaceListChanged(newValue)}
+  }
+
+  /// Scoped remote-leader command return route. This is deliberately not
+  /// TeamCallRequest: every call carries a project/team grant and an
+  /// idempotency key validated by the authoritative control plane.
+  public var teamLeaderCommandRequest: Termmesh_Peer_V1_TeamLeaderCommandRequest {
+    get {
+      if case .teamLeaderCommandRequest(let v)? = payload {return v}
+      return Termmesh_Peer_V1_TeamLeaderCommandRequest()
+    }
+    set {payload = .teamLeaderCommandRequest(newValue)}
+  }
+
+  public var teamLeaderCommandResponse: Termmesh_Peer_V1_TeamLeaderCommandResponse {
+    get {
+      if case .teamLeaderCommandResponse(let v)? = payload {return v}
+      return Termmesh_Peer_V1_TeamLeaderCommandResponse()
+    }
+    set {payload = .teamLeaderCommandResponse(newValue)}
+  }
+
   public var ping: Termmesh_Peer_V1_Ping {
     get {
       if case .ping(let v)? = payload {return v}
@@ -733,6 +865,20 @@ public nonisolated struct Termmesh_Peer_V1_Envelope: Sendable {
     /// Gated behind capability "team.call.v1" (Hello.capabilities).
     case teamCallRequest(Termmesh_Peer_V1_TeamCallRequest)
     case teamCallResponse(Termmesh_Peer_V1_TeamCallResponse)
+    /// Gated behind capability "team.leader.v1" (Hello.capabilities).
+    case teamLeaderBootstrapRequest(Termmesh_Peer_V1_TeamLeaderBootstrapRequest)
+    case teamLeaderBootstrapResponse(Termmesh_Peer_V1_TeamLeaderBootstrapResponse)
+    /// Client opts into host-pushed complete workspace rosters. Gated behind
+    /// capability "workspace.list.subscribe.v1". The snapshot and every
+    /// subsequent change use WorkspaceListChanged so this never races a
+    /// response-waiting ListWorkspaces RPC on the same session.
+    case subscribeWorkspaceList(Termmesh_Peer_V1_SubscribeWorkspaceList)
+    case workspaceListChanged(Termmesh_Peer_V1_WorkspaceListChanged)
+    /// Scoped remote-leader command return route. This is deliberately not
+    /// TeamCallRequest: every call carries a project/team grant and an
+    /// idempotency key validated by the authoritative control plane.
+    case teamLeaderCommandRequest(Termmesh_Peer_V1_TeamLeaderCommandRequest)
+    case teamLeaderCommandResponse(Termmesh_Peer_V1_TeamLeaderCommandResponse)
     case ping(Termmesh_Peer_V1_Ping)
     case pong(Termmesh_Peer_V1_Pong)
     case goodbye(Termmesh_Peer_V1_Goodbye)
@@ -1119,6 +1265,33 @@ public nonisolated struct Termmesh_Peer_V1_ListWorkspaces: Sendable {
 }
 
 public nonisolated struct Termmesh_Peer_V1_WorkspaceList: Sendable {
+  // SwiftProtobuf.Message conformance is added in an extension below. See the
+  // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
+  // methods supported on all messages.
+
+  public var workspaces: [Termmesh_Peer_V1_Workspace] = []
+
+  public var unknownFields = SwiftProtobuf.UnknownStorage()
+
+  public init() {}
+}
+
+/// Subscribe to a complete roster snapshot plus future roster changes. This
+/// deliberately has no request/reply acknowledgement: the first
+/// WorkspaceListChanged is the authoritative snapshot and starts the stream.
+public nonisolated struct Termmesh_Peer_V1_SubscribeWorkspaceList: Sendable {
+  // SwiftProtobuf.Message conformance is added in an extension below. See the
+  // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
+  // methods supported on all messages.
+
+  public var unknownFields = SwiftProtobuf.UnknownStorage()
+
+  public init() {}
+}
+
+/// Host-pushed complete roster. A whole snapshot makes reconnect convergence
+/// deterministic: removals need no tombstone bookkeeping on the sidebar.
+public nonisolated struct Termmesh_Peer_V1_WorkspaceListChanged: Sendable {
   // SwiftProtobuf.Message conformance is added in an extension below. See the
   // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
   // methods supported on all messages.
@@ -2186,6 +2359,133 @@ public nonisolated struct Termmesh_Peer_V1_TeamCallResponse: Sendable {
   public init() {}
 }
 
+public nonisolated struct Termmesh_Peer_V1_TeamLeaderBootstrapRequest: Sendable {
+  // SwiftProtobuf.Message conformance is added in an extension below. See the
+  // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
+  // methods supported on all messages.
+
+  public var projectID: String = String()
+
+  public var leaderPlacement: Termmesh_Peer_V1_TeamLeaderPlacement = .unspecified
+
+  /// Exactly 16 random bytes. Reusing it for a second bootstrap is rejected.
+  public var requestID: Data = Data()
+
+  public var unknownFields = SwiftProtobuf.UnknownStorage()
+
+  public init() {}
+}
+
+public nonisolated struct Termmesh_Peer_V1_TeamLeaderGrant: Sendable {
+  // SwiftProtobuf.Message conformance is added in an extension below. See the
+  // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
+  // methods supported on all messages.
+
+  /// Exactly 32 random bytes, looked up in the host's grant registry.
+  public var grantID: Data = Data()
+
+  public var projectID: String = String()
+
+  public var teamUuid: String = String()
+
+  public var role: Termmesh_Peer_V1_TeamLeaderRole = .unspecified
+
+  public var expiresAtUnixSecs: UInt64 = 0
+
+  public var unknownFields = SwiftProtobuf.UnknownStorage()
+
+  public init() {}
+}
+
+public nonisolated struct Termmesh_Peer_V1_TeamLeaderBootstrapResponse: Sendable {
+  // SwiftProtobuf.Message conformance is added in an extension below. See the
+  // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
+  // methods supported on all messages.
+
+  public var ok: Bool = false
+
+  public var teamUuid: String = String()
+
+  public var grant: Termmesh_Peer_V1_TeamLeaderGrant {
+    get {_grant ?? Termmesh_Peer_V1_TeamLeaderGrant()}
+    set {_grant = newValue}
+  }
+  /// Returns true if `grant` has been explicitly set.
+  public var hasGrant: Bool {self._grant != nil}
+  /// Clears the value of `grant`. Subsequent reads from it will return its default value.
+  public mutating func clearGrant() {self._grant = nil}
+
+  public var errorCode: String = String()
+
+  public var errorMessage: String = String()
+
+  public var unknownFields = SwiftProtobuf.UnknownStorage()
+
+  public init() {}
+
+  fileprivate var _grant: Termmesh_Peer_V1_TeamLeaderGrant? = nil
+}
+
+public nonisolated struct Termmesh_Peer_V1_TeamLeaderCommandRequest: Sendable {
+  // SwiftProtobuf.Message conformance is added in an extension below. See the
+  // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
+  // methods supported on all messages.
+
+  public var grant: Termmesh_Peer_V1_TeamLeaderGrant {
+    get {_grant ?? Termmesh_Peer_V1_TeamLeaderGrant()}
+    set {_grant = newValue}
+  }
+  /// Returns true if `grant` has been explicitly set.
+  public var hasGrant: Bool {self._grant != nil}
+  /// Clears the value of `grant`. Subsequent reads from it will return its default value.
+  public mutating func clearGrant() {self._grant = nil}
+
+  /// Repeated outside the grant so a forged cross-team route is rejected
+  /// before dispatch rather than silently rewritten.
+  public var teamUuid: String = String()
+
+  /// Exactly 16 opaque bytes. Replays return the cached response and never
+  /// repeat a task or pane mutation.
+  public var requestID: Data = Data()
+
+  /// Must be on the existing PeerTeamCall allow-list. Lifecycle methods stay
+  /// forbidden even to a leader grant.
+  public var method: String = String()
+
+  /// UTF-8 JSON object. The control plane enforces a bounded encoded request
+  /// size and parses this before hopping to any UI executor.
+  public var paramsJson: String = String()
+
+  public var unknownFields = SwiftProtobuf.UnknownStorage()
+
+  public init() {}
+
+  fileprivate var _grant: Termmesh_Peer_V1_TeamLeaderGrant? = nil
+}
+
+public nonisolated struct Termmesh_Peer_V1_TeamLeaderCommandResponse: Sendable {
+  // SwiftProtobuf.Message conformance is added in an extension below. See the
+  // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
+  // methods supported on all messages.
+
+  public var requestID: Data = Data()
+
+  public var ok: Bool = false
+
+  /// True when this response came from the completed/in-flight replay cache.
+  public var cached: Bool = false
+
+  public var resultJson: String = String()
+
+  public var errorCode: String = String()
+
+  public var errorMessage: String = String()
+
+  public var unknownFields = SwiftProtobuf.UnknownStorage()
+
+  public init() {}
+}
+
 public nonisolated struct Termmesh_Peer_V1_Ping: Sendable {
   // SwiftProtobuf.Message conformance is added in an extension below. See the
   // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
@@ -2269,9 +2569,17 @@ nonisolated extension Termmesh_Peer_V1_TerminateSurfaceErrorCode: SwiftProtobuf.
   public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{2}\0TERMINATE_SURFACE_ERROR_CODE_UNSPECIFIED\0\u{1}TERMINATE_SURFACE_ERROR_CODE_INVALID_REQUEST\0\u{1}TERMINATE_SURFACE_ERROR_CODE_DUPLICATE_REQUEST_ID\0\u{1}TERMINATE_SURFACE_ERROR_CODE_INTERNAL\0")
 }
 
+nonisolated extension Termmesh_Peer_V1_TeamLeaderPlacement: SwiftProtobuf._ProtoNameProviding {
+  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{2}\0TEAM_LEADER_PLACEMENT_UNSPECIFIED\0\u{1}TEAM_LEADER_PLACEMENT_LOCAL\0\u{1}TEAM_LEADER_PLACEMENT_PEER\0")
+}
+
+nonisolated extension Termmesh_Peer_V1_TeamLeaderRole: SwiftProtobuf._ProtoNameProviding {
+  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{2}\0TEAM_LEADER_ROLE_UNSPECIFIED\0\u{1}TEAM_LEADER_ROLE_LEADER\0\u{1}TEAM_LEADER_ROLE_OBSERVER\0")
+}
+
 nonisolated extension Termmesh_Peer_V1_Envelope: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
   public static let protoMessageName: String = _protobuf_package + ".Envelope"
-  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{1}seq\0\u{3}correlation_id\0\u{2}\u{8}hello\0\u{3}auth_challenge\0\u{1}auth\0\u{3}auth_result\0\u{4}\u{7}list_surfaces\0\u{3}surface_list\0\u{3}attach_surface\0\u{3}attach_result\0\u{3}detach_surface\0\u{3}list_workspaces\0\u{3}workspace_list\0\u{3}workspace_control\0\u{3}create_workspace_request\0\u{3}create_workspace_response\0\u{3}pty_data\0\u{1}input\0\u{1}resize\0\u{3}grid_snapshot\0\u{3}data_ack\0\u{3}scrollback_request\0\u{3}scrollback_chunk\0\u{4}\u{4}workspace_update\0\u{3}rename_workspace_request\0\u{3}delete_workspace_request\0\u{3}ensure_surface_request\0\u{3}ensure_surface_response\0\u{3}terminate_surface_request\0\u{3}terminate_surface_response\0\u{3}host_stats\0\u{3}list_teams\0\u{3}team_list\0\u{1}ping\0\u{1}pong\0\u{3}team_call_request\0\u{3}team_call_response\0\u{2}\u{7}goodbye\0\u{2}'error\0")
+  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{1}seq\0\u{3}correlation_id\0\u{2}\u{8}hello\0\u{3}auth_challenge\0\u{1}auth\0\u{3}auth_result\0\u{4}\u{7}list_surfaces\0\u{3}surface_list\0\u{3}attach_surface\0\u{3}attach_result\0\u{3}detach_surface\0\u{3}list_workspaces\0\u{3}workspace_list\0\u{3}workspace_control\0\u{3}create_workspace_request\0\u{3}create_workspace_response\0\u{3}pty_data\0\u{1}input\0\u{1}resize\0\u{3}grid_snapshot\0\u{3}data_ack\0\u{3}scrollback_request\0\u{3}scrollback_chunk\0\u{4}\u{4}workspace_update\0\u{3}rename_workspace_request\0\u{3}delete_workspace_request\0\u{3}ensure_surface_request\0\u{3}ensure_surface_response\0\u{3}terminate_surface_request\0\u{3}terminate_surface_response\0\u{3}host_stats\0\u{3}list_teams\0\u{3}team_list\0\u{1}ping\0\u{1}pong\0\u{3}team_call_request\0\u{3}team_call_response\0\u{3}team_leader_bootstrap_request\0\u{3}team_leader_bootstrap_response\0\u{3}subscribe_workspace_list\0\u{3}workspace_list_changed\0\u{3}team_leader_command_request\0\u{3}team_leader_command_response\0\u{1}goodbye\0\u{2}'error\0")
 
   public mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
     while let fieldNumber = try decoder.nextFieldNumber() {
@@ -2736,6 +3044,84 @@ nonisolated extension Termmesh_Peer_V1_Envelope: SwiftProtobuf.Message, SwiftPro
           self.payload = .teamCallResponse(v)
         }
       }()
+      case 54: try {
+        var v: Termmesh_Peer_V1_TeamLeaderBootstrapRequest?
+        var hadOneofValue = false
+        if let current = self.payload {
+          hadOneofValue = true
+          if case .teamLeaderBootstrapRequest(let m) = current {v = m}
+        }
+        try decoder.decodeSingularMessageField(value: &v)
+        if let v = v {
+          if hadOneofValue {try decoder.handleConflictingOneOf()}
+          self.payload = .teamLeaderBootstrapRequest(v)
+        }
+      }()
+      case 55: try {
+        var v: Termmesh_Peer_V1_TeamLeaderBootstrapResponse?
+        var hadOneofValue = false
+        if let current = self.payload {
+          hadOneofValue = true
+          if case .teamLeaderBootstrapResponse(let m) = current {v = m}
+        }
+        try decoder.decodeSingularMessageField(value: &v)
+        if let v = v {
+          if hadOneofValue {try decoder.handleConflictingOneOf()}
+          self.payload = .teamLeaderBootstrapResponse(v)
+        }
+      }()
+      case 56: try {
+        var v: Termmesh_Peer_V1_SubscribeWorkspaceList?
+        var hadOneofValue = false
+        if let current = self.payload {
+          hadOneofValue = true
+          if case .subscribeWorkspaceList(let m) = current {v = m}
+        }
+        try decoder.decodeSingularMessageField(value: &v)
+        if let v = v {
+          if hadOneofValue {try decoder.handleConflictingOneOf()}
+          self.payload = .subscribeWorkspaceList(v)
+        }
+      }()
+      case 57: try {
+        var v: Termmesh_Peer_V1_WorkspaceListChanged?
+        var hadOneofValue = false
+        if let current = self.payload {
+          hadOneofValue = true
+          if case .workspaceListChanged(let m) = current {v = m}
+        }
+        try decoder.decodeSingularMessageField(value: &v)
+        if let v = v {
+          if hadOneofValue {try decoder.handleConflictingOneOf()}
+          self.payload = .workspaceListChanged(v)
+        }
+      }()
+      case 58: try {
+        var v: Termmesh_Peer_V1_TeamLeaderCommandRequest?
+        var hadOneofValue = false
+        if let current = self.payload {
+          hadOneofValue = true
+          if case .teamLeaderCommandRequest(let m) = current {v = m}
+        }
+        try decoder.decodeSingularMessageField(value: &v)
+        if let v = v {
+          if hadOneofValue {try decoder.handleConflictingOneOf()}
+          self.payload = .teamLeaderCommandRequest(v)
+        }
+      }()
+      case 59: try {
+        var v: Termmesh_Peer_V1_TeamLeaderCommandResponse?
+        var hadOneofValue = false
+        if let current = self.payload {
+          hadOneofValue = true
+          if case .teamLeaderCommandResponse(let m) = current {v = m}
+        }
+        try decoder.decodeSingularMessageField(value: &v)
+        if let v = v {
+          if hadOneofValue {try decoder.handleConflictingOneOf()}
+          self.payload = .teamLeaderCommandResponse(v)
+        }
+      }()
       case 60: try {
         var v: Termmesh_Peer_V1_Goodbye?
         var hadOneofValue = false
@@ -2918,6 +3304,30 @@ nonisolated extension Termmesh_Peer_V1_Envelope: SwiftProtobuf.Message, SwiftPro
     case .teamCallResponse?: try {
       guard case .teamCallResponse(let v)? = self.payload else { preconditionFailure() }
       try visitor.visitSingularMessageField(value: v, fieldNumber: 53)
+    }()
+    case .teamLeaderBootstrapRequest?: try {
+      guard case .teamLeaderBootstrapRequest(let v)? = self.payload else { preconditionFailure() }
+      try visitor.visitSingularMessageField(value: v, fieldNumber: 54)
+    }()
+    case .teamLeaderBootstrapResponse?: try {
+      guard case .teamLeaderBootstrapResponse(let v)? = self.payload else { preconditionFailure() }
+      try visitor.visitSingularMessageField(value: v, fieldNumber: 55)
+    }()
+    case .subscribeWorkspaceList?: try {
+      guard case .subscribeWorkspaceList(let v)? = self.payload else { preconditionFailure() }
+      try visitor.visitSingularMessageField(value: v, fieldNumber: 56)
+    }()
+    case .workspaceListChanged?: try {
+      guard case .workspaceListChanged(let v)? = self.payload else { preconditionFailure() }
+      try visitor.visitSingularMessageField(value: v, fieldNumber: 57)
+    }()
+    case .teamLeaderCommandRequest?: try {
+      guard case .teamLeaderCommandRequest(let v)? = self.payload else { preconditionFailure() }
+      try visitor.visitSingularMessageField(value: v, fieldNumber: 58)
+    }()
+    case .teamLeaderCommandResponse?: try {
+      guard case .teamLeaderCommandResponse(let v)? = self.payload else { preconditionFailure() }
+      try visitor.visitSingularMessageField(value: v, fieldNumber: 59)
     }()
     case .goodbye?: try {
       guard case .goodbye(let v)? = self.payload else { preconditionFailure() }
@@ -3701,6 +4111,55 @@ nonisolated extension Termmesh_Peer_V1_WorkspaceList: SwiftProtobuf.Message, Swi
   }
 
   public static func ==(lhs: Termmesh_Peer_V1_WorkspaceList, rhs: Termmesh_Peer_V1_WorkspaceList) -> Bool {
+    if lhs.workspaces != rhs.workspaces {return false}
+    if lhs.unknownFields != rhs.unknownFields {return false}
+    return true
+  }
+}
+
+nonisolated extension Termmesh_Peer_V1_SubscribeWorkspaceList: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
+  public static let protoMessageName: String = _protobuf_package + ".SubscribeWorkspaceList"
+  public static let _protobuf_nameMap = SwiftProtobuf._NameMap()
+
+  public mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
+    // Load everything into unknown fields
+    while try decoder.nextFieldNumber() != nil {}
+  }
+
+  public func traverse<V: SwiftProtobuf.Visitor>(visitor: inout V) throws {
+    try unknownFields.traverse(visitor: &visitor)
+  }
+
+  public static func ==(lhs: Termmesh_Peer_V1_SubscribeWorkspaceList, rhs: Termmesh_Peer_V1_SubscribeWorkspaceList) -> Bool {
+    if lhs.unknownFields != rhs.unknownFields {return false}
+    return true
+  }
+}
+
+nonisolated extension Termmesh_Peer_V1_WorkspaceListChanged: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
+  public static let protoMessageName: String = _protobuf_package + ".WorkspaceListChanged"
+  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{1}workspaces\0")
+
+  public mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
+    while let fieldNumber = try decoder.nextFieldNumber() {
+      // The use of inline closures is to circumvent an issue where the compiler
+      // allocates stack space for every case branch when no optimizations are
+      // enabled. https://github.com/apple/swift-protobuf/issues/1034
+      switch fieldNumber {
+      case 1: try { try decoder.decodeRepeatedMessageField(value: &self.workspaces) }()
+      default: break
+      }
+    }
+  }
+
+  public func traverse<V: SwiftProtobuf.Visitor>(visitor: inout V) throws {
+    if !self.workspaces.isEmpty {
+      try visitor.visitRepeatedMessageField(value: self.workspaces, fieldNumber: 1)
+    }
+    try unknownFields.traverse(visitor: &visitor)
+  }
+
+  public static func ==(lhs: Termmesh_Peer_V1_WorkspaceListChanged, rhs: Termmesh_Peer_V1_WorkspaceListChanged) -> Bool {
     if lhs.workspaces != rhs.workspaces {return false}
     if lhs.unknownFields != rhs.unknownFields {return false}
     return true
@@ -5686,6 +6145,259 @@ nonisolated extension Termmesh_Peer_V1_TeamCallResponse: SwiftProtobuf.Message, 
 
   public static func ==(lhs: Termmesh_Peer_V1_TeamCallResponse, rhs: Termmesh_Peer_V1_TeamCallResponse) -> Bool {
     if lhs.ok != rhs.ok {return false}
+    if lhs.resultJson != rhs.resultJson {return false}
+    if lhs.errorCode != rhs.errorCode {return false}
+    if lhs.errorMessage != rhs.errorMessage {return false}
+    if lhs.unknownFields != rhs.unknownFields {return false}
+    return true
+  }
+}
+
+nonisolated extension Termmesh_Peer_V1_TeamLeaderBootstrapRequest: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
+  public static let protoMessageName: String = _protobuf_package + ".TeamLeaderBootstrapRequest"
+  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{3}project_id\0\u{3}leader_placement\0\u{3}request_id\0")
+
+  public mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
+    while let fieldNumber = try decoder.nextFieldNumber() {
+      // The use of inline closures is to circumvent an issue where the compiler
+      // allocates stack space for every case branch when no optimizations are
+      // enabled. https://github.com/apple/swift-protobuf/issues/1034
+      switch fieldNumber {
+      case 1: try { try decoder.decodeSingularStringField(value: &self.projectID) }()
+      case 2: try { try decoder.decodeSingularEnumField(value: &self.leaderPlacement) }()
+      case 3: try { try decoder.decodeSingularBytesField(value: &self.requestID) }()
+      default: break
+      }
+    }
+  }
+
+  public func traverse<V: SwiftProtobuf.Visitor>(visitor: inout V) throws {
+    if !self.projectID.isEmpty {
+      try visitor.visitSingularStringField(value: self.projectID, fieldNumber: 1)
+    }
+    if self.leaderPlacement != .unspecified {
+      try visitor.visitSingularEnumField(value: self.leaderPlacement, fieldNumber: 2)
+    }
+    if !self.requestID.isEmpty {
+      try visitor.visitSingularBytesField(value: self.requestID, fieldNumber: 3)
+    }
+    try unknownFields.traverse(visitor: &visitor)
+  }
+
+  public static func ==(lhs: Termmesh_Peer_V1_TeamLeaderBootstrapRequest, rhs: Termmesh_Peer_V1_TeamLeaderBootstrapRequest) -> Bool {
+    if lhs.projectID != rhs.projectID {return false}
+    if lhs.leaderPlacement != rhs.leaderPlacement {return false}
+    if lhs.requestID != rhs.requestID {return false}
+    if lhs.unknownFields != rhs.unknownFields {return false}
+    return true
+  }
+}
+
+nonisolated extension Termmesh_Peer_V1_TeamLeaderGrant: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
+  public static let protoMessageName: String = _protobuf_package + ".TeamLeaderGrant"
+  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{3}grant_id\0\u{3}project_id\0\u{3}team_uuid\0\u{1}role\0\u{3}expires_at_unix_secs\0")
+
+  public mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
+    while let fieldNumber = try decoder.nextFieldNumber() {
+      // The use of inline closures is to circumvent an issue where the compiler
+      // allocates stack space for every case branch when no optimizations are
+      // enabled. https://github.com/apple/swift-protobuf/issues/1034
+      switch fieldNumber {
+      case 1: try { try decoder.decodeSingularBytesField(value: &self.grantID) }()
+      case 2: try { try decoder.decodeSingularStringField(value: &self.projectID) }()
+      case 3: try { try decoder.decodeSingularStringField(value: &self.teamUuid) }()
+      case 4: try { try decoder.decodeSingularEnumField(value: &self.role) }()
+      case 5: try { try decoder.decodeSingularUInt64Field(value: &self.expiresAtUnixSecs) }()
+      default: break
+      }
+    }
+  }
+
+  public func traverse<V: SwiftProtobuf.Visitor>(visitor: inout V) throws {
+    if !self.grantID.isEmpty {
+      try visitor.visitSingularBytesField(value: self.grantID, fieldNumber: 1)
+    }
+    if !self.projectID.isEmpty {
+      try visitor.visitSingularStringField(value: self.projectID, fieldNumber: 2)
+    }
+    if !self.teamUuid.isEmpty {
+      try visitor.visitSingularStringField(value: self.teamUuid, fieldNumber: 3)
+    }
+    if self.role != .unspecified {
+      try visitor.visitSingularEnumField(value: self.role, fieldNumber: 4)
+    }
+    if self.expiresAtUnixSecs != 0 {
+      try visitor.visitSingularUInt64Field(value: self.expiresAtUnixSecs, fieldNumber: 5)
+    }
+    try unknownFields.traverse(visitor: &visitor)
+  }
+
+  public static func ==(lhs: Termmesh_Peer_V1_TeamLeaderGrant, rhs: Termmesh_Peer_V1_TeamLeaderGrant) -> Bool {
+    if lhs.grantID != rhs.grantID {return false}
+    if lhs.projectID != rhs.projectID {return false}
+    if lhs.teamUuid != rhs.teamUuid {return false}
+    if lhs.role != rhs.role {return false}
+    if lhs.expiresAtUnixSecs != rhs.expiresAtUnixSecs {return false}
+    if lhs.unknownFields != rhs.unknownFields {return false}
+    return true
+  }
+}
+
+nonisolated extension Termmesh_Peer_V1_TeamLeaderBootstrapResponse: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
+  public static let protoMessageName: String = _protobuf_package + ".TeamLeaderBootstrapResponse"
+  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{1}ok\0\u{3}team_uuid\0\u{1}grant\0\u{3}error_code\0\u{3}error_message\0")
+
+  public mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
+    while let fieldNumber = try decoder.nextFieldNumber() {
+      // The use of inline closures is to circumvent an issue where the compiler
+      // allocates stack space for every case branch when no optimizations are
+      // enabled. https://github.com/apple/swift-protobuf/issues/1034
+      switch fieldNumber {
+      case 1: try { try decoder.decodeSingularBoolField(value: &self.ok) }()
+      case 2: try { try decoder.decodeSingularStringField(value: &self.teamUuid) }()
+      case 3: try { try decoder.decodeSingularMessageField(value: &self._grant) }()
+      case 4: try { try decoder.decodeSingularStringField(value: &self.errorCode) }()
+      case 5: try { try decoder.decodeSingularStringField(value: &self.errorMessage) }()
+      default: break
+      }
+    }
+  }
+
+  public func traverse<V: SwiftProtobuf.Visitor>(visitor: inout V) throws {
+    // The use of inline closures is to circumvent an issue where the compiler
+    // allocates stack space for every if/case branch local when no optimizations
+    // are enabled. https://github.com/apple/swift-protobuf/issues/1034 and
+    // https://github.com/apple/swift-protobuf/issues/1182
+    if self.ok != false {
+      try visitor.visitSingularBoolField(value: self.ok, fieldNumber: 1)
+    }
+    if !self.teamUuid.isEmpty {
+      try visitor.visitSingularStringField(value: self.teamUuid, fieldNumber: 2)
+    }
+    try { if let v = self._grant {
+      try visitor.visitSingularMessageField(value: v, fieldNumber: 3)
+    } }()
+    if !self.errorCode.isEmpty {
+      try visitor.visitSingularStringField(value: self.errorCode, fieldNumber: 4)
+    }
+    if !self.errorMessage.isEmpty {
+      try visitor.visitSingularStringField(value: self.errorMessage, fieldNumber: 5)
+    }
+    try unknownFields.traverse(visitor: &visitor)
+  }
+
+  public static func ==(lhs: Termmesh_Peer_V1_TeamLeaderBootstrapResponse, rhs: Termmesh_Peer_V1_TeamLeaderBootstrapResponse) -> Bool {
+    if lhs.ok != rhs.ok {return false}
+    if lhs.teamUuid != rhs.teamUuid {return false}
+    if lhs._grant != rhs._grant {return false}
+    if lhs.errorCode != rhs.errorCode {return false}
+    if lhs.errorMessage != rhs.errorMessage {return false}
+    if lhs.unknownFields != rhs.unknownFields {return false}
+    return true
+  }
+}
+
+nonisolated extension Termmesh_Peer_V1_TeamLeaderCommandRequest: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
+  public static let protoMessageName: String = _protobuf_package + ".TeamLeaderCommandRequest"
+  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{1}grant\0\u{3}team_uuid\0\u{3}request_id\0\u{1}method\0\u{3}params_json\0")
+
+  public mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
+    while let fieldNumber = try decoder.nextFieldNumber() {
+      // The use of inline closures is to circumvent an issue where the compiler
+      // allocates stack space for every case branch when no optimizations are
+      // enabled. https://github.com/apple/swift-protobuf/issues/1034
+      switch fieldNumber {
+      case 1: try { try decoder.decodeSingularMessageField(value: &self._grant) }()
+      case 2: try { try decoder.decodeSingularStringField(value: &self.teamUuid) }()
+      case 3: try { try decoder.decodeSingularBytesField(value: &self.requestID) }()
+      case 4: try { try decoder.decodeSingularStringField(value: &self.method) }()
+      case 5: try { try decoder.decodeSingularStringField(value: &self.paramsJson) }()
+      default: break
+      }
+    }
+  }
+
+  public func traverse<V: SwiftProtobuf.Visitor>(visitor: inout V) throws {
+    // The use of inline closures is to circumvent an issue where the compiler
+    // allocates stack space for every if/case branch local when no optimizations
+    // are enabled. https://github.com/apple/swift-protobuf/issues/1034 and
+    // https://github.com/apple/swift-protobuf/issues/1182
+    try { if let v = self._grant {
+      try visitor.visitSingularMessageField(value: v, fieldNumber: 1)
+    } }()
+    if !self.teamUuid.isEmpty {
+      try visitor.visitSingularStringField(value: self.teamUuid, fieldNumber: 2)
+    }
+    if !self.requestID.isEmpty {
+      try visitor.visitSingularBytesField(value: self.requestID, fieldNumber: 3)
+    }
+    if !self.method.isEmpty {
+      try visitor.visitSingularStringField(value: self.method, fieldNumber: 4)
+    }
+    if !self.paramsJson.isEmpty {
+      try visitor.visitSingularStringField(value: self.paramsJson, fieldNumber: 5)
+    }
+    try unknownFields.traverse(visitor: &visitor)
+  }
+
+  public static func ==(lhs: Termmesh_Peer_V1_TeamLeaderCommandRequest, rhs: Termmesh_Peer_V1_TeamLeaderCommandRequest) -> Bool {
+    if lhs._grant != rhs._grant {return false}
+    if lhs.teamUuid != rhs.teamUuid {return false}
+    if lhs.requestID != rhs.requestID {return false}
+    if lhs.method != rhs.method {return false}
+    if lhs.paramsJson != rhs.paramsJson {return false}
+    if lhs.unknownFields != rhs.unknownFields {return false}
+    return true
+  }
+}
+
+nonisolated extension Termmesh_Peer_V1_TeamLeaderCommandResponse: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
+  public static let protoMessageName: String = _protobuf_package + ".TeamLeaderCommandResponse"
+  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{3}request_id\0\u{1}ok\0\u{1}cached\0\u{3}result_json\0\u{3}error_code\0\u{3}error_message\0")
+
+  public mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
+    while let fieldNumber = try decoder.nextFieldNumber() {
+      // The use of inline closures is to circumvent an issue where the compiler
+      // allocates stack space for every case branch when no optimizations are
+      // enabled. https://github.com/apple/swift-protobuf/issues/1034
+      switch fieldNumber {
+      case 1: try { try decoder.decodeSingularBytesField(value: &self.requestID) }()
+      case 2: try { try decoder.decodeSingularBoolField(value: &self.ok) }()
+      case 3: try { try decoder.decodeSingularBoolField(value: &self.cached) }()
+      case 4: try { try decoder.decodeSingularStringField(value: &self.resultJson) }()
+      case 5: try { try decoder.decodeSingularStringField(value: &self.errorCode) }()
+      case 6: try { try decoder.decodeSingularStringField(value: &self.errorMessage) }()
+      default: break
+      }
+    }
+  }
+
+  public func traverse<V: SwiftProtobuf.Visitor>(visitor: inout V) throws {
+    if !self.requestID.isEmpty {
+      try visitor.visitSingularBytesField(value: self.requestID, fieldNumber: 1)
+    }
+    if self.ok != false {
+      try visitor.visitSingularBoolField(value: self.ok, fieldNumber: 2)
+    }
+    if self.cached != false {
+      try visitor.visitSingularBoolField(value: self.cached, fieldNumber: 3)
+    }
+    if !self.resultJson.isEmpty {
+      try visitor.visitSingularStringField(value: self.resultJson, fieldNumber: 4)
+    }
+    if !self.errorCode.isEmpty {
+      try visitor.visitSingularStringField(value: self.errorCode, fieldNumber: 5)
+    }
+    if !self.errorMessage.isEmpty {
+      try visitor.visitSingularStringField(value: self.errorMessage, fieldNumber: 6)
+    }
+    try unknownFields.traverse(visitor: &visitor)
+  }
+
+  public static func ==(lhs: Termmesh_Peer_V1_TeamLeaderCommandResponse, rhs: Termmesh_Peer_V1_TeamLeaderCommandResponse) -> Bool {
+    if lhs.requestID != rhs.requestID {return false}
+    if lhs.ok != rhs.ok {return false}
+    if lhs.cached != rhs.cached {return false}
     if lhs.resultJson != rhs.resultJson {return false}
     if lhs.errorCode != rhs.errorCode {return false}
     if lhs.errorMessage != rhs.errorMessage {return false}

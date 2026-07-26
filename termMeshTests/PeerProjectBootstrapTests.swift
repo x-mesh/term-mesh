@@ -1,4 +1,5 @@
 import XCTest
+import PeerProto
 
 #if canImport(term_mesh_DEV)
 @testable import term_mesh_DEV
@@ -64,5 +65,95 @@ final class PeerProjectBootstrapTests: XCTestCase {
             projectRoot: "/app/p", projectName: "x", agents: ["a"], isolateAgents: false
         )
         XCTAssertNil(PeerProjectBootstrap.script(for: plan, gitURL: nil))
+    }
+
+    func test_remote_ref_keeps_peer_namespace_with_optional_surface() {
+        let workspace = UUID()
+        let surface = UUID()
+        let ref = RemoteRef(hostPeerID: "peer-a", workspaceID: workspace, surfaceID: surface)
+
+        XCTAssertEqual(ref.hostPeerID, "peer-a")
+        XCTAssertEqual(ref.workspaceID, workspace)
+        XCTAssertEqual(ref.surfaceID, surface)
+        XCTAssertEqual(SelectionTarget.remote(ref).workspaceID, workspace)
+        XCTAssertEqual(SelectionTarget.remote(ref).surfaceID, surface)
+    }
+
+    func test_local_selection_has_no_peer_namespace() {
+        let workspace = UUID()
+        let surface = UUID()
+        let target = SelectionTarget.local(workspaceID: workspace, surfaceID: surface)
+
+        XCTAssertEqual(target.workspaceID, workspace)
+        XCTAssertEqual(target.surfaceID, surface)
+        XCTAssertNotEqual(target, .remote(RemoteRef(hostPeerID: "peer-a", workspaceID: workspace, surfaceID: surface)))
+    }
+
+    func test_leader_endpoint_round_trips_remote_host_without_a_pane_uuid() throws {
+        let endpoint = LeaderEndpoint.peer(hostKey: "peer-jw-server")
+        let decoded = try JSONDecoder().decode(
+            LeaderEndpoint.self,
+            from: JSONEncoder().encode(endpoint)
+        )
+
+        XCTAssertEqual(decoded, endpoint)
+        XCTAssertEqual(decoded.hostKey, "peer-jw-server")
+    }
+
+    func test_project_leader_defaults_to_local_for_legacy_callers() {
+        let leader = ProjectLeader(mode: "codex", model: "gpt-5")
+
+        XCTAssertEqual(leader.endpoint, .local)
+        XCTAssertNil(leader.endpoint.hostKey)
+    }
+
+    func test_remote_leader_stays_local_until_remote_attach_commits() {
+        XCTAssertEqual(
+            TeamOrchestrator.initialLeaderEndpoint(
+                forRequestedEndpoint: .peer(hostKey: "peer-jw-server")
+            ),
+            .local
+        )
+        XCTAssertEqual(
+            TeamOrchestrator.initialLeaderEndpoint(forRequestedEndpoint: .local),
+            .local
+        )
+    }
+
+    func test_direct_local_peer_endpoint_is_rejected_before_attach() {
+        let defaults = UserDefaults.standard
+        let old = defaults.object(forKey: PeerFederationSettings.socketPathKey)
+        defer {
+            if let old { defaults.set(old, forKey: PeerFederationSettings.socketPathKey) }
+            else { defaults.removeObject(forKey: PeerFederationSettings.socketPathKey) }
+        }
+        defaults.set("/tmp/term-mesh-test-peer.sock", forKey: PeerFederationSettings.socketPathKey)
+
+        XCTAssertTrue(PeerPaneHostSpec.direct(sockPath: "/tmp/./term-mesh-test-peer.sock").targetsLocalPeerServer)
+        XCTAssertFalse(PeerPaneHostSpec.direct(sockPath: "/tmp/other-peer.sock").targetsLocalPeerServer)
+        XCTAssertFalse(PeerPaneHostSpec.ssh(target: "peer", remoteSockPath: "/tmp/peer.sock", port: nil, identityFile: nil).targetsLocalPeerServer)
+    }
+
+    func test_remote_leader_launch_exports_route_to_final_cli_without_visible_grant_stage() {
+        var grant = Termmesh_Peer_V1_TeamLeaderGrant()
+        grant.grantID = Data(repeating: 0xab, count: 32)
+        grant.projectID = "name:demo"
+        grant.teamUuid = "team-uuid"
+        grant.expiresAtUnixSecs = 123
+
+        let prepare = TeamOrchestrator.remoteLeaderPrepareCommand()
+        let launch = TeamOrchestrator.remoteLeaderCommand(
+            cli: "codex",
+            model: "gpt-5",
+            teamName: "demo",
+            workingDirectory: "/srv/demo",
+            grant: grant
+        )
+
+        XCTAssertFalse(prepare.contains("abab"), "the visible preparation must contain no grant")
+        XCTAssertEqual(prepare, "unset HISTFILE; stty -echo")
+        XCTAssertTrue(launch.hasPrefix("export TERMMESH_LEADER_GRANT_ID="))
+        XCTAssertTrue(launch.contains("; exec /bin/sh -lc "))
+        XCTAssertTrue(launch.contains("codex --model gpt-5"))
     }
 }

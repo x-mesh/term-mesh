@@ -1020,6 +1020,7 @@ struct SidebarProjectsSection: View {
                             workingDirectory: directory,
                             leaderMode: leader.mode,
                             leaderModel: leader.model,
+                            leaderEndpoint: leader.endpoint,
                             tabManager: tabManager
                         )
                         guard team != nil else { return }

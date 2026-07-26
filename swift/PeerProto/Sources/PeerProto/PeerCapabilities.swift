@@ -24,6 +24,10 @@ public enum PeerCapability {
     /// `proto/peer/v1/peer.proto`'s "Workspace lifecycle" section).
     /// Mirrors `WORKSPACE_LIFECYCLE_V1` on the Rust side.
     public static let workspaceLifecycleV1 = "workspace.lifecycle.v1"
+    /// Complete workspace-roster snapshots pushed after a client subscribes.
+    /// This replaces sidebar process/socket polling while preserving a single
+    /// authoritative source for additions, removals, and layout metadata.
+    public static let workspaceListSubscribeV1 = "workspace.list.subscribe.v1"
     /// Deterministic daemon-owned surface reconciliation via
     /// `EnsureSurfaceRequest`/`EnsureSurfaceResponse`.
     public static let surfaceEnsureV1 = "surface.ensure.v1"
@@ -51,11 +55,15 @@ public enum PeerCapability {
     /// Advertised by the HOST. Unlike the roster, this CHANGES things, so
     /// the allow-list — not the capability — is what bounds it.
     public static let teamCallV1 = "team.call.v1"
+    /// Project-bound remote leader bootstrap with scoped, expiring grants.
+    /// This is separate from `team.call.v1` so its lifecycle exception cannot
+    /// widen that generic allow-list.
+    public static let teamLeaderV1 = "team.leader.v1"
 
     /// Every capability this build supports. Single source of truth for
     /// populating outgoing `Hello.capabilities` — don't hand-roll the list
     /// at each call site.
-    public static let supported: [String] = [ptyDataCoalesceV1, replayRingV1, workspaceLifecycleV1, surfaceEnsureV1, surfaceTerminateV1, hostStatsV1, gridSnapshotV1, teamRosterV1, teamCallV1]
+    public static let supported: [String] = [ptyDataCoalesceV1, replayRingV1, workspaceLifecycleV1, workspaceListSubscribeV1, surfaceEnsureV1, surfaceTerminateV1, hostStatsV1, gridSnapshotV1, teamRosterV1, teamCallV1, teamLeaderV1]
 }
 
 /// The other side's advertised feature flags, parsed once out of its

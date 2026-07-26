@@ -429,7 +429,7 @@ struct ContentView: View {
                     let isVisible = isSelectedWorkspace || isRetiringWorkspace
                     let portalPriority = isSelectedWorkspace ? 2 : (isRetiringWorkspace ? 1 : 0)
                     WorkspaceRetrievalChrome(workspace: tab) {
-                        WorkspaceContentView(
+                        SelectedWorkspaceContentView(
                             workspace: tab,
                             isWorkspaceVisible: isVisible,
                             isWorkspaceInputActive: isInputActive,
