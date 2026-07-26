@@ -335,6 +335,17 @@ extension ReviewBoardTask {
         "merged",
     ]
 
+    /// A local completion closes execution. When the coordinator has already
+    /// advanced that same work to review, its status is the newer phase.
+    ///
+    /// Keep this transition narrow: a stale coordinator `review_ready` must
+    /// never overwrite a local block or failure.
+    private static func mergedStatus(local: String, coordinator: String) -> String {
+        if coordinatorOnlyPhases.contains(coordinator) { return coordinator }
+        if local == "completed", coordinator == "review_ready" { return coordinator }
+        return local
+    }
+
     /// One row for one piece of work, now that both sides key on the same id.
     ///
     /// Neither side is simply right: agents move the task through execution,
@@ -346,7 +357,7 @@ extension ReviewBoardTask {
             id: rawID,
             teamName: teamName == "Unknown team" ? other.teamName : teamName,
             title: title.isEmpty ? other.title : title,
-            status: Self.coordinatorOnlyPhases.contains(other.status) ? other.status : status,
+            status: Self.mergedStatus(local: status, coordinator: other.status),
             // Where it runs is the coordinator's to say; who holds it is the
             // team's. Prefer the agent, because that is what a person looks for.
             assignee: assignee ?? other.assignee,

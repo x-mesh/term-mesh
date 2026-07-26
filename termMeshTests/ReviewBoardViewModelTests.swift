@@ -259,6 +259,23 @@ final class ReviewBoardTaskMergeTests: XCTestCase {
         XCTAssertEqual(merged.status, "in_progress")
     }
 
+    /// Completion ends execution locally; the coordinator's review phase is
+    /// the next state and must remain visible on the Review Board.
+    func testCoordinatorReviewReadyAdvancesACompletedTeamTask() {
+        let merged = team(status: "completed")
+            .merging(coordinator: coordinator(status: "review_ready"))
+        XCTAssertEqual(merged.status, "review_ready")
+    }
+
+    /// A stale coordinator update must not erase a local stop that still needs
+    /// attention.
+    func testCoordinatorReviewReadyDoesNotOverwriteALocalBlock() {
+        let merged = team(status: "blocked", blockedReason: "build failed")
+            .merging(coordinator: coordinator(status: "review_ready"))
+        XCTAssertEqual(merged.status, "blocked")
+        XCTAssertEqual(merged.blockedReason, "build failed")
+    }
+
     /// Review and merge are phases the team vocabulary cannot express, so
     /// when the coordinator reports one it is saying something new.
     func testMergePhaseComesFromTheCoordinator() {

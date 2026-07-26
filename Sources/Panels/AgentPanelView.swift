@@ -471,6 +471,11 @@ private struct TurnFooter: View {
                         .padding(.vertical, 1.5)
                         .background(verdictColor.opacity(0.18), in: Capsule())
                         .foregroundStyle(verdictColor)
+                        // A verdict is the state, not expendable metadata.
+                        // Keep it intact while the facts to its right truncate.
+                        .lineLimit(1)
+                        .fixedSize(horizontal: true, vertical: false)
+                        .layoutPriority(2)
                 }
                 // Stated by the agent, not inferred from the screen going
                 // quiet — the whole reason the pane path needed a timer here.
