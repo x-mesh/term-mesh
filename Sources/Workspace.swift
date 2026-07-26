@@ -1424,6 +1424,8 @@ final class Workspace: Identifiable, ObservableObject {
         agentName: String,
         teamName: String,
         workingDirectory: String,
+        cli: String = "claude",
+        color: String = "",
         focus: Bool = false
     ) -> AgentPanel? {
         guard let sourceTabId = surfaceIdFromPanelId(panelId) else { return nil }
@@ -1436,7 +1438,8 @@ final class Workspace: Identifiable, ObservableObject {
         guard let paneId = sourcePaneId else { return nil }
 
         let agentPanel = AgentPanel(agentName: agentName, teamName: teamName,
-                                    workingDirectory: workingDirectory)
+                                    workingDirectory: workingDirectory,
+                                    cli: cli, color: color)
         panels[agentPanel.id] = agentPanel
         panelTitles[agentPanel.id] = agentPanel.displayTitle
 

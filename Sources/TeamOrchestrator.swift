@@ -757,7 +757,9 @@ final class TeamOrchestrator: ObservableObject {
                insertFirst: insertFirst,
                agentName: agentName,
                teamName: teamName,
-               workingDirectory: agentWorkDir
+               workingDirectory: agentWorkDir,
+               cli: agentCli,
+               color: agentColor
            ) {
             if AgentPipeTransport.needsBridge(cli: agentCli),
                let bridge = AgentPipeTransport.bridgePath(workingDirectory: agentWorkDir) {
@@ -3187,6 +3189,13 @@ final class TeamOrchestrator: ObservableObject {
         for i in lines.indices {
             lines[i] = lines[i].replacingOccurrences(
                 of: "`tm-agent reply` body", with: "reply")
+            // The runbook prints the alternation too, and it is the same trap:
+            // codex read the bar as a field separator and packed the whole
+            // header onto one line. Correcting only the delegate template left
+            // the runbook still teaching it.
+            lines[i] = lines[i].replacingOccurrences(
+                of: "STATUS: DONE|BLOCKED|NEEDS_REVIEW",
+                with: "STATUS: <DONE, BLOCKED, or NEEDS_REVIEW>")
         }
 
         guard let start = lines.firstIndex(where: {

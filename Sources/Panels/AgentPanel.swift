@@ -17,6 +17,13 @@ final class AgentPanel: ObservableObject, Panel {
     let agentName: String
     let teamName: String
     let workingDirectory: String
+    /// Which CLI is behind this pane, and the colour the team assigned it.
+    ///
+    /// Five panes side by side are five identical grey headers otherwise. The
+    /// team already picks a colour per agent and the pane title already shows
+    /// it as an emoji; nothing was carrying either into the view.
+    let cli: String
+    let color: String
 
     @Published var title: String
     var displayTitle: String { title }
@@ -28,11 +35,14 @@ final class AgentPanel: ObservableObject, Panel {
     private var focusRequest: (() -> Void)?
 
     init(id: UUID = UUID(), agentName: String, teamName: String,
-         workingDirectory: String, title: String? = nil) {
+         workingDirectory: String, cli: String = "claude", color: String = "",
+         title: String? = nil) {
         self.id = id
         self.agentName = agentName
         self.teamName = teamName
         self.workingDirectory = workingDirectory
+        self.cli = cli
+        self.color = color
         self.title = title ?? agentName
         // A panel is an ObservableObject wrapping another one, so its own
         // changes have to be forwarded or the pane never redraws.

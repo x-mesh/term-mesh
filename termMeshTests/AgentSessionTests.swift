@@ -493,6 +493,22 @@ final class AgentSessionTests: XCTestCase {
         XCTAssertTrue(cleaned.contains("## Runbook Digest"))
     }
 
+    /// The runbook prints the alternation too, in its own fenced example.
+    /// Correcting only the delegate template left the runbook still teaching
+    /// the bar that codex read as a field separator.
+    func testTheRunbooksOwnAlternationIsSpelledOutToo() {
+        let digest = """
+            Begin every reply with this 5-line header:
+            ```
+            STATUS: DONE|BLOCKED|NEEDS_REVIEW
+            FILES: <changed paths or "none">
+            ```
+            """
+        let cleaned = TeamOrchestrator.withoutTerminalProtocol(digest)
+        XCTAssertFalse(cleaned.contains("DONE|BLOCKED"))
+        XCTAssertTrue(cleaned.contains("STATUS: <DONE, BLOCKED, or NEEDS_REVIEW>"))
+    }
+
     /// The CLI has three copies of this block and they do not agree word for
     /// word, so it is read by shape. This is the `broadcast` wording.
     func testEveryWordingOfTheBlockIsRecognised() {

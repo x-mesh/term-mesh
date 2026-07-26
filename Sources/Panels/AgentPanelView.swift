@@ -20,6 +20,20 @@ struct AgentPanelView: View {
 
     private var session: AgentSession { panel.session }
 
+    /// The colour the team assigned this agent, which the pane title already
+    /// shows as an emoji and the view was throwing away.
+    private var accent: Color {
+        switch panel.color {
+        case "green":   return .green
+        case "blue":    return .blue
+        case "yellow":  return .yellow
+        case "red":     return .red
+        case "cyan":    return .cyan
+        case "magenta": return .purple
+        default:        return .secondary
+        }
+    }
+
     var body: some View {
         VStack(spacing: 0) {
             header
@@ -38,19 +52,26 @@ struct AgentPanelView: View {
     // MARK: - Header
 
     private var header: some View {
-        HStack(spacing: 8) {
-            Circle()
-                .fill(session.isRunning ? Color.green : Color.secondary)
-                .frame(width: 7, height: 7)
-            Text(panel.agentName).font(.system(size: 12, weight: .semibold))
-            if let summary = session.summary {
+        HStack(spacing: 7) {
+            // The agent's own colour, as a rail rather than a dot: five panes
+            // side by side were five identical grey lines, and a 7pt dot is
+            // not something you pick a pane out by.
+            Capsule().fill(accent).frame(width: 3, height: 15)
+            Text(panel.agentName)
+                .font(.system(size: 13, weight: .bold))
+                .foregroundStyle(accent)
+            CliBadge(cli: panel.cli, accent: accent)
+            if let summary = session.summary, !summary.isEmpty {
                 Text(summary)
-                    .font(.system(size: 11))
+                    .font(.system(size: 10))
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
                     .truncationMode(.middle)
             }
             Spacer()
+            if !session.isRunning {
+                Text("stopped").font(.system(size: 10)).foregroundStyle(.secondary)
+            }
             // Two different facts, and the pane path could show neither: the
             // turn is open, and something is arriving right now. A turn can be
             // open and silent for a minute while a tool runs.
@@ -62,7 +83,60 @@ struct AgentPanelView: View {
             }
         }
         .padding(.horizontal, 10)
-        .padding(.vertical, 6)
+        .padding(.vertical, 7)
+        .background(accent.opacity(isFocused ? 0.12 : 0.05))
+    }
+
+    // MARK: - The banner
+
+    /// Said once, at the top, the way a CLI greets you when it starts.
+    ///
+    /// The header identifies the pane at a glance while scrolling; this says
+    /// the things worth reading exactly once — which CLI, which model, which
+    /// directory. Both exist because they answer different questions, and a
+    /// banner that scrolls away cannot answer the first one.
+    private var banner: some View {
+        HStack(alignment: .top, spacing: 10) {
+            Text(Self.mark(for: panel.cli))
+                .font(.system(size: 20, weight: .semibold, design: .monospaced))
+                .foregroundStyle(accent)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(panel.agentName)
+                    .font(.system(size: 15, weight: .bold))
+                    .foregroundStyle(accent)
+                Text(panel.cli.uppercased())
+                    .font(.system(size: 10, weight: .semibold).monospaced())
+                    .tracking(1.6)
+                    .foregroundStyle(.secondary)
+                if let summary = session.summary, !summary.isEmpty {
+                    Text(summary).font(.system(size: 10)).foregroundStyle(.secondary)
+                }
+                Text(panel.workingDirectory)
+                    .font(.system(size: 10).monospaced())
+                    .foregroundStyle(.tertiary)
+                    .lineLimit(1)
+                    .truncationMode(.head)
+            }
+            Spacer(minLength: 0)
+        }
+        .padding(10)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(accent.opacity(0.07), in: RoundedRectangle(cornerRadius: 8))
+        .overlay(RoundedRectangle(cornerRadius: 8).strokeBorder(accent.opacity(0.35)))
+    }
+
+    /// A mark per CLI. Letters, not invented logos — the complaint was not
+    /// being able to tell panes apart, and a symbol that has to be decoded
+    /// first is not an answer to that.
+    private static func mark(for cli: String) -> String {
+        switch cli {
+        case "claude": return "✳"
+        case "codex":  return "◇"
+        case "kiro":   return "◈"
+        case "cursor": return "▸"
+        case "agy":    return "◆"
+        default:       return "●"
+        }
     }
 
     // MARK: - Transcript
@@ -71,6 +145,7 @@ struct AgentPanelView: View {
         ScrollViewReader { proxy in
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 10) {
+                    banner
                     ForEach(session.entries) { entry in
                         row(entry).id(entry.id)
                     }
@@ -212,6 +287,22 @@ struct AgentPanelView: View {
             // exists to stop making.
             NSSound.beep()
         }
+    }
+}
+
+/// Which CLI is behind a pane, said rather than symbolised.
+private struct CliBadge: View {
+    let cli: String
+    let accent: Color
+
+    var body: some View {
+        Text(cli.uppercased())
+            .font(.system(size: 9, weight: .bold).monospaced())
+            .tracking(0.8)
+            .padding(.horizontal, 5)
+            .padding(.vertical, 1.5)
+            .background(accent.opacity(0.20), in: Capsule())
+            .foregroundStyle(accent)
     }
 }
 
