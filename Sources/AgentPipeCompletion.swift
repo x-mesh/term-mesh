@@ -29,7 +29,10 @@ final class AgentPipeCompletion {
         let agentName: String
         let path: String
         var offset: UInt64 = 0
-        var carry = ""
+        /// Bytes, for the same reason `AgentSession` keeps bytes: a read ends
+        /// where the kernel handed it over, which can be mid-character, and
+        /// decoding a partial chunk loses the whole thing.
+        var carry = Data()
         /// The task the last instruction carried, so its answer closes it and
         /// not whichever task happens to be first in the list.
         var pendingTaskId: String?
@@ -108,12 +111,16 @@ final class AgentPipeCompletion {
                 try handle.seek(toOffset: watch.offset)
                 guard let chunk = try handle.readToEnd(), !chunk.isEmpty else { continue }
                 watches[agentId]?.offset = watch.offset + UInt64(chunk.count)
-                let text = watch.carry + (String(data: chunk, encoding: .utf8) ?? "")
-                // A read can land mid-line; the tail waits for the rest rather
-                // than being parsed as a truncated object.
-                var lines = text.components(separatedBy: "\n")
-                watches[agentId]?.carry = lines.removeLast()
-                for line in lines { consume(line, agentId: agentId) }
+                var buffer = watch.carry
+                buffer.append(chunk)
+                while let newline = buffer.firstIndex(of: 0x0A) {
+                    let lineData = Data(buffer[buffer.startIndex..<newline])
+                    buffer = Data(buffer[buffer.index(after: newline)...])
+                    if let line = String(data: lineData, encoding: .utf8), !line.isEmpty {
+                        consume(line, agentId: agentId)
+                    }
+                }
+                watches[agentId]?.carry = buffer
             } catch {
                 continue
             }

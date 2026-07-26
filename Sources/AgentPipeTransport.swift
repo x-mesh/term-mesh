@@ -184,6 +184,7 @@ enum AgentPipeTransport {
         cli: String,
         fifoPath: String,
         model: String,
+        cliPath: String = "",
         bridgePath: String,
         rendererPath: String?,
         workingDirectory: String
@@ -194,6 +195,9 @@ enum AgentPipeTransport {
             + " --events \(quoted(fifoPath + ".events"))"
             + " --cwd \(quoted(workingDirectory))"
         if !model.isEmpty { run += " --model \(quoted(model))" }
+        // The binary Settings resolved. Without it the bridge finds whatever
+        // PATH offers, which is not necessarily the one the user chose.
+        if !cliPath.isEmpty { run += " --exe \(quoted(cliPath))" }
         let f = quoted(fifoPath)
         if let rendererPath {
             run += " 2>&1 | /usr/bin/env python3 \(quoted(rendererPath)) --fifo \(f)"
@@ -235,9 +239,16 @@ enum AgentPipeTransport {
         )
     }
 
+    /// Undo everything `markDriven` and the launch line set up.
+    ///
+    /// Nothing called this on detach or destroy, so an agent name kept its
+    /// `driven` mark after its pane was gone. Re-attach the same name with
+    /// Agent Panes switched back to Terminal and every send would still be
+    /// routed to a FIFO that no longer exists.
     static func discard(agentId: String) {
         forgetDriven(agentId: agentId)
         try? FileManager.default.removeItem(atPath: fifoPath(agentId: agentId))
+        try? FileManager.default.removeItem(atPath: fifoPath(agentId: agentId) + ".events")
     }
 
     // MARK: - Launching

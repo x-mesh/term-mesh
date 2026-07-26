@@ -701,7 +701,11 @@ final class TeamOrchestrator: ObservableObject {
             agentCommand = AgentPipeTransport.bridgeLaunchCommand(
                 cli: agentCli,
                 fifoPath: AgentPipeTransport.fifoPath(agentId: agentId),
-                model: agentModel,
+                // Same translation the native path does. A stored tier reaches
+                // codex as `--model sonnet`, which it accepts and then answers
+                // nothing at all — measured.
+                model: Self.bridgeModelArg(cli: agentCli, model: agentModel),
+                cliPath: cliPath,
                 bridgePath: bridge,
                 rendererPath: AgentPipeTransport.rendersOutput
                     ? AgentPipeTransport.rendererPath(workingDirectory: agentWorkDir)
@@ -808,6 +812,13 @@ final class TeamOrchestrator: ObservableObject {
             agentPanel.session.onTurnEnd = { [teamName, agentName] final, _, taskId in
                 Self.fileReport(teamName: teamName, agentName: agentName,
                                 taskId: taskId, text: final)
+                // A turn with no task behind it must not close somebody
+                // else's. Broadcasts and anything typed in the composer carry
+                // no `TASK_ID`, and `selectTask` would then guess — the newest
+                // open task — so answering a question could mark an unrelated
+                // assigned task completed. The report is still filed; only the
+                // board is left alone.
+                guard let taskId else { return }
                 AutoReplyEmit.emit(
                     teamName: teamName,
                     agentName: agentName,
@@ -1973,6 +1984,7 @@ final class TeamOrchestrator: ObservableObject {
         }
 
         let agent = team.agents[agentIndex]
+        Self.releaseTransport(agentId: agent.id)
 
         // D3-A P2 (b): release any pending claude-sid watcher slot so the
         // FSEventStream tears down promptly. Safe to call regardless of cli.
@@ -3303,6 +3315,18 @@ final class TeamOrchestrator: ObservableObject {
         return safe.isEmpty ? "unknown" : safe
     }
 
+    /// Let go of everything an agent's transport set up.
+    ///
+    /// `markDriven` had no counterpart: an agent name kept its pipe
+    /// registration after its pane was gone, so re-attaching the same name —
+    /// even with Agent Panes switched back to Terminal — routed every send to
+    /// a FIFO that no longer existed. The completion watcher and the FIFO
+    /// files leaked with it.
+    static func releaseTransport(agentId: String) {
+        AgentPipeTransport.discard(agentId: agentId)
+        AgentPipeCompletion.shared.forget(agentId: agentId)
+    }
+
     /// Whether a turn to this agent still needs a Return pressed after it.
     ///
     /// It never did for the agent's sake — the Return is there because the
@@ -4362,6 +4386,7 @@ final class TeamOrchestrator: ObservableObject {
 
         // D3-A P2 (b): release any pending claude-sid watcher slots so
         // FSEventStream(s) for this team's workdirs tear down promptly.
+        for agent in team.agents { Self.releaseTransport(agentId: agent.id) }
         for agent in team.agents where agent.cli == "claude" {
             let workDir = agent.worktreePath ?? agent.originalAgentWorkDir ?? team.workingDirectory
             ClaudeSessionWatcher.shared.unregisterPendingClaudePane(

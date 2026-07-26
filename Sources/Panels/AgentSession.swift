@@ -239,7 +239,19 @@ final class AgentSession: ObservableObject {
 
     private var process: Process?
     private var stdin: FileHandle?
-    private var carry = ""
+    /// Bytes, not a string.
+    ///
+    /// A pipe read ends wherever the kernel handed the buffer over, which can
+    /// be the middle of a multi-byte character. Decoding each chunk on arrival
+    /// and dropping it when that fails loses the whole chunk — for a Korean
+    /// answer that is most of a line, and if the line it lands in is `result`
+    /// the turn never ends at all. Split on newlines in the bytes; decode only
+    /// what is whole.
+    private var carry = Data()
+
+    /// A line that never arrives must not grow forever. Far above any real
+    /// event: a long tool result is tens of kilobytes.
+    private static let maxLineBytes = 8 * 1024 * 1024
     /// Tool calls waiting for their result, keyed by the id the events use.
     private var openTools: [String: Int] = [:]
     /// Assistant text for the turn in flight, so `result` can be trusted to
@@ -404,8 +416,30 @@ final class AgentSession: ObservableObject {
     private func finish(code: Int32) {
         isRunning = false
         isThinking = false
+        canInterrupt = false
+        streamOpen.removeAll()
+        streamingIds.removeAll()
         if code != 0 {
             append(.notice(id: UUID(), "the agent exited (\(code))"))
+        }
+        // A turn that was running when the process went is not going to end on
+        // its own, and its task would sit `in_progress` forever while every
+        // instruction behind it waited on a queue that will never drain.
+        if turnInFlight {
+            let end = TurnEnd(stop: "process_exited", failed: true, cost: nil,
+                              duration: nil, tokensIn: nil, tokensOut: nil)
+            append(.turnEnded(id: UUID(), end))
+            let answered = currentTaskId
+            currentTaskId = nil
+            turnInFlight = false
+            // No STATUS, so this reads as NEEDS_REVIEW rather than a success —
+            // nobody said it worked, and the agent is not there to say.
+            onTurnEnd?("the agent exited before finishing this turn", end, answered)
+        }
+        if !queued.isEmpty {
+            append(.notice(id: UUID(),
+                           "\(queued.count) queued instruction(s) were never delivered"))
+            queued.removeAll()
         }
     }
 
@@ -432,6 +466,15 @@ final class AgentSession: ObservableObject {
         return try write(text, from: speaker, taskId: Self.taskId(in: text))
     }
 
+    /// Whether a turn is running, whoever started it.
+    ///
+    /// This used to be set only for leader writes, so a person typing in the
+    /// composer left it false — and a task arriving during that turn was
+    /// written straight into the same stdin, taking `currentTaskId` with it.
+    /// The person's `result` would then close the leader's task, or the CLI
+    /// would merge the two and one completion would simply never arrive.
+    private var turnInFlight = false
+
     @discardableResult
     private func write(_ text: String, from speaker: Speaker, taskId: String?) throws -> Int {
         guard let stdin, isRunning else { throw SendError.notRunning }
@@ -440,10 +483,9 @@ final class AgentSession: ObservableObject {
         // Shown from the receipt (`isReplay`) rather than from here, so what is
         // drawn is what the agent confirmed receiving — not what was hoped for.
         pendingSpeaker = speaker
-        if speaker == .leader {
-            turnInFlight = true
-            currentTaskId = taskId
-        }
+        // Any write opens a turn. Only a leader's carries a task.
+        turnInFlight = true
+        if speaker == .leader { currentTaskId = taskId }
         isThinking = true
         return payload.count
     }
@@ -483,7 +525,6 @@ final class AgentSession: ObservableObject {
     /// and a person's message still goes straight in, joining the turn already
     /// running, which is what makes interrupting useful.
     private var queued: [(text: String, taskId: String?)] = []
-    private var turnInFlight = false
 
     static func encode(text: String) throws -> Data {
         var data = try JSONSerialization.data(withJSONObject: [
@@ -520,12 +561,19 @@ final class AgentSession: ObservableObject {
     // MARK: - Reading the stream
 
     private func consume(_ data: Data) {
-        // A read can land mid-line, so the tail waits for the rest rather than
-        // being parsed as a truncated object.
-        let text = carry + (String(data: data, encoding: .utf8) ?? "")
-        var lines = text.components(separatedBy: "\n")
-        carry = lines.removeLast()
-        for line in lines where !line.isEmpty { handle(line) }
+        carry.append(data)
+        while let newline = carry.firstIndex(of: 0x0A) {
+            let line = Data(carry[carry.startIndex..<newline])
+            carry = Data(carry[carry.index(after: newline)...])
+            guard !line.isEmpty, let text = String(data: line, encoding: .utf8),
+                  !text.isEmpty
+            else { continue }
+            handle(text)
+        }
+        if carry.count > Self.maxLineBytes {
+            append(.notice(id: UUID(), "dropped an unterminated line of \(carry.count) bytes"))
+            carry.removeAll()
+        }
     }
 
     private func handle(_ line: String) {
@@ -806,5 +854,24 @@ final class AgentSession: ObservableObject {
         turnInFlight = true
         currentTaskId = taskId
     }
+
+    /// A turn opened by either speaker, without a process.
+    func openTurnForTesting(from speaker: Speaker, taskId: String? = nil) {
+        pendingSpeaker = speaker
+        turnInFlight = true
+        isThinking = true
+        if speaker == .leader { currentTaskId = taskId }
+    }
+
+    /// A leader instruction arriving while a turn is already running.
+    func queueForTesting(_ text: String) {
+        queued.append((text, Self.taskId(in: text)))
+    }
+
+    /// Bytes as the reader would hand them over, boundaries and all.
+    func consumeForTesting(_ data: Data) { consume(data) }
+
+    /// The process going away.
+    func finishForTesting(code: Int32) { finish(code: code) }
     #endif
 }

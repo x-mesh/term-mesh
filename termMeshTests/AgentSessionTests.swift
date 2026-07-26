@@ -400,6 +400,96 @@ final class AgentSessionTests: XCTestCase {
         XCTAssertFalse(read.hasMore)
     }
 
+    // MARK: - What the review found
+
+    /// A pipe read ends wherever the kernel handed the buffer over, which can
+    /// be the middle of a multi-byte character. Decoding each chunk on arrival
+    /// and dropping it when that fails loses the whole chunk — and if the line
+    /// it lands in is `result`, the turn never ends at all.
+    func testALineSplitMidCharacterStillArrivesWhole() throws {
+        var ended: [String] = []
+        let s = AgentSession()
+        s.onTurnEnd = { text, _, _ in ended.append(text) }
+        let line = event(["type": "result", "stop_reason": "end_turn",
+                          "result": "감귤류 재배의 역사는 길다"])
+        var bytes = Array(Data((line + "\n").utf8))
+        // Cut inside the first Korean character.
+        let cut = bytes.firstIndex(of: 0xEA) ?? (bytes.count / 2)
+        let head = Data(bytes[..<(cut + 1)])
+        let tail = Data(bytes[(cut + 1)...])
+        s.consumeForTesting(head)
+        XCTAssertTrue(ended.isEmpty, "half a character is not a line")
+        s.consumeForTesting(tail)
+        XCTAssertEqual(ended, ["감귤류 재배의 역사는 길다"])
+    }
+
+    /// Several lines in one read, and a trailing partial that waits.
+    func testWholeLinesArriveEvenWhenTheLastOneIsPartial() {
+        let s = AgentSession()
+        let a = event(["type": "assistant", "message": ["content": [["type": "text", "text": "one"]]]])
+        let b = event(["type": "assistant", "message": ["content": [["type": "text", "text": "two"]]]])
+        s.consumeForTesting(Data((a + "\n" + b + "\n" + "{\"partial").utf8))
+        XCTAssertEqual(s.entries.count, 2)
+    }
+
+    /// A person typing in the composer opens a turn too. This used to be set
+    /// only for leader writes, so a task arriving during a person's turn went
+    /// straight into the same stdin and took `currentTaskId` with it — the
+    /// person's result would then close the leader's task.
+    func testALeaderTaskWaitsBehindAPersonsTurn() throws {
+        var answered: [String?] = []
+        let s = AgentSession()
+        s.onTurnEnd = { _, _, task in answered.append(task) }
+        s.openTurnForTesting(from: .person)
+        s.queueForTesting("TASK_ID: abc12345\ndo the thing")
+
+        // The person's turn ends first, and it answers no task.
+        s.ingestForTesting(event(["type": "result", "result": "person answer"]))
+        XCTAssertEqual(answered, [nil], "a person's turn carries no task")
+    }
+
+    /// If the process dies mid-turn its task would sit `in_progress` forever
+    /// and everything queued behind it would never be delivered.
+    func testAProcessThatDiesMidTurnEndsTheTurn() {
+        var reported: [(String, String?)] = []
+        let s = AgentSession()
+        s.onTurnEnd = { text, _, task in reported.append((text, task)) }
+        s.openTurnForTesting(from: .leader, taskId: "e82188a0")
+        s.finishForTesting(code: 1)
+
+        XCTAssertEqual(reported.count, 1)
+        XCTAssertEqual(reported.first?.1, "e82188a0")
+        // No STATUS in that text, so it reads as NEEDS_REVIEW rather than a
+        // success: nobody said it worked and the agent is not there to say.
+        XCTAssertEqual(AgentPipeCompletion.headerEvent(from: reported.first!.0).status,
+                       "NEEDS_REVIEW")
+    }
+
+    /// The bridge command the terminal path builds had neither.
+    func testTheTerminalBridgeCarriesTheModelAndThePath() {
+        let cmd = AgentPipeTransport.bridgeLaunchCommand(
+            cli: "codex", fifoPath: "/tmp/p/x.stdin",
+            model: TeamOrchestrator.bridgeModelArg(cli: "codex", model: "sonnet"),
+            cliPath: "/opt/homebrew/bin/codex",
+            bridgePath: "/repo/bridge.py", rendererPath: nil,
+            workingDirectory: "/tmp")
+        XCTAssertTrue(cmd.contains("gpt-5.5"), "a tier is not a model codex knows")
+        XCTAssertFalse(cmd.contains("sonnet"))
+        XCTAssertTrue(cmd.contains("--exe"))
+        XCTAssertTrue(cmd.contains("/opt/homebrew/bin/codex"))
+    }
+
+    /// `markDriven` had no counterpart, so a name kept its pipe registration
+    /// after its pane was gone and a later terminal-hosted agent of the same
+    /// name had every send routed to a FIFO that no longer existed.
+    func testReleasingAnAgentUndoesItsRegistration() {
+        let id = "reviewer@release-test"
+        AgentPipeTransport.markDriven(agentId: id)
+        XCTAssertTrue(AgentPipeTransport.isDriven(agentId: id))
+        TeamOrchestrator.releaseTransport(agentId: id)
+        XCTAssertFalse(AgentPipeTransport.isDriven(agentId: id))
+    }
+
     // MARK: - A turn is one thing
 
     private var say: AgentSession.Entry { .said(id: UUID(), .leader, "do it") }
