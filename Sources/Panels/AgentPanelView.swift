@@ -358,10 +358,7 @@ private struct Instruction: View {
                         .foregroundStyle(.tint)
                 }
             }
-            Text(expanded ? read.full : read.headline)
-                .font(.system(size: 12))
-                .textSelection(.enabled)
-                .fixedSize(horizontal: false, vertical: true)
+            MarkdownText(text: expanded ? read.full : read.headline)
         }
         .padding(8)
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -481,13 +478,96 @@ private struct Answer: View {
     let streaming: Bool
 
     var body: some View {
-        Text(text)
-            .font(.system(size: 12))
-            .textSelection(.enabled)
-            .fixedSize(horizontal: false, vertical: true)
+        MarkdownText(text: text, streaming: streaming)
             .overlay(alignment: .bottomTrailing) {
                 if streaming { Caret().alignmentGuide(.bottom) { $0[.bottom] } }
             }
+    }
+}
+
+/// Markdown, kept quiet.
+///
+/// Agents write markdown whether or not anything renders it, so the pane was
+/// showing `**bold**` and `## Heading` as literal characters. A full renderer
+/// is the wrong answer for a dense product surface: headings blown up to
+/// display sizes turn a five-line answer into a poster. So a heading carries
+/// weight, not size. Code is the exception, because a fenced block is the one
+/// thing in an answer you read character by character.
+struct MarkdownText: View {
+    let text: String
+    var streaming: Bool = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            ForEach(Array(AgentMarkdown.blocks(text).enumerated()), id: \.offset) { _, block in
+                switch block {
+                case .paragraph(let body):
+                    inline(body)
+                case .heading(let level, let title):
+                    // Weight, not size: 13/12.5/12 against a 12pt body. A
+                    // heading should be findable when you scan, not loud when
+                    // you read.
+                    inline(title)
+                        .font(.system(size: level == 1 ? 13 : (level == 2 ? 12.5 : 12),
+                                      weight: level <= 2 ? .bold : .semibold))
+                        .padding(.top, 2)
+                case .bullet(let marker, let body):
+                    HStack(alignment: .firstTextBaseline, spacing: 6) {
+                        Text(marker)
+                            .font(.system(size: 11).monospacedDigit())
+                            .foregroundStyle(.secondary)
+                        inline(body)
+                    }
+                case .quote(let body):
+                    HStack(alignment: .top, spacing: 8) {
+                        Rectangle().fill(.quaternary).frame(width: 2)
+                        inline(body).foregroundStyle(.secondary)
+                    }
+                case .code(let language, let body):
+                    CodeBlock(language: language, code: body)
+                case .rule:
+                    Rectangle().fill(.quaternary).frame(height: 1).padding(.vertical, 2)
+                }
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    /// Inline emphasis resolves once the row stops streaming. Half-written
+    /// emphasis is unparseable by definition, and parsing it on each of a few
+    /// hundred deltas costs more than it returns.
+    private func inline(_ body: String) -> Text {
+        streaming ? Text(body).font(.system(size: 12))
+                  : Text(AgentMarkdown.inline(body)).font(.system(size: 12))
+    }
+}
+
+/// A fenced block: monospaced, scrollable, and coloured enough to scan.
+private struct CodeBlock: View {
+    let language: String?
+    let code: String
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            if let language, !language.isEmpty {
+                Text(language)
+                    .font(.system(size: 9, weight: .medium).monospaced())
+                    .foregroundStyle(.tertiary)
+                    .padding(.horizontal, 8)
+                    .padding(.top, 5)
+            }
+            // Horizontal scrolling rather than wrapping: a wrapped command line
+            // is a line you cannot copy correctly by eye.
+            ScrollView(.horizontal, showsIndicators: false) {
+                Text(AgentMarkdown.highlighted(code, language: language))
+                    .font(.system(size: 11, design: .monospaced))
+                    .textSelection(.enabled)
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 6)
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Color.primary.opacity(0.06), in: RoundedRectangle(cornerRadius: 6))
     }
 }
 

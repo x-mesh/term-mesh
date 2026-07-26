@@ -400,6 +400,93 @@ final class AgentSessionTests: XCTestCase {
         XCTAssertFalse(read.hasMore)
     }
 
+    // MARK: - Markdown
+
+    /// The pane was showing `## Heading` and `**bold**` as literal characters,
+    /// because agents write markdown whether or not anything renders it.
+    func testBlocksComeApartTheWayTheyWereWritten() {
+        let blocks = AgentMarkdown.blocks("""
+            ## What I found
+
+            The parser lives in `Foo.swift`.
+
+            - first
+            - second
+            1. step one
+
+            ```swift
+            let x = 1
+            ```
+            """)
+        guard case .heading(let level, let title) = blocks[0] else {
+            return XCTFail("expected a heading, got \(blocks[0])")
+        }
+        XCTAssertEqual(level, 2)
+        XCTAssertEqual(title, "What I found")
+        XCTAssertEqual(blocks.count, 6)
+        guard case .bullet(let marker, _) = blocks[2] else { return XCTFail("expected a bullet") }
+        XCTAssertEqual(marker, "•")
+        // An agent quoting "step 3" means 3, so the number it wrote survives.
+        guard case .bullet(let ordinal, _) = blocks[4] else { return XCTFail("expected an ordinal") }
+        XCTAssertEqual(ordinal, "1.")
+        guard case .code(let language, let body) = blocks[5] else { return XCTFail("expected code") }
+        XCTAssertEqual(language, "swift")
+        XCTAssertEqual(body, "let x = 1")
+    }
+
+    /// While a turn streams the closing fence has not arrived. Treating the
+    /// opening line as a paragraph until it does makes the block flicker into
+    /// existence.
+    func testAnUnclosedFenceIsAlreadyCode() {
+        let blocks = AgentMarkdown.blocks(#"here:\#n```json\#n{\#n  "a": 1"#)
+        guard case .code(let language, let body) = blocks.last else {
+            return XCTFail("expected code, got \(String(describing: blocks.last))")
+        }
+        XCTAssertEqual(language, "json")
+        XCTAssertTrue(body.contains("\"a\""))
+    }
+
+    /// `#hashtag` and `#!/bin/sh` are not headings.
+    func testAHashWithoutASpaceIsNotAHeading() {
+        guard case .paragraph = AgentMarkdown.blocks("#!/bin/sh")[0] else {
+            return XCTFail("expected a paragraph")
+        }
+    }
+
+    /// In JSON the interesting strings are the keys, and a key is a string
+    /// with a colon after it.
+    func testJsonKeysReadDifferentlyFromValues() {
+        let tokens = AgentMarkdown.tokenize("{\"name\": \"term-mesh\", \"n\": 42}",
+                                            language: "json")
+        XCTAssertTrue(tokens.contains { $0.0 == "\"name\"" && $0.1 == .key })
+        XCTAssertTrue(tokens.contains { $0.0 == "\"term-mesh\"" && $0.1 == .string })
+        XCTAssertTrue(tokens.contains { $0.0 == "42" && $0.1 == .number })
+    }
+
+    func testCommentsAndKeywordsAreFound() {
+        let tokens = AgentMarkdown.tokenize("// note\nlet x = 1", language: "swift")
+        XCTAssertTrue(tokens.contains { $0.0 == "// note" && $0.1 == .comment })
+        XCTAssertTrue(tokens.contains { $0.0 == "let" && $0.1 == .keyword })
+    }
+
+    /// Guessing keywords for an unknown language colours the wrong words,
+    /// which is worse than colouring none.
+    func testAnUnknownLanguageGetsNoInventedKeywords() {
+        let tokens = AgentMarkdown.tokenize("let x = \"hi\"", language: "brainfuck")
+        XCTAssertFalse(tokens.contains { $0.1 == .keyword })
+        XCTAssertTrue(tokens.contains { $0.0 == "\"hi\"" && $0.1 == .string })
+    }
+
+    /// Nothing may be dropped: highlighting is colour over the same characters.
+    func testTokenizingLosesNothing() {
+        for (code, lang) in [("let a = 1 // x", "swift"),
+                             ("{\"k\": [1, 2]}", "json"),
+                             ("echo $HOME # hi", "bash")] {
+            let joined = AgentMarkdown.tokenize(code, language: lang).map(\.0).joined()
+            XCTAssertEqual(joined, code, lang)
+        }
+    }
+
     // MARK: - Following the bottom
 
     /// A view that follows the bottom cannot key on `entries.count`.
