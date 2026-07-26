@@ -1758,7 +1758,9 @@ struct TeamCreationView: View {
         } else {
             displayPreset = preset
         }
-        let resolved = displayPreset.resolve(with: providerDetector)
+        let resolved = displayPreset.usesExactResolution
+            ? displayPreset.resolveExactly()
+            : displayPreset.resolve(with: providerDetector)
         let bestCount = resolved.filter { $0.status == .best }.count
         let fbCount = resolved.filter { if case .fallback = $0.status { return true }; return false }.count
         let isSelected = selectedSmartPresetId == preset.id
@@ -1864,7 +1866,12 @@ struct TeamCreationView: View {
         .frame(maxWidth: .infinity, alignment: .leading)
         .contentShape(Rectangle())
         .onTapGesture {
-            if !isEditingName { applySmartPreset(displayPreset) }
+            if !isEditingName {
+                applySmartPreset(
+                    displayPreset,
+                    resolveProviders: !displayPreset.usesExactResolution
+                )
+            }
         }
         .onHover { hovered in
             hoveredSmartPresetId = hovered ? preset.id : (hoveredSmartPresetId == preset.id ? nil : hoveredSmartPresetId)
@@ -2150,7 +2157,7 @@ struct TeamCreationView: View {
             : template.payload
         switch payload {
         case .smart(let preset):
-            applySmartPreset(preset, resolveProviders: template.origin == .builtIn)
+            applySmartPreset(preset, resolveProviders: !preset.usesExactResolution)
         case .workflow(let preset):
             applyWorkflowPreset(preset)
         case .quick(let preset):

@@ -1634,6 +1634,7 @@ class TeamTemplateManager: ObservableObject {
             description: "\(agents.count) agent\(agents.count == 1 ? "" : "s")",
             leaderMode: leaderMode,
             leaderModel: leaderModel,
+            resolutionMode: .exact,
             agents: agents
         )
         store.customs.append(TeamTemplate(
@@ -1675,6 +1676,7 @@ class TeamTemplateManager: ObservableObject {
 
     func renameCustom(id: TemplateID, name: String) throws {
         let displayName = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !displayName.isEmpty else { return }
         try updateCustom(id: id) { template in
             template.name = displayName
             if case .smart(var preset) = template.payload {
@@ -2048,6 +2050,11 @@ struct ProviderPreference: Codable, Equatable {
     var customInstructions: String? = nil
 }
 
+enum SmartPresetResolutionMode: String, Codable {
+    case smart
+    case exact
+}
+
 /// Resolved agent slot after provider detection.
 struct ResolvedAgent {
     let role: String
@@ -2073,14 +2080,20 @@ struct SmartTeamPreset: Identifiable, Codable, Equatable {
     var leaderMode: String
     /// The leader model was not part of schema 1. nil means the CLI default.
     var leaderModel: String? = nil
+    /// Legacy presets and customized built-ins omit this and retain provider
+    /// fallback behavior. New Project snapshots opt into exact restoration.
+    var resolutionMode: SmartPresetResolutionMode? = nil
     var agents: [ProviderPreference]
 
-    /// Restore a user-authored snapshot without provider substitution.
+    var usesExactResolution: Bool {
+        resolutionMode == .exact
+    }
+
+    /// Restore an exact snapshot without provider substitution.
     ///
-    /// Custom presets are exact configurations. If a selected CLI is missing,
-    /// the form should still show what was saved so the user can install it or
-    /// edit it; silently changing CLI while retaining that CLI's model creates
-    /// an invalid pair and makes Save/Load lossy.
+    /// If a selected CLI is missing, the form still shows what was saved so the
+    /// user can install it or edit it. Provider-aware presets continue to use
+    /// `resolve(with:)`.
     func resolveExactly() -> [ResolvedAgent] {
         agents.map { pref in
             ResolvedAgent(

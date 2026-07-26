@@ -351,7 +351,8 @@ struct TeamAgentComposer: View {
                         }
                     }
                     .frame(width: 150)
-                    if agents[index].hostKey != nil {
+                    if agents[index].hostKey != nil
+                        && !(supportsDefaultPlacement && inheritedAgentIDs.contains(agent.id)) {
                         TextField("/path/on/that/machine", text: Binding(
                             get: { agents[index].hostDirectory },
                             set: {

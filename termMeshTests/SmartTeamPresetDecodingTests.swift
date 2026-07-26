@@ -62,6 +62,8 @@ final class SmartTeamPresetDecodingTests: XCTestCase {
 
         XCTAssertEqual(preset.id, "standard")
         XCTAssertNil(preset.leaderModel)
+        XCTAssertNil(preset.resolutionMode)
+        XCTAssertFalse(preset.usesExactResolution)
         XCTAssertEqual(preset.agents.count, 2)
         XCTAssertTrue(preset.agents.allSatisfy { $0.primaryModel == nil && $0.fallbackModel == nil })
         XCTAssertTrue(preset.agents.allSatisfy { $0.customInstructions == nil })
@@ -127,6 +129,7 @@ final class SmartTeamPresetDecodingTests: XCTestCase {
             description: "Architecture team",
             leaderMode: "codex",
             leaderModel: "gpt-5.5",
+            resolutionMode: .exact,
             agents: [
                 ProviderPreference(
                     role: "architect",
@@ -147,6 +150,8 @@ final class SmartTeamPresetDecodingTests: XCTestCase {
 
         XCTAssertEqual(decoded, preset)
         XCTAssertEqual(decoded.leaderModel, "gpt-5.5")
+        XCTAssertEqual(decoded.resolutionMode, .exact)
+        XCTAssertTrue(decoded.usesExactResolution)
         XCTAssertEqual(
             decoded.resolve(with: ProviderDetector()).first?.customInstructions,
             "Own the ADR."
@@ -316,8 +321,14 @@ final class SmartTeamPresetDecodingTests: XCTestCase {
 
         XCTAssertEqual(reloaded.lastSelectedId, id)
         XCTAssertEqual(preset.leaderModel, "gpt-5.5")
+        XCTAssertEqual(preset.resolutionMode, .exact)
+        XCTAssertTrue(preset.usesExactResolution)
         XCTAssertEqual(preset.agents, preferences)
         XCTAssertEqual(preset.agents.map(\.role), ["architect", "tester"])
+        let exactAgents = preset.resolveExactly()
+        XCTAssertEqual(exactAgents.map(\.role), ["architect", "tester"])
+        XCTAssertEqual(exactAgents.map(\.cli), ["claude", "codex"])
+        XCTAssertEqual(exactAgents.map(\.model), ["opus", "sonnet"])
 
         let raw = String(decoding: try Data(contentsOf: fileURL), as: UTF8.self)
         XCTAssertFalse(raw.contains("hostKey"))
@@ -344,5 +355,8 @@ final class SmartTeamPresetDecodingTests: XCTestCase {
             return XCTFail("expected smart preset")
         }
         XCTAssertEqual(preset.name, "After")
+
+        try manager.renameCustom(id: id, name: "   ")
+        XCTAssertEqual(manager.template(for: id)?.name, "After")
     }
 }

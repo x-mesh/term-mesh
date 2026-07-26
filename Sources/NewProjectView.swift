@@ -742,7 +742,7 @@ struct NewProjectView: View {
                 : AgentRolePreset.defaultModel(for: leaderCli)
         }
 
-        let resolvedAgents = template.origin == .custom
+        let resolvedAgents = preset.usesExactResolution
             ? preset.resolveExactly()
             : preset.resolve(with: providerDetector)
         let rows = resolvedAgents.compactMap { resolved -> TeamAgentRow? in
@@ -896,6 +896,7 @@ private struct TeamPresetManagementRow: View {
     let onTogglePin: () -> Void
     let onDelete: (() -> Void)?
     @State private var name: String
+    @FocusState private var isNameFocused: Bool
 
     init(
         template: TeamTemplate,
@@ -917,7 +918,11 @@ private struct TeamPresetManagementRow: View {
             if template.origin == .custom {
                 TextField("Preset name", text: $name)
                     .textFieldStyle(.roundedBorder)
-                    .onSubmit { onRename(name) }
+                    .focused($isNameFocused)
+                    .onSubmit { commitRename() }
+                    .onChange(of: isNameFocused) { _, focused in
+                        if !focused { commitRename() }
+                    }
             } else {
                 Text(template.name)
                 Text("Built-in")
@@ -935,6 +940,20 @@ private struct TeamPresetManagementRow: View {
                 }
                 .buttonStyle(.borderless)
             }
+        }
+        .onDisappear { commitRename() }
+    }
+
+    private func commitRename() {
+        guard template.origin == .custom else { return }
+        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else {
+            name = template.name
+            return
+        }
+        name = trimmed
+        if trimmed != template.name {
+            onRename(trimmed)
         }
     }
 }
