@@ -2042,16 +2042,29 @@ struct RemoteHostGroupView: View {
            let profile = PeerHostProfileStore.shared.profile(id: profileID) {
             Divider()
             Button("Edit…") {
-                onEdit(PeerHostEditorContext(profile: profile, isNew: false))
+                Task { @MainActor in
+                    // Let AppKit finish its nested context-menu event loop
+                    // before presenting a SwiftUI sheet. Presenting inline
+                    // re-enters AttributeGraph while the menu is still
+                    // tracking and can spin the main thread indefinitely.
+                    try? await Task.sleep(nanoseconds: 50_000_000)
+                    onEdit(PeerHostEditorContext(profile: profile, isNew: false))
+                }
             }
             Button("Delete…", role: .destructive) {
-                showDeleteConfirm = true
+                Task { @MainActor in
+                    try? await Task.sleep(nanoseconds: 50_000_000)
+                    showDeleteConfirm = true
+                }
             }
         } else if let draft = store.profileDraft(for: host) {
             // Ad-hoc SSH connection → offer promotion to a saved host.
             Divider()
             Button("Save as Host…") {
-                onEdit(PeerHostEditorContext(profile: draft, isNew: true))
+                Task { @MainActor in
+                    try? await Task.sleep(nanoseconds: 50_000_000)
+                    onEdit(PeerHostEditorContext(profile: draft, isNew: true))
+                }
             }
         }
     }
@@ -2271,15 +2284,21 @@ struct RemoteHostGroupView: View {
                     store.openSurfaceAsPane(host)
                 }
                 Button("New Workspace…") {
-                    newWorkspaceTitle = ""
-                    showNewWorkspaceAlert = true
+                    Task { @MainActor in
+                        try? await Task.sleep(nanoseconds: 50_000_000)
+                        newWorkspaceTitle = ""
+                        showNewWorkspaceAlert = true
+                    }
                 }
                 .disabled(host.supportsWorkspaceLifecycle != true)
                 if store.hasSidebarLease(for: host.id) {
                     Button("Disconnect") { store.disconnectSavedHost(host) }
                 }
                 Button("Force Disconnect (Close All Panes)…") {
-                    showForceDisconnectConfirm = true
+                    Task { @MainActor in
+                        try? await Task.sleep(nanoseconds: 50_000_000)
+                        showForceDisconnectConfirm = true
+                    }
                 }
             case .connecting:
                 Button("Cancel Connection") { store.cancelConnectingHost(host) }
