@@ -610,6 +610,20 @@ final class AgentSessionTests: XCTestCase {
         }
     }
 
+    func testTableBecomesOneQuietStructuredBlock() {
+        let blocks = AgentMarkdown.blocks("""
+            | Host | Status |
+            | --- | --- |
+            | Mac | Ready |
+            | Linux | Offline |
+            """)
+        guard case .table(let headers, let rows) = try? XCTUnwrap(blocks.first) else {
+            return XCTFail("expected a table")
+        }
+        XCTAssertEqual(headers, ["Host", "Status"])
+        XCTAssertEqual(rows, [["Mac", "Ready"], ["Linux", "Offline"]])
+    }
+
     /// In JSON the interesting strings are the keys, and a key is a string
     /// with a colon after it.
     func testJsonKeysReadDifferentlyFromValues() {

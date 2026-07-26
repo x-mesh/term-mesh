@@ -738,6 +738,8 @@ struct MarkdownText: View {
                     }
                 case .code(let language, let body):
                     CodeBlock(language: language, code: body)
+                case .table(let headers, let rows):
+                    MarkdownTable(headers: headers, rows: rows, streaming: streaming)
                 case .rule:
                     Rectangle().fill(.quaternary).frame(height: 1).padding(.vertical, 2)
                 }
@@ -752,6 +754,43 @@ struct MarkdownText: View {
     private func inline(_ body: String) -> Text {
         streaming ? Text(body).font(.system(size: 12))
                   : Text(AgentMarkdown.inline(body)).font(.system(size: 12))
+    }
+}
+
+/// A small report table, not a spreadsheet: the header has just enough weight
+/// to orient a scan, and wide tables scroll instead of squeezing words into a
+/// pile of ellipses.
+private struct MarkdownTable: View {
+    let headers: [String]
+    let rows: [[String]]
+    let streaming: Bool
+
+    var body: some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            Grid(alignment: .leading, horizontalSpacing: 14, verticalSpacing: 5) {
+                GridRow {
+                    ForEach(Array(headers.enumerated()), id: \.offset) { _, header in
+                        cell(header)
+                            .font(.system(size: 11.5, weight: .semibold))
+                            .foregroundStyle(.secondary)
+                    }
+                }
+                Divider().gridCellColumns(headers.count)
+                ForEach(Array(rows.enumerated()), id: \.offset) { _, row in
+                    GridRow {
+                        ForEach(Array(headers.indices), id: \.self) { index in
+                            cell(index < row.count ? row[index] : "")
+                        }
+                    }
+                }
+            }
+            .padding(.vertical, 2)
+        }
+    }
+
+    private func cell(_ text: String) -> Text {
+        streaming ? Text(text).font(.system(size: 12))
+                  : Text(AgentMarkdown.inline(text)).font(.system(size: 12))
     }
 }
 

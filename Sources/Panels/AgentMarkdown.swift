@@ -21,6 +21,7 @@ enum AgentMarkdown {
         case bullet(marker: String, text: String)
         case quote(String)
         case code(language: String?, text: String)
+        case table(headers: [String], rows: [[String]])
         case rule
 
         var id: Int {
@@ -30,6 +31,7 @@ enum AgentMarkdown {
             case .bullet(let m, let s): return m.hashValue &+ s.hashValue
             case .quote(let s): return ~s.hashValue
             case .code(let l, let s): return (l ?? "").hashValue &+ s.hashValue
+            case .table(let headers, let rows): return headers.hashValue &+ rows.hashValue
             case .rule: return 0
             }
         }
@@ -69,6 +71,20 @@ enum AgentMarkdown {
                 }
                 out.append(.code(language: language.isEmpty ? nil : language,
                                  text: body.joined(separator: "\n")))
+                continue
+            }
+
+            if let divider = lines.first,
+               let headers = tableCells(raw),
+               isTableDivider(divider) {
+                flushParagraph()
+                lines = lines.dropFirst()
+                var rows: [[String]] = []
+                while let row = lines.first, let cells = tableCells(row) {
+                    rows.append(cells)
+                    lines = lines.dropFirst()
+                }
+                out.append(.table(headers: headers, rows: rows))
                 continue
             }
 
@@ -117,6 +133,27 @@ enum AgentMarkdown {
             return (digits + ".", String(line.dropFirst(digits.count + 2)))
         }
         return nil
+    }
+
+    /// GitHub-style tables are useful for compact status reports. Keep this
+    /// deliberately narrow: a header plus a divider is a table; pipe-shaped
+    /// prose is still prose.
+    private static func tableCells(_ line: String) -> [String]? {
+        let trimmed = line.trimmingCharacters(in: .whitespaces)
+        guard trimmed.contains("|") else { return nil }
+        let body = trimmed
+            .trimmingCharacters(in: CharacterSet(charactersIn: "|"))
+        let cells = body.split(separator: "|", omittingEmptySubsequences: false)
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+        return cells.count >= 2 && cells.allSatisfy { !$0.isEmpty } ? cells : nil
+    }
+
+    private static func isTableDivider(_ line: String) -> Bool {
+        guard let cells = tableCells(line) else { return false }
+        return cells.allSatisfy { cell in
+            let trimmed = cell.trimmingCharacters(in: CharacterSet(charactersIn: ":"))
+            return trimmed.count >= 3 && trimmed.allSatisfy { $0 == "-" }
+        }
     }
 
     // MARK: - Inline
