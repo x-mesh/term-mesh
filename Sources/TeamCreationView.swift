@@ -2350,7 +2350,7 @@ struct TeamCreationView: View {
                 fallbackCli: row.preset.cli,
                 fallbackModel: row.preset.model,
                 reason: "Inline edit",
-                customInstructions: row.customInstructions.nonEmpty
+                customInstructions: row.customInstructions.isEmpty ? nil : row.customInstructions
             )
         }
     }

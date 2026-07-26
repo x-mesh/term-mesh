@@ -107,6 +107,7 @@ final class PeerProjectBootstrapTests: XCTestCase {
         XCTAssertNil(leader.endpoint.hostKey)
     }
 
+    @MainActor
     func test_remote_leader_stays_local_until_remote_attach_commits() {
         XCTAssertEqual(
             TeamOrchestrator.initialLeaderEndpoint(
@@ -134,6 +135,7 @@ final class PeerProjectBootstrapTests: XCTestCase {
         XCTAssertFalse(PeerPaneHostSpec.ssh(target: "peer", remoteSockPath: "/tmp/peer.sock", port: nil, identityFile: nil).targetsLocalPeerServer)
     }
 
+    @MainActor
     func test_remote_leader_launch_exports_route_to_final_cli_without_visible_grant_stage() {
         var grant = Termmesh_Peer_V1_TeamLeaderGrant()
         grant.grantID = Data(repeating: 0xab, count: 32)

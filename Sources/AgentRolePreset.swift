@@ -1673,6 +1673,17 @@ class TeamTemplateManager: ObservableObject {
         rebuildTemplates()
     }
 
+    func renameCustom(id: TemplateID, name: String) throws {
+        let displayName = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        try updateCustom(id: id) { template in
+            template.name = displayName
+            if case .smart(var preset) = template.payload {
+                preset.name = displayName
+                template.payload = .smart(preset)
+            }
+        }
+    }
+
     func pin(id: TemplateID) throws {
         guard template(for: id) != nil else {
             throw TeamTemplateManagerError.templateNotFound(id)

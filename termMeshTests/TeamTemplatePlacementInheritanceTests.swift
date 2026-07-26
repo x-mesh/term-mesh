@@ -103,7 +103,6 @@ final class TeamTemplatePlacementInheritanceTests: XCTestCase {
         super.tearDown()
     }
 
-    @MainActor
     func testRemoteProjectPathsRemembersAndReturnsPathForHostAndRoot() {
         let host = "host-\(UUID().uuidString)"
         let localRoot = "/tmp/\(UUID().uuidString)"
@@ -118,7 +117,6 @@ final class TeamTemplatePlacementInheritanceTests: XCTestCase {
     /// Keyed by (host, localRoot) together — a path remembered for one
     /// project must not leak into the lookup for a different local checkout
     /// on the same host.
-    @MainActor
     func testRemoteProjectPathsIsScopedToHostAndLocalRootPairTogether() {
         let host = "host-\(UUID().uuidString)"
         let rootA = "/tmp/\(UUID().uuidString)"
@@ -133,7 +131,6 @@ final class TeamTemplatePlacementInheritanceTests: XCTestCase {
     /// `anyPath` is the last-resort fallback — any project this host has
     /// ever been given, so a brand new project at least lands in the right
     /// neighbourhood.
-    @MainActor
     func testRemoteProjectPathsAnyPathFallsBackToAnyRememberedProjectOnThatHost() {
         let host = "host-\(UUID().uuidString)"
         let localRoot = "/tmp/\(UUID().uuidString)"
@@ -148,7 +145,6 @@ final class TeamTemplatePlacementInheritanceTests: XCTestCase {
     /// Blank input is refused rather than remembered as an empty string,
     /// which would otherwise satisfy `path(host:localRoot:)`'s non-empty
     /// guard incorrectly on the next lookup.
-    @MainActor
     func testRemoteProjectPathsIgnoresBlankHostLocalRootOrPath() {
         let host = "host-\(UUID().uuidString)"
         let localRoot = "/tmp/\(UUID().uuidString)"

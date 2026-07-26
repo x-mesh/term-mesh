@@ -61,8 +61,10 @@ final class SmartTeamPresetDecodingTests: XCTestCase {
         let preset = try iso8601Decoder.decode(SmartTeamPreset.self, from: Data(json.utf8))
 
         XCTAssertEqual(preset.id, "standard")
+        XCTAssertNil(preset.leaderModel)
         XCTAssertEqual(preset.agents.count, 2)
         XCTAssertTrue(preset.agents.allSatisfy { $0.primaryModel == nil && $0.fallbackModel == nil })
+        XCTAssertTrue(preset.agents.allSatisfy { $0.customInstructions == nil })
     }
 
     /// An unrecognized top-level field (e.g. added by a newer build) must not
@@ -115,6 +117,40 @@ final class SmartTeamPresetDecodingTests: XCTestCase {
             return XCTFail("expected .smart payload")
         }
         XCTAssertEqual(decodedPreset.agents.first?.primaryModel, "sonnet")
+    }
+
+    func testNewLeaderModelAndInstructionsRoundTripAndResolve() throws {
+        let preset = SmartTeamPreset(
+            id: "architecture-3",
+            name: "Architecture 3",
+            icon: "person.3",
+            description: "Architecture team",
+            leaderMode: "codex",
+            leaderModel: "gpt-5.5",
+            agents: [
+                ProviderPreference(
+                    role: "architect",
+                    primaryCli: "claude",
+                    primaryModel: "opus",
+                    fallbackCli: "claude",
+                    fallbackModel: "opus",
+                    reason: "",
+                    customInstructions: "Own the ADR."
+                )
+            ]
+        )
+
+        let decoded = try JSONDecoder().decode(
+            SmartTeamPreset.self,
+            from: JSONEncoder().encode(preset)
+        )
+
+        XCTAssertEqual(decoded, preset)
+        XCTAssertEqual(decoded.leaderModel, "gpt-5.5")
+        XCTAssertEqual(
+            decoded.resolve(with: ProviderDetector()).first?.customInstructions,
+            "Own the ADR."
+        )
     }
 
     // MARK: - UserCustomTemplateStore (the custom-snapshot store on disk)
@@ -246,5 +282,67 @@ final class SmartTeamPresetDecodingTests: XCTestCase {
 
         XCTAssertNotNil(second.template(for: newId))
         XCTAssertEqual(second.template(for: newId)?.name, "My Team")
+    }
+
+    func testAtomicSmartPresetCreationPersistsExactOrderedTeamWithoutPlacement() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let fileURL = directory.appendingPathComponent("team-templates.custom.json")
+        let manager = TeamTemplateManager(catalog: .fallback, fileURL: fileURL)
+        let preferences = [
+            ProviderPreference(
+                role: "architect", primaryCli: "claude", primaryModel: "opus",
+                fallbackCli: "claude", fallbackModel: "opus", reason: "",
+                customInstructions: "Design first."
+            ),
+            ProviderPreference(
+                role: "tester", primaryCli: "codex", primaryModel: "sonnet",
+                fallbackCli: "codex", fallbackModel: "sonnet", reason: "",
+                customInstructions: "Test remotely."
+            ),
+        ]
+
+        let id = manager.createSmartPreset(
+            name: "Architecture 3",
+            leaderMode: "codex",
+            leaderModel: "gpt-5.5",
+            agents: preferences
+        )
+        let reloaded = TeamTemplateManager(catalog: .fallback, fileURL: fileURL)
+        guard case .smart(let preset) = reloaded.template(for: id)?.payload else {
+            return XCTFail("expected persisted smart preset")
+        }
+
+        XCTAssertEqual(reloaded.lastSelectedId, id)
+        XCTAssertEqual(preset.leaderModel, "gpt-5.5")
+        XCTAssertEqual(preset.agents, preferences)
+        XCTAssertEqual(preset.agents.map(\.role), ["architect", "tester"])
+
+        let raw = String(decoding: try Data(contentsOf: fileURL), as: UTF8.self)
+        XCTAssertFalse(raw.contains("hostKey"))
+        XCTAssertFalse(raw.contains("hostDirectory"))
+    }
+
+    func testRenameKeepsTemplateAndSmartPayloadNamesInSync() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let fileURL = directory.appendingPathComponent("team-templates.custom.json")
+        let manager = TeamTemplateManager(catalog: .fallback, fileURL: fileURL)
+        let id = manager.createSmartPreset(
+            name: "Before",
+            leaderMode: "claude",
+            leaderModel: "sonnet",
+            agents: []
+        )
+
+        try manager.renameCustom(id: id, name: "After")
+
+        XCTAssertEqual(manager.template(for: id)?.name, "After")
+        guard case .smart(let preset) = manager.template(for: id)?.payload else {
+            return XCTFail("expected smart preset")
+        }
+        XCTAssertEqual(preset.name, "After")
     }
 }

@@ -205,6 +205,147 @@ struct NewProjectView: View {
         .padding(.vertical, 14)
     }
 
+    private var teamPresetRow: some View {
+        Grid(alignment: .leading, horizontalSpacing: 12) {
+            GridRow {
+                Text("Team preset")
+                    .font(.subheadline.bold())
+                HStack(spacing: 8) {
+                    Menu {
+                        Button("Default · 1 Executor") {
+                            applyDefaultTeam()
+                        }
+                        if !customSmartTemplates.isEmpty {
+                            Section("My Presets") {
+                                ForEach(customSmartTemplates) { template in
+                                    Button(template.name) { applyTemplate(template) }
+                                }
+                            }
+                        }
+                        if !builtInSmartTemplates.isEmpty {
+                            Section("Built-in") {
+                                ForEach(builtInSmartTemplates) { template in
+                                    Button(template.name) { applyTemplate(template) }
+                                }
+                            }
+                        }
+                    } label: {
+                        HStack(spacing: 6) {
+                            Image(systemName: isTeamCustomized ? "slider.horizontal.3" : "person.3")
+                            Text(teamPresetDisplayName)
+                            Image(systemName: "chevron.up.chevron.down")
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                        }
+                        .frame(minWidth: 190, alignment: .leading)
+                    }
+                    .menuStyle(.borderlessButton)
+                    .accessibilityIdentifier("newProject.teamPreset")
+
+                    if isTeamCustomized {
+                        Button("Save as…") {
+                            savePresetName = suggestedPresetName
+                            showingSavePreset = true
+                        }
+                    }
+
+                    Button {
+                        toggleSelectedPresetPin()
+                    } label: {
+                        Image(systemName: selectedPresetIsPinned ? "pin.fill" : "pin")
+                    }
+                    .buttonStyle(.borderless)
+                    .disabled(selectedTeamPresetId == nil)
+                    .help(selectedPresetIsPinned ? "Unpin this preset" : "Use this preset by default")
+
+                    Button("Manage…") {
+                        showingManagePresets = true
+                    }
+                    .buttonStyle(.borderless)
+                }
+            }
+        }
+    }
+
+    private var savePresetSheet: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            Text("Save Team Preset")
+                .font(.headline)
+            TextField("Preset name", text: $savePresetName)
+                .textFieldStyle(.roundedBorder)
+                .accessibilityIdentifier("newProject.savePreset.name")
+            Text("Saves the leader and ordered agent roles, CLIs, models, and instructions. Machine and folder choices stay project-specific.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            HStack {
+                Spacer()
+                Button("Cancel") { showingSavePreset = false }
+                    .keyboardShortcut(.cancelAction)
+                Button("Save") { saveCurrentTeamPreset() }
+                    .keyboardShortcut(.defaultAction)
+                    .disabled(savePresetName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+            }
+        }
+        .padding(20)
+        .frame(width: 440)
+    }
+
+    private var customSmartTemplates: [TeamTemplate] {
+        teamTemplateManager.customTemplates.filter {
+            if case .smart = $0.payload { return true }
+            return false
+        }
+    }
+
+    private var builtInSmartTemplates: [TeamTemplate] {
+        teamTemplateManager.templates.filter {
+            guard $0.origin == .builtIn else { return false }
+            if case .smart = $0.payload { return true }
+            return false
+        }
+    }
+
+    private var currentTeamSignature: TeamSignature {
+        TeamSignature(
+            leaderCli: leaderCli,
+            leaderModel: leaderCli == "repl"
+                ? nil
+                : AgentRolePreset.normalizeModel(leaderModel, for: leaderCli),
+            agents: agents.map {
+                TeamSignature.Agent(
+                    role: $0.preset.name,
+                    cli: $0.preset.cli,
+                    model: AgentRolePreset.normalizeModel($0.preset.model, for: $0.preset.cli),
+                    instructions: $0.customInstructions
+                )
+            }
+        )
+    }
+
+    private var isTeamCustomized: Bool {
+        guard let appliedTeamSignature else { return false }
+        return appliedTeamSignature != currentTeamSignature
+    }
+
+    private var teamPresetDisplayName: String {
+        if isTeamCustomized { return "Customized" }
+        guard let selectedTeamPresetId else { return "Default · 1 Executor" }
+        return teamTemplateManager.template(for: selectedTeamPresetId)?.name ?? "Customized"
+    }
+
+    private var suggestedPresetName: String {
+        let roles = agents.map(\.preset.displayName)
+        if let first = roles.first, roles.allSatisfy({ $0 == first }) {
+            return "\(first) \(roles.count)"
+        }
+        return "My Team \(agents.count)"
+    }
+
+    private var selectedPresetIsPinned: Bool {
+        selectedTeamPresetId != nil && selectedTeamPresetId == teamTemplateManager.pinnedId
+    }
+
     /// A single row: who leads, and where — folded together because showing
     /// this next to `Runs on` / `Agent = jw-server` as three separate answers
     /// read as three different opinions about where the project lives, when
@@ -378,7 +519,7 @@ struct NewProjectView: View {
             guard !parent.isEmpty else { return }
             directory = (parent as NSString)
                 .appendingPathComponent(typed.isEmpty ? Self.placeholderProjectName : typed)
-            for i in agents.indices where agents[i].hostKey == runsOnHostKey {
+            for i in agents.indices where inheritedAgentIDs.contains(agents[i].id) {
                 agents[i].hostDirectory = directory
             }
         }
@@ -408,6 +549,14 @@ struct NewProjectView: View {
     /// UI says it is remote.
     private var connectedPeers: [HostEntry] {
         selectablePeers.filter(\.isConnected)
+    }
+
+    private var defaultPlacementLabel: String {
+        guard let runsOnHostKey,
+              let host = selectablePeers.first(where: { $0.id == runsOnHostKey }) else {
+            return "Default · This Mac"
+        }
+        return "Default · \(host.displayName)"
     }
 
     /// What the isolation choice will actually produce, named.
@@ -447,12 +596,15 @@ struct NewProjectView: View {
     /// member back to this Mac is not overruled on the next redraw. Nothing is
     /// counted as new when the list shrinks.
     private func adoptProjectMachineForNewRows() {
-        defer { knownAgentCount = agents.count }
-        guard let runsOnHostKey, agents.count > knownAgentCount else { return }
-        for i in knownAgentCount..<agents.count where agents[i].hostKey == nil {
+        let currentIDs = Set(agents.map(\.id))
+        let newIDs = currentIDs.subtracting(knownAgentIDs)
+        inheritedAgentIDs.formIntersection(currentIDs)
+        for i in agents.indices where newIDs.contains(agents[i].id) {
+            inheritedAgentIDs.insert(agents[i].id)
             agents[i].hostKey = runsOnHostKey
-            agents[i].hostDirectory = trimmedDirectory
+            agents[i].hostDirectory = runsOnHostKey == nil ? "" : trimmedDirectory
         }
+        knownAgentIDs = currentIDs
     }
 
     /// Move the whole form to the chosen machine.
@@ -465,7 +617,7 @@ struct NewProjectView: View {
     private func applyRunsOn(_ hostKey: String?) {
         folderEdited = false
         guard let hostKey else {
-            for i in agents.indices {
+            for i in agents.indices where inheritedAgentIDs.contains(agents[i].id) {
                 agents[i].hostKey = nil
                 agents[i].hostDirectory = ""
             }
@@ -487,11 +639,10 @@ struct NewProjectView: View {
             .first { $0.stableKey == hostKey }?
             .predictedProjectPath(forProjectNamed: leaf)
         directory = predicted ?? RemoteProjectPaths.shared.anyPath(host: hostKey) ?? ""
-        for i in agents.indices {
+        for i in agents.indices where inheritedAgentIDs.contains(agents[i].id) {
             agents[i].hostKey = hostKey
             agents[i].hostDirectory = directory
         }
-        knownAgentCount = agents.count
     }
 
     private var footer: some View {
@@ -539,13 +690,121 @@ struct NewProjectView: View {
         .padding(.vertical, 14)
     }
 
-    /// One agent to begin with. An empty list would make Create produce the
-    /// inert workspace this screen exists to stop producing, and the row is
-    /// removable for anyone who genuinely wants the folder alone.
-    private func seedFirstAgent() {
-        guard agents.isEmpty, let preset = presetManager.presets.first(where: { $0.name == "executor" })
+    private func applyInitialTeamPreset() {
+        guard agents.isEmpty else { return }
+        if let pinnedId = teamTemplateManager.pinnedId,
+           pinnedId.category == .smart,
+           let template = teamTemplateManager.template(for: pinnedId) {
+            applyTemplate(template)
+        } else {
+            applyDefaultTeam()
+        }
+    }
+
+    private func applyDefaultTeam() {
+        guard var preset = presetManager.presets.first(where: { $0.name == "executor" })
             ?? presetManager.presets.first else { return }
-        agents = [TeamAgentRow(preset: preset, customInstructions: "")]
+        preset.cli = "claude"
+        preset.model = AgentRolePreset.defaultModel(for: "claude")
+        leaderCli = "claude"
+        leaderModel = AgentRolePreset.defaultModel(for: "claude")
+        selectedTeamPresetId = nil
+        installPresetAgents([
+            TeamAgentRow(preset: preset, customInstructions: "")
+        ])
+        appliedTeamSignature = currentTeamSignature
+    }
+
+    private func applyTemplate(_ template: TeamTemplate) {
+        let payload = template.origin == .builtIn
+            ? (teamTemplateManager.effectivePayload(for: template.id) ?? template.payload)
+            : template.payload
+        guard case .smart(let preset) = payload else { return }
+
+        leaderCli = preset.leaderMode
+        if leaderCli != "repl" {
+            let candidate = preset.leaderModel ?? AgentRolePreset.defaultModel(for: leaderCli)
+            leaderModel = AgentRolePreset.models(for: leaderCli).contains(candidate)
+                ? candidate
+                : AgentRolePreset.defaultModel(for: leaderCli)
+        }
+
+        let rows = preset.resolve(with: providerDetector).compactMap { resolved -> TeamAgentRow? in
+            guard var role = presetManager.presets.first(where: { $0.name == resolved.role })
+                    ?? presetManager.presets.first(where: { $0.name == "executor" })
+                    ?? presetManager.presets.first else { return nil }
+            role.cli = resolved.cli
+            role.model = resolved.model
+            let badge: TeamAgentRow.ProviderBadge
+            switch resolved.status {
+            case .normal:
+                badge = .none
+            case .best:
+                badge = .best(reason: resolved.reason)
+            case .fallback(let wanted):
+                badge = .fallback(wanted: wanted)
+            }
+            return TeamAgentRow(
+                preset: role,
+                customInstructions: resolved.customInstructions,
+                providerBadge: badge
+            )
+        }
+        guard !rows.isEmpty else { return }
+        selectedTeamPresetId = template.id
+        try? teamTemplateManager.setLastSelected(id: template.id)
+        installPresetAgents(rows)
+        appliedTeamSignature = currentTeamSignature
+    }
+
+    private func installPresetAgents(_ rows: [TeamAgentRow]) {
+        agents = rows.map { row in
+            var resolved = row
+            resolved.hostKey = runsOnHostKey
+            resolved.hostDirectory = runsOnHostKey == nil ? "" : trimmedDirectory
+            return resolved
+        }
+        let ids = Set(agents.map(\.id))
+        inheritedAgentIDs = ids
+        knownAgentIDs = ids
+    }
+
+    private func saveCurrentTeamPreset() {
+        let name = savePresetName.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !name.isEmpty else { return }
+        let preferences = agents.map { row in
+            ProviderPreference(
+                role: row.preset.name,
+                primaryCli: row.preset.cli,
+                primaryModel: row.preset.model,
+                fallbackCli: row.preset.cli,
+                fallbackModel: row.preset.model,
+                reason: "",
+                customInstructions: row.customInstructions.isEmpty ? nil : row.customInstructions
+            )
+        }
+        let id = teamTemplateManager.createSmartPreset(
+            name: name,
+            leaderMode: leaderCli,
+            leaderModel: leaderCli == "repl" ? nil : leaderModel,
+            agents: preferences
+        )
+        selectedTeamPresetId = id
+        appliedTeamSignature = currentTeamSignature
+        showingSavePreset = false
+    }
+
+    private func toggleSelectedPresetPin() {
+        guard let id = selectedTeamPresetId else { return }
+        if teamTemplateManager.pinnedId == id {
+            teamTemplateManager.unpin()
+        } else {
+            do {
+                try teamTemplateManager.pin(id: id)
+            } catch {
+                presetError = error.localizedDescription
+            }
+        }
     }
 
     private func chooseFolder() {
@@ -557,5 +816,105 @@ struct NewProjectView: View {
         panel.message = "Choose a folder for this project"
         guard panel.runModal() == .OK, let url = panel.url else { return }
         directory = url.path
+    }
+}
+
+private struct TeamPresetManagerSheet: View {
+    @ObservedObject var manager: TeamTemplateManager
+    @Binding var selectedId: TemplateID?
+    @Environment(\.dismiss) private var dismiss
+
+    private var smartTemplates: [TeamTemplate] {
+        manager.templates.filter {
+            if case .smart = $0.payload { return true }
+            return false
+        }
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack {
+                Text("Team Presets")
+                    .font(.headline)
+                Spacer()
+                Button("Done") { dismiss() }
+                    .keyboardShortcut(.defaultAction)
+            }
+            List {
+                ForEach(smartTemplates) { template in
+                    TeamPresetManagementRow(
+                        template: template,
+                        isPinned: manager.pinnedId == template.id,
+                        onRename: { name in
+                            try? manager.renameCustom(id: template.id, name: name)
+                        },
+                        onTogglePin: {
+                            if manager.pinnedId == template.id {
+                                manager.unpin()
+                            } else {
+                                try? manager.pin(id: template.id)
+                            }
+                        },
+                        onDelete: template.origin == .custom ? {
+                            if selectedId == template.id { selectedId = nil }
+                            try? manager.deleteCustom(id: template.id)
+                        } : nil
+                    )
+                }
+            }
+            .frame(minHeight: 280)
+        }
+        .padding(20)
+        .frame(width: 520, height: 380)
+    }
+}
+
+private struct TeamPresetManagementRow: View {
+    let template: TeamTemplate
+    let isPinned: Bool
+    let onRename: (String) -> Void
+    let onTogglePin: () -> Void
+    let onDelete: (() -> Void)?
+    @State private var name: String
+
+    init(
+        template: TeamTemplate,
+        isPinned: Bool,
+        onRename: @escaping (String) -> Void,
+        onTogglePin: @escaping () -> Void,
+        onDelete: (() -> Void)?
+    ) {
+        self.template = template
+        self.isPinned = isPinned
+        self.onRename = onRename
+        self.onTogglePin = onTogglePin
+        self.onDelete = onDelete
+        _name = State(initialValue: template.name)
+    }
+
+    var body: some View {
+        HStack(spacing: 8) {
+            if template.origin == .custom {
+                TextField("Preset name", text: $name)
+                    .textFieldStyle(.roundedBorder)
+                    .onSubmit { onRename(name) }
+            } else {
+                Text(template.name)
+                Text("Built-in")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            Spacer()
+            Button(action: onTogglePin) {
+                Image(systemName: isPinned ? "pin.fill" : "pin")
+            }
+            .buttonStyle(.borderless)
+            if let onDelete {
+                Button(role: .destructive, action: onDelete) {
+                    Image(systemName: "trash")
+                }
+                .buttonStyle(.borderless)
+            }
+        }
     }
 }
