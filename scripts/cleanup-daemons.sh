@@ -38,7 +38,6 @@ SOCKETS=()
 USER_TMP="${TMPDIR:-$(getconf DARWIN_USER_TEMP_DIR 2>/dev/null || echo /tmp)}"
 for pattern in /tmp/term-meshd*.sock \
                "$USER_TMP"/term-meshd*.sock \
-               "$HOME/Library/Application Support/term-mesh/term-meshd"*.sock \
                /tmp/term-mesh-peer-*.sock \
                /tmp/term-mesh-peer-*/peer.sock \
                /tmp/tm-peer-ssh-*.sock \
@@ -49,6 +48,14 @@ for pattern in /tmp/term-meshd*.sock \
     [ -S "$sock" ] 2>/dev/null && SOCKETS+=("$sock") || true
   done
 done
+# Application Support contains spaces, so shell word-splitting cannot safely
+# enumerate these paths. Collect them with NUL delimiters instead.
+while IFS= read -r -d '' sock; do
+  [ -S "$sock" ] && SOCKETS+=("$sock")
+done < <(
+  find "$HOME/Library/Application Support/term-mesh" \
+    -maxdepth 1 -type s -name 'term-meshd*.sock' -print0 2>/dev/null
+)
 # De-duplicate (patterns overlap)
 if [ ${#SOCKETS[@]} -gt 0 ]; then
   IFS=$'\n' read -r -d '' -a SOCKETS < <(printf '%s\n' "${SOCKETS[@]}" | sort -u && printf '\0') || true
@@ -174,7 +181,12 @@ for pid in $(pgrep -x term-meshd 2>/dev/null || true); do
   case " $ACTIVE_PIDS " in
     *" $pid "*) continue ;;
   esac
+  PPID_VALUE=$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ')
   CMD=$(ps -o command= -p "$pid" 2>/dev/null || echo "?")
+  if [ "$PPID_VALUE" != "1" ] && [ -n "$PPID_VALUE" ]; then
+    echo "  UNMAPPED-ACTIVE: pid $pid (parent: $PPID_VALUE, kept; $CMD)"
+    continue
+  fi
   echo "  ORPHAN: pid $pid ($CMD)"
   ORPHANS=$((ORPHANS + 1))
   if $KILL; then
