@@ -669,6 +669,20 @@ final class TeamOrchestrator: ObservableObject {
                 // `--resume <sid>` so claude re-attaches to its prior session.
                 agentCommand.append(" --resume \(sid)")
             }
+            // Opt-in, claude-only: take turns on a pipe instead of having them
+            // typed into this pane. The process still runs here and is still
+            // watched; what the pane shows becomes raw NDJSON, which is the
+            // cost this option exists to measure. See `AgentPipeTransport`.
+            if AgentPipeTransport.canDrive(cli: agentCli) {
+                AgentPipeTransport.prepareDirectory()
+                agentCommand = AgentPipeTransport.launchCommand(
+                    claudePath: cliPath,
+                    fifoPath: AgentPipeTransport.fifoPath(agentId: agentId),
+                    model: Self.resolveClaudeModelArg(agentModel),
+                    instructions: agentInstructions,
+                    extraArgs: extraArgs
+                )
+            }
         }
 
         // Wrap so the terminal stays open (drops to shell) if the CLI exits.
@@ -2561,6 +2575,23 @@ final class TeamOrchestrator: ObservableObject {
         }
     }
 
+    /// The agent behind this pane, when it is one this build drives by pipe.
+    ///
+    /// Keyed off the live team rather than a stored flag so an agent created
+    /// before the option was turned on is not mistaken for one that has a FIFO
+    /// waiting — the launch command is what creates the pipe, and only agents
+    /// launched under the option have one.
+    private func pipeDrivenAgent(teamName: String, panelId: UUID) -> AgentMember? {
+        guard AgentPipeTransport.isEnabled,
+              let team = teams[teamName],
+              let agent = team.agents.first(where: { $0.panelId == panelId }),
+              AgentPipeTransport.supports(cli: agent.cli),
+              FileManager.default.fileExists(
+                  atPath: AgentPipeTransport.fifoPath(agentId: agent.id))
+        else { return nil }
+        return agent
+    }
+
     /// Send text to an agent by its unique panelId (skips name lookup entirely).
     /// Used by broadcast and asyncTeamBroadcast to avoid duplicate-name collapse.
     /// When `recordPendingReturnFor` is set and `withReturn` is false, records the
@@ -2569,6 +2600,33 @@ final class TeamOrchestrator: ObservableObject {
     /// team.send / team.delegate for deterministic duplicate-name addressing).
     @discardableResult
     func sendToAgentByPanel(teamName: String, panelId: UUID, workspaceId: UUID, text: String, tabManager: TabManager, withReturn: Bool = true, recordPendingReturnFor agentName: String? = nil, completion: ((Bool) -> Void)? = nil) -> Bool {
+        // An agent driven by a pipe takes its turn there, and none of what
+        // follows applies to it: no paste queue, no pending-Return target, no
+        // in-flight accounting to keep a restart from cutting a paste in half.
+        // Those exist to get text through a terminal intact; a write to a FIFO
+        // either lands whole or reports why it did not.
+        if let agent = pipeDrivenAgent(teamName: teamName, panelId: panelId) {
+            do {
+                let n = try AgentPipeTransport.deliver(text: text, agentId: agent.id)
+                #if DEBUG
+                dlog("agent.pipe.deliver agent=\(agent.id) bytes=\(n)")
+                #endif
+                completion?(true)
+                return true
+            } catch {
+                // Falling back to typing would hide the failure behind a path
+                // that usually works, and the point of this option is to see
+                // whether the pipe holds.
+                Logger.team.error(
+                    "pipe delivery failed for \(agent.id, privacy: .public): \(String(describing: error), privacy: .public)"
+                )
+                #if DEBUG
+                dlog("agent.pipe.deliver.FAILED agent=\(agent.id) err=\(error)")
+                #endif
+                completion?(false)
+                return false
+            }
+        }
         if !withReturn,
            let agentName,
            let team = teams[teamName],
