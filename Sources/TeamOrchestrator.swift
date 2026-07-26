@@ -974,7 +974,9 @@ final class TeamOrchestrator: ObservableObject {
             cliPaths[cli] = path
         }
 
-        let colors = ["green", "blue", "yellow", "magenta", "cyan", "red"]
+        // Colours belong to roles now, so the loop carries what it has used
+        // rather than counting slots.
+        var takenColors: Set<String> = []
         var members: [AgentMember] = []
 
         // Create a single workspace for the team
@@ -1354,10 +1356,13 @@ final class TeamOrchestrator: ObservableObject {
             }
 
             // Build headless members (no panelId — they're daemon subprocesses)
-            let colors = ["green", "blue", "yellow", "magenta", "cyan", "red"]
+            var takenColors: Set<String> = []
             var headlessMembers: [AgentMember] = []
             for (index, agent) in agents.enumerated() {
-                let agentColor = agent.color.isEmpty ? colors[index % colors.count] : agent.color
+                let agentColor = agent.color.isEmpty
+                    ? Self.agentColor(forRole: agent.agentType, taken: takenColors)
+                    : agent.color
+                takenColors.insert(agentColor)
                 let agentCli = agent.cli.isEmpty ? "claude" : agent.cli
                 let effectiveInstructions = AgentRunbookService.shared.composeInstructions(
                     roleName: agent.agentType,
@@ -1443,7 +1448,10 @@ final class TeamOrchestrator: ObservableObject {
         // Build agent panes with Claude running directly via command parameter
         // This bypasses shell init (.zshrc/.zprofile) entirely for reliable startup.
         for (index, agent) in agents.enumerated() {
-            let agentColor = agent.color.isEmpty ? colors[index % colors.count] : agent.color
+            let agentColor = agent.color.isEmpty
+                ? Self.agentColor(forRole: agent.agentType, taken: takenColors)
+                : agent.color
+            takenColors.insert(agentColor)
 
             // Worktree for this agent
             var agentWorkDir = sharedWorkDir ?? workingDirectory
@@ -1819,9 +1827,9 @@ final class TeamOrchestrator: ObservableObject {
             return .failure(.cliBinaryNotFound(cli: normalizedCli))
         }
 
-        // 6. Pick a color deterministically based on current agent count
-        let colorList = ["green", "blue", "yellow", "magenta", "cyan", "red"]
-        let agentColor = colorList[team.agents.count % colorList.count]
+        // 6. The role's colour, so it is the same one next time
+        let agentColor = Self.agentColor(forRole: agentType,
+                                         taken: Set(team.agents.map(\.color)))
 
         // 7. Choose split target and orientation
         // - First agent: split RIGHT from the leader pane (horizontal) — consistent with createTeam layout
@@ -2093,9 +2101,9 @@ final class TeamOrchestrator: ObservableObject {
             mode: .digest
         )
 
-        // 7. Pick color deterministically from current agent count
-        let colorList = ["green", "blue", "yellow", "magenta", "cyan", "red"]
-        let agentColor = colorList[team.agents.count % colorList.count]
+        // 7. The role's colour, so it is the same one next time
+        let agentColor = Self.agentColor(forRole: agentType,
+                                         taken: Set(team.agents.map(\.color)))
 
         // 8. Choose split target — last agent pane or leader pane
         let splitFrom: UUID
@@ -4617,7 +4625,6 @@ final class TeamOrchestrator: ObservableObject {
         // ("<name>@<team>"). We don't have full per-agent metadata in the
         // resume result envelope, so cli/model/color/instructions default
         // sensibly until the daemon emits state updates.
-        let colors = ["green", "blue", "yellow", "magenta", "cyan", "red"]
         let members: [AgentMember] = agentIds.enumerated().map { index, fullId in
             let name = String(fullId.split(separator: "@").first ?? Substring(fullId))
             return AgentMember(
@@ -4628,7 +4635,7 @@ final class TeamOrchestrator: ObservableObject {
                 launchCommand: Self.defaultLaunchCommand(for: "claude"),
                 model: "sonnet",
                 agentType: name,
-                color: colors[index % colors.count],
+                color: Self.agentColor(forRole: name, taken: []),
                 instructions: "",
                 workspaceId: workspace.id,
                 panelId: nil, // headless — no real panel (resumed team)
@@ -5291,6 +5298,34 @@ final class TeamOrchestrator: ObservableObject {
             return codexReasoningEffort(model) == nil ? model : ""
         default: return model
         }
+    }
+
+    /// A colour that belongs to the role rather than to the order it arrived in.
+    ///
+    /// It was `colorList[team.agents.count % 6]` — the slot, not the agent. So
+    /// `reviewer` was blue in one team and yellow in the next, which makes a
+    /// colour something to re-learn per team instead of something to
+    /// recognise. Hashing the role name fixes that: reviewer is the same
+    /// colour every time, in every team, on every machine.
+    ///
+    /// Deliberately not per CLI. Which provider is behind a pane is already
+    /// said twice — the chip and the mascot — and spending the colour on it too
+    /// would leave two agents of the same role indistinguishable, which is the
+    /// thing you actually need to tell apart.
+    ///
+    /// Six colours and more roles than that means collisions, so a colour
+    /// already taken in this team steps to the next free one. Stability across
+    /// teams for the common case; never a duplicate within one.
+    static func agentColor(forRole role: String, taken: Set<String>) -> String {
+        let palette = ["green", "blue", "yellow", "magenta", "cyan", "red"]
+        var hash = 5381
+        for byte in role.lowercased().utf8 { hash = (hash &* 33) &+ Int(byte) }
+        let start = abs(hash) % palette.count
+        for offset in 0..<palette.count {
+            let candidate = palette[(start + offset) % palette.count]
+            if !taken.contains(candidate) { return candidate }
+        }
+        return palette[start]
     }
 
     /// Map short model names to Codex CLI model identifiers.

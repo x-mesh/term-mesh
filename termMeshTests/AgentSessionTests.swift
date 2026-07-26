@@ -548,6 +548,63 @@ final class AgentSessionTests: XCTestCase {
         XCTAssertEqual(TeamOrchestrator.withoutTerminalProtocol(broken), broken)
     }
 
+    // MARK: - Which colour an agent gets
+
+    /// It was the slot, not the agent: `colorList[agents.count % 6]`. So
+    /// `reviewer` was blue in one team and yellow in the next, which makes a
+    /// colour something to re-learn per team rather than something to
+    /// recognise.
+    func testARoleKeepsItsColourAcrossTeams() {
+        let first = TeamOrchestrator.agentColor(forRole: "reviewer", taken: [])
+        let second = TeamOrchestrator.agentColor(forRole: "reviewer", taken: [])
+        XCTAssertEqual(first, second)
+        // And it does not depend on who else is in the team, only on what is
+        // already taken.
+        XCTAssertEqual(TeamOrchestrator.agentColor(forRole: "explorer", taken: []),
+                       TeamOrchestrator.agentColor(forRole: "explorer", taken: []))
+    }
+
+    func testDifferentRolesGetDifferentColoursWhereTheyCan() {
+        var taken: Set<String> = []
+        var seen: [String] = []
+        for role in ["explorer", "executor", "reviewer", "planner", "tester", "writer"] {
+            let colour = TeamOrchestrator.agentColor(forRole: role, taken: taken)
+            taken.insert(colour)
+            seen.append(colour)
+        }
+        XCTAssertEqual(Set(seen).count, 6, "six roles, six colours: \(seen)")
+    }
+
+    /// Six colours and more roles than that, so a colour already in use steps
+    /// to the next free one — stability across teams for the common case,
+    /// never a duplicate within one.
+    func testATakenColourStepsAside() {
+        let alone = TeamOrchestrator.agentColor(forRole: "reviewer", taken: [])
+        let crowded = TeamOrchestrator.agentColor(forRole: "reviewer", taken: [alone])
+        XCTAssertNotEqual(crowded, alone)
+    }
+
+    /// Deliberately not per CLI. Which provider is behind a pane is already
+    /// said twice — the chip and the mascot — and spending the colour on it too
+    /// would leave two agents of the same role indistinguishable, which is the
+    /// thing you actually need to tell apart.
+    func testTheColourIsTheRolesNotTheProviders() {
+        // Same role, same colour — whatever CLI happens to be behind it, since
+        // the CLI is not an input here at all.
+        XCTAssertEqual(TeamOrchestrator.agentColor(forRole: "reviewer", taken: []),
+                       TeamOrchestrator.agentColor(forRole: "reviewer", taken: []))
+        // Two roles can hash to the same colour — six colours, more roles —
+        // and that is what the taken set is for. Asserting they differ with an
+        // empty set was asserting the absence of collisions, which is not a
+        // property this has or needs; `reviewer` and `explorer` both land on
+        // green.
+        var taken: Set<String> = []
+        let first = TeamOrchestrator.agentColor(forRole: "reviewer", taken: taken)
+        taken.insert(first)
+        XCTAssertNotEqual(TeamOrchestrator.agentColor(forRole: "explorer", taken: taken),
+                          first, "within one team they must differ")
+    }
+
     // MARK: - The mascots
 
     /// They only read as one family if they line up, and a stray space is the
