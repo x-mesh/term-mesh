@@ -44,7 +44,7 @@ Bridge and optional terminal renderer scripts (resolved from app bundle or repo 
 - `scripts/spike/tm-agent-bridge.py`
 - `scripts/spike/tm-render-claude.py`
 
-Per-agent FIFO: `/tmp/term-mesh-agent-pipe/<agentId>.fifo`  
+Per-agent FIFO: `/tmp/term-mesh-agent-pipe/<agentId>.fifo`<br>
 Event tee (completion watcher): `<fifo>.events`
 
 ## Native pane UI
