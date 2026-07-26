@@ -120,6 +120,66 @@ final class AgentPipeCompletionTests: XCTestCase {
         XCTAssertEqual(message["content"] as? String, "line one\nline two")
     }
 
+    // MARK: - Which task a reply closes
+
+    private func task(_ id: String, _ status: String, minutesAgo: Int) -> TeamOrchestrator.TeamTask {
+        TeamOrchestrator.TeamTask(
+            id: id, title: id, details: nil, acceptanceCriteria: [], labels: [],
+            estimatedSize: nil, assignee: "executor", status: status, priority: 2,
+            dependsOn: [], parentTaskId: nil, childTaskIds: [],
+            reassignmentCount: 0,
+            createdBy: "leader", result: nil,
+            createdAt: Date().addingTimeInterval(TimeInterval(-60 * minutesAgo)),
+            updatedAt: Date().addingTimeInterval(TimeInterval(-60 * minutesAgo))
+        )
+    }
+
+    /// The one that was measured going wrong.
+    ///
+    /// A turn parked task A as blocked. An unrelated turn then finished, and
+    /// the old rule — first non-terminal in list order, with `blocked` counted
+    /// as non-terminal — handed it task A. A was marked completed, its block
+    /// reason lost, and B's own task was left untouched.
+    func testAReplyDoesNotCompleteSomebodyElsesBlockedTask() {
+        let tasks = [task("A", "blocked", minutesAgo: 10),
+                     task("B", "assigned", minutesAgo: 1)]
+        let picked = AutoReplyEmit.selectTask(from: tasks, preferredTaskId: nil)
+        XCTAssertEqual(picked?.id, "B", "the reply belongs to the open task, not the parked one")
+    }
+
+    /// Parking is a decision. Only a reply that names the task may undo one.
+    func testABlockedTaskCanStillBeClosedWhenNamed() {
+        let tasks = [task("A", "blocked", minutesAgo: 10)]
+        XCTAssertNil(AutoReplyEmit.selectTask(from: tasks, preferredTaskId: nil))
+        XCTAssertEqual(AutoReplyEmit.selectTask(from: tasks, preferredTaskId: "A")?.id, "A")
+    }
+
+    func testTheNamedTaskWinsOverEverything() {
+        let tasks = [task("A", "in_progress", minutesAgo: 5),
+                     task("B", "assigned", minutesAgo: 1)]
+        XCTAssertEqual(AutoReplyEmit.selectTask(from: tasks, preferredTaskId: "B")?.id, "B")
+    }
+
+    /// Without a name, a reply is likelier to answer the instruction just
+    /// given than the oldest one still open.
+    func testTheMostRecentOpenTaskIsTheBetterGuess() {
+        let tasks = [task("old", "assigned", minutesAgo: 30),
+                     task("new", "assigned", minutesAgo: 1)]
+        XCTAssertEqual(AutoReplyEmit.selectTask(from: tasks, preferredTaskId: nil)?.id, "new")
+    }
+
+    func testRunningWorkBeatsMerelyAssignedWork() {
+        let tasks = [task("assigned-newer", "assigned", minutesAgo: 1),
+                     task("running", "in_progress", minutesAgo: 20)]
+        XCTAssertEqual(AutoReplyEmit.selectTask(from: tasks, preferredTaskId: nil)?.id, "running")
+    }
+
+    func testFinishedWorkIsNeverReopened() {
+        let tasks = [task("done", "completed", minutesAgo: 1),
+                     task("gone", "abandoned", minutesAgo: 2)]
+        XCTAssertNil(AutoReplyEmit.selectTask(from: tasks, preferredTaskId: nil))
+    }
+
     /// `exec` takes only the first word, and the caller prefixes the launch
     /// line with it when the agent works in a worktree. Handing back a bare
     /// `rm -f … && …` chain replaced the pane's shell with `rm`, which did its

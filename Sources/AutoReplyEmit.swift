@@ -8,6 +8,43 @@ import Foundation
 enum AutoReplyEmit {
     private static let resultTruncChars = 1500
 
+    /// Statuses a reply must never reopen.
+    static let terminalStatuses: Set<String> = [
+        "completed", "failed", "abandoned", "cancelled",
+    ]
+
+    /// Which task a reply is answering.
+    ///
+    /// When the caller knows — it wrote the capsule, so it does — the answer is
+    /// the task the capsule named and there is nothing to decide.
+    ///
+    /// When it does not, this is a guess, and the shape of the guess matters.
+    /// It used to be "first non-terminal in list order", with `blocked` counted
+    /// as non-terminal. An unrelated turn was measured walking up to a task
+    /// another turn had parked as blocked, marking it completed, and leaving
+    /// its own task untouched — losing the block reason on the way.
+    ///
+    /// So a blocked task is now only closable by a reply that names it. Parking
+    /// something is a decision; a drive-by reply is not entitled to undo one.
+    /// Among the rest the most recent wins, because a reply is far likelier to
+    /// answer the instruction just given than the oldest one still open.
+    static func selectTask(
+        from tasks: [TeamOrchestrator.TeamTask],
+        preferredTaskId: String?
+    ) -> TeamOrchestrator.TeamTask? {
+        if let preferredTaskId,
+           let named = tasks.first(where: { $0.id == preferredTaskId }) {
+            return named
+        }
+        if let running = tasks.filter({ $0.status == "in_progress" })
+            .max(by: { $0.createdAt < $1.createdAt }) {
+            return running
+        }
+        return tasks
+            .filter { !terminalStatuses.contains($0.status) && $0.status != "blocked" }
+            .max(by: { $0.createdAt < $1.createdAt })
+    }
+
     /// Normalize FULL_REPORT field: strip whitespace, treat "n/a" as nil.
     private static func normalizedFullReportPath(_ raw: String?) -> String? {
         guard let s = raw?.trimmingCharacters(in: .whitespacesAndNewlines), !s.isEmpty else { return nil }
@@ -52,11 +89,7 @@ enum AutoReplyEmit {
             staleOnly: false,
             dependsOn: nil
         )
-        let terminal: Set<String> = ["completed", "failed", "abandoned", "cancelled"]
-        let target = preferredTaskId.flatMap { id in tasks.first(where: { $0.id == id }) }
-            ?? tasks.first(where: { $0.status == "in_progress" })
-            ?? tasks.first(where: { !terminal.contains($0.status) })
-        guard let task = target else {
+        guard let task = selectTask(from: tasks, preferredTaskId: preferredTaskId) else {
             return false
         }
 
