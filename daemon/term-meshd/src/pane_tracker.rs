@@ -64,15 +64,12 @@ fn scan_pane_sessions(system: &mut System) -> HashMap<String, PaneInfo> {
     system.refresh_processes_specifics(
         ProcessesToUpdate::All,
         true,
-        ProcessRefreshKind::nothing(),
+        ProcessRefreshKind::nothing().with_exe(UpdateKind::OnlyIfNotSet),
     );
     let targets: Vec<(Pid, String)> = system
         .processes()
         .iter()
-        .filter_map(|(pid, process)| {
-            let name = process.name().to_str()?;
-            matches!(name, "claude" | "codex").then(|| (*pid, name.to_string()))
-        })
+        .filter_map(|(pid, process)| cli_name(process).map(|cli| (*pid, cli.to_string())))
         .collect();
 
     let target_pids: Vec<Pid> = targets.iter().map(|(pid, _)| *pid).collect();
@@ -112,6 +109,17 @@ fn scan_pane_sessions(system: &mut System) -> HashMap<String, PaneInfo> {
         );
     }
     result
+}
+
+fn cli_name(process: &sysinfo::Process) -> Option<&'static str> {
+    let process_name = process.name().to_str();
+    let executable_name = process
+        .exe()
+        .and_then(|path| path.file_name())
+        .and_then(|name| name.to_str());
+    ["claude", "codex"]
+        .into_iter()
+        .find(|candidate| process_name == Some(*candidate) || executable_name == Some(*candidate))
 }
 
 // SECURITY: process environments contain API keys and tokens. Extract only
@@ -165,5 +173,52 @@ mod tests {
     fn snapshot_initially_empty() {
         let tracker = PaneTracker::new();
         assert!(tracker.snapshot().is_empty());
+    }
+
+    #[test]
+    fn scan_finds_named_cli_process_without_shell_commands() {
+        let temp = tempfile::tempdir().unwrap();
+        let executable = temp.path().join("codex");
+        std::fs::copy("/bin/sleep", &executable).unwrap();
+        let panel_id = format!("pane-tracker-test-{}", std::process::id());
+        let mut child = std::process::Command::new(&executable)
+            .arg("5")
+            .env("TERMMESH_PANEL_ID", &panel_id)
+            .current_dir(temp.path())
+            .spawn()
+            .unwrap();
+        let child_pid = child.id();
+
+        let mut system = System::new();
+        let mut found = None;
+        for _ in 0..20 {
+            let snapshot = scan_pane_sessions(&mut system);
+            if let Some(info) = snapshot.get(&panel_id) {
+                found = Some(info.clone());
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let diagnostic = system
+            .process(Pid::from_u32(child_pid))
+            .map(|process| {
+                format!(
+                    "name={:?} exe={:?} cwd={:?} env_count={}",
+                    process.name(),
+                    process.exe(),
+                    process.cwd(),
+                    process.environ().len()
+                )
+            })
+            .unwrap_or_else(|| "process missing".to_string());
+        let _ = child.kill();
+        let _ = child.wait();
+
+        let info = found.unwrap_or_else(|| {
+            panic!("sysinfo should discover the named codex process: {diagnostic}")
+        });
+        assert_eq!(info.cli, "codex");
+        assert_eq!(info.cwd, temp.path().to_string_lossy());
+        assert!(info.proc_start_unix > 0);
     }
 }
