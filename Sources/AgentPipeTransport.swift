@@ -42,6 +42,34 @@ enum AgentPipeTransport {
         isEnabled && supports(cli: cli)
     }
 
+    /// Draw the session instead of showing its wire format.
+    ///
+    /// `--print` is the non-interactive mode, so nothing renders the stream:
+    /// the pane fills with NDJSON. Piping stdout through a filter keeps the
+    /// pane a terminal and asks for no changes anywhere else, which is why it
+    /// is the first thing to try — it prices the rendering work before anyone
+    /// commits to owning an agent UI.
+    ///
+    /// Off means the pane shows the raw events, which is worth being able to
+    /// see: the renderer's job is to leave things out, and that is only
+    /// checkable against what it left.
+    static let renderKey = "agentPipeTransport.render"
+
+    static var rendersOutput: Bool {
+        UserDefaults.standard.object(forKey: renderKey) as? Bool ?? true
+    }
+
+    /// The filter, found next to the app or in the repo it was built from.
+    static func rendererPath(workingDirectory: String) -> String? {
+        let name = "scripts/spike/tm-render-claude.py"
+        var candidates: [String] = []
+        if let res = Bundle.main.resourcePath {
+            candidates.append((res as NSString).appendingPathComponent(name))
+        }
+        candidates.append((workingDirectory as NSString).appendingPathComponent(name))
+        return candidates.first { FileManager.default.isReadableFile(atPath: $0) }
+    }
+
     // MARK: - Where the pipe lives
 
     private static var root: URL {
@@ -92,7 +120,8 @@ enum AgentPipeTransport {
         fifoPath: String,
         model: String,
         instructions: String,
-        extraArgs: [String]
+        extraArgs: [String],
+        rendererPath: String? = nil
     ) -> String {
         var parts = [
             quoted(claudePath),
@@ -112,13 +141,19 @@ enum AgentPipeTransport {
         parts += extraArgs.map(quoted)
 
         let f = quoted(fifoPath)
+        var run = parts.joined(separator: " ") + " <&3"
+        if let rendererPath {
+            // `2>&1` as well, so a claude error is not left invisible behind a
+            // filter that only reads stdout.
+            run += " 2>&1 | /usr/bin/env python3 \(quoted(rendererPath))"
+        }
         let chain = [
             "rm -f \(f)",
             "mkdir -p \(quoted((fifoPath as NSString).deletingLastPathComponent))",
             "mkfifo -m 600 \(f)",
             // Hold the write end open here so the reader never blocks or ends.
             "exec 3<>\(f)",
-            parts.joined(separator: " ") + " <&3",
+            run,
         ].joined(separator: " && ")
 
         // Handed back as one command, not a chain, because the caller may

@@ -680,7 +680,10 @@ final class TeamOrchestrator: ObservableObject {
                     fifoPath: AgentPipeTransport.fifoPath(agentId: agentId),
                     model: Self.resolveClaudeModelArg(agentModel),
                     instructions: agentInstructions,
-                    extraArgs: extraArgs
+                    extraArgs: extraArgs,
+                    rendererPath: AgentPipeTransport.rendersOutput
+                        ? AgentPipeTransport.rendererPath(workingDirectory: agentWorkDir)
+                        : nil
                 )
             }
         }
