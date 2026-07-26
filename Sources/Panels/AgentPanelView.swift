@@ -17,6 +17,7 @@ struct AgentPanelView: View {
 
     @State private var draft = ""
     @FocusState private var composerFocused: Bool
+    @Environment(\.colorScheme) private var colorScheme
     /// Whether the view is following the bottom. Reading back through a
     /// transcript is the one thing auto-scroll must not fight.
     @State private var following = true
@@ -38,6 +39,21 @@ struct AgentPanelView: View {
         case "magenta": return .purple
         default:        return .secondary
         }
+    }
+
+    /// Role colour answers "which worker is this"; provider colour answers
+    /// "which engine is behind it". Keeping both prevents a Claude executor
+    /// and a Claude reviewer from collapsing into the same identity.
+    private var providerAccent: Color {
+        ProviderIdentity.readableAccent(
+            for: panel.cli,
+            colorScheme: colorScheme,
+            fallback: accent
+        )
+    }
+
+    private var providerMarkAccent: Color {
+        ProviderIdentity.markAccent(for: panel.cli, fallback: accent)
     }
 
     var body: some View {
@@ -73,7 +89,7 @@ struct AgentPanelView: View {
                 .foregroundStyle(accent)
                 .lineLimit(1)
                 .fixedSize()
-            CliBadge(cli: panel.cli, accent: accent)
+            CliBadge(cli: panel.cli, accent: providerAccent)
                 .fixedSize()
             if let summary = session.summary, !summary.isEmpty {
                 Text(summary)
@@ -112,7 +128,11 @@ struct AgentPanelView: View {
     /// banner that scrolls away cannot answer the first one.
     private var banner: some View {
         HStack(alignment: .top, spacing: 10) {
-            Mascot(rows: Self.mascot(for: panel.cli), accent: accent)
+            Mascot(
+                cli: panel.cli,
+                rows: Self.mascot(for: panel.cli),
+                fallbackAccent: providerMarkAccent
+            )
             VStack(alignment: .leading, spacing: 2) {
                 Text(panel.agentName)
                     .font(.system(size: 15, weight: .bold))
@@ -134,19 +154,15 @@ struct AgentPanelView: View {
         }
         .padding(10)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .background(accent.opacity(0.07), in: RoundedRectangle(cornerRadius: 8))
-        .overlay(RoundedRectangle(cornerRadius: 8).strokeBorder(accent.opacity(0.35)))
+        .background(providerMarkAccent.opacity(0.07), in: RoundedRectangle(cornerRadius: 8))
+        .overlay(RoundedRectangle(cornerRadius: 8).strokeBorder(providerMarkAccent.opacity(0.35)))
     }
 
-    /// A mascot per CLI, in block characters, all nine columns wide so they
-    /// read as one family rather than six unrelated doodles.
+    /// A compact mark per CLI, in block characters, all nine columns wide so
+    /// the banners retain one rhythm while each provider retains its silhouette.
     ///
-    /// Claude's is its own welcome banner. The rest are silhouettes taken from
-    /// what the thing is called — codex a knot of code, kiro a cut gem, cursor
-    /// a pointer, agy (Antigravity) something lifting off, gemini a pair of
-    /// sparks. Deliberately not imitations of anyone's logo: the pane says the
-    /// CLI's name beside the mascot, so the drawing never has to be decoded to
-    /// answer "which one is this".
+    /// Provider colour is applied by `Mascot`: Claude stays coral, Cursor stays
+    /// monochrome, and the two Google marks retain their multicolour identity.
     static func mascot(for cli: String) -> [String] {
         switch cli {
         case "claude":
@@ -166,9 +182,9 @@ struct AgentPanelView: View {
                     "  ▐█▙▖   ",
                     "  ▐███▙▖ "]
         case "agy":
-            return ["   ▗▖    ",
-                    "  ▟██▙   ",
-                    " ▘▘  ▝▝  "]
+            return ["   ▟█▙   ",
+                    "  ▟███▙  ",
+                    " ▟█▛ ▜█▙ "]
         case "gemini":
             return ["  ▗▄▖▗▖  ",
                     " ▝█████▘ ",
@@ -521,21 +537,135 @@ private struct TurnFooter: View {
 /// A `Text` holding all three rows would space them by the font's line height
 /// and the blocks would not meet — the drawing only reads as one if the rows
 /// touch, so each is its own row with the leading pulled out.
+private enum ProviderIdentity {
+    /// Brand colour used by the mark itself. It is decorative and can retain
+    /// the provider's original saturation; text uses `readableAccent` below.
+    static func markAccent(for cli: String, fallback: Color) -> Color {
+        switch cli.lowercased() {
+        case "claude": return Color(red: 0.85, green: 0.47, blue: 0.34)
+        case "codex":  return Color(red: 0.06, green: 0.64, blue: 0.50)
+        case "kiro":   return Color(red: 0.58, green: 0.42, blue: 0.94)
+        case "cursor": return .primary
+        case "agy":    return Color(red: 0.25, green: 0.63, blue: 0.96)
+        case "gemini": return Color(red: 0.26, green: 0.52, blue: 0.96)
+        default:       return fallback
+        }
+    }
+
+    /// Small badge text needs stronger contrast than a decorative logo.
+    /// These are darker/lighter steps of the same provider hue, selected for
+    /// the active appearance rather than replacing brand identity with gray.
+    static func readableAccent(
+        for cli: String,
+        colorScheme: ColorScheme,
+        fallback: Color
+    ) -> Color {
+        let isDark = colorScheme == .dark
+        switch cli.lowercased() {
+        case "claude":
+            return isDark
+                ? Color(red: 0.93, green: 0.61, blue: 0.48)
+                : Color(red: 0.63, green: 0.23, blue: 0.14)
+        case "codex":
+            return isDark
+                ? Color(red: 0.31, green: 0.86, blue: 0.70)
+                : Color(red: 0.02, green: 0.40, blue: 0.31)
+        case "kiro":
+            return isDark
+                ? Color(red: 0.75, green: 0.64, blue: 0.97)
+                : Color(red: 0.36, green: 0.21, blue: 0.68)
+        case "cursor":
+            return .primary
+        case "agy":
+            return isDark
+                ? Color(red: 0.48, green: 0.74, blue: 1.00)
+                : Color(red: 0.08, green: 0.35, blue: 0.67)
+        case "gemini":
+            return isDark
+                ? Color(red: 0.56, green: 0.70, blue: 1.00)
+                : Color(red: 0.10, green: 0.29, blue: 0.67)
+        default:
+            return fallback
+        }
+    }
+
+    /// Letter-coded palettes keep the pixel marks deterministic and make the
+    /// Antigravity A match its orange → green/blue → violet reference without
+    /// baking a raster asset into the app.
+    private static let rainbow: [Character: Color] = [
+        "O": Color(red: 1.00, green: 0.54, blue: 0.22),
+        "R": Color(red: 1.00, green: 0.36, blue: 0.36),
+        "Y": Color(red: 1.00, green: 0.80, blue: 0.25),
+        "G": Color(red: 0.29, green: 0.77, blue: 0.42),
+        "C": Color(red: 0.30, green: 0.79, blue: 0.94),
+        "M": Color(red: 0.84, green: 0.35, blue: 0.73),
+        "P": Color(red: 0.66, green: 0.37, blue: 1.00),
+        "B": Color(red: 0.23, green: 0.51, blue: 0.96),
+    ]
+
+    private static let agyTones = [
+        "   OOR   ",
+        "  YYOMP  ",
+        " CCG PBB ",
+    ]
+
+    private static let geminiTones = [
+        "  BBGRR  ",
+        " RRYGGGB ",
+        "  YYBBB  ",
+    ]
+
+    static func mascotColor(
+        for cli: String,
+        row: Int,
+        column: Int,
+        fallback: Color
+    ) -> Color {
+        let tones: [String]?
+        switch cli.lowercased() {
+        case "agy": tones = agyTones
+        case "gemini": tones = geminiTones
+        default: tones = nil
+        }
+        if let tones, tones.indices.contains(row) {
+            let characters = Array(tones[row])
+            if characters.indices.contains(column),
+               let colour = rainbow[characters[column]] {
+                return colour
+            }
+        }
+        return markAccent(for: cli, fallback: fallback)
+    }
+}
+
 private struct Mascot: View {
+    let cli: String
     let rows: [String]
-    let accent: Color
+    let fallbackAccent: Color
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            ForEach(Array(rows.enumerated()), id: \.offset) { _, row in
-                Text(row)
+            ForEach(Array(rows.enumerated()), id: \.offset) { rowIndex, row in
+                colored(row, at: rowIndex)
                     .font(.system(size: 11, design: .monospaced))
                     .lineSpacing(0)
                     .fixedSize()
             }
         }
-        .foregroundStyle(accent)
         .accessibilityHidden(true)
+    }
+
+    private func colored(_ row: String, at rowIndex: Int) -> Text {
+        Array(row).enumerated().reduce(Text("")) { result, item in
+            result + Text(String(item.element)).foregroundColor(
+                ProviderIdentity.mascotColor(
+                    for: cli,
+                    row: rowIndex,
+                    column: item.offset,
+                    fallback: fallbackAccent
+                )
+            )
+        }
     }
 }
 
