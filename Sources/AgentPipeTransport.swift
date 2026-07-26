@@ -16,11 +16,15 @@ import Foundation
 /// its context, and marks the end of each with `{"type":"result"}`.
 /// See `docs/spike/agent-protocol-verify.md`.
 ///
-/// **This is opt-in and claude-only.** The pane path is untouched and remains
-/// the default: it is what makes a running agent watchable, and this trades
-/// that view for a channel. Turning it on shows raw NDJSON in the pane, because
-/// `--print` is not the interactive UI — so this exists to measure that cost
-/// honestly, not to replace anything yet.
+/// The other four CLIs reach the same place by different roads, so they run
+/// behind `scripts/spike/tm-agent-bridge.py`, which speaks their protocol and
+/// emits claude's events — see `needsBridge`.
+///
+/// **This is opt-in.** The pane path is untouched and remains the default: it
+/// is what makes a running agent watchable, and this trades that view for a
+/// channel. What it buys back is measurable — a receipt for every delivery, a
+/// stated end to every turn, and a person who can still type into the pane —
+/// so this exists to price that trade honestly, not to replace anything yet.
 enum AgentPipeTransport {
     /// Off unless asked for. The pane path is the product; this is an
     /// experiment running beside it.
@@ -40,16 +44,32 @@ enum AgentPipeTransport {
     /// cannot do, so those two run behind a bridge that owns the child's stdio
     /// and speaks for it.
     ///
-    /// Cursor is absent on purpose: it has no stdio channel at all. A turn is
-    /// a process there, resumed by a session id it hands back — a third shape,
-    /// and not this one.
+    /// Cursor and agy are a third shape: no stdio channel at all, and a turn
+    /// *is* a process. That reads like the terminal path and is not — the
+    /// answer comes back on stdout and the process exiting is the end-of-turn
+    /// signal, which is plainer than any of the protocols. What it costs is the
+    /// context reloaded every turn and an id that has to be kept: cursor hands
+    /// it back in the answer, agy announces it only in its log. Both go behind
+    /// the bridge too, so the shape stays the bridge's problem.
     static func supports(cli: String) -> Bool {
         cli == "claude" || needsBridge(cli: cli)
     }
 
-    /// CLIs whose protocol has to be spoken, not just written to.
+    /// CLIs the bridge has to run on the agent's behalf — either because their
+    /// protocol must be spoken rather than written to, or because they have no
+    /// channel to write to at all.
     static func needsBridge(cli: String) -> Bool {
-        cli == "codex" || cli == "kiro"
+        ["codex", "kiro", "cursor", "agy"].contains(cli)
+    }
+
+    /// CLIs that exist only on the pipe.
+    ///
+    /// The pane path has no launch line for these: it runs a CLI's interactive
+    /// UI and takes its turns by typing, and a turn-per-process CLI has neither
+    /// to offer. Selecting one as an agent's CLI therefore depends on the
+    /// transport, which is why it is asked here rather than assumed.
+    static func isPipeOnly(cli: String) -> Bool {
+        cli == "cursor" || cli == "agy"
     }
 
     /// The bridge, found next to the app or in the repo it was built from.

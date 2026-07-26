@@ -5,6 +5,11 @@ Claude's channel is one-directional: write a line of NDJSON to its stdin and
 that is the whole delivery. A FIFO is enough, so the process can sit in a pane
 with its stdout going wherever it likes.
 
+Cursor and agy are not that shape either, in the opposite direction: they have
+no stdin channel at all. A turn *is* a process, and the thread is carried by an
+id handed back — in cursor's answer, in agy's log file. So the bridge runs one
+process per turn and keeps that id.
+
 Codex and Kiro are not that shape. Both are request/response — `thread/start`
 hands back a `threadId` that every later `turn/start` must carry, `session/new`
 hands back a `sessionId` that every later `session/prompt` must carry. Whoever
@@ -32,6 +37,7 @@ import argparse
 import json
 import os
 import queue
+import re
 import subprocess
 import sys
 import threading
@@ -94,6 +100,7 @@ class Emitter:
     """Everything upstream sees claude's vocabulary, whoever produced it."""
 
     def __init__(self, events_path: str | None):
+        self.path = events_path
         self.fh = open(events_path, "a", encoding="utf-8") if events_path else None
 
     def emit(self, obj: dict) -> None:
@@ -180,6 +187,226 @@ class JsonRpc:
                 if until_method and obj["method"] == until_method:
                     return obj
         return None
+
+
+# ── cursor, agy: a turn is a process ───────────────────────────────────────
+
+class PerTurnBridge:
+    """A CLI with no stdin channel, where each turn is its own process.
+
+    This is not the terminal path in disguise. The answer arrives on stdout
+    rather than on a screen, and the process exiting *is* the end-of-turn
+    signal — plainer than any of the three protocols. What it costs is the
+    context reloaded each turn, and an id that has to be kept to stay on the
+    same thread.
+
+    That id is the one place the two differ. Cursor puts it in the answer, so
+    it is read from the same object as everything else. agy announces it only
+    in its log file, so the bridge gives it a log to write and reads the line
+    back out — string-scraping for state, which is what this whole exercise is
+    trying to get away from, but it is a stable server log line rather than a
+    rendered screen.
+    """
+
+    # agy's own words, from the server log it is told to write.
+    AGY_CONVERSATION = re.compile(r"Created conversation ([0-9a-f-]{36})")
+
+    def __init__(self, cli: str, cwd: str, model: str | None, emitter: Emitter):
+        self.cli = cli
+        self.cwd = cwd
+        self.model = model
+        self.out = emitter
+        self.thread: str | None = None
+        self.opened = False
+        self.log_path = os.path.join(
+            os.path.dirname(emitter.path or "") or "/tmp",
+            f"agy-{os.getpid()}.log")
+
+    # Nothing is running between turns, so there is nothing to be dead.
+    alive = True
+
+    def start(self) -> bool:
+        self.out.emit({"type": "system", "subtype": "init", "cwd": self.cwd,
+                       "model": self.model or "", "tools": []})
+        # The session has been announced once. Cursor announces it again at the
+        # head of every turn, because for cursor every turn is a new process —
+        # which is exactly the thing this is hiding.
+        self.opened = True
+        return True
+
+    def _argv(self, text: str) -> list[str]:
+        if self.cli == "cursor":
+            argv = ["cursor-agent", "-p", "--force",
+                    "--output-format", "stream-json"]
+            if self.model:
+                argv += ["--model", self.model]
+            if self.thread:
+                argv += ["--resume", self.thread]
+            return argv + [text]
+        # `--print` is a string flag: it swallows the next token as the prompt,
+        # so `agy --print --dangerously-skip-permissions "…"` asks agy to
+        # explain that flag. Everything else has to come first.
+        argv = ["agy", "--dangerously-skip-permissions", "--log-file", self.log_path]
+        if self.thread:
+            argv += ["--conversation", self.thread]
+        else:
+            # NOT `--continue`: that means "the most recent conversation" for
+            # the whole machine, so two agents here would steal each other's
+            # thread. The first turn starts fresh and pins the id afterwards.
+            pass
+        return argv + ["--print", text]
+
+    def turn(self, text: str, timeout: float) -> None:
+        self.out.sent(text)
+        env = dict(os.environ)
+        env.pop("CLAUDECODE", None)
+        env.pop("CLAUDE_CODE_ENTRYPOINT", None)
+        try:
+            p = subprocess.Popen(self._argv(text), cwd=self.cwd, env=env,
+                                 stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                 text=True, bufsize=1)
+        except OSError as exc:
+            self.out.result(f"could not start {self.cli}: {exc}",
+                            stop="spawn_failed", failed=True)
+            return
+
+        said = self._read_cursor(p) if self.cli == "cursor" else self._read_agy(p)
+        try:
+            code = p.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            p.kill()
+            self.out.result(f"{self.cli} did not finish in {timeout:.0f}s",
+                            stop="timeout", failed=True)
+            return
+
+        if self.cli == "cursor":
+            return  # cursor reports its own turn; see `_read_cursor`
+
+        self.thread = self.thread or self._agy_thread()
+        # A turn that ends with nothing said is not a success — reporting it as
+        # one is how an empty answer becomes a completed task.
+        if code != 0:
+            self.out.result(said or f"{self.cli} exited {code}",
+                            stop=f"exit_{code}", failed=True)
+        elif not said.strip():
+            self.out.result("the turn ended without an answer",
+                            stop="empty", failed=True)
+        else:
+            self.out.result(said, stop="end_turn")
+
+    def _read_cursor(self, p: subprocess.Popen) -> str:
+        """Pass cursor's events through — they are already claude's shape.
+
+        `system/init`, `user`, `assistant` with content blocks, `result` with
+        `is_error` and `usage`: the only CLI here that needs no translation.
+        What it needs instead is the per-turn process hidden — a fresh `init`
+        every turn would redraw the session banner, and its echo of the prompt
+        would read as a new question rather than the receipt for one.
+        """
+        thinking: list[str] = []
+        for line in p.stdout:
+            line = line.strip()
+            if not line.startswith("{"):
+                continue
+            try:
+                o = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            self.thread = o.get("session_id") or self.thread
+            kind = o.get("type")
+            if kind == "result":
+                self._cursor_result(o)
+                continue
+            if kind == "tool_call":
+                self._cursor_tool(o)
+                continue
+            if kind == "system":
+                if self.opened:
+                    continue
+                self.opened = True
+            elif kind == "user":
+                continue  # already emitted as the receipt, with the sender known
+            elif kind == "thinking":
+                # Deltas, so they are joined and shown once rather than a rule
+                # per fragment.
+                if o.get("subtype") == "delta":
+                    thinking.append(o.get("text", ""))
+                elif thinking:
+                    self.out.emit({"type": "assistant", "message": {"content": [
+                        {"type": "thinking", "thinking": "".join(thinking)}]}})
+                    thinking = []
+                continue
+            self.out.emit(o)
+        return ""
+
+    def _cursor_tool(self, o: dict) -> None:
+        """`{"<name>ToolCall": {"args": …, "result": {"success"|"error": …}}}`.
+
+        The tool's name is the wrapper key, which is the one shape here that
+        has to be read structurally rather than by field.
+        """
+        call = o.get("tool_call") or {}
+        key = next((k for k in call if k.endswith("ToolCall")), None)
+        if not key:
+            return
+        body = call.get(key) or {}
+        name = key[: -len("ToolCall")]
+        if o.get("subtype") == "started":
+            args = body.get("args") or {}
+            headline = (args.get("command") or args.get("path")
+                        or args.get("pattern") or args.get("query") or "")
+            self.out.tool(name, str(headline))
+            return
+        result = body.get("result") or {}
+        failed = "error" in result
+        payload = result.get("error") if failed else result.get("success")
+        if isinstance(payload, dict):
+            payload = payload.get("content") or json.dumps(payload, ensure_ascii=False)
+        self.out.tool_result(str(payload or "")[:400], failed=failed)
+
+    def _cursor_result(self, o: dict) -> None:
+        """Cursor's own verdict, with one correction.
+
+        Measured: asked to recall a word, cursor worked it out in its reasoning
+        — "The word is TANGERINE" — emitted no assistant text, and ended the
+        turn `is_error: false` with `result: ""`. Passed through, that is a
+        completed task with no answer in it. The turn did end, so it must not
+        sit open; but nothing was said, so it cannot be called a success. The
+        reasoning is not promoted into the answer — inventing one from what the
+        model was thinking is worse than saying nothing was said.
+        """
+        said = (o.get("result") or "").strip()
+        if not said and not o.get("is_error"):
+            o = dict(o, is_error=True, subtype="error", stop_reason="empty",
+                     result="the turn ended with an answer only in its reasoning")
+        self.out.emit(o)
+
+    def _read_agy(self, p: subprocess.Popen) -> str:
+        """agy answers in plain text, so the whole answer is one block.
+
+        Emitting each line as it arrives would draw a rule per line; there is
+        no structure here to tell a paragraph from a tool's output.
+        """
+        lines = []
+        for line in p.stdout:
+            # Its argument parser complains on stdout before answering.
+            if line.startswith("# Un-recognized argument"):
+                continue
+            lines.append(line.rstrip("\n"))
+        said = "\n".join(lines).strip()
+        self.out.text(said)
+        return said
+
+    def _agy_thread(self) -> str | None:
+        try:
+            with open(self.log_path, encoding="utf-8", errors="replace") as fh:
+                found = self.AGY_CONVERSATION.findall(fh.read())
+        except OSError:
+            return None
+        return found[-1] if found else None
+
+    def stop(self) -> None:
+        pass
 
 
 # ── codex: initialize → thread/start → turn/start … turn/completed ──────────
@@ -270,6 +497,10 @@ class CodexBridge:
         self.out.result(final, stop="end_turn" if done else "timeout",
                         cost=usage.get("total_cost_usd"))
 
+    @property
+    def alive(self) -> bool:
+        return self.child.alive
+
     def stop(self) -> None:
         self.child.stop()
 
@@ -329,6 +560,10 @@ class AcpBridge:
         stop = ((resp or {}).get("result") or {}).get("stopReason") or "timeout"
         self.out.result(final, stop=stop)
 
+    @property
+    def alive(self) -> bool:
+        return self.child.alive
+
     def stop(self) -> None:
         self.child.stop()
 
@@ -336,7 +571,8 @@ class AcpBridge:
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--cli", required=True, choices=["codex", "kiro", "gemini"])
+    ap.add_argument("--cli", required=True,
+                    choices=["codex", "kiro", "gemini", "cursor", "agy"])
     ap.add_argument("--fifo", required=True, help="turns arrive here, one per line")
     ap.add_argument("--events", help="normalised events are appended here too")
     ap.add_argument("--cwd", default=None)
@@ -347,7 +583,9 @@ def main() -> int:
     cwd = args.cwd or os.getcwd()
     out = Emitter(args.events)
 
-    if args.cli == "codex":
+    if args.cli in ("cursor", "agy"):
+        bridge = PerTurnBridge(args.cli, cwd, args.model, out)
+    elif args.cli == "codex":
         bridge = CodexBridge(cwd, args.model, out)
     elif args.cli == "kiro":
         # `kiro-cli acp`, NOT `kiro-cli chat acp`: both parse and only the first
@@ -385,7 +623,7 @@ def main() -> int:
                     if not text:
                         continue
                     bridge.turn(text, args.turn_timeout)
-            if not bridge.child.alive:
+            if not bridge.alive:
                 log("agent exited")
                 break
     except KeyboardInterrupt:

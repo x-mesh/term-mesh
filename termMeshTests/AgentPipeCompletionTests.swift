@@ -253,6 +253,38 @@ final class AgentPipeCompletionTests: XCTestCase {
                        "a torn-down agent is not still on a pipe")
     }
 
+    // MARK: - Which shapes the bridge covers
+
+    /// Three shapes, one vocabulary.
+    ///
+    /// Claude writes NDJSON to stdin, so a FIFO is the whole delivery. Codex
+    /// and kiro are request/response — an id comes back that every later turn
+    /// must carry — so delivering means reading the replies, which a one-way
+    /// pipe cannot do. Cursor and agy have no stdin channel at all: a turn is a
+    /// process, resumed by an id handed back in the answer (cursor) or
+    /// announced in a log file (agy). Everything but claude goes behind the
+    /// bridge, so upstream only ever sees claude's events.
+    func testEveryCliBehindTheBridgeIsStillSupported() {
+        for cli in ["codex", "kiro", "cursor", "agy"] {
+            XCTAssertTrue(AgentPipeTransport.needsBridge(cli: cli), cli)
+            XCTAssertTrue(AgentPipeTransport.supports(cli: cli), cli)
+        }
+        XCTAssertTrue(AgentPipeTransport.supports(cli: "claude"))
+        XCTAssertFalse(AgentPipeTransport.needsBridge(cli: "claude"),
+                       "a FIFO is claude's whole delivery")
+    }
+
+    /// A turn-per-process CLI has no interactive UI to host and no stdin to
+    /// type into, so the pane path cannot run one at all.
+    func testTurnPerProcessClisExistOnlyOnThePipe() {
+        XCTAssertTrue(AgentPipeTransport.isPipeOnly(cli: "cursor"))
+        XCTAssertTrue(AgentPipeTransport.isPipeOnly(cli: "agy"))
+        for cli in ["claude", "codex", "kiro", "gemini"] {
+            XCTAssertFalse(AgentPipeTransport.isPipeOnly(cli: cli),
+                           "\(cli) has a pane path and must keep it")
+        }
+    }
+
     func testAgentsAreTrackedApart() {
         AgentPipeTransport.markDriven(agentId: "a@t")
         AgentPipeTransport.forgetDriven(agentId: "b@t")
