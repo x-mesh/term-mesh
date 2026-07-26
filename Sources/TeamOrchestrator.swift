@@ -2723,6 +2723,32 @@ final class TeamOrchestrator: ObservableObject {
 
     func sendToLeader(teamName: String, text: String, tabManager: TabManager) -> Bool {
         guard let team = teams[teamName] else { return false }
+        if case .peer = team.leaderEndpoint {
+            guard let located = AppDelegate.shared?.locateSurface(surfaceId: team.leaderPanelId),
+                  let workspace = located.tabManager.tabs.first(where: { $0.id == located.workspaceId }),
+                  let panel = workspace.terminalPanel(for: team.leaderPanelId),
+                  let surface = panel.surface.surface
+            else { return false }
+
+            // Bracketed paste is unreliable when the viewer pane itself is a
+            // peer relay: Ghostty can report the local paste drained while the
+            // remote Claude composer never receives it. Socket-style key text
+            // traverses the same relay reliably. Keep Return separate so the
+            // relay PTY has time to flush the text before Claude submits it.
+            let normalized = text
+                .replacingOccurrences(of: "\r\n", with: " ")
+                .replacingOccurrences(of: "\n", with: " ")
+                .replacingOccurrences(of: "\r", with: " ")
+            TerminalController.shared.sendSocketText(normalized, surface: surface)
+            panel.surface.forceRefresh()
+            DispatchQueue.main.asyncAfter(deadline: .now() + Self.remoteLeaderReturnGap) {
+                TerminalController.shared.sendNamedKeyWithRetry(
+                    on: panel.surface,
+                    keyName: "return"
+                ) { _, _ in }
+            }
+            return true
+        }
         // Adopted mode: leader lives in a different workspace than the agent workspace.
         // Use AppDelegate to locate the leader panel across all windows.
         if let leaderWsId = team.leaderWorkspaceId {
@@ -3284,6 +3310,7 @@ final class TeamOrchestrator: ObservableObject {
     /// arrive in that order. Well past a peer round trip, well under the
     /// unsubmitted-paste deadline below.
     private static let remoteReturnGap: TimeInterval = 1.5
+    private static let remoteLeaderReturnGap: TimeInterval = 5.0
 
     /// How long a paste may sit unsubmitted before this side presses Return.
     ///
