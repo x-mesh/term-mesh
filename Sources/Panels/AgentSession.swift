@@ -528,6 +528,18 @@ final class AgentSession: ObservableObject {
         // process. Leaving their carets on would say "still writing" forever.
         streamOpen.removeAll()
         streamingIds.removeAll()
+        // Same for a tool whose result never came. Measured on kiro: five rows
+        // left spinning because the bridge dropped the id its results carried,
+        // and a row with no id can never be closed by one. The id is carried
+        // now, but a CLI that simply never reports is still possible, and the
+        // turn being over is proof that nothing is still running.
+        for position in openTools.values where position < entries.count {
+            guard case .tool(let id, var call) = entries[position], call.isRunning
+            else { continue }
+            call.result = ""
+            entries[position] = .tool(id: id, call)
+        }
+        openTools.removeAll()
         append(.turnEnded(id: UUID(), end))
         isThinking = false
         turnInFlight = false

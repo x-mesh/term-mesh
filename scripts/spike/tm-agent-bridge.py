@@ -44,6 +44,30 @@ import threading
 import time
 
 
+def acp_text(content) -> str:
+    """Pull the text out of ACP content blocks.
+
+    `[{"type": "content", "content": {"type": "text", "text": …}}]` is the
+    nested shape; `[{"type": "text", "text": …}]` the flat one. Both appear.
+    """
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list):
+        return ""
+    out = []
+    for block in content:
+        if not isinstance(block, dict):
+            continue
+        inner = block.get("content")
+        if isinstance(inner, dict) and inner.get("type") == "text":
+            out.append(inner.get("text", ""))
+        elif block.get("type") == "text":
+            out.append(block.get("text", ""))
+        elif isinstance(inner, str):
+            out.append(inner)
+    return "".join(out)
+
+
 def log(msg: str) -> None:
     # Colour only for a terminal. When the app hosts this there is nothing to
     # interpret the escapes, and they would arrive as literal garbage in a view
@@ -122,13 +146,19 @@ class Emitter:
             self.emit({"type": "assistant",
                        "message": {"content": [{"type": "text", "text": s}]}})
 
-    def tool(self, name: str, headline: str) -> None:
-        self.emit({"type": "assistant", "message": {"content": [
-            {"type": "tool_use", "name": name, "input": {"command": headline}}]}})
+    def tool(self, name: str, headline: str, call_id: str = "") -> None:
+        # The id is what lets a result land on the call it answers. Without it
+        # the row it opened never closes, and a spinner spins forever.
+        block = {"type": "tool_use", "name": name, "input": {"command": headline}}
+        if call_id:
+            block["id"] = call_id
+        self.emit({"type": "assistant", "message": {"content": [block]}})
 
-    def tool_result(self, body: str, failed: bool = False) -> None:
-        self.emit({"type": "user", "message": {"content": [
-            {"type": "tool_result", "content": body, "is_error": failed}]}})
+    def tool_result(self, body: str, failed: bool = False, call_id: str = "") -> None:
+        block = {"type": "tool_result", "content": body, "is_error": failed}
+        if call_id:
+            block["tool_use_id"] = call_id
+        self.emit({"type": "user", "message": {"content": [block]}})
 
     # ── streaming ──────────────────────────────────────────────────────
     #
@@ -517,9 +547,18 @@ class CodexBridge:
                         said.append(body)
                         self.out.text(body)
                 elif kind in ("commandExecution", "command_execution"):
-                    self.out.tool("shell", item.get("command", ""))
+                    # One event, both halves: codex reports the finished item,
+                    # so opening a row and leaving it open would spin forever.
+                    cid = str(item.get("id") or "")
+                    self.out.tool("shell", item.get("command", ""), call_id=cid)
+                    failed = bool(item.get("exitCode") or item.get("exit_code"))
+                    self.out.tool_result(
+                        str(item.get("aggregatedOutput") or item.get("output") or "")[:400],
+                        failed=failed, call_id=cid)
                 elif kind in ("fileChange", "file_change", "patchApply"):
-                    self.out.tool("edit", str(item.get("path", "")))
+                    cid = str(item.get("id") or "")
+                    self.out.tool("edit", str(item.get("path", "")), call_id=cid)
+                    self.out.tool_result("", call_id=cid)
 
         params = {"threadId": self.thread_id,
                   "input": [{"type": "text", "text": text}]}
@@ -577,6 +616,9 @@ class AcpBridge:
         self.cwd = cwd
         self.model = model
         self.session: str | None = None
+        # A tool's output can arrive across several updates, before the one
+        # that reports its status.
+        self.tool_output: dict[str, str] = {}
 
     def start(self) -> bool:
         init = self.rpc.request("initialize", {
@@ -616,12 +658,21 @@ class AcpBridge:
                 self.out.delta(chunk)
             elif kind == "tool_call":
                 self.out.tool(u.get("title") or u.get("kind") or "tool",
-                              str(u.get("rawInput") or "")[:200])
+                              str(u.get("rawInput") or "")[:200],
+                              call_id=str(u.get("toolCallId") or ""))
             elif kind == "tool_call_update":
+                cid = str(u.get("toolCallId") or "")
+                # ACP's content is a list of content blocks, sometimes nested
+                # one deeper. Stringifying it gave a python repr — or, when it
+                # arrived on an earlier update than the status, nothing at all,
+                # which is why these rows closed with no output.
+                text = acp_text(u.get("content"))
+                if text:
+                    self.tool_output[cid] = self.tool_output.get(cid, "") + text
                 status = u.get("status")
                 if status in ("completed", "failed"):
-                    self.out.tool_result(str(u.get("content") or "")[:400],
-                                         failed=status == "failed")
+                    self.out.tool_result(self.tool_output.pop(cid, "")[:400],
+                                         failed=status == "failed", call_id=cid)
 
         resp = self.rpc.request("session/prompt", {
             "sessionId": self.session,

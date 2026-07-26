@@ -221,6 +221,25 @@ final class AgentSessionTests: XCTestCase {
         XCTAssertFalse(s.streamingIds.contains(id))
     }
 
+    /// Measured on kiro: five tool rows left spinning, because the bridge
+    /// dropped the `toolCallId` its results carried and a row with no id can
+    /// never be closed by one. The id is carried now — and a CLI that simply
+    /// never reports a result is still possible, so the turn being over is
+    /// taken as proof that nothing is still running.
+    func testATurnEndingClosesToolRowsThatNeverReported() throws {
+        let s = session([
+            event(["type": "assistant", "message": ["content": [
+                ["type": "tool_use", "id": "t1", "name": "Read",
+                 "input": ["file_path": "/tmp/x"]]]]]),
+            event(["type": "result", "stop_reason": "end_turn"]),
+        ])
+        guard case .tool(_, let call) = try XCTUnwrap(s.entries.first) else {
+            return XCTFail("expected a tool call")
+        }
+        XCTAssertFalse(call.isRunning, "the turn is over; nothing is still running")
+        XCTAssertFalse(call.failed, "and not reporting is not the same as failing")
+    }
+
     /// A turn can end with a block still open — an error, a stop, a killed
     /// process. A caret left on says "still writing" forever.
     func testATurnEndingMidStreamStopsTheCaret() {
