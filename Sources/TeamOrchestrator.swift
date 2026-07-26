@@ -743,6 +743,14 @@ final class TeamOrchestrator: ObservableObject {
         // id (written to <sid>.jsonl) can be captured asynchronously and
         // back-filled into `claudeSessionId`. Other CLIs skip this — they
         // don't write into ~/.claude/projects/.
+        if AgentPipeTransport.canDrive(cli: agentCli) {
+            // Structural completion for this agent: the turn announces its own
+            // end, so nothing has to watch its screen for one.
+            AgentPipeCompletion.shared.watch(
+                agentId: agentId, teamName: teamName, agentName: agentName
+            )
+        }
+
         if agentCli == "claude" {
             ClaudeSessionWatcher.shared.bindIfNeeded()
             ClaudeSessionWatcher.shared.registerPendingClaudePane(
@@ -2566,9 +2574,10 @@ final class TeamOrchestrator: ObservableObject {
            FileManager.default.fileExists(
                atPath: AgentPipeTransport.fifoPath(agentId: agent.id)) {
             do {
+                AgentPipeCompletion.shared.expect(agentId: agent.id, instruction: text)
                 let n = try AgentPipeTransport.deliver(text: text, agentId: agent.id)
                 #if DEBUG
-                dlog("agent.pipe.deliver agent=\(agent.id) bytes=\(n) via=name")
+                dlog("agent.pipe.deliver agent=\(agent.id) bytes=\(n) via=name task=\(AgentPipeCompletion.taskId(in: text) ?? "-")")
                 #endif
                 completion?(true)
                 return true
@@ -2652,9 +2661,10 @@ final class TeamOrchestrator: ObservableObject {
         // either lands whole or reports why it did not.
         if let agent = pipeDrivenAgent(teamName: teamName, panelId: panelId) {
             do {
+                AgentPipeCompletion.shared.expect(agentId: agent.id, instruction: text)
                 let n = try AgentPipeTransport.deliver(text: text, agentId: agent.id)
                 #if DEBUG
-                dlog("agent.pipe.deliver agent=\(agent.id) bytes=\(n)")
+                dlog("agent.pipe.deliver agent=\(agent.id) bytes=\(n) task=\(AgentPipeCompletion.taskId(in: text) ?? "-")")
                 #endif
                 completion?(true)
                 return true

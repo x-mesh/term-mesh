@@ -141,11 +141,13 @@ enum AgentPipeTransport {
         parts += extraArgs.map(quoted)
 
         let f = quoted(fifoPath)
-        var run = parts.joined(separator: " ") + " <&3"
+        var run = parts.joined(separator: " ") + " <&3 2>&1"
+        // A copy for this side to read. The pane is a view; a view is not a
+        // place to read state back out of, which is the whole lesson of the
+        // scrollback detector.
+        run += " | tee \(quoted(fifoPath + ".events"))"
         if let rendererPath {
-            // `2>&1` as well, so a claude error is not left invisible behind a
-            // filter that only reads stdout.
-            run += " 2>&1 | /usr/bin/env python3 \(quoted(rendererPath))"
+            run += " | /usr/bin/env python3 \(quoted(rendererPath))"
         }
         let chain = [
             "rm -f \(f)",

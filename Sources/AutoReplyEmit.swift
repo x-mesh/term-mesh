@@ -22,6 +22,17 @@ enum AutoReplyEmit {
         teamName: String,
         agentName: String,
         event: AutoReplyEvent,
+        // The task this reply is answering, when the caller knows it.
+        //
+        // The scrollback path never can: it sees an answer appear on a screen
+        // with nothing tying it to a request. So it guesses — first
+        // `in_progress`, else the first non-terminal task — and `blocked` is
+        // not in that terminal set, so an unrelated turn can walk up and mark
+        // a blocked task completed. Observed doing exactly that.
+        //
+        // A caller that sent the instruction does know, and passing it here is
+        // the difference between closing a task and closing *this* task.
+        preferredTaskId: String? = nil,
         store: TeamDataStore = .shared
     ) -> Bool {
         let replyText = formatReplyText(event)
@@ -42,7 +53,8 @@ enum AutoReplyEmit {
             dependsOn: nil
         )
         let terminal: Set<String> = ["completed", "failed", "abandoned", "cancelled"]
-        let target = tasks.first(where: { $0.status == "in_progress" })
+        let target = preferredTaskId.flatMap { id in tasks.first(where: { $0.id == id }) }
+            ?? tasks.first(where: { $0.status == "in_progress" })
             ?? tasks.first(where: { !terminal.contains($0.status) })
         guard let task = target else {
             return false
