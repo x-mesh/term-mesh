@@ -657,7 +657,7 @@ impl AgentSessionManager {
             let wt_info = worktree::create(wt_params)?;
 
             // Watch the worktree directory
-            watcher.watch_path(&wt_info.path);
+            watcher.watch_path(&wt_info.path)?;
 
             let session = AgentSession {
                 id: uuid::Uuid::new_v4().to_string(),

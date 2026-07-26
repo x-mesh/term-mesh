@@ -980,8 +980,14 @@ async fn watch_handler(
     State(state): State<Arc<HttpState>>,
     Json(req): Json<WatchRequest>,
 ) -> impl IntoResponse {
-    state.watcher_handle.watch_path(&req.path);
-    Json(serde_json::json!({"status": "ok", "watching": req.path}))
+    match state.watcher_handle.watch_path(&req.path) {
+        Ok(()) => Json(serde_json::json!({"status": "ok", "watching": req.path})).into_response(),
+        Err(error) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"status": "error", "error": error})),
+        )
+            .into_response(),
+    }
 }
 
 async fn unwatch_handler(

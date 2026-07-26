@@ -208,6 +208,10 @@ final class TermMeshDaemon: ObservableObject {
             let process = Process()
             process.executableURL = URL(fileURLWithPath: binaryPath)
             var env = ProcessInfo.processInfo.environment
+            // A GUI-owned daemon must not outlive the app after a crash,
+            // forced reload, or SIGKILL. Standalone/headless launches omit
+            // this variable and retain their independent lifecycle.
+            env["TERMMESH_OWNER_PID"] = String(ProcessInfo.processInfo.processIdentifier)
 
             // Ensure Resources/bin is in PATH for daemon and all its child processes.
             // When launched from Finder/Spotlight, macOS provides a minimal PATH that
@@ -620,14 +624,48 @@ final class TermMeshDaemon: ObservableObject {
 
     // MARK: - Watcher (F-05)
 
+    /// Normalize a file-watch target and reject paths whose recursive event
+    /// volume would cover the whole machine or user account.
+    static func safeWatchPath(
+        _ path: String,
+        homeDirectory: String = FileManager.default.homeDirectoryForCurrentUser.path
+    ) -> String? {
+        let trimmed = path.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty, trimmed.hasPrefix("/") else { return nil }
+
+        let normalized = URL(fileURLWithPath: trimmed)
+            .standardizedFileURL
+            .resolvingSymlinksInPath()
+            .path
+        guard normalized.hasPrefix("/") else { return nil }
+
+        let normalizedHome = URL(fileURLWithPath: homeDirectory)
+            .standardizedFileURL
+            .resolvingSymlinksInPath()
+            .path
+        let dangerous = Set([
+            "/", "/Users", "/tmp", "/private", "/private/tmp",
+            "/var", "/private/var", normalizedHome,
+        ])
+        return dangerous.contains(normalized) ? nil : normalized
+    }
+
     /// Start watching a directory for file events.
     func watchPath(_ path: String) {
-        let _ = rpcCall(method: "watcher.watch", params: ["path": path])
+        guard let safePath = Self.safeWatchPath(path) else {
+            Logger.daemon.warning("refusing recursive watch of broad path: \(path, privacy: .public)")
+            return
+        }
+        let _ = rpcCall(method: "watcher.watch", params: ["path": safePath])
     }
 
     /// Stop watching a directory.
     func unwatchPath(_ path: String) {
-        let _ = rpcCall(method: "watcher.unwatch", params: ["path": path])
+        let normalized = URL(fileURLWithPath: path)
+            .standardizedFileURL
+            .resolvingSymlinksInPath()
+            .path
+        let _ = rpcCall(method: "watcher.unwatch", params: ["path": normalized])
     }
 
     // MARK: - Sessions

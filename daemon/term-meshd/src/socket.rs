@@ -1822,6 +1822,7 @@ async fn dispatch(req: &Request, ctx: &Context) -> Response {
 
             Ok(serde_json::json!({
                 "pid": std::process::id(),
+                "owner_pid": crate::configured_owner_pid(),
                 "version": env!("CARGO_PKG_VERSION"),
                 "uptime_secs": uptime_secs,
                 "subsystems": {
@@ -2077,10 +2078,10 @@ async fn dispatch(req: &Request, ctx: &Context) -> Response {
                 path: String,
             }
             match serde_json::from_value::<WatchParams>(req.params.clone()) {
-                Ok(p) => {
-                    ctx.watcher_handle.watch_path(&p.path);
-                    Ok(serde_json::json!({"status": "ok"}))
-                }
+                Ok(p) => ctx
+                    .watcher_handle
+                    .watch_path(&p.path)
+                    .map(|()| serde_json::json!({"status": "ok"})),
                 Err(e) => Err(format!("invalid params: {e}")),
             }
         }

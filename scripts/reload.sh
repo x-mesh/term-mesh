@@ -54,6 +54,45 @@ sanitize_path() {
   echo "$cleaned"
 }
 
+daemon_pid_for_socket() {
+  local socket_path="$1"
+  printf '{"jsonrpc":"2.0","id":1,"method":"daemon.status","params":{}}\n' \
+    | nc -U -w 2 "$socket_path" 2>/dev/null \
+    | /usr/bin/python3 -c 'import json,sys
+try: print(json.load(sys.stdin)["result"]["pid"])
+except Exception: pass' 2>/dev/null || true
+}
+
+stop_daemon_for_socket() {
+  local socket_path="$1"
+  local pid=""
+  local attempt=0
+  [[ -S "$socket_path" ]] || return 0
+
+  pid="$(daemon_pid_for_socket "$socket_path")"
+  if [[ "$pid" =~ ^[0-9]+$ ]]; then
+    kill "$pid" 2>/dev/null || true
+    for attempt in {1..20}; do
+      kill -0 "$pid" 2>/dev/null || break
+      sleep 0.1
+    done
+    if kill -0 "$pid" 2>/dev/null; then
+      kill -9 "$pid" 2>/dev/null || true
+    fi
+  fi
+  rm -f "$socket_path"
+}
+
+wait_for_app_exit() {
+  local pattern="$1"
+  local attempt=0
+  for attempt in {1..40}; do
+    pgrep -f "$pattern" >/dev/null 2>&1 || return 0
+    sleep 0.1
+  done
+  return 1
+}
+
 print_tag_cleanup_reminder() {
   local current_slug="$1"
   local path=""
@@ -278,31 +317,36 @@ if [[ -n "$TAG" && "$APP_NAME" != "$SEARCH_APP_NAME" ]]; then
         || /usr/libexec/PlistBuddy -c "Add :LSEnvironment:TERMMESH_SOCKET_PATH string \"${TERMMESH_SOCKET}\"" "$INFO_PLIST"
       /usr/libexec/PlistBuddy -c "Set :LSEnvironment:TERMMESH_DEBUG_LOG \"${TERMMESH_DEBUG_LOG}\"" "$INFO_PLIST" 2>/dev/null \
         || /usr/libexec/PlistBuddy -c "Add :LSEnvironment:TERMMESH_DEBUG_LOG string \"${TERMMESH_DEBUG_LOG}\"" "$INFO_PLIST"
-      if [[ -S "$TERMMESH_DAEMON_SOCKET" ]]; then
-        for PID in $(lsof -t "$TERMMESH_DAEMON_SOCKET" 2>/dev/null); do
-          kill "$PID" 2>/dev/null || true
-        done
-        rm -f "$TERMMESH_DAEMON_SOCKET"
-      fi
-      if [[ -S "$TERMMESH_SOCKET" ]]; then
-        rm -f "$TERMMESH_SOCKET"
-      fi
     fi
   fi
   APP_PATH="$TAG_APP_PATH"
 fi
 
-# Ensure any running instance is fully terminated, regardless of DerivedData path.
+# Ask the old app to terminate cleanly first. Remote agents can make
+# applicationShouldTerminate return `.terminateLater` for up to 2.5 seconds,
+# so the old fixed 0.3-second delay routinely killed the app before
+# applicationWillTerminate could stop its daemon.
 /usr/bin/osascript -e "tell application id \"${BUNDLE_ID}\" to quit" >/dev/null 2>&1 || true
-sleep 0.3
 if [[ -z "$TAG" ]]; then
-  # Non-tag mode: kill any running instance (across any DerivedData path) to avoid socket conflicts.
-  pkill -f "/${BASE_APP_NAME}.app/Contents/MacOS/${BASE_APP_NAME}" || true
+  APP_PROCESS_PATTERN="/${BASE_APP_NAME}.app/Contents/MacOS/${BASE_APP_NAME}"
 else
-  # Tag mode: only kill the tagged instance; allow side-by-side with the main app.
-  pkill -f "${APP_NAME}.app/Contents/MacOS/${BASE_APP_NAME}" || true
+  APP_PROCESS_PATTERN="${APP_NAME}.app/Contents/MacOS/${BASE_APP_NAME}"
 fi
-sleep 0.3
+if ! wait_for_app_exit "$APP_PROCESS_PATTERN"; then
+  # Last resort after the graceful-shutdown budget has elapsed.
+  pkill -f "$APP_PROCESS_PATTERN" || true
+fi
+
+# Tagged instances have an exact daemon socket, so clean up a pre-owner-watch
+# daemon from an older build as well. Do this only after the app has exited;
+# unlinking the live control socket first leaves an unreachable daemon behind.
+if [[ -n "${TERMMESH_DAEMON_SOCKET:-}" ]]; then
+  stop_daemon_for_socket "$TERMMESH_DAEMON_SOCKET"
+fi
+if [[ -n "${TERMMESH_SOCKET:-}" ]]; then
+  rm -f "$TERMMESH_SOCKET"
+fi
+
 if [[ -d "$PWD/daemon" && -f "$PWD/daemon/Cargo.toml" ]]; then
   (cd "$PWD/daemon" && cargo build --release 2>/dev/null) || true
 fi

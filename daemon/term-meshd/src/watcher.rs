@@ -81,36 +81,44 @@ enum WatcherCommand {
 }
 
 impl WatcherHandle {
-    pub fn watch_path(&self, path: &str) {
+    pub fn watch_path(&self, path: &str) -> Result<(), String> {
+        let path = validated_watch_path(path)?;
+        let path = path.to_string_lossy().into_owned();
+
         // Update state immediately so snapshot reflects it right away
         {
             let mut state = self.state.lock().unwrap();
-            if state.watched_paths.iter().any(|p| p == path) {
-                return; // Already watching
+            if state.watched_paths.iter().any(|p| p == &path) {
+                return Ok(()); // Already watching
             }
-            state.watched_paths.push(path.to_string());
+            // Queue the OS-watcher mutation before publishing state. If the
+            // worker has stopped or is saturated, a snapshot must not claim a
+            // path is watched when no underlying watch exists.
+            self.command_tx
+                .try_send(WatcherCommand::Watch(path.clone()))
+                .map_err(|error| format!("file watcher command queue unavailable: {error}"))?;
+            state.watched_paths.push(path.clone());
             // Load .gitignore rules if enabled
             if state.use_gitignore {
-                let rules = load_gitignore_rules(path);
+                let rules = load_gitignore_rules(&path);
                 state.gitignore_patterns.extend(rules);
             }
         }
-        // Send command to the watcher thread to actually start watching
-        let _ = self
-            .command_tx
-            .try_send(WatcherCommand::Watch(path.to_string()));
+        Ok(())
     }
 
     pub fn unwatch_path(&self, path: &str) {
+        let path = normalized_watch_path(path);
+        let path = path.to_string_lossy().into_owned();
         {
             let mut state = self.state.lock().unwrap();
-            state.watched_paths.retain(|p| p != path);
+            state.watched_paths.retain(|p| p != &path);
             // Remove gitignore rules for this base dir
             state.gitignore_patterns.retain(|r| r.base_dir != path);
         }
         let _ = self
             .command_tx
-            .try_send(WatcherCommand::Unwatch(path.to_string()));
+            .try_send(WatcherCommand::Unwatch(path));
     }
 
     /// Enable/disable .gitignore-based filtering for file events.
@@ -184,6 +192,53 @@ impl WatcherHandle {
             timeline,
         }
     }
+}
+
+/// Normalize a watch target without requiring it to still exist. This lets an
+/// `unwatch` remove state after a project directory has been deleted.
+fn normalized_watch_path(path: &str) -> PathBuf {
+    let path = PathBuf::from(path.trim());
+    fs::canonicalize(&path).unwrap_or(path)
+}
+
+/// Reject recursive watches whose blast radius is effectively the whole
+/// machine or user account. The app filters these too, but the daemon is a
+/// public socket boundary and must enforce the invariant itself.
+fn validated_watch_path(path: &str) -> Result<PathBuf, String> {
+    let normalized = normalized_watch_path(path);
+    if path.trim().is_empty() {
+        return Err("watch path must not be empty".to_string());
+    }
+    if !normalized.is_absolute() {
+        return Err("watch path must be absolute".to_string());
+    }
+    if !normalized.is_dir() {
+        return Err(format!(
+            "watch path is not an existing directory: {}",
+            normalized.display()
+        ));
+    }
+
+    let mut dangerous = vec![
+        PathBuf::from("/"),
+        PathBuf::from("/Users"),
+        PathBuf::from("/tmp"),
+        PathBuf::from("/private"),
+        PathBuf::from("/private/tmp"),
+        PathBuf::from("/var"),
+        PathBuf::from("/private/var"),
+    ];
+    if let Some(home) = dirs::home_dir() {
+        dangerous.push(fs::canonicalize(&home).unwrap_or(home));
+    }
+
+    if dangerous.iter().any(|candidate| candidate == &normalized) {
+        return Err(format!(
+            "refusing recursive watch of broad path: {}",
+            normalized.display()
+        ));
+    }
+    Ok(normalized)
 }
 
 /// Start the file watcher background task.
@@ -514,7 +569,8 @@ mod tests {
     }
 
     fn make_handle(state: Arc<Mutex<WatcherState>>) -> WatcherHandle {
-        let (tx, _rx) = mpsc::channel(16);
+        let (tx, mut rx) = mpsc::channel(16);
+        std::thread::spawn(move || while rx.blocking_recv().is_some() {});
         WatcherHandle {
             state,
             command_tx: tx,
@@ -606,15 +662,34 @@ mod tests {
     fn watch_path_adds_to_watched() {
         let state = make_watcher_state();
         let handle = make_handle(state);
+        let temp = tempfile::tempdir().unwrap();
+        let path = fs::canonicalize(temp.path())
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
 
-        handle.watch_path("/tmp/test");
+        handle.watch_path(&path).unwrap();
         let snap = handle.snapshot();
-        assert_eq!(snap.watched_paths, vec!["/tmp/test"]);
+        assert_eq!(snap.watched_paths, vec![path.clone()]);
 
         // Duplicate watch should not add twice
-        handle.watch_path("/tmp/test");
+        handle.watch_path(&path).unwrap();
         let snap = handle.snapshot();
         assert_eq!(snap.watched_paths.len(), 1);
+    }
+
+    #[test]
+    fn watch_path_rejects_broad_and_invalid_paths() {
+        let state = make_watcher_state();
+        let handle = make_handle(state);
+
+        assert!(handle.watch_path("/").is_err());
+        assert!(handle.watch_path("").is_err());
+        assert!(handle.watch_path("relative/path").is_err());
+        if let Some(home) = dirs::home_dir() {
+            assert!(handle.watch_path(&home.to_string_lossy()).is_err());
+        }
+        assert!(handle.snapshot().watched_paths.is_empty());
     }
 
     #[test]
@@ -693,12 +768,22 @@ mod tests {
     fn unwatch_path_removes_from_watched() {
         let state = make_watcher_state();
         let handle = make_handle(state);
+        let first = tempfile::tempdir().unwrap();
+        let second = tempfile::tempdir().unwrap();
+        let first_path = fs::canonicalize(first.path())
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let second_path = fs::canonicalize(second.path())
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
 
-        handle.watch_path("/tmp/test");
-        handle.watch_path("/tmp/other");
-        handle.unwatch_path("/tmp/test");
+        handle.watch_path(&first_path).unwrap();
+        handle.watch_path(&second_path).unwrap();
+        handle.unwatch_path(&first_path);
 
         let snap = handle.snapshot();
-        assert_eq!(snap.watched_paths, vec!["/tmp/other"]);
+        assert_eq!(snap.watched_paths, vec![second_path]);
     }
 }

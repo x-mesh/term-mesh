@@ -70,6 +70,54 @@ try: print(json.load(sys.stdin)["result"]["pid"])
 except Exception: pass' 2>/dev/null || true
 }
 
+daemon_owner_pid_via_rpc() {
+  printf '{"jsonrpc":"2.0","id":1,"method":"daemon.status","params":{}}\n' \
+    | nc -U -w 2 "$1" 2>/dev/null \
+    | /usr/bin/python3 -c 'import json,sys
+try:
+    owner=json.load(sys.stdin)["result"].get("owner_pid")
+    print("" if owner is None else owner)
+except Exception: pass' 2>/dev/null || true
+}
+
+# A daemon that advertises a dead GUI owner is orphaned even though its own
+# listening socket still accepts connections. Older GUI builds did not expose
+# owner_pid, so retain a narrow PPID=1 + app-bundle fallback for those only.
+daemon_is_gui_orphan() {
+  local pid="$1"
+  local owner_pid="$2"
+  local ppid=""
+  local command=""
+
+  if [[ "$owner_pid" =~ ^[0-9]+$ ]]; then
+    ! kill -0 "$owner_pid" 2>/dev/null
+    return
+  fi
+
+  ppid="$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ')"
+  command="$(ps -o command= -p "$pid" 2>/dev/null || true)"
+  [[ "$ppid" == "1" && "$command" == *".app/Contents/Resources/bin/term-meshd"* ]]
+}
+
+terminate_daemon_pid() {
+  local pid="$1"
+  local attempt=0
+  kill "$pid" 2>/dev/null || true
+  for attempt in 1 2 3; do
+    sleep 1
+    if ! kill -0 "$pid" 2>/dev/null; then
+      echo "    → terminated"
+      return 0
+    fi
+  done
+  if kill -0 "$pid" 2>/dev/null; then
+    kill -9 "$pid" 2>/dev/null || true
+    echo "    → SIGKILL (ignored SIGTERM)"
+  else
+    echo "    → terminated"
+  fi
+}
+
 STALE_COUNT=0
 ACTIVE_PIDS=""
 if [ ${#SOCKETS[@]} -gt 0 ]; then
@@ -83,12 +131,25 @@ if [ ${#SOCKETS[@]} -gt 0 ]; then
       fi
     else
       PID=""
+      OWNER_PID=""
       case "$sock" in
-        *term-meshd*.sock) PID=$(daemon_pid_via_rpc "$sock") ;;
+        *term-meshd*.sock)
+          PID=$(daemon_pid_via_rpc "$sock")
+          OWNER_PID=$(daemon_owner_pid_via_rpc "$sock")
+          ;;
       esac
       if [ -n "$PID" ]; then
-        echo "  ACTIVE: $sock (pid: $PID)"
-        ACTIVE_PIDS="$ACTIVE_PIDS $PID"
+        if daemon_is_gui_orphan "$PID" "$OWNER_PID"; then
+          echo "  ORPHAN-LISTENER: $sock (pid: $PID, dead owner: ${OWNER_PID:-legacy GUI})"
+          if $KILL; then
+            terminate_daemon_pid "$PID"
+            rm -f "$sock"
+            echo "    → socket removed"
+          fi
+        else
+          echo "  ACTIVE: $sock (pid: $PID${OWNER_PID:+, owner: $OWNER_PID})"
+          ACTIVE_PIDS="$ACTIVE_PIDS $PID"
+        fi
       else
         echo "  ACTIVE: $sock"
       fi
@@ -117,18 +178,8 @@ for pid in $(pgrep -x term-meshd 2>/dev/null || true); do
   echo "  ORPHAN: pid $pid ($CMD)"
   ORPHANS=$((ORPHANS + 1))
   if $KILL; then
-    kill "$pid" 2>/dev/null || true
     # Pre-v0.157 builds ignore SIGTERM (FSEvents watcher bug) — escalate.
-    for _ in 1 2 3; do
-      sleep 1
-      kill -0 "$pid" 2>/dev/null || break
-    done
-    if kill -0 "$pid" 2>/dev/null; then
-      kill -9 "$pid" 2>/dev/null || true
-      echo "    → SIGKILL (ignored SIGTERM)"
-    else
-      echo "    → terminated"
-    fi
+    terminate_daemon_pid "$pid"
   fi
 done
 [ "$ORPHANS" -eq 0 ] && echo "  (none)"
