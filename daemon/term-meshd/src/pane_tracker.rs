@@ -82,11 +82,7 @@ fn scan_pane_sessions(system: &mut System) -> HashMap<String, PaneInfo> {
     let refresh_kind = ProcessRefreshKind::nothing().with_cwd(UpdateKind::Always);
     #[cfg(not(target_os = "macos"))]
     let refresh_kind = refresh_kind.with_environ(UpdateKind::Always);
-    system.refresh_processes_specifics(
-        ProcessesToUpdate::Some(&target_pids),
-        false,
-        refresh_kind,
-    );
+    system.refresh_processes_specifics(ProcessesToUpdate::Some(&target_pids), false, refresh_kind);
 
     let mut result = HashMap::new();
     for (pid, cli) in targets {
@@ -197,8 +193,10 @@ fn macos_process_arguments(pid: u32) -> Option<Vec<u8>> {
 
 #[cfg(target_os = "macos")]
 fn panel_id_from_macos_procargs(data: &[u8]) -> Option<String> {
-    let argc_bytes: [u8; std::mem::size_of::<libc::c_int>()] =
-        data.get(..std::mem::size_of::<libc::c_int>())?.try_into().ok()?;
+    let argc_bytes: [u8; std::mem::size_of::<libc::c_int>()] = data
+        .get(..std::mem::size_of::<libc::c_int>())?
+        .try_into()
+        .ok()?;
     let argc = libc::c_int::from_ne_bytes(argc_bytes);
     if !(0..=4096).contains(&argc) {
         return None;
@@ -342,7 +340,10 @@ mod tests {
             panic!("sysinfo should discover the named codex process: {diagnostic}")
         });
         assert_eq!(info.cli, "codex");
-        assert_eq!(info.cwd, temp.path().to_string_lossy());
+        assert_eq!(
+            info.cwd,
+            temp.path().canonicalize().unwrap().to_string_lossy()
+        );
         assert!(info.proc_start_unix > 0);
     }
 }
