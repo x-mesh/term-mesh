@@ -200,4 +200,64 @@ final class AgentPipeCompletionTests: XCTestCase {
         XCTAssertTrue(cmd.contains("--replay-user-messages"),
                       "the receipt is what makes delivery verifiable")
     }
+
+    /// Taking the channel took the keyboard with it.
+    ///
+    /// On the typing path the pane *was* the agent's stdin, so a person could
+    /// always break in mid-session — half of what makes a running agent
+    /// watchable. On the pipe the agent reads a FIFO and nothing reads the
+    /// terminal, so that goes unless something gives it back. The renderer is
+    /// the last stage of the pipeline and `/dev/tty` is reachable from there
+    /// regardless of redirection, so it reads the keys and writes them into the
+    /// same FIFO — measured live: a typed question answered from the context of
+    /// a turn the leader had sent.
+    func testTheRendererIsGivenThePipeSoAPersonCanBreakIn() {
+        let cmd = AgentPipeTransport.launchCommand(
+            claudePath: "/usr/local/bin/claude",
+            fifoPath: "/tmp/pipes/executor@team.stdin",
+            model: "sonnet",
+            instructions: "",
+            extraArgs: [],
+            rendererPath: "/repo/scripts/spike/tm-render-claude.py"
+        )
+        XCTAssertTrue(cmd.contains("tm-render-claude.py'\'' --fifo")
+                      || cmd.contains("tm-render-claude.py") && cmd.contains("--fifo"),
+                      "without the pipe the renderer has nowhere to put what is typed")
+    }
+
+    // MARK: - Which agents are on a pipe
+
+    /// The regression this replaces.
+    ///
+    /// Delivery used to ask whether the FIFO existed. A team's first
+    /// instruction goes out while the panes are still starting, so for the
+    /// first second the answer is no — and the code read that as "not on a
+    /// pipe" and typed instead. Typing at a `--print` process reaches nobody:
+    /// it reads its stdin and never the terminal. The text vanished and the
+    /// send reported success. Measured: `explorer` never received its init
+    /// prompt while `executor`, launched four seconds later, did.
+    func testAnAgentIsOnAPipeFromLaunch_notFromWhetherItsFifoExistsYet() {
+        let id = "explorer@pipe-test"
+        AgentPipeTransport.forgetDriven(agentId: id)
+        XCTAssertFalse(AgentPipeTransport.isDriven(agentId: id))
+
+        AgentPipeTransport.markDriven(agentId: id)
+        XCTAssertTrue(AgentPipeTransport.isDriven(agentId: id),
+                      "the pane is on the pipe before it has made the pipe")
+        XCTAssertFalse(FileManager.default.fileExists(
+            atPath: AgentPipeTransport.fifoPath(agentId: id)),
+            "and that is exactly the window the old check got wrong")
+
+        AgentPipeTransport.discard(agentId: id)
+        XCTAssertFalse(AgentPipeTransport.isDriven(agentId: id),
+                       "a torn-down agent is not still on a pipe")
+    }
+
+    func testAgentsAreTrackedApart() {
+        AgentPipeTransport.markDriven(agentId: "a@t")
+        AgentPipeTransport.forgetDriven(agentId: "b@t")
+        XCTAssertTrue(AgentPipeTransport.isDriven(agentId: "a@t"))
+        XCTAssertFalse(AgentPipeTransport.isDriven(agentId: "b@t"))
+        AgentPipeTransport.forgetDriven(agentId: "a@t")
+    }
 }

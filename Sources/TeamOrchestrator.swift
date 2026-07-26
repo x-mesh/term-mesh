@@ -685,6 +685,9 @@ final class TeamOrchestrator: ObservableObject {
                         ? AgentPipeTransport.rendererPath(workingDirectory: agentWorkDir)
                         : nil
                 )
+                // This pane's transport, settled here so delivery never has to
+                // infer it from a file that does not exist yet.
+                AgentPipeTransport.markDriven(agentId: agentId)
             }
         }
 
@@ -705,6 +708,9 @@ final class TeamOrchestrator: ObservableObject {
                     : nil,
                 workingDirectory: agentWorkDir
             )
+            // This pane's transport, settled here so delivery never has to
+            // infer it from a file that does not exist yet.
+            AgentPipeTransport.markDriven(agentId: agentId)
         }
 
         // Wrap so the terminal stays open (drops to shell) if the CLI exits.
@@ -2588,10 +2594,7 @@ final class TeamOrchestrator: ObservableObject {
         // turn there. Both entry points need it — `team.send` resolves by name
         // and never reaches the panel-targeted one, so wiring only that left
         // delivery quietly on the typing path while reporting success.
-        if AgentPipeTransport.isEnabled,
-           AgentPipeTransport.supports(cli: agent.cli),
-           FileManager.default.fileExists(
-               atPath: AgentPipeTransport.fifoPath(agentId: agent.id)) {
+        if AgentPipeTransport.isDriven(agentId: agent.id) {
             do {
                 AgentPipeCompletion.shared.expect(agentId: agent.id, instruction: text)
                 let n = try AgentPipeTransport.deliver(text: text, agentId: agent.id)
@@ -2650,17 +2653,15 @@ final class TeamOrchestrator: ObservableObject {
 
     /// The agent behind this pane, when it is one this build drives by pipe.
     ///
-    /// Keyed off the live team rather than a stored flag so an agent created
-    /// before the option was turned on is not mistaken for one that has a FIFO
-    /// waiting — the launch command is what creates the pipe, and only agents
-    /// launched under the option have one.
+    /// Answered from what the agent's pane was launched with, not from the
+    /// option's current value or the FIFO's presence. An agent created before
+    /// the option was turned on has no pipe, and one created a moment ago has
+    /// not made its FIFO yet — both are the launch line's business, and it is
+    /// the launch line that records the answer.
     private func pipeDrivenAgent(teamName: String, panelId: UUID) -> AgentMember? {
-        guard AgentPipeTransport.isEnabled,
-              let team = teams[teamName],
+        guard let team = teams[teamName],
               let agent = team.agents.first(where: { $0.panelId == panelId }),
-              AgentPipeTransport.supports(cli: agent.cli),
-              FileManager.default.fileExists(
-                  atPath: AgentPipeTransport.fifoPath(agentId: agent.id))
+              AgentPipeTransport.isDriven(agentId: agent.id)
         else { return nil }
         return agent
     }

@@ -40,6 +40,7 @@ import json
 import os
 import shutil
 import sys
+import threading
 
 # 256-colour codes, chosen to survive both light and dark terminals rather than
 # to look good on one.
@@ -95,6 +96,11 @@ class Renderer:
         self.show_thinking = show_thinking
         self.hooks_seen = 0
         self.tools_open: dict[str, str] = {}
+        self.opened = False
+        # Turns this pane typed itself, so the replay can say who spoke. The
+        # pane cannot otherwise tell a leader's task from a person's question,
+        # and after the fact that is the more useful of the two labels.
+        self.mine: set[str] = set()
 
     def emit(self, s: str = "") -> None:
         print(s, flush=True)
@@ -124,6 +130,11 @@ class Renderer:
                     self.emit(f"{mark} hook {name}{OFF}")
             return
         if sub == "init":
+            # Sent at the head of every turn, not once per session. Drawing the
+            # whole banner again each time buries the conversation in it.
+            if self.opened:
+                return
+            self.opened = True
             model = o.get("model") or ""
             cwd = o.get("cwd", "")
             tools = len(o.get("tools") or [])
@@ -145,7 +156,15 @@ class Renderer:
         content = o.get("message", {}).get("content")
         if isinstance(content, str):
             # The replay of what we sent — the receipt the typing path lacks.
-            tag = "sent" if o.get("isReplay") else "user"
+            # It is also the only framed copy of a typed line: the terminal
+            # already echoed it as it was typed, and printing a third is noise.
+            if not o.get("isReplay"):
+                tag = "user"
+            elif content.strip() in self.mine:
+                self.mine.discard(content.strip())
+                tag = "you"
+            else:
+                tag = "leader"
             self.emit(rule(tag, BLUE))
             self.emit(wrap(content))
             return
@@ -213,17 +232,52 @@ class Renderer:
         self.emit(f"{DIM}  {o.get('type')}{OFF}")
 
 
+def type_into(fifo_path: str, renderer: "Renderer") -> None:
+    """Let the person watching the pane talk to the agent.
+
+    On the typing path this came free: the pane *was* the agent's stdin, so a
+    human could always take over mid-session. That is half of what "visible"
+    means here, and taking the channel takes it away — the agent now reads a
+    FIFO and nobody reads the keyboard.
+
+    Getting it back costs one thread. `stdin` is the pipe from the agent, but
+    `/dev/tty` is the controlling terminal regardless of redirection, so the
+    keystrokes are still reachable from here. A line typed in the pane becomes
+    a turn, in the same envelope the leader's instructions use — the agent
+    cannot tell the two apart, which is the point.
+    """
+    try:
+        tty = open("/dev/tty", encoding="utf-8", errors="replace")
+    except OSError:
+        return  # no terminal (a test harness, a log capture) — nothing to read
+    for line in tty:
+        text = line.strip()
+        if not text:
+            continue
+        try:
+            with open(fifo_path, "w", encoding="utf-8") as fifo:
+                fifo.write(json.dumps(
+                    {"type": "user", "message": {"role": "user", "content": text}},
+                    ensure_ascii=False) + "\n")
+            renderer.mine.add(text)
+        except OSError as exc:
+            print(f"{RED}  could not deliver: {exc}{OFF}", flush=True)
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--hooks", action="store_true", help="show every hook event")
     ap.add_argument("--raw", action="store_true", help="print the JSON above each line")
     ap.add_argument("--no-thinking", action="store_true", help="hide thinking markers")
+    ap.add_argument("--fifo", help="deliver lines typed in the pane to this agent")
     ap.add_argument("file", nargs="?", help="read from a file instead of stdin")
     args = ap.parse_args()
 
     r = Renderer(show_hooks=args.hooks, show_raw=args.raw,
                  show_thinking=not args.no_thinking)
+    if args.fifo:
+        threading.Thread(target=type_into, args=(args.fifo, r), daemon=True).start()
     stream = open(args.file, encoding="utf-8") if args.file else sys.stdin
 
     try:

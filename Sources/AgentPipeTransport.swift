@@ -62,6 +62,36 @@ enum AgentPipeTransport {
         isEnabled && supports(cli: cli)
     }
 
+    // MARK: - Who is actually on a pipe
+
+    /// Agents whose pane was launched on the pipe, recorded when the launch
+    /// line is built.
+    ///
+    /// The FIFO's existence looks like the same answer and is not: the pane
+    /// creates it, so there is a window after launch where an agent is on the
+    /// pipe and the file is not there yet. Delivery used to read that window as
+    /// "not on a pipe" and fall back to typing — into a `--print` process,
+    /// which reads its stdin and never the terminal. The text went nowhere and
+    /// the send reported success. An agent's transport is decided when its pane
+    /// is launched, so that is where it is recorded.
+    private static let drivenLock = NSLock()
+    private static var driven: Set<String> = []
+
+    static func markDriven(agentId: String) {
+        drivenLock.lock(); defer { drivenLock.unlock() }
+        driven.insert(agentId)
+    }
+
+    static func isDriven(agentId: String) -> Bool {
+        drivenLock.lock(); defer { drivenLock.unlock() }
+        return driven.contains(agentId)
+    }
+
+    static func forgetDriven(agentId: String) {
+        drivenLock.lock(); defer { drivenLock.unlock() }
+        driven.remove(agentId)
+    }
+
     /// Draw the session instead of showing its wire format.
     ///
     /// `--print` is the non-interactive mode, so nothing renders the stream:
@@ -112,10 +142,10 @@ enum AgentPipeTransport {
             + " --events \(quoted(fifoPath + ".events"))"
             + " --cwd \(quoted(workingDirectory))"
         if !model.isEmpty { run += " --model \(quoted(model))" }
-        if let rendererPath {
-            run += " 2>&1 | /usr/bin/env python3 \(quoted(rendererPath))"
-        }
         let f = quoted(fifoPath)
+        if let rendererPath {
+            run += " 2>&1 | /usr/bin/env python3 \(quoted(rendererPath)) --fifo \(f)"
+        }
         let chain = [
             "rm -f \(f)",
             "mkdir -p \(quoted((fifoPath as NSString).deletingLastPathComponent))",
@@ -154,6 +184,7 @@ enum AgentPipeTransport {
     }
 
     static func discard(agentId: String) {
+        forgetDriven(agentId: agentId)
         try? FileManager.default.removeItem(atPath: fifoPath(agentId: agentId))
     }
 
@@ -203,7 +234,10 @@ enum AgentPipeTransport {
         // scrollback detector.
         run += " | tee \(quoted(fifoPath + ".events"))"
         if let rendererPath {
-            run += " | /usr/bin/env python3 \(quoted(rendererPath))"
+            // The renderer also takes the keyboard: on the typing path a human
+            // could always talk to the agent mid-session, and the pipe removes
+            // that unless something reads the terminal.
+            run += " | /usr/bin/env python3 \(quoted(rendererPath)) --fifo \(f)"
         }
         let chain = [
             "rm -f \(f)",
@@ -238,6 +272,14 @@ enum AgentPipeTransport {
         }
     }
 
+    /// How long a pipe-driven agent may still be starting up.
+    ///
+    /// Measured: a team's first instruction goes out about 200ms after the pane
+    /// is asked for, and the pane needs roughly a second to reach its `mkfifo`.
+    /// Waiting is what the typing path got for free — keystrokes sit in the
+    /// PTY buffer until something reads them.
+    private static let pipeReadyTimeout: TimeInterval = 5
+
     /// Put one user turn on the agent's stdin.
     ///
     /// The text goes as-is. Nothing is flattened — a task carrying newlines
@@ -247,16 +289,30 @@ enum AgentPipeTransport {
     @discardableResult
     static func deliver(text: String, agentId: String) throws -> Int {
         let path = fifoPath(agentId: agentId)
-        guard FileManager.default.fileExists(atPath: path) else {
-            throw DeliveryError.noPipe(path)
-        }
         let payload = try encode(text: text)
 
-        // Non-blocking: the pane holds the FIFO open, so this should not wait —
-        // and if that pane has gone, this must fail rather than hang a caller.
-        let fd = open(path, O_WRONLY | O_NONBLOCK)
-        guard fd >= 0 else {
-            throw DeliveryError.writeFailed("open errno \(errno)")
+        // Non-blocking, so the caller is never hung by a pane that has gone —
+        // but a pane that has not arrived *yet* is a different thing, and the
+        // two look alike for the first second of a team's life.
+        //
+        // A team's first instruction goes out while the panes are still coming
+        // up, and readiness has two steps, not one: the pane creates the FIFO,
+        // then the process behind it opens the read end. Opening for writing in
+        // between gives ENXIO — "no reader" — which is a wait, not a failure.
+        // Waiting is what the terminal gave for free: keystrokes sit in the PTY
+        // buffer until something reads them.
+        let deadline = Date().addingTimeInterval(pipeReadyTimeout)
+        var fd: Int32 = -1
+        while true {
+            fd = open(path, O_WRONLY | O_NONBLOCK)
+            if fd >= 0 { break }
+            let failure = errno
+            guard failure == ENXIO || failure == ENOENT, Date() < deadline else {
+                throw failure == ENOENT
+                    ? DeliveryError.noPipe(path)
+                    : DeliveryError.writeFailed("open errno \(failure)")
+            }
+            usleep(50_000)
         }
         defer { close(fd) }
 
