@@ -270,6 +270,40 @@ final class AgentSessionTests: XCTestCase {
         XCTAssertTrue(launch.arguments.contains("--include-partial-messages"))
     }
 
+    // MARK: - Following the bottom
+
+    /// A view that follows the bottom cannot key on `entries.count`.
+    ///
+    /// A streamed answer grows a row that is already there, so the count sits
+    /// still while the text runs off the bottom of the pane — which is exactly
+    /// what it did: auto-scroll only moved when a *new* row appeared.
+    func testEveryMutationMovesTheRevision() {
+        let s = AgentSession()
+        s.ingestForTesting(blockStart(0, "text"))
+        let afterStart = s.revision
+
+        s.ingestForTesting(delta(0, "half a sen"))
+        XCTAssertGreaterThan(s.revision, afterStart, "a delta changed the text")
+        let afterDelta = s.revision
+        XCTAssertEqual(s.entries.count, 1, "and did not change the count")
+
+        s.ingestForTesting(delta(0, "tence"))
+        XCTAssertGreaterThan(s.revision, afterDelta)
+    }
+
+    /// A tool result closes a row without adding one, and that changes what is
+    /// on screen too.
+    func testAToolResultMovesTheRevision() {
+        let s = session([event(["type": "assistant", "message": ["content": [
+            ["type": "tool_use", "id": "t1", "name": "Bash",
+             "input": ["command": "swift build"]]]]])])
+        let before = s.revision
+        s.ingestForTesting(event(["type": "user", "message": ["content": [
+            ["type": "tool_result", "tool_use_id": "t1", "content": "done"]]]]))
+        XCTAssertGreaterThan(s.revision, before)
+        XCTAssertEqual(s.entries.count, 1)
+    }
+
     // MARK: - The end of a turn
 
     /// Stated, not inferred.

@@ -17,6 +17,12 @@ struct AgentPanelView: View {
 
     @State private var draft = ""
     @FocusState private var composerFocused: Bool
+    /// Whether the view is following the bottom. Reading back through a
+    /// transcript is the one thing auto-scroll must not fight.
+    @State private var following = true
+    /// When the last append happened, so the bottom leaving the screen because
+    /// *we* grew the content is not mistaken for the user scrolling away.
+    @State private var grewAt = Date.distantPast
 
     private var session: AgentSession { panel.session }
 
@@ -175,16 +181,45 @@ struct AgentPanelView: View {
                     ForEach(session.entries) { entry in
                         row(entry).id(entry.id)
                     }
-                    // Anchors the auto-scroll, so a stream of tool calls does
-                    // not have to be chased down the pane by hand.
-                    Color.clear.frame(height: 1).id(Self.bottom)
+                    // Anchors the auto-scroll, and doubles as the test for
+                    // whether the bottom is on screen at all.
+                    Color.clear.frame(height: 1)
+                        .id(Self.bottom)
+                        .onAppear { following = true }
+                        .onDisappear {
+                            // Content growing pushes this off screen too, and
+                            // that is not the user walking away — only a
+                            // disappearance with no recent append is.
+                            if Date().timeIntervalSince(grewAt) > 0.4 { following = false }
+                        }
                 }
                 .padding(12)
                 .frame(maxWidth: .infinity, alignment: .leading)
             }
-            .onChange(of: session.entries.count) { _, _ in
-                withAnimation(.easeOut(duration: 0.15)) {
-                    proxy.scrollTo(Self.bottom, anchor: .bottom)
+            // Every mutation, not every append: a streamed answer grows a row
+            // that already exists, and keying on the count meant the text ran
+            // off the bottom while the view sat still.
+            .onChange(of: session.revision) { _, _ in
+                grewAt = Date()
+                guard following else { return }
+                // Unanimated on purpose. A 250-delta answer animating each step
+                // is not a smooth scroll, it is a stutter.
+                proxy.scrollTo(Self.bottom, anchor: .bottom)
+            }
+            .overlay(alignment: .bottomTrailing) {
+                if !following {
+                    Button {
+                        following = true
+                        withAnimation { proxy.scrollTo(Self.bottom, anchor: .bottom) }
+                    } label: {
+                        Label("Latest", systemImage: "arrow.down")
+                            .font(.system(size: 10, weight: .medium))
+                            .padding(.horizontal, 8)
+                            .padding(.vertical, 4)
+                            .background(.regularMaterial, in: Capsule())
+                    }
+                    .buttonStyle(.plain)
+                    .padding(10)
                 }
             }
         }

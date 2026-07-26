@@ -73,7 +73,16 @@ final class AgentSession: ObservableObject {
 
     // MARK: - State
 
-    @Published private(set) var entries: [Entry] = []
+    @Published private(set) var entries: [Entry] = [] {
+        didSet { revision &+= 1 }
+    }
+
+    /// Changes on every mutation, not just every append.
+    ///
+    /// A view following the bottom cannot key on `entries.count`: a streamed
+    /// answer grows an entry that is already there, so the count sits still
+    /// while the text runs off the bottom of the pane.
+    @Published private(set) var revision = 0
     @Published private(set) var isThinking = false {
         didSet {
             guard oldValue != isThinking else { return }
