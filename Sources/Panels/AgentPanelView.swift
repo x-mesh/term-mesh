@@ -85,18 +85,6 @@ struct AgentPanelView: View {
                 Text(session.streamingIds.isEmpty ? "working" : "writing")
                     .font(.system(size: 10))
                     .foregroundStyle(.secondary)
-                ProgressView().controlSize(.small).scaleEffect(0.6)
-                if session.canInterrupt {
-                    // Stops the turn, not the session: claude reads this on the
-                    // same stdin its turns arrive on, and the next turn still
-                    // has its context.
-                    Button(action: session.interrupt) {
-                        Image(systemName: "stop.fill").font(.system(size: 9))
-                    }
-                    .buttonStyle(.plain)
-                    .foregroundStyle(.secondary)
-                    .help("Stop this turn")
-                }
             }
         }
         .padding(.horizontal, 10)
@@ -225,6 +213,20 @@ struct AgentPanelView: View {
                 // is not a smooth scroll, it is a stutter.
                 proxy.scrollTo(Self.bottom, anchor: .bottom)
             }
+            // Which of six panes is working is a question you answer by
+            // glancing, not by reading. So the state also has a shape, in the
+            // same corner of every pane, faint enough to sit over the
+            // transcript without competing with it.
+            .overlay(alignment: .topTrailing) {
+                if session.isThinking {
+                    WorkingMark(accent: accent)
+                        .padding(.top, 10)
+                        .padding(.trailing, 12)
+                        .transition(.opacity)
+                        .allowsHitTesting(false)
+                }
+            }
+            .animation(.easeOut(duration: 0.2), value: session.isThinking)
             .overlay(alignment: .bottomTrailing) {
                 if !following {
                     Button {
@@ -354,11 +356,19 @@ struct AgentPanelView: View {
                 .lineLimit(1...8)
                 .focused($composerFocused)
                 .onSubmit(send)
-            Button(action: send) {
-                Image(systemName: "arrow.up.circle.fill").font(.system(size: 16))
+            // One button, two jobs. A stop that only exists while a turn runs
+            // has to live where your hand already is: a 9pt icon appearing at
+            // the far end of the header for the three seconds a haiku turn
+            // lasts is not a control anyone can find. Send and stop are also
+            // never both available, so they are never two buttons.
+            Button(action: canStop ? session.interrupt : send) {
+                Image(systemName: canStop ? "stop.circle.fill" : "arrow.up.circle.fill")
+                    .font(.system(size: 16))
+                    .foregroundStyle(canStop ? AnyShapeStyle(Color.red) : AnyShapeStyle(.tint))
             }
             .buttonStyle(.plain)
-            .disabled(!canSend)
+            .disabled(!canStop && !canSend)
+            .help(canStop ? "Stop this turn" : "Send")
         }
         .padding(.horizontal, 10)
         .padding(.vertical, 8)
@@ -368,6 +378,10 @@ struct AgentPanelView: View {
     private var canSend: Bool {
         session.isRunning && !draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
+
+    /// Stopping wins while a turn is in flight — the one moment the button is
+    /// worth pressing for something other than sending.
+    private var canStop: Bool { session.isThinking && session.canInterrupt }
 
     private func send() {
         guard canSend else { return }
@@ -623,6 +637,50 @@ private struct CodeBlock: View {
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .background(Color.primary.opacity(0.06), in: RoundedRectangle(cornerRadius: 6))
+    }
+}
+
+/// Nine squares, pulsing along the diagonal: this pane is working.
+///
+/// Placed over the transcript rather than in the header because the question
+/// it answers is asked across a whole window — which of six agents is busy —
+/// and that is answered by glancing at a shape in a fixed place, not by
+/// reading a word at the end of a row. Faint on purpose: it sits on top of
+/// text, and anything strong enough to notice while reading is too strong.
+private struct WorkingMark: View {
+    let accent: Color
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @State private var pulsing = false
+
+    private static let side: CGFloat = 6
+    private static let gap: CGFloat = 2
+
+    var body: some View {
+        VStack(spacing: Self.gap) {
+            ForEach(0..<3, id: \.self) { row in
+                HStack(spacing: Self.gap) {
+                    ForEach(0..<3, id: \.self) { column in
+                        RoundedRectangle(cornerRadius: 1)
+                            .fill(accent)
+                            .frame(width: Self.side, height: Self.side)
+                            .scaleEffect(pulsing ? 0.2 : 1)
+                            .animation(
+                                reduceMotion ? nil : .easeInOut(duration: 0.3)
+                                    .repeatForever(autoreverses: true)
+                                    // The wave runs down the diagonal, which is
+                                    // what makes nine squares read as one
+                                    // object rather than nine.
+                                    .delay(Double(row + column) * 0.1),
+                                value: pulsing)
+                    }
+                }
+            }
+        }
+        .opacity(0.28)
+        .onAppear { if !reduceMotion { pulsing = true } }
+        // A grid of squares keeping time is not something to announce; the
+        // header already says "working" in words.
+        .accessibilityHidden(true)
     }
 }
 
