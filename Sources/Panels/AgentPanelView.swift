@@ -63,18 +63,27 @@ struct AgentPanelView: View {
             // side by side were five identical grey lines, and a 7pt dot is
             // not something you pick a pane out by.
             Capsule().fill(accent).frame(width: 3, height: 15)
+            // A pane can be narrow, and a wrapped name reads as two agents:
+            // measured at a real width, this row broke into `explore / r` and
+            // `CLAUD / E`. Identity never wraps and never yields; the model
+            // summary is the part worth losing first, so it is the only thing
+            // allowed to shrink.
             Text(panel.agentName)
                 .font(.system(size: 13, weight: .bold))
                 .foregroundStyle(accent)
+                .lineLimit(1)
+                .fixedSize()
             CliBadge(cli: panel.cli, accent: accent)
+                .fixedSize()
             if let summary = session.summary, !summary.isEmpty {
                 Text(summary)
                     .font(.system(size: 10))
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
-                    .truncationMode(.middle)
+                    .truncationMode(.tail)
+                    .layoutPriority(-1)
             }
-            Spacer()
+            Spacer(minLength: 4)
             if !session.isRunning {
                 Text("stopped").font(.system(size: 10)).foregroundStyle(.secondary)
             }
@@ -85,6 +94,7 @@ struct AgentPanelView: View {
                 Text(session.streamingIds.isEmpty ? "working" : "writing")
                     .font(.system(size: 10))
                     .foregroundStyle(.secondary)
+                    .fixedSize()
             }
         }
         .padding(.horizontal, 10)
@@ -213,20 +223,6 @@ struct AgentPanelView: View {
                 // is not a smooth scroll, it is a stutter.
                 proxy.scrollTo(Self.bottom, anchor: .bottom)
             }
-            // Which of six panes is working is a question you answer by
-            // glancing, not by reading. So the state also has a shape, in the
-            // same corner of every pane, faint enough to sit over the
-            // transcript without competing with it.
-            .overlay(alignment: .topTrailing) {
-                if session.isThinking {
-                    WorkingMark(accent: accent)
-                        .padding(.top, 10)
-                        .padding(.trailing, 12)
-                        .transition(.opacity)
-                        .allowsHitTesting(false)
-                }
-            }
-            .animation(.easeOut(duration: 0.2), value: session.isThinking)
             .overlay(alignment: .bottomTrailing) {
                 if !following {
                     Button {
@@ -356,6 +352,18 @@ struct AgentPanelView: View {
                 .lineLimit(1...8)
                 .focused($composerFocused)
                 .onSubmit(send)
+            // Which of six panes is working is a question you answer by
+            // glancing, not by reading. So the state has a shape — and it
+            // lives here rather than over the transcript, where it landed on
+            // the banner card and read as the banner's decoration. This row
+            // never scrolls, is the same place in every pane, and puts "it is
+            // working" next to "stop it".
+            if session.isThinking {
+                WorkingMark(accent: accent)
+                    .transition(.opacity)
+                    .allowsHitTesting(false)
+            }
+
             // One button, two jobs. A stop that only exists while a turn runs
             // has to live where your hand already is: a 9pt icon appearing at
             // the far end of the header for the three seconds a haiku turn
@@ -373,6 +381,7 @@ struct AgentPanelView: View {
         .padding(.horizontal, 10)
         .padding(.vertical, 8)
         .background(Color.primary.opacity(isFocused ? 0.04 : 0.02))
+        .animation(.easeOut(duration: 0.2), value: session.isThinking)
     }
 
     private var canSend: Bool {
@@ -650,37 +659,60 @@ private struct CodeBlock: View {
 private struct WorkingMark: View {
     let accent: Color
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
-    @State private var pulsing = false
 
     private static let side: CGFloat = 6
     private static let gap: CGFloat = 2
+    /// 0.6s of pulse and a 0.2s rest, so the wave reads as a wave and not as a
+    /// stutter that never stops.
+    private static let cycle: Double = 0.8
+    private static let pulse: Double = 0.6
 
     var body: some View {
-        VStack(spacing: Self.gap) {
-            ForEach(0..<3, id: \.self) { row in
-                HStack(spacing: Self.gap) {
-                    ForEach(0..<3, id: \.self) { column in
-                        RoundedRectangle(cornerRadius: 1)
-                            .fill(accent)
-                            .frame(width: Self.side, height: Self.side)
-                            .scaleEffect(pulsing ? 0.2 : 1)
-                            .animation(
-                                reduceMotion ? nil : .easeInOut(duration: 0.3)
-                                    .repeatForever(autoreverses: true)
-                                    // The wave runs down the diagonal, which is
-                                    // what makes nine squares read as one
-                                    // object rather than nine.
-                                    .delay(Double(row + column) * 0.1),
-                                value: pulsing)
+        // Driven from the clock rather than from a state flip.
+        //
+        // The first version animated `scaleEffect` off an `onAppear` toggle with
+        // `.repeatForever`, and measured, it never moved at all: two frames a
+        // quarter-second apart were identical to the pixel while an agent was
+        // working. Inside a conditionally-inserted overlay, on a pane that
+        // re-renders on every delta, a repeating animation hung on a one-shot
+        // state change is not something to rely on. Time is always there.
+        TimelineView(.animation(minimumInterval: 1.0 / 30, paused: reduceMotion)) { timeline in
+            let now = timeline.date.timeIntervalSinceReferenceDate
+            VStack(spacing: Self.gap) {
+                ForEach(0..<3, id: \.self) { row in
+                    HStack(spacing: Self.gap) {
+                        ForEach(0..<3, id: \.self) { column in
+                            RoundedRectangle(cornerRadius: 1)
+                                .fill(accent)
+                                .frame(width: Self.side, height: Self.side)
+                                .scaleEffect(reduceMotion ? 1
+                                             : Self.scale(at: now, row: row, column: column))
+                        }
                     }
                 }
             }
         }
         .opacity(0.28)
-        .onAppear { if !reduceMotion { pulsing = true } }
         // A grid of squares keeping time is not something to announce; the
         // header already says "working" in words.
         .accessibilityHidden(true)
+    }
+
+    /// Each square shrinks and returns, offset down the diagonal.
+    ///
+    /// The diagonal is what makes nine squares read as one object rather than
+    /// nine: `(row + column)` gives the anti-diagonal, so the wave crosses the
+    /// grid corner to corner.
+    private static func scale(at time: Double, row: Int, column: Int) -> CGFloat {
+        let phase = (time - Double(row + column) * 0.1)
+            .truncatingRemainder(dividingBy: cycle)
+        let p = phase < 0 ? phase + cycle : phase
+        guard p < pulse else { return 1 }
+        let half = pulse / 2
+        let t = p < half ? p / half : (pulse - p) / half
+        // Smoothstep, so it eases at both ends without a bounce.
+        let eased = t * t * (3 - 2 * t)
+        return CGFloat(1 - 0.8 * eased)
     }
 }
 
