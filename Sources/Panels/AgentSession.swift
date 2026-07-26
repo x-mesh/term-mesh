@@ -74,7 +74,19 @@ final class AgentSession: ObservableObject {
     // MARK: - State
 
     @Published private(set) var entries: [Entry] = []
-    @Published private(set) var isThinking = false
+    @Published private(set) var isThinking = false {
+        didSet {
+            guard oldValue != isThinking else { return }
+            onBusyChanged?(isThinking)
+        }
+    }
+
+    /// Fired when a turn starts or ends.
+    ///
+    /// `isThinking` is the truth and it lives on the main actor, while the
+    /// status RPC is served off it — so the fact has to be pushed somewhere an
+    /// off-main reader can see, rather than pulled.
+    var onBusyChanged: ((Bool) -> Void)?
     @Published private(set) var isRunning = false
     /// What the CLI announced about itself, shown once rather than per turn.
     @Published private(set) var summary: String?

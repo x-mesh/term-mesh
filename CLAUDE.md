@@ -104,7 +104,7 @@ Before launching a new tagged run, clean up any older tags you started in this s
 
 Named CLI profile sets (path + extraArgs + env + modelOverride) stored in `~/Library/Application Support/term-mesh/cli-profiles.json`.
 
-**Settings에서 만들기:** Settings → CLI Paths에서 각 CLI(claude / kiro / codex / gemini)별로 프로파일을 추가하고 이름, 실행 경로, 추가 인수(extraArgs), 환경 변수, 모델 override를 지정. 경로 필드에는 자동 감지된 경로와 최근 사용 경로가 dropdown으로 표시됨.
+**Settings에서 만들기:** Settings → CLI Paths에서 각 CLI(claude / kiro / codex / gemini / cursor / agy)별로 프로파일을 추가하고 이름, 실행 경로, 추가 인수(extraArgs), 환경 변수, 모델 override를 지정. 경로 필드에는 자동 감지된 경로와 최근 사용 경로가 dropdown으로 표시됨.
 
 **메뉴바에서 전환:** 메뉴바 아이콘 → CLI Profile 서브메뉴에서 CLI별 프로파일을 라디오 버튼으로 즉시 전환. "Apply to Active Pane (Restart)"를 선택하면 현재 pane을 새 프로파일로 hard restart.
 
@@ -113,6 +113,28 @@ Named CLI profile sets (path + extraArgs + env + modelOverride) stored in `~/Lib
 **extraArgs 주의:** `--model`, `--resume`, `--session-id`, `--dangerously-skip-permissions`, `--print`, `--append-system-prompt`는 term-mesh가 자동으로 주입하므로 extraArgs에 넣지 말 것(경고 표시됨).
 
 **헤드리스 모드:** `tm-agent create` / `tm-agent attach` 시에도 활성 프로파일의 extraArgs / env / modelOverride가 동일하게 적용됨.
+
+**cursor / agy:** Settings → CLI Paths에는 항상 경로 필드가 있다(`cursor-agent`, `agy`). 에이전트 role/attach CLI picker에는 **Native Agent Panes**가 켜져 있을 때만 나타난다 — 둘 다 대화형 TUI·stdin 채널이 없어 터미널 pane으로는 실행할 수 없다.
+
+## Native Agent Panes (experimental)
+
+기본값은 **Terminal**(기존 Ghostty pane). Settings → Agent Teams → **Agent Panes** → **Native**를 고르면:
+
+- pipe transport(`agentPipeTransport.enabled`)와 native panel(`agentPipeTransport.nativePanel`)이 함께 켜진다. 하나만 켜는 UI는 없다.
+- 에이전트 UI는 `AgentPanelView`(SwiftUI) — 지시문, streaming 답변, 접을 수 있는 tool row, 턴 종료 cost/시간.
+- `tm-agent delegate` / `send` / `broadcast`는 CLI 이름 그대로; delivery만 paste+Return → pipe/native stdin으로 바뀐다.
+- 턴 완료는 `AgentPipeCompletion`이 `<fifo>.events`의 `{"type":"result"}`를 읽는다. Standard Reply Header(5-field) 계약은 동일.
+- 지원 CLI: claude(직접 NDJSON), codex/kiro/cursor/agy(`scripts/spike/tm-agent-bridge.py`).
+- Shell Integration health: native agent pane은 **agentMode**(파란색) — shell integration N/A.
+
+Spike 상세: `docs/spike/agent-pipe-render.md`
+
+VERIFY (stale CLI 이름·동작 불일치):
+
+```bash
+rg -n 'agentPipeTransport|Agent Panes|Native Agent|cursor-agent|tm-agent-bridge' AGENTS.md CLAUDE.md CHANGELOG.md docs/spike/agent-pipe-render.md
+xcodebuild -project GhosttyTabs.xcodeproj -scheme term-mesh -configuration Debug -destination 'platform=macOS' -only-testing:termMeshTests/AgentSessionTests -only-testing:termMeshTests/AgentPipeCompletionTests test
+```
 
 ## Debug event log
 

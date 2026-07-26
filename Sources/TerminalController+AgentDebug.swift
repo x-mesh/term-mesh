@@ -30,6 +30,13 @@ extension TerminalController {
                         "running": panel.session.isRunning,
                         "thinking": panel.session.isThinking,
                         "summary": panel.session.summary ?? "",
+                        // What the rest of the app believes, beside what is
+                        // actually true. These disagreed for most of an
+                        // afternoon and comparing them is how that ended.
+                        "runtime_state": TeamOrchestrator.shared.agentRuntimeStateForTesting(
+                            teamName: panel.teamName, agentName: panel.agentName),
+                        "in_flight": TeamOrchestrator.shared.isNativeTurnInFlight(
+                            teamName: panel.teamName, agentName: panel.agentName),
                         "entries": panel.session.entries.map(Self.describe),
                     ])
                 }

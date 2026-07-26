@@ -768,6 +768,29 @@ final class TeamOrchestrator: ObservableObject {
                     model: Self.bridgeModelArg(cli: agentCli, model: agentModel),
                     cliPath: cliPath
                 )
+                // A bridged CLI has no `--append-system-prompt`, and none of
+                // them agree on an equivalent, so its role has to arrive as a
+                // turn. Nothing was sending that turn: measured, two codex
+                // agents sat with zero turns received, running but with no idea
+                // what they were. Claude never showed it because its role rides
+                // in on the launch line.
+                //
+                // Written straight away rather than waited for: the process is
+                // up, the bridge reads stdin once its handshake finishes, and
+                // a pipe holds what was written in the meantime.
+                if !agentInstructions.isEmpty {
+                    // Asked for as a briefing, not a job. Claude reads its role
+                    // from the launch line and never answers it; a bridged CLI
+                    // receives the same text as a *turn* and sets about doing
+                    // it — measured, one spent a minute writing analysis while
+                    // the team's first broadcast sat queued behind it. The
+                    // confirm line is the one `create` already uses.
+                    let briefing = Self.withoutTerminalProtocol(agentInstructions)
+                        + "\n\nThis is your standing brief, not a task. "
+                        + "Do no work now: reply with exactly "
+                        + "\"Agent \(agentName) ready.\" and wait."
+                    try? agentPanel.session.send(briefing, from: .leader)
+                }
             } else {
                 agentPanel.start(
                     claudePath: cliPath,
@@ -778,6 +801,10 @@ final class TeamOrchestrator: ObservableObject {
             }
             // The turn states its own end and carries its final text, so the
             // reply is read from that rather than scraped off a screen.
+            agentPanel.session.onBusyChanged = { [teamName, agentName] busy in
+                TeamDataStore.shared.setAgentBusy(
+                    teamName: teamName, agentName: agentName, busy: busy)
+            }
             agentPanel.session.onTurnEnd = { [teamName, agentName] final, _, taskId in
                 Self.fileReport(teamName: teamName, agentName: agentName,
                                 taskId: taskId, text: final)
@@ -6291,11 +6318,38 @@ final class TeamOrchestrator: ObservableObject {
         restorableFleets.removeAll { $0.teamUuid == teamUuid }
     }
 
+    /// Whether this agent is mid-turn, from the process rather than the board.
+    ///
+    /// The one signal the terminal path never had. There, "busy" could only be
+    /// guessed from a task's status or from the screen still changing; here the
+    /// turn began when a line was written and ends when `result` arrives.
+    func isNativeTurnInFlight(teamName: String, agentName: String) -> Bool {
+        guard let team = teams[teamName],
+              let agent = selectAgent(in: team.agents, name: agentName),
+              let panelId = agent.panelId,
+              let panel = nativeAgentPanel(workspaceId: agent.workspaceId, panelId: panelId)
+        else { return false }
+        return panel.session.isThinking
+    }
+
+    #if DEBUG
+    func agentRuntimeStateForTesting(teamName: String, agentName: String) -> String {
+        agentRuntimeState(teamName: teamName, agentName: agentName)
+    }
+    #endif
+
     private func agentRuntimeState(teamName: String, agentName: String) -> String {
         // Phase 2: parked is daemon-authoritative — overrides task-derived state
         // because the subprocess is not live regardless of task board entry.
         if TeamDataStore.shared.isAgentParked(teamName: teamName, agentName: agentName) {
             return "parked"
+        }
+        // Everything below is derived from the task board, and a broadcast
+        // creates no task — so a whole team mid-answer read as `idle`, and
+        // "did everyone reply?" had no way to be asked. A natively-held agent
+        // has the real answer: its turn is either in flight or it is not.
+        if isNativeTurnInFlight(teamName: teamName, agentName: agentName) {
+            return "running"
         }
         guard let task = activeTask(for: teamName, agentName: agentName) else { return "idle" }
         // Phase E Wave 1: an assigned/queued task that has gone stale past the

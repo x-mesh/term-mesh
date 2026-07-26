@@ -62,6 +62,7 @@ final class TeamDataStore: ObservableObject, @unchecked Sendable {
     /// (`agents/<name>.json:parked`). Set via `setAgentParked` whenever the
     /// daemon emits a parked-state update.
     private var parkedAgents: [String: Set<String>] = [:]
+    private var busyAgents: [String: Set<String>] = [:]
 
     /// Watch drift finding in the leader inbox. Deduped by checkId; idempotent on post.
     struct WatchDriftItem {
@@ -344,6 +345,37 @@ final class TeamDataStore: ObservableObject, @unchecked Sendable {
         }
         lock.unlock()
         if changed { notifyChanged() }
+    }
+
+    // MARK: - Turn in flight
+
+    /// Agents with a turn actually running, published by the app.
+    ///
+    /// Every other state here is derived from the task board, and a broadcast
+    /// creates no task — so a whole team mid-answer read as `idle` and "has
+    /// everyone replied?" had no way to be asked. A natively-held agent knows
+    /// the real answer, but it knows it on the main actor, and `team.status` is
+    /// served off it. So the app pushes the fact here, where an off-main reader
+    /// can see it.
+    func setAgentBusy(teamName: String, agentName: String, busy: Bool) {
+        lock.lock()
+        let had = busyAgents[teamName]?.contains(agentName) ?? false
+        if busy { busyAgents[teamName, default: []].insert(agentName) }
+        else { busyAgents[teamName]?.remove(agentName) }
+        let changed = had != busy
+        lock.unlock()
+        if changed { notifyChanged() }
+    }
+
+    func clearBusyAgents(teamName: String) {
+        lock.lock()
+        let changed = busyAgents.removeValue(forKey: teamName) != nil
+        lock.unlock()
+        if changed { notifyChanged() }
+    }
+
+    private func isAgentBusyUnsafe(teamName: String, agentName: String) -> Bool {
+        busyAgents[teamName]?.contains(agentName) ?? false
     }
 
     /// Public, lock-acquiring query for callers outside the data store.
@@ -1038,7 +1070,7 @@ final class TeamDataStore: ObservableObject, @unchecked Sendable {
         // Sidebar renders this as an amber/⏳ indicator. Derived locally;
         // daemon may also push the same label via an anomaly event in the
         // future — both paths converge on the same case string.
-        let agentState: String
+        var agentState: String
         if isAgentParkedUnsafe(teamName: teamName, agentName: agentName) {
             agentState = "parked"
         } else if let task = activeTask {
@@ -1056,6 +1088,11 @@ final class TeamDataStore: ObservableObject, @unchecked Sendable {
             }
         } else {
             agentState = "idle"
+        }
+        // A turn in flight outranks anything the board can say: the board knows
+        // about tasks, and this agent may simply have been asked a question.
+        if isAgentBusyUnsafe(teamName: teamName, agentName: agentName) {
+            agentState = "running"
         }
 
         // Heartbeat
