@@ -12,7 +12,21 @@ struct AgentRolePreset: Identifiable, Codable, Equatable {
     var isBuiltIn: Bool       // built-in presets can't be deleted
 
     /// Supported CLI types for agent execution.
-    static let supportedCLIs = ["claude", "kiro", "codex", "gemini"]
+    /// The CLIs a picker may offer.
+    ///
+    /// Cursor and agy are here only when the native pane is on, and that is not
+    /// a policy choice: they have no interactive UI to host and no stdin to
+    /// type into, so a terminal pane has nothing to run. Offering them there
+    /// would be offering a pane that opens empty.
+    static var supportedCLIs: [String] {
+        let base = ["claude", "kiro", "codex", "gemini"]
+        return AgentPipeTransport.usesNativePanel ? base + ["cursor", "agy"] : base
+    }
+
+    /// Every CLI the app knows, whether or not it can be selected right now.
+    /// Settings lists paths for all of them, so a path can be set before the
+    /// option that makes it usable is turned on.
+    static let knownCLIs = ["claude", "kiro", "codex", "gemini", "cursor", "agy"]
 
     /// Built-in default models per CLI type.
     static func builtInModels(for cli: String) -> [String] {
@@ -31,6 +45,16 @@ struct AgentRolePreset: Identifiable, Codable, Equatable {
                     "gemini-3.1-pro-preview", "gemini-3-flash-preview",
                     "gemini-3.1-flash-lite-preview",
                     "gemini-2.5-pro", "gemini-2.5-flash", "gemini-2.5-flash-lite"]
+        case "cursor":
+            // The two its own `--help` names. Claude's tiers are absent because
+            // cursor does not know them, and a tier passed through was measured
+            // ending a turn in silence on the CLI that behaves the same way.
+            return ["gpt-5", "sonnet-4-thinking"]
+        case "agy":
+            // `--model` is documented as "Model for the current CLI session"
+            // with no values given, so there is nothing honest to list. Empty
+            // means the CLI's own default, which is what was measured working.
+            return []
         default:
             return ["sonnet", "opus", "haiku"]
         }
@@ -65,6 +89,9 @@ struct AgentRolePreset: Identifiable, Codable, Equatable {
         switch cli {
         case "codex":  return "gpt-5.5"
         case "gemini": return "gemini-3.1-pro-preview"
+        // Empty means "do not pass --model", which is what both were measured
+        // working with. A claude tier would be a name neither recognises.
+        case "cursor", "agy": return ""
         default:       return "sonnet"
         }
     }
@@ -1874,7 +1901,7 @@ class ProviderDetector: ObservableObject {
 
     @Published private(set) var available: Set<String> = ["claude"]
 
-    static let allCLIs = ["claude", "codex", "gemini", "kiro"]
+    static let allCLIs = ["claude", "codex", "gemini", "kiro", "cursor", "agy"]
 
     private static let searchPaths: [String: [String]] = {
         let home = NSHomeDirectory()
@@ -1907,6 +1934,18 @@ class ProviderDetector: ObservableObject {
                 (home as NSString).appendingPathComponent(".local/bin/kiro-cli"),
                 "/usr/local/bin/kiro-cli",
                 "/opt/homebrew/bin/kiro-cli",
+            ],
+            // The binary is `cursor-agent`, not `cursor` — the latter is the
+            // editor.
+            "cursor": [
+                (home as NSString).appendingPathComponent(".local/bin/cursor-agent"),
+                "/usr/local/bin/cursor-agent",
+                "/opt/homebrew/bin/cursor-agent",
+            ],
+            "agy": [
+                (home as NSString).appendingPathComponent(".local/bin/agy"),
+                "/usr/local/bin/agy",
+                "/opt/homebrew/bin/agy",
             ],
         ]
     }()

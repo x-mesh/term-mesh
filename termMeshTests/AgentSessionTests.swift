@@ -532,6 +532,56 @@ final class AgentSessionTests: XCTestCase {
         XCTAssertEqual(TeamOrchestrator.withoutTerminalProtocol(broken), broken)
     }
 
+    // MARK: - Which CLIs a picker may offer
+
+    private func withNativePanel(_ on: Bool, _ body: () -> Void) {
+        let d = UserDefaults.standard
+        let enabled = d.object(forKey: AgentPipeTransport.enabledKey)
+        let native = d.object(forKey: AgentPipeTransport.nativePanelKey)
+        d.set(on, forKey: AgentPipeTransport.enabledKey)
+        d.set(on, forKey: AgentPipeTransport.nativePanelKey)
+        body()
+        d.set(enabled, forKey: AgentPipeTransport.enabledKey)
+        d.set(native, forKey: AgentPipeTransport.nativePanelKey)
+    }
+
+    /// Not a policy choice: cursor and agy have no interactive UI to host and
+    /// no stdin to type into, so a terminal pane has nothing to run. Offering
+    /// them there would be offering a pane that opens empty.
+    func testTurnPerProcessClisAreOfferedOnlyWhereTheyCanRun() {
+        withNativePanel(false) {
+            XCTAssertFalse(AgentRolePreset.supportedCLIs.contains("cursor"))
+            XCTAssertFalse(AgentRolePreset.supportedCLIs.contains("agy"))
+            XCTAssertTrue(AgentRolePreset.supportedCLIs.contains("claude"))
+        }
+        withNativePanel(true) {
+            XCTAssertTrue(AgentRolePreset.supportedCLIs.contains("cursor"))
+            XCTAssertTrue(AgentRolePreset.supportedCLIs.contains("agy"))
+        }
+    }
+
+    /// Settings lists a path for every CLI the app knows, so one can be set
+    /// before the option that makes it selectable is turned on.
+    func testEveryKnownCliCanHaveAPathSetForIt() {
+        for cli in ["claude", "kiro", "codex", "gemini", "cursor", "agy"] {
+            XCTAssertTrue(AgentRolePreset.knownCLIs.contains(cli), cli)
+        }
+    }
+
+    /// Neither knows claude's tiers, and a name a CLI does not recognise is
+    /// worse than none — measured on codex, which took `--model sonnet`,
+    /// accepted the turn, and said nothing. Empty means the flag is not passed.
+    func testATierNameIsDroppedRatherThanHandedToACliThatCannotReadIt() {
+        for cli in ["cursor", "agy"] {
+            XCTAssertEqual(TeamOrchestrator.bridgeModelArg(cli: cli, model: "sonnet"), "", cli)
+            XCTAssertEqual(TeamOrchestrator.bridgeModelArg(cli: cli, model: "haiku"), "", cli)
+            // A real model name is the user's own and passes through.
+            XCTAssertEqual(TeamOrchestrator.bridgeModelArg(cli: cli, model: "gpt-5"), "gpt-5", cli)
+        }
+        XCTAssertEqual(AgentRolePreset.defaultModel(for: "cursor"), "")
+        XCTAssertEqual(AgentRolePreset.defaultModel(for: "agy"), "")
+    }
+
     // MARK: - The model a bridged CLI will take
 
     /// Team models are stored as claude's tiers, because that is what the

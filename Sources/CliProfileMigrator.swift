@@ -6,7 +6,7 @@ enum CliProfileMigrator {
     static func migrateIfNeeded(defaults: UserDefaults = .standard) {
         guard !defaults.bool(forKey: migratedKey) else { return }
 
-        for cli in ["claude", "kiro", "codex", "gemini"] {
+        for cli in AgentRolePreset.knownCLIs {
             let legacyPath = defaults.string(forKey: "cliPath.\(cli)") ?? ""
             guard !legacyPath.isEmpty else { continue }
 

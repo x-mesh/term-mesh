@@ -168,11 +168,15 @@ final class AgentSession: ObservableObject {
         cli: String,
         bridgePath: String,
         model: String,
+        cliPath: String = "",
         workingDirectory: String,
         environment: [String: String] = ProcessInfo.processInfo.environment
     ) -> Launch {
         var args = [bridgePath, "--cli", cli, "--cwd", workingDirectory]
         if !model.isEmpty { args += ["--model", model] }
+        // The path Settings resolved, so the bridge runs the binary the user
+        // chose rather than whichever one PATH happens to find.
+        if !cliPath.isEmpty { args += ["--exe", cliPath] }
         return Launch(executable: "/usr/bin/env",
                       arguments: ["python3"] + args,
                       workingDirectory: workingDirectory,

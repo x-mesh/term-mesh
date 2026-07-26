@@ -52,10 +52,11 @@ final class AgentPanel: ObservableObject, Panel {
     /// A CLI whose protocol the bridge speaks. Its instructions arrive as the
     /// first turn instead of a system prompt — the bridge has no equivalent of
     /// `--append-system-prompt`, and none of these CLIs agree on one.
-    func start(bridgedCli: String, bridgePath: String, model: String) {
+    func start(bridgedCli: String, bridgePath: String, model: String,
+               cliPath: String = "") {
         session.start(AgentSession.bridgeLaunch(
             cli: bridgedCli, bridgePath: bridgePath, model: model,
-            workingDirectory: workingDirectory
+            cliPath: cliPath, workingDirectory: workingDirectory
         ))
     }
 

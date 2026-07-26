@@ -324,7 +324,7 @@ final class MenuBarExtraController: NSObject, NSMenuDelegate {
 
     private func updateProfileSubmenu() {
         profileSubmenu.removeAllItems()
-        let cliFamilies = ["claude", "kiro", "codex", "gemini"]
+        let cliFamilies = AgentRolePreset.supportedCLIs
         for cli in cliFamilies {
             let familyItem = NSMenuItem(title: cli.capitalized, action: nil, keyEquivalent: "")
             familyItem.isEnabled = false

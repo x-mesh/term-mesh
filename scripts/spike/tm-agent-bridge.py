@@ -287,8 +287,10 @@ class PerTurnBridge:
     # agy's own words, from the server log it is told to write.
     AGY_CONVERSATION = re.compile(r"Created conversation ([0-9a-f-]{36})")
 
-    def __init__(self, cli: str, cwd: str, model: str | None, emitter: Emitter):
+    def __init__(self, cli: str, cwd: str, model: str | None, emitter: Emitter,
+                 exe: str | None = None):
         self.cli = cli
+        self.exe = exe
         self.cwd = cwd
         self.model = model
         self.out = emitter
@@ -312,7 +314,7 @@ class PerTurnBridge:
 
     def _argv(self, text: str) -> list[str]:
         if self.cli == "cursor":
-            argv = ["cursor-agent", "-p", "--force",
+            argv = [self.exe or "cursor-agent", "-p", "--force",
                     "--output-format", "stream-json"]
             if self.model:
                 argv += ["--model", self.model]
@@ -322,7 +324,8 @@ class PerTurnBridge:
         # `--print` is a string flag: it swallows the next token as the prompt,
         # so `agy --print --dangerously-skip-permissions "…"` asks agy to
         # explain that flag. Everything else has to come first.
-        argv = ["agy", "--dangerously-skip-permissions", "--log-file", self.log_path]
+        argv = [self.exe or "agy", "--dangerously-skip-permissions",
+                "--log-file", self.log_path]
         if self.thread:
             argv += ["--conversation", self.thread]
         else:
@@ -488,8 +491,9 @@ class PerTurnBridge:
 # ── codex: initialize → thread/start → turn/start … turn/completed ──────────
 
 class CodexBridge:
-    def __init__(self, cwd: str, model: str | None, emitter: Emitter):
-        argv = ["codex", "app-server"]
+    def __init__(self, cwd: str, model: str | None, emitter: Emitter,
+                 exe: str | None = None):
+        argv = [exe or "codex", "app-server"]
         self.child = Child(argv, cwd)
         self.rpc = JsonRpc(self.child, emitter)
         self.out = emitter
@@ -702,6 +706,9 @@ def main() -> int:
     ap.add_argument("--events", help="normalised events are appended here too")
     ap.add_argument("--cwd", default=None)
     ap.add_argument("--model", default=None)
+    # The app resolves a CLI's path from Settings; without this the bridge would
+    # find a different binary on PATH than the one the user chose.
+    ap.add_argument("--exe", default=None, help="path to the CLI binary")
     ap.add_argument("--turn-timeout", type=float, default=600.0)
     args = ap.parse_args()
 
@@ -709,17 +716,18 @@ def main() -> int:
     out = Emitter(args.events)
 
     if args.cli in ("cursor", "agy"):
-        bridge = PerTurnBridge(args.cli, cwd, args.model, out)
+        bridge = PerTurnBridge(args.cli, cwd, args.model, out, exe=args.exe)
     elif args.cli == "codex":
-        bridge = CodexBridge(cwd, args.model, out)
+        bridge = CodexBridge(cwd, args.model, out, exe=args.exe)
     elif args.cli == "kiro":
         # `kiro-cli acp`, NOT `kiro-cli chat acp`: both parse and only the first
         # is a server. The second starts the interactive chat agent, which reads
         # the handshake as a user message and answers it in prose.
-        bridge = AcpBridge(["kiro-cli", "acp", "--trust-all-tools"], cwd, out,
-                           model=args.model)
+        bridge = AcpBridge([args.exe or "kiro-cli", "acp", "--trust-all-tools"],
+                           cwd, out, model=args.model)
     else:
-        bridge = AcpBridge(["gemini", "--acp", "--yolo"], cwd, out, model=args.model)
+        bridge = AcpBridge([args.exe or "gemini", "--acp", "--yolo"], cwd, out,
+                           model=args.model)
 
     if not bridge.start():
         out.result("", stop="startup_failed", failed=True)

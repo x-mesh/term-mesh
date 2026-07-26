@@ -86,7 +86,7 @@ enum SettingsSection: String, CaseIterable, Identifiable {
         case .automation: return ["automation", "socket", "claude", "port", "integration", "password"]
         case .agentTeams: return ["agent", "team", "leader", "model", "directory", "rendering", "interval", "refresh", "recycle", "auto"]
         case .agentRunbooks: return ["agent", "runbook", "skill", "claude", "codex", "opencode", "install", "role"]
-        case .agentCLIPaths: return ["cli", "path", "claude", "kiro", "codex", "gemini", "binary", "agent"]
+        case .agentCLIPaths: return ["cli", "path", "binary", "agent"] + AgentRolePreset.knownCLIs
         case .agentModels: return ["model", "custom", "version", "gemini", "codex", "kiro", "claude", "preview"]
         case .worktrees: return ["worktrees", "worktree", "base directory", "cleanup", "auto"]
         case .dashboard: return ["dashboard", "http", "localhost", "port", "remote"]
@@ -1435,7 +1435,7 @@ struct SettingsView: View {
 
     @ViewBuilder
     private var sectionAgentModels: some View {
-        ForEach(AgentRolePreset.supportedCLIs, id: \.self) { cli in
+        ForEach(AgentRolePreset.knownCLIs, id: \.self) { cli in
             CLICustomModelsSection(cli: cli)
         }
         SettingsCardNote("Add custom model names per CLI. These appear alongside built-in models in the team creation picker.")
@@ -3565,6 +3565,19 @@ enum CLIPathSettings {
                 (home as NSString).appendingPathComponent(".npm-global/bin/gemini"),
                 (home as NSString).appendingPathComponent(".volta/bin/gemini"),
                 "/opt/homebrew/opt/node/bin/gemini",
+            ]
+        case "cursor":
+            // The binary is `cursor-agent`; plain `cursor` is the editor.
+            candidates = [
+                (home as NSString).appendingPathComponent(".local/bin/cursor-agent"),
+                "/usr/local/bin/cursor-agent",
+                "/opt/homebrew/bin/cursor-agent",
+            ]
+        case "agy":
+            candidates = [
+                (home as NSString).appendingPathComponent(".local/bin/agy"),
+                "/usr/local/bin/agy",
+                "/opt/homebrew/bin/agy",
             ]
         default:
             candidates = []

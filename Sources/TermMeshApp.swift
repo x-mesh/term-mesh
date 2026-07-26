@@ -1519,7 +1519,7 @@ struct TermMeshApp: App {
         alert.addButton(withTitle: "Cancel")
 
         // Build available commands from CLI path settings
-        let cliNames = ["claude", "kiro", "codex", "gemini"]
+        let cliNames = AgentRolePreset.knownCLIs
         var availableCommands: [String] = ["(shell only)"]
         for cli in cliNames {
             if CLIPathSettings.resolvedPath(for: cli) != nil {

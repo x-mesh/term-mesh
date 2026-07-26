@@ -763,7 +763,8 @@ final class TeamOrchestrator: ObservableObject {
                let bridge = AgentPipeTransport.bridgePath(workingDirectory: agentWorkDir) {
                 agentPanel.start(
                     bridgedCli: agentCli, bridgePath: bridge,
-                    model: Self.bridgeModelArg(cli: agentCli, model: agentModel)
+                    model: Self.bridgeModelArg(cli: agentCli, model: agentModel),
+                    cliPath: cliPath
                 )
             } else {
                 agentPanel.start(
@@ -5272,6 +5273,13 @@ final class TeamOrchestrator: ObservableObject {
     static func bridgeModelArg(cli: String, model: String) -> String {
         switch cli {
         case "codex": return codexModelName(model)
+        case "cursor", "agy":
+            // Neither knows claude's tiers, and a name a CLI does not recognise
+            // is worse than none — measured on codex, which took `--model
+            // sonnet`, accepted the turn, and said nothing. Empty means the
+            // flag is not passed at all, which is what both were measured
+            // working with.
+            return codexReasoningEffort(model) == nil ? model : ""
         default: return model
         }
     }
