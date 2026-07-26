@@ -108,12 +108,12 @@ final class PeerProjectBootstrapTests: XCTestCase {
     }
 
     @MainActor
-    func test_remote_leader_uses_inert_local_anchor_until_remote_attach_commits() {
+    func test_remote_leader_keeps_requested_identity_with_inert_local_anchor() {
         XCTAssertEqual(
             TeamOrchestrator.initialLeaderEndpoint(
                 forRequestedEndpoint: .peer(hostKey: "peer-jw-server")
             ),
-            .local
+            .peer(hostKey: "peer-jw-server")
         )
         XCTAssertEqual(
             TeamOrchestrator.initialLeaderEndpoint(forRequestedEndpoint: .local),

@@ -480,10 +480,10 @@ extension TeamOrchestrator {
         pairSpec: String = "",
         tabManager: TabManager
     ) -> Team? {
-        // Peer attachment is asynchronous. Keep the inert local anchor as the
-        // stored endpoint until `attachRemoteLeader` commits its replacement;
-        // otherwise a detached failure is displayed as a healthy remote
-        // leader. No leader CLI is launched on this machine.
+        // Peer attachment is asynchronous. Record the requested endpoint from
+        // the start, but keep `leaderReady` false until attach commits. This
+        // avoids a visible local → remote identity change without presenting
+        // an unattached peer leader as usable. No leader CLI is launched here.
         let initialLeaderEndpoint = Self.initialLeaderEndpoint(
             forRequestedEndpoint: leaderEndpoint
         )
@@ -589,15 +589,13 @@ extension TeamOrchestrator {
         return team
     }
 
-    /// The requested peer endpoint becomes durable only after a remote pane
-    /// is attached and launched. This pure seam also guards the failure path.
+    /// Preserve the user's requested endpoint while the pane is connecting.
+    /// Readiness, rather than pretending the endpoint is local, guards sends
+    /// and exposes attach failure.
     static func initialLeaderEndpoint(
         forRequestedEndpoint endpoint: LeaderEndpoint
     ) -> LeaderEndpoint {
-        switch endpoint {
-        case .local, .peer(_):
-            .local
-        }
+        endpoint
     }
 
     static func shouldLaunchLeaderLocally(

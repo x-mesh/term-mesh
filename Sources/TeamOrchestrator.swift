@@ -4191,6 +4191,8 @@ final class TeamOrchestrator: ObservableObject {
         return [
             "team_name": team.id,
             "leader_session_id": team.leaderSessionId,
+            "leader_ready": team.leaderReady,
+            "leader_failure": team.leaderFailureDescription as Any? ?? NSNull(),
             "workspace_id": team.workspaceId.uuidString,
             "agent_count": team.agents.count,
             "agents": team.agents.map { agent in
