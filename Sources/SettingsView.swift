@@ -86,7 +86,7 @@ enum SettingsSection: String, CaseIterable, Identifiable {
         case .automation: return ["automation", "socket", "claude", "port", "integration", "password"]
         case .agentTeams: return ["agent", "team", "leader", "model", "directory", "rendering", "interval", "refresh", "recycle", "auto"]
         case .agentRunbooks: return ["agent", "runbook", "skill", "claude", "codex", "opencode", "install", "role"]
-        case .agentCLIPaths: return ["cli", "path", "claude", "kiro", "codex", "gemini", "binary", "agent"]
+        case .agentCLIPaths: return ["cli", "path", "binary", "agent"] + AgentRolePreset.knownCLIs
         case .agentModels: return ["model", "custom", "version", "gemini", "codex", "kiro", "claude", "preview"]
         case .worktrees: return ["worktrees", "worktree", "base directory", "cleanup", "auto"]
         case .dashboard: return ["dashboard", "http", "localhost", "port", "remote"]
@@ -152,6 +152,13 @@ struct SettingsView: View {
     @AppStorage(ReviewBoardSettings.enabledKey)
     private var reviewBoardEnabled = false
     @AppStorage("teamDefaultLeaderMode") private var teamDefaultLeaderMode = "claude"
+
+    /// Whether agents get a pane the app draws instead of a terminal.
+    ///
+    /// Stored under the pane key; the transport key is written alongside it,
+    /// because a native pane *is* the pipe transport with no terminal around
+    /// it and turning on one without the other does nothing.
+    @AppStorage(AgentPipeTransport.nativePanelKey) private var agentNativePanes = false
     @AppStorage("teamDefaultModel") private var teamDefaultModel = "sonnet"
     @AppStorage("teamDefaultWorkingDirectory") private var teamDefaultWorkingDirectory = ""
     @AppStorage("agentRenderingInterval") private var agentRenderingInterval = 3
@@ -1301,6 +1308,32 @@ struct SettingsView: View {
     @ViewBuilder
     private var sectionAgentTeams: some View {
         SettingsCard {
+                        if settingsMatch("agent", "pane", "native", "terminal",
+                                         "surface", "stream", "team") {
+                        SettingsCardRow(
+                            "Agent Panes",
+                            subtitle: agentNativePanes
+                                ? "Agents run in the app and are drawn by it — streamed text, tool calls that fold, a message box. No terminal."
+                                : "Agents run a CLI inside a terminal pane, as they always have.",
+                            controlWidth: pickerColumnWidth
+                        ) {
+                            Picker("", selection: $agentNativePanes) {
+                                Text("Terminal").tag(false)
+                                Text("Native").tag(true)
+                            }
+                            .labelsHidden()
+                            .pickerStyle(.segmented)
+                        }
+                        // Two keys, one decision: the native pane is the pipe
+                        // transport without a terminal around it, and turning
+                        // on the pane alone would do nothing at all.
+                        .onChange(of: agentNativePanes) { _, on in
+                            UserDefaults.standard.set(on, forKey: AgentPipeTransport.enabledKey)
+                        }
+
+                        SettingsCardDivider()
+                        }
+
                         if settingsMatch("leader", "mode", "repl", "claude", "agent", "team") {
                         SettingsCardRow(
                             "Default Leader Mode",
@@ -1485,7 +1518,7 @@ struct SettingsView: View {
 
     @ViewBuilder
     private var sectionAgentModels: some View {
-        ForEach(AgentRolePreset.supportedCLIs, id: \.self) { cli in
+        ForEach(AgentRolePreset.knownCLIs, id: \.self) { cli in
             CLICustomModelsSection(cli: cli)
         }
         SettingsCardNote("Add custom model names per CLI. These appear alongside built-in models in the team creation picker.")
@@ -3615,6 +3648,19 @@ enum CLIPathSettings {
                 (home as NSString).appendingPathComponent(".npm-global/bin/gemini"),
                 (home as NSString).appendingPathComponent(".volta/bin/gemini"),
                 "/opt/homebrew/opt/node/bin/gemini",
+            ]
+        case "cursor":
+            // The binary is `cursor-agent`; plain `cursor` is the editor.
+            candidates = [
+                (home as NSString).appendingPathComponent(".local/bin/cursor-agent"),
+                "/usr/local/bin/cursor-agent",
+                "/opt/homebrew/bin/cursor-agent",
+            ]
+        case "agy":
+            candidates = [
+                (home as NSString).appendingPathComponent(".local/bin/agy"),
+                "/usr/local/bin/agy",
+                "/opt/homebrew/bin/agy",
             ]
         default:
             candidates = []

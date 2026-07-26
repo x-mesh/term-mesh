@@ -747,6 +747,52 @@ final class TeamOrchestrator: ObservableObject {
                 // `--resume <sid>` so claude re-attaches to its prior session.
                 agentCommand.append(" --resume \(sid)")
             }
+            // Opt-in, claude-only: take turns on a pipe instead of having them
+            // typed into this pane. The process still runs here and is still
+            // watched; what the pane shows becomes raw NDJSON, which is the
+            // cost this option exists to measure. See `AgentPipeTransport`.
+            if AgentPipeTransport.canDrive(cli: agentCli) {
+                AgentPipeTransport.prepareDirectory()
+                agentCommand = AgentPipeTransport.launchCommand(
+                    claudePath: cliPath,
+                    fifoPath: AgentPipeTransport.fifoPath(agentId: agentId),
+                    model: Self.resolveClaudeModelArg(agentModel),
+                    instructions: agentInstructions,
+                    extraArgs: extraArgs,
+                    rendererPath: AgentPipeTransport.rendersOutput
+                        ? AgentPipeTransport.rendererPath(workingDirectory: agentWorkDir)
+                        : nil
+                )
+                // This pane's transport, settled here so delivery never has to
+                // infer it from a file that does not exist yet.
+                AgentPipeTransport.markDriven(agentId: agentId)
+            }
+        }
+
+        // A CLI that has to be spoken to rather than written at runs behind the
+        // bridge, which owns its stdio, speaks its protocol, and emits claude's
+        // event shape so nothing upstream has to learn a second vocabulary.
+        if AgentPipeTransport.canDrive(cli: agentCli),
+           AgentPipeTransport.needsBridge(cli: agentCli),
+           let bridge = AgentPipeTransport.bridgePath(workingDirectory: agentWorkDir) {
+            AgentPipeTransport.prepareDirectory()
+            agentCommand = AgentPipeTransport.bridgeLaunchCommand(
+                cli: agentCli,
+                fifoPath: AgentPipeTransport.fifoPath(agentId: agentId),
+                // Same translation the native path does. A stored tier reaches
+                // codex as `--model sonnet`, which it accepts and then answers
+                // nothing at all — measured.
+                model: Self.bridgeModelArg(cli: agentCli, model: agentModel),
+                cliPath: cliPath,
+                bridgePath: bridge,
+                rendererPath: AgentPipeTransport.rendersOutput
+                    ? AgentPipeTransport.rendererPath(workingDirectory: agentWorkDir)
+                    : nil,
+                workingDirectory: agentWorkDir
+            )
+            // This pane's transport, settled here so delivery never has to
+            // infer it from a file that does not exist yet.
+            AgentPipeTransport.markDriven(agentId: agentId)
         }
 
         // Wrap so the terminal stays open (drops to shell) if the CLI exits.
@@ -777,6 +823,113 @@ final class TeamOrchestrator: ObservableObject {
             paneEnv.merge(extraEnv) { _, new in new }
         }
 
+        // No terminal at all: the agent is held in the pane, not run inside a
+        // shell inside a PTY inside it. Everything below — the shell wrapper,
+        // the pane env, the FIFO — is what a terminal host needs; a native pane
+        // needs a process and somewhere to draw it.
+        // A bridged CLI with no bridge script on disk cannot be held here, and
+        // falling through to the terminal is the right answer rather than
+        // opening a pane with nothing in it.
+        let bridgeReady = !AgentPipeTransport.needsBridge(cli: agentCli)
+            || AgentPipeTransport.bridgePath(workingDirectory: agentWorkDir) != nil
+        if AgentPipeTransport.canHoldNatively(cli: agentCli), bridgeReady,
+           let agentPanel = workspace.newAgentSplit(
+               from: splitFrom,
+               orientation: orientation,
+               insertFirst: insertFirst,
+               agentName: agentName,
+               teamName: teamName,
+               workingDirectory: agentWorkDir,
+               cli: agentCli,
+               color: agentColor
+           ) {
+            if AgentPipeTransport.needsBridge(cli: agentCli),
+               let bridge = AgentPipeTransport.bridgePath(workingDirectory: agentWorkDir) {
+                agentPanel.start(
+                    bridgedCli: agentCli, bridgePath: bridge,
+                    model: Self.bridgeModelArg(cli: agentCli, model: agentModel),
+                    cliPath: cliPath
+                )
+                // A bridged CLI has no `--append-system-prompt`, and none of
+                // them agree on an equivalent, so its role has to arrive as a
+                // turn. Nothing was sending that turn: measured, two codex
+                // agents sat with zero turns received, running but with no idea
+                // what they were. Claude never showed it because its role rides
+                // in on the launch line.
+                //
+                // Written straight away rather than waited for: the process is
+                // up, the bridge reads stdin once its handshake finishes, and
+                // a pipe holds what was written in the meantime.
+                if !agentInstructions.isEmpty {
+                    // Asked for as a briefing, not a job. Claude reads its role
+                    // from the launch line and never answers it; a bridged CLI
+                    // receives the same text as a *turn* and sets about doing
+                    // it — measured, one spent a minute writing analysis while
+                    // the team's first broadcast sat queued behind it. The
+                    // confirm line is the one `create` already uses.
+                    let briefing = Self.withoutTerminalProtocol(agentInstructions)
+                        + "\n\nThis is your standing brief, not a task. "
+                        + "Do no work now: reply with exactly "
+                        + "\"Agent \(agentName) ready.\" and wait."
+                    try? agentPanel.session.send(briefing, from: .leader)
+                }
+            } else {
+                agentPanel.start(
+                    claudePath: cliPath,
+                    model: Self.resolveClaudeModelArg(agentModel),
+                    instructions: agentInstructions,
+                    extraArgs: extraArgs
+                )
+            }
+            // The turn states its own end and carries its final text, so the
+            // reply is read from that rather than scraped off a screen.
+            agentPanel.session.onBusyChanged = { [teamName, agentName] busy in
+                TeamDataStore.shared.setAgentBusy(
+                    teamName: teamName, agentName: agentName, busy: busy)
+            }
+            agentPanel.session.onTurnEnd = { [teamName, agentName] final, _, taskId in
+                Self.fileReport(teamName: teamName, agentName: agentName,
+                                taskId: taskId, text: final)
+                // A turn with no task behind it must not close somebody
+                // else's. Broadcasts and anything typed in the composer carry
+                // no `TASK_ID`, and `selectTask` would then guess — the newest
+                // open task — so answering a question could mark an unrelated
+                // assigned task completed. The report is still filed; only the
+                // board is left alone.
+                guard let taskId else { return }
+                AutoReplyEmit.emit(
+                    teamName: teamName,
+                    agentName: agentName,
+                    event: AgentPipeCompletion.headerEvent(from: final),
+                    preferredTaskId: taskId
+                )
+            }
+            let colorEmoji = Self.colorEmoji(agentColor)
+            workspace.setPanelCustomTitle(panelId: agentPanel.id,
+                                          title: "\(colorEmoji) \(agentName)")
+            return AgentMember(
+                id: agentId,
+                name: agentName,
+                teamName: teamName,
+                cli: agentCli,
+                launchCommand: Self.defaultLaunchCommand(for: agentCli),
+                model: agentModel,
+                agentType: agentType,
+                color: agentColor,
+                instructions: agentInstructions,
+                workspaceId: workspace.id,
+                panelId: agentPanel.id,
+                parentSessionId: leaderSessionId,
+                claudeSessionId: nil,
+                createdAt: Date(),
+                worktreeName: worktreeName,
+                worktreePath: worktreePath,
+                worktreeBranch: worktreeBranch,
+                originalSpawnCommand: agentCommand,
+                originalAgentWorkDir: agentWorkDir
+            )
+        }
+
         // Spawn the split pane. `insertFirst` lets hard-restart respawn into the
         // exact slot the dead pane occupied within its parent split.
         guard let panel = workspace.newTerminalSplit(
@@ -804,6 +957,14 @@ final class TeamOrchestrator: ObservableObject {
         // id (written to <sid>.jsonl) can be captured asynchronously and
         // back-filled into `claudeSessionId`. Other CLIs skip this — they
         // don't write into ~/.claude/projects/.
+        if AgentPipeTransport.canDrive(cli: agentCli) {
+            // Structural completion for this agent: the turn announces its own
+            // end, so nothing has to watch its screen for one.
+            AgentPipeCompletion.shared.watch(
+                agentId: agentId, teamName: teamName, agentName: agentName
+            )
+        }
+
         if agentCli == "claude" {
             ClaudeSessionWatcher.shared.bindIfNeeded()
             ClaudeSessionWatcher.shared.registerPendingClaudePane(
@@ -941,7 +1102,9 @@ final class TeamOrchestrator: ObservableObject {
             cliPaths[cli] = path
         }
 
-        let colors = ["green", "blue", "yellow", "magenta", "cyan", "red"]
+        // Colours belong to roles now, so the loop carries what it has used
+        // rather than counting slots.
+        var takenColors: Set<String> = []
         var members: [AgentMember] = []
 
         // Create a single workspace for the team
@@ -1345,10 +1508,13 @@ final class TeamOrchestrator: ObservableObject {
             }
 
             // Build headless members (no panelId — they're daemon subprocesses)
-            let colors = ["green", "blue", "yellow", "magenta", "cyan", "red"]
+            var takenColors: Set<String> = []
             var headlessMembers: [AgentMember] = []
             for (index, agent) in agents.enumerated() {
-                let agentColor = agent.color.isEmpty ? colors[index % colors.count] : agent.color
+                let agentColor = agent.color.isEmpty
+                    ? Self.agentColor(forRole: agent.agentType, taken: takenColors)
+                    : agent.color
+                takenColors.insert(agentColor)
                 let agentCli = agent.cli.isEmpty ? "claude" : agent.cli
                 let effectiveInstructions = AgentRunbookService.shared.composeInstructions(
                     roleName: agent.agentType,
@@ -1436,7 +1602,10 @@ final class TeamOrchestrator: ObservableObject {
         // Build agent panes with Claude running directly via command parameter
         // This bypasses shell init (.zshrc/.zprofile) entirely for reliable startup.
         for (index, agent) in agents.enumerated() {
-            let agentColor = agent.color.isEmpty ? colors[index % colors.count] : agent.color
+            let agentColor = agent.color.isEmpty
+                ? Self.agentColor(forRole: agent.agentType, taken: takenColors)
+                : agent.color
+            takenColors.insert(agentColor)
 
             // Worktree for this agent
             var agentWorkDir = sharedWorkDir ?? workingDirectory
@@ -1814,9 +1983,9 @@ final class TeamOrchestrator: ObservableObject {
             return .failure(.cliBinaryNotFound(cli: normalizedCli))
         }
 
-        // 6. Pick a color deterministically based on current agent count
-        let colorList = ["green", "blue", "yellow", "magenta", "cyan", "red"]
-        let agentColor = colorList[team.agents.count % colorList.count]
+        // 6. The role's colour, so it is the same one next time
+        let agentColor = Self.agentColor(forRole: agentType,
+                                         taken: Set(team.agents.map(\.color)))
 
         // 7. Choose split target and orientation
         // - First agent: split RIGHT from the leader pane (horizontal) — consistent with createTeam layout
@@ -1933,6 +2102,7 @@ final class TeamOrchestrator: ObservableObject {
         }
 
         let agent = team.agents[agentIndex]
+        Self.releaseTransport(agentId: agent.id)
 
         // D3-A P2 (b): release any pending claude-sid watcher slot so the
         // FSEventStream tears down promptly. Safe to call regardless of cli.
@@ -2094,9 +2264,9 @@ final class TeamOrchestrator: ObservableObject {
             mode: .digest
         )
 
-        // 7. Pick color deterministically from current agent count
-        let colorList = ["green", "blue", "yellow", "magenta", "cyan", "red"]
-        let agentColor = colorList[team.agents.count % colorList.count]
+        // 7. The role's colour, so it is the same one next time
+        let agentColor = Self.agentColor(forRole: agentType,
+                                         taken: Set(team.agents.map(\.color)))
 
         // 8. Choose split target — last agent pane or leader pane
         let splitFrom: UUID
@@ -2664,6 +2834,36 @@ final class TeamOrchestrator: ObservableObject {
             #endif
             completion?(false); return false
         }
+        // Same fork as the panel-targeted path: an agent on a pipe takes its
+        // turn there. Both entry points need it — `team.send` resolves by name
+        // and never reaches the panel-targeted one, so wiring only that left
+        // delivery quietly on the typing path while reporting success.
+        // A natively-held agent has no pipe and no pane to type into: the
+        // process is right here, so the turn is a write to its stdin. This has
+        // to come first — the FIFO fork below would find no FIFO and the
+        // terminal fork after it would type at nothing.
+        if let panelId = agent.panelId,
+           let agentPanel = nativeAgentPanel(workspaceId: agent.workspaceId, panelId: panelId) {
+            return deliverNatively(agentPanel, agentId: agent.id, text: text,
+                                   completion: completion)
+        }
+        if AgentPipeTransport.isDriven(agentId: agent.id) {
+            do {
+                AgentPipeCompletion.shared.expect(agentId: agent.id, instruction: text)
+                let n = try AgentPipeTransport.deliver(text: text, agentId: agent.id)
+                #if DEBUG
+                dlog("agent.pipe.deliver agent=\(agent.id) bytes=\(n) via=name task=\(AgentPipeCompletion.taskId(in: text) ?? "-")")
+                #endif
+                completion?(true)
+                return true
+            } catch {
+                #if DEBUG
+                dlog("agent.pipe.deliver.FAILED agent=\(agent.id) err=\(error)")
+                #endif
+                completion?(false)
+                return false
+            }
+        }
         let teamAgentKey = "\(teamName)/\(agentName)"
         if migratingAgents.contains(teamAgentKey) {
             #if DEBUG
@@ -2705,6 +2905,21 @@ final class TeamOrchestrator: ObservableObject {
         }
     }
 
+    /// The agent behind this pane, when it is one this build drives by pipe.
+    ///
+    /// Answered from what the agent's pane was launched with, not from the
+    /// option's current value or the FIFO's presence. An agent created before
+    /// the option was turned on has no pipe, and one created a moment ago has
+    /// not made its FIFO yet — both are the launch line's business, and it is
+    /// the launch line that records the answer.
+    private func pipeDrivenAgent(teamName: String, panelId: UUID) -> AgentMember? {
+        guard let team = teams[teamName],
+              let agent = team.agents.first(where: { $0.panelId == panelId }),
+              AgentPipeTransport.isDriven(agentId: agent.id)
+        else { return nil }
+        return agent
+    }
+
     /// Send text to an agent by its unique panelId (skips name lookup entirely).
     /// Used by broadcast and asyncTeamBroadcast to avoid duplicate-name collapse.
     /// When `recordPendingReturnFor` is set and `withReturn` is false, records the
@@ -2713,6 +2928,38 @@ final class TeamOrchestrator: ObservableObject {
     /// team.send / team.delegate for deterministic duplicate-name addressing).
     @discardableResult
     func sendToAgentByPanel(teamName: String, panelId: UUID, workspaceId: UUID, text: String, tabManager: TabManager, withReturn: Bool = true, recordPendingReturnFor agentName: String? = nil, completion: ((Bool) -> Void)? = nil) -> Bool {
+        // An agent driven by a pipe takes its turn there, and none of what
+        // follows applies to it: no paste queue, no pending-Return target, no
+        // in-flight accounting to keep a restart from cutting a paste in half.
+        // Those exist to get text through a terminal intact; a write to a FIFO
+        // either lands whole or reports why it did not.
+        if let native = nativeAgentPanel(workspaceId: workspaceId, panelId: panelId) {
+            return deliverNatively(native, agentId: native.agentName, text: text,
+                                   completion: completion)
+        }
+        if let agent = pipeDrivenAgent(teamName: teamName, panelId: panelId) {
+            do {
+                AgentPipeCompletion.shared.expect(agentId: agent.id, instruction: text)
+                let n = try AgentPipeTransport.deliver(text: text, agentId: agent.id)
+                #if DEBUG
+                dlog("agent.pipe.deliver agent=\(agent.id) bytes=\(n) task=\(AgentPipeCompletion.taskId(in: text) ?? "-")")
+                #endif
+                completion?(true)
+                return true
+            } catch {
+                // Falling back to typing would hide the failure behind a path
+                // that usually works, and the point of this option is to see
+                // whether the pipe holds.
+                Logger.team.error(
+                    "pipe delivery failed for \(agent.id, privacy: .public): \(String(describing: error), privacy: .public)"
+                )
+                #if DEBUG
+                dlog("agent.pipe.deliver.FAILED agent=\(agent.id) err=\(error)")
+                #endif
+                completion?(false)
+                return false
+            }
+        }
         if !withReturn,
            let agentName,
            let team = teams[teamName],
@@ -3103,6 +3350,200 @@ final class TeamOrchestrator: ObservableObject {
     /// Exponential backoff delays (ms) for surface-nil retry in sendTextToPanel.
     /// 4 attempts: 50 → 150 → 400 → 800 ms (total ~1.4 s before final failure).
     private static let sendTextRetryDelaysMs: [Double] = [50, 150, 400, 800]
+
+    /// Hand a turn to an agent this side is holding.
+    ///
+    /// Both entry points need it. `team.send` resolves by name; broadcast and
+    /// panel-targeted delegate resolve by panel — and only the first had this,
+    /// so the others fell through to the pipe fork, found no FIFO, waited out
+    /// the readiness timeout and failed.
+    private func deliverNatively(_ panel: AgentPanel, agentId: String, text: String,
+                                 completion: ((Bool) -> Void)?) -> Bool {
+        do {
+            _ = try panel.session.send(Self.withoutTerminalProtocol(text), from: .leader)
+            #if DEBUG
+            dlog("agent.native.deliver agent=\(agentId) chars=\(text.count)")
+            #endif
+            completion?(true)
+            return true
+        } catch {
+            #if DEBUG
+            dlog("agent.native.deliver.FAILED agent=\(agentId) err=\(error)")
+            #endif
+            completion?(false)
+            return false
+        }
+    }
+
+    /// Drop the "you MUST run `tm-agent reply`" block from an instruction.
+    ///
+    /// That block exists for one reason, and its own comment says so: the pane
+    /// path cannot detect completion, so the agent is told to announce it by
+    /// running a shell command. Here the turn announces its own end and the
+    /// task is already closed by the time the agent could run anything —
+    /// measured, the agent ran it anyway and got `no_active_task` back, a
+    /// guaranteed-failing tool call on every single turn.
+    ///
+    /// It is not merely noise, it is false: it tells the agent the leader
+    /// cannot see it finish. What the header is *for* still matters, so the
+    /// block is replaced rather than deleted — the verdict is the agent's and
+    /// nothing else can supply it.
+    static func withoutTerminalProtocol(_ text: String) -> String {
+        var lines = text.components(separatedBy: "\n")
+
+        // The runbook says the same thing in prose rather than in a block —
+        // "CRITICAL: … you MUST invoke `tm-agent reply` … the leader cannot
+        // detect completion and the team stalls" — and it reaches the agent in
+        // its very first turn. Same falsehood, different shape, so it is
+        // corrected rather than dropped: the requirement is real, the shell
+        // command is not.
+        for i in lines.indices where lines[i].hasPrefix("CRITICAL:")
+            && lines[i].contains("tm-agent reply") {
+            lines[i] = "CRITICAL: End every reply with the 5-field header "
+                + "(STATUS/FILES/VERIFY/NEXT/FULL_REPORT), one field per line. "
+                + "The leader reads it directly — do not run a shell command to send it."
+        }
+
+        // The digest mandates the same command in three more places, which now
+        // contradicts the line above — and an agent told both will do both,
+        // which is how the failing call got measured in the first place. The
+        // mandates go; the corrected line is left as the only authority.
+        lines.removeAll { line in
+            guard line.contains("tm-agent reply") else { return false }
+            return line.contains("When done") || line.contains("Finish with")
+        }
+        // This one is about the header's *shape*, which is still wanted — only
+        // the command it hangs off is gone.
+        for i in lines.indices {
+            lines[i] = lines[i].replacingOccurrences(
+                of: "`tm-agent reply` body", with: "reply")
+            // The runbook prints the alternation too, and it is the same trap:
+            // codex read the bar as a field separator and packed the whole
+            // header onto one line. Correcting only the delegate template left
+            // the runbook still teaching it.
+            lines[i] = lines[i].replacingOccurrences(
+                of: "STATUS: DONE|BLOCKED|NEEDS_REVIEW",
+                with: "STATUS: <DONE, BLOCKED, or NEEDS_REVIEW>")
+        }
+
+        guard let start = lines.firstIndex(where: {
+            $0.hasPrefix("[REQUIRED FINAL STEP")
+        }) else { return lines.joined(separator: "\n") }
+
+        // A bracketed line, a fenced example, then one paragraph of prose about
+        // why the command matters. Read by shape rather than by matching the
+        // wording, because there are three copies of it — two in the Rust CLI,
+        // one here — and they do not agree word for word.
+        var end = start + 1
+        var fences = 0
+        while end < lines.count, fences < 2 {
+            if lines[end].hasPrefix("```") { fences += 1 }
+            end += 1
+        }
+        guard fences == 2 else { return text }
+        while end < lines.count,
+              !lines[end].trimmingCharacters(in: .whitespaces).isEmpty {
+            end += 1
+        }
+
+        lines.replaceSubrange(start..<end, with: [
+            "[FINAL LINE — end your reply with this header, one field per line]",
+            // Not `DONE|BLOCKED|NEEDS_REVIEW`: measured, codex read the
+            // alternation bar as a field separator and answered with the whole
+            // header on one line — `STATUS: DONE|FILES: none|…` — which parses
+            // the status as everything after it.
+            "STATUS: <DONE, BLOCKED, or NEEDS_REVIEW>",
+            "FILES: <changed paths or none>",
+            "VERIFY: <single shell command or n/a>",
+            "NEXT: <action or NONE>",
+            "FULL_REPORT: <result file path or n/a>",
+        ])
+        // The capsule closes by repeating the demand — "not by printing the
+        // header in your reply" — which is now the opposite of what is wanted.
+        lines.removeAll { $0.hasPrefix("[REMINDER]") && $0.contains("tm-agent reply") }
+        return lines.joined(separator: "\n")
+    }
+
+    /// File a turn's full text where the leader looks for it.
+    ///
+    /// Written by the CLI until now, as a side effect of the agent running
+    /// `tm-agent reply`. Dropping that command from the instruction — because
+    /// it can only fail here — took the file with it, and the leader's
+    /// documented way to read a full report is `cat
+    /// ~/.term-mesh/results/<team>/<task_id>.md`. Replies are truncated to
+    /// 1500 characters over the socket, so without the file a long report is
+    /// simply gone.
+    ///
+    /// Both names, as the CLI writes them: the task's, and the agent's latest.
+    static func fileReport(teamName: String, agentName: String,
+                           taskId: String?, text: String) {
+        let dir = URL(fileURLWithPath: NSHomeDirectory())
+            .appendingPathComponent(".term-mesh/results", isDirectory: true)
+            .appendingPathComponent(safeFilename(teamName), isDirectory: true)
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        var names = ["\(safeFilename(agentName))-reply.md"]
+        if let taskId, !taskId.isEmpty { names.append("\(safeFilename(taskId)).md") }
+        for name in names {
+            try? text.write(to: dir.appendingPathComponent(name),
+                            atomically: true, encoding: .utf8)
+        }
+    }
+
+    /// Same character set the CLI allows, so a name written by one side is
+    /// found by the other.
+    private static func safeFilename(_ value: String) -> String {
+        let safe = value.filter { $0.isLetter || $0.isNumber || $0 == "-" || $0 == "_" || $0 == "." }
+        return safe.isEmpty ? "unknown" : safe
+    }
+
+    /// Let go of everything an agent's transport set up.
+    ///
+    /// `markDriven` had no counterpart: an agent name kept its pipe
+    /// registration after its pane was gone, so re-attaching the same name —
+    /// even with Agent Panes switched back to Terminal — routed every send to
+    /// a FIFO that no longer existed. The completion watcher and the FIFO
+    /// files leaked with it.
+    static func releaseTransport(agentId: String) {
+        AgentPipeTransport.discard(agentId: agentId)
+        AgentPipeCompletion.shared.forget(agentId: agentId)
+    }
+
+    /// Whether a turn to this agent still needs a Return pressed after it.
+    ///
+    /// It never did for the agent's sake — the Return is there because the
+    /// transport is a terminal and a TUI composer submits on one. An agent held
+    /// natively has no composer: the write to its stdin *is* the turn, complete
+    /// the moment it lands.
+    ///
+    /// Asked when the Return arrives rather than announced with the text: the
+    /// CLI's first attempt is already a round trip, so answering it there is
+    /// one mechanism instead of two, and it covers every caller — including the
+    /// ones that never learn about a new response field.
+    func agentNeedsReturn(teamName: String, agentName: String) -> Bool {
+        guard let team = teams[teamName],
+              let agent = selectAgent(in: team.agents, name: agentName),
+              let panelId = agent.panelId,
+              nativeAgentPanel(workspaceId: agent.workspaceId, panelId: panelId) != nil
+        else { return true }
+        return false
+    }
+
+    /// The panel behind a natively-held agent, if that is what it is.
+    ///
+    /// Same two-step lookup `sendTextToPanel` uses: the agent's own workspace
+    /// first, then a global surface lookup, because a broadcast can reach a
+    /// team whose panes live in another window.
+    private func nativeAgentPanel(workspaceId: UUID, panelId: UUID) -> AgentPanel? {
+        if let tabManager = AppDelegate.shared?.tabManagerFor(tabId: workspaceId),
+           let workspace = tabManager.tabs.first(where: { $0.id == workspaceId }),
+           let panel = workspace.agentPanel(for: panelId) {
+            return panel
+        }
+        guard let located = AppDelegate.shared?.locateSurface(surfaceId: panelId),
+              let workspace = located.tabManager.tabs.first(where: { $0.id == located.workspaceId })
+        else { return nil }
+        return workspace.agentPanel(for: panelId)
+    }
 
     private func sendTextToPanel(workspaceId: UUID, panelId: UUID, text: String, tabManager: TabManager, withReturn: Bool = true, retryCount: Int = 0, completion: ((Bool) -> Void)? = nil) -> Bool {
         // Try the provided tabManager first, then fall back to global surface lookup
@@ -4251,6 +4692,7 @@ final class TeamOrchestrator: ObservableObject {
 
         // D3-A P2 (b): release any pending claude-sid watcher slots so
         // FSEventStream(s) for this team's workdirs tear down promptly.
+        for agent in team.agents { Self.releaseTransport(agentId: agent.id) }
         for agent in team.agents where agent.cli == "claude" {
             let workDir = agent.worktreePath ?? agent.originalAgentWorkDir ?? team.workingDirectory
             ClaudeSessionWatcher.shared.unregisterPendingClaudePane(
@@ -4541,7 +4983,6 @@ final class TeamOrchestrator: ObservableObject {
         // ("<name>@<team>"). We don't have full per-agent metadata in the
         // resume result envelope, so cli/model/color/instructions default
         // sensibly until the daemon emits state updates.
-        let colors = ["green", "blue", "yellow", "magenta", "cyan", "red"]
         let members: [AgentMember] = agentIds.enumerated().map { index, fullId in
             let name = String(fullId.split(separator: "@").first ?? Substring(fullId))
             return AgentMember(
@@ -4552,7 +4993,7 @@ final class TeamOrchestrator: ObservableObject {
                 launchCommand: Self.defaultLaunchCommand(for: "claude"),
                 model: "sonnet",
                 agentType: name,
-                color: colors[index % colors.count],
+                color: Self.agentColor(forRole: name, taken: []),
                 instructions: "",
                 workspaceId: workspace.id,
                 panelId: nil, // headless — no real panel (resumed team)
@@ -5198,6 +5639,60 @@ final class TeamOrchestrator: ObservableObject {
         parts += extraArgs.map { shellQuote($0) }
 
         return parts.joined(separator: " ")
+    }
+
+    /// The model name a bridged CLI will actually accept.
+    ///
+    /// Team models are stored as claude's tiers — sonnet, opus, haiku — because
+    /// that is what the picker offers for every CLI. The pane path translates
+    /// per CLI on the way into the launch line; the native path was handing the
+    /// tier straight through, and measured, codex took `--model sonnet`,
+    /// accepted the turn, and ended it having said nothing.
+    ///
+    /// Reasoning effort is *not* carried, so the three tiers collapse to one
+    /// model here. The pane path differentiates them with a codex-specific
+    /// effort flag, and inventing that param on `turn/start` without measuring
+    /// it would be a guess.
+    static func bridgeModelArg(cli: String, model: String) -> String {
+        switch cli {
+        case "codex": return codexModelName(model)
+        case "cursor", "agy":
+            // Neither knows claude's tiers, and a name a CLI does not recognise
+            // is worse than none — measured on codex, which took `--model
+            // sonnet`, accepted the turn, and said nothing. Empty means the
+            // flag is not passed at all, which is what both were measured
+            // working with.
+            return codexReasoningEffort(model) == nil ? model : ""
+        default: return model
+        }
+    }
+
+    /// A colour that belongs to the role rather than to the order it arrived in.
+    ///
+    /// It was `colorList[team.agents.count % 6]` — the slot, not the agent. So
+    /// `reviewer` was blue in one team and yellow in the next, which makes a
+    /// colour something to re-learn per team instead of something to
+    /// recognise. Hashing the role name fixes that: reviewer is the same
+    /// colour every time, in every team, on every machine.
+    ///
+    /// Deliberately not per CLI. Which provider is behind a pane is already
+    /// said twice — the chip and the mascot — and spending the colour on it too
+    /// would leave two agents of the same role indistinguishable, which is the
+    /// thing you actually need to tell apart.
+    ///
+    /// Six colours and more roles than that means collisions, so a colour
+    /// already taken in this team steps to the next free one. Stability across
+    /// teams for the common case; never a duplicate within one.
+    static func agentColor(forRole role: String, taken: Set<String>) -> String {
+        let palette = ["green", "blue", "yellow", "magenta", "cyan", "red"]
+        var hash = 5381
+        for byte in role.lowercased().utf8 { hash = (hash &* 33) &+ Int(byte) }
+        let start = abs(hash) % palette.count
+        for offset in 0..<palette.count {
+            let candidate = palette[(start + offset) % palette.count]
+            if !taken.contains(candidate) { return candidate }
+        }
+        return palette[start]
     }
 
     /// Map short model names to Codex CLI model identifiers.
@@ -6163,17 +6658,46 @@ final class TeamOrchestrator: ObservableObject {
         restorableFleets.removeAll { $0.teamUuid == teamUuid }
     }
 
+    /// Whether this agent is mid-turn, from the process rather than the board.
+    ///
+    /// The one signal the terminal path never had. There, "busy" could only be
+    /// guessed from a task's status or from the screen still changing; here the
+    /// turn began when a line was written and ends when `result` arrives.
+    func isNativeTurnInFlight(teamName: String, agentName: String) -> Bool {
+        guard let team = teams[teamName],
+              let agent = selectAgent(in: team.agents, name: agentName),
+              let panelId = agent.panelId,
+              let panel = nativeAgentPanel(workspaceId: agent.workspaceId, panelId: panelId)
+        else { return false }
+        return panel.session.isThinking
+    }
+
+    #if DEBUG
+    func agentRuntimeStateForTesting(teamName: String, agentName: String) -> String {
+        agentRuntimeState(teamName: teamName, agentName: agentName)
+    }
+    #endif
+
     private func agentRuntimeState(teamName: String, agentName: String) -> String {
         // Phase 2: parked is daemon-authoritative — overrides task-derived state
         // because the subprocess is not live regardless of task board entry.
         if TeamDataStore.shared.isAgentParked(teamName: teamName, agentName: agentName) {
             return "parked"
         }
-        // A pane that is printing is working, whatever the board says. A task
-        // stays `assigned` from hand-off until the agent files a result, so on
+        // Two ways to know an agent is busy, and the task board is neither.
+        //
+        // A task stays `assigned` from hand-off until a result is filed, so on
         // the board alone an agent halfway through the work and an agent that
-        // never started are the same thing — and the board showed both as
-        // idle while the pane beside it scrolled.
+        // never started are the same thing — and a broadcast creates no task
+        // at all, so a whole team mid-answer reads as idle.
+        //
+        // A natively-held agent knows exactly: its turn is either in flight or
+        // it is not, so that answer is taken first. A terminal pane can only be
+        // watched, and a pane that is printing is working whatever the board
+        // says.
+        if isNativeTurnInFlight(teamName: teamName, agentName: agentName) {
+            return "running"
+        }
         let paneIsWorking = teams[teamName]?
             .agents.first { $0.name == agentName }?
             .panelId

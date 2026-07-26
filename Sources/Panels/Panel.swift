@@ -5,6 +5,10 @@ import Combine
 public enum PanelType: String, Codable, Sendable {
     case terminal
     case browser
+    /// An agent held directly, with no terminal in between. The browser panel
+    /// already showed the split tree does not care what is in a pane; this is
+    /// the same move for agents, which — measured — need a pipe and not a PTY.
+    case agent
 }
 
 enum FocusFlashCurve: Equatable {

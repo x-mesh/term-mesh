@@ -2,6 +2,21 @@
 
 All notable changes to term-mesh are documented here.
 
+## [Unreleased]
+
+### Added (experimental — off by default)
+
+- **에이전트 pane을 터미널 대신 앱이 직접 그린다** — Settings → Agent Teams → Agent Panes에서 **Native**를 고르면 에이전트가 Ghostty 터미널 대신 앱 안의 대화형 surface에서 돌아간다. 지시문·답변·도구 호출이 각각 구분되어 보이고, 도구 출력은 접을 수 있으며, 답이 쓰이는 동안 streaming 상태가 표시된다. 기본값은 **Terminal**이라 켜지 않으면 지금까지와 동일하다.
+- **에이전트에게 지시를 붙여넣지 않고 pipe로 전달한다** — Native mode와 함께 켜지며, `tm-agent delegate`/`send`가 paste+Return 대신 pipe/FIFO(또는 native pane의 stdin)로 한 턴을 넘긴다. 턴 종료는 CLI의 `result` 이벤트로 판별하므로 화면 diff 기반 auto-reply 추론을 쓰지 않는다.
+- **cursor·agy CLI를 에이전트로 선택할 수 있다** — Native mode에서만 role preset / attach CLI 목록에 추가된다. 둘 다 대화형 TUI가 없어 터미널 pane으로는 호스트할 수 없고, `scripts/spike/tm-agent-bridge.py`가 턴 단위 프로세스를 대신 실행한다. Settings → CLI Paths에서는 `cursor-agent`·`agy` 경로를 미리 잡아 둘 수 있다.
+- **pane마다 역할 색·CLI 뱃지·마스코트로 구분한다** — 여러 native pane을 나란히 둘 때 헤더 색 rail, CLI face, agent name으로 어느 pane인지 터미널을 읽지 않고 구분한다. 색은 pane 슬롯이 아니라 팀 role에 붙는다.
+
+### Changed (experimental)
+
+- **Shell Integration 상태에서 native agent pane은 agentMode로 표시된다** — TUI shell integration을 기대하지 않으므로 Settings → Shell Health에서 파란 **agentMode**로 분류된다.
+
+Spike reference: `docs/spike/agent-pipe-render.md`
+
 ## [0.167.0] - 2026-07-23
 
 ### Added

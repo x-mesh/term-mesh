@@ -127,6 +127,8 @@
 		RPP00002 /* RemoteProjectPaths.swift in Sources */ = {isa = PBXBuildFile; fileRef = RPP00001 /* RemoteProjectPaths.swift */; };
 		ASP00002 /* AgentStartupPrompt.swift in Sources */ = {isa = PBXBuildFile; fileRef = ASP00001 /* AgentStartupPrompt.swift */; };
 		TORA0002 /* TeamOrchestrator+RemoteAgent.swift in Sources */ = {isa = PBXBuildFile; fileRef = TORA0001 /* TeamOrchestrator+RemoteAgent.swift */; };
+		APT0000000000000000003 /* AgentPipeTransport.swift in Sources */ = {isa = PBXBuildFile; fileRef = APT0000000000000000006 /* AgentPipeTransport.swift */; };
+		APC0000000000000000003 /* AgentPipeCompletion.swift in Sources */ = {isa = PBXBuildFile; fileRef = APC0000000000000000006 /* AgentPipeCompletion.swift */; };
 		A5001702 /* DashboardController.swift in Sources */ = {isa = PBXBuildFile; fileRef = A5001703 /* DashboardController.swift */; };
 		A5001704 /* dashboard in Resources */ = {isa = PBXBuildFile; fileRef = A5001705 /* dashboard */; };
 		ARB00002 /* AgentRunbookService.swift in Sources */ = {isa = PBXBuildFile; fileRef = ARB00001 /* AgentRunbookService.swift */; };
@@ -147,6 +149,7 @@
 		CVB00025 /* TerminalController+BrowserData.swift in Sources */ = {isa = PBXBuildFile; fileRef = CVS00025 /* TerminalController+BrowserData.swift */; };
 		CVB00026 /* TerminalController+BrowserScript.swift in Sources */ = {isa = PBXBuildFile; fileRef = CVS00026 /* TerminalController+BrowserScript.swift */; };
 		TC0B0006 /* TerminalController+Debug.swift in Sources */ = {isa = PBXBuildFile; fileRef = TC0F0006 /* TerminalController+Debug.swift */; };
+		A5009030 /* TerminalController+AgentDebug.swift in Sources */ = {isa = PBXBuildFile; fileRef = A5009031 /* TerminalController+AgentDebug.swift */; };
 		CVB00021 /* TerminalController+DebugOverlay.swift in Sources */ = {isa = PBXBuildFile; fileRef = CVS00021 /* TerminalController+DebugOverlay.swift */; };
 		CVB00022 /* TerminalController+DebugVisual.swift in Sources */ = {isa = PBXBuildFile; fileRef = CVS00022 /* TerminalController+DebugVisual.swift */; };
 		CVB00023 /* TerminalController+DebugInput.swift in Sources */ = {isa = PBXBuildFile; fileRef = CVS00023 /* TerminalController+DebugInput.swift */; };
@@ -162,6 +165,10 @@
 		A5001402 /* BrowserPanel.swift in Sources */ = {isa = PBXBuildFile; fileRef = A5001412 /* BrowserPanel.swift */; };
 		A5001403 /* TerminalPanelView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A5001413 /* TerminalPanelView.swift */; };
 		A5001404 /* BrowserPanelView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A5001414 /* BrowserPanelView.swift */; };
+		A5009001 /* AgentSession.swift in Sources */ = {isa = PBXBuildFile; fileRef = A5009008 /* AgentSession.swift */; };
+		A5009006 /* AgentPanel.swift in Sources */ = {isa = PBXBuildFile; fileRef = A5009009 /* AgentPanel.swift */; };
+		A5009007 /* AgentPanelView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A500900A /* AgentPanelView.swift */; };
+		A5009080 /* AgentMarkdown.swift in Sources */ = {isa = PBXBuildFile; fileRef = A5009081 /* AgentMarkdown.swift */; };
 		A5001405 /* PanelContentView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A5001415 /* PanelContentView.swift */; };
 		A5001406 /* Workspace.swift in Sources */ = {isa = PBXBuildFile; fileRef = A5001416 /* Workspace.swift */; };
 		A5001407 /* WorkspaceContentView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A5001417 /* WorkspaceContentView.swift */; };
@@ -227,6 +234,8 @@
 				F7000000A1B2C3D4E5F60718 /* IMEHistoryTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = F7000001A1B2C3D4E5F60718 /* IMEHistoryTests.swift */; };
 				F8000000A1B2C3D4E5F60718 /* IMESendKeyTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = F8000001A1B2C3D4E5F60718 /* IMESendKeyTests.swift */; };
 				F9000000A1B2C3D4E5F60718 /* AutoReplyDetectorTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = F9000001A1B2C3D4E5F60718 /* AutoReplyDetectorTests.swift */; };
+		APCT000000000000000003 /* AgentPipeCompletionTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = APCT000000000000000006 /* AgentPipeCompletionTests.swift */; };
+		A5009020 /* AgentSessionTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A5009021 /* AgentSessionTests.swift */; };
 				F9000010A1B2C3D4E5F60718 /* WorkspaceRetrievalDirectoryTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = F9000011A1B2C3D4E5F60718 /* WorkspaceRetrievalDirectoryTests.swift */; };
 				F9000014A1B2C3D4E5F60718 /* PeerHostStatsTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = F9000015A1B2C3D4E5F60718 /* PeerHostStatsTests.swift */; };
 				FA000000A1B2C3D4E5F60718 /* PeerSocketProberTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = FA000001A1B2C3D4E5F60718 /* PeerSocketProberTests.swift */; };
@@ -412,6 +421,8 @@
 		RPP00001 /* RemoteProjectPaths.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RemoteProjectPaths.swift; sourceTree = "<group>"; };
 		ASP00001 /* AgentStartupPrompt.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AgentStartupPrompt.swift; sourceTree = "<group>"; };
 		TORA0001 /* TeamOrchestrator+RemoteAgent.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "TeamOrchestrator+RemoteAgent.swift"; sourceTree = "<group>"; };
+			APT0000000000000000006 /* AgentPipeTransport.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AgentPipeTransport.swift; sourceTree = "<group>"; };
+			APC0000000000000000006 /* AgentPipeCompletion.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AgentPipeCompletion.swift; sourceTree = "<group>"; };
 		A5001703 /* DashboardController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DashboardController.swift; sourceTree = "<group>"; };
 		A5001705 /* dashboard */ = {isa = PBXFileReference; lastKnownFileType = folder; path = dashboard; sourceTree = "<group>"; };
 		ARB00001 /* AgentRunbookService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AgentRunbookService.swift; sourceTree = "<group>"; };
@@ -434,6 +445,7 @@
 		CVS00025 /* TerminalController+BrowserData.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "TerminalController+BrowserData.swift"; sourceTree = "<group>"; };
 		CVS00026 /* TerminalController+BrowserScript.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "TerminalController+BrowserScript.swift"; sourceTree = "<group>"; };
 		TC0F0006 /* TerminalController+Debug.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "TerminalController+Debug.swift"; sourceTree = "<group>"; };
+		A5009031 /* TerminalController+AgentDebug.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "TerminalController+AgentDebug.swift"; sourceTree = "<group>"; };
 		CVS00021 /* TerminalController+DebugOverlay.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "TerminalController+DebugOverlay.swift"; sourceTree = "<group>"; };
 		CVS00022 /* TerminalController+DebugVisual.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "TerminalController+DebugVisual.swift"; sourceTree = "<group>"; };
 		CVS00023 /* TerminalController+DebugInput.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "TerminalController+DebugInput.swift"; sourceTree = "<group>"; };
@@ -450,6 +462,10 @@
 		A5001412 /* BrowserPanel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Panels/BrowserPanel.swift; sourceTree = "<group>"; };
 		A5001413 /* TerminalPanelView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Panels/TerminalPanelView.swift; sourceTree = "<group>"; };
 		A5001414 /* BrowserPanelView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Panels/BrowserPanelView.swift; sourceTree = "<group>"; };
+		A5009008 /* AgentSession.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Panels/AgentSession.swift; sourceTree = "<group>"; };
+		A5009009 /* AgentPanel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Panels/AgentPanel.swift; sourceTree = "<group>"; };
+		A500900A /* AgentPanelView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Panels/AgentPanelView.swift; sourceTree = "<group>"; };
+		A5009081 /* AgentMarkdown.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Panels/AgentMarkdown.swift; sourceTree = "<group>"; };
 		A5001415 /* PanelContentView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Panels/PanelContentView.swift; sourceTree = "<group>"; };
 		A5001416 /* Workspace.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Workspace.swift; sourceTree = "<group>"; };
 		A5001417 /* WorkspaceContentView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WorkspaceContentView.swift; sourceTree = "<group>"; };
@@ -512,6 +528,8 @@
 			F7000001A1B2C3D4E5F60718 /* IMEHistoryTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = IMEHistoryTests.swift; sourceTree = "<group>"; };
 			F8000001A1B2C3D4E5F60718 /* IMESendKeyTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = IMESendKeyTests.swift; sourceTree = "<group>"; };
 			F9000001A1B2C3D4E5F60718 /* AutoReplyDetectorTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AutoReplyDetectorTests.swift; sourceTree = "<group>"; };
+			APCT000000000000000006 /* AgentPipeCompletionTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AgentPipeCompletionTests.swift; sourceTree = "<group>"; };
+		A5009021 /* AgentSessionTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AgentSessionTests.swift; sourceTree = "<group>"; };
 			F9000011A1B2C3D4E5F60718 /* WorkspaceRetrievalDirectoryTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WorkspaceRetrievalDirectoryTests.swift; sourceTree = "<group>"; };
 			F9000015A1B2C3D4E5F60718 /* PeerHostStatsTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PeerHostStatsTests.swift; sourceTree = "<group>"; };
 			FA000001A1B2C3D4E5F60718 /* PeerSocketProberTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PeerSocketProberTests.swift; sourceTree = "<group>"; };
@@ -602,7 +620,7 @@
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 			shellPath = /bin/sh;
-			shellScript = "# Generate BuildInfo.swift with git SHA\n\"${SRCROOT}/scripts/generate-build-info.sh\"\nset -euo pipefail\nDEST=\"${TARGET_BUILD_DIR}/${UNLOCALIZED_RESOURCES_FOLDER_PATH}\"\nGHOSTTY_DEST=\"${DEST}/ghostty\"\nTERMINFO_DEST=\"${DEST}/terminfo\"\nTERMMESH_SHELL_DEST=\"${DEST}/shell-integration\"\nSRC_SHARE=\"${SRCROOT}/ghostty/zig-out/share\"\nGHOSTTY_SRC=\"${SRC_SHARE}/ghostty\"\nTERMINFO_SRC=\"${SRC_SHARE}/terminfo\"\nFALLBACK_GHOSTTY=\"${SRCROOT}/Resources/ghostty\"\nFALLBACK_TERMINFO=\"${SRCROOT}/Resources/ghostty/terminfo\"\nTERMINFO_OVERLAY=\"${SRCROOT}/Resources/terminfo-overlay\"\nTERMMESH_SHELL_SRC=\"${SRCROOT}/Resources/shell-integration\"\nif [ -d \"$GHOSTTY_SRC\" ]; then\n  mkdir -p \"$GHOSTTY_DEST\"\n  rsync -a --delete \"$GHOSTTY_SRC/\" \"$GHOSTTY_DEST/\"\nelif [ -d \"$FALLBACK_GHOSTTY\" ]; then\n  mkdir -p \"$GHOSTTY_DEST\"\n  rsync -a --delete \"$FALLBACK_GHOSTTY/\" \"$GHOSTTY_DEST/\"\nfi\nif [ -d \"$TERMINFO_SRC\" ]; then\n  mkdir -p \"$TERMINFO_DEST\"\n  rsync -a --delete \"$TERMINFO_SRC/\" \"$TERMINFO_DEST/\"\nelif [ -d \"$FALLBACK_TERMINFO\" ]; then\n  mkdir -p \"$TERMINFO_DEST\"\n  rsync -a --delete \"$FALLBACK_TERMINFO/\" \"$TERMINFO_DEST/\"\nfi\n# Overlay any term-mesh-specific terminfo adjustments.\n# This intentionally does not use --delete so we only patch specific entries.\nif [ -d \"$TERMINFO_OVERLAY\" ]; then\n  mkdir -p \"$TERMINFO_DEST\"\n  rsync -a \"$TERMINFO_OVERLAY/\" \"$TERMINFO_DEST/\"\nfi\nif [ -d \"$TERMMESH_SHELL_SRC\" ]; then\n  mkdir -p \"$TERMMESH_SHELL_DEST\"\n  # Use '/.' so dotfiles like .zshenv/.zprofile are copied too.\n  rsync -a \"$TERMMESH_SHELL_SRC/.\" \"$TERMMESH_SHELL_DEST/\"\nfi\n# Copy term-mesh Ghostty config overrides (e.g. shell-integration=none).\nTERMMESH_CONF=\"${SRCROOT}/Resources/ghostty-termmesh.conf\"\nif [ -f \"$TERMMESH_CONF\" ]; then\n  cp -p \"$TERMMESH_CONF\" \"$DEST/ghostty-termmesh.conf\"\nfi\nTEAM_TEMPLATES_BUILTIN=\"${SRCROOT}/Resources/team-templates.builtin.json\"\nif [ -f \"$TEAM_TEMPLATES_BUILTIN\" ]; then\n  cp -p \"$TEAM_TEMPLATES_BUILTIN\" \"$DEST/team-templates.builtin.json\"\nfi\n# Copy team scripts into the bundle for Release builds.\nTEAM_SCRIPTS_SRC=\"${SRCROOT}/scripts\"\nTEAM_SCRIPTS_DEST=\"${DEST}/scripts\"\nif [ -d \"$TEAM_SCRIPTS_SRC\" ]; then\n  mkdir -p \"$TEAM_SCRIPTS_DEST\"\n  for f in team-leader.sh team-leader-claude.sh tm-agent.sh agent-notify.sh agent-title.sh; do\n    [ -f \"$TEAM_SCRIPTS_SRC/$f\" ] && cp -p \"$TEAM_SCRIPTS_SRC/$f\" \"$TEAM_SCRIPTS_DEST/$f\"\n  done\n  chmod +x \"$TEAM_SCRIPTS_DEST\"/*.sh 2>/dev/null || true\nfi\n# Copy Claude slash commands + skills into the bundle (single source of truth).\n# Command/skill list lives in scripts/copy-claude-commands.sh.\n\"${SRCROOT}/scripts/copy-claude-commands.sh\"\nINFO_PLIST=\"${TARGET_BUILD_DIR}/${INFOPLIST_PATH}\"\nCOMMIT=\"$(git -C \"${SRCROOT}\" rev-parse --short=9 HEAD 2>/dev/null || true)\"\nif [ -n \"$COMMIT\" ] && [ -f \"$INFO_PLIST\" ]; then\n  /usr/libexec/PlistBuddy -c \"Set :TermMeshCommit $COMMIT\" \"$INFO_PLIST\" >/dev/null 2>&1 || /usr/libexec/PlistBuddy -c \"Add :TermMeshCommit string $COMMIT\" \"$INFO_PLIST\" >/dev/null 2>&1 || true\nfi\n";
+			shellScript = "# Generate BuildInfo.swift with git SHA\n\"${SRCROOT}/scripts/generate-build-info.sh\"\nset -euo pipefail\nDEST=\"${TARGET_BUILD_DIR}/${UNLOCALIZED_RESOURCES_FOLDER_PATH}\"\nGHOSTTY_DEST=\"${DEST}/ghostty\"\nTERMINFO_DEST=\"${DEST}/terminfo\"\nTERMMESH_SHELL_DEST=\"${DEST}/shell-integration\"\nSRC_SHARE=\"${SRCROOT}/ghostty/zig-out/share\"\nGHOSTTY_SRC=\"${SRC_SHARE}/ghostty\"\nTERMINFO_SRC=\"${SRC_SHARE}/terminfo\"\nFALLBACK_GHOSTTY=\"${SRCROOT}/Resources/ghostty\"\nFALLBACK_TERMINFO=\"${SRCROOT}/Resources/ghostty/terminfo\"\nTERMINFO_OVERLAY=\"${SRCROOT}/Resources/terminfo-overlay\"\nTERMMESH_SHELL_SRC=\"${SRCROOT}/Resources/shell-integration\"\nif [ -d \"$GHOSTTY_SRC\" ]; then\n  mkdir -p \"$GHOSTTY_DEST\"\n  rsync -a --delete \"$GHOSTTY_SRC/\" \"$GHOSTTY_DEST/\"\nelif [ -d \"$FALLBACK_GHOSTTY\" ]; then\n  mkdir -p \"$GHOSTTY_DEST\"\n  rsync -a --delete \"$FALLBACK_GHOSTTY/\" \"$GHOSTTY_DEST/\"\nfi\nif [ -d \"$TERMINFO_SRC\" ]; then\n  mkdir -p \"$TERMINFO_DEST\"\n  rsync -a --delete \"$TERMINFO_SRC/\" \"$TERMINFO_DEST/\"\nelif [ -d \"$FALLBACK_TERMINFO\" ]; then\n  mkdir -p \"$TERMINFO_DEST\"\n  rsync -a --delete \"$FALLBACK_TERMINFO/\" \"$TERMINFO_DEST/\"\nfi\n# Overlay any term-mesh-specific terminfo adjustments.\n# This intentionally does not use --delete so we only patch specific entries.\nif [ -d \"$TERMINFO_OVERLAY\" ]; then\n  mkdir -p \"$TERMINFO_DEST\"\n  rsync -a \"$TERMINFO_OVERLAY/\" \"$TERMINFO_DEST/\"\nfi\nif [ -d \"$TERMMESH_SHELL_SRC\" ]; then\n  mkdir -p \"$TERMMESH_SHELL_DEST\"\n  # Use '/.' so dotfiles like .zshenv/.zprofile are copied too.\n  rsync -a \"$TERMMESH_SHELL_SRC/.\" \"$TERMMESH_SHELL_DEST/\"\nfi\n# Copy term-mesh Ghostty config overrides (e.g. shell-integration=none).\nTERMMESH_CONF=\"${SRCROOT}/Resources/ghostty-termmesh.conf\"\nif [ -f \"$TERMMESH_CONF\" ]; then\n  cp -p \"$TERMMESH_CONF\" \"$DEST/ghostty-termmesh.conf\"\nfi\nTEAM_TEMPLATES_BUILTIN=\"${SRCROOT}/Resources/team-templates.builtin.json\"\nif [ -f \"$TEAM_TEMPLATES_BUILTIN\" ]; then\n  cp -p \"$TEAM_TEMPLATES_BUILTIN\" \"$DEST/team-templates.builtin.json\"\nfi\n# Copy team scripts into the bundle for Release builds.\nTEAM_SCRIPTS_SRC=\"${SRCROOT}/scripts\"\nTEAM_SCRIPTS_DEST=\"${DEST}/scripts\"\nif [ -d \"$TEAM_SCRIPTS_SRC\" ]; then\n  mkdir -p \"$TEAM_SCRIPTS_DEST\"\n  for f in team-leader.sh team-leader-claude.sh tm-agent.sh agent-notify.sh agent-title.sh; do\n    [ -f \"$TEAM_SCRIPTS_SRC/$f\" ] && cp -p \"$TEAM_SCRIPTS_SRC/$f\" \"$TEAM_SCRIPTS_DEST/$f\"\n  done\n  chmod +x \"$TEAM_SCRIPTS_DEST\"/*.sh 2>/dev/null || true\nfi\n# Agent bridge + renderer. Without these in the bundle a Release app run from\n# any directory but this repo finds no bridge, so codex/kiro silently fall back\n# to a terminal and cursor/agy have no fallback at all.\nSPIKE_SRC=\"${TEAM_SCRIPTS_SRC}/spike\"\nSPIKE_DEST=\"${TEAM_SCRIPTS_DEST}/spike\"\nif [ -d \"$SPIKE_SRC\" ]; then\n  mkdir -p \"$SPIKE_DEST\"\n  for f in tm-agent-bridge.py tm-render-claude.py; do\n    [ -f \"$SPIKE_SRC/$f\" ] && cp -p \"$SPIKE_SRC/$f\" \"$SPIKE_DEST/$f\"\n  done\n  chmod +x \"$SPIKE_DEST\"/*.py 2>/dev/null || true\nfi\n# Copy Claude slash commands + skills into the bundle (single source of truth).\n# Command/skill list lives in scripts/copy-claude-commands.sh.\n\"${SRCROOT}/scripts/copy-claude-commands.sh\"\nINFO_PLIST=\"${TARGET_BUILD_DIR}/${INFOPLIST_PATH}\"\nCOMMIT=\"$(git -C \"${SRCROOT}\" rev-parse --short=9 HEAD 2>/dev/null || true)\"\nif [ -n \"$COMMIT\" ] && [ -f \"$INFO_PLIST\" ]; then\n  /usr/libexec/PlistBuddy -c \"Set :TermMeshCommit $COMMIT\" \"$INFO_PLIST\" >/dev/null 2>&1 || /usr/libexec/PlistBuddy -c \"Add :TermMeshCommit string $COMMIT\" \"$INFO_PLIST\" >/dev/null 2>&1 || true\nfi\n";
 		};
 /* End PBXShellScriptBuildPhase section */
 
@@ -726,6 +744,7 @@
 				CVS00025 /* TerminalController+BrowserData.swift */,
 				CVS00026 /* TerminalController+BrowserScript.swift */,
 				TC0F0006 /* TerminalController+Debug.swift */,
+				A5009031 /* TerminalController+AgentDebug.swift */,
 				CVS00021 /* TerminalController+DebugOverlay.swift */,
 				CVS00022 /* TerminalController+DebugVisual.swift */,
 				CVS00023 /* TerminalController+DebugInput.swift */,
@@ -746,6 +765,8 @@
 				RPP00001 /* RemoteProjectPaths.swift */,
 				ASP00001 /* AgentStartupPrompt.swift */,
 				TORA0001 /* TeamOrchestrator+RemoteAgent.swift */,
+				APT0000000000000000006 /* AgentPipeTransport.swift */,
+				APC0000000000000000006 /* AgentPipeCompletion.swift */,
 				ARB00001 /* AgentRunbookService.swift */,
 				ARB00003 /* AgentRunbookSettingsView.swift */,
 				CPF00001 /* CliProfile.swift */,
@@ -778,6 +799,10 @@
 				A5001412 /* BrowserPanel.swift */,
 				A5001413 /* TerminalPanelView.swift */,
 				A5001414 /* BrowserPanelView.swift */,
+				A5009008 /* AgentSession.swift */,
+				A5009009 /* AgentPanel.swift */,
+				A500900A /* AgentPanelView.swift */,
+				A5009081 /* AgentMarkdown.swift */,
 				A5001510 /* TermMeshWebView.swift */,
 				A5009910 /* EnvCompat.swift */,
 				A5001415 /* PanelContentView.swift */,
@@ -860,6 +885,8 @@
 				F7000001A1B2C3D4E5F60718 /* IMEHistoryTests.swift */,
 				F8000001A1B2C3D4E5F60718 /* IMESendKeyTests.swift */,
 				F9000001A1B2C3D4E5F60718 /* AutoReplyDetectorTests.swift */,
+				APCT000000000000000006 /* AgentPipeCompletionTests.swift */,
+				A5009021 /* AgentSessionTests.swift */,
 				F9000011A1B2C3D4E5F60718 /* WorkspaceRetrievalDirectoryTests.swift */,
 				F9000015A1B2C3D4E5F60718 /* PeerHostStatsTests.swift */,
 				FA000001A1B2C3D4E5F60718 /* PeerSocketProberTests.swift */,
@@ -1124,6 +1151,7 @@
 				CVB00025 /* TerminalController+BrowserData.swift in Sources */,
 				CVB00026 /* TerminalController+BrowserScript.swift in Sources */,
 				TC0B0006 /* TerminalController+Debug.swift in Sources */,
+				A5009030 /* TerminalController+AgentDebug.swift in Sources */,
 				CVB00021 /* TerminalController+DebugOverlay.swift in Sources */,
 				CVB00022 /* TerminalController+DebugVisual.swift in Sources */,
 				CVB00023 /* TerminalController+DebugInput.swift in Sources */,
@@ -1144,6 +1172,8 @@
 				RPP00002 /* RemoteProjectPaths.swift in Sources */,
 				ASP00002 /* AgentStartupPrompt.swift in Sources */,
 				TORA0002 /* TeamOrchestrator+RemoteAgent.swift in Sources */,
+				APT0000000000000000003 /* AgentPipeTransport.swift in Sources */,
+				APC0000000000000000003 /* AgentPipeCompletion.swift in Sources */,
 				ARB00002 /* AgentRunbookService.swift in Sources */,
 				ARB00004 /* AgentRunbookSettingsView.swift in Sources */,
 				CPF00002 /* CliProfile.swift in Sources */,
@@ -1179,6 +1209,10 @@
 				A5001402 /* BrowserPanel.swift in Sources */,
 				A5001403 /* TerminalPanelView.swift in Sources */,
 				A5001404 /* BrowserPanelView.swift in Sources */,
+				A5009001 /* AgentSession.swift in Sources */,
+				A5009006 /* AgentPanel.swift in Sources */,
+				A5009007 /* AgentPanelView.swift in Sources */,
+				A5009080 /* AgentMarkdown.swift in Sources */,
 				A5001500 /* TermMeshWebView.swift in Sources */,
 				A5009900 /* EnvCompat.swift in Sources */,
 				A5001405 /* PanelContentView.swift in Sources */,
@@ -1230,6 +1264,8 @@
 				F7000000A1B2C3D4E5F60718 /* IMEHistoryTests.swift in Sources */,
 				F8000000A1B2C3D4E5F60718 /* IMESendKeyTests.swift in Sources */,
 				F9000000A1B2C3D4E5F60718 /* AutoReplyDetectorTests.swift in Sources */,
+				APCT000000000000000003 /* AgentPipeCompletionTests.swift in Sources */,
+				A5009020 /* AgentSessionTests.swift in Sources */,
 				F9000010A1B2C3D4E5F60718 /* WorkspaceRetrievalDirectoryTests.swift in Sources */,
 				F9000014A1B2C3D4E5F60718 /* PeerHostStatsTests.swift in Sources */,
 				FA000000A1B2C3D4E5F60718 /* PeerSocketProberTests.swift in Sources */,

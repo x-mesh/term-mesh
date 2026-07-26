@@ -1192,6 +1192,8 @@ class TerminalController {
             return v2Result(id: id, self.v2DebugActivateApp())
         case "debug.command_palette.toggle":
             return v2Result(id: id, self.v2DebugToggleCommandPalette(params: params))
+        case "debug.agent.transcript":
+            return v2Result(id: id, self.v2DebugAgentTranscript(params: params))
         case "debug.command_palette.rename_tab.open":
             return v2Result(id: id, self.v2DebugOpenCommandPaletteRenameTabInput(params: params))
         case "debug.command_palette.visible":
@@ -1472,6 +1474,7 @@ class TerminalController {
             "debug.type",
             "debug.app.activate",
             "debug.command_palette.toggle",
+            "debug.agent.transcript",
             "debug.command_palette.rename_tab.open",
             "debug.command_palette.visible",
             "debug.command_palette.selection",
@@ -2830,7 +2833,8 @@ class TerminalController {
             }
         }
         return dispatched
-            ? v2Ok(id: id, result: ["sent": true, "text_delivered": textDelivered, "team_name": teamName, "agent_name": agentName])
+            ? v2Ok(id: id, result: ["sent": true, "text_delivered": textDelivered,
+                                    "team_name": teamName, "agent_name": agentName])
             : v2Error(id: id, code: "not_found", message: "Agent or team not found")
     }
 
@@ -3711,6 +3715,20 @@ class TerminalController {
         // paste hit, even for duplicate-named agents. Falls back when stale (e.g. after
         // a hard restart rewrote the panelId).
         let explicitPanelId = (params["panel_id"] as? String).flatMap(UUID.init(uuidString:))
+
+        // An agent held natively has no keyboard to press Return on, and needs
+        // none: the write to its stdin was already a whole turn, submitted the
+        // moment it landed. The caller is asking "is this turn in?", and the
+        // answer is yes — so it is answered here rather than left to a ladder
+        // that can only fail, eight times, over eleven seconds, ending in a
+        // warning about a Return nothing was waiting for.
+        if key.lowercased() == "return",
+           await MainActor.run(body: {
+               !TeamOrchestrator.shared.agentNeedsReturn(teamName: teamName, agentName: agentName)
+           }) {
+            return v2Ok(id: id, result: ["sent": true, "no_keyboard": true,
+                                         "team_name": teamName, "agent_name": agentName])
+        }
 
         let result: (sent: Bool, targetMissing: Bool, reason: String) = await withCheckedContinuation { continuation in
             Task { @MainActor in
