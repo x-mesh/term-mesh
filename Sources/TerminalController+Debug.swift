@@ -564,6 +564,7 @@ extension TerminalController {
                                 leaderMode: leaderMode,
                                 leaderModel: leaderModel,
                                 leaderEndpoint: leaderEndpoint,
+                                leaderWorkingDirectory: remotePath,
                                 tabManager: tabManager
                             )
                         }

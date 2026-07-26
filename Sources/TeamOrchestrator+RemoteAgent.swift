@@ -38,8 +38,8 @@ extension TeamOrchestrator {
         }
     }
 
-    /// Replace the temporary local leader pane with a pane whose process runs
-    /// on `hostKey`. The remote process receives only an expiring scoped
+    /// Replace the inert local anchor with a pane whose process runs on
+    /// `hostKey`. The remote process receives only an expiring scoped
     /// grant and its own daemon socket; the viewer's TERMMESH_SOCKET is never
     /// copied across the peer boundary.
     @MainActor
@@ -471,6 +471,7 @@ extension TeamOrchestrator {
         leaderMode: String,
         leaderModel: String = "sonnet",
         leaderEndpoint: LeaderEndpoint = .local,
+        leaderWorkingDirectory: String? = nil,
         worktreeMode: String = "off",
         executionMode: String = "pane",
         resumeSessionId: String? = nil,
@@ -479,11 +480,14 @@ extension TeamOrchestrator {
         pairSpec: String = "",
         tabManager: TabManager
     ) -> Team? {
-        // Peer attachment is asynchronous. Keep the newly-created local
-        // leader as the stored endpoint until `attachRemoteLeader` commits
-        // its replacement; otherwise a detached failure is displayed as a
-        // healthy remote leader.
+        // Peer attachment is asynchronous. Keep the inert local anchor as the
+        // stored endpoint until `attachRemoteLeader` commits its replacement;
+        // otherwise a detached failure is displayed as a healthy remote
+        // leader. No leader CLI is launched on this machine.
         let initialLeaderEndpoint = Self.initialLeaderEndpoint(
+            forRequestedEndpoint: leaderEndpoint
+        )
+        let launchLeaderLocally = Self.shouldLaunchLeaderLocally(
             forRequestedEndpoint: leaderEndpoint
         )
         // A remote pane is a peer surface pulled into this workspace, so it
@@ -529,6 +533,7 @@ extension TeamOrchestrator {
             worktreeMode: worktreeMode,
             executionMode: executionMode,
             leaderEndpoint: initialLeaderEndpoint,
+            launchLeaderLocally: launchLeaderLocally,
             tabManager: tabManager
         ) else { return nil }
 
@@ -545,13 +550,16 @@ extension TeamOrchestrator {
                     try await self.attachRemoteLeader(
                         teamName: team.id,
                         hostKey: hostKey,
-                        workingDirectory: workingDirectory,
+                        workingDirectory: leaderWorkingDirectory ?? workingDirectory,
                         cli: leaderMode,
                         model: leaderModel
                     )
                 } catch {
-                    RemoteWorkLog.info(
-                        "Could not start remote leader on \(hostKey): \(error)"
+                    let description = "Could not start remote leader on \(hostKey): \(error)"
+                    RemoteWorkLog.info(description)
+                    self.markRemoteLeaderFailed(
+                        teamName: team.id,
+                        description: description
                     )
                 }
             }
@@ -590,6 +598,13 @@ extension TeamOrchestrator {
         case .local, .peer(_):
             .local
         }
+    }
+
+    static func shouldLaunchLeaderLocally(
+        forRequestedEndpoint endpoint: LeaderEndpoint
+    ) -> Bool {
+        if case .peer = endpoint { return false }
+        return true
     }
 
     /// Say that work on this host has stopped, because the host has.

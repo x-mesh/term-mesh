@@ -92,6 +92,11 @@ final class TeamOrchestrator: ObservableObject {
         /// The leader's host namespace.  Older teams did not carry this
         /// field; its default preserves their established local behaviour.
         var leaderEndpoint: LeaderEndpoint = .local
+        /// False while a requested peer leader is still connecting or failed
+        /// to launch. A placeholder pane may exist locally, but it must never
+        /// receive leader instructions as if it were a running CLI.
+        var leaderReady: Bool = true
+        var leaderFailureDescription: String? = nil
         let workingDirectory: String
         let workspaceId: UUID     // agent workspace (may differ from leader workspace in "adopted" mode)
         var agents: [AgentMember]
@@ -157,7 +162,25 @@ final class TeamOrchestrator: ObservableObject {
         team.leaderPanelId = panelID
         team.leaderWorkspaceId = nil
         team.leaderEndpoint = endpoint
+        team.leaderReady = true
+        team.leaderFailureDescription = nil
         teams[teamName] = team
+        syncTeamStateToDaemon()
+    }
+
+    func markRemoteLeaderFailed(teamName: String, description: String) {
+        guard var team = teams[teamName] else { return }
+        team.leaderReady = false
+        team.leaderFailureDescription = description
+        teams[teamName] = team
+        if let located = AppDelegate.shared?.locateSurface(surfaceId: team.leaderPanelId),
+           let workspace = located.tabManager.tabs.first(where: { $0.id == located.workspaceId }) {
+            workspace.setPanelCustomTitle(
+                panelId: team.leaderPanelId,
+                title: "⚠ Remote leader failed"
+            )
+        }
+        syncTeamStateToDaemon()
     }
     // Round-robin counter per "teamName/agentName" key — cycles across duplicate-named agents.
     private var agentSendRoundRobin: [String: Int] = [:]
@@ -825,6 +848,7 @@ final class TeamOrchestrator: ObservableObject {
         worktreeMode: String = "off",
         executionMode: String = "pane",
         leaderEndpoint: LeaderEndpoint = .local,
+        launchLeaderLocally: Bool = true,
         adoptedLeaderSurfaceId: UUID? = nil,
         skipRunbookPromptForInteractiveAgents: Bool = false,
         /// Phase 2 (pane-mode resume): agent name → claude session id, used to
@@ -1039,7 +1063,21 @@ final class TeamOrchestrator: ObservableObject {
         let leaderWorkspaceId: UUID?
         var detectedLeaderCli: String? = nil
 
-        if leaderMode == "adopted" {
+        if !launchLeaderLocally {
+            leaderWorkspaceId = nil
+            leaderPanelId = defaultPanelId
+            switch leaderMode {
+            case "claude": detectedLeaderCli = "claude"
+            case "codex": detectedLeaderCli = "codex"
+            case "kiro": detectedLeaderCli = "kiro"
+            case "gemini": detectedLeaderCli = "gemini"
+            default: detectedLeaderCli = nil
+            }
+            workspace.setPanelCustomTitle(
+                panelId: leaderPanelId,
+                title: "Connecting remote leader…"
+            )
+        } else if leaderMode == "adopted" {
             guard let adoptedSurfaceId = adoptedLeaderSurfaceId else {
                 Logger.team.error("[team] adopted mode requires adoptedLeaderSurfaceId")
                 return nil
@@ -1346,7 +1384,7 @@ final class TeamOrchestrator: ObservableObject {
                 }
             }
 
-            let team = Team(
+            var team = Team(
                 id: name,
                 leaderSessionId: leaderSessionId,
                 leaderMode: leaderMode,
@@ -1365,6 +1403,7 @@ final class TeamOrchestrator: ObservableObject {
                 sharedWorktreePath: nil,
                 sharedWorktreeBranch: nil
             )
+            team.leaderReady = launchLeaderLocally
             teams[name] = team
             TeamDataStore.shared.registerTeam(name, agentNames: headlessMembers.map(\.name))
             syncTeamStateToDaemon()
@@ -1527,7 +1566,7 @@ final class TeamOrchestrator: ObservableObject {
         // of overwriting the prior one. Headless teams skip this branch and
         // get their uuid backfilled by `headless.create_team` (line ~1085).
         let paneTeamUuid = UUID().uuidString
-        let team = Team(
+        var team = Team(
             id: name,
             leaderSessionId: leaderSessionId,
             leaderMode: leaderMode,
@@ -1550,6 +1589,7 @@ final class TeamOrchestrator: ObservableObject {
             pairModel: pairEligible ? pairModel : "",
             pairPanelId: pairEligible ? members.first?.panelId : nil
         )
+        team.leaderReady = launchLeaderLocally
         teams[name] = team
         // Register in thread-safe data store for off-main access (approach C: dual queue)
         TeamDataStore.shared.registerTeam(name, agentNames: members.map(\.name))
@@ -2722,7 +2762,7 @@ final class TeamOrchestrator: ObservableObject {
     }
 
     func sendToLeader(teamName: String, text: String, tabManager: TabManager) -> Bool {
-        guard let team = teams[teamName] else { return false }
+        guard let team = teams[teamName], team.leaderReady else { return false }
         if case .peer = team.leaderEndpoint {
             guard let located = AppDelegate.shared?.locateSurface(surfaceId: team.leaderPanelId),
                   let workspace = located.tabManager.tabs.first(where: { $0.id == located.workspaceId }),
@@ -4037,6 +4077,8 @@ final class TeamOrchestrator: ObservableObject {
                 "leader_cli": team.leaderMode,
                 "leader_panel_id": team.leaderPanelId.uuidString,
                 "leader_endpoint": leaderEndpoint,
+                "leader_ready": team.leaderReady,
+                "leader_failure": team.leaderFailureDescription as Any? ?? NSNull(),
             ] as [String: Any]
         }
     }

@@ -108,7 +108,7 @@ final class PeerProjectBootstrapTests: XCTestCase {
     }
 
     @MainActor
-    func test_remote_leader_stays_local_until_remote_attach_commits() {
+    func test_remote_leader_uses_inert_local_anchor_until_remote_attach_commits() {
         XCTAssertEqual(
             TeamOrchestrator.initialLeaderEndpoint(
                 forRequestedEndpoint: .peer(hostKey: "peer-jw-server")
@@ -118,6 +118,14 @@ final class PeerProjectBootstrapTests: XCTestCase {
         XCTAssertEqual(
             TeamOrchestrator.initialLeaderEndpoint(forRequestedEndpoint: .local),
             .local
+        )
+        XCTAssertFalse(
+            TeamOrchestrator.shouldLaunchLeaderLocally(
+                forRequestedEndpoint: .peer(hostKey: "peer-jw-server")
+            )
+        )
+        XCTAssertTrue(
+            TeamOrchestrator.shouldLaunchLeaderLocally(forRequestedEndpoint: .local)
         )
     }
 
