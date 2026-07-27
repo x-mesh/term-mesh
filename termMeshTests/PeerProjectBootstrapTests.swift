@@ -265,6 +265,22 @@ final class PeerProjectBootstrapTests: XCTestCase {
             ),
             "test -d '/app/p/x'"
         )
+        // The whole-script form is the only guard against a step being added
+        // that nobody declared, so the named variant is spelled out too — the
+        // unscoped `|| true` that used to end this script was invisible to
+        // every substring assertion in this file.
+        XCTAssertEqual(
+            PeerProjectBootstrap.script(
+                for: plan, gitURL: nil, sourceKind: .existingFolder, memMeshProjectID: "demo"
+            ),
+            "test -d '/app/p/x' && "
+                + "( top=$(git -C '/app/p/x' rev-parse --show-toplevel 2>/dev/null) "
+                + "&& here=$(cd '/app/p/x' 2>/dev/null && pwd -P) "
+                + "&& [ -n \"$top\" ] && [ \"$top\" = \"$here\" ] "
+                + "&& { git -C '/app/p/x' config --local --get mem-mesh.project-id >/dev/null 2>&1 "
+                + "|| git -C '/app/p/x' config --local mem-mesh.project-id 'demo'; } "
+                + "|| true )"
+        )
     }
 
     func test_a_plain_legacy_shared_folder_needs_no_script() {
@@ -298,12 +314,45 @@ final class PeerProjectBootstrapTests: XCTestCase {
         XCTAssertTrue(
             text.contains("config --local --get mem-mesh.project-id >/dev/null 2>&1 ||")
         )
-        // The repository has to exist first, and failing to name it must not
-        // fail a project whose files are already in place.
+        // The repository has to exist before it can be named.
         let initRange = try XCTUnwrap(text.range(of: "git -C '/app/p/x' init"))
         let idRange = try XCTUnwrap(text.range(of: "config --local mem-mesh.project-id"))
         XCTAssertLessThan(initRange.lowerBound, idRange.lowerBound)
-        XCTAssertTrue(text.hasSuffix("|| true"))
+    }
+
+    /// Every setup shape, not just the one the feature was written against —
+    /// moving the append inside `sourceKind == .empty` would leave the whole
+    /// suite green while cloned and existing-folder projects lost their id.
+    func test_identity_is_pinned_for_every_kind_of_project_setup() throws {
+        let isolated = PeerProjectBootstrap.plan(
+            projectRoot: "/app/p", projectName: "x", agents: ["a"], isolateAgents: true
+        )
+        let shared = PeerProjectBootstrap.plan(
+            projectRoot: "/app/p", projectName: "x", agents: ["a"], isolateAgents: false
+        )
+        let cases: [(String, String?)] = [
+            ("clone-isolated", PeerProjectBootstrap.script(
+                for: isolated, gitURL: "u", memMeshProjectID: "demo")),
+            ("clone-shared", PeerProjectBootstrap.script(
+                for: shared, gitURL: "u", memMeshProjectID: "demo")),
+            ("new-folder-isolated", PeerProjectBootstrap.script(
+                for: isolated, gitURL: nil, memMeshProjectID: "demo")),
+            ("existing-isolated", PeerProjectBootstrap.script(
+                for: isolated, gitURL: nil, sourceKind: .existingFolder, memMeshProjectID: "demo")),
+            ("existing-shared", PeerProjectBootstrap.script(
+                for: shared, gitURL: nil, sourceKind: .existingFolder, memMeshProjectID: "demo")),
+            ("empty-isolated", PeerProjectBootstrap.script(
+                for: isolated, gitURL: nil, sourceKind: .empty, memMeshProjectID: "demo")),
+            ("empty-shared", PeerProjectBootstrap.script(
+                for: shared, gitURL: nil, sourceKind: .empty, memMeshProjectID: "demo")),
+        ]
+        for (label, script) in cases {
+            let text = try XCTUnwrap(script, label)
+            XCTAssertTrue(
+                text.contains("git -C '/app/p/x' config --local mem-mesh.project-id 'demo'"),
+                "\(label) lost the pinned identity"
+            )
+        }
     }
 
     func test_mem_mesh_identity_omitted_when_the_caller_names_nothing() throws {
@@ -316,20 +365,140 @@ final class PeerProjectBootstrapTests: XCTestCase {
         XCTAssertFalse(text.contains("mem-mesh.project-id"))
     }
 
-    func test_mem_mesh_project_id_meets_the_id_charset_or_is_dropped() {
+    /// The composed script is one `&&` chain, so a naming step that ends in a
+    /// bare `|| true` reports a failed clone as a success. Asserted by running
+    /// it, because the shape alone is what fooled the substring assertions.
+    func test_pinning_an_identity_does_not_swallow_a_failed_setup_step() throws {
+        let missing = "/app/definitely-not-here-\(UUID().uuidString)"
+        let plan = PeerProjectBootstrap.plan(
+            projectRoot: (missing as NSString).deletingLastPathComponent,
+            projectName: (missing as NSString).lastPathComponent,
+            agents: ["a"],
+            isolateAgents: false
+        )
+        let text = try XCTUnwrap(
+            PeerProjectBootstrap.script(
+                for: plan, gitURL: nil, sourceKind: .existingFolder, memMeshProjectID: "demo"
+            )
+        )
+        XCTAssertNotEqual(
+            Self.shellStatus(text), 0,
+            "an absent existing folder must still fail the script"
+        )
+    }
+
+    /// `rev-parse --git-dir` answers for any ancestor repository, so naming a
+    /// project folder that merely sits inside somebody else's checkout would
+    /// rename that checkout instead.
+    func test_identity_is_not_written_into_a_repository_that_merely_contains_it() throws {
+        let root = try Self.makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(atPath: root) }
+        let outer = (root as NSString).appendingPathComponent("outer")
+        let inner = (outer as NSString).appendingPathComponent("packages/proj")
+        try FileManager.default.createDirectory(
+            atPath: inner, withIntermediateDirectories: true
+        )
+        XCTAssertEqual(Self.shellStatus("git -C \(Self.quoted(outer)) init -q"), 0)
+
+        let plan = PeerProjectBootstrap.Plan(primaryPath: inner, agentCheckouts: [])
+        let text = try XCTUnwrap(
+            PeerProjectBootstrap.script(
+                for: plan, gitURL: nil, sourceKind: .existingFolder, memMeshProjectID: "proj"
+            )
+        )
+        XCTAssertEqual(Self.shellStatus(text), 0, "naming must stay non-fatal")
+        XCTAssertEqual(
+            Self.shellStatus(
+                "git -C \(Self.quoted(outer)) config --local --get mem-mesh.project-id"
+            ),
+            1,
+            "the surrounding repository must be left alone"
+        )
+
+        // The project's own repository, by contrast, is named — including when
+        // the caller's path is unresolved (/var vs /private/var on macOS).
+        XCTAssertEqual(Self.shellStatus("git -C \(Self.quoted(inner)) init -q"), 0)
+        XCTAssertEqual(Self.shellStatus(text), 0)
+        XCTAssertEqual(
+            Self.shellStatus(
+                "test \"$(git -C \(Self.quoted(inner)) config --local "
+                    + "--get mem-mesh.project-id)\" = proj"
+            ),
+            0
+        )
+    }
+
+    func test_mem_mesh_project_id_meets_the_id_charset() {
         XCTAssertEqual(PeerProjectBootstrap.memMeshProjectID(for: "term-mesh"), "term-mesh")
         XCTAssertEqual(PeerProjectBootstrap.memMeshProjectID(for: " my project "), "my-project")
-        XCTAssertEqual(PeerProjectBootstrap.memMeshProjectID(for: "a/b.c"), "a-b-c")
         XCTAssertEqual(PeerProjectBootstrap.memMeshProjectID(for: "under_score"), "under_score")
+        // Lowercased like the repo's other slugs, so a project is not `My-App`
+        // to mem-mesh and `my-app` to its own team.
+        XCTAssertEqual(PeerProjectBootstrap.memMeshProjectID(for: "My App"), "my-app")
         // Runs collapse and edges are trimmed, so the id never starts, ends or
         // doubles up on the separator the substitution introduces.
         XCTAssertEqual(PeerProjectBootstrap.memMeshProjectID(for: "--a  b--"), "a-b")
-        XCTAssertEqual(PeerProjectBootstrap.memMeshProjectID(for: "한글"), nil)
-        XCTAssertEqual(PeerProjectBootstrap.memMeshProjectID(for: "   "), nil)
-        XCTAssertEqual(
-            PeerProjectBootstrap.memMeshProjectID(for: String(repeating: "a", count: 150))?.count,
-            100
+        XCTAssertNil(PeerProjectBootstrap.memMeshProjectID(for: "   "))
+    }
+
+    /// A name the charset cannot render is the common case here, not the
+    /// exotic one — and collapsing it silently is how two projects end up
+    /// sharing one memory namespace.
+    func test_a_name_the_charset_cannot_render_stays_distinct_and_still_pins() throws {
+        let payment = try XCTUnwrap(PeerProjectBootstrap.memMeshProjectID(for: "결제-api"))
+        let auth = try XCTUnwrap(PeerProjectBootstrap.memMeshProjectID(for: "인증-api"))
+        XCTAssertTrue(payment.hasPrefix("api-"), payment)
+        XCTAssertTrue(auth.hasPrefix("api-"), auth)
+        XCTAssertNotEqual(payment, auth, "two projects must not share one identity")
+
+        // Nothing renderable at all is still pinned: unpinned is the
+        // per-directory drift this exists to prevent.
+        let korean = try XCTUnwrap(PeerProjectBootstrap.memMeshProjectID(for: "한글"))
+        XCTAssertNotEqual(korean, PeerProjectBootstrap.memMeshProjectID(for: "가나"))
+        // Separator-only names have nothing to render either.
+        XCTAssertNotNil(PeerProjectBootstrap.memMeshProjectID(for: "..."))
+
+        for name in ["결제-api", "한글", "...", String(repeating: "a-", count: 60), "a/b.c"] {
+            let id = try XCTUnwrap(PeerProjectBootstrap.memMeshProjectID(for: name), name)
+            XCTAssertLessThanOrEqual(id.count, 100, name)
+            XCTAssertFalse(id.hasPrefix("-"), name)
+            XCTAssertFalse(id.hasSuffix("-"), name)
+            XCTAssertNil(id.rangeOfCharacter(from: Self.forbiddenInProjectID), name)
+        }
+        // Truncation happens after the collapse, so it must not put the
+        // separator back at the edge it just removed.
+        let long = try XCTUnwrap(
+            PeerProjectBootstrap.memMeshProjectID(for: String(repeating: "a-", count: 60))
         )
+        XCTAssertEqual(long.count, 100)
+        XCTAssertFalse(long.hasSuffix("-"))
+    }
+
+    private static let forbiddenInProjectID =
+        CharacterSet(charactersIn: "abcdefghijklmnopqrstuvwxyz0123456789_-").inverted
+
+    private static func quoted(_ value: String) -> String {
+        "'" + value.replacingOccurrences(of: "'", with: "'\\''") + "'"
+    }
+
+    private static func makeTemporaryDirectory() throws -> String {
+        let path = (NSTemporaryDirectory() as NSString)
+            .appendingPathComponent("tm-bootstrap-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(
+            atPath: path, withIntermediateDirectories: true
+        )
+        return path
+    }
+
+    private static func shellStatus(_ script: String) -> Int32 {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/bin/sh")
+        process.arguments = ["-c", script]
+        process.standardOutput = FileHandle.nullDevice
+        process.standardError = FileHandle.nullDevice
+        do { try process.run() } catch { return -1 }
+        process.waitUntilExit()
+        return process.terminationStatus
     }
 
     func test_project_deletion_quotes_deduplicates_and_removes_only_exact_paths() throws {

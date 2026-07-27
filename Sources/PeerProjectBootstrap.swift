@@ -1,3 +1,4 @@
+import CryptoKit
 import Foundation
 
 enum ProjectSourceKind: String, Codable, CaseIterable {
@@ -304,37 +305,80 @@ enum PeerProjectBootstrap {
     /// mem-mesh reads `git config --local mem-mesh.project-id` before falling
     /// back to the checkout's directory name, and a repository's local config
     /// is shared by all of its worktrees. Writing the name once at creation
-    /// therefore gives the project one identity across hosts, agent worktrees
-    /// and later clones — and it does so with git alone, so a machine that
-    /// receives a project does not need mem-mesh installed to agree with the
-    /// one that sent it.
+    /// therefore gives the project one identity across its own worktrees and
+    /// across every host term-mesh sets up — each host is written on that
+    /// host, with git alone, so a machine receiving a project needs no
+    /// mem-mesh installation to agree with the one that sent it. A clone taken
+    /// outside term-mesh still gets nothing: `--local` config is not carried
+    /// by clone, fetch or push.
     ///
     /// Without this, every copy falls back to its own directory name: the same
     /// project is `demo` here and `demo-executor` in an agent's worktree, and
     /// memories written from one are invisible to a search scoped to the other.
+    ///
+    /// mem-mesh's charset is `^[a-zA-Z0-9_-]{1,100}$`, which many real names do
+    /// not survive — every Korean name reduces to whatever ASCII sits beside
+    /// it, so `결제-api` and `인증-api` would both be `api` and share one
+    /// namespace. When the slug loses something the name carried, a digest of
+    /// the name as typed is appended: readable while it can be, distinct once
+    /// it cannot. A name with nothing usable in it is pinned from the digest
+    /// alone rather than left unpinned, because unpinned is the per-directory
+    /// drift this exists to prevent.
     static func memMeshProjectID(for name: String) -> String? {
-        // mem-mesh's own constraint (`^[a-zA-Z0-9_-]{1,100}$`).
-        let allowed = Set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-")
-        let mapped = String(
-            name.trimmingCharacters(in: .whitespacesAndNewlines)
-                .map { allowed.contains($0) ? $0 : "-" }
-        )
-        let collapsed = mapped
+        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+
+        // Lowercased to match the repo's other slugs (`AgentRolePreset.slugify`,
+        // `teamNameCandidate`), so one project is not `My-App` to mem-mesh and
+        // `my-app` to its own team.
+        let allowed = Set("abcdefghijklmnopqrstuvwxyz0123456789_-")
+        var lostCharacters = false
+        let mapped = String(trimmed.lowercased().map { character -> Character in
+            if allowed.contains(character) { return character }
+            // Whitespace is how people separate words, not information the id
+            // drops. Everything else the charset cannot render is a real loss.
+            if !character.isWhitespace { lostCharacters = true }
+            return "-"
+        })
+        let slug = mapped
             .split(separator: "-", omittingEmptySubsequences: true)
             .joined(separator: "-")
-        let bounded = String(collapsed.prefix(100))
-        return bounded.isEmpty ? nil : bounded
+        guard lostCharacters || slug.count > 100 else { return slug }
+
+        let digest = SHA256.hash(data: Data(trimmed.utf8))
+            .prefix(4)
+            .map { String(format: "%02x", $0) }
+            .joined()
+        // Trimmed after bounding, not before: cutting a collapsed slug at 100
+        // can land on the separator the collapse just removed.
+        let head = String(slug.prefix(100 - digest.count - 1))
+            .trimmingCharacters(in: CharacterSet(charactersIn: "-"))
+        return head.isEmpty ? digest : "\(head)-\(digest)"
     }
 
-    /// Pin the identity without ever overwriting a choice the repository
-    /// already carries, and without letting the attempt fail project creation:
-    /// a project whose files are in place but whose name is not pinned is a
-    /// worse outcome to trade for than a failed setup.
+    /// Pin the identity on the project's own repository, once.
+    ///
+    /// Three properties have to hold together:
+    ///
+    /// - Failing to name a project must not fail the project. Files in place
+    ///   without a pinned name is the better of the two outcomes.
+    /// - That fallback must not reach the steps before it. `script` joins every
+    ///   step with `&&`, and `A && B || true` parses as `(A && B) || true`, so
+    ///   an unscoped `|| true` would report a failed clone as a success. Hence
+    ///   the subshell — the same shape the worktree steps already use.
+    /// - It must write to this project's repository and no other. `rev-parse
+    ///   --git-dir` succeeds from any descendant, so a project folder created
+    ///   inside somebody else's checkout would otherwise rename that checkout.
+    ///   Comparing toplevel to project path is what separates the two, and both
+    ///   sides are resolved because git reports a physical path while the
+    ///   caller's may not be (`/var` vs `/private/var` on macOS).
     private static func memMeshIdentityStep(primary: String, projectID: String) -> String {
-        "git -C \(primary) rev-parse --git-dir >/dev/null 2>&1 "
+        "( top=$(git -C \(primary) rev-parse --show-toplevel 2>/dev/null) "
+            + "&& here=$(cd \(primary) 2>/dev/null && pwd -P) "
+            + "&& [ -n \"$top\" ] && [ \"$top\" = \"$here\" ] "
             + "&& { git -C \(primary) config --local --get mem-mesh.project-id >/dev/null 2>&1 "
             + "|| git -C \(primary) config --local mem-mesh.project-id \(quote(projectID)); } "
-            + "|| true"
+            + "|| true )"
     }
 
     /// Carry out the plan on the host.
@@ -349,7 +393,10 @@ enum PeerProjectBootstrap {
         plan: Plan,
         gitURL: String?,
         sourceKind: ProjectSourceKind = .clone,
-        memMeshProjectID: String? = nil,
+        // Deliberately not defaulted: `nil` and "the caller forgot" would
+        // otherwise be the same value, and a forgotten id is permanent —
+        // nothing rewrites a pin once the project exists.
+        memMeshProjectID: String?,
         timeoutSeconds: TimeInterval = 300
     ) async throws {
         guard let script = script(
@@ -371,7 +418,8 @@ enum PeerProjectBootstrap {
         plan: Plan,
         gitURL: String?,
         sourceKind: ProjectSourceKind,
-        memMeshProjectID: String? = nil,
+        // See `run` — not defaulted, for the same reason.
+        memMeshProjectID: String?,
         timeoutSeconds: TimeInterval = 300
     ) async throws {
         guard let script = script(

@@ -548,8 +548,12 @@ extension TerminalController {
                                 sshTarget: sshTarget, port: host.sshPort,
                                 identityFile: host.identityFile,
                                 plan: plan, gitURL: (gitURL?.isEmpty ?? true) ? nil : gitURL,
+                                // The project's name, the same one the team is
+                                // created under below — not `remotePath`'s leaf,
+                                // which is the host's own directory convention
+                                // and would pin a different id on every machine.
                                 memMeshProjectID: PeerProjectBootstrap.memMeshProjectID(
-                                    for: (remotePath as NSString).lastPathComponent
+                                    for: URL(fileURLWithPath: directory).lastPathComponent
                                 )
                             )
                             let rows: [TeamAgentRow] = plan.agentCheckouts.compactMap { checkout in
