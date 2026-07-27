@@ -356,6 +356,39 @@ final class AgentPipeCompletionTests: XCTestCase {
         XCTAssertEqual(Set(results.compactMap { $0["task_id"] as? String }), Set([taskA.id, taskB.id]))
     }
 
+    func testExactInstanceClaimSkipsBusySiblingAndCompensatesOnlyItsOwnDelivery() throws {
+        let team = "claim-instance-test-\(UUID().uuidString)"
+        let store = TeamDataStore.shared
+        let first = TeamDataStore.AgentRegistration(name: "executor", instanceId: "instance-a")
+        let second = TeamDataStore.AgentRegistration(name: "executor", instanceId: "instance-b")
+        store.registerTeam(team, agents: [first, second])
+        defer { store.unregisterTeam(team) }
+
+        let task = try XCTUnwrap(store.createTask(teamName: team, title: "pooled"))
+        store.setAgentBusy(teamName: team, agentName: "executor", agentInstanceId: "instance-b", busy: true)
+        XCTAssertNil(
+            store.claimTask(teamName: team, agentName: "executor", agentInstanceId: "instance-b"),
+            "a busy duplicate must not be selected for auto-claim"
+        )
+
+        let claimed = try XCTUnwrap(
+            store.claimTask(teamName: team, agentName: "executor", agentInstanceId: "instance-a")
+        )
+        XCTAssertEqual(claimed.id, task.id)
+        XCTAssertEqual(claimed.assigneeInstanceId, "instance-a")
+
+        // A stale completion for the sibling cannot release this exact claim.
+        XCTAssertNil(store.releaseClaim(
+            teamName: team, taskId: task.id, assigneeInstanceId: "instance-b"
+        ))
+        let released = try XCTUnwrap(store.releaseClaim(
+            teamName: team, taskId: task.id, assigneeInstanceId: "instance-a"
+        ))
+        XCTAssertNil(released.assignee)
+        XCTAssertNil(released.assigneeInstanceId)
+        XCTAssertEqual(released.status, "queued")
+    }
+
     func testDuplicateRolePoolPrefersIdleThenAdvancesDeterministically() {
         // Instance 0 is busy, so cursor 0 must skip it and select instance 1.
         let first = try! XCTUnwrap(TeamOrchestrator.nextEligiblePoolIndex(

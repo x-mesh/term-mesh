@@ -408,8 +408,11 @@ final class TeamDataStore: ObservableObject, @unchecked Sendable {
         if changed { notifyChanged() }
     }
 
-    private func isAgentBusyUnsafe(teamName: String, agentName: String) -> Bool {
-        busyAgents[teamName]?.contains(agentName) ?? false
+    private func isAgentBusyUnsafe(teamName: String, agentName: String, agentInstanceId: String? = nil) -> Bool {
+        let busy = busyAgents[teamName] ?? []
+        // Name-only reports predate per-pane identity and must remain
+        // conservative. An instance-specific report only blocks that pane.
+        return busy.contains(agentName) || agentInstanceId.map(busy.contains) == true
     }
 
     func isAgentBusy(teamName: String, agentName: String, agentInstanceId: String) -> Bool {
@@ -800,10 +803,32 @@ final class TeamDataStore: ObservableObject, @unchecked Sendable {
     /// whose dependencies are all completed and assign it to the given agent
     /// (status → assigned). Returns nil if no claimable task exists.
     @discardableResult
-    func claimTask(teamName: String, agentName: String) -> TeamOrchestrator.TeamTask? {
+    func claimTask(
+        teamName: String,
+        agentName: String,
+        agentInstanceId: String? = nil
+    ) -> TeamOrchestrator.TeamTask? {
         lock.lock()
         defer { lock.unlock() }
         guard var tasks = taskBoards[teamName] else { return nil }
+        let resolvedInstanceId: String?
+        if let agentInstanceId = agentInstanceId?.teamDataNilIfBlank {
+            guard teamRegistry[teamName]?.contains(where: {
+                $0.name == agentName && $0.instanceId == agentInstanceId
+            }) == true,
+            !isAgentBusyUnsafe(teamName: teamName, agentName: agentName, agentInstanceId: agentInstanceId),
+            !tasks.contains(where: {
+                $0.assigneeInstanceId == agentInstanceId
+                    && !["completed", "failed", "abandoned", "cancelled"].contains($0.status)
+            }) else { return nil }
+            resolvedInstanceId = agentInstanceId
+        } else {
+            // Legacy callers must not mutate an arbitrary duplicate role.
+            let candidates = teamRegistry[teamName, default: []].filter { $0.name == agentName }
+            guard candidates.count == 1,
+                  !isAgentBusyUnsafe(teamName: teamName, agentName: agentName) else { return nil }
+            resolvedInstanceId = candidates[0].instanceId
+        }
         // Find pending tasks with no assignee AND satisfied dependencies, sorted
         // by priority descending then createdAt ascending. The dependency gate
         // keeps an autonomous claim loop from pulling a task whose inputs aren't
@@ -819,10 +844,33 @@ final class TeamDataStore: ObservableObject, @unchecked Sendable {
         }).first else { return nil }
         let now = Date()
         tasks[idx].assignee = agentName
-        tasks[idx].assigneeInstanceId = teamRegistry[teamName]?.first(where: { $0.name == agentName })?.instanceId
+        tasks[idx].assigneeInstanceId = resolvedInstanceId
         tasks[idx].status = "assigned"
         tasks[idx].updatedAt = now
         tasks[idx].lastProgressAt = now
+        taskBoards[teamName] = tasks
+        noteTasksChanged()
+        notifyChanged()
+        return tasks[idx]
+    }
+
+    /// Undo a claim only while the same instance still owns it. A late paste
+    /// acknowledgement must never unassign work that was subsequently rerouted.
+    @discardableResult
+    func releaseClaim(teamName: String, taskId: String, assigneeInstanceId: String) -> TeamOrchestrator.TeamTask? {
+        lock.lock()
+        defer { lock.unlock() }
+        guard var tasks = taskBoards[teamName],
+              let idx = tasks.firstIndex(where: { $0.id == taskId }),
+              tasks[idx].assigneeInstanceId == assigneeInstanceId,
+              ["assigned", "in_progress"].contains(tasks[idx].status) else { return nil }
+        let now = Date()
+        tasks[idx].assignee = nil
+        tasks[idx].assigneeInstanceId = nil
+        tasks[idx].status = "queued"
+        tasks[idx].updatedAt = now
+        tasks[idx].lastProgressAt = now
+        tasks[idx].reassignmentCount += 1
         taskBoards[teamName] = tasks
         noteTasksChanged()
         notifyChanged()

@@ -4384,9 +4384,11 @@ class TerminalController {
                     "prev_status": prevStatus
                 ])
                 if newStatus == "completed", let assignee = task.assignee, !assignee.isEmpty {
-                    let tn = teamName, an = assignee
+                    let tn = teamName, an = assignee, ai = task.assigneeInstanceId
                     Task { @MainActor in
-                        TeamOrchestrator.shared.handleTaskCompletionForAutoRecycle(teamName: tn, agentName: an)
+                        TeamOrchestrator.shared.handleTaskCompletionForAutoRecycle(
+                            teamName: tn, agentName: an, agentInstanceId: ai
+                        )
                     }
                 }
             }

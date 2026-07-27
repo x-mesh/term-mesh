@@ -3162,12 +3162,29 @@ final class TeamOrchestrator: ObservableObject {
 
     /// Must be called on the main thread.
     @discardableResult
-    func sendToAgentAutoLocate(teamName: String, agentName: String, text: String) -> Bool {
+    func sendToAgentAutoLocate(
+        teamName: String,
+        agentName: String,
+        agentInstanceId: String? = nil,
+        text: String,
+        completion: ((Bool) -> Void)? = nil
+    ) -> Bool {
         guard let team = teams[teamName],
-              let agent = selectAgent(in: team.agents, name: agentName),
+              let agent = agentInstanceId.flatMap({ id in
+                  team.agents.first { $0.name == agentName && $0.agentInstanceId == id }
+              }) ?? (agentInstanceId == nil ? selectAgent(in: team.agents, name: agentName) : nil),
               let pid = agent.panelId,
-              let located = AppDelegate.shared?.locateSurface(surfaceId: pid) else { return false }
-        return sendTextToPanel(workspaceId: agent.workspaceId, panelId: pid, text: text, tabManager: located.tabManager)
+              let located = AppDelegate.shared?.locateSurface(surfaceId: pid) else {
+            completion?(false)
+            return false
+        }
+        return sendTextToPanel(
+            workspaceId: agent.workspaceId,
+            panelId: pid,
+            text: text,
+            tabManager: located.tabManager,
+            completion: completion
+        )
     }
 
     func sendToLeader(teamName: String, text: String, tabManager: TabManager) -> Bool {
@@ -4454,9 +4471,16 @@ final class TeamOrchestrator: ObservableObject {
     /// Called when an agent's task transitions to "completed". Increments the
     /// agent's completedTaskCount and triggers a guard recycle when the count
     /// reaches the effective threshold (agent override → team default → nil = off).
-    func handleTaskCompletionForAutoRecycle(teamName: String, agentName: String) {
+    func handleTaskCompletionForAutoRecycle(
+        teamName: String,
+        agentName: String,
+        agentInstanceId: String? = nil
+    ) {
         guard var team = teams[teamName],
-              let agentIdx = team.agents.firstIndex(where: { $0.name == agentName }) else {
+              let agentIdx = team.agents.firstIndex(where: {
+                  $0.name == agentName
+                      && (agentInstanceId == nil || $0.agentInstanceId == agentInstanceId)
+              }) else {
             #if DEBUG
             dlog("autoRecycle.handleCompletion teamName=\(teamName) agentName=\(agentName) skip=team_or_agent_not_found")
             #endif
@@ -4481,10 +4505,23 @@ final class TeamOrchestrator: ObservableObject {
             // next → report). It is intentionally NOT done on the recycle branch,
             // because recycleAgent hard-restarts the pane (drops context) and a task
             // claimed into it would be interrupted by the restart.
-            autoClaimNext(teamName: teamName, agentName: agentName)
+            autoClaimNext(
+                teamName: teamName,
+                agentName: agentName,
+                agentInstanceId: team.agents[agentIdx].agentInstanceId
+            )
             return
         }
-        recycleAgent(teamName: teamName, agentName: agentName, force: false)
+        // `recycleAgent(name:)` is a legacy UI entry point and may resolve a
+        // duplicate sibling. Completion already selected this exact instance,
+        // so retain that identity through the restart too.
+        if let panelId = team.agents[agentIdx].panelId {
+            Task { @MainActor in
+                _ = await self.restartAgentPaneHard(panelId: panelId)
+            }
+        } else {
+            recycleAgent(teamName: teamName, agentName: agentName, force: false)
+        }
     }
 
     /// Continuous work-stealing: when an agent finishes a task (and is not being
@@ -4500,33 +4537,47 @@ final class TeamOrchestrator: ObservableObject {
     /// turning "leader broadcasts `tm-agent claim` every wave" into "idle agents
     /// drain the pool on their own".
     ///
-    /// Duplicate-named caveat: the push routes by agent NAME via `notifyTaskCreated`
-    /// → `selectAgent` round-robin. For the common case of uniquely-named agents
-    /// this targets the exact pane that just freed up. When several panes share a
-    /// name, round-robin may push to a sibling pane; correct per-pane addressing
-    /// needs the panel_id field tracked as the Tier-3 BUG-2 fix.
-    private func autoClaimNext(teamName: String, agentName: String) {
-        guard let claimed = TeamDataStore.shared.claimTask(teamName: teamName, agentName: agentName) else {
+    /// The completed pane's durable instance id remains bound across claim and
+    /// delivery; duplicate role siblings are never eligible as a side effect.
+    private func autoClaimNext(teamName: String, agentName: String, agentInstanceId: String) {
+        guard let claimed = TeamDataStore.shared.claimTask(
+            teamName: teamName, agentName: agentName, agentInstanceId: agentInstanceId
+        ) else {
             return  // empty pool or all deps unmet — nothing to pull
         }
         #if DEBUG
         dlog("[autoClaimNext] team=\(teamName) agent=\(agentName) claimed task=\(claimed.id.prefix(8)) title=\(claimed.title.prefix(40))")
         #endif
-        // Push via the auto-locating sender: it makes exactly one selectAgent
-        // (round-robin) decision and resolves the owning tabManager itself through
-        // AppDelegate.locateSurface, so it reaches the pane even for multi-window
-        // teams without a second, possibly-divergent agent lookup.
         let instruction = formatTaskAssignmentInstruction(task: claimed)
-        let pushed = sendToAgentAutoLocate(teamName: teamName, agentName: agentName, text: instruction)
+        let pushed = sendToAgentAutoLocate(
+            teamName: teamName,
+            agentName: agentName,
+            agentInstanceId: agentInstanceId,
+            text: instruction,
+            completion: { [weak self] delivered in
+                guard !delivered else { return }
+                self?.compensateAutoClaimDelivery(
+                    teamName: teamName, taskId: claimed.id, agentInstanceId: agentInstanceId
+                )
+            }
+        )
         if !pushed {
-            // Delivery failed (pane gone / migrating) — release the task so another
-            // idle agent (or a manual claim) can pick it up instead of it sitting
-            // assigned-but-undelivered.
-            _ = TeamDataStore.shared.reassignTask(teamName: teamName, taskId: claimed.id, assignee: nil)
+            compensateAutoClaimDelivery(
+                teamName: teamName, taskId: claimed.id, agentInstanceId: agentInstanceId
+            )
             #if DEBUG
             dlog("[autoClaimNext] push FAILED task=\(claimed.id.prefix(8)) — returned to pool team=\(teamName) agent=\(agentName)")
             #endif
         }
+    }
+
+    private func compensateAutoClaimDelivery(teamName: String, taskId: String, agentInstanceId: String) {
+        guard TeamDataStore.shared.releaseClaim(
+            teamName: teamName, taskId: taskId, assigneeInstanceId: agentInstanceId
+        ) != nil else { return }
+        #if DEBUG
+        dlog("[autoClaimNext] delivery FAILED task=\(taskId.prefix(8)) — returned exact claim to pool team=\(teamName) instance=\(agentInstanceId.prefix(8))")
+        #endif
     }
 
     /// Snapshot of a pane's position in the bonsplit tree, captured before

@@ -139,9 +139,11 @@ enum AutoReplyEmit {
                 "prev_status": prevStatus
             ] as [String: Any])
             if taskStatus == "completed" {
-                let tn = teamName, an = updated.assignee ?? agentName
+                let tn = teamName, an = updated.assignee ?? agentName, ai = updated.assigneeInstanceId
                 Task { @MainActor in
-                    TeamOrchestrator.shared.handleTaskCompletionForAutoRecycle(teamName: tn, agentName: an)
+                    TeamOrchestrator.shared.handleTaskCompletionForAutoRecycle(
+                        teamName: tn, agentName: an, agentInstanceId: ai
+                    )
                 }
             }
         }
