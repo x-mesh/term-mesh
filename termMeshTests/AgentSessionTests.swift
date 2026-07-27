@@ -640,7 +640,7 @@ final class AgentSessionTests: XCTestCase {
             cliPath: "/opt/homebrew/bin/codex",
             bridgePath: "/repo/bridge.py", rendererPath: nil,
             workingDirectory: "/tmp")
-        XCTAssertTrue(cmd.contains("gpt-5.5"), "a tier is not a model codex knows")
+        XCTAssertTrue(cmd.contains("gpt-5.6-sol"), "a tier is not a model codex knows")
         XCTAssertFalse(cmd.contains("sonnet"))
         XCTAssertTrue(cmd.contains("--exe"))
         XCTAssertTrue(cmd.contains("/opt/homebrew/bin/codex"))
@@ -1306,6 +1306,83 @@ final class AgentSessionTests: XCTestCase {
         XCTAssertEqual(AgentRolePreset.defaultModel(for: "agy"), "")
     }
 
+    /// The Claude CLI resolves its own tiers, so passing one through is what
+    /// keeps an agent on the current model. Rewriting `opus` to a pinned id
+    /// held every agent on the previous Opus after Opus 5 shipped — and because
+    /// the pin still launched, nothing surfaced it.
+    func testAClaudeTierIsLeftForTheCliToResolve() {
+        for tier in ["sonnet", "opus", "fable", "haiku"] {
+            XCTAssertEqual(TeamOrchestrator.resolveClaudeModelArg(tier), tier)
+            XCTAssertFalse(
+                AgentRolePreset.models(for: "claude").firstIndex(of: tier) == nil,
+                "\(tier) must be offered by the picker"
+            )
+        }
+        // No pinned id anywhere in what the picker offers — a version written
+        // down here is one that has to be edited on every model release.
+        for model in AgentRolePreset.models(for: "claude") {
+            XCTAssertFalse(model.hasPrefix("claude-"), model)
+        }
+        // Stored before the tier list settled.
+        XCTAssertEqual(TeamOrchestrator.resolveClaudeModelArg("opus-1m"), "opus")
+        XCTAssertEqual(AgentRolePreset.normalizeModel("opus-1m", for: "claude"), "opus")
+    }
+
+    /// Codex takes exact ids, so the list has to match its own catalog —
+    /// including the two entries in that catalog it will not run from a
+    /// `--model` flag.
+    func testCodexIsOfferedOnlyModelsItStillRuns() {
+        let models = AgentRolePreset.models(for: "codex")
+        XCTAssertTrue(models.contains("gpt-5.6-sol"))
+        XCTAssertEqual(AgentRolePreset.defaultModel(for: "codex"), "gpt-5.6-sol")
+        // `supported_in_api: false` and `visibility: hide` respectively.
+        XCTAssertFalse(models.contains("gpt-5.3-codex-spark"))
+        XCTAssertFalse(models.contains("codex-auto-review"))
+        // Gone from the catalog entirely.
+        for retired in ["gpt-5.3-codex", "gpt-5.2-codex", "gpt-5.2",
+                        "gpt-5.1-codex-max", "gpt-5.1-codex-mini"] {
+            XCTAssertFalse(models.contains(retired), retired)
+        }
+    }
+
+    /// kiro takes exact ids, so a tier only reaches the right model if this
+    /// side names it — there is no family for the CLI to resolve.
+    func testAKiroTierNamesAModelKiroLists() {
+        let listed = AgentRolePreset.models(for: "kiro")
+        for id in ["claude-opus-5", "claude-sonnet-5", "claude-haiku-4.5", "auto"] {
+            XCTAssertTrue(listed.contains(id), id)
+        }
+        // fable is absent because kiro does not carry it — offering a tier the
+        // CLI has no model for is a launch that fails at the flag.
+        XCTAssertFalse(listed.contains("fable"))
+    }
+
+    /// cursor and agy spell the reasoning level into the id rather than taking
+    /// a separate flag, so every entry has to name one.
+    func testTheIdBasedCliesAreOfferedNamesTheyPublish() {
+        let cursor = AgentRolePreset.models(for: "cursor")
+        XCTAssertTrue(cursor.contains("claude-opus-5-thinking-high"))
+        XCTAssertTrue(cursor.contains("claude-fable-5-thinking-high"))
+        XCTAssertTrue(cursor.contains("auto"))
+        // Neither was ever in cursor's list — `gpt-5-mini` and
+        // `claude-4-sonnet-thinking` are the names it actually publishes.
+        XCTAssertFalse(cursor.contains("gpt-5"))
+        XCTAssertFalse(cursor.contains("sonnet-4-thinking"))
+
+        let agy = AgentRolePreset.models(for: "agy")
+        XCTAssertTrue(agy.contains("gemini-3.1-pro-high"))
+        XCTAssertFalse(agy.isEmpty, "agy publishes a list now — empty hid it")
+
+        // Both still default to not passing the flag at all, which is what was
+        // measured working; the list is for picking, not for a default.
+        XCTAssertEqual(AgentRolePreset.defaultModel(for: "cursor"), "")
+        XCTAssertEqual(AgentRolePreset.defaultModel(for: "agy"), "")
+        // And a claude tier still never reaches either.
+        for cli in ["cursor", "agy"] {
+            XCTAssertEqual(TeamOrchestrator.bridgeModelArg(cli: cli, model: "opus"), "", cli)
+        }
+    }
+
     // MARK: - The model a bridged CLI will take
 
     /// Team models are stored as claude's tiers, because that is what the
@@ -1314,12 +1391,12 @@ final class AgentSessionTests: XCTestCase {
     /// guard caught it, but the cause was here.
     func testATierNameIsTranslatedBeforeItReachesCodex() {
         XCTAssertEqual(TeamOrchestrator.bridgeModelArg(cli: "codex", model: "sonnet"),
-                       "gpt-5.5")
+                       "gpt-5.6-sol")
         XCTAssertEqual(TeamOrchestrator.bridgeModelArg(cli: "codex", model: "haiku"),
-                       "gpt-5.5")
+                       "gpt-5.6-sol")
         // A name the user typed themselves is theirs, not a tier to remap.
-        XCTAssertEqual(TeamOrchestrator.bridgeModelArg(cli: "codex", model: "gpt-5.2-codex"),
-                       "gpt-5.2-codex")
+        XCTAssertEqual(TeamOrchestrator.bridgeModelArg(cli: "codex", model: "gpt-5.6-luna"),
+                       "gpt-5.6-luna")
     }
 
     /// Kiro's picker offers the same tier names and its CLI takes them.

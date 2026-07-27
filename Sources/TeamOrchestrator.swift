@@ -5832,20 +5832,36 @@ final class TeamOrchestrator: ObservableObject {
         return "'" + s.replacingOccurrences(of: "'", with: "'\\''") + "'"
     }
 
-    /// Map term-mesh tier names to the exact `--model` argument Claude CLI expects.
-    /// "opus" and legacy "opus-1m" both map to claude-opus-4-8[1m].
+    /// Map term-mesh tier names to the `--model` argument Claude CLI expects.
+    ///
+    /// Tiers pass through untouched. The CLI accepts them itself — its alias
+    /// list is `sonnet`, `opus`, `haiku`, `fable`, `best`, their `[1m]` forms,
+    /// and `opusplan` — and resolves each to the current model in that family.
+    /// This used to rewrite `opus` to a pinned `claude-opus-4-8[1m]`, which
+    /// quietly held every agent on the previous Opus once Opus 5 shipped: the
+    /// pin kept working, so nothing surfaced the staleness. Resolving the tier
+    /// is the CLI's job, and it does it at launch rather than at build time.
+    ///
+    /// The `[1m]` suffix is not carried over either. It asked for a 1M context
+    /// window on a model whose default was smaller; the models the tiers now
+    /// resolve to are natively 1M.
     static func resolveClaudeModelArg(_ model: String) -> String {
         switch model {
-        case "opus", "opus-1m": return "claude-opus-4-8[1m]"
-        default:                return model
+        // Stored before the tier list settled; `opus` is what it meant.
+        case "opus-1m": return "opus"
+        default:        return model
         }
     }
 
     /// Map short model names (used internally) to kiro-cli model identifiers.
+    ///
+    /// kiro takes exact ids rather than tiers, so unlike the Claude CLI it
+    /// cannot resolve a family itself — every release has to be written down
+    /// here. Names below are from kiro's own `Available models` list.
     private static func kiroModelName(_ shortName: String) -> String {
         switch shortName.lowercased() {
-        case "opus":   return "claude-opus-4.8"
-        case "sonnet": return "claude-sonnet-4.6"
+        case "opus":   return "claude-opus-5"
+        case "sonnet": return "claude-sonnet-5"
         case "haiku":  return "claude-haiku-4.5"
         default:       return shortName  // pass through if already full name
         }
@@ -6005,11 +6021,15 @@ final class TeamOrchestrator: ObservableObject {
     }
 
     /// Map short model names to Codex CLI model identifiers.
-    /// All short tiers map to gpt-5.5; differentiation happens via reasoning effort
-    /// (see codexReasoningEffort). New-style names pass through directly.
+    /// All short tiers map to gpt-5.6-sol; differentiation happens via reasoning
+    /// effort (see codexReasoningEffort). New-style names pass through directly.
+    ///
+    /// Sol is the top entry in the CLI's own catalog (`~/.codex/models_cache.json`,
+    /// priority 1, "Latest frontier agentic coding model") and carries the whole
+    /// effort ladder the tiers need — low through max, plus ultra.
     private static func codexModelName(_ shortName: String) -> String {
         switch shortName.lowercased() {
-        case "opus", "sonnet", "haiku": return "gpt-5.5"
+        case "opus", "sonnet", "haiku": return "gpt-5.6-sol"
         default: return shortName
         }
     }

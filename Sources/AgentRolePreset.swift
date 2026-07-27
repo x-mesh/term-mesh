@@ -32,29 +32,51 @@ struct AgentRolePreset: Identifiable, Codable, Equatable {
     static func builtInModels(for cli: String) -> [String] {
         switch cli {
         case "claude":
-            // "opus" maps to claude-opus-4-8[1m] (Opus 4.8, 1M context).
-            return ["sonnet", "opus", "haiku"]
+            // The CLI's own alias set, which it resolves to the current model in
+            // each family — `latest_per_family` in the Claude Code binary reads
+            // fable → claude-fable-5, opus → claude-opus-5,
+            // sonnet → claude-sonnet-5, haiku → claude-haiku-4-5.
+            // Listing tiers rather than pinned ids is what keeps this from
+            // going stale on every model release.
+            return ["sonnet", "opus", "fable", "haiku"]
         case "kiro":
-            return ["sonnet", "opus", "haiku"]
-        case "codex":
+            // Tiers first (they are what the rest of the app stores), then the
+            // newest of each family kiro actually lists. `auto` is its own
+            // default — it picks per task.
             return ["sonnet", "opus", "haiku",
-                    "gpt-5.5", "gpt-5.3-codex", "gpt-5.2-codex", "gpt-5.2",
-                    "gpt-5.1-codex-max", "gpt-5.1-codex-mini"]
+                    "auto", "claude-opus-5", "claude-sonnet-5", "claude-haiku-4.5",
+                    "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"]
+        case "codex":
+            // From the CLI's own catalog (`~/.codex/models_cache.json`), in its
+            // priority order. Excludes the two entries it will not run from a
+            // `--model` flag: gpt-5.3-codex-spark (`supported_in_api: false`)
+            // and codex-auto-review (`visibility: hide`).
+            return ["sonnet", "opus", "haiku",
+                    "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna",
+                    "gpt-5.5", "gpt-5.4", "gpt-5.4-mini"]
         case "gemini":
             return ["sonnet", "opus", "haiku",
                     "gemini-3.1-pro-preview", "gemini-3-flash-preview",
                     "gemini-3.1-flash-lite-preview",
                     "gemini-2.5-pro", "gemini-2.5-flash", "gemini-2.5-flash-lite"]
         case "cursor":
-            // The two its own `--help` names. Claude's tiers are absent because
-            // cursor does not know them, and a tier passed through was measured
-            // ending a turn in silence on the CLI that behaves the same way.
-            return ["gpt-5", "sonnet-4-thinking"]
+            // The newest of each family cursor lists. Claude's tiers are absent
+            // because cursor does not know them, and a tier passed through was
+            // measured ending a turn in silence on the CLI that behaves the
+            // same way. Cursor spells effort into the id rather than taking a
+            // separate flag, so each entry names one — `high` is its own label
+            // for the unqualified model ("Opus 5 1M"), not an escalation.
+            return ["auto",
+                    "claude-opus-5-thinking-high", "claude-sonnet-5-thinking-high",
+                    "claude-fable-5-thinking-high",
+                    "gpt-5.6-sol-high", "gpt-5.6-terra-high", "gpt-5.6-luna-high",
+                    "composer-2.5", "gemini-3.1-pro"]
         case "agy":
-            // `--model` is documented as "Model for the current CLI session"
-            // with no values given, so there is nothing honest to list. Empty
-            // means the CLI's own default, which is what was measured working.
-            return []
+            // The newest of each family agy lists. Like cursor it carries the
+            // reasoning level in the id.
+            return ["gemini-3.1-pro-high", "gemini-3.6-flash-high",
+                    "claude-opus-4-6-thinking", "claude-sonnet-4-6",
+                    "gpt-oss-120b-medium"]
         default:
             return ["sonnet", "opus", "haiku"]
         }
@@ -63,12 +85,23 @@ struct AgentRolePreset: Identifiable, Codable, Equatable {
     /// User-facing label for a model in a given CLI context.
     /// Internal storage may use tier names ("opus"/"sonnet"/"haiku") for cross-CLI uniformity,
     /// but UI shows CLI-native text.
+    ///
+    /// These name the model each tier resolves to today. They are the one place
+    /// a version number is still written down, and only as text — the launch
+    /// path passes the tier through, so a label left behind by a release is
+    /// wrong in the picker and nowhere else.
     static func modelDisplayLabel(_ model: String, for cli: String) -> String {
         switch (cli.lowercased(), model.lowercased()) {
-        case ("claude", "opus"):  return "Opus 4.8 (1M context)"
-        case ("codex", "opus"):   return "gpt-5.5 (high)"
-        case ("codex", "sonnet"): return "gpt-5.5 (medium)"
-        case ("codex", "haiku"):  return "gpt-5.5 (low)"
+        case ("claude", "fable"):  return "Fable 5"
+        case ("claude", "opus"):   return "Opus 5"
+        case ("claude", "sonnet"): return "Sonnet 5"
+        case ("claude", "haiku"):  return "Haiku 4.5"
+        case ("codex", "opus"):   return "gpt-5.6-sol (high)"
+        case ("codex", "sonnet"): return "gpt-5.6-sol (medium)"
+        case ("codex", "haiku"):  return "gpt-5.6-sol (low)"
+        case ("kiro", "opus"):   return "claude-opus-5"
+        case ("kiro", "sonnet"): return "claude-sonnet-5"
+        case ("kiro", "haiku"):  return "claude-haiku-4.5"
         case ("gemini", "opus"):   return "gemini-3.1-pro-preview"
         case ("gemini", "sonnet"): return "gemini-3-flash-preview"
         case ("gemini", "haiku"):  return "gemini-3.1-flash-lite-preview"
@@ -87,7 +120,7 @@ struct AgentRolePreset: Identifiable, Codable, Equatable {
     /// Default model for a given CLI.
     static func defaultModel(for cli: String) -> String {
         switch cli {
-        case "codex":  return "gpt-5.5"
+        case "codex":  return "gpt-5.6-sol"
         case "gemini": return "gemini-3.1-pro-preview"
         // Empty means "do not pass --model", which is what both were measured
         // working with. A claude tier would be a name neither recognises.
