@@ -4672,6 +4672,7 @@ fn send_return_key_with_retry(
     text_delivered: bool,
     context: &str,
     panel_id: Option<&str>,
+    agent_instance_id: Option<&str>,
 ) -> bool {
     let delays = return_retry_delays_ms(text_delivered, context);
     eprintln!(
@@ -4697,6 +4698,7 @@ fn send_return_key_with_retry(
                 "agent_name": target,
                 "key": "return",
                 "panel_id": panel_id,
+                "agent_instance_id": agent_instance_id,
             }),
         ) {
             Ok(r) if r["ok"].as_bool().unwrap_or(false) => return true,
@@ -4709,6 +4711,28 @@ fn send_return_key_with_retry(
         delays.len()
     );
     false
+}
+
+/// Resolve the durable selected member before a delegate starts.  `panel_id`
+/// is only a transient locator; every retry carries this instance selector so
+/// a restart or mixed-transport failure cannot silently land on a same-name
+/// sibling.  Returning `None` preserves the legacy unique-name path, while a
+/// duplicate name without an instance is rejected by the Swift RPC.
+fn selected_agent_instance_id(
+    sock: &PathBuf,
+    team: &str,
+    target: &str,
+    panel_id: Option<&str>,
+) -> Option<String> {
+    let status = rpc_call(sock, "team.status", json!({ "team_name": team })).ok()?;
+    let agents = status["result"]["agents"].as_array()?;
+    let matches = agents.iter().filter(|agent| {
+        agent["name"].as_str() == Some(target)
+            && panel_id.map_or(true, |panel| agent["panel_id"].as_str() == Some(panel))
+    }).collect::<Vec<_>>();
+    (matches.len() == 1)
+        .then(|| matches[0]["agent_instance_id"].as_str().map(str::to_owned))
+        .flatten()
 }
 
 fn truncate_summary(content: &str, max_chars: usize) -> String {
@@ -6246,6 +6270,7 @@ fn main() {
                     text_delivered,
                     "team.send",
                     panel.as_deref(),
+                    None,
                 );
             }
             print_result(send_result);
@@ -7956,6 +7981,7 @@ fn run_create(
                             text_delivered,
                             "team.create.init",
                             None,
+                            None,
                         );
                         eprintln!("  \u{2713} {name}: init prompt sent");
                     }
@@ -9228,6 +9254,7 @@ fn run_delegate_result(
 ) -> Result<Value, String> {
     let resolved_title = title.unwrap_or_else(|| task_title_from_text(text));
     let resolved_priority = priority.unwrap_or(2);
+    let selected_instance_id = selected_agent_instance_id(sock, team, target, panel_id);
 
     if should_acquire_worktree(
         worktree_policy,
@@ -9262,6 +9289,7 @@ fn run_delegate_result(
         "text": text,
         "task_title": resolved_title,
         "priority": resolved_priority,
+        "agent_instance_id": selected_instance_id,
     });
     if let Some(ctx) = context {
         delegate_params["context"] = json!(ctx);
@@ -9338,6 +9366,7 @@ fn run_delegate_result(
                         "team_name": team, "agent_name": target,
                         "text": format!("{instruction}\n"),
                         "panel_id": panel_id,
+                        "agent_instance_id": selected_instance_id,
                     }),
                 );
                 match &retry {
@@ -9354,6 +9383,7 @@ fn run_delegate_result(
                                 text_delivered,
                                 "team.delegate.retry",
                                 panel_id,
+                                selected_instance_id.as_deref(),
                             );
                         }
                         return Ok(patched);
@@ -9409,6 +9439,7 @@ fn run_delegate_result(
                 text_delivered,
                 "team.delegate",
                 panel_id,
+                selected_instance_id.as_deref(),
             );
 
             return Ok(v);
@@ -9422,8 +9453,9 @@ fn run_delegate_result(
     let mut params = json!({
         "team_name": team,
         "title": resolved_title,
-        "assignee": target,
-        "priority": resolved_priority,
+                "assignee": target,
+                "priority": resolved_priority,
+                "agent_instance_id": selected_instance_id,
     });
     if let Some(d) = desc {
         params["description"] = json!(d);
@@ -9517,6 +9549,7 @@ fn run_delegate_result(
             "team_name": team, "agent_name": target,
             "text": &send_text,
             "panel_id": panel_id,
+            "agent_instance_id": selected_instance_id,
         }),
     )
     .map_err(|e| format!("team.send: {e}"))?;
@@ -9533,6 +9566,7 @@ fn run_delegate_result(
                 "team_name": team, "agent_name": target,
                 "text": &send_text,
                 "panel_id": panel_id,
+                "agent_instance_id": selected_instance_id,
             }),
         );
         match retry {
@@ -10003,7 +10037,7 @@ fn run_delegate_result_with_worktree(
     }
 
     let _ =
-        send_return_key_with_retry(sock, team, target, true, "team.delegate.worktree", panel_id);
+        send_return_key_with_retry(sock, team, target, true, "team.delegate.worktree", panel_id, None);
     Ok(json!({ "task": task, "send": sent, "worktree": meta.path }))
 }
 
@@ -12717,6 +12751,7 @@ fn run_claim(sock: &PathBuf, team: &str, agent: &str) {
                             agent,
                             true,
                             "team.task.claim",
+                            None,
                             None,
                         );
                         println!(
