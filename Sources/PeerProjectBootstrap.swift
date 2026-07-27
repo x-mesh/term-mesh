@@ -229,7 +229,8 @@ enum PeerProjectBootstrap {
     static func script(
         for plan: Plan,
         gitURL: String?,
-        sourceKind: ProjectSourceKind = .clone
+        sourceKind: ProjectSourceKind = .clone,
+        memMeshProjectID: String? = nil
     ) -> String? {
         var steps: [String] = []
         let primary = quote(plan.primaryPath)
@@ -289,7 +290,51 @@ enum PeerProjectBootstrap {
                 || gitURL?.isEmpty == false
                 || sourceKind == .existingFolder
         else { return nil }
+        // Appended after the guard on purpose: a project that needed no setup
+        // still needs none, and there is no repository to name yet either.
+        if let memMeshProjectID, !memMeshProjectID.isEmpty {
+            steps.append(memMeshIdentityStep(primary: primary, projectID: memMeshProjectID))
+        }
         return steps.joined(separator: " && ")
+    }
+
+    /// The project id mem-mesh should answer with on every machine holding a
+    /// copy of this project.
+    ///
+    /// mem-mesh reads `git config --local mem-mesh.project-id` before falling
+    /// back to the checkout's directory name, and a repository's local config
+    /// is shared by all of its worktrees. Writing the name once at creation
+    /// therefore gives the project one identity across hosts, agent worktrees
+    /// and later clones — and it does so with git alone, so a machine that
+    /// receives a project does not need mem-mesh installed to agree with the
+    /// one that sent it.
+    ///
+    /// Without this, every copy falls back to its own directory name: the same
+    /// project is `demo` here and `demo-executor` in an agent's worktree, and
+    /// memories written from one are invisible to a search scoped to the other.
+    static func memMeshProjectID(for name: String) -> String? {
+        // mem-mesh's own constraint (`^[a-zA-Z0-9_-]{1,100}$`).
+        let allowed = Set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-")
+        let mapped = String(
+            name.trimmingCharacters(in: .whitespacesAndNewlines)
+                .map { allowed.contains($0) ? $0 : "-" }
+        )
+        let collapsed = mapped
+            .split(separator: "-", omittingEmptySubsequences: true)
+            .joined(separator: "-")
+        let bounded = String(collapsed.prefix(100))
+        return bounded.isEmpty ? nil : bounded
+    }
+
+    /// Pin the identity without ever overwriting a choice the repository
+    /// already carries, and without letting the attempt fail project creation:
+    /// a project whose files are in place but whose name is not pinned is a
+    /// worse outcome to trade for than a failed setup.
+    private static func memMeshIdentityStep(primary: String, projectID: String) -> String {
+        "git -C \(primary) rev-parse --git-dir >/dev/null 2>&1 "
+            + "&& { git -C \(primary) config --local --get mem-mesh.project-id >/dev/null 2>&1 "
+            + "|| git -C \(primary) config --local mem-mesh.project-id \(quote(projectID)); } "
+            + "|| true"
     }
 
     /// Carry out the plan on the host.
@@ -304,9 +349,15 @@ enum PeerProjectBootstrap {
         plan: Plan,
         gitURL: String?,
         sourceKind: ProjectSourceKind = .clone,
+        memMeshProjectID: String? = nil,
         timeoutSeconds: TimeInterval = 300
     ) async throws {
-        guard let script = script(for: plan, gitURL: gitURL, sourceKind: sourceKind) else { return }
+        guard let script = script(
+            for: plan,
+            gitURL: gitURL,
+            sourceKind: sourceKind,
+            memMeshProjectID: memMeshProjectID
+        ) else { return }
         try await PeerHostReadinessChecker.runScript(
             sshTarget: sshTarget,
             port: port,
@@ -320,10 +371,14 @@ enum PeerProjectBootstrap {
         plan: Plan,
         gitURL: String?,
         sourceKind: ProjectSourceKind,
+        memMeshProjectID: String? = nil,
         timeoutSeconds: TimeInterval = 300
     ) async throws {
         guard let script = script(
-            for: plan, gitURL: gitURL, sourceKind: sourceKind
+            for: plan,
+            gitURL: gitURL,
+            sourceKind: sourceKind,
+            memMeshProjectID: memMeshProjectID
         ) else { return }
         try await withCheckedThrowingContinuation {
             (continuation: CheckedContinuation<Void, Error>) in

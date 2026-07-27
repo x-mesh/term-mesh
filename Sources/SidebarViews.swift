@@ -1087,6 +1087,10 @@ struct SidebarProjectsSection: View {
         var localProjectPath: String?
         var leaderProjectPath: String?
         let gitURL = source.gitURL.trimmingCharacters(in: .whitespacesAndNewlines)
+        // One name for every copy. Each placement's directory is the host's own
+        // convention — deriving the id from it would give the same project a
+        // different mem-mesh identity on each machine.
+        let memMeshProjectID = PeerProjectBootstrap.memMeshProjectID(for: name)
 
         for placement in placements {
             let placedRows = placement.agentIndices.map { rows[$0] }
@@ -1113,7 +1117,8 @@ struct SidebarProjectsSection: View {
                         identityFile: host.identityFile,
                         plan: plan,
                         gitURL: gitURL.isEmpty ? nil : gitURL,
-                        sourceKind: kind
+                        sourceKind: kind,
+                        memMeshProjectID: memMeshProjectID
                     )
                 } catch {
                     let detail = PeerProjectBootstrap.remoteFailureDescription(
@@ -1148,7 +1153,8 @@ struct SidebarProjectsSection: View {
                 try await PeerProjectBootstrap.runLocal(
                     plan: primaryOnly,
                     gitURL: gitURL.isEmpty ? nil : gitURL,
-                    sourceKind: kind
+                    sourceKind: kind,
+                    memMeshProjectID: memMeshProjectID
                 )
                 localProjectPath = plan.primaryPath
             }

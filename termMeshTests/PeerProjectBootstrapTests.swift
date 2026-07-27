@@ -272,6 +272,64 @@ final class PeerProjectBootstrapTests: XCTestCase {
             projectRoot: "/app/p", projectName: "x", agents: ["a"], isolateAgents: false
         )
         XCTAssertNil(PeerProjectBootstrap.script(for: plan, gitURL: nil))
+        // Naming a project that is not being set up would resurrect a script
+        // for the one case that deliberately has none.
+        XCTAssertNil(
+            PeerProjectBootstrap.script(for: plan, gitURL: nil, memMeshProjectID: "demo")
+        )
+    }
+
+    func test_project_name_is_pinned_as_the_mem_mesh_identity_once() throws {
+        let plan = PeerProjectBootstrap.plan(
+            projectRoot: "/app/p", projectName: "x", agents: ["a"], isolateAgents: true
+        )
+        let text = try XCTUnwrap(
+            PeerProjectBootstrap.script(
+                for: plan, gitURL: nil, sourceKind: .empty, memMeshProjectID: "demo"
+            )
+        )
+        // Written on the primary copy only: worktrees share one local config,
+        // so naming each checkout separately would be the drift, not the fix.
+        XCTAssertTrue(
+            text.contains("git -C '/app/p/x' config --local mem-mesh.project-id 'demo'")
+        )
+        XCTAssertFalse(text.contains("git -C '/app/p/x-a' config --local mem-mesh.project-id"))
+        // An id the repository already carries is the user's, not ours.
+        XCTAssertTrue(
+            text.contains("config --local --get mem-mesh.project-id >/dev/null 2>&1 ||")
+        )
+        // The repository has to exist first, and failing to name it must not
+        // fail a project whose files are already in place.
+        let initRange = try XCTUnwrap(text.range(of: "git -C '/app/p/x' init"))
+        let idRange = try XCTUnwrap(text.range(of: "config --local mem-mesh.project-id"))
+        XCTAssertLessThan(initRange.lowerBound, idRange.lowerBound)
+        XCTAssertTrue(text.hasSuffix("|| true"))
+    }
+
+    func test_mem_mesh_identity_omitted_when_the_caller_names_nothing() throws {
+        let plan = PeerProjectBootstrap.plan(
+            projectRoot: "/app/p", projectName: "x", agents: ["a"], isolateAgents: true
+        )
+        let text = try XCTUnwrap(
+            PeerProjectBootstrap.script(for: plan, gitURL: nil, sourceKind: .empty)
+        )
+        XCTAssertFalse(text.contains("mem-mesh.project-id"))
+    }
+
+    func test_mem_mesh_project_id_meets_the_id_charset_or_is_dropped() {
+        XCTAssertEqual(PeerProjectBootstrap.memMeshProjectID(for: "term-mesh"), "term-mesh")
+        XCTAssertEqual(PeerProjectBootstrap.memMeshProjectID(for: " my project "), "my-project")
+        XCTAssertEqual(PeerProjectBootstrap.memMeshProjectID(for: "a/b.c"), "a-b-c")
+        XCTAssertEqual(PeerProjectBootstrap.memMeshProjectID(for: "under_score"), "under_score")
+        // Runs collapse and edges are trimmed, so the id never starts, ends or
+        // doubles up on the separator the substitution introduces.
+        XCTAssertEqual(PeerProjectBootstrap.memMeshProjectID(for: "--a  b--"), "a-b")
+        XCTAssertEqual(PeerProjectBootstrap.memMeshProjectID(for: "한글"), nil)
+        XCTAssertEqual(PeerProjectBootstrap.memMeshProjectID(for: "   "), nil)
+        XCTAssertEqual(
+            PeerProjectBootstrap.memMeshProjectID(for: String(repeating: "a", count: 150))?.count,
+            100
+        )
     }
 
     func test_project_deletion_quotes_deduplicates_and_removes_only_exact_paths() throws {

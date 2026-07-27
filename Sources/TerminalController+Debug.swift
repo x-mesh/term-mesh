@@ -547,7 +547,10 @@ extension TerminalController {
                             try? await PeerProjectBootstrap.run(
                                 sshTarget: sshTarget, port: host.sshPort,
                                 identityFile: host.identityFile,
-                                plan: plan, gitURL: (gitURL?.isEmpty ?? true) ? nil : gitURL
+                                plan: plan, gitURL: (gitURL?.isEmpty ?? true) ? nil : gitURL,
+                                memMeshProjectID: PeerProjectBootstrap.memMeshProjectID(
+                                    for: (remotePath as NSString).lastPathComponent
+                                )
                             )
                             let rows: [TeamAgentRow] = plan.agentCheckouts.compactMap { checkout in
                                 guard let preset = presets.first(where: { $0.name == checkout.agent })

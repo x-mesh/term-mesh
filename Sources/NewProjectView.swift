@@ -827,7 +827,10 @@ struct NewProjectView: View {
                                     let value = gitURL.trimmingCharacters(in: .whitespacesAndNewlines)
                                     return value.isEmpty ? nil : value
                                 }(),
-                                sourceKind: sourceKind
+                                sourceKind: sourceKind,
+                                memMeshProjectID: PeerProjectBootstrap.memMeshProjectID(
+                                    for: effectiveName
+                                )
                             )
                         }
                         try await onCreate(
