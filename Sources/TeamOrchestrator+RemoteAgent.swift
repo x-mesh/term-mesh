@@ -482,6 +482,8 @@ extension TeamOrchestrator {
             throw RemoteAgentError.paneCreationFailed
         }
 
+        markLeaderPolicyState(teamName: teamName, state: "injected")
+
         // Publish the peer endpoint only after the remote pane accepts its
         // launch command. Until then the same pane remains visibly pending,
         // without creating or removing a transient split.
@@ -1149,17 +1151,23 @@ extension TeamOrchestrator {
         // and then close it.
         let remoteRows = rows.filter { $0.hostKey != nil }
         let remoteLeaderSystemPrompt: String?
-        if case let .peer(hostKey) = leaderEndpoint,
-           leaderMode.lowercased() == "claude" {
+        if case let .peer(hostKey) = leaderEndpoint {
             let remoteSocketPath = RemoteHostStore.shared.sortedHosts
                 .first(where: { $0.id == hostKey })?
                 .remoteSockPath ?? "inherited from TERMMESH_SOCKET"
-            remoteLeaderSystemPrompt = Self.remoteLeaderClaudeSystemPrompt(
-                teamName: teamName,
-                rows: rows,
-                remoteWorkingDirectory: leaderWorkingDirectory ?? workingDirectory,
-                remoteSocketPath: remoteSocketPath
-            )
+            if leaderMode.lowercased() == "claude" {
+                remoteLeaderSystemPrompt = Self.remoteLeaderClaudeSystemPrompt(
+                    teamName: teamName,
+                    rows: rows,
+                    remoteWorkingDirectory: leaderWorkingDirectory ?? workingDirectory,
+                    remoteSocketPath: remoteSocketPath
+                )
+            } else {
+                // Non-Claude peer CLIs receive the same canonical payload via
+                // a staged file plus `LeaderParallelPolicy.launchDirective`.
+                // Do not copy routing rules into this launch path.
+                remoteLeaderSystemPrompt = LeaderParallelPolicy.renderedInstructions
+            }
         } else {
             remoteLeaderSystemPrompt = nil
         }
@@ -1256,6 +1264,11 @@ extension TeamOrchestrator {
                     self.markRemoteLeaderFailed(
                         teamName: team.id,
                         description: description
+                    )
+                    self.markLeaderPolicyState(
+                        teamName: team.id,
+                        state: "failed",
+                        failureDescription: description
                     )
                 }
             }
@@ -1493,9 +1506,7 @@ extension TeamOrchestrator {
         let enter = RemoteShellPath.prologue
             + "mkdir -p '\(quotedDir)' && cd '\(quotedDir)'"
         switch cli {
-        case "codex":
-            return "\(enter) && codex --model \(model)"
-        default:
+        case "claude":
             guard let systemPromptFile else {
                 return "\(enter) && claude --model \(model) --dangerously-skip-permissions"
             }
@@ -1505,6 +1516,19 @@ extension TeamOrchestrator {
                 + " && claude --model \(model)"
                 + " --system-prompt \"$TERMMESH_LEADER_PROMPT\""
                 + " --dangerously-skip-permissions"
+        case "codex", "kiro", "gemini":
+            guard let systemPromptFile else {
+                return "\(enter) && \(cli) --model \(model)"
+            }
+            let directive = LeaderParallelPolicy.launchDirective(promptFile: systemPromptFile)
+            switch cli {
+            case "kiro":
+                return "\(enter) && kiro chat --model \(model) \(shellQuoted(directive))"
+            default:
+                return "\(enter) && \(cli) --model \(model) \(shellQuoted(directive))"
+            }
+        default:
+            return "\(enter) && \(cli) --model \(model)"
         }
     }
 

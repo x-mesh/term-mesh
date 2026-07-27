@@ -471,6 +471,32 @@ final class PeerProjectBootstrapTests: XCTestCase {
         XCTAssertTrue(launch.contains("--dangerously-skip-permissions"))
     }
 
+    @MainActor
+    func test_all_peer_leader_clis_receive_the_canonical_policy_directive() {
+        let promptFile = "/tmp/term-mesh-leader-policy.md"
+        let directive = LeaderParallelPolicy.launchDirective(promptFile: promptFile)
+        XCTAssertTrue(directive.contains("version \(LeaderParallelPolicy.version)"))
+        XCTAssertTrue(directive.contains("digest \(LeaderParallelPolicy.digest)"))
+
+        for (cli, expectedLaunch) in [
+            ("codex", "codex --model gpt-5"),
+            ("kiro", "kiro chat --model gpt-5"),
+            ("gemini", "gemini --model gpt-5"),
+        ] {
+            let launch = TeamOrchestrator.remoteAgentCommand(
+                cli: cli,
+                model: "gpt-5",
+                agentName: "leader",
+                teamName: "demo",
+                workingDirectory: "/srv/demo",
+                systemPromptFile: promptFile
+            )
+            XCTAssertTrue(launch.contains(expectedLaunch), "\(cli) launch missing")
+            XCTAssertTrue(launch.contains(promptFile), "\(cli) policy file missing")
+            XCTAssertTrue(launch.contains(LeaderParallelPolicy.digest), "\(cli) policy digest missing")
+        }
+    }
+
     /// The launch looks where the CLI was actually installed.
     ///
     /// A host whose only `claude` sits in `~/.local/bin` — where the official

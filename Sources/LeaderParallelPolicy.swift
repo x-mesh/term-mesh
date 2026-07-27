@@ -71,4 +71,11 @@ enum LeaderParallelPolicy {
         \(renderedRules)
         """
     }
+
+    /// The sole first-turn/file-read directive used by CLIs without a native
+    /// system-prompt flag. Keeping the version and digest here lets every
+    /// renderer prove that it consumed this policy source rather than a copy.
+    static func launchDirective(promptFile: String) -> String {
+        "Read \(promptFile) before doing any work. It contains your team-leader instructions and the canonical Leader Parallel Routing Policy (version \(version), digest \(digest)). Follow it for all team coordination."
+    }
 }

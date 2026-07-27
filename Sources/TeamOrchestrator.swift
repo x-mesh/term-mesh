@@ -105,6 +105,10 @@ final class TeamOrchestrator: ObservableObject {
         /// receive leader instructions as if it were a running CLI.
         var leaderReady: Bool = true
         var leaderFailureDescription: String? = nil
+        /// Observable policy injection state. `failed`/`degraded` are never
+        /// silently treated as a normal ready leader.
+        var leaderPolicyState: String = "pending"
+        var leaderPolicyFailureDescription: String? = nil
         let workingDirectory: String
         let workspaceId: UUID     // agent workspace (may differ from leader workspace in "adopted" mode)
         var agents: [AgentMember]
@@ -207,6 +211,18 @@ final class TeamOrchestrator: ObservableObject {
                 title: "⚠ Remote leader failed"
             )
         }
+        syncTeamStateToDaemon()
+    }
+
+    func markLeaderPolicyState(
+        teamName: String,
+        state: String,
+        failureDescription: String? = nil
+    ) {
+        guard var team = teams[teamName] else { return }
+        team.leaderPolicyState = state
+        team.leaderPolicyFailureDescription = failureDescription
+        teams[teamName] = team
         syncTeamStateToDaemon()
     }
     // Round-robin counter per "teamName/agentName" key — cycles across duplicate-named agents.
@@ -1609,6 +1625,7 @@ final class TeamOrchestrator: ObservableObject {
                 sharedWorktreeBranch: nil
             )
             team.leaderReady = launchLeaderLocally
+            team.leaderPolicyState = leaderMode == "claude" ? "injected" : "pending"
             teams[name] = team
             TeamDataStore.shared.registerTeam(name, agents: headlessMembers.map { .init(name: $0.name, instanceId: $0.agentInstanceId) })
             syncTeamStateToDaemon()
@@ -1798,6 +1815,7 @@ final class TeamOrchestrator: ObservableObject {
             pairPanelId: pairEligible ? members.first?.panelId : nil
         )
         team.leaderReady = launchLeaderLocally
+        team.leaderPolicyState = leaderMode == "claude" ? "injected" : "pending"
         teams[name] = team
         // Register in thread-safe data store for off-main access (approach C: dual queue)
         TeamDataStore.shared.registerTeam(name, agents: members.map { .init(name: $0.name, instanceId: $0.agentInstanceId) })
@@ -1830,17 +1848,22 @@ final class TeamOrchestrator: ObservableObject {
                 #if DEBUG
                 dlog("[team] kiro leader prompt file written to \(promptFile) (profile-directed, no delay)")
                 #endif
+                markLeaderPolicyState(teamName: name, state: "injected")
             } else {
                 // codex/gemini: still need delayed TUI injection
                 let delay: Double = 5.0
                 DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
                     guard let self else { return }
-                    let msg = "Read the file \(promptFile) — it contains your team leader instructions with agent list and tm-agent commands. Follow those instructions for all team coordination."
                     let sent = self.sendTextToPanel(
                         workspaceId: workspace.id,
                         panelId: leaderPanelId,
-                        text: msg,
+                        text: LeaderParallelPolicy.launchDirective(promptFile: promptFile),
                         tabManager: tabManager
+                    )
+                    self.markLeaderPolicyState(
+                        teamName: name,
+                        state: sent ? "injected" : "failed",
+                        failureDescription: sent ? nil : "Could not deliver the canonical leader policy to the \(leaderMode) leader pane."
                     )
                     #if DEBUG
                     dlog("[team] leader prompt injection \(sent ? "OK" : "FAILED") for \(leaderMode) leader in team '\(name)'")
@@ -4773,6 +4796,11 @@ final class TeamOrchestrator: ObservableObject {
                 "leader_endpoint": leaderEndpoint,
                 "leader_ready": team.leaderReady,
                 "leader_failure": team.leaderFailureDescription as Any? ?? NSNull(),
+                "leader_policy_version": LeaderParallelPolicy.version,
+                "leader_policy_digest": LeaderParallelPolicy.digest,
+                "leader_policy_source": "LeaderParallelPolicy",
+                "leader_policy_state": team.leaderPolicyState,
+                "leader_policy_failure": team.leaderPolicyFailureDescription as Any? ?? NSNull(),
             ] as [String: Any]
         }
     }
@@ -4887,6 +4915,11 @@ final class TeamOrchestrator: ObservableObject {
             "leader_session_id": team.leaderSessionId,
             "leader_ready": team.leaderReady,
             "leader_failure": team.leaderFailureDescription as Any? ?? NSNull(),
+            "leader_policy_version": LeaderParallelPolicy.version,
+            "leader_policy_digest": LeaderParallelPolicy.digest,
+            "leader_policy_source": "LeaderParallelPolicy",
+            "leader_policy_state": team.leaderPolicyState,
+            "leader_policy_failure": team.leaderPolicyFailureDescription as Any? ?? NSNull(),
             "workspace_id": team.workspaceId.uuidString,
             "agent_count": team.agents.count,
             "agents": team.agents.map { agent in
@@ -5875,16 +5908,12 @@ final class TeamOrchestrator: ObservableObject {
 
         let defaultPrompt: String
         if isLeader {
-            // Leader profile tells kiro to read the prompt file on startup.
-            // The file is written after agents are created (by createTeam).
-            defaultPrompt = """
-            You are a team leader in term-mesh. \
-            On startup, immediately read /tmp/term-mesh-leader-\(teamName).md — \
-            it contains your full team instructions with agent list and tm-agent commands. \
-            Follow those instructions for all team coordination. \
-            Rules: 1) Be concise. 2) Delegate work, don't do it yourself. \
-            3) Always read agent results before responding. 4) Use short, clear instructions.
-            """
+            // The file is written after panes are created. The read directive
+            // itself comes from the canonical policy source, not a copied
+            // launch-specific instruction string.
+            defaultPrompt = LeaderParallelPolicy.launchDirective(
+                promptFile: "/tmp/term-mesh-leader-\(teamName).md"
+            )
         } else {
             defaultPrompt = """
             You are a focused worker agent named '\(agentName)' in team '\(teamName)'. \

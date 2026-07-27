@@ -44,6 +44,15 @@ final class AgentSessionTests: XCTestCase {
         XCTAssertTrue(policy.contains("This policy is active."))
     }
 
+    func testLeaderParallelPolicyUsesOneCanonicalLaunchDirective() {
+        let directive = LeaderParallelPolicy.launchDirective(promptFile: "/tmp/policy.md")
+
+        XCTAssertTrue(directive.contains("/tmp/policy.md"))
+        XCTAssertTrue(directive.contains("version \(LeaderParallelPolicy.version)"))
+        XCTAssertTrue(directive.contains("digest \(LeaderParallelPolicy.digest)"))
+        XCTAssertTrue(directive.contains("canonical Leader Parallel Routing Policy"))
+    }
+
     private func agentMember(name: String = "executor") -> TeamOrchestrator.AgentMember {
         TeamOrchestrator.AgentMember(
             id: "\(name)@identity-test",

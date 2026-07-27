@@ -3066,7 +3066,7 @@ class TerminalController {
         }
 
         // Minimal MainActor hold: get team struct (agent names, UUIDs, team metadata) only
-        let teamInfo: (leaderSessionId: String, workspaceId: String, agents: [(name: String, id: String, instanceId: String, cli: String, model: String, agentType: String, color: String, workspaceId: String, panelId: String?, completedTaskCount: Int, worktreeBranch: String?, worktreePath: String?, hostKey: String?)], createdAt: String)? = await MainActor.run {
+        let teamInfo: (leaderSessionId: String, workspaceId: String, agents: [(name: String, id: String, instanceId: String, cli: String, model: String, agentType: String, color: String, workspaceId: String, panelId: String?, completedTaskCount: Int, worktreeBranch: String?, worktreePath: String?, hostKey: String?)], createdAt: String, policyState: String, policyFailure: String?)? = await MainActor.run {
             guard let team = TeamOrchestrator.shared.teamStruct(name: teamName) else { return nil }
             return (
                 leaderSessionId: team.leaderSessionId,
@@ -3077,7 +3077,9 @@ class TerminalController {
                      completedTaskCount: a.completedTaskCount, worktreeBranch: a.worktreeBranch, worktreePath: a.worktreePath,
                      hostKey: a.hostKey)
                 },
-                createdAt: ISO8601DateFormatter().string(from: team.createdAt)
+                createdAt: ISO8601DateFormatter().string(from: team.createdAt),
+                policyState: team.leaderPolicyState,
+                policyFailure: team.leaderPolicyFailureDescription
             )
         }
         guard let teamInfo else {
@@ -3131,6 +3133,11 @@ class TerminalController {
             "attention_count": inboxCount,
             "task_count": taskTotal,
             "created_at": teamInfo.createdAt,
+            "leader_policy_version": LeaderParallelPolicy.version,
+            "leader_policy_digest": LeaderParallelPolicy.digest,
+            "leader_policy_source": "LeaderParallelPolicy",
+            "leader_policy_state": teamInfo.policyState,
+            "leader_policy_failure": teamInfo.policyFailure as Any? ?? NSNull(),
         ] as [String: Any])
     }
 
