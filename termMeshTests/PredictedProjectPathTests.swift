@@ -60,4 +60,25 @@ final class PredictedProjectPathTests: XCTestCase {
         XCTAssertEqual(plan.primaryPath, "/app/tm-projects/demo")
         XCTAssertEqual(plan.agentCheckouts.first?.path, "/app/tm-projects/demo-executor")
     }
+
+    func testRepositoryURLsInferAProjectName() {
+        XCTAssertEqual(
+            NewProjectView.projectName(fromRepositoryURL: "git@github.com:org/term-mesh.git"),
+            "term-mesh"
+        )
+        XCTAssertEqual(
+            NewProjectView.projectName(fromRepositoryURL: "https://github.com/org/term-mesh.git/"),
+            "term-mesh"
+        )
+        XCTAssertEqual(
+            NewProjectView.projectName(fromRepositoryURL: "ssh://git@example.com/org/my%20app.git"),
+            "my app"
+        )
+    }
+
+    func testIncompleteRepositoryURLsDoNotInventAName() {
+        XCTAssertNil(NewProjectView.projectName(fromRepositoryURL: ""))
+        XCTAssertNil(NewProjectView.projectName(fromRepositoryURL: "repository"))
+        XCTAssertNil(NewProjectView.projectName(fromRepositoryURL: "https://github.com/"))
+    }
 }

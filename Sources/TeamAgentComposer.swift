@@ -37,6 +37,7 @@ struct TeamAgentComposer: View {
     var defaultHostKey: String?
     var defaultHostDirectory = ""
     var inheritedAgentIDs: Set<UUID> = []
+    var showsPlacementControls = true
     var onAgentPlacementChanged: (_ agentID: UUID, _ inheritsDefault: Bool) -> Void = { _, _ in }
 
     @ObservedObject private var presetManager = AgentRolePresetManager.shared
@@ -149,7 +150,7 @@ struct TeamAgentComposer: View {
                     }
                     .frame(width: 130)
 
-                    if !selectablePeers.isEmpty {
+                    if showsPlacementControls && !selectablePeers.isEmpty {
                         Button(action: applyHostToAll) {
                             Label("Apply to All", systemImage: "arrow.triangle.2.circlepath")
                                 .font(.caption)
@@ -318,7 +319,7 @@ struct TeamAgentComposer: View {
                 // Which machine. Only offered when there is a peer to offer —
                 // on a single-machine setup the choice would be a control with
                 // one option and a question nobody asked.
-                if !selectablePeers.isEmpty {
+                if showsPlacementControls && !selectablePeers.isEmpty {
                     Picker("", selection: Binding(
                         get: {
                             if supportsDefaultPlacement && inheritedAgentIDs.contains(agent.id) {

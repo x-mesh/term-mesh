@@ -1023,6 +1023,9 @@ struct SidebarProjectsSection: View {
                         leaderWorkingDirectory: leader.endpoint.hostKey == nil
                             ? nil
                             : source.projectPath,
+                        worktreeMode: source.hostKey == nil && source.isolateAgents
+                            ? "isolated"
+                            : "off",
                         projectSource: source,
                         tabManager: tabManager
                     ) != nil else {
@@ -1071,7 +1074,8 @@ struct SidebarProjectsSection: View {
                 port: host.sshPort,
                 identityFile: host.identityFile,
                 plan: plan,
-                gitURL: source.gitURL.isEmpty ? nil : source.gitURL
+                gitURL: source.gitURL.isEmpty ? nil : source.gitURL,
+                sourceKind: source.kind
             )
         } catch {
             RemoteWorkLog.info("Could not prepare \(name) on \(host.displayName): \(error)")
@@ -1079,9 +1083,7 @@ struct SidebarProjectsSection: View {
         }
 
         var prepared = rows
-        for checkout in plan.agentCheckouts {
-            guard let i = prepared.firstIndex(where: { $0.preset.name == checkout.agent })
-            else { continue }
+        for (i, checkout) in plan.agentCheckouts.enumerated() where i < prepared.count {
             prepared[i].hostKey = hostKey
             prepared[i].hostDirectory = checkout.path
         }

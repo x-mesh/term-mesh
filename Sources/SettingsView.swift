@@ -161,6 +161,8 @@ struct SettingsView: View {
     @AppStorage(AgentPipeTransport.nativePanelKey) private var agentNativePanes = false
     @AppStorage("teamDefaultModel") private var teamDefaultModel = "sonnet"
     @AppStorage("teamDefaultWorkingDirectory") private var teamDefaultWorkingDirectory = ""
+    @AppStorage(ProjectLocationSettings.localProjectsRootKey)
+    private var localProjectsRoot = ProjectLocationSettings.defaultLocalProjectsRoot
     @AppStorage("agentRenderingInterval") private var agentRenderingInterval = 3
     // Phase 2 headless: idle-park threshold (0 = disabled, max 1440 min/24h)
     @AppStorage("headlessIdleParkMinutes") private var headlessIdleParkMinutes = 60
@@ -1370,6 +1372,32 @@ struct SettingsView: View {
                         }
 
                         if settingsMatch("directory", "working", "path", "agent", "team") {
+                        SettingsCardDivider()
+
+                        SettingsCardRow(
+                            "Projects Under",
+                            subtitle: "Default parent folder for new projects on This Mac."
+                        ) {
+                            HStack(spacing: 8) {
+                                TextField("~/work/project", text: $localProjectsRoot)
+                                    .textFieldStyle(.roundedBorder)
+                                    .frame(width: 170)
+                                Button("Browse…") {
+                                    let panel = NSOpenPanel()
+                                    panel.canChooseDirectories = true
+                                    panel.canChooseFiles = false
+                                    panel.allowsMultipleSelection = false
+                                    panel.presentAsSheet { response in
+                                        if response == .OK, let url = panel.url {
+                                            localProjectsRoot = url.path
+                                        }
+                                    }
+                                }
+                                .buttonStyle(.bordered)
+                                .controlSize(.small)
+                            }
+                        }
+
                         SettingsCardDivider()
 
                         SettingsCardRow(

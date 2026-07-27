@@ -35,17 +35,21 @@ final class PeerProjectBootstrapTests: XCTestCase {
         XCTAssertEqual(Set(plan.agentCheckouts.map(\.path)), ["/app/tm-projects/myproj"])
     }
 
-    func test_clones_each_agent_from_the_copy_on_that_machine() {
+    func test_creates_each_agent_as_a_worktree_of_the_primary_copy() {
         let plan = PeerProjectBootstrap.plan(
             projectRoot: "/app/p", projectName: "x", agents: ["a"], isolateAgents: true
         )
         let script = PeerProjectBootstrap.script(for: plan, gitURL: "git@github.com:org/x.git")
         let text = try! XCTUnwrap(script)
         XCTAssertTrue(text.contains("git clone 'git@github.com:org/x.git' '/app/p/x'"))
-        // The member's copy comes from the one already here — the network and
-        // any credentials are needed once, for the project.
-        XCTAssertTrue(text.contains("git clone '/app/p/x' '/app/p/x-a'"))
-        XCTAssertFalse(text.contains("--shared"), "borrowed objects break when the source is gc'd")
+        // The network and credentials are needed once; agent checkouts share
+        // objects safely through Git's first-class worktree mechanism.
+        XCTAssertTrue(
+            text.contains(
+                "git -C '/app/p/x' worktree add -b 'agent/a' '/app/p/x-a' HEAD"
+            )
+        )
+        XCTAssertFalse(text.contains("git clone '/app/p/x'"))
     }
 
     func test_running_it_twice_is_running_it_once() {
@@ -57,22 +61,56 @@ final class PeerProjectBootstrapTests: XCTestCase {
         XCTAssertTrue(text.contains("test -d '/app/p/x'/.git ||"))
         XCTAssertTrue(text.contains("git -C '/app/p/x-a' rev-parse --git-dir"))
         // A branch left over from a previous run is the normal second visit.
-        XCTAssertTrue(text.contains("switch 'agent/a' 2>/dev/null || "))
+        XCTAssertTrue(text.contains("show-ref --verify --quiet refs/heads/'agent/a'"))
+        XCTAssertTrue(text.contains("worktree add '/app/p/x-a' 'agent/a'"))
     }
 
-    func test_new_isolated_project_initializes_primary_before_cloning_agents() {
+    func test_empty_project_initializes_and_commits_before_adding_worktrees() {
         let plan = PeerProjectBootstrap.plan(
             projectRoot: "/app/p", projectName: "x", agents: ["a"], isolateAgents: true
         )
-        let text = try! XCTUnwrap(PeerProjectBootstrap.script(for: plan, gitURL: nil))
+        let text = try! XCTUnwrap(
+            PeerProjectBootstrap.script(for: plan, gitURL: nil, sourceKind: .empty)
+        )
 
         let initRange = try! XCTUnwrap(text.range(of: "git -C '/app/p/x' init"))
-        let cloneRange = try! XCTUnwrap(text.range(of: "git clone '/app/p/x' '/app/p/x-a'"))
-        XCTAssertLessThan(initRange.lowerBound, cloneRange.lowerBound)
-        XCTAssertTrue(text.contains("find '/app/p/x' -mindepth 1"))
+        let commitRange = try! XCTUnwrap(text.range(of: "commit --allow-empty"))
+        let worktreeRange = try! XCTUnwrap(text.range(of: "worktree add"))
+        XCTAssertLessThan(initRange.lowerBound, commitRange.lowerBound)
+        XCTAssertLessThan(commitRange.lowerBound, worktreeRange.lowerBound)
     }
 
-    func test_a_plain_shared_folder_needs_no_script() {
+    func test_duplicate_agent_roles_receive_unique_paths_and_branches() {
+        let plan = PeerProjectBootstrap.plan(
+            projectRoot: "/app/p",
+            projectName: "x",
+            agents: ["executor", "executor"],
+            isolateAgents: true
+        )
+
+        XCTAssertEqual(
+            plan.agentCheckouts.map(\.path),
+            ["/app/p/x-executor", "/app/p/x-executor-2"]
+        )
+        XCTAssertEqual(
+            plan.agentCheckouts.map(\.branch),
+            ["agent/executor", "agent/executor-2"]
+        )
+    }
+
+    func test_existing_shared_folder_is_validated_without_modifying_it() {
+        let plan = PeerProjectBootstrap.plan(
+            projectRoot: "/app/p", projectName: "x", agents: ["a"], isolateAgents: false
+        )
+        XCTAssertEqual(
+            PeerProjectBootstrap.script(
+                for: plan, gitURL: nil, sourceKind: .existingFolder
+            ),
+            "test -d '/app/p/x'"
+        )
+    }
+
+    func test_a_plain_legacy_shared_folder_needs_no_script() {
         let plan = PeerProjectBootstrap.plan(
             projectRoot: "/app/p", projectName: "x", agents: ["a"], isolateAgents: false
         )

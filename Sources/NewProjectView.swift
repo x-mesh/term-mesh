@@ -28,6 +28,7 @@ struct NewProjectView: View {
 
     @State private var directory: String = ""
     @State private var name: String = ""
+    @State private var sourceKind: ProjectSourceKind = .clone
     @State private var nameEdited = false
     /// Whether the folder has been typed into directly, which stops the name
     /// from moving it.
@@ -48,6 +49,15 @@ struct NewProjectView: View {
     /// Where the project comes from. A folder that is already there, or a
     /// repository to clone onto that machine.
     @State private var gitURL: String = ""
+    @State private var showsCustomPath = false
+    @State private var showsCustomPlacement = false
+    @FocusState private var focusedField: Field?
+
+    private enum Field {
+        case repositoryURL
+        case name
+        case directory
+    }
     /// Whether each agent gets its own checkout.
     ///
     /// On by default because agents sharing one directory collide in every way
@@ -153,6 +163,11 @@ struct NewProjectView: View {
                         defaultHostKey: runsOnHostKey,
                         defaultHostDirectory: trimmedDirectory,
                         inheritedAgentIDs: inheritedAgentIDs,
+                        // Cross-machine agent placement needs a checkout
+                        // bootstrap on every selected host. Until that
+                        // transaction is supported end-to-end, do not expose
+                        // controls that merely launch a pane in a missing path.
+                        showsPlacementControls: false,
                         onAgentPlacementChanged: { id, inheritsDefault in
                             if inheritsDefault {
                                 inheritedAgentIDs.insert(id)
@@ -171,6 +186,8 @@ struct NewProjectView: View {
         .onAppear {
             applyInitialTeamPreset()
             adoptProjectMachineForNewRows()
+            applyDerivedDestination()
+            focusedField = .repositoryURL
         }
         .onChange(of: agents.map(\.id)) { _, _ in
             adoptProjectMachineForNewRows()
@@ -408,29 +425,35 @@ struct NewProjectView: View {
                             .foregroundStyle(.secondary)
                     }
 
-                    Divider().frame(height: 16)
+                    if showsCustomPlacement {
+                        Divider().frame(height: 16)
 
-                    Picker("", selection: $leaderPlacement) {
-                        Text(defaultPlacementLabel).tag(HostPlacement.inherited)
-                        Text("This Mac").tag(HostPlacement.explicit(nil))
-                        ForEach(selectablePeers, id: \.id) { host in
-                            Text(host.isConnected ? host.displayName : "\(host.displayName) — offline")
-                                .tag(HostPlacement.explicit(host.id))
+                        Picker("", selection: $leaderPlacement) {
+                            Text(defaultPlacementLabel).tag(HostPlacement.inherited)
+                            Text("This Mac").tag(HostPlacement.explicit(nil))
+                            ForEach(selectablePeers, id: \.id) { host in
+                                Text(host.isConnected ? host.displayName : "\(host.displayName) — offline")
+                                    .tag(HostPlacement.explicit(host.id))
+                            }
                         }
-                    }
-                    .labelsHidden()
-                    .frame(width: 170)
-                    .accessibilityIdentifier("newProject.leaderHost")
-                    .onChange(of: leaderPlacement) { _, placement in
-                        guard case .explicit(let hostKey?) = placement,
-                              let host = selectablePeers.first(where: { $0.id == hostKey }),
-                              !host.isConnected else { return }
-                        hostStore.connectSavedHost(host)
-                    }
-                    if let leaderHostKey,
-                       let host = selectablePeers.first(where: { $0.id == leaderHostKey }),
-                       !host.isConnected {
-                        Label("connecting…", systemImage: "arrow.triangle.2.circlepath")
+                        .labelsHidden()
+                        .frame(width: 170)
+                        .accessibilityIdentifier("newProject.leaderHost")
+                        .onChange(of: leaderPlacement) { _, placement in
+                            guard case .explicit(let hostKey?) = placement,
+                                  let host = selectablePeers.first(where: { $0.id == hostKey }),
+                                  !host.isConnected else { return }
+                            hostStore.connectSavedHost(host)
+                        }
+                        if let leaderHostKey,
+                           let host = selectablePeers.first(where: { $0.id == leaderHostKey }),
+                           !host.isConnected {
+                            Label("connecting…", systemImage: "arrow.triangle.2.circlepath")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                    } else {
+                        Text(defaultPlacementLabel)
                             .font(.caption)
                             .foregroundStyle(.secondary)
                     }
@@ -440,110 +463,208 @@ struct NewProjectView: View {
     }
 
     private var projectFields: some View {
-        Grid(alignment: .leading, horizontalSpacing: 12, verticalSpacing: 10) {
-            GridRow {
-                Text("Default machine")
-                HStack(spacing: 8) {
-                    Picker("", selection: $runsOnHostKey) {
-                        Text("This Mac").tag(String?.none)
-                        ForEach(selectablePeers, id: \.id) { host in
-                            Text(host.isConnected ? host.displayName : "\(host.displayName) — offline")
-                                .tag(String?.some(host.id))
-                        }
-                    }
-                    .labelsHidden()
-                    .frame(width: 220)
-                    if selectablePeers.isEmpty {
-                        Text("add a peer in Settings to run a project elsewhere")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                    } else if let runsOnHostKey,
-                              let host = selectablePeers.first(where: { $0.id == runsOnHostKey }),
-                              !host.isConnected {
-                        Label("connecting…", systemImage: "arrow.triangle.2.circlepath")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
+        VStack(alignment: .leading, spacing: 14) {
+            Picker("Project source", selection: $sourceKind) {
+                Text("Clone repository").tag(ProjectSourceKind.clone)
+                Text("Existing folder").tag(ProjectSourceKind.existingFolder)
+                Text("Empty project").tag(ProjectSourceKind.empty)
+            }
+            .pickerStyle(.segmented)
+            .labelsHidden()
+            .accessibilityLabel("Project source")
+
+            Grid(alignment: .leading, horizontalSpacing: 12, verticalSpacing: 10) {
+                if sourceKind == .clone {
+                    GridRow {
+                        Text("Repository URL")
+                        TextField("git@github.com:org/repo.git", text: $gitURL)
+                            .textFieldStyle(.roundedBorder)
+                            .focused($focusedField, equals: .repositoryURL)
                     }
                 }
-            }
-            GridRow {
-                Text(runsOnHostKey == nil ? "Folder" : "Folder on that machine")
-                HStack(spacing: 6) {
-                    TextField(
-                        folderPlaceholder,
-                        text: Binding(
-                            get: { directory },
-                            set: { directory = $0; folderEdited = true }
-                        )
-                    )
-                    .textFieldStyle(.roundedBorder)
-                    // No panel for a remote path: this Mac cannot browse that
-                    // machine's disk, and a picker that quietly shows the
-                    // wrong filesystem is worse than none.
-                    if runsOnHostKey == nil {
-                        Button("Choose…", action: chooseFolder)
-                    }
-                }
-            }
-            GridRow {
-                Text("Clone from")
-                TextField("git@github.com:org/repo.git — optional", text: $gitURL)
-                    .textFieldStyle(.roundedBorder)
-            }
-            GridRow {
-                Text("Isolation")
-                HStack(spacing: 8) {
-                    Picker("", selection: $isolateAgents) {
-                        Text("Each agent gets its own checkout").tag(true)
-                        Text("All agents share one").tag(false)
-                    }
-                    .labelsHidden()
-                    .frame(width: 260)
-                    if isolateAgents {
-                        Text(isolationHint)
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                    }
-                }
-            }
-            GridRow {
-                Text("Name")
-                // Follows the folder until someone disagrees with it, then
-                // stops following — a field that keeps overwriting what you
-                // typed is worse than one that never guessed.
-                TextField(
-                    URL(fileURLWithPath: trimmedDirectory).lastPathComponent,
-                    text: Binding(
+
+                GridRow {
+                    Text("Name")
+                    TextField("project-name", text: Binding(
                         get: { name },
                         set: { name = $0; nameEdited = true }
-                    )
-                )
-                .textFieldStyle(.roundedBorder)
+                    ))
+                    .textFieldStyle(.roundedBorder)
+                    .focused($focusedField, equals: .name)
+                }
+
+                GridRow {
+                    Text("Project machine")
+                    HStack(spacing: 8) {
+                        Picker("", selection: $runsOnHostKey) {
+                            Text("This Mac").tag(String?.none)
+                            ForEach(selectablePeers, id: \.id) { host in
+                                Text(host.isConnected ? host.displayName : "\(host.displayName) — offline")
+                                    .tag(String?.some(host.id))
+                            }
+                        }
+                        .labelsHidden()
+                        .frame(width: 220)
+                        if let runsOnHostKey,
+                           let host = selectablePeers.first(where: { $0.id == runsOnHostKey }),
+                           !host.isConnected {
+                            Label("connecting…", systemImage: "arrow.triangle.2.circlepath")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                }
+
+                if sourceKind == .existingFolder || showsCustomPath {
+                    GridRow {
+                        Text(sourceKind == .existingFolder ? "Folder" : "Destination")
+                        HStack(spacing: 6) {
+                            TextField(folderPlaceholder, text: Binding(
+                                get: { directory },
+                                set: { directory = $0; folderEdited = true }
+                            ))
+                            .textFieldStyle(.roundedBorder)
+                            .focused($focusedField, equals: .directory)
+                            if runsOnHostKey == nil {
+                                Button("Choose…", action: chooseFolder)
+                            }
+                        }
+                    }
+                } else {
+                    GridRow {
+                        Text("Destination")
+                        HStack(spacing: 8) {
+                            Text(trimmedDirectory.isEmpty ? "Choose a project machine and name" : trimmedDirectory)
+                                .foregroundStyle(trimmedDirectory.isEmpty ? .secondary : .primary)
+                                .lineLimit(1)
+                                .truncationMode(.middle)
+                            Spacer()
+                            Button("Customize…") {
+                                showsCustomPath = true
+                                focusedField = .directory
+                            }
+                            .buttonStyle(.borderless)
+                        }
+                    }
+                }
+
+                GridRow {
+                    Text("Agent checkouts")
+                    HStack(spacing: 8) {
+                        Text(checkoutDescription)
+                        if sourceKind == .existingFolder && gitURL.isEmpty {
+                            Text("Git not detected; agents share this folder")
+                                .font(.caption)
+                                .foregroundStyle(.orange)
+                        } else if isolateAgents {
+                            Text(isolationHint)
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                }
             }
+
+            Button {
+                showsCustomPlacement.toggle()
+            } label: {
+                Label(
+                    showsCustomPlacement ? "Hide leader placement" : "Customize leader placement",
+                    systemImage: showsCustomPlacement ? "chevron.down" : "chevron.right"
+                )
+                .font(.caption)
+            }
+            .buttonStyle(.borderless)
+        }
+        .onChange(of: gitURL) { _, value in
+            guard sourceKind == .clone, !nameEdited,
+                  let inferred = Self.projectName(fromRepositoryURL: value) else { return }
+            name = inferred
+            applyDerivedDestination()
+        }
+        .onChange(of: sourceKind) { _, kind in
+            nameEdited = false
+            folderEdited = false
+            showsCustomPath = kind == .existingFolder
+            if kind == .empty {
+                gitURL = ""
+                name = ""
+                focusedField = .name
+            } else if kind == .clone {
+                focusedField = .repositoryURL
+            } else {
+                gitURL = ""
+                directory = ""
+                focusedField = .directory
+            }
+            applyDerivedDestination()
+        }
+        .onChange(of: name) { _, _ in
+            applyDerivedDestination()
         }
         .onChange(of: directory) { _, newValue in
-            guard !nameEdited else { return }
+            guard sourceKind == .existingFolder, !nameEdited else { return }
             let trimmed = newValue.trimmingCharacters(in: .whitespacesAndNewlines)
-            let leaf = trimmed.isEmpty ? "" : URL(fileURLWithPath: trimmed).lastPathComponent
-            name = leaf == Self.placeholderProjectName ? "" : leaf
-        }
-        .onChange(of: name) { _, newName in
-            // Typing the name moves the folder with it, so `<root>/<name>` stays
-            // true without anyone having to edit the path by hand. Stops the
-            // moment the folder is edited directly — at that point the person
-            // has said where it goes and the name is not entitled to argue.
-            guard !folderEdited, !directory.isEmpty else { return }
-            let typed = newName.trimmingCharacters(in: .whitespacesAndNewlines)
-            let parent = (directory as NSString).deletingLastPathComponent
-            guard !parent.isEmpty else { return }
-            directory = (parent as NSString)
-                .appendingPathComponent(typed.isEmpty ? Self.placeholderProjectName : typed)
-            for i in agents.indices where inheritedAgentIDs.contains(agents[i].id) {
-                agents[i].hostDirectory = directory
-            }
+            guard !trimmed.isEmpty else { return }
+            name = URL(fileURLWithPath: trimmed).lastPathComponent
         }
         .onChange(of: runsOnHostKey) { _, newHost in
             applyRunsOn(newHost)
+            applyDerivedDestination()
+        }
+    }
+
+    private var checkoutDescription: String {
+        if sourceKind == .existingFolder && gitURL.isEmpty {
+            return "Shared folder"
+        }
+        return isolateAgents ? "Git worktree per agent" : "Shared primary checkout"
+    }
+
+    static func projectName(fromRepositoryURL raw: String) -> String? {
+        var trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        while trimmed.hasSuffix("/") {
+            trimmed.removeLast()
+        }
+        guard !trimmed.isEmpty else { return nil }
+        let tail: String
+        if let url = URL(string: trimmed), url.scheme != nil {
+            guard let component = url.pathComponents.last,
+                  component != "/" else { return nil }
+            tail = component
+        } else if let slash = trimmed.lastIndex(of: "/") {
+            tail = String(trimmed[trimmed.index(after: slash)...])
+        } else if let colon = trimmed.lastIndex(of: ":") {
+            tail = String(trimmed[trimmed.index(after: colon)...])
+        } else {
+            return nil
+        }
+        let decoded = tail.removingPercentEncoding ?? tail
+        let name = decoded.hasSuffix(".git") ? String(decoded.dropLast(4)) : decoded
+        let clean = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        return clean.isEmpty ? nil : clean
+    }
+
+    private func applyDerivedDestination() {
+        guard sourceKind != .existingFolder, !folderEdited else { return }
+        let projectName = effectiveName.isEmpty ? Self.placeholderProjectName : effectiveName
+        let root: String
+        if let hostKey = runsOnHostKey,
+           let configured = PeerHostProfileStore.shared.profiles
+            .first(where: { $0.stableKey == hostKey })?
+            .projectRootPath?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !configured.isEmpty {
+            root = configured
+        } else if runsOnHostKey == nil {
+            root = ProjectLocationSettings.expandedLocalProjectsRoot()
+        } else {
+            root = ""
+        }
+        directory = root.isEmpty
+            ? ""
+            : (root as NSString).appendingPathComponent(projectName)
+        for i in agents.indices where inheritedAgentIDs.contains(agents[i].id) {
+            agents[i].hostDirectory = runsOnHostKey == nil ? "" : directory
         }
     }
 
@@ -658,18 +779,14 @@ struct NewProjectView: View {
 
     private var footer: some View {
         HStack {
-            Text(creationError ?? (
-                runsOnHostKey == nil
-                    ? "The team is created in this folder alongside the project."
-                    : "The agents work on that machine; their panes open here."
-            ))
+            Text(creationError ?? creationSummary)
             .font(.caption)
             .foregroundStyle(creationError == nil ? Color.secondary : Color.red)
             Spacer()
             Button("Cancel", action: onClose)
                 .keyboardShortcut(.cancelAction)
                 .disabled(isCreating)
-            Button("Create") {
+            Button("Create Project") {
                 // A project living on another machine still needs somewhere
                 // here for its window to open. The remote path is not that
                 // place — nothing local would be able to enter it — so the
@@ -681,6 +798,22 @@ struct NewProjectView: View {
                 creationError = nil
                 Task { @MainActor in
                     do {
+                        if runsOnHostKey == nil {
+                            let primaryOnly = PeerProjectBootstrap.plan(
+                                projectRoot: parentOf(trimmedDirectory),
+                                projectName: effectiveName,
+                                agents: [],
+                                isolateAgents: false
+                            )
+                            try await PeerProjectBootstrap.runLocal(
+                                plan: primaryOnly,
+                                gitURL: {
+                                    let value = gitURL.trimmingCharacters(in: .whitespacesAndNewlines)
+                                    return value.isEmpty ? nil : value
+                                }(),
+                                sourceKind: sourceKind
+                            )
+                        }
                         try await onCreate(
                             effectiveName,
                             localDirectory,
@@ -689,7 +822,8 @@ struct NewProjectView: View {
                                 hostKey: runsOnHostKey,
                                 projectPath: trimmedDirectory,
                                 gitURL: gitURL.trimmingCharacters(in: .whitespacesAndNewlines),
-                                isolateAgents: isolateAgents
+                                isolateAgents: effectiveIsolation,
+                                kind: sourceKind
                             ),
                             ProjectLeader(
                                 mode: leaderCli,
@@ -706,7 +840,7 @@ struct NewProjectView: View {
             }
             .keyboardShortcut(.defaultAction)
             .disabled(
-                isCreating || trimmedDirectory.isEmpty || effectiveName.isEmpty
+                isCreating || !canCreate
                     || !leaderEndpointIsReady
             )
             .overlay {
@@ -718,6 +852,34 @@ struct NewProjectView: View {
         }
         .padding(.horizontal, 20)
         .padding(.vertical, 14)
+    }
+
+    private var effectiveIsolation: Bool {
+        isolateAgents && !(sourceKind == .existingFolder && gitURL.isEmpty)
+    }
+
+    private var canCreate: Bool {
+        guard !trimmedDirectory.isEmpty, !effectiveName.isEmpty else { return false }
+        if sourceKind == .clone {
+            return !gitURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        }
+        return true
+    }
+
+    private var creationSummary: String {
+        let action: String
+        switch sourceKind {
+        case .clone: action = "Clone \(gitURL.isEmpty ? "repository" : gitURL)"
+        case .existingFolder: action = "Use existing folder"
+        case .empty: action = "Create empty Git project"
+        }
+        let machine = runsOnHostKey.flatMap { hostKey in
+            selectablePeers.first(where: { $0.id == hostKey })?.displayName
+        } ?? "This Mac"
+        let checkout = effectiveIsolation
+            ? "\(agents.count) agent worktree\(agents.count == 1 ? "" : "s")"
+            : "shared checkout"
+        return "\(action) → \(trimmedDirectory) on \(machine) · \(checkout)"
     }
 
     private var leaderEndpointIsReady: Bool {
@@ -853,6 +1015,36 @@ struct NewProjectView: View {
         panel.message = "Choose a folder for this project"
         guard panel.runModal() == .OK, let url = panel.url else { return }
         directory = url.path
+        if sourceKind == .existingFolder {
+            name = url.lastPathComponent
+            Task {
+                if let origin = await Self.localGitOrigin(at: url.path) {
+                    gitURL = origin
+                }
+            }
+        }
+    }
+
+    private static func localGitOrigin(at path: String) async -> String? {
+        await Task.detached(priority: .utility) {
+            let process = Process()
+            process.executableURL = URL(fileURLWithPath: "/usr/bin/git")
+            process.arguments = ["-C", path, "remote", "get-url", "origin"]
+            let output = Pipe()
+            process.standardOutput = output
+            process.standardError = FileHandle.nullDevice
+            do {
+                try process.run()
+                process.waitUntilExit()
+            } catch {
+                return nil
+            }
+            guard process.terminationStatus == 0 else { return nil }
+            let data = (try? output.fileHandleForReading.readToEnd()) ?? Data()
+            let value = String(data: data, encoding: .utf8)?
+                .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            return value.isEmpty ? nil : value
+        }.value
     }
 }
 

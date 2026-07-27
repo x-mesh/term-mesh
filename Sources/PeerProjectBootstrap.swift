@@ -1,5 +1,26 @@
 import Foundation
 
+enum ProjectSourceKind: String, Codable, CaseIterable {
+    case clone
+    case existingFolder
+    case empty
+}
+
+enum ProjectLocationSettings {
+    static let localProjectsRootKey = "termMesh.localProjectsRoot"
+    static let defaultLocalProjectsRoot = "~/work/project"
+
+    static var localProjectsRoot: String {
+        let saved = UserDefaults.standard.string(forKey: localProjectsRootKey)?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return saved.isEmpty ? defaultLocalProjectsRoot : saved
+    }
+
+    static func expandedLocalProjectsRoot() -> String {
+        (localProjectsRoot as NSString).expandingTildeInPath
+    }
+}
+
 /// Getting a project, and each agent's own copy of it, onto another machine.
 ///
 /// Agents that share one checkout collide in every way that matters: they
@@ -7,19 +28,9 @@ import Foundation
 /// their tool state — settings, caches, installed dependencies — is one set of
 /// files with several writers.
 ///
-/// A git worktree is the usual answer and is the wrong one here. Worktrees
-/// share `.git`, so two agents cannot both start from `main`, and the refs and
-/// object store they share become a lock others are waiting on — agents run
-/// git constantly, and the contention surfaces as work that fails now and then
-/// for no visible reason. A clone shares nothing: its own refs, its own index,
-/// its own config and hooks. On a machine with disk, that is simpler and it is
-/// the isolation actually being asked for.
-///
-/// Cloned from the primary copy on the same machine rather than from the
-/// remote: credentials and the network are needed once, for the project, and
-/// never again for a member. Deliberately not `--shared` or `--reference` —
-/// borrowing another repository's objects means a `gc` over there can break a
-/// clone over here, and disk is cheaper than that failure.
+/// Each agent gets a Git worktree. That gives every worker its own index,
+/// branch and working files while downloading the repository only once.
+/// Branch names and paths are unique even when a preset repeats a role.
 enum PeerProjectBootstrap {
     enum DeletionError: LocalizedError {
         case unsafePath(String)
@@ -65,13 +76,17 @@ enum PeerProjectBootstrap {
                 agentCheckouts: agents.map { (agent: $0, path: primary, branch: "") }
             )
         }
+        var occurrences: [String: Int] = [:]
         return Plan(
             primaryPath: primary,
             agentCheckouts: agents.map { agent in
-                (
+                let count = (occurrences[agent] ?? 0) + 1
+                occurrences[agent] = count
+                let suffix = count == 1 ? agent : "\(agent)-\(count)"
+                return (
                     agent: agent,
-                    path: (root as NSString).appendingPathComponent("\(projectName)-\(agent)"),
-                    branch: "agent/\(agent)"
+                    path: (root as NSString).appendingPathComponent("\(projectName)-\(suffix)"),
+                    branch: "agent/\(suffix)"
                 )
             }
         )
@@ -84,7 +99,11 @@ enum PeerProjectBootstrap {
     /// running it twice is running it once. The `||` on the branch switch is
     /// deliberate: an agent's branch surviving from a previous run is the
     /// normal case on the second visit, not a failure.
-    static func script(for plan: Plan, gitURL: String?) -> String? {
+    static func script(
+        for plan: Plan,
+        gitURL: String?,
+        sourceKind: ProjectSourceKind = .clone
+    ) -> String? {
         var steps: [String] = []
         let primary = quote(plan.primaryPath)
         if let gitURL, !gitURL.isEmpty {
@@ -92,8 +111,25 @@ enum PeerProjectBootstrap {
                 "test -d \(primary)/.git || git clone \(quote(gitURL)) \(primary)"
             )
         } else {
-            steps.append("mkdir -p \(primary)")
-            if plan.agentCheckouts.contains(where: { $0.path != plan.primaryPath }) {
+            if sourceKind == .existingFolder {
+                // "Existing" is a promise, not a request to create a missing
+                // directory. Failing here keeps the sheet open with a useful
+                // error instead of launching panes whose `cd` already failed.
+                steps.append("test -d \(primary)")
+            } else {
+                steps.append("mkdir -p \(primary)")
+            }
+            if sourceKind == .empty {
+                steps.append(
+                    "git -C \(primary) rev-parse --git-dir >/dev/null 2>&1 "
+                        + "|| git -C \(primary) init"
+                )
+                steps.append(
+                    "git -C \(primary) rev-parse --verify HEAD >/dev/null 2>&1 "
+                        + "|| git -C \(primary) -c user.name=term-mesh "
+                        + "-c user.email=term-mesh@local commit --allow-empty -m 'Initial commit'"
+                )
+            } else if plan.agentCheckouts.contains(where: { $0.path != plan.primaryPath }) {
                 // A brand-new project has no repository to clone yet. Make
                 // the primary directory the repository instead of attempting
                 // `git clone <plain folder>`, which fails and used to leave
@@ -112,19 +148,18 @@ enum PeerProjectBootstrap {
         }
         for checkout in plan.agentCheckouts where checkout.path != plan.primaryPath {
             let path = quote(checkout.path)
+            let branch = quote(checkout.branch)
             steps.append(
                 "(git -C \(path) rev-parse --git-dir >/dev/null 2>&1 "
-                    + "|| git clone \(primary) \(path))"
-            )
-            if !checkout.branch.isEmpty {
-                let branch = quote(checkout.branch)
-                steps.append(
-                    "(git -C \(path) switch \(branch) 2>/dev/null "
-                        + "|| git -C \(path) switch -c \(branch))"
+                    + "|| (git -C \(primary) show-ref --verify --quiet refs/heads/\(branch) "
+                    + "&& git -C \(primary) worktree add \(path) \(branch) "
+                    + "|| git -C \(primary) worktree add -b \(branch) \(path) HEAD))"
                 )
-            }
         }
-        guard steps.count > 1 || gitURL?.isEmpty == false else { return nil }
+        guard steps.count > 1
+                || gitURL?.isEmpty == false
+                || sourceKind == .existingFolder
+        else { return nil }
         return steps.joined(separator: " && ")
     }
 
@@ -139,9 +174,10 @@ enum PeerProjectBootstrap {
         identityFile: String?,
         plan: Plan,
         gitURL: String?,
+        sourceKind: ProjectSourceKind = .clone,
         timeoutSeconds: TimeInterval = 300
     ) async throws {
-        guard let script = script(for: plan, gitURL: gitURL) else { return }
+        guard let script = script(for: plan, gitURL: gitURL, sourceKind: sourceKind) else { return }
         try await PeerHostReadinessChecker.runScript(
             sshTarget: sshTarget,
             port: port,
@@ -149,6 +185,68 @@ enum PeerProjectBootstrap {
             script: script,
             timeoutSeconds: timeoutSeconds
         )
+    }
+
+    static func runLocal(
+        plan: Plan,
+        gitURL: String?,
+        sourceKind: ProjectSourceKind,
+        timeoutSeconds: TimeInterval = 300
+    ) async throws {
+        guard let script = script(
+            for: plan, gitURL: gitURL, sourceKind: sourceKind
+        ) else { return }
+        try await withCheckedThrowingContinuation {
+            (continuation: CheckedContinuation<Void, Error>) in
+            DispatchQueue.global(qos: .userInitiated).async {
+                let process = Process()
+                process.executableURL = URL(fileURLWithPath: "/bin/sh")
+                process.arguments = ["-lc", script]
+                let errorPipe = Pipe()
+                process.standardError = errorPipe
+                do {
+                    try process.run()
+                } catch {
+                    continuation.resume(throwing: error)
+                    return
+                }
+                let deadline = Date().addingTimeInterval(timeoutSeconds)
+                while process.isRunning, Date() < deadline {
+                    Thread.sleep(forTimeInterval: 0.05)
+                }
+                if process.isRunning {
+                    process.terminate()
+                    continuation.resume(throwing: ProjectBootstrapError.timedOut)
+                    return
+                }
+                guard process.terminationStatus == 0 else {
+                    let data = (try? errorPipe.fileHandleForReading.readToEnd()) ?? Data()
+                    let message = String(data: data, encoding: .utf8)?
+                        .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+                    continuation.resume(
+                        throwing: ProjectBootstrapError.commandFailed(
+                            message.isEmpty ? "git exited with \(process.terminationStatus)" : message
+                        )
+                    )
+                    return
+                }
+                continuation.resume(returning: ())
+            }
+        }
+    }
+
+    enum ProjectBootstrapError: LocalizedError {
+        case timedOut
+        case commandFailed(String)
+
+        var errorDescription: String? {
+            switch self {
+            case .timedOut:
+                return "Project setup timed out."
+            case .commandFailed(let message):
+                return "Project setup failed: \(message)"
+            }
+        }
     }
 
     /// Build the one destructive command in the project lifecycle.
@@ -182,6 +280,7 @@ enum PeerProjectBootstrap {
 /// Where a project comes from and how its members are laid out, as the
 /// creation form describes it.
 struct ProjectSource: Equatable {
+    var kind: ProjectSourceKind
     /// The peer it lives on, or nil for this machine.
     var hostKey: String?
     /// The project's directory on that machine.
@@ -191,6 +290,20 @@ struct ProjectSource: Equatable {
     var gitURL: String
     /// Whether each member gets its own checkout.
     var isolateAgents: Bool
+
+    init(
+        hostKey: String?,
+        projectPath: String,
+        gitURL: String,
+        isolateAgents: Bool,
+        kind: ProjectSourceKind? = nil
+    ) {
+        self.kind = kind ?? (gitURL.isEmpty ? .empty : .clone)
+        self.hostKey = hostKey
+        self.projectPath = projectPath
+        self.gitURL = gitURL
+        self.isolateAgents = isolateAgents
+    }
 }
 
 /// What runs the project's leader pane.
