@@ -13,6 +13,35 @@ use tokio::time::{interval, Duration};
 const MAX_FRAME: usize = 64 * 1024;
 const MAX_EVENT_FRAME: usize = 4 * 1024;
 
+/// Default ceiling on concurrent connections, mirroring the sibling peer
+/// server's `MAX_PEER_CONNECTIONS`.
+///
+/// Accepting without a bound let one caller — or one runaway script — spawn
+/// tasks and file descriptors until something else on the machine broke,
+/// with nothing to point at. A limit turns that into a log line naming the
+/// ceiling. Override with `TERMMESH_COORDINATOR_MAX_CONNECTIONS`.
+const DEFAULT_MAX_CONNECTIONS: usize = 64;
+const MAX_CONNECTIONS_VAR: &str = "TERMMESH_COORDINATOR_MAX_CONNECTIONS";
+
+/// Split from the env read so the parse can be tested. A value that is not a
+/// positive integer is ignored rather than refusing to start: a coordinator
+/// up with the wrong ceiling is easier to notice and correct than one that
+/// never came up.
+fn parse_max_connections(raw: Option<&str>) -> usize {
+    let Some(raw) = raw else {
+        return DEFAULT_MAX_CONNECTIONS;
+    };
+    match raw.trim().parse::<usize>() {
+        Ok(value) if value > 0 => value,
+        _ => {
+            tracing::warn!(
+                "{MAX_CONNECTIONS_VAR}={raw:?} is not a positive integer; using {DEFAULT_MAX_CONNECTIONS}"
+            );
+            DEFAULT_MAX_CONNECTIONS
+        }
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct Request {
     id: Option<Value>,
@@ -41,10 +70,21 @@ pub async fn serve(api: Arc<Api>, path: &Path) -> Result<()> {
         let _ = std::fs::remove_file(path);
     }
     let listener = bind_with_tight_umask(path)?;
+    let max_connections = parse_max_connections(std::env::var(MAX_CONNECTIONS_VAR).ok().as_deref());
+    tracing::info!("coordinator connection ceiling: {max_connections}");
+    let permits = Arc::new(tokio::sync::Semaphore::new(max_connections));
     loop {
         let (stream, _) = listener.accept().await?;
+        let Ok(permit) = Arc::clone(&permits).try_acquire_owned() else {
+            tracing::warn!(
+                "coordinator connection limit reached ({max_connections}); closing new client — raise {MAX_CONNECTIONS_VAR} to allow more"
+            );
+            drop(stream);
+            continue;
+        };
         let api = api.clone();
         tokio::spawn(async move {
+            let _permit = permit;
             if let Err(error) = handle_connection(api, stream).await {
                 tracing::debug!(%error, "coordinator socket connection ended");
             }
@@ -203,10 +243,51 @@ async fn write_response(
     Ok(())
 }
 
+/// Refuse to bind under a directory somebody else controls.
+///
+/// The socket file itself is created 0600, but that says nothing about the
+/// directory holding it: a parent owned by another user can have the entry
+/// swapped between bind and connect. The sibling peer server already refuses
+/// this (`term-meshd/src/peer/server.rs::harden_parent_directory`), and the
+/// path here is env-overridable to anywhere, so the same check belongs here.
+///
+/// A world-writable directory with the sticky bit is the system temp dir —
+/// the kernel already stops one user removing another's entries there, which
+/// is the property being asked for.
+#[cfg(unix)]
+fn harden_parent_directory(parent: &Path) -> Result<()> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    if !parent.exists() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let meta = std::fs::metadata(parent)?;
+    if !meta.is_dir() {
+        anyhow::bail!("coordinator socket parent {} is not a directory", parent.display());
+    }
+    let owner_uid = unsafe { libc::geteuid() };
+    let mode = meta.mode();
+    if meta.uid() == owner_uid {
+        if mode & 0o777 != 0o700 {
+            let mut perms = meta.permissions();
+            perms.set_mode(0o700);
+            std::fs::set_permissions(parent, perms)?;
+        }
+    } else if mode & 0o1000 == 0 {
+        anyhow::bail!(
+            "coordinator socket parent {} is owned by uid {}, not {}; refusing to bind",
+            parent.display(),
+            meta.uid(),
+            owner_uid
+        );
+    }
+    Ok(())
+}
+
 #[cfg(unix)]
 fn bind_with_tight_umask(path: &Path) -> Result<UnixListener> {
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
+        harden_parent_directory(parent)?;
     }
     struct UmaskGuard(libc::mode_t);
     impl Drop for UmaskGuard {
@@ -257,4 +338,27 @@ fn enforce_owner_uid(stream: &UnixStream) -> Result<()> {
         anyhow::bail!("peer uid rejected");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A ceiling read from the environment, and the reasons to ignore one.
+    ///
+    /// Zero is rejected rather than honoured: a semaphore with no permits
+    /// refuses every client, which is indistinguishable from a coordinator
+    /// that never started.
+    #[test]
+    fn connection_ceiling_falls_back_on_anything_unusable() {
+        assert_eq!(parse_max_connections(Some("128")), 128);
+        assert_eq!(parse_max_connections(Some("  128  ")), 128);
+        for unusable in [None, Some(""), Some("0"), Some("-1"), Some("lots")] {
+            assert_eq!(
+                parse_max_connections(unusable),
+                DEFAULT_MAX_CONNECTIONS,
+                "expected fallback for {unusable:?}"
+            );
+        }
+    }
 }

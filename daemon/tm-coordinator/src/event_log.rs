@@ -67,9 +67,18 @@ impl EventLog for LocalJournalEventLog {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("create journal dir {}", parent.display()))?;
         }
-        let mut file = OpenOptions::new()
-            .create(true)
-            .append(true)
+        // 0600 at creation, not after: the journal holds the same task bodies
+        // and project paths the socket is gated to protect, and a file created
+        // at the ambient umask is readable by the whole machine for however
+        // long it takes to narrow it.
+        let mut options = OpenOptions::new();
+        options.create(true).append(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options
             .open(&self.path)
             .with_context(|| format!("open journal {}", self.path.display()))?;
         serde_json::to_writer(&mut file, event)?;
