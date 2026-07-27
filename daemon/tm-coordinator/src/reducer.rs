@@ -5,7 +5,7 @@ use crate::model::{
     Task, TaskId, TaskStatus,
 };
 use anyhow::{bail, Result};
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
 use serde_json::Value;
 use std::path::Path;
 use std::str::FromStr;
@@ -45,6 +45,24 @@ impl Reducer {
         let this = Self { conn };
         this.init()?;
         Ok(this)
+    }
+
+    /// A read-only view of an existing database, for serving queries while a
+    /// writer holds its own connection.
+    ///
+    /// Opened `SQLITE_OPEN_READ_ONLY` so a query path cannot mutate by
+    /// accident, and without `init()` — the schema belongs to the writer, and
+    /// creating tables from here would be a write. In WAL mode (set by the
+    /// writer at open) readers do not block the writer and the writer does
+    /// not block readers, which is the entire point: an fsync on the write
+    /// path used to stall every reader behind the same mutex.
+    pub fn open_read_only(path: &Path) -> Result<Self> {
+        let conn = Connection::open_with_flags(
+            path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
+        conn.busy_timeout(std::time::Duration::from_secs(5))?;
+        Ok(Self { conn })
     }
 
     pub fn in_memory() -> Result<Self> {

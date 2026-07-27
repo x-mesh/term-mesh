@@ -60,9 +60,49 @@ impl Config {
     }
 }
 
+/// Where read queries go, so they do not queue behind a writer's fsync.
+///
+/// `mutate` holds the reducer mutex across `event_log.append`, which ends in
+/// a blocking `sync_data`. Every read handler took that same mutex, so one
+/// client's disk flush froze `task.list`, `orchestration.status` and the rest
+/// for its duration. sqlite in WAL mode lets readers run against their own
+/// connections while a writer commits, so they get theirs.
+///
+/// `:memory:` has no shared database to open a second connection onto — each
+/// one would be a fresh, empty db — so that case keeps the old behaviour and
+/// reads through the writer's connection.
+enum Readers {
+    Shared,
+    Pool(ReadPool),
+}
+
+struct ReadPool {
+    path: PathBuf,
+    /// Connections are kept rather than reopened per query. The mutex is held
+    /// only to take one out and put it back, never across the query itself —
+    /// which is the whole difference from the writer's lock.
+    idle: Mutex<Vec<Reducer>>,
+}
+
+impl ReadPool {
+    fn with<T>(&self, f: impl FnOnce(&Reducer) -> Result<T>) -> Result<T> {
+        let reducer = match self.idle.lock().expect("read pool poisoned").pop() {
+            Some(reducer) => reducer,
+            None => Reducer::open_read_only(&self.path)?,
+        };
+        let outcome = f(&reducer);
+        // Returned even when the query failed: the error belongs to the query,
+        // not to the connection, and dropping it would make a failing query
+        // also cost a reconnect.
+        self.idle.lock().expect("read pool poisoned").push(reducer);
+        outcome
+    }
+}
+
 pub struct Api {
     config: Config,
     reducer: Mutex<Reducer>,
+    readers: Readers,
     event_log: Arc<dyn EventLog>,
     event_tx: broadcast::Sender<IntentEvent>,
     /// Why the log could not be replayed at open, when it could not be. The
@@ -139,9 +179,20 @@ impl Api {
             }
         };
         let (event_tx, _) = broadcast::channel(256);
+        // A degraded run answers from an empty in-memory projection, so there
+        // is no file for readers to open — they share the writer as before.
+        let readers = if degraded_reason.is_some() || config.reducer_path == Path::new(":memory:") {
+            Readers::Shared
+        } else {
+            Readers::Pool(ReadPool {
+                path: config.reducer_path.clone(),
+                idle: Mutex::new(Vec::new()),
+            })
+        };
         Ok(Arc::new(Self {
             config,
             reducer: Mutex::new(reducer),
+            readers,
             event_log,
             event_tx,
             degraded_reason,
@@ -159,10 +210,25 @@ impl Api {
                 use_local_journal: true,
             },
             reducer: Mutex::new(Reducer::in_memory()?),
+            readers: Readers::Shared,
             event_log,
             event_tx,
             degraded_reason: None,
         }))
+    }
+
+    /// Run a query off the write path.
+    ///
+    /// Every read handler goes through here so none of them takes the mutex
+    /// that `mutate` holds across its fsync.
+    fn read<T>(&self, f: impl FnOnce(&Reducer) -> Result<T>) -> Result<T> {
+        match &self.readers {
+            Readers::Pool(pool) => pool.with(f),
+            Readers::Shared => {
+                let reducer = self.reducer.lock().expect("reducer mutex poisoned");
+                f(&reducer)
+            }
+        }
     }
 
     pub fn subscribe(&self) -> broadcast::Receiver<IntentEvent> {
@@ -201,14 +267,24 @@ impl Api {
     /// to parse prose out of `mem_mesh.status` is a badge that silently
     /// stops working the day the prose changes.
     fn status(&self) -> Result<Value> {
-        let reducer = self.reducer.lock().expect("reducer mutex poisoned");
-        let hosts = reducer.hosts()?;
-        // Existence, not a census — one row is enough to raise the badge, so
-        // stop the scan there rather than paying for every task on the board.
-        let suspect_host = !reducer.tasks(None, Some(TaskStatus::Suspect), 1)?.is_empty();
-        let fenced_zombie = !reducer
-            .tasks(None, Some(TaskStatus::Quarantined), 1)?
-            .is_empty();
+        let (hosts, suspect_host, fenced_zombie, watermark, pending_merge_count) =
+            self.read(|reducer| {
+            let hosts = reducer.hosts()?;
+            // Existence, not a census — one row is enough to raise the badge,
+            // so stop the scan there rather than paying for every task on the
+            // board.
+            let suspect_host = !reducer.tasks(None, Some(TaskStatus::Suspect), 1)?.is_empty();
+            let fenced_zombie = !reducer
+                .tasks(None, Some(TaskStatus::Quarantined), 1)?
+                .is_empty();
+            Ok((
+                hosts,
+                suspect_host,
+                fenced_zombie,
+                reducer.watermark()?,
+                reducer.merge_queue(None, Some(MergeQueueStatus::Queued))?.len(),
+            ))
+            })?;
         // The backend's own health, plus why this process could not use it.
         // Kept inside `mem_mesh` so everything about the log reads together.
         let mut mem_mesh_health = self.event_log.health();
@@ -221,7 +297,7 @@ impl Api {
         Ok(json!({
             "version": env!("CARGO_PKG_VERSION"),
             "socket_path": self.config.socket_path,
-            "reducer_watermark": reducer.watermark()?,
+            "reducer_watermark": watermark,
             "mem_mesh": mem_mesh_health,
             // The machine-readable half of `mem_mesh`. Without it a client
             // that cannot find this key has to assume the log is fine, and
@@ -238,7 +314,7 @@ impl Api {
             // already names itself (`EVENT_LOG_UNAVAILABLE`).
             "mem_mesh_available": self.event_log.is_available() && self.degraded_reason.is_none(),
             "known_host_count": hosts.len(),
-            "pending_merge_count": reducer.merge_queue(None, Some(MergeQueueStatus::Queued))?.len(),
+            "pending_merge_count": pending_merge_count,
             "suspect_host": suspect_host,
             "fenced_zombie": fenced_zombie,
             // Panel runs are mirrored onto the team task board, not here.
@@ -263,8 +339,7 @@ impl Api {
     }
 
     fn project_list(&self) -> Result<Value> {
-        let reducer = self.reducer.lock().expect("reducer mutex poisoned");
-        Ok(json!({ "projects": reducer.projects()? }))
+        self.read(|reducer| Ok(json!({ "projects": reducer.projects()? })))
     }
 
     fn project_add(&self, params: Value) -> Result<Value> {
@@ -290,8 +365,7 @@ impl Api {
     }
 
     fn host_list(&self) -> Result<Value> {
-        let reducer = self.reducer.lock().expect("reducer mutex poisoned");
-        Ok(json!({ "hosts": reducer.hosts()? }))
+        self.read(|reducer| Ok(json!({ "hosts": reducer.hosts()? })))
     }
 
     fn host_observe(&self, params: Value) -> Result<Value> {
@@ -365,10 +439,11 @@ impl Api {
             limit: Option<i64>,
         }
         let p: Params = serde_json::from_value(params)?;
-        let reducer = self.reducer.lock().expect("reducer mutex poisoned");
-        Ok(
-            json!({ "tasks": reducer.tasks(p.project_id.as_ref(), p.status, p.limit.unwrap_or(100))? }),
-        )
+        self.read(|reducer| {
+            Ok(
+                json!({ "tasks": reducer.tasks(p.project_id.as_ref(), p.status, p.limit.unwrap_or(100))? }),
+            )
+        })
     }
 
     fn task_get(&self, params: Value) -> Result<Value> {
@@ -377,20 +452,21 @@ impl Api {
             task_id: TaskId,
         }
         let p: Params = serde_json::from_value(params)?;
-        let reducer = self.reducer.lock().expect("reducer mutex poisoned");
-        let task = reducer.task(&p.task_id)?;
-        let attempts = reducer.attempts(&p.task_id)?;
-        let latest_review_snapshot = reducer.latest_review_snapshot(&p.task_id)?;
-        let merge_queue = match &task {
-            Some(task) => reducer.merge_queue(Some(&task.project_id), None)?,
-            None => Vec::new(),
-        }
-        .into_iter()
-        .filter(|item| item.task_id == p.task_id)
-        .collect::<Vec<_>>();
-        Ok(
-            json!({ "task": task, "attempts": attempts, "latest_review_snapshot": latest_review_snapshot, "merge_queue": merge_queue }),
-        )
+        self.read(|reducer| {
+            let task = reducer.task(&p.task_id)?;
+            let attempts = reducer.attempts(&p.task_id)?;
+            let latest_review_snapshot = reducer.latest_review_snapshot(&p.task_id)?;
+            let merge_queue = match &task {
+                Some(task) => reducer.merge_queue(Some(&task.project_id), None)?,
+                None => Vec::new(),
+            }
+            .into_iter()
+            .filter(|item| item.task_id == p.task_id)
+            .collect::<Vec<_>>();
+            Ok(
+                json!({ "task": task, "attempts": attempts, "latest_review_snapshot": latest_review_snapshot, "merge_queue": merge_queue }),
+            )
+        })
     }
 
     fn task_create(&self, params: Value) -> Result<Value> {
@@ -431,8 +507,7 @@ impl Api {
             task_id: TaskId,
         }
         let p: Params = serde_json::from_value(params)?;
-        let reducer = self.reducer.lock().expect("reducer mutex poisoned");
-        Ok(json!({ "attempts": reducer.attempts(&p.task_id)? }))
+        self.read(|reducer| Ok(json!({ "attempts": reducer.attempts(&p.task_id)? })))
     }
 
     fn task_place(&self, params: Value) -> Result<Value> {
@@ -817,8 +892,7 @@ impl Api {
             status: Option<MergeQueueStatus>,
         }
         let p: Params = serde_json::from_value(params)?;
-        let reducer = self.reducer.lock().expect("reducer mutex poisoned");
-        Ok(json!({ "items": reducer.merge_queue(p.project_id.as_ref(), p.status)? }))
+        self.read(|reducer| Ok(json!({ "items": reducer.merge_queue(p.project_id.as_ref(), p.status)? })))
     }
 
     fn merge_queue_transition(&self, params: Value) -> Result<Value> {
@@ -929,8 +1003,7 @@ impl Api {
             .transpose()
             .map_err(|e| anyhow::anyhow!(e))?;
         let token = FencingToken::from_str(token).map_err(|e| anyhow::anyhow!(e))?;
-        let reducer = self.reducer.lock().expect("reducer mutex poisoned");
-        reducer.is_current_fence(&task_id, attempt_id.as_ref(), &token)
+        self.read(|reducer| reducer.is_current_fence(&task_id, attempt_id.as_ref(), &token))
     }
 }
 
@@ -962,7 +1035,9 @@ fn validate_sha_digest(base_sha: &str, head_sha: &str, diff_digest: &str) -> Res
     Ok(())
 }
 
+/// Evaluated as an argument to `mutate_checked`, i.e. before it takes the
+/// write lock — so this reads off the pool rather than queueing behind a
+/// writer that has not started yet.
 fn project_for_task(task_id: &TaskId, api: &Api) -> Result<Option<ProjectId>> {
-    let reducer = api.reducer.lock().expect("reducer mutex poisoned");
-    Ok(reducer.task(task_id)?.map(|task| task.project_id))
+    api.read(|reducer| Ok(reducer.task(task_id)?.map(|task| task.project_id)))
 }

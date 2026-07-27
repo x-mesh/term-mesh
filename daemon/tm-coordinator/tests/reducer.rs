@@ -1052,3 +1052,66 @@ fn a_failed_append_leaves_the_projection_and_the_request_id_free() {
         "the retry must do the work, not report a hit that never happened"
     );
 }
+
+/// Reads are served while a write is in flight.
+///
+/// Every read handler used to take the same mutex `mutate` holds across its
+/// fsync, so one client's disk flush froze `task.list` and friends for its
+/// duration. Readers now run on their own sqlite connections in WAL mode.
+///
+/// This needs a file-backed database: `:memory:` gives each connection its
+/// own empty db, so that configuration deliberately keeps sharing the
+/// writer's connection and would not exercise the pool at all.
+#[test]
+fn reads_do_not_wait_behind_a_writer_holding_the_log() {
+    use std::time::{Duration, Instant};
+
+    struct SlowAppend;
+    impl EventLog for SlowAppend {
+        fn append(&self, _event: &IntentEvent) -> Result<()> {
+            std::thread::sleep(Duration::from_millis(300));
+            Ok(())
+        }
+        fn read_all(&self) -> Result<Vec<IntentEvent>> {
+            Ok(Vec::new())
+        }
+        fn health(&self) -> serde_json::Value {
+            json!({"status": "test"})
+        }
+        fn is_available(&self) -> bool {
+            true
+        }
+    }
+
+    let dir = tempdir().unwrap();
+    let config = Config {
+        enabled: true,
+        socket_path: dir.path().join("sock"),
+        reducer_path: dir.path().join("reducer.sqlite"),
+        journal_path: None,
+        use_local_journal: false,
+    };
+    let api = Api::open_with_event_log(config, Arc::new(SlowAppend)).unwrap();
+
+    let writer = {
+        let api = Arc::clone(&api);
+        std::thread::spawn(move || {
+            api.handle(
+                "project.add",
+                json!({"request_id": "slow", "root_path": "/tmp/repo", "name": "repo"}),
+            )
+        })
+    };
+
+    // Let the writer get inside its append before timing the read.
+    std::thread::sleep(Duration::from_millis(60));
+    let started = Instant::now();
+    api.handle("project.list", json!({})).unwrap();
+    let read_took = started.elapsed();
+
+    writer.join().unwrap().unwrap();
+    assert!(
+        read_took < Duration::from_millis(150),
+        "a read waited {read_took:?} for a writer's 300ms flush"
+    );
+}
