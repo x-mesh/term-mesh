@@ -3005,7 +3005,7 @@ class TerminalController {
         let lineLimit = params["lines"] as? Int
 
         // Get panel references with minimal MainActor hold time
-        let panels: [(name: String, panel: TerminalPanel)] = await MainActor.run {
+        let panels: [(name: String, instanceId: String, panel: TerminalPanel)] = await MainActor.run {
             let tabManager = TeamOrchestrator.shared.resolveTabManager(teamName: teamName) ?? self.tabManager
             guard let tabManager else { return [] }
             return TeamOrchestrator.shared.allAgentPanels(teamName: teamName, tabManager: tabManager)
@@ -3018,7 +3018,10 @@ class TerminalController {
         let agentTexts: [(Int, [String: Any])] = await withTaskGroup(
             of: (Int, [String: Any]).self
         ) { group in
-            for (index, (name, panel)) in panels.enumerated() {
+            for (index, (name, instanceId, panel)) in panels.enumerated() {
+                let taskId = TeamDataStore.shared.agentDataEnrichment(
+                    teamName: teamName, agentName: name, agentInstanceId: instanceId
+                )["active_task_id"] as? String
                 group.addTask {
                     let base64Str: String = await MainActor.run {
                         self.readTerminalTextBase64(
@@ -3031,7 +3034,12 @@ class TerminalController {
                         let raw = String(base64Str.dropFirst(3)).trimmingCharacters(in: .whitespacesAndNewlines)
                         text = Data(base64Encoded: raw).flatMap { String(data: $0, encoding: .utf8) } ?? ""
                     }
-                    return (index, ["agent_name": name, "text": text] as [String: Any])
+                    return (index, [
+                        "agent_name": name,
+                        "agent_instance_id": instanceId,
+                        "task_id": taskId as Any? ?? NSNull(),
+                        "text": text,
+                    ] as [String: Any])
                 }
             }
             var results: [(Int, [String: Any])] = []
@@ -3081,7 +3089,9 @@ class TerminalController {
         let taskTotal = store.taskCount(teamName: teamName)
 
         let agents: [[String: Any]] = teamInfo.agents.map { agent in
-            let enrichment = store.agentDataEnrichment(teamName: teamName, agentName: agent.name)
+            let enrichment = store.agentDataEnrichment(
+                teamName: teamName, agentName: agent.name, agentInstanceId: agent.instanceId
+            )
             var info: [String: Any] = [
                 "id": agent.id,
                 "name": agent.name,
@@ -4347,6 +4357,14 @@ class TerminalController {
         let worktreeFinishedAt = (params["worktree_finished_at"] as? String).flatMap { ISO8601DateFormatter().date(from: $0) }
         let worktreeFinishMode = params["worktree_finish_mode"] as? String
         let worktreeRemoved = params["worktree_removed"] as? Bool
+        let agentInstanceId = params["agent_instance_id"] as? String
+
+        if let agentInstanceId,
+           let task = store.getTask(teamName: teamName, taskId: taskId),
+           task.assigneeInstanceId != agentInstanceId {
+            return v2Error(id: id, code: "task_identity_mismatch",
+                           message: "Task assignment does not match agent_instance_id")
+        }
 
         // Snapshot prev status before update so events.publish can include it.
         let prevStatus = store.getTask(teamName: teamName, taskId: taskId)?.status ?? ""
@@ -4888,7 +4906,7 @@ class TerminalController {
         var agentTexts: [[String: Any]] = []
         v2MainSync {
             let panels = TeamOrchestrator.shared.allAgentPanels(teamName: teamName, tabManager: tabManager)
-            for (name, panel) in panels {
+            for (name, instanceId, panel) in panels {
                 let response = readTerminalTextBase64(
                     terminalPanel: panel,
                     includeScrollback: true,
@@ -4899,7 +4917,15 @@ class TerminalController {
                     let base64 = String(response.dropFirst(3)).trimmingCharacters(in: .whitespacesAndNewlines)
                     text = Data(base64Encoded: base64).flatMap { String(data: $0, encoding: .utf8) } ?? ""
                 }
-                agentTexts.append(["agent_name": name, "text": text])
+                let taskId = TeamDataStore.shared.agentDataEnrichment(
+                    teamName: teamName, agentName: name, agentInstanceId: instanceId
+                )["active_task_id"] as? String
+                agentTexts.append([
+                    "agent_name": name,
+                    "agent_instance_id": instanceId,
+                    "task_id": taskId as Any? ?? NSNull(),
+                    "text": text,
+                ])
             }
         }
         return .ok(["team_name": teamName, "agents": agentTexts])

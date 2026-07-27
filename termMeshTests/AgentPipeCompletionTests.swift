@@ -389,6 +389,35 @@ final class AgentPipeCompletionTests: XCTestCase {
         XCTAssertEqual(released.status, "queued")
     }
 
+    func testStatusAndResultRowsPreserveDuplicateInstanceTaskAttribution() throws {
+        let team = "status-instance-test-\(UUID().uuidString)"
+        let store = TeamDataStore.shared
+        store.registerTeam(team, agents: [
+            .init(name: "executor", instanceId: "instance-a"),
+            .init(name: "executor", instanceId: "instance-b"),
+        ])
+        defer { store.unregisterTeam(team) }
+
+        let first = try XCTUnwrap(store.createTask(
+            teamName: team, title: "A", assignee: "executor", assigneeInstanceId: "instance-a"
+        ))
+        let second = try XCTUnwrap(store.createTask(
+            teamName: team, title: "B", assignee: "executor", assigneeInstanceId: "instance-b"
+        ))
+        XCTAssertEqual(
+            store.agentDataEnrichment(teamName: team, agentName: "executor", agentInstanceId: "instance-a")["active_task_id"] as? String,
+            first.id
+        )
+        XCTAssertEqual(
+            store.agentDataEnrichment(teamName: team, agentName: "executor", agentInstanceId: "instance-b")["active_task_id"] as? String,
+            second.id
+        )
+
+        let rows = store.resultStatus(teamName: team)["agents"] as? [[String: Any]]
+        XCTAssertEqual(Set(rows?.compactMap { $0["agent_instance_id"] as? String } ?? []), Set(["instance-a", "instance-b"]))
+        XCTAssertEqual(Set(rows?.compactMap { $0["task_id"] as? String } ?? []), Set([first.id, second.id]))
+    }
+
     func testDuplicateRolePoolPrefersIdleThenAdvancesDeterministically() {
         // Instance 0 is busy, so cursor 0 must skip it and select instance 1.
         let first = try! XCTUnwrap(TeamOrchestrator.nextEligiblePoolIndex(

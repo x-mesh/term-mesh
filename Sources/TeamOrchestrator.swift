@@ -4885,19 +4885,22 @@ final class TeamOrchestrator: ObservableObject {
             "workspace_id": team.workspaceId.uuidString,
             "agent_count": team.agents.count,
             "agents": team.agents.map { agent in
-                let activeTask = activeTask(for: team.id, agentName: agent.name)
+                let enrichment = TeamDataStore.shared.agentDataEnrichment(
+                    teamName: team.id, agentName: agent.name, agentInstanceId: agent.agentInstanceId
+                )
                 let heartbeat = heartbeats[team.id]?[agent.name]
                 var info: [String: Any] = [
                     "id": agent.id,
                     "name": agent.name,
+                    "agent_instance_id": agent.agentInstanceId,
                     "cli": agent.cli,
                     "model": agent.model,
                     "agent_type": agent.agentType,
-                    "active_task_id": activeTask?.id as Any? ?? NSNull(),
-                    "active_task_title": activeTask?.title as Any? ?? NSNull(),
-                    "active_task_status": activeTask?.status as Any? ?? NSNull(),
-                    "active_task_is_stale": activeTask.map(isTaskStale) ?? false,
-                    "agent_state": agentRuntimeState(teamName: team.id, agentName: agent.name),
+                    "active_task_id": enrichment["active_task_id"] ?? NSNull(),
+                    "active_task_title": enrichment["active_task_title"] ?? NSNull(),
+                    "active_task_status": enrichment["active_task_status"] ?? NSNull(),
+                    "active_task_is_stale": enrichment["active_task_is_stale"] ?? false,
+                    "agent_state": enrichment["agent_state"] ?? agentRuntimeState(teamName: team.id, agentName: agent.name),
                     "waiting_input": agentIsWaitingInput(agent),
                     "heartbeat_age_seconds": heartbeatAgeSeconds(teamName: team.id, agentName: agent.name) as Any? ?? NSNull(),
                     "last_heartbeat_summary": heartbeat?.summary as Any? ?? NSNull(),
@@ -6148,14 +6151,14 @@ final class TeamOrchestrator: ObservableObject {
     }
 
     /// Get all agent panels for a team.
-    func allAgentPanels(teamName: String, tabManager: TabManager) -> [(name: String, panel: TerminalPanel)] {
+    func allAgentPanels(teamName: String, tabManager: TabManager) -> [(name: String, instanceId: String, panel: TerminalPanel)] {
         guard let team = teams[teamName] else { return [] }
-        var results: [(name: String, panel: TerminalPanel)] = []
+        var results: [(name: String, instanceId: String, panel: TerminalPanel)] = []
         for agent in team.agents {
             guard let pid = agent.panelId,
                   let workspace = tabManager.tabs.first(where: { $0.id == agent.workspaceId }),
                   let panel = workspace.terminalPanel(for: pid) else { continue }
-            results.append((name: agent.name, panel: panel))
+            results.append((name: agent.name, instanceId: agent.agentInstanceId, panel: panel))
         }
         return results
     }

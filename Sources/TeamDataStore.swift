@@ -1156,7 +1156,11 @@ final class TeamDataStore: ObservableObject, @unchecked Sendable {
 
     /// Returns data-layer enrichment for a given agent, avoiding MainActor.
     /// Includes active task, heartbeat, and runtime state derived from task status.
-    func agentDataEnrichment(teamName: String, agentName: String) -> [String: Any] {
+    func agentDataEnrichment(
+        teamName: String,
+        agentName: String,
+        agentInstanceId: String? = nil
+    ) -> [String: Any] {
         lock.lock()
         defer { lock.unlock() }
 
@@ -1167,7 +1171,11 @@ final class TeamDataStore: ObservableObject, @unchecked Sendable {
         // derived filter is the single source of truth).
         let terminalStatuses: Set<String> = ["completed", "failed", "abandoned", "cancelled"]
         let activeTask = taskBoards[teamName, default: []]
-            .filter { $0.assignee == agentName && !terminalStatuses.contains($0.status) }
+            .filter {
+                $0.assignee == agentName
+                    && (agentInstanceId == nil || $0.assigneeInstanceId == agentInstanceId)
+                    && !terminalStatuses.contains($0.status)
+            }
             .sorted { $0.updatedAt > $1.updatedAt }
             .first
 
@@ -1215,7 +1223,7 @@ final class TeamDataStore: ObservableObject, @unchecked Sendable {
         }
         // A turn in flight outranks anything the board can say: the board knows
         // about tasks, and this agent may simply have been asked a question.
-        if isAgentBusyUnsafe(teamName: teamName, agentName: agentName) {
+        if isAgentBusyUnsafe(teamName: teamName, agentName: agentName, agentInstanceId: agentInstanceId) {
             agentState = "running"
         }
 
@@ -1367,30 +1375,43 @@ final class TeamDataStore: ObservableObject, @unchecked Sendable {
         agentFilter: [String]? = nil,
         activeOnly: Bool = false
     ) -> [String: Any] {
-        let allAgents = agentNames(for: teamName)
+        lock.lock()
+        let allAgents = teamRegistry[teamName, default: []]
+        let tasks = taskBoards[teamName, default: []]
+        lock.unlock()
         guard !allAgents.isEmpty else { return [:] }
-        let agents: [String]
+        let agents: [AgentRegistration]
         if let filter = agentFilter, !filter.isEmpty {
             let filterSet = Set(filter)
-            agents = allAgents.filter { filterSet.contains($0) }
+            agents = allAgents.filter { filterSet.contains($0.name) }
         } else if activeOnly {
-            let activeAssignees = agentsWithActiveTask(teamName: teamName)
-            agents = allAgents.filter { activeAssignees.contains($0) }
+            let terminalStatuses: Set<String> = ["completed", "failed", "abandoned", "cancelled"]
+            let activeInstances = Set(tasks.compactMap { task in
+                !terminalStatuses.contains(task.status) ? task.assigneeInstanceId : nil
+            })
+            agents = allAgents.filter { registration in
+                registration.instanceId.map(activeInstances.contains) == true
+            }
         } else {
             agents = allAgents
         }
         let dir = Self.resultDirectory(teamName: teamName)
         var agentStatus: [[String: Any]] = []
-        for name in agents {
-            let assignedTasks = listTasks(teamName: teamName, status: nil, assignee: name,
-                                          needsAttention: false, priority: nil, staleOnly: false, dependsOn: nil)
-            let path = assignedTasks.last.map { task in
+        for agent in agents {
+            let assignedTask = tasks
+                .filter { $0.assignee == agent.name && $0.assigneeInstanceId == agent.instanceId }
+                .sorted { $0.updatedAt > $1.updatedAt }
+                .first
+            let path = assignedTask.map { task in
                 (dir as NSString).appendingPathComponent("\(task.id).result.json")
-            } ?? (dir as NSString).appendingPathComponent("\(name).result.json")
-            agentStatus.append([
-                "agent_name": name,
+            } ?? (dir as NSString).appendingPathComponent("\(agent.name).result.json")
+            var row: [String: Any] = [
+                "agent_name": agent.name,
                 "has_result": FileManager.default.fileExists(atPath: path),
-            ])
+                "task_id": assignedTask?.id as Any? ?? NSNull(),
+                "agent_instance_id": agent.instanceId as Any? ?? NSNull(),
+            ]
+            agentStatus.append(row)
         }
         let completed = agentStatus.filter { $0["has_result"] as? Bool == true }.count
         let total = agents.count
@@ -1403,20 +1424,6 @@ final class TeamDataStore: ObservableObject, @unchecked Sendable {
             // means "no work tracked yet", not "all done".
             "all_done": total > 0 && completed == total,
         ]
-    }
-
-    /// Names of agents in `teamName` that currently have a non-terminal task assigned.
-    private func agentsWithActiveTask(teamName: String) -> Set<String> {
-        lock.lock()
-        defer { lock.unlock() }
-        let terminalStatuses: Set<String> = ["completed", "failed", "abandoned", "cancelled"]
-        var result: Set<String> = []
-        for task in taskBoards[teamName, default: []] {
-            if let assignee = task.assignee, !terminalStatuses.contains(task.status) {
-                result.insert(assignee)
-            }
-        }
-        return result
     }
 
     func collectResults(teamName: String) -> [[String: Any]] {

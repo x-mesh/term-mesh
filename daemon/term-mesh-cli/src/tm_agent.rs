@@ -501,6 +501,9 @@ enum Commands {
     /// Read an agent's terminal output
     Read {
         agent: String,
+        /// Durable agent instance selector (required when the role name is duplicated)
+        #[arg(long = "agent-instance-id")]
+        agent_instance_id: Option<String>,
         #[arg(long, default_value_t = 50)]
         lines: u32,
     },
@@ -805,6 +808,9 @@ enum Commands {
         /// Explicit task id to close (skips auto-selection when multiple active tasks exist)
         #[arg(long = "task-id")]
         task_id: Option<String>,
+        /// Durable agent instance selector. Required for an implicit reply from a duplicated role.
+        #[arg(long = "agent-instance-id")]
+        agent_instance_id: Option<String>,
     },
     /// Stream daemon events (default), or control autonomous drift-watch via the
     /// `on`/`off`/`status` subcommands (watcher Phase 2, daemon `watch.*` RPC).
@@ -4585,7 +4591,12 @@ fn atomic_write_file(path: &Path, content: &str) -> Result<(), String> {
 ///
 /// Priority: non-stale tasks first, then `in_progress` over `assigned`/other,
 /// then most recent `created_at` wins. Returns `(selected_id, all_candidates)`.
-fn select_reply_task(sock: &PathBuf, team: &str, sender: &str) -> (Option<String>, Vec<String>) {
+fn select_reply_task(
+    sock: &PathBuf,
+    team: &str,
+    sender: &str,
+    agent_instance_id: Option<&str>,
+) -> (Option<String>, Vec<String>) {
     let Ok(task_resp) = rpc_call(
         sock,
         "team.task.list",
@@ -4603,7 +4614,7 @@ fn select_reply_task(sock: &PathBuf, team: &str, sender: &str) -> (Option<String
             !matches!(
                 st,
                 "completed" | "failed" | "abandoned" | "cancelled" | "superseded"
-            )
+            ) && agent_instance_id.map_or(true, |id| t["agent_instance_id"].as_str() == Some(id))
         })
         .collect();
     // Sort by (non-stale first, in_progress first, created_at desc).
@@ -4625,6 +4636,55 @@ fn select_reply_task(sock: &PathBuf, team: &str, sender: &str) -> (Option<String
         .collect();
     let selected = all.first().cloned();
     (selected, all)
+}
+
+/// Resolve the durable instance that owns a reply. A task id is itself an
+/// authoritative attribution key, so it can resolve a duplicated role without
+/// reviving the old name-only "pick a sibling" behavior.
+fn reply_agent_instance_id(
+    sock: &PathBuf,
+    team: &str,
+    sender: &str,
+    explicit_instance_id: Option<&str>,
+    task_id: Option<&str>,
+) -> Result<Option<String>, String> {
+    if let Some(task_id) = task_id {
+        let task = rpc_call(sock, "team.task.get", json!({ "team_name": team, "task_id": task_id }))?;
+        return task_instance_for_reply(&task["result"], task_id, sender, explicit_instance_id);
+    }
+    let status = rpc_call(sock, "team.status", json!({ "team_name": team }))?;
+    let matches = status["result"]["agents"].as_array().map(|agents| {
+        agents.iter().filter(|agent| agent["name"].as_str() == Some(sender)).collect::<Vec<_>>()
+    }).unwrap_or_default();
+    if let Some(explicit) = explicit_instance_id {
+        return matches.iter()
+            .any(|agent| agent["agent_instance_id"].as_str() == Some(explicit))
+            .then(|| Some(explicit.to_string()))
+            .ok_or_else(|| format!("agent_instance_id {explicit} is not a {sender} in team {team}"));
+    }
+    match matches.as_slice() {
+        [] => Err(format!("agent {sender} not found in team {team}")),
+        [agent] => Ok(agent["agent_instance_id"].as_str().map(str::to_owned)),
+        _ => Err(format!("multiple agents named {sender}; pass --task-id or --agent-instance-id")),
+    }
+}
+
+fn task_instance_for_reply(
+    task: &Value,
+    task_id: &str,
+    sender: &str,
+    explicit_instance_id: Option<&str>,
+) -> Result<Option<String>, String> {
+    if task["assignee"].as_str() != Some(sender) {
+        return Err(format!("task {task_id} is not assigned to {sender}"));
+    }
+    let instance = task["agent_instance_id"].as_str().map(str::to_owned);
+    if let Some(explicit) = explicit_instance_id {
+        if instance.as_deref() != Some(explicit) {
+            return Err(format!("task {task_id} does not belong to agent_instance_id {explicit}"));
+        }
+    }
+    Ok(instance)
 }
 
 /// Bare replies retain the unique-name/single-task compatibility path, but
@@ -5922,6 +5982,7 @@ fn main() {
         Commands::List => rpc_call(&sock, "team.list", json!({})),
         Commands::Read {
             agent: ref agent_name,
+            agent_instance_id,
             lines,
         } => {
             // Check if agent is headless — route to daemon socket
@@ -5943,6 +6004,7 @@ fn main() {
                 "team.read",
                 json!({
                     "team_name": team, "agent_name": agent_name, "lines": lines,
+                    "agent_instance_id": agent_instance_id,
                 }),
             )
         }
@@ -6577,6 +6639,7 @@ fn main() {
             text,
             from,
             task_id: explicit_task_id,
+            agent_instance_id: explicit_agent_instance_id,
         } => {
             let sender = from.unwrap_or_else(|| agent.clone());
             let mut content = text.join(" ");
@@ -6618,7 +6681,15 @@ fn main() {
             } else if is_stateless_watcher {
                 None
             } else {
-                let (selected, candidates) = select_reply_task(&sock, &team, &sender);
+                let selected_instance_id = match reply_agent_instance_id(
+                    &sock, &team, &sender, explicit_agent_instance_id.as_deref(), None,
+                ) {
+                    Ok(instance) => instance,
+                    Err(message) => { eprintln!("reply for {sender}: {message}"); process::exit(2); }
+                };
+                let (selected, candidates) = select_reply_task(
+                    &sock, &team, &sender, selected_instance_id.as_deref(),
+                );
                 match unambiguous_reply_task(&candidates) {
                     Ok(task_id) => task_id.or(selected),
                     Err(message) => {
@@ -6627,8 +6698,20 @@ fn main() {
                     }
                 }
             };
-            let alias_result_path =
-                write_result_file(&team, &format!("{sender}-reply.md"), &content).ok();
+            let reply_instance_id = match reply_agent_instance_id(
+                &sock,
+                &team,
+                &sender,
+                explicit_agent_instance_id.as_deref(),
+                reply_task_id.as_deref(),
+            ) {
+                Ok(instance) => instance,
+                Err(message) => { eprintln!("reply for {sender}: {message}"); process::exit(2); }
+            };
+            let alias_name = reply_instance_id.as_deref()
+                .map(|id| format!("{sender}-{id}-reply.md"))
+                .unwrap_or_else(|| format!("{sender}-reply.md"));
+            let alias_result_path = write_result_file(&team, &alias_name, &content).ok();
             let task_result_path = reply_task_id
                 .as_deref()
                 .and_then(|tid| write_result_file(&team, &format!("{tid}.md"), &content).ok());
@@ -6658,6 +6741,8 @@ fn main() {
             // Auto-submit report for wait detection (with result_path)
             let mut report_params = json!({
                 "team_name": team, "agent_name": sender, "content": summary,
+                "task_id": reply_task_id,
+                "agent_instance_id": reply_instance_id,
             });
             if let Some(path) = result_path {
                 report_params["result_path"] = json!(path.to_string_lossy());
@@ -6677,6 +6762,7 @@ fn main() {
                 let mut update = json!({
                     "team_name": &team, "task_id": tid,
                     "status": task_status, "result": &summary,
+                    "agent_instance_id": reply_instance_id,
                 });
                 // P2: use body-only text for detail fields, not the full header+body summary
                 let detail: &str = if body_summary.trim().is_empty() {
@@ -6809,6 +6895,19 @@ fn cmd_daemon_replay_capacity(sock: &PathBuf, set: Option<&str>) {
 #[cfg(test)]
 mod daemon_replay_capacity_tests {
     use super::*;
+
+    #[test]
+    fn reply_task_identity_rejects_same_name_sibling() {
+        let task = json!({
+            "assignee": "executor",
+            "agent_instance_id": "instance-a",
+        });
+        assert_eq!(
+            task_instance_for_reply(&task, "task-a", "executor", Some("instance-a")).unwrap(),
+            Some("instance-a".to_string())
+        );
+        assert!(task_instance_for_reply(&task, "task-a", "executor", Some("instance-b")).is_err());
+    }
 
     #[test]
     fn parse_byte_size_plain_digits() {
