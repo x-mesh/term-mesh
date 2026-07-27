@@ -295,22 +295,57 @@ impl Reducer {
         status: Option<TaskStatus>,
         limit: i64,
     ) -> Result<Vec<Task>> {
-        let mut all = self.all_tasks()?;
-        if let Some(project_id) = project_id {
-            all.retain(|task| &task.project_id == project_id);
+        // Filter in SQL rather than loading every row and discarding most of
+        // them.
+        let mut sql = String::from(
+            "SELECT task_id,project_id,title,body,status,priority,depends_on_json,created_by,created_at_ms,updated_at_ms,current_attempt_id,placement_json,last_reason
+             FROM tasks",
+        );
+        let mut clauses: Vec<&str> = Vec::new();
+        if project_id.is_some() {
+            clauses.push("project_id=:project_id");
         }
-        if let Some(status) = status {
-            all.retain(|task| task.status == status);
+        let status_text = status.as_ref().map(status_string).transpose()?;
+        if status_text.is_some() {
+            clauses.push("status=:status");
         }
-        all.truncate(limit.max(0) as usize);
-        Ok(all)
+        if !clauses.is_empty() {
+            sql.push_str(" WHERE ");
+            sql.push_str(&clauses.join(" AND "));
+        }
+        sql.push_str(" ORDER BY priority DESC, created_at_ms LIMIT :limit");
+
+        let mut stmt = self.conn.prepare(&sql)?;
+        let mut bindings: Vec<(&str, &dyn rusqlite::ToSql)> = Vec::new();
+        let project_text = project_id.map(|id| id.as_str().to_string());
+        if let Some(project_text) = project_text.as_ref() {
+            bindings.push((":project_id", project_text));
+        }
+        if let Some(status_text) = status_text.as_ref() {
+            bindings.push((":status", status_text));
+        }
+        let limit = limit.max(0);
+        bindings.push((":limit", &limit));
+        let rows = stmt.query_map(bindings.as_slice(), row_to_task)?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(Into::into)
     }
 
     pub fn task(&self, task_id: &TaskId) -> Result<Option<Task>> {
-        Ok(self
-            .all_tasks()?
-            .into_iter()
-            .find(|task| &task.task_id == task_id))
+        // By primary key, not by scanning. This is on the write path — every
+        // place, update, reassign, suspect, quarantine and fence check reads a
+        // task first — and terminal tasks are never deleted, so loading and
+        // JSON-decoding the whole table to find one row made each write cost
+        // grow with everything the coordinator had ever been asked to do.
+        self.conn
+            .query_row(
+                "SELECT task_id,project_id,title,body,status,priority,depends_on_json,created_by,created_at_ms,updated_at_ms,current_attempt_id,placement_json,last_reason
+                 FROM tasks WHERE task_id=?1",
+                params![task_id.as_str()],
+                row_to_task,
+            )
+            .optional()
+            .map_err(Into::into)
     }
 
     pub fn attempts(&self, task_id: &TaskId) -> Result<Vec<Attempt>> {
@@ -424,10 +459,17 @@ impl Reducer {
     }
 
     pub fn merge_queue_item(&self, queue_id: &MergeQueueId) -> Result<Option<MergeQueueItem>> {
-        Ok(self
-            .all_merge_queue()?
-            .into_iter()
-            .find(|item| &item.queue_id == queue_id))
+        // Same reason as `task`: a point lookup on the write path, against a
+        // table nothing ever deletes from.
+        self.conn
+            .query_row(
+                "SELECT queue_id,project_id,task_id,attempt_id,status,approved_by,approved_at_ms,last_error
+                 FROM merge_queue WHERE queue_id=?1",
+                params![queue_id.as_str()],
+                row_to_merge_queue_item,
+            )
+            .optional()
+            .map_err(Into::into)
     }
 
     pub fn current_fence(
@@ -471,16 +513,6 @@ impl Reducer {
                         .expires_at_ms
                         .is_none_or(|expires| expires > now_ms())
             }))
-    }
-
-    fn all_tasks(&self) -> Result<Vec<Task>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT task_id,project_id,title,body,status,priority,depends_on_json,created_by,created_at_ms,updated_at_ms,current_attempt_id,placement_json,last_reason
-             FROM tasks ORDER BY priority DESC, created_at_ms",
-        )?;
-        let rows = stmt.query_map([], row_to_task)?;
-        rows.collect::<std::result::Result<Vec<_>, _>>()
-            .map_err(Into::into)
     }
 
     fn reduce_project_added(&self, event: &IntentEvent) -> Result<()> {
