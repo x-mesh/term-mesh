@@ -3239,6 +3239,28 @@ mod runbook_tests {
     }
 
     #[test]
+    fn result_collect_compaction_preserves_body_free_parallel_telemetry() {
+        let resp = json!({
+            "result": { "results": [{
+                "task_id": "task-a",
+                "agent_instance_id": "instance-a",
+                "parallel_telemetry": {
+                    "wave_id": "wave-a", "task_id": "task-a",
+                    "agent_instance_id": "instance-a", "host": null,
+                    "checkout": "checkout-a", "delivery": "completed", "synthesis": "pending"
+                },
+                "content": "STATUS: DONE\nFILES: none\nVERIFY: n/a\nNEXT: NONE\nFULL_REPORT: n/a\n\nsecret body"
+            }]}
+        });
+        let compact = compact_result_collect_response(resp, false);
+        let item = &compact["result"]["results"][0];
+        assert!(item.get("content").is_none());
+        assert_eq!(item["parallel_telemetry"]["task_id"].as_str(), Some("task-a"));
+        assert_eq!(item["parallel_telemetry"]["agent_instance_id"].as_str(), Some("instance-a"));
+        assert!(!item.to_string().contains("secret body"));
+    }
+
+    #[test]
     fn collect_result_path_overrides_header_full_report() {
         // When task has result_path from DB, it should win over the reply-header FULL_REPORT.
         let resp = json!({

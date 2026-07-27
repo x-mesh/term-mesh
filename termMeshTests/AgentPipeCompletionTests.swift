@@ -418,6 +418,25 @@ final class AgentPipeCompletionTests: XCTestCase {
         XCTAssertEqual(Set(rows?.compactMap { $0["task_id"] as? String } ?? []), Set([first.id, second.id]))
     }
 
+    func testTaskTelemetryIsAdditiveAndContainsNoPromptOrResultBody() throws {
+        let team = "telemetry-test-\(UUID().uuidString)"
+        let store = TeamDataStore.shared
+        store.registerTeam(team, agents: [.init(name: "executor", instanceId: "instance-a")])
+        defer { store.unregisterTeam(team) }
+
+        let task = try XCTUnwrap(store.createTask(
+            teamName: team, title: "secret title", details: "secret prompt",
+            assignee: "executor", assigneeInstanceId: "instance-a"
+        ))
+        let row = store.taskDictionary(task)
+        let telemetry = try XCTUnwrap(row["parallel_telemetry"] as? [String: Any])
+        XCTAssertEqual(telemetry["task_id"] as? String, task.id)
+        XCTAssertEqual(telemetry["agent_instance_id"] as? String, "instance-a")
+        XCTAssertNotNil(telemetry["wave_id"])
+        XCTAssertNotNil(telemetry["host"])
+        XCTAssertFalse(telemetry.values.contains { "\($0)".contains("secret") })
+    }
+
     /// The bug this pins: the plain pipe/bridge completion path (claude
     /// without a native panel, or codex/kiro/cursor/agy behind the bridge)
     /// read a turn's end off `.events` and called `AutoReplyEmit.emit`

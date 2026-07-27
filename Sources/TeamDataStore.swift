@@ -1438,6 +1438,9 @@ final class TeamDataStore: ObservableObject, @unchecked Sendable {
                 "task_id": assignedTask?.id as Any? ?? NSNull(),
                 "agent_instance_id": agent.instanceId as Any? ?? NSNull(),
             ]
+            if let assignedTask {
+                row["parallel_telemetry"] = Self.parallelTelemetry(for: assignedTask)
+            }
             agentStatus.append(row)
         }
         let completed = agentStatus.filter { $0["has_result"] as? Bool == true }.count
@@ -1465,13 +1468,19 @@ final class TeamDataStore: ObservableObject, @unchecked Sendable {
             guard let instance = result["agent_instance_id"] as? String else {
                 // Legacy fallback is only safe for a task with an unambiguous alias.
                 if tasks.filter({ $0.assignee == task.assignee }).count != 1 { continue }
-                results.append(result)
+                var enriched = result
+                enriched["parallel_telemetry"] = Self.parallelTelemetry(for: task)
+                enriched["content_bytes"] = (result["content"] as? String)?.lengthOfBytes(using: .utf8) ?? 0
+                results.append(enriched)
                 continue
             }
             guard instance == task.assigneeInstanceId, seen.insert(task.id).inserted else { continue }
-            results.append(result)
+            var enriched = result
+            enriched["parallel_telemetry"] = Self.parallelTelemetry(for: task)
+            enriched["content_bytes"] = (result["content"] as? String)?.lengthOfBytes(using: .utf8) ?? 0
+            results.append(enriched)
         }
-        return results
+        return results.sorted { ($0["task_id"] as? String ?? "") < ($1["task_id"] as? String ?? "") }
     }
 
     func clearResults(teamName: String) {
@@ -1497,6 +1506,7 @@ final class TeamDataStore: ObservableObject, @unchecked Sendable {
             "superseded_by": task.supersededBy as Any? ?? NSNull(),
             "assignee": task.assignee as Any? ?? NSNull(),
             "agent_instance_id": task.assigneeInstanceId as Any? ?? NSNull(),
+            "parallel_telemetry": Self.parallelTelemetry(for: task),
             "blocked_reason": task.blockedReason as Any? ?? NSNull(),
             "review_summary": task.reviewSummary as Any? ?? NSNull(),
             "created_by": task.createdBy,
@@ -1534,6 +1544,21 @@ final class TeamDataStore: ObservableObject, @unchecked Sendable {
             dict["stale_seconds"] = NSNull()
         }
         return dict
+    }
+
+    /// Additive, body-free routing telemetry for machine readers. Values are
+    /// identifiers, digests/status strings, and byte counts only; task details,
+    /// prompts, reports, and result bodies never enter this object.
+    private static func parallelTelemetry(for task: TeamOrchestrator.TeamTask) -> [String: Any] {
+        [
+            "wave_id": task.parentTaskId ?? task.id,
+            "task_id": task.id,
+            "agent_instance_id": task.assigneeInstanceId as Any? ?? NSNull(),
+            "host": NSNull(),
+            "checkout": task.worktreePath ?? task.worktreeBranch ?? NSNull(),
+            "delivery": task.status == "assigned" || task.status == "in_progress" ? "scheduled" : task.status,
+            "synthesis": task.reviewSummary == nil ? "pending" : "available",
+        ]
     }
 
     func messageDictionary(_ message: TeamOrchestrator.TeamMessage) -> [String: Any] {

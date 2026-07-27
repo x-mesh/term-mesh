@@ -3066,7 +3066,7 @@ class TerminalController {
         }
 
         // Minimal MainActor hold: get team struct (agent names, UUIDs, team metadata) only
-        let teamInfo: (leaderSessionId: String, workspaceId: String, agents: [(name: String, id: String, instanceId: String, cli: String, model: String, agentType: String, color: String, workspaceId: String, panelId: String?, completedTaskCount: Int, worktreeBranch: String?, worktreePath: String?)], createdAt: String)? = await MainActor.run {
+        let teamInfo: (leaderSessionId: String, workspaceId: String, agents: [(name: String, id: String, instanceId: String, cli: String, model: String, agentType: String, color: String, workspaceId: String, panelId: String?, completedTaskCount: Int, worktreeBranch: String?, worktreePath: String?, hostKey: String?)], createdAt: String)? = await MainActor.run {
             guard let team = TeamOrchestrator.shared.teamStruct(name: teamName) else { return nil }
             return (
                 leaderSessionId: team.leaderSessionId,
@@ -3074,7 +3074,8 @@ class TerminalController {
                 agents: team.agents.map { a in
                     (name: a.name, id: a.id, instanceId: a.agentInstanceId, cli: a.cli, model: a.model, agentType: a.agentType, color: a.color,
                      workspaceId: a.workspaceId.uuidString, panelId: a.panelId?.uuidString,
-                     completedTaskCount: a.completedTaskCount, worktreeBranch: a.worktreeBranch, worktreePath: a.worktreePath)
+                     completedTaskCount: a.completedTaskCount, worktreeBranch: a.worktreeBranch, worktreePath: a.worktreePath,
+                     hostKey: a.hostKey)
                 },
                 createdAt: ISO8601DateFormatter().string(from: team.createdAt)
             )
@@ -3109,8 +3110,17 @@ class TerminalController {
             for (key, value) in enrichment { info[key] = value }
             if let branch = agent.worktreeBranch { info["worktree_branch"] = branch }
             if let path = agent.worktreePath { info["worktree_path"] = path }
+            info["parallel_telemetry"] = [
+                "wave_id": (enrichment["active_task_id"] as? String) ?? agent.instanceId,
+                "task_id": enrichment["active_task_id"] ?? NSNull(),
+                "agent_instance_id": agent.instanceId,
+                "host": agent.hostKey ?? NSNull(),
+                "checkout": agent.worktreePath ?? agent.worktreeBranch ?? agent.workspaceId,
+                "delivery": (enrichment["agent_state"] as? String) ?? "unknown",
+                "synthesis": "pending",
+            ]
             return info
-        }
+        }.sorted { ($0["agent_instance_id"] as? String ?? "") < ($1["agent_instance_id"] as? String ?? "") }
 
         return v2Ok(id: id, result: [
             "team_name": teamName,

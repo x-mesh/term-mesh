@@ -4922,6 +4922,15 @@ final class TeamOrchestrator: ObservableObject {
                 if let path = agent.worktreePath {
                     info["worktree_path"] = path
                 }
+                info["parallel_telemetry"] = [
+                    "wave_id": (enrichment["active_task_id"] as? String) ?? agent.agentInstanceId,
+                    "task_id": enrichment["active_task_id"] ?? NSNull(),
+                    "agent_instance_id": agent.agentInstanceId,
+                    "host": agent.hostKey as Any? ?? NSNull(),
+                    "checkout": agent.worktreePath ?? agent.worktreeBranch ?? agent.workspaceId.uuidString,
+                    "delivery": enrichment["agent_state"] ?? "unknown",
+                    "synthesis": "pending",
+                ]
                 return info as [String: Any]
             },
             "attention_count": teamInbox.count,
