@@ -874,6 +874,7 @@ extension TeamOrchestrator {
         model: String,
         cli: String
     ) throws -> AgentMember {
+        let agentInstanceId = UUID().uuidString
         let bridge = AgentPipeTransport.needsBridge(cli: cli)
             ? AgentPipeTransport.bridgePath(workingDirectory: workingDirectory)
             : nil
@@ -945,7 +946,7 @@ extension TeamOrchestrator {
                 teamName: teamName, agentName: agentName, busy: busy
             )
         }
-        panel.session.onTurnEnd = { [teamName = team.id, agentName] final, _, taskId in
+        panel.session.onTurnEnd = { [teamName = team.id, agentName, agentInstanceId] final, _, taskId in
             Self.fileReport(
                 teamName: teamName, agentName: agentName,
                 taskId: taskId, text: final
@@ -955,7 +956,8 @@ extension TeamOrchestrator {
                 teamName: teamName,
                 agentName: agentName,
                 event: AgentPipeCompletion.headerEvent(from: final),
-                preferredTaskId: taskId
+                preferredTaskId: taskId,
+                agentInstanceId: agentInstanceId
             )
         }
         workspace.setPanelCustomTitle(
@@ -965,6 +967,7 @@ extension TeamOrchestrator {
 
         let member = AgentMember(
             id: "\(agentName)@\(team.id)",
+            agentInstanceId: agentInstanceId,
             name: agentName,
             teamName: team.id,
             cli: cli,

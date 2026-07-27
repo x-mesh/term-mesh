@@ -400,6 +400,9 @@ final class TeamOrchestrator: ObservableObject {
         var labels: [String]
         var estimatedSize: Int?
         var assignee: String?
+        /// Immutable identity of the assignee selected when this task was
+        /// assigned. Names are routing aliases and may be duplicated.
+        var assigneeInstanceId: String? = nil
         var status: String     // "queued", "assigned", "in_progress", "blocked", "review_ready", "completed", "failed", "abandoned"
         var priority: Int
         var dependsOn: [String]
@@ -718,6 +721,7 @@ final class TeamOrchestrator: ObservableObject {
         tabManager: TabManager
     ) -> AgentMember? {
         let agentId = "\(agentName)@\(teamName)"
+        let agentInstanceId = UUID().uuidString
 
         // Build CLI-specific invocation
         var agentCommand: String
@@ -906,7 +910,7 @@ final class TeamOrchestrator: ObservableObject {
                 TeamDataStore.shared.setAgentBusy(
                     teamName: teamName, agentName: agentName, busy: busy)
             }
-            agentPanel.session.onTurnEnd = { [teamName, agentName] final, _, taskId in
+            agentPanel.session.onTurnEnd = { [teamName, agentName, agentInstanceId] final, _, taskId in
                 Self.fileReport(teamName: teamName, agentName: agentName,
                                 taskId: taskId, text: final)
                 // A turn with no task behind it must not close somebody
@@ -920,7 +924,8 @@ final class TeamOrchestrator: ObservableObject {
                     teamName: teamName,
                     agentName: agentName,
                     event: AgentPipeCompletion.headerEvent(from: final),
-                    preferredTaskId: taskId
+                    preferredTaskId: taskId,
+                    agentInstanceId: agentInstanceId
                 )
             }
             let colorEmoji = Self.colorEmoji(agentColor)
@@ -928,6 +933,7 @@ final class TeamOrchestrator: ObservableObject {
                                           title: "\(colorEmoji) \(agentName)")
             return AgentMember(
                 id: agentId,
+                agentInstanceId: agentInstanceId,
                 name: agentName,
                 teamName: teamName,
                 cli: agentCli,
@@ -995,6 +1001,7 @@ final class TeamOrchestrator: ObservableObject {
 
         return AgentMember(
             id: agentId,
+            agentInstanceId: agentInstanceId,
             name: agentName,
             teamName: teamName,
             cli: agentCli,
@@ -1598,7 +1605,7 @@ final class TeamOrchestrator: ObservableObject {
             )
             team.leaderReady = launchLeaderLocally
             teams[name] = team
-            TeamDataStore.shared.registerTeam(name, agentNames: headlessMembers.map(\.name))
+            TeamDataStore.shared.registerTeam(name, agents: headlessMembers.map { .init(name: $0.name, instanceId: $0.agentInstanceId) })
             syncTeamStateToDaemon()
             Logger.team.info("created headless team '\(name, privacy: .public)' with \(headlessMembers.count, privacy: .public) agent(s) + leader console")
             return team
@@ -1788,7 +1795,7 @@ final class TeamOrchestrator: ObservableObject {
         team.leaderReady = launchLeaderLocally
         teams[name] = team
         // Register in thread-safe data store for off-main access (approach C: dual queue)
-        TeamDataStore.shared.registerTeam(name, agentNames: members.map(\.name))
+        TeamDataStore.shared.registerTeam(name, agents: members.map { .init(name: $0.name, instanceId: $0.agentInstanceId) })
         syncTeamStateToDaemon()
         Logger.team.info("created team '\(name, privacy: .public)' with \(members.count, privacy: .public) agent(s) + leader console")
 
@@ -2052,7 +2059,7 @@ final class TeamOrchestrator: ObservableObject {
         // 9. Commit updated team state
         team.agents.append(member)
         teams[teamName] = team
-        TeamDataStore.shared.registerTeam(teamName, agentNames: team.agents.map(\.name))
+        TeamDataStore.shared.registerTeam(teamName, agents: team.agents.map { .init(name: $0.name, instanceId: $0.agentInstanceId) })
         syncTeamStateToDaemon()
         Logger.team.info("attached agent '\(agentName, privacy: .public)' to team '\(teamName, privacy: .public)' (\(team.agents.count, privacy: .public) total)")
 
@@ -2161,7 +2168,7 @@ final class TeamOrchestrator: ObservableObject {
                 // pane from the preserved leader. The team is briefly visible with
                 // agent_count 0 in status/daemon sync until the add fills it.
                 teams[teamName] = team
-                TeamDataStore.shared.registerTeam(teamName, agentNames: [])
+                TeamDataStore.shared.registerTeam(teamName, agents: [])
                 syncTeamStateToDaemon()
                 Logger.team.info("detached last agent '\(agentName, privacy: .public)' from team '\(teamName, privacy: .public)' — empty team preserved (keepTeamIfEmpty)")
                 return .success(DetachResult(
@@ -2185,7 +2192,7 @@ final class TeamOrchestrator: ObservableObject {
             ))
         } else {
             teams[teamName] = team
-            TeamDataStore.shared.registerTeam(teamName, agentNames: team.agents.map(\.name))
+            TeamDataStore.shared.registerTeam(teamName, agents: team.agents.map { .init(name: $0.name, instanceId: $0.agentInstanceId) })
             syncTeamStateToDaemon()
             Logger.team.info("detached agent '\(agentName, privacy: .public)' from team '\(teamName, privacy: .public)' (\(remaining, privacy: .public) remaining)")
             return .success(DetachResult(
@@ -2333,7 +2340,7 @@ final class TeamOrchestrator: ObservableObject {
         // 11. Commit updated team state
         team.agents.append(member)
         teams[teamName] = team
-        TeamDataStore.shared.registerTeam(teamName, agentNames: team.agents.map(\.name))
+        TeamDataStore.shared.registerTeam(teamName, agents: team.agents.map { .init(name: $0.name, instanceId: $0.agentInstanceId) })
         syncTeamStateToDaemon()
         Logger.team.info("add_agent: added '\(agentName, privacy: .public)' to team '\(teamName, privacy: .public)' (\(team.agents.count, privacy: .public) total)")
 
@@ -3210,12 +3217,18 @@ final class TeamOrchestrator: ObservableObject {
         completion: ((Bool) -> Void)? = nil
     ) -> DelegateResult? {
         let title = taskTitle?.nilIfBlank ?? String(text.prefix(80))
-        // Task assignee stays the agent NAME even when delivery is panel-targeted —
-        // panel_id is DELIVERY-ONLY so wait/collect/reports keyed on name are unaffected.
+        let assignedInstanceId: String? = {
+            guard let team = teams[teamName] else { return nil }
+            if let panelId {
+                return team.agents.first(where: { $0.name == agentName && $0.panelId == panelId })?.agentInstanceId
+            }
+            return selectAgent(in: team.agents, name: agentName)?.agentInstanceId
+        }()
         guard let task = TeamDataStore.shared.createTask(
             teamName: teamName,
             title: title,
             assignee: agentName,
+            assigneeInstanceId: assignedInstanceId,
             priority: priority ?? 2
         ) else { return nil }
         let instruction = formatDelegateInstruction(task: task, text: text, context: context)
@@ -3842,7 +3855,7 @@ final class TeamOrchestrator: ObservableObject {
         guard !team.agents.contains(where: { $0.name == member.name }) else { return false }
         team.agents.append(member)
         teams[teamName] = team
-        TeamDataStore.shared.registerTeam(teamName, agentNames: team.agents.map(\.name))
+        TeamDataStore.shared.registerTeam(teamName, agents: team.agents.map { .init(name: $0.name, instanceId: $0.agentInstanceId) })
         syncTeamStateToDaemon()
         return true
     }
@@ -4225,7 +4238,7 @@ final class TeamOrchestrator: ObservableObject {
         memberToSwap.completedTaskCount = 0
         team.agents[idx] = memberToSwap
         teams[teamName] = team
-        TeamDataStore.shared.registerTeam(teamName, agentNames: team.agents.map(\.name))
+        TeamDataStore.shared.registerTeam(teamName, agents: team.agents.map { .init(name: $0.name, instanceId: $0.agentInstanceId) })
         syncTeamStateToDaemon()
         migratingAgents.remove(teamAgentKey)
 
@@ -5112,7 +5125,7 @@ final class TeamOrchestrator: ObservableObject {
             teamUuid: teamUuid
         )
         teams[teamName] = team
-        TeamDataStore.shared.registerTeam(teamName, agentNames: members.map(\.name))
+        TeamDataStore.shared.registerTeam(teamName, agents: members.map { .init(name: $0.name, instanceId: $0.agentInstanceId) })
         syncTeamStateToDaemon()
         Logger.team.info("[headless] adopted resumed team '\(teamName, privacy: .public)' uuid=\(teamUuid ?? "?", privacy: .public)")
         return team
@@ -6062,6 +6075,9 @@ final class TeamOrchestrator: ObservableObject {
             labels: labels.compactMap(\.nilIfBlank),
             estimatedSize: estimatedSize,
             assignee: normalizedAssignee,
+            assigneeInstanceId: normalizedAssignee.flatMap { name in
+                teams[teamName]?.agents.first(where: { $0.name == name })?.agentInstanceId
+            },
             status: normalizedAssignee == nil ? "queued" : "assigned",
             priority: max(1, min(priority, 3)),
             dependsOn: dependsOn.compactMap(\.nilIfBlank),
@@ -6121,6 +6137,9 @@ final class TeamOrchestrator: ObservableObject {
         let now = Date()
         if let assignee {
             tasks[idx].assignee = assignee.nilIfBlank
+            tasks[idx].assigneeInstanceId = tasks[idx].assignee.flatMap { agentName in
+                teams[teamName]?.agents.first(where: { $0.name == agentName })?.agentInstanceId
+            }
             if tasks[idx].status == "queued", tasks[idx].assignee != nil {
                 tasks[idx].status = "assigned"
             }
@@ -6197,6 +6216,9 @@ final class TeamOrchestrator: ObservableObject {
         let now = Date()
         let previousAssignee = tasks[idx].assignee
         tasks[idx].assignee = assignee?.nilIfBlank
+        tasks[idx].assigneeInstanceId = tasks[idx].assignee.flatMap { agentName in
+            teams[teamName]?.agents.first(where: { $0.name == agentName })?.agentInstanceId
+        }
         tasks[idx].status = tasks[idx].assignee == nil ? "queued" : "assigned"
         tasks[idx].blockedReason = nil
         tasks[idx].reviewSummary = nil
@@ -6413,6 +6435,7 @@ final class TeamOrchestrator: ObservableObject {
             "reassignment_count": task.reassignmentCount,
             "superseded_by": task.supersededBy as Any? ?? NSNull(),
             "assignee": task.assignee as Any? ?? NSNull(),
+            "agent_instance_id": task.assigneeInstanceId as Any? ?? NSNull(),
             "blocked_reason": task.blockedReason as Any? ?? NSNull(),
             "review_summary": task.reviewSummary as Any? ?? NSNull(),
             "created_by": task.createdBy,
