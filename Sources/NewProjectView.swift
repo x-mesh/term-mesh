@@ -163,11 +163,7 @@ struct NewProjectView: View {
                         defaultHostKey: runsOnHostKey,
                         defaultHostDirectory: trimmedDirectory,
                         inheritedAgentIDs: inheritedAgentIDs,
-                        // Cross-machine agent placement needs a checkout
-                        // bootstrap on every selected host. Until that
-                        // transaction is supported end-to-end, do not expose
-                        // controls that merely launch a pane in a missing path.
-                        showsPlacementControls: false,
+                        showsPlacementControls: true,
                         onAgentPlacementChanged: { id, inheritsDefault in
                             if inheritsDefault {
                                 inheritedAgentIDs.insert(id)
@@ -857,7 +853,7 @@ struct NewProjectView: View {
             .keyboardShortcut(.defaultAction)
             .disabled(
                 isCreating || !canCreate
-                    || !leaderEndpointIsReady
+                    || !placementHostsAreReady
             )
             .overlay {
                 if isCreating {
@@ -895,12 +891,27 @@ struct NewProjectView: View {
         let checkout = effectiveIsolation
             ? "\(agents.count) agent worktree\(agents.count == 1 ? "" : "s")"
             : "shared checkout"
-        return "\(action) → \(trimmedDirectory) on \(machine) · \(checkout)"
+        return "\(action) → \(trimmedDirectory) on \(machine) · \(checkout) · \(agentPlacementSummary)"
     }
 
-    private var leaderEndpointIsReady: Bool {
-        guard let leaderHostKey else { return true }
-        return selectablePeers.first(where: { $0.id == leaderHostKey })?.isConnected == true
+    private var agentPlacementSummary: String {
+        let labels = agents.map { row -> String in
+            guard let hostKey = row.hostKey else { return "This Mac" }
+            return selectablePeers.first(where: { $0.id == hostKey })?.displayName ?? hostKey
+        }
+        let counts = Dictionary(grouping: labels, by: { $0 }).mapValues(\.count)
+        let ordered = counts.keys.sorted().map { "\($0) ×\(counts[$0] ?? 0)" }
+        return "agents: " + ordered.joined(separator: ", ")
+    }
+
+    private var placementHostsAreReady: Bool {
+        let remoteKeys = Set(
+            [runsOnHostKey, leaderHostKey].compactMap { $0 }
+                + agents.compactMap(\.hostKey)
+        )
+        return remoteKeys.allSatisfy { hostKey in
+            selectablePeers.first(where: { $0.id == hostKey })?.isConnected == true
+        }
     }
 
     private func applyInitialTeamPreset() {

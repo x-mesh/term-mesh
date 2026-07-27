@@ -56,6 +56,133 @@ enum PeerProjectBootstrap {
         }
     }
 
+    /// One machine/path participating in a project creation transaction.
+    ///
+    /// The source checkout, leader checkout and agent checkouts may live on
+    /// different machines. Grouping them before any command runs lets the
+    /// caller prepare every destination first and launch panes only after the
+    /// whole filesystem transaction succeeds.
+    struct Placement: Equatable {
+        var hostKey: String?
+        var projectPath: String
+        var agentIndices: [Int]
+        var includesLeader: Bool
+        var isSource: Bool
+    }
+
+    enum PlacementError: LocalizedError, Equatable {
+        case missingProjectPath(hostKey: String)
+
+        var errorDescription: String? {
+            switch self {
+            case .missingProjectPath(let hostKey):
+                return "Choose a project folder for \(hostKey)."
+            }
+        }
+    }
+
+    /// Resolve the source, leader and member choices into checkout groups.
+    ///
+    /// `additionalRemoteProjectPath` supplies the host convention for a peer
+    /// that is not the Project machine. A row's explicit directory wins over
+    /// that convention. Groups are keyed by both host and project path so two
+    /// agents deliberately pointed at different copies on one host remain
+    /// different transactions.
+    static func placements(
+        source: ProjectSource,
+        rows: [TeamAgentRow],
+        leaderHostKey: String?,
+        localProjectsRoot: String,
+        additionalRemoteProjectPath: (String) -> String?
+    ) throws -> [Placement] {
+        let projectName = URL(fileURLWithPath: source.projectPath).lastPathComponent
+        var result: [Placement] = []
+
+        func normalized(_ path: String) -> String {
+            (path.trimmingCharacters(in: .whitespacesAndNewlines) as NSString)
+                .standardizingPath
+        }
+
+        func path(
+            for hostKey: String?,
+            preferred: String? = nil
+        ) throws -> String {
+            if let preferred {
+                let value = normalized(preferred)
+                if !value.isEmpty && value != "." { return value }
+            }
+            if hostKey == source.hostKey {
+                return normalized(source.projectPath)
+            }
+            if hostKey == nil {
+                return normalized(
+                    (localProjectsRoot as NSString).appendingPathComponent(projectName)
+                )
+            }
+            guard let hostKey,
+                  let predicted = additionalRemoteProjectPath(hostKey),
+                  !normalized(predicted).isEmpty,
+                  normalized(predicted) != "."
+            else {
+                throw PlacementError.missingProjectPath(hostKey: hostKey ?? "This Mac")
+            }
+            return normalized(predicted)
+        }
+
+        func merge(
+            hostKey: String?,
+            projectPath: String,
+            agentIndex: Int? = nil,
+            includesLeader: Bool = false,
+            isSource: Bool = false
+        ) {
+            if let index = result.firstIndex(where: {
+                $0.hostKey == hostKey && $0.projectPath == projectPath
+            }) {
+                if let agentIndex { result[index].agentIndices.append(agentIndex) }
+                result[index].includesLeader = result[index].includesLeader || includesLeader
+                result[index].isSource = result[index].isSource || isSource
+                return
+            }
+            result.append(Placement(
+                hostKey: hostKey,
+                projectPath: projectPath,
+                agentIndices: agentIndex.map { [$0] } ?? [],
+                includesLeader: includesLeader,
+                isSource: isSource
+            ))
+        }
+
+        let sourcePath = try path(for: source.hostKey, preferred: source.projectPath)
+        merge(
+            hostKey: source.hostKey,
+            projectPath: sourcePath,
+            includesLeader: leaderHostKey == source.hostKey,
+            isSource: true
+        )
+
+        for (index, row) in rows.enumerated() {
+            let projectPath = try path(
+                for: row.hostKey,
+                preferred: row.hostDirectory
+            )
+            merge(
+                hostKey: row.hostKey,
+                projectPath: projectPath,
+                agentIndex: index
+            )
+        }
+
+        if leaderHostKey != source.hostKey {
+            merge(
+                hostKey: leaderHostKey,
+                projectPath: try path(for: leaderHostKey),
+                includesLeader: true
+            )
+        }
+        return result
+    }
+
     /// Where everything goes, without touching the machine.
     ///
     /// Separated from doing it so the paths can be shown before anything is

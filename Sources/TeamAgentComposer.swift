@@ -112,95 +112,115 @@ struct TeamAgentComposer: View {
                     .disabled(agents.isEmpty)
                 }
 
-                // Bulk model selector — only applies on explicit button click
-                if !agents.isEmpty {
-                    Button(action: applyModelToAll) {
-                        Label("Apply to All", systemImage: "arrow.triangle.2.circlepath")
-                            .font(.caption)
-                    }
-                    .buttonStyle(.borderless)
-                    .help("Change all \(bulkCli) agents' model to \(bulkModel)")
-                    Picker("", selection: Binding(
-                        get: { bulkCli },
-                        set: { newCli in
-                            bulkCli = newCli
-                            bulkModel = AgentRolePreset.defaultModel(for: newCli)
-                        }
-                    )) {
-                        ForEach(AgentRolePreset.supportedCLIs, id: \.self) { cli in
-                            Text(cli).tag(cli)
-                        }
-                    }
-                    .frame(width: 85)
-                    // Self-healing binding mirrors the leader picker pattern so
-                    // bulkModel can never be visually empty when bulkCli changes.
-                    Picker("", selection: Binding(
-                        get: {
-                            let opts = bulkModels
-                            if opts.contains(bulkModel) { return bulkModel }
-                            let fallback = AgentRolePreset.defaultModel(for: bulkCli)
-                            DispatchQueue.main.async { bulkModel = fallback }
-                            return fallback
-                        },
-                        set: { bulkModel = $0 }
-                    )) {
-                        ForEach(bulkModels, id: \.self) { m in
-                            Text(AgentRolePreset.modelDisplayLabel(m, for: bulkCli)).tag(m)
-                        }
-                    }
-                    .frame(width: 130)
-
-                    if showsPlacementControls && !selectablePeers.isEmpty {
-                        Button(action: applyHostToAll) {
-                            Label("Apply to All", systemImage: "arrow.triangle.2.circlepath")
-                                .font(.caption)
-                        }
-                        .buttonStyle(.borderless)
-                        .help("Put every agent on this machine, at this path")
-                        Picker("", selection: Binding(
-                            get: {
-                                if supportsDefaultPlacement && bulkUsesDefaultPlacement {
-                                    return Self.defaultPlacementTag
-                                }
-                                return bulkHostKey ?? Self.localPlacementTag
-                            },
-                            set: { selection in
-                                if selection == Self.defaultPlacementTag {
-                                    bulkUsesDefaultPlacement = true
-                                    bulkHostKey = defaultHostKey
-                                    bulkHostDirectory = defaultHostDirectory
-                                } else {
-                                    bulkUsesDefaultPlacement = false
-                                    bulkHostKey = selection == Self.localPlacementTag ? nil : selection
-                                    bulkHostDirectory = bulkHostKey
-                                        .map { defaultDirectory(forHost: $0, excluding: -1) } ?? ""
-                                }
-                            }
-                        )) {
-                            if supportsDefaultPlacement {
-                                Text("Default · \(defaultMachineLabel)")
-                                    .tag(Self.defaultPlacementTag)
-                            }
-                            Text("This Mac").tag(Self.localPlacementTag)
-                            ForEach(selectablePeers, id: \.id) { host in
-                                Text(host.displayName).tag(host.id)
-                            }
-                        }
-                        .frame(width: 110)
-                        if bulkHostKey != nil && !bulkUsesDefaultPlacement {
-                            TextField("/path/on/that/machine", text: $bulkHostDirectory)
-                                .textFieldStyle(.roundedBorder)
-                                .frame(width: 160)
-                        }
-                    }
-                }
-
                 Text("\(agents.count)")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .padding(.horizontal, 8)
                     .padding(.vertical, 2)
                     .background(Capsule().fill(.quaternary))
+            }
+
+            // Keep the two bulk operations on their own line. Their previous
+            // position beside the title pushed the machine controls beyond
+            // the fixed-width New Project sheet, making them exist but
+            // impossible to see or use.
+            if !agents.isEmpty {
+                VStack(alignment: .leading, spacing: 6) {
+                    HStack(spacing: 8) {
+                        Text("Model")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .frame(width: 56, alignment: .leading)
+                        Picker("", selection: Binding(
+                            get: { bulkCli },
+                            set: { newCli in
+                                bulkCli = newCli
+                                bulkModel = AgentRolePreset.defaultModel(for: newCli)
+                            }
+                        )) {
+                            ForEach(AgentRolePreset.supportedCLIs, id: \.self) { cli in
+                                Text(cli).tag(cli)
+                            }
+                        }
+                        .frame(width: 85)
+                        // Self-healing binding mirrors the leader picker pattern so
+                        // bulkModel can never be visually empty when bulkCli changes.
+                        Picker("", selection: Binding(
+                            get: {
+                                let opts = bulkModels
+                                if opts.contains(bulkModel) { return bulkModel }
+                                let fallback = AgentRolePreset.defaultModel(for: bulkCli)
+                                DispatchQueue.main.async { bulkModel = fallback }
+                                return fallback
+                            },
+                            set: { bulkModel = $0 }
+                        )) {
+                            ForEach(bulkModels, id: \.self) { m in
+                                Text(AgentRolePreset.modelDisplayLabel(m, for: bulkCli)).tag(m)
+                            }
+                        }
+                        .frame(width: 130)
+                        Button(action: applyModelToAll) {
+                            Label("Apply to All", systemImage: "arrow.triangle.2.circlepath")
+                                .font(.caption)
+                        }
+                        .buttonStyle(.borderless)
+                        .help("Change all \(bulkCli) agents' model to \(bulkModel)")
+                        Spacer()
+                    }
+
+                    if showsPlacementControls {
+                        HStack(spacing: 8) {
+                            Text("Runs on")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                                .frame(width: 56, alignment: .leading)
+                            Picker("", selection: Binding(
+                                get: {
+                                    if supportsDefaultPlacement && bulkUsesDefaultPlacement {
+                                        return Self.defaultPlacementTag
+                                    }
+                                    return bulkHostKey ?? Self.localPlacementTag
+                                },
+                                set: { selection in
+                                    if selection == Self.defaultPlacementTag {
+                                        bulkUsesDefaultPlacement = true
+                                        bulkHostKey = defaultHostKey
+                                        bulkHostDirectory = defaultHostDirectory
+                                    } else {
+                                        bulkUsesDefaultPlacement = false
+                                        bulkHostKey = selection == Self.localPlacementTag ? nil : selection
+                                        bulkHostDirectory = bulkHostKey
+                                            .map { defaultDirectory(forHost: $0, excluding: -1) } ?? ""
+                                        connectHostIfNeeded(bulkHostKey)
+                                    }
+                                }
+                            )) {
+                                if supportsDefaultPlacement {
+                                    Text("Default · \(defaultMachineLabel)")
+                                        .tag(Self.defaultPlacementTag)
+                                }
+                                Text("This Mac").tag(Self.localPlacementTag)
+                                ForEach(selectablePeers, id: \.id) { host in
+                                    Text(host.displayName).tag(host.id)
+                                }
+                            }
+                            .frame(width: 180)
+                            if bulkHostKey != nil && !bulkUsesDefaultPlacement {
+                                TextField("Project folder", text: $bulkHostDirectory)
+                                    .textFieldStyle(.roundedBorder)
+                                    .frame(maxWidth: .infinity)
+                            }
+                            Button(action: applyHostToAll) {
+                                Label("Apply to All", systemImage: "arrow.triangle.2.circlepath")
+                                    .font(.caption)
+                            }
+                            .buttonStyle(.borderless)
+                            .help("Put every agent on this machine, at this path")
+                        }
+                        .accessibilityIdentifier("teamAgentComposer.bulkPlacement")
+                    }
+                }
             }
 
             ForEach(Array(agents.enumerated()), id: \.element.id) { index, agent in
@@ -316,56 +336,6 @@ struct TeamAgentComposer: View {
                 }
                 .frame(width: 130)
 
-                // Which machine. Only offered when there is a peer to offer —
-                // on a single-machine setup the choice would be a control with
-                // one option and a question nobody asked.
-                if showsPlacementControls && !selectablePeers.isEmpty {
-                    Picker("", selection: Binding(
-                        get: {
-                            if supportsDefaultPlacement && inheritedAgentIDs.contains(agent.id) {
-                                return Self.defaultPlacementTag
-                            }
-                            return agents[index].hostKey ?? Self.localPlacementTag
-                        },
-                        set: { selection in
-                            if selection == Self.defaultPlacementTag {
-                                agents[index].hostKey = defaultHostKey
-                                agents[index].hostDirectory = defaultHostKey == nil ? "" : defaultHostDirectory
-                                onAgentPlacementChanged(agent.id, true)
-                            } else {
-                                let newHost = selection == Self.localPlacementTag ? nil : selection
-                                agents[index].hostKey = newHost
-                                agents[index].hostDirectory = newHost
-                                    .map { defaultDirectory(forHost: $0, excluding: index) } ?? ""
-                                onAgentPlacementChanged(agent.id, false)
-                            }
-                        }
-                    )) {
-                        if supportsDefaultPlacement {
-                            Text("Default · \(defaultMachineLabel)")
-                                .tag(Self.defaultPlacementTag)
-                        }
-                        Text("This Mac").tag(Self.localPlacementTag)
-                        ForEach(selectablePeers, id: \.id) { host in
-                            Text(host.isConnected ? host.displayName : "\(host.displayName) — offline")
-                                .tag(host.id)
-                        }
-                    }
-                    .frame(width: 150)
-                    if agents[index].hostKey != nil
-                        && !(supportsDefaultPlacement && inheritedAgentIDs.contains(agent.id)) {
-                        TextField("/path/on/that/machine", text: Binding(
-                            get: { agents[index].hostDirectory },
-                            set: {
-                                agents[index].hostDirectory = $0
-                                onAgentPlacementChanged(agent.id, false)
-                            }
-                        ))
-                        .textFieldStyle(.roundedBorder)
-                        .frame(width: 170)
-                    }
-                }
-
                 // Provider badge
                 switch agent.providerBadge {
                 case .best(let reason):
@@ -410,6 +380,10 @@ struct TeamAgentComposer: View {
                 }
                 .buttonStyle(.borderless)
                 .disabled(agents.count <= 1)
+            }
+
+            if showsPlacementControls {
+                agentPlacementRow(index: index, agent: agent)
             }
 
             // Custom instructions (collapsible)
@@ -486,6 +460,70 @@ struct TeamAgentComposer: View {
         }
     }
 
+    private func agentPlacementRow(index: Int, agent: TeamAgentRow) -> some View {
+        HStack(spacing: 8) {
+            Text("Runs on")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .frame(width: 64, alignment: .leading)
+
+            Picker("", selection: Binding(
+                get: {
+                    if supportsDefaultPlacement && inheritedAgentIDs.contains(agent.id) {
+                        return Self.defaultPlacementTag
+                    }
+                    return agents[index].hostKey ?? Self.localPlacementTag
+                },
+                set: { selection in
+                    if selection == Self.defaultPlacementTag {
+                        agents[index].hostKey = defaultHostKey
+                        agents[index].hostDirectory = defaultHostKey == nil ? "" : defaultHostDirectory
+                        onAgentPlacementChanged(agent.id, true)
+                    } else {
+                        let newHost = selection == Self.localPlacementTag ? nil : selection
+                        agents[index].hostKey = newHost
+                        agents[index].hostDirectory = newHost
+                            .map { defaultDirectory(forHost: $0, excluding: index) } ?? ""
+                        connectHostIfNeeded(newHost)
+                        onAgentPlacementChanged(agent.id, false)
+                    }
+                }
+            )) {
+                if supportsDefaultPlacement {
+                    Text("Default · \(defaultMachineLabel)")
+                        .tag(Self.defaultPlacementTag)
+                }
+                Text("This Mac").tag(Self.localPlacementTag)
+                ForEach(selectablePeers, id: \.id) { host in
+                    Text(host.isConnected ? host.displayName : "\(host.displayName) — offline")
+                        .tag(host.id)
+                }
+            }
+            .frame(width: 180)
+
+            if agents[index].hostKey != nil
+                && !(supportsDefaultPlacement && inheritedAgentIDs.contains(agent.id)) {
+                TextField("Project folder on that machine", text: Binding(
+                    get: { agents[index].hostDirectory },
+                    set: {
+                        agents[index].hostDirectory = $0
+                        onAgentPlacementChanged(agent.id, false)
+                    }
+                ))
+                .textFieldStyle(.roundedBorder)
+                .help("Primary project folder; an isolated agent worktree is created beside it")
+            } else {
+                Text("Uses the project machine and destination")
+                    .font(.caption)
+                    .foregroundStyle(.tertiary)
+            }
+
+            Spacer(minLength: 0)
+        }
+        .padding(.leading, 48)
+        .accessibilityIdentifier("teamAgentComposer.agentPlacement.\(agent.id.uuidString)")
+    }
+
     // MARK: - Quick Presets (legacy, simple role-only)
 
 
@@ -512,9 +550,18 @@ struct TeamAgentComposer: View {
                 agents[i].hostDirectory = bulkHostKey == nil
                     ? ""
                     : bulkHostDirectory.trimmingCharacters(in: .whitespacesAndNewlines)
+                connectHostIfNeeded(bulkHostKey)
                 onAgentPlacementChanged(agents[i].id, false)
             }
         }
+    }
+
+    private func connectHostIfNeeded(_ hostKey: String?) {
+        guard let hostKey,
+              let host = selectablePeers.first(where: { $0.id == hostKey }),
+              !host.isConnected
+        else { return }
+        hostStore.connectSavedHost(host)
     }
 
     private func defaultDirectory(forHost hostKey: String, excluding index: Int) -> String {

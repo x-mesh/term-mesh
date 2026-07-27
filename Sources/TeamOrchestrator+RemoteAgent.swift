@@ -1212,6 +1212,13 @@ extension TeamOrchestrator {
                 guard !path.isEmpty else { continue }
                 locations.insert(.init(hostKey: hostKey, path: path))
             }
+            if case let .peer(hostKey) = leaderEndpoint {
+                let path = (leaderWorkingDirectory ?? "")
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                if !path.isEmpty {
+                    locations.insert(.init(hostKey: hostKey, path: path))
+                }
+            }
             team.remoteProjectLocations = locations.sorted {
                 ($0.hostKey, $0.path) < ($1.hostKey, $1.path)
             }

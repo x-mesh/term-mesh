@@ -477,6 +477,11 @@ final class RemoteHostStore: ObservableObject {
                 hosts[key]?.symbolName = p.symbolName
                 hosts[key]?.sshPort = p.sshPort
                 hosts[key]?.identityFile = p.identityFile
+                // A coordinator-discovered row may predate its saved profile
+                // and therefore have no SSH route. Keep the route in sync too:
+                // placement pickers intentionally hide entries that cannot be
+                // reached over SSH to prepare their project checkout.
+                hosts[key]?.sshTarget = p.sshTarget
                 // Always replace the row's route from the profile. This is
                 // what makes clearing an explicit socket observable: upsert
                 // invalidates `lastResolvedSocket`, so this assignment turns

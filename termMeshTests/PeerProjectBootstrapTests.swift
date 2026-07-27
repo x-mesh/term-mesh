@@ -8,6 +8,28 @@ import PeerProto
 #endif
 
 final class PeerProjectBootstrapTests: XCTestCase {
+    private func row(
+        _ name: String,
+        hostKey: String?,
+        directory: String = ""
+    ) -> TeamAgentRow {
+        TeamAgentRow(
+            preset: AgentRolePreset(
+                id: UUID(),
+                name: name,
+                displayName: name.capitalized,
+                cli: "claude",
+                model: "sonnet",
+                color: "blue",
+                instructions: "",
+                isBuiltIn: false
+            ),
+            customInstructions: "",
+            hostKey: hostKey,
+            hostDirectory: directory
+        )
+    }
+
     func test_isolated_agents_each_get_their_own_checkout_and_branch() {
         let plan = PeerProjectBootstrap.plan(
             projectRoot: "/app/tm-projects",
@@ -33,6 +55,135 @@ final class PeerProjectBootstrapTests: XCTestCase {
             isolateAgents: false
         )
         XCTAssertEqual(Set(plan.agentCheckouts.map(\.path)), ["/app/tm-projects/myproj"])
+    }
+
+    func test_placements_group_source_local_member_and_remote_leader() throws {
+        let source = ProjectSource(
+            hostKey: "ssh:jw-server",
+            projectPath: "/app/tm-projects/bloom",
+            gitURL: "git@github.com:org/bloom.git",
+            isolateAgents: true,
+            kind: .clone
+        )
+        let rows = [
+            row("executor", hostKey: "ssh:jw-server", directory: "/app/tm-projects/bloom"),
+            row("architect", hostKey: nil),
+        ]
+
+        let placements = try PeerProjectBootstrap.placements(
+            source: source,
+            rows: rows,
+            leaderHostKey: "ssh:mac-sub",
+            localProjectsRoot: "/Users/me/work"
+        ) { hostKey in
+            hostKey == "ssh:mac-sub" ? "/Users/sub/work/bloom" : nil
+        }
+
+        XCTAssertEqual(placements, [
+            .init(
+                hostKey: "ssh:jw-server",
+                projectPath: "/app/tm-projects/bloom",
+                agentIndices: [0],
+                includesLeader: false,
+                isSource: true
+            ),
+            .init(
+                hostKey: nil,
+                projectPath: "/Users/me/work/bloom",
+                agentIndices: [1],
+                includesLeader: false,
+                isSource: false
+            ),
+            .init(
+                hostKey: "ssh:mac-sub",
+                projectPath: "/Users/sub/work/bloom",
+                agentIndices: [],
+                includesLeader: true,
+                isSource: false
+            ),
+        ])
+    }
+
+    func test_placements_keep_explicit_agent_folders_on_each_host() throws {
+        let source = ProjectSource(
+            hostKey: nil,
+            projectPath: "/Users/me/work/bloom",
+            gitURL: "git@github.com:org/bloom.git",
+            isolateAgents: true,
+            kind: .clone
+        )
+        let rows = [
+            row("executor", hostKey: "ssh:a", directory: "/srv/a/bloom"),
+            row("architect", hostKey: "ssh:b", directory: "/opt/projects/bloom"),
+        ]
+
+        let placements = try PeerProjectBootstrap.placements(
+            source: source,
+            rows: rows,
+            leaderHostKey: nil,
+            localProjectsRoot: "/Users/me/work",
+            additionalRemoteProjectPath: { _ in nil }
+        )
+
+        XCTAssertEqual(placements.map(\.hostKey), [nil, "ssh:a", "ssh:b"])
+        XCTAssertEqual(
+            placements.map(\.projectPath),
+            ["/Users/me/work/bloom", "/srv/a/bloom", "/opt/projects/bloom"]
+        )
+        XCTAssertEqual(placements.map(\.agentIndices), [[], [0], [1]])
+        XCTAssertTrue(placements[0].includesLeader)
+    }
+
+    func test_placements_group_multiple_agents_on_the_same_peer() throws {
+        let source = ProjectSource(
+            hostKey: nil,
+            projectPath: "/Users/me/work/bloom",
+            gitURL: "git@github.com:org/bloom.git",
+            isolateAgents: true,
+            kind: .clone
+        )
+        let rows = [
+            row("executor", hostKey: "ssh:jw-server", directory: "/app/tm-projects/bloom"),
+            row("architect", hostKey: "ssh:jw-server", directory: "/app/tm-projects/bloom"),
+        ]
+
+        let placements = try PeerProjectBootstrap.placements(
+            source: source,
+            rows: rows,
+            leaderHostKey: nil,
+            localProjectsRoot: "/Users/me/work",
+            additionalRemoteProjectPath: { _ in nil }
+        )
+
+        XCTAssertEqual(placements.count, 2)
+        XCTAssertEqual(placements[1].hostKey, "ssh:jw-server")
+        XCTAssertEqual(placements[1].projectPath, "/app/tm-projects/bloom")
+        XCTAssertEqual(placements[1].agentIndices, [0, 1])
+    }
+
+    func test_placements_require_a_folder_for_an_additional_peer() {
+        let source = ProjectSource(
+            hostKey: nil,
+            projectPath: "/Users/me/work/bloom",
+            gitURL: "",
+            isolateAgents: false,
+            kind: .empty
+        )
+
+        XCTAssertThrowsError(
+            try PeerProjectBootstrap.placements(
+                source: source,
+                rows: [row("executor", hostKey: "ssh:unknown")],
+                leaderHostKey: nil,
+                localProjectsRoot: "/Users/me/work",
+                additionalRemoteProjectPath: { _ in nil }
+            )
+        ) { error in
+            XCTAssertEqual(
+                error as? PeerProjectBootstrap.PlacementError,
+                .missingProjectPath(hostKey: "ssh:unknown")
+            )
+        }
     }
 
     func test_creates_each_agent_as_a_worktree_of_the_primary_copy() {

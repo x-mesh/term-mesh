@@ -1010,20 +1010,22 @@ struct SidebarProjectsSection: View {
                     // work in them: an agent whose directory is not there
                     // starts in a shell that failed to `cd` and looks
                     // attached while being nothing of the kind.
-                    let prepared = try await prepareRemoteCheckouts(
-                        name: name, rows: rows, source: source
+                    let prepared = try await prepareProjectCheckouts(
+                        name: name,
+                        rows: rows,
+                        source: source,
+                        leaderHostKey: leader.endpoint.hostKey
                     )
                     guard TeamOrchestrator.shared.createTeam(
                         named: name,
-                        rows: prepared,
-                        workingDirectory: directory,
+                        rows: prepared.rows,
+                        workingDirectory: prepared.localProjectPath ?? directory,
                         leaderMode: leader.mode,
                         leaderModel: leader.model,
                         leaderEndpoint: leader.endpoint,
-                        leaderWorkingDirectory: leader.endpoint.hostKey == nil
-                            ? nil
-                            : source.projectPath,
-                        worktreeMode: source.hostKey == nil && source.isolateAgents
+                        leaderWorkingDirectory: prepared.leaderProjectPath,
+                        worktreeMode: source.isolateAgents
+                            && prepared.rows.contains(where: { $0.hostKey == nil })
                             ? "isolated"
                             : "off",
                         projectSource: source,
@@ -1041,53 +1043,119 @@ struct SidebarProjectsSection: View {
     }
 
 
-    /// Clone the project and each member's copy of it on the far machine, and
-    /// point the rows at what was made.
+    private struct PreparedProjectCheckouts {
+        var rows: [TeamAgentRow]
+        /// Primary checkout on this Mac, when either the source, leader or a
+        /// member runs here. The local team engine builds its own worktrees
+        /// from this root.
+        var localProjectPath: String?
+        /// Primary checkout on the leader's machine. nil tells a local leader
+        /// to use `localProjectPath`; a remote leader always receives a path.
+        var leaderProjectPath: String?
+    }
+
+    /// Prepare every machine selected in the form before launching anyone.
     ///
-    /// Returns the rows unchanged when the project is local or nothing needs
-    /// preparing — the caller should not have to know which case it is in.
+    /// Remote members receive the concrete worktree path made for them.
+    /// Local members stay host=nil and let the existing local team engine
+    /// create its worktrees from `localProjectPath`, avoiding a second,
+    /// competing local worktree implementation.
     @MainActor
-    private func prepareRemoteCheckouts(
+    private func prepareProjectCheckouts(
         name: String,
         rows: [TeamAgentRow],
-        source: ProjectSource
-    ) async throws -> [TeamAgentRow] {
-        guard let hostKey = source.hostKey else { return rows }
-        guard let host = RemoteHostStore.shared.sortedHosts.first(where: { $0.id == hostKey }),
-              let sshTarget = host.sshTarget, !sshTarget.isEmpty
-        else {
-            throw ProjectCreationError.remoteHostUnavailable
-        }
-        guard !source.projectPath.isEmpty else {
-            throw ProjectCreationError.remotePathMissing
-        }
-
-        let plan = PeerProjectBootstrap.plan(
-            projectRoot: (source.projectPath as NSString).deletingLastPathComponent,
-            projectName: (source.projectPath as NSString).lastPathComponent,
-            agents: rows.map(\.preset.name),
-            isolateAgents: source.isolateAgents
-        )
-        do {
-            try await PeerProjectBootstrap.run(
-                sshTarget: sshTarget,
-                port: host.sshPort,
-                identityFile: host.identityFile,
-                plan: plan,
-                gitURL: source.gitURL.isEmpty ? nil : source.gitURL,
-                sourceKind: source.kind
-            )
-        } catch {
-            RemoteWorkLog.info("Could not prepare \(name) on \(host.displayName): \(error)")
-            throw error
+        source: ProjectSource,
+        leaderHostKey: String?
+    ) async throws -> PreparedProjectCheckouts {
+        let placements = try PeerProjectBootstrap.placements(
+            source: source,
+            rows: rows,
+            leaderHostKey: leaderHostKey,
+            localProjectsRoot: ProjectLocationSettings.expandedLocalProjectsRoot()
+        ) { hostKey in
+            PeerHostProfileStore.shared.profiles
+                .first(where: { $0.stableKey == hostKey })?
+                .predictedProjectPath(
+                    forProjectNamed: URL(fileURLWithPath: source.projectPath).lastPathComponent
+                )
+                ?? RemoteProjectPaths.shared.path(
+                    host: hostKey, localRoot: source.projectPath
+                )
         }
 
         var prepared = rows
-        for (i, checkout) in plan.agentCheckouts.enumerated() where i < prepared.count {
-            prepared[i].hostKey = hostKey
-            prepared[i].hostDirectory = checkout.path
+        var localProjectPath: String?
+        var leaderProjectPath: String?
+        let gitURL = source.gitURL.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        for placement in placements {
+            let placedRows = placement.agentIndices.map { rows[$0] }
+            let plan = PeerProjectBootstrap.plan(
+                projectRoot: (placement.projectPath as NSString).deletingLastPathComponent,
+                projectName: (placement.projectPath as NSString).lastPathComponent,
+                agents: placedRows.map(\.preset.name),
+                isolateAgents: source.isolateAgents
+            )
+            let kind: ProjectSourceKind = placement.isSource
+                ? source.kind
+                : (gitURL.isEmpty ? source.kind : .clone)
+
+            if let hostKey = placement.hostKey {
+                guard let host = RemoteHostStore.shared.sortedHosts.first(where: { $0.id == hostKey }),
+                      let sshTarget = host.sshTarget, !sshTarget.isEmpty
+                else {
+                    throw ProjectCreationError.remoteHostUnavailable
+                }
+                do {
+                    try await PeerProjectBootstrap.run(
+                        sshTarget: sshTarget,
+                        port: host.sshPort,
+                        identityFile: host.identityFile,
+                        plan: plan,
+                        gitURL: gitURL.isEmpty ? nil : gitURL,
+                        sourceKind: kind
+                    )
+                } catch {
+                    RemoteWorkLog.info(
+                        "Could not prepare \(name) on \(host.displayName): \(error)"
+                    )
+                    throw error
+                }
+                for (offset, rowIndex) in placement.agentIndices.enumerated()
+                    where offset < plan.agentCheckouts.count {
+                    prepared[rowIndex].hostKey = hostKey
+                    prepared[rowIndex].hostDirectory = plan.agentCheckouts[offset].path
+                }
+                RemoteProjectPaths.shared.remember(
+                    host: hostKey,
+                    localRoot: source.projectPath,
+                    path: plan.primaryPath
+                )
+            } else {
+                // Local team creation owns local member worktrees. This step
+                // prepares only their shared primary checkout.
+                let primaryOnly = PeerProjectBootstrap.Plan(
+                    primaryPath: plan.primaryPath,
+                    agentCheckouts: []
+                )
+                try await PeerProjectBootstrap.runLocal(
+                    plan: primaryOnly,
+                    gitURL: gitURL.isEmpty ? nil : gitURL,
+                    sourceKind: kind
+                )
+                localProjectPath = plan.primaryPath
+            }
+
+            if placement.includesLeader {
+                leaderProjectPath = placement.hostKey == nil ? nil : plan.primaryPath
+            }
         }
-        return prepared
+
+        return PreparedProjectCheckouts(
+            rows: prepared,
+            localProjectPath: localProjectPath,
+            leaderProjectPath: leaderProjectPath
+        )
     }
 
     private enum ProjectCreationError: LocalizedError {
