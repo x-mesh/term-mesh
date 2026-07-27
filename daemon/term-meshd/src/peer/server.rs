@@ -17,7 +17,54 @@ use super::persist;
 use super::surface::PtyManager;
 use crate::supervisor::{shutdown_supervised, spawn_supervised};
 
-const MAX_PEER_CONNECTIONS: usize = 16;
+/// Default ceiling on concurrent peer-federation connections.
+///
+/// This is not a pane limit, but it behaves like one: every attached pane
+/// holds a connection for its whole lifetime, and workspace mirrors,
+/// consoles and short-lived surface probes draw from the same pool. So the
+/// real number of panes a client can hold open on this host is this value
+/// minus whatever else it has connected.
+///
+/// 16 was low enough to be reached in ordinary use — a workspace with a
+/// dozen remote panes could not open one more connection, which broke the
+/// shell-cleanup sweep at exactly the moment a crowded host needed it.
+/// The cap still exists to bound what a single client can make the daemon
+/// hold; it is not meant to be a limit anyone reaches by working normally.
+///
+/// Override at startup with `TERMMESH_PEER_MAX_CONNECTIONS`.
+const DEFAULT_MAX_PEER_CONNECTIONS: usize = 64;
+
+/// The configured connection ceiling. Read once at accept-loop start:
+/// the semaphore is sized from it, so a later change to the environment
+/// would not be honoured anyway.
+///
+/// A malformed or zero value falls back to the default rather than
+/// refusing to boot — a host that comes up with the wrong ceiling is far
+/// easier to notice and correct than one that does not come up at all.
+fn max_peer_connections() -> usize {
+    parse_max_peer_connections(std::env::var(MAX_CONNECTIONS_VAR).ok().as_deref())
+}
+
+const MAX_CONNECTIONS_VAR: &str = "TERMMESH_PEER_MAX_CONNECTIONS";
+
+/// Split from `max_peer_connections` so the parse is testable without
+/// mutating process-wide environment from a test that runs in parallel
+/// with every other test in this module.
+fn parse_max_peer_connections(raw: Option<&str>) -> usize {
+    let Some(raw) = raw else {
+        return DEFAULT_MAX_PEER_CONNECTIONS;
+    };
+    match raw.trim().parse::<usize>() {
+        Ok(value) if value > 0 => value,
+        _ => {
+            tracing::warn!(
+                "{MAX_CONNECTIONS_VAR}={raw:?} is not a positive integer; \
+                 using {DEFAULT_MAX_PEER_CONNECTIONS}"
+            );
+            DEFAULT_MAX_PEER_CONNECTIONS
+        }
+    }
+}
 
 /// Production entry point (the only caller is `main.rs`). Unlike
 /// `serve_with_manager` (used throughout this module's own tests, and by
@@ -104,7 +151,9 @@ async fn serve_with_host(
     let listener = bind_with_tight_umask(&path)?;
     harden_socket_permissions(&path);
     tracing::info!("peer-federation listening on {}", path.display());
-    let connection_permits = Arc::new(Semaphore::new(MAX_PEER_CONNECTIONS));
+    let max_connections = max_peer_connections();
+    tracing::info!("peer-federation connection ceiling: {max_connections}");
+    let connection_permits = Arc::new(Semaphore::new(max_connections));
     let owner_uid = current_uid();
     let mut connection_tasks = JoinSet::new();
 
@@ -126,7 +175,15 @@ async fn serve_with_host(
                             continue;
                         }
                         let Ok(permit) = connection_permits.clone().try_acquire_owned() else {
-                            tracing::warn!("peer connection limit reached; closing new client");
+                            // Name the ceiling and the way out. The client
+                            // sees only its handshake read returning EOF,
+                            // which is indistinguishable from a dead host —
+                            // this line is the sole record of the real cause.
+                            tracing::warn!(
+                                "peer connection limit reached ({max_connections}); \
+                                 closing new client — raise {MAX_CONNECTIONS_VAR} \
+                                 to allow more"
+                            );
                             drop(stream);
                             continue;
                         };
@@ -377,6 +434,24 @@ fn peer_uid_matches(_stream: &tokio::net::UnixStream, _expected_uid: u32) -> boo
 #[cfg(test)]
 mod integration_tests {
     use super::*;
+
+    /// A ceiling read from the environment, and the reasons to ignore one.
+    ///
+    /// Zero is rejected rather than honoured: a semaphore with no permits
+    /// refuses every client, so a host booted that way would look exactly
+    /// like a host that is down, with nothing to distinguish the two.
+    #[test]
+    fn connection_ceiling_falls_back_on_anything_unusable() {
+        assert_eq!(parse_max_peer_connections(Some("128")), 128);
+        assert_eq!(parse_max_peer_connections(Some("  128  ")), 128);
+        for unusable in [None, Some(""), Some("0"), Some("-1"), Some("many")] {
+            assert_eq!(
+                parse_max_peer_connections(unusable),
+                DEFAULT_MAX_PEER_CONNECTIONS,
+                "expected fallback for {unusable:?}"
+            );
+        }
+    }
     /// A surface the host made on request goes away once nobody holds it, and
     /// one the operator declared does not.
     ///
