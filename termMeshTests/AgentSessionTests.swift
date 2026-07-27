@@ -60,6 +60,16 @@ final class AgentSessionTests: XCTestCase {
         XCTAssertNotNil(UUID(uuidString: duplicate.agentInstanceId))
     }
 
+    func testRecycleKeepsInstanceIDButReattachGetsANewOne() {
+        let original = agentMember()
+        var recycled = agentMember()
+        recycled.agentInstanceId = original.agentInstanceId // hard restart swap contract
+        let reattached = agentMember() // detach removes the old member first
+
+        XCTAssertEqual(recycled.agentInstanceId, original.agentInstanceId)
+        XCTAssertNotEqual(reattached.agentInstanceId, original.agentInstanceId)
+    }
+
     func testRemoteClaudeLaunchUsesSSHAndKeepsRemoteDirectoryOutOfLocalProcess() {
         let launch = AgentSession.remoteClaudeLaunch(
             sshTarget: "root@jw-server",

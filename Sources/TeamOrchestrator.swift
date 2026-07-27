@@ -4221,6 +4221,7 @@ final class TeamOrchestrator: ObservableObject {
         // Both single (recycleAgent) and bulk (recycleAllAgents) paths go through here,
         // so no external post-restart reset is needed or correct.
         var memberToSwap = newMember
+        memberToSwap.agentInstanceId = old.agentInstanceId
         memberToSwap.completedTaskCount = 0
         team.agents[idx] = memberToSwap
         teams[teamName] = team
@@ -4978,21 +4979,36 @@ final class TeamOrchestrator: ObservableObject {
                 // (in_progress tasks are normalized to assigned inside).
                 TeamDataStore.shared.loadBoard(teamName: teamName, teamUuid: uuid)
             }
-            // Map archived agents by name and copy session_id back.
+            // Names remain the legacy routing key; restore the durable
+            // instance UUID independently of the mutable panel locator.
             var archivedSessionsByName: [String: String] = [:]
-            for a in agentsArr {
-                guard let name = a["name"] as? String,
-                      let sid = a["session_id"] as? String,
-                      !sid.isEmpty else { continue }
-                archivedSessionsByName[name] = sid
+            let archivedInstanceIDs: [String?] = agentsArr.map { a in
+                guard let instanceID = a["agent_instance_id"] as? String,
+                      !instanceID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                    return nil
+                }
+                return instanceID
             }
-            if !archivedSessionsByName.isEmpty {
-                t.agents = t.agents.map { member in
+            for a in agentsArr {
+                guard let name = a["name"] as? String else { continue }
+                if let sid = a["session_id"] as? String, !sid.isEmpty {
+                    archivedSessionsByName[name] = sid
+                }
+            }
+            if !archivedSessionsByName.isEmpty || !archivedInstanceIDs.isEmpty {
+                t.agents = t.agents.enumerated().map { index, member in
                     var m = member
                     if let sid = archivedSessionsByName[member.name] {
                         // Store as claudeSessionId (the real Claude sid).
                         // parentSessionId stays as the term-mesh routing UUID.
                         m.claudeSessionId = sid
+                    }
+                    // A modern archive carries the IDs in roster order, so
+                    // duplicate names never collapse. A wholly legacy archive
+                    // has no IDs and deliberately retains generated values.
+                    if index < archivedInstanceIDs.count,
+                       let instanceID = archivedInstanceIDs[index] {
+                        m.agentInstanceId = instanceID
                     }
                     return m
                 }
@@ -5203,6 +5219,7 @@ final class TeamOrchestrator: ObservableObject {
             "agents": team.agents.map { a -> [String: Any] in
                 var row: [String: Any] = [
                     "name": a.name,
+                    "agent_instance_id": a.agentInstanceId,
                     "cli": a.cli,
                     "model": a.model,
                     "agent_type": a.agentType,
@@ -5400,6 +5417,7 @@ final class TeamOrchestrator: ObservableObject {
             "agents": team.agents.map { a -> [String: Any] in
                 var row: [String: Any] = [
                     "name": a.name,
+                    "agent_instance_id": a.agentInstanceId,
                     "cli": a.cli,
                     "model": a.model,
                     "agent_type": a.agentType,
