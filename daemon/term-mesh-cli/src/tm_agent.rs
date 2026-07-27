@@ -3138,6 +3138,19 @@ mod runbook_tests {
     }
 
     #[test]
+    fn bare_reply_refuses_multiple_active_tasks() {
+        let candidates = vec!["task-a".to_string(), "task-b".to_string()];
+        let error = unambiguous_reply_task(&candidates).unwrap_err();
+        assert!(error.contains("--task-id"));
+    }
+
+    #[test]
+    fn bare_reply_keeps_single_task_compatibility() {
+        let candidates = vec!["task-a".to_string()];
+        assert_eq!(unambiguous_reply_task(&candidates).unwrap().as_deref(), Some("task-a"));
+    }
+
+    #[test]
     fn reply_protocol_status_blocked() {
         let content =
             "STATUS: BLOCKED\nFILES: none\nVERIFY: n/a\nNEXT: leader\nFULL_REPORT: n/a\n\nreason";
@@ -4612,6 +4625,19 @@ fn select_reply_task(sock: &PathBuf, team: &str, sender: &str) -> (Option<String
         .collect();
     let selected = all.first().cloned();
     (selected, all)
+}
+
+/// Bare replies retain the unique-name/single-task compatibility path, but
+/// must never guess when one sender owns more than one live task.
+fn unambiguous_reply_task(candidates: &[String]) -> Result<Option<String>, String> {
+    match candidates {
+        [] => Ok(None),
+        [only] => Ok(Some(only.clone())),
+        many => Err(format!(
+            "ambiguous active tasks: {}; pass --task-id explicitly",
+            many.join(" ")
+        )),
+    }
 }
 
 fn return_retry_delays_ms(text_delivered: bool, context: &str) -> &'static [u64] {
@@ -6568,13 +6594,13 @@ fn main() {
                 None
             } else {
                 let (selected, candidates) = select_reply_task(&sock, &team, &sender);
-                if candidates.len() >= 2 {
-                    eprintln!(
-                        "  Warning: multiple candidate tasks for {sender}: {} — pass --task-id explicitly to disambiguate.",
-                        candidates.join(" ")
-                    );
+                match unambiguous_reply_task(&candidates) {
+                    Ok(task_id) => task_id.or(selected),
+                    Err(message) => {
+                        eprintln!("reply for {sender} is {message}");
+                        std::process::exit(2);
+                    }
                 }
-                selected
             };
             let alias_result_path =
                 write_result_file(&team, &format!("{sender}-reply.md"), &content).ok();
