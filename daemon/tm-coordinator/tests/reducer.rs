@@ -753,3 +753,160 @@ fn running_to_cancelled_updates_task_and_attempt_projection() {
     let queue = api.handle("merge.queue", json!({})).unwrap();
     assert_eq!(queue["items"][0]["status"], "cancelled");
 }
+
+/// A second `task.place` on an already-placed task is refused.
+///
+/// `Placed -> Placed` is a legal status transition (any state may repeat), so
+/// the status check alone let a retry mint a second attempt and fence while
+/// the first attempt kept running on its original host, never told it had
+/// lost the task. That is two hosts owning one task — the thing fencing
+/// exists to prevent, slipping past on the very first placement.
+///
+/// A retry that lost its idempotency key is the realistic way in, so the
+/// second call here deliberately uses a fresh `request_id`.
+#[test]
+fn placing_an_already_placed_task_is_refused() {
+    let (api, _project_id, task_id) = api_with_project_task();
+    let h1 = observe_host(&api, "h1", "hst_1111", 0.1, 0, vec!["/tmp/repo"]);
+    let h2 = observe_host(&api, "h2", "hst_2222", 0.2, 0, vec!["/tmp/repo"]);
+
+    let first = api
+        .handle(
+            "task.place",
+            json!({"request_id": "place-1", "task_id": task_id, "host_id": h1}),
+        )
+        .unwrap();
+    let first_attempt = first["event"]["payload"]["attempt_id"].clone();
+
+    let second = api.handle(
+        "task.place",
+        json!({"request_id": "place-2", "task_id": task_id, "host_id": h2}),
+    );
+    assert!(second.is_err(), "a second placement must not be accepted");
+
+    let task = api
+        .handle("task.get", json!({"task_id": task_id}))
+        .unwrap();
+    assert_eq!(
+        task["task"]["current_attempt_id"], first_attempt,
+        "the original attempt must still own the task"
+    );
+    let live: Vec<_> = task["attempts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|a| a["status"] != "cancelled")
+        .collect();
+    assert_eq!(live.len(), 1, "exactly one attempt may be live: {live:?}");
+}
+
+/// Replaying a log twice reaches the same state, and a duplicated event is a
+/// no-op rather than a second application.
+///
+/// This is the invariant the events-dedup short-circuit depends on. It only
+/// holds because an event and its reduction now commit together: before that
+/// they were separate autocommits, so a crash between them left a projection
+/// the log could never repair — every later replay saw the event_id already
+/// present and skipped the reduction that was missing.
+#[test]
+fn folding_the_same_log_twice_reaches_the_same_state() {
+    let dir = tempdir().unwrap();
+    let log = Arc::new(LocalJournalEventLog::new(dir.path().join("events.ndjson")));
+    let api = Api::for_tests(log.clone() as Arc<dyn EventLog>).unwrap();
+    let project = api
+        .handle(
+            "project.add",
+            json!({"request_id": "project", "root_path": "/tmp/repo", "name": "repo"}),
+        )
+        .unwrap();
+    let project_id: ProjectId =
+        serde_json::from_value(project["event"]["project_id"].clone()).unwrap();
+    let task = api
+        .handle(
+            "task.create",
+            json!({"request_id": "task", "project_id": project_id, "title": "slice", "body": ""}),
+        )
+        .unwrap();
+    let task_id: TaskId =
+        serde_json::from_value(task["event"]["payload"]["task_id"].clone()).unwrap();
+    let host_id = observe_host(&api, "h1", "hst_1111", 0.1, 0, vec!["/tmp/repo"]);
+    api.handle(
+        "task.place",
+        json!({"request_id": "place", "task_id": task_id, "host_id": host_id}),
+    )
+    .unwrap();
+
+    let events = log.read_all().unwrap();
+    assert!(!events.is_empty());
+
+    let once = Reducer::replay(&events).unwrap();
+    let doubled: Vec<_> = events.iter().chain(events.iter()).cloned().collect();
+    let twice = Reducer::replay(&doubled).unwrap();
+
+    assert_eq!(
+        serde_json::to_value(once.tasks(None, None, 100).unwrap()).unwrap(),
+        serde_json::to_value(twice.tasks(None, None, 100).unwrap()).unwrap(),
+        "a duplicated log must not change the projection"
+    );
+    assert_eq!(
+        once.watermark().unwrap(),
+        twice.watermark().unwrap(),
+        "a duplicated event must not advance the watermark twice"
+    );
+}
+
+/// A reduction that fails leaves no trace of its event, so the same event can
+/// be applied successfully later.
+///
+/// This is what the transaction buys, and the events-dedup short-circuit
+/// depends on it. Previously the `events` row and the reduction were separate
+/// autocommits: a reduction that failed part-way still left the event row
+/// behind, and every later replay found that event_id present, returned
+/// early, and never ran the reduction that was missing — the projection could
+/// not be repaired by replaying the log, which is the one recovery mechanism
+/// an event-sourced store has.
+///
+/// A `task_placed` naming a task that does not exist is the cheapest way to
+/// make a reduction fail after the event row has been written.
+#[test]
+fn a_failed_reduction_leaves_no_event_behind() {
+    let reducer = Reducer::in_memory().unwrap();
+    let missing_task = TaskId::try_from("tsk_does_not_exist".to_string()).unwrap();
+    let attempt_id = "att_1111";
+    let event = IntentEvent::new(
+        "task_placed",
+        Some("place-torn".to_string()),
+        None,
+        json!({
+            "attempt": {
+                "attempt_id": attempt_id,
+                "task_id": missing_task,
+                "host_id": "hst_1111",
+                "status": "created",
+                "created_at_ms": 1,
+                "updated_at_ms": 1
+            },
+            "placement": {"host_id": "hst_1111", "mode": "worktree"},
+            "task_id": missing_task,
+            "attempt_id": attempt_id,
+            "token": "fen_1111"
+        }),
+    );
+
+    assert!(
+        reducer.apply(&event).is_err(),
+        "placing onto a missing task must fail"
+    );
+    assert!(
+        reducer
+            .event_by_request_id("place-torn")
+            .unwrap()
+            .is_none(),
+        "a failed reduction must not leave its event row committed"
+    );
+    assert_eq!(
+        reducer.watermark().unwrap(),
+        0,
+        "a failed reduction must not advance the watermark"
+    );
+}

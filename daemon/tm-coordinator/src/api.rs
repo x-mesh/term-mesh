@@ -444,6 +444,22 @@ impl Api {
             if !task.status.can_transition_to(&TaskStatus::Placed) {
                 bail!("invalid task transition {:?} -> placed", task.status);
             }
+            // `Placed -> Placed` is a legal transition (the status machine lets
+            // any state repeat), so the status check alone waves through a
+            // second placement of a task that already has one. That minted a
+            // fresh attempt and fence while the first attempt kept running on
+            // its original host, never told it had lost the task — two hosts
+            // owning one task, which is the thing fencing exists to prevent.
+            //
+            // A retry that lost its idempotency key lands here. Refusing is
+            // the honest answer: the caller can read the placement back, and
+            // moving a placed task is what `task.reassign` is for.
+            if task.current_attempt_id.is_some() {
+                bail!(
+                    "task {} is already placed; use task.reassign to move it",
+                    p.task_id.as_str()
+                );
+            }
             let host = reducer.choose_host(&task.project_id, p.host_id.as_ref())?;
             let attempt_id = AttemptId::new_random();
             let token = FencingToken::new_random();

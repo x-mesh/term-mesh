@@ -210,6 +210,20 @@ impl Reducer {
     }
 
     pub fn apply(&self, event: &IntentEvent) -> Result<()> {
+        // The event row and everything it implies land together or not at all.
+        //
+        // Without this they were separate autocommits, and the dedup below
+        // turned a torn write into a permanent one: a crash after the event
+        // row committed but before (or partway through) its reduction left a
+        // projection that did not match the log, and every future replay found
+        // the event_id already present, returned here, and never ran the
+        // reduction that would have repaired it. Folding the same log twice
+        // has to reach the same state; that only holds if a fold is atomic.
+        //
+        // `unchecked_transaction` because `apply` takes `&self`. Safe here:
+        // every caller (`replay`, `Api::mutate`, startup catch-up) invokes it
+        // at the top level, so these never nest.
+        let tx = self.conn.unchecked_transaction()?;
         let json = serde_json::to_string(event)?;
         let inserted = self.conn.execute(
             "INSERT OR IGNORE INTO events(event_id,request_id,kind,project_id,ts_ms,event_json) VALUES(?1,?2,?3,?4,?5,?6)",
@@ -223,10 +237,12 @@ impl Reducer {
             ],
         )?;
         if inserted == 0 {
+            // Already applied. Nothing was written, so letting the transaction
+            // roll back on drop is the whole cleanup.
             return Ok(());
         }
 
-        match event.kind.as_str() {
+        let reduced = match event.kind.as_str() {
             "project_added" => self.reduce_project_added(event),
             "task_created" => self.reduce_task_created(event),
             "task_status_changed" => self.reduce_task_status_changed(event),
@@ -242,7 +258,10 @@ impl Reducer {
             "merge_queue_transitioned" => self.reduce_merge_queue_transitioned(event),
             "fence_issued" => self.reduce_fence_issued(event),
             _ => Ok(()),
-        }
+        };
+        reduced?;
+        tx.commit()?;
+        Ok(())
     }
 
     pub fn projects(&self) -> Result<Vec<Project>> {
@@ -620,12 +639,18 @@ impl Reducer {
         if !task.status.can_transition_to(&status) {
             bail!("invalid task transition {:?} -> {:?}", task.status, status);
         }
-        if matches!(status, TaskStatus::Reassigned) {
-            self.conn.execute(
-                "UPDATE attempts SET status='cancelled', updated_at_ms=?1 WHERE task_id=?2 AND attempt_id<>?3 AND status NOT IN ('merged','failed','cancelled')",
-                params![event.ts_ms as i64, attempt.task_id.as_str(), attempt.attempt_id.as_str()],
-            )?;
-        }
+        // Every other live attempt for this task loses, whichever event got us
+        // here. Scoping this to `Reassigned` meant a second `task_placed` took
+        // over `current_attempt_id` while the previous attempt stayed
+        // `created` — still running somewhere the coordinator no longer
+        // tracked. The API now refuses that second placement outright, but the
+        // reducer replays whatever the log already holds, so it repairs rather
+        // than rejects: on a first placement there is nothing to cancel and
+        // this updates no rows.
+        self.conn.execute(
+            "UPDATE attempts SET status='cancelled', updated_at_ms=?1 WHERE task_id=?2 AND attempt_id<>?3 AND status NOT IN ('merged','failed','cancelled')",
+            params![event.ts_ms as i64, attempt.task_id.as_str(), attempt.attempt_id.as_str()],
+        )?;
         self.insert_attempt(&attempt)?;
         self.conn.execute(
             "UPDATE tasks SET status=?1,current_attempt_id=?2,placement_json=?3,updated_at_ms=?4 WHERE task_id=?5",
