@@ -36,6 +36,15 @@ final class AutoReplyPoller {
     // FIX 2: Cap lastScrollbackText to avoid unbounded memory growth on long-running agents.
     private static let lastScrollbackCapBytes = 2 * 1024 * 1024
 
+    /// How much of the pane the redraw fallback below feeds the detector.
+    ///
+    /// Matched to `AutoReplyDetector`'s own sliding window (300 lines): the
+    /// detector discards anything older the moment it arrives, so feeding the
+    /// whole capped scrollback only to have it dropped put a megabyte-scale
+    /// string walk on a 500 ms main-actor tick, per working agent pane. An
+    /// in-place redraw touches the screen, which is a fraction of this.
+    private static let redrawFeedLines = 300
+
     // FIX 1: Private serial queue so concurrent ticks can't interleave reads.
     private let pollQueue = DispatchQueue(label: "term-mesh.auto-reply.poll", qos: .userInitiated)
     // FIX 1: Skip a new tick while the previous batch's reads are still in flight.
@@ -356,7 +365,7 @@ final class AutoReplyPoller {
         // duplicate emits are already blocked by `lastFiredHash`.
         var feed = delta
         if feed.isEmpty, state.lastScrollbackText != previousText {
-            feed = state.lastScrollbackText
+            feed = Self.screenBottom(of: state.lastScrollbackText, lines: Self.redrawFeedLines)
         }
         if !feed.isEmpty, let data = feed.data(using: .utf8) {
             if let ev = state.detector.pushBytes(data, at: now) {
