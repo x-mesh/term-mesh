@@ -287,3 +287,35 @@ fn a_second_placement_does_not_reuse_a_host_it_just_filled() {
         "its one free slot is spoken for, so the next task goes elsewhere"
     );
 }
+
+/// Two hosts alike in capacity and load resolve the same way every time.
+///
+/// The sort ends on host_id precisely so that case has an answer; without a
+/// test, a later change to the comparator could make placement depend on row
+/// order and nobody would notice until two runs disagreed.
+#[test]
+fn identical_hosts_break_the_tie_the_same_way_every_time() {
+    let mut winners = Vec::new();
+    for round in 0..3 {
+        let (_dir, api) = new_api();
+        let (_project_id, task_id) = project_with_task(&api, &format!("tie-{round}"));
+        // Observed in opposite orders across rounds: if anything downstream
+        // depended on insertion order, these would disagree.
+        if round % 2 == 0 {
+            observe_with_slots(&api, "a", "hst_aaaa", 4, 1, 0.5);
+            observe_with_slots(&api, "b", "hst_bbbb", 4, 1, 0.5);
+        } else {
+            observe_with_slots(&api, "b", "hst_bbbb", 4, 1, 0.5);
+            observe_with_slots(&api, "a", "hst_aaaa", 4, 1, 0.5);
+        }
+        let placed = api
+            .handle("task.place", json!({"request_id": "place", "task_id": task_id}))
+            .unwrap();
+        winners.push(placed_host(&placed).to_string());
+    }
+    assert_eq!(
+        winners,
+        vec!["hst_aaaa", "hst_aaaa", "hst_aaaa"],
+        "a tie must resolve on host_id, regardless of the order they were observed"
+    );
+}

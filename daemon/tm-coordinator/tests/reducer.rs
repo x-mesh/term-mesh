@@ -910,3 +910,145 @@ fn a_failed_reduction_leaves_no_event_behind() {
         "a failed reduction must not advance the watermark"
     );
 }
+
+/// Re-fencing a live attempt invalidates the token already handed out for it.
+///
+/// The existing coverage re-fences at task level (`attempt_id: None`), but
+/// `review.snapshot`/`approve`/`reject` check the attempt-scoped fence, and
+/// generation only accumulates within one attempt_id — every place mints a
+/// fresh one, so that counter is otherwise never exercised past 1.
+#[test]
+fn re_fencing_an_attempt_retires_its_previous_token() {
+    let (api, _project_id, task_id) = api_with_project_task();
+    let host = observe_host(&api, "h1", "hst_1111", 0.1, 0, vec!["/tmp/repo"]);
+    let placed = api
+        .handle(
+            "task.place",
+            json!({"request_id": "place", "task_id": task_id, "host_id": host}),
+        )
+        .unwrap();
+    let attempt_id = placed["event"]["payload"]["attempt_id"].as_str().unwrap().to_string();
+    let first_token = placed["event"]["payload"]["token"].as_str().unwrap().to_string();
+
+    let refenced = api
+        .handle(
+            "fence",
+            json!({
+                "request_id": "refence",
+                "task_id": task_id,
+                "attempt_id": attempt_id,
+                "holder": "leader"
+            }),
+        )
+        .unwrap();
+    let second_token = refenced["event"]["payload"]["token"].as_str().unwrap().to_string();
+    assert_ne!(first_token, second_token);
+
+    assert!(
+        !api.is_current_fence(task_id.as_str(), Some(&attempt_id), &first_token)
+            .unwrap(),
+        "the superseded token must stop being current"
+    );
+    assert!(
+        api.is_current_fence(task_id.as_str(), Some(&attempt_id), &second_token)
+            .unwrap(),
+        "the newest token must be current"
+    );
+}
+
+/// A truncated trailing line is reported, and the rest of the log is not
+/// silently reinterpreted.
+///
+/// `append` writes the JSON and the newline separately before syncing, so a
+/// crash between them leaves exactly this shape. Whatever `read_all` decides
+/// to do, it must be a decision someone chose — today it fails the whole
+/// read, which puts the coordinator in its degraded mode rather than letting
+/// a partial event through as if it were complete.
+#[test]
+fn a_truncated_trailing_line_does_not_pass_as_an_event() {
+    use std::io::Write;
+
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("events.ndjson");
+    let log = LocalJournalEventLog::new(path.clone());
+    let event = IntentEvent::new("project_added", Some("one".to_string()), None, json!({}));
+    log.append(&event).unwrap();
+
+    let mut file = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+    file.write_all(b"{\"schema\":1,\"event_id\":\"evt_trunc\"").unwrap();
+    drop(file);
+
+    let result = log.read_all();
+    assert!(
+        result.is_err(),
+        "a half-written line must not be read as an event"
+    );
+}
+
+/// An append that fails leaves nothing behind, so the same request can be
+/// retried.
+///
+/// `mutate` appends before applying, so the projection should be untouched
+/// and the request_id unconsumed. That was inferred from reading the order,
+/// never verified — a change that applied first, or that left partial state
+/// on an append error, would have gone unnoticed.
+#[test]
+fn a_failed_append_leaves_the_projection_and_the_request_id_free() {
+    struct FailFirstAppend {
+        fail_next: Mutex<bool>,
+        events: Mutex<Vec<IntentEvent>>,
+    }
+
+    impl EventLog for FailFirstAppend {
+        fn append(&self, event: &IntentEvent) -> Result<()> {
+            let mut fail = self.fail_next.lock().unwrap();
+            if *fail {
+                *fail = false;
+                bail!("disk went away");
+            }
+            self.events.lock().unwrap().push(event.clone());
+            Ok(())
+        }
+
+        fn read_all(&self) -> Result<Vec<IntentEvent>> {
+            Ok(self.events.lock().unwrap().clone())
+        }
+
+        fn health(&self) -> serde_json::Value {
+            json!({"status": "test"})
+        }
+
+        fn is_available(&self) -> bool {
+            true
+        }
+    }
+
+    let log = Arc::new(FailFirstAppend {
+        fail_next: Mutex::new(true),
+        events: Mutex::new(Vec::new()),
+    });
+    let api = Api::for_tests(log.clone() as Arc<dyn EventLog>).unwrap();
+
+    let failed = api.handle(
+        "project.add",
+        json!({"request_id": "retry-me", "root_path": "/tmp/repo", "name": "repo"}),
+    );
+    assert!(failed.is_err(), "the append failure must surface");
+
+    let projects = api.handle("project.list", json!({})).unwrap();
+    assert!(
+        projects["projects"].as_array().unwrap().is_empty(),
+        "a failed append must not leave a project behind"
+    );
+
+    let retried = api
+        .handle(
+            "project.add",
+            json!({"request_id": "retry-me", "root_path": "/tmp/repo", "name": "repo"}),
+        )
+        .expect("the same request_id must be free to retry");
+    assert_eq!(
+        retried["idempotent"], false,
+        "the retry must do the work, not report a hit that never happened"
+    );
+}
