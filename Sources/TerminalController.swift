@@ -2556,7 +2556,7 @@ class TerminalController {
                 agentInstanceId: params["agent_instance_id"] as? String
             )
             guard let agent = selection.agent else {
-                if selection.candidates.count > 1 && (params["agent_instance_id"] as? String).nilIfBlankTC == nil {
+                if selection.candidates.count > 1 && (params["agent_instance_id"] as? String)?.nilIfBlankTC == nil {
                     let candidates = selection.candidates.map { ["agent_name": $0.name, "agent_instance_id": $0.agentInstanceId] }
                     return V2CallResult.err(code: "ambiguous_agent", message: "Agent name '\(agentName)' has multiple instances; pass agent_instance_id", data: ["candidates": candidates])
                 }
@@ -2828,19 +2828,11 @@ class TerminalController {
         guard let agentInstanceId = selection.instanceId else {
             return v2Error(id: id, code: "not_found", message: "Agent not found")
         }
-        // Optional deterministic per-pane addressing. When a valid panel_id resolves to
-        // a live, non-migrating agent pane, delivery bypasses name round-robin.
-        let panelId = await MainActor.run {
-            TeamOrchestrator.shared.resolveAgentForRPC(
-                teamName: teamName, agentName: agentName, agentInstanceId: agentInstanceId
-            ).agent?.panelId
-        }
-
         // Per-agent send serialization: wait for the preceding paste+Return cycle to
         // finish (including 250 ms post-Return cooldown) before pasting new text.
         // This prevents rapid consecutive sends from racing inside the codex TUI
         // submit window and dropping every other message.
-        let agentKey = "\(teamName)/\(agentName)"
+        let agentKey = "\(teamName)/\(agentInstanceId)"
         let (prevGate, _): (SendGate?, SendGate) = await MainActor.run {
             let prev = TerminalController.perAgentGateQueue[agentKey]?.last
             let gate = SendGate()
@@ -2879,28 +2871,9 @@ class TerminalController {
             Task { @MainActor in
                 let tabManager = TeamOrchestrator.shared.resolveTabManager(teamName: teamName) ?? self.tabManager
                 guard let tabManager else { resume(false); return }
-                // Deterministic per-pane delivery: if a valid panel_id resolves to a live,
-                // non-migrating agent pane in this team, paste directly into that pane and
-                // record it as the pending Return target (the separate team.send_key Return
-                // carries the same panel_id from the Rust CLI). Otherwise fall back to the
-                // name-based round-robin path (backward compatible).
-                if let pid = panelId,
-                   !TeamOrchestrator.shared.isAgentMigrating(teamName: teamName, agentName: agentName),
-                   let agent = TeamOrchestrator.shared.teams[teamName]?.agents.first(where: { $0.panelId == pid && $0.name == agentName }) {
-                    let ok = TeamOrchestrator.shared.sendToAgentByPanel(
-                        teamName: teamName,
-                        panelId: pid,
-                        workspaceId: agent.workspaceId,
-                        text: text,
-                        tabManager: tabManager,
-                        withReturn: false, // Return is sent separately by Rust CLI via team.send_key
-                        recordPendingReturnFor: agentName,
-                        completion: { ack in resume(ack) } // await paste ack like the name path
-                    )
-                    dispatched = ok
-                    if !ok { resume(false) }
-                    return
-                }
+                // Keep only the durable instance across the stagger/queue wait.
+                // sendToAgent resolves its current panel, transport and host here,
+                // immediately before delivery, so a restarted sibling is never used.
                 let ok = TeamOrchestrator.shared.sendToAgent(
                     teamName: teamName,
                     agentName: agentName,
@@ -3717,14 +3690,6 @@ class TerminalController {
         let taskTitle = params["task_title"] as? String
         let priority = params["priority"] as? Int
         let context = params["context"] as? String
-        // Optional deterministic per-pane addressing. delegateToAgent uses this only
-        // when it resolves to a live, non-migrating pane with this panelId+name;
-        // otherwise it falls back to name-based round-robin. Task assignee stays the name.
-        let panelId = await MainActor.run {
-            TeamOrchestrator.shared.resolveAgentForRPC(
-                teamName: teamName, agentName: agentName, agentInstanceId: agentInstanceId
-            ).agent?.panelId
-        }
         let store = TeamDataStore.shared
 
         // Stagger: dynamic gap based on team size to prevent main-queue saturation
@@ -3766,7 +3731,6 @@ class TerminalController {
                     priority: priority,
                     context: context,
                     tabManager: tabManager,
-                    panelId: panelId,
                     completion: { ok in resume(ok) }
                 )
                 if capturedDelegateResult == nil { resume(false) }
@@ -3779,15 +3743,12 @@ class TerminalController {
 
         var returnSubmitted = false
         if textDelivered, params["submit_return"] as? Bool == true {
-            var keyParams: [String: Any] = [
+            let keyParams: [String: Any] = [
                 "team": teamName,
                 "agent": agentName,
                 "key": "return",
                 "agent_instance_id": agentInstanceId,
             ]
-            if let panelId {
-                keyParams["panel_id"] = panelId.uuidString
-            }
             let keyResponse = await asyncTeamSendKey(params: keyParams, id: id)
             if let data = keyResponse.data(using: .utf8),
                let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
@@ -3834,17 +3795,6 @@ class TerminalController {
         guard let agentInstanceId = selection.instanceId else {
             return v2Error(id: id, code: "not_found", message: "Agent not found")
         }
-        // Optional explicit per-pane target for the Return. When present and it still
-        // resolves to a live agent pane, it takes precedence over pendingReturnTarget
-        // and the name lookup — guaranteeing the Return lands on the exact pane the
-        // paste hit, even for duplicate-named agents. Falls back when stale (e.g. after
-        // a hard restart rewrote the panelId).
-        let explicitPanelId = await MainActor.run {
-            TeamOrchestrator.shared.resolveAgentForRPC(
-                teamName: teamName, agentName: agentName, agentInstanceId: agentInstanceId
-            ).agent?.panelId
-        }
-
         // An agent held natively has no keyboard to press Return on, and needs
         // none: the write to its stdin was already a whole turn, submitted the
         // moment it landed. The caller is asking "is this turn in?", and the
@@ -3853,7 +3803,9 @@ class TerminalController {
         // warning about a Return nothing was waiting for.
         if key.lowercased() == "return",
            await MainActor.run(body: {
-               !TeamOrchestrator.shared.agentNeedsReturn(teamName: teamName, agentName: agentName)
+               !TeamOrchestrator.shared.agentNeedsReturn(
+                   teamName: teamName, agentName: agentName, agentInstanceId: agentInstanceId
+               )
            }) {
             return v2Ok(id: id, result: ["sent": true, "no_keyboard": true,
                                          "team_name": teamName, "agent_name": agentName])
@@ -3873,39 +3825,23 @@ class TerminalController {
                     }
                 }
 
-                let keyIsReturn = key.lowercased() == "return"
-                // 1) Explicit panel_id (return only) — preferred when it resolves live.
-                let explicitTarget: (panelId: UUID, workspaceId: UUID)? = {
-                    guard keyIsReturn, let epid = explicitPanelId,
-                          let team = TeamOrchestrator.shared.teams[teamName],
-                          let agent = team.agents.first(where: { $0.panelId == epid }) else { return nil }
-                    return (epid, agent.workspaceId)
-                }()
-                // 2) pendingReturnTarget (the pane the last paste landed on).
-                let pendingTarget = (keyIsReturn && explicitTarget == nil)
-                    ? TeamOrchestrator.shared.pendingReturnTarget(teamName: teamName, agentName: agentName)
-                    : nil
+                // Resolve the instance at key-delivery time. Do not reuse a
+                // panel_id captured before a restart/migration async gap.
+                let liveAgent = TeamOrchestrator.shared.resolveAgentForRPC(
+                    teamName: teamName, agentName: agentName, agentInstanceId: agentInstanceId
+                ).agent
                 let pid: UUID
                 let workspaceId: UUID
-                if let explicitTarget {
-                    pid = explicitTarget.panelId
-                    workspaceId = explicitTarget.workspaceId
-                } else if let pendingTarget {
-                    pid = pendingTarget.panelId
-                    workspaceId = pendingTarget.workspaceId
-                } else {
-                    guard let team = TeamOrchestrator.shared.teams[teamName],
-                          let agent = team.agents.first(where: { $0.name == agentName }) else {
-                        resume(sent: false, targetMissing: true, reason: "agent_not_found")
-                        return
-                    }
-                    guard let agentPanelId = agent.panelId else {
-                        resume(sent: false, targetMissing: true, reason: "headless_no_pane")
-                        return
-                    }
-                    pid = agentPanelId
-                    workspaceId = agent.workspaceId
+                guard let liveAgent else {
+                    resume(sent: false, targetMissing: true, reason: "agent_not_found")
+                    return
                 }
+                guard let agentPanelId = liveAgent.panelId else {
+                    resume(sent: false, targetMissing: true, reason: "headless_no_pane")
+                    return
+                }
+                pid = agentPanelId
+                workspaceId = liveAgent.workspaceId
                 let tabManager = TeamOrchestrator.shared.resolveTabManager(teamName: teamName) ?? self.tabManager
                 guard let tabManager,
                       let ws = tabManager.tabs.first(where: { $0.id == workspaceId }),
@@ -3929,9 +3865,11 @@ class TerminalController {
         // gate enqueued in asyncTeamSend; together they serialize consecutive sends to
         // the same codex/agent pane and prevent TUI submit-window drops.
         if result.sent && key.lowercased() == "return" {
-            let agentKey = "\(teamName)/\(agentName)"
+            let agentKey = "\(teamName)/\(agentInstanceId)"
             await MainActor.run {
-                TeamOrchestrator.shared.clearPendingReturnTarget(teamName: teamName, agentName: agentName)
+                TeamOrchestrator.shared.clearPendingReturnTarget(
+                    teamName: teamName, agentName: agentName, agentInstanceId: agentInstanceId
+                )
             }
             try? await Task.sleep(nanoseconds: TerminalController.kPostReturnCooldownNs)
             let gateToOpen: SendGate? = await MainActor.run {

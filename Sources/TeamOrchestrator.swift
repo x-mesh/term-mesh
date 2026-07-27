@@ -2906,6 +2906,13 @@ final class TeamOrchestrator: ObservableObject {
         return named.count == 1 ? (named[0], named) : (nil, named)
     }
 
+    /// A durable instance is the only key allowed to survive an async gap.
+    /// Pane, pipe, host, and workspace locators are read from the current
+    /// roster immediately before delivery, since restart replaces them.
+    private func agentOperationKey(teamName: String, agentInstanceId: String) -> String {
+        "\(teamName)/\(agentInstanceId)"
+    }
+
     /// Send text to a specific agent in a team.
     /// When multiple agents share the same name, round-robins across them.
     /// Maintains an in-flight counter and a panelId snapshot so a concurrent
@@ -2958,7 +2965,7 @@ final class TeamOrchestrator: ObservableObject {
                 return false
             }
         }
-        let teamAgentKey = "\(teamName)/\(agentName)"
+        let teamAgentKey = agentOperationKey(teamName: teamName, agentInstanceId: agent.agentInstanceId)
         if migratingAgents.contains(teamAgentKey) {
             #if DEBUG
             dlog("[team.sendToAgent] aborted reason=migration_in_flight team=\(teamName) agent=\(agentName)")
@@ -2978,7 +2985,7 @@ final class TeamOrchestrator: ObservableObject {
         activeSends[teamAgentKey, default: 0] += 1
         if !withReturn, let identity = agentIdentity(for: agent) {
             pendingReturnTargets[teamAgentKey] = identity
-            scheduleOwedReturn(teamName: teamName, agentName: agentName, panelId: pid)
+            scheduleOwedReturn(teamName: teamName, agentName: agent.agentInstanceId, panelId: pid)
         }
         return sendTextToPanel(
             workspaceId: agent.workspaceId,
@@ -3245,6 +3252,11 @@ final class TeamOrchestrator: ObservableObject {
         let title = taskTitle?.nilIfBlank ?? String(text.prefix(80))
         let assignedInstanceId: String? = {
             guard let team = teams[teamName] else { return nil }
+            if let agentInstanceId {
+                return resolveAgentForRPC(
+                    teamName: teamName, agentName: agentName, agentInstanceId: agentInstanceId
+                ).agent?.agentInstanceId
+            }
             if let panelId {
                 return team.agents.first(where: { $0.name == agentName && $0.panelId == panelId })?.agentInstanceId
             }
@@ -3621,9 +3633,11 @@ final class TeamOrchestrator: ObservableObject {
     /// CLI's first attempt is already a round trip, so answering it there is
     /// one mechanism instead of two, and it covers every caller — including the
     /// ones that never learn about a new response field.
-    func agentNeedsReturn(teamName: String, agentName: String) -> Bool {
+    func agentNeedsReturn(teamName: String, agentName: String, agentInstanceId: String? = nil) -> Bool {
         guard let team = teams[teamName],
-              let agent = selectAgent(in: team.agents, name: agentName),
+              let agent = agentInstanceId.flatMap({
+                  resolveAgentForRPC(teamName: teamName, agentName: agentName, agentInstanceId: $0).agent
+              }) ?? selectAgent(in: team.agents, name: agentName),
               let panelId = agent.panelId,
               nativeAgentPanel(workspaceId: agent.workspaceId, panelId: panelId) != nil
         else { return true }
@@ -3953,8 +3967,14 @@ final class TeamOrchestrator: ObservableObject {
         }
     }
 
-    func clearPendingReturnTarget(teamName: String, agentName: String, panelId: UUID? = nil) {
-        let key = "\(teamName)/\(agentName)"
+    func clearPendingReturnTarget(
+        teamName: String,
+        agentName: String,
+        agentInstanceId: String? = nil,
+        panelId: UUID? = nil
+    ) {
+        let key = agentInstanceId.map { agentOperationKey(teamName: teamName, agentInstanceId: $0) }
+            ?? "\(teamName)/\(agentName)"
         guard let panelId else {
             pendingReturnTargets.removeValue(forKey: key)
             return
@@ -4158,10 +4178,10 @@ final class TeamOrchestrator: ObservableObject {
         guard let oldPid = old.panelId else {
             return .failure(.headlessNoPane)
         }
-        // Use panelId-based key when available so duplicate-named agents each get
-        // their own migration slot and don't block each other (P2-1 fix).
-        let teamAgentKey = disambiguatePanelId.map { "\(teamName)/\($0.uuidString)" }
-            ?? "\(teamName)/\(agentName)"
+        // The pane id is replaced by this operation.  The durable instance id
+        // keeps migration, paste draining and the post-restart refresh tied to
+        // this member rather than a stale pane or duplicate-name sibling.
+        let teamAgentKey = agentOperationKey(teamName: teamName, agentInstanceId: old.agentInstanceId)
         if migratingAgents.contains(teamAgentKey) {
             return .failure(.alreadyMigrating)
         }
