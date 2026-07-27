@@ -15,6 +15,51 @@ import XCTest
 @MainActor
 final class AgentSessionTests: XCTestCase {
 
+    private func agentMember(name: String = "executor") -> TeamOrchestrator.AgentMember {
+        TeamOrchestrator.AgentMember(
+            id: "\(name)@identity-test",
+            name: name,
+            teamName: "identity-test",
+            cli: "claude",
+            launchCommand: "claude",
+            model: "sonnet",
+            agentType: "executor",
+            color: "green",
+            instructions: "",
+            workspaceId: UUID(),
+            panelId: nil,
+            parentSessionId: nil,
+            claudeSessionId: nil,
+            claudeSessionIdCapturedAt: nil,
+            createdAt: Date(),
+            worktreeName: nil,
+            worktreePath: nil,
+            worktreeBranch: nil,
+            remoteSurfaceID: nil,
+            remoteSurfaceSpawned: false,
+            hostKey: nil,
+            originalSpawnCommand: nil,
+            originalAgentWorkDir: nil,
+            autoRecycleEvery: nil,
+            completedTaskCount: 0
+        )
+    }
+
+    /// A duplicate-name request must still be distinguishable before the
+    /// existing unique-name guard rejects it. Routing cannot use `panelId`:
+    /// pane recreation changes that value.
+    func testDuplicateNameCandidatesReceiveDistinctNonEmptyInstanceIDs() {
+        let first = agentMember()
+        let duplicate = agentMember()
+
+        XCTAssertEqual(first.name, duplicate.name)
+        XCTAssertFalse(first.agentInstanceId.isEmpty)
+        XCTAssertFalse(duplicate.agentInstanceId.isEmpty)
+        XCTAssertNotEqual(first.agentInstanceId, duplicate.agentInstanceId)
+        XCTAssertNotNil(UUID(uuidString: first.agentInstanceId))
+        XCTAssertNotNil(UUID(uuidString: duplicate.agentInstanceId))
+    }
+
     func testRemoteClaudeLaunchUsesSSHAndKeepsRemoteDirectoryOutOfLocalProcess() {
         let launch = AgentSession.remoteClaudeLaunch(
             sshTarget: "root@jw-server",

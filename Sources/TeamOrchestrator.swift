@@ -10,7 +10,10 @@ final class TeamOrchestrator: ObservableObject {
     static let shared = TeamOrchestrator()
 
     struct AgentMember: Identifiable {
-        let id: String           // agent-name@team-name (stable identity across hard restart)
+        let id: String           // agent-name@team-name (legacy routing key)
+        /// Team-scoped durable identity. Unlike `panelId`, this survives a
+        /// hard restart; unlike `id`, it does not depend on a role/name.
+        var agentInstanceId: String = UUID().uuidString
         let name: String         // e.g. "executor", "reviewer"
         let teamName: String
         let cli: String          // "claude", "kiro" (which CLI to run)
