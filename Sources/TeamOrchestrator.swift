@@ -2099,6 +2099,7 @@ final class TeamOrchestrator: ObservableObject {
     func detachAgent(
         teamName: String,
         agentName: String,
+        agentInstanceId: String? = nil,
         tabManager: TabManager,
         force: Bool = true,
         /// When true, a last-agent detach preserves the (now empty) team record
@@ -2113,7 +2114,9 @@ final class TeamOrchestrator: ObservableObject {
         guard var team = teams[teamName] else {
             return .failure(.teamNotFound(name: teamName))
         }
-        guard let agentIndex = team.agents.firstIndex(where: { $0.name == agentName }) else {
+        guard let agentIndex = team.agents.firstIndex(where: {
+            $0.name == agentName && (agentInstanceId == nil || $0.agentInstanceId == agentInstanceId)
+        }) else {
             return .failure(.agentNotFound(
                 name: agentName,
                 available: team.agents.map(\.name)
@@ -2879,18 +2882,40 @@ final class TeamOrchestrator: ObservableObject {
         return candidates[idx]
     }
 
+    /// Resolves a team member for an RPC operation without round-robin.  The
+    /// durable instance selector is additive: a unique legacy name continues
+    /// to work, while duplicate names require `agent_instance_id` so a mutating
+    /// request can never affect an arbitrary sibling.
+    func resolveAgentForRPC(
+        teamName: String,
+        agentName: String,
+        agentInstanceId: String?
+    ) -> (agent: AgentMember?, candidates: [AgentMember]) {
+        guard let team = teams[teamName] else { return (nil, []) }
+        let named = team.agents.filter { $0.name == agentName }
+        if let agentInstanceId, !agentInstanceId.isEmpty {
+            return (named.first { $0.agentInstanceId == agentInstanceId }, named)
+        }
+        return named.count == 1 ? (named[0], named) : (nil, named)
+    }
+
     /// Send text to a specific agent in a team.
     /// When multiple agents share the same name, round-robins across them.
     /// Maintains an in-flight counter and a panelId snapshot so a concurrent
     /// hard restart can either drain (preferred) or detect mid-flight migration.
-    func sendToAgent(teamName: String, agentName: String, text: String, tabManager: TabManager, withReturn: Bool = true, completion: ((Bool) -> Void)? = nil) -> Bool {
+    func sendToAgent(teamName: String, agentName: String, agentInstanceId: String? = nil, text: String, tabManager: TabManager, withReturn: Bool = true, completion: ((Bool) -> Void)? = nil) -> Bool {
         guard let team = teams[teamName] else {
             #if DEBUG
             dlog("[team.sendToAgent] DROP reason=team_not_found team=\(teamName) agent=\(agentName)")
             #endif
             completion?(false); return false
         }
-        guard let agent = selectAgent(in: team.agents, name: agentName) else {
+        let agent: AgentMember? = if let agentInstanceId {
+            resolveAgentForRPC(teamName: teamName, agentName: agentName, agentInstanceId: agentInstanceId).agent
+        } else {
+            selectAgent(in: team.agents, name: agentName)
+        }
+        guard let agent else {
             #if DEBUG
             dlog("[team.sendToAgent] DROP reason=agent_not_found team=\(teamName) agent=\(agentName) agentCount=\(team.agents.count)")
             #endif
@@ -3200,6 +3225,7 @@ final class TeamOrchestrator: ObservableObject {
     func delegateToAgent(
         teamName: String,
         agentName: String,
+        agentInstanceId: String? = nil,
         text: String,
         taskTitle: String? = nil,
         priority: Int? = nil,
@@ -3248,6 +3274,7 @@ final class TeamOrchestrator: ObservableObject {
         let delivered = sendToAgent(
             teamName: teamName,
             agentName: agentName,
+            agentInstanceId: agentInstanceId,
             text: instruction,
             tabManager: tabManager,
             withReturn: submit,
@@ -3789,10 +3816,12 @@ final class TeamOrchestrator: ObservableObject {
     /// Send Ctrl+C (ETX) to a specific agent's terminal, interrupting the current operation.
     /// Unlike sendToAgent which types text into the prompt, this sends a raw interrupt signal
     /// that works even when the agent is busy (thinking/running tools).
-    func interruptAgent(teamName: String, agentName: String, tabManager: TabManager) -> Bool {
+    func interruptAgent(teamName: String, agentName: String, agentInstanceId: String? = nil, tabManager: TabManager) -> Bool {
         guard let team = teams[teamName],
-              let agent = team.agents.first(where: { $0.name == agentName }) else { return false }
-        guard let panel = agentPanel(teamName: teamName, agentName: agentName, tabManager: tabManager) else { return false }
+              let agent = (agentInstanceId.flatMap { instanceId in
+                  resolveAgentForRPC(teamName: teamName, agentName: agentName, agentInstanceId: instanceId).agent
+              } ?? team.agents.first(where: { $0.name == agentName })) else { return false }
+        guard let panel = agentPanel(teamName: teamName, agentName: agentName, agentInstanceId: agent.agentInstanceId, tabManager: tabManager) else { return false }
         // Send ETX byte (0x03 = Ctrl+C) directly to PTY — bypasses TUI input handling
         panel.sendText("\u{03}")
         #if DEBUG
@@ -3850,6 +3879,13 @@ final class TeamOrchestrator: ObservableObject {
     func agentIdentity(teamName: String, agentName: String) -> AgentPaneIdentity? {
         guard let team = teams[teamName],
               let agent = team.agents.first(where: { $0.name == agentName }) else { return nil }
+        return agentIdentity(for: agent)
+    }
+
+    func agentIdentity(teamName: String, agentName: String, agentInstanceId: String) -> AgentPaneIdentity? {
+        guard let agent = resolveAgentForRPC(
+            teamName: teamName, agentName: agentName, agentInstanceId: agentInstanceId
+        ).agent else { return nil }
         return agentIdentity(for: agent)
     }
 
@@ -5942,7 +5978,7 @@ final class TeamOrchestrator: ObservableObject {
 
     /// Read terminal text from a specific agent's pane.
     /// Returns the panel for external callers to use with readTerminalTextBase64.
-    func agentPanel(teamName: String, agentName: String, tabManager: TabManager) -> TerminalPanel? {
+    func agentPanel(teamName: String, agentName: String, agentInstanceId: String? = nil, tabManager: TabManager) -> TerminalPanel? {
         guard let team = teams[teamName] else { return nil }
         // Leader-as-watch-target: the leader lives in `leaderPanelId`, outside the
         // `agents[]` array. Resolve it explicitly so `tm-agent read leader` and a
@@ -5962,7 +5998,9 @@ final class TeamOrchestrator: ObservableObject {
             }
             return nil
         }
-        guard let agent = team.agents.first(where: { $0.name == agentName }) else { return nil }
+        guard let agent = agentInstanceId.flatMap({ instanceId in
+            resolveAgentForRPC(teamName: teamName, agentName: agentName, agentInstanceId: instanceId).agent
+        }) ?? team.agents.first(where: { $0.name == agentName }) else { return nil }
         guard let pid = agent.panelId else { return nil }
         guard let workspace = tabManager.tabs.first(where: { $0.id == agent.workspaceId }) else { return nil }
         return workspace.terminalPanel(for: pid)

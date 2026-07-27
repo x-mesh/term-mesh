@@ -2351,6 +2351,7 @@ class TerminalController {
                     "agents": team.agents.map { agent -> [String: Any] in
                         var info: [String: Any] = [
                             "id": agent.id, "name": agent.name,
+                            "agent_instance_id": agent.agentInstanceId,
                             "model": agent.model,
                             "workspace_id": agent.workspaceId.uuidString,
                         ]
@@ -2463,6 +2464,7 @@ class TerminalController {
                     "team_name": team.id,
                     "agent_name": newAgent.name,
                     "agent_id": newAgent.id,
+                    "agent_instance_id": newAgent.agentInstanceId,
                     "workspace_id": team.workspaceId.uuidString,
                     "agent_count": team.agents.count,
                     "model": newAgent.model,
@@ -2548,9 +2550,23 @@ class TerminalController {
             let teamName = explicitTeamName
                 ?? TeamOrchestrator.workspaceTeamName(for: resolved.workspaceId)
 
+            let selection = TeamOrchestrator.shared.resolveAgentForRPC(
+                teamName: teamName,
+                agentName: agentName,
+                agentInstanceId: params["agent_instance_id"] as? String
+            )
+            guard let agent = selection.agent else {
+                if selection.candidates.count > 1 && (params["agent_instance_id"] as? String).nilIfBlankTC == nil {
+                    let candidates = selection.candidates.map { ["agent_name": $0.name, "agent_instance_id": $0.agentInstanceId] }
+                    return V2CallResult.err(code: "ambiguous_agent", message: "Agent name '\(agentName)' has multiple instances; pass agent_instance_id", data: ["candidates": candidates])
+                }
+                return V2CallResult.err(code: "not_found", message: "Agent not found", data: nil)
+            }
+
             let outcome = TeamOrchestrator.shared.detachAgent(
                 teamName: teamName,
                 agentName: agentName,
+                agentInstanceId: agent.agentInstanceId,
                 tabManager: resolved.tabManager,
                 force: force,
                 keepTeamIfEmpty: keepTeamIfEmpty
@@ -2562,6 +2578,7 @@ class TerminalController {
                     "detached": true,
                     "team_name": detachResult.teamName,
                     "agent_name": detachResult.agentName,
+                    "agent_instance_id": agent.agentInstanceId,
                     "remaining_agents": detachResult.remainingAgents,
                     "team_destroyed": detachResult.teamDestroyed,
                 ] as [String: Any])
@@ -2735,6 +2752,7 @@ class TerminalController {
                     "team_name": teamName,
                     "agent_name": member.name,
                     "agent_id": member.id,
+                    "agent_instance_id": member.agentInstanceId,
                     "agent_type": member.agentType,
                     "cli": member.cli,
                     "model": member.model,
@@ -2750,6 +2768,49 @@ class TerminalController {
         return v2Result(id: id, result)
     }
 
+    /// Resolves the additive `agent_instance_id` selector before any RPC side
+    /// effect.  A legacy name is accepted only when it has exactly one match.
+    private func resolveTeamAgentInstance(
+        params: [String: Any],
+        teamName: String,
+        agentName: String
+    ) async -> (instanceId: String?, failure: V2CallResult?) {
+        let requestedInstanceId = params["agent_instance_id"] as? String
+        return await MainActor.run {
+            let resolution = TeamOrchestrator.shared.resolveAgentForRPC(
+                teamName: teamName,
+                agentName: agentName,
+                agentInstanceId: requestedInstanceId
+            )
+            if let agent = resolution.agent {
+                return (agent.agentInstanceId, nil)
+            }
+            guard !resolution.candidates.isEmpty else {
+                return (nil, .err(code: "not_found", message: "Agent '\(agentName)' not found in team '\(teamName)'", data: nil))
+            }
+            if requestedInstanceId?.isEmpty == false {
+                return (nil, .err(
+                    code: "not_found",
+                    message: "Agent instance '\(requestedInstanceId!)' not found for '\(agentName)'",
+                    data: ["team_name": teamName, "agent_name": agentName]
+                ))
+            }
+            let candidates = resolution.candidates.map { agent -> [String: Any] in
+                var candidate: [String: Any] = [
+                    "agent_name": agent.name,
+                    "agent_instance_id": agent.agentInstanceId,
+                ]
+                if let panelId = agent.panelId { candidate["panel_id"] = panelId.uuidString }
+                return candidate
+            }
+            return (nil, .err(
+                code: "ambiguous_agent",
+                message: "Agent name '\(agentName)' has multiple instances; pass agent_instance_id",
+                data: ["team_name": teamName, "agent_name": agentName, "candidates": candidates]
+            ))
+        }
+    }
+
     private func asyncTeamSend(params: [String: Any], id: Any?) async -> String {
         guard let teamName = params["team_name"] as? String else {
             return v2Error(id: id, code: "invalid_params", message: "Missing team_name")
@@ -2760,9 +2821,20 @@ class TerminalController {
         guard let text = params["text"] as? String else {
             return v2Error(id: id, code: "invalid_params", message: "Missing text")
         }
+        let selection = await resolveTeamAgentInstance(
+            params: params, teamName: teamName, agentName: agentName
+        )
+        if let failure = selection.failure { return v2Result(id: id, failure) }
+        guard let agentInstanceId = selection.instanceId else {
+            return v2Error(id: id, code: "not_found", message: "Agent not found")
+        }
         // Optional deterministic per-pane addressing. When a valid panel_id resolves to
         // a live, non-migrating agent pane, delivery bypasses name round-robin.
-        let panelId = (params["panel_id"] as? String).flatMap(UUID.init(uuidString:))
+        let panelId = await MainActor.run {
+            TeamOrchestrator.shared.resolveAgentForRPC(
+                teamName: teamName, agentName: agentName, agentInstanceId: agentInstanceId
+            ).agent?.panelId
+        }
 
         // Per-agent send serialization: wait for the preceding paste+Return cycle to
         // finish (including 250 ms post-Return cooldown) before pasting new text.
@@ -2832,6 +2904,7 @@ class TerminalController {
                 let ok = TeamOrchestrator.shared.sendToAgent(
                     teamName: teamName,
                     agentName: agentName,
+                    agentInstanceId: agentInstanceId,
                     text: text,
                     tabManager: tabManager,
                     withReturn: false, // Return is sent separately by Rust CLI via team.send_key
@@ -2843,7 +2916,8 @@ class TerminalController {
         }
         return dispatched
             ? v2Ok(id: id, result: ["sent": true, "text_delivered": textDelivered,
-                                    "team_name": teamName, "agent_name": agentName])
+                                    "team_name": teamName, "agent_name": agentName,
+                                    "agent_instance_id": agentInstanceId])
             : v2Error(id: id, code: "not_found", message: "Agent or team not found")
     }
 
@@ -2915,6 +2989,11 @@ class TerminalController {
         guard let agentName = params["agent_name"] as? String else {
             return v2Error(id: id, code: "invalid_params", message: "Missing agent_name")
         }
+        let selection = await resolveTeamAgentInstance(params: params, teamName: teamName, agentName: agentName)
+        if let failure = selection.failure { return v2Result(id: id, failure) }
+        guard let agentInstanceId = selection.instanceId else {
+            return v2Error(id: id, code: "not_found", message: "Agent not found")
+        }
         let lineLimit = params["lines"] as? Int
 
         // Minimal MainActor hold: only read terminal raw bytes, decode base64 off-main
@@ -2924,7 +3003,7 @@ class TerminalController {
                 return (nil, .err(code: "unavailable", message: "TabManager not available", data: nil))
             }
             guard let panel = TeamOrchestrator.shared.agentPanel(
-                teamName: teamName, agentName: agentName, tabManager: tabManager
+                teamName: teamName, agentName: agentName, agentInstanceId: agentInstanceId, tabManager: tabManager
             ) else {
                 return (nil, .err(code: "not_found", message: "Agent not found", data: nil))
             }
@@ -2942,7 +3021,8 @@ class TerminalController {
         }
         let base64 = String(response.dropFirst(3)).trimmingCharacters(in: .whitespacesAndNewlines)
         let text = Data(base64Encoded: base64).flatMap { String(data: $0, encoding: .utf8) } ?? ""
-        return v2Ok(id: id, result: ["text": text, "agent_name": agentName, "team_name": teamName])
+        return v2Ok(id: id, result: ["text": text, "agent_name": agentName,
+                                    "agent_instance_id": agentInstanceId, "team_name": teamName])
     }
 
     private func asyncTeamCollect(params: [String: Any], id: Any?) async -> String {
@@ -3005,13 +3085,13 @@ class TerminalController {
         }
 
         // Minimal MainActor hold: get team struct (agent names, UUIDs, team metadata) only
-        let teamInfo: (leaderSessionId: String, workspaceId: String, agents: [(name: String, id: String, cli: String, model: String, agentType: String, color: String, workspaceId: String, panelId: String?, completedTaskCount: Int, worktreeBranch: String?, worktreePath: String?)], createdAt: String)? = await MainActor.run {
+        let teamInfo: (leaderSessionId: String, workspaceId: String, agents: [(name: String, id: String, instanceId: String, cli: String, model: String, agentType: String, color: String, workspaceId: String, panelId: String?, completedTaskCount: Int, worktreeBranch: String?, worktreePath: String?)], createdAt: String)? = await MainActor.run {
             guard let team = TeamOrchestrator.shared.teamStruct(name: teamName) else { return nil }
             return (
                 leaderSessionId: team.leaderSessionId,
                 workspaceId: team.workspaceId.uuidString,
                 agents: team.agents.map { a in
-                    (name: a.name, id: a.id, cli: a.cli, model: a.model, agentType: a.agentType, color: a.color,
+                    (name: a.name, id: a.id, instanceId: a.agentInstanceId, cli: a.cli, model: a.model, agentType: a.agentType, color: a.color,
                      workspaceId: a.workspaceId.uuidString, panelId: a.panelId?.uuidString,
                      completedTaskCount: a.completedTaskCount, worktreeBranch: a.worktreeBranch, worktreePath: a.worktreePath)
                 },
@@ -3032,6 +3112,7 @@ class TerminalController {
             var info: [String: Any] = [
                 "id": agent.id,
                 "name": agent.name,
+                "agent_instance_id": agent.instanceId,
                 "cli": agent.cli,
                 "model": agent.model,
                 "agent_type": agent.agentType,
@@ -3080,9 +3161,15 @@ class TerminalController {
             return v2Error(id: id, code: "invalid_params", message: "Missing agent_name")
         }
         // Minimal MainActor hold: get agent struct only
+        let selection = await resolveTeamAgentInstance(params: params, teamName: teamName, agentName: agentName)
+        if let failure = selection.failure { return v2Result(id: id, failure) }
+        guard let agentInstanceId = selection.instanceId else {
+            return v2Error(id: id, code: "not_found", message: "Agent not found")
+        }
         let agentInfo: (id: String, name: String, cli: String, model: String, agentType: String, color: String, workspaceId: String, panelId: String?, worktreeBranch: String?, worktreePath: String?)? = await MainActor.run {
-            guard let team = TeamOrchestrator.shared.teamStruct(name: teamName),
-                  let agent = team.agents.first(where: { $0.name == agentName }) else { return nil }
+            guard let agent = TeamOrchestrator.shared.resolveAgentForRPC(
+                teamName: teamName, agentName: agentName, agentInstanceId: agentInstanceId
+            ).agent else { return nil }
             return (id: agent.id, name: agent.name, cli: agent.cli, model: agent.model,
                     agentType: agent.agentType, color: agent.color,
                     workspaceId: agent.workspaceId.uuidString, panelId: agent.panelId?.uuidString,
@@ -3097,6 +3184,7 @@ class TerminalController {
             "id": agentInfo.id, "name": agentInfo.name, "cli": agentInfo.cli,
             "model": agentInfo.model, "agent_type": agentInfo.agentType,
             "workspace_id": agentInfo.workspaceId,
+            "agent_instance_id": agentInstanceId,
         ]
         if let pid = agentInfo.panelId {
             info["panel_id"] = pid
@@ -3446,15 +3534,21 @@ class TerminalController {
         guard let agentName = params["agent_name"] as? String else {
             return v2Error(id: id, code: "invalid_params", message: "Missing agent_name")
         }
+        let selection = await resolveTeamAgentInstance(params: params, teamName: teamName, agentName: agentName)
+        if let failure = selection.failure { return v2Result(id: id, failure) }
+        guard let agentInstanceId = selection.instanceId else {
+            return v2Error(id: id, code: "not_found", message: "Agent not found")
+        }
         let success = await MainActor.run {
             let tabManager = TeamOrchestrator.shared.resolveTabManager(teamName: teamName) ?? self.tabManager
             guard let tabManager else { return false }
             return TeamOrchestrator.shared.interruptAgent(
-                teamName: teamName, agentName: agentName, tabManager: tabManager
+                teamName: teamName, agentName: agentName, agentInstanceId: agentInstanceId, tabManager: tabManager
             )
         }
         return success
-            ? v2Ok(id: id, result: ["interrupted": true, "team_name": teamName, "agent_name": agentName])
+            ? v2Ok(id: id, result: ["interrupted": true, "team_name": teamName,
+                                    "agent_name": agentName, "agent_instance_id": agentInstanceId])
             : v2Error(id: id, code: "not_found", message: "Agent or team not found")
     }
 
@@ -3481,10 +3575,15 @@ class TerminalController {
         guard let agentName = (params["agent"] ?? params["agent_name"]) as? String else {
             return v2Error(id: id, code: "invalid_params", message: "Missing agent_name")
         }
+        let selection = await resolveTeamAgentInstance(params: params, teamName: teamName, agentName: agentName)
+        if let failure = selection.failure { return v2Result(id: id, failure) }
+        guard let agentInstanceId = selection.instanceId else {
+            return v2Error(id: id, code: "not_found", message: "Agent not found")
+        }
         // Dispatch on mode: "soft" (default, in-place ETX+retype) | "hard" (close + respawn)
         let mode = ((params["mode"] as? String) ?? "soft").lowercased()
         if mode == "hard" {
-            return await asyncTeamRestartHard(teamName: teamName, agentName: agentName, id: id)
+            return await asyncTeamRestartHard(teamName: teamName, agentName: agentName, agentInstanceId: agentInstanceId, id: id)
         }
 
         let result: (sent: Bool, targetMissing: Bool, reason: String, launchCommand: String) = await withCheckedContinuation { continuation in
@@ -3492,7 +3591,7 @@ class TerminalController {
                 @MainActor func resume(sent: Bool, targetMissing: Bool, reason: String, launchCommand: String) {
                     continuation.resume(returning: (sent, targetMissing, reason, launchCommand))
                 }
-                guard let identity = TeamOrchestrator.shared.agentIdentity(teamName: teamName, agentName: agentName) else {
+                guard let identity = TeamOrchestrator.shared.agentIdentity(teamName: teamName, agentName: agentName, agentInstanceId: agentInstanceId) else {
                     resume(sent: false, targetMissing: true, reason: "agent_not_found", launchCommand: "")
                     return
                 }
@@ -3530,6 +3629,7 @@ class TerminalController {
                 "restarted": true,
                 "team_name": teamName,
                 "agent_name": agentName,
+                "agent_instance_id": agentInstanceId,
                 "launch_command_preview": String(result.launchCommand.prefix(120)),
                 "launch_command_len": result.launchCommand.count,
             ])
@@ -3552,14 +3652,14 @@ class TerminalController {
     /// Hard restart — close the agent pane and respawn it in the same slot.
     /// Routing (name → panelId) updates in Swift in-memory teams; daemon mirror
     /// follows via syncTeamStateToDaemon. No dedicated RPC on the daemon side.
-    private func asyncTeamRestartHard(teamName: String, agentName: String, id: Any?) async -> String {
+    private func asyncTeamRestartHard(teamName: String, agentName: String, agentInstanceId: String, id: Any?) async -> String {
         let outcome: Result<(old: UUID, new: UUID), TeamOrchestrator.RestartHardError>
             = await MainActor.run {
                 Task { @MainActor in
-                    await TeamOrchestrator.shared.restartAgentPaneHard(
-                        teamName: teamName,
-                        agentName: agentName
-                    )
+                    guard let panelId = TeamOrchestrator.shared.resolveAgentForRPC(
+                        teamName: teamName, agentName: agentName, agentInstanceId: agentInstanceId
+                    ).agent?.panelId else { return .failure(.agentNotFound) }
+                    return await TeamOrchestrator.shared.restartAgentPaneHard(panelId: panelId)
                 }
             }.value
         switch outcome {
@@ -3569,6 +3669,7 @@ class TerminalController {
                 "mode": "hard",
                 "team_name": teamName,
                 "agent_name": agentName,
+                "agent_instance_id": agentInstanceId,
                 "old_panel_id": r.old.uuidString,
                 "new_panel_id": r.new.uuidString,
             ])
@@ -3603,13 +3704,14 @@ class TerminalController {
                            message: "agent name must not contain commas; use fan-out for multiple agents")
         }
 
-        // Validate agent exists in the team before creating task
-        let agentExists: Bool = await MainActor.run {
-            guard let team = TeamOrchestrator.shared.teams[teamName] else { return false }
-            return team.agents.contains(where: { $0.name == agentName })
-        }
-        guard agentExists else {
-            return v2Error(id: id, code: "not_found", message: "Agent '\(agentName)' not found in team '\(teamName)'")
+        // Resolve before task creation: ambiguous legacy names must fail with
+        // no task-board mutation and no terminal input side effect.
+        let selection = await resolveTeamAgentInstance(
+            params: params, teamName: teamName, agentName: agentName
+        )
+        if let failure = selection.failure { return v2Result(id: id, failure) }
+        guard let agentInstanceId = selection.instanceId else {
+            return v2Error(id: id, code: "not_found", message: "Agent not found")
         }
 
         let taskTitle = params["task_title"] as? String
@@ -3618,7 +3720,11 @@ class TerminalController {
         // Optional deterministic per-pane addressing. delegateToAgent uses this only
         // when it resolves to a live, non-migrating pane with this panelId+name;
         // otherwise it falls back to name-based round-robin. Task assignee stays the name.
-        let panelId = (params["panel_id"] as? String).flatMap(UUID.init(uuidString:))
+        let panelId = await MainActor.run {
+            TeamOrchestrator.shared.resolveAgentForRPC(
+                teamName: teamName, agentName: agentName, agentInstanceId: agentInstanceId
+            ).agent?.panelId
+        }
         let store = TeamDataStore.shared
 
         // Stagger: dynamic gap based on team size to prevent main-queue saturation
@@ -3654,6 +3760,7 @@ class TerminalController {
                 capturedDelegateResult = TeamOrchestrator.shared.delegateToAgent(
                     teamName: teamName,
                     agentName: agentName,
+                    agentInstanceId: agentInstanceId,
                     text: text,
                     taskTitle: taskTitle,
                     priority: priority,
@@ -3676,6 +3783,7 @@ class TerminalController {
                 "team": teamName,
                 "agent": agentName,
                 "key": "return",
+                "agent_instance_id": agentInstanceId,
             ]
             if let panelId {
                 keyParams["panel_id"] = panelId.uuidString
@@ -3702,6 +3810,7 @@ class TerminalController {
             "sent": true,
             "text_delivered": textDelivered,
             "return_submitted": returnSubmitted,
+            "agent_instance_id": agentInstanceId,
         ])
     }
 
@@ -3718,12 +3827,23 @@ class TerminalController {
         guard let key = params["key"] as? String else {
             return v2Error(id: id, code: "invalid_params", message: "Missing key")
         }
+        let selection = await resolveTeamAgentInstance(
+            params: params, teamName: teamName, agentName: agentName
+        )
+        if let failure = selection.failure { return v2Result(id: id, failure) }
+        guard let agentInstanceId = selection.instanceId else {
+            return v2Error(id: id, code: "not_found", message: "Agent not found")
+        }
         // Optional explicit per-pane target for the Return. When present and it still
         // resolves to a live agent pane, it takes precedence over pendingReturnTarget
         // and the name lookup — guaranteeing the Return lands on the exact pane the
         // paste hit, even for duplicate-named agents. Falls back when stale (e.g. after
         // a hard restart rewrote the panelId).
-        let explicitPanelId = (params["panel_id"] as? String).flatMap(UUID.init(uuidString:))
+        let explicitPanelId = await MainActor.run {
+            TeamOrchestrator.shared.resolveAgentForRPC(
+                teamName: teamName, agentName: agentName, agentInstanceId: agentInstanceId
+            ).agent?.panelId
+        }
 
         // An agent held natively has no keyboard to press Return on, and needs
         // none: the write to its stdin was already a whole turn, submitted the
@@ -3825,7 +3945,8 @@ class TerminalController {
         }
 
         return result.sent
-            ? v2Ok(id: id, result: ["sent": true, "team_name": teamName, "agent_name": agentName, "key": key])
+            ? v2Ok(id: id, result: ["sent": true, "team_name": teamName, "agent_name": agentName,
+                                    "agent_instance_id": agentInstanceId, "key": key])
             : v2Error(
                 id: id,
                 code: result.targetMissing ? "not_found" : "delivery_failed",
