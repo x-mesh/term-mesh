@@ -577,7 +577,15 @@ struct NewProjectView: View {
             .buttonStyle(.borderless)
         }
         .onChange(of: gitURL) { _, value in
-            guard sourceKind == .clone, !nameEdited,
+            // SwiftUI may call the TextField binding setter while installing
+            // the control, which marks an untouched empty Name as edited.
+            // An empty field still means "infer it"; only preserve a
+            // non-empty name the user actually supplied.
+            guard sourceKind == .clone,
+                  Self.shouldInferProjectName(
+                    currentName: name,
+                    nameWasEdited: nameEdited
+                  ),
                   let inferred = Self.projectName(fromRepositoryURL: value) else { return }
             name = inferred
             applyDerivedDestination()
@@ -643,6 +651,14 @@ struct NewProjectView: View {
         let name = decoded.hasSuffix(".git") ? String(decoded.dropLast(4)) : decoded
         let clean = name.trimmingCharacters(in: .whitespacesAndNewlines)
         return clean.isEmpty ? nil : clean
+    }
+
+    static func shouldInferProjectName(
+        currentName: String,
+        nameWasEdited: Bool
+    ) -> Bool {
+        !nameWasEdited
+            || currentName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 
     private func applyDerivedDestination() {

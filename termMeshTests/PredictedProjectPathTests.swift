@@ -81,4 +81,28 @@ final class PredictedProjectPathTests: XCTestCase {
         XCTAssertNil(NewProjectView.projectName(fromRepositoryURL: "repository"))
         XCTAssertNil(NewProjectView.projectName(fromRepositoryURL: "https://github.com/"))
     }
+
+    func testEmptyNameStillInfersWhenSwiftUIMarkedItEdited() {
+        XCTAssertTrue(
+            NewProjectView.shouldInferProjectName(
+                currentName: "",
+                nameWasEdited: true
+            )
+        )
+        XCTAssertTrue(
+            NewProjectView.shouldInferProjectName(
+                currentName: "   ",
+                nameWasEdited: true
+            )
+        )
+    }
+
+    func testExplicitNonEmptyNameIsPreserved() {
+        XCTAssertFalse(
+            NewProjectView.shouldInferProjectName(
+                currentName: "my-custom-name",
+                nameWasEdited: true
+            )
+        )
+    }
 }
