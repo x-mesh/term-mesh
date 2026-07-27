@@ -233,3 +233,57 @@ fn used_slots_without_a_total_is_accepted() {
         .to_string();
     assert!(overcommitted.contains("used_slots exceeds total_slots"));
 }
+
+/// A burst of placements does not all land on the same host.
+///
+/// `used_slots` is only ever reported by `host.observe`, so between two
+/// reports every placement saw the same stale capacity: each one ranked the
+/// same host best and went there, past what that host had said it could take.
+/// Counting our own placement closes that window.
+///
+/// Both hosts get one free slot and are separated only by load, so the first
+/// task has an unambiguous winner and the second must go elsewhere.
+#[test]
+fn a_second_placement_does_not_reuse_a_host_it_just_filled() {
+    let (_dir, api) = new_api();
+    let (project_id, first_task) = project_with_task(&api, "burst");
+    observe_with_slots(&api, "h1", "hst_1111", 4, 3, 0.1);
+    observe_with_slots(&api, "h2", "hst_2222", 4, 3, 0.9);
+
+    let second = api
+        .handle(
+            "task.create",
+            json!({
+                "request_id": "burst-tsk-2",
+                "project_id": project_id,
+                "title": "second",
+                "body": ""
+            }),
+        )
+        .unwrap();
+    let second_task = second["event"]["payload"]["task_id"].as_str().unwrap().to_string();
+
+    let first_placed = api
+        .handle(
+            "task.place",
+            json!({"request_id": "place-1", "task_id": first_task}),
+        )
+        .unwrap();
+    assert_eq!(
+        placed_host(&first_placed),
+        "hst_1111",
+        "the lighter-loaded host wins the first placement"
+    );
+
+    let second_placed = api
+        .handle(
+            "task.place",
+            json!({"request_id": "place-2", "task_id": second_task}),
+        )
+        .unwrap();
+    assert_eq!(
+        placed_host(&second_placed),
+        "hst_2222",
+        "its one free slot is spoken for, so the next task goes elsewhere"
+    );
+}

@@ -106,8 +106,18 @@ impl Api {
         let reducer = Reducer::open(&config.reducer_path)?;
         let degraded_reason = match event_log.read_all() {
             Ok(events) => {
+                // The reducer is persisted, so on an ordinary restart it
+                // already holds every one of these events. Replaying them
+                // anyway cost a transaction and a round trip each, just to be
+                // told the event was known — for the whole life of the log,
+                // on every start. Ask once which ids are already in, then
+                // fold only the tail that is not.
+                let applied = reducer.applied_event_ids().unwrap_or_default();
                 let mut replay_error = None;
                 for event in &events {
+                    if applied.contains(event.event_id.as_str()) {
+                        continue;
+                    }
                     if let Err(error) = reducer.apply(event) {
                         replay_error = Some(format!("replaying {}: {error}", event.kind));
                         break;

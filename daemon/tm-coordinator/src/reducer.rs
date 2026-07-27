@@ -10,6 +10,23 @@ use serde_json::Value;
 use std::path::Path;
 use std::str::FromStr;
 
+/// Best-effort 0600 on a file we just created. A failure here is not worth
+/// refusing to start over — the caller is already holding an open handle, and
+/// the socket in front of this is uid-gated — but it is worth recording.
+#[cfg(unix)]
+fn restrict_to_owner(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    if path == Path::new(":memory:") {
+        return;
+    }
+    if let Err(error) = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)) {
+        tracing::warn!(path = %path.display(), %error, "could not restrict permissions");
+    }
+}
+
+#[cfg(not(unix))]
+fn restrict_to_owner(_path: &Path) {}
+
 pub struct Reducer {
     conn: Connection,
 }
@@ -20,6 +37,11 @@ impl Reducer {
             std::fs::create_dir_all(parent)?;
         }
         let conn = Connection::open(path)?;
+        // Same reasoning that gates the socket to 0600: this file holds task
+        // titles and bodies, project roots and the host inventory. Leaving it
+        // at the ambient umask (commonly 022) made the data at rest readable
+        // by anyone on the machine while the socket in front of it was shut.
+        restrict_to_owner(path);
         let this = Self { conn };
         this.init()?;
         Ok(this)
@@ -195,6 +217,23 @@ impl Reducer {
             .query_row("SELECT COALESCE(MAX(seq), 0) FROM events", [], |row| {
                 row.get(0)
             })?)
+    }
+
+    /// Ids of every event already folded in, for a caller replaying a log
+    /// against a projection that survived the last run.
+    ///
+    /// `apply` is idempotent on its own — the events table rejects a repeat —
+    /// but startup was paying a transaction and a round trip per historical
+    /// event to be told "already have it", every time, for the life of the
+    /// log. One read up front turns that into a set lookup.
+    ///
+    /// Not `watermark()`: `seq` is this table's own autoincrement, not a
+    /// position in the log, so it cannot say where a replay should resume.
+    pub fn applied_event_ids(&self) -> Result<std::collections::HashSet<String>> {
+        let mut stmt = self.conn.prepare("SELECT event_id FROM events")?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        rows.collect::<std::result::Result<std::collections::HashSet<_>, _>>()
+            .map_err(Into::into)
     }
 
     pub fn event_by_request_id(&self, request_id: &str) -> Result<Option<IntentEvent>> {
@@ -684,6 +723,19 @@ impl Reducer {
             params![event.ts_ms as i64, attempt.task_id.as_str(), attempt.attempt_id.as_str()],
         )?;
         self.insert_attempt(&attempt)?;
+        // Provisionally spend a slot on the host we just chose.
+        //
+        // `used_slots` is otherwise only ever written by `host.observe`, so
+        // between one report and the next every placement saw the same stale
+        // capacity: a burst of placements all ranked the same host best and
+        // all landed on it, well past what it had said it could take. Counting
+        // our own decision closes that window. The next observation overwrites
+        // this with the truth, so the estimate cannot drift for long, and a
+        // host missing from the table simply updates no rows.
+        self.conn.execute(
+            "UPDATE hosts SET used_slots = used_slots + 1 WHERE host_id=?1",
+            params![placement.host_id.as_str()],
+        )?;
         self.conn.execute(
             "UPDATE tasks SET status=?1,current_attempt_id=?2,placement_json=?3,updated_at_ms=?4 WHERE task_id=?5",
             params![
