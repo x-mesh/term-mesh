@@ -44,6 +44,7 @@ extension TeamOrchestrator {
         case duplicateName(String)
         case cliUnavailable(String, String)
         case promptStagingFailed(String)
+        case partialShellClose(closed: Int, failed: Int, reason: String)
 
         var description: String {
             switch self {
@@ -59,6 +60,8 @@ extension TeamOrchestrator {
                 return "\(cli) is not installed on \(host)"
             case .promptStagingFailed(let host):
                 return "could not stage the leader prompt on \(host)"
+            case .partialShellClose(let closed, let failed, let reason):
+                return "closed \(closed) shell(s); \(failed) refused — \(reason)"
             }
         }
     }
@@ -68,7 +71,7 @@ extension TeamOrchestrator {
             host.workspaces.flatMap(\.panes).map { ($0.id, $0) },
             uniquingKeysWith: { first, _ in first }
         )
-        let claimed = claimedRemoteSurfaceIDs(hostKey: host.id)
+        let claimed = claimedRemoteSurfaceIDs(host: host)
         let managed = Dictionary(
             ManagedPeerSurfaceStore.shared.records(hostKey: host.id).compactMap { record in
                 record.surfaceID.map { ($0, record) }
@@ -135,22 +138,127 @@ extension TeamOrchestrator {
         guard !host.activeSockPath.isEmpty else {
             throw RemoteAgentError.hostNotConnected(host.displayName)
         }
-        let protected = claimedRemoteSurfaceIDs(hostKey: host.id)
+        let protected = claimedRemoteSurfaceIDs(host: host)
         let targets = surfaceIDs.subtracting(protected)
         guard !targets.isEmpty else { return 0 }
 
-        let connection = try await PeerRelaySession.connect(hostSockPath: host.activeSockPath)
-        defer { Task { await connection.cancel() } }
+        // Prefer a connection the host has already granted. Opening one here
+        // is what made this sweep unusable: the host allows a fixed number of
+        // concurrent peer connections and every attached pane holds one, so a
+        // host with enough leftover shells to be worth sweeping has no slot
+        // left to grant, and the dial came back as an EOF mid-handshake.
+        //
+        // The donor must not be one of the shells being closed. Borrowing a
+        // target's own session sends its own death down its own connection:
+        // the host drops the PTY without telling the client, so the local pane
+        // stays attached to a stream that will never produce another byte, and
+        // the sweep counts it as a clean close.
+        var borrowed = borrowedRelaySession(
+            hostKey: host.paneHostSpec.hostKey, excluding: targets
+        )
+        var opened: PeerRelayConnection?
+        var dialFailed = false
+        defer { if let opened { Task { await opened.cancel() } } }
+
+        // Dial only once the borrowed session is gone. That death is also what
+        // frees the slot this path was avoiding, so the sweep can finish on its
+        // own connection rather than failing every remaining target.
+        func send(_ paneID: Data) async throws {
+            if let session = borrowed {
+                if try await session.requestClosePane(paneID) { return }
+                borrowed = nil
+            }
+            if opened == nil {
+                guard !dialFailed else {
+                    throw RemoteAgentError.hostNotConnected(host.displayName)
+                }
+                do {
+                    opened = try await PeerRelaySession.connect(
+                        hostSockPath: host.activeSockPath
+                    )
+                } catch {
+                    // Remember it: without this every remaining target pays for
+                    // the same refused dial.
+                    dialFailed = true
+                    throw error
+                }
+            }
+            try await opened?.session.requestClosePane(paneID: paneID)
+        }
         var closed = 0
+        var firstFailure: Error?
         for surfaceID in targets {
-            try await connection.session.requestClosePane(paneID: surfaceID)
-            ManagedPeerSurfaceStore.shared.forget(hostKey: host.id, surfaceID: surfaceID)
-            closed += 1
+            // One shell refusing to close must not strand the ones behind it.
+            // A sweep here is routinely dozens long, and aborting on the first
+            // failure left the caller no way to tell "nothing closed" from
+            // "most of them did" — so every target is attempted and the
+            // shortfall is reported afterwards.
+            do {
+                try await send(surfaceID)
+                ManagedPeerSurfaceStore.shared.forget(hostKey: host.id, surfaceID: surfaceID)
+                closed += 1
+            } catch {
+                firstFailure = firstFailure ?? error
+            }
+        }
+        if let firstFailure {
+            throw RemoteAgentError.partialShellClose(
+                closed: closed,
+                failed: targets.count - closed,
+                reason: String(describing: firstFailure)
+            )
         }
         return closed
     }
 
-    private func claimedRemoteSurfaceIDs(hostKey: String) -> Set<Data> {
+    /// Every open pane whose shell runs on `hostKey`.
+    ///
+    /// Shared by the two callers that need to know which of the host's
+    /// surfaces this app is currently holding — one to protect them, one to
+    /// borrow a connection from them.
+    private func peerPaneSessions(hostKey: PeerPaneHostKey) -> [PeerPaneSession] {
+        guard let app = AppDelegate.shared else { return [] }
+        var result: [PeerPaneSession] = []
+        for context in app.mainWindowContexts.values {
+            for workspace in context.tabManager.tabs {
+                for panel in workspace.panels.values {
+                    guard let terminal = panel as? TerminalPanel,
+                          let session = terminal.peerPaneSession,
+                          !session.isTorndown,
+                          session.lease.key == hostKey
+                    else { continue }
+                    result.append(session)
+                }
+            }
+        }
+        return result
+    }
+
+    /// A live relay session on `hostKey`, to carry control requests that are
+    /// about the host rather than about one pane. Control frames are
+    /// fire-and-forget and carry their own pane id, so which pane's session
+    /// delivers them does not matter — only that the host already granted it,
+    /// and that it is not itself one of the panes being acted on.
+    private func borrowedRelaySession(
+        hostKey: PeerPaneHostKey,
+        excluding targets: Set<Data>
+    ) -> PeerRelaySession? {
+        peerPaneSessions(hostKey: hostKey)
+            .first { !targets.contains($0.originSurface.surfaceID) }?
+            .relaySession
+    }
+
+    /// Surfaces on `host` that this app is already using, which a cleanup
+    /// sweep must never close.
+    ///
+    /// Three kinds, equally in use: a team agent's surface, a team leader's,
+    /// and — the one this originally missed — any remote pane the user simply
+    /// has open. The cleanup sheet promises "tracked shells are protected",
+    /// and a pane sitting on screen is the most visible kind of tracked there
+    /// is; leaving it out bucketed it as `unclaimed`, which Select All then
+    /// swept up.
+    private func claimedRemoteSurfaceIDs(host: HostEntry) -> Set<Data> {
+        let hostKey = host.id
         var result = Set(
             teams.values
                 .flatMap(\.agents)
@@ -165,6 +273,10 @@ extension TeamOrchestrator {
             else { continue }
             result.insert(session.originSurface.surfaceID)
         }
+        result.formUnion(
+            peerPaneSessions(hostKey: host.paneHostSpec.hostKey)
+                .map(\.originSurface.surfaceID)
+        )
         return result
     }
 

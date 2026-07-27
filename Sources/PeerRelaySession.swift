@@ -879,6 +879,22 @@ final class PeerRelaySession {
         try await session.requestClosePane(paneID: surfaceID)
     }
 
+    /// Close some OTHER pane on this host, over the connection this session
+    /// already holds. Returns false when the session is gone, so a caller
+    /// sweeping several panes can move to another borrowed session.
+    ///
+    /// The host caps concurrent peer connections (`MAX_PEER_CONNECTIONS`), and
+    /// every attached pane holds one. A cleanup sweep that dials its own
+    /// connection therefore fails precisely when it is needed — a host crowded
+    /// with leftover shells is a host with no free connection slot. Borrowing
+    /// an open session asks the host for nothing new.
+    @discardableResult
+    func requestClosePane(_ paneID: Data) async throws -> Bool {
+        guard let session else { return false }
+        try await session.requestClosePane(paneID: paneID)
+        return true
+    }
+
     // ── Stale-socket sweep ──────────────────────────────────────────
     //
     // Per-session sockets land in a private per-user directory.

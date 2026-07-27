@@ -2105,6 +2105,17 @@ private struct PeerShellCleanupSheet: View {
         items.filter { $0.state != .inUse }.count
     }
 
+    /// Every shell the host would actually close. `inUse` is excluded because
+    /// `closePeerShells` subtracts the claimed set anyway — selecting one would
+    /// inflate the button's count with work that never happens.
+    private var closeableIDs: Set<Data> {
+        Set(items.filter { $0.state != .inUse }.map(\.id))
+    }
+
+    private var allCloseableSelected: Bool {
+        !closeableIDs.isEmpty && closeableIDs.isSubset(of: selection)
+    }
+
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
             HStack {
@@ -2122,7 +2133,7 @@ private struct PeerShellCleanupSheet: View {
                 }
             }
 
-            Text("Tracked shells are protected. Orphans and shells whose folder was deleted are selected automatically. Busy shells require an explicit selection.")
+            Text("Tracked shells are protected. Orphans and shells whose folder was deleted are selected automatically. Busy shells require an explicit selection — Select All counts as one.")
                 .font(.caption)
                 .foregroundColor(.secondary)
 
@@ -2130,6 +2141,25 @@ private struct PeerShellCleanupSheet: View {
                 Text(error)
                     .font(.caption)
                     .foregroundColor(.red)
+            }
+
+            // A host accumulates a shell per project run, so the list is
+            // routinely dozens long and the automatic selection covers only the
+            // two states it can prove are dead. Clearing the rest one checkbox
+            // at a time is the whole reason this sheet felt unusable.
+            HStack(spacing: 10) {
+                Button(allCloseableSelected ? "Deselect All" : "Select All") {
+                    if allCloseableSelected {
+                        selection.subtract(closeableIDs)
+                    } else {
+                        selection.formUnion(closeableIDs)
+                    }
+                }
+                .disabled(closeableIDs.isEmpty || isLoading)
+                Text("\(selection.count) of \(closeableCount) selected")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+                Spacer()
             }
 
             List(items) { item in
@@ -2692,7 +2722,12 @@ struct RemoteHostGroupView: View {
             shellCleanupItems.removeAll { shellCleanupSelection.contains($0.id) }
             shellCleanupSelection = []
         } catch {
-            shellCleanupError = String(describing: error)
+            // Part of the sweep may have landed before the failure, so the list
+            // on screen no longer describes the host. Re-read it, then restore
+            // the message the refresh clears on its way in.
+            let message = String(describing: error)
+            await loadShellCleanup()
+            shellCleanupError = message
         }
         shellCleanupLoading = false
     }
