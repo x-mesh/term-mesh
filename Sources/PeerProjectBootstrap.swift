@@ -235,7 +235,9 @@ enum PeerProjectBootstrap {
         let primary = quote(plan.primaryPath)
         if let gitURL, !gitURL.isEmpty {
             steps.append(
-                "test -d \(primary)/.git || git clone \(quote(gitURL)) \(primary)"
+                "test -d \(primary)/.git || "
+                    + "GIT_SSH_COMMAND=\(quote(nonInteractiveGitSSHCommand)) "
+                    + "git clone \(quote(gitURL)) \(primary)"
             )
         } else {
             if sourceKind == .existingFolder {
@@ -393,6 +395,10 @@ enum PeerProjectBootstrap {
         if lowercased.contains("repository not found") {
             return "The repository was not found or this machine does not have access to it."
         }
+        if lowercased.contains("host key verification failed")
+            || lowercased.contains("authenticity of host") {
+            return "The Git host identity could not be verified. Check this machine's SSH known_hosts entry, then try again."
+        }
         if lowercased.contains("could not resolve host")
             || lowercased.contains("temporary failure in name resolution") {
             return "This machine could not reach the Git host. Check its network and DNS settings."
@@ -429,6 +435,12 @@ enum PeerProjectBootstrap {
     private static func quote(_ value: String) -> String {
         "'" + value.replacingOccurrences(of: "'", with: "'\\''") + "'"
     }
+
+    /// A project sheet cannot answer an SSH prompt hidden inside a remote
+    /// `git clone`. Trust a host only on first sight, reject changed keys, and
+    /// fail immediately when credentials need interaction.
+    private static let nonInteractiveGitSSHCommand =
+        "ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new"
 }
 
 /// Where a project comes from and how its members are laid out, as the

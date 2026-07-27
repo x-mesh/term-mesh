@@ -192,7 +192,13 @@ final class PeerProjectBootstrapTests: XCTestCase {
         )
         let script = PeerProjectBootstrap.script(for: plan, gitURL: "git@github.com:org/x.git")
         let text = try! XCTUnwrap(script)
-        XCTAssertTrue(text.contains("git clone 'git@github.com:org/x.git' '/app/p/x'"))
+        XCTAssertTrue(
+            text.contains(
+                "GIT_SSH_COMMAND='ssh -o BatchMode=yes "
+                    + "-o StrictHostKeyChecking=accept-new' "
+                    + "git clone 'git@github.com:org/x.git' '/app/p/x'"
+            )
+        )
         // The network and credentials are needed once; agent checkouts share
         // objects safely through Git's first-class worktree mechanism.
         XCTAssertTrue(
@@ -328,6 +334,16 @@ final class PeerProjectBootstrapTests: XCTestCase {
                 gitURL: "git@github.com:org/repo.git"
             ),
             "This machine could not reach the Git host. Check its network and DNS settings."
+        )
+    }
+
+    func test_remote_git_changed_host_key_has_an_actionable_message() {
+        XCTAssertEqual(
+            PeerProjectBootstrap.remoteFailureDescription(
+                PeerHostReadinessError.sshFailed("Host key verification failed."),
+                gitURL: "git@github.com:org/repo.git"
+            ),
+            "The Git host identity could not be verified. Check this machine's SSH known_hosts entry, then try again."
         )
     }
 
