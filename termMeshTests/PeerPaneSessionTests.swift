@@ -717,6 +717,117 @@ final class RemoteHostForceDisconnectOrderTests: XCTestCase {
 
 }
 
+/// The leftover-shell sweep: what it counts, and what it reports when part
+/// of the batch refuses to close.
+final class PeerShellSweepTests: XCTestCase {
+
+    private func ids(_ n: Int) -> Set<Data> {
+        Set((0..<n).map { Data([UInt8($0)]) })
+    }
+
+    private struct Refused: Error {}
+
+    @MainActor
+    func test_every_target_closed_is_counted() async throws {
+        var seen: [Data] = []
+        let closed = try await TeamOrchestrator.sweepClose(
+            targets: ids(5),
+            send: { _ in },
+            onClosed: { seen.append($0) }
+        )
+        XCTAssertEqual(closed, 5)
+        XCTAssertEqual(seen.count, 5, "the completion runs once per closed shell, not per target")
+    }
+
+    /// One refusal must not strand the shells behind it — the whole point of
+    /// the sweep. Before this, the first failure aborted the batch.
+    @MainActor
+    func test_one_refusal_does_not_strand_the_rest() async throws {
+        let targets = ids(6)
+        let doomed = targets.sorted { $0.lexicographicallyPrecedes($1) }[2]
+        var attempted = 0
+        var closedIDs: [Data] = []
+
+        do {
+            _ = try await TeamOrchestrator.sweepClose(
+                targets: targets,
+                send: { id in
+                    attempted += 1
+                    if id == doomed { throw Refused() }
+                },
+                onClosed: { closedIDs.append($0) }
+            )
+            XCTFail("a refusal must surface as an error")
+        } catch let error as TeamOrchestrator.RemoteAgentError {
+            guard case .partialShellClose(let closed, let failed, _) = error else {
+                return XCTFail("expected partialShellClose, got \(error)")
+            }
+            XCTAssertEqual(closed, 5)
+            XCTAssertEqual(failed, 1)
+            XCTAssertEqual(closed + failed, targets.count, "every target is accounted for")
+        }
+
+        XCTAssertEqual(attempted, 6, "the sweep must not stop at the failure")
+        XCTAssertFalse(closedIDs.contains(doomed), "a refused shell must not be marked closed")
+    }
+
+    /// "Nothing closed" and "most of them did" have to be distinguishable —
+    /// the caller shows the count to the user.
+    @MainActor
+    func test_a_total_failure_reports_zero_closed() async throws {
+        do {
+            _ = try await TeamOrchestrator.sweepClose(
+                targets: ids(4),
+                send: { _ in throw Refused() }
+            )
+            XCTFail("expected an error")
+        } catch let error as TeamOrchestrator.RemoteAgentError {
+            guard case .partialShellClose(let closed, let failed, _) = error else {
+                return XCTFail("expected partialShellClose, got \(error)")
+            }
+            XCTAssertEqual(closed, 0)
+            XCTAssertEqual(failed, 4)
+        }
+    }
+
+    /// Only the first failure is reported. A dozen identical refusals should
+    /// not bury the one reason the user needs to read.
+    @MainActor
+    func test_the_first_failure_is_the_one_reported() async throws {
+        struct First: Error {}
+        struct Later: Error {}
+        var call = 0
+        do {
+            _ = try await TeamOrchestrator.sweepClose(
+                targets: ids(3),
+                send: { _ in
+                    call += 1
+                    throw call == 1 ? First() : Later()
+                }
+            )
+            XCTFail("expected an error")
+        } catch let error as TeamOrchestrator.RemoteAgentError {
+            guard case .partialShellClose(_, _, let reason) = error else {
+                return XCTFail("expected partialShellClose, got \(error)")
+            }
+            XCTAssertTrue(reason.contains("First"), "got \(reason)")
+        }
+    }
+
+    /// An empty batch is a no-op, not an error. `closePeerShells` reaches this
+    /// when every selected shell turned out to be protected.
+    @MainActor
+    func test_an_empty_sweep_closes_nothing_and_does_not_throw() async throws {
+        var sendCalled = false
+        let closed = try await TeamOrchestrator.sweepClose(
+            targets: [],
+            send: { _ in sendCalled = true }
+        )
+        XCTAssertEqual(closed, 0)
+        XCTAssertFalse(sendCalled)
+    }
+}
+
 /// One PTY, two windows onto it — the size arbitration between a local pane
 /// and an attached remote viewer.
 final class RemoteViewerSizeArbitrationTests: XCTestCase {

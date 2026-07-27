@@ -185,17 +185,34 @@ extension TeamOrchestrator {
             }
             try await opened?.session.requestClosePane(paneID: paneID)
         }
+        return try await Self.sweepClose(targets: targets, send: send) { surfaceID in
+            ManagedPeerSurfaceStore.shared.forget(hostKey: host.id, surfaceID: surfaceID)
+        }
+    }
+
+    /// Attempt every target, count what actually closed, and report the
+    /// shortfall as one error.
+    ///
+    /// One shell refusing to close must not strand the ones behind it. A sweep
+    /// here is routinely dozens long, and aborting on the first failure left
+    /// the caller no way to tell "nothing closed" from "most of them did" — so
+    /// every target is attempted and the count comes with the failure.
+    ///
+    /// Split from `closePeerShells` because the counting is the part worth
+    /// testing and the rest of that function is session lookup: which
+    /// connection to borrow, when to dial. Those need a live host; this does
+    /// not.
+    static func sweepClose(
+        targets: Set<Data>,
+        send: (Data) async throws -> Void,
+        onClosed: (Data) -> Void = { _ in }
+    ) async throws -> Int {
         var closed = 0
         var firstFailure: Error?
         for surfaceID in targets {
-            // One shell refusing to close must not strand the ones behind it.
-            // A sweep here is routinely dozens long, and aborting on the first
-            // failure left the caller no way to tell "nothing closed" from
-            // "most of them did" — so every target is attempted and the
-            // shortfall is reported afterwards.
             do {
                 try await send(surfaceID)
-                ManagedPeerSurfaceStore.shared.forget(hostKey: host.id, surfaceID: surfaceID)
+                onClosed(surfaceID)
                 closed += 1
             } catch {
                 firstFailure = firstFailure ?? error
