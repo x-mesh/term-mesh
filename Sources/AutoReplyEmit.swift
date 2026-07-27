@@ -89,13 +89,16 @@ enum AutoReplyEmit {
             dependsOn: nil
         )
         guard let task = selectTask(from: tasks, preferredTaskId: preferredTaskId),
-              let expectedInstanceId = task.assigneeInstanceId,
-              agentInstanceId == expectedInstanceId else {
+              store.agentIdentityMatches(
+                  teamName: teamName, agentName: agentName,
+                  expectedInstanceId: task.assigneeInstanceId,
+                  reportedInstanceId: agentInstanceId)
+        else {
             return false
         }
 
         guard store.writeResult(teamName: teamName, agentName: agentName,
-                                agentInstanceId: expectedInstanceId, taskId: task.id,
+                                agentInstanceId: agentInstanceId, taskId: task.id,
                                 content: replyText, resultPath: resultPath)
         else { return false }
         store.postMessage(teamName: teamName, from: agentName, content: replyText, type: "report")

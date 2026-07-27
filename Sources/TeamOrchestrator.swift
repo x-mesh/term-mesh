@@ -990,7 +990,8 @@ final class TeamOrchestrator: ObservableObject {
             // Structural completion for this agent: the turn announces its own
             // end, so nothing has to watch its screen for one.
             AgentPipeCompletion.shared.watch(
-                agentId: agentId, teamName: teamName, agentName: agentName
+                agentId: agentId, teamName: teamName, agentName: agentName,
+                agentInstanceId: agentInstanceId
             )
         }
 

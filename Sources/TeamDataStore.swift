@@ -66,6 +66,32 @@ final class TeamDataStore: ObservableObject, @unchecked Sendable {
     // ownership uses the durable per-pane instance id whenever it is known.
     private var teamRegistry: [String: [AgentRegistration]] = [:]
 
+    /// The one gate `writeResult` and `AutoReplyEmit.emit` both call before
+    /// attributing a report to a task, so the two paths cannot drift apart
+    /// on what counts as a match.
+    ///
+    /// A task that tracked a real instance (any duplicate-role assignment)
+    /// must match it exactly — that is what tells siblings apart, and a
+    /// `nil` report against it is a miss, not a pass. A task that tracked
+    /// none is the legacy/unique-name case, and a `nil` report only clears
+    /// it when the registry currently shows exactly one agent under that
+    /// name: two duplicates both missing an instance id would be
+    /// indistinguishable from each other, so that is refused rather than
+    /// guessed at.
+    func agentIdentityMatches(
+        teamName: String, agentName: String,
+        expectedInstanceId: String?, reportedInstanceId: String?
+    ) -> Bool {
+        if let expectedInstanceId {
+            return expectedInstanceId == reportedInstanceId
+        }
+        guard reportedInstanceId == nil else { return false }
+        lock.lock()
+        let count = teamRegistry[teamName]?.filter { $0.name == agentName }.count ?? 0
+        lock.unlock()
+        return count == 1
+    }
+
     struct ContextEntry {
         var key: String
         var value: String
@@ -1321,10 +1347,11 @@ final class TeamDataStore: ObservableObject, @unchecked Sendable {
             lock.lock()
             let task = taskBoards[teamName]?.first(where: { $0.id == taskId })
             lock.unlock()
-            guard let task,
-                  task.assignee == agentName,
-                  let expected = task.assigneeInstanceId,
-                  expected == agentInstanceId
+            guard let task, task.assignee == agentName,
+                  agentIdentityMatches(
+                      teamName: teamName, agentName: agentName,
+                      expectedInstanceId: task.assigneeInstanceId,
+                      reportedInstanceId: agentInstanceId)
             else { return false }
         }
         let dir = Self.resultDirectory(teamName: teamName)

@@ -27,6 +27,11 @@ final class AgentPipeCompletion {
     private struct Watch {
         let teamName: String
         let agentName: String
+        /// Which duplicate this watch belongs to. A pipe-driven agent's turn
+        /// carries no pane to prove it, so this is the only thing that can —
+        /// without it, `AutoReplyEmit`'s duplicate guard sees `nil` against a
+        /// task's real `assigneeInstanceId` and silently drops the reply.
+        let agentInstanceId: String?
         let path: String
         var offset: UInt64 = 0
         /// Bytes, for the same reason `AgentSession` keeps bytes: a read ends
@@ -50,9 +55,9 @@ final class AgentPipeCompletion {
         AgentPipeTransport.fifoPath(agentId: agentId) + ".events"
     }
 
-    func watch(agentId: String, teamName: String, agentName: String) {
+    func watch(agentId: String, teamName: String, agentName: String, agentInstanceId: String? = nil) {
         watches[agentId] = Watch(
-            teamName: teamName, agentName: agentName,
+            teamName: teamName, agentName: agentName, agentInstanceId: agentInstanceId,
             path: Self.eventsPath(agentId: agentId)
         )
         start()
@@ -148,7 +153,8 @@ final class AgentPipeCompletion {
             teamName: watch.teamName,
             agentName: watch.agentName,
             event: event,
-            preferredTaskId: watch.pendingTaskId
+            preferredTaskId: watch.pendingTaskId,
+            agentInstanceId: watch.agentInstanceId
         )
         watches[agentId]?.pendingTaskId = nil
     }

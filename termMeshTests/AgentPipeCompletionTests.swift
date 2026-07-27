@@ -418,6 +418,100 @@ final class AgentPipeCompletionTests: XCTestCase {
         XCTAssertEqual(Set(rows?.compactMap { $0["task_id"] as? String } ?? []), Set([first.id, second.id]))
     }
 
+    /// The bug this pins: the plain pipe/bridge completion path (claude
+    /// without a native panel, or codex/kiro/cursor/agy behind the bridge)
+    /// read a turn's end off `.events` and called `AutoReplyEmit.emit`
+    /// without an `agentInstanceId` at all — unlike the native-panel and
+    /// remote-agent paths, which always pass theirs. For a duplicate-role
+    /// task carrying a real `assigneeInstanceId`, that `nil` can never equal
+    /// the expected instance, so the completion is silently dropped: the
+    /// task sits open forever even though the agent finished and said so.
+    func testPipeCompletionWithoutInstanceIdIsRejectedAgainstADuplicateTask() throws {
+        let team = "mixed-transport-test-\(UUID().uuidString)"
+        let store = TeamDataStore.shared
+        store.registerTeam(team, agents: [
+            .init(name: "executor", instanceId: "instance-a"),
+            .init(name: "executor", instanceId: "instance-b"),
+        ])
+        defer { store.clearResults(teamName: team); store.unregisterTeam(team) }
+
+        let task = try XCTUnwrap(store.createTask(
+            teamName: team, title: "pooled", assignee: "executor", assigneeInstanceId: "instance-a"
+        ))
+
+        // What the buggy pipe path did: no agentInstanceId at all.
+        let droppedByMissingInstance = AutoReplyEmit.emit(
+            teamName: team, agentName: "executor",
+            event: AutoReplyEvent(status: "DONE", files: "none", verify: "n/a",
+                                   next: "NONE", fullReport: "n/a", body: "", raw: ""),
+            preferredTaskId: task.id, agentInstanceId: nil, store: store
+        )
+        XCTAssertFalse(droppedByMissingInstance,
+                       "a completion with no instance must not close a task that names one")
+        XCTAssertEqual(store.collectResults(teamName: team).count, 0,
+                       "the missing-instance turn must not have filed a result either")
+
+        // The fixed path: the watch now carries the instance it was opened for.
+        let closedByMatchingInstance = AutoReplyEmit.emit(
+            teamName: team, agentName: "executor",
+            event: AutoReplyEvent(status: "DONE", files: "none", verify: "n/a",
+                                   next: "NONE", fullReport: "n/a", body: "", raw: ""),
+            preferredTaskId: task.id, agentInstanceId: "instance-a", store: store
+        )
+        XCTAssertTrue(closedByMatchingInstance)
+    }
+
+    /// Backward compatibility for the common case: a team with no duplicate
+    /// role names never populates `assigneeInstanceId`, and the pipe
+    /// completion path must keep closing those tasks exactly as it did
+    /// before instance tracking existed — a `nil` reported against a `nil`
+    /// expectation is still a match, not a mismatch.
+    func testPipeCompletionStillClosesUniqueNameTasksWithNoInstanceTracking() throws {
+        let team = "unique-name-test-\(UUID().uuidString)"
+        let store = TeamDataStore.shared
+        store.registerTeam(team, agents: [.init(name: "executor", instanceId: nil)])
+        defer { store.clearResults(teamName: team); store.unregisterTeam(team) }
+
+        let task = try XCTUnwrap(store.createTask(teamName: team, title: "solo", assignee: "executor"))
+        XCTAssertNil(task.assigneeInstanceId, "a non-duplicate assignment tracks no instance")
+
+        let closed = AutoReplyEmit.emit(
+            teamName: team, agentName: "executor",
+            event: AutoReplyEvent(status: "DONE", files: "none", verify: "n/a",
+                                   next: "NONE", fullReport: "n/a", body: "", raw: ""),
+            preferredTaskId: task.id, agentInstanceId: nil, store: store
+        )
+        XCTAssertTrue(closed, "no duplicates in play means nil vs nil is a legitimate match")
+    }
+
+    /// The unsafe half of the same legacy allowance: two siblings sharing a
+    /// name with neither tracking an instance id are exactly as
+    /// indistinguishable from each other as they would be with tracking
+    /// turned off entirely. Letting a `nil` report clear a `nil` expectation
+    /// here would let either duplicate close the other's task, so the
+    /// shared attribution gate must refuse it rather than guess.
+    func testNilIdentityIsRejectedWhenTheNameHasDuplicates() throws {
+        let team = "duplicate-nil-test-\(UUID().uuidString)"
+        let store = TeamDataStore.shared
+        store.registerTeam(team, agents: [
+            .init(name: "executor", instanceId: nil),
+            .init(name: "executor", instanceId: nil),
+        ])
+        defer { store.clearResults(teamName: team); store.unregisterTeam(team) }
+
+        let task = try XCTUnwrap(store.createTask(teamName: team, title: "ambiguous", assignee: "executor"))
+        XCTAssertNil(task.assigneeInstanceId, "auto-resolution finds no single instance to pin among duplicates")
+
+        let closed = AutoReplyEmit.emit(
+            teamName: team, agentName: "executor",
+            event: AutoReplyEvent(status: "DONE", files: "none", verify: "n/a",
+                                   next: "NONE", fullReport: "n/a", body: "", raw: ""),
+            preferredTaskId: task.id, agentInstanceId: nil, store: store
+        )
+        XCTAssertFalse(closed, "nil cannot be trusted to mean 'the same one' when two siblings share it")
+        XCTAssertEqual(store.collectResults(teamName: team).count, 0)
+    }
+
     func testDuplicateRolePoolPrefersIdleThenAdvancesDeterministically() {
         // Instance 0 is busy, so cursor 0 must skip it and select instance 1.
         let first = try! XCTUnwrap(TeamOrchestrator.nextEligiblePoolIndex(
