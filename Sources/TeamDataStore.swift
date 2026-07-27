@@ -82,6 +82,9 @@ final class TeamDataStore: ObservableObject, @unchecked Sendable {
     /// (`agents/<name>.json:parked`). Set via `setAgentParked` whenever the
     /// daemon emits a parked-state update.
     private var parkedAgents: [String: Set<String>] = [:]
+    /// Busy identity is instance-first. A legacy name entry remains supported
+    /// for callers that cannot yet identify their pane, but never collapses
+    /// instance-specific callers into the same pool member.
     private var busyAgents: [String: Set<String>] = [:]
 
     /// Watch drift finding in the leader inbox. Deduped by checkId; idempotent on post.
@@ -382,11 +385,17 @@ final class TeamDataStore: ObservableObject, @unchecked Sendable {
     /// the real answer, but it knows it on the main actor, and `team.status` is
     /// served off it. So the app pushes the fact here, where an off-main reader
     /// can see it.
-    func setAgentBusy(teamName: String, agentName: String, busy: Bool) {
+    func setAgentBusy(
+        teamName: String,
+        agentName: String,
+        agentInstanceId: String? = nil,
+        busy: Bool
+    ) {
         lock.lock()
-        let had = busyAgents[teamName]?.contains(agentName) ?? false
-        if busy { busyAgents[teamName, default: []].insert(agentName) }
-        else { busyAgents[teamName]?.remove(agentName) }
+        let key = agentInstanceId?.teamDataNilIfBlank ?? agentName
+        let had = busyAgents[teamName]?.contains(key) ?? false
+        if busy { busyAgents[teamName, default: []].insert(key) }
+        else { busyAgents[teamName]?.remove(key) }
         let changed = had != busy
         lock.unlock()
         if changed { notifyChanged() }
@@ -401,6 +410,24 @@ final class TeamDataStore: ObservableObject, @unchecked Sendable {
 
     private func isAgentBusyUnsafe(teamName: String, agentName: String) -> Bool {
         busyAgents[teamName]?.contains(agentName) ?? false
+    }
+
+    func isAgentBusy(teamName: String, agentName: String, agentInstanceId: String) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        let busy = busyAgents[teamName] ?? []
+        // A legacy name-only busy report is conservative: it still blocks the
+        // pool until that caller upgrades to an instance id.
+        return busy.contains(agentInstanceId) || busy.contains(agentName)
+    }
+
+    func hasActiveTask(teamName: String, agentInstanceId: String) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        let terminal: Set<String> = ["completed", "failed", "abandoned", "cancelled"]
+        return taskBoards[teamName, default: []].contains {
+            $0.assigneeInstanceId == agentInstanceId && !terminal.contains($0.status)
+        }
     }
 
     /// Public, lock-acquiring query for callers outside the data store.

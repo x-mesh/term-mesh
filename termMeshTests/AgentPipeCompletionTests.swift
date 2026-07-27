@@ -355,4 +355,27 @@ final class AgentPipeCompletionTests: XCTestCase {
         XCTAssertEqual(results.count, 2)
         XCTAssertEqual(Set(results.compactMap { $0["task_id"] as? String }), Set([taskA.id, taskB.id]))
     }
+
+    func testDuplicateRolePoolPrefersIdleThenAdvancesDeterministically() {
+        // Instance 0 is busy, so cursor 0 must skip it and select instance 1.
+        let first = try! XCTUnwrap(TeamOrchestrator.nextEligiblePoolIndex(
+            candidateCount: 3, cursor: 0, isEligible: { $0 != 0 }
+        ))
+        XCTAssertEqual(first.index, 1)
+        XCTAssertEqual(first.nextCursor, 2)
+
+        // After assigning instance 1, it becomes ineligible in the same
+        // serial scheduling turn. The next request cannot duplicate it.
+        let second = try! XCTUnwrap(TeamOrchestrator.nextEligiblePoolIndex(
+            candidateCount: 3, cursor: first.nextCursor, isEligible: { $0 == 2 }
+        ))
+        XCTAssertEqual(second.index, 2)
+        XCTAssertEqual(second.nextCursor, 0)
+
+        // A wrap returns to the original idle instance in stable roster order.
+        let third = try! XCTUnwrap(TeamOrchestrator.nextEligiblePoolIndex(
+            candidateCount: 3, cursor: second.nextCursor, isEligible: { $0 == 1 }
+        ))
+        XCTAssertEqual(third.index, 1)
+    }
 }

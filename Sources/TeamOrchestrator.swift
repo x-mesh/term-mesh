@@ -211,6 +211,9 @@ final class TeamOrchestrator: ObservableObject {
     }
     // Round-robin counter per "teamName/agentName" key — cycles across duplicate-named agents.
     private var agentSendRoundRobin: [String: Int] = [:]
+    /// Assignment cursor is deliberately separate from ad-hoc `team.send`.
+    /// Scheduling a task must not be perturbed by status pings or messages.
+    private var agentAssignmentRoundRobin: [String: Int] = [:]
     // Last paste target awaiting a separate Return, keyed by "teamName/agentName".
     // Needed when duplicate-named agents are round-robined: the follow-up
     // team.send_key must hit the pane that received the text, not the first name match.
@@ -906,9 +909,10 @@ final class TeamOrchestrator: ObservableObject {
             }
             // The turn states its own end and carries its final text, so the
             // reply is read from that rather than scraped off a screen.
-            agentPanel.session.onBusyChanged = { [teamName, agentName] busy in
+            agentPanel.session.onBusyChanged = { [teamName, agentName, agentInstanceId] busy in
                 TeamDataStore.shared.setAgentBusy(
-                    teamName: teamName, agentName: agentName, busy: busy)
+                    teamName: teamName, agentName: agentName,
+                    agentInstanceId: agentInstanceId, busy: busy)
             }
             agentPanel.session.onTurnEnd = { [teamName, agentName, agentInstanceId] final, _, taskId in
                 Self.fileReport(teamName: teamName, agentName: agentName,
@@ -2889,6 +2893,53 @@ final class TeamOrchestrator: ObservableObject {
         return candidates[idx]
     }
 
+    /// Returns the first eligible position at/after `cursor`, wrapping once.
+    /// Keeping the primitive data-only makes the duplicate-pool scheduling
+    /// contract directly regression-testable without creating terminal panes.
+    static func nextEligiblePoolIndex(
+        candidateCount: Int,
+        cursor: Int,
+        isEligible: (Int) -> Bool
+    ) -> (index: Int, nextCursor: Int)? {
+        guard candidateCount > 0 else { return nil }
+        let start = ((cursor % candidateCount) + candidateCount) % candidateCount
+        for offset in 0..<candidateCount {
+            let index = (start + offset) % candidateCount
+            if isEligible(index) {
+                return (index, (index + 1) % candidateCount)
+            }
+        }
+        return nil
+    }
+
+    /// Schedules a role pool by durable instance identity. Candidate order is
+    /// the team's stable roster order; the cursor is scoped to team+role.
+    private func selectIdleAgent(in team: Team, role: String) -> AgentMember? {
+        let candidates = team.agents.filter { $0.name == role }
+        let key = "\(team.id)/\(role)"
+        let cursor = agentAssignmentRoundRobin[key] ?? 0
+        guard let choice = Self.nextEligiblePoolIndex(
+            candidateCount: candidates.count,
+            cursor: cursor,
+            isEligible: { [weak self] index in
+                guard let self else { return false }
+                let agent = candidates[index]
+                guard agent.panelId != nil,
+                      !self.migratingAgents.contains(self.agentOperationKey(teamName: team.id, agentInstanceId: agent.agentInstanceId)),
+                      !TeamDataStore.shared.isAgentParked(teamName: team.id, agentName: agent.name),
+                      !TeamDataStore.shared.isAgentBusy(teamName: team.id, agentName: agent.name, agentInstanceId: agent.agentInstanceId),
+                      !TeamDataStore.shared.hasActiveTask(teamName: team.id, agentInstanceId: agent.agentInstanceId)
+                else { return false }
+                if let panelId = agent.panelId,
+                   let panel = self.nativeAgentPanel(workspaceId: agent.workspaceId, panelId: panelId),
+                   panel.session.isThinking { return false }
+                return true
+            }
+        ) else { return nil }
+        agentAssignmentRoundRobin[key] = choice.nextCursor
+        return candidates[choice.index]
+    }
+
     /// Resolves a team member for an RPC operation without round-robin.  The
     /// durable instance selector is additive: a unique legacy name continues
     /// to work, while duplicate names require `agent_instance_id` so a mutating
@@ -3024,7 +3075,7 @@ final class TeamOrchestrator: ObservableObject {
     /// Send text to an agent by its unique panelId (skips name lookup entirely).
     /// Used by broadcast and asyncTeamBroadcast to avoid duplicate-name collapse.
     /// When `recordPendingReturnFor` is set and `withReturn` is false, records the
-    /// pasted pane as the pending Return target keyed by "<team>/<agentName>" so a
+    /// pasted pane as the pending Return target keyed by "<team>/<instance>" so a
     /// separate team.send_key Return lands on the SAME pane (used by panel-targeted
     /// team.send / team.delegate for deterministic duplicate-name addressing).
     @discardableResult
@@ -3062,19 +3113,21 @@ final class TeamOrchestrator: ObservableObject {
             }
         }
         if !withReturn,
-           let agentName,
+           agentName != nil,
            let team = teams[teamName],
-           let agent = team.agents.first(where: { $0.panelId == panelId && $0.name == agentName }),
+           let agent = team.agents.first(where: { $0.panelId == panelId }),
            let identity = agentIdentity(for: agent) {
-            pendingReturnTargets["\(teamName)/\(agentName)"] = identity
-            scheduleOwedReturn(teamName: teamName, agentName: agentName, panelId: panelId)
+            let operationKey = agentOperationKey(teamName: teamName, agentInstanceId: agent.agentInstanceId)
+            pendingReturnTargets[operationKey] = identity
+            scheduleOwedReturn(teamName: teamName, agentName: agent.agentInstanceId, panelId: panelId)
         }
         // When an agentName is provided (panel-targeted send/delegate, incl. /tm
         // fan-out), mirror sendToAgent's in-flight accounting so a concurrent
         // name-keyed hard restart drains the paste before tearing the pane down,
         // instead of closing it mid-paste. Broadcast callers pass agentName=nil and
         // keep the original untracked fast path.
-        let teamAgentKey = agentName.map { "\(teamName)/\($0)" }
+        let teamAgentKey = teams[teamName]?.agents.first(where: { $0.panelId == panelId })
+            .map { agentOperationKey(teamName: teamName, agentInstanceId: $0.agentInstanceId) }
         if let teamAgentKey { activeSends[teamAgentKey, default: 0] += 1 }
         return sendTextToPanel(workspaceId: workspaceId, panelId: panelId, text: text, tabManager: tabManager, withReturn: withReturn) { [weak self] sent in
             if let self, let teamAgentKey {
@@ -3171,7 +3224,9 @@ final class TeamOrchestrator: ObservableObject {
         #endif
         guard let assignee = task.assignee?.nilIfBlank else { return true }
         let assigneeNotice = formatTaskAssignmentInstruction(task: task)
-        return sendToAgent(teamName: teamName, agentName: assignee, text: assigneeNotice, tabManager: tabManager)
+        return sendToAgent(teamName: teamName, agentName: assignee,
+                           agentInstanceId: task.assigneeInstanceId,
+                           text: assigneeNotice, tabManager: tabManager)
     }
 
     @discardableResult
@@ -3213,7 +3268,9 @@ final class TeamOrchestrator: ObservableObject {
     func dispatchTaskToAssignee(teamName: String, task: TeamTask, tabManager: TabManager) -> Bool {
         guard let assignee = task.assignee?.nilIfBlank else { return false }
         let instruction = formatTaskDispatchInstruction(task: task)
-        let dispatched = sendToAgent(teamName: teamName, agentName: assignee, text: instruction, tabManager: tabManager)
+        let dispatched = sendToAgent(teamName: teamName, agentName: assignee,
+                                     agentInstanceId: task.assigneeInstanceId,
+                                     text: instruction, tabManager: tabManager)
         // Skip leader stdin injection — leader gets notifications via tm-agent wait/inbox
         let event = dispatched ? "started" : "start_failed"
         Logger.team.info("[dispatchTask] \(event, privacy: .public) task=\(task.id.prefix(8), privacy: .public) assignee=\(assignee, privacy: .public)")
@@ -3250,23 +3307,24 @@ final class TeamOrchestrator: ObservableObject {
         completion: ((Bool) -> Void)? = nil
     ) -> DelegateResult? {
         let title = taskTitle?.nilIfBlank ?? String(text.prefix(80))
-        let assignedInstanceId: String? = {
+        let target: AgentMember? = {
             guard let team = teams[teamName] else { return nil }
             if let agentInstanceId {
                 return resolveAgentForRPC(
                     teamName: teamName, agentName: agentName, agentInstanceId: agentInstanceId
-                ).agent?.agentInstanceId
+                ).agent
             }
             if let panelId {
-                return team.agents.first(where: { $0.name == agentName && $0.panelId == panelId })?.agentInstanceId
+                return team.agents.first(where: { $0.name == agentName && $0.panelId == panelId })
             }
-            return selectAgent(in: team.agents, name: agentName)?.agentInstanceId
+            return selectIdleAgent(in: team, role: agentName)
         }()
+        guard let target else { return nil }
         guard let task = TeamDataStore.shared.createTask(
             teamName: teamName,
             title: title,
             assignee: agentName,
-            assigneeInstanceId: assignedInstanceId,
+            assigneeInstanceId: target.agentInstanceId,
             priority: priority ?? 2
         ) else { return nil }
         let instruction = formatDelegateInstruction(task: task, text: text, context: context)
@@ -3274,32 +3332,31 @@ final class TeamOrchestrator: ObservableObject {
         // provided, bypass name round-robin (selectAgent) and paste directly into that
         // pane. The follow-up team.send_key Return carries the same panel_id (Rust side)
         // AND pendingReturnTargets is keyed to that exact pane.
-        let teamAgentKey = "\(teamName)/\(agentName)"
-        if let pid = panelId,
-           !migratingAgents.contains(teamAgentKey),
-           let team = teams[teamName],
-           let agent = team.agents.first(where: { $0.panelId == pid && $0.name == agentName }) {
+        let teamAgentKey = agentOperationKey(teamName: teamName, agentInstanceId: target.agentInstanceId)
+        if let pid = target.panelId,
+           !migratingAgents.contains(teamAgentKey) {
             // pendingReturnTargets is recorded inside sendToAgentByPanel via
             // recordPendingReturnFor when withReturn==false.
             let delivered = sendToAgentByPanel(
                 teamName: teamName,
                 panelId: pid,
-                workspaceId: agent.workspaceId,
+                workspaceId: target.workspaceId,
                 text: instruction,
                 tabManager: tabManager,
                 withReturn: submit,
-                recordPendingReturnFor: agentName,
+                recordPendingReturnFor: target.agentInstanceId,
                 completion: completion
             )
             return DelegateResult(task: task, textDelivered: delivered, instruction: instruction)
         }
         // CLI callers keep submit=false and send Return separately after paste ack.
         // GUI callers can submit=true to use the IME paste path's inline Return.
-        // No panelId (or stale/migrating) → name-based round-robin (backward compat).
+        // A target is selected exactly once above; never make a second
+        // round-robin decision after the task has been assigned.
         let delivered = sendToAgent(
             teamName: teamName,
             agentName: agentName,
-            agentInstanceId: agentInstanceId,
+            agentInstanceId: target.agentInstanceId,
             text: instruction,
             tabManager: tabManager,
             withReturn: submit,

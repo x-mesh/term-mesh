@@ -941,9 +941,10 @@ extension TeamOrchestrator {
             )
         }
 
-        panel.session.onBusyChanged = { [teamName = team.id, agentName] busy in
+        panel.session.onBusyChanged = { [teamName = team.id, agentName, agentInstanceId] busy in
             TeamDataStore.shared.setAgentBusy(
-                teamName: teamName, agentName: agentName, busy: busy
+                teamName: teamName, agentName: agentName,
+                agentInstanceId: agentInstanceId, busy: busy
             )
         }
         panel.session.onTurnEnd = { [teamName = team.id, agentName, agentInstanceId] final, _, taskId in

@@ -3677,14 +3677,15 @@ class TerminalController {
                            message: "agent name must not contain commas; use fan-out for multiple agents")
         }
 
-        // Resolve before task creation: ambiguous legacy names must fail with
-        // no task-board mutation and no terminal input side effect.
-        let selection = await resolveTeamAgentInstance(
-            params: params, teamName: teamName, agentName: agentName
-        )
-        if let failure = selection.failure { return v2Result(id: id, failure) }
-        guard let agentInstanceId = selection.instanceId else {
-            return v2Error(id: id, code: "not_found", message: "Agent not found")
+        // An explicit instance stays exact. Without it, scheduling happens on
+        // the main actor inside `delegateToAgent`, where idle-state check,
+        // cursor advance, task assignment and delivery share one serial turn.
+        let requestedInstanceId = params["agent_instance_id"] as? String
+        if let requestedInstanceId, !requestedInstanceId.isEmpty {
+            let selection = await resolveTeamAgentInstance(
+                params: params, teamName: teamName, agentName: agentName
+            )
+            if let failure = selection.failure { return v2Result(id: id, failure) }
         }
 
         let taskTitle = params["task_title"] as? String
@@ -3725,7 +3726,7 @@ class TerminalController {
                 capturedDelegateResult = TeamOrchestrator.shared.delegateToAgent(
                     teamName: teamName,
                     agentName: agentName,
-                    agentInstanceId: agentInstanceId,
+                    agentInstanceId: requestedInstanceId,
                     text: text,
                     taskTitle: taskTitle,
                     priority: priority,
@@ -3747,7 +3748,7 @@ class TerminalController {
                 "team": teamName,
                 "agent": agentName,
                 "key": "return",
-                "agent_instance_id": agentInstanceId,
+                "agent_instance_id": delegateResult.task.assigneeInstanceId ?? NSNull(),
             ]
             let keyResponse = await asyncTeamSendKey(params: keyParams, id: id)
             if let data = keyResponse.data(using: .utf8),
@@ -3771,7 +3772,7 @@ class TerminalController {
             "sent": true,
             "text_delivered": textDelivered,
             "return_submitted": returnSubmitted,
-            "agent_instance_id": agentInstanceId,
+            "agent_instance_id": delegateResult.task.assigneeInstanceId ?? NSNull(),
         ])
     }
 
