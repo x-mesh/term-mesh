@@ -1212,6 +1212,15 @@ pub(crate) fn reap_if_abandoned(host: &Arc<PeerHost>, surface_id: &[u8]) {
     });
 }
 
+/// The `team.*` methods a peer may call — the Rust half of the contract in
+/// `PeerTeamCall.swift`, which carries the full reasoning.
+///
+/// A ceiling, not a scope: it bounds what a peer may do to what the local
+/// control socket can already do, and deliberately does not bound WHICH team
+/// it does it to (the team is named in the request and resolved as given).
+/// Sound only because a peer is always another machine the same person owns;
+/// `team.leader.v1` scopes its caller with a registered grant because that
+/// caller is an autonomous process rather than a person.
 pub(crate) fn team_call_allowed(method: &str) -> bool {
     matches!(
         method,

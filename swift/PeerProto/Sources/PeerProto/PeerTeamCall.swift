@@ -11,6 +11,20 @@ import Foundation
 ///
 /// Adding a method here is a security decision, not a convenience one: ask
 /// whether a peer holding it could reach outside the team.
+///
+/// What the list deliberately does NOT say is WHICH team. A peer names the
+/// team in its own request and the host resolves it as given, so this bounds
+/// what a peer may do without bounding whose team it does it to. That is
+/// sound only because a peer is always another machine the same person owns:
+/// the caller is their own viewer app, driven by hand, so it is treated as
+/// equivalent to the local control socket. `team.leader.v1` scopes its caller
+/// to a single team with a registered grant precisely because that caller is
+/// an autonomous process rather than a person — the difference between the
+/// two designs is the caller, not an oversight in this one.
+///
+/// Revisit the day a peer can be someone else's machine. The four directing
+/// methods and the two task-writing ones would then need restricting to teams
+/// the connection has already attached a surface for; the reads can stay.
 public enum PeerTeamCall {
     public static let allowedMethods: Set<String> = [
         // Reads — the team's own state.
