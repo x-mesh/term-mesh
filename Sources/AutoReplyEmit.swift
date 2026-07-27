@@ -70,16 +70,15 @@ enum AutoReplyEmit {
         // A caller that sent the instruction does know, and passing it here is
         // the difference between closing a task and closing *this* task.
         preferredTaskId: String? = nil,
+        agentInstanceId: String? = nil,
         store: TeamDataStore = .shared
     ) -> Bool {
         let replyText = formatReplyText(event)
         let resultPath = normalizedFullReportPath(event.fullReport)
 
-        // 1. team.report equivalent — write file + post message
-        _ = store.writeResult(teamName: teamName, agentName: agentName, content: replyText, resultPath: resultPath)
-        store.postMessage(teamName: teamName, from: agentName, content: replyText, type: "report")
-
-        // 2. Find target task for this assignee (mirror Rust CLI auto-complete)
+        // 1. Find target task for this assignee (mirror Rust CLI auto-complete).
+        // The assignment carries the pane identity captured at dispatch, so a
+        // reply from a duplicate role can never file against its sibling.
         let tasks = store.listTasks(
             teamName: teamName,
             status: nil,
@@ -89,11 +88,19 @@ enum AutoReplyEmit {
             staleOnly: false,
             dependsOn: nil
         )
-        guard let task = selectTask(from: tasks, preferredTaskId: preferredTaskId) else {
+        guard let task = selectTask(from: tasks, preferredTaskId: preferredTaskId),
+              let expectedInstanceId = task.assigneeInstanceId,
+              agentInstanceId == expectedInstanceId else {
             return false
         }
 
-        // 3. Map STATUS to task status + drive updateTask
+        guard store.writeResult(teamName: teamName, agentName: agentName,
+                                agentInstanceId: expectedInstanceId, taskId: task.id,
+                                content: replyText, resultPath: resultPath)
+        else { return false }
+        store.postMessage(teamName: teamName, from: agentName, content: replyText, type: "report")
+
+        // 2. Map STATUS to task status + drive updateTask
         let taskStatus: String
         switch event.status {
         case "BLOCKED": taskStatus = "blocked"

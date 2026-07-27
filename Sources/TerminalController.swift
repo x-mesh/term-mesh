@@ -4190,7 +4190,15 @@ class TerminalController {
             return v2Error(id: id, code: "invalid_params", message: "Missing content")
         }
         let resultPath = params["result_path"] as? String
-        let wrote = store.writeResult(teamName: teamName, agentName: agentName, content: content, resultPath: resultPath)
+        let taskId = params["task_id"] as? String
+        let agentInstanceId = params["agent_instance_id"] as? String
+        let wrote = store.writeResult(teamName: teamName, agentName: agentName,
+                                      agentInstanceId: agentInstanceId, taskId: taskId,
+                                      content: content, resultPath: resultPath)
+        guard wrote else {
+            return v2Error(id: id, code: "result_identity_mismatch",
+                           message: "Result task assignment does not match agent_instance_id")
+        }
         store.postMessage(teamName: teamName, from: agentName, content: content, type: "report")
 
         // Publish reply event best-effort so tm-agent wait push subscribers are woken.
@@ -4199,11 +4207,11 @@ class TerminalController {
             "kind": "reply",
             "team": teamName,
             "agent": agentName,
-            "task_id": "",
+            "task_id": taskId ?? "",
             "header": headerPreview
         ])
 
-        return v2Ok(id: id, result: ["reported": wrote, "team_name": teamName, "agent_name": agentName])
+        return v2Ok(id: id, result: ["reported": wrote, "team_name": teamName, "agent_name": agentName, "task_id": taskId ?? NSNull()])
     }
 
     private func teamDataResultStatus(params: [String: Any], id: Any?, store: TeamDataStore) -> String {
@@ -4342,6 +4350,7 @@ class TerminalController {
         }
         let details = params["description"] as? String
         let assignee = (params["assignee"] as? String) ?? (params["assign"] as? String)
+        let assigneeInstanceId = params["agent_instance_id"] as? String
         let acceptanceCriteria = params["acceptance_criteria"] as? [String] ?? []
         let labels = params["labels"] as? [String] ?? []
         let estimatedSize = params["estimated_size"] as? Int
@@ -4356,6 +4365,7 @@ class TerminalController {
             title: title,
             details: details,
             assignee: assignee,
+            assigneeInstanceId: assigneeInstanceId,
             acceptanceCriteria: acceptanceCriteria,
             labels: labels,
             estimatedSize: estimatedSize,

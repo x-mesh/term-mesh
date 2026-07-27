@@ -57,8 +57,14 @@ final class TeamDataStore: ObservableObject, @unchecked Sendable {
         }
     }
 
-    // Team registry: name → agent names (synced from TeamOrchestrator on create/destroy)
-    private var teamRegistry: [String: [String]] = [:]
+    struct AgentRegistration: Equatable {
+        let name: String
+        let instanceId: String?
+    }
+
+    // Team registry: name → agents. `name` is a legacy routing alias; result
+    // ownership uses the durable per-pane instance id whenever it is known.
+    private var teamRegistry: [String: [AgentRegistration]] = [:]
 
     struct ContextEntry {
         var key: String
@@ -122,8 +128,12 @@ final class TeamDataStore: ObservableObject, @unchecked Sendable {
     // MARK: - Team Registry
 
     func registerTeam(_ name: String, agentNames: [String]) {
+        registerTeam(name, agents: agentNames.map { AgentRegistration(name: $0, instanceId: nil) })
+    }
+
+    func registerTeam(_ name: String, agents: [AgentRegistration]) {
         lock.lock()
-        teamRegistry[name] = agentNames
+        teamRegistry[name] = agents
         lock.unlock()
         notifyChanged()
     }
@@ -443,7 +453,13 @@ final class TeamDataStore: ObservableObject, @unchecked Sendable {
     func agentNames(for teamName: String) -> [String] {
         lock.lock()
         defer { lock.unlock() }
-        return teamRegistry[teamName] ?? []
+        return (teamRegistry[teamName] ?? []).map(\.name)
+    }
+
+    func agentInstanceId(teamName: String, agentName: String) -> String? {
+        lock.lock()
+        defer { lock.unlock() }
+        return teamRegistry[teamName]?.first(where: { $0.name == agentName })?.instanceId
     }
 
     func registeredTeamNames() -> [String] {
@@ -508,6 +524,7 @@ final class TeamDataStore: ObservableObject, @unchecked Sendable {
         title: String,
         details: String? = nil,
         assignee: String? = nil,
+        assigneeInstanceId: String? = nil,
         acceptanceCriteria: [String] = [],
         labels: [String] = [],
         estimatedSize: Int? = nil,
@@ -558,6 +575,9 @@ final class TeamDataStore: ObservableObject, @unchecked Sendable {
             labels: labels.compactMap(\.teamDataNilIfBlank),
             estimatedSize: estimatedSize,
             assignee: normalizedAssignee,
+            assigneeInstanceId: assigneeInstanceId ?? normalizedAssignee.flatMap { agentName in
+                teamRegistry[teamName]?.first(where: { $0.name == agentName })?.instanceId
+            },
             status: normalizedAssignee == nil ? "queued" : "assigned",
             priority: max(1, min(priority, 3)),
             dependsOn: validatedDependsOn,
@@ -620,6 +640,9 @@ final class TeamDataStore: ObservableObject, @unchecked Sendable {
         let now = Date()
         if let assignee {
             tasks[idx].assignee = assignee.teamDataNilIfBlank
+            tasks[idx].assigneeInstanceId = tasks[idx].assignee.flatMap { agentName in
+                teamRegistry[teamName]?.first(where: { $0.name == agentName })?.instanceId
+            }
             if tasks[idx].status == "queued", tasks[idx].assignee != nil {
                 tasks[idx].status = "assigned"
             }
@@ -711,6 +734,9 @@ final class TeamDataStore: ObservableObject, @unchecked Sendable {
         let now = Date()
         let previousAssignee = tasks[idx].assignee
         tasks[idx].assignee = assignee?.teamDataNilIfBlank
+        tasks[idx].assigneeInstanceId = tasks[idx].assignee.flatMap { agentName in
+            teamRegistry[teamName]?.first(where: { $0.name == agentName })?.instanceId
+        }
         tasks[idx].status = tasks[idx].assignee == nil ? "queued" : "assigned"
         tasks[idx].blockedReason = nil
         tasks[idx].reviewSummary = nil
@@ -766,6 +792,7 @@ final class TeamDataStore: ObservableObject, @unchecked Sendable {
         }).first else { return nil }
         let now = Date()
         tasks[idx].assignee = agentName
+        tasks[idx].assigneeInstanceId = teamRegistry[teamName]?.first(where: { $0.name == agentName })?.instanceId
         tasks[idx].status = "assigned"
         tasks[idx].updatedAt = now
         tasks[idx].lastProgressAt = now
@@ -1196,15 +1223,38 @@ final class TeamDataStore: ObservableObject, @unchecked Sendable {
         "/tmp/term-mesh-team-\(teamName)"
     }
 
-    func writeResult(teamName: String, agentName: String, content: String, resultPath: String? = nil) -> Bool {
+    /// Persist a result. A task result is keyed by `taskId`, never by a role
+    /// name: two executor panes may share that alias. The name-keyed file is
+    /// retained only as a legacy read fallback for reports without a task.
+    func writeResult(
+        teamName: String,
+        agentName: String,
+        agentInstanceId: String? = nil,
+        taskId: String? = nil,
+        content: String,
+        resultPath: String? = nil
+    ) -> Bool {
+        if let taskId {
+            lock.lock()
+            let task = taskBoards[teamName]?.first(where: { $0.id == taskId })
+            lock.unlock()
+            guard let task,
+                  task.assignee == agentName,
+                  let expected = task.assigneeInstanceId,
+                  expected == agentInstanceId
+            else { return false }
+        }
         let dir = Self.resultDirectory(teamName: teamName)
         try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
-        let path = (dir as NSString).appendingPathComponent("\(agentName).result.json")
+        let primaryKey = taskId ?? agentName
+        let path = (dir as NSString).appendingPathComponent("\(primaryKey).result.json")
         var payload: [String: Any] = [
             "agent": agentName,
             "content": content,
             "timestamp": ISO8601DateFormatter().string(from: Date()),
         ]
+        if let taskId { payload["task_id"] = taskId }
+        if let agentInstanceId { payload["agent_instance_id"] = agentInstanceId }
         if let rp = resultPath, !rp.isEmpty {
             payload["result_path"] = rp
         }
@@ -1214,12 +1264,18 @@ final class TeamDataStore: ObservableObject, @unchecked Sendable {
         return FileManager.default.createFile(atPath: path, contents: data)
     }
 
-    func readResult(teamName: String, agentName: String) -> [String: Any]? {
+    func readResult(teamName: String, taskId: String, agentName: String? = nil) -> [String: Any]? {
         let dir = Self.resultDirectory(teamName: teamName)
-        let path = (dir as NSString).appendingPathComponent("\(agentName).result.json")
+        let path = (dir as NSString).appendingPathComponent("\(taskId).result.json")
         guard let data = FileManager.default.contents(atPath: path),
               let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-            return nil
+            // Legacy reports did not have a task id and were keyed by role.
+            guard let agentName else { return nil }
+            let legacy = (dir as NSString).appendingPathComponent("\(agentName).result.json")
+            guard let legacyData = FileManager.default.contents(atPath: legacy),
+                  let legacyObj = try? JSONSerialization.jsonObject(with: legacyData) as? [String: Any]
+            else { return nil }
+            return legacyObj
         }
         return obj
     }
@@ -1251,7 +1307,11 @@ final class TeamDataStore: ObservableObject, @unchecked Sendable {
         let dir = Self.resultDirectory(teamName: teamName)
         var agentStatus: [[String: Any]] = []
         for name in agents {
-            let path = (dir as NSString).appendingPathComponent("\(name).result.json")
+            let assignedTasks = listTasks(teamName: teamName, status: nil, assignee: name,
+                                          needsAttention: false, priority: nil, staleOnly: false, dependsOn: nil)
+            let path = assignedTasks.last.map { task in
+                (dir as NSString).appendingPathComponent("\(task.id).result.json")
+            } ?? (dir as NSString).appendingPathComponent("\(name).result.json")
             agentStatus.append([
                 "agent_name": name,
                 "has_result": FileManager.default.fileExists(atPath: path),
@@ -1285,8 +1345,28 @@ final class TeamDataStore: ObservableObject, @unchecked Sendable {
     }
 
     func collectResults(teamName: String) -> [[String: Any]] {
-        let agents = agentNames(for: teamName)
-        return agents.compactMap { readResult(teamName: teamName, agentName: $0) }
+        // One row per task/instance. Name aliases are only a fallback for
+        // old result files, never the primary collect key.
+        let tasks = listTasks(teamName: teamName, status: nil, assignee: nil,
+                              needsAttention: false, priority: nil, staleOnly: false, dependsOn: nil)
+        var results: [[String: Any]] = []
+        var seen = Set<String>()
+        for task in tasks where task.assignee != nil {
+            guard let result = readResult(teamName: teamName, taskId: task.id, agentName: task.assignee) else { continue }
+            guard let instance = result["agent_instance_id"] as? String else {
+                // Legacy fallback is only safe for a task with an unambiguous alias.
+                if tasks.filter({ $0.assignee == task.assignee }).count != 1 { continue }
+                results.append(result)
+                continue
+            }
+            guard instance == task.assigneeInstanceId, seen.insert(task.id).inserted else { continue }
+            results.append(result)
+        }
+        return results
+    }
+
+    func clearResults(teamName: String) {
+        try? FileManager.default.removeItem(atPath: Self.resultDirectory(teamName: teamName))
     }
 
     // MARK: - Task Dictionary (for JSON responses)
@@ -1307,6 +1387,7 @@ final class TeamDataStore: ObservableObject, @unchecked Sendable {
             "reassignment_count": task.reassignmentCount,
             "superseded_by": task.supersededBy as Any? ?? NSNull(),
             "assignee": task.assignee as Any? ?? NSNull(),
+            "agent_instance_id": task.assigneeInstanceId as Any? ?? NSNull(),
             "blocked_reason": task.blockedReason as Any? ?? NSNull(),
             "review_summary": task.reviewSummary as Any? ?? NSNull(),
             "created_by": task.createdBy,

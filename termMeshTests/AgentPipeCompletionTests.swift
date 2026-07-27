@@ -321,4 +321,38 @@ final class AgentPipeCompletionTests: XCTestCase {
         XCTAssertFalse(AgentPipeTransport.isDriven(agentId: "b@t"))
         AgentPipeTransport.forgetDriven(agentId: "a@t")
     }
+
+    func testTaskResultsKeepDuplicateAgentInstancesSeparateAndRejectMismatch() throws {
+        let team = "result-instance-test-\(UUID().uuidString)"
+        let store = TeamDataStore.shared
+        let first = TeamDataStore.AgentRegistration(name: "executor", instanceId: "instance-a")
+        let second = TeamDataStore.AgentRegistration(name: "executor", instanceId: "instance-b")
+        store.registerTeam(team, agents: [first, second])
+        defer {
+            store.clearResults(teamName: team)
+            store.unregisterTeam(team)
+        }
+
+        let taskA = try XCTUnwrap(store.createTask(teamName: team, title: "A", assignee: "executor"))
+        // Re-register with the second duplicate first, mirroring panel-targeted
+        // assignment selection for the next task.
+        store.registerTeam(team, agents: [second, first])
+        let taskB = try XCTUnwrap(store.createTask(teamName: team, title: "B", assignee: "executor"))
+        XCTAssertEqual(taskA.assigneeInstanceId, "instance-a")
+        XCTAssertEqual(taskB.assigneeInstanceId, "instance-b")
+
+        XCTAssertTrue(store.writeResult(teamName: team, agentName: "executor",
+                                        agentInstanceId: "instance-a", taskId: taskA.id,
+                                        content: "A done"))
+        XCTAssertTrue(store.writeResult(teamName: team, agentName: "executor",
+                                        agentInstanceId: "instance-b", taskId: taskB.id,
+                                        content: "B done"))
+        XCTAssertFalse(store.writeResult(teamName: team, agentName: "executor",
+                                         agentInstanceId: "instance-a", taskId: taskB.id,
+                                         content: "wrong pane"))
+
+        let results = store.collectResults(teamName: team)
+        XCTAssertEqual(results.count, 2)
+        XCTAssertEqual(Set(results.compactMap { $0["task_id"] as? String }), Set([taskA.id, taskB.id]))
+    }
 }
