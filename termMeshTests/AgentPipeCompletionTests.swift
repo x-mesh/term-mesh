@@ -389,6 +389,56 @@ final class AgentPipeCompletionTests: XCTestCase {
         XCTAssertEqual(released.status, "queued")
     }
 
+    /// Integration-sized board scenario for one local and one peer checkout:
+    /// readiness is driven by task IDs, ownership by instance IDs, and a hard
+    /// timebox blocks unfinished work rather than manufacturing success.
+    func testCheckoutDependencyWaveAndTimeboxKeepCorrelationVisible() throws {
+        let team = "wave-matrix-test-\(UUID().uuidString)"
+        let store = TeamDataStore.shared
+        let local = TeamDataStore.AgentRegistration(name: "executor", instanceId: "local-instance")
+        let peer = TeamDataStore.AgentRegistration(name: "executor", instanceId: "peer-instance")
+        store.registerTeam(team, agents: [local, peer])
+        defer { store.unregisterTeam(team) }
+
+        let localTask = try XCTUnwrap(store.createTask(
+            teamName: team, title: "local write", assignee: "executor", assigneeInstanceId: local.instanceId
+        ))
+        let peerTask = try XCTUnwrap(store.createTask(
+            teamName: team, title: "peer dependent write", dependsOn: [localTask.id]
+        ))
+        _ = store.updateTask(teamName: team, taskId: localTask.id, worktreePath: "/local/project")
+        _ = store.updateTask(teamName: team, taskId: peerTask.id, worktreePath: "/peer/project")
+
+        XCTAssertNil(store.claimTask(teamName: team, agentName: "executor", agentInstanceId: peer.instanceId),
+                     "DAG gate must hold the peer wave until its exact parent completes")
+        _ = store.updateTask(teamName: team, taskId: localTask.id, status: "completed")
+        let claimed = try XCTUnwrap(store.claimTask(
+            teamName: team, agentName: "executor", agentInstanceId: peer.instanceId
+        ))
+        XCTAssertEqual(claimed.id, peerTask.id)
+        XCTAssertEqual(claimed.assigneeInstanceId, peer.instanceId)
+
+        let localRow = try XCTUnwrap(store.getTask(teamName: team, taskId: localTask.id))
+        let peerRow = try XCTUnwrap(store.getTask(teamName: team, taskId: peerTask.id))
+        let localTelemetry = try XCTUnwrap(store.taskDictionary(localRow)["parallel_telemetry"] as? [String: Any])
+        let peerTelemetry = try XCTUnwrap(store.taskDictionary(peerRow)["parallel_telemetry"] as? [String: Any])
+        XCTAssertEqual(localTelemetry["task_id"] as? String, localTask.id)
+        XCTAssertEqual(localTelemetry["agent_instance_id"] as? String, local.instanceId)
+        XCTAssertEqual(localTelemetry["checkout"] as? String, "/local/project")
+        XCTAssertEqual(peerTelemetry["task_id"] as? String, peerTask.id)
+        XCTAssertEqual(peerTelemetry["agent_instance_id"] as? String, peer.instanceId)
+        XCTAssertEqual(peerTelemetry["checkout"] as? String, "/peer/project")
+
+        let timedOut = store.convergeTimebox(teamName: team, taskIds: [localTask.id, peerTask.id])
+        XCTAssertEqual(timedOut.map(\.id), [peerTask.id])
+        let convergedPeer = try XCTUnwrap(store.getTask(teamName: team, taskId: peerTask.id))
+        XCTAssertEqual(convergedPeer.status, "blocked")
+        XCTAssertNotEqual(convergedPeer.status, "completed")
+        XCTAssertEqual(convergedPeer.assigneeInstanceId, peer.instanceId,
+                       "timebox must retain task_id + agent_instance_id correlation")
+        XCTAssertTrue(convergedPeer.blockedReason?.contains("Timebox hard deadline") == true)
+    }
+
     func testStatusAndResultRowsPreserveDuplicateInstanceTaskAttribution() throws {
         let team = "status-instance-test-\(UUID().uuidString)"
         let store = TeamDataStore.shared
