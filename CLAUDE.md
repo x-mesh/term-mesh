@@ -470,38 +470,36 @@ tm-agent wait --timeout 120 --mode any        # ALWAYS use this to wait; NEVER u
 tm-agent recycle <agent>                      # guarded hard restart for idle/stopped workers; drops transcript context
 tm-agent brief <agent>
 
-# Parallel delegation pattern — round-robin routing (active since d69c9d0c)
-# Sequential delegate routes to DIFFERENT panels automatically:
-#   1. tm-agent delegate executor 'task A'   # → executor panel 1
-#   2. tm-agent delegate executor 'task B'   # → executor panel 2 (round-robin)
-# Both-idle race: if both panels are idle simultaneously, add a 0.5–1s gap or
-# use the work-pool pattern (unassigned task create + tm-agent claim).
-# Do NOT delegate the same task twice — that always produces duplicate work.
+# LeaderParallelPolicy v1 — runtime-enforced (single source: `Sources/LeaderParallelPolicy.swift`)
+# Every local/peer leader receives the same policy_version and policy_digest. `status` exposes
+# source/version/digest plus policy state; injection failure is explicit `failed`, never silent.
+# For substantive work, form a parallel wave by default. Claim or dispatch only DAG-ready tasks:
+# every `depends_on` task must be completed; failed/blocked dependencies never release a child.
 #
-# Work-pool / autonomous claim pattern (GAP-4 claim-push active since 3b312b7a):
+# Placement is one unified local+peer pool. A task's stable correlation key is
+# `task_id + agent_instance_id`; the same role/name may have multiple instances.
+# Name-only selectors are rejected when ambiguous, while unique-name callers remain compatible.
+# Idle-first deterministic routing selects an eligible exact instance and never collapses sibling rows.
+#
+# Work-pool / autonomous claim pattern:
 #   tm-agent task create 'task A'            # unassigned — enters pool
 #   tm-agent task create 'task B'            # unassigned — enters pool
-#   tm-agent broadcast 'tm-agent claim'       # Option A: all panels claim simultaneously (preferred)
-#   tm-agent send executor 'tm-agent claim'; sleep 0.5; tm-agent send executor 'tm-agent claim'  # Option B: round-robin sequential
-#   tm-agent task finish-worktree <task_id> --to parent --cleanup  # finish gk wt attached to a task
+#   tm-agent broadcast 'tm-agent claim'      # one initial kick
+# AUTO-CLAIM-NEXT: a completed, non-recycled exact instance claims the next ready
+# unassigned task itself. If delivery fails, that same instance's claim is released back to
+# the unassigned pool; no sibling is reassigned accidentally. Directed delegate/fan-out tasks
+# are already assigned and are therefore not consumed by the pool.
 #
-# AUTO-CLAIM-NEXT (self-draining pool — Tier 1 work-stealing): when an agent
-# finishes a task and is NOT being auto-recycled, it AUTOMATICALLY claims the
-# next task from the UNASSIGNED pool and is pushed its instruction — no second
-# `tm-agent claim` broadcast needed per wave. So for the work-pool pattern you
-# now kick it ONCE; idle agents drain the pool on their own until it is empty:
-#   tm-agent task create 'task A'; tm-agent task create 'task B'; tm-agent task create 'task C'
-#   tm-agent broadcast 'tm-agent claim'   # one kick — each agent then auto-pulls the next on finish
-# Scope: only consumes UNASSIGNED tasks, so directed delegate/fan-out (which
-# create already-ASSIGNED tasks) are unaffected. Dependency-aware: a pooled task
-# is only auto-claimed once every task it `dependsOn` has COMPLETED (a failed dep
-# does not release it). Auto-claim is skipped on the recycle wave (the pane hard
-# restarts). Duplicate-named agents: the push routes by name (round-robin), so a
-# sibling pane may receive it — exact per-pane delivery awaits the panel_id fix.
+# Same-checkout concurrent writes require explicit disjoint ownership or worktree isolation.
+# Distinct local/peer checkouts do not require an additional worktree; assign a branch owner and
+# serialize pushes to the same remote branch. Concurrent read-only work is allowed in one checkout.
 #
-# Broadcast reaches ALL panels including duplicate-named agents (BUG-3 fix d69c9d0c):
-#   tm-agent broadcast 'msg'   # every pane receives — no name-based collapse
+# Machine-readable status/task/collect/reports retain duplicate rows and expose body-free routing
+# telemetry (wave/task/agent_instance/host/checkout/delivery/synthesis). A hard timebox converges
+# on completed evidence and blocks/cancels/splits remaining work — timeout is never success.
 #
+# Broadcast reaches ALL panels including duplicate-named agents:
+#   tm-agent broadcast 'msg'
 # Regression test: ./scripts/test-parallel.sh --skip-team-create
 
 # Agent task lifecycle
