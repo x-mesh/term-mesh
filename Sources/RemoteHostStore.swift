@@ -463,7 +463,7 @@ final class RemoteHostStore: ObservableObject {
                     workspaces: [],
                     activeSockPath: "",
                     sshTarget: p.sshTarget,
-                    remoteSockPath: p.remoteSocket.isEmpty ? nil : p.remoteSocket,
+                    remoteSockPath: p.connectionSocket,
                     sshPort: p.sshPort,
                     identityFile: p.identityFile,
                     profileID: p.id,
@@ -477,16 +477,11 @@ final class RemoteHostStore: ObservableObject {
                 hosts[key]?.symbolName = p.symbolName
                 hosts[key]?.sshPort = p.sshPort
                 hosts[key]?.identityFile = p.identityFile
-                // A non-empty profile socket is the user's explicit choice
-                // and must WIN over whatever this row cached from an earlier
-                // resolution — the old nil-only fill meant editing the
-                // socket path in the profile editor never reached the
-                // sidebar row, which kept tunneling to the stale path.
-                // An empty profile socket means auto-detect: keep the
-                // resolved path so reconnects skip a redundant probe.
-                if !p.remoteSocket.isEmpty {
-                    hosts[key]?.remoteSockPath = p.remoteSocket
-                }
+                // Always replace the row's route from the profile. This is
+                // what makes clearing an explicit socket observable: upsert
+                // invalidates `lastResolvedSocket`, so this assignment turns
+                // the old row cache into nil and the next connect probes.
+                hosts[key]?.remoteSockPath = p.connectionSocket
             }
         }
         for (key, entry) in hosts where entry.profileID != nil && !profileKeys.contains(key) {

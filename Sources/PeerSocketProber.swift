@@ -19,8 +19,8 @@
 //      (PeerFederationSettings.defaultSocketPath).
 //
 //  A stale socket file (daemon dead, file left behind) still matches
-//  `[ -S ]`; that is acceptable — the subsequent tunnel + workspace
-//  listing fails through the normal error path with a clear message.
+//  `[ -S ]`; discovery deliberately leaves that distinction to
+//  PeerHostDoctor's subsequent tunnel + protocol-handshake check.
 
 import Bonsplit
 import Darwin
@@ -77,7 +77,11 @@ enum PeerSocketProber {
     static let remoteCommand: String =
         #"sh -c 'p=$(sed -n "s/^TERMMESH_PEER_SOCKET=//p" "$HOME/.config/term-mesh/peer.env" 2>/dev/null | tail -n 1 | sed "s/^[[:space:]]*//;s/[[:space:]]*$//;s/^\"//;s/\"$//"); for c in "$p" "${XDG_RUNTIME_DIR:+$XDG_RUNTIME_DIR/tm-peer.sock}" "/run/user/$(id -u)/tm-peer.sock" "/tmp/term-mesh-peer-$(id -u)/peer.sock"; do [ -n "$c" ] && [ -S "$c" ] && { printf "%s" "$c"; exit 0; }; done; exit 43'"#
 
-    /// Pure classification of a finished (or killed) probe run.
+    /// Pure classification of a finished (or killed) discovery run.
+    ///
+    /// Success only proves that a socket-shaped filesystem entry exists.
+    /// `PeerHostDoctor.test` follows this with an SSH forward + peer
+    /// handshake before presenting the route as connected.
     /// Factored out of `probe` so the exit-code/output matrix is
     /// unit-testable without ssh.
     static func classify(

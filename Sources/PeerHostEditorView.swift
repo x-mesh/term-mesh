@@ -37,6 +37,7 @@ struct PeerHostEditorView: View {
         case testing
         case ok(String)              // live socket path
         case daemonMissing           // SSH fine, no term-meshd → offer install
+        case relayFailed(socket: String, message: String)
         case sshFailed(String)
         case installing
         case installFailed(String)
@@ -238,9 +239,10 @@ struct PeerHostEditorView: View {
             agentStackStatusLine
 
             HStack {
-                Button("Test", action: runTest)
+                Button("Test Relay", action: runTest)
                     .disabled(doctorBusy
                               || profile.sshTarget.trimmingCharacters(in: .whitespaces).isEmpty)
+                    .help("Open the SSH tunnel and complete a peer protocol handshake")
                 if case .daemonMissing = doctorState, testedDraft != nil {
                     Button("Install term-meshd…") { showInstallConfirm = true }
                         .disabled(doctorBusy)
@@ -354,10 +356,11 @@ struct PeerHostEditorView: View {
         case .idle:
             EmptyView()
         case .testing:
-            Label("Testing connection…", systemImage: "ellipsis.circle")
+            Label("Testing SSH tunnel and peer handshake…", systemImage: "ellipsis.circle")
                 .font(.caption).foregroundColor(.secondary)
         case .ok(let path):
-            Label("Connected — daemon socket: \(path)", systemImage: "checkmark.circle.fill")
+            Label("Relay ready — peer handshake succeeded via \(path)",
+                  systemImage: "checkmark.circle.fill")
                 .font(.caption).foregroundColor(.green)
         case .daemonMissing:
             Label(daemonMissingStatusText,
@@ -377,9 +380,18 @@ struct PeerHostEditorView: View {
                 systemImage: "exclamationmark.arrow.circlepath"
             )
         case .okVersionUnknown(let path):
-            Label("Connected — daemon socket: \(path) — version unknown",
+            Label("Relay ready via \(path) — server version unknown",
                   systemImage: "questionmark.circle")
                 .font(.caption).foregroundColor(.secondary)
+        case .relayFailed(let socket, let message):
+            VStack(alignment: .leading, spacing: 2) {
+                Label("Relay failed after finding \(socket)",
+                      systemImage: "point.3.connected.trianglepath.dotted")
+                    .font(.caption).foregroundColor(.red)
+                Text(message)
+                    .font(.caption2).foregroundColor(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
         case .sshFailed(let msg):
             Label("SSH failed: \(msg)", systemImage: "xmark.circle.fill")
                 .font(.caption).foregroundColor(.red)
@@ -647,7 +659,8 @@ struct PeerHostEditorView: View {
         Task {
             let result = await PeerHostDoctor.test(
                 sshTarget: draft.sshTarget, port: draft.sshPort,
-                identityFile: draft.identityFile
+                identityFile: draft.identityFile,
+                remoteSocket: draft.remoteSocket
             )
             // A field edit (→ invalidateDoctorState) or a fresh Test
             // could have superseded this response while it was in
@@ -684,6 +697,8 @@ struct PeerHostEditorView: View {
                 // answering — a host can carry the scripts and hooks
                 // before its daemon is ever installed.
                 await refreshAgentStack(draft: draft, gen: gen)
+            case .relayFailed(let socket, let message):
+                doctorState = .relayFailed(socket: socket, message: message)
             case .sshFailed(let msg): doctorState = .sshFailed(msg)
             }
         }
@@ -731,7 +746,8 @@ struct PeerHostEditorView: View {
             // (e.g. release binary built against a newer glibc).
             let result = await PeerHostDoctor.test(
                 sshTarget: draft.sshTarget, port: draft.sshPort,
-                identityFile: draft.identityFile
+                identityFile: draft.identityFile,
+                remoteSocket: draft.remoteSocket
             )
             guard gen == doctorGeneration else { return }
             switch result {
@@ -747,6 +763,8 @@ struct PeerHostEditorView: View {
                 )
                 guard gen == doctorGeneration else { return }
                 doctorState = .diagnosed(PeerHostDoctor.summarizeDiagnosis(raw))
+            case .relayFailed(let socket, let message):
+                doctorState = .relayFailed(socket: socket, message: message)
             case .sshFailed(let msg):
                 doctorState = .sshFailed(msg)
             }

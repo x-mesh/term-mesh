@@ -101,9 +101,14 @@ struct PeerHostProfile: Codable, Identifiable, Equatable {
     /// `user@host` or an ssh-config alias. V1 profiles are SSH-only —
     /// direct-socket hosts remain ad-hoc sidebar entries.
     var sshTarget: String
-    /// Remote peer socket path. Empty = auto-detect on connect
-    /// (PeerSocketProber); the resolved path is cached back here.
+    /// User-pinned remote peer socket path. Empty = auto-detect on connect
+    /// (PeerSocketProber). Auto-detection results live in
+    /// `lastResolvedSocket`, never in this editor-facing field.
     var remoteSocket: String
+    /// Last successful auto-detection result. This is an implementation
+    /// cache, not a user choice: clearing `remoteSocket` clears this too,
+    /// forcing the next connection to probe again.
+    var lastResolvedSocket: String?
     /// Explicit SSH port (`-p`). nil = ssh default / ssh-config.
     var sshPort: Int?
     /// Identity file (`-i`). nil = default keys / ssh-config.
@@ -132,6 +137,7 @@ struct PeerHostProfile: Codable, Identifiable, Equatable {
         displayName: String = "",
         sshTarget: String,
         remoteSocket: String = "",
+        lastResolvedSocket: String? = nil,
         sshPort: Int? = nil,
         identityFile: String? = nil,
         colorHex: String? = nil,
@@ -145,6 +151,7 @@ struct PeerHostProfile: Codable, Identifiable, Equatable {
         self.displayName = displayName
         self.sshTarget = sshTarget
         self.remoteSocket = remoteSocket
+        self.lastResolvedSocket = lastResolvedSocket
         self.sshPort = sshPort
         self.identityFile = identityFile
         self.colorHex = colorHex
@@ -157,6 +164,14 @@ struct PeerHostProfile: Codable, Identifiable, Equatable {
 
     var effectiveDisplayName: String {
         displayName.isEmpty ? sshTarget : displayName
+    }
+
+    /// Socket to use for a connection without conflating explicit
+    /// configuration with an auto-detection cache.
+    var connectionSocket: String? {
+        if !remoteSocket.isEmpty { return remoteSocket }
+        guard let lastResolvedSocket, !lastResolvedSocket.isEmpty else { return nil }
+        return lastResolvedSocket
     }
 
     /// Where a project with this folder name would live on this machine.

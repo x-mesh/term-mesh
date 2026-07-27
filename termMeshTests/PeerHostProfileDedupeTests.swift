@@ -284,6 +284,38 @@ final class PeerHostProfileDedupeTests: XCTestCase {
         XCTAssertEqual(result[1].id, other.id)
     }
 
+    func test_upserted_clearingExplicitSocketInvalidatesResolvedCache() {
+        let original = PeerHostProfile(
+            sshTarget: "host-a",
+            remoteSocket: "/run/user/501/old.sock",
+            lastResolvedSocket: "/run/user/501/detected.sock"
+        )
+        var edited = original
+        edited.remoteSocket = ""
+
+        let result = PeerHostProfileStore.upserted([original], with: edited)
+
+        XCTAssertEqual(result.count, 1)
+        XCTAssertEqual(result[0].remoteSocket, "")
+        XCTAssertNil(result[0].lastResolvedSocket)
+        XCTAssertNil(result[0].connectionSocket)
+    }
+
+    func test_upserted_unrelatedEditKeepsAutoDetectedCache() {
+        let original = PeerHostProfile(
+            displayName: "Before",
+            sshTarget: "host-a",
+            lastResolvedSocket: "/run/user/501/detected.sock"
+        )
+        var edited = original
+        edited.displayName = "After"
+
+        let result = PeerHostProfileStore.upserted([original], with: edited)
+
+        XCTAssertEqual(result[0].lastResolvedSocket, "/run/user/501/detected.sock")
+        XCTAssertEqual(result[0].connectionSocket, "/run/user/501/detected.sock")
+    }
+
     func test_upserted_appendsNewProfile() {
         let existing = profile(sshTarget: "host-a")
         let brandNew = profile(sshTarget: "host-b")
