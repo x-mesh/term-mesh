@@ -25,7 +25,7 @@ struct PeerHostReadiness: Equatable {
     var isReady: Bool { projectRootExists && !installedCLIs.isEmpty }
 }
 
-enum PeerHostReadinessError: Error, CustomStringConvertible {
+enum PeerHostReadinessError: LocalizedError, CustomStringConvertible {
     case noProjectRoot
     case sshFailed(String)
 
@@ -37,6 +37,8 @@ enum PeerHostReadinessError: Error, CustomStringConvertible {
             return detail
         }
     }
+
+    var errorDescription: String? { description }
 }
 
 /// Where a CLI actually lives on a host, as opposed to where a non-interactive
@@ -212,14 +214,18 @@ enum PeerHostReadinessChecker {
         let out = String(
             data: outPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8
         ) ?? ""
-        guard proc.terminationStatus == 0 || !out.isEmpty else {
-            let err = String(
-                data: errPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8
-            ) ?? ""
+        let err = String(
+            data: errPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8
+        ) ?? ""
+        guard proc.terminationStatus == 0 else {
+            let detail = [out, err]
+                .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+                .filter { !$0.isEmpty }
+                .joined(separator: "\n")
             throw PeerHostReadinessError.sshFailed(
-                err.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                detail.isEmpty
                     ? "exited \(proc.terminationStatus)"
-                    : err.trimmingCharacters(in: .whitespacesAndNewlines)
+                    : detail
             )
         }
         return out

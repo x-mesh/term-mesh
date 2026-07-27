@@ -293,6 +293,44 @@ final class PeerProjectBootstrapTests: XCTestCase {
         )
     }
 
+    func test_remote_git_ssh_auth_failure_has_an_actionable_message() {
+        let error = PeerHostReadinessError.sshFailed(
+            """
+            Cloning into '/app/tm-projects/bloom'...
+            git@github.com: Permission denied (publickey).
+            fatal: Could not read from remote repository.
+            """
+        )
+
+        XCTAssertEqual(
+            PeerProjectBootstrap.remoteFailureDescription(
+                error,
+                gitURL: "git@github.com:JINWOO-J/bloom.git"
+            ),
+            "Git SSH authentication failed. Add an SSH key with access to this repository on this machine, then try again."
+        )
+        XCTAssertEqual(
+            error.localizedDescription,
+            """
+            Cloning into '/app/tm-projects/bloom'...
+            git@github.com: Permission denied (publickey).
+            fatal: Could not read from remote repository.
+            """
+        )
+    }
+
+    func test_remote_git_network_failure_has_an_actionable_message() {
+        XCTAssertEqual(
+            PeerProjectBootstrap.remoteFailureDescription(
+                PeerHostReadinessError.sshFailed(
+                    "ssh: Could not resolve hostname github.com: Name or service not known"
+                ),
+                gitURL: "git@github.com:org/repo.git"
+            ),
+            "This machine could not reach the Git host. Check its network and DNS settings."
+        )
+    }
+
     func test_remote_ref_keeps_peer_namespace_with_optional_surface() {
         let workspace = UUID()
         let surface = UUID()

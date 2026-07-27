@@ -1116,10 +1116,17 @@ struct SidebarProjectsSection: View {
                         sourceKind: kind
                     )
                 } catch {
-                    RemoteWorkLog.info(
-                        "Could not prepare \(name) on \(host.displayName): \(error)"
+                    let detail = PeerProjectBootstrap.remoteFailureDescription(
+                        error,
+                        gitURL: gitURL.isEmpty ? nil : gitURL
                     )
-                    throw error
+                    RemoteWorkLog.info(
+                        "Could not prepare \(name) on \(host.displayName): \(detail)"
+                    )
+                    throw ProjectCreationError.remoteSetupFailed(
+                        host: host.displayName,
+                        detail: detail
+                    )
                 }
                 for (offset, rowIndex) in placement.agentIndices.enumerated()
                     where offset < plan.agentCheckouts.count {
@@ -1162,6 +1169,7 @@ struct SidebarProjectsSection: View {
         case teamCreationFailed
         case remoteHostUnavailable
         case remotePathMissing
+        case remoteSetupFailed(host: String, detail: String)
 
         var errorDescription: String? {
             switch self {
@@ -1171,6 +1179,8 @@ struct SidebarProjectsSection: View {
                 "The selected remote machine is unavailable."
             case .remotePathMissing:
                 "Enter a folder on the remote machine."
+            case .remoteSetupFailed(let host, let detail):
+                "Could not prepare \(host): \(detail)"
             }
         }
     }

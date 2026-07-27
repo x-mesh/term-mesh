@@ -792,8 +792,12 @@ struct NewProjectView: View {
     private var footer: some View {
         HStack {
             Text(creationError ?? creationSummary)
-            .font(.caption)
-            .foregroundStyle(creationError == nil ? Color.secondary : Color.red)
+                .font(.caption)
+                .foregroundStyle(creationError == nil ? Color.secondary : Color.red)
+                .lineLimit(creationError == nil ? 1 : 2)
+                .fixedSize(horizontal: false, vertical: creationError != nil)
+                .layoutPriority(1)
+                .help(creationError ?? creationSummary)
             Spacer()
             Button("Cancel", action: onClose)
                 .keyboardShortcut(.cancelAction)

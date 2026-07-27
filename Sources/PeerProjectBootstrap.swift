@@ -376,6 +376,33 @@ enum PeerProjectBootstrap {
         }
     }
 
+    /// Turn common remote Git failures into a next action instead of exposing
+    /// SSH's multi-line diagnostic verbatim in the project sheet.
+    static func remoteFailureDescription(_ error: Error, gitURL: String?) -> String {
+        let detail = error.localizedDescription
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let lowercased = detail.lowercased()
+        let repository = gitURL?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+
+        if lowercased.contains("permission denied (publickey)") {
+            return repository.isEmpty
+                ? "SSH authentication failed. Add an SSH key on this machine, then try again."
+                : "Git SSH authentication failed. Add an SSH key with access to this repository on this machine, then try again."
+        }
+        if lowercased.contains("repository not found") {
+            return "The repository was not found or this machine does not have access to it."
+        }
+        if lowercased.contains("could not resolve host")
+            || lowercased.contains("temporary failure in name resolution") {
+            return "This machine could not reach the Git host. Check its network and DNS settings."
+        }
+        if lowercased.contains("timed out") {
+            return "Project setup timed out on this machine. Check its network connection, then try again."
+        }
+        return detail.isEmpty ? "Project setup failed on this machine." : detail
+    }
+
     /// Build the one destructive command in the project lifecycle.
     ///
     /// Only absolute, specific paths are accepted. A project root must have
