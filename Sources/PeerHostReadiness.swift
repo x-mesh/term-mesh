@@ -39,6 +39,44 @@ enum PeerHostReadinessError: Error, CustomStringConvertible {
     }
 }
 
+/// Where a CLI actually lives on a host, as opposed to where a non-interactive
+/// shell will look for it.
+///
+/// Every shell this app opens on a host is non-interactive, and `-lc` does not
+/// rescue that: installers write their PATH line into `~/.bashrc`, which opens
+/// with a guard that returns immediately when the shell is not interactive —
+/// so a line 100 lines below it never runs. The effect is that the directory
+/// the official installer chose (`~/.local/bin`, for Claude Code) is invisible
+/// in exactly the shells this app uses, and a host with a perfectly working
+/// CLI reads back as "not installed".
+///
+/// The same directories are already listed in the Rust daemon's
+/// `user_bin_dirs()`; both halves of the app should look in the same places.
+enum RemoteShellPath {
+    /// Ordered most-specific first: a user's own install should win over one a
+    /// package manager put in a shared prefix.
+    static let binDirs = [
+        "$HOME/.local/bin",
+        "$HOME/.cargo/bin",
+        "$HOME/bin",
+        "$HOME/go/bin",
+        "$HOME/.bun/bin",
+        "$HOME/.npm-global/bin",
+        "$HOME/.npm-packages/bin",
+        "/opt/homebrew/bin",
+        "/usr/local/bin",
+    ]
+
+    /// Prefix for every script this app runs on a host — both the probes that
+    /// ask whether a CLI exists and the command that launches it, which have
+    /// to agree or a CLI is found and then fails to start.
+    ///
+    /// Deliberately unquoted: `$HOME` has to expand on the far side. The
+    /// inherited `$PATH` stays last so a host that has already arranged things
+    /// keeps its own precedence.
+    static let prologue = "export PATH=\"\(binDirs.joined(separator: ":")):$PATH\"; "
+}
+
 enum PeerHostReadinessChecker {
     /// The CLIs term-mesh knows how to run as an agent.
     static let knownCLIs = ["claude", "codex", "kiro", "gemini"]
@@ -64,7 +102,8 @@ enum PeerHostReadinessChecker {
         let probes = knownCLIs
             .map { "command -v \($0) >/dev/null 2>&1 && echo 'cli \($0)'" }
             .joined(separator: "; ")
-        let script = "test -d \(quotedRoot) && echo 'root yes' || echo 'root no'; \(probes)"
+        let script = RemoteShellPath.prologue
+            + "test -d \(quotedRoot) && echo 'root yes' || echo 'root no'; \(probes)"
 
         let output = try await run(
             sshTarget: sshTarget, port: port, identityFile: identityFile,

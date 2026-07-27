@@ -499,7 +499,8 @@ extension TeamOrchestrator {
             throw RemoteAgentError.cliUnavailable(cli, host.displayName)
         }
         let marker = "__TERMMESH_CLI_AVAILABLE__"
-        let probe = "command -v \(shellQuoted(cli)) >/dev/null 2>&1 "
+        let probe = RemoteShellPath.prologue
+            + "command -v \(shellQuoted(cli)) >/dev/null 2>&1 "
             + "&& printf %s \(shellQuoted(marker))"
         do {
             let output = try await PeerHostReadinessChecker.runScript(
@@ -540,7 +541,8 @@ extension TeamOrchestrator {
         }
         let marker = "__TERMMESH_LEADER_READY__"
         let missing = "__TERMMESH_LEADER_CLI_MISSING__"
-        var script = "if ! command -v \(shellQuoted(cli)) >/dev/null 2>&1; "
+        var script = RemoteShellPath.prologue
+            + "if ! command -v \(shellQuoted(cli)) >/dev/null 2>&1; "
             + "then printf %s \(shellQuoted(missing)); exit 0; fi"
         if let systemPrompt, let promptFile {
             script += "; umask 077; printf %s \(shellQuoted(systemPrompt)) > \(shellQuoted(promptFile))"
@@ -1457,7 +1459,11 @@ extension TeamOrchestrator {
         // short-circuited, and the CLI never started — leaving a pane that
         // looked attached and was a dead shell, with the reason one scroll up.
         // Idempotent, so an existing directory costs nothing.
-        let enter = "mkdir -p '\(quotedDir)' && cd '\(quotedDir)'"
+        // The launch has to see the same PATH the probe did. Finding a CLI and
+        // then starting a shell that cannot is the worst of both: the guard
+        // passes and the pane dies with "command not found".
+        let enter = RemoteShellPath.prologue
+            + "mkdir -p '\(quotedDir)' && cd '\(quotedDir)'"
         switch cli {
         case "codex":
             return "\(enter) && codex --model \(model)"

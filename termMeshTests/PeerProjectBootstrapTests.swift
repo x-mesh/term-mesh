@@ -227,4 +227,57 @@ final class PeerProjectBootstrapTests: XCTestCase {
         XCTAssertTrue(launch.contains("rm -f"))
         XCTAssertTrue(launch.contains("--dangerously-skip-permissions"))
     }
+
+    /// The launch looks where the CLI was actually installed.
+    ///
+    /// A host whose only `claude` sits in `~/.local/bin` — where the official
+    /// installer puts it — read back as "not installed", because the PATH line
+    /// installers add lives in `~/.bashrc` below its non-interactive guard, and
+    /// every shell this app opens is non-interactive.
+    @MainActor
+    func test_remote_launch_puts_user_bin_dirs_on_path() {
+        let launch = TeamOrchestrator.remoteAgentCommand(
+            cli: "claude",
+            model: "sonnet",
+            agentName: "worker",
+            teamName: "demo",
+            workingDirectory: "/srv/demo"
+        )
+
+        XCTAssertTrue(launch.hasPrefix("export PATH="), "PATH has to be set before anything runs")
+        XCTAssertTrue(launch.contains("$HOME/.local/bin"))
+        XCTAssertTrue(launch.contains(":$PATH\""), "the host's own PATH must survive, last")
+        // Ordering matters as much as membership: a cd into the project before
+        // PATH is set would run the CLI lookup with the old PATH.
+        let pathEnd = try? XCTUnwrap(launch.range(of: ":$PATH\";"))
+        let cd = try? XCTUnwrap(launch.range(of: "cd '"))
+        if let pathEnd, let cd {
+            XCTAssertLessThan(pathEnd.lowerBound, cd.lowerBound)
+        }
+    }
+
+    /// The probe and the launch have to agree on where to look. Finding a CLI
+    /// and then starting a shell that cannot is the worst of both outcomes:
+    /// the guard passes and the pane dies with "command not found".
+    @MainActor
+    func test_probe_and_launch_share_one_path_rule() {
+        let launch = TeamOrchestrator.remoteAgentCommand(
+            cli: "claude", model: "sonnet", agentName: "worker",
+            teamName: "demo", workingDirectory: "/srv/demo"
+        )
+        XCTAssertTrue(launch.hasPrefix(RemoteShellPath.prologue))
+        XCTAssertTrue(RemoteShellPath.binDirs.contains("$HOME/.local/bin"))
+    }
+
+    /// A directory with a quote in it stays one argument.
+    @MainActor
+    func test_remote_launch_escapes_a_quote_in_the_working_directory() {
+        let launch = TeamOrchestrator.remoteAgentCommand(
+            cli: "claude", model: "sonnet", agentName: "worker",
+            teamName: "demo", workingDirectory: "/srv/it's here"
+        )
+
+        XCTAssertTrue(launch.contains("'/srv/it'\\''s here'"))
+        XCTAssertFalse(launch.contains("cd '/srv/it's here'"), "an unescaped quote would end the argument early")
+    }
 }
