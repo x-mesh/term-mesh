@@ -9,7 +9,7 @@
 //! into the connection's outgoing channel wrapped as `PtyData` frames.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -112,6 +112,9 @@ async fn reader_loop(
     // handshake reaches Ready, dropped (= unregistered) with this frame.
     // Underscore: the binding exists for its Drop, it is never read.
     let mut broadcast_guard: Option<layout::BroadcastGuard> = None;
+    // Shared with the Broadcaster so a roster push can skip connections that
+    // never subscribed. Written here, read there.
+    let wants_workspace_roster = Arc::new(AtomicBool::new(false));
     // Started at Ready for a client that asked for stats; aborted when this
     // loop returns, on every exit path (see the abort below).
     let mut host_stats_task: Option<JoinHandle<()>> = None;
@@ -226,10 +229,11 @@ async fn reader_loop(
                 // From Ready on, this connection receives layout pushes
                 // triggered by any connection's WorkspaceControl. The guard
                 // unregisters on connection teardown (any exit path).
-                broadcast_guard = Some(host.clients.register(
+                broadcast_guard = Some(host.clients.register_with_roster_flag(
                     outgoing_tx.clone(),
                     seq_counter.clone(),
                     peer_id.clone(),
+                    Arc::clone(&wants_workspace_roster),
                 ));
                 // Only for a client that advertised host.stats.v1; everyone
                 // else costs nothing. Aborted on teardown below rather than
@@ -421,6 +425,10 @@ async fn reader_loop(
                     send_error(&outgoing_tx, 106, "workspace roster subscription not negotiated").await;
                     continue;
                 }
+                // Flip before the baseline goes out. Layout pushes only reach
+                // subscribers now, so a connection that never asks stays out
+                // of the roster fan-out entirely.
+                wants_workspace_roster.store(true, Ordering::Relaxed);
                 let workspaces = host.workspace_roster();
                 send(
                     &outgoing_tx,

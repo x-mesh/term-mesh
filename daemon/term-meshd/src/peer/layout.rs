@@ -17,7 +17,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
@@ -664,6 +664,14 @@ struct RegisteredClient {
     /// The connection's own outgoing seq counter — pushes must continue
     /// each connection's monotonic sequence, not share a global one.
     seq: Arc<AtomicU64>,
+    /// Set once this connection sends `SubscribeWorkspaceList`.
+    ///
+    /// Shared with the connection task, which is the only writer: the
+    /// subscription arrives on its receive loop, long after registration.
+    /// Without it the roster went to every client on every layout push —
+    /// including a viewer watching one pane, which had already been sent
+    /// the scoped delta it actually needed.
+    wants_roster: Arc<AtomicBool>,
 }
 
 struct PendingLeaderResponse {
@@ -687,11 +695,28 @@ impl Broadcaster {
         seq: Arc<AtomicU64>,
         peer_id: Vec<u8>,
     ) -> BroadcastGuard {
+        self.register_with_roster_flag(tx, seq, peer_id, Arc::new(AtomicBool::new(false)))
+    }
+
+    /// `register`, plus the handle the connection flips when it subscribes to
+    /// the workspace roster.
+    pub fn register_with_roster_flag(
+        self: &Arc<Self>,
+        tx: mpsc::Sender<Envelope>,
+        seq: Arc<AtomicU64>,
+        peer_id: Vec<u8>,
+        wants_roster: Arc<AtomicBool>,
+    ) -> BroadcastGuard {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        self.clients
-            .lock()
-            .unwrap()
-            .insert(id, RegisteredClient { tx, peer_id, seq });
+        self.clients.lock().unwrap().insert(
+            id,
+            RegisteredClient {
+                tx,
+                peer_id,
+                seq,
+                wants_roster,
+            },
+        );
         BroadcastGuard {
             broadcaster: Arc::clone(self),
             id,
@@ -701,9 +726,43 @@ impl Broadcaster {
     /// Fan a payload out to every registered connection, stamping each
     /// envelope with that connection's next seq. Clone-then-send: the
     /// guard is released before any channel interaction.
+    /// Whether anyone has asked for the workspace roster.
+    ///
+    /// Checked before the roster is built, not after: assembling it walks
+    /// every workspace's pane tree, so with no subscriber the cheapest
+    /// correct thing is to never start.
+    pub fn has_roster_subscriber(&self) -> bool {
+        self.clients
+            .lock()
+            .unwrap()
+            .values()
+            .any(|client| client.wants_roster.load(Ordering::Relaxed))
+    }
+
+    /// Send only to connections that subscribed to the roster.
+    pub fn broadcast_to_roster_subscribers(&self, payload: &peer_proto::v1::envelope::Payload) {
+        let clients: Vec<RegisteredClient> = self
+            .clients
+            .lock()
+            .unwrap()
+            .values()
+            .filter(|client| client.wants_roster.load(Ordering::Relaxed))
+            .cloned()
+            .collect();
+        self.send_to(clients, payload);
+    }
+
     pub fn broadcast(&self, payload: &peer_proto::v1::envelope::Payload) {
         let clients: Vec<RegisteredClient> =
             self.clients.lock().unwrap().values().cloned().collect();
+        self.send_to(clients, payload);
+    }
+
+    fn send_to(
+        &self,
+        clients: Vec<RegisteredClient>,
+        payload: &peer_proto::v1::envelope::Payload,
+    ) {
         for client in clients {
             let env = Envelope {
                 seq: client.seq.fetch_add(1, Ordering::Relaxed) + 1,
@@ -1790,9 +1849,19 @@ impl PeerHost {
     }
 
     pub fn broadcast_workspace_roster(&self) {
-        self.clients.broadcast(&Payload::WorkspaceListChanged(WorkspaceListChanged {
-            workspaces: self.workspace_roster(),
-        }));
+        // `workspace_roster` rebuilds a layout snapshot for EVERY workspace,
+        // each a recursive walk of its pane tree. With nobody subscribed that
+        // is pure waste, and this runs on every debounced layout push — which
+        // fires throughout a divider drag.
+        if !self.clients.has_roster_subscriber() {
+            return;
+        }
+        self.clients
+            .broadcast_to_roster_subscribers(&Payload::WorkspaceListChanged(
+                WorkspaceListChanged {
+                    workspaces: self.workspace_roster(),
+                },
+            ));
     }
 
     /// Wire snapshot of any single workspace's tree by id — the generic
@@ -2937,6 +3006,60 @@ mod tests {
             host.default_workspace_title(),
             "renamed",
             "no-op must not have applied"
+        );
+    }
+
+    /// A client that never subscribed to the roster is not sent one, and
+    /// with no subscriber at all the roster is never even assembled.
+    ///
+    /// Building it walks every workspace's pane tree, and this runs on every
+    /// debounced layout push — which fires repeatedly throughout a divider
+    /// drag. A viewer watching a single pane was receiving the whole roster
+    /// each time, right after the scoped delta it actually asked for.
+    #[tokio::test]
+    async fn workspace_roster_reaches_only_subscribers() {
+        let manager = Arc::new(PtyManager::new());
+        let host = Arc::new(PeerHost::new(Arc::clone(&manager)));
+
+        let (plain_tx, mut plain_rx) = mpsc::channel(8);
+        let _plain = host.clients.register(
+            plain_tx,
+            Arc::new(AtomicU64::new(0)),
+            vec![0xC1; 16],
+        );
+        assert!(
+            !host.clients.has_roster_subscriber(),
+            "registering alone must not imply a subscription"
+        );
+
+        host.broadcast_workspace_roster();
+        assert!(
+            plain_rx.try_recv().is_err(),
+            "a non-subscriber must receive nothing"
+        );
+
+        let (sub_tx, mut sub_rx) = mpsc::channel(8);
+        let wants = Arc::new(AtomicBool::new(false));
+        let _sub = host.clients.register_with_roster_flag(
+            sub_tx,
+            Arc::new(AtomicU64::new(0)),
+            vec![0xD1; 16],
+            Arc::clone(&wants),
+        );
+        wants.store(true, Ordering::Relaxed);
+        assert!(host.clients.has_roster_subscriber());
+
+        host.broadcast_workspace_roster();
+        assert!(
+            matches!(
+                sub_rx.try_recv().ok().and_then(|env| env.payload),
+                Some(Payload::WorkspaceListChanged(_))
+            ),
+            "the subscriber must get the roster"
+        );
+        assert!(
+            plain_rx.try_recv().is_err(),
+            "the non-subscriber must still receive nothing"
         );
     }
 
