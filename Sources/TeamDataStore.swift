@@ -926,6 +926,37 @@ final class TeamDataStore: ObservableObject, @unchecked Sendable {
         return tasks[idx]
     }
 
+    /// Converge one parallel wave at a hard deadline. A deadline is evidence
+    /// of incompleteness, never evidence of success: only already-completed
+    /// tasks remain completed; every other selected task is explicitly blocked.
+    @discardableResult
+    func convergeTimebox(
+        teamName: String,
+        taskIds: [String]? = nil,
+        reason: String = "Timebox hard deadline reached; converge on completed evidence."
+    ) -> [TeamOrchestrator.TeamTask] {
+        lock.lock()
+        defer { lock.unlock() }
+        guard var tasks = taskBoards[teamName] else { return [] }
+        let selected = taskIds.map(Set.init)
+        let terminal: Set<String> = ["completed", "failed", "abandoned", "cancelled"]
+        let now = Date()
+        var changed: [TeamOrchestrator.TeamTask] = []
+        for index in tasks.indices where selected?.contains(tasks[index].id) ?? true {
+            guard !terminal.contains(tasks[index].status) else { continue }
+            tasks[index].status = "blocked"
+            tasks[index].blockedReason = reason
+            tasks[index].lastProgressAt = now
+            tasks[index].updatedAt = now
+            changed.append(tasks[index])
+        }
+        guard !changed.isEmpty else { return [] }
+        taskBoards[teamName] = tasks
+        noteTasksChanged()
+        notifyChanged()
+        return changed
+    }
+
     @discardableResult
     func splitTask(
         teamName: String,

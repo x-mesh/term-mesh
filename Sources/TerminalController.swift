@@ -2107,6 +2107,8 @@ class TerminalController {
             return teamDataTaskClear(params: params, id: id, store: store)
         case "team.task.claim":
             return teamDataTaskClaim(params: params, id: id, store: store)
+        case "team.task.timebox":
+            return teamDataTaskTimebox(params: params, id: id, store: store)
         case "team.task.create":
             return teamDataTaskCreate(params: params, id: id, store: store)
         case "team.task.update":
@@ -4024,6 +4026,7 @@ class TerminalController {
         // handler at `case "team.task.claim"` was dead code, breaking the
         // documented work-pool / manual-claim pattern.
         "team.task.claim",
+        "team.task.timebox",
         "team.task.update",
         "team.context.set",
         "team.context.get",
@@ -4065,8 +4068,12 @@ class TerminalController {
                 return teamDataTaskClear(params: params, id: id, store: store)
             case "team.task.create":
                 return teamDataTaskCreate(params: params, id: id, store: store)
+            case "team.task.claim":
+                return teamDataTaskClaim(params: params, id: id, store: store)
             case "team.task.update":
                 return teamDataTaskUpdate(params: params, id: id, store: store)
+            case "team.task.timebox":
+                return teamDataTaskTimebox(params: params, id: id, store: store)
             case "team.context.set":
                 return teamDataContextSet(params: params, id: id, store: store)
             case "team.context.get":
@@ -4286,8 +4293,11 @@ class TerminalController {
         guard let agentName = params["agent_name"] as? String else {
             return v2Error(id: id, code: "invalid_params", message: "Missing agent_name")
         }
+        let agentInstanceId = params["agent_instance_id"] as? String
         let shouldPush = params["push"] as? Bool ?? true
-        if let task = store.claimTask(teamName: teamName, agentName: agentName) {
+        if let task = store.claimTask(
+            teamName: teamName, agentName: agentName, agentInstanceId: agentInstanceId
+        ) {
             let claimedTask = task
             let fallbackTabManager = self.tabManager
             // Push task instruction to the claiming agent after a short delay to let
@@ -4305,6 +4315,24 @@ class TerminalController {
             return v2Ok(id: id, result: store.taskDictionary(task))
         }
         return v2Ok(id: id, result: NSNull())
+    }
+
+    private func teamDataTaskTimebox(params: [String: Any], id: Any?, store: TeamDataStore) -> String {
+        guard let teamName = params["team_name"] as? String else {
+            return v2Error(id: id, code: "invalid_params", message: "Missing team_name")
+        }
+        let changed = store.convergeTimebox(
+            teamName: teamName,
+            taskIds: params["task_ids"] as? [String],
+            reason: params["reason"] as? String
+                ?? "Timebox hard deadline reached; converge on completed evidence."
+        )
+        return v2Ok(id: id, result: [
+            "team_name": teamName,
+            "tasks": changed.map(store.taskDictionary),
+            "count": changed.count,
+            "outcome": "converged_not_success",
+        ])
     }
 
     private func teamDataTaskCreate(params: [String: Any], id: Any?, store: TeamDataStore) -> String {
