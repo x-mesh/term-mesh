@@ -1,15 +1,12 @@
 import CryptoKit
 import Foundation
 
-/// The one policy source for a future leader-routing gate.
-///
-/// This type deliberately has no callers yet.  The current leader prompts keep
-/// their existing behavior until the instance-aware routing gate is complete.
-/// Every local or peer leader renderer must consume `renderedInstructions`,
-/// rather than copying any rule below, when that gate is enabled.
+/// The one policy source for leader routing. Every local or peer leader prompt
+/// renderer consumes `renderedInstructions`; no renderer owns a fork of these
+/// scheduling rules.
 enum LeaderParallelPolicy {
     static let version = "1"
-    static let activation = "routing-gate-pending"
+    static let activation = "runtime-enforced"
 
     /// Ordered rules are both the canonical policy and the digest input.  Do
     /// not reorder them: a changed order is a policy change and must produce a
@@ -58,9 +55,8 @@ enum LeaderParallelPolicy {
             .joined()
     }
 
-    /// The only policy payload a leader prompt renderer may inject once the
-    /// routing gate is ready.  Keeping the activation state in-band makes an
-    /// accidental early wiring visible rather than silently enabling it.
+    /// The only policy payload leader prompt renderers may inject. Keeping the
+    /// activation state in-band makes launch parity observable to the leader.
     static var renderedInstructions: String {
         let renderedRules = rules.map { "- [\($0.id)] \($0.text)" }
             .joined(separator: "\n")
@@ -70,7 +66,7 @@ enum LeaderParallelPolicy {
         policy_digest: \(digest)
         policy_activation: \(activation)
 
-        This policy is defined but inactive until the instance-aware routing gate passes. Do not claim that these rules are enforced by the scheduler yet.
+        This policy is active. Treat these rules as the scheduling contract for local and peer workers; report a degraded policy state rather than silently bypassing them.
 
         \(renderedRules)
         """

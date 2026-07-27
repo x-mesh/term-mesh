@@ -20,13 +20,13 @@ final class AgentSessionTests: XCTestCase {
         let second = LeaderParallelPolicy.renderedInstructions
 
         XCTAssertEqual(LeaderParallelPolicy.version, "1")
-        XCTAssertEqual(LeaderParallelPolicy.activation, "routing-gate-pending")
+        XCTAssertEqual(LeaderParallelPolicy.activation, "runtime-enforced")
         XCTAssertEqual(first, second)
         XCTAssertEqual(LeaderParallelPolicy.digest.count, 64)
         XCTAssertTrue(LeaderParallelPolicy.digest.allSatisfy { $0.isHexDigit })
         XCTAssertTrue(first.contains("policy_version: 1"))
         XCTAssertTrue(first.contains("policy_digest: \(LeaderParallelPolicy.digest)"))
-        XCTAssertTrue(first.contains("policy_activation: routing-gate-pending"))
+        XCTAssertTrue(first.contains("policy_activation: runtime-enforced"))
     }
 
     func testLeaderParallelPolicyContainsEveryRequiredRoutingRule() {
@@ -41,7 +41,7 @@ final class AgentSessionTests: XCTestCase {
             "policy-parity",
             "timebox-convergence",
         ].forEach { XCTAssertTrue(policy.contains("[\($0)]"), "missing \($0)") }
-        XCTAssertTrue(policy.contains("inactive until the instance-aware routing gate passes"))
+        XCTAssertTrue(policy.contains("This policy is active."))
     }
 
     private func agentMember(name: String = "executor") -> TeamOrchestrator.AgentMember {

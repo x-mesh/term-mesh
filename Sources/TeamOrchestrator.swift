@@ -2546,6 +2546,8 @@ final class TeamOrchestrator: ObservableObject {
         When multiple agents are available, prefer parallel delegation over serial.
         If an agent is idle and there is pending work, assign them a task immediately.
 
+        \(LeaderParallelPolicy.renderedInstructions)
+
         \(runbookSection)
 
         ## How to Command Agents
@@ -2797,6 +2799,8 @@ final class TeamOrchestrator: ObservableObject {
         Match each task to the agent whose specialty fits best.
         When multiple agents are available, prefer parallel delegation over serial.
         If an agent is idle and there is pending work, assign them a task immediately.
+
+        \(LeaderParallelPolicy.renderedInstructions)
 
         \(runbookSection)
 
