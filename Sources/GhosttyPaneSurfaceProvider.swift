@@ -713,6 +713,10 @@ final class GhosttyPaneSurfaceProvider: PeerSurfaceProvider {
                         if let ptr = ts.surface {
                             ghostty_surface_clear_pty_data_callback(ptr)
                         }
+                        // Nobody is looking from elsewhere any more, so the
+                        // local pane stops accommodating a viewer that has
+                        // left and takes its own size back.
+                        ts.clearRemoteViewerPixelSize()
                         provider.value?.tapHubs.removeValue(forKey: ts.id)
                     }
                 }
@@ -732,7 +736,8 @@ final class GhosttyPaneSurfaceProvider: PeerSurfaceProvider {
             input: input,
             resize: { [weakTS, hub] cols, rows in
                 await MainActor.run {
-                    guard let ptr = weakTS.value?.surface else { return }
+                    guard let terminalSurface = weakTS.value,
+                          let ptr = terminalSurface.surface else { return }
                     // ghostty_surface_set_size takes pixel dimensions.
                     // Use current cell size to convert cols×rows → pixels.
                     let curSz = ghostty_surface_size(ptr)
@@ -743,24 +748,34 @@ final class GhosttyPaneSurfaceProvider: PeerSurfaceProvider {
                     let (h, hOverflow) = safeRows.multipliedReportingOverflow(by: UInt32(curSz.cell_height_px))
                     guard !wOverflow, !hOverflow else { return }
 
-                    // The host pane and each remote viewer surface are sized
-                    // independently; the host follows the viewer here. The
-                    // viewer's real size only reaches us via this resize (the
-                    // attach `clientCols/clientRows` carry the host-echoed size,
-                    // not the viewer's). Until it lands, the viewer renders
-                    // host-sized PTY bytes into a differently-sized grid, so
-                    // absolute-cursor TUIs (Claude Code, vim, htop) paint
-                    // spinners/status lines on top of body text and the screen
-                    // looks garbled/duplicated. Match the host pane to the
-                    // viewer, then — only on a real dimension change — wipe the
-                    // viewer's now-stale grid so the SIGWINCH-driven repaint
-                    // lands clean at the new size. The clear is yielded before
-                    // the repaint bytes (which arrive via the PTY tap), so the
-                    // viewer sees: clear → full repaint. Skipped on a no-op
-                    // resize so plain shells don't lose their view.
-                    let sizeChanged = UInt32(curSz.columns) != safeCols
-                        || UInt32(curSz.rows) != safeRows
-                    ghostty_surface_set_size(ptr, w, h)
+                    // The host pane and each remote viewer are two windows onto
+                    // one PTY, and a PTY has one size. The viewer's real size
+                    // only reaches us here (the attach `clientCols/clientRows`
+                    // carry the host-echoed size, not the viewer's). Until it
+                    // lands, the viewer renders host-sized PTY bytes into a
+                    // differently-sized grid, so absolute-cursor TUIs (Claude
+                    // Code, vim, htop) paint spinners/status lines on top of
+                    // body text and the screen looks garbled/duplicated.
+                    //
+                    // `applyRemoteViewerPixelSize` owns the arbitration — while
+                    // the local pane is on screen the smaller of the two wins,
+                    // otherwise the viewer does — and keeps the local pane's own
+                    // size cache honest. Setting the size here directly is what
+                    // let the two paths overwrite each other unseen: the local
+                    // side went on comparing against a value the surface no
+                    // longer had, so it never noticed it had been resized, and
+                    // the shell kept wrapping to a width the viewer wasn't
+                    // drawing.
+                    //
+                    // On a real change, wipe the viewer's now-stale grid so the
+                    // SIGWINCH-driven repaint lands clean at the new size. The
+                    // clear is yielded before the repaint bytes (which arrive
+                    // via the PTY tap), so the viewer sees: clear → full
+                    // repaint. Skipped on a no-op resize so plain shells don't
+                    // lose their view.
+                    let sizeChanged = terminalSurface.applyRemoteViewerPixelSize(
+                        width: w, height: h
+                    )
                     if sizeChanged {
                         // ESC[2J (erase screen) + ESC[H (cursor home).
                         hub.broadcast(Data([0x1B, 0x5B, 0x32, 0x4A, 0x1B, 0x5B, 0x48]))

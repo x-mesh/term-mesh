@@ -273,6 +273,12 @@ final class TerminalSurface: Identifiable, ObservableObject {
     private let surfaceView: GhosttyNSView
     private var lastPixelWidth: UInt32 = 0
     private var lastPixelHeight: UInt32 = 0
+    /// What the local pane's own layout last asked for, kept even when a
+    /// viewer is currently winning, so the surface can return to it the moment
+    /// the viewer detaches.
+    private var localPixelSize: (w: UInt32, h: UInt32)?
+    /// What an attached remote viewer asked for, nil when nobody is attached.
+    private var remoteViewerPixelSize: (w: UInt32, h: UInt32)?
     private var lastXScale: CGFloat = 0
     private var lastYScale: CGFloat = 0
     private var pendingTextQueue: [Data] = []
@@ -977,11 +983,13 @@ final class TerminalSurface: Identifiable, ObservableObject {
         let hpx = pixelDimension(from: resolvedBackingHeight)
         guard wpx > 0, hpx > 0 else { return }
 
+        localPixelSize = (wpx, hpx)
+        let resolved = resolvedPixelSize()
         let scaleChanged = !scaleApproximatelyEqual(xScale, lastXScale) || !scaleApproximatelyEqual(yScale, lastYScale)
-        let sizeChanged = wpx != lastPixelWidth || hpx != lastPixelHeight
+        let sizeChanged = resolved.w != lastPixelWidth || resolved.h != lastPixelHeight
 
         #if DEBUG
-        Self.sizeLog("updateSize-call surface=\(id.uuidString.prefix(8)) size=\(wpx)x\(hpx) prev=\(lastPixelWidth)x\(lastPixelHeight) changed=\((scaleChanged || sizeChanged) ? 1 : 0)")
+        Self.sizeLog("updateSize-call surface=\(id.uuidString.prefix(8)) size=\(resolved.w)x\(resolved.h) prev=\(lastPixelWidth)x\(lastPixelHeight) changed=\((scaleChanged || sizeChanged) ? 1 : 0)")
         #endif
 
         guard scaleChanged || sizeChanged else { return }
@@ -989,7 +997,7 @@ final class TerminalSurface: Identifiable, ObservableObject {
         #if DEBUG
         if sizeChanged {
             let win = attachedView?.window != nil ? "1" : "0"
-            Self.sizeLog("updateSize surface=\(id.uuidString.prefix(8)) size=\(wpx)x\(hpx) prev=\(lastPixelWidth)x\(lastPixelHeight) win=\(win)")
+            Self.sizeLog("updateSize surface=\(id.uuidString.prefix(8)) size=\(resolved.w)x\(resolved.h) prev=\(lastPixelWidth)x\(lastPixelHeight) win=\(win)")
         }
         #endif
 
@@ -1000,12 +1008,96 @@ final class TerminalSurface: Identifiable, ObservableObject {
         }
 
         if sizeChanged {
-            ghostty_surface_set_size(surface, wpx, hpx)
-            lastPixelWidth = wpx
-            lastPixelHeight = hpx
+            applyResolvedSize(resolved, to: surface)
         }
 
         // Let Ghostty continue rendering on its own wakeups for steady-state frames.
+    }
+
+    /// Adopt the size a remote viewer asked for. Returns whether the surface
+    /// actually changed, which the caller needs: a viewer only has to be sent
+    /// a fresh screen when it did.
+    ///
+    /// Routed through here rather than calling `ghostty_surface_set_size`
+    /// directly so the local pane's cache stays true. When the two paths each
+    /// set the size behind the other's back, `updateSize` compares against a
+    /// value the surface no longer has, concludes nothing changed, and the
+    /// two views drift apart silently.
+    @discardableResult
+    func applyRemoteViewerPixelSize(width: UInt32, height: UInt32) -> Bool {
+        guard let surface = surface, width > 0, height > 0 else { return false }
+        remoteViewerPixelSize = (width, height)
+        let resolved = resolvedPixelSize()
+        guard resolved.w != lastPixelWidth || resolved.h != lastPixelHeight else { return false }
+        #if DEBUG
+        Self.sizeLog(
+            "viewerSize surface=\(id.uuidString.prefix(8)) asked=\(width)x\(height) "
+                + "resolved=\(resolved.w)x\(resolved.h) prev=\(lastPixelWidth)x\(lastPixelHeight) "
+                + "localOnScreen=\(isLocallyOnScreen ? 1 : 0)"
+        )
+        #endif
+        applyResolvedSize(resolved, to: surface)
+        return true
+    }
+
+    /// The viewer is gone; the local pane gets its own size back.
+    func clearRemoteViewerPixelSize() {
+        guard remoteViewerPixelSize != nil else { return }
+        remoteViewerPixelSize = nil
+        guard let surface = surface else { return }
+        let resolved = resolvedPixelSize()
+        guard resolved.w != lastPixelWidth || resolved.h != lastPixelHeight else { return }
+        applyResolvedSize(resolved, to: surface)
+    }
+
+    private func applyResolvedSize(_ size: (w: UInt32, h: UInt32), to surface: ghostty_surface_t) {
+        ghostty_surface_set_size(surface, size.w, size.h)
+        lastPixelWidth = size.w
+        lastPixelHeight = size.h
+    }
+
+    /// One PTY, two windows onto it — so one size has to win.
+    ///
+    /// Whoever loses renders a grid that does not match what the shell drew
+    /// into it: lines wrapped at a column that is no longer the edge, and a
+    /// cursor the shell believes is somewhere the screen does not show. That
+    /// last part is not cosmetic — it is where the next typed character
+    /// lands, which is how a keystroke ends up in the middle of the prompt.
+    ///
+    /// So the smaller of the two wins while both are on screen. A short line
+    /// never has to be re-wrapped to fit a narrow grid; it just leaves margin,
+    /// and margin is the one failure mode here that loses nothing. When the
+    /// local pane is not on screen there is nobody to shortchange, and the
+    /// viewer gets exactly what it asked for.
+    private func resolvedPixelSize() -> (w: UInt32, h: UInt32) {
+        Self.resolvePixelSize(
+            local: localPixelSize,
+            remote: remoteViewerPixelSize,
+            localOnScreen: isLocallyOnScreen,
+            fallback: (lastPixelWidth, lastPixelHeight)
+        )
+    }
+
+    /// The rule itself, separated from the surface so it can be tested
+    /// without one.
+    static func resolvePixelSize(
+        local: (w: UInt32, h: UInt32)?,
+        remote: (w: UInt32, h: UInt32)?,
+        localOnScreen: Bool,
+        fallback: (w: UInt32, h: UInt32)
+    ) -> (w: UInt32, h: UInt32) {
+        guard let remote else { return local ?? fallback }
+        guard let local, localOnScreen else { return remote }
+        return (min(local.w, remote.w), min(local.h, remote.h))
+    }
+
+    /// Whether a person could actually be looking at the local pane. A pane
+    /// parked in an unselected workspace has a view but no window, and one
+    /// hidden behind a portal swap is marked not-visible; neither is somebody
+    /// whose reading the viewer has to accommodate.
+    private var isLocallyOnScreen: Bool {
+        guard let view = attachedView else { return false }
+        return view.isVisibleInUI && view.window != nil
     }
 
     /// Force a full size recalculation and surface redraw.
