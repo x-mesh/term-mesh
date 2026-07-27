@@ -15,6 +15,35 @@ import XCTest
 @MainActor
 final class AgentSessionTests: XCTestCase {
 
+    func testLeaderParallelPolicyRendersStableVersionAndDigest() {
+        let first = LeaderParallelPolicy.renderedInstructions
+        let second = LeaderParallelPolicy.renderedInstructions
+
+        XCTAssertEqual(LeaderParallelPolicy.version, "1")
+        XCTAssertEqual(LeaderParallelPolicy.activation, "routing-gate-pending")
+        XCTAssertEqual(first, second)
+        XCTAssertEqual(LeaderParallelPolicy.digest.count, 64)
+        XCTAssertTrue(LeaderParallelPolicy.digest.allSatisfy { $0.isHexDigit })
+        XCTAssertTrue(first.contains("policy_version: 1"))
+        XCTAssertTrue(first.contains("policy_digest: \(LeaderParallelPolicy.digest)"))
+        XCTAssertTrue(first.contains("policy_activation: routing-gate-pending"))
+    }
+
+    func testLeaderParallelPolicyContainsEveryRequiredRoutingRule() {
+        let policy = LeaderParallelPolicy.renderedInstructions
+
+        [
+            "parallel-default",
+            "dag-readiness",
+            "unified-placement-pool",
+            "same-checkout-isolation",
+            "branch-merge-boundary",
+            "policy-parity",
+            "timebox-convergence",
+        ].forEach { XCTAssertTrue(policy.contains("[\($0)]"), "missing \($0)") }
+        XCTAssertTrue(policy.contains("inactive until the instance-aware routing gate passes"))
+    }
+
     private func agentMember(name: String = "executor") -> TeamOrchestrator.AgentMember {
         TeamOrchestrator.AgentMember(
             id: "\(name)@identity-test",
