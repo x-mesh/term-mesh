@@ -673,21 +673,61 @@ final class AgentSessionTests: XCTestCase {
     /// At one gap for everything, a turn's five parts read as five unrelated
     /// rows. Tight inside a turn, open between them.
     func testATurnIsSpacedAsOneThing() {
-        let inside = AgentPanelView.gap(before: answer, after: think)
-        let footerGap = AgentPanelView.gap(before: footer, after: answer)
-        let between = AgentPanelView.gap(before: say, after: footer)
+        let inside = AgentSession.topGap(before: answer, after: think)
+        let footerGap = AgentSession.topGap(before: footer, after: answer)
+        let between = AgentSession.topGap(before: say, after: footer)
 
         XCTAssertLessThan(footerGap, inside, "a footer closes the answer above it")
         XCTAssertGreaterThan(between, inside, "a new turn needs room")
         // Reasoning and the tools it drives are one train of thought.
-        XCTAssertLessThanOrEqual(AgentPanelView.gap(before: toolRow, after: think), 4)
-        XCTAssertLessThanOrEqual(AgentPanelView.gap(before: toolRow, after: toolRow), 4)
+        XCTAssertLessThanOrEqual(AgentSession.topGap(before: toolRow, after: think), 4)
+        XCTAssertLessThanOrEqual(AgentSession.topGap(before: toolRow, after: toolRow), 4)
     }
 
     /// A new instruction starts a turn wherever it lands, even mid-stream.
     func testAnInstructionAlwaysStartsATurn() {
-        XCTAssertEqual(AgentPanelView.gap(before: say, after: answer),
-                       AgentPanelView.gap(before: say, after: footer))
+        XCTAssertEqual(AgentSession.topGap(before: say, after: answer),
+                       AgentSession.topGap(before: say, after: footer))
+    }
+
+    /// The view must not have to look at a row's neighbour, nor read identity
+    /// through the enum, to lay a transcript out.
+    ///
+    /// Deriving either during layout is what let a `LazyVStack` placement pass
+    /// re-enter itself and spin the main thread at 100% with the view graph
+    /// never converging.
+    func testRowsCarryTheirOwnIdentityAndSpacing() {
+        let entries = [say, think, toolRow, answer, footer]
+        let rows = AgentSession.rows(for: entries)
+
+        XCTAssertEqual(rows.map(\.id), entries.map(\.id))
+        // Each row's gap is the one the neighbour rule gives it, already applied.
+        var previous: AgentSession.Entry?
+        for (row, entry) in zip(rows, entries) {
+            XCTAssertEqual(row.topGap, AgentSession.topGap(before: entry, after: previous))
+            previous = entry
+        }
+        // The first row has no neighbour to depend on.
+        XCTAssertEqual(rows.first?.topGap, AgentSession.topGap(before: say, after: nil))
+        XCTAssertTrue(AgentSession.rows(for: []).isEmpty)
+    }
+
+    /// A streamed delta must announce itself once. `AgentPanel` forwards every
+    /// `objectWillChange` the session sends, so publishing both `entries` and
+    /// `revision` for one mutation rebuilt the whole transcript twice per
+    /// character that arrived.
+    func testAStreamedDeltaAnnouncesItselfOnce() {
+        let s = session([blockStart(0, "text")])
+        var announcements = 0
+        let token = s.objectWillChange.sink { _ in announcements += 1 }
+        defer { token.cancel() }
+
+        s.ingestForTesting(delta(0, "half a sen"))
+
+        XCTAssertEqual(announcements, 1, "one mutation, one announcement")
+        // And the rows the view reads are already the new ones — they are
+        // rebuilt before the announcement, not after it.
+        XCTAssertEqual(s.rows.map(\.id), s.entries.map(\.id))
     }
 
     // MARK: - Stopping a turn

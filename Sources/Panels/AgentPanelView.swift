@@ -208,18 +208,19 @@ struct AgentPanelView: View {
     private var transcript: some View {
         ScrollViewReader { proxy in
             ScrollView {
-                // Spacing is uniform no longer: a turn runs instruction →
-                // thinking → tools → answer → footer, and at one gap for
-                // everything those five read as five unrelated rows. Tight
-                // inside a turn, open between them.
+                // Rows arrive with their identity and spacing already decided
+                // (`AgentSession.Row`). Deriving either here — enumerating the
+                // entries per body evaluation, keying on a path through the
+                // enum, or reaching back to `entries[index - 1]` for the gap —
+                // is what made this LazyVStack's placement pass re-enter itself
+                // and spin the main thread.
                 LazyVStack(alignment: .leading, spacing: 0) {
                     banner
-                    if session.entries.isEmpty { emptyState }
-                    ForEach(Array(session.entries.enumerated()), id: \.element.id) { index, entry in
-                        row(entry)
-                            .padding(.top, Self.gap(before: entry,
-                                                    after: index > 0 ? session.entries[index - 1] : nil))
-                            .id(entry.id)
+                    if session.rows.isEmpty { emptyState }
+                    ForEach(session.rows) { item in
+                        row(item.entry)
+                            .padding(.top, item.topGap)
+                            .id(item.id)
                     }
                     // Anchors the auto-scroll, and doubles as the test for
                     // whether the bottom is on screen at all.
@@ -267,22 +268,8 @@ struct AgentPanelView: View {
 
     private static let bottom = "bottom"
 
-    /// How much air a row needs above it, given what came before.
-    ///
-    /// The footer belongs to the answer it closes, so it sits close. A new
-    /// instruction, or anything after a footer, starts a turn and gets room.
-    static func gap(before entry: AgentSession.Entry,
-                    after previous: AgentSession.Entry?) -> CGFloat {
-        guard let previous else { return 12 }
-        if case .turnEnded = previous { return 20 }
-        if case .said = entry { return 20 }
-        if case .turnEnded = entry { return 6 }
-        switch (previous, entry) {
-        // Reasoning and the tools it drives are one train of thought.
-        case (.thought, .tool), (.tool, .thought), (.tool, .tool): return 4
-        default: return 8
-        }
-    }
+    // How much air a row needs above it is `AgentSession.topGap` — decided once
+    // per mutation with the row, not per layout pass from its neighbour.
 
     /// What a pane says before anything has happened in it.
     ///

@@ -195,8 +195,70 @@ final class AgentSession: ObservableObject {
 
     // MARK: - State
 
-    @Published private(set) var entries: [Entry] = [] {
-        didSet { revision &+= 1 }
+    /// Deliberately not `@Published`: `revision` below is the one announcement
+    /// a mutation makes. Publishing both sent two `objectWillChange` per
+    /// streamed delta — `AgentPanel` forwards every one of them — so the
+    /// transcript rebuilt itself twice for each character that arrived.
+    private(set) var entries: [Entry] = [] {
+        didSet {
+            // Before `revision`, never after: the announcement is what makes a
+            // body re-run, and it must not find rows that describe the previous
+            // entries.
+            rows = Self.rows(for: entries)
+            revision &+= 1
+        }
+    }
+
+    /// One transcript row, with its identity and its spacing already decided.
+    ///
+    /// The view used to derive both per body evaluation, from
+    /// `Array(entries.enumerated())` keyed on `\.element.id`. That made identity
+    /// a read *through* the enum, so a layout pass copied every entry's payload
+    /// once per item it placed; and the row's top padding read
+    /// `entries[index - 1]`, which makes a row's geometry depend on its
+    /// neighbour — inside a `LazyVStack`, a placement pass that can re-enter
+    /// itself. Together they pinned the main thread at 100% with the view graph
+    /// never converging (observed: a 25-minute hang whose every backtrace sat in
+    /// `AG::Graph::UpdateStack::update`, under `LazyStack.place(subviews:)`).
+    ///
+    /// Deciding both here costs one pass per mutation instead of one per layout,
+    /// and leaves `id` a stored property that nothing has to unwrap an enum to
+    /// read.
+    struct Row: Identifiable {
+        let id: UUID
+        /// Presentation, in the model on purpose: it is a function of which
+        /// *kinds* of entry sit next to each other, so it can only be settled
+        /// where the neighbours are already in hand.
+        let topGap: CGFloat
+        let entry: Entry
+    }
+
+    /// The transcript as the view consumes it. Rebuilt with `entries`.
+    private(set) var rows: [Row] = []
+
+    /// Spacing is uniform no longer: a turn runs instruction → thinking → tools
+    /// → answer → footer, and at one gap for everything those five read as five
+    /// unrelated rows. Tight inside a turn, open between them.
+    static func topGap(before entry: Entry, after previous: Entry?) -> CGFloat {
+        guard let previous else { return 12 }
+        if case .turnEnded = previous { return 20 }
+        if case .said = entry { return 20 }
+        if case .turnEnded = entry { return 6 }
+        switch (previous, entry) {
+        // Reasoning and the tools it drives are one train of thought.
+        case (.thought, .tool), (.tool, .thought), (.tool, .tool): return 4
+        default: return 8
+        }
+    }
+
+    static func rows(for entries: [Entry]) -> [Row] {
+        var previous: Entry?
+        return entries.map { entry in
+            defer { previous = entry }
+            return Row(id: entry.id,
+                       topGap: topGap(before: entry, after: previous),
+                       entry: entry)
+        }
     }
 
     /// Changes on every mutation, not just every append.
