@@ -1240,4 +1240,34 @@ final class AgentSessionTests: XCTestCase {
         }
         XCTAssertEqual(last, "2099", "the newest must survive, not the oldest")
     }
+
+    /// A late result does not land on somebody else's tool row.
+    ///
+    /// `openTools` holds absolute indices into `entries`, so trimming from the
+    /// front moves every row an equal number of places earlier. A stale index
+    /// still points *somewhere*, and `closeTool`'s only guard is that the row
+    /// it finds is a tool — so when the rows are tools, as they are during a
+    /// long run, the result is written into an unrelated call with nothing to
+    /// reject it. Every row here is a tool for exactly that reason: it is what
+    /// makes the mistake silent rather than caught.
+    func testAToolResultDoesNotLandOnAnotherRowAfterATrim() throws {
+        let s = AgentSession()
+        s.ingestForTesting(event(["type": "assistant", "message": ["content": [
+            ["type": "tool_use", "id": "t1", "name": "Read",
+             "input": ["file_path": "/first"]]]]]))
+        for i in 0..<2_100 {
+            s.ingestForTesting(event(["type": "assistant", "message": ["content": [
+                ["type": "tool_use", "id": "later-\(i)", "name": "Read",
+                 "input": ["file_path": "/later/\(i)"]]]]]))
+        }
+        s.ingestForTesting(event(["type": "user", "message": ["content": [
+            ["type": "tool_result", "tool_use_id": "t1", "content": "t1 output"]]]]))
+
+        XCTAssertLessThanOrEqual(s.entries.count, 2_000)
+        let misplaced = s.entries.contains { entry in
+            guard case .tool(_, let call) = entry else { return false }
+            return call.result == "t1 output" && call.headline != "/first"
+        }
+        XCTAssertFalse(misplaced, "a trimmed-away call's result must not be written into another row")
+    }
 }

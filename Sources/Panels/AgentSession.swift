@@ -818,9 +818,9 @@ final class AgentSession: ObservableObject {
             else { return }
             switch block["type"] as? String {
             case "text":
-                entries.append(.answered(id: UUID(), ""))
+                append(.answered(id: UUID(), ""))
             case "thinking":
-                entries.append(.thought(id: UUID(), ""))
+                append(.thought(id: UUID(), ""))
             default:
                 // Tool calls arrive complete, with their arguments already
                 // parsed. Assembling them from `input_json_delta` would mean
@@ -871,7 +871,7 @@ final class AgentSession: ObservableObject {
         // buries it in schema.
         let headline = (args["command"] ?? args["file_path"] ?? args["pattern"]
                         ?? args["path"] ?? args["description"]) as? String ?? ""
-        entries.append(.tool(id: UUID(), ToolCall(name: name, headline: headline)))
+        append(.tool(id: UUID(), ToolCall(name: name, headline: headline)))
         if let id = block["id"] as? String { openTools[id] = entries.count - 1 }
     }
 
@@ -968,11 +968,29 @@ final class AgentSession: ObservableObject {
 
     private func append(_ entry: Entry) {
         entries.append(entry)
-        // A long session is a memory leak with a scrollbar. The terminal had
-        // the same problem and answered it with a scrollback limit.
-        if entries.count > Self.maxEntries {
-            entries.removeFirst(entries.count - Self.maxEntries)
-        }
+        trimToCap()
+    }
+
+    /// Drop the oldest entries once the session exceeds its cap.
+    ///
+    /// A long session is a memory leak with a scrollbar. The terminal had the
+    /// same problem and answered it with a scrollback limit.
+    ///
+    /// `streamOpen` and `openTools` hold absolute positions into `entries`, so
+    /// dropping from the front without shifting them leaves every open stream
+    /// and tool call pointing one row per dropped entry too far back — deltas
+    /// would land on someone else's text. That is the reason the two hottest
+    /// append paths (streamed content, tool calls) could not simply call
+    /// `append` before: they are the only ones that keep positions, they are
+    /// the ones that need the cap most, and this is what makes it safe for
+    /// them. An entry whose position falls inside the dropped range is gone,
+    /// so its key is dropped with it.
+    private func trimToCap() {
+        guard entries.count > Self.maxEntries else { return }
+        let dropped = entries.count - Self.maxEntries
+        entries.removeFirst(dropped)
+        streamOpen = streamOpen.compactMapValues { $0 >= dropped ? $0 - dropped : nil }
+        openTools = openTools.compactMapValues { $0 >= dropped ? $0 - dropped : nil }
     }
 
     /// Escape sequences are for a grid of cells; there is not one here.
