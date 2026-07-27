@@ -46,6 +46,9 @@ class TerminalController {
     var tabManager: TabManager?
     var accessMode: SocketControlMode = .termMeshOnly
     let myPid = getpid()
+    #if DEBUG
+    var debugPeerShellInspection: [String: Any]?
+    #endif
 
     /// Dedicated queue for team data commands that don't need MainActor.
     /// Approach C (dual queue): data-only team operations bypass v2MainSync entirely.
@@ -1239,6 +1242,12 @@ class TerminalController {
             return v2Result(id: id, self.v2DebugTeamAttachRemote(params: params))
         case "debug.project.create":
             return v2Result(id: id, self.v2DebugProjectCreate(params: params))
+        case "debug.project.delete":
+            return v2Result(id: id, self.v2DebugProjectDelete(params: params))
+        case "debug.peer.shells.inspect":
+            return v2Result(id: id, self.v2DebugPeerShellInspect(params: params))
+        case "debug.peer.shells.status":
+            return v2Result(id: id, self.v2DebugPeerShellStatus())
         case "debug.reviewboard.delegate":
             return v2Result(id: id, self.v2DebugReviewBoardDelegate(params: params))
         case "debug.reviewboard.reveal":

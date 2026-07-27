@@ -351,6 +351,141 @@ final class AgentSession: ObservableObject {
                       environment: environment)
     }
 
+    /// Hold a Claude process on an SSH peer in this app's native pane.
+    ///
+    /// SSH carries the same stdin/stdout stream that a local native pane uses.
+    /// The remote shell exists only to load the peer's login PATH and replace
+    /// itself with Claude; no terminal surface is created or attached.
+    static func remoteClaudeLaunch(
+        sshTarget: String,
+        port: Int?,
+        identityFile: String?,
+        model: String,
+        instructions: String,
+        extraArgs: [String] = [],
+        workingDirectory: String,
+        remoteEnvironment: [String: String] = [:]
+    ) -> Launch {
+        let claude = claudeLaunch(
+            claudePath: "claude",
+            model: model,
+            instructions: instructions,
+            extraArgs: extraArgs,
+            workingDirectory: workingDirectory,
+            environment: [:]
+        )
+        let command = remoteCommand(
+            executable: claude.executable,
+            arguments: claude.arguments,
+            workingDirectory: workingDirectory,
+            environment: remoteEnvironment
+        )
+        return Launch(
+            executable: "/usr/bin/ssh",
+            arguments: sshArguments(
+                target: sshTarget,
+                port: port,
+                identityFile: identityFile
+            ) + [command],
+            // `Process` needs a local directory. The requested directory lives
+            // on the peer and is created by `remoteCommand`.
+            workingDirectory: FileManager.default.temporaryDirectory.path,
+            environment: ProcessInfo.processInfo.environment,
+            interruptible: true
+        )
+    }
+
+    /// Run the normal local protocol bridge while its child CLI lives on the
+    /// peer. This keeps Codex/Kiro/Cursor normalization local and sends only
+    /// the child process across SSH.
+    static func remoteBridgeLaunch(
+        cli: String,
+        bridgePath: String,
+        model: String,
+        sshTarget: String,
+        port: Int?,
+        identityFile: String?,
+        workingDirectory: String,
+        remoteEnvironment: [String: String] = [:],
+        environment: [String: String] = ProcessInfo.processInfo.environment
+    ) -> Launch {
+        var env = environment
+        let ssh = ["/usr/bin/ssh"] + sshArguments(
+            target: sshTarget,
+            port: port,
+            identityFile: identityFile
+        )
+        if let encoded = try? JSONSerialization.data(withJSONObject: ssh),
+           let value = String(data: encoded, encoding: .utf8) {
+            env["TERMMESH_REMOTE_NATIVE_SSH_ARGS"] = value
+        }
+        env["TERMMESH_REMOTE_NATIVE_CWD"] = workingDirectory
+        if let encoded = try? JSONSerialization.data(withJSONObject: remoteEnvironment),
+           let value = String(data: encoded, encoding: .utf8) {
+            env["TERMMESH_REMOTE_NATIVE_ENV"] = value
+        }
+
+        var args = [bridgePath, "--cli", cli, "--cwd", workingDirectory]
+        if !model.isEmpty { args += ["--model", model] }
+        return Launch(
+            executable: "/usr/bin/env",
+            arguments: ["python3"] + args,
+            workingDirectory: FileManager.default.temporaryDirectory.path,
+            environment: env
+        )
+    }
+
+    static func sshArguments(
+        target: String,
+        port: Int?,
+        identityFile: String?
+    ) -> [String] {
+        var args = ["-T", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10"]
+        if let port { args += ["-p", String(port)] }
+        if let identityFile, !identityFile.isEmpty { args += ["-i", identityFile] }
+        args.append(target)
+        return args
+    }
+
+    private static func remoteCommand(
+        executable: String,
+        arguments: [String],
+        workingDirectory: String,
+        environment: [String: String]
+    ) -> String {
+        let directory = shellQuoted(workingDirectory)
+        // Peer terminal surfaces receive this from term-meshd. Keep native SSH
+        // equivalent: Claude otherwise rejects explicit bypass mode for a root
+        // peer even though the same agent works in the relay terminal path.
+        let assignments = environment
+            .filter { $0.key != "PATH" }
+            .filter { isSafeEnvironmentKey($0.key) }
+            .sorted { $0.key < $1.key }
+            .map { "\($0.key)=\($0.value)" }
+        let launch = (["env", "IS_SANDBOX=1"] + assignments + [executable] + arguments)
+            .map(shellQuoted)
+            .joined(separator: " ")
+        let remotePath = "$HOME/.local/bin:/opt/homebrew/bin:/opt/homebrew/sbin:"
+            + "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+        let loginLaunch = shellQuoted(
+            "export PATH=\"\(remotePath)\"; exec \(launch)"
+        )
+        return "mkdir -p \(directory) && cd \(directory) && "
+            + "exec \"${SHELL:-/bin/sh}\" -lc \(loginLaunch)"
+    }
+
+    private static func shellQuoted(_ value: String) -> String {
+        "'" + value.replacingOccurrences(of: "'", with: "'\\''") + "'"
+    }
+
+    private static func isSafeEnvironmentKey(_ value: String) -> Bool {
+        guard let first = value.first,
+              first == "_" || first.isLetter else { return false }
+        return value.dropFirst().allSatisfy {
+            $0 == "_" || $0.isLetter || $0.isNumber
+        }
+    }
+
     func start(_ launch: Launch) {
         guard process == nil else { return }
         let p = Process()
@@ -459,11 +594,21 @@ final class AgentSession: ObservableObject {
     @discardableResult
     func send(_ text: String, from speaker: Speaker) throws -> Int {
         guard isRunning else { throw SendError.notRunning }
+        // Native turns report completion from their result event. Peer-proxied
+        // worktree delegates can bypass deliverNatively(), so strip terminal
+        // completion instructions again at the final stdin boundary.
+        let deliveredText = speaker == .leader
+            ? TeamOrchestrator.withoutTerminalProtocol(text)
+            : text
         if speaker == .leader, turnInFlight {
-            queued.append((text, Self.taskId(in: text)))
+            queued.append((deliveredText, Self.taskId(in: deliveredText)))
             return 0
         }
-        return try write(text, from: speaker, taskId: Self.taskId(in: text))
+        return try write(
+            deliveredText,
+            from: speaker,
+            taskId: Self.taskId(in: deliveredText)
+        )
     }
 
     /// Whether a turn is running, whoever started it.

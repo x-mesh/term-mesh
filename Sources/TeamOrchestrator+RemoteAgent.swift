@@ -16,14 +16,34 @@ import PeerProto
 // without knowing the agent is somewhere else.
 
 extension TeamOrchestrator {
+    struct PeerShellCleanupItem: Identifiable, Equatable {
+        enum State: Equatable {
+            case inUse
+            case managedOrphan
+            case missingDirectory
+            case unclaimed
+        }
+
+        let id: Data
+        let title: String
+        let workingDirectory: String
+        let isBusy: Bool
+        let state: State
+
+        var idLabel: String { id.prefix(4).map { String(format: "%02x", $0) }.joined() }
+    }
+
     enum RemoteAgentError: Error, CustomStringConvertible {
         case teamNotFound(String)
         case hostNotFound(String)
         case hostNotConnected(String)
         case noAttachableSurface(String)
+        case noFreshSurface(String)
         case workspaceGone
         case paneCreationFailed
         case duplicateName(String)
+        case cliUnavailable(String, String)
+        case promptStagingFailed(String)
 
         var description: String {
             switch self {
@@ -31,10 +51,129 @@ extension TeamOrchestrator {
             case .hostNotFound(let key): return "no host \(key)"
             case .hostNotConnected(let name): return "\(name) is not connected"
             case .noAttachableSurface(let name): return "\(name) has no free surface to attach"
+            case .noFreshSurface(let name): return "\(name) could not create a fresh leader surface"
             case .workspaceGone: return "the team's workspace is gone"
             case .paneCreationFailed: return "could not open the remote pane"
             case .duplicateName(let name): return "the team already has an agent named \(name)"
+            case .cliUnavailable(let cli, let host):
+                return "\(cli) is not installed on \(host)"
+            case .promptStagingFailed(let host):
+                return "could not stage the leader prompt on \(host)"
             }
+        }
+    }
+
+    func inspectPeerShells(host: HostEntry) async throws -> [PeerShellCleanupItem] {
+        let panes = Dictionary(
+            host.workspaces.flatMap(\.panes).map { ($0.id, $0) },
+            uniquingKeysWith: { first, _ in first }
+        )
+        let claimed = claimedRemoteSurfaceIDs(hostKey: host.id)
+        let managed = Dictionary(
+            ManagedPeerSurfaceStore.shared.records(hostKey: host.id).compactMap { record in
+                record.surfaceID.map { ($0, record) }
+            },
+            uniquingKeysWith: { first, _ in first }
+        )
+
+        var seenPaths = Set<String>()
+        let indexedPaths = panes.values
+            .compactMap(\.workingDirectoryPath)
+            .filter { !$0.isEmpty && seenPaths.insert($0).inserted }
+        var missingPaths = Set<String>()
+        if let sshTarget = host.sshTarget, !sshTarget.isEmpty, !indexedPaths.isEmpty {
+            let checks = indexedPaths.enumerated().map { index, path in
+                "if [ ! -d \(Self.shellQuoted(path)) ]; "
+                    + "then printf 'MISSING \(index)\\n'; fi"
+            }
+            let output = try await PeerHostReadinessChecker.runScript(
+                sshTarget: sshTarget,
+                port: host.sshPort,
+                identityFile: host.identityFile,
+                script: checks.joined(separator: "\n") + "\ntrue",
+                timeoutSeconds: 20
+            )
+            for line in output.split(separator: "\n") {
+                let fields = line.split(separator: " ")
+                guard fields.count == 2, fields[0] == "MISSING",
+                      let index = Int(fields[1]), indexedPaths.indices.contains(index)
+                else { continue }
+                missingPaths.insert(indexedPaths[index])
+            }
+        }
+
+        return panes.values.map { pane in
+            let path = pane.workingDirectoryPath ?? ""
+            let state: PeerShellCleanupItem.State
+            if claimed.contains(pane.id) {
+                state = .inUse
+            } else if managed[pane.id] != nil {
+                state = .managedOrphan
+            } else if !path.isEmpty && missingPaths.contains(path) {
+                state = .missingDirectory
+            } else {
+                state = .unclaimed
+            }
+            return PeerShellCleanupItem(
+                id: pane.id,
+                title: pane.title,
+                workingDirectory: path,
+                isBusy: pane.isBusy,
+                state: state
+            )
+        }
+        .sorted {
+            if $0.state != $1.state {
+                return cleanupStateOrder($0.state) < cleanupStateOrder($1.state)
+            }
+            return $0.workingDirectory.localizedStandardCompare($1.workingDirectory)
+                == .orderedAscending
+        }
+    }
+
+    func closePeerShells(host: HostEntry, surfaceIDs: Set<Data>) async throws -> Int {
+        guard !host.activeSockPath.isEmpty else {
+            throw RemoteAgentError.hostNotConnected(host.displayName)
+        }
+        let protected = claimedRemoteSurfaceIDs(hostKey: host.id)
+        let targets = surfaceIDs.subtracting(protected)
+        guard !targets.isEmpty else { return 0 }
+
+        let connection = try await PeerRelaySession.connect(hostSockPath: host.activeSockPath)
+        defer { Task { await connection.cancel() } }
+        var closed = 0
+        for surfaceID in targets {
+            try await connection.session.requestClosePane(paneID: surfaceID)
+            ManagedPeerSurfaceStore.shared.forget(hostKey: host.id, surfaceID: surfaceID)
+            closed += 1
+        }
+        return closed
+    }
+
+    private func claimedRemoteSurfaceIDs(hostKey: String) -> Set<Data> {
+        var result = Set(
+            teams.values
+                .flatMap(\.agents)
+                .filter { $0.hostKey == hostKey }
+                .compactMap(\.remoteSurfaceID)
+        )
+        for team in teams.values {
+            guard team.leaderEndpoint == .peer(hostKey: hostKey),
+                  let located = AppDelegate.shared?.locateSurface(surfaceId: team.leaderPanelId),
+                  let workspace = located.tabManager.tabs.first(where: { $0.id == located.workspaceId }),
+                  let session = workspace.terminalPanel(for: team.leaderPanelId)?.peerPaneSession
+            else { continue }
+            result.insert(session.originSurface.surfaceID)
+        }
+        return result
+    }
+
+    private func cleanupStateOrder(_ state: PeerShellCleanupItem.State) -> Int {
+        switch state {
+        case .managedOrphan: return 0
+        case .missingDirectory: return 1
+        case .unclaimed: return 2
+        case .inUse: return 3
         }
     }
 
@@ -48,7 +187,8 @@ extension TeamOrchestrator {
         hostKey: String,
         workingDirectory: String,
         cli: String,
-        model: String
+        model: String,
+        systemPrompt: String? = nil
     ) async throws {
         guard let team = teams[teamName] else { throw RemoteAgentError.teamNotFound(teamName) }
         guard let teamUUID = team.teamUuid else { throw RemoteAgentError.teamNotFound(teamName) }
@@ -56,6 +196,9 @@ extension TeamOrchestrator {
             throw RemoteAgentError.hostNotFound(hostKey)
         }
         guard host.isConnected else { throw RemoteAgentError.hostNotConnected(host.displayName) }
+        let promptFile = systemPrompt.map { _ in
+            "/tmp/term-mesh-leader-prompt-\(teamUUID).txt"
+        }
         guard let tabManager = AppDelegate.shared?.tabManagerFor(tabId: team.workspaceId),
               let workspace = tabManager.tabs.first(where: { $0.id == team.workspaceId }) else {
             throw RemoteAgentError.workspaceGone
@@ -63,22 +206,34 @@ extension TeamOrchestrator {
 
         let lease = try await PeerPaneHostRegistry.shared.acquire(host.paneHostSpec)
         let session: PeerPaneSession
+        let spawnedSurfaceID: Data
         do {
             let surfaces = try await PeerPaneSession.listSurfaces(on: lease)
-            var chosen = surfaces.first(where: \.attachable)
-            // A project leader needs one remote surface, not a transient
-            // shell followed by a second relay surface. Reuse an attachable
-            // surface first; only split when the host has none left. The
-            // local placeholder is replaced in place below and stays the
-            // project's relay pane until the project closes.
-            if chosen == nil,
-               let source = surfaces.first?.surfaceID,
-               let fresh = try await PeerPaneSession.spawnSurface(on: lease, splitting: source) {
-                chosen = fresh
+            // `attachable` only means another viewer may attach. It says
+            // nothing about what the surface is running. Reusing one here can
+            // paste the bootstrap grant into an already-running Claude pane,
+            // where Claude answers the shell command as prose and the new
+            // project silently inherits the old relay.
+            //
+            // Reserve a fresh shell exactly as remote agents do. Falling back
+            // to an existing surface would recreate the credential leak this
+            // path is preventing, so an old/full host must fail visibly.
+            guard let source = surfaces.first?.surfaceID,
+                  let chosen = try await PeerPaneSession.spawnSurface(
+                      on: lease,
+                      splitting: source
+                  )
+            else {
+                throw RemoteAgentError.noFreshSurface(host.displayName)
             }
-            guard let chosen else {
-                throw RemoteAgentError.noAttachableSurface(host.displayName)
-            }
+            spawnedSurfaceID = chosen.surfaceID
+            ManagedPeerSurfaceStore.shared.remember(
+                hostKey: hostKey,
+                surfaceID: chosen.surfaceID,
+                teamName: teamName,
+                role: "leader",
+                workingDirectory: workingDirectory
+            )
             session = try await PeerPaneSession.attach(
                 lease: lease,
                 surface: chosen,
@@ -90,6 +245,34 @@ extension TeamOrchestrator {
             throw error
         }
         PeerPaneHostRegistry.shared.release(lease)
+
+        func abandonSpawnedLeader(panelID: UUID? = nil) async {
+            if let panelID {
+                _ = workspace.closePanel(panelID, force: true)
+            } else {
+                session.teardown()
+            }
+            await Self.closeManagedRemoteSurface(
+                hostSockPath: host.activeSockPath,
+                hostKey: hostKey,
+                surfaceID: spawnedSurfaceID
+            )
+            if let promptFile {
+                await Self.removeRemoteLeaderPrompt(host: host, promptFile: promptFile)
+            }
+        }
+
+        do {
+            try await Self.prepareRemoteLeader(
+                cli: cli,
+                host: host,
+                systemPrompt: systemPrompt,
+                promptFile: promptFile
+            )
+        } catch {
+            await abandonSpawnedLeader()
+            throw error
+        }
 
         var bootstrap = Termmesh_Peer_V1_TeamLeaderBootstrapRequest()
         bootstrap.projectID = "name:\(teamName)"
@@ -104,7 +287,7 @@ extension TeamOrchestrator {
             projectID == "name:\(teamName)" ? teamUUID : nil
         }
         guard grantResponse.ok else {
-            session.teardown()
+            await abandonSpawnedLeader()
             throw RemoteAgentError.paneCreationFailed
         }
 
@@ -112,7 +295,7 @@ extension TeamOrchestrator {
             panelId: team.leaderPanelId,
             session: session
         ) else {
-            session.teardown()
+            await abandonSpawnedLeader()
             throw RemoteAgentError.paneCreationFailed
         }
         replaceLeaderAnchorPanel(teamName: teamName, panelID: panel.id)
@@ -122,7 +305,7 @@ extension TeamOrchestrator {
             panelId: panel.id,
             title: "👑 Leader (\(cli.capitalized)) @\(host.displayName)"
         )
-        await Self.waitForPaneToStart(panelId: panel.id)
+        await Self.waitForRemoteShell(session: session)
 
         // Do not paste the bearer grant into the terminal's visible scrollback
         // or history. First disable echo and history without any secret, then
@@ -136,6 +319,7 @@ extension TeamOrchestrator {
             text: prepare,
             tabManager: tabManager
         ) else {
+            await abandonSpawnedLeader(panelID: panel.id)
             throw RemoteAgentError.paneCreationFailed
         }
 
@@ -144,7 +328,8 @@ extension TeamOrchestrator {
             model: model,
             teamName: teamName,
             workingDirectory: workingDirectory,
-            grant: grantResponse.grant
+            grant: grantResponse.grant,
+            systemPromptFile: promptFile
         )
         let launched = await sendRemoteLeaderStage(
             teamName: teamName,
@@ -164,6 +349,7 @@ extension TeamOrchestrator {
                 tabManager: tabManager,
                 withReturn: true
             )
+            await abandonSpawnedLeader(panelID: panel.id)
             throw RemoteAgentError.paneCreationFailed
         }
 
@@ -174,6 +360,112 @@ extension TeamOrchestrator {
             teamName: teamName,
             panelID: panel.id,
             endpoint: .peer(hostKey: hostKey)
+        )
+    }
+
+    private static func closeManagedRemoteSurface(
+        hostSockPath: String,
+        hostKey: String,
+        surfaceID: Data
+    ) async {
+        guard !hostSockPath.isEmpty,
+              let connection = try? await PeerRelaySession.connect(hostSockPath: hostSockPath)
+        else { return }
+        do {
+            try await connection.session.requestClosePane(paneID: surfaceID)
+            ManagedPeerSurfaceStore.shared.forget(hostKey: hostKey, surfaceID: surfaceID)
+        } catch {
+            // Keep the record. The host row's shell manager can retry it after
+            // a reconnect instead of losing the only ownership evidence.
+        }
+        await connection.cancel()
+    }
+
+    private static func ensureRemoteCLIAvailable(cli: String, host: HostEntry) async throws {
+        guard let sshTarget = host.sshTarget, !sshTarget.isEmpty else { return }
+        guard AgentRolePreset.knownCLIs.contains(cli) else {
+            throw RemoteAgentError.cliUnavailable(cli, host.displayName)
+        }
+        let marker = "__TERMMESH_CLI_AVAILABLE__"
+        let probe = "command -v \(shellQuoted(cli)) >/dev/null 2>&1 "
+            + "&& printf %s \(shellQuoted(marker))"
+        do {
+            let output = try await PeerHostReadinessChecker.runScript(
+                sshTarget: sshTarget,
+                port: host.sshPort,
+                identityFile: host.identityFile,
+                script: "exec \"${SHELL:-/bin/sh}\" -lc \(shellQuoted(probe))",
+                timeoutSeconds: 15
+            )
+            guard output.contains(marker) else {
+                throw RemoteAgentError.cliUnavailable(cli, host.displayName)
+            }
+        } catch {
+            throw RemoteAgentError.cliUnavailable(cli, host.displayName)
+        }
+    }
+
+    /// Probe the CLI and stage the long Claude prompt in one SSH round trip.
+    ///
+    /// Sending the prompt through the attached terminal splits it into several
+    /// bracketed-paste transactions. Their boundary bytes then become literal
+    /// shell input inside the quoted prompt. A mode-0600 file keeps the launch
+    /// line short; the shell reads and removes it before starting Claude.
+    private static func prepareRemoteLeader(
+        cli: String,
+        host: HostEntry,
+        systemPrompt: String?,
+        promptFile: String?
+    ) async throws {
+        guard let sshTarget = host.sshTarget, !sshTarget.isEmpty else {
+            if systemPrompt != nil {
+                throw RemoteAgentError.promptStagingFailed(host.displayName)
+            }
+            return try await ensureRemoteCLIAvailable(cli: cli, host: host)
+        }
+        guard AgentRolePreset.knownCLIs.contains(cli) else {
+            throw RemoteAgentError.cliUnavailable(cli, host.displayName)
+        }
+        let marker = "__TERMMESH_LEADER_READY__"
+        let missing = "__TERMMESH_LEADER_CLI_MISSING__"
+        var script = "if ! command -v \(shellQuoted(cli)) >/dev/null 2>&1; "
+            + "then printf %s \(shellQuoted(missing)); exit 0; fi"
+        if let systemPrompt, let promptFile {
+            script += "; umask 077; printf %s \(shellQuoted(systemPrompt)) > \(shellQuoted(promptFile))"
+        }
+        script += "; printf %s \(shellQuoted(marker))"
+        do {
+            let output = try await PeerHostReadinessChecker.runScript(
+                sshTarget: sshTarget,
+                port: host.sshPort,
+                identityFile: host.identityFile,
+                script: script,
+                timeoutSeconds: 20
+            )
+            if output.contains(missing) {
+                throw RemoteAgentError.cliUnavailable(cli, host.displayName)
+            }
+            guard output.contains(marker) else {
+                throw RemoteAgentError.promptStagingFailed(host.displayName)
+            }
+        } catch let error as RemoteAgentError {
+            throw error
+        } catch {
+            if systemPrompt == nil {
+                throw RemoteAgentError.cliUnavailable(cli, host.displayName)
+            }
+            throw RemoteAgentError.promptStagingFailed(host.displayName)
+        }
+    }
+
+    private static func removeRemoteLeaderPrompt(host: HostEntry, promptFile: String) async {
+        guard let sshTarget = host.sshTarget, !sshTarget.isEmpty else { return }
+        _ = try? await PeerHostReadinessChecker.runScript(
+            sshTarget: sshTarget,
+            port: host.sshPort,
+            identityFile: host.identityFile,
+            script: "rm -f -- \(shellQuoted(promptFile))",
+            timeoutSeconds: 10
         )
     }
 
@@ -247,16 +539,43 @@ extension TeamOrchestrator {
             throw RemoteAgentError.workspaceGone
         }
 
+        // Fail before opening either kind of pane. Otherwise a missing remote
+        // executable leaves a dead native bridge or a terminal that looks like
+        // an agent but only contains "command not found".
+        try await Self.ensureRemoteCLIAvailable(cli: cli, host: host)
+
         // Split off the last agent's pane, or the leader's — the same shape a
         // local `add` produces, so a mixed team does not look different from
         // one that happens to run entirely here.
         let splitFrom = team.agents.last?.panelId ?? team.leaderPanelId
+
+        // The leader remains a terminal, but members follow Agent Panes.
+        // An SSH-backed relay can carry the structured process stream straight
+        // into a local AgentPanel; a legacy direct-socket peer has no process
+        // channel, so it keeps the terminal relay path below.
+        if AgentPipeTransport.canHoldNatively(cli: cli),
+           let sshTarget = host.sshTarget, !sshTarget.isEmpty {
+            return try attachRemoteNativeAgent(
+                team: team,
+                workspace: workspace,
+                tabManager: tabManager,
+                host: host,
+                sshTarget: sshTarget,
+                splitFrom: splitFrom,
+                agentName: agentName,
+                workingDirectory: workingDirectory,
+                agentType: agentType,
+                model: model,
+                cli: cli
+            )
+        }
 
         let registry = PeerPaneHostRegistry.shared
         let lease = try await registry.acquire(host.paneHostSpec)
         let panel: TerminalPanel
         let attachedSurfaceID: Data
         var spawnedSurface = false
+        var spawnedSurfaceID: Data?
         do {
             let surfaces = try await PeerPaneSession.listSurfaces(on: lease)
             // Ask for a shell of our own rather than taking one of the
@@ -290,6 +609,14 @@ extension TeamOrchestrator {
                let fresh = try await PeerPaneSession.spawnSurface(on: lease, splitting: source) {
                 chosen = fresh
                 spawnedSurface = true
+                spawnedSurfaceID = fresh.surfaceID
+                ManagedPeerSurfaceStore.shared.remember(
+                    hostKey: hostKey,
+                    surfaceID: fresh.surfaceID,
+                    teamName: teamName,
+                    role: agentName,
+                    workingDirectory: workingDirectory
+                )
             }
             guard let chosen else {
                 registry.release(lease)
@@ -319,6 +646,13 @@ extension TeamOrchestrator {
             opened.surface.resetTerminal()
         } catch {
             registry.release(lease)
+            if let spawnedSurfaceID {
+                await Self.closeManagedRemoteSurface(
+                    hostSockPath: host.activeSockPath,
+                    hostKey: hostKey,
+                    surfaceID: spawnedSurfaceID
+                )
+            }
             throw error
         }
 
@@ -344,9 +678,18 @@ extension TeamOrchestrator {
             createdAt: Date(),
             remoteSurfaceID: attachedSurfaceID,
             remoteSurfaceSpawned: spawnedSurface,
-            hostKey: hostKey
+            hostKey: hostKey,
+            originalAgentWorkDir: workingDirectory
         )
         guard adoptAgentMember(member, teamName: teamName) else {
+            _ = workspace.closePanel(panel.id, force: true)
+            if let spawnedSurfaceID {
+                await Self.closeManagedRemoteSurface(
+                    hostSockPath: host.activeSockPath,
+                    hostKey: hostKey,
+                    surfaceID: spawnedSurfaceID
+                )
+            }
             throw RemoteAgentError.duplicateName(agentName)
         }
         // Remembered on success rather than on typing, so a path that turned
@@ -362,7 +705,9 @@ extension TeamOrchestrator {
         // race a local pane has, for the same reason: text that arrives while
         // a shell is still coming up lands in a buffer nobody submits.
         Task { @MainActor in
-            await Self.waitForPaneToStart(panelId: panel.id)
+            if let session = panel.peerPaneSession {
+                await Self.waitForRemoteShell(session: session)
+            }
             let command = Self.remoteAgentCommand(
                 cli: cli,
                 model: model,
@@ -382,6 +727,168 @@ extension TeamOrchestrator {
         }
 
         return member
+    }
+
+    @MainActor
+    private func attachRemoteNativeAgent(
+        team: Team,
+        workspace: Workspace,
+        tabManager _: TabManager,
+        host: HostEntry,
+        sshTarget: String,
+        splitFrom: UUID,
+        agentName: String,
+        workingDirectory: String,
+        agentType: String,
+        model: String,
+        cli: String
+    ) throws -> AgentMember {
+        let bridge = AgentPipeTransport.needsBridge(cli: cli)
+            ? AgentPipeTransport.bridgePath(workingDirectory: workingDirectory)
+            : nil
+        if AgentPipeTransport.needsBridge(cli: cli), bridge == nil {
+            throw RemoteAgentError.paneCreationFailed
+        }
+
+        let color = Self.agentColor(
+            forRole: agentType,
+            taken: Set(team.agents.map(\.color))
+        )
+        let instructions = AgentRunbookService.shared.composeInstructions(
+            roleName: agentType,
+            presetInstructions: "",
+            customInstructions: nil,
+            workingDirectory: workingDirectory,
+            mode: .digest
+        )
+        let remoteEnvironment = Self.remoteNativeAgentEnvironment(
+            teamName: team.id,
+            agentName: agentName,
+            agentType: agentType,
+            agentCli: cli,
+            workspaceId: workspace.id,
+            socketPath: host.remoteSockPath
+        )
+        guard let panel = workspace.newAgentSplit(
+            from: splitFrom,
+            orientation: team.agents.isEmpty ? .horizontal : .vertical,
+            agentName: agentName,
+            teamName: team.id,
+            workingDirectory: workingDirectory,
+            cli: cli,
+            color: color
+        ) else {
+            throw RemoteAgentError.paneCreationFailed
+        }
+
+        if let bridge {
+            panel.start(
+                remoteBridgedCli: cli,
+                bridgePath: bridge,
+                model: Self.bridgeModelArg(cli: cli, model: model),
+                target: sshTarget,
+                port: host.sshPort,
+                identityFile: host.identityFile,
+                remoteEnvironment: remoteEnvironment
+            )
+            if !instructions.isEmpty {
+                let briefing = Self.withoutTerminalProtocol(instructions)
+                    + "\n\nThis is your standing brief, not a task. "
+                    + "Do no work now: reply with exactly "
+                    + "\"Agent \(agentName) ready.\" and wait."
+                try? panel.session.send(briefing, from: .leader)
+            }
+        } else {
+            panel.start(
+                remoteClaudeAt: sshTarget,
+                port: host.sshPort,
+                identityFile: host.identityFile,
+                model: Self.resolveClaudeModelArg(model),
+                instructions: instructions,
+                remoteEnvironment: remoteEnvironment
+            )
+        }
+
+        panel.session.onBusyChanged = { [teamName = team.id, agentName] busy in
+            TeamDataStore.shared.setAgentBusy(
+                teamName: teamName, agentName: agentName, busy: busy
+            )
+        }
+        panel.session.onTurnEnd = { [teamName = team.id, agentName] final, _, taskId in
+            Self.fileReport(
+                teamName: teamName, agentName: agentName,
+                taskId: taskId, text: final
+            )
+            guard let taskId else { return }
+            AutoReplyEmit.emit(
+                teamName: teamName,
+                agentName: agentName,
+                event: AgentPipeCompletion.headerEvent(from: final),
+                preferredTaskId: taskId
+            )
+        }
+        workspace.setPanelCustomTitle(
+            panelId: panel.id,
+            title: "\(Self.colorEmoji(color)) \(agentName) @\(host.displayName)"
+        )
+
+        let member = AgentMember(
+            id: "\(agentName)@\(team.id)",
+            name: agentName,
+            teamName: team.id,
+            cli: cli,
+            launchCommand: cli,
+            model: model,
+            agentType: agentType,
+            color: color,
+            instructions: instructions,
+            workspaceId: workspace.id,
+            panelId: panel.id,
+            createdAt: Date(),
+            hostKey: host.id,
+            originalAgentWorkDir: workingDirectory
+        )
+        guard adoptAgentMember(member, teamName: team.id) else {
+            _ = workspace.closePanel(panel.id, force: true)
+            throw RemoteAgentError.duplicateName(agentName)
+        }
+        RemoteProjectPaths.shared.remember(
+            host: host.id,
+            localRoot: team.workingDirectory,
+            path: workingDirectory
+        )
+        return member
+    }
+
+    private static func remoteNativeAgentEnvironment(
+        teamName: String,
+        agentName: String,
+        agentType: String,
+        agentCli: String,
+        workspaceId: UUID,
+        socketPath: String?
+    ) -> [String: String] {
+        var env: [String: String] = [
+            "TERMMESH_TEAM_AGENT": "1",
+            "CMUX_TEAM_AGENT": "1",
+            "TERMMESH_TEAM_NAME": teamName,
+            "CMUX_TEAM_NAME": teamName,
+            "TERMMESH_TEAM": teamName,
+            "CMUX_TEAM": teamName,
+            "TERMMESH_CLI": agentCli,
+            "TERMMESH_AGENT_NAME": agentName,
+            "TERMMESH_AGENT_ROLE": agentType,
+            "TERMMESH_WORKSPACE_ID": workspaceId.uuidString,
+        ]
+        if let socketPath, !socketPath.isEmpty {
+            env["TERMMESH_SOCKET"] = socketPath
+            env["CMUX_SOCKET"] = socketPath
+        }
+        if agentCli == "claude" {
+            env["CLAUDECODE"] = "1"
+            env["CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS"] = "1"
+        }
+        return env
     }
 
     /// Stop what this agent left running on the other machine, then close its
@@ -412,10 +919,19 @@ extension TeamOrchestrator {
             return ws.terminalPanel(for: id)
         }
 
+        // A native remote member is an SSH child owned by AgentSession.
+        // Closing the panel stops that process; there is no peer surface or
+        // interactive CLI to unwind first.
+        if let workspace, let panelId, workspace.agentPanel(for: panelId) != nil {
+            _ = workspace.closePanel(panelId, force: true)
+            return
+        }
+
         if let panel {
             TerminalController.shared.sendNamedKeyWithRetry(on: panel.surface, keyName: "ctrl-c") { _, _ in }
         }
         let surfaceID = agent.remoteSurfaceSpawned ? agent.remoteSurfaceID : nil
+        let surfaceHostKey = agent.hostKey
         let quit = Self.quitCommand(cli: agent.cli)
 
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
@@ -444,11 +960,13 @@ extension TeamOrchestrator {
                 if let workspace, let panelId {
                     _ = workspace.closePanel(panelId, force: true)
                 }
-                guard let surfaceID, let hostSockPath else { return }
-                Task.detached {
-                    guard let conn = try? await PeerRelaySession.connect(hostSockPath: hostSockPath) else { return }
-                    try? await conn.session.requestClosePane(paneID: surfaceID)
-                    await conn.cancel()
+                guard let surfaceID, let hostSockPath, let surfaceHostKey else { return }
+                Task { @MainActor in
+                    await Self.closeManagedRemoteSurface(
+                        hostSockPath: hostSockPath,
+                        hostKey: surfaceHostKey,
+                        surfaceID: surfaceID
+                    )
                 }
             }
         }
@@ -477,6 +995,7 @@ extension TeamOrchestrator {
         pairMode: String = "none",
         pairModel: String = "",
         pairSpec: String = "",
+        projectSource: ProjectSource? = nil,
         tabManager: TabManager
     ) -> Team? {
         // Peer attachment is asynchronous. Record the requested endpoint from
@@ -494,6 +1013,21 @@ extension TeamOrchestrator {
         // locally and moving them would start each CLI on the wrong machine
         // and then close it.
         let remoteRows = rows.filter { $0.hostKey != nil }
+        let remoteLeaderSystemPrompt: String?
+        if case let .peer(hostKey) = leaderEndpoint,
+           leaderMode.lowercased() == "claude" {
+            let remoteSocketPath = RemoteHostStore.shared.sortedHosts
+                .first(where: { $0.id == hostKey })?
+                .remoteSockPath ?? "inherited from TERMMESH_SOCKET"
+            remoteLeaderSystemPrompt = Self.remoteLeaderClaudeSystemPrompt(
+                teamName: teamName,
+                rows: rows,
+                remoteWorkingDirectory: leaderWorkingDirectory ?? workingDirectory,
+                remoteSocketPath: remoteSocketPath
+            )
+        } else {
+            remoteLeaderSystemPrompt = nil
+        }
         let localTuples = rows.filter { $0.hostKey == nil }.map { row in
             let customInstructions = row.customInstructions == row.preset.instructions
                 ? ""
@@ -518,7 +1052,7 @@ extension TeamOrchestrator {
             )
         }
 
-        guard let team = createTeam(
+        guard var team = createTeam(
             name: teamName,
             agents: localTuples,
             workingDirectory: workingDirectory,
@@ -536,6 +1070,26 @@ extension TeamOrchestrator {
             tabManager: tabManager
         ) else { return nil }
 
+        if let projectSource {
+            var locations: Set<Team.RemoteProjectLocation> = []
+            if let hostKey = projectSource.hostKey {
+                locations.insert(.init(hostKey: hostKey, path: projectSource.projectPath))
+            }
+            for row in remoteRows {
+                guard let hostKey = row.hostKey else { continue }
+                let path = row.hostDirectory.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !path.isEmpty else { continue }
+                locations.insert(.init(hostKey: hostKey, path: path))
+            }
+            team.remoteProjectLocations = locations.sorted {
+                ($0.hostKey, $0.path) < ($1.hostKey, $1.path)
+            }
+            recordRemoteProjectLocations(
+                teamName: team.id,
+                locations: team.remoteProjectLocations
+            )
+        }
+
         // One at a time. Choosing a surface reads which ones this app's agents
         // already hold, so two attaches running at once both look at a roster
         // that does not have the other in it yet, both pick the same free
@@ -551,7 +1105,8 @@ extension TeamOrchestrator {
                         hostKey: hostKey,
                         workingDirectory: leaderWorkingDirectory ?? workingDirectory,
                         cli: leaderMode,
-                        model: leaderModel
+                        model: leaderModel,
+                        systemPrompt: remoteLeaderSystemPrompt
                     )
                 } catch {
                     let description = "Could not start remote leader on \(hostKey): \(error)"
@@ -586,6 +1141,83 @@ extension TeamOrchestrator {
             }
         }
         return team
+    }
+
+    @MainActor
+    func deleteProject(teamName: String, tabManager: TabManager) async throws {
+        guard let team = teams[teamName] else {
+            throw RemoteAgentError.teamNotFound(teamName)
+        }
+
+        let grouped = Dictionary(grouping: team.remoteProjectLocations, by: \.hostKey)
+        var deletionJobs: [(host: HostEntry, script: String)] = []
+        for (hostKey, locations) in grouped {
+            guard let host = RemoteHostStore.shared.sortedHosts.first(where: { $0.id == hostKey })
+            else {
+                throw RemoteAgentError.hostNotFound(hostKey)
+            }
+            guard host.isConnected, let sshTarget = host.sshTarget, !sshTarget.isEmpty else {
+                throw RemoteAgentError.hostNotConnected(host.displayName)
+            }
+            let script = try PeerProjectBootstrap.deletionScript(paths: locations.map(\.path))
+            deletionJobs.append((host, script))
+        }
+
+        let workspace = tabManager.tabs.first(where: { $0.id == team.workspaceId })
+        var remoteSurfaces: [(socket: String, hostKey: String, surfaceID: Data)] = []
+        if case let .peer(hostKey) = team.leaderEndpoint,
+           let host = RemoteHostStore.shared.sortedHosts.first(where: { $0.id == hostKey }),
+           let panel = workspace?.terminalPanel(for: team.leaderPanelId),
+           let session = panel.peerPaneSession {
+            TerminalController.shared.sendNamedKeyWithRetry(
+                on: panel.surface, keyName: "ctrl-c"
+            ) { _, _ in }
+            remoteSurfaces.append((
+                host.activeSockPath, hostKey, session.originSurface.surfaceID
+            ))
+        }
+
+        for agent in team.agents {
+            guard let panelID = agent.panelId else { continue }
+            if workspace?.agentPanel(for: panelID) != nil {
+                _ = workspace?.closePanel(panelID, force: true)
+            } else if agent.remoteSurfaceSpawned,
+                      let surfaceID = agent.remoteSurfaceID,
+                      let hostKey = agent.hostKey,
+                      let host = RemoteHostStore.shared.sortedHosts.first(where: { $0.id == hostKey }) {
+                remoteSurfaces.append((host.activeSockPath, hostKey, surfaceID))
+            }
+        }
+
+        for remote in remoteSurfaces where !remote.socket.isEmpty {
+            let connection = try await PeerRelaySession.connect(hostSockPath: remote.socket)
+            try await connection.session.requestClosePane(paneID: remote.surfaceID)
+            await connection.cancel()
+            ManagedPeerSurfaceStore.shared.forget(
+                hostKey: remote.hostKey,
+                surfaceID: remote.surfaceID
+            )
+        }
+
+        try await Task.sleep(nanoseconds: 500_000_000)
+        for job in deletionJobs {
+            guard let sshTarget = job.host.sshTarget else { continue }
+            try await PeerHostReadinessChecker.runScript(
+                sshTarget: sshTarget,
+                port: job.host.sshPort,
+                identityFile: job.host.identityFile,
+                script: job.script,
+                timeoutSeconds: 60
+            )
+        }
+        for hostKey in grouped.keys {
+            RemoteProjectPaths.shared.forget(
+                host: hostKey,
+                localRoot: team.workingDirectory
+            )
+        }
+
+        _ = destroyTeam(name: teamName, tabManager: tabManager, archive: false)
     }
 
     /// Preserve the user's requested endpoint while the pane is connecting.
@@ -656,12 +1288,13 @@ extension TeamOrchestrator {
     @discardableResult
     func releaseAllRemoteAgentsForQuit() -> Bool {
         let remote = teams.values.flatMap(\.agents).filter { $0.hostKey != nil }
-        guard !remote.isEmpty else { return false }
+        var askedTerminalAgentToQuit = false
         for agent in remote {
             guard let panelId = agent.panelId,
                   let located = AppDelegate.shared?.locateSurface(surfaceId: panelId),
                   let workspace = located.tabManager.tabs.first(where: { $0.id == located.workspaceId }),
                   let panel = workspace.terminalPanel(for: panelId) else { continue }
+            askedTerminalAgentToQuit = true
             _ = panel.surface.sendIMEText(Self.quitCommand(cli: agent.cli), withReturn: false)
             DispatchQueue.main.asyncAfter(deadline: .now() + Self.quitReturnGap) {
                 TerminalController.shared.sendNamedKeyWithRetry(
@@ -669,7 +1302,7 @@ extension TeamOrchestrator {
                 ) { _, _ in }
             }
         }
-        return true
+        return askedTerminalAgentToQuit
     }
 
     /// Room for the quit command to reach the far machine before the Return
@@ -703,7 +1336,8 @@ extension TeamOrchestrator {
         model: String,
         agentName: String,
         teamName: String,
-        workingDirectory: String
+        workingDirectory: String,
+        systemPromptFile: String? = nil
     ) -> String {
         let quotedDir = workingDirectory.replacingOccurrences(of: "'", with: "'\\''")
         // `mkdir -p` before `cd`, because a project on another machine has
@@ -716,7 +1350,15 @@ extension TeamOrchestrator {
         case "codex":
             return "\(enter) && codex --model \(model)"
         default:
-            return "\(enter) && claude --model \(model) --dangerously-skip-permissions"
+            guard let systemPromptFile else {
+                return "\(enter) && claude --model \(model) --dangerously-skip-permissions"
+            }
+            let quotedFile = shellQuoted(systemPromptFile)
+            return "\(enter) && TERMMESH_LEADER_PROMPT=$(cat \(quotedFile))"
+                + " && rm -f \(quotedFile)"
+                + " && claude --model \(model)"
+                + " --system-prompt \"$TERMMESH_LEADER_PROMPT\""
+                + " --dangerously-skip-permissions"
         }
     }
 
@@ -725,7 +1367,8 @@ extension TeamOrchestrator {
         model: String,
         teamName: String,
         workingDirectory: String,
-        grant: Termmesh_Peer_V1_TeamLeaderGrant
+        grant: Termmesh_Peer_V1_TeamLeaderGrant,
+        systemPromptFile: String? = nil
     ) -> String {
         let hexGrant = grant.grantID.map { String(format: "%02x", $0) }.joined()
         let exports = [
@@ -741,7 +1384,8 @@ extension TeamOrchestrator {
             model: model,
             agentName: "leader",
             teamName: teamName,
-            workingDirectory: workingDirectory
+            workingDirectory: workingDirectory,
+            systemPromptFile: systemPromptFile
         )
         // `export` applies to the final CLI, unlike a shell assignment prefix
         // before `mkdir`, which would have scoped the grant to that one setup
@@ -759,15 +1403,26 @@ extension TeamOrchestrator {
         "unset HISTFILE; stty -echo"
     }
 
-    /// Wait for a freshly attached pane to stop painting before typing into it.
+    /// Wait until the relay has forwarded actual shell output before typing.
+    ///
+    /// `AutoReplyPoller` watches registered agent output, not transport
+    /// readiness. A remote leader is not an agent member yet, so asking that
+    /// poller kept every leader at its full 25-second timeout even though the
+    /// relay had rendered its first frame almost immediately.
     @MainActor
-    static func waitForPaneToStart(panelId: UUID, timeout: TimeInterval = 25) async {
-        AutoReplyPoller.shared.ensureRunning()
+    static func waitForRemoteShell(
+        session: PeerPaneSession,
+        timeout: TimeInterval = 3,
+        settleDelay: TimeInterval = 0.5
+    ) async {
         let deadline = Date().addingTimeInterval(timeout)
         while Date() < deadline {
-            if AutoReplyPoller.shared.isPaneActive(panelId: panelId) { break }
-            try? await Task.sleep(nanoseconds: 300_000_000)
+            let snapshot = session.relaySession.ioSnapshot
+            if (snapshot["bytes_enqueued"] as? UInt64 ?? 0) > 0 { break }
+            try? await Task.sleep(nanoseconds: 100_000_000)
         }
-        try? await Task.sleep(nanoseconds: 1_500_000_000)
+        try? await Task.sleep(
+            nanoseconds: UInt64(max(0, settleDelay) * 1_000_000_000)
+        )
     }
 }

@@ -70,6 +70,28 @@ final class AgentPanel: ObservableObject, Panel {
         ))
     }
 
+    func start(remoteClaudeAt target: String, port: Int?, identityFile: String?,
+               model: String, instructions: String,
+               remoteEnvironment: [String: String] = [:]) {
+        session.start(AgentSession.remoteClaudeLaunch(
+            sshTarget: target, port: port, identityFile: identityFile,
+            model: model, instructions: instructions,
+            workingDirectory: workingDirectory,
+            remoteEnvironment: remoteEnvironment
+        ))
+    }
+
+    func start(remoteBridgedCli cli: String, bridgePath: String, model: String,
+               target: String, port: Int?, identityFile: String?,
+               remoteEnvironment: [String: String] = [:]) {
+        session.start(AgentSession.remoteBridgeLaunch(
+            cli: cli, bridgePath: bridgePath, model: model,
+            sshTarget: target, port: port, identityFile: identityFile,
+            workingDirectory: workingDirectory,
+            remoteEnvironment: remoteEnvironment
+        ))
+    }
+
     // MARK: - Panel
 
     func close() {

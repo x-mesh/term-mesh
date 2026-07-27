@@ -15,6 +15,80 @@ import XCTest
 @MainActor
 final class AgentSessionTests: XCTestCase {
 
+    func testRemoteClaudeLaunchUsesSSHAndKeepsRemoteDirectoryOutOfLocalProcess() {
+        let launch = AgentSession.remoteClaudeLaunch(
+            sshTarget: "root@jw-server",
+            port: 2222,
+            identityFile: "/tmp/key file",
+            model: "sonnet",
+            instructions: "review 'carefully'",
+            workingDirectory: "/app/project with space",
+            remoteEnvironment: [
+                "TERMMESH_SOCKET": "/run/user/0/tm-peer.sock",
+                "TERMMESH_AGENT_NAME": "executor",
+            ]
+        )
+
+        XCTAssertEqual(launch.executable, "/usr/bin/ssh")
+        XCTAssertEqual(Array(launch.arguments.prefix(4)),
+                       ["-T", "-o", "BatchMode=yes", "-o"])
+        XCTAssertTrue(launch.arguments.contains("2222"))
+        XCTAssertTrue(launch.arguments.contains("/tmp/key file"))
+        XCTAssertEqual(launch.arguments.dropLast().last, "root@jw-server")
+        XCTAssertTrue(launch.arguments.last?.contains("mkdir -p '/app/project with space'") == true)
+        XCTAssertTrue(launch.arguments.last?.contains("claude") == true)
+        XCTAssertTrue(launch.arguments.last?.contains("--print") == true)
+        XCTAssertTrue(launch.arguments.last?.contains("IS_SANDBOX=1") == true)
+        XCTAssertTrue(launch.arguments.last?.contains(
+            "TERMMESH_SOCKET=/run/user/0/tm-peer.sock"
+        ) == true)
+        XCTAssertTrue(launch.arguments.last?.contains(
+            "TERMMESH_AGENT_NAME=executor"
+        ) == true)
+        XCTAssertTrue(launch.arguments.last?.contains(
+            "$HOME/.local/bin:/opt/homebrew/bin"
+        ) == true)
+        XCTAssertTrue(launch.arguments.last?.contains("review") == true)
+        XCTAssertNotEqual(launch.workingDirectory, "/app/project with space")
+    }
+
+    func testRemoteBridgeLaunchDescribesSSHChildWithoutMovingLocalBridgeCwd() throws {
+        let launch = AgentSession.remoteBridgeLaunch(
+            cli: "codex",
+            bridgePath: "/bundle/tm-agent-bridge.py",
+            model: "gpt-5",
+            sshTarget: "root@peer",
+            port: nil,
+            identityFile: nil,
+            workingDirectory: "/remote/repo",
+            remoteEnvironment: [
+                "TERMMESH_SOCKET": "/tmp/peer.sock",
+                "TERMMESH_AGENT_NAME": "reviewer",
+            ],
+            environment: [:]
+        )
+
+        XCTAssertEqual(launch.executable, "/usr/bin/env")
+        XCTAssertEqual(launch.environment["TERMMESH_REMOTE_NATIVE_CWD"], "/remote/repo")
+        let encoded = try XCTUnwrap(
+            launch.environment["TERMMESH_REMOTE_NATIVE_SSH_ARGS"]?.data(using: .utf8)
+        )
+        let ssh = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: encoded) as? [String]
+        )
+        XCTAssertEqual(ssh.first, "/usr/bin/ssh")
+        XCTAssertEqual(ssh.last, "root@peer")
+        let envData = try XCTUnwrap(
+            launch.environment["TERMMESH_REMOTE_NATIVE_ENV"]?.data(using: .utf8)
+        )
+        let remoteEnv = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: envData) as? [String: String]
+        )
+        XCTAssertEqual(remoteEnv["TERMMESH_SOCKET"], "/tmp/peer.sock")
+        XCTAssertEqual(remoteEnv["TERMMESH_AGENT_NAME"], "reviewer")
+        XCTAssertNotEqual(launch.workingDirectory, "/remote/repo")
+    }
+
     private func session(_ lines: [String]) -> AgentSession {
         let s = AgentSession()
         for line in lines { s.ingestForTesting(line) }

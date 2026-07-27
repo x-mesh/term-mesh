@@ -565,6 +565,12 @@ extension TerminalController {
                                 leaderModel: leaderModel,
                                 leaderEndpoint: leaderEndpoint,
                                 leaderWorkingDirectory: remotePath,
+                                projectSource: ProjectSource(
+                                    hostKey: hostKey,
+                                    projectPath: remotePath,
+                                    gitURL: gitURL ?? "",
+                                    isolateAgents: (params["isolate"] as? Bool) ?? true
+                                ),
                                 tabManager: tabManager
                             )
                         }
@@ -660,6 +666,79 @@ extension TerminalController {
             }
         }
         return result
+    }
+
+    func v2DebugProjectDelete(params: [String: Any]) -> V2CallResult {
+        guard let team = params["team"] as? String, !team.isEmpty,
+              let tabManager else {
+            return .err(code: "invalid_params", message: "team is required", data: nil)
+        }
+        Task { @MainActor in
+            do {
+                try await TeamOrchestrator.shared.deleteProject(
+                    teamName: team,
+                    tabManager: tabManager
+                )
+                #if DEBUG
+                dlog("debug.project.delete complete team=\(team)")
+                #endif
+            } catch {
+                #if DEBUG
+                dlog("debug.project.delete failed team=\(team) error=\(error)")
+                #endif
+            }
+        }
+        return .ok(["started": true])
+    }
+
+    func v2DebugPeerShellInspect(params: [String: Any]) -> V2CallResult {
+        guard let handle = params["host"] as? String, !handle.isEmpty,
+              let host = RemoteHostStore.shared.sortedHosts.first(where: {
+                  $0.id == handle
+                      || $0.displayName.caseInsensitiveCompare(handle) == .orderedSame
+              })
+        else {
+            return .err(code: "invalid_params", message: "connected host is required", data: nil)
+        }
+        debugPeerShellInspection = nil
+        Task { @MainActor in
+            do {
+                let items = try await TeamOrchestrator.shared.inspectPeerShells(host: host)
+                debugPeerShellInspection = [
+                    "ok": true,
+                    "items": items.map { item in
+                        [
+                            "id": item.id.base64EncodedString(),
+                            "title": item.title,
+                            "directory": item.workingDirectory,
+                            "busy": item.isBusy,
+                            "state": Self.peerShellStateLabel(item.state),
+                        ] as [String: Any]
+                    },
+                ]
+            } catch {
+                debugPeerShellInspection = [
+                    "ok": false,
+                    "error": String(describing: error),
+                ]
+            }
+        }
+        return .ok(["started": true])
+    }
+
+    func v2DebugPeerShellStatus() -> V2CallResult {
+        .ok(debugPeerShellInspection ?? ["pending": true])
+    }
+
+    private static func peerShellStateLabel(
+        _ state: TeamOrchestrator.PeerShellCleanupItem.State
+    ) -> String {
+        switch state {
+        case .inUse: return "in_use"
+        case .managedOrphan: return "managed_orphan"
+        case .missingDirectory: return "missing_directory"
+        case .unclaimed: return "unclaimed"
+        }
     }
 
     func v2DebugReviewBoardDelegate(params: [String: Any]) -> V2CallResult {

@@ -50,6 +50,11 @@ final class RemoteProjectPaths {
         UserDefaults.standard.set(paths, forKey: Self.storageKey)
     }
 
+    func forget(host: String, localRoot: String) {
+        paths.removeValue(forKey: key(host: host, localRoot: localRoot))
+        UserDefaults.standard.set(paths, forKey: Self.storageKey)
+    }
+
     /// Any path known for this machine, whatever the project.
     ///
     /// A worse answer than the project-specific one and a better answer than
@@ -58,5 +63,78 @@ final class RemoteProjectPaths {
     func anyPath(host: String) -> String? {
         let prefix = "\(host)\u{0000}"
         return paths.first { $0.key.hasPrefix(prefix) && !$0.value.isEmpty }?.value
+    }
+}
+
+/// Host-side shells created for remote leaders and terminal agents.
+///
+/// A peer surface survives a local viewer disappearing. Remembering the
+/// surfaces we created lets a later app run distinguish its abandoned shells
+/// from shells the operator opened themselves.
+@MainActor
+final class ManagedPeerSurfaceStore {
+    struct Record: Codable, Identifiable, Equatable {
+        let hostKey: String
+        let surfaceIDBase64: String
+        let teamName: String
+        let role: String
+        let workingDirectory: String
+        let createdAt: Date
+
+        var id: String { "\(hostKey)\u{0000}\(surfaceIDBase64)" }
+        var surfaceID: Data? { Data(base64Encoded: surfaceIDBase64) }
+    }
+
+    static let shared = ManagedPeerSurfaceStore()
+    private static let storageKey = "termmesh.managedPeerSurfaces"
+    private var records: [Record]
+
+    private init() {
+        guard let data = UserDefaults.standard.data(forKey: Self.storageKey),
+              let decoded = try? JSONDecoder().decode([Record].self, from: data)
+        else {
+            records = []
+            return
+        }
+        records = decoded
+    }
+
+    func remember(
+        hostKey: String,
+        surfaceID: Data,
+        teamName: String,
+        role: String,
+        workingDirectory: String
+    ) {
+        let encoded = surfaceID.base64EncodedString()
+        records.removeAll {
+            $0.hostKey == hostKey && $0.surfaceIDBase64 == encoded
+        }
+        records.append(Record(
+            hostKey: hostKey,
+            surfaceIDBase64: encoded,
+            teamName: teamName,
+            role: role,
+            workingDirectory: workingDirectory,
+            createdAt: Date()
+        ))
+        persist()
+    }
+
+    func forget(hostKey: String, surfaceID: Data) {
+        let encoded = surfaceID.base64EncodedString()
+        records.removeAll {
+            $0.hostKey == hostKey && $0.surfaceIDBase64 == encoded
+        }
+        persist()
+    }
+
+    func records(hostKey: String) -> [Record] {
+        records.filter { $0.hostKey == hostKey }
+    }
+
+    private func persist() {
+        guard let data = try? JSONEncoder().encode(records) else { return }
+        UserDefaults.standard.set(data, forKey: Self.storageKey)
     }
 }

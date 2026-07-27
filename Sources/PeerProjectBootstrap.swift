@@ -21,6 +21,17 @@ import Foundation
 /// borrowing another repository's objects means a `gc` over there can break a
 /// clone over here, and disk is cheaper than that failure.
 enum PeerProjectBootstrap {
+    enum DeletionError: LocalizedError {
+        case unsafePath(String)
+
+        var errorDescription: String? {
+            switch self {
+            case .unsafePath(let path):
+                return "Refusing to delete unsafe remote path: \(path)"
+            }
+        }
+    }
+
     struct Plan: Equatable {
         /// The project's own copy, `<root>/<name>`.
         var primaryPath: String
@@ -82,17 +93,34 @@ enum PeerProjectBootstrap {
             )
         } else {
             steps.append("mkdir -p \(primary)")
+            if plan.agentCheckouts.contains(where: { $0.path != plan.primaryPath }) {
+                // A brand-new project has no repository to clone yet. Make
+                // the primary directory the repository instead of attempting
+                // `git clone <plain folder>`, which fails and used to leave
+                // every advertised checkout as an unrelated empty directory.
+                //
+                // Do not silently turn an existing folder with files into a
+                // repository: cloning it would omit every untracked file and
+                // give agents checkouts that look valid but contain none of
+                // the project.
+                steps.append(
+                    "(git -C \(primary) rev-parse --git-dir >/dev/null 2>&1 "
+                        + "|| (test -z \"$(find \(primary) -mindepth 1 -maxdepth 1 "
+                        + "-print -quit)\" && git -C \(primary) init))"
+                )
+            }
         }
         for checkout in plan.agentCheckouts where checkout.path != plan.primaryPath {
             let path = quote(checkout.path)
             steps.append(
-                "test -d \(path)/.git || git clone \(primary) \(path)"
+                "(git -C \(path) rev-parse --git-dir >/dev/null 2>&1 "
+                    + "|| git clone \(primary) \(path))"
             )
             if !checkout.branch.isEmpty {
                 let branch = quote(checkout.branch)
                 steps.append(
-                    "git -C \(path) switch \(branch) 2>/dev/null "
-                        + "|| git -C \(path) switch -c \(branch)"
+                    "(git -C \(path) switch \(branch) 2>/dev/null "
+                        + "|| git -C \(path) switch -c \(branch))"
                 )
             }
         }
@@ -121,6 +149,29 @@ enum PeerProjectBootstrap {
             script: script,
             timeoutSeconds: timeoutSeconds
         )
+    }
+
+    /// Build the one destructive command in the project lifecycle.
+    ///
+    /// Only absolute, specific paths are accepted. A project root must have
+    /// at least two components below `/` (`/tmp/project`, `/app/projects`, …);
+    /// broad roots and relative paths never reach `rm`.
+    static func deletionScript(paths: [String]) throws -> String {
+        let safePaths = try Array(Set(paths)).sorted().map { path -> String in
+            let trimmed = path.trimmingCharacters(in: .whitespacesAndNewlines)
+            let standardized = (trimmed as NSString).standardizingPath
+            let components = standardized.split(separator: "/")
+            guard trimmed.hasPrefix("/"),
+                  standardized.hasPrefix("/"),
+                  standardized != "/",
+                  components.count >= 2
+            else {
+                throw DeletionError.unsafePath(path)
+            }
+            return standardized
+        }
+        guard !safePaths.isEmpty else { throw DeletionError.unsafePath("") }
+        return "rm -rf -- " + safePaths.map(quote).joined(separator: " ")
     }
 
     private static func quote(_ value: String) -> String {

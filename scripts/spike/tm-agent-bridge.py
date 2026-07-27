@@ -38,10 +38,62 @@ import json
 import os
 import queue
 import re
+import shlex
 import subprocess
 import sys
 import threading
 import time
+
+
+def process_location(argv: list[str], cwd: str) -> tuple[list[str], str | None]:
+    """Move a child process behind SSH when the native pane hosts a peer agent."""
+    raw = os.environ.get("TERMMESH_REMOTE_NATIVE_SSH_ARGS")
+    if not raw:
+        return argv, cwd
+    try:
+        ssh = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise OSError(f"invalid remote SSH arguments: {exc}") from exc
+    if not isinstance(ssh, list) or not ssh or not all(isinstance(v, str) for v in ssh):
+        raise OSError("invalid remote SSH arguments")
+    remote_cwd = os.environ.get("TERMMESH_REMOTE_NATIVE_CWD") or cwd
+    quoted_cwd = shlex.quote(remote_cwd)
+    remote_env = {}
+    raw_env = os.environ.get("TERMMESH_REMOTE_NATIVE_ENV")
+    if raw_env:
+        try:
+            remote_env = json.loads(raw_env)
+        except json.JSONDecodeError as exc:
+            raise OSError(f"invalid remote environment: {exc}") from exc
+        if not isinstance(remote_env, dict) or not all(
+            isinstance(k, str) and isinstance(v, str)
+            for k, v in remote_env.items()
+        ):
+            raise OSError("invalid remote environment")
+    assignments = [
+        f"{key}={value}"
+        for key, value in sorted(remote_env.items())
+        if key != "PATH"
+        and key
+        and key.replace("_", "a").isalnum()
+        and not key[0].isdigit()
+    ]
+    # Peer-hosted terminal surfaces already carry this marker. Claude uses it
+    # to permit explicitly requested bypass mode under root; native SSH must
+    # preserve the same host contract instead of behaving differently.
+    remote_path = (
+        "$HOME/.local/bin:/opt/homebrew/bin:/opt/homebrew/sbin:"
+        "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+    )
+    inner = (
+        f'export PATH="{remote_path}"; '
+        "exec env IS_SANDBOX=1 " + shlex.join(assignments + argv)
+    )
+    command = (
+        f"mkdir -p {quoted_cwd} && cd {quoted_cwd} && "
+        f'exec "${{SHELL:-/bin/sh}}" -lc {shlex.quote(inner)}'
+    )
+    return ssh + [command], None
 
 
 def acp_text(content) -> str:
@@ -86,8 +138,9 @@ class Child:
         # A nested agent CLI refuses to start when it thinks it is inside one.
         env.pop("CLAUDECODE", None)
         env.pop("CLAUDE_CODE_ENTRYPOINT", None)
+        argv, process_cwd = process_location(argv, cwd)
         self.p = subprocess.Popen(
-            argv, cwd=cwd, env=env,
+            argv, cwd=process_cwd, env=env,
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
             text=True, bufsize=1,
         )
@@ -341,7 +394,8 @@ class PerTurnBridge:
         env.pop("CLAUDECODE", None)
         env.pop("CLAUDE_CODE_ENTRYPOINT", None)
         try:
-            p = subprocess.Popen(self._argv(text), cwd=self.cwd, env=env,
+            argv, process_cwd = process_location(self._argv(text), self.cwd)
+            p = subprocess.Popen(argv, cwd=process_cwd, env=env,
                                  stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
                                  text=True, bufsize=1)
         except OSError as exc:

@@ -1,3 +1,4 @@
+import AppKit
 import SwiftUI
 
 /// The session, drawn as what it is rather than as characters.
@@ -494,29 +495,7 @@ private struct WorkingHeaderBackground: View {
                         endPoint: .trailing
                     )
                 } else {
-                    TimelineView(.animation(minimumInterval: 1.0 / 30)) { timeline in
-                        GeometryReader { geometry in
-                            let time = timeline.date.timeIntervalSinceReferenceDate
-                            let phase = time.truncatingRemainder(dividingBy: Self.cycle)
-                                / Self.cycle
-                            let width = geometry.size.width
-                            let bandWidth = max(90, width * 0.48)
-
-                            LinearGradient(
-                                colors: [
-                                    .clear,
-                                    accent.opacity(0.05),
-                                    accent.opacity(0.18),
-                                    accent.opacity(0.05),
-                                    .clear,
-                                ],
-                                startPoint: .leading,
-                                endPoint: .trailing
-                            )
-                            .frame(width: bandWidth)
-                            .offset(x: -bandWidth + CGFloat(phase) * (width + bandWidth))
-                        }
-                    }
+                    AnimatedHeaderBand(accent: accent, duration: Self.cycle)
                 }
             }
         }
@@ -916,22 +895,17 @@ private struct WorkingMark: View {
         // working. Inside a conditionally-inserted overlay, on a pane that
         // re-renders on every delta, a repeating animation hung on a one-shot
         // state change is not something to rely on. Time is always there.
-        TimelineView(.animation(minimumInterval: 1.0 / 30, paused: reduceMotion)) { timeline in
-            let now = timeline.date.timeIntervalSinceReferenceDate
-            VStack(spacing: Self.gap) {
-                ForEach(0..<3, id: \.self) { row in
-                    HStack(spacing: Self.gap) {
-                        ForEach(0..<3, id: \.self) { column in
-                            RoundedRectangle(cornerRadius: 1)
-                                .fill(accent)
-                                .frame(width: Self.side, height: Self.side)
-                                .scaleEffect(reduceMotion ? 1
-                                             : Self.scale(at: now, row: row, column: column))
-                        }
-                    }
-                }
-            }
-        }
+        AnimatedWorkingMark(
+            accent: accent,
+            side: Self.side,
+            gap: Self.gap,
+            cycle: Self.cycle,
+            reduceMotion: reduceMotion
+        )
+        .frame(
+            width: Self.side * 3 + Self.gap * 2,
+            height: Self.side * 3 + Self.gap * 2
+        )
         // Faint made sense when this sat over the transcript; in the composer
         // row it sits over nothing, so the reason is gone. Still a step under
         // the stop button beside it — that one is the thing to press, this one
@@ -957,6 +931,134 @@ private struct WorkingMark: View {
         // Smoothstep, so it eases at both ends without a bounce.
         let eased = t * t * (3 - 2 * t)
         return CGFloat(1 - 0.8 * eased)
+    }
+}
+
+private struct AnimatedHeaderBand: NSViewRepresentable {
+    let accent: Color
+    let duration: Double
+
+    func makeNSView(context: Context) -> HeaderBandView {
+        HeaderBandView()
+    }
+
+    func updateNSView(_ view: HeaderBandView, context: Context) {
+        view.update(accent: NSColor(accent), duration: duration)
+    }
+}
+
+private final class HeaderBandView: NSView {
+    private let band = CAGradientLayer()
+    private var duration: Double = 0
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        wantsLayer = true
+        layer?.masksToBounds = true
+        band.startPoint = CGPoint(x: 0, y: 0.5)
+        band.endPoint = CGPoint(x: 1, y: 0.5)
+        layer?.addSublayer(band)
+    }
+
+    required init?(coder: NSCoder) { nil }
+
+    func update(accent: NSColor, duration: Double) {
+        band.colors = [
+            accent.withAlphaComponent(0).cgColor,
+            accent.withAlphaComponent(0.05).cgColor,
+            accent.withAlphaComponent(0.18).cgColor,
+            accent.withAlphaComponent(0.05).cgColor,
+            accent.withAlphaComponent(0).cgColor,
+        ]
+        guard self.duration != duration || band.animation(forKey: "travel") == nil else { return }
+        self.duration = duration
+        needsLayout = true
+    }
+
+    override func layout() {
+        super.layout()
+        let width = max(90, bounds.width * 0.48)
+        band.frame = CGRect(x: -width, y: 0, width: width, height: bounds.height)
+        band.removeAnimation(forKey: "travel")
+        let animation = CABasicAnimation(keyPath: "position.x")
+        animation.fromValue = -width / 2
+        animation.toValue = bounds.width + width / 2
+        animation.duration = duration
+        animation.repeatCount = .infinity
+        animation.timingFunction = CAMediaTimingFunction(name: .linear)
+        band.add(animation, forKey: "travel")
+    }
+}
+
+private struct AnimatedWorkingMark: NSViewRepresentable {
+    let accent: Color
+    let side: CGFloat
+    let gap: CGFloat
+    let cycle: Double
+    let reduceMotion: Bool
+
+    func makeNSView(context: Context) -> WorkingMarkView {
+        WorkingMarkView()
+    }
+
+    func updateNSView(_ view: WorkingMarkView, context: Context) {
+        view.update(
+            accent: NSColor(accent),
+            side: side,
+            gap: gap,
+            cycle: cycle,
+            reduceMotion: reduceMotion
+        )
+    }
+}
+
+private final class WorkingMarkView: NSView {
+    private let squares = (0..<9).map { _ in CALayer() }
+    private var configuration = ""
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        wantsLayer = true
+        squares.forEach {
+            $0.cornerRadius = 1
+            layer?.addSublayer($0)
+        }
+    }
+
+    required init?(coder: NSCoder) { nil }
+
+    func update(
+        accent: NSColor,
+        side: CGFloat,
+        gap: CGFloat,
+        cycle: Double,
+        reduceMotion: Bool
+    ) {
+        let next = "\(accent.description)-\(side)-\(gap)-\(cycle)-\(reduceMotion)"
+        guard next != configuration else { return }
+        configuration = next
+        for (index, square) in squares.enumerated() {
+            let row = index / 3
+            let column = index % 3
+            square.frame = CGRect(
+                x: CGFloat(column) * (side + gap),
+                y: CGFloat(2 - row) * (side + gap),
+                width: side,
+                height: side
+            )
+            square.backgroundColor = accent.cgColor
+            square.removeAllAnimations()
+            guard !reduceMotion else { continue }
+            let animation = CABasicAnimation(keyPath: "transform.scale")
+            animation.fromValue = 1
+            animation.toValue = 0.45
+            animation.autoreverses = true
+            animation.duration = cycle * 0.375
+            animation.beginTime = CACurrentMediaTime()
+                + Double(row + column) * cycle / 12
+            animation.repeatCount = .infinity
+            square.add(animation, forKey: "pulse")
+        }
     }
 }
 

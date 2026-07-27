@@ -82,6 +82,11 @@ final class TeamOrchestrator: ObservableObject {
     }
 
     struct Team: Identifiable {
+        struct RemoteProjectLocation: Hashable {
+            let hostKey: String
+            let path: String
+        }
+
         let id: String            // team name
         let leaderSessionId: String
         let leaderMode: String    // "repl", "claude", "kiro", "codex", "gemini", "adopted"
@@ -127,6 +132,10 @@ final class TeamOrchestrator: ObservableObject {
         /// Team-wide auto-recycle default: recycle an agent every N completed tasks.
         /// nil = disabled; per-agent autoRecycleEvery overrides this.
         var defaultAutoRecycleEvery: Int? = nil
+        /// Remote directories created for this project. These are retained
+        /// until the explicit Delete Project action; ordinary pane/workspace
+        /// close only detaches viewers and never removes them.
+        var remoteProjectLocations: [RemoteProjectLocation] = []
     }
 
     struct AgentPaneIdentity: Equatable {
@@ -150,6 +159,13 @@ final class TeamOrchestrator: ObservableObject {
     }
 
     @Published private(set) var teams: [String: Team] = [:]
+
+    func recordRemoteProjectLocations(
+        teamName: String,
+        locations: [Team.RemoteProjectLocation]
+    ) {
+        teams[teamName]?.remoteProjectLocations = locations
+    }
 
     /// Install the remote pane that replaced the pending leader anchor. Kept
     /// on the owning type because `teams` is intentionally read-only to extensions.
@@ -2635,6 +2651,49 @@ final class TeamOrchestrator: ObservableObject {
         """
     }
 
+    /// The same leader contract used by a local Claude pane, assembled before
+    /// remote members have been attached to the team record.
+    ///
+    /// `attachRemoteLeader` runs first so the project opens around its leader;
+    /// reading `team.agents` there would therefore produce an empty roster and
+    /// teach Claude to use its built-in Agent tool. The rows are the source of
+    /// truth at that point.
+    static func remoteLeaderClaudeSystemPrompt(
+        teamName: String,
+        rows: [TeamAgentRow],
+        remoteWorkingDirectory: String,
+        remoteSocketPath: String
+    ) -> String {
+        let agentList = rows.enumerated().map { index, row in
+            let instructions = row.customInstructions
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            let source = instructions.isEmpty ? row.preset.instructions : instructions
+            let summary = oneLinerFromInstructions(source)
+            return summary.isEmpty
+                ? "  \(index + 1). \(row.preset.name) (\(row.preset.name))"
+                : "  \(index + 1). \(row.preset.name) (\(row.preset.name)) — \(summary)"
+        }.joined(separator: "\n")
+        let remoteRunbooks = """
+        ## Agent Runbooks
+
+        Source of truth on this machine: `.agent-runbooks/<role>.md` under \(remoteWorkingDirectory).
+        Each worker receives its composed role brief when its pane starts.
+
+        Useful commands:
+        ```
+        tm-agent runbook status
+        tm-agent runbook install --tool all
+        ```
+        """
+        return buildLeaderClaudeSystemPrompt(
+            teamName: teamName,
+            agentList: agentList,
+            runbookSection: remoteRunbooks,
+            tmAgent: "tm-agent",
+            socketPath: remoteSocketPath
+        )
+    }
+
     /// Build team leader instructions for non-Claude CLI leaders (kiro, codex, gemini).
     /// These CLIs lack a --system-prompt flag, so we inject instructions as the first message.
     private func buildTeamLeaderPrompt(
@@ -4682,13 +4741,19 @@ final class TeamOrchestrator: ObservableObject {
     }
 
     /// Destroy a team — send Ctrl-C to all agents and close the workspace.
-    func destroyTeam(name: String, tabManager: TabManager) -> Bool {
+    func destroyTeam(
+        name: String,
+        tabManager: TabManager,
+        archive: Bool = true
+    ) -> Bool {
         guard let team = teams[name] else { return false }
         // Phase 2 (pane-mode resume): persist a `mode: "pane"` archive so this
         // team shows up in `Resume from previous team`. Best-effort — failures
         // don't block destroy. Headless teams are archived daemon-side by
         // `headless.destroy_team` and never enter this code path.
-        archivePaneTeamIfApplicable(team)
+        if archive {
+            archivePaneTeamIfApplicable(team)
+        }
 
         // D3-A P2 (b): release any pending claude-sid watcher slots so
         // FSEventStream(s) for this team's workdirs tear down promptly.

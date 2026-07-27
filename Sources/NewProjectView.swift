@@ -23,7 +23,7 @@ struct NewProjectView: View {
         _ rows: [TeamAgentRow],
         _ source: ProjectSource,
         _ leader: ProjectLeader
-    ) -> Void
+    ) async throws -> Void
     let onClose: () -> Void
 
     @State private var directory: String = ""
@@ -70,6 +70,8 @@ struct NewProjectView: View {
     @State private var showingManagePresets = false
     @State private var savePresetName = ""
     @State private var presetError: String?
+    @State private var isCreating = false
+    @State private var creationError: String?
     /// Where the leader runs: following this project's Default machine, or
     /// somewhere the user pointed it on purpose.
     ///
@@ -656,16 +658,17 @@ struct NewProjectView: View {
 
     private var footer: some View {
         HStack {
-            Text(
+            Text(creationError ?? (
                 runsOnHostKey == nil
                     ? "The team is created in this folder alongside the project."
                     : "The agents work on that machine; their panes open here."
-            )
+            ))
             .font(.caption)
-            .foregroundStyle(.secondary)
+            .foregroundStyle(creationError == nil ? Color.secondary : Color.red)
             Spacer()
             Button("Cancel", action: onClose)
                 .keyboardShortcut(.cancelAction)
+                .disabled(isCreating)
             Button("Create") {
                 // A project living on another machine still needs somewhere
                 // here for its window to open. The remote path is not that
@@ -674,26 +677,44 @@ struct NewProjectView: View {
                 let localDirectory = runsOnHostKey == nil
                     ? trimmedDirectory
                     : FileManager.default.homeDirectoryForCurrentUser.path
-                onCreate(
-                    effectiveName,
-                    localDirectory,
-                    agents,
-                    ProjectSource(
-                        hostKey: runsOnHostKey,
-                        projectPath: trimmedDirectory,
-                        gitURL: gitURL.trimmingCharacters(in: .whitespacesAndNewlines),
-                        isolateAgents: isolateAgents
-                    ),
-                    ProjectLeader(
-                        mode: leaderCli,
-                        model: leaderModel,
-                        endpoint: leaderHostKey.map { .peer(hostKey: $0) } ?? .local
-                    )
-                )
-                onClose()
+                isCreating = true
+                creationError = nil
+                Task { @MainActor in
+                    do {
+                        try await onCreate(
+                            effectiveName,
+                            localDirectory,
+                            agents,
+                            ProjectSource(
+                                hostKey: runsOnHostKey,
+                                projectPath: trimmedDirectory,
+                                gitURL: gitURL.trimmingCharacters(in: .whitespacesAndNewlines),
+                                isolateAgents: isolateAgents
+                            ),
+                            ProjectLeader(
+                                mode: leaderCli,
+                                model: leaderModel,
+                                endpoint: leaderHostKey.map { .peer(hostKey: $0) } ?? .local
+                            )
+                        )
+                        onClose()
+                    } catch {
+                        creationError = error.localizedDescription
+                        isCreating = false
+                    }
+                }
             }
             .keyboardShortcut(.defaultAction)
-            .disabled(trimmedDirectory.isEmpty || effectiveName.isEmpty || !leaderEndpointIsReady)
+            .disabled(
+                isCreating || trimmedDirectory.isEmpty || effectiveName.isEmpty
+                    || !leaderEndpointIsReady
+            )
+            .overlay {
+                if isCreating {
+                    ProgressView()
+                        .controlSize(.small)
+                }
+            }
         }
         .padding(.horizontal, 20)
         .padding(.vertical, 14)

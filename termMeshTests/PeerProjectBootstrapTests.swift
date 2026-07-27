@@ -55,9 +55,21 @@ final class PeerProjectBootstrapTests: XCTestCase {
         let text = try! XCTUnwrap(PeerProjectBootstrap.script(for: plan, gitURL: "u"))
         // Every step is guarded on its own result already existing.
         XCTAssertTrue(text.contains("test -d '/app/p/x'/.git ||"))
-        XCTAssertTrue(text.contains("test -d '/app/p/x-a'/.git ||"))
+        XCTAssertTrue(text.contains("git -C '/app/p/x-a' rev-parse --git-dir"))
         // A branch left over from a previous run is the normal second visit.
         XCTAssertTrue(text.contains("switch 'agent/a' 2>/dev/null || "))
+    }
+
+    func test_new_isolated_project_initializes_primary_before_cloning_agents() {
+        let plan = PeerProjectBootstrap.plan(
+            projectRoot: "/app/p", projectName: "x", agents: ["a"], isolateAgents: true
+        )
+        let text = try! XCTUnwrap(PeerProjectBootstrap.script(for: plan, gitURL: nil))
+
+        let initRange = try! XCTUnwrap(text.range(of: "git -C '/app/p/x' init"))
+        let cloneRange = try! XCTUnwrap(text.range(of: "git clone '/app/p/x' '/app/p/x-a'"))
+        XCTAssertLessThan(initRange.lowerBound, cloneRange.lowerBound)
+        XCTAssertTrue(text.contains("find '/app/p/x' -mindepth 1"))
     }
 
     func test_a_plain_shared_folder_needs_no_script() {
@@ -65,6 +77,31 @@ final class PeerProjectBootstrapTests: XCTestCase {
             projectRoot: "/app/p", projectName: "x", agents: ["a"], isolateAgents: false
         )
         XCTAssertNil(PeerProjectBootstrap.script(for: plan, gitURL: nil))
+    }
+
+    func test_project_deletion_quotes_deduplicates_and_removes_only_exact_paths() throws {
+        let script = try PeerProjectBootstrap.deletionScript(paths: [
+            "/app/projects/demo-agent",
+            "/app/projects/demo",
+            "/app/projects/demo",
+        ])
+
+        XCTAssertEqual(
+            script,
+            "rm -rf -- '/app/projects/demo' '/app/projects/demo-agent'"
+        )
+    }
+
+    func test_project_deletion_rejects_broad_or_relative_paths() {
+        for path in ["/", "/tmp", "tmp/demo", ".", ""] {
+            XCTAssertThrowsError(try PeerProjectBootstrap.deletionScript(paths: [path]))
+        }
+    }
+
+    func test_project_deletion_standardizes_before_validation() {
+        XCTAssertThrowsError(
+            try PeerProjectBootstrap.deletionScript(paths: ["/tmp/project/../.."])
+        )
     }
 
     func test_remote_ref_keeps_peer_namespace_with_optional_surface() {
@@ -165,5 +202,29 @@ final class PeerProjectBootstrapTests: XCTestCase {
         XCTAssertTrue(launch.hasPrefix("export TERMMESH_LEADER_GRANT_ID="))
         XCTAssertTrue(launch.contains("; exec /bin/sh -lc "))
         XCTAssertTrue(launch.contains("codex --model gpt-5"))
+    }
+
+    @MainActor
+    func test_remote_claude_leader_launch_injects_term_mesh_prompt() {
+        var grant = Termmesh_Peer_V1_TeamLeaderGrant()
+        grant.grantID = Data(repeating: 0xcd, count: 32)
+        grant.projectID = "name:demo"
+        grant.teamUuid = "team-uuid"
+        grant.expiresAtUnixSecs = 123
+
+        let launch = TeamOrchestrator.remoteLeaderCommand(
+            cli: "claude",
+            model: "sonnet",
+            teamName: "demo",
+            workingDirectory: "/srv/demo",
+            grant: grant,
+            systemPromptFile: "/tmp/term-mesh-leader-prompt-team-uuid.txt"
+        )
+
+        XCTAssertTrue(launch.contains("claude --model sonnet"))
+        XCTAssertTrue(launch.contains("--system-prompt"))
+        XCTAssertTrue(launch.contains("TERMMESH_LEADER_PROMPT=$(cat"))
+        XCTAssertTrue(launch.contains("rm -f"))
+        XCTAssertTrue(launch.contains("--dangerously-skip-permissions"))
     }
 }

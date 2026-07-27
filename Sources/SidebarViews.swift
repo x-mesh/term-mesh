@@ -997,40 +997,40 @@ struct SidebarProjectsSection: View {
         .sheet(isPresented: $isCreatingProject) {
             NewProjectView(
                 onCreate: { name, directory, rows, source, leader in
-                    Task { @MainActor in
-                        // A name already in use means the project is open, not
-                        // that something failed. Creating one silently returned
-                        // nil and the sheet just closed, which reads as the
-                        // button not working — so go to the one that is there.
-                        if let existing = TeamOrchestrator.shared.teams[name],
-                           let workspace = tabManager.tabs.first(where: { $0.id == existing.workspaceId }) {
-                            tabManager.selectWorkspace(workspace)
-                            return
-                        }
-                        // The checkouts have to exist before anyone is sent to
-                        // work in them: an agent whose directory is not there
-                        // starts in a shell that failed to `cd` and looks
-                        // attached while being nothing of the kind.
-                        let prepared = await prepareRemoteCheckouts(
-                            name: name, rows: rows, source: source
-                        )
-                        let team = TeamOrchestrator.shared.createTeam(
-                            named: name,
-                            rows: prepared,
-                            workingDirectory: directory,
-                            leaderMode: leader.mode,
-                            leaderModel: leader.model,
-                            leaderEndpoint: leader.endpoint,
-                            leaderWorkingDirectory: leader.endpoint.hostKey == nil
-                                ? nil
-                                : source.projectPath,
-                            tabManager: tabManager
-                        )
-                        guard team != nil else { return }
-                        // A project with agents in it is what the board is
-                        // for, so making one puts it up.
-                        ReviewBoardSettings.setVisible(true)
+                    // A name already in use means the project is open, not
+                    // that something failed. Creating one silently returned
+                    // nil and the sheet just closed, which reads as the
+                    // button not working — so go to the one that is there.
+                    if let existing = TeamOrchestrator.shared.teams[name],
+                       let workspace = tabManager.tabs.first(where: { $0.id == existing.workspaceId }) {
+                        tabManager.selectWorkspace(workspace)
+                        return
                     }
+                    // The checkouts have to exist before anyone is sent to
+                    // work in them: an agent whose directory is not there
+                    // starts in a shell that failed to `cd` and looks
+                    // attached while being nothing of the kind.
+                    let prepared = try await prepareRemoteCheckouts(
+                        name: name, rows: rows, source: source
+                    )
+                    guard TeamOrchestrator.shared.createTeam(
+                        named: name,
+                        rows: prepared,
+                        workingDirectory: directory,
+                        leaderMode: leader.mode,
+                        leaderModel: leader.model,
+                        leaderEndpoint: leader.endpoint,
+                        leaderWorkingDirectory: leader.endpoint.hostKey == nil
+                            ? nil
+                            : source.projectPath,
+                        projectSource: source,
+                        tabManager: tabManager
+                    ) != nil else {
+                        throw ProjectCreationError.teamCreationFailed
+                    }
+                    // A project with agents in it is what the board is
+                    // for, so making one puts it up.
+                    ReviewBoardSettings.setVisible(true)
                 },
                 onClose: { isCreatingProject = false }
             )
@@ -1048,12 +1048,16 @@ struct SidebarProjectsSection: View {
         name: String,
         rows: [TeamAgentRow],
         source: ProjectSource
-    ) async -> [TeamAgentRow] {
-        guard let hostKey = source.hostKey,
-              let host = RemoteHostStore.shared.sortedHosts.first(where: { $0.id == hostKey }),
-              let sshTarget = host.sshTarget, !sshTarget.isEmpty,
-              !source.projectPath.isEmpty
-        else { return rows }
+    ) async throws -> [TeamAgentRow] {
+        guard let hostKey = source.hostKey else { return rows }
+        guard let host = RemoteHostStore.shared.sortedHosts.first(where: { $0.id == hostKey }),
+              let sshTarget = host.sshTarget, !sshTarget.isEmpty
+        else {
+            throw ProjectCreationError.remoteHostUnavailable
+        }
+        guard !source.projectPath.isEmpty else {
+            throw ProjectCreationError.remotePathMissing
+        }
 
         let plan = PeerProjectBootstrap.plan(
             projectRoot: (source.projectPath as NSString).deletingLastPathComponent,
@@ -1070,10 +1074,8 @@ struct SidebarProjectsSection: View {
                 gitURL: source.gitURL.isEmpty ? nil : source.gitURL
             )
         } catch {
-            // Said out loud and then attempted anyway: the directories may
-            // already be right, and refusing here would turn a warning into a
-            // project that was never created.
             RemoteWorkLog.info("Could not prepare \(name) on \(host.displayName): \(error)")
+            throw error
         }
 
         var prepared = rows
@@ -1084,6 +1086,23 @@ struct SidebarProjectsSection: View {
             prepared[i].hostDirectory = checkout.path
         }
         return prepared
+    }
+
+    private enum ProjectCreationError: LocalizedError {
+        case teamCreationFailed
+        case remoteHostUnavailable
+        case remotePathMissing
+
+        var errorDescription: String? {
+            switch self {
+            case .teamCreationFailed:
+                "Could not create the project team."
+            case .remoteHostUnavailable:
+                "The selected remote machine is unavailable."
+            case .remotePathMissing:
+                "Enter a folder on the remote machine."
+            }
+        }
     }
 }
 
@@ -1253,6 +1272,13 @@ struct SidebarRemoteAgentTarget: Identifiable {
     /// is the one case this cannot serve — a member needs teammates.
     let teamName: String?
     var id: String { projectLabel }
+}
+
+private struct SidebarProjectDeletionTarget: Identifiable {
+    let label: String
+    let teamName: String
+    let locations: [TeamOrchestrator.Team.RemoteProjectLocation]
+    var id: String { teamName }
 }
 
 /// Put a member of this project's team on another machine.
@@ -1551,6 +1577,8 @@ private struct SidebarPeerProjectsView: View {
     @State private var delegateTarget: SidebarProjectDelegateTarget?
     /// Non-nil presents the remote-agent sheet.
     @State private var remoteAgentTarget: SidebarRemoteAgentTarget?
+    @State private var deletionTarget: SidebarProjectDeletionTarget?
+    @State private var deletionFailure: String?
 
     private var connectedHosts: [HostEntry] {
         hosts.filter { $0.isConnected && !$0.workspaces.isEmpty }
@@ -1716,6 +1744,18 @@ private struct SidebarPeerProjectsView: View {
             )
         }
         .disabled(teamName(for: group) == nil)
+        Divider()
+        Button("Delete Project…", role: .destructive) {
+            guard let teamName = teamName(for: group),
+                  let team = TeamOrchestrator.shared.teams[teamName]
+            else { return }
+            deletionTarget = SidebarProjectDeletionTarget(
+                label: group.identity.label,
+                teamName: teamName,
+                locations: team.remoteProjectLocations
+            )
+        }
+        .disabled(teamName(for: group) == nil)
     }
 
 
@@ -1823,6 +1863,49 @@ private struct SidebarPeerProjectsView: View {
         }
         .sheet(item: $remoteAgentTarget) { target in
             SidebarRemoteAgentSheet(target: target) { remoteAgentTarget = nil }
+        }
+        .alert(
+            "Delete “\(deletionTarget?.label ?? "Project")”?",
+            isPresented: Binding(
+                get: { deletionTarget != nil },
+                set: { if !$0 { deletionTarget = nil } }
+            ),
+            presenting: deletionTarget
+        ) { target in
+            Button("Delete Project", role: .destructive) {
+                deletionTarget = nil
+                Task { @MainActor in
+                    do {
+                        try await TeamOrchestrator.shared.deleteProject(
+                            teamName: target.teamName,
+                            tabManager: tabManager
+                        )
+                    } catch {
+                        deletionFailure = error.localizedDescription
+                    }
+                }
+            }
+            Button("Cancel", role: .cancel) { deletionTarget = nil }
+        } message: { target in
+            if target.locations.isEmpty {
+                Text("The project and its panes will close. Local folders are kept.")
+            } else {
+                let paths = target.locations
+                    .map { "\($0.hostKey): \($0.path)" }
+                    .joined(separator: "\n")
+                Text("The leader and agents will stop. These remote folders will be permanently deleted:\n\n\(paths)")
+            }
+        }
+        .alert(
+            "Couldn’t Delete Project",
+            isPresented: Binding(
+                get: { deletionFailure != nil },
+                set: { if !$0 { deletionFailure = nil } }
+            )
+        ) {
+            Button("OK") { deletionFailure = nil }
+        } message: {
+            Text(deletionFailure ?? "")
         }
     }
 
@@ -2008,6 +2091,123 @@ private struct SidebarProjectLocalRowView: View {
     }
 }
 
+private struct PeerShellCleanupSheet: View {
+    let hostName: String
+    let items: [TeamOrchestrator.PeerShellCleanupItem]
+    let isLoading: Bool
+    let error: String?
+    @Binding var selection: Set<Data>
+    let onRefresh: () -> Void
+    let onClose: () -> Void
+    @Environment(\.dismiss) private var dismiss
+
+    private var closeableCount: Int {
+        items.filter { $0.state != .inUse }.count
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            HStack {
+                VStack(alignment: .leading, spacing: 3) {
+                    Text("Manage Project Shells")
+                        .font(.headline)
+                    Text(hostName)
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                }
+                Spacer()
+                if isLoading {
+                    ProgressView()
+                        .controlSize(.small)
+                }
+            }
+
+            Text("Tracked shells are protected. Orphans and shells whose folder was deleted are selected automatically. Busy shells require an explicit selection.")
+                .font(.caption)
+                .foregroundColor(.secondary)
+
+            if let error {
+                Text(error)
+                    .font(.caption)
+                    .foregroundColor(.red)
+            }
+
+            List(items) { item in
+                HStack(spacing: 10) {
+                    Toggle("", isOn: Binding(
+                        get: { selection.contains(item.id) },
+                        set: { selected in
+                            if selected {
+                                selection.insert(item.id)
+                            } else {
+                                selection.remove(item.id)
+                            }
+                        }
+                    ))
+                    .labelsHidden()
+                    .disabled(item.state == .inUse)
+
+                    VStack(alignment: .leading, spacing: 3) {
+                        HStack(spacing: 6) {
+                            Text(item.title.isEmpty ? "Shell" : item.title)
+                                .lineLimit(1)
+                            Text(item.idLabel)
+                                .font(.system(.caption2, design: .monospaced))
+                                .foregroundColor(.secondary)
+                        }
+                        Text(item.workingDirectory.isEmpty ? "Unknown folder" : item.workingDirectory)
+                            .font(.system(.caption, design: .monospaced))
+                            .foregroundColor(.secondary)
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                    }
+
+                    Spacer()
+                    if item.isBusy {
+                        Text("busy")
+                            .foregroundColor(.orange)
+                    }
+                    Text(stateLabel(item.state))
+                        .foregroundColor(stateColor(item.state))
+                }
+                .font(.caption)
+            }
+            .frame(minHeight: 300)
+
+            HStack {
+                Text("\(items.count) shells · \(closeableCount) manageable")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+                Spacer()
+                Button("Refresh", action: onRefresh)
+                    .disabled(isLoading)
+                Button("Cancel") { dismiss() }
+                Button("Close \(selection.count) Shells", role: .destructive, action: onClose)
+                    .disabled(selection.isEmpty || isLoading)
+            }
+        }
+        .padding(18)
+        .frame(minWidth: 680, minHeight: 430)
+    }
+
+    private func stateLabel(_ state: TeamOrchestrator.PeerShellCleanupItem.State) -> String {
+        switch state {
+        case .inUse: return "in use"
+        case .managedOrphan: return "orphan"
+        case .missingDirectory: return "folder deleted"
+        case .unclaimed: return "unclaimed"
+        }
+    }
+
+    private func stateColor(_ state: TeamOrchestrator.PeerShellCleanupItem.State) -> Color {
+        switch state {
+        case .inUse: return .green
+        case .managedOrphan, .missingDirectory: return .orange
+        case .unclaimed: return .secondary
+        }
+    }
+}
+
 struct RemoteHostGroupView: View {
     @Environment(\.colorScheme) private var colorScheme
     let host: HostEntry
@@ -2021,6 +2221,11 @@ struct RemoteHostGroupView: View {
     @State private var showNewWorkspaceAlert = false
     @State private var newWorkspaceTitle = ""
     @State private var showForceDisconnectConfirm = false
+    @State private var showShellCleanup = false
+    @State private var shellCleanupItems: [TeamOrchestrator.PeerShellCleanupItem] = []
+    @State private var shellCleanupSelection = Set<Data>()
+    @State private var shellCleanupLoading = false
+    @State private var shellCleanupError: String?
 
     init(host: HostEntry, store: RemoteHostStore,
          usesSeparatedPresentation: Bool,
@@ -2283,6 +2488,13 @@ struct RemoteHostGroupView: View {
                 Button("Open Surface as Pane…") {
                     store.openSurfaceAsPane(host)
                 }
+                Button("Manage Project Shells…") {
+                    Task { @MainActor in
+                        try? await Task.sleep(nanoseconds: 50_000_000)
+                        showShellCleanup = true
+                        await loadShellCleanup()
+                    }
+                }
                 Button("New Workspace…") {
                     Task { @MainActor in
                         try? await Task.sleep(nanoseconds: 50_000_000)
@@ -2422,6 +2634,21 @@ struct RemoteHostGroupView: View {
         } message: {
             Text("Creates a new workspace on \"\(host.displayName)\".")
         }
+        .sheet(isPresented: $showShellCleanup) {
+            PeerShellCleanupSheet(
+                hostName: host.displayName,
+                items: shellCleanupItems,
+                isLoading: shellCleanupLoading,
+                error: shellCleanupError,
+                selection: $shellCleanupSelection,
+                onRefresh: {
+                    Task { await loadShellCleanup() }
+                },
+                onClose: {
+                    Task { await closeSelectedShells() }
+                }
+            )
+        }
         .padding(.horizontal, usesSeparatedPresentation ? 0 : 6)
         .onChange(of: isExpanded) { newValue in
             SidebarLayoutSettings.setHostCollapsed(host.id, !newValue)
@@ -2429,6 +2656,45 @@ struct RemoteHostGroupView: View {
         .onChange(of: store.expandSignal) { signal in
             if signal.key == host.id { isExpanded = true }
         }
+    }
+
+    @MainActor
+    private func loadShellCleanup() async {
+        shellCleanupLoading = true
+        shellCleanupError = nil
+        do {
+            let items = try await TeamOrchestrator.shared.inspectPeerShells(host: host)
+            shellCleanupItems = items
+            shellCleanupSelection = Set(items.compactMap { item in
+                guard !item.isBusy else { return nil }
+                switch item.state {
+                case .managedOrphan, .missingDirectory: return item.id
+                case .inUse, .unclaimed: return nil
+                }
+            })
+        } catch {
+            shellCleanupItems = []
+            shellCleanupSelection = []
+            shellCleanupError = String(describing: error)
+        }
+        shellCleanupLoading = false
+    }
+
+    @MainActor
+    private func closeSelectedShells() async {
+        shellCleanupLoading = true
+        shellCleanupError = nil
+        do {
+            _ = try await TeamOrchestrator.shared.closePeerShells(
+                host: host,
+                surfaceIDs: shellCleanupSelection
+            )
+            shellCleanupItems.removeAll { shellCleanupSelection.contains($0.id) }
+            shellCleanupSelection = []
+        } catch {
+            shellCleanupError = String(describing: error)
+        }
+        shellCleanupLoading = false
     }
 }
 
