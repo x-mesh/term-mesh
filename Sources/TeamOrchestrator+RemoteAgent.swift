@@ -1043,7 +1043,7 @@ extension TeamOrchestrator {
     /// only one this side asked the host to make — a shell the operator
     /// published is theirs, and we merely borrowed it.
     @MainActor
-    func releaseRemoteAgent(_ agent: AgentMember, closing workspace: Workspace?) {
+    func releaseRemoteAgent(_ agent: AgentMember, closing workspace: Workspace?, teamName: String? = nil) {
         let hostSockPath = agent.hostKey
             .flatMap { key in RemoteHostStore.shared.sortedHosts.first { $0.id == key } }
             .map(\.activeSockPath)
@@ -1061,6 +1061,7 @@ extension TeamOrchestrator {
         // interactive CLI to unwind first.
         if let workspace, let panelId, workspace.agentPanel(for: panelId) != nil {
             _ = workspace.closePanel(panelId, force: true)
+            reapDetachedAgentWorktree(agent, teamName: teamName)
             return
         }
 
@@ -1097,6 +1098,7 @@ extension TeamOrchestrator {
                 if let workspace, let panelId {
                     _ = workspace.closePanel(panelId, force: true)
                 }
+                self.reapDetachedAgentWorktree(agent, teamName: teamName)
                 guard let surfaceID, let hostSockPath, let surfaceHostKey else { return }
                 Task { @MainActor in
                     await Self.closeManagedRemoteSurface(
@@ -1105,6 +1107,42 @@ extension TeamOrchestrator {
                         surfaceID: surfaceID
                     )
                 }
+            }
+        }
+    }
+
+    /// A detached agent's instance-tagged checkout has no future occupant, so
+    /// try to reclaim it. Gated twice: the path must be one this team created
+    /// (recorded in `remoteProjectLocations` at creation), and the remote
+    /// script itself refuses anything that is not a clean linked worktree —
+    /// see `PeerProjectBootstrap.reapWorktreeScript`. Restart and recycle
+    /// never come through here; only a true detach does.
+    private func reapDetachedAgentWorktree(_ agent: AgentMember, teamName: String?) {
+        guard let teamName,
+              let hostKey = agent.hostKey,
+              let workDir = agent.originalAgentWorkDir?
+                  .trimmingCharacters(in: .whitespacesAndNewlines),
+              !workDir.isEmpty,
+              let team = teams[teamName],
+              team.remoteProjectLocations.contains(
+                  Team.RemoteProjectLocation(hostKey: hostKey, path: workDir)
+              ),
+              let host = RemoteHostStore.shared.sortedHosts.first(where: { $0.id == hostKey }),
+              let sshTarget = host.sshTarget, !sshTarget.isEmpty
+        else { return }
+        let port = host.sshPort
+        let identityFile = host.identityFile
+        Task.detached {
+            await PeerProjectBootstrap.reapWorktree(
+                sshTarget: sshTarget,
+                port: port,
+                identityFile: identityFile,
+                path: workDir
+            )
+            await MainActor.run {
+                RemoteWorkLog.info(
+                    "Reaped \(agent.name)'s checkout on \(host.displayName) (kept if it held uncommitted work): \(workDir)"
+                )
             }
         }
     }

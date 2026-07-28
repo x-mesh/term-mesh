@@ -51,6 +51,9 @@ struct NewProjectView: View {
     @State private var gitURL: String = ""
     @State private var showsCustomPath = false
     @State private var showsCustomPlacement = false
+    /// Sample tag for the checkout-name hint; the real one is minted at
+    /// creation time in `ProjectCreationFlow.prepareCheckouts`.
+    @State private var previewInstanceTag = PeerProjectBootstrap.makeInstanceTag()
     @FocusState private var focusedField: Field?
 
     private enum Field {
@@ -709,7 +712,10 @@ struct NewProjectView: View {
             projectRoot: trimmedDirectory.isEmpty ? "…" : parentOf(trimmedDirectory),
             projectName: effectiveName.isEmpty ? "project" : effectiveName,
             agents: agents.map(\.preset.name),
-            isolateAgents: true
+            isolateAgents: true,
+            // Illustrative only — creation mints its own tag. Stable across
+            // body evaluations so the hint doesn't shimmer while typing.
+            instanceTag: previewInstanceTag
         )
         guard let first = plan.agentCheckouts.first else { return "" }
         return "\(URL(fileURLWithPath: first.path).lastPathComponent) on \(first.branch)"
@@ -1331,6 +1337,10 @@ enum ProjectCreationFlow {
         // convention — deriving the id from it would give the same project a
         // different mem-mesh identity on each machine.
         let memMeshProjectID = PeerProjectBootstrap.memMeshProjectID(for: name)
+        // One tag for the whole transaction: retrying a failed placement
+        // reuses the same paths (idempotent), while a later re-creation of
+        // the same project never adopts this run's leftovers.
+        let instanceTag = PeerProjectBootstrap.makeInstanceTag()
 
         for placement in placements {
             let placedRows = placement.agentIndices.map { rows[$0] }
@@ -1338,7 +1348,8 @@ enum ProjectCreationFlow {
                 projectRoot: (placement.projectPath as NSString).deletingLastPathComponent,
                 projectName: (placement.projectPath as NSString).lastPathComponent,
                 agents: placedRows.map(\.preset.name),
-                isolateAgents: source.isolateAgents
+                isolateAgents: source.isolateAgents,
+                instanceTag: instanceTag
             )
             let kind: ProjectSourceKind = placement.isSource
                 ? source.kind

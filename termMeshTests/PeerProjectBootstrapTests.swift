@@ -255,6 +255,80 @@ final class PeerProjectBootstrapTests: XCTestCase {
         )
     }
 
+    func test_instance_tag_makes_each_creations_checkouts_unique() {
+        let plan = PeerProjectBootstrap.plan(
+            projectRoot: "/app/p",
+            projectName: "x",
+            agents: ["executor", "executor"],
+            isolateAgents: true,
+            instanceTag: "260728-a3f2"
+        )
+
+        XCTAssertEqual(
+            plan.agentCheckouts.map(\.path),
+            ["/app/p/x-executor-260728-a3f2", "/app/p/x-executor-2-260728-a3f2"]
+        )
+        XCTAssertEqual(
+            plan.agentCheckouts.map(\.branch),
+            ["agent/executor-260728-a3f2", "agent/executor-2-260728-a3f2"]
+        )
+        // The primary is the project itself — instance tags are for the
+        // temporary stations only.
+        XCTAssertEqual(plan.primaryPath, "/app/p/x")
+    }
+
+    func test_instance_tag_format_is_date_dash_hex() {
+        let tag = PeerProjectBootstrap.makeInstanceTag(
+            now: Date(timeIntervalSince1970: 1_785_000_000) // 2026-07-25 UTC
+        )
+        // yyMMdd-xxxx: 6 digits, dash, 4 hex. The date half depends on the
+        // machine's zone, so assert shape rather than the exact day.
+        XCTAssertEqual(tag.count, 11)
+        let parts = tag.split(separator: "-")
+        XCTAssertEqual(parts.count, 2)
+        XCTAssertTrue(parts[0].allSatisfy(\.isNumber))
+        XCTAssertTrue(parts[1].allSatisfy { $0.isHexDigit && ($0.isNumber || $0.isLowercase) })
+    }
+
+    func test_bootstrap_prunes_stale_worktree_registrations_when_isolating() throws {
+        let isolated = PeerProjectBootstrap.plan(
+            projectRoot: "/app/p", projectName: "x", agents: ["a"],
+            isolateAgents: true, instanceTag: "260728-ffff"
+        )
+        let text = try XCTUnwrap(PeerProjectBootstrap.script(for: isolated, gitURL: "u"))
+        let prune = try XCTUnwrap(text.range(of: "git -C '/app/p/x' worktree prune"))
+        let add = try XCTUnwrap(text.range(of: "worktree add"))
+        XCTAssertLessThan(prune.lowerBound, add.lowerBound, "reclaim before adding more")
+
+        // A shared plan has no worktrees to prune.
+        let shared = PeerProjectBootstrap.plan(
+            projectRoot: "/app/p", projectName: "x", agents: ["a"], isolateAgents: false
+        )
+        let sharedText = PeerProjectBootstrap.script(for: shared, gitURL: "u")
+        XCTAssertFalse(sharedText?.contains("worktree prune") ?? false)
+    }
+
+    func test_reap_script_only_deletes_a_clean_linked_worktree() throws {
+        let script = try PeerProjectBootstrap.reapWorktreeScript(
+            path: "/app/p/x-executor-260728-a3f2"
+        )
+        // Structural guards, in the script itself: linked worktree only
+        // (git-dir differs from git-common-dir; a primary checkout fails
+        // this), and clean only (porcelain empty).
+        XCTAssertTrue(script.contains("--absolute-git-dir"))
+        XCTAssertTrue(script.contains("--git-common-dir"))
+        XCTAssertTrue(script.contains(#"[ "$GD" != "$CD" ]"#))
+        XCTAssertTrue(script.contains("status --porcelain"))
+        XCTAssertTrue(script.contains("worktree prune"))
+        XCTAssertTrue(script.contains("rm -rf -- \"$WT\""))
+    }
+
+    func test_reap_script_refuses_unsafe_paths() {
+        XCTAssertThrowsError(try PeerProjectBootstrap.reapWorktreeScript(path: "/"))
+        XCTAssertThrowsError(try PeerProjectBootstrap.reapWorktreeScript(path: "relative/path"))
+        XCTAssertThrowsError(try PeerProjectBootstrap.reapWorktreeScript(path: "/app"))
+    }
+
     func test_existing_shared_folder_is_validated_without_modifying_it() {
         let plan = PeerProjectBootstrap.plan(
             projectRoot: "/app/p", projectName: "x", agents: ["a"], isolateAgents: false

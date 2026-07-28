@@ -2183,7 +2183,7 @@ final class TeamOrchestrator: ObservableObject {
             // machine, and the only way to reach it is through the pane — so
             // the pane has to outlive the interrupt. `releaseRemoteAgent`
             // closes it once that is done.
-            releaseRemoteAgent(agent, closing: workspace)
+            releaseRemoteAgent(agent, closing: workspace, teamName: teamName)
         } else if let workspace, let pid = agent.panelId {
             _ = workspace.closePanel(pid, force: force)
         }

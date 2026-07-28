@@ -184,15 +184,42 @@ enum PeerProjectBootstrap {
         return result
     }
 
+    /// A per-creation suffix for agent checkouts: the date it happened and
+    /// enough randomness to never repeat.
+    ///
+    /// Without it, every run of the same project names the same directories
+    /// (`demo-executor`), and the idempotent bootstrap script happily adopts
+    /// whatever already sits at that path — a previous run's leftovers, or an
+    /// unrelated folder that merely has a `.git`. A checkout is an agent
+    /// instance's temporary station, so its name carries the instance, not
+    /// just the role. One tag per creation transaction, shared by every
+    /// machine in it: retries of the same plan stay idempotent, distinct
+    /// creations never collide.
+    static func makeInstanceTag(now: Date = Date()) -> String {
+        let formatter = DateFormatter()
+        formatter.dateFormat = "yyMMdd"
+        formatter.timeZone = TimeZone.current
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        let random = (0..<4).map { _ in
+            "0123456789abcdef".randomElement().map(String.init) ?? "0"
+        }.joined()
+        return "\(formatter.string(from: now))-\(random)"
+    }
+
     /// Where everything goes, without touching the machine.
     ///
     /// Separated from doing it so the paths can be shown before anything is
     /// created, and asserted in a test without an ssh connection.
+    ///
+    /// `instanceTag` (see `makeInstanceTag`) suffixes every agent checkout
+    /// and branch. nil keeps the legacy role-only names — for previews and
+    /// tests; real creations should always pass one.
     static func plan(
         projectRoot: String,
         projectName: String,
         agents: [String],
-        isolateAgents: Bool
+        isolateAgents: Bool,
+        instanceTag: String? = nil
     ) -> Plan {
         let root = (projectRoot as NSString).standardizingPath
         let primary = (root as NSString).appendingPathComponent(projectName)
@@ -210,7 +237,10 @@ enum PeerProjectBootstrap {
             agentCheckouts: agents.map { agent in
                 let count = (occurrences[agent] ?? 0) + 1
                 occurrences[agent] = count
-                let suffix = count == 1 ? agent : "\(agent)-\(count)"
+                var suffix = count == 1 ? agent : "\(agent)-\(count)"
+                if let instanceTag, !instanceTag.isEmpty {
+                    suffix = "\(suffix)-\(instanceTag)"
+                }
                 return (
                     agent: agent,
                     path: (root as NSString).appendingPathComponent("\(projectName)-\(suffix)"),
@@ -276,6 +306,14 @@ enum PeerProjectBootstrap {
                         + "-print -quit)\" && git -C \(primary) init))"
                 )
             }
+        }
+        if plan.agentCheckouts.contains(where: { $0.path != plan.primaryPath }) {
+            // Hygiene before adding more: reclaim the registrations of agent
+            // worktrees whose directories are already gone (reaped on agent
+            // detach, or deleted by hand). Without it they accumulate in
+            // `.git/worktrees` forever — each creation makes new ones now
+            // that checkout names carry an instance tag.
+            steps.append("git -C \(primary) worktree prune 2>/dev/null || true")
         }
         for checkout in plan.agentCheckouts where checkout.path != plan.primaryPath {
             let path = quote(checkout.path)
@@ -518,21 +556,72 @@ enum PeerProjectBootstrap {
     /// at least two components below `/` (`/tmp/project`, `/app/projects`, …);
     /// broad roots and relative paths never reach `rm`.
     static func deletionScript(paths: [String]) throws -> String {
-        let safePaths = try Array(Set(paths)).sorted().map { path -> String in
-            let trimmed = path.trimmingCharacters(in: .whitespacesAndNewlines)
-            let standardized = (trimmed as NSString).standardizingPath
-            let components = standardized.split(separator: "/")
-            guard trimmed.hasPrefix("/"),
-                  standardized.hasPrefix("/"),
-                  standardized != "/",
-                  components.count >= 2
-            else {
-                throw DeletionError.unsafePath(path)
-            }
-            return standardized
-        }
+        let safePaths = try Array(Set(paths)).sorted().map(validatedDeletablePath)
         guard !safePaths.isEmpty else { throw DeletionError.unsafePath("") }
         return "rm -rf -- " + safePaths.map(quote).joined(separator: " ")
+    }
+
+    private static func validatedDeletablePath(_ path: String) throws -> String {
+        let trimmed = path.trimmingCharacters(in: .whitespacesAndNewlines)
+        let standardized = (trimmed as NSString).standardizingPath
+        let components = standardized.split(separator: "/")
+        guard trimmed.hasPrefix("/"),
+              standardized.hasPrefix("/"),
+              standardized != "/",
+              components.count >= 2
+        else {
+            throw DeletionError.unsafePath(path)
+        }
+        return standardized
+    }
+
+    /// Remove a detached agent's checkout, but only when git itself proves
+    /// it is disposable.
+    ///
+    /// An instance-tagged checkout has exactly one occupant, ever — nothing
+    /// will come back for it — so leaving it behind on detach turns every
+    /// removed agent into garbage on someone else's disk. The guards are
+    /// structural rather than bookkept: the directory must be a LINKED
+    /// worktree (`--git-dir` differs from `--git-common-dir`; a primary
+    /// checkout fails this and is never touched), and `status --porcelain`
+    /// must be empty (uncommitted work keeps the directory, with committed
+    /// work already safe in the `agent/…` branch either way). Anything the
+    /// probes cannot prove — not a repo, git too old, permissions — is left
+    /// alone; a false "keep" costs a directory, a false "reap" costs work.
+    static func reapWorktreeScript(path: String) throws -> String {
+        let safe = quote(try validatedDeletablePath(path))
+        return """
+        WT=\(safe)
+        if [ -e "$WT/.git" ]; then
+          GD=$(git -C "$WT" rev-parse --absolute-git-dir 2>/dev/null)
+          CD=$(git -C "$WT" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)
+          if [ -n "$GD" ] && [ -n "$CD" ] && [ "$GD" != "$CD" ] \
+             && [ -z "$(git -C "$WT" status --porcelain 2>/dev/null)" ]; then
+            rm -rf -- "$WT" && git --git-dir "$CD" worktree prune 2>/dev/null || true
+          fi
+        fi
+        """
+    }
+
+    /// `reapWorktreeScript` over ssh, as a best effort: the agent is already
+    /// gone either way, and a machine that cannot be reached right now keeps
+    /// the directory until the next creation's `worktree prune` or the
+    /// project's deletion.
+    static func reapWorktree(
+        sshTarget: String,
+        port: Int?,
+        identityFile: String?,
+        path: String,
+        timeoutSeconds: TimeInterval = 60
+    ) async {
+        guard let script = try? reapWorktreeScript(path: path) else { return }
+        _ = try? await PeerHostReadinessChecker.runScript(
+            sshTarget: sshTarget,
+            port: port,
+            identityFile: identityFile,
+            script: script,
+            timeoutSeconds: timeoutSeconds
+        )
     }
 
     private static func quote(_ value: String) -> String {
