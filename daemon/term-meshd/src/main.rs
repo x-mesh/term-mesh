@@ -16,6 +16,7 @@ mod paste_cleanup;
 mod peer;
 mod socket;
 mod supervisor;
+mod task_diff;
 #[allow(dead_code)]
 mod sync;
 mod tokens;
@@ -382,6 +383,7 @@ async fn main() -> anyhow::Result<()> {
                     shutdown_rx.clone(),
                     monitor_rx.clone(),
                     headless_manager.clone(),
+                    agent_manager.clone(),
                 ))
             });
     if peer_task.is_some() {

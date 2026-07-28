@@ -2350,6 +2350,16 @@ extension ReviewBoardCoordinatorService {
                     : "This task is \(detail.status ?? "not ready") rather than review_ready."
             )
         }
+        // Work that ran on another machine cannot be read with local git —
+        // the worktree path names a directory on that machine. Ask the host
+        // that has it. It resolves the path from its own task board; this side
+        // sends a task id and nothing else, which is what let the method onto
+        // the peer allow-list at all.
+        if let hostID = detail.hostID,
+           let host = hostsByCoordinatorID()[hostID],
+           !host.activeSockPath.isEmpty {
+            return await peerReview(task: task, detail: detail, host: host)
+        }
         // The attempt's own worktree first: it is the one the coordinator
         // placed. The team-board row is the fallback for work the board knows
         // about by the other route.
@@ -2378,6 +2388,51 @@ extension ReviewBoardCoordinatorService {
                 taskID: task.rawID, detail: detail, patch: nil,
                 blocker: "Could not read the worktree: \(error.localizedDescription)"
             )
+        }
+    }
+
+    /// Read the patch off the machine that did the work.
+    ///
+    /// The peer answers with the same three things local git produces — heads,
+    /// a stat and a patch — because the approval that follows cites a digest,
+    /// and a digest computed over a differently-shaped patch would never match
+    /// what the coordinator recorded.
+    private func peerReview(
+        task: ReviewBoardTask,
+        detail: ReviewBoardReviewDetail,
+        host: HostEntry
+    ) async -> ReviewBoardReview {
+        func blocked(_ reason: String) -> ReviewBoardReview {
+            ReviewBoardReview(taskID: task.rawID, detail: detail, patch: nil, blocker: reason)
+        }
+        guard let data = try? JSONSerialization.data(withJSONObject: ["task_id": task.rawID]),
+              let paramsJSON = String(data: data, encoding: .utf8) else {
+            return blocked("Could not ask \(host.displayName) for the change.")
+        }
+        do {
+            let conn = try await PeerRelaySession.connect(hostSockPath: host.activeSockPath)
+            defer { Task { await conn.cancel() } }
+            let response = try await conn.session.callTeam(
+                method: "team.task.diff", paramsJSON: paramsJSON
+            )
+            guard response.ok else {
+                // The host's own wording. `no_worktree` and `git_error` are
+                // different problems and only it knows which happened.
+                return blocked(
+                    "\(host.displayName) could not read the change: \(response.errorMessage)"
+                )
+            }
+            guard let patch = ReviewBoardEvidence.Patch(peerResponse: response.resultJson) else {
+                return blocked("\(host.displayName) answered with something unreadable.")
+            }
+            return ReviewBoardReview(
+                taskID: task.rawID, detail: detail, patch: patch,
+                blocker: patch.isEmpty
+                    ? "The worktree on \(host.displayName) has no changes against its parent."
+                    : nil
+            )
+        } catch {
+            return blocked("\(host.displayName): \(error.localizedDescription)")
         }
     }
 

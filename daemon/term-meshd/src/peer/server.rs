@@ -80,6 +80,7 @@ pub async fn serve(
     shutdown_rx: watch::Receiver<bool>,
     monitor_rx: watch::Receiver<Option<crate::monitor::SystemSnapshot>>,
     teams: Arc<tokio::sync::Mutex<crate::headless::HeadlessManager>>,
+    agents: Arc<crate::agent::AgentSessionManager>,
 ) -> anyhow::Result<()> {
     let manager = Arc::new(PtyManager::new());
     manager.spawn_from_config();
@@ -103,6 +104,10 @@ pub async fn serve(
     // Only the daemon has agent teams; without this the host answers no
     // ListTeams and never advertises team.roster.v1.
     host.set_teams(teams);
+    // And the task board, which is what `team.task.diff` reads a worktree path
+    // out of. Wired here for the same reason as the manager above: only the
+    // daemon has one, and a host without it says so rather than guessing.
+    host.set_agents(agents);
     serve_with_host(path, shutdown_rx, host).await
 }
 

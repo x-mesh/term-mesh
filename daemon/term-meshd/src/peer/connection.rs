@@ -342,7 +342,12 @@ async fn reader_loop(
                         ),
                     }
                 } else if let Some(manager) = host.team_manager() {
-                    run_headless_team_call(&manager, &request.method, &request.params_json)
+                    run_headless_team_call(
+                        &manager,
+                        host.agent_store().as_ref(),
+                        &request.method,
+                        &request.params_json,
+                    )
                         .await
                 } else {
                     TeamCallResponse {
@@ -1264,6 +1269,7 @@ pub(crate) fn team_call_allowed(method: &str) -> bool {
 /// many reads) and is honestly reported as unsupported here rather than faked.
 async fn run_headless_team_call(
     manager: &Arc<tokio::sync::Mutex<crate::headless::HeadlessManager>>,
+    agents: Option<&Arc<crate::agent::AgentSessionManager>>,
     method: &str,
     params_json: &str,
 ) -> TeamCallResponse {
@@ -1348,6 +1354,41 @@ async fn run_headless_team_call(
                     Err(e) => err("host_error", e.to_string()),
                 },
                 Err(e) => err("host_error", e),
+            }
+        }
+        // The one method that reads a repository. What makes it safe is what
+        // it does NOT accept: the caller names a task, and this host resolves
+        // the directory from its own board. A path parameter would let a peer
+        // read any repository on this machine; an argument parameter would let
+        // it run git with flags that write.
+        "team.task.diff" => {
+            let Some(task_id) = params.get("task_id").and_then(|v| v.as_str()) else {
+                return err("invalid_params", "team.task.diff needs task_id".into());
+            };
+            let Some(agents) = agents else {
+                return err(
+                    "unsupported_on_host",
+                    "this host has no task board to read a worktree from".into(),
+                );
+            };
+            let task = match agents.task_get(task_id) {
+                Ok(task) => task,
+                Err(e) => return err("host_error", e),
+            };
+            match crate::task_diff::read(
+                task.worktree_path.as_deref(),
+                task.worktree_parent.as_deref(),
+            )
+            .await
+            {
+                Ok(diff) => match serde_json::to_value(diff) {
+                    Ok(value) => ok(value),
+                    Err(e) => err("host_error", e.to_string()),
+                },
+                // A task with no worktree, or one whose worktree is gone, is an
+                // error with a reason — never an empty success that a caller
+                // would read as "nothing changed" and approve.
+                Err(e) => err(e.code(), e.message()),
             }
         }
         // Allowed in the shared vocabulary, but not a single daemon op — the
@@ -3081,5 +3122,112 @@ mod team_call_allow_list_tests {
             assert!(!team_call_allowed(method), "{method} must stay out");
         }
         assert!(team_call_allowed("team.task.diff"));
+    }
+}
+
+/// `team.task.diff` as a peer actually reaches it.
+///
+/// The module-level tests below the allow-list prove the method is *callable*;
+/// these prove what it does with what a caller can control — which is only a
+/// task id, by design.
+#[cfg(test)]
+mod team_task_diff_tests {
+    use super::*;
+
+    fn manager() -> Arc<tokio::sync::Mutex<crate::headless::HeadlessManager>> {
+        Arc::new(tokio::sync::Mutex::new(
+            crate::headless::HeadlessManager::new(),
+        ))
+    }
+
+    fn board() -> Arc<crate::agent::AgentSessionManager> {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.keep().join("agents.db");
+        Arc::new(crate::agent::AgentSessionManager::new(path).expect("agent db"))
+    }
+
+    #[tokio::test]
+    async fn it_needs_a_task_id_and_nothing_else_is_accepted() {
+        let board = board();
+        // A path is not a parameter. Passing one must not make it a parameter:
+        // the call still fails for the missing task id rather than reading the
+        // directory the caller named.
+        let response = run_headless_team_call(
+            &manager(),
+            Some(&board),
+            "team.task.diff",
+            r#"{"team_name":"ws","worktree_path":"/etc"}"#,
+        )
+        .await;
+        assert!(!response.ok);
+        assert_eq!(response.error_code, "invalid_params");
+        assert!(
+            response.error_message.contains("task_id"),
+            "{}",
+            response.error_message
+        );
+    }
+
+    #[tokio::test]
+    async fn a_host_with_no_task_board_says_so_rather_than_guessing_a_directory() {
+        let response = run_headless_team_call(
+            &manager(),
+            None,
+            "team.task.diff",
+            r#"{"task_id":"tsk_1"}"#,
+        )
+        .await;
+        assert!(!response.ok);
+        assert_eq!(response.error_code, "unsupported_on_host");
+    }
+
+    #[tokio::test]
+    async fn a_task_this_host_does_not_have_is_an_error_not_an_empty_diff() {
+        let board = board();
+        let response = run_headless_team_call(
+            &manager(),
+            Some(&board),
+            "team.task.diff",
+            r#"{"task_id":"tsk_nobody"}"#,
+        )
+        .await;
+        assert!(!response.ok, "result was {}", response.result_json);
+        assert_eq!(response.error_code, "host_error");
+        assert!(response.result_json.is_empty());
+    }
+
+    /// A task the board has but that never got a worktree. The failure has to
+    /// carry a reason: an empty success here would read to the review board as
+    /// "nothing changed", which is an approvable state.
+    #[tokio::test]
+    async fn a_task_with_no_worktree_reports_why() {
+        let board = board();
+        let task = board
+            .task_create(crate::agent::TaskCreateParams {
+                title: "no worktree".into(),
+                description: None,
+                priority: None,
+                created_by: None,
+                deps: None,
+                fix_budget: None,
+                worktree_policy: None,
+            })
+            .expect("task");
+
+        let response = run_headless_team_call(
+            &manager(),
+            Some(&board),
+            "team.task.diff",
+            &format!(r#"{{"task_id":"{}"}}"#, task.id),
+        )
+        .await;
+
+        assert!(!response.ok);
+        assert_eq!(response.error_code, "no_worktree");
+        assert!(
+            response.error_message.contains("no worktree recorded"),
+            "{}",
+            response.error_message
+        );
     }
 }

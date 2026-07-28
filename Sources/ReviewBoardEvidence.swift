@@ -52,6 +52,51 @@ enum ReviewBoardEvidence {
         let files: [FileSummary]
 
         var isEmpty: Bool { files.isEmpty }
+
+        init(
+            baseSHA: String,
+            headSHA: String,
+            digest: String,
+            text: String,
+            isTruncated: Bool,
+            files: [FileSummary]
+        ) {
+            self.baseSHA = baseSHA
+            self.headSHA = headSHA
+            self.digest = digest
+            self.text = text
+            self.isTruncated = isTruncated
+            self.files = files
+        }
+
+        /// The same patch, read off a peer that did the work.
+        ///
+        /// Only the machine holding the worktree can compute the digest, so it
+        /// sends one — over the untruncated bytes, which is exactly what the
+        /// local path digests too. Everything else is the raw `--numstat` and
+        /// `--name-status` output, run through the same parser, so a peer
+        /// review and a local one produce the identical shape. Anything less
+        /// would give the coordinator a digest it could never match.
+        init?(peerResponse json: String) {
+            guard let data = json.data(using: .utf8),
+                  let object = try? JSONSerialization.jsonObject(with: data)
+                    as? [String: Any],
+                  let headSHA = object["head_sha"] as? String,
+                  let baseSHA = object["base_sha"] as? String,
+                  let digest = object["diff_digest"] as? String,
+                  !headSHA.isEmpty, !baseSHA.isEmpty, digest.hasPrefix("sha256:") else {
+                return nil
+            }
+            self.headSHA = headSHA
+            self.baseSHA = baseSHA
+            self.digest = digest
+            text = object["patch"] as? String ?? ""
+            isTruncated = object["truncated"] as? Bool ?? false
+            files = ReviewBoardEvidence.summarize(
+                numstat: object["numstat"] as? String ?? "",
+                nameStatus: object["name_status"] as? String ?? ""
+            )
+        }
     }
 
     /// Beyond this the patch is shown as an excerpt. A review pane that tries

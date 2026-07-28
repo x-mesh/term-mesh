@@ -972,6 +972,14 @@ pub struct PeerHost {
     /// a client sees from a daemon too old to answer `ListTeams` — so the
     /// capability is advertised only when this is set.
     teams: Mutex<Option<Arc<tokio::sync::Mutex<crate::headless::HeadlessManager>>>>,
+    /// The daemon's task board, when one was wired in.
+    ///
+    /// Separate from `teams` because they answer different questions: the team
+    /// manager knows about running agents, the task board knows where a task
+    /// did its work. `team.task.diff` needs the second and nothing else, and a
+    /// host without a board answers that method honestly rather than guessing
+    /// at a directory.
+    agents: Mutex<Option<Arc<crate::agent::AgentSessionManager>>>,
 }
 
 /// Debounce window for layout pushes. Mirrors the Swift host's 120 ms
@@ -1083,6 +1091,7 @@ impl PeerHost {
             surface_lifecycle: Mutex::new(HashMap::new()),
             monitor: Mutex::new(None),
             teams: Mutex::new(None),
+            agents: Mutex::new(None),
         }
     }
 
@@ -1132,6 +1141,15 @@ impl PeerHost {
         &self,
     ) -> Option<Arc<tokio::sync::Mutex<crate::headless::HeadlessManager>>> {
         self.teams.lock().unwrap().clone()
+    }
+
+    pub fn set_agents(&self, agents: Arc<crate::agent::AgentSessionManager>) {
+        *self.agents.lock().unwrap() = Some(agents);
+    }
+
+    /// The task board, if one was wired in.
+    pub fn agent_store(&self) -> Option<Arc<crate::agent::AgentSessionManager>> {
+        self.agents.lock().unwrap().clone()
     }
 
     /// A receiver for the live system stats, if a monitor was wired in.

@@ -222,4 +222,68 @@ final class ReviewBoardEvidenceTests: XCTestCase {
         process.waitUntilExit()
         return data
     }
+
+    // MARK: - A patch read off a peer
+
+    /// The peer sends the digest because only the machine holding the worktree
+    /// has the untruncated bytes to compute it over. Everything else is raw
+    /// git output run through the same parser the local path uses, so both
+    /// produce the identical shape — a differently-shaped peer patch would
+    /// give the coordinator a digest it could never match.
+    func testAPeerPayloadDecodesToTheSameShapeALocalReadProduces() throws {
+        // Built rather than pasted: git's numstat and name-status are
+        // tab-separated, and a literal tab inside a JSON string is not JSON.
+        let payload: [String: Any] = [
+            "head_sha": "bbbb2222", "base_sha": "aaaa1111", "branch": "feat/thing",
+            "diff_digest": "sha256:cafebabe",
+            "numstat": ["3\t1\tSources/a.swift", "0\t9\tdocs/old.md"].joined(separator: "\n"),
+            "name_status": ["M\tSources/a.swift", "D\tdocs/old.md"].joined(separator: "\n"),
+            "patch": "diff --git a/Sources/a.swift b/Sources/a.swift\n",
+            "truncated": false,
+        ]
+        let json = String(
+            data: try JSONSerialization.data(withJSONObject: payload), encoding: .utf8
+        )!
+        let patch = try XCTUnwrap(ReviewBoardEvidence.Patch(peerResponse: json))
+
+        XCTAssertEqual(patch.headSHA, "bbbb2222")
+        XCTAssertEqual(patch.baseSHA, "aaaa1111")
+        XCTAssertEqual(patch.digest, "sha256:cafebabe")
+        XCTAssertFalse(patch.isTruncated)
+        XCTAssertFalse(patch.isEmpty)
+        XCTAssertEqual(patch.files.map(\.path), ["Sources/a.swift", "docs/old.md"])
+        XCTAssertEqual(patch.files.map(\.kind), ["modified", "deleted"])
+        XCTAssertEqual(patch.files.map(\.add), [3, 0])
+        XCTAssertEqual(patch.files.map(\.del), [1, 9])
+    }
+
+    /// A truncated patch has to say so. The digest still covers everything,
+    /// which is the only reason showing an excerpt is safe.
+    func testATruncatedPeerPatchKeepsTheDigestOverTheWhole() throws {
+        let json = #"{"head_sha":"b","base_sha":"a","diff_digest":"sha256:ff","patch":"...","truncated":true}"#
+        let patch = try XCTUnwrap(ReviewBoardEvidence.Patch(peerResponse: json))
+        XCTAssertTrue(patch.isTruncated)
+        XCTAssertEqual(patch.digest, "sha256:ff")
+        XCTAssertTrue(patch.isEmpty, "no numstat means no files, which reads as nothing to review")
+    }
+
+    /// A payload without a usable digest is refused rather than decoded into a
+    /// patch that would be approved against nothing.
+    func testAPayloadMissingWhatAnApprovalCitesIsRejected() {
+        let cases = [
+            #"{"base_sha":"a","diff_digest":"sha256:ff"}"#,
+            #"{"head_sha":"b","diff_digest":"sha256:ff"}"#,
+            #"{"head_sha":"b","base_sha":"a"}"#,
+            #"{"head_sha":"","base_sha":"a","diff_digest":"sha256:ff"}"#,
+            // An unprefixed digest is not the algorithm the coordinator compares.
+            #"{"head_sha":"b","base_sha":"a","diff_digest":"ff"}"#,
+            "not json at all",
+        ]
+        for json in cases {
+            XCTAssertNil(
+                ReviewBoardEvidence.Patch(peerResponse: json),
+                "must not decode: \(json)"
+            )
+        }
+    }
 }
