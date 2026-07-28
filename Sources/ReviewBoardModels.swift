@@ -3,6 +3,7 @@ import SwiftUI
 
 enum ReviewBoardSettings {
     static let enabledKey = "reviewBoard.enabled"
+    static let defaultEnabled = true
     static let widthKey = "reviewBoard.width"
     static let isClosedKey = "reviewBoard.isClosed"
     static let selectedTaskIDKey = "reviewBoard.selectedTaskID"
@@ -19,7 +20,14 @@ enum ReviewBoardSettings {
     /// One place decides now, and it writes both.
     static var isVisible: Bool {
         let defaults = UserDefaults.standard
-        return defaults.bool(forKey: enabledKey) && !defaults.bool(forKey: isClosedKey)
+        return isEnabled(defaults: defaults) && !defaults.bool(forKey: isClosedKey)
+    }
+
+    static func isEnabled(defaults: UserDefaults = .standard) -> Bool {
+        guard defaults.object(forKey: enabledKey) != nil else {
+            return defaultEnabled
+        }
+        return defaults.bool(forKey: enabledKey)
     }
 
     static func setVisible(_ visible: Bool) {

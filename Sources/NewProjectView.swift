@@ -81,6 +81,12 @@ struct NewProjectView: View {
     /// Where the project comes from. A folder that is already there, or a
     /// repository to clone onto that machine.
     @State private var gitURL: String = ""
+    @State private var gitBranch: String = ""
+    @State private var repositoryBranches: [String] = []
+    @State private var defaultRepositoryBranch: String?
+    @State private var isLoadingRepositoryBranches = false
+    @State private var repositoryBranchError: String?
+    @State private var branchEdited = false
     @State private var repositoryURLSuggestions: [String] = []
     @State private var isLoadingRepositorySuggestions = false
     @State private var showsTeamEditor = false
@@ -89,6 +95,7 @@ struct NewProjectView: View {
 
     private enum Field {
         case repositoryURL
+        case repositoryBranch
         case name
         case directory
     }
@@ -107,12 +114,13 @@ struct NewProjectView: View {
     /// hand. It stays on the menu for anyone who wants it and it is not what
     /// starting a project means.
     @State private var leaderCli = "claude"
-    @State private var leaderModel = AgentRolePreset.defaultModel(for: "claude")
+    @State private var leaderModel = "opus"
     @State private var selectedTeamPresetId: TemplateID?
     @State private var appliedTeamSignature: TeamSignature?
     @State private var showingSavePreset = false
     @State private var showingManagePresets = false
     @State private var savePresetName = ""
+    @State private var presetSaveConfirmation: String?
     @State private var presetError: String?
     @State private var creationError: String?
     @State private var showsCreationProgress = false
@@ -185,13 +193,13 @@ struct NewProjectView: View {
                         teamSummaryRow
                         if showsTeamEditor {
                             teamPresetRow
-                            leaderRow
-                            agentPlacementRow
+                            teamRuntimeRow
                             TeamAgentComposer(
                                 agents: $agents,
                                 workingDirectory: trimmedDirectory,
                                 onComposionChanged: {},
                                 defaultModel: AgentRolePreset.defaultModel(for: "claude"),
+                                usesCompactRows: true,
                                 supportsDefaultPlacement: true,
                                 defaultHostKey: defaultAgentHostKey,
                                 defaultHostDirectory: defaultAgentHostDirectory,
@@ -234,6 +242,9 @@ struct NewProjectView: View {
             guard !Task.isCancelled else { return }
             repositoryURLSuggestions = suggestions
             isLoadingRepositorySuggestions = false
+        }
+        .task(id: branchLookupID) {
+            await loadRepositoryBranches()
         }
         .onChange(of: agents.map(\.id)) { _, _ in
             adoptProjectMachineForNewRows()
@@ -459,25 +470,51 @@ struct NewProjectView: View {
                     .accessibilityIdentifier("newProject.teamPreset")
 
                     if isTeamCustomized {
-                        Button("Save as…") {
-                            savePresetName = suggestedPresetName
-                            showingSavePreset = true
+                        if selectedTeamPresetIsCustom {
+                            Button("Save changes") {
+                                saveChangesToSelectedPreset()
+                            }
+                            .buttonStyle(.borderedProminent)
+                            .controlSize(.small)
+                            .accessibilityIdentifier("newProject.savePresetChanges")
+                        } else {
+                            Button("Save as new…") {
+                                presentSavePresetSheet()
+                            }
+                            .accessibilityIdentifier("newProject.savePresetAsNew")
                         }
+
+                        Label("Unsaved", systemImage: "circle.fill")
+                            .font(.caption)
+                            .foregroundStyle(.orange)
+                            .labelStyle(.titleAndIcon)
+                    } else if let presetSaveConfirmation {
+                        Label(presetSaveConfirmation, systemImage: "checkmark.circle.fill")
+                            .font(.caption)
+                            .foregroundStyle(.green)
                     }
 
-                    Button {
-                        toggleSelectedPresetPin()
+                    Menu {
+                        Button("Save as new…") {
+                            presentSavePresetSheet()
+                        }
+                        Button("Revert changes") {
+                            revertCurrentTeamChanges()
+                        }
+                        .disabled(!isTeamCustomized)
+                        Divider()
+                        Button(selectedPresetIsPinned ? "Unpin preset" : "Use as default") {
+                            toggleSelectedPresetPin()
+                        }
+                        .disabled(selectedTeamPresetId == nil)
+                        Button("Manage presets…") {
+                            showingManagePresets = true
+                        }
                     } label: {
-                        Image(systemName: selectedPresetIsPinned ? "pin.fill" : "pin")
+                        Image(systemName: "ellipsis")
                     }
                     .buttonStyle(.borderless)
-                    .disabled(selectedTeamPresetId == nil)
-                    .help(selectedPresetIsPinned ? "Unpin this preset" : "Use this preset by default")
-
-                    Button("Manage…") {
-                        showingManagePresets = true
-                    }
-                    .buttonStyle(.borderless)
+                    .help("More preset actions")
                 }
             }
         }
@@ -545,9 +582,16 @@ struct NewProjectView: View {
     }
 
     private var teamPresetDisplayName: String {
-        if isTeamCustomized { return "Customized" }
-        guard let selectedTeamPresetId else { return "Default · 1 Executor" }
-        return teamTemplateManager.template(for: selectedTeamPresetId)?.name ?? "Customized"
+        if let selectedTeamPresetId,
+           let name = teamTemplateManager.template(for: selectedTeamPresetId)?.name {
+            return name
+        }
+        return isTeamCustomized ? "Customized" : "Default · 1 Executor"
+    }
+
+    private var selectedTeamPresetIsCustom: Bool {
+        guard let selectedTeamPresetId else { return false }
+        return teamTemplateManager.template(for: selectedTeamPresetId)?.origin == .custom
     }
 
     private var suggestedPresetName: String {
@@ -562,114 +606,118 @@ struct NewProjectView: View {
         selectedTeamPresetId != nil && selectedTeamPresetId == teamTemplateManager.pinnedId
     }
 
-    private var agentPlacementRow: some View {
-        Grid(alignment: .leading, horizontalSpacing: 12, verticalSpacing: 6) {
-            GridRow {
-                Text("Agent placement")
+    /// Leader and member placement are one runtime decision. Keeping them in a
+    /// single row makes the relationship explicit and puts placement beside
+    /// the agent list it controls instead of leaving it as a detached form
+    /// section.
+    private var teamRuntimeRow: some View {
+        VStack(alignment: .leading, spacing: 5) {
+            HStack(spacing: 8) {
+                Text("Leader")
                     .font(.subheadline.bold())
-                HStack(spacing: 8) {
-                    Picker("", selection: Binding(
-                        get: { agentPlacementMode },
-                        set: { mode in
-                            agentPlacementMode = mode
-                            if mode == .allOnOneMachine {
-                                allAgentsHostKey = runsOnHostKey
-                            }
-                            applyAgentPlacementMode()
+                    .frame(width: 120, alignment: .leading)
+
+                Picker("", selection: Binding(
+                    get: { leaderCli },
+                    set: { newCli in
+                        let old = leaderCli
+                        leaderCli = newCli
+                        if AgentRolePreset.models(for: old) != AgentRolePreset.models(for: newCli) {
+                            leaderModel = Self.defaultLeaderModel(for: newCli)
                         }
+                    }
+                )) {
+                    ForEach(AgentRolePreset.supportedCLIs, id: \.self) { cli in
+                        Text(cli.capitalized).tag(cli)
+                    }
+                    Text("REPL (manual)").tag("repl")
+                }
+                .labelsHidden()
+                .frame(width: 118)
+
+                if leaderCli != "repl" {
+                    Picker("", selection: Binding(
+                        get: {
+                            let options = AgentRolePreset.models(for: leaderCli)
+                            let normalized = AgentRolePreset.normalizeModel(leaderModel, for: leaderCli)
+                            guard options.contains(normalized) else {
+                                let fallback = Self.defaultLeaderModel(for: leaderCli)
+                                DispatchQueue.main.async { leaderModel = fallback }
+                                return fallback
+                            }
+                            if normalized != leaderModel {
+                                DispatchQueue.main.async { leaderModel = normalized }
+                            }
+                            return normalized
+                        },
+                        set: { leaderModel = $0 }
                     )) {
-                        ForEach(AgentPlacementMode.allCases, id: \.self) { mode in
-                            Text(mode.label).tag(mode)
+                        ForEach(AgentRolePreset.models(for: leaderCli), id: \.self) { model in
+                            Text(AgentRolePreset.modelDisplayLabel(model, for: leaderCli)).tag(model)
                         }
                     }
                     .labelsHidden()
-                    .frame(width: 180)
-                    .accessibilityIdentifier("newProject.agentPlacementMode")
+                    .frame(width: 132)
+                } else {
+                    Text("Manual console")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .frame(width: 132, alignment: .leading)
+                }
 
-                    if agentPlacementMode == .allOnOneMachine {
-                        Picker("", selection: $allAgentsHostKey) {
-                            Text("This Mac").tag(String?.none)
-                            ForEach(selectablePeers, id: \.id) { host in
-                                Text(host.isConnected ? host.displayName : "\(host.displayName) — offline")
-                                    .tag(String?.some(host.id))
-                            }
+                Divider()
+                    .frame(height: 24)
+                    .padding(.horizontal, 4)
+
+                Text("Agents run")
+                    .font(.caption.bold())
+                    .foregroundStyle(.secondary)
+
+                Picker("", selection: Binding(
+                    get: { agentPlacementMode },
+                    set: { mode in
+                        agentPlacementMode = mode
+                        if mode == .allOnOneMachine {
+                            allAgentsHostKey = runsOnHostKey
                         }
-                        .labelsHidden()
-                        .frame(width: 180)
-                        .accessibilityIdentifier("newProject.allAgentsHost")
-                        .onChange(of: allAgentsHostKey) { _, hostKey in
-                            connectHostIfNeeded(hostKey)
-                            applyAgentPlacementMode()
-                        }
+                        applyAgentPlacementMode()
+                    }
+                )) {
+                    ForEach(AgentPlacementMode.allCases, id: \.self) { mode in
+                        Text(mode.label).tag(mode)
                     }
                 }
+                .labelsHidden()
+                .frame(width: 165)
+                .accessibilityIdentifier("newProject.agentPlacementMode")
+
+                if agentPlacementMode == .allOnOneMachine {
+                    Picker("", selection: $allAgentsHostKey) {
+                        Text("This Mac").tag(String?.none)
+                        ForEach(selectablePeers, id: \.id) { host in
+                            Text(host.isConnected ? host.displayName : "\(host.displayName) — offline")
+                                .tag(String?.some(host.id))
+                        }
+                    }
+                    .labelsHidden()
+                    .frame(maxWidth: 150)
+                    .accessibilityIdentifier("newProject.allAgentsHost")
+                    .onChange(of: allAgentsHostKey) { _, hostKey in
+                        connectHostIfNeeded(hostKey)
+                        applyAgentPlacementMode()
+                    }
+                }
+
+                Spacer(minLength: 0)
             }
-            GridRow {
-                Color.clear.frame(width: 120, height: 1)
+
+            HStack(spacing: 8) {
+                Color.clear.frame(width: 390, height: 1)
                 Text(agentPlacementDetail)
                     .font(.caption)
                     .foregroundStyle(.secondary)
-            }
-        }
-    }
-
-    /// A single row: who leads, and where — folded together because showing
-    /// this next to `Runs on` / `Agent = jw-server` as three separate answers
-    /// read as three different opinions about where the project lives, when
-    /// they were meant to be the same one until someone said otherwise.
-    private var leaderRow: some View {
-        Grid(alignment: .leading, horizontalSpacing: 12, verticalSpacing: 10) {
-            GridRow {
-                Text("Leader")
-                    .font(.subheadline.bold())
-                HStack(spacing: 8) {
-                    Picker("", selection: Binding(
-                        get: { leaderCli },
-                        set: { newCli in
-                            let old = leaderCli
-                            leaderCli = newCli
-                            if AgentRolePreset.models(for: old) != AgentRolePreset.models(for: newCli) {
-                                leaderModel = AgentRolePreset.defaultModel(for: newCli)
-                            }
-                        }
-                    )) {
-                        ForEach(AgentRolePreset.supportedCLIs, id: \.self) { cli in
-                            Text(cli.capitalized).tag(cli)
-                        }
-                        Text("REPL (manual)").tag("repl")
-                    }
-                    .labelsHidden()
-                    .fixedSize()
-
-                    if leaderCli != "repl" {
-                        Picker("", selection: Binding(
-                            get: {
-                                let options = AgentRolePreset.models(for: leaderCli)
-                                let normalized = AgentRolePreset.normalizeModel(leaderModel, for: leaderCli)
-                                guard options.contains(normalized) else {
-                                    let fallback = AgentRolePreset.defaultModel(for: leaderCli)
-                                    DispatchQueue.main.async { leaderModel = fallback }
-                                    return fallback
-                                }
-                                if normalized != leaderModel {
-                                    DispatchQueue.main.async { leaderModel = normalized }
-                                }
-                                return normalized
-                            },
-                            set: { leaderModel = $0 }
-                        )) {
-                            ForEach(AgentRolePreset.models(for: leaderCli), id: \.self) { m in
-                                Text(AgentRolePreset.modelDisplayLabel(m, for: leaderCli)).tag(m)
-                            }
-                        }
-                        .labelsHidden()
-                        .fixedSize()
-                    } else {
-                        Text("a console you drive by hand — no model")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                    }
-                }
+                    .lineLimit(1)
+                Spacer(minLength: 0)
             }
         }
     }
@@ -717,6 +765,72 @@ struct NewProjectView: View {
                                         .padding(.horizontal, 8)
                                         .padding(.vertical, 5)
                                 }
+                            }
+                        }
+                    }
+
+                    GridRow(alignment: .top) {
+                        Text("Branch")
+                            .padding(.top, 5)
+                        VStack(alignment: .leading, spacing: 4) {
+                            HStack(spacing: 6) {
+                                TextField(
+                                    defaultRepositoryBranch ?? "Default branch",
+                                    text: Binding(
+                                        get: { gitBranch },
+                                        set: {
+                                            gitBranch = RepositoryBranchLookup.singleLine($0)
+                                            branchEdited = true
+                                        }
+                                    )
+                                )
+                                .textFieldStyle(.roundedBorder)
+                                .lineLimit(1)
+                                .focused($focusedField, equals: .repositoryBranch)
+                                .accessibilityLabel("Repository branch")
+
+                                Menu {
+                                    ForEach(repositoryBranches, id: \.self) { branch in
+                                        Button {
+                                            selectRepositoryBranch(branch)
+                                        } label: {
+                                            if branch == gitBranch {
+                                                Label(branch, systemImage: "checkmark")
+                                            } else {
+                                                Text(branch)
+                                            }
+                                        }
+                                    }
+                                } label: {
+                                    Image(systemName: "chevron.up.chevron.down")
+                                        .frame(width: 18, height: 18)
+                                }
+                                .menuStyle(.borderlessButton)
+                                .fixedSize()
+                                .disabled(repositoryBranches.isEmpty)
+                                .accessibilityLabel("Choose repository branch")
+                            }
+
+                            if isLoadingRepositoryBranches {
+                                HStack(spacing: 6) {
+                                    ProgressView()
+                                        .controlSize(.small)
+                                    Text("Loading branches…")
+                                }
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                            } else if focusedField == .repositoryBranch,
+                                      !matchingRepositoryBranches.isEmpty {
+                                repositoryBranchSuggestionList
+                            } else if let repositoryBranchError {
+                                Text(repositoryBranchError)
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            } else if let defaultRepositoryBranch,
+                                      !repositoryBranches.isEmpty {
+                                Text("\(repositoryBranches.count) branches · Default: \(defaultRepositoryBranch)")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
                             }
                         }
                     }
@@ -852,6 +966,11 @@ struct NewProjectView: View {
             }
         }
         .onChange(of: gitURL) { _, value in
+            branchEdited = false
+            gitBranch = ""
+            repositoryBranches = []
+            defaultRepositoryBranch = nil
+            repositoryBranchError = nil
             // SwiftUI may call the TextField binding setter while installing
             // the control, which marks an untouched empty Name as edited.
             // An empty field still means "infer it"; only preserve a
@@ -870,12 +989,14 @@ struct NewProjectView: View {
             folderEdited = false
             if kind == .empty {
                 gitURL = ""
+                gitBranch = ""
                 name = ""
                 focusedField = .name
             } else if kind == .clone {
                 focusedField = .repositoryURL
             } else {
                 gitURL = ""
+                gitBranch = ""
                 directory = ""
                 focusedField = .directory
             }
@@ -906,6 +1027,89 @@ struct NewProjectView: View {
 
     private var repositoryDiscoveryID: String {
         (repositoryDirectories + ["|"] + repositorySearchRoots).joined(separator: "\n")
+    }
+
+    private var branchLookupID: String {
+        sourceKind == .clone
+            ? gitURL.trimmingCharacters(in: .whitespacesAndNewlines)
+            : ""
+    }
+
+    private var matchingRepositoryBranches: [String] {
+        RepositoryBranchLookup.matches(
+            repositoryBranches,
+            query: gitBranch,
+            excluding: gitBranch,
+            limit: 8
+        )
+    }
+
+    private var repositoryBranchSuggestionList: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            ForEach(matchingRepositoryBranches, id: \.self) { branch in
+                Button {
+                    selectRepositoryBranch(branch)
+                } label: {
+                    HStack(spacing: 7) {
+                        Image(systemName: "arrow.triangle.branch")
+                            .foregroundStyle(.secondary)
+                        Text(branch)
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                        Spacer(minLength: 0)
+                    }
+                    .contentShape(Rectangle())
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 5)
+                }
+                .buttonStyle(.plain)
+            }
+        }
+        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 6))
+        .overlay {
+            RoundedRectangle(cornerRadius: 6)
+                .stroke(Color(nsColor: .separatorColor).opacity(0.7), lineWidth: 1)
+        }
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel("Repository branch suggestions")
+    }
+
+    private func selectRepositoryBranch(_ branch: String) {
+        gitBranch = branch
+        branchEdited = true
+        focusedField = nil
+    }
+
+    private func loadRepositoryBranches() async {
+        let repositoryURL = branchLookupID
+        repositoryBranches = []
+        defaultRepositoryBranch = nil
+        repositoryBranchError = nil
+        isLoadingRepositoryBranches = false
+
+        guard sourceKind == .clone,
+              PeerProjectBootstrap.repositoryURLProblem(repositoryURL) == nil else {
+            return
+        }
+
+        do {
+            try await Task.sleep(for: .milliseconds(350))
+            guard !Task.isCancelled else { return }
+            isLoadingRepositoryBranches = true
+            let result = try await RepositoryBranchLookup.load(from: repositoryURL)
+            guard !Task.isCancelled, branchLookupID == repositoryURL else { return }
+            repositoryBranches = result.branches
+            defaultRepositoryBranch = result.defaultBranch
+            if !branchEdited {
+                gitBranch = result.defaultBranch ?? result.branches.first ?? ""
+            }
+        } catch is CancellationError {
+            return
+        } catch {
+            guard branchLookupID == repositoryURL else { return }
+            repositoryBranchError = "Couldn’t load branches. You can enter one manually."
+        }
+        isLoadingRepositoryBranches = false
     }
 
     private var repositoryURLMatchCount: Int {
@@ -1287,6 +1491,7 @@ struct NewProjectView: View {
             hostKey: runsOnHostKey,
             projectPath: trimmedDirectory,
             gitURL: gitURL.trimmingCharacters(in: .whitespacesAndNewlines),
+            gitBranch: gitBranch.trimmingCharacters(in: .whitespacesAndNewlines),
             isolateAgents: effectiveIsolation,
             kind: sourceKind
         )
@@ -1427,9 +1632,13 @@ struct NewProjectView: View {
     }
 
     private var creationSummary: String {
-        let action: String
+        var action: String
         switch sourceKind {
-        case .clone: action = "Clone \(gitURL.isEmpty ? "repository" : gitURL)"
+        case .clone:
+            action = "Clone \(gitURL.isEmpty ? "repository" : gitURL)"
+            if !gitBranch.isEmpty {
+                action += " · \(gitBranch)"
+            }
         case .existingFolder: action = "Use existing folder"
         case .empty: action = "Create empty Git project"
         }
@@ -1468,7 +1677,7 @@ struct NewProjectView: View {
         preset.cli = "claude"
         preset.model = AgentRolePreset.defaultModel(for: "claude")
         leaderCli = "claude"
-        leaderModel = AgentRolePreset.defaultModel(for: "claude")
+        leaderModel = Self.defaultLeaderModel(for: "claude")
         selectedTeamPresetId = nil
         installPresetAgents([
             TeamAgentRow(preset: preset, customInstructions: "")
@@ -1484,10 +1693,10 @@ struct NewProjectView: View {
 
         leaderCli = preset.leaderMode
         if leaderCli != "repl" {
-            let candidate = preset.leaderModel ?? AgentRolePreset.defaultModel(for: leaderCli)
+            let candidate = preset.leaderModel ?? Self.defaultLeaderModel(for: leaderCli)
             leaderModel = AgentRolePreset.models(for: leaderCli).contains(candidate)
                 ? candidate
-                : AgentRolePreset.defaultModel(for: leaderCli)
+                : Self.defaultLeaderModel(for: leaderCli)
         }
 
         let resolvedAgents = preset.usesExactResolution
@@ -1536,7 +1745,20 @@ struct NewProjectView: View {
     private func saveCurrentTeamPreset() {
         let name = savePresetName.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !name.isEmpty else { return }
-        let preferences = agents.map { row in
+        let id = teamTemplateManager.createSmartPreset(
+            name: name,
+            leaderMode: leaderCli,
+            leaderModel: leaderCli == "repl" ? nil : leaderModel,
+            agents: currentProviderPreferences
+        )
+        selectedTeamPresetId = id
+        appliedTeamSignature = currentTeamSignature
+        showingSavePreset = false
+        showPresetSavedConfirmation("Saved")
+    }
+
+    private var currentProviderPreferences: [ProviderPreference] {
+        agents.map { row in
             ProviderPreference(
                 role: row.preset.name,
                 primaryCli: row.preset.cli,
@@ -1547,15 +1769,53 @@ struct NewProjectView: View {
                 customInstructions: row.customInstructions.isEmpty ? nil : row.customInstructions
             )
         }
-        let id = teamTemplateManager.createSmartPreset(
-            name: name,
-            leaderMode: leaderCli,
-            leaderModel: leaderCli == "repl" ? nil : leaderModel,
-            agents: preferences
-        )
-        selectedTeamPresetId = id
-        appliedTeamSignature = currentTeamSignature
-        showingSavePreset = false
+    }
+
+    private func presentSavePresetSheet() {
+        savePresetName = suggestedPresetName
+        showingSavePreset = true
+    }
+
+    private func saveChangesToSelectedPreset() {
+        guard let selectedTeamPresetId,
+              var template = teamTemplateManager.template(for: selectedTeamPresetId),
+              template.origin == .custom,
+              case .smart(var preset) = template.payload else { return }
+        preset.leaderMode = leaderCli
+        preset.leaderModel = leaderCli == "repl" ? nil : leaderModel
+        preset.agents = currentProviderPreferences
+        preset.description = "\(agents.count) agent\(agents.count == 1 ? "" : "s")"
+        template.payload = .smart(preset)
+        do {
+            try teamTemplateManager.updateCustom(template)
+            appliedTeamSignature = currentTeamSignature
+            showPresetSavedConfirmation("Saved")
+        } catch {
+            presetError = error.localizedDescription
+        }
+    }
+
+    private func revertCurrentTeamChanges() {
+        if let selectedTeamPresetId,
+           let template = teamTemplateManager.template(for: selectedTeamPresetId) {
+            applyTemplate(template)
+        } else {
+            applyDefaultTeam()
+        }
+    }
+
+    private func showPresetSavedConfirmation(_ message: String) {
+        presetSaveConfirmation = message
+        Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 1_600_000_000)
+            if !isTeamCustomized {
+                presetSaveConfirmation = nil
+            }
+        }
+    }
+
+    static func defaultLeaderModel(for cli: String) -> String {
+        cli == "claude" ? "opus" : AgentRolePreset.defaultModel(for: cli)
     }
 
     private func toggleSelectedPresetPin() {
@@ -1787,6 +2047,124 @@ enum RepositoryURLAutocomplete {
         components.user = nil
         components.password = nil
         return components.string ?? trimmed
+    }
+}
+
+enum RepositoryBranchLookup {
+    struct Result: Equatable {
+        let defaultBranch: String?
+        let branches: [String]
+    }
+
+    enum LookupError: Error {
+        case failed
+        case timedOut
+    }
+
+    static func singleLine(_ raw: String) -> String {
+        raw.split(whereSeparator: \.isWhitespace).first.map(String.init) ?? ""
+    }
+
+    static func matches(
+        _ branches: [String],
+        query rawQuery: String,
+        excluding selected: String? = nil,
+        limit: Int
+    ) -> [String] {
+        guard limit > 0 else { return [] }
+        let query = rawQuery.trimmingCharacters(in: .whitespacesAndNewlines)
+        return Array(branches.lazy.filter { branch in
+            if let selected,
+               branch.caseInsensitiveCompare(selected) == .orderedSame {
+                return false
+            }
+            return query.isEmpty || branch.localizedCaseInsensitiveContains(query)
+        }.prefix(limit))
+    }
+
+    static func parse(_ output: String) -> Result {
+        var defaultBranch: String?
+        var branches = Set<String>()
+
+        for rawLine in output.split(whereSeparator: \.isNewline) {
+            let line = String(rawLine)
+            if line.hasPrefix("ref: refs/heads/"),
+               line.hasSuffix("\tHEAD") {
+                defaultBranch = String(
+                    line
+                        .dropFirst("ref: refs/heads/".count)
+                        .dropLast("\tHEAD".count)
+                )
+                continue
+            }
+            guard let range = line.range(of: "\trefs/heads/") else { continue }
+            let branch = String(line[range.upperBound...])
+            if !branch.isEmpty {
+                branches.insert(branch)
+            }
+        }
+
+        let sorted = branches.sorted {
+            $0.localizedStandardCompare($1) == .orderedAscending
+        }
+        let ordered: [String]
+        if let defaultBranch,
+           let index = sorted.firstIndex(of: defaultBranch) {
+            var copy = sorted
+            copy.remove(at: index)
+            ordered = [defaultBranch] + copy
+        } else {
+            ordered = sorted
+        }
+        return Result(defaultBranch: defaultBranch, branches: ordered)
+    }
+
+    static func load(
+        from repositoryURL: String,
+        timeoutSeconds: TimeInterval = 15
+    ) async throws -> Result {
+        try await Task.detached(priority: .utility) {
+            let process = Process()
+            process.executableURL = URL(fileURLWithPath: "/usr/bin/git")
+            process.arguments = [
+                "ls-remote", "--symref", repositoryURL,
+                "HEAD", "refs/heads/*"
+            ]
+            var environment = ProcessInfo.processInfo.environment
+            environment["GIT_TERMINAL_PROMPT"] = "0"
+            environment["GIT_SSH_COMMAND"] =
+                "ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new"
+            process.environment = environment
+
+            let output = Pipe()
+            process.standardOutput = output
+            process.standardError = FileHandle.nullDevice
+            try process.run()
+            let outputRead = Task.detached(priority: .utility) {
+                output.fileHandleForReading.readDataToEndOfFile()
+            }
+
+            let deadline = Date().addingTimeInterval(timeoutSeconds)
+            while process.isRunning, Date() < deadline {
+                Thread.sleep(forTimeInterval: 0.05)
+            }
+            if process.isRunning {
+                process.terminate()
+                process.waitUntilExit()
+                _ = await outputRead.value
+                throw LookupError.timedOut
+            }
+            guard process.terminationStatus == 0 else {
+                _ = await outputRead.value
+                throw LookupError.failed
+            }
+            let data = await outputRead.value
+            let result = parse(String(data: data, encoding: .utf8) ?? "")
+            guard !result.branches.isEmpty else {
+                throw LookupError.failed
+            }
+            return result
+        }.value
     }
 }
 
@@ -2123,6 +2501,7 @@ enum ProjectCreationFlow {
                 command: checkoutCommandPreview(
                     plan: plan,
                     gitURL: gitURL.isEmpty ? nil : gitURL,
+                    gitBranch: source.gitBranch,
                     sourceKind: kind
                 ),
                 status: .running
@@ -2142,6 +2521,7 @@ enum ProjectCreationFlow {
                         identityFile: host.identityFile,
                         plan: plan,
                         gitURL: gitURL.isEmpty ? nil : gitURL,
+                        gitBranch: source.gitBranch,
                         sourceKind: kind,
                         memMeshProjectID: memMeshProjectID,
                         environment: PeerHostEnvironment.stored(forHostKey: hostKey)
@@ -2181,6 +2561,7 @@ enum ProjectCreationFlow {
                     try await PeerProjectBootstrap.runLocal(
                         plan: primaryOnly,
                         gitURL: gitURL.isEmpty ? nil : gitURL,
+                        gitBranch: source.gitBranch,
                         sourceKind: kind,
                         memMeshProjectID: memMeshProjectID
                     )
@@ -2238,12 +2619,18 @@ enum ProjectCreationFlow {
     private static func checkoutCommandPreview(
         plan: PeerProjectBootstrap.Plan,
         gitURL: String?,
+        gitBranch: String?,
         sourceKind: ProjectSourceKind
     ) -> String {
         let primary = shellDisplayQuote(plan.primaryPath)
         let base: String
         if let gitURL, !gitURL.isEmpty {
-            base = "git clone \(shellDisplayQuote(sanitizedRepositoryURL(gitURL))) \(primary)"
+            let branch = gitBranch?
+                .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            let branchArgument = branch.isEmpty
+                ? ""
+                : " --branch \(shellDisplayQuote(branch))"
+            base = "git clone\(branchArgument) \(shellDisplayQuote(sanitizedRepositoryURL(gitURL))) \(primary)"
         } else {
             switch sourceKind {
             case .clone:

@@ -9,6 +9,7 @@ enum ReviewBoardCoordinatorSettings {
     static let binaryPathEnvironmentKey = "TERMMESH_COORDINATOR_BINARY"
     static let localJournalEnvironmentKey = "TERMMESH_COORDINATOR_LOCAL_JOURNAL"
     static let distributedFeatureKey = "distributedWorkspaces.enabled"
+    static let defaultDistributedWorkspacesEnabled = true
 
     /// Environment for a coordinator we launch ourselves.
     ///
@@ -36,8 +37,8 @@ enum ReviewBoardCoordinatorSettings {
         defaults: UserDefaults = .standard
     ) -> Bool {
         environment[enabledEnvironmentKey] == "1"
-            && defaults.bool(forKey: distributedFeatureKey)
-            && defaults.bool(forKey: ReviewBoardSettings.enabledKey)
+            && distributedWorkspacesEnabled(defaults: defaults)
+            && ReviewBoardSettings.isEnabled(defaults: defaults)
     }
 
     /// The two UserDefaults halves of the gate, read and written as one.
@@ -45,13 +46,20 @@ enum ReviewBoardCoordinatorSettings {
     /// flipping it moves both together — a half-set state (one key on, one
     /// off) can only come from an older build and must read as off.
     static func distributedWorkspacesToggleOn(defaults: UserDefaults = .standard) -> Bool {
-        defaults.bool(forKey: distributedFeatureKey)
-            && defaults.bool(forKey: ReviewBoardSettings.enabledKey)
+        distributedWorkspacesEnabled(defaults: defaults)
+            && ReviewBoardSettings.isEnabled(defaults: defaults)
     }
 
     static func setDistributedWorkspacesToggle(_ on: Bool, defaults: UserDefaults = .standard) {
         defaults.set(on, forKey: distributedFeatureKey)
         defaults.set(on, forKey: ReviewBoardSettings.enabledKey)
+    }
+
+    private static func distributedWorkspacesEnabled(defaults: UserDefaults) -> Bool {
+        guard defaults.object(forKey: distributedFeatureKey) != nil else {
+            return defaultDistributedWorkspacesEnabled
+        }
+        return defaults.bool(forKey: distributedFeatureKey)
     }
 
     static func socketPath(

@@ -260,16 +260,20 @@ enum PeerProjectBootstrap {
     static func script(
         for plan: Plan,
         gitURL: String?,
+        gitBranch: String? = nil,
         sourceKind: ProjectSourceKind = .clone,
         memMeshProjectID: String? = nil
     ) -> String? {
         var steps: [String] = []
         let primary = quote(plan.primaryPath)
         if let gitURL, !gitURL.isEmpty {
+            let branch = gitBranch?
+                .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            let branchArgument = branch.isEmpty ? "" : " --branch \(quote(branch))"
             steps.append(
                 "test -d \(primary)/.git || "
                     + "GIT_SSH_COMMAND=\(quote(nonInteractiveGitSSHCommand)) "
-                    + "git clone \(quote(gitURL)) \(primary)"
+                    + "git clone\(branchArgument) \(quote(gitURL)) \(primary)"
             )
         } else {
             if sourceKind == .existingFolder {
@@ -468,6 +472,7 @@ enum PeerProjectBootstrap {
         identityFile: String?,
         plan: Plan,
         gitURL: String?,
+        gitBranch: String? = nil,
         sourceKind: ProjectSourceKind = .clone,
         // Deliberately not defaulted: `nil` and "the caller forgot" would
         // otherwise be the same value, and a forgotten id is permanent —
@@ -481,6 +486,7 @@ enum PeerProjectBootstrap {
         guard let script = script(
             for: plan,
             gitURL: gitURL,
+            gitBranch: gitBranch,
             sourceKind: sourceKind,
             memMeshProjectID: memMeshProjectID
         ) else { return }
@@ -500,6 +506,7 @@ enum PeerProjectBootstrap {
     static func runLocal(
         plan: Plan,
         gitURL: String?,
+        gitBranch: String? = nil,
         sourceKind: ProjectSourceKind,
         // See `run` — not defaulted, for the same reason.
         memMeshProjectID: String?,
@@ -508,6 +515,7 @@ enum PeerProjectBootstrap {
         guard let script = script(
             for: plan,
             gitURL: gitURL,
+            gitBranch: gitBranch,
             sourceKind: sourceKind,
             memMeshProjectID: memMeshProjectID
         ) else { return }
@@ -691,6 +699,9 @@ struct ProjectSource: Equatable {
     /// A repository to clone if the project is not there yet. Empty means the
     /// directory is expected to be, or to become, whatever the agents make it.
     var gitURL: String
+    /// Branch checked out by the primary clone. Empty means the repository's
+    /// remote default branch.
+    var gitBranch: String
     /// Whether each member gets its own checkout.
     var isolateAgents: Bool
 
@@ -698,6 +709,7 @@ struct ProjectSource: Equatable {
         hostKey: String?,
         projectPath: String,
         gitURL: String,
+        gitBranch: String = "",
         isolateAgents: Bool,
         kind: ProjectSourceKind? = nil
     ) {
@@ -705,6 +717,7 @@ struct ProjectSource: Equatable {
         self.hostKey = hostKey
         self.projectPath = projectPath
         self.gitURL = gitURL
+        self.gitBranch = gitBranch
         self.isolateAgents = isolateAgents
     }
 }

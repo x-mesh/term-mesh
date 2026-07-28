@@ -20,18 +20,22 @@ import Foundation
 /// behind `scripts/spike/tm-agent-bridge.py`, which speaks their protocol and
 /// emits claude's events — see `needsBridge`.
 ///
-/// **This is opt-in.** The pane path is untouched and remains the default: it
-/// is what makes a running agent watchable, and this trades that view for a
-/// channel. What it buys back is measurable — a receipt for every delivery, a
-/// stated end to every turn, and a person who can still type into the pane —
-/// so this exists to price that trade honestly, not to replace anything yet.
+/// Fresh installs use the native path. A stored Terminal choice still wins,
+/// keeping the Ghostty pane available as an explicit fallback for CLIs or
+/// workflows that need the full interactive TUI.
 enum AgentPipeTransport {
-    /// Off unless asked for. The pane path is the product; this is an
-    /// experiment running beside it.
     static let enabledKey = "agentPipeTransport.enabled"
+    static let defaultEnabled = true
 
     static var isEnabled: Bool {
-        UserDefaults.standard.bool(forKey: enabledKey)
+        transportEnabled()
+    }
+
+    static func transportEnabled(defaults: UserDefaults = .standard) -> Bool {
+        guard defaults.object(forKey: enabledKey) != nil else {
+            return defaultEnabled
+        }
+        return defaults.bool(forKey: enabledKey)
     }
 
     /// Which CLIs have been measured taking turns this way.
@@ -126,11 +130,18 @@ enum AgentPipeTransport {
     /// this turn cost $0.31 — so a tool result can be folded, an answer stays
     /// selectable, and a turn's facts are laid out rather than printed.
     ///
-    /// Claude only, and off by default: the pane path is the product.
     static let nativePanelKey = "agentPipeTransport.nativePanel"
+    static let defaultNativePanel = true
 
     static var usesNativePanel: Bool {
-        isEnabled && UserDefaults.standard.bool(forKey: nativePanelKey)
+        transportEnabled() && nativePanelEnabled()
+    }
+
+    static func nativePanelEnabled(defaults: UserDefaults = .standard) -> Bool {
+        guard defaults.object(forKey: nativePanelKey) != nil else {
+            return defaultNativePanel
+        }
+        return defaults.bool(forKey: nativePanelKey)
     }
 
     /// Which CLIs can be held without a terminal.

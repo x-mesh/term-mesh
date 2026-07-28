@@ -31,6 +31,10 @@ struct TeamAgentComposer: View {
     var onMaxCost: (() -> Void)?
     var onBalanced: (() -> Void)?
     var onMinCost: (() -> Void)?
+    /// New Project uses dense, table-like rows so a team remains scannable
+    /// when it has several members. The original card presentation stays the
+    /// default for the dedicated team editor.
+    var usesCompactRows = false
     /// New Project has a transient default machine that members can inherit.
     /// Other callers leave this off and retain the original explicit host UI.
     var supportsDefaultPlacement = false
@@ -51,6 +55,7 @@ struct TeamAgentComposer: View {
     @State private var bulkHostKey: String?
     @State private var bulkHostDirectory: String = ""
     @State private var bulkUsesDefaultPlacement = true
+    @State private var expandedAgentIDs: Set<UUID> = []
 
     private static let defaultPlacementTag = "__term_mesh_default__"
     private static let localPlacementTag = "__term_mesh_local__"
@@ -224,12 +229,37 @@ struct TeamAgentComposer: View {
                 }
             }
 
-            ForEach(Array(agents.enumerated()), id: \.element.id) { index, agent in
-                agentCard(index: index, agent: agent)
-            }
-            .onMove { source, destination in
-                agents.move(fromOffsets: source, toOffset: destination)
-                onComposionChanged()
+            if usesCompactRows {
+                compactColumnHeader
+                VStack(spacing: 0) {
+                    ForEach(Array(agents.enumerated()), id: \.element.id) { index, agent in
+                        compactAgentRow(index: index, agent: agent)
+                        if index < agents.count - 1 {
+                            Divider()
+                                .padding(.leading, 46)
+                        }
+                    }
+                    .onMove { source, destination in
+                        agents.move(fromOffsets: source, toOffset: destination)
+                        onComposionChanged()
+                    }
+                }
+                .background(
+                    RoundedRectangle(cornerRadius: 8)
+                        .fill(.quaternary.opacity(0.45))
+                )
+                .overlay(
+                    RoundedRectangle(cornerRadius: 8)
+                        .stroke(Color.secondary.opacity(0.12), lineWidth: 1)
+                )
+            } else {
+                ForEach(Array(agents.enumerated()), id: \.element.id) { index, agent in
+                    agentCard(index: index, agent: agent)
+                }
+                .onMove { source, destination in
+                    agents.move(fromOffsets: source, toOffset: destination)
+                    onComposionChanged()
+                }
             }
 
             Button(action: addAgent) {
@@ -238,6 +268,282 @@ struct TeamAgentComposer: View {
             }
             .buttonStyle(.borderless)
         }
+    }
+
+    private var compactColumnHeader: some View {
+        HStack(spacing: 8) {
+            Color.clear.frame(width: 14)
+            Text("#").frame(width: 20, alignment: .leading)
+            Text("Role").frame(width: 148, alignment: .leading)
+            Text("CLI").frame(width: 90, alignment: .leading)
+            Text("Model").frame(width: 142, alignment: .leading)
+            Text("Status")
+            Spacer(minLength: 0)
+            Color.clear.frame(width: 50)
+        }
+        .font(.caption2)
+        .foregroundStyle(.tertiary)
+        .padding(.horizontal, 10)
+    }
+
+    private func compactAgentRow(index: Int, agent: TeamAgentRow) -> some View {
+        let isExpanded = expandedAgentIDs.contains(agent.id)
+        let hasCustomInstructions = !agent.customInstructions.isEmpty
+            && agent.customInstructions != agent.preset.instructions
+
+        return VStack(alignment: .leading, spacing: 0) {
+            HStack(spacing: 8) {
+                Image(systemName: "line.3.horizontal")
+                    .font(.caption)
+                    .foregroundStyle(.tertiary)
+                    .frame(width: 14)
+
+                Text("\(index + 1)")
+                    .font(.caption2.bold())
+                    .foregroundStyle(.secondary)
+                    .frame(width: 20, alignment: .leading)
+
+                HStack(spacing: 6) {
+                    Circle()
+                        .fill(Self.agentColor(agent.preset.color))
+                        .frame(width: 8, height: 8)
+                    Picker("", selection: Binding(
+                        get: { agent.preset.id },
+                        set: { newId in
+                            if let preset = presetManager.presets.first(where: { $0.id == newId }) {
+                                agents[index].preset = preset
+                                agents[index].customInstructions = ""
+                                onComposionChanged()
+                            }
+                        }
+                    )) {
+                        ForEach(presetManager.presets) { preset in
+                            Text(preset.displayName).tag(preset.id)
+                        }
+                    }
+                    .labelsHidden()
+                }
+                .frame(width: 148, alignment: .leading)
+
+                Picker("", selection: Binding(
+                    get: { agent.preset.cli },
+                    set: { newCli in
+                        let oldCli = agents[index].preset.cli
+                        agents[index].preset.cli = newCli
+                        agents[index].providerBadge = .none
+                        if AgentRolePreset.models(for: oldCli) != AgentRolePreset.models(for: newCli) {
+                            agents[index].preset.model = AgentRolePreset.defaultModel(for: newCli)
+                        }
+                        onComposionChanged()
+                    }
+                )) {
+                    ForEach(AgentRolePreset.supportedCLIs, id: \.self) { cli in
+                        Text(cli).tag(cli)
+                    }
+                }
+                .labelsHidden()
+                .frame(width: 90)
+
+                Picker("", selection: Binding(
+                    get: {
+                        let options = AgentRolePreset.models(for: agent.preset.cli)
+                        let normalized = AgentRolePreset.normalizeModel(
+                            agent.preset.model,
+                            for: agent.preset.cli
+                        )
+                        guard options.contains(normalized) else {
+                            let fallback = AgentRolePreset.defaultModel(for: agent.preset.cli)
+                            DispatchQueue.main.async {
+                                guard index < agents.count else { return }
+                                agents[index].preset.model = fallback
+                            }
+                            return fallback
+                        }
+                        return normalized
+                    },
+                    set: {
+                        agents[index].preset.model = $0
+                        onComposionChanged()
+                    }
+                )) {
+                    ForEach(AgentRolePreset.models(for: agent.preset.cli), id: \.self) { model in
+                        Text(AgentRolePreset.modelDisplayLabel(model, for: agent.preset.cli))
+                            .tag(model)
+                    }
+                }
+                .labelsHidden()
+                .frame(width: 142)
+
+                compactStatus(for: agent, hasCustomInstructions: hasCustomInstructions)
+
+                Spacer(minLength: 0)
+
+                Button {
+                    withAnimation(.easeOut(duration: 0.16)) {
+                        if isExpanded {
+                            expandedAgentIDs.remove(agent.id)
+                        } else {
+                            expandedAgentIDs.insert(agent.id)
+                        }
+                    }
+                } label: {
+                    Image(systemName: "chevron.right")
+                        .font(.caption2.bold())
+                        .rotationEffect(.degrees(isExpanded ? 90 : 0))
+                        .frame(width: 18, height: 22)
+                }
+                .buttonStyle(.borderless)
+                .help(isExpanded ? "Hide agent details" : "Show agent details")
+
+                Button {
+                    expandedAgentIDs.remove(agent.id)
+                    agents.remove(at: index)
+                    onComposionChanged()
+                } label: {
+                    Image(systemName: "minus.circle")
+                        .foregroundStyle(.red.opacity(0.72))
+                        .frame(width: 18, height: 22)
+                }
+                .buttonStyle(.borderless)
+                .disabled(agents.count <= 1)
+                .help("Remove agent")
+            }
+            .padding(.horizontal, 10)
+            .padding(.vertical, 9)
+
+            if isExpanded {
+                Divider()
+                    .padding(.leading, 46)
+
+                VStack(alignment: .leading, spacing: 12) {
+                    if showsPlacementControls {
+                        agentPlacementRow(index: index, agent: agent)
+                            .padding(.leading, -48)
+                    }
+
+                    HStack(alignment: .top, spacing: 14) {
+                        compactInstructionsEditor(
+                            index: index,
+                            agent: agent,
+                            isCustomized: hasCustomInstructions
+                        )
+                        compactResolvedPrompt(agent: agent)
+                    }
+                }
+                .padding(.leading, 46)
+                .padding(.trailing, 12)
+                .padding(.bottom, 12)
+                .padding(.top, 10)
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func compactStatus(
+        for agent: TeamAgentRow,
+        hasCustomInstructions: Bool
+    ) -> some View {
+        switch agent.providerBadge {
+        case .best(let reason):
+            Label(reason, systemImage: "bolt.fill")
+                .foregroundStyle(.green)
+                .lineLimit(1)
+        case .fallback(let wanted):
+            Label("Install \(wanted)", systemImage: "arrow.uturn.backward")
+                .foregroundStyle(.orange)
+                .lineLimit(1)
+        case .none:
+            if hasCustomInstructions {
+                Label("Custom", systemImage: "pencil")
+                    .foregroundStyle(.orange)
+            } else {
+                Text("Role runbook")
+                    .foregroundStyle(.secondary)
+            }
+        }
+    }
+
+    private func compactInstructionsEditor(
+        index: Int,
+        agent: TeamAgentRow,
+        isCustomized: Bool
+    ) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack {
+                Text(agent.preset.name == "watcher" ? "Watcher Spec" : "Instructions")
+                    .font(.caption.bold())
+                Spacer()
+                if isCustomized {
+                    Button("Reset") {
+                        agents[index].customInstructions = ""
+                        onComposionChanged()
+                    }
+                    .buttonStyle(.borderless)
+                    .font(.caption2)
+                }
+            }
+
+            ZStack(alignment: .topLeading) {
+                if agent.customInstructions.isEmpty {
+                    Text("Optional team-specific instructions")
+                        .font(.system(.caption, design: .monospaced))
+                        .foregroundStyle(.tertiary)
+                        .padding(.top, 7)
+                        .padding(.leading, 5)
+                        .allowsHitTesting(false)
+                }
+                TextEditor(text: Binding(
+                    get: { agent.customInstructions },
+                    set: {
+                        agents[index].customInstructions = $0
+                        onComposionChanged()
+                    }
+                ))
+                .font(.system(.caption, design: .monospaced))
+                .frame(height: 92)
+                .overlay(
+                    RoundedRectangle(cornerRadius: 5)
+                        .stroke(Color.secondary.opacity(0.18), lineWidth: 1)
+                )
+            }
+        }
+        .frame(maxWidth: .infinity)
+    }
+
+    private func compactResolvedPrompt(agent: TeamAgentRow) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 6) {
+                Text("Resolved Prompt")
+                    .font(.caption.bold())
+                Text("Read-only")
+                    .font(.system(size: 9, weight: .medium))
+                    .foregroundStyle(.secondary)
+                    .padding(.horizontal, 5)
+                    .padding(.vertical, 1)
+                    .background(RoundedRectangle(cornerRadius: 4).fill(Color.secondary.opacity(0.1)))
+                Spacer()
+                runbookBadge(for: agent)
+            }
+
+            ScrollView {
+                Text(effectiveRunbookPrompt(for: agent))
+                    .font(.system(.caption2, design: .monospaced))
+                    .foregroundStyle(.secondary)
+                    .textSelection(.enabled)
+                    .frame(maxWidth: .infinity, alignment: .topLeading)
+                    .padding(7)
+            }
+            .frame(height: 92)
+            .background(
+                RoundedRectangle(cornerRadius: 5)
+                    .fill(Color(nsColor: .textBackgroundColor).opacity(0.35))
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 5)
+                    .stroke(Color.secondary.opacity(0.14), lineWidth: 1)
+            )
+        }
+        .frame(maxWidth: .infinity)
     }
 
     private func agentCard(index: Int, agent: TeamAgentRow) -> some View {

@@ -1,3 +1,4 @@
+import Bonsplit
 import Foundation
 import PeerProto
 
@@ -704,10 +705,8 @@ extension TeamOrchestrator {
             )
         }
 
-        // Split off the last agent's pane, or the leader's — the same shape a
-        // local `add` produces, so a mixed team does not look different from
-        // one that happens to run entirely here.
-        let splitFrom = team.agents.last?.panelId ?? team.leaderPanelId
+        // Use the same incremental grid growth as local `add`/`attach`.
+        let placement = nextAgentSplitPlacement(team: team, workspace: workspace)
 
         // The leader remains a terminal, but members follow Agent Panes.
         // An SSH-backed relay can carry the structured process stream straight
@@ -721,7 +720,8 @@ extension TeamOrchestrator {
                 tabManager: tabManager,
                 host: host,
                 sshTarget: sshTarget,
-                splitFrom: splitFrom,
+                splitFrom: placement.panelId,
+                orientation: placement.orientation,
                 agentName: agentName,
                 workingDirectory: workingDirectory,
                 agentType: agentType,
@@ -791,9 +791,9 @@ extension TeamOrchestrator {
             registry.release(lease)
             guard let opened = workspace.openRemotePane(
                 session: session,
-                orientation: team.agents.isEmpty ? .horizontal : .vertical,
+                orientation: placement.orientation,
                 focus: false,
-                from: splitFrom
+                from: placement.panelId
             ) else {
                 session.teardown()
                 throw RemoteAgentError.paneCreationFailed
@@ -852,6 +852,7 @@ extension TeamOrchestrator {
             }
             throw RemoteAgentError.duplicateName(agentName)
         }
+        scheduleAgentGridEqualization(workspace: workspace)
         // Remembered on success rather than on typing, so a path that turned
         // out to be wrong is not the one offered next time.
         RemoteProjectPaths.shared.remember(
@@ -898,6 +899,7 @@ extension TeamOrchestrator {
         host: HostEntry,
         sshTarget: String,
         splitFrom: UUID,
+        orientation: SplitOrientation,
         agentName: String,
         workingDirectory: String,
         agentType: String,
@@ -936,7 +938,7 @@ extension TeamOrchestrator {
             )) { _, internalValue in internalValue }
         guard let panel = workspace.newAgentSplit(
             from: splitFrom,
-            orientation: team.agents.isEmpty ? .horizontal : .vertical,
+            orientation: orientation,
             agentName: agentName,
             teamName: team.id,
             workingDirectory: workingDirectory,
@@ -1020,6 +1022,7 @@ extension TeamOrchestrator {
             _ = workspace.closePanel(panel.id, force: true)
             throw RemoteAgentError.duplicateName(agentName)
         }
+        scheduleAgentGridEqualization(workspace: workspace)
         RemoteProjectPaths.shared.remember(
             host: host.id,
             localRoot: team.workingDirectory,

@@ -468,6 +468,79 @@ final class TeamOrchestrator: ObservableObject {
 
     // MARK: - Aspect-Ratio-Aware Grid Layout
 
+    struct AgentPaneCandidate {
+        let panelId: UUID
+        let width: Double
+        let height: Double
+    }
+
+    struct AgentSplitPlacement {
+        let panelId: UUID
+        let orientation: SplitOrientation
+    }
+
+    /// Pick the existing agent pane that has the most room, then divide it
+    /// along its longest axis. Late `add`/`attach` calls arrive one at a time,
+    /// so they cannot use the batch creator's precomputed grid. Growing the
+    /// largest cell gives the same balanced result incrementally instead of
+    /// chaining every newcomer below the previous pane.
+    static func nextAgentSplitPlacement(
+        leaderPanelId: UUID,
+        candidates: [AgentPaneCandidate]
+    ) -> AgentSplitPlacement {
+        guard var largest = candidates.first else {
+            return AgentSplitPlacement(panelId: leaderPanelId, orientation: .horizontal)
+        }
+
+        var largestArea = largest.width * largest.height
+        for candidate in candidates.dropFirst() {
+            let area = candidate.width * candidate.height
+            if area > largestArea {
+                largest = candidate
+                largestArea = area
+            }
+        }
+
+        return AgentSplitPlacement(
+            panelId: largest.panelId,
+            orientation: largest.width >= largest.height ? .horizontal : .vertical
+        )
+    }
+
+    func nextAgentSplitPlacement(team: Team, workspace: Workspace) -> AgentSplitPlacement {
+        let frameByPaneId = Dictionary(
+            uniqueKeysWithValues: workspace.bonsplitController.layoutSnapshot().panes.map {
+                ($0.paneId, $0.frame)
+            }
+        )
+        let candidates = team.agents.compactMap { agent -> AgentPaneCandidate? in
+            guard let panelId = agent.panelId,
+                  let paneId = workspace.paneId(forPanelId: panelId),
+                  let frame = frameByPaneId[paneId.id.uuidString] else {
+                return nil
+            }
+            return AgentPaneCandidate(
+                panelId: panelId,
+                width: frame.width,
+                height: frame.height
+            )
+        }
+
+        // Geometry may briefly be unavailable during a layout pass. Preserve
+        // the old target as a deterministic fallback, but use the pane count
+        // to avoid recreating an endless downward chain.
+        if candidates.isEmpty, let lastPanelId = team.agents.last?.panelId {
+            return AgentSplitPlacement(
+                panelId: lastPanelId,
+                orientation: team.agents.count == 1 ? .vertical : .horizontal
+            )
+        }
+        return Self.nextAgentSplitPlacement(
+            leaderPanelId: team.leaderPanelId,
+            candidates: candidates
+        )
+    }
+
     /// Compute optimal (cols, rows) so each pane's aspect ratio is closest to 1:1 (square).
     /// Falls back to fixed column logic when container size is unavailable.
     private func optimalGridDimensions(
@@ -566,6 +639,18 @@ final class TeamOrchestrator: ObservableObject {
             #if DEBUG
             dlog("[equalize] ERROR: tree root is not a split (single pane?)")
             #endif
+        }
+    }
+
+    /// Bonsplit applies split mutations over multiple layout passes. Re-run
+    /// equalization after each pass so both terminal and native late joiners
+    /// settle into the same balanced agent grid.
+    func scheduleAgentGridEqualization(workspace: Workspace) {
+        for delay in [0.05, 0.3, 0.8] {
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self, weak workspace] in
+                guard let workspace else { return }
+                self?.equalizeAgentGrid(workspace: workspace)
+            }
         }
     }
 
@@ -789,10 +874,9 @@ final class TeamOrchestrator: ObservableObject {
                 // `--resume <sid>` so claude re-attaches to its prior session.
                 agentCommand.append(" --resume \(sid)")
             }
-            // Opt-in, claude-only: take turns on a pipe instead of having them
-            // typed into this pane. The process still runs here and is still
-            // watched; what the pane shows becomes raw NDJSON, which is the
-            // cost this option exists to measure. See `AgentPipeTransport`.
+            // Native agent panes take turns over a pipe instead of synthetic
+            // paste+Return. Terminal remains an explicit Settings fallback.
+            // See `AgentPipeTransport`.
             if AgentPipeTransport.canDrive(cli: agentCli) {
                 AgentPipeTransport.prepareDirectory()
                 agentCommand = AgentPipeTransport.launchCommand(
@@ -1776,13 +1860,7 @@ final class TeamOrchestrator: ObservableObject {
             )
         }
 
-        // Equalize splits multiple times: bonsplit needs layout passes to settle.
-        // First pass immediate, then delayed passes for robustness.
-        for delay in [0.05, 0.3, 0.8] {
-            DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
-                self?.equalizeAgentGrid(workspace: workspace)
-            }
-        }
+        scheduleAgentGridEqualization(workspace: workspace)
 
         // D3-A P1-A: fresh pane teams must carry a stable teamUuid from
         // creation. Without it, archive_pane sends an empty team_uuid and
@@ -2041,18 +2119,8 @@ final class TeamOrchestrator: ObservableObject {
         let agentColor = Self.agentColor(forRole: agentType,
                                          taken: Set(team.agents.map(\.color)))
 
-        // 7. Choose split target and orientation
-        // - First agent: split RIGHT from the leader pane (horizontal) — consistent with createTeam layout
-        // - Subsequent: split DOWN from the last existing agent (vertical) — stacks under prior agents
-        let splitFrom: UUID
-        let orientation: SplitOrientation
-        if let lastAgent = team.agents.last, let lastPanel = lastAgent.panelId {
-            splitFrom = lastPanel
-            orientation = .vertical
-        } else {
-            splitFrom = team.leaderPanelId
-            orientation = .horizontal
-        }
+        // 7. Grow the agent area by splitting its largest existing cell.
+        let placement = nextAgentSplitPlacement(team: team, workspace: workspace)
 
         // 8. Delegate pane construction to the shared helper
         let attachProfile = CLIPathSettings.activeProfile(for: normalizedCli)
@@ -2075,8 +2143,8 @@ final class TeamOrchestrator: ObservableObject {
             worktreeName: nil,
             worktreePath: nil,
             worktreeBranch: nil,
-            splitFrom: splitFrom,
-            orientation: orientation,
+            splitFrom: placement.panelId,
+            orientation: placement.orientation,
             extraArgs: attachExtraArgs,
             extraEnv: attachExtraEnv,
             tabManager: tabManager
@@ -2089,6 +2157,7 @@ final class TeamOrchestrator: ObservableObject {
         teams[teamName] = team
         TeamDataStore.shared.registerTeam(teamName, agents: team.agents.map { .init(name: $0.name, instanceId: $0.agentInstanceId) })
         syncTeamStateToDaemon()
+        scheduleAgentGridEqualization(workspace: workspace)
         Logger.team.info("attached agent '\(agentName, privacy: .public)' to team '\(teamName, privacy: .public)' (\(team.agents.count, privacy: .public) total)")
 
         return .success((team: team, newAgent: member))
@@ -2325,16 +2394,8 @@ final class TeamOrchestrator: ObservableObject {
         let agentColor = Self.agentColor(forRole: agentType,
                                          taken: Set(team.agents.map(\.color)))
 
-        // 8. Choose split target — last agent pane or leader pane
-        let splitFrom: UUID
-        let orientation: SplitOrientation
-        if let lastAgent = team.agents.last, let lastPanel = lastAgent.panelId {
-            splitFrom = lastPanel
-            orientation = .vertical
-        } else {
-            splitFrom = team.leaderPanelId
-            orientation = .horizontal
-        }
+        // 8. Grow the agent area by splitting its largest existing cell.
+        let placement = nextAgentSplitPlacement(team: team, workspace: workspace)
 
         // 9. Apply active CLI profile overrides (extraArgs / env / modelOverride)
         let profile = CLIPathSettings.activeProfile(for: normalizedCli)
@@ -2359,8 +2420,8 @@ final class TeamOrchestrator: ObservableObject {
             worktreeName: nil,
             worktreePath: nil,
             worktreeBranch: nil,
-            splitFrom: splitFrom,
-            orientation: orientation,
+            splitFrom: placement.panelId,
+            orientation: placement.orientation,
             extraArgs: extraArgs,
             extraEnv: extraEnv,
             tabManager: tabManager
@@ -2373,6 +2434,7 @@ final class TeamOrchestrator: ObservableObject {
         teams[teamName] = team
         TeamDataStore.shared.registerTeam(teamName, agents: team.agents.map { .init(name: $0.name, instanceId: $0.agentInstanceId) })
         syncTeamStateToDaemon()
+        scheduleAgentGridEqualization(workspace: workspace)
         Logger.team.info("add_agent: added '\(agentName, privacy: .public)' to team '\(teamName, privacy: .public)' (\(team.agents.count, privacy: .public) total)")
 
         return .success(member)
