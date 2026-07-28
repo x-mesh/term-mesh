@@ -66,7 +66,25 @@ struct AgentPanelView: View {
             composer
         }
         .background(Color(nsColor: .textBackgroundColor))
-        .onTapGesture { onFocus() }
+        // Clicking anywhere in the pane puts the caret where typing goes, the
+        // way clicking a terminal pane does. Reporting focus without taking the
+        // caret would leave the pane focused and un-typeable.
+        .onTapGesture {
+            onFocus()
+            composerFocused = true
+        }
+        // Clicking the composer is a click on the text field, not on the body
+        // above, so the tap gesture never fired and the workspace went on
+        // believing the previously focused pane — usually the leader terminal —
+        // still had focus. A terminal told it is focused reclaims the window's
+        // first responder whenever it re-lays out, and an agent pane re-lays
+        // the workspace out on every streamed delta. The result was typing that
+        // landed a few characters here and then continued in the leader's
+        // shell: the pane could not be typed into at all while anything was
+        // running. Taking focus has to be reported, not just accepted.
+        .onChange(of: composerFocused) { _, focused in
+            if focused { onFocus() }
+        }
         .onAppear {
             panel.onFocusRequested { composerFocused = true }
         }
