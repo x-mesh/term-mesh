@@ -907,6 +907,181 @@ mod integration_tests {
         server_task.abort();
     }
 
+    /// `team.task.diff` against a real daemon on another machine.
+    ///
+    /// The test above proves the method works over a real socket in one
+    /// process. This proves it works over the link people actually use: a
+    /// reviewer on one machine reading a patch out of a worktree on another,
+    /// through an SSH-forwarded peer socket.
+    ///
+    /// `#[ignore]` because it needs a host this repository cannot start.
+    /// Point it at one and run it:
+    ///
+    /// ```sh
+    /// ssh -N -L /tmp/tm-peer-live.sock:/run/user/0/tm-peer.sock root@host &
+    /// TM_PEER_SOCK=/tmp/tm-peer-live.sock TM_TASK_ID=<id> TM_EXPECT_DIGEST=<sha256 hex> \\
+    ///   cargo test -p term-meshd --bin term-meshd a_patch_can_be_read_off_another_machine \\
+    ///   -- --ignored --nocapture
+    /// ```
+    #[tokio::test]
+    #[ignore = "needs a live peer host; see the doc comment"]
+    async fn a_patch_can_be_read_off_another_machine() {
+        let sock = std::env::var("TM_PEER_SOCK").expect("TM_PEER_SOCK");
+        let task_id = std::env::var("TM_TASK_ID").expect("TM_TASK_ID");
+
+        let stream = UnixStream::connect(&sock)
+            .await
+            .unwrap_or_else(|e| panic!("connect {sock}: {e}"));
+        let (mut reader, mut writer) = stream.into_split();
+
+        write_envelope(
+            &mut writer,
+            &Envelope {
+                seq: 1,
+                correlation_id: 0,
+                payload: Some(Payload::Hello(Hello {
+                    protocol_version: PROTOCOL_VERSION.into(),
+                    peer_id: vec![0x33; 16],
+                    display_name: "live-review".into(),
+                    capabilities: peer_proto::capability::supported_vec(),
+                    app_version: "live".into(),
+                })),
+            },
+        )
+        .await
+        .expect("hello");
+
+        // A live host pushes HostStats and layout frames on its own schedule,
+        // so nothing here may assume the next frame is the answer. The
+        // in-process test never saw this: that host has no monitor wired in.
+        async fn hello_of(
+            reader: &mut (impl tokio::io::AsyncRead + Unpin),
+        ) -> peer_proto::v1::Hello {
+            for _ in 0..20 {
+                match read_envelope(reader).await.expect("frame").payload {
+                    Some(Payload::Hello(h)) => return h,
+                    _ => continue,
+                }
+            }
+            panic!("no Hello in the first 20 frames");
+        }
+
+        let h = hello_of(&mut reader).await;
+        println!("host: {} ({})", h.display_name, h.app_version);
+        assert!(
+            h.capabilities
+                .iter()
+                .any(|c| c == peer_proto::capability::TEAM_CALL_V1),
+            "host does not advertise team.call.v1: {:?}",
+            h.capabilities
+        );
+
+        write_envelope(
+            &mut writer,
+            &Envelope {
+                seq: 2,
+                correlation_id: 0,
+                payload: Some(Payload::Auth(Auth {
+                    method: "ssh-passthrough".into(),
+                    token_id: vec![],
+                    signature: vec![],
+                })),
+            },
+        )
+        .await
+        .expect("auth");
+
+        async fn diff(
+            reader: &mut (impl tokio::io::AsyncRead + Unpin),
+            writer: &mut (impl tokio::io::AsyncWrite + Unpin),
+            seq: u64,
+            params_json: String,
+        ) -> peer_proto::v1::TeamCallResponse {
+            write_envelope(
+                writer,
+                &Envelope {
+                    seq,
+                    correlation_id: 0,
+                    payload: Some(Payload::TeamCallRequest(
+                        peer_proto::v1::TeamCallRequest {
+                            method: "team.task.diff".into(),
+                            params_json,
+                        },
+                    )),
+                },
+            )
+            .await
+            .expect("request");
+            // Skip whatever the host happened to be pushing.
+            for _ in 0..50 {
+                if let Some(Payload::TeamCallResponse(r)) =
+                    read_envelope(reader).await.expect("response").payload
+                {
+                    return r;
+                }
+            }
+            panic!("no TeamCallResponse in the next 50 frames");
+        }
+
+        let answered = diff(
+            &mut reader,
+            &mut writer,
+            3,
+            format!(r#"{{"task_id":"{task_id}"}}"#),
+        )
+        .await;
+        assert!(answered.ok, "diff failed: {}", answered.error_message);
+
+        // Printed verbatim so the app's decoder can be pinned against the bytes
+        // a real host actually sent, rather than against a hand-written fixture.
+        if let Ok(path) = std::env::var("TM_SAVE_PAYLOAD") {
+            std::fs::write(&path, &answered.result_json).expect("save payload");
+            println!("payload saved to {path}");
+        }
+        let value: serde_json::Value = serde_json::from_str(&answered.result_json).expect("json");
+        println!(
+            "head={} base={} branch={}\ndigest={} truncated={}",
+            value["head_sha"], value["base_sha"], value["branch"], value["diff_digest"],
+            value["truncated"]
+        );
+        println!("--- numstat ---\n{}", value["numstat"].as_str().unwrap_or(""));
+        println!("--- name_status ---\n{}", value["name_status"].as_str().unwrap_or(""));
+        println!("--- patch ---\n{}", value["patch"].as_str().unwrap_or(""));
+
+        assert_eq!(value["head_sha"].as_str().unwrap().len(), 40);
+        assert!(!value["patch"].as_str().unwrap().is_empty());
+        assert!(!value["numstat"].as_str().unwrap().is_empty());
+
+        // The digest is what an approval cites, so it is checked against the
+        // host's own `git diff | sha256sum` rather than merely being present.
+        if let Ok(expected) = std::env::var("TM_EXPECT_DIGEST") {
+            assert_eq!(
+                value["diff_digest"].as_str().unwrap(),
+                format!("sha256:{expected}"),
+                "the digest must be exactly SHA-256 of `git diff base..head` stdout"
+            );
+        }
+
+        // An unknown task is an error with a reason, never an empty success —
+        // the board would read that as "nothing changed", an approvable state.
+        let unknown = diff(
+            &mut reader,
+            &mut writer,
+            4,
+            r#"{"task_id":"tsk_definitely_not_there"}"#.into(),
+        )
+        .await;
+        assert!(!unknown.ok, "an unknown task must not answer ok");
+        assert!(unknown.result_json.is_empty());
+        println!("unknown task -> {} {}", unknown.error_code, unknown.error_message);
+
+        // And a path is not a parameter, across the link as much as in process.
+        let no_id = diff(&mut reader, &mut writer, 5, r#"{"worktree_path":"/etc"}"#.into()).await;
+        assert!(!no_id.ok);
+        assert_eq!(no_id.error_code, "invalid_params");
+        println!("path-only -> {} {}", no_id.error_code, no_id.error_message);
+    }
+
     /// A team is invisible in the layout tree, so a client can only learn
     /// where a project's leader sits by asking. This drives the real wire:
     /// handshake, auth, then ListTeams against a host wired to a team

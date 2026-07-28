@@ -286,4 +286,32 @@ final class ReviewBoardEvidenceTests: XCTestCase {
             )
         }
     }
+
+    /// The bytes a real host actually sent.
+    ///
+    /// Captured off jw-server over an SSH-forwarded peer socket
+    /// (`peer/server.rs::a_patch_can_be_read_off_another_machine`), so this
+    /// pins the decoder against the wire rather than against a fixture someone
+    /// wrote to match it. The digest is the host's own
+    /// `git diff main..HEAD | sha256sum`, which is what an approval cites.
+    func testTheDecoderReadsWhatARealHostSent() throws {
+        let url = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .appendingPathComponent("Fixtures/peer-task-diff.json")
+        let json = try String(contentsOf: url, encoding: .utf8)
+        let patch = try XCTUnwrap(ReviewBoardEvidence.Patch(peerResponse: json))
+
+        XCTAssertEqual(patch.headSHA, "74724e88cb570b20d7cd980b944fac1d5cdeb986")
+        XCTAssertEqual(patch.baseSHA, "8a9efb1776d7d898b46b9b5630f1d9960d6a4f56")
+        XCTAssertEqual(
+            patch.digest,
+            "sha256:f8870ba9789e0eae7cfba15a2bfbe672e55f2688518d2113bcfc1e7d03dfc5ea"
+        )
+        XCTAssertFalse(patch.isTruncated)
+        XCTAssertEqual(patch.files.map(\.path), ["a.txt", "added.txt"])
+        XCTAssertEqual(patch.files.map(\.kind), ["modified", "added"])
+        XCTAssertEqual(patch.files.map(\.add), [2, 1])
+        XCTAssertEqual(patch.files.map(\.del), [0, 0])
+        XCTAssertTrue(patch.text.contains("+new file on the peer"), patch.text)
+    }
 }
