@@ -356,6 +356,154 @@ final class ReviewBoardCoordinatorServiceTests: XCTestCase {
         )
     }
 
+    // MARK: - Reviewing a finished attempt
+
+    /// The one call a review renders from. Picking the attempt by
+    /// `current_attempt_id` matters: the list also carries retired attempts,
+    /// and approving against a stale one is refused by the coordinator.
+    func testReviewDetailReadsTheCurrentAttemptAndItsEvidence() async throws {
+        let socketPath = "/tmp/tm-coordinator-test-\(getpid())-\(UUID().uuidString.prefix(8)).sock"
+        let server = FakeCoordinatorServer(socketPath: socketPath)
+        let task = try server.start(expectedRequests: 1)
+        defer { server.stop(); task.cancel() }
+
+        let client = ReviewBoardCoordinatorClient(socketPath: socketPath)
+        let detail = try await client.reviewDetail(taskID: "tsk_review")
+
+        XCTAssertEqual(detail.attemptID, "att_current")
+        XCTAssertEqual(detail.fencingToken, "fen_current", "the retired attempt's token must not win")
+        XCTAssertEqual(detail.worktreePath, "/tmp/wt/task")
+        XCTAssertEqual(detail.snapshot?.snapshotID, "rev_1")
+        XCTAssertEqual(detail.snapshot?.headSHA, "bbb")
+        XCTAssertEqual(detail.snapshot?.diffDigest, "sha256:cafe")
+        XCTAssertEqual(detail.queueID, "mrq_1")
+        XCTAssertTrue(detail.isApprovable)
+    }
+
+    /// A task that reached `review_ready` through the team-board mirror has no
+    /// attempt and no snapshot — `task.update` records neither. The board has
+    /// to know that rather than offer a button that cannot work.
+    func testATaskWithNoAttemptIsNotApprovable() {
+        let mirrored = ReviewBoardReviewDetail(
+            status: "review_ready", attemptID: nil, fencingToken: nil,
+            worktreePath: nil, hostID: nil, snapshot: nil,
+            queueID: nil, queueStatus: nil, queueLastError: nil
+        )
+        XCTAssertFalse(mirrored.isApprovable)
+        let running = ReviewBoardReviewDetail(
+            status: "assigned", attemptID: "att_1", fencingToken: "fen_1",
+            worktreePath: nil, hostID: nil, snapshot: nil,
+            queueID: nil, queueStatus: nil, queueLastError: nil
+        )
+        XCTAssertFalse(running.isApprovable, "only a finished attempt is reviewable")
+    }
+
+    /// The params are the contract. A fake that answers whatever the parser
+    /// reads stays green while the real coordinator refuses the call.
+    func testApprovalSendsTheEvidenceTheCoordinatorRechecks() async throws {
+        let socketPath = "/tmp/tm-coordinator-test-\(getpid())-\(UUID().uuidString.prefix(8)).sock"
+        let server = FakeCoordinatorServer(socketPath: socketPath)
+        let task = try server.start(expectedRequests: 2)
+        defer { server.stop(); task.cancel() }
+
+        let client = ReviewBoardCoordinatorClient(socketPath: socketPath)
+        let evidence = try await client.recordReviewSnapshot(
+            taskID: "tsk_review", attemptID: "att_current", fencingToken: "fen_current",
+            baseSHA: "aaa", headSHA: "bbb", diffDigest: "sha256:cafe",
+            summary: "ready", files: [["path": "a.swift", "kind": "modified", "add": 1, "del": 0]]
+        )
+        XCTAssertEqual(evidence.snapshotID, "rev_2")
+
+        let snapshotParams = try XCTUnwrap(server.params(for: "review.snapshot"))
+        XCTAssertEqual(snapshotParams["base_sha"] as? String, "aaa")
+        XCTAssertEqual(snapshotParams["head_sha"] as? String, "bbb")
+        XCTAssertEqual(snapshotParams["diff_digest"] as? String, "sha256:cafe")
+        XCTAssertEqual(snapshotParams["fencing_token"] as? String, "fen_current")
+        // Derived from the evidence: the same tree state retried is idempotent,
+        // a different one gets its own id. The key is global to the
+        // coordinator, so it names what it is.
+        XCTAssertEqual(
+            snapshotParams["request_id"] as? String,
+            "review.snapshot:tsk_review:att_current:bbb"
+        )
+
+        let queueID = try await client.approve(
+            taskID: "tsk_review", attemptID: "att_current", fencingToken: "fen_current",
+            reviewer: "jinwoo", evidence: evidence
+        )
+        XCTAssertEqual(queueID, "mrq_2", "approving IS queueing — nothing is merged by it")
+
+        let approveParams = try XCTUnwrap(server.params(for: "approve"))
+        // All four fields the coordinator re-checks against the stored
+        // snapshot (api.rs:827-836). Sending a stale head_sha is what
+        // `snapshot evidence mismatch` is for.
+        XCTAssertEqual(approveParams["task_id"] as? String, "tsk_review")
+        XCTAssertEqual(approveParams["attempt_id"] as? String, "att_current")
+        XCTAssertEqual(approveParams["snapshot_id"] as? String, "rev_2")
+        XCTAssertEqual(approveParams["head_sha"] as? String, "bbb")
+        XCTAssertEqual(approveParams["diff_digest"] as? String, "sha256:cafe")
+        XCTAssertEqual(approveParams["reviewer"] as? String, "jinwoo")
+        // Naming the snapshot makes a transport retry return the original
+        // approval instead of attempting a second one, which would fail — the
+        // task has already left review_ready.
+        XCTAssertEqual(
+            approveParams["request_id"] as? String,
+            "approve:tsk_review:att_current:rev_2"
+        )
+    }
+
+    /// The coordinator requires a reason and briefs the next attempt with it,
+    /// so an empty one is refused here rather than sent.
+    func testARejectionWithoutAReasonNeverLeaves() async throws {
+        let socketPath = "/tmp/tm-coordinator-test-\(getpid())-\(UUID().uuidString.prefix(8)).sock"
+        let server = FakeCoordinatorServer(socketPath: socketPath)
+        let task = try server.start(expectedRequests: 1)
+        defer { server.stop(); task.cancel() }
+
+        let client = ReviewBoardCoordinatorClient(socketPath: socketPath)
+        do {
+            try await client.reject(
+                taskID: "t", attemptID: "a", fencingToken: "f",
+                reviewer: "jinwoo", reason: "   "
+            )
+            XCTFail("an empty reason must not reach the coordinator")
+        } catch {
+            XCTAssertNil(server.params(for: "reject"))
+        }
+
+        try await client.reject(
+            taskID: "tsk_review", attemptID: "att_current", fencingToken: "fen_current",
+            reviewer: "jinwoo", reason: "  범위가 넘쳤다  "
+        )
+        let params = try XCTUnwrap(server.params(for: "reject"))
+        XCTAssertEqual(params["reason"] as? String, "범위가 넘쳤다")
+        XCTAssertNil(params["snapshot_id"], "rejecting proves the fence, not what was read")
+    }
+
+    /// An error from the coordinator has to reach the caller. Swallowing it
+    /// would show a board that says the approval landed when it did not.
+    func testACoordinatorRefusalIsNotSwallowed() async throws {
+        let socketPath = "/tmp/tm-coordinator-test-\(getpid())-\(UUID().uuidString.prefix(8)).sock"
+        let server = FakeCoordinatorServer(socketPath: socketPath, errorMethods: ["approve"])
+        let task = try server.start(expectedRequests: 1)
+        defer { server.stop(); task.cancel() }
+
+        let client = ReviewBoardCoordinatorClient(socketPath: socketPath)
+        do {
+            _ = try await client.approve(
+                taskID: "t", attemptID: "a", fencingToken: "f", reviewer: "r",
+                evidence: ReviewBoardSnapshotEvidence(
+                    snapshotID: "rev_1", headSHA: "bbb", diffDigest: "sha256:cafe", baseSHA: "aaa"
+                )
+            )
+            XCTFail("a refused approval must throw")
+        } catch let error as ReviewBoardCoordinatorError {
+            guard case .jsonRPCError = error else {
+                return XCTFail("expected the coordinator's own error, got \(error)")
+            }
+        }
+    }
+
     func testClientParsesFakeUDSSnapshotAndSanitizesDisplayData() async throws {
         let socketPath = "/tmp/tm-coordinator-test-\(getpid())-\(UUID().uuidString.prefix(8)).sock"
         let server = FakeCoordinatorServer(socketPath: socketPath)
@@ -557,6 +705,15 @@ private final class FakeCoordinatorServer: @unchecked Sendable {
     private let lock = NSLock()
     private var listenerFD: Int32 = -1
     private var clientFDs: Set<Int32> = []
+    /// What the client actually sent. A fake that only answers proves the
+    /// parser reads its own fixture; the params are the half that has to match
+    /// the coordinator's contract.
+    private var recorded: [(method: String, params: [String: Any])] = []
+
+    func params(for method: String) -> [String: Any]? {
+        lock.lock(); defer { lock.unlock() }
+        return recorded.last { $0.method == method }?.params
+    }
 
     init(socketPath: String, errorMethods: Set<String> = []) {
         self.socketPath = socketPath
@@ -653,6 +810,9 @@ private final class FakeCoordinatorServer: @unchecked Sendable {
             throw Failure.invalidRequest
         }
         let id = request["id"] as? Int ?? 1
+        lock.lock()
+        recorded.append((method, request["params"] as? [String: Any] ?? [:]))
+        lock.unlock()
         if errorMethods.contains(method) {
             let response: [String: Any] = [
                 "jsonrpc": "2.0",
@@ -718,6 +878,48 @@ private final class FakeCoordinatorServer: @unchecked Sendable {
                     ],
                 ],
             ]
+        // Shape copied from daemon/tm-coordinator/src/api.rs:449-470 — task,
+        // attempts, the newest snapshot and this task's queue rows together.
+        case "task.get":
+            result = [
+                "task": [
+                    "task_id": "tsk_review",
+                    "status": "review_ready",
+                    "current_attempt_id": "att_current",
+                ],
+                "attempts": [
+                    // A retired attempt first, so picking by current_attempt_id
+                    // is actually exercised rather than "take the first one".
+                    ["attempt_id": "att_old", "fencing_token": "fen_stale", "status": "cancelled"],
+                    [
+                        "attempt_id": "att_current",
+                        "fencing_token": "fen_current",
+                        "worktree_path": "/tmp/wt/task",
+                        "host_id": "hst_1111",
+                        "status": "review_ready",
+                    ],
+                ],
+                "latest_review_snapshot": [
+                    "snapshot_id": "rev_1",
+                    "base_sha": "aaa",
+                    "head_sha": "bbb",
+                    "diff_digest": "sha256:cafe",
+                ],
+                "merge_queue": [
+                    ["queue_id": "mrq_1", "status": "queued", "last_error": NSNull()],
+                ],
+            ]
+        // Mutating methods answer with the mutate_checked envelope.
+        case "review.snapshot":
+            result = ["accepted": true, "idempotent": false, "event": ["payload": ["snapshot_id": "rev_2"]]]
+        case "approve":
+            result = [
+                "accepted": true,
+                "idempotent": false,
+                "event": ["payload": ["merge_queue_item": ["queue_id": "mrq_2", "status": "queued"]]],
+            ]
+        case "reject", "merge.queue.transition":
+            result = ["accepted": true, "idempotent": false, "event": ["payload": [:]]]
         case "events.subscribe":
             result = ["subscribed": true]
         default:

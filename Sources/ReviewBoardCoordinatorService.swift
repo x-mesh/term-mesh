@@ -188,6 +188,47 @@ enum ReviewBoardCoordinatorError: Error, Equatable {
     case syscall(String, Int32)
 }
 
+/// What an approval must repeat back to prove which tree it approved.
+///
+/// The coordinator stores no patch, so these three fields are the whole of
+/// what "this is what I reviewed" means to it: change the worktree between
+/// reading and approving and the evidence stops matching, and the approval is
+/// refused rather than landing something nobody looked at.
+struct ReviewBoardSnapshotEvidence: Equatable {
+    let snapshotID: String
+    let headSHA: String
+    let diffDigest: String
+    /// Not part of the evidence the coordinator re-checks — it validates
+    /// `head_sha` and `diff_digest` only — but carried because a reader needs
+    /// it to reproduce the diff.
+    let baseSHA: String?
+}
+
+/// One task as a reviewer needs it: what to act on, what is already recorded,
+/// and whether it has moved on already.
+struct ReviewBoardReviewDetail: Equatable {
+    let status: String?
+    let attemptID: String?
+    /// Read off the attempt, never minted. Issuing a fresh fence would take
+    /// the token from whoever is running the attempt — the thing fencing
+    /// exists to prevent.
+    let fencingToken: String?
+    let worktreePath: String?
+    let hostID: String?
+    let snapshot: ReviewBoardSnapshotEvidence?
+    let queueID: String?
+    let queueStatus: String?
+    let queueLastError: String?
+
+    /// Whether an approval could be attempted at all. A task that reached
+    /// `review_ready` through the team-board mirror has no snapshot and no
+    /// attempt, and the board has to say so rather than offer a button that
+    /// cannot work.
+    var isApprovable: Bool {
+        status == "review_ready" && attemptID != nil && fencingToken != nil
+    }
+}
+
 /// Whether a subscription loop should still be running. Kept as its own
 /// object so the loop's life is decided by `stop()` and nothing else — tying
 /// it to the client's lifetime instead means a caller who does not happen to
@@ -422,6 +463,198 @@ final class ReviewBoardCoordinatorClient: @unchecked Sendable {
             method: "task.place",
             params: ["request_id": requestID, "task_id": taskID]
         )
+    }
+
+    // MARK: - Reviewing a finished attempt
+
+    /// Everything a reviewer needs about one task, from the one call that
+    /// carries it.
+    ///
+    /// `task.get` returns the task, its attempts, the newest review snapshot
+    /// and this task's merge-queue rows together, so a board can render a
+    /// review and then act on it without a second round trip. The pieces are
+    /// gathered here rather than handed out raw because three of them only
+    /// mean anything together: an approval needs the attempt, the token that
+    /// attempt is currently fenced with, and the snapshot whose evidence it
+    /// must match.
+    func reviewDetail(taskID: String) async throws -> ReviewBoardReviewDetail {
+        let result = try await request(method: "task.get", params: ["task_id": taskID])
+        guard let object = result as? [String: Any] else {
+            throw ReviewBoardCoordinatorError.invalidResponse
+        }
+        let task = object["task"] as? [String: Any]
+        let attemptID = task?["current_attempt_id"] as? String
+        // The token is read off the attempt rather than minted: issuing a
+        // fresh fence would take it from whoever is running the attempt.
+        // That copy is only trustworthy because the reducer now updates it
+        // with the fence (see `re_fencing_updates_the_token_that_task_get_reports`).
+        let attempts = object["attempts"] as? [[String: Any]] ?? []
+        let attempt = attempts.first { $0["attempt_id"] as? String == attemptID }
+        var snapshot: ReviewBoardSnapshotEvidence?
+        if let raw = object["latest_review_snapshot"] as? [String: Any],
+           let id = raw["snapshot_id"] as? String,
+           let head = raw["head_sha"] as? String,
+           let digest = raw["diff_digest"] as? String {
+            snapshot = ReviewBoardSnapshotEvidence(
+                snapshotID: id,
+                headSHA: head,
+                diffDigest: digest,
+                baseSHA: raw["base_sha"] as? String
+            )
+        }
+        let queue = object["merge_queue"] as? [[String: Any]] ?? []
+        return ReviewBoardReviewDetail(
+            status: task?["status"] as? String,
+            attemptID: attemptID,
+            fencingToken: attempt?["fencing_token"] as? String,
+            worktreePath: attempt?["worktree_path"] as? String,
+            hostID: attempt?["host_id"] as? String,
+            snapshot: snapshot,
+            queueID: queue.last?["queue_id"] as? String,
+            queueStatus: queue.last?["status"] as? String,
+            queueLastError: queue.last?["last_error"] as? String
+        )
+    }
+
+    /// Record what is being reviewed, and get back the id an approval cites.
+    ///
+    /// The coordinator stores no patch — by design (`mission-control-approval-queue`
+    /// §v1) — so what it keeps is the pair of shas plus a digest, and an
+    /// approval must repeat them exactly. That is what makes an approval refer
+    /// to a specific state of the tree rather than to "the task": if the
+    /// worktree moves between reading and approving, the evidence stops
+    /// matching and the approval is refused instead of landing something
+    /// nobody looked at.
+    func recordReviewSnapshot(
+        taskID: String,
+        attemptID: String,
+        fencingToken: String,
+        baseSHA: String,
+        headSHA: String,
+        diffDigest: String,
+        summary: String?,
+        files: [[String: Any]]
+    ) async throws -> ReviewBoardSnapshotEvidence {
+        var params: [String: Any] = [
+            // Derived from the evidence, not random: a retry of the same
+            // snapshot is then idempotent, while a different tree state gets
+            // its own id. The key is global to the coordinator, so it names
+            // what it is.
+            "request_id": "review.snapshot:\(taskID):\(attemptID):\(headSHA)",
+            "task_id": taskID,
+            "attempt_id": attemptID,
+            "fencing_token": fencingToken,
+            "base_sha": baseSHA,
+            "head_sha": headSHA,
+            "diff_digest": diffDigest,
+        ]
+        if let summary, !summary.isEmpty { params["summary"] = summary }
+        if !files.isEmpty { params["files"] = files }
+        let result = try await request(method: "review.snapshot", params: params)
+        guard let payload = eventPayload(in: result),
+              let snapshotID = payload["snapshot_id"] as? String else {
+            throw ReviewBoardCoordinatorError.invalidResponse
+        }
+        return ReviewBoardSnapshotEvidence(
+            snapshotID: snapshotID,
+            headSHA: headSHA,
+            diffDigest: diffDigest,
+            baseSHA: baseSHA
+        )
+    }
+
+    /// Approve an attempt and put it on the merge queue.
+    ///
+    /// Returns the queue id, because approving IS queueing — the coordinator
+    /// moves the task to `queued_for_merge` and inserts the row in one step.
+    /// Nothing is merged by this call.
+    @discardableResult
+    func approve(
+        taskID: String,
+        attemptID: String,
+        fencingToken: String,
+        reviewer: String,
+        evidence: ReviewBoardSnapshotEvidence
+    ) async throws -> String {
+        let result = try await request(
+            method: "approve",
+            params: [
+                // Naming the snapshot means a retry after a transport failure
+                // returns the original approval rather than attempting a
+                // second one — which would fail, since the task has already
+                // left `review_ready`.
+                "request_id": "approve:\(taskID):\(attemptID):\(evidence.snapshotID)",
+                "task_id": taskID,
+                "attempt_id": attemptID,
+                "fencing_token": fencingToken,
+                "reviewer": reviewer,
+                "snapshot_id": evidence.snapshotID,
+                "head_sha": evidence.headSHA,
+                "diff_digest": evidence.diffDigest,
+            ]
+        )
+        guard let payload = eventPayload(in: result),
+              let item = payload["merge_queue_item"] as? [String: Any],
+              let queueID = item["queue_id"] as? String else {
+            throw ReviewBoardCoordinatorError.invalidResponse
+        }
+        return queueID
+    }
+
+    /// Send an attempt back with a reason.
+    ///
+    /// No snapshot is involved: rejecting does not need to prove what was
+    /// looked at, only that the reviewer holds the current fence. The reason
+    /// is required by the coordinator and is what the next attempt is briefed
+    /// with, so an empty one is refused here rather than sent.
+    func reject(
+        taskID: String,
+        attemptID: String,
+        fencingToken: String,
+        reviewer: String,
+        reason: String
+    ) async throws {
+        let trimmed = reason.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else {
+            throw ReviewBoardCoordinatorError.jsonRPCError(
+                code: nil,
+                message: "A rejection needs a reason — it is what the next attempt is told."
+            )
+        }
+        _ = try await request(
+            method: "reject",
+            params: [
+                "request_id": "reject:\(taskID):\(attemptID)",
+                "task_id": taskID,
+                "attempt_id": attemptID,
+                "fencing_token": fencingToken,
+                "reviewer": reviewer,
+                "reason": trimmed,
+            ]
+        )
+    }
+
+    /// Move a queued item along. The merge itself happens elsewhere; this
+    /// records what happened to it.
+    func transitionMergeQueue(
+        queueID: String,
+        status: String,
+        lastError: String? = nil
+    ) async throws {
+        var params: [String: Any] = [
+            "request_id": "merge.queue.transition:\(queueID):\(status)",
+            "queue_id": queueID,
+            "status": status,
+        ]
+        if let lastError, !lastError.isEmpty { params["last_error"] = lastError }
+        _ = try await request(method: "merge.queue.transition", params: params)
+    }
+
+    /// Every mutating coordinator method answers with the same envelope.
+    private func eventPayload(in result: Any) -> [String: Any]? {
+        guard let object = result as? [String: Any],
+              let event = object["event"] as? [String: Any] else { return nil }
+        return event["payload"] as? [String: Any]
     }
 
     func observeHosts(_ observations: [CoordinatorHostObservation]) async {
