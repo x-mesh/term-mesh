@@ -1426,8 +1426,25 @@ final class ReviewBoardCoordinatorService: ObservableObject {
         client: ReviewBoardCoordinatorClient
     ) async {
         await mirrorTeamStatuses(coordinatorRows: inputs.rows, client: client)
+        // A placed task whose dependencies have not landed is held, not sent.
+        // The graph was stored and drawn on the row but nothing consulted it,
+        // so a phase-2 task went out the moment it was placed and started
+        // against a tree missing phase 1. Held work stays `placed` and goes
+        // out on the refresh after its last dependency lands — which is also
+        // what lets a chain run without a leader watching it.
+        let snapshotTasks = snapshot.tasks
+        let dispatchable = inputs.rows.filter { row in
+            let dependsOn = row["depends_on"] as? [String] ?? []
+            guard let reason = AutoPilotDispatch.blockingReason(
+                dependsOn: dependsOn, in: snapshotTasks
+            ) else { return true }
+            RemoteWorkLog.info(
+                "Holding \"\(row["title"] as? String ?? "task")\": \(reason)"
+            )
+            return false
+        }
         await CoordinatorPlacementDispatcher.shared.reconcile(
-            taskRows: inputs.rows,
+            taskRows: dispatchable,
             projectRoots: inputs.roots,
             hostsByCoordinatorID: hostsByCoordinatorID(),
             localHostID: CoordinatorHostObservation(
