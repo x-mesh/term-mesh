@@ -16,7 +16,7 @@
 //! outside the lock.
 
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
@@ -119,13 +119,49 @@ fn walk_to_git_root(cwd: &str) -> String {
         // `.git` is a directory in a normal clone and a FILE in a worktree
         // or submodule, so test for existence rather than for a directory —
         // term-mesh's own worktrees would otherwise report no project.
-        if dir.join(".git").exists() {
+        let dotgit = dir.join(".git");
+        if dotgit.exists() {
+            // A linked worktree is a temporary station of its primary
+            // project, not a project of its own: an agent working in
+            // `demo-executor-260728-a3f2` is working on `demo`, and
+            // reporting the worktree path fragmented the sidebar's project
+            // grouping into one ghost project per agent. Resolve it to the
+            // primary. A submodule's `.git` is also a file but points into
+            // `.git/modules/…` — that one IS its own project (ghostty inside
+            // term-mesh), so it keeps its own root.
+            if let Some(primary) = linked_worktree_primary(&dotgit) {
+                return primary;
+            }
             return dir.to_string_lossy().into_owned();
         }
         if !dir.pop() {
             return String::new();
         }
     }
+}
+
+/// The primary checkout's root when `.git` is a linked-worktree pointer
+/// file (`gitdir: <primary>/.git/worktrees/<name>`), else None. Reads the
+/// file rather than running git: this sits on the layout-snapshot path.
+fn linked_worktree_primary(dotgit: &Path) -> Option<String> {
+    if !dotgit.is_file() {
+        return None;
+    }
+    let text = std::fs::read_to_string(dotgit).ok()?;
+    let target = text.strip_prefix("gitdir:")?.trim();
+    // `<primary>/.git/worktrees/<name>` — anything else (a submodule's
+    // `.git/modules/…`, an unrecognised layout) is not a linked worktree.
+    let target_path = Path::new(target);
+    let worktrees_dir = target_path.parent()?; // …/.git/worktrees
+    let git_dir = worktrees_dir.parent()?; // …/.git
+    if worktrees_dir.file_name()? != "worktrees" || git_dir.file_name()? != ".git" {
+        return None;
+    }
+    let primary = git_dir.parent()?;
+    if !primary.is_absolute() {
+        return None;
+    }
+    Some(primary.to_string_lossy().into_owned())
 }
 
 #[derive(Debug)]
@@ -2018,7 +2054,8 @@ mod tests {
 
     #[test]
     fn project_root_accepts_a_git_file_for_worktrees() {
-        // A linked worktree (and a submodule) has `.git` as a FILE.
+        // A `.git` FILE whose pointer is not a recognisable linked-worktree
+        // gitdir still marks a repo root of its own.
         let tmp = tempfile::tempdir().expect("tempdir");
         let worktree = tmp.path().join("feature-branch");
         std::fs::create_dir_all(worktree.join("Sources")).expect("mkdir");
@@ -2027,6 +2064,55 @@ mod tests {
         assert_eq!(
             walk_to_git_root(worktree.join("Sources").to_str().unwrap()),
             worktree.to_string_lossy()
+        );
+    }
+
+    #[test]
+    fn project_root_resolves_a_linked_worktree_to_its_primary() {
+        // An agent's instance-tagged worktree is a temporary station of the
+        // primary project — it must group under `demo`, not appear as a
+        // ghost project called `demo-executor-260728-a3f2`.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let primary = tmp.path().join("demo");
+        let worktree = tmp.path().join("demo-executor-260728-a3f2");
+        std::fs::create_dir_all(worktree.join("src")).expect("mkdir");
+        std::fs::write(
+            worktree.join(".git"),
+            format!(
+                "gitdir: {}\n",
+                primary.join(".git/worktrees/demo-executor").display()
+            ),
+        )
+        .expect("write");
+
+        assert_eq!(
+            walk_to_git_root(worktree.join("src").to_str().unwrap()),
+            primary.to_string_lossy()
+        );
+    }
+
+    #[test]
+    fn project_root_keeps_a_submodule_as_its_own_project() {
+        // A submodule's `.git` file points into `.git/modules/…` — it is a
+        // repository in its own right (ghostty inside term-mesh), so panes
+        // working in it stay grouped under the submodule, never absorbed
+        // into the superproject.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let superproject = tmp.path().join("term-mesh");
+        let submodule = superproject.join("ghostty");
+        std::fs::create_dir_all(submodule.join("src")).expect("mkdir");
+        std::fs::write(
+            submodule.join(".git"),
+            format!(
+                "gitdir: {}\n",
+                superproject.join(".git/modules/ghostty").display()
+            ),
+        )
+        .expect("write");
+
+        assert_eq!(
+            walk_to_git_root(submodule.join("src").to_str().unwrap()),
+            submodule.to_string_lossy()
         );
     }
 

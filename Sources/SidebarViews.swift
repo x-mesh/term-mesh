@@ -1234,6 +1234,12 @@ struct SidebarRemoteAgentSheet: View {
                         .foregroundColor(.secondary)
                     TextField("/root/project", text: $directory)
                         .textFieldStyle(.roundedBorder)
+                    // The same convention creation uses: an agent never
+                    // shares the project's checkout with the leader.
+                    Text("A folder this project owns gets the agent its own dated worktree beside it; any other path is used as typed.")
+                        .font(.system(size: 9))
+                        .foregroundColor(Color.secondary.opacity(0.8))
+                        .fixedSize(horizontal: false, vertical: true)
                 }
 
                 VStack(alignment: .leading, spacing: 5) {

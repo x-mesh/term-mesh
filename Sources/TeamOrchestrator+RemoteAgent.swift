@@ -677,6 +677,32 @@ extension TeamOrchestrator {
         // an agent but only contains "command not found".
         try await Self.ensureRemoteCLIAvailable(cli: cli, host: host)
 
+        // The project's checkout convention applies to late joiners too.
+        // Creation gives every agent an instance-tagged worktree; this path
+        // used to drop a later agent straight into whatever directory was
+        // typed — which the sheet prefills with the project PRIMARY, i.e.
+        // the leader's own checkout. Two writers, one working tree: the
+        // collision the worktrees exist to prevent, back through the side
+        // door. When the requested directory is one this project created,
+        // carve the newcomer its own station beside it instead. Anything
+        // not recorded as the project's stays exactly as typed.
+        var workingDirectory = workingDirectory
+        if let isolated = await Self.prepareLateAgentCheckout(
+            team: team,
+            host: host,
+            hostKey: hostKey,
+            agentName: agentName,
+            requestedDirectory: workingDirectory
+        ) {
+            workingDirectory = isolated.path
+            var locations = team.remoteProjectLocations
+            locations.append(.init(hostKey: hostKey, path: isolated.path))
+            recordRemoteProjectLocations(
+                teamName: teamName,
+                locations: locations.sorted { ($0.hostKey, $0.path) < ($1.hostKey, $1.path) }
+            )
+        }
+
         // Split off the last agent's pane, or the leader's — the same shape a
         // local `add` produces, so a mixed team does not look different from
         // one that happens to run entirely here.
@@ -1109,6 +1135,77 @@ extension TeamOrchestrator {
                 }
             }
         }
+    }
+
+    /// A late-added agent's own checkout, prepared on the host — or nil to
+    /// use the requested directory exactly as given.
+    ///
+    /// Applies only when the requested directory is recorded as one of this
+    /// project's (`remoteProjectLocations`) — a team without project records,
+    /// or an explicitly custom path, keeps today's behavior. The primary is
+    /// derived from the directory itself over ssh (`--git-common-dir`), so a
+    /// recorded worktree path resolves to the same primary its siblings came
+    /// from. The checkout uses the same instance-tag scheme as creation; the
+    /// mem-mesh identity needs no re-pinning because `--local` git config is
+    /// shared with every worktree of the repository. Best effort on purpose:
+    /// any failure falls back to the requested directory, which is exactly
+    /// what this path always did.
+    static func prepareLateAgentCheckout(
+        team: Team,
+        host: HostEntry,
+        hostKey: String,
+        agentName: String,
+        requestedDirectory: String
+    ) async -> (path: String, branch: String)? {
+        let requested = requestedDirectory.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !requested.isEmpty,
+              let sshTarget = host.sshTarget, !sshTarget.isEmpty,
+              team.remoteProjectLocations.contains(
+                  Team.RemoteProjectLocation(hostKey: hostKey, path: requested)
+              )
+        else { return nil }
+
+        let quoted = "'" + requested.replacingOccurrences(of: "'", with: "'\\''") + "'"
+        guard let commonDir = try? await PeerHostReadinessChecker.runScript(
+            sshTarget: sshTarget,
+            port: host.sshPort,
+            identityFile: host.identityFile,
+            script: "git -C \(quoted) rev-parse --path-format=absolute --git-common-dir 2>/dev/null",
+            timeoutSeconds: 30
+        ).trimmingCharacters(in: .whitespacesAndNewlines),
+              commonDir.hasSuffix("/.git")
+        else { return nil }
+        let primary = String(commonDir.dropLast("/.git".count))
+        guard !primary.isEmpty, primary != "/" else { return nil }
+
+        let plan = PeerProjectBootstrap.plan(
+            projectRoot: (primary as NSString).deletingLastPathComponent,
+            projectName: (primary as NSString).lastPathComponent,
+            agents: [agentName],
+            isolateAgents: true,
+            instanceTag: PeerProjectBootstrap.makeInstanceTag()
+        )
+        guard let checkout = plan.agentCheckouts.first else { return nil }
+        do {
+            try await PeerProjectBootstrap.run(
+                sshTarget: sshTarget,
+                port: host.sshPort,
+                identityFile: host.identityFile,
+                plan: plan,
+                gitURL: nil,
+                sourceKind: .existingFolder,
+                memMeshProjectID: nil
+            )
+        } catch {
+            RemoteWorkLog.info(
+                "Could not carve a worktree for \(agentName) on \(host.displayName) — using \(requested): \(error)"
+            )
+            return nil
+        }
+        RemoteWorkLog.info(
+            "\(agentName) joins in its own checkout on \(host.displayName): \(checkout.path) (\(checkout.branch))"
+        )
+        return (path: checkout.path, branch: checkout.branch)
     }
 
     /// A detached agent's instance-tagged checkout has no future occupant, so
