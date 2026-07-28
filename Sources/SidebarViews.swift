@@ -783,9 +783,6 @@ enum SidebarLayoutSettings {
     static let localTabsCollapsedKey = "sidebar.section.localTabs.collapsed"
     static let remoteHostsCollapsedKey = "sidebar.section.remoteHosts.collapsed"
     static let collapsedHostKeysKey = "sidebar.remoteHost.collapsedKeys"
-    /// Folded by default: unassigned workspaces are the exception on a
-    /// project axis, so they stay out of the way until asked for.
-    static let unassignedWorkspacesExpandedKey = "sidebar.peerProjects.unassigned.expanded"
 
     /// Last user-committed sidebar width (saved on drag end only, so
     /// transient window-resize clamps never overwrite user intent).
@@ -927,12 +924,10 @@ struct SidebarAxisPicker: View {
 /// The Project axis: every workspace this app can see, local and peer, grouped
 /// by the project it works inside.
 struct SidebarProjectsSection: View {
-    @EnvironmentObject private var tabManager: TabManager
     @ObservedObject var store: RemoteHostStore
     let usesSeparatedPresentation: Bool
     @AppStorage(SidebarLayoutSettings.localTabsCollapsedKey)
     private var isCollapsed = false
-    @State private var isCreatingProject = false
 
     var body: some View {
         VStack(spacing: 0) {
@@ -967,7 +962,14 @@ struct SidebarProjectsSection: View {
                     // team sheet was closer than the duplicate before it, but
                     // it still asked about pair mode and worktree isolation of
                     // someone who had not chosen a folder yet.
-                    isCreatingProject = true
+                    //
+                    // The sheet itself belongs to the app, not to this header:
+                    // the titlebar's + opens the same one, and it is visible
+                    // exactly when the sidebar — and so this button — is not.
+                    NotificationCenter.default.post(
+                        name: .projectCreationRequested,
+                        object: nil
+                    )
                 } label: {
                     Image(systemName: "plus")
                         .font(.system(size: 9, weight: .semibold))
@@ -994,201 +996,6 @@ struct SidebarProjectsSection: View {
             }
         }
         .padding(.bottom, 4)
-        .sheet(isPresented: $isCreatingProject) {
-            NewProjectView(
-                onCreate: { name, directory, rows, source, leader in
-                    // A name already in use means the project is open, not
-                    // that something failed. Creating one silently returned
-                    // nil and the sheet just closed, which reads as the
-                    // button not working — so go to the one that is there.
-                    if let existing = TeamOrchestrator.shared.teams[name],
-                       let workspace = tabManager.tabs.first(where: { $0.id == existing.workspaceId }) {
-                        tabManager.selectWorkspace(workspace)
-                        return
-                    }
-                    // The checkouts have to exist before anyone is sent to
-                    // work in them: an agent whose directory is not there
-                    // starts in a shell that failed to `cd` and looks
-                    // attached while being nothing of the kind.
-                    let prepared = try await prepareProjectCheckouts(
-                        name: name,
-                        rows: rows,
-                        source: source,
-                        leaderHostKey: leader.endpoint.hostKey
-                    )
-                    guard TeamOrchestrator.shared.createTeam(
-                        named: name,
-                        rows: prepared.rows,
-                        workingDirectory: prepared.localProjectPath ?? directory,
-                        leaderMode: leader.mode,
-                        leaderModel: leader.model,
-                        leaderEndpoint: leader.endpoint,
-                        leaderWorkingDirectory: prepared.leaderProjectPath,
-                        worktreeMode: source.isolateAgents
-                            && prepared.rows.contains(where: { $0.hostKey == nil })
-                            ? "isolated"
-                            : "off",
-                        projectSource: source,
-                        tabManager: tabManager
-                    ) != nil else {
-                        throw ProjectCreationError.teamCreationFailed
-                    }
-                    // A project with agents in it is what the board is
-                    // for, so making one puts it up.
-                    ReviewBoardSettings.setVisible(true)
-                },
-                onClose: { isCreatingProject = false }
-            )
-        }
-    }
-
-
-    private struct PreparedProjectCheckouts {
-        var rows: [TeamAgentRow]
-        /// Primary checkout on this Mac, when either the source, leader or a
-        /// member runs here. The local team engine builds its own worktrees
-        /// from this root.
-        var localProjectPath: String?
-        /// Primary checkout on the leader's machine. nil tells a local leader
-        /// to use `localProjectPath`; a remote leader always receives a path.
-        var leaderProjectPath: String?
-    }
-
-    /// Prepare every machine selected in the form before launching anyone.
-    ///
-    /// Remote members receive the concrete worktree path made for them.
-    /// Local members stay host=nil and let the existing local team engine
-    /// create its worktrees from `localProjectPath`, avoiding a second,
-    /// competing local worktree implementation.
-    @MainActor
-    private func prepareProjectCheckouts(
-        name: String,
-        rows: [TeamAgentRow],
-        source: ProjectSource,
-        leaderHostKey: String?
-    ) async throws -> PreparedProjectCheckouts {
-        let placements = try PeerProjectBootstrap.placements(
-            source: source,
-            rows: rows,
-            leaderHostKey: leaderHostKey,
-            localProjectsRoot: ProjectLocationSettings.expandedLocalProjectsRoot()
-        ) { hostKey in
-            PeerHostProfileStore.shared.profiles
-                .first(where: { $0.stableKey == hostKey })?
-                .predictedProjectPath(
-                    forProjectNamed: URL(fileURLWithPath: source.projectPath).lastPathComponent
-                )
-                ?? RemoteProjectPaths.shared.path(
-                    host: hostKey, localRoot: source.projectPath
-                )
-        }
-
-        var prepared = rows
-        var localProjectPath: String?
-        var leaderProjectPath: String?
-        let gitURL = source.gitURL.trimmingCharacters(in: .whitespacesAndNewlines)
-        // One name for every copy. Each placement's directory is the host's own
-        // convention — deriving the id from it would give the same project a
-        // different mem-mesh identity on each machine.
-        let memMeshProjectID = PeerProjectBootstrap.memMeshProjectID(for: name)
-
-        for placement in placements {
-            let placedRows = placement.agentIndices.map { rows[$0] }
-            let plan = PeerProjectBootstrap.plan(
-                projectRoot: (placement.projectPath as NSString).deletingLastPathComponent,
-                projectName: (placement.projectPath as NSString).lastPathComponent,
-                agents: placedRows.map(\.preset.name),
-                isolateAgents: source.isolateAgents
-            )
-            let kind: ProjectSourceKind = placement.isSource
-                ? source.kind
-                : (gitURL.isEmpty ? source.kind : .clone)
-
-            if let hostKey = placement.hostKey {
-                guard let host = RemoteHostStore.shared.sortedHosts.first(where: { $0.id == hostKey }),
-                      let sshTarget = host.sshTarget, !sshTarget.isEmpty
-                else {
-                    throw ProjectCreationError.remoteHostUnavailable
-                }
-                do {
-                    try await PeerProjectBootstrap.run(
-                        sshTarget: sshTarget,
-                        port: host.sshPort,
-                        identityFile: host.identityFile,
-                        plan: plan,
-                        gitURL: gitURL.isEmpty ? nil : gitURL,
-                        sourceKind: kind,
-                        memMeshProjectID: memMeshProjectID
-                    )
-                } catch {
-                    let detail = PeerProjectBootstrap.remoteFailureDescription(
-                        error,
-                        gitURL: gitURL.isEmpty ? nil : gitURL
-                    )
-                    RemoteWorkLog.info(
-                        "Could not prepare \(name) on \(host.displayName): \(detail)"
-                    )
-                    throw ProjectCreationError.remoteSetupFailed(
-                        host: host.displayName,
-                        detail: detail
-                    )
-                }
-                for (offset, rowIndex) in placement.agentIndices.enumerated()
-                    where offset < plan.agentCheckouts.count {
-                    prepared[rowIndex].hostKey = hostKey
-                    prepared[rowIndex].hostDirectory = plan.agentCheckouts[offset].path
-                }
-                RemoteProjectPaths.shared.remember(
-                    host: hostKey,
-                    localRoot: source.projectPath,
-                    path: plan.primaryPath
-                )
-            } else {
-                // Local team creation owns local member worktrees. This step
-                // prepares only their shared primary checkout.
-                let primaryOnly = PeerProjectBootstrap.Plan(
-                    primaryPath: plan.primaryPath,
-                    agentCheckouts: []
-                )
-                try await PeerProjectBootstrap.runLocal(
-                    plan: primaryOnly,
-                    gitURL: gitURL.isEmpty ? nil : gitURL,
-                    sourceKind: kind,
-                    memMeshProjectID: memMeshProjectID
-                )
-                localProjectPath = plan.primaryPath
-            }
-
-            if placement.includesLeader {
-                leaderProjectPath = placement.hostKey == nil ? nil : plan.primaryPath
-            }
-        }
-
-        return PreparedProjectCheckouts(
-            rows: prepared,
-            localProjectPath: localProjectPath,
-            leaderProjectPath: leaderProjectPath
-        )
-    }
-
-    private enum ProjectCreationError: LocalizedError {
-        case teamCreationFailed
-        case remoteHostUnavailable
-        case remotePathMissing
-        case remoteSetupFailed(host: String, detail: String)
-
-        var errorDescription: String? {
-            switch self {
-            case .teamCreationFailed:
-                "Could not create the project team."
-            case .remoteHostUnavailable:
-                "The selected remote machine is unavailable."
-            case .remotePathMissing:
-                "Enter a folder on the remote machine."
-            case .remoteSetupFailed(let host, let detail):
-                "Could not prepare \(host): \(detail)"
-            }
-        }
     }
 }
 
@@ -1657,8 +1464,10 @@ private struct SidebarPeerProjectsView: View {
     let store: RemoteHostStore
     let usesSeparatedPresentation: Bool
     let paneExpansionCommand: PeerPaneExpansionCommand
-    @AppStorage(SidebarLayoutSettings.unassignedWorkspacesExpandedKey)
-    private var isUnassignedExpanded = false
+    /// The same key the switch above writes, so the unassigned footer can send
+    /// the user to the view that actually lists those workspaces.
+    @AppStorage(SidebarAxisSettings.selectedAxisKey)
+    private var selectedAxisRaw = SidebarAxisSettings.defaultAxis.rawValue
     /// Non-nil presents the delegate sheet.
     @State private var delegateTarget: SidebarProjectDelegateTarget?
     /// Non-nil presents the remote-agent sheet.
@@ -1677,11 +1486,10 @@ private struct SidebarPeerProjectsView: View {
     /// remote workspace twice. Matches the rule the Local Workspaces section
     /// applies (`SidebarPresentationSettings`).
     ///
-    /// A local workspace naming no project used to be dropped, on the grounds
-    /// that the Local Workspaces section above was still its home. Under the
-    /// Project axis that section is not mounted at all, so dropping it made
-    /// the workspace unreachable without switching axes. It joins Unassigned
-    /// now, the same as a peer workspace in the same position.
+    /// A local workspace naming no project is counted rather than listed: the
+    /// Host view already shows it under Workspaces, so a second copy here was
+    /// duplication. What it contributes is the footer's count — the one thing
+    /// the Host view cannot say from over there.
     private var localMembers: [(Workspace, PeerProjectIdentity)] {
         tabManager.tabs.compactMap { workspace in
             guard !workspace.isPeerMirror else { return nil }
@@ -1705,9 +1513,9 @@ private struct SidebarPeerProjectsView: View {
     /// Split the connected roster into named projects and the leftovers.
     /// A workspace whose panes do not name a project (a shell sitting in the
     /// home directory, panes spread across unrelated trees) is NOT given a
-    /// group header — calling it a project would be a lie — but it is not
-    /// dropped either, since this view is the only route to it while the
-    /// Project axis is selected.
+    /// group header — calling it a project would be a lie — and it is not
+    /// listed either: the Host view is where those live. Only the count
+    /// survives, so the axis admits what it is leaving out.
     private var groupedWorkspaces: (
         projects: [SidebarPeerProjectGroup],
         unassigned: [SidebarPeerProjectGroup.WorkspaceItem]
@@ -1880,12 +1688,12 @@ private struct SidebarPeerProjectsView: View {
                         .foregroundColor(.secondary)
                     // The empty state is the only place this view mentions
                     // hosts at all — without it a peerless Project view would
-                    // be a dead end with no route to connecting one. Once a
-                    // peer IS connected the advice changes: the workspaces
-                    // exist, they just are not in a project folder.
+                    // be a dead end with no route to connecting one. Once
+                    // there ARE workspaces the footer below already accounts
+                    // for them, so this line only has to say what to do next.
                     Text(grouped.unassigned.isEmpty
-                         ? "Click + to open a folder as a workspace, or connect a peer in the Host view."
-                         : "No workspace is working inside a project folder yet.")
+                         ? "Click + to start a project, or connect a peer in the Host view."
+                         : "Click + to start one.")
                         .font(.system(size: 9))
                         .foregroundColor(Color.secondary.opacity(0.72))
                         .fixedSize(horizontal: false, vertical: true)
@@ -1941,7 +1749,7 @@ private struct SidebarPeerProjectsView: View {
             }
 
             if !grouped.unassigned.isEmpty {
-                unassignedSection(grouped.unassigned)
+                unassignedFooter(grouped.unassigned)
             }
         }
         .sheet(item: $delegateTarget) { target in
@@ -2049,42 +1857,43 @@ private struct SidebarPeerProjectsView: View {
         }
     }
 
-    @ViewBuilder
-    private func unassignedSection(
+    /// What this axis is leaving out, in one line.
+    ///
+    /// These workspaces used to be listed here in an expandable section, which
+    /// was the Host view's roster reprinted under a heading saying the opposite
+    /// of what its rows are. The count still has to be said — a workspace
+    /// silently missing from the sidebar reads as lost — but saying it once,
+    /// next to the way to go and see them, does that job without turning the
+    /// project axis back into the host one.
+    private func unassignedFooter(
         _ items: [SidebarPeerProjectGroup.WorkspaceItem]
     ) -> some View {
-        VStack(spacing: 4) {
-            Button {
-                withAnimation(.easeInOut(duration: 0.15)) {
-                    isUnassignedExpanded.toggle()
-                }
-            } label: {
-                HStack(spacing: 4) {
-                    Image(systemName: "chevron.right")
-                        .font(.system(size: 8, weight: .semibold))
-                        .rotationEffect(.degrees(isUnassignedExpanded ? 90 : 0))
-                        .foregroundColor(Color.secondary.opacity(0.7))
-                    Text("Unassigned (\(items.count))")
-                        .font(.system(size: 9, weight: .semibold))
-                        .foregroundColor(Color.secondary.opacity(0.75))
-                        .lineLimit(1)
-                }
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .contentShape(Rectangle())
+        let count = items.count
+        let noun = count == 1 ? "workspace" : "workspaces"
+        return Button {
+            selectedAxisRaw = SidebarAxis.host.rawValue
+        } label: {
+            HStack(spacing: 4) {
+                Text("\(count) \(noun) without a project")
+                    .font(.system(size: 9))
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+                Image(systemName: "chevron.right")
+                    .font(.system(size: 7, weight: .semibold))
+                Spacer(minLength: 0)
             }
-            .buttonStyle(.plain)
-            .padding(.leading, 16)
-            .padding(.top, 6)
-            .padding(.bottom, 1)
-            .accessibilityLabel("Unassigned workspaces")
-            .help("Workspaces whose working directory does not name a project")
-
-            if isUnassignedExpanded {
-                ForEach(items) { item in
-                    workspaceRow(item)
-                }
-            }
+            .foregroundColor(Color.secondary.opacity(0.6))
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .contentShape(Rectangle())
         }
+        .buttonStyle(.plain)
+        .padding(.leading, 16)
+        .padding(.trailing, 12)
+        .padding(.top, 6)
+        .padding(.bottom, 1)
+        .accessibilityIdentifier("sidebar.projects.unassignedLink")
+        .accessibilityLabel("\(count) \(noun) without a project — show the Host view")
+        .help("Listed under Workspaces and Peer Hosts in the Host view")
     }
 }
 
@@ -2849,10 +2658,12 @@ struct RemoteWorkspaceRowView: View {
     private var canManage: Bool { host.supportsWorkspaceLifecycle == true }
 
     private var mirroredWorkspace: Workspace? {
+        // App-wide on purpose: one app holds one view of a host workspace,
+        // so the row reads "open" in every window and clicking it goes to
+        // wherever that view lives.
         PeerClientCoordinator.shared.mirroredWorkspace(
             forHostKey: host.paneHostSpec.hostKey,
-            hostWorkspaceID: workspace.id,
-            in: tabManager
+            hostWorkspaceID: workspace.id
         )
     }
 
