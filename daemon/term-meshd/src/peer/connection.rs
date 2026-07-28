@@ -791,11 +791,18 @@ async fn reader_loop(
                 };
                 match input.kind {
                     Some(peer_proto::v1::input::Kind::Keys(keys)) => {
+                        // Typing marks this connection as the one driving the
+                        // PTY, which is what wins winsize arbitration — see
+                        // `PtySurface::note_input`. Before the write, so a
+                        // size-sensitive redraw the input provokes already
+                        // happens at the typist's size.
+                        entry.surface.note_input(size_requester);
                         if let Err(e) = write_surface_input(entry.surface.clone(), keys).await {
                             tracing::warn!("PTY write failed: {e}");
                         }
                     }
                     Some(peer_proto::v1::input::Kind::Paste(p)) => {
+                        entry.surface.note_input(size_requester);
                         if let Err(e) = write_surface_input(entry.surface.clone(), p.text).await {
                             tracing::warn!("PTY paste-write failed: {e}");
                         }

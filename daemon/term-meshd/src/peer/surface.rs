@@ -407,12 +407,11 @@ pub struct PtySurface {
     modes: Mutex<BTreeSet<u16>>,
     /// Per-attacher requested winsize, keyed by an opaque requester id (one
     /// per connection). A PTY has a single winsize, so concurrent viewers
-    /// are arbitrated tmux-style: the PTY gets min(cols) × min(rows) across
-    /// all live requests, and a departing attacher's request is dropped so
-    /// the survivors get their size back. Replaces the last-writer-wins
-    /// free-for-all that made two different-sized windows fight over the
-    /// grid.
-    size_requests: Mutex<HashMap<u64, (u16, u16)>>,
+    /// are arbitrated — see [`SizeArbiter::effective`] for the policy
+    /// (typist-recency first, per-axis min among the silent). Replaces the
+    /// last-writer-wins free-for-all that made two different-sized windows
+    /// fight over the grid.
+    size_requests: Mutex<SizeArbiter>,
     /// The host-side screen model (see [`ScreenModel`]). Locked briefly by
     /// the reader loop per chunk and by attach-time snapshot reads; never
     /// held across an await.
@@ -442,6 +441,46 @@ enum ChildState {
 struct ChildLifecycle {
     pid: libc::pid_t,
     state: ChildState,
+}
+
+/// Winsize arbitration state for one PTY (behind `size_requests`).
+///
+/// Two policies, picked by whether anyone has typed:
+///
+/// - Someone attached has sent input → the most recent typist's requested
+///   size rules (tmux `window-size latest`). The pane a person is working
+///   in must be able to reclaim its grid from a smaller viewer that merely
+///   *watches* — under a pure min rule the watcher pins the PTY and the
+///   working pane has no counter-move at all.
+/// - Nobody has typed → per-axis min across all requests (tmux default),
+///   so a workspace mirrored read-only into differently-sized windows
+///   renders whole in every one of them.
+#[derive(Debug, Default)]
+struct SizeArbiter {
+    /// Requested winsize per live attacher.
+    requests: HashMap<u64, (u16, u16)>,
+    /// When each attacher last typed, as a per-surface monotonic stamp.
+    /// Entries leave with their attacher (`drop_size_request`), so a
+    /// departed typist cannot rule from the grave.
+    input_stamps: HashMap<u64, u64>,
+    next_stamp: u64,
+}
+
+impl SizeArbiter {
+    fn effective(&self) -> Option<(u16, u16)> {
+        let latest_typist = self
+            .input_stamps
+            .iter()
+            .filter(|(id, _)| self.requests.contains_key(*id))
+            .max_by_key(|&(_, stamp)| *stamp)
+            .map(|(id, _)| *id);
+        if let Some(id) = latest_typist {
+            return self.requests.get(&id).copied();
+        }
+        let cols = self.requests.values().map(|&(c, _)| c).min()?;
+        let rows = self.requests.values().map(|&(_, r)| r).min()?;
+        Some((cols, rows))
+    }
 }
 
 impl PtySurface {
@@ -477,7 +516,7 @@ impl PtySurface {
             byte_seq: AtomicU64::new(0),
             replay: Mutex::new(ReplayBuffer::default()),
             modes: Mutex::new(BTreeSet::new()),
-            size_requests: Mutex::new(HashMap::new()),
+            size_requests: Mutex::new(SizeArbiter::default()),
             screen: Mutex::new(ScreenModel::new(cols, rows)),
             master_fd: child.master_fd,
             child: Mutex::new(ChildLifecycle {
@@ -954,46 +993,72 @@ impl PtySurface {
         Ok(())
     }
 
-    /// Record `requester`'s desired winsize and apply the arbitrated
-    /// minimum across all live requests (tmux-style: every viewer sees a
-    /// grid that fits the smallest of them). Callers pair this with
+    /// Record `requester`'s desired winsize and apply the arbitrated size
+    /// (see [`SizeArbiter::effective`]). Callers pair this with
     /// [`drop_size_request`] on detach; a raw [`resize`] bypasses
     /// arbitration and is reserved for single-writer paths (spawn).
     pub fn request_size(&self, requester: u64, cols: u16, rows: u16) -> std::io::Result<()> {
-        let min = {
-            let mut requests = self.size_requests.lock().unwrap();
-            requests.insert(requester, (cols, rows));
-            Self::arbitrated_min(&requests)
+        let effective = {
+            let mut arbiter = self.size_requests.lock().unwrap();
+            arbiter.requests.insert(requester, (cols, rows));
+            arbiter.effective()
         };
-        match min {
-            Some((c, r)) => self.resize(c, r),
-            None => Ok(()),
+        self.apply_arbitrated(effective)
+    }
+
+    /// Mark `requester` as the attacher most recently typing into this PTY,
+    /// and re-arbitrate. This is what lets the pane someone is actually
+    /// working in reclaim its grid from a smaller passive viewer: the min
+    /// rule alone locks the PTY at the smallest attacher's size with nothing
+    /// the working pane can do about it — resizing it just re-loses the min.
+    /// Called per input frame, so it resizes only on an actual change.
+    pub fn note_input(&self, requester: u64) {
+        let effective = {
+            let mut arbiter = self.size_requests.lock().unwrap();
+            arbiter.next_stamp += 1;
+            let stamp = arbiter.next_stamp;
+            arbiter.input_stamps.insert(requester, stamp);
+            arbiter.effective()
+        };
+        if let Err(e) = self.apply_arbitrated(effective) {
+            tracing::warn!("post-input resize failed: {e}");
         }
     }
 
-    /// Forget `requester`'s size request and re-apply the minimum of the
+    /// Forget `requester`'s size request and re-arbitrate among the
     /// survivors, so closing a small viewer gives the remaining ones their
     /// full grid back. No-op on the PTY when no requests remain — the last
     /// applied size simply persists.
     pub fn drop_size_request(&self, requester: u64) {
-        let min = {
-            let mut requests = self.size_requests.lock().unwrap();
-            if requests.remove(&requester).is_none() {
+        let effective = {
+            let mut arbiter = self.size_requests.lock().unwrap();
+            arbiter.input_stamps.remove(&requester);
+            if arbiter.requests.remove(&requester).is_none() {
                 return;
             }
-            Self::arbitrated_min(&requests)
+            arbiter.effective()
         };
-        if let Some((c, r)) = min {
-            if let Err(e) = self.resize(c, r) {
-                tracing::warn!("post-detach resize failed: {e}");
-            }
+        if let Err(e) = self.apply_arbitrated(effective) {
+            tracing::warn!("post-detach resize failed: {e}");
         }
     }
 
-    fn arbitrated_min(requests: &HashMap<u64, (u16, u16)>) -> Option<(u16, u16)> {
-        let cols = requests.values().map(|&(c, _)| c).min()?;
-        let rows = requests.values().map(|&(_, r)| r).min()?;
-        Some((cols, rows))
+    /// Resize to the arbitrated size iff it differs from the PTY's current
+    /// one. The guard is what makes `note_input`'s per-keystroke call
+    /// affordable; TIOCSWINSZ with an unchanged size would not SIGWINCH
+    /// anyway, so nothing is lost by skipping it.
+    fn apply_arbitrated(&self, effective: Option<(u16, u16)>) -> std::io::Result<()> {
+        let Some((c, r)) = effective else {
+            return Ok(());
+        };
+        let current = (
+            self.cols.load(Ordering::Relaxed) as u16,
+            self.rows.load(Ordering::Relaxed) as u16,
+        );
+        if current == (c, r) {
+            return Ok(());
+        }
+        self.resize(c, r)
     }
 
     /// True when the shell has handed the terminal's foreground process
@@ -2300,11 +2365,12 @@ mod tests {
         .expect("spawn /bin/cat")
     }
 
-    /// Winsize arbitration: with several attachers the PTY is sized to the
-    /// per-axis minimum (tmux behaviour), and a departing attacher's request
-    /// is dropped so the survivors get their grid back. Requester 1 asks for
-    /// a wide-short grid and requester 2 for a narrow-tall one, so the min
-    /// is a mix of both axes — proving cols and rows arbitrate independently.
+    /// Winsize arbitration, no-typist half: with several attachers and no
+    /// input on record the PTY is sized to the per-axis minimum (tmux
+    /// default), and a departing attacher's request is dropped so the
+    /// survivors get their grid back. Requester 1 asks for a wide-short grid
+    /// and requester 2 for a narrow-tall one, so the min is a mix of both
+    /// axes — proving cols and rows arbitrate independently.
     #[tokio::test]
     async fn winsize_arbitrates_min_across_attachers() {
         let surface = cat_surface();
@@ -2329,6 +2395,49 @@ mod tests {
         surface.drop_size_request(99);
         surface.drop_size_request(1);
         assert_eq!(size(&surface), (120, 30), "last size persists when empty");
+    }
+
+    /// Winsize arbitration, typist half: input recency overrides the min.
+    /// This is the "small passive viewer pins my working pane at 80×24 and
+    /// resizing it does nothing" fix — under min-only rules the working pane
+    /// has no counter-move while the watcher stays attached; with recency,
+    /// typing IS the counter-move.
+    #[tokio::test]
+    async fn winsize_follows_the_attacher_typing_last() {
+        let surface = cat_surface();
+        let size = |s: &PtySurface| {
+            (
+                s.cols.load(Ordering::Relaxed) as u16,
+                s.rows.load(Ordering::Relaxed) as u16,
+            )
+        };
+
+        surface.request_size(1, 120, 30).expect("first request");
+        surface.request_size(2, 80, 40).expect("second request");
+        assert_eq!(size(&surface), (80, 30), "nobody typed yet → min");
+
+        surface.note_input(1);
+        assert_eq!(size(&surface), (120, 30), "typist's own size wins the min");
+
+        surface.note_input(2);
+        assert_eq!(size(&surface), (80, 40), "latest typist takes over");
+
+        // A silent third viewer attaching smaller cannot steal the grid…
+        surface.request_size(3, 60, 20).expect("third request");
+        assert_eq!(size(&surface), (80, 40), "watcher can't shrink the typist");
+
+        // …and the ruling typist leaving falls back to the previous one,
+        // not to the watcher's min.
+        surface.drop_size_request(2);
+        assert_eq!(size(&surface), (120, 30), "earlier typist inherits rule");
+
+        // A typist updating its request keeps ruling at the new size.
+        surface.request_size(1, 100, 50).expect("typist resize");
+        assert_eq!(size(&surface), (100, 50), "ruling typist may resize freely");
+
+        // Every typist gone → min across the survivors again.
+        surface.drop_size_request(1);
+        assert_eq!(size(&surface), (60, 20), "no typist left → back to min");
     }
 
     #[tokio::test]
