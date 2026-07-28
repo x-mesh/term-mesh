@@ -173,6 +173,10 @@ struct ReviewBoardTask: Identifiable, Equatable, Sendable {
     let resultPath: String?
     let worktreeBranch: String?
     let worktreeParent: String?
+    /// Where the work actually is. Present on team-board rows only — a task
+    /// the coordinator placed carries no worktree facts (its `attempts` row
+    /// does, and that comes from `task.get`).
+    let worktreePath: String?
     let worktreeFinishMode: String?
     let worktreeRemoved: Bool?
     let isStale: Bool
@@ -211,6 +215,7 @@ struct ReviewBoardTask: Identifiable, Equatable, Sendable {
         resultPath: String? = nil,
         worktreeBranch: String? = nil,
         worktreeParent: String? = nil,
+        worktreePath: String? = nil,
         worktreeFinishMode: String? = nil,
         worktreeRemoved: Bool? = nil,
         isStale: Bool = false,
@@ -232,6 +237,11 @@ struct ReviewBoardTask: Identifiable, Equatable, Sendable {
         self.resultPath = resultPath.flatMap(ReviewBoardText.safePathLabel)
         self.worktreeBranch = worktreeBranch.map(ReviewBoardText.safeLabel)
         self.worktreeParent = worktreeParent.map(ReviewBoardText.safeLabel)
+        // Not run through safeLabel: this is a path the app hands to git, not
+        // a string it prints. Redacting it would make it unusable.
+        self.worktreePath = worktreePath
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .flatMap { $0.isEmpty ? nil : $0 }
         self.worktreeFinishMode = worktreeFinishMode.map(ReviewBoardText.safeLabel)
         self.worktreeRemoved = worktreeRemoved
         self.isStale = isStale
@@ -259,6 +269,7 @@ struct ReviewBoardTask: Identifiable, Equatable, Sendable {
             resultPath: dictionary["result_path"] as? String,
             worktreeBranch: dictionary["worktree_branch"] as? String,
             worktreeParent: dictionary["worktree_parent"] as? String,
+            worktreePath: dictionary["worktree_path"] as? String,
             worktreeFinishMode: dictionary["worktree_finish_mode"] as? String,
             worktreeRemoved: dictionary["worktree_removed"] as? Bool,
             isStale: dictionary["is_stale"] as? Bool ?? false,
@@ -387,6 +398,7 @@ extension ReviewBoardTask {
             resultPath: resultPath ?? other.resultPath,
             worktreeBranch: worktreeBranch,
             worktreeParent: worktreeParent,
+            worktreePath: [worktreePath, other.worktreePath].compactMap { $0 }.first,
             worktreeFinishMode: worktreeFinishMode,
             worktreeRemoved: worktreeRemoved,
             isStale: isStale,

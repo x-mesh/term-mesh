@@ -1,12 +1,50 @@
 import Combine
 import Foundation
 
+/// What the board can DO, injected the way the snapshot is read.
+///
+/// The read path has been fakeable since the beginning (`snapshotProvider`);
+/// the write path had no seam at all, because there was nothing to write.
+/// Giving it the same shape is what keeps approving testable without a live
+/// coordinator socket — and keeps the view model from reaching for a
+/// singleton.
+struct ReviewBoardActions {
+    var review: @MainActor (ReviewBoardTask) async -> ReviewBoardReview
+    var approve: @MainActor (ReviewBoardReview) async throws -> Void
+    var reject: @MainActor (ReviewBoardReview, String) async throws -> Void
+
+    /// What the board does before anything is wired: nothing, and it says so.
+    static let unavailable = ReviewBoardActions(
+        review: { task in
+            ReviewBoardReview(
+                taskID: task.rawID, detail: .unavailable, patch: nil,
+                blocker: "The coordinator is off, so nothing can be approved from here."
+            )
+        },
+        approve: { _ in throw ReviewBoardCoordinatorError.disabled },
+        reject: { _, _ in throw ReviewBoardCoordinatorError.disabled }
+    )
+}
+
 @MainActor
 final class ReviewBoardViewModel: ObservableObject {
     @Published private(set) var snapshot: ReviewBoardSnapshot
     @Published var selectedTaskID: String?
 
+    /// The selected task's evidence, once it has been read. Nil while nothing
+    /// is selected or the read has not finished.
+    @Published private(set) var review: ReviewBoardReview?
+    /// True while a read or a decision is in flight. The buttons watch this so
+    /// a second click cannot start a second approval.
+    @Published private(set) var actionInFlight = false
+    /// The last failure, in the words the coordinator or git used. Cleared
+    /// when the next action starts — a stale error next to a fresh result
+    /// reads as though the fresh one failed.
+    @Published private(set) var actionError: String?
+
     private var snapshotProvider: @MainActor () -> ReviewBoardSnapshot
+    private var actions: ReviewBoardActions = .unavailable
+    private var reviewedTaskID: String?
     private var teamCancellable: AnyCancellable?
     private var activityTicker: Timer?
 
@@ -113,6 +151,90 @@ final class ReviewBoardViewModel: ObservableObject {
     func setSnapshotProvider(_ provider: @escaping @MainActor () -> ReviewBoardSnapshot) {
         snapshotProvider = provider
         refresh()
+    }
+
+    func setActions(_ actions: ReviewBoardActions) {
+        self.actions = actions
+    }
+
+    // MARK: - Reviewing the selected task
+
+    /// Read the selected task's evidence.
+    ///
+    /// Keyed on which task was read, so re-appearing or a refresh tick does
+    /// not re-run git for a task already in hand — reading a patch is a
+    /// subprocess, not a property.
+    func loadReview(for task: ReviewBoardTask, force: Bool = false) async {
+        guard force || reviewedTaskID != task.rawID else { return }
+        guard !actionInFlight else { return }
+        actionInFlight = true
+        actionError = nil
+        let result = await actions.review(task)
+        // The selection can move while a read is in flight; a result for a
+        // task nobody is looking at must not replace what is on screen.
+        guard selectedTaskID == nil || task.id == selectedTaskID else {
+            actionInFlight = false
+            return
+        }
+        reviewedTaskID = task.rawID
+        review = result
+        actionInFlight = false
+    }
+
+    /// Approve what was read. Returns whether it landed, so a view can close
+    /// a sheet only on success.
+    @discardableResult
+    func approve() async -> Bool {
+        await act { review in try await self.actions.approve(review) }
+    }
+
+    @discardableResult
+    func reject(reason: String) async -> Bool {
+        await act { review in try await self.actions.reject(review, reason) }
+    }
+
+    private func act(_ body: (ReviewBoardReview) async throws -> Void) async -> Bool {
+        guard let review, !actionInFlight else { return false }
+        // The panel hides the buttons when the coordinator cannot act, but the
+        // panel is not the only caller. Refusing here means the reason shown is
+        // the one already read off the task rather than whatever the
+        // coordinator returns for an approval it was never going to accept.
+        guard review.canAct else {
+            actionError = review.blocker ?? "This task cannot be decided yet."
+            return false
+        }
+        actionInFlight = true
+        actionError = nil
+        do {
+            try await body(review)
+            // The task has moved on, so what was read no longer describes it.
+            // Dropping it forces the next look to re-read rather than offer a
+            // second decision on a decided task.
+            reviewedTaskID = nil
+            self.review = nil
+            actionInFlight = false
+            refresh()
+            return true
+        } catch {
+            actionError = Self.message(for: error)
+            actionInFlight = false
+            return false
+        }
+    }
+
+    /// The coordinator's own words where it has them. A rejected approval says
+    /// `snapshot evidence mismatch` or `stale_fencing_token`, and those are the
+    /// two things a reviewer actually needs to see — replacing them with
+    /// "Approval failed" would hide which one happened.
+    private static func message(for error: Error) -> String {
+        switch error {
+        case ReviewBoardCoordinatorError.disabled:
+            return "The coordinator is off."
+        case let ReviewBoardCoordinatorError.jsonRPCError(_, message):
+            return message
+        default:
+            return error.localizedDescription
+        }
     }
 
     func selectTask(id: String) {

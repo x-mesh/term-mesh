@@ -225,6 +225,185 @@ final class ReviewBoardViewModelTests: XCTestCase {
         ReviewBoardSettings.saveWidth(1_000, defaults: defaults)
         XCTAssertEqual(ReviewBoardSettings.loadWidth(defaults: defaults), ReviewBoardSettings.maximumWidth)
     }
+
+    // MARK: - Approving from the board
+
+    private func review(
+        taskID: String = "tsk_1",
+        approvable: Bool = true,
+        blocker: String? = nil
+    ) -> ReviewBoardReview {
+        ReviewBoardReview(
+            taskID: taskID,
+            detail: ReviewBoardReviewDetail(
+                status: approvable ? "review_ready" : "assigned",
+                attemptID: approvable ? "att_1" : nil,
+                fencingToken: approvable ? "fen_1" : nil,
+                worktreePath: "/tmp/wt", hostID: nil, snapshot: nil,
+                queueID: nil, queueStatus: nil, queueLastError: nil
+            ),
+            patch: ReviewBoardEvidence.Patch(
+                baseSHA: "aaa", headSHA: "bbb", digest: "sha256:cafe",
+                text: "diff", isTruncated: false,
+                files: [.init(path: "a.swift", kind: "modified", add: 1, del: 0)]
+            ),
+            blocker: blocker
+        )
+    }
+
+    private func task(_ id: String = "tsk_1", status: String = "review_ready") -> ReviewBoardTask {
+        ReviewBoardTask(id: id, teamName: "ws", title: "Fix it", status: status)
+    }
+
+    /// The write path is injected the way the read path is, so a decision can
+    /// be exercised without a coordinator socket.
+    @MainActor
+    func test_approving_calls_through_and_clears_what_was_read() async {
+        var approved: [String] = []
+        let model = ReviewBoardViewModel(
+            initialSnapshot: ReviewBoardSnapshot(
+                tasks: [task()], panelRuns: [], coordinatorOnline: true,
+                memMeshAvailable: true, suspectHost: false, fencedZombie: false
+            ),
+            selectedTaskID: nil,
+            snapshotProvider: { .empty }
+        )
+        model.setActions(ReviewBoardActions(
+            review: { _ in self.review() },
+            approve: { approved.append($0.taskID) },
+            reject: { _, _ in XCTFail("not this one") }
+        ))
+
+        await model.loadReview(for: task())
+        XCTAssertEqual(model.review?.taskID, "tsk_1")
+        XCTAssertTrue(model.review?.canAct == true)
+
+        let landed = await model.approve()
+        XCTAssertTrue(landed)
+        XCTAssertEqual(approved, ["tsk_1"])
+        // The task has moved on, so what was read no longer describes it —
+        // leaving it would offer a second decision on a decided task.
+        XCTAssertNil(model.review)
+        XCTAssertNil(model.actionError)
+        XCTAssertFalse(model.actionInFlight)
+    }
+
+    /// The coordinator's own words survive. `snapshot evidence mismatch` and
+    /// `stale_fencing_token` are the two a reviewer has to tell apart, and
+    /// "Approval failed" hides which happened.
+    @MainActor
+    func test_a_refusal_keeps_the_coordinators_wording_and_the_review() async {
+        let model = ReviewBoardViewModel(
+            initialSnapshot: .empty, selectedTaskID: nil, snapshotProvider: { .empty }
+        )
+        model.setActions(ReviewBoardActions(
+            review: { _ in self.review() },
+            approve: { _ in
+                throw ReviewBoardCoordinatorError.jsonRPCError(
+                    code: -32000, message: "snapshot evidence mismatch"
+                )
+            },
+            reject: { _, _ in }
+        ))
+
+        await model.loadReview(for: task())
+        let landed = await model.approve()
+
+        XCTAssertFalse(landed)
+        XCTAssertEqual(model.actionError, "snapshot evidence mismatch")
+        XCTAssertNotNil(model.review, "a refused approval leaves the review to retry")
+        XCTAssertFalse(model.actionInFlight)
+    }
+
+    /// A task the coordinator cannot act on still renders — with the reason.
+    /// A board that just omits the buttons leaves the reader guessing whether
+    /// the feature is missing or the task is.
+    @MainActor
+    func test_a_task_with_no_attempt_reports_why_rather_than_offering_a_button() async {
+        let model = ReviewBoardViewModel(
+            initialSnapshot: .empty, selectedTaskID: nil, snapshotProvider: { .empty }
+        )
+        model.setActions(ReviewBoardActions(
+            review: { _ in
+                self.review(approvable: false, blocker: "This task has no coordinator attempt")
+            },
+            approve: { _ in XCTFail("must not be reachable") },
+            reject: { _, _ in }
+        ))
+
+        await model.loadReview(for: task())
+        XCTAssertFalse(model.review?.canAct == true)
+        XCTAssertEqual(model.review?.blocker, "This task has no coordinator attempt")
+
+        // And acting anyway is refused by the model, not by the coordinator —
+        // the reason shown is the one already read off the task.
+        let landed = await model.approve()
+        XCTAssertFalse(landed)
+        XCTAssertEqual(model.actionError, "This task has no coordinator attempt")
+        XCTAssertFalse(model.actionInFlight)
+    }
+
+    /// Reading a patch is a subprocess, not a property: the 2-second refresh
+    /// tick must not re-run git for a task already in hand.
+    @MainActor
+    func test_a_task_already_read_is_not_read_again() async {
+        var reads = 0
+        let model = ReviewBoardViewModel(
+            initialSnapshot: .empty, selectedTaskID: nil, snapshotProvider: { .empty }
+        )
+        model.setActions(ReviewBoardActions(
+            review: { _ in reads += 1; return self.review() },
+            approve: { _ in }, reject: { _, _ in }
+        ))
+
+        await model.loadReview(for: task())
+        await model.loadReview(for: task())
+        XCTAssertEqual(reads, 1)
+
+        await model.loadReview(for: task(), force: true)
+        XCTAssertEqual(reads, 2, "an explicit re-read still works")
+
+        // A different task is a different read.
+        await model.loadReview(for: task("tsk_2"))
+        XCTAssertEqual(reads, 3)
+    }
+
+    /// Rejecting needs a reason, and the model passes it through untouched —
+    /// the client is what trims and refuses an empty one.
+    @MainActor
+    func test_rejecting_passes_the_reason_through() async {
+        var sent: String?
+        let model = ReviewBoardViewModel(
+            initialSnapshot: .empty, selectedTaskID: nil, snapshotProvider: { .empty }
+        )
+        model.setActions(ReviewBoardActions(
+            review: { _ in self.review() },
+            approve: { _ in XCTFail("not this one") },
+            reject: { _, reason in sent = reason }
+        ))
+
+        await model.loadReview(for: task())
+        let landed = await model.reject(reason: "범위가 넘쳤다")
+
+        XCTAssertTrue(landed)
+        XCTAssertEqual(sent, "범위가 넘쳤다")
+        XCTAssertNil(model.review)
+    }
+
+    /// Nothing wired: the board says so instead of throwing an opaque error.
+    @MainActor
+    func test_an_unwired_board_reports_that_the_coordinator_is_off() async {
+        let model = ReviewBoardViewModel(
+            initialSnapshot: .empty, selectedTaskID: nil, snapshotProvider: { .empty }
+        )
+        await model.loadReview(for: task())
+        XCTAssertFalse(model.review?.canAct == true)
+        XCTAssertNotNil(model.review?.blocker)
+
+        let landed = await model.approve()
+        XCTAssertFalse(landed)
+        XCTAssertEqual(model.actionError, model.review?.blocker)
+    }
 }
 
 final class ReviewBoardTaskMergeTests: XCTestCase {
@@ -443,4 +622,5 @@ final class ReviewBoardAgentReportTests: XCTestCase {
         XCTAssertEqual(ReviewBoardText.splitDirective("READ-ONLY").rest, "READ-ONLY")
         XCTAssertNil(ReviewBoardText.splitDirective("READ-ONLY").directive)
     }
+
 }

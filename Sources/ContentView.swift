@@ -1547,6 +1547,15 @@ struct ContentView: View {
             reviewBoardViewModel.setSnapshotProvider {
                 coordinator.providerSnapshot()
             }
+            // The reviewer's name is what the coordinator records on the merge
+            // queue entry, and it has no notion of accounts — the login name
+            // is the only thing here that identifies a person.
+            let reviewer = NSUserName()
+            reviewBoardViewModel.setActions(ReviewBoardActions(
+                review: { await coordinator.review(task: $0) },
+                approve: { try await coordinator.approve($0, reviewer: reviewer) },
+                reject: { try await coordinator.reject($0, reviewer: reviewer, reason: $1) }
+            ))
             reviewBoardViewModel.refresh()
         })
 

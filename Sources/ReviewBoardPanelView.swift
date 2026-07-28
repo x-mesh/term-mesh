@@ -5,6 +5,12 @@ struct ReviewBoardPanelView: View {
     @ObservedObject var viewModel: ReviewBoardViewModel
     let onClose: () -> Void
 
+    /// The reason typed into the reject box. Held here rather than in the view
+    /// model because it is a half-finished sentence, not board state — losing
+    /// it when the panel closes is correct.
+    @State private var rejectReason = ""
+    @State private var isRejecting = false
+
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             header
@@ -310,6 +316,9 @@ struct ReviewBoardPanelView: View {
                 .foregroundColor(.secondary)
                 .accessibilityIdentifier("reviewBoard.task.finishedAt")
             }
+            if task.status == "review_ready" {
+                reviewSection(task)
+            }
             // The instruction in full — directive and all. The row above shows
             // the constraint as a mark and drops it from the text; here the
             // instruction IS the task for work delegated from a pane, so it is
@@ -429,5 +438,164 @@ struct ReviewBoardPanelView: View {
             .foregroundColor(.secondary)
             .textCase(.uppercase)
             .accessibilityAddTraits(.isHeader)
+    }
+
+    // MARK: - Reviewing
+
+    /// The decision, under everything that informs it.
+    ///
+    /// Only for `review_ready`: the coordinator refuses an approval for any
+    /// other status, so offering the button elsewhere would be offering a
+    /// click that returns an error.
+    @ViewBuilder
+    private func reviewSection(_ task: ReviewBoardTask) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            if let review = viewModel.review, review.taskID == task.rawID {
+                if let patch = review.patch {
+                    changedFiles(patch)
+                    patchView(patch)
+                }
+                if let blocker = review.blocker {
+                    // Why the buttons are not there. A board that simply omits
+                    // them leaves the reader to guess whether the feature is
+                    // missing or the task is.
+                    Label(blocker, systemImage: "info.circle")
+                        .font(.system(size: 11))
+                        .foregroundColor(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .accessibilityIdentifier("reviewBoard.review.blocker")
+                }
+                if review.canAct { decisionControls() }
+            } else if viewModel.actionInFlight {
+                HStack(spacing: 6) {
+                    ProgressView().controlSize(.small)
+                    Text("Reading the change…").font(.system(size: 11))
+                }
+                .foregroundColor(.secondary)
+            }
+            if let error = viewModel.actionError {
+                // The coordinator's own words: `snapshot evidence mismatch`
+                // and `stale_fencing_token` are the two a reviewer has to be
+                // able to tell apart.
+                Label(error, systemImage: "exclamationmark.triangle.fill")
+                    .font(.system(size: 11))
+                    .foregroundColor(.red)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .textSelection(.enabled)
+                    .accessibilityIdentifier("reviewBoard.review.error")
+            }
+        }
+        .task(id: task.rawID) { await viewModel.loadReview(for: task) }
+    }
+
+    @ViewBuilder
+    private func changedFiles(_ patch: ReviewBoardEvidence.Patch) -> some View {
+        VStack(alignment: .leading, spacing: 3) {
+            sectionTitle("\(patch.files.count) changed")
+            ForEach(patch.files, id: \.path) { file in
+                HStack(spacing: 6) {
+                    Text(file.kind.prefix(1).uppercased())
+                        .font(.system(size: 9, weight: .bold))
+                        .frame(width: 11)
+                        .foregroundColor(color(for: file.kind))
+                    Text(file.path)
+                        .font(.system(size: 11, design: .monospaced))
+                        .lineLimit(1)
+                        .truncationMode(.head)
+                    Spacer(minLength: 4)
+                    Text("+\(file.add)").foregroundColor(.green)
+                    Text("−\(file.del)").foregroundColor(.red)
+                }
+                .font(.system(size: 10).monospacedDigit())
+            }
+        }
+    }
+
+    private func color(for kind: String) -> Color {
+        switch kind {
+        case "added": return .green
+        case "deleted": return .red
+        case "renamed", "copied": return .orange
+        default: return .secondary
+        }
+    }
+
+    @ViewBuilder
+    private func patchView(_ patch: ReviewBoardEvidence.Patch) -> some View {
+        VStack(alignment: .leading, spacing: 3) {
+            // Its own scroll view with a fixed height: the panel is one long
+            // ScrollView, and a patch dropped into it would push everything
+            // else — including the buttons — off the bottom.
+            ScrollView([.horizontal, .vertical]) {
+                Text(patch.text)
+                    .font(.system(size: 10, design: .monospaced))
+                    .textSelection(.enabled)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(6)
+            }
+            .frame(height: 220)
+            .background(Color(nsColor: .textBackgroundColor))
+            .clipShape(RoundedRectangle(cornerRadius: 6))
+            .overlay(
+                RoundedRectangle(cornerRadius: 6)
+                    .stroke(Color(nsColor: .separatorColor), lineWidth: 1)
+            )
+            .accessibilityIdentifier("reviewBoard.review.patch")
+            if patch.isTruncated {
+                // The digest still covers the whole patch; only the display is
+                // shortened. Saying so keeps "I read it" honest.
+                Text("Shown up to \(ReviewBoardEvidence.displayByteLimit / 1024)KB — the digest covers all of it.")
+                    .font(.system(size: 10))
+                    .foregroundColor(.secondary)
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func decisionControls() -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 8) {
+                Button("Approve") {
+                    Task { await viewModel.approve() }
+                }
+                .buttonStyle(.borderedProminent)
+                .accessibilityIdentifier("reviewBoard.review.approve")
+
+                Button(isRejecting ? "Cancel" : "Reject") {
+                    isRejecting.toggle()
+                    rejectReason = ""
+                }
+                .accessibilityIdentifier("reviewBoard.review.reject")
+
+                Spacer(minLength: 0)
+                if viewModel.actionInFlight { ProgressView().controlSize(.small) }
+            }
+            .font(.system(size: 11))
+            .disabled(viewModel.actionInFlight)
+
+            if isRejecting {
+                // The reason is required by the coordinator and is what the
+                // next attempt is briefed with, so the button stays off until
+                // there is one.
+                TextField("Why it goes back", text: $rejectReason, axis: .vertical)
+                    .textFieldStyle(.roundedBorder)
+                    .font(.system(size: 11))
+                    .lineLimit(2...4)
+                Button("Send back") {
+                    Task {
+                        if await viewModel.reject(reason: rejectReason) {
+                            isRejecting = false
+                            rejectReason = ""
+                        }
+                    }
+                }
+                .font(.system(size: 11))
+                .disabled(
+                    viewModel.actionInFlight
+                        || rejectReason.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                )
+                .accessibilityIdentifier("reviewBoard.review.rejectConfirm")
+            }
+        }
     }
 }

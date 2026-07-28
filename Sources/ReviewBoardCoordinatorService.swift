@@ -2167,3 +2167,165 @@ final class CoordinatorPlacementDispatcher {
         }
     }
 }
+
+// MARK: - Reviewing a task
+
+/// One task, read and ready to act on.
+///
+/// The pieces only mean something together: the coordinator's view of the
+/// attempt (what an approval must cite) and the patch read out of the working
+/// tree (what a person actually looks at). `blocker` is the honest answer when
+/// they cannot be assembled — a board that offers a button it knows cannot
+/// work is worse than one that says why.
+struct ReviewBoardReview: Equatable {
+    let taskID: String
+    let detail: ReviewBoardReviewDetail
+    let patch: ReviewBoardEvidence.Patch?
+    let blocker: String?
+
+    var canAct: Bool { blocker == nil && detail.isApprovable }
+}
+
+extension ReviewBoardCoordinatorService {
+
+    /// Gather everything a review needs, or say why it cannot be gathered.
+    ///
+    /// Reads the coordinator first because it decides whether an approval is
+    /// possible at all, and only then goes to the filesystem: there is no
+    /// point running git for a task whose `review_ready` came from the
+    /// team-board mirror, which records no attempt and no snapshot.
+    func review(task: ReviewBoardTask) async -> ReviewBoardReview {
+        guard let client else {
+            return ReviewBoardReview(
+                taskID: task.rawID,
+                detail: .unavailable,
+                patch: nil,
+                blocker: "The coordinator is off, so nothing can be approved from here."
+            )
+        }
+        let detail: ReviewBoardReviewDetail
+        do {
+            detail = try await client.reviewDetail(taskID: task.rawID)
+        } catch {
+            return ReviewBoardReview(
+                taskID: task.rawID,
+                detail: .unavailable,
+                patch: nil,
+                blocker: "Could not read the task: \(error.localizedDescription)"
+            )
+        }
+        guard detail.isApprovable else {
+            return ReviewBoardReview(
+                taskID: task.rawID, detail: detail, patch: nil,
+                blocker: detail.attemptID == nil
+                    // The mirror path: `task.update` moved it to review_ready
+                    // without placing an attempt, so there is nothing to
+                    // approve even though the board says it is ready.
+                    ? "This task has no coordinator attempt — it was marked ready by the team board, which records nothing to approve."
+                    : "This task is \(detail.status ?? "not ready") rather than review_ready."
+            )
+        }
+        // The attempt's own worktree first: it is the one the coordinator
+        // placed. The team-board row is the fallback for work the board knows
+        // about by the other route.
+        guard let worktree = detail.worktreePath ?? task.worktreePath else {
+            return ReviewBoardReview(
+                taskID: task.rawID, detail: detail, patch: nil,
+                blocker: "This attempt records no worktree, so there is no change to read."
+            )
+        }
+        do {
+            let patch = try await ReviewBoardEvidence.read(
+                worktreePath: worktree,
+                parentRef: task.worktreeParent
+            )
+            return ReviewBoardReview(
+                taskID: task.rawID, detail: detail, patch: patch,
+                blocker: patch.isEmpty ? "The worktree has no changes against its parent." : nil
+            )
+        } catch ReviewBoardEvidenceError.unknownBase {
+            return ReviewBoardReview(
+                taskID: task.rawID, detail: detail, patch: nil,
+                blocker: "The task records no parent branch, so there is nothing to diff against."
+            )
+        } catch {
+            return ReviewBoardReview(
+                taskID: task.rawID, detail: detail, patch: nil,
+                blocker: "Could not read the worktree: \(error.localizedDescription)"
+            )
+        }
+    }
+
+    /// Approve what was read.
+    ///
+    /// A snapshot is recorded from the patch in hand rather than reusing
+    /// whatever the coordinator last stored: approving against a stale
+    /// snapshot would either be refused as an evidence mismatch or — worse, if
+    /// it happened to match — land a tree nobody looked at. Recording is
+    /// idempotent for the same head, so re-approving the same review costs
+    /// nothing.
+    func approve(_ review: ReviewBoardReview, reviewer: String, summary: String? = nil) async throws {
+        guard let client else { throw ReviewBoardCoordinatorError.disabled }
+        let (attemptID, token, patch) = try requireActionable(review)
+        let evidence = try await client.recordReviewSnapshot(
+            taskID: review.taskID,
+            attemptID: attemptID,
+            fencingToken: token,
+            baseSHA: patch.baseSHA,
+            headSHA: patch.headSHA,
+            diffDigest: patch.digest,
+            summary: summary,
+            files: patch.files.map(\.rpcValue)
+        )
+        _ = try await client.approve(
+            taskID: review.taskID,
+            attemptID: attemptID,
+            fencingToken: token,
+            reviewer: reviewer,
+            evidence: evidence
+        )
+        refresh()
+    }
+
+    /// Send it back. No snapshot: rejecting does not have to prove what was
+    /// read, only that the reviewer holds the current fence.
+    func reject(_ review: ReviewBoardReview, reviewer: String, reason: String) async throws {
+        guard let client else { throw ReviewBoardCoordinatorError.disabled }
+        guard let attemptID = review.detail.attemptID,
+              let token = review.detail.fencingToken else {
+            throw ReviewBoardCoordinatorError.invalidResponse
+        }
+        try await client.reject(
+            taskID: review.taskID,
+            attemptID: attemptID,
+            fencingToken: token,
+            reviewer: reviewer,
+            reason: reason
+        )
+        refresh()
+    }
+
+    private func requireActionable(
+        _ review: ReviewBoardReview
+    ) throws -> (attemptID: String, token: String, patch: ReviewBoardEvidence.Patch) {
+        guard let attemptID = review.detail.attemptID,
+              let token = review.detail.fencingToken,
+              let patch = review.patch else {
+            throw ReviewBoardCoordinatorError.jsonRPCError(
+                code: nil,
+                message: review.blocker ?? "This task cannot be approved from here."
+            )
+        }
+        return (attemptID, token, patch)
+    }
+}
+
+extension ReviewBoardReviewDetail {
+    /// Nothing known — the shape a review takes when the coordinator could not
+    /// be asked at all.
+    static let unavailable = ReviewBoardReviewDetail(
+        status: nil, attemptID: nil, fencingToken: nil,
+        worktreePath: nil, hostID: nil, snapshot: nil,
+        queueID: nil, queueStatus: nil, queueLastError: nil
+    )
+}
