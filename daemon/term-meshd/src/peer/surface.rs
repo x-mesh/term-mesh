@@ -1220,6 +1220,16 @@ fn pane_environment(surface_id: &[u8]) -> Vec<(String, String)> {
         "TERMMESH_SOCKET".to_string(),
         crate::socket::default_socket_path().to_string_lossy().into_owned(),
     ));
+    // A root daemon's panes are where term-mesh types agent launches, and
+    // Claude Code refuses `--dangerously-skip-permissions` as root unless
+    // IS_SANDBOX says the environment is disposable — its own container
+    // escape hatch. Every root peer needed a hand-made systemd drop-in for
+    // this (jw-server had one, jwserver68/69 did not, and their agents died
+    // at the CLI's refusal); the daemon knows it is root, so it can say so
+    // itself. Non-root daemons add nothing.
+    if unsafe { libc::geteuid() } == 0 {
+        env.push(("IS_SANDBOX".to_string(), "1".to_string()));
+    }
     env
 }
 
