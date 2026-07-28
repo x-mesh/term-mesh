@@ -42,7 +42,23 @@ final class ReviewBoardViewModel: ObservableObject {
     /// reads as though the fresh one failed.
     @Published private(set) var actionError: String?
 
+    /// The boundary, as configured. Read from settings so what the toggle
+    /// shows and what the runner enforces cannot drift apart.
+    @Published private(set) var autoPilot: AutoPilotPolicy
+    /// What auto pilot did, newest first — including what it declined, which
+    /// is usually the question being asked.
+    @Published private(set) var autoPilotAudit: [AutoPilotAudit] = []
+    /// Merges that can still be taken back.
+    @Published private(set) var autoPilotUndoPoints: [AutoPilotUndoPoint] = []
+    @Published private(set) var undoInFlight = false
+    /// The result of the last undo, in git's words when it failed.
+    @Published private(set) var undoMessage: String?
+
     private var snapshotProvider: @MainActor () -> ReviewBoardSnapshot
+    /// Where the auto pilot policy is read and written. Injected so a test can
+    /// exercise the toggle without arming unattended merging for whoever is
+    /// running the tests.
+    private let defaults: UserDefaults
     private var actions: ReviewBoardActions = .unavailable
     private var reviewedTaskID: String?
     private var teamCancellable: AnyCancellable?
@@ -53,9 +69,12 @@ final class ReviewBoardViewModel: ObservableObject {
         selectedTaskID: String? = UserDefaults.standard.string(forKey: ReviewBoardSettings.selectedTaskIDKey),
         snapshotProvider: @escaping @MainActor () -> ReviewBoardSnapshot = {
             TeamDataStoreReviewBoardSnapshotProvider().snapshot()
-        }
+        },
+        defaults: UserDefaults = .standard
     ) {
         snapshot = initialSnapshot
+        self.defaults = defaults
+        autoPilot = AutoPilotPolicy.load(from: defaults)
         self.selectedTaskID = selectedTaskID
         self.snapshotProvider = snapshotProvider
         if initialSnapshot == .empty {
@@ -240,6 +259,61 @@ final class ReviewBoardViewModel: ObservableObject {
     func selectTask(id: String) {
         selectedTaskID = id
         UserDefaults.standard.set(id, forKey: ReviewBoardSettings.selectedTaskIDKey)
+    }
+
+    // MARK: - Auto pilot
+
+    /// Turning it on, and where it may go.
+    ///
+    /// Written straight through to the settings rather than held here: the
+    /// runner reads the policy fresh on every sweep, so a toggle that only
+    /// changed a published property would look on and act off.
+    func setAutoPilotEnabled(_ enabled: Bool) {
+        var updated = autoPilot
+        updated.isEnabled = enabled
+        updated.save(to: defaults)
+        autoPilot = updated
+        reloadAutoPilotJournals()
+    }
+
+    func setAutoPilotCeiling(_ branch: String) {
+        let trimmed = branch.trimmingCharacters(in: .whitespacesAndNewlines)
+        var updated = autoPilot
+        updated.ceilingBranch = trimmed.isEmpty ? AutoPilotPolicy.defaultCeiling : trimmed
+        updated.save(to: defaults)
+        autoPilot = updated
+    }
+
+    /// What it did, newest first, and what can still be taken back.
+    func reloadAutoPilotJournals() {
+        guard let team = snapshot.tasks.first?.teamName, !team.isEmpty else {
+            autoPilotAudit = []
+            autoPilotUndoPoints = []
+            return
+        }
+        autoPilotAudit = AutoPilotJournal<AutoPilotAudit>(teamName: team, kind: "audit").entries()
+        autoPilotUndoPoints = AutoPilotUndoLog(teamName: team).points()
+    }
+
+    /// Put a branch back. Reads where it actually is first — moving a ref out
+    /// from under a checkout is what makes an undo worse than the merge.
+    func undoAutoMerge(_ point: AutoPilotUndoPoint) async {
+        guard !undoInFlight else { return }
+        undoInFlight = true
+        undoMessage = nil
+        defer { undoInFlight = false }
+
+        let placement = await AutoPilotUndo.placement(
+            of: point.branch, in: point.repositoryPath
+        )
+        switch await AutoPilotUndo.apply(AutoPilotUndo.plan(for: point, placement: placement)) {
+        case .done(let message):
+            undoMessage = message
+            reloadAutoPilotJournals()
+            refresh()
+        case .failed(let reason):
+            undoMessage = reason
+        }
     }
 
     func statusBadges(for task: ReviewBoardTask?) -> [ReviewBoardStatus] {

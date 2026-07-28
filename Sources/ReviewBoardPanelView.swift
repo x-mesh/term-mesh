@@ -32,6 +32,10 @@ struct ReviewBoardPanelView: View {
                         if let task = viewModel.selectedTask {
                             taskDetails(task)
                         }
+                        // Last: it is a setting and a log, not the work. It
+                        // should be findable, not in the way of the row someone
+                        // opened the board to read.
+                        autoPilotSection
                     }
                     .padding(12)
                 }
@@ -40,7 +44,10 @@ struct ReviewBoardPanelView: View {
         .background(Color(nsColor: .windowBackgroundColor))
         .accessibilityIdentifier("reviewBoard.panel")
         .accessibilityElement(children: .contain)
-        .onAppear { viewModel.refresh() }
+        .onAppear {
+            viewModel.refresh()
+            viewModel.reloadAutoPilotJournals()
+        }
     }
 
     private var header: some View {
@@ -438,6 +445,113 @@ struct ReviewBoardPanelView: View {
             .foregroundColor(.secondary)
             .textCase(.uppercase)
             .accessibilityAddTraits(.isHeader)
+    }
+
+    // MARK: - Auto pilot
+
+    /// The switch, the boundary it works inside, and what it has done.
+    ///
+    /// All three together on purpose. A toggle on its own asks someone to arm
+    /// unattended merging without telling them how far it can go, and a log on
+    /// its own leaves "why is this still sitting here" unanswered.
+    private var autoPilotSection: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 8) {
+                sectionTitle("Auto Pilot")
+                Spacer(minLength: 8)
+                Toggle("", isOn: Binding(
+                    get: { viewModel.autoPilot.isEnabled },
+                    set: { viewModel.setAutoPilotEnabled($0) }
+                ))
+                .labelsHidden()
+                .toggleStyle(.switch)
+                .controlSize(.mini)
+                .accessibilityLabel("Auto Pilot")
+            }
+
+            // The boundary is stated whether it is on or off. Someone deciding
+            // whether to turn it on is exactly who needs to read it.
+            Text(boundarySentence)
+                .font(.system(size: 11))
+                .foregroundColor(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+
+            if !viewModel.autoPilotUndoPoints.isEmpty {
+                undoList
+            }
+            if let message = viewModel.undoMessage {
+                Text(message)
+                    .font(.system(size: 11))
+                    .foregroundColor(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            if !viewModel.autoPilotAudit.isEmpty {
+                auditList
+            }
+        }
+        .padding(10)
+        .background(
+            RoundedRectangle(cornerRadius: 6).fill(Color.primary.opacity(0.04))
+        )
+        .accessibilityIdentifier("reviewBoard.autoPilot")
+    }
+
+    private var boundarySentence: String {
+        let policy = viewModel.autoPilot
+        let limits = "Merges only into \(policy.ceilingBranch), never pushes, "
+            + "at most \(policy.maxAutoMerges) merges per session."
+        return policy.isEnabled
+            ? limits
+            : "Off. When on: \(limits.prefix(1).lowercased())\(limits.dropFirst())"
+    }
+
+    private var undoList: some View {
+        VStack(alignment: .leading, spacing: 5) {
+            sectionTitle("Undo")
+            ForEach(viewModel.autoPilotUndoPoints.prefix(3), id: \.sha) { point in
+                HStack(spacing: 6) {
+                    VStack(alignment: .leading, spacing: 1) {
+                        Text("\(point.branch) → \(point.sha.prefix(8))")
+                            .font(.system(size: 11, design: .monospaced))
+                        Text("before merging \(point.taskID)")
+                            .font(.system(size: 10))
+                            .foregroundColor(.secondary)
+                    }
+                    Spacer(minLength: 6)
+                    Button("Put back") {
+                        Task { await viewModel.undoAutoMerge(point) }
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                    .disabled(viewModel.undoInFlight)
+                    .help("Move \(point.branch) back to where it was before this merge")
+                }
+            }
+        }
+    }
+
+    private var auditList: some View {
+        VStack(alignment: .leading, spacing: 5) {
+            sectionTitle("Recent decisions")
+            ForEach(viewModel.autoPilotAudit.prefix(6), id: \.atMS) { entry in
+                HStack(alignment: .top, spacing: 6) {
+                    Image(systemName: entry.wasApproved
+                          ? "checkmark.circle.fill" : "pause.circle")
+                        .foregroundColor(entry.wasApproved ? .green : .secondary)
+                        .font(.system(size: 10))
+                        .accessibilityHidden(true)
+                    VStack(alignment: .leading, spacing: 1) {
+                        Text(entry.title)
+                            .font(.system(size: 11, weight: .medium))
+                            .lineLimit(1)
+                        Text(entry.reason)
+                            .font(.system(size: 10))
+                            .foregroundColor(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                }
+            }
+        }
     }
 
     // MARK: - Reviewing

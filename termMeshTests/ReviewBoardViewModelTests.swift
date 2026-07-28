@@ -404,6 +404,88 @@ final class ReviewBoardViewModelTests: XCTestCase {
         XCTAssertFalse(landed)
         XCTAssertEqual(model.actionError, model.review?.blocker)
     }
+
+
+    // MARK: - Auto pilot from the board
+
+    /// The toggle writes through to settings, because the runner reads the
+    /// policy fresh on every sweep — a toggle that only moved a published
+    /// property would look on and act off.
+    @MainActor
+    func test_the_toggle_writes_through_to_what_the_runner_reads() {
+        let defaults = UserDefaults(suiteName: "board.autopilot.\(UUID().uuidString)")!
+        let model = ReviewBoardViewModel(
+            initialSnapshot: .empty, selectedTaskID: nil,
+            snapshotProvider: { .empty }, defaults: defaults
+        )
+
+        XCTAssertFalse(model.autoPilot.isEnabled, "off until someone turns it on")
+
+        model.setAutoPilotEnabled(true)
+        XCTAssertTrue(model.autoPilot.isEnabled)
+        XCTAssertTrue(AutoPilotPolicy.load(from: defaults).isEnabled)
+
+        model.setAutoPilotCeiling("integration")
+        XCTAssertEqual(AutoPilotPolicy.load(from: defaults).ceilingBranch, "integration")
+
+        // An emptied field is a mistake, not a request to merge into nothing.
+        model.setAutoPilotCeiling("   ")
+        XCTAssertEqual(model.autoPilot.ceilingBranch, "develop")
+        XCTAssertEqual(AutoPilotPolicy.load(from: defaults).ceilingBranch, "develop")
+    }
+
+    /// The board reads whatever the runner already wrote, so the log survives
+    /// a restart — and holds are in it, since "why is this still sitting here"
+    /// is the usual question.
+    @MainActor
+    func test_the_board_reads_back_what_auto_pilot_recorded() {
+        let team = "ws-\(UUID().uuidString.prefix(8))"
+        let audit = AutoPilotJournal<AutoPilotAudit>(teamName: team, kind: "audit")
+        audit.record(AutoPilotAudit(
+            taskID: "tsk_1", title: "Wire the queue", decision: "held",
+            reason: "Nothing has verified this task's build or tests.",
+            headSHA: "abc", checkCommand: nil, atMS: 1
+        ))
+        AutoPilotUndoLog(teamName: team).record(AutoPilotUndoPoint(
+            branch: "develop", sha: "deadbeef", taskID: "tsk_1",
+            repositoryPath: "/repo", recordedAtMS: 2
+        ))
+        defer {
+            let base = FileManager.default.homeDirectoryForCurrentUser
+                .appendingPathComponent(".term-mesh/autopilot", isDirectory: true)
+            try? FileManager.default.removeItem(at: base.appendingPathComponent("\(team)-audit.json"))
+            try? FileManager.default.removeItem(at: base.appendingPathComponent("\(team)-undo.json"))
+        }
+
+        let snapshot = ReviewBoardSnapshot(
+            tasks: [ReviewBoardTask(id: "tsk_1", teamName: team, title: "T", status: "review_ready")],
+            panelRuns: [], coordinatorOnline: true, memMeshAvailable: true,
+            suspectHost: false, fencedZombie: false
+        )
+        let model = ReviewBoardViewModel(
+            initialSnapshot: snapshot, selectedTaskID: nil, snapshotProvider: { snapshot },
+            defaults: UserDefaults(suiteName: "board.autopilot.\(UUID().uuidString)")!
+        )
+        model.reloadAutoPilotJournals()
+
+        XCTAssertEqual(model.autoPilotAudit.count, 1)
+        XCTAssertFalse(model.autoPilotAudit[0].wasApproved)
+        XCTAssertEqual(model.autoPilotUndoPoints.map(\.sha), ["deadbeef"])
+    }
+
+    /// With no team there is no journal to read, and inventing one would show
+    /// another project's decisions.
+    @MainActor
+    func test_an_empty_board_has_no_auto_pilot_history() {
+        let model = ReviewBoardViewModel(
+            initialSnapshot: .empty, selectedTaskID: nil, snapshotProvider: { .empty },
+            defaults: UserDefaults(suiteName: "board.autopilot.\(UUID().uuidString)")!
+        )
+        model.reloadAutoPilotJournals()
+        XCTAssertTrue(model.autoPilotAudit.isEmpty)
+        XCTAssertTrue(model.autoPilotUndoPoints.isEmpty)
+    }
+
 }
 
 final class ReviewBoardTaskMergeTests: XCTestCase {

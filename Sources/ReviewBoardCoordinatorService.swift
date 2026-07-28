@@ -909,6 +909,10 @@ final class ReviewBoardCoordinatorService: ObservableObject {
     static let shared = ReviewBoardCoordinatorService()
 
     @Published private(set) var snapshot = ReviewBoardSnapshot.empty
+    /// Built once: it carries the per-session approval count the policy's
+    /// budget is measured against, so rebuilding it every refresh would reset
+    /// the budget to zero every two seconds.
+    private var cachedAutoPilotRunner: AutoPilotRunner?
     /// Hosts the coordinator remembers, live or not. Empty whenever the
     /// integration is off, so every consumer degrades to peer-roster-only.
     @Published private(set) var knownHosts: [CoordinatorKnownHost] = []
@@ -1363,7 +1367,106 @@ final class ReviewBoardCoordinatorService: ObservableObject {
                 await Self.placeUnplacedTasks(placementInputs.rows, client: client)
                 await self?.dispatchPlacements(placementInputs, client: client)
             }
+            // Auto pilot rides the same refresh for the same reason: a decision
+            // it declines this time it will reconsider on the next read, so a
+            // dropped event costs a beat rather than a stall. It is a no-op
+            // while the toggle is off.
+            await self?.runAutoPilot()
         }
+    }
+
+    // MARK: - Auto pilot
+
+    /// Approve what has earned it, then merge what has been approved.
+    ///
+    /// One pass, in that order, on the refresh — approving and then waiting a
+    /// whole cycle to merge would make every automatic landing take two beats
+    /// for no reason.
+    private func runAutoPilot() async {
+        let policy = AutoPilotPolicy.load()
+        guard policy.isEnabled else { return }
+
+        let tasks = await MainActor.run { self.snapshot.tasks }
+        guard !tasks.isEmpty else { return }
+
+        let runner = autoPilotRunner()
+        let outcomes = await runner.sweep(tasks)
+        if outcomes.contains(where: \.approved) {
+            // The approvals just made are what the merge step looks at, and
+            // the snapshot in hand predates them.
+            await MainActor.run { self.refresh() }
+        }
+        await mergeApprovedWork(policy: policy)
+    }
+
+    private func autoPilotRunner() -> AutoPilotRunner {
+        if let existing = cachedAutoPilotRunner { return existing }
+        let team = snapshot.tasks.first?.teamName ?? "default"
+        let reviewer = NSUserName()
+        let runner = AutoPilotRunner(
+            policy: { AutoPilotPolicy.load() },
+            reviewer: { [weak self] task in
+                guard let self else {
+                    return ReviewBoardReview(
+                        taskID: task.rawID, detail: .unavailable, patch: nil,
+                        blocker: "The board is gone."
+                    )
+                }
+                return await self.review(task: task)
+            },
+            approver: { [weak self] review, summary in
+                guard let self else { throw ReviewBoardCoordinatorError.disabled }
+                try await self.approve(review, reviewer: reviewer, summary: summary)
+            },
+            checker: AutoPilotCheck.live(),
+            audit: AutoPilotJournal<AutoPilotAudit>(teamName: team, kind: "audit")
+        )
+        cachedAutoPilotRunner = runner
+        return runner
+    }
+
+    /// Merge what the queue is holding, recording where each branch stood
+    /// first. The undo point is written before the merge because a merge that
+    /// fails halfway is exactly when it is needed, and by then the ceiling's
+    /// old SHA is gone.
+    private func mergeApprovedWork(policy: AutoPilotPolicy) async {
+        let (queue, tasks) = await MainActor.run {
+            (self.snapshot.mergeQueue.filter { $0.status == "queued" }, self.snapshot.tasks)
+        }
+        guard !queue.isEmpty else { return }
+        guard let merger = ReviewBoardMergeRunner.live(coordinator: self) else {
+            RemoteWorkLog.info("Auto pilot cannot merge: git-kit was not found.")
+            return
+        }
+
+        let team = tasks.first?.teamName ?? "default"
+        let undoLog = AutoPilotUndoLog(teamName: team)
+        for item in queue {
+            guard let job = ReviewBoardMergeRunner.Job(
+                item: item, tasks: tasks, target: policy.ceilingBranch
+            ), let path = job.worktreePath else { continue }
+
+            if let sha = await Self.currentSHA(of: policy.ceilingBranch, in: path) {
+                undoLog.record(AutoPilotUndoPoint(
+                    branch: policy.ceilingBranch,
+                    sha: sha,
+                    taskID: job.taskID,
+                    repositoryPath: path,
+                    recordedAtMS: Int64(Date().timeIntervalSince1970 * 1000)
+                ))
+            }
+            await merger.process(job)
+        }
+    }
+
+    private static func currentSHA(of branch: String, in repository: String) async -> String? {
+        guard let output = try? await ProcessRun.capture(
+            executable: "/usr/bin/git",
+            arguments: ["-C", repository, "rev-parse", "refs/heads/\(branch)"],
+            timeout: 30
+        ), output.status == 0 else { return nil }
+        let sha = output.stdoutText.trimmingCharacters(in: .whitespacesAndNewlines)
+        return sha.isEmpty ? nil : sha
     }
 
     /// What a team status means in the coordinator's vocabulary.
