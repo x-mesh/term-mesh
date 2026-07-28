@@ -61,7 +61,7 @@ enum AutoPilotUndo {
         }
         guard !placement.isDirty else {
             return .refuse(
-                "\(point.branch) is checked out at \(path) with uncommitted changes. "
+                "\(point.branch) is checked out at \(path) with uncommitted changes to tracked files. "
                     + "Commit or stash them first — undoing must not throw away your own work."
             )
         }
@@ -112,7 +112,11 @@ enum AutoPilotUndo {
         guard let path = checkoutPath(of: branch, inPorcelain: listing.stdoutText) else {
             return .notCheckedOut
         }
-        let status = await run(["-C", path, "status", "--porcelain"])
+        // Tracked changes only. `reset --hard` moves HEAD and overwrites
+        // tracked files; it does not touch untracked ones, so a stray build
+        // artifact is not something an undo could destroy — and refusing on
+        // one would make undo unusable in any real checkout.
+        let status = await run(["-C", path, "status", "--porcelain", "--untracked-files=no"])
         let dirty = (status?.stdoutText ?? "")
             .trimmingCharacters(in: .whitespacesAndNewlines)
             .isEmpty == false

@@ -120,7 +120,11 @@ final class AutoPilotUndoTests: XCTestCase {
         XCTAssertEqual(placement, .init(checkedOutAt: "/work/dev", isDirty: true))
         // Dirtiness is asked of the worktree that has the branch, not the
         // repository the merge was recorded against.
-        XCTAssertEqual(seen.last, ["-C", "/work/dev", "status", "--porcelain"])
+        XCTAssertEqual(
+            seen.last,
+            ["-C", "/work/dev", "status", "--porcelain", "--untracked-files=no"],
+            "untracked files cannot be destroyed by reset --hard, so they must not block an undo"
+        )
     }
 
     /// A git that cannot answer must not be read as "not checked out" and then

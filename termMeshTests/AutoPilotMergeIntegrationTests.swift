@@ -68,7 +68,13 @@ final class AutoPilotMergeIntegrationTests: XCTestCase {
     /// holding one commit — the shape auto pilot merges.
     private func makeWorkToMerge() async throws -> (worktree: String, head: String) {
         try await git(["init", "-q", "-b", "main", "."])
-        try await git(["commit", "-q", "--allow-empty", "-m", "base"])
+        // A tracked file, so "dirty" can mean something below: an untracked
+        // file is not dirtiness reset --hard could destroy.
+        try "one\n".write(
+            to: root.appendingPathComponent("a.txt"), atomically: true, encoding: .utf8
+        )
+        try await git(["add", "-A"])
+        try await git(["commit", "-qm", "base"])
         try await git(["branch", "develop"])
         try await git(["checkout", "-q", "develop"])
         try await git(["commit", "-q", "--allow-empty", "-m", "develop moves"])
@@ -179,8 +185,10 @@ final class AutoPilotMergeIntegrationTests: XCTestCase {
             queueID: "mrq_1", taskID: "tsk_1", worktreePath: worktree, target: "develop"
         ))
 
+        // A tracked file, edited. An untracked one would not block: reset
+        // --hard cannot destroy what git is not tracking.
         try "mine".write(
-            to: root.appendingPathComponent("mine.txt"), atomically: true, encoding: .utf8
+            to: root.appendingPathComponent("a.txt"), atomically: true, encoding: .utf8
         )
         let point = AutoPilotUndoPoint(
             branch: "develop", sha: developBefore, taskID: "tsk_1",
@@ -196,9 +204,47 @@ final class AutoPilotMergeIntegrationTests: XCTestCase {
             return XCTFail("a dirty checkout must refuse: \(result)")
         }
         XCTAssertTrue(reason.contains("uncommitted"), reason)
+        let stillMine = try String(
+            contentsOf: root.appendingPathComponent("a.txt"), encoding: .utf8
+        )
+        XCTAssertEqual(stillMine, "mine", "the refusal must leave the edits alone")
+    }
+
+    /// The other half of that rule. A build artifact sitting in the checkout is
+    /// not something `reset --hard` could destroy, and refusing on one would
+    /// make undo unusable in any repository anyone actually works in.
+    func testAnUntrackedFileDoesNotBlockTheUndo() async throws {
+        let (worktree, _) = try await makeWorkToMerge()
+        let developBefore = try await git(["rev-parse", "develop"])
+
+        let runner = ReviewBoardMergeRunner(
+            command: { arguments, _ in try await self.gitKit(arguments, in: self.repository) },
+            report: { _, _, _ in }
+        )
+        _ = await runner.process(ReviewBoardMergeRunner.Job(
+            queueID: "mrq_1", taskID: "tsk_1", worktreePath: worktree, target: "develop"
+        ))
+
+        try "artifact".write(
+            to: root.appendingPathComponent("build.log"), atomically: true, encoding: .utf8
+        )
+        let placement = await AutoPilotUndo.placement(of: "develop", in: repository)
+        XCTAssertFalse(placement.isDirty, "an untracked file is not blocking dirtiness")
+
+        let point = AutoPilotUndoPoint(
+            branch: "develop", sha: developBefore, taskID: "tsk_1",
+            repositoryPath: repository, recordedAtMS: 1
+        )
+        let result = await AutoPilotUndo.apply(
+            AutoPilotUndo.plan(for: point, placement: placement)
+        )
+        guard case .done = result else { return XCTFail("undo should proceed: \(result)") }
+
+        let restored = try await git(["rev-parse", "develop"])
+        XCTAssertEqual(restored, developBefore)
         XCTAssertTrue(
-            FileManager.default.fileExists(atPath: root.appendingPathComponent("mine.txt").path),
-            "the refusal must leave the edits alone"
+            FileManager.default.fileExists(atPath: root.appendingPathComponent("build.log").path),
+            "and the artifact survives, because reset --hard never touched it"
         )
     }
 

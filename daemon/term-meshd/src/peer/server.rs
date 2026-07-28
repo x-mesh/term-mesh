@@ -707,6 +707,206 @@ mod integration_tests {
         server_task.abort();
     }
 
+    /// `team.task.diff` over the real wire, against a real repository.
+    ///
+    /// This is the whole point of the method: work done on this machine is
+    /// reviewable from another one. So the host gets a task board holding a
+    /// task with a real worktree, and the caller — which knows only a task id —
+    /// gets back a patch it could compute a digest against.
+    #[tokio::test]
+    async fn task_diff_travels_the_wire_and_refuses_what_it_cannot_read() {
+        use std::process::Command as SyncCommand;
+
+        fn git(dir: &std::path::Path, args: &[&str]) {
+            let out = SyncCommand::new("git")
+                .args(args)
+                .current_dir(dir)
+                .env("GIT_AUTHOR_NAME", "T")
+                .env("GIT_AUTHOR_EMAIL", "t@t")
+                .env("GIT_COMMITTER_NAME", "T")
+                .env("GIT_COMMITTER_EMAIL", "t@t")
+                .output()
+                .expect("git");
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+
+        let tmp = TempDir::new().unwrap();
+        let sock_path = tmp.path().join("peer.sock");
+
+        // The work, on this machine.
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        git(&repo, &["init", "-q", "-b", "main"]);
+        std::fs::write(repo.join("a.txt"), "one\n").unwrap();
+        git(&repo, &["add", "-A"]);
+        git(&repo, &["commit", "-qm", "base"]);
+        git(&repo, &["checkout", "-q", "-b", "feat/thing"]);
+        std::fs::write(repo.join("a.txt"), "one\ntwo\n").unwrap();
+        git(&repo, &["commit", "-qam", "the work"]);
+
+        // The board that knows where it is. Only the host reads this; the
+        // caller never names the directory.
+        let board = Arc::new(
+            crate::agent::AgentSessionManager::new(tmp.path().join("agents.db"))
+                .expect("agent db"),
+        );
+        let task = board
+            .task_create(crate::agent::TaskCreateParams {
+                title: "the work".into(),
+                description: None,
+                priority: None,
+                created_by: None,
+                deps: None,
+                fix_budget: None,
+                worktree_policy: None,
+            })
+            .expect("task");
+        board
+            .task_update(crate::agent::TaskUpdateParams {
+                id: task.id.clone(),
+                title: None,
+                description: None,
+                status: None,
+                priority: None,
+                assignee: None,
+                worktree_policy: None,
+                worktree_path: Some(repo.to_str().unwrap().to_string()),
+                worktree_branch: Some("feat/thing".into()),
+                worktree_parent: Some("main".into()),
+                worktree_created: None,
+                worktree_reused: None,
+                worktree_init: None,
+                worktree_finished_at_ms: None,
+                worktree_finish_mode: None,
+                worktree_removed: None,
+            })
+            .expect("worktree recorded");
+
+        let host = Arc::new(PeerHost::new(cat_manager()));
+        let teams = Arc::new(tokio::sync::Mutex::new(
+            crate::headless::HeadlessManager::new(),
+        ));
+        host.set_teams(teams);
+        host.set_agents(board);
+
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let sock_path_task = sock_path.clone();
+        let host_task = host.clone();
+        let server_task = tokio::spawn(async move {
+            serve_with_host(sock_path_task, shutdown_rx, host_task)
+                .await
+                .unwrap();
+        });
+        for _ in 0..50 {
+            if sock_path.exists() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+
+        let stream = UnixStream::connect(&sock_path).await.unwrap();
+        let (mut reader, mut writer) = stream.into_split();
+        write_envelope(
+            &mut writer,
+            &Envelope {
+                seq: 1,
+                correlation_id: 0,
+                payload: Some(Payload::Hello(Hello {
+                    protocol_version: PROTOCOL_VERSION.into(),
+                    peer_id: vec![0x22; 16],
+                    display_name: "reviewer".into(),
+                    capabilities: peer_proto::capability::supported_vec(),
+                    app_version: "test".into(),
+                })),
+            },
+        )
+        .await
+        .unwrap();
+        let _ = read_envelope(&mut reader).await.unwrap();
+        let _ = read_envelope(&mut reader).await.unwrap();
+        write_envelope(
+            &mut writer,
+            &Envelope {
+                seq: 2,
+                correlation_id: 0,
+                payload: Some(Payload::Auth(Auth {
+                    method: "ssh-passthrough".into(),
+                    token_id: vec![],
+                    signature: vec![],
+                })),
+            },
+        )
+        .await
+        .unwrap();
+        let _ = read_envelope(&mut reader).await.unwrap();
+
+        async fn call(
+            reader: &mut (impl tokio::io::AsyncRead + Unpin),
+            writer: &mut (impl tokio::io::AsyncWrite + Unpin),
+            seq: u64,
+            params_json: &str,
+        ) -> peer_proto::v1::TeamCallResponse {
+            write_envelope(
+                writer,
+                &Envelope {
+                    seq,
+                    correlation_id: 0,
+                    payload: Some(Payload::TeamCallRequest(
+                        peer_proto::v1::TeamCallRequest {
+                            method: "team.task.diff".into(),
+                            params_json: params_json.into(),
+                        },
+                    )),
+                },
+            )
+            .await
+            .unwrap();
+            match read_envelope(reader).await.unwrap().payload {
+                Some(Payload::TeamCallResponse(r)) => r,
+                other => panic!("expected TeamCallResponse, got {other:?}"),
+            }
+        }
+
+        let answered = call(
+            &mut reader,
+            &mut writer,
+            3,
+            &format!(r#"{{"task_id":"{}"}}"#, task.id),
+        )
+        .await;
+        assert!(answered.ok, "diff failed: {}", answered.error_message);
+
+        let value: serde_json::Value = serde_json::from_str(&answered.result_json).unwrap();
+        assert_eq!(value["head_sha"].as_str().unwrap().len(), 40);
+        assert!(value["diff_digest"]
+            .as_str()
+            .unwrap()
+            .starts_with("sha256:"));
+        assert!(value["patch"].as_str().unwrap().contains("+two"));
+        assert!(value["numstat"].as_str().unwrap().contains("a.txt"));
+        assert_eq!(value["branch"].as_str().unwrap(), "feat/thing");
+        assert_eq!(value["truncated"].as_bool().unwrap(), false);
+
+        // A task this host does not have is an error with a reason, never an
+        // empty success — the board would read that as "nothing changed",
+        // which is an approvable state.
+        let unknown = call(&mut reader, &mut writer, 4, r#"{"task_id":"tsk_nobody"}"#).await;
+        assert!(!unknown.ok);
+        assert!(unknown.result_json.is_empty());
+
+        // And a path is not a parameter, on the wire as much as anywhere.
+        let no_id = call(&mut reader, &mut writer, 5, r#"{"worktree_path":"/etc"}"#).await;
+        assert!(!no_id.ok);
+        assert_eq!(no_id.error_code, "invalid_params");
+
+        let _ = shutdown_tx.send(true);
+        server_task.abort();
+    }
+
     /// A team is invisible in the layout tree, so a client can only learn
     /// where a project's leader sits by asking. This drives the real wire:
     /// handshake, auth, then ListTeams against a host wired to a team
