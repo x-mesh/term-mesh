@@ -12,14 +12,18 @@ final class ReviewBoardCoordinatorServiceTests: XCTestCase {
         let defaults = UserDefaults(suiteName: "ReviewBoardCoordinatorServiceTests.\(UUID().uuidString)")!
         let environment = [ReviewBoardCoordinatorSettings.enabledEnvironmentKey: "1"]
 
+        XCTAssertTrue(ReviewBoardCoordinatorSettings.isIntegrationEnabled(environment: environment, defaults: defaults))
+        XCTAssertFalse(ReviewBoardCoordinatorSettings.isIntegrationEnabled(environment: [:], defaults: defaults))
+
+        defaults.set(false, forKey: ReviewBoardCoordinatorSettings.distributedFeatureKey)
         XCTAssertFalse(ReviewBoardCoordinatorSettings.isIntegrationEnabled(environment: environment, defaults: defaults))
 
         defaults.set(true, forKey: ReviewBoardCoordinatorSettings.distributedFeatureKey)
+        defaults.set(false, forKey: ReviewBoardSettings.enabledKey)
         XCTAssertFalse(ReviewBoardCoordinatorSettings.isIntegrationEnabled(environment: environment, defaults: defaults))
 
         defaults.set(true, forKey: ReviewBoardSettings.enabledKey)
         XCTAssertTrue(ReviewBoardCoordinatorSettings.isIntegrationEnabled(environment: environment, defaults: defaults))
-        XCTAssertFalse(ReviewBoardCoordinatorSettings.isIntegrationEnabled(environment: [:], defaults: defaults))
     }
 
     func testCoordinatorSocketPathFollowsOverrideAndTaggedConvention() {
@@ -48,7 +52,7 @@ final class ReviewBoardCoordinatorServiceTests: XCTestCase {
     func testDistributedWorkspacesToggleMovesBothGateKeys() {
         let defaults = UserDefaults(suiteName: "DistributedToggleTests.\(UUID().uuidString)")!
 
-        XCTAssertFalse(ReviewBoardCoordinatorSettings.distributedWorkspacesToggleOn(defaults: defaults))
+        XCTAssertTrue(ReviewBoardCoordinatorSettings.distributedWorkspacesToggleOn(defaults: defaults))
 
         ReviewBoardCoordinatorSettings.setDistributedWorkspacesToggle(true, defaults: defaults)
         XCTAssertTrue(defaults.bool(forKey: ReviewBoardCoordinatorSettings.distributedFeatureKey))

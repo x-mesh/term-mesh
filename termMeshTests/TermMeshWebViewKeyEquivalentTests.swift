@@ -2155,7 +2155,7 @@ final class SidebarBranchLayoutSettingsTests: XCTestCase {
 }
 
 final class SidebarPresentationSettingsTests: XCTestCase {
-    func testSeparatedSectionsAreDisabledByDefault() {
+    func testSeparatedSectionsAreEnabledByDefault() {
         let suiteName = "SidebarPresentationSettingsTests.Default.\(UUID().uuidString)"
         guard let defaults = UserDefaults(suiteName: suiteName) else {
             XCTFail("Failed to create isolated UserDefaults suite")
@@ -2164,7 +2164,7 @@ final class SidebarPresentationSettingsTests: XCTestCase {
         defer { defaults.removePersistentDomain(forName: suiteName) }
 
         XCTAssertNil(defaults.object(forKey: SidebarPresentationSettings.separatedSectionsEnabledKey))
-        XCTAssertFalse(SidebarPresentationSettings.usesSeparatedSections(defaults: defaults))
+        XCTAssertTrue(SidebarPresentationSettings.usesSeparatedSections(defaults: defaults))
     }
 
     func testStoredPreferencePersistsAcrossDefaultsInstances() {

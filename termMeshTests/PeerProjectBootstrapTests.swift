@@ -209,6 +209,31 @@ final class PeerProjectBootstrapTests: XCTestCase {
         XCTAssertFalse(text.contains("git clone '/app/p/x'"))
     }
 
+    func test_selected_repository_branch_is_cloned_before_worktrees_are_created() {
+        let plan = PeerProjectBootstrap.plan(
+            projectRoot: "/app/p", projectName: "x", agents: ["a"], isolateAgents: true
+        )
+        let text = try! XCTUnwrap(
+            PeerProjectBootstrap.script(
+                for: plan,
+                gitURL: "git@github.com:org/x.git",
+                gitBranch: "release/v2"
+            )
+        )
+
+        XCTAssertTrue(
+            text.contains(
+                "git clone --branch 'release/v2' "
+                    + "'git@github.com:org/x.git' '/app/p/x'"
+            )
+        )
+        XCTAssertTrue(
+            text.contains(
+                "git -C '/app/p/x' worktree add -b 'agent/a' '/app/p/x-a' HEAD"
+            )
+        )
+    }
+
     func test_running_it_twice_is_running_it_once() {
         let plan = PeerProjectBootstrap.plan(
             projectRoot: "/app/p", projectName: "x", agents: ["a"], isolateAgents: true

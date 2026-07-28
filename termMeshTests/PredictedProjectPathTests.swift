@@ -16,6 +16,14 @@ import XCTest
 /// off that folder, and every agent checkout became a sibling of the root
 /// instead of living inside the project.
 final class PredictedProjectPathTests: XCTestCase {
+    func testNewProjectLeaderDefaultsToClaudeOpus() {
+        XCTAssertEqual(NewProjectView.defaultLeaderModel(for: "claude"), "opus")
+        XCTAssertEqual(
+            NewProjectView.defaultLeaderModel(for: "codex"),
+            AgentRolePreset.defaultModel(for: "codex")
+        )
+    }
+
     private func profile(root: String?) -> PeerHostProfile {
         var p = PeerHostProfile(sshTarget: "root@example")
         p.projectRootPath = root
@@ -121,6 +129,37 @@ final class PredictedProjectPathTests: XCTestCase {
                 limit: 6
             ),
             []
+        )
+    }
+
+    func testRemoteBranchesParseDefaultAndSortItFirst() {
+        let result = RepositoryBranchLookup.parse(
+            """
+            ref: refs/heads/main\tHEAD
+            aaaaaaaa\tHEAD
+            bbbbbbbb\trefs/heads/release/v2
+            aaaaaaaa\trefs/heads/main
+            cccccccc\trefs/heads/develop
+            """
+        )
+
+        XCTAssertEqual(result.defaultBranch, "main")
+        XCTAssertEqual(result.branches, ["main", "develop", "release/v2"])
+    }
+
+    func testBranchSearchSupportsPartialNamesAndExcludesSelection() {
+        XCTAssertEqual(
+            RepositoryBranchLookup.matches(
+                ["main", "feature/auth", "feature/search", "release/v2"],
+                query: "feature",
+                excluding: "feature/auth",
+                limit: 8
+            ),
+            ["feature/search"]
+        )
+        XCTAssertEqual(
+            RepositoryBranchLookup.singleLine("release/v2\nmain"),
+            "release/v2"
         )
     }
 

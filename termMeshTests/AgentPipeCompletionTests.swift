@@ -303,6 +303,20 @@ final class AgentPipeCompletionTests: XCTestCase {
                        "a FIFO is claude's whole delivery")
     }
 
+    func testNativeAgentPanesAreEnabledByDefaultAndRespectStoredChoices() {
+        let suiteName = "AgentPipeTransportDefaults.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+
+        XCTAssertTrue(AgentPipeTransport.transportEnabled(defaults: defaults))
+        XCTAssertTrue(AgentPipeTransport.nativePanelEnabled(defaults: defaults))
+
+        defaults.set(false, forKey: AgentPipeTransport.enabledKey)
+        defaults.set(false, forKey: AgentPipeTransport.nativePanelKey)
+        XCTAssertFalse(AgentPipeTransport.transportEnabled(defaults: defaults))
+        XCTAssertFalse(AgentPipeTransport.nativePanelEnabled(defaults: defaults))
+    }
+
     /// A turn-per-process CLI has no interactive UI to host and no stdin to
     /// type into, so the pane path cannot run one at all.
     func testTurnPerProcessClisExistOnlyOnThePipe() {

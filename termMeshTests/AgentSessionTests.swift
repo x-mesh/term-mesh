@@ -1213,6 +1213,61 @@ final class AgentSessionTests: XCTestCase {
         XCTAssertNotEqual(crowded, alone)
     }
 
+    // MARK: - Incremental agent pane placement
+
+    func testFirstAgentSplitsToTheRightOfLeader() {
+        let leader = UUID()
+        let placement = TeamOrchestrator.nextAgentSplitPlacement(
+            leaderPanelId: leader,
+            candidates: []
+        )
+
+        XCTAssertEqual(placement.panelId, leader)
+        XCTAssertEqual(placement.orientation.rawValue, "horizontal")
+    }
+
+    func testLateAgentSplitsLargestPaneAlongItsLongestAxis() {
+        let smaller = UUID()
+        let largest = UUID()
+        let placement = TeamOrchestrator.nextAgentSplitPlacement(
+            leaderPanelId: UUID(),
+            candidates: [
+                .init(panelId: smaller, width: 300, height: 300),
+                .init(panelId: largest, width: 420, height: 700),
+            ]
+        )
+
+        XCTAssertEqual(placement.panelId, largest)
+        XCTAssertEqual(placement.orientation.rawValue, "vertical")
+    }
+
+    func testWideAgentPaneSplitsSideBySide() {
+        let wide = UUID()
+        let placement = TeamOrchestrator.nextAgentSplitPlacement(
+            leaderPanelId: UUID(),
+            candidates: [
+                .init(panelId: wide, width: 700, height: 350),
+            ]
+        )
+
+        XCTAssertEqual(placement.panelId, wide)
+        XCTAssertEqual(placement.orientation.rawValue, "horizontal")
+    }
+
+    func testEqualAreaPlacementKeepsTeamOrderStable() {
+        let first = UUID()
+        let second = UUID()
+        let placement = TeamOrchestrator.nextAgentSplitPlacement(
+            leaderPanelId: UUID(),
+            candidates: [
+                .init(panelId: first, width: 400, height: 300),
+                .init(panelId: second, width: 300, height: 400),
+            ]
+        )
+
+        XCTAssertEqual(placement.panelId, first)
+    }
+
     /// Deliberately not per CLI. Which provider is behind a pane is already
     /// said twice — the chip and the mascot — and spending the colour on it too
     /// would leave two agents of the same role indistinguishable, which is the
