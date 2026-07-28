@@ -85,7 +85,15 @@ def process_location(argv: list[str], cwd: str) -> tuple[list[str], str | None]:
         "$HOME/.local/bin:/opt/homebrew/bin:/opt/homebrew/sbin:"
         "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
     )
+    # `-l` below lets the account's shell load its normal login profile
+    # (`.bash_profile`/`.profile`, `.zprofile`, …). term-mesh then layers one
+    # deterministic, shell-agnostic opt-in file on top. Keep its stdout away
+    # from app-server's JSON-RPC stream: even an innocent `echo` would otherwise
+    # look like a broken protocol frame to the bridge.
+    agent_env = "$HOME/.config/term-mesh/agent-env"
     inner = (
+        f'if [ -f "{agent_env}" ]; then '
+        f'set -a; . "{agent_env}" >/dev/null || exit 78; set +a; fi; '
         f'export PATH="{remote_path}"; '
         "exec env IS_SANDBOX=1 " + shlex.join(assignments + argv)
     )

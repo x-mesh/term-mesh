@@ -148,9 +148,9 @@ struct SettingsView: View {
     // the cross-host UI without ever launching a coordinator — safe until the
     // feature is ready to ship on by itself.
     @AppStorage(ReviewBoardCoordinatorSettings.distributedFeatureKey)
-    private var distributedWorkspacesEnabled = false
+    private var distributedWorkspacesEnabled = ReviewBoardCoordinatorSettings.defaultDistributedWorkspacesEnabled
     @AppStorage(ReviewBoardSettings.enabledKey)
-    private var reviewBoardEnabled = false
+    private var reviewBoardEnabled = ReviewBoardSettings.defaultEnabled
     @AppStorage("teamDefaultLeaderMode") private var teamDefaultLeaderMode = "claude"
 
     /// Whether agents get a pane the app draws instead of a terminal.
@@ -158,7 +158,8 @@ struct SettingsView: View {
     /// Stored under the pane key; the transport key is written alongside it,
     /// because a native pane *is* the pipe transport with no terminal around
     /// it and turning on one without the other does nothing.
-    @AppStorage(AgentPipeTransport.nativePanelKey) private var agentNativePanes = false
+    @AppStorage(AgentPipeTransport.nativePanelKey)
+    private var agentNativePanes = AgentPipeTransport.defaultNativePanel
     @AppStorage("teamDefaultModel") private var teamDefaultModel = "sonnet"
     @AppStorage("teamDefaultWorkingDirectory") private var teamDefaultWorkingDirectory = ""
     @AppStorage(ProjectLocationSettings.localProjectsRootKey)

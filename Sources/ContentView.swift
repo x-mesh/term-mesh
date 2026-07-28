@@ -531,7 +531,8 @@ struct ContentView: View {
     }
 
     @AppStorage("sidebarBlendMode") private var sidebarBlendMode = SidebarBlendModeOption.withinWindow.rawValue
-    @AppStorage(ReviewBoardSettings.enabledKey) private var isReviewBoardEnabled = false
+    @AppStorage(ReviewBoardSettings.enabledKey)
+    private var isReviewBoardEnabled = ReviewBoardSettings.defaultEnabled
     @AppStorage(ReviewBoardSettings.isClosedKey) private var isReviewBoardClosed = false
     @AppStorage("hideWelcomeScreen") private var hideWelcomeScreen: Bool = false
     @AppStorage("showStatusBar") private var showStatusBar: Bool = true

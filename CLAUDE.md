@@ -118,7 +118,7 @@ Named CLI profile sets (path + extraArgs + env + modelOverride) stored in `~/Lib
 
 ## Native Agent Panes (experimental)
 
-기본값은 **Terminal**(기존 Ghostty pane). Settings → Agent Teams → **Agent Panes** → **Native**를 고르면:
+기본값은 **Native**다. Settings → Agent Teams → **Agent Panes**에서 기존 Ghostty pane이 필요하면 **Terminal**로 바꿀 수 있다. Native에서는:
 
 - pipe transport(`agentPipeTransport.enabled`)와 native panel(`agentPipeTransport.nativePanel`)이 함께 켜진다. 하나만 켜는 UI는 없다.
 - 에이전트 UI는 `AgentPanelView`(SwiftUI) — 지시문, streaming 답변, 접을 수 있는 tool row, 턴 종료 cost/시간.

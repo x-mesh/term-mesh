@@ -1,17 +1,17 @@
 # Agent pipe transport & native panes (spike)
 
-Experimental opt-in path that delivers team instructions over a pipe instead of
-typing into a terminal pane, and optionally renders agent sessions in a native
-SwiftUI surface rather than a Ghostty grid.
+Path that delivers team instructions over a pipe instead of typing into a
+terminal pane and renders agent sessions in a native SwiftUI surface rather
+than a Ghostty grid.
 
-**Status:** spike / off by default. The terminal pane path remains the product
-default.
+**Status:** Native is the fresh-install default. Terminal remains available as
+an explicit fallback.
 
 ## User-facing controls
 
 | Setting | Location | Default | Effect |
 |---------|----------|---------|--------|
-| Agent Panes | Settings → Agent Teams → **Agent Panes** | Terminal | **Native** enables pipe transport (`agentPipeTransport.enabled`) and native rendering (`agentPipeTransport.nativePanel`) together. |
+| Agent Panes | Settings → Agent Teams → **Agent Panes** | Native | **Native** enables pipe transport (`agentPipeTransport.enabled`) and native rendering (`agentPipeTransport.nativePanel`) together. |
 | CLI paths | Settings → CLI Paths | — | Lists all known CLIs including `cursor` and `agy`; paths can be configured before Native mode is on. |
 | Agent picker CLIs | Team / role preset CLI field | claude, kiro, codex, gemini | With Native on, adds **cursor** and **agy**. |
 
@@ -23,7 +23,7 @@ UserDefaults keys (for debugging):
 
 ## Modes compared
 
-| | Terminal (default) | Native (experimental) |
+| | Terminal (fallback) | Native (default) |
 |---|-------------------|----------------------|
 | Transport | Paste instruction + synthetic Return | FIFO / process stdin (Claude NDJSON) or bridge |
 | UI | Ghostty terminal showing CLI TUI or `--print` NDJSON | `AgentPanelView` over `AgentSession` model |

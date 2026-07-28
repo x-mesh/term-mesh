@@ -130,7 +130,7 @@ enum SidebarBranchLayoutSettings {
 
 enum SidebarPresentationSettings {
     static let separatedSectionsEnabledKey = "sidebar.presentation.separatedSections.enabled"
-    static let defaultSeparatedSectionsEnabled = false
+    static let defaultSeparatedSectionsEnabled = true
 
     static func usesSeparatedSections(defaults: UserDefaults = .standard) -> Bool {
         guard defaults.object(forKey: separatedSectionsEnabledKey) != nil else {
