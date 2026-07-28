@@ -70,6 +70,31 @@ enum AutoPilotUndo {
 
     // MARK: - Reading and applying
 
+    /// The repository that outlives the merge.
+    ///
+    /// `worktree finish --cleanup` deletes the worktree it merged from, so an
+    /// undo point recorded against that path points at a directory that no
+    /// longer exists by the time anyone wants to use it. The shared git
+    /// directory's parent is the checkout that stays.
+    static func repositoryRoot(
+        containing worktreePath: String,
+        run: (_ arguments: [String]) async -> ProcessRun.Output? = { arguments in
+            try? await ProcessRun.capture(
+                executable: "/usr/bin/git", arguments: arguments, timeout: 30
+            )
+        }
+    ) async -> String? {
+        guard let output = await run([
+            "-C", worktreePath, "rev-parse", "--path-format=absolute", "--git-common-dir",
+        ]), output.status == 0 else { return nil }
+        let commonDir = output.stdoutText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !commonDir.isEmpty else { return nil }
+        // A bare repository has no parent checkout to reset; the common dir is
+        // itself the repository, and update-ref against it is right.
+        guard commonDir.hasSuffix("/.git") else { return commonDir }
+        return (commonDir as NSString).deletingLastPathComponent
+    }
+
     /// Where the branch is, read from git rather than assumed.
     static func placement(
         of branch: String,

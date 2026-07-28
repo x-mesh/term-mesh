@@ -1446,12 +1446,17 @@ final class ReviewBoardCoordinatorService: ObservableObject {
                 item: item, tasks: tasks, target: policy.ceilingBranch
             ), let path = job.worktreePath else { continue }
 
-            if let sha = await Self.currentSHA(of: policy.ceilingBranch, in: path) {
+            // Against the repository, not the worktree: `finish --cleanup`
+            // deletes the worktree it merged from, so an undo point recorded
+            // there would name a directory that is gone by the time anyone
+            // wants it.
+            let repository = await AutoPilotUndo.repositoryRoot(containing: path) ?? path
+            if let sha = await Self.currentSHA(of: policy.ceilingBranch, in: repository) {
                 undoLog.record(AutoPilotUndoPoint(
                     branch: policy.ceilingBranch,
                     sha: sha,
                     taskID: job.taskID,
-                    repositoryPath: path,
+                    repositoryPath: repository,
                     recordedAtMS: Int64(Date().timeIntervalSince1970 * 1000)
                 ))
             }
