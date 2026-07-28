@@ -208,48 +208,63 @@ struct AutoPilotUndoPoint: Equatable, Codable {
     }
 }
 
-/// The undo points for this session, newest first.
+/// A newest-first, bounded list on disk.
 ///
-/// Kept on disk rather than in memory: the merge that most needs undoing is
-/// the one that made the app unusable, and a crashed app remembers nothing.
-final class AutoPilotUndoLog {
+/// On disk rather than in memory because the thing most worth reading back is
+/// what happened just before something went wrong, and a crashed app remembers
+/// nothing.
+final class AutoPilotJournal<Entry: Codable & Equatable> {
     private let url: URL
-    private let queue = DispatchQueue(label: "com.termmesh.autopilot.undo")
-    private let limit = 50
+    private let queue = DispatchQueue(label: "com.termmesh.autopilot.journal")
+    private let limit: Int
 
-    init(url: URL) {
+    init(url: URL, limit: Int = 50) {
         self.url = url
+        self.limit = limit
     }
 
-    convenience init(teamName: String) {
+    convenience init(teamName: String, kind: String, limit: Int = 50) {
         let base = FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent(".term-mesh/autopilot", isDirectory: true)
-        self.init(url: base.appendingPathComponent("\(teamName)-undo.json"))
+        self.init(url: base.appendingPathComponent("\(teamName)-\(kind).json"), limit: limit)
     }
 
-    func record(_ point: AutoPilotUndoPoint) {
+    func record(_ entry: Entry) {
         queue.sync {
-            var points = loadUnsafe()
-            points.insert(point, at: 0)
-            if points.count > limit { points = Array(points.prefix(limit)) }
+            var all = loadUnsafe()
+            all.insert(entry, at: 0)
+            if all.count > limit { all = Array(all.prefix(limit)) }
             try? FileManager.default.createDirectory(
                 at: url.deletingLastPathComponent(), withIntermediateDirectories: true
             )
-            guard let data = try? JSONEncoder().encode(points) else { return }
+            guard let data = try? JSONEncoder().encode(all) else { return }
             try? data.write(to: url, options: .atomic)
         }
     }
 
-    func points() -> [AutoPilotUndoPoint] {
+    func entries() -> [Entry] {
         queue.sync { loadUnsafe() }
     }
 
-    func latest(forTask taskID: String) -> AutoPilotUndoPoint? {
-        points().first { $0.taskID == taskID }
+    private func loadUnsafe() -> [Entry] {
+        guard let data = try? Data(contentsOf: url) else { return [] }
+        return (try? JSONDecoder().decode([Entry].self, from: data)) ?? []
+    }
+}
+
+/// Where a branch stood before auto pilot moved it — recorded before the
+/// merge, not after. A merge that fails halfway is exactly when this is
+/// needed, and by then there is no ceiling SHA left to read.
+typealias AutoPilotUndoLog = AutoPilotJournal<AutoPilotUndoPoint>
+
+extension AutoPilotJournal where Entry == AutoPilotUndoPoint {
+    convenience init(teamName: String) {
+        self.init(teamName: teamName, kind: "undo")
     }
 
-    private func loadUnsafe() -> [AutoPilotUndoPoint] {
-        guard let data = try? Data(contentsOf: url) else { return [] }
-        return (try? JSONDecoder().decode([AutoPilotUndoPoint].self, from: data)) ?? []
+    func points() -> [AutoPilotUndoPoint] { entries() }
+
+    func latest(forTask taskID: String) -> AutoPilotUndoPoint? {
+        entries().first { $0.taskID == taskID }
     }
 }
