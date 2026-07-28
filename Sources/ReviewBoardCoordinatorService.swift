@@ -2305,6 +2305,23 @@ extension ReviewBoardCoordinatorService {
         refresh()
     }
 
+    /// Record what became of a queued merge.
+    ///
+    /// The merge runs elsewhere; this is only the report. It refreshes because
+    /// the board's queue list is what a person watches to know whether the
+    /// merge they approved actually landed.
+    func transitionMergeQueue(
+        queueID: String,
+        status: String,
+        lastError: String? = nil
+    ) async throws {
+        guard let client else { throw ReviewBoardCoordinatorError.disabled }
+        try await client.transitionMergeQueue(
+            queueID: queueID, status: status, lastError: lastError
+        )
+        refresh()
+    }
+
     private func requireActionable(
         _ review: ReviewBoardReview
     ) throws -> (attemptID: String, token: String, patch: ReviewBoardEvidence.Patch) {

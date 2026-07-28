@@ -159,75 +159,24 @@ enum ReviewBoardEvidence {
 
     // MARK: - Running git
 
-    private static let queue = DispatchQueue(
-        label: "com.termmesh.reviewboard.evidence",
-        qos: .userInitiated
-    )
-    private static let stderrQueue = DispatchQueue(
-        label: "com.termmesh.reviewboard.evidence.stderr",
-        qos: .userInitiated
-    )
-
+    /// The pipe-drain and watchdog dance lives in `ProcessRun`; two copies of
+    /// it is one copy too many for code whose failure mode is a hang.
     private static func run(_ arguments: [String], timeout: TimeInterval) async throws -> Data {
-        try await withCheckedThrowingContinuation { continuation in
-            queue.async {
-                let process = Process()
-                let stdout = Pipe()
-                let stderr = Pipe()
-                process.executableURL = URL(fileURLWithPath: "/usr/bin/git")
-                process.arguments = arguments
-                process.standardOutput = stdout
-                process.standardError = stderr
-                do {
-                    try process.run()
-                } catch {
-                    continuation.resume(
-                        throwing: ReviewBoardEvidenceError.commandFailed(error.localizedDescription)
-                    )
-                    return
-                }
-                // A patch outruns the 64KB pipe buffer routinely, so both
-                // pipes are drained before anything waits on the process, and
-                // stderr on its own queue. Waiting first deadlocks; draining
-                // one after the other only moves the deadlock to whichever
-                // pipe fills while the other is being read.
-                var errorOutput = Data()
-                let stderrDone = DispatchGroup()
-                stderrDone.enter()
-                stderrQueue.async {
-                    errorOutput = stderr.fileHandleForReading.readDataToEndOfFile()
-                    stderrDone.leave()
-                }
-                // The read above is what actually bounds this: a git that
-                // never writes and never exits would hold the queue forever,
-                // so the deadline is enforced by terminating the process,
-                // which closes the pipes and lets the read return.
-                let watchdog = DispatchWorkItem { if process.isRunning { process.terminate() } }
-                stderrQueue.asyncAfter(deadline: .now() + timeout, execute: watchdog)
-
-                let output = stdout.fileHandleForReading.readDataToEndOfFile()
-                stderrDone.wait()
-                process.waitUntilExit()
-                let timedOut = watchdog.isCancelled == false && process.terminationReason == .uncaughtSignal
-                watchdog.cancel()
-
-                guard process.terminationStatus == 0 else {
-                    let label = "git \(arguments.joined(separator: " "))"
-                    if timedOut {
-                        continuation.resume(throwing: ReviewBoardEvidenceError.timedOut(label))
-                        return
-                    }
-                    let message = String(decoding: errorOutput, as: UTF8.self)
-                        .trimmingCharacters(in: .whitespacesAndNewlines)
-                    continuation.resume(
-                        throwing: ReviewBoardEvidenceError.commandFailed(
-                            message.isEmpty ? label : message
-                        )
-                    )
-                    return
-                }
-                continuation.resume(returning: output)
-            }
+        let output: ProcessRun.Output
+        do {
+            output = try await ProcessRun.capture(
+                executable: "/usr/bin/git", arguments: arguments, timeout: timeout
+            )
+        } catch let ProcessRun.Failure.couldNotStart(reason) {
+            throw ReviewBoardEvidenceError.commandFailed(reason)
         }
+
+        guard output.status == 0 else {
+            let label = "git \(arguments.joined(separator: " "))"
+            if output.timedOut { throw ReviewBoardEvidenceError.timedOut(label) }
+            let message = output.stderrText
+            throw ReviewBoardEvidenceError.commandFailed(message.isEmpty ? label : message)
+        }
+        return output.stdout
     }
 }

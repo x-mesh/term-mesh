@@ -32,6 +32,8 @@
 		A17000000000000000000001 /* ReviewBoardModels.swift in Sources */ = {isa = PBXBuildFile; fileRef = A17000000000000000000005 /* ReviewBoardModels.swift */; };
 		A17000000000000000000009 /* ReviewBoardEvidence.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1700000000000000000000A /* ReviewBoardEvidence.swift */; };
 		A1720000000000000000000B /* AutoPilotPolicy.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1720000000000000000000C /* AutoPilotPolicy.swift */; };
+		A1750000000000000000000B /* ReviewBoardMergeRunner.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1750000000000000000000C /* ReviewBoardMergeRunner.swift */; };
+		A1740000000000000000000B /* ProcessRun.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1740000000000000000000C /* ProcessRun.swift */; };
 		A17000000000000000000002 /* ReviewBoardViewModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = A17000000000000000000006 /* ReviewBoardViewModel.swift */; };
 		A17000000000000000000003 /* ReviewBoardPanelView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A17000000000000000000007 /* ReviewBoardPanelView.swift */; };
 		A17000000000000000000004 /* ReviewBoardViewModelTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A17000000000000000000008 /* ReviewBoardViewModelTests.swift */; };
@@ -39,6 +41,7 @@
 		A17100000000000000000002 /* ReviewBoardCoordinatorServiceTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A17100000000000000000004 /* ReviewBoardCoordinatorServiceTests.swift */; };
 		A17100000000000000000009 /* ReviewBoardEvidenceTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1710000000000000000000A /* ReviewBoardEvidenceTests.swift */; };
 		A1730000000000000000000B /* AutoPilotPolicyTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1730000000000000000000C /* AutoPilotPolicyTests.swift */; };
+		A1760000000000000000000B /* ReviewBoardMergeRunnerTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1760000000000000000000C /* ReviewBoardMergeRunnerTests.swift */; };
 		A15000000000000000000001 /* WorkspaceRemoteRetrievalModels.swift in Sources */ = {isa = PBXBuildFile; fileRef = A15000000000000000000003 /* WorkspaceRemoteRetrievalModels.swift */; };
 		A15000000000000000000002 /* WorkspaceRemoteRetrievalModelsTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A15000000000000000000004 /* WorkspaceRemoteRetrievalModelsTests.swift */; };
 		A15100000000000000000001 /* RemoteGitCheckpointService.swift in Sources */ = {isa = PBXBuildFile; fileRef = A15100000000000000000005 /* RemoteGitCheckpointService.swift */; };
@@ -334,6 +337,8 @@
 			A17000000000000000000005 /* ReviewBoardModels.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ReviewBoardModels.swift; sourceTree = "<group>"; };
 			A1700000000000000000000A /* ReviewBoardEvidence.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ReviewBoardEvidence.swift; sourceTree = "<group>"; };
 			A1720000000000000000000C /* AutoPilotPolicy.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AutoPilotPolicy.swift; sourceTree = "<group>"; };
+			A1750000000000000000000C /* ReviewBoardMergeRunner.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ReviewBoardMergeRunner.swift; sourceTree = "<group>"; };
+			A1740000000000000000000C /* ProcessRun.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ProcessRun.swift; sourceTree = "<group>"; };
 			A17000000000000000000006 /* ReviewBoardViewModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ReviewBoardViewModel.swift; sourceTree = "<group>"; };
 			A17000000000000000000007 /* ReviewBoardPanelView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ReviewBoardPanelView.swift; sourceTree = "<group>"; };
 			A17000000000000000000008 /* ReviewBoardViewModelTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ReviewBoardViewModelTests.swift; sourceTree = "<group>"; };
@@ -341,6 +346,7 @@
 			A17100000000000000000004 /* ReviewBoardCoordinatorServiceTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ReviewBoardCoordinatorServiceTests.swift; sourceTree = "<group>"; };
 			A1710000000000000000000A /* ReviewBoardEvidenceTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ReviewBoardEvidenceTests.swift; sourceTree = "<group>"; };
 			A1730000000000000000000C /* AutoPilotPolicyTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AutoPilotPolicyTests.swift; sourceTree = "<group>"; };
+			A1760000000000000000000C /* ReviewBoardMergeRunnerTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ReviewBoardMergeRunnerTests.swift; sourceTree = "<group>"; };
 			A15000000000000000000003 /* WorkspaceRemoteRetrievalModels.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WorkspaceRemoteRetrievalModels.swift; sourceTree = "<group>"; };
 			A15000000000000000000004 /* WorkspaceRemoteRetrievalModelsTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WorkspaceRemoteRetrievalModelsTests.swift; sourceTree = "<group>"; };
 			A15100000000000000000005 /* RemoteGitCheckpointService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RemoteGitCheckpointService.swift; sourceTree = "<group>"; };
@@ -670,6 +676,8 @@
 					A17000000000000000000005 /* ReviewBoardModels.swift */,
 					A1700000000000000000000A /* ReviewBoardEvidence.swift */,
 A1720000000000000000000C /* AutoPilotPolicy.swift */,
+A1750000000000000000000C /* ReviewBoardMergeRunner.swift */,
+A1740000000000000000000C /* ProcessRun.swift */,
 					A17000000000000000000006 /* ReviewBoardViewModel.swift */,
 					A17000000000000000000007 /* ReviewBoardPanelView.swift */,
 					A17100000000000000000003 /* ReviewBoardCoordinatorService.swift */,
@@ -920,6 +928,7 @@ A1720000000000000000000C /* AutoPilotPolicy.swift */,
 				A17100000000000000000004 /* ReviewBoardCoordinatorServiceTests.swift */,
 				A1710000000000000000000A /* ReviewBoardEvidenceTests.swift */,
 A1730000000000000000000C /* AutoPilotPolicyTests.swift */,
+A1760000000000000000000C /* ReviewBoardMergeRunnerTests.swift */,
 				A15000000000000000000004 /* WorkspaceRemoteRetrievalModelsTests.swift */,
 				A15100000000000000000008 /* WorkspaceRetrievalStoreTests.swift */,
 				5A57E1F90000000000000004 /* PasteShelfStoreTests.swift */,
@@ -1080,6 +1089,8 @@ A1730000000000000000000C /* AutoPilotPolicyTests.swift */,
 					A17000000000000000000001 /* ReviewBoardModels.swift in Sources */,
 					A17000000000000000000009 /* ReviewBoardEvidence.swift in Sources */,
 A1720000000000000000000B /* AutoPilotPolicy.swift in Sources */,
+A1750000000000000000000B /* ReviewBoardMergeRunner.swift in Sources */,
+A1740000000000000000000B /* ProcessRun.swift in Sources */,
 					A17000000000000000000002 /* ReviewBoardViewModel.swift in Sources */,
 					A17000000000000000000003 /* ReviewBoardPanelView.swift in Sources */,
 					A17100000000000000000001 /* ReviewBoardCoordinatorService.swift in Sources */,
@@ -1304,6 +1315,7 @@ A1720000000000000000000B /* AutoPilotPolicy.swift in Sources */,
 				A17100000000000000000002 /* ReviewBoardCoordinatorServiceTests.swift in Sources */,
 				A17100000000000000000009 /* ReviewBoardEvidenceTests.swift in Sources */,
 A1730000000000000000000B /* AutoPilotPolicyTests.swift in Sources */,
+A1760000000000000000000B /* ReviewBoardMergeRunnerTests.swift in Sources */,
 				A15000000000000000000002 /* WorkspaceRemoteRetrievalModelsTests.swift in Sources */,
 				A15100000000000000000004 /* WorkspaceRetrievalStoreTests.swift in Sources */,
 				5A57E1F90000000000000002 /* PasteShelfStoreTests.swift in Sources */,
