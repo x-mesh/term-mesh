@@ -179,6 +179,23 @@ struct ReviewBoardTask: Identifiable, Equatable, Sendable {
     let staleSeconds: Int?
     let updatedAt: String?
 
+    /// Statuses that mean the agent is done with it — `review_ready` included,
+    /// because the work finished even though the review has not.
+    private static let finishedStatuses: Set<String> = [
+        "completed", "review_ready", "approved", "merged", "done"
+    ]
+
+    /// When the task finished, or nil while it is still running.
+    ///
+    /// There is no `completed_at` to read: both boards stamp `updated_at` on
+    /// every state change, so for a task that has reached a terminal status
+    /// that stamp *is* the finish. Deriving it here rather than showing
+    /// `updatedAt` on every row keeps the board from labelling a running
+    /// task's last heartbeat as a completion.
+    var finishedAt: String? {
+        Self.finishedStatuses.contains(status) ? updatedAt : nil
+    }
+
     init(
         id: String,
         teamName: String,
@@ -696,6 +713,75 @@ enum ReviewBoardText {
     /// downstream working in one representation.
     static func timestamp(fromUnixMilliseconds milliseconds: UInt64) -> String {
         timestampFormatter.string(from: Date(timeIntervalSince1970: Double(milliseconds) / 1000))
+    }
+
+    /// The two shapes an ISO-8601 stamp arrives in here: the coordinator's own,
+    /// written by `timestamp(fromUnixMilliseconds:)` above, and the team
+    /// board's, which carries fractional seconds. One parser would silently
+    /// return nil for half the rows.
+    private static let timestampParsers: [ISO8601DateFormatter] = {
+        let plain = ISO8601DateFormatter()
+        plain.formatOptions = [.withInternetDateTime]
+        let fractional = ISO8601DateFormatter()
+        fractional.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return [plain, fractional]
+    }()
+
+    private static let clockFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.dateFormat = "HH:mm"
+        return formatter
+    }()
+
+    private static let datedClockFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.dateFormat = "M/d HH:mm"
+        return formatter
+    }()
+
+    /// A wall-clock reading of a stamp, for a row a person is looking at.
+    ///
+    /// The board carried these as raw `2026-07-28T08:32:11Z` strings, which is
+    /// the machine's form: it answers "when" only after the reader has done
+    /// timezone arithmetic. Today's times drop the date — a review board is
+    /// read while the work is happening.
+    static func clockTime(_ iso: String) -> String? {
+        for parser in timestampParsers {
+            guard let date = parser.date(from: iso) else { continue }
+            return Calendar.current.isDateInToday(date)
+                ? clockFormatter.string(from: date)
+                : datedClockFormatter.string(from: date)
+        }
+        return nil
+    }
+
+    /// Directives a delegated instruction opens with, addressed to the agent
+    /// rather than describing the task.
+    private static let titleDirectives = ["READ-ONLY", "READ ONLY"]
+
+    /// Split a leading protocol directive off a task title.
+    ///
+    /// A delegated instruction is used verbatim as the title, and those open
+    /// with the constraint the agent was handed — `READ-ONLY 설계 검토. 파일
+    /// 수정 절대 금지 …`. Rendered as-is it ate the first line of every card,
+    /// so a board of four tasks read as four copies of the same word with the
+    /// actual work truncated behind it. The constraint is worth keeping, just
+    /// not as the headline: returned separately, it becomes a mark on the row.
+    static func splitDirective(_ title: String) -> (directive: String?, rest: String) {
+        let trimmed = title.trimmingCharacters(in: .whitespacesAndNewlines)
+        for directive in titleDirectives {
+            guard trimmed.count > directive.count,
+                  trimmed.prefix(directive.count).caseInsensitiveCompare(directive) == .orderedSame
+            else { continue }
+            let separators = CharacterSet(charactersIn: " :.-—·|").union(.whitespacesAndNewlines)
+            let rest = String(trimmed.dropFirst(directive.count))
+                .trimmingCharacters(in: separators)
+            // A title that was nothing but the directive still has to say
+            // something, so it keeps what it had.
+            guard !rest.isEmpty else { return (nil, trimmed) }
+            return (directive.uppercased(), rest)
+        }
+        return (nil, trimmed)
     }
 
     static func safeBody(_ value: String, limit: Int = 240) -> String {

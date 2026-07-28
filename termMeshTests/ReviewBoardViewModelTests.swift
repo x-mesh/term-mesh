@@ -379,4 +379,68 @@ final class ReviewBoardAgentReportTests: XCTestCase {
         let report = ReviewBoardAgentReport(result: "STATUS: DONE\nNEXT: NONE\n\n* rebuilt the xcframework\n")
         XCTAssertEqual(report?.body, "* rebuilt the xcframework")
     }
+
+    // MARK: - When a task finished
+
+    /// Neither board writes a `completed_at`, so a terminal status is what
+    /// turns the last `updated_at` into a finish. Reading it off a running
+    /// task would label a heartbeat as a completion.
+    func test_a_finish_time_belongs_only_to_a_task_that_finished() {
+        func task(_ status: String) -> ReviewBoardTask {
+            ReviewBoardTask(id: "t", teamName: "ws", title: "Fix the parser",
+                            status: status, updatedAt: "2026-07-28T08:32:11Z")
+        }
+        for done in ["completed", "review_ready", "approved", "merged"] {
+            XCTAssertEqual(task(done).finishedAt, "2026-07-28T08:32:11Z", done)
+        }
+        for running in ["queued", "assigned", "in_progress", "blocked", "failed"] {
+            XCTAssertNil(task(running).finishedAt, running)
+        }
+        // Terminal but never stamped — nothing to show rather than a guess.
+        XCTAssertNil(
+            ReviewBoardTask(id: "t", teamName: "ws", title: "x", status: "completed").finishedAt
+        )
+    }
+
+    /// Both stamp shapes reach this board: the coordinator's plain ISO-8601 and
+    /// the team board's with fractional seconds. One parser dropped half of
+    /// them, and a dropped stamp is a row with no time at all.
+    func test_both_stamp_shapes_read_as_a_clock_time() {
+        XCTAssertNotNil(ReviewBoardText.clockTime("2026-07-28T08:32:11Z"))
+        XCTAssertNotNil(ReviewBoardText.clockTime("2026-07-28T08:32:11.482Z"))
+        XCTAssertNil(ReviewBoardText.clockTime("whenever"))
+        // A day other than today keeps its date — otherwise a week-old row
+        // reads as if it just happened.
+        let old = ReviewBoardText.clockTime("2020-01-02T03:04:05Z")
+        XCTAssertEqual(old?.contains("1/2"), true, String(describing: old))
+    }
+
+    // MARK: - The directive a delegated title opens with
+
+    /// The instruction is used verbatim as the title, so the constraint handed
+    /// to the agent became the headline of the card and pushed the actual work
+    /// out of the two lines a row has.
+    func test_a_leading_directive_is_lifted_out_of_the_title() {
+        let parts = ReviewBoardText.splitDirective("READ-ONLY 설계 검토. 파일 수정 절대 금지")
+        XCTAssertEqual(parts.directive, "READ-ONLY")
+        XCTAssertEqual(parts.rest, "설계 검토. 파일 수정 절대 금지")
+
+        // Spelling and separator vary; the mark does not.
+        XCTAssertEqual(ReviewBoardText.splitDirective("read only: check the plan").directive,
+                       "READ ONLY")
+        XCTAssertEqual(ReviewBoardText.splitDirective("READ-ONLY — audit").rest, "audit")
+
+        // A title that merely starts with the same letters is not a directive.
+        let plain = ReviewBoardText.splitDirective("Read-only mode is broken")
+        XCTAssertEqual(plain.directive, "READ-ONLY")
+        XCTAssertEqual(plain.rest, "mode is broken")
+
+        // Nothing to lift.
+        XCTAssertNil(ReviewBoardText.splitDirective("수정 작업. gk pull 로그").directive)
+        XCTAssertEqual(ReviewBoardText.splitDirective("수정 작업. gk pull 로그").rest,
+                       "수정 작업. gk pull 로그")
+        // Directive with nothing behind it still has to say something.
+        XCTAssertEqual(ReviewBoardText.splitDirective("READ-ONLY").rest, "READ-ONLY")
+        XCTAssertNil(ReviewBoardText.splitDirective("READ-ONLY").directive)
+    }
 }

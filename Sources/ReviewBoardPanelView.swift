@@ -109,7 +109,9 @@ struct ReviewBoardPanelView: View {
                     Image(systemName: item.isFailed ? "arrow.triangle.merge" : "clock")
                         .foregroundColor(item.isFailed ? .red : .secondary)
                         .accessibilityHidden(true)
-                    Text(viewModel.taskTitle(forMergeQueueItem: item))
+                    Text(ReviewBoardText.splitDirective(
+                        viewModel.taskTitle(forMergeQueueItem: item)
+                    ).rest)
                         .font(.system(size: 12, weight: .medium))
                         .lineLimit(1)
                     Spacer(minLength: 4)
@@ -125,9 +127,13 @@ struct ReviewBoardPanelView: View {
                 }
                 HStack(spacing: 6) {
                     Text("approved by \(item.approvedBy)")
-                    if let approvedAt = item.approvedAt {
+                    // The fix's own finish time. This was the raw ISO stamp,
+                    // which answers "when" only after the reader does timezone
+                    // arithmetic in their head.
+                    if let approvedAt = item.approvedAt.flatMap(ReviewBoardText.clockTime) {
                         Text("·")
                         Text(approvedAt)
+                            .monospacedDigit()
                     }
                     Spacer(minLength: 4)
                 }
@@ -161,12 +167,24 @@ struct ReviewBoardPanelView: View {
 
     private func taskRow(_ task: ReviewBoardTask) -> some View {
         let isSelected = viewModel.selectedTask?.id == task.id
+        let parts = ReviewBoardText.splitDirective(task.title)
         return Button {
             viewModel.selectTask(id: task.id)
         } label: {
             VStack(alignment: .leading, spacing: 5) {
                 HStack(spacing: 6) {
-                    Text(task.title)
+                    if let directive = parts.directive {
+                        // The constraint the agent was handed, kept as a mark
+                        // so it stops being the headline of every card.
+                        Text(directive)
+                            .font(.system(size: 9, weight: .bold))
+                            .padding(.horizontal, 4)
+                            .padding(.vertical, 1)
+                            .background(Color.secondary.opacity(0.16))
+                            .clipShape(RoundedRectangle(cornerRadius: 3))
+                            .foregroundColor(.secondary)
+                    }
+                    Text(parts.rest)
                         .font(.system(size: 12, weight: .medium))
                         .lineLimit(2)
                     Spacer(minLength: 4)
@@ -193,6 +211,14 @@ struct ReviewBoardPanelView: View {
                     if let assignee = task.assignee {
                         Text("·")
                         Text(assignee)
+                    }
+                    // When it finished, on the rows that have finished. A
+                    // board with no time on it cannot answer "is this still
+                    // moving?" — the question it exists to answer.
+                    if let finished = task.finishedAt.flatMap(ReviewBoardText.clockTime) {
+                        Text("·")
+                        Text("done \(finished)")
+                            .monospacedDigit()
                     }
                     Spacer(minLength: 4)
                     Text("P\(task.priority)")
@@ -271,9 +297,23 @@ struct ReviewBoardPanelView: View {
                 .accessibilityLabel("Stopped because: \(reason)")
                 .accessibilityIdentifier("reviewBoard.task.reason")
             }
-            // The instruction in full. The row above truncates it to a line,
-            // and for work delegated from a pane the instruction IS the task —
-            // there is no separate description to fall back on.
+            if let finished = task.finishedAt.flatMap(ReviewBoardText.clockTime) {
+                HStack(spacing: 5) {
+                    Image(systemName: "checkmark.circle")
+                        .font(.system(size: 10))
+                        .accessibilityHidden(true)
+                    Text("Finished \(finished)")
+                        .monospacedDigit()
+                    Spacer(minLength: 0)
+                }
+                .font(.system(size: 11))
+                .foregroundColor(.secondary)
+                .accessibilityIdentifier("reviewBoard.task.finishedAt")
+            }
+            // The instruction in full — directive and all. The row above shows
+            // the constraint as a mark and drops it from the text; here the
+            // instruction IS the task for work delegated from a pane, so it is
+            // shown as the agent received it.
             if !task.title.isEmpty {
                 Text(task.title)
                     .font(.system(size: 11))
