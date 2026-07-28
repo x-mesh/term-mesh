@@ -960,6 +960,26 @@ impl Reducer {
                 event.payload.get("expires_at_ms").and_then(|v| v.as_i64())
             ],
         )?;
+        // The attempt row carries a copy of the token, and it is what every
+        // reader gets: `task.get` returns `attempts[]`, and there is no RPC
+        // that exposes the `fences` table. Leaving the copy behind made that
+        // copy silently wrong the moment anyone re-fenced — a caller would
+        // read a token, send it, and be told `stale_fencing_token` with no way
+        // to see why or to ask for the current one. The only workaround was to
+        // issue a fresh fence, which takes the token away from whoever is
+        // actually running the attempt: the precise thing fencing exists to
+        // prevent. Updating both together is what makes the readable copy
+        // true.
+        //
+        // A fence with no attempt (task-scoped) or for an attempt that does
+        // not exist matches no row; `fence` is deliberately unchecked, so that
+        // is a legal call and not an error here.
+        if let Some(attempt_id) = attempt_id.as_ref() {
+            self.conn.execute(
+                "UPDATE attempts SET fencing_token=?1, updated_at_ms=?2 WHERE attempt_id=?3",
+                params![token, event.ts_ms as i64, attempt_id.as_str()],
+            )?;
+        }
         Ok(())
     }
 

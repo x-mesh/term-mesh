@@ -956,6 +956,84 @@ fn re_fencing_an_attempt_retires_its_previous_token() {
     );
 }
 
+/// `task.get` is the only way to read a fencing token — nothing exposes the
+/// `fences` table — so the attempt's copy has to be the current one.
+///
+/// It was not: re-fencing wrote `fences` and left `attempts.fencing_token`
+/// behind. A reader would take that token, be refused with
+/// `stale_fencing_token`, and have no way to see why. The only escape was to
+/// mint a fresh fence, which takes the token from whoever is running the
+/// attempt — the thing fencing exists to prevent.
+#[test]
+fn re_fencing_updates_the_token_that_task_get_reports() {
+    let (api, _project_id, task_id) = api_with_project_task();
+    let host = observe_host(&api, "h1", "hst_1111", 0.1, 0, vec!["/tmp/repo"]);
+    let placed = api
+        .handle(
+            "task.place",
+            json!({"request_id": "place", "task_id": task_id, "host_id": host}),
+        )
+        .unwrap();
+    let attempt_id = placed["event"]["payload"]["attempt_id"].as_str().unwrap().to_string();
+
+    let token_from_task_get = |api: &Api| -> String {
+        let got = api
+            .handle("task.get", json!({"task_id": task_id}))
+            .unwrap();
+        got["attempts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|a| a["attempt_id"] == json!(attempt_id))
+            .expect("the placed attempt")["fencing_token"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    };
+
+    // Placement already agrees — the regression is only visible after a
+    // second fence.
+    let placed_token = placed["event"]["payload"]["token"].as_str().unwrap().to_string();
+    assert_eq!(token_from_task_get(&api), placed_token);
+
+    let refenced = api
+        .handle(
+            "fence",
+            json!({
+                "request_id": "refence",
+                "task_id": task_id,
+                "attempt_id": attempt_id,
+                "holder": "review-board"
+            }),
+        )
+        .unwrap();
+    let current = refenced["event"]["payload"]["token"].as_str().unwrap().to_string();
+
+    assert_eq!(
+        token_from_task_get(&api),
+        current,
+        "the token a reader can see must be the one the fence check accepts"
+    );
+
+    // The point of the copy being right: it is usable. Approving with the
+    // token read back from `task.get` has to pass the fence check.
+    let snapshot = api
+        .handle(
+            "review.snapshot",
+            json!({
+                "request_id": "snapshot-after-refence",
+                "task_id": task_id,
+                "attempt_id": attempt_id,
+                "fencing_token": token_from_task_get(&api),
+                "base_sha": "base",
+                "head_sha": "head",
+                "diff_digest": "sha256:good"
+            }),
+        )
+        .expect("a token read from task.get must be accepted");
+    assert!(snapshot["accepted"].as_bool().unwrap_or(false));
+}
+
 /// A truncated trailing line is reported, and the rest of the log is not
 /// silently reinterpreted.
 ///
