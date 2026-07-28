@@ -1,4 +1,28 @@
+import Foundation
 import SwiftUI
+
+struct ProjectBootStep: Identifiable, Equatable {
+    enum Status: Equatable {
+        case pending
+        case running
+        case completed
+        case failed(String)
+    }
+
+    let id: String
+    let order: Int
+    var title: String
+    var detail: String
+    var command: String?
+    var status: Status
+}
+
+enum ProjectCreationEvent: Equatable {
+    case planned(ProjectBootStep)
+    case started(ProjectBootStep)
+    case completed(id: String, detail: String?)
+    case failed(id: String, message: String)
+}
 
 /// Starting a project: what it is, where it lives, and who works on it.
 ///
@@ -22,9 +46,17 @@ struct NewProjectView: View {
         _ localDirectory: String,
         _ rows: [TeamAgentRow],
         _ source: ProjectSource,
-        _ leader: ProjectLeader
+        _ leader: ProjectLeader,
+        _ progress: @escaping @MainActor (ProjectCreationEvent) -> Void
     ) async throws -> Void
     let onClose: () -> Void
+    /// Local repositories the app already knows about. Their `origin` remotes
+    /// become lightweight autocomplete suggestions; no home-directory scan is
+    /// needed just to open this sheet.
+    let repositoryDirectories: [String]
+    /// Roots that may contain projects not currently open in term-mesh.
+    /// Discovery is shallow, bounded and runs off-main.
+    let repositorySearchRoots: [String]
 
     @State private var directory: String = ""
     @State private var name: String = ""
@@ -38,7 +70,7 @@ struct NewProjectView: View {
     @State private var knownAgentIDs: Set<UUID> = []
     @State private var inheritedAgentIDs: Set<UUID> = []
     @State private var agents: [TeamAgentRow] = []
-    /// The machine this project lives on.
+    /// The machine the leader and primary checkout live on.
     ///
     /// Asked first because everything after it depends on the answer. A folder
     /// on this Mac is chosen with a file panel; a folder on another machine is
@@ -49,11 +81,10 @@ struct NewProjectView: View {
     /// Where the project comes from. A folder that is already there, or a
     /// repository to clone onto that machine.
     @State private var gitURL: String = ""
-    @State private var showsCustomPath = false
-    @State private var showsCustomPlacement = false
-    /// Sample tag for the checkout-name hint; the real one is minted at
-    /// creation time in `ProjectCreationFlow.prepareCheckouts`.
-    @State private var previewInstanceTag = PeerProjectBootstrap.makeInstanceTag()
+    @State private var repositoryURLSuggestions: [String] = []
+    @State private var isLoadingRepositorySuggestions = false
+    @State private var showsTeamEditor = false
+    @State private var showsAdvancedOptions = false
     @FocusState private var focusedField: Field?
 
     private enum Field {
@@ -83,32 +114,25 @@ struct NewProjectView: View {
     @State private var showingManagePresets = false
     @State private var savePresetName = ""
     @State private var presetError: String?
-    @State private var isCreating = false
     @State private var creationError: String?
-    /// Where the leader runs: following this project's Default machine, or
-    /// somewhere the user pointed it on purpose.
-    ///
-    /// Modeled as inheritance rather than a copied host key so "still
-    /// following the default" and "coincidentally on the same machine" can
-    /// never be confused with each other — the earlier design copied
-    /// `runsOnHostKey` into a second field and the two silently drifted
-    /// apart the moment either one changed alone.
-    @State private var leaderPlacement: HostPlacement = .inherited
+    @State private var showsCreationProgress = false
+    @State private var creationStartedAt: Date?
+    @State private var bootSteps: [ProjectBootStep] = []
+    @State private var showsBootCommands = true
+    @State private var agentPlacementMode: AgentPlacementMode = .sameAsLeader
+    @State private var allAgentsHostKey: String?
 
-    /// A place something in this form runs: the project's Default machine,
-    /// or an explicit override of it (`nil` inside `.explicit` means "This
-    /// Mac", stated on purpose rather than left blank).
-    enum HostPlacement: Hashable {
-        case inherited
-        case explicit(String?)
-    }
+    enum AgentPlacementMode: String, CaseIterable {
+        case sameAsLeader
+        case allOnOneMachine
+        case perAgent
 
-    /// The leader's effective host, resolving `leaderPlacement` against the
-    /// current Default machine. Read-only: set `leaderPlacement`, not this.
-    private var leaderHostKey: String? {
-        switch leaderPlacement {
-        case .inherited: return runsOnHostKey
-        case .explicit(let hostKey): return hostKey
+        var label: String {
+            switch self {
+            case .sameAsLeader: "Same as leader"
+            case .allOnOneMachine: "All on one machine"
+            case .perAgent: "Choose per agent"
+            }
         }
     }
 
@@ -151,32 +175,41 @@ struct NewProjectView: View {
         VStack(alignment: .leading, spacing: 0) {
             header
             Divider()
-            ScrollView {
-                VStack(alignment: .leading, spacing: 16) {
-                    projectFields
-                    Divider()
-                    teamPresetRow
-                    leaderRow
-                    TeamAgentComposer(
-                        agents: $agents,
-                        workingDirectory: trimmedDirectory,
-                        onComposionChanged: {},
-                        defaultModel: AgentRolePreset.defaultModel(for: "claude"),
-                        supportsDefaultPlacement: true,
-                        defaultHostKey: runsOnHostKey,
-                        defaultHostDirectory: trimmedDirectory,
-                        inheritedAgentIDs: inheritedAgentIDs,
-                        showsPlacementControls: true,
-                        onAgentPlacementChanged: { id, inheritsDefault in
-                            if inheritsDefault {
-                                inheritedAgentIDs.insert(id)
-                            } else {
-                                inheritedAgentIDs.remove(id)
-                            }
+            if showsCreationProgress {
+                bootProgressView
+            } else {
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 16) {
+                        projectFields
+                        Divider()
+                        teamSummaryRow
+                        if showsTeamEditor {
+                            teamPresetRow
+                            leaderRow
+                            agentPlacementRow
+                            TeamAgentComposer(
+                                agents: $agents,
+                                workingDirectory: trimmedDirectory,
+                                onComposionChanged: {},
+                                defaultModel: AgentRolePreset.defaultModel(for: "claude"),
+                                supportsDefaultPlacement: true,
+                                defaultHostKey: defaultAgentHostKey,
+                                defaultHostDirectory: defaultAgentHostDirectory,
+                                inheritedAgentIDs: inheritedAgentIDs,
+                                showsPlacementControls: agentPlacementMode == .perAgent,
+                                showsBulkPlacementControls: false,
+                                onAgentPlacementChanged: { id, inheritsDefault in
+                                    if inheritsDefault {
+                                        inheritedAgentIDs.insert(id)
+                                    } else {
+                                        inheritedAgentIDs.remove(id)
+                                    }
+                                }
+                            )
                         }
-                    )
+                    }
+                    .padding(20)
                 }
-                .padding(20)
             }
             Divider()
             footer
@@ -187,6 +220,20 @@ struct NewProjectView: View {
             adoptProjectMachineForNewRows()
             applyDerivedDestination()
             focusedField = .repositoryURL
+        }
+        .task(id: repositoryDiscoveryID) {
+            let directories = repositoryDirectories
+            let roots = repositorySearchRoots
+            isLoadingRepositorySuggestions = true
+            let suggestions = await Task.detached(priority: .utility) {
+                RepositoryURLAutocomplete.loadOriginURLs(
+                    from: directories,
+                    searching: roots
+                )
+            }.value
+            guard !Task.isCancelled else { return }
+            repositoryURLSuggestions = suggestions
+            isLoadingRepositorySuggestions = false
         }
         .onChange(of: agents.map(\.id)) { _, _ in
             adoptProjectMachineForNewRows()
@@ -224,6 +271,154 @@ struct NewProjectView: View {
         }
         .padding(.horizontal, 20)
         .padding(.vertical, 14)
+    }
+
+    private var bootProgressView: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            HStack(alignment: .firstTextBaseline) {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(creationError == nil ? "Starting \(effectiveName)" : "Could not start \(effectiveName)")
+                        .font(.title3.weight(.semibold))
+                    Text(bootProgressSummary)
+                        .font(.subheadline)
+                        .foregroundStyle(.secondary)
+                }
+                Spacer()
+                if creationError == nil, let creationStartedAt {
+                    TimelineView(.periodic(from: .now, by: 1)) { context in
+                        Text(Self.elapsedText(from: creationStartedAt, to: context.date))
+                            .font(.system(.caption, design: .monospaced))
+                            .foregroundStyle(.secondary)
+                    }
+                }
+            }
+            .padding(.horizontal, 24)
+            .padding(.vertical, 18)
+
+            Divider()
+
+            ScrollView {
+                LazyVStack(alignment: .leading, spacing: 0) {
+                    ForEach(bootSteps.sorted(by: { $0.order < $1.order })) { step in
+                        bootStepRow(step)
+                        if step.id != bootSteps.sorted(by: { $0.order < $1.order }).last?.id {
+                            Divider()
+                                .padding(.leading, 46)
+                        }
+                    }
+                }
+                .padding(.horizontal, 24)
+                .padding(.vertical, 8)
+            }
+
+            Divider()
+            Toggle("Show launch commands", isOn: $showsBootCommands)
+                .toggleStyle(.switch)
+                .controlSize(.small)
+                .font(.caption)
+                .padding(.horizontal, 24)
+                .padding(.vertical, 12)
+        }
+        .accessibilityIdentifier("newProject.bootProgress")
+    }
+
+    private func bootStepRow(_ step: ProjectBootStep) -> some View {
+        HStack(alignment: .top, spacing: 12) {
+            Group {
+                switch step.status {
+                case .pending:
+                    Image(systemName: "circle")
+                        .foregroundStyle(.tertiary)
+                case .running:
+                    ProgressView()
+                        .controlSize(.small)
+                case .completed:
+                    Image(systemName: "checkmark.circle.fill")
+                        .foregroundStyle(.green)
+                case .failed:
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .foregroundStyle(.red)
+                }
+            }
+            .frame(width: 18, height: 18)
+
+            VStack(alignment: .leading, spacing: 5) {
+                Text(step.title)
+                    .font(.subheadline.weight(step.status == .running ? .semibold : .regular))
+                Text(stepDetail(step))
+                    .font(.caption)
+                    .foregroundStyle(stepFailure(step) == nil ? Color.secondary : Color.red)
+                    .fixedSize(horizontal: false, vertical: true)
+                if showsBootCommands, let command = step.command, !command.isEmpty {
+                    Text("› \(command)")
+                        .font(.system(.caption, design: .monospaced))
+                        .foregroundStyle(.secondary)
+                        .lineLimit(2)
+                        .truncationMode(.middle)
+                        .textSelection(.enabled)
+                        .help(command)
+                }
+            }
+            Spacer()
+        }
+        .padding(.vertical, 11)
+    }
+
+    private func stepDetail(_ step: ProjectBootStep) -> String {
+        if let failure = stepFailure(step) { return failure }
+        return step.detail
+    }
+
+    private func stepFailure(_ step: ProjectBootStep) -> String? {
+        guard case .failed(let message) = step.status else { return nil }
+        return message
+    }
+
+    private var bootProgressSummary: String {
+        let completed = bootSteps.filter { $0.status == .completed }.count
+        if creationError != nil {
+            return "\(completed) of \(bootSteps.count) steps complete · Check the failed step below"
+        }
+        return "\(completed) of \(bootSteps.count) steps complete"
+    }
+
+    private static func elapsedText(from start: Date, to end: Date) -> String {
+        let seconds = max(0, Int(end.timeIntervalSince(start)))
+        return "\(seconds)s"
+    }
+
+    private var teamSummaryRow: some View {
+        HStack(spacing: 10) {
+            Text("Team")
+                .font(.subheadline.bold())
+                .frame(width: 120, alignment: .leading)
+            Image(systemName: "person.3")
+                .foregroundStyle(.secondary)
+            Text(teamSummaryTitle)
+                .lineLimit(1)
+            Text(agentPlacementCompactSummary)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+            Spacer()
+            Button(showsTeamEditor ? "Done" : "Change") {
+                withAnimation(.easeOut(duration: 0.18)) {
+                    showsTeamEditor.toggle()
+                }
+            }
+            .buttonStyle(.borderless)
+            .accessibilityIdentifier("newProject.teamEditorToggle")
+        }
+    }
+
+    private var teamSummaryTitle: String {
+        let leader = leaderCli == "repl"
+            ? "Manual REPL"
+            : "\(leaderCli.capitalized) \(AgentRolePreset.modelDisplayLabel(leaderModel, for: leaderCli))"
+        let members = agents.count == 1
+            ? "1 \(agents[0].preset.displayName)"
+            : "\(agents.count) agents"
+        return "\(teamPresetDisplayName) · \(leader) + \(members)"
     }
 
     private var teamPresetRow: some View {
@@ -367,6 +562,57 @@ struct NewProjectView: View {
         selectedTeamPresetId != nil && selectedTeamPresetId == teamTemplateManager.pinnedId
     }
 
+    private var agentPlacementRow: some View {
+        Grid(alignment: .leading, horizontalSpacing: 12, verticalSpacing: 6) {
+            GridRow {
+                Text("Agent placement")
+                    .font(.subheadline.bold())
+                HStack(spacing: 8) {
+                    Picker("", selection: Binding(
+                        get: { agentPlacementMode },
+                        set: { mode in
+                            agentPlacementMode = mode
+                            if mode == .allOnOneMachine {
+                                allAgentsHostKey = runsOnHostKey
+                            }
+                            applyAgentPlacementMode()
+                        }
+                    )) {
+                        ForEach(AgentPlacementMode.allCases, id: \.self) { mode in
+                            Text(mode.label).tag(mode)
+                        }
+                    }
+                    .labelsHidden()
+                    .frame(width: 180)
+                    .accessibilityIdentifier("newProject.agentPlacementMode")
+
+                    if agentPlacementMode == .allOnOneMachine {
+                        Picker("", selection: $allAgentsHostKey) {
+                            Text("This Mac").tag(String?.none)
+                            ForEach(selectablePeers, id: \.id) { host in
+                                Text(host.isConnected ? host.displayName : "\(host.displayName) — offline")
+                                    .tag(String?.some(host.id))
+                            }
+                        }
+                        .labelsHidden()
+                        .frame(width: 180)
+                        .accessibilityIdentifier("newProject.allAgentsHost")
+                        .onChange(of: allAgentsHostKey) { _, hostKey in
+                            connectHostIfNeeded(hostKey)
+                            applyAgentPlacementMode()
+                        }
+                    }
+                }
+            }
+            GridRow {
+                Color.clear.frame(width: 120, height: 1)
+                Text(agentPlacementDetail)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+        }
+    }
+
     /// A single row: who leads, and where — folded together because showing
     /// this next to `Runs on` / `Agent = jw-server` as three separate answers
     /// read as three different opinions about where the project lives, when
@@ -423,39 +669,6 @@ struct NewProjectView: View {
                             .font(.caption)
                             .foregroundStyle(.secondary)
                     }
-
-                    if showsCustomPlacement {
-                        Divider().frame(height: 16)
-
-                        Picker("", selection: $leaderPlacement) {
-                            Text(defaultPlacementLabel).tag(HostPlacement.inherited)
-                            Text("This Mac").tag(HostPlacement.explicit(nil))
-                            ForEach(selectablePeers, id: \.id) { host in
-                                Text(host.isConnected ? host.displayName : "\(host.displayName) — offline")
-                                    .tag(HostPlacement.explicit(host.id))
-                            }
-                        }
-                        .labelsHidden()
-                        .frame(width: 170)
-                        .accessibilityIdentifier("newProject.leaderHost")
-                        .onChange(of: leaderPlacement) { _, placement in
-                            guard case .explicit(let hostKey?) = placement,
-                                  let host = selectablePeers.first(where: { $0.id == hostKey }),
-                                  !host.isConnected else { return }
-                            hostStore.connectSavedHost(host)
-                        }
-                        if let leaderHostKey,
-                           let host = selectablePeers.first(where: { $0.id == leaderHostKey }),
-                           !host.isConnected {
-                            Label("connecting…", systemImage: "arrow.triangle.2.circlepath")
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
-                        }
-                    } else {
-                        Text(defaultPlacementLabel)
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                    }
                 }
             }
         }
@@ -474,26 +687,55 @@ struct NewProjectView: View {
 
             Grid(alignment: .leading, horizontalSpacing: 12, verticalSpacing: 10) {
                 if sourceKind == .clone {
-                    GridRow {
+                    GridRow(alignment: .top) {
                         Text("Repository URL")
-                        TextField("git@github.com:org/repo.git", text: $gitURL)
+                            .padding(.top, 5)
+                        VStack(alignment: .leading, spacing: 4) {
+                            TextField(
+                                "git@github.com:org/repo.git",
+                                text: Binding(
+                                    get: { gitURL },
+                                    set: {
+                                        gitURL = RepositoryURLAutocomplete.singleLine($0)
+                                    }
+                                )
+                            )
                             .textFieldStyle(.roundedBorder)
+                            .lineLimit(1)
                             .focused($focusedField, equals: .repositoryURL)
+                            .accessibilityLabel("Repository URL")
+
+                            if focusedField == .repositoryURL {
+                                if isLoadingRepositorySuggestions {
+                                    repositoryURLSuggestionLoading
+                                } else if !matchingRepositoryURLSuggestions.isEmpty {
+                                    repositoryURLSuggestionList
+                                } else if shouldShowNoRepositoryMatches {
+                                    Text("No saved repositories match “\(gitURL)”")
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
+                                        .padding(.horizontal, 8)
+                                        .padding(.vertical, 5)
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if sourceKind == .empty {
+                    GridRow {
+                        Text("Project name")
+                        TextField("project-name", text: Binding(
+                            get: { name },
+                            set: { name = $0; nameEdited = true }
+                        ))
+                        .textFieldStyle(.roundedBorder)
+                        .focused($focusedField, equals: .name)
                     }
                 }
 
                 GridRow {
-                    Text("Name")
-                    TextField("project-name", text: Binding(
-                        get: { name },
-                        set: { name = $0; nameEdited = true }
-                    ))
-                    .textFieldStyle(.roundedBorder)
-                    .focused($focusedField, equals: .name)
-                }
-
-                GridRow {
-                    Text("Project machine")
+                    Text("Leader runs on")
                     HStack(spacing: 8) {
                         Picker("", selection: $runsOnHostKey) {
                             Text("This Mac").tag(String?.none)
@@ -514,9 +756,9 @@ struct NewProjectView: View {
                     }
                 }
 
-                if sourceKind == .existingFolder || showsCustomPath {
+                if sourceKind == .existingFolder {
                     GridRow {
-                        Text(sourceKind == .existingFolder ? "Folder" : "Destination")
+                        Text("Project folder")
                         HStack(spacing: 6) {
                             TextField(folderPlaceholder, text: Binding(
                                 get: { directory },
@@ -533,30 +775,12 @@ struct NewProjectView: View {
                     GridRow {
                         Text("Destination")
                         HStack(spacing: 8) {
-                            Text(trimmedDirectory.isEmpty ? "Choose a project machine and name" : trimmedDirectory)
+                            Text(trimmedDirectory.isEmpty ? "Choose a leader machine and name" : trimmedDirectory)
                                 .foregroundStyle(trimmedDirectory.isEmpty ? .secondary : .primary)
                                 .lineLimit(1)
                                 .truncationMode(.middle)
                             Spacer()
-                            Button("Customize…") {
-                                showsCustomPath = true
-                                focusedField = .directory
-                            }
-                            .buttonStyle(.borderless)
-                        }
-                    }
-                }
-
-                GridRow {
-                    Text("Agent checkouts")
-                    HStack(spacing: 8) {
-                        Text(checkoutDescription)
-                        if sourceKind == .existingFolder && gitURL.isEmpty {
-                            Text("Git not detected; agents share this folder")
-                                .font(.caption)
-                                .foregroundStyle(.orange)
-                        } else if isolateAgents {
-                            Text(isolationHint)
+                            Text("Automatic")
                                 .font(.caption)
                                 .foregroundStyle(.secondary)
                         }
@@ -565,15 +789,67 @@ struct NewProjectView: View {
             }
 
             Button {
-                showsCustomPlacement.toggle()
+                withAnimation(.easeInOut(duration: 0.16)) {
+                    showsAdvancedOptions.toggle()
+                }
             } label: {
-                Label(
-                    showsCustomPlacement ? "Hide leader placement" : "Customize leader placement",
-                    systemImage: showsCustomPlacement ? "chevron.down" : "chevron.right"
-                )
-                .font(.caption)
+                HStack(spacing: 5) {
+                    Image(systemName: "chevron.right")
+                        .font(.caption2.weight(.semibold))
+                        .rotationEffect(.degrees(showsAdvancedOptions ? 90 : 0))
+                    Text("Advanced options")
+                        .font(.caption)
+                    Spacer()
+                }
+                .contentShape(Rectangle())
             }
-            .buttonStyle(.borderless)
+            .buttonStyle(.plain)
+            .accessibilityLabel(showsAdvancedOptions ? "Hide advanced options" : "Show advanced options")
+
+            if showsAdvancedOptions {
+                Grid(alignment: .leading, horizontalSpacing: 12, verticalSpacing: 10) {
+                    if sourceKind == .clone {
+                        GridRow {
+                            Text("Project name")
+                            TextField("project-name", text: Binding(
+                                get: { name },
+                                set: { name = $0; nameEdited = true }
+                            ))
+                            .textFieldStyle(.roundedBorder)
+                            .focused($focusedField, equals: .name)
+                        }
+                    }
+
+                    if sourceKind != .existingFolder {
+                        GridRow {
+                            Text("Destination")
+                            TextField(folderPlaceholder, text: Binding(
+                                get: { directory },
+                                set: { directory = $0; folderEdited = true }
+                            ))
+                            .textFieldStyle(.roundedBorder)
+                            .focused($focusedField, equals: .directory)
+                        }
+                    }
+
+                    GridRow {
+                        Text("Agent checkouts")
+                        if sourceKind == .existingFolder && gitURL.isEmpty {
+                            Text("Shared folder")
+                                .foregroundStyle(.secondary)
+                        } else {
+                            Picker("", selection: $isolateAgents) {
+                                Text("Git worktree per agent").tag(true)
+                                Text("Shared primary checkout").tag(false)
+                            }
+                            .labelsHidden()
+                            .fixedSize()
+                        }
+                    }
+                }
+                .padding(.top, 8)
+                .transition(.opacity.combined(with: .move(edge: .top)))
+            }
         }
         .onChange(of: gitURL) { _, value in
             // SwiftUI may call the TextField binding setter while installing
@@ -592,7 +868,6 @@ struct NewProjectView: View {
         .onChange(of: sourceKind) { _, kind in
             nameEdited = false
             folderEdited = false
-            showsCustomPath = kind == .existingFolder
             if kind == .empty {
                 gitURL = ""
                 name = ""
@@ -621,11 +896,86 @@ struct NewProjectView: View {
         }
     }
 
-    private var checkoutDescription: String {
-        if sourceKind == .existingFolder && gitURL.isEmpty {
-            return "Shared folder"
+    private var matchingRepositoryURLSuggestions: [String] {
+        RepositoryURLAutocomplete.matches(
+            repositoryURLSuggestions,
+            query: gitURL,
+            limit: 6
+        )
+    }
+
+    private var repositoryDiscoveryID: String {
+        (repositoryDirectories + ["|"] + repositorySearchRoots).joined(separator: "\n")
+    }
+
+    private var repositoryURLMatchCount: Int {
+        RepositoryURLAutocomplete.matchingCount(
+            repositoryURLSuggestions,
+            query: gitURL
+        )
+    }
+
+    private var shouldShowNoRepositoryMatches: Bool {
+        !gitURL.isEmpty
+            && repositoryURLSuggestions.count > 0
+            && repositoryURLMatchCount == 0
+            && PeerProjectBootstrap.repositoryURLProblem(gitURL) != nil
+    }
+
+    private var repositoryURLSuggestionLoading: some View {
+        HStack(spacing: 6) {
+            ProgressView()
+                .controlSize(.small)
+            Text("Finding repositories…")
+                .font(.caption)
+                .foregroundStyle(.secondary)
         }
-        return isolateAgents ? "Git worktree per agent" : "Shared primary checkout"
+        .padding(.horizontal, 8)
+        .padding(.vertical, 5)
+    }
+
+    private var repositoryURLSuggestionList: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            Text(repositoryURLSuggestionHeader)
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+                .padding(.horizontal, 8)
+                .padding(.vertical, 5)
+
+            ForEach(matchingRepositoryURLSuggestions, id: \.self) { suggestion in
+                Button {
+                    gitURL = suggestion
+                } label: {
+                    HStack(spacing: 7) {
+                        Image(systemName: "arrow.triangle.branch")
+                            .foregroundStyle(.secondary)
+                        Text(suggestion)
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                        Spacer(minLength: 0)
+                    }
+                    .contentShape(Rectangle())
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 5)
+                }
+                .buttonStyle(.plain)
+                .help(suggestion)
+            }
+        }
+        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 6))
+        .overlay {
+            RoundedRectangle(cornerRadius: 6)
+                .stroke(Color(nsColor: .separatorColor).opacity(0.7), lineWidth: 1)
+        }
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel("Repository URL suggestions")
+    }
+
+    private var repositoryURLSuggestionHeader: String {
+        if gitURL.isEmpty {
+            return "\(repositoryURLSuggestions.count) repositories · Type to search"
+        }
+        return "\(repositoryURLMatchCount) matching repositories"
     }
 
     static func projectName(fromRepositoryURL raw: String) -> String? {
@@ -678,9 +1028,7 @@ struct NewProjectView: View {
         directory = root.isEmpty
             ? ""
             : (root as NSString).appendingPathComponent(projectName)
-        for i in agents.indices where inheritedAgentIDs.contains(agents[i].id) {
-            agents[i].hostDirectory = runsOnHostKey == nil ? "" : directory
-        }
+        syncInheritedAgentPlacements()
     }
 
     /// Stands in for a project name that has not been given yet, so the
@@ -698,27 +1046,113 @@ struct NewProjectView: View {
         hostStore.sortedHosts.filter { !($0.sshTarget ?? "").isEmpty }
     }
 
-    private var defaultPlacementLabel: String {
-        guard let runsOnHostKey,
-              let host = selectablePeers.first(where: { $0.id == runsOnHostKey }) else {
-            return "Default · This Mac"
+    private var defaultAgentHostKey: String? {
+        switch agentPlacementMode {
+        case .sameAsLeader, .perAgent:
+            runsOnHostKey
+        case .allOnOneMachine:
+            allAgentsHostKey
         }
-        return "Default · \(host.displayName)"
     }
 
-    /// What the isolation choice will actually produce, named.
-    private var isolationHint: String {
-        let plan = PeerProjectBootstrap.plan(
-            projectRoot: trimmedDirectory.isEmpty ? "…" : parentOf(trimmedDirectory),
-            projectName: effectiveName.isEmpty ? "project" : effectiveName,
-            agents: agents.map(\.preset.name),
-            isolateAgents: true,
-            // Illustrative only — creation mints its own tag. Stable across
-            // body evaluations so the hint doesn't shimmer while typing.
-            instanceTag: previewInstanceTag
-        )
-        guard let first = plan.agentCheckouts.first else { return "" }
-        return "\(URL(fileURLWithPath: first.path).lastPathComponent) on \(first.branch)"
+    private var defaultAgentHostDirectory: String {
+        projectDirectory(for: defaultAgentHostKey)
+    }
+
+    private func machineLabel(_ hostKey: String?) -> String {
+        guard let hostKey else { return "This Mac" }
+        return selectablePeers.first(where: { $0.id == hostKey })?.displayName ?? hostKey
+    }
+
+    private var agentPlacementCompactSummary: String {
+        switch agentPlacementMode {
+        case .sameAsLeader:
+            return "agents follow leader"
+        case .allOnOneMachine:
+            return "all agents on \(machineLabel(allAgentsHostKey))"
+        case .perAgent:
+            let hosts = Set(agents.map(\.hostKey))
+            if hosts.count == 1, let only = hosts.first {
+                return "all agents on \(machineLabel(only))"
+            }
+            return "agents across \(hosts.count) machines"
+        }
+    }
+
+    private var agentPlacementDetail: String {
+        switch agentPlacementMode {
+        case .sameAsLeader:
+            return "Every agent follows the leader to \(machineLabel(runsOnHostKey))."
+        case .allOnOneMachine:
+            return "Every agent runs on \(machineLabel(allAgentsHostKey)); the leader stays on \(machineLabel(runsOnHostKey))."
+        case .perAgent:
+            return "Choose a machine in each agent row. Default follows the leader."
+        }
+    }
+
+    static func resolvedAgentHostKey(
+        mode: AgentPlacementMode,
+        leaderHostKey: String?,
+        allAgentsHostKey: String?,
+        explicitHostKey: String?,
+        inheritsDefault: Bool
+    ) -> String? {
+        switch mode {
+        case .sameAsLeader:
+            return leaderHostKey
+        case .allOnOneMachine:
+            return allAgentsHostKey
+        case .perAgent:
+            return inheritsDefault ? leaderHostKey : explicitHostKey
+        }
+    }
+
+    private func projectDirectory(for hostKey: String?) -> String {
+        guard let hostKey else { return "" }
+        if hostKey == runsOnHostKey { return trimmedDirectory }
+        let projectName = effectiveName.isEmpty ? Self.placeholderProjectName : effectiveName
+        if let predicted = PeerHostProfileStore.shared.profiles
+            .first(where: { $0.stableKey == hostKey })?
+            .predictedProjectPath(forProjectNamed: projectName) {
+            return predicted
+        }
+        if let remembered = RemoteProjectPaths.shared.path(
+            host: hostKey,
+            localRoot: trimmedDirectory
+        ) {
+            return remembered
+        }
+        return RemoteProjectPaths.shared.anyPath(host: hostKey) ?? ""
+    }
+
+    private func connectHostIfNeeded(_ hostKey: String?) {
+        guard let hostKey,
+              let host = selectablePeers.first(where: { $0.id == hostKey }),
+              !host.isConnected else { return }
+        hostStore.connectSavedHost(host)
+    }
+
+    private func applyAgentPlacementMode() {
+        if agentPlacementMode != .perAgent {
+            inheritedAgentIDs = Set(agents.map(\.id))
+        }
+        syncInheritedAgentPlacements()
+    }
+
+    private func syncInheritedAgentPlacements() {
+        for index in agents.indices {
+            let inheritsDefault = inheritedAgentIDs.contains(agents[index].id)
+            if agentPlacementMode == .perAgent && !inheritsDefault { continue }
+            let hostKey = Self.resolvedAgentHostKey(
+                mode: agentPlacementMode,
+                leaderHostKey: runsOnHostKey,
+                allAgentsHostKey: allAgentsHostKey,
+                explicitHostKey: agents[index].hostKey,
+                inheritsDefault: inheritsDefault
+            )
+            agents[index].hostKey = hostKey
+            agents[index].hostDirectory = projectDirectory(for: hostKey)
+        }
     }
 
     private func parentOf(_ path: String) -> String {
@@ -751,8 +1185,9 @@ struct NewProjectView: View {
         inheritedAgentIDs.formIntersection(currentIDs)
         for i in agents.indices where newIDs.contains(agents[i].id) {
             inheritedAgentIDs.insert(agents[i].id)
-            agents[i].hostKey = runsOnHostKey
-            agents[i].hostDirectory = runsOnHostKey == nil ? "" : trimmedDirectory
+            let hostKey = defaultAgentHostKey
+            agents[i].hostKey = hostKey
+            agents[i].hostDirectory = projectDirectory(for: hostKey)
         }
         knownAgentIDs = currentIDs
     }
@@ -767,11 +1202,8 @@ struct NewProjectView: View {
     private func applyRunsOn(_ hostKey: String?) {
         folderEdited = false
         guard let hostKey else {
-            for i in agents.indices where inheritedAgentIDs.contains(agents[i].id) {
-                agents[i].hostKey = nil
-                agents[i].hostDirectory = ""
-            }
             directory = ""
+            syncInheritedAgentPlacements()
             return
         }
         // Picking a machine is as good as saying "use that one", so the
@@ -789,90 +1221,50 @@ struct NewProjectView: View {
             .first { $0.stableKey == hostKey }?
             .predictedProjectPath(forProjectNamed: leaf)
         directory = predicted ?? RemoteProjectPaths.shared.anyPath(host: hostKey) ?? ""
-        for i in agents.indices where inheritedAgentIDs.contains(agents[i].id) {
-            agents[i].hostKey = hostKey
-            agents[i].hostDirectory = directory
-        }
+        syncInheritedAgentPlacements()
     }
 
     private var footer: some View {
         HStack {
-            Text(creationError ?? creationSummary)
-                .font(.caption)
-                .foregroundStyle(creationError == nil ? Color.secondary : Color.red)
-                .lineLimit(creationError == nil ? 1 : 2)
-                .fixedSize(horizontal: false, vertical: creationError != nil)
-                .layoutPriority(1)
-                .help(creationError ?? creationSummary)
-            Spacer()
-            Button("Cancel", action: onClose)
-                .keyboardShortcut(.cancelAction)
-                .disabled(isCreating)
-            Button("Create Project") {
-                // A project living on another machine still needs somewhere
-                // here for its window to open. The remote path is not that
-                // place — nothing local would be able to enter it — so the
-                // panes start at home and the members carry the real one.
-                let localDirectory = runsOnHostKey == nil
-                    ? trimmedDirectory
-                    : FileManager.default.homeDirectoryForCurrentUser.path
-                isCreating = true
-                creationError = nil
-                Task { @MainActor in
-                    do {
-                        if runsOnHostKey == nil {
-                            let primaryOnly = PeerProjectBootstrap.plan(
-                                projectRoot: parentOf(trimmedDirectory),
-                                projectName: effectiveName,
-                                agents: [],
-                                isolateAgents: false
-                            )
-                            try await PeerProjectBootstrap.runLocal(
-                                plan: primaryOnly,
-                                gitURL: {
-                                    let value = gitURL.trimmingCharacters(in: .whitespacesAndNewlines)
-                                    return value.isEmpty ? nil : value
-                                }(),
-                                sourceKind: sourceKind,
-                                memMeshProjectID: PeerProjectBootstrap.memMeshProjectID(
-                                    for: effectiveName
-                                )
-                            )
-                        }
-                        try await onCreate(
-                            effectiveName,
-                            localDirectory,
-                            agents,
-                            ProjectSource(
-                                hostKey: runsOnHostKey,
-                                projectPath: trimmedDirectory,
-                                gitURL: gitURL.trimmingCharacters(in: .whitespacesAndNewlines),
-                                isolateAgents: effectiveIsolation,
-                                kind: sourceKind
-                            ),
-                            ProjectLeader(
-                                mode: leaderCli,
-                                model: leaderModel,
-                                endpoint: leaderHostKey.map { .peer(hostKey: $0) } ?? .local
-                            )
-                        )
-                        onClose()
-                    } catch {
-                        creationError = error.localizedDescription
-                        isCreating = false
-                    }
-                }
+            if showsCreationProgress {
+                Text(creationError == nil
+                    ? "Keep this window open while the project starts."
+                    : "Review the failed step, then retry or change the settings.")
+                    .font(.caption)
+                    .foregroundStyle(creationError == nil ? Color.secondary : Color.red)
+            } else {
+                Text(creationError ?? creationSummary)
+                    .font(.caption)
+                    .foregroundStyle(creationError == nil ? Color.secondary : Color.red)
+                    .lineLimit(creationError == nil ? 1 : 2)
+                    .fixedSize(horizontal: false, vertical: creationError != nil)
+                    .layoutPriority(1)
+                    .help(creationError ?? creationSummary)
             }
-            .keyboardShortcut(.defaultAction)
-            .disabled(
-                isCreating || !canCreate
-                    || !placementHostsAreReady
-            )
-            .overlay {
-                if isCreating {
-                    ProgressView()
-                        .controlSize(.small)
+            Spacer()
+            if showsCreationProgress {
+                if creationError != nil {
+                    Button("Back to settings") {
+                        showsCreationProgress = false
+                        creationError = nil
+                    }
+                    .keyboardShortcut(.cancelAction)
+                    Button("Retry project") {
+                        startCreation()
+                    }
+                    .keyboardShortcut(.defaultAction)
+                } else {
+                    Button("Starting…") {}
+                        .disabled(true)
                 }
+            } else {
+                Button("Cancel", action: onClose)
+                    .keyboardShortcut(.cancelAction)
+                Button(createActionLabel) {
+                    startCreation()
+                }
+                .keyboardShortcut(.defaultAction)
+                .disabled(!canCreate || !placementHostsAreReady)
             }
         }
         .padding(.horizontal, 20)
@@ -883,12 +1275,155 @@ struct NewProjectView: View {
         isolateAgents && !(sourceKind == .existingFolder && gitURL.isEmpty)
     }
 
+    private func startCreation() {
+        if let problem = PeerProjectBootstrap.repositoryURLProblem(gitURL) {
+            creationError = problem
+            return
+        }
+        let localDirectory = runsOnHostKey == nil
+            ? trimmedDirectory
+            : FileManager.default.homeDirectoryForCurrentUser.path
+        let source = ProjectSource(
+            hostKey: runsOnHostKey,
+            projectPath: trimmedDirectory,
+            gitURL: gitURL.trimmingCharacters(in: .whitespacesAndNewlines),
+            isolateAgents: effectiveIsolation,
+            kind: sourceKind
+        )
+        let leader = ProjectLeader(
+            mode: leaderCli,
+            model: leaderModel,
+            endpoint: runsOnHostKey.map { .peer(hostKey: $0) } ?? .local
+        )
+
+        showsCreationProgress = true
+        creationStartedAt = Date()
+        creationError = nil
+        bootSteps = plannedLaunchSteps(source: source, leader: leader)
+
+        Task { @MainActor in
+            do {
+                try await onCreate(
+                    effectiveName,
+                    localDirectory,
+                    agents,
+                    source,
+                    leader,
+                    handleCreationEvent
+                )
+                onClose()
+            } catch {
+                let message = error.localizedDescription
+                creationError = message
+                failRunningBootStep(message: message)
+            }
+        }
+    }
+
+    private func plannedLaunchSteps(
+        source: ProjectSource,
+        leader: ProjectLeader
+    ) -> [ProjectBootStep] {
+        let leaderHost = machineLabel(leader.endpoint.hostKey)
+        let leaderPath = source.projectPath
+        var steps = [
+            ProjectBootStep(
+                id: "leader",
+                order: 1_000,
+                title: "Start leader",
+                detail: "\(leader.mode.capitalized) · \(AgentRolePreset.modelDisplayLabel(leader.model, for: leader.mode)) · \(leaderHost) · \(leaderPath)",
+                command: ProjectCreationFlow.launchCommandPreview(
+                    cli: leader.mode,
+                    model: leader.model,
+                    directory: leaderPath
+                ),
+                status: .pending
+            )
+        ]
+        steps += agents.enumerated().map { index, agent in
+            let hostKey = Self.resolvedAgentHostKey(
+                mode: agentPlacementMode,
+                leaderHostKey: runsOnHostKey,
+                allAgentsHostKey: allAgentsHostKey,
+                explicitHostKey: agent.hostKey,
+                inheritsDefault: inheritedAgentIDs.contains(agent.id)
+            )
+            let path = hostKey == nil
+                ? (effectiveIsolation ? "Git worktree from \(trimmedDirectory)" : trimmedDirectory)
+                : (agent.hostDirectory.isEmpty ? defaultAgentHostDirectory : agent.hostDirectory)
+            let cli = agent.preset.cli.isEmpty ? "claude" : agent.preset.cli
+            return ProjectBootStep(
+                id: "agent:\(agent.id.uuidString)",
+                order: 2_000 + index,
+                title: "Start \(agent.preset.displayName)",
+                detail: "\(cli.capitalized) · \(AgentRolePreset.modelDisplayLabel(agent.preset.model, for: cli)) · \(machineLabel(hostKey)) · \(path)",
+                command: ProjectCreationFlow.launchCommandPreview(
+                    cli: cli,
+                    model: agent.preset.model,
+                    directory: path
+                ),
+                status: .pending
+            )
+        }
+        return steps
+    }
+
+    private func handleCreationEvent(_ event: ProjectCreationEvent) {
+        bootSteps = Self.applying(event, to: bootSteps)
+    }
+
+    static func applying(
+        _ event: ProjectCreationEvent,
+        to steps: [ProjectBootStep]
+    ) -> [ProjectBootStep] {
+        var result = steps
+        switch event {
+        case .planned(let step):
+            upsert(step, in: &result)
+        case .started(var step):
+            step.status = .running
+            upsert(step, in: &result)
+        case .completed(let id, let detail):
+            if let index = result.firstIndex(where: { $0.id == id }) {
+                result[index].status = .completed
+                if let detail { result[index].detail = detail }
+            }
+        case .failed(let id, let message):
+            if let index = result.firstIndex(where: { $0.id == id }) {
+                result[index].status = .failed(message)
+            }
+        }
+        return result.sorted(by: { $0.order < $1.order })
+    }
+
+    private static func upsert(_ step: ProjectBootStep, in steps: inout [ProjectBootStep]) {
+        if let index = steps.firstIndex(where: { $0.id == step.id }) {
+            steps[index] = step
+        } else {
+            steps.append(step)
+        }
+    }
+
+    private func failRunningBootStep(message: String) {
+        if let index = bootSteps.firstIndex(where: { $0.status == .running }) {
+            bootSteps[index].status = .failed(message)
+        }
+    }
+
     private var canCreate: Bool {
         guard !trimmedDirectory.isEmpty, !effectiveName.isEmpty else { return false }
         if sourceKind == .clone {
             return !gitURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
         }
         return true
+    }
+
+    private var createActionLabel: String {
+        switch sourceKind {
+        case .clone: "Clone Repository"
+        case .existingFolder: "Open Project"
+        case .empty: "Create Empty Project"
+        }
     }
 
     private var creationSummary: String {
@@ -904,22 +1439,12 @@ struct NewProjectView: View {
         let checkout = effectiveIsolation
             ? "\(agents.count) agent worktree\(agents.count == 1 ? "" : "s")"
             : "shared checkout"
-        return "\(action) → \(trimmedDirectory) on \(machine) · \(checkout) · \(agentPlacementSummary)"
-    }
-
-    private var agentPlacementSummary: String {
-        let labels = agents.map { row -> String in
-            guard let hostKey = row.hostKey else { return "This Mac" }
-            return selectablePeers.first(where: { $0.id == hostKey })?.displayName ?? hostKey
-        }
-        let counts = Dictionary(grouping: labels, by: { $0 }).mapValues(\.count)
-        let ordered = counts.keys.sorted().map { "\($0) ×\(counts[$0] ?? 0)" }
-        return "agents: " + ordered.joined(separator: ", ")
+        return "\(action) → \(trimmedDirectory) · Leader: \(machine) · \(agentPlacementCompactSummary) · \(checkout)"
     }
 
     private var placementHostsAreReady: Bool {
         let remoteKeys = Set(
-            [runsOnHostKey, leaderHostKey].compactMap { $0 }
+            [runsOnHostKey].compactMap { $0 }
                 + agents.compactMap(\.hostKey)
         )
         return remoteKeys.allSatisfy { hostKey in
@@ -999,8 +1524,8 @@ struct NewProjectView: View {
     private func installPresetAgents(_ rows: [TeamAgentRow]) {
         agents = rows.map { row in
             var resolved = row
-            resolved.hostKey = runsOnHostKey
-            resolved.hostDirectory = runsOnHostKey == nil ? "" : trimmedDirectory
+            resolved.hostKey = defaultAgentHostKey
+            resolved.hostDirectory = defaultAgentHostDirectory
             return resolved
         }
         let ids = Set(agents.map(\.id))
@@ -1085,6 +1610,183 @@ struct NewProjectView: View {
                 .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
             return value.isEmpty ? nil : value
         }.value
+    }
+}
+
+enum RepositoryURLAutocomplete {
+    private static let skippedDirectoryNames: Set<String> = [
+        ".build", ".cache", ".swiftpm", "DerivedData", "Library",
+        "node_modules", "Pods", "vendor"
+    ]
+
+    static func singleLine(_ raw: String) -> String {
+        guard raw.contains(where: \.isWhitespace) else { return raw }
+        let parts = raw.split(whereSeparator: \.isWhitespace).map(String.init)
+        guard parts.count > 1 else { return parts.first ?? "" }
+        return parts.first(where: {
+            PeerProjectBootstrap.repositoryURLProblem($0) == nil
+        }) ?? parts.first ?? ""
+    }
+
+    static func matches(_ suggestions: [String], query rawQuery: String, limit: Int) -> [String] {
+        guard limit > 0 else { return [] }
+        let query = rawQuery.trimmingCharacters(in: .whitespacesAndNewlines)
+        return Array(suggestions.lazy.filter { suggestion in
+            guard suggestion.caseInsensitiveCompare(query) != .orderedSame else { return false }
+            return query.isEmpty || suggestion.localizedCaseInsensitiveContains(query)
+        }.prefix(limit))
+    }
+
+    static func matchingCount(_ suggestions: [String], query rawQuery: String) -> Int {
+        let query = rawQuery.trimmingCharacters(in: .whitespacesAndNewlines)
+        return suggestions.reduce(into: 0) { count, suggestion in
+            if query.isEmpty || suggestion.localizedCaseInsensitiveContains(query) {
+                count += 1
+            }
+        }
+    }
+
+    static func discoverRepositories(
+        under roots: [String],
+        maximumDepth: Int = 4,
+        maximumRepositories: Int = 250
+    ) -> [String] {
+        guard maximumDepth >= 0, maximumRepositories > 0 else { return [] }
+        let fileManager = FileManager.default
+        var queue = roots.map {
+            (TeamCreationRecentDirs.normalize($0), 0)
+        }
+        var nextIndex = 0
+        var visited = Set<String>()
+        var repositories: [String] = []
+
+        while nextIndex < queue.count, repositories.count < maximumRepositories {
+            let (directory, depth) = queue[nextIndex]
+            nextIndex += 1
+            guard !directory.isEmpty, visited.insert(directory).inserted else { continue }
+
+            var isDirectory: ObjCBool = false
+            guard fileManager.fileExists(atPath: directory, isDirectory: &isDirectory),
+                  isDirectory.boolValue else { continue }
+
+            let gitMetadata = (directory as NSString).appendingPathComponent(".git")
+            if fileManager.fileExists(atPath: gitMetadata) {
+                repositories.append(directory)
+                continue
+            }
+            guard depth < maximumDepth else { continue }
+
+            let children: [URL]
+            do {
+                children = try fileManager.contentsOfDirectory(
+                    at: URL(fileURLWithPath: directory),
+                    includingPropertiesForKeys: [.isDirectoryKey, .isSymbolicLinkKey],
+                    options: []
+                )
+            } catch {
+                continue
+            }
+
+            for child in children.sorted(by: { $0.lastPathComponent < $1.lastPathComponent }) {
+                let name = child.lastPathComponent
+                guard !name.hasPrefix("."), !skippedDirectoryNames.contains(name) else { continue }
+                guard let values = try? child.resourceValues(
+                    forKeys: [.isDirectoryKey, .isSymbolicLinkKey]
+                ), values.isDirectory == true, values.isSymbolicLink != true else { continue }
+                queue.append((child.standardizedFileURL.path, depth + 1))
+            }
+        }
+        return repositories
+    }
+
+    static func loadOriginURLs(
+        from directories: [String],
+        searching roots: [String] = []
+    ) -> [String] {
+        var seenDirectories = Set<String>()
+        var seenURLs = Set<String>()
+        var result: [String] = []
+
+        let discoveredDirectories = discoverRepositories(under: roots)
+        for rawDirectory in directories + discoveredDirectories {
+            let directory = TeamCreationRecentDirs.normalize(rawDirectory)
+            guard !directory.isEmpty, seenDirectories.insert(directory).inserted else { continue }
+
+            if let repositoryURL = originURLFromConfig(in: directory),
+               seenURLs.insert(repositoryURL).inserted {
+                result.append(repositoryURL)
+            }
+        }
+        return result
+    }
+
+    static func originURLFromConfig(in repository: String) -> String? {
+        let fileManager = FileManager.default
+        let gitMetadata = URL(fileURLWithPath: repository).appendingPathComponent(".git")
+        let configURL: URL
+
+        var isDirectory: ObjCBool = false
+        guard fileManager.fileExists(atPath: gitMetadata.path, isDirectory: &isDirectory) else {
+            return nil
+        }
+        if isDirectory.boolValue {
+            configURL = gitMetadata.appendingPathComponent("config")
+        } else {
+            guard let pointer = try? String(contentsOf: gitMetadata, encoding: .utf8),
+                  let firstLine = pointer.split(whereSeparator: \.isNewline).first,
+                  firstLine.lowercased().hasPrefix("gitdir:") else { return nil }
+            let rawPath = firstLine.dropFirst("gitdir:".count)
+                .trimmingCharacters(in: .whitespaces)
+            let gitDirectory = URL(
+                fileURLWithPath: rawPath,
+                relativeTo: gitMetadata.deletingLastPathComponent()
+            ).standardizedFileURL
+            let commonDirectory: URL
+            let commonPointer = gitDirectory.appendingPathComponent("commondir")
+            if let rawCommon = try? String(contentsOf: commonPointer, encoding: .utf8)
+                .trimmingCharacters(in: .whitespacesAndNewlines),
+               !rawCommon.isEmpty {
+                commonDirectory = URL(
+                    fileURLWithPath: rawCommon,
+                    relativeTo: gitDirectory
+                ).standardizedFileURL
+            } else {
+                commonDirectory = gitDirectory
+            }
+            configURL = commonDirectory.appendingPathComponent("config")
+        }
+
+        guard let config = try? String(contentsOf: configURL, encoding: .utf8) else {
+            return nil
+        }
+        var isOriginSection = false
+        for rawLine in config.split(whereSeparator: \.isNewline) {
+            let line = rawLine.trimmingCharacters(in: .whitespaces)
+            if line.hasPrefix("[") {
+                let normalized = line.lowercased()
+                    .replacingOccurrences(of: " ", with: "")
+                    .replacingOccurrences(of: "'", with: "\"")
+                isOriginSection = normalized == "[remote\"origin\"]"
+                continue
+            }
+            guard isOriginSection, let equals = line.firstIndex(of: "=") else { continue }
+            let key = line[..<equals].trimmingCharacters(in: .whitespaces).lowercased()
+            guard key == "url" else { continue }
+            let value = line[line.index(after: equals)...]
+                .trimmingCharacters(in: .whitespaces)
+            let sanitized = sanitizedURL(value)
+            return sanitized.isEmpty ? nil : sanitized
+        }
+        return nil
+    }
+
+    private static func sanitizedURL(_ raw: String) -> String {
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard var components = URLComponents(string: trimmed),
+              components.scheme != nil else { return trimmed }
+        components.user = nil
+        components.password = nil
+        return components.string ?? trimmed
     }
 }
 
@@ -1235,6 +1937,7 @@ enum ProjectCreationFlow {
         case remoteHostUnavailable
         case remotePathMissing
         case remoteSetupFailed(host: String, detail: String)
+        case invalidRepositoryURL(String)
 
         var errorDescription: String? {
             switch self {
@@ -1246,6 +1949,8 @@ enum ProjectCreationFlow {
                 "Enter a folder on the remote machine."
             case .remoteSetupFailed(let host, let detail):
                 "Could not prepare \(host): \(detail)"
+            case .invalidRepositoryURL(let problem):
+                problem
             }
         }
     }
@@ -1258,6 +1963,7 @@ enum ProjectCreationFlow {
         rows: [TeamAgentRow],
         source: ProjectSource,
         leader: ProjectLeader,
+        progress: @escaping @MainActor (ProjectCreationEvent) -> Void = { _ in },
         tabManager: TabManager
     ) async throws {
         // A name already in use means the project is open, not that something
@@ -1276,8 +1982,43 @@ enum ProjectCreationFlow {
             name: name,
             rows: rows,
             source: source,
-            leaderHostKey: leader.endpoint.hostKey
+            leaderHostKey: leader.endpoint.hostKey,
+            progress: progress
         )
+        let leaderPath = prepared.leaderProjectPath
+            ?? prepared.localProjectPath
+            ?? directory
+        progress(.started(ProjectBootStep(
+            id: "leader",
+            order: 1_000,
+            title: "Start leader",
+            detail: "\(leader.mode.capitalized) · \(hostDisplayName(leader.endpoint.hostKey)) · \(leaderPath)",
+            command: launchCommandPreview(
+                cli: leader.mode,
+                model: leader.model,
+                directory: leaderPath
+            ),
+            status: .running
+        )))
+        for (index, row) in prepared.rows.enumerated() {
+            let cli = row.preset.cli.isEmpty ? "claude" : row.preset.cli
+            let path = row.hostDirectory.isEmpty
+                ? (source.isolateAgents ? "Git worktree from \(prepared.localProjectPath ?? directory)" : (prepared.localProjectPath ?? directory))
+                : row.hostDirectory
+            progress(.started(ProjectBootStep(
+                id: "agent:\(row.id.uuidString)",
+                order: 2_000 + index,
+                title: "Start \(row.preset.displayName)",
+                detail: "\(cli.capitalized) · \(hostDisplayName(row.hostKey)) · \(path)",
+                command: launchCommandPreview(
+                    cli: cli,
+                    model: row.preset.model,
+                    directory: path
+                ),
+                status: .running
+            )))
+        }
+        await Task.yield()
         guard TeamOrchestrator.shared.createTeam(
             named: name,
             rows: prepared.rows,
@@ -1293,7 +2034,18 @@ enum ProjectCreationFlow {
             projectSource: source,
             tabManager: tabManager
         ) != nil else {
+            progress(.failed(id: "leader", message: "Could not create the project team."))
             throw CreationError.teamCreationFailed
+        }
+        progress(.completed(
+            id: "leader",
+            detail: "\(leader.mode.capitalized) launched on \(hostDisplayName(leader.endpoint.hostKey)) · \(leaderPath)"
+        ))
+        for row in prepared.rows {
+            progress(.completed(
+                id: "agent:\(row.id.uuidString)",
+                detail: "\(row.preset.displayName) launch requested on \(hostDisplayName(row.hostKey))"
+            ))
         }
         // A project with agents in it is what the board is for, so making one
         // puts it up.
@@ -1311,7 +2063,8 @@ enum ProjectCreationFlow {
         name: String,
         rows: [TeamAgentRow],
         source: ProjectSource,
-        leaderHostKey: String?
+        leaderHostKey: String?,
+        progress: @escaping @MainActor (ProjectCreationEvent) -> Void = { _ in }
     ) async throws -> PreparedCheckouts {
         let placements = try PeerProjectBootstrap.placements(
             source: source,
@@ -1333,6 +2086,10 @@ enum ProjectCreationFlow {
         var localProjectPath: String?
         var leaderProjectPath: String?
         let gitURL = source.gitURL.trimmingCharacters(in: .whitespacesAndNewlines)
+        // Defense for paths that did not come through the form's own check.
+        if let problem = PeerProjectBootstrap.repositoryURLProblem(gitURL) {
+            throw CreationError.invalidRepositoryURL(problem)
+        }
         // One name for every copy. Each placement's directory is the host's own
         // convention — deriving the id from it would give the same project a
         // different mem-mesh identity on each machine.
@@ -1342,7 +2099,7 @@ enum ProjectCreationFlow {
         // the same project never adopts this run's leftovers.
         let instanceTag = PeerProjectBootstrap.makeInstanceTag()
 
-        for placement in placements {
+        for (placementIndex, placement) in placements.enumerated() {
             let placedRows = placement.agentIndices.map { rows[$0] }
             let plan = PeerProjectBootstrap.plan(
                 projectRoot: (placement.projectPath as NSString).deletingLastPathComponent,
@@ -1354,6 +2111,23 @@ enum ProjectCreationFlow {
             let kind: ProjectSourceKind = placement.isSource
                 ? source.kind
                 : (gitURL.isEmpty ? source.kind : .clone)
+            let stepID = checkoutStepID(
+                hostKey: placement.hostKey,
+                path: plan.primaryPath
+            )
+            let checkoutStep = ProjectBootStep(
+                id: stepID,
+                order: placementIndex,
+                title: checkoutTitle(kind: kind),
+                detail: "\(hostDisplayName(placement.hostKey)) · \(plan.primaryPath)",
+                command: checkoutCommandPreview(
+                    plan: plan,
+                    gitURL: gitURL.isEmpty ? nil : gitURL,
+                    sourceKind: kind
+                ),
+                status: .running
+            )
+            progress(.started(checkoutStep))
 
             if let hostKey = placement.hostKey {
                 guard let host = RemoteHostStore.shared.sortedHosts.first(where: { $0.id == hostKey }),
@@ -1369,7 +2143,8 @@ enum ProjectCreationFlow {
                         plan: plan,
                         gitURL: gitURL.isEmpty ? nil : gitURL,
                         sourceKind: kind,
-                        memMeshProjectID: memMeshProjectID
+                        memMeshProjectID: memMeshProjectID,
+                        environment: PeerHostEnvironment.stored(forHostKey: hostKey)
                     )
                 } catch {
                     let detail = PeerProjectBootstrap.remoteFailureDescription(
@@ -1379,6 +2154,7 @@ enum ProjectCreationFlow {
                     RemoteWorkLog.info(
                         "Could not prepare \(name) on \(host.displayName): \(detail)"
                     )
+                    progress(.failed(id: stepID, message: detail))
                     throw CreationError.remoteSetupFailed(
                         host: host.displayName,
                         detail: detail
@@ -1401,14 +2177,24 @@ enum ProjectCreationFlow {
                     primaryPath: plan.primaryPath,
                     agentCheckouts: []
                 )
-                try await PeerProjectBootstrap.runLocal(
-                    plan: primaryOnly,
-                    gitURL: gitURL.isEmpty ? nil : gitURL,
-                    sourceKind: kind,
-                    memMeshProjectID: memMeshProjectID
-                )
+                do {
+                    try await PeerProjectBootstrap.runLocal(
+                        plan: primaryOnly,
+                        gitURL: gitURL.isEmpty ? nil : gitURL,
+                        sourceKind: kind,
+                        memMeshProjectID: memMeshProjectID
+                    )
+                } catch {
+                    progress(.failed(id: stepID, message: error.localizedDescription))
+                    throw error
+                }
                 localProjectPath = plan.primaryPath
             }
+
+            progress(.completed(
+                id: stepID,
+                detail: "\(hostDisplayName(placement.hostKey)) · \(plan.primaryPath)"
+            ))
 
             if placement.includesLeader {
                 leaderProjectPath = placement.hostKey == nil ? nil : plan.primaryPath
@@ -1420,5 +2206,78 @@ enum ProjectCreationFlow {
             localProjectPath: localProjectPath,
             leaderProjectPath: leaderProjectPath
         )
+    }
+
+    static func launchCommandPreview(
+        cli: String,
+        model: String,
+        directory: String
+    ) -> String {
+        let cd = directory.hasPrefix("Git worktree")
+            ? "cd <agent-worktree>"
+            : "cd \(shellDisplayQuote(directory))"
+        let executable = cli == "repl" ? "term-mesh leader" : cli
+        let modelArgument = model.isEmpty || cli == "repl"
+            ? ""
+            : " --model \(shellDisplayQuote(model))"
+        return "\(cd) && \(executable)\(modelArgument)"
+    }
+
+    private static func checkoutStepID(hostKey: String?, path: String) -> String {
+        "checkout:\(hostKey ?? "local"):\(path)"
+    }
+
+    private static func checkoutTitle(kind: ProjectSourceKind) -> String {
+        switch kind {
+        case .clone: "Clone repository"
+        case .existingFolder: "Verify project checkout"
+        case .empty: "Create Git project"
+        }
+    }
+
+    private static func checkoutCommandPreview(
+        plan: PeerProjectBootstrap.Plan,
+        gitURL: String?,
+        sourceKind: ProjectSourceKind
+    ) -> String {
+        let primary = shellDisplayQuote(plan.primaryPath)
+        let base: String
+        if let gitURL, !gitURL.isEmpty {
+            base = "git clone \(shellDisplayQuote(sanitizedRepositoryURL(gitURL))) \(primary)"
+        } else {
+            switch sourceKind {
+            case .clone:
+                base = "git clone <repository> \(primary)"
+            case .existingFolder:
+                base = "test -d \(primary)"
+            case .empty:
+                base = "mkdir -p \(primary) && git -C \(primary) init"
+            }
+        }
+        guard plan.agentCheckouts.contains(where: { $0.path != plan.primaryPath }) else {
+            return base
+        }
+        return "\(base) && git -C \(primary) worktree add …"
+    }
+
+    static func sanitizedRepositoryURL(_ raw: String) -> String {
+        guard var components = URLComponents(string: raw),
+              components.scheme != nil else { return raw }
+        components.user = nil
+        components.password = nil
+        return components.string ?? raw
+    }
+
+    private static func shellDisplayQuote(_ value: String) -> String {
+        guard value.contains(where: { $0.isWhitespace || $0 == "'" }) else { return value }
+        return "'" + value.replacingOccurrences(of: "'", with: "'\\''") + "'"
+    }
+
+    @MainActor
+    private static func hostDisplayName(_ hostKey: String?) -> String {
+        guard let hostKey else { return "This Mac" }
+        return RemoteHostStore.shared.sortedHosts
+            .first(where: { $0.id == hostKey })?
+            .displayName ?? hostKey
     }
 }

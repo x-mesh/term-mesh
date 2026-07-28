@@ -82,6 +82,96 @@ final class PredictedProjectPathTests: XCTestCase {
         XCTAssertNil(NewProjectView.projectName(fromRepositoryURL: "https://github.com/"))
     }
 
+    func testRepositoryURLInputKeepsOnlyOneLine() {
+        XCTAssertEqual(
+            RepositoryURLAutocomplete.singleLine(
+                "\n  git@github.com:org/term-mesh.git  \nextra clipboard text"
+            ),
+            "git@github.com:org/term-mesh.git"
+        )
+        XCTAssertEqual(
+            RepositoryURLAutocomplete.singleLine(
+                "Copied from chat https://github.com/org/term-mesh.git ignored second line"
+            ),
+            "https://github.com/org/term-mesh.git"
+        )
+        XCTAssertEqual(
+            RepositoryURLAutocomplete.singleLine("git@github.com:org/term-mesh.git"),
+            "git@github.com:org/term-mesh.git"
+        )
+    }
+
+    func testRepositoryURLSuggestionsFilterAndHideExactValue() {
+        let suggestions = [
+            "git@github.com:org/term-mesh.git",
+            "https://github.com/org/other.git",
+            "https://gitlab.com/org/term-tools.git"
+        ]
+        XCTAssertEqual(
+            RepositoryURLAutocomplete.matches(suggestions, query: "term", limit: 6),
+            [
+                "git@github.com:org/term-mesh.git",
+                "https://gitlab.com/org/term-tools.git"
+            ]
+        )
+        XCTAssertEqual(
+            RepositoryURLAutocomplete.matches(
+                suggestions,
+                query: "git@github.com:org/term-mesh.git",
+                limit: 6
+            ),
+            []
+        )
+    }
+
+    func testRepositoryDiscoveryFindsProjectsBelowConfiguredRoot() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("RepositoryDiscovery-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let direct = root.appendingPathComponent("direct")
+        let grouped = root.appendingPathComponent("group/nested")
+        let ignored = root.appendingPathComponent(".hidden/project")
+        for repository in [direct, grouped, ignored] {
+            try FileManager.default.createDirectory(
+                at: repository.appendingPathComponent(".git"),
+                withIntermediateDirectories: true
+            )
+        }
+
+        XCTAssertEqual(
+            Set(RepositoryURLAutocomplete.discoverRepositories(under: [root.path])),
+            Set([direct.path, grouped.path])
+        )
+    }
+
+    func testRepositoryOriginIsReadDirectlyFromGitConfig() throws {
+        let repository = FileManager.default.temporaryDirectory
+            .appendingPathComponent("RepositoryOrigin-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: repository) }
+        let gitDirectory = repository.appendingPathComponent(".git")
+        try FileManager.default.createDirectory(
+            at: gitDirectory,
+            withIntermediateDirectories: true
+        )
+        try """
+        [core]
+            bare = false
+        [remote "origin"]
+            url = https://token@example.com/org/project.git
+            fetch = +refs/heads/*:refs/remotes/origin/*
+        """.write(
+            to: gitDirectory.appendingPathComponent("config"),
+            atomically: true,
+            encoding: .utf8
+        )
+
+        XCTAssertEqual(
+            RepositoryURLAutocomplete.originURLFromConfig(in: repository.path),
+            "https://example.com/org/project.git"
+        )
+    }
+
     func testEmptyNameStillInfersWhenSwiftUIMarkedItEdited() {
         XCTAssertTrue(
             NewProjectView.shouldInferProjectName(
@@ -103,6 +193,111 @@ final class PredictedProjectPathTests: XCTestCase {
                 currentName: "my-custom-name",
                 nameWasEdited: true
             )
+        )
+    }
+
+    func testAgentPlacementCanFollowTheLeader() {
+        XCTAssertEqual(
+            NewProjectView.resolvedAgentHostKey(
+                mode: .sameAsLeader,
+                leaderHostKey: "leader-host",
+                allAgentsHostKey: "other-host",
+                explicitHostKey: "explicit-host",
+                inheritsDefault: false
+            ),
+            "leader-host"
+        )
+    }
+
+    func testAgentPlacementCanPutEveryoneOnOneMachine() {
+        XCTAssertEqual(
+            NewProjectView.resolvedAgentHostKey(
+                mode: .allOnOneMachine,
+                leaderHostKey: "leader-host",
+                allAgentsHostKey: "agent-host",
+                explicitHostKey: "explicit-host",
+                inheritsDefault: false
+            ),
+            "agent-host"
+        )
+    }
+
+    func testPerAgentPlacementPreservesOverridesAndLeaderInheritance() {
+        XCTAssertEqual(
+            NewProjectView.resolvedAgentHostKey(
+                mode: .perAgent,
+                leaderHostKey: "leader-host",
+                allAgentsHostKey: "agent-host",
+                explicitHostKey: "explicit-host",
+                inheritsDefault: false
+            ),
+            "explicit-host"
+        )
+        XCTAssertEqual(
+            NewProjectView.resolvedAgentHostKey(
+                mode: .perAgent,
+                leaderHostKey: "leader-host",
+                allAgentsHostKey: "agent-host",
+                explicitHostKey: "explicit-host",
+                inheritsDefault: true
+            ),
+            "leader-host"
+        )
+    }
+
+    func testBootProgressMovesAPlannedStepThroughRunningAndCompleted() {
+        let planned = ProjectBootStep(
+            id: "leader",
+            order: 1_000,
+            title: "Start leader",
+            detail: "Claude · This Mac",
+            command: "claude --model sonnet",
+            status: .pending
+        )
+        var steps = NewProjectView.applying(.planned(planned), to: [])
+        XCTAssertEqual(steps.first?.status, .pending)
+
+        steps = NewProjectView.applying(.started(planned), to: steps)
+        XCTAssertEqual(steps.first?.status, .running)
+
+        steps = NewProjectView.applying(
+            .completed(id: "leader", detail: "Claude launched on This Mac"),
+            to: steps
+        )
+        XCTAssertEqual(steps.first?.status, .completed)
+        XCTAssertEqual(steps.first?.detail, "Claude launched on This Mac")
+    }
+
+    func testBootProgressKeepsCheckoutBeforeLeaderAndAgents() {
+        let leader = ProjectBootStep(
+            id: "leader",
+            order: 1_000,
+            title: "Start leader",
+            detail: "",
+            command: nil,
+            status: .pending
+        )
+        let checkout = ProjectBootStep(
+            id: "checkout:local:/tmp/demo",
+            order: 0,
+            title: "Clone repository",
+            detail: "",
+            command: nil,
+            status: .running
+        )
+        let steps = NewProjectView.applying(
+            .started(checkout),
+            to: [leader]
+        )
+        XCTAssertEqual(steps.map(\.id), ["checkout:local:/tmp/demo", "leader"])
+    }
+
+    func testBootCommandRemovesRepositoryCredentials() {
+        XCTAssertEqual(
+            ProjectCreationFlow.sanitizedRepositoryURL(
+                "https://token:secret@example.com/org/demo.git"
+            ),
+            "https://example.com/org/demo.git"
         )
     }
 }

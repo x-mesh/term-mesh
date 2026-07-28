@@ -337,6 +337,44 @@ enum PeerProjectBootstrap {
         return steps.joined(separator: " && ")
     }
 
+    /// Why this Repository URL cannot work, or nil when it can (or when it
+    /// is empty — emptiness is the caller's decision, not a URL defect).
+    ///
+    /// Exists because the form used to accept anything and the first thing to
+    /// object was `git clone` on a machine at the other end of ssh — a pasted
+    /// chat block with a URL somewhere inside it produced
+    /// `fatal: protocol 'available skills\n https' is not supported`, on the
+    /// one machine that did not already have the clone. The form is where the
+    /// mistake happened; the form is where it should be caught.
+    static func repositoryURLProblem(_ raw: String) -> String? {
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+        if trimmed.contains(where: \.isNewline) {
+            return "Repository URL is several lines — paste just the URL."
+        }
+        if trimmed.contains(where: \.isWhitespace) {
+            return "Repository URL cannot contain spaces."
+        }
+        // The shapes git actually accepts: scheme://…, scp-like user@host:path
+        // (a colon before any slash), or a filesystem path.
+        if let schemeEnd = trimmed.range(of: "://") {
+            let scheme = trimmed[trimmed.startIndex..<schemeEnd.lowerBound]
+            let validScheme = !scheme.isEmpty && scheme.allSatisfy {
+                $0.isLetter || $0.isNumber || $0 == "+" || $0 == "-" || $0 == "."
+            }
+            return validScheme ? nil : "\"\(scheme)\" is not a URL scheme."
+        }
+        if trimmed.hasPrefix("/") || trimmed.hasPrefix("~") || trimmed.hasPrefix(".") {
+            return nil
+        }
+        if let colon = trimmed.firstIndex(of: ":"),
+           trimmed.startIndex < colon,
+           !trimmed[trimmed.startIndex..<colon].contains("/") {
+            return nil
+        }
+        return "Not a git URL — expected https://…, git@host:path, or a path."
+    }
+
     /// The project id mem-mesh should answer with on every machine holding a
     /// copy of this project.
     ///
@@ -435,6 +473,9 @@ enum PeerProjectBootstrap {
         // otherwise be the same value, and a forgotten id is permanent —
         // nothing rewrites a pin once the project exists.
         memMeshProjectID: String?,
+        // The host profile's variables — a clone behind a proxy needs them
+        // as much as the agent that follows does.
+        environment: [String: String] = [:],
         timeoutSeconds: TimeInterval = 300
     ) async throws {
         guard let script = script(
@@ -443,11 +484,15 @@ enum PeerProjectBootstrap {
             sourceKind: sourceKind,
             memMeshProjectID: memMeshProjectID
         ) else { return }
+        let assignments = PeerHostEnvironment.inlineAssignments(environment)
+        let prefixed = assignments.isEmpty
+            ? script
+            : "export \(assignments) && \(script)"
         try await PeerHostReadinessChecker.runScript(
             sshTarget: sshTarget,
             port: port,
             identityFile: identityFile,
-            script: script,
+            script: prefixed,
             timeoutSeconds: timeoutSeconds
         )
     }

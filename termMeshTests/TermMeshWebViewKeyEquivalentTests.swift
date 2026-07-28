@@ -794,6 +794,47 @@ final class BrowserDeveloperToolsShortcutDefaultsTests: XCTestCase {
 }
 
 final class WorkspaceRenameShortcutDefaultsTests: XCTestCase {
+    func testNewProjectShortcutDefaultsToControlOptionCommandN() {
+        XCTAssertEqual(KeyboardShortcutSettings.Action.newProject.label, "New Project")
+        XCTAssertEqual(
+            KeyboardShortcutSettings.Action.newProject.defaultsKey,
+            "shortcut.newProject"
+        )
+
+        let shortcut = KeyboardShortcutSettings.Action.newProject.defaultShortcut
+        XCTAssertEqual(shortcut.key, "n")
+        XCTAssertTrue(shortcut.command)
+        XCTAssertTrue(shortcut.option)
+        XCTAssertFalse(shortcut.shift)
+        XCTAssertTrue(shortcut.control)
+    }
+
+    @MainActor
+    func testNewProjectShortcutMatchesPhysicalNKeyUnderKoreanInputSource() {
+        _ = NSApplication.shared
+        let app = AppDelegate()
+        let event = NSEvent.keyEvent(
+            with: .keyDown,
+            location: .zero,
+            modifierFlags: [.command, .option, .control],
+            timestamp: ProcessInfo.processInfo.systemUptime,
+            windowNumber: 0,
+            context: nil,
+            characters: "ㅜ",
+            charactersIgnoringModifiers: "ㅜ",
+            isARepeat: false,
+            keyCode: 45
+        )
+
+        XCTAssertNotNil(event)
+        XCTAssertTrue(
+            app.matchShortcut(
+                event: event!,
+                shortcut: KeyboardShortcutSettings.Action.newProject.defaultShortcut
+            )
+        )
+    }
+
     func testRenameTabShortcutDefaultsAndMetadata() {
         XCTAssertEqual(KeyboardShortcutSettings.Action.renameTab.label, "Rename Tab")
         XCTAssertEqual(KeyboardShortcutSettings.Action.renameTab.defaultsKey, "shortcut.renameTab")

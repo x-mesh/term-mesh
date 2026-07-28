@@ -129,6 +129,12 @@ struct PeerHostProfile: Codable, Identifiable, Equatable {
     /// Optional deterministic runner recipe. nil keeps this profile as a
     /// normal browse/picker-only peer host.
     var savedRunner: PeerSavedRunnerProfile?
+    /// Environment variables for everything term-mesh runs on this machine —
+    /// agent/leader launches (typed and native-ssh) and project bootstrap
+    /// scripts. Per-host because that is what they describe: one box needs a
+    /// proxy, another needs `IS_SANDBOX=1`, and neither belongs on the other.
+    /// Optional so profiles saved before the field existed still decode.
+    var environment: [String: String]?
     var lastConnectedAt: Date?
     var createdAt: Date
 
@@ -144,6 +150,7 @@ struct PeerHostProfile: Codable, Identifiable, Equatable {
         symbolName: String? = nil,
         projectRootPath: String? = nil,
         savedRunner: PeerSavedRunnerProfile? = nil,
+        environment: [String: String]? = nil,
         lastConnectedAt: Date? = nil,
         createdAt: Date = Date()
     ) {
@@ -158,6 +165,7 @@ struct PeerHostProfile: Codable, Identifiable, Equatable {
         self.symbolName = symbolName
         self.projectRootPath = projectRootPath
         self.savedRunner = savedRunner
+        self.environment = environment
         self.lastConnectedAt = lastConnectedAt
         self.createdAt = createdAt
     }
@@ -187,4 +195,39 @@ struct PeerHostProfile: Codable, Identifiable, Equatable {
     /// Stable key aligning this profile with live sidebar entries —
     /// must stay in sync with RemoteHostStore's stableKey convention.
     var stableKey: String { "ssh:\(sshTarget)" }
+}
+
+/// Shared shaping of a peer host's environment variables for shell use.
+/// Everything that runs on a peer goes through a shell at some point, so
+/// there is exactly one quoting/validation story, here.
+enum PeerHostEnvironment {
+    /// Keys a POSIX shell accepts as assignments. Anything else is dropped
+    /// rather than quoted into something surprising — a bad key is a typo,
+    /// and typos should not become shell words.
+    static func sanitized(_ environment: [String: String]) -> [(key: String, value: String)] {
+        environment
+            .filter { key, _ in
+                guard let first = key.first,
+                      first.isLetter || first == "_" else { return false }
+                return key.allSatisfy { $0.isLetter || $0.isNumber || $0 == "_" }
+            }
+            .sorted { $0.key < $1.key }
+            .map { (key: $0.key, value: $0.value) }
+    }
+
+    /// `K1='v1' K2='v2'` — the prefix form that scopes the variables to the
+    /// single command that follows. Empty when nothing (valid) is set.
+    static func inlineAssignments(_ environment: [String: String]) -> String {
+        sanitized(environment)
+            .map { "\($0.key)='\($0.value.replacingOccurrences(of: "'", with: "'\\''"))'" }
+            .joined(separator: " ")
+    }
+
+    /// The environment saved for a host, by the sidebar's stable key.
+    @MainActor
+    static func stored(forHostKey hostKey: String) -> [String: String] {
+        PeerHostProfileStore.shared.profiles
+            .first { $0.stableKey == hostKey }?
+            .environment ?? [:]
+    }
 }

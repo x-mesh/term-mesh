@@ -458,7 +458,8 @@ extension TeamOrchestrator {
             teamName: teamName,
             workingDirectory: workingDirectory,
             grant: grantResponse.grant,
-            systemPromptFile: promptFile
+            systemPromptFile: promptFile,
+            environment: PeerHostEnvironment.stored(forHostKey: host.id)
         )
         let launched = await sendRemoteLeaderStage(
             teamName: teamName,
@@ -872,7 +873,8 @@ extension TeamOrchestrator {
                 model: model,
                 agentName: agentName,
                 teamName: teamName,
-                workingDirectory: workingDirectory
+                workingDirectory: workingDirectory,
+                environment: PeerHostEnvironment.stored(forHostKey: hostKey)
             )
             _ = self.sendToAgentByPanel(
                 teamName: teamName,
@@ -921,14 +923,17 @@ extension TeamOrchestrator {
             workingDirectory: workingDirectory,
             mode: .digest
         )
-        let remoteEnvironment = Self.remoteNativeAgentEnvironment(
-            teamName: team.id,
-            agentName: agentName,
-            agentType: agentType,
-            agentCli: cli,
-            workspaceId: workspace.id,
-            socketPath: host.remoteSockPath
-        )
+        // The host profile's variables underneath, term-mesh's own on top —
+        // a profile must be able to add a proxy, not to impersonate the team.
+        let remoteEnvironment = PeerHostEnvironment.stored(forHostKey: host.id)
+            .merging(Self.remoteNativeAgentEnvironment(
+                teamName: team.id,
+                agentName: agentName,
+                agentType: agentType,
+                agentCli: cli,
+                workspaceId: workspace.id,
+                socketPath: host.remoteSockPath
+            )) { _, internalValue in internalValue }
         guard let panel = workspace.newAgentSplit(
             from: splitFrom,
             orientation: team.agents.isEmpty ? .horizontal : .vertical,
@@ -1194,7 +1199,8 @@ extension TeamOrchestrator {
                 plan: plan,
                 gitURL: nil,
                 sourceKind: .existingFolder,
-                memMeshProjectID: nil
+                memMeshProjectID: nil,
+                environment: PeerHostEnvironment.stored(forHostKey: hostKey)
             )
         } catch {
             RemoteWorkLog.info(
@@ -1627,7 +1633,8 @@ extension TeamOrchestrator {
         agentName: String,
         teamName: String,
         workingDirectory: String,
-        systemPromptFile: String? = nil
+        systemPromptFile: String? = nil,
+        environment: [String: String] = [:]
     ) -> String {
         let quotedDir = workingDirectory.replacingOccurrences(of: "'", with: "'\\''")
         // `mkdir -p` before `cd`, because a project on another machine has
@@ -1640,30 +1647,35 @@ extension TeamOrchestrator {
         // passes and the pane dies with "command not found".
         let enter = RemoteShellPath.prologue
             + "mkdir -p '\(quotedDir)' && cd '\(quotedDir)'"
+        // The host profile's variables, as an assignment prefix scoped to the
+        // CLI itself (`K='v' claude …`). This is where a per-machine
+        // IS_SANDBOX or proxy reaches a typed launch.
+        let assignments = PeerHostEnvironment.inlineAssignments(environment)
+        let envPrefix = assignments.isEmpty ? "" : assignments + " "
         switch cli {
         case "claude":
             guard let systemPromptFile else {
-                return "\(enter) && claude --model \(model) --dangerously-skip-permissions"
+                return "\(enter) && \(envPrefix)claude --model \(model) --dangerously-skip-permissions"
             }
             let quotedFile = shellQuoted(systemPromptFile)
             return "\(enter) && TERMMESH_LEADER_PROMPT=$(cat \(quotedFile))"
                 + " && rm -f \(quotedFile)"
-                + " && claude --model \(model)"
+                + " && \(envPrefix)claude --model \(model)"
                 + " --system-prompt \"$TERMMESH_LEADER_PROMPT\""
                 + " --dangerously-skip-permissions"
         case "codex", "kiro", "gemini":
             guard let systemPromptFile else {
-                return "\(enter) && \(cli) --model \(model)"
+                return "\(enter) && \(envPrefix)\(cli) --model \(model)"
             }
             let directive = LeaderParallelPolicy.launchDirective(promptFile: systemPromptFile)
             switch cli {
             case "kiro":
-                return "\(enter) && kiro chat --model \(model) \(shellQuoted(directive))"
+                return "\(enter) && \(envPrefix)kiro chat --model \(model) \(shellQuoted(directive))"
             default:
-                return "\(enter) && \(cli) --model \(model) \(shellQuoted(directive))"
+                return "\(enter) && \(envPrefix)\(cli) --model \(model) \(shellQuoted(directive))"
             }
         default:
-            return "\(enter) && \(cli) --model \(model)"
+            return "\(enter) && \(envPrefix)\(cli) --model \(model)"
         }
     }
 
@@ -1673,7 +1685,8 @@ extension TeamOrchestrator {
         teamName: String,
         workingDirectory: String,
         grant: Termmesh_Peer_V1_TeamLeaderGrant,
-        systemPromptFile: String? = nil
+        systemPromptFile: String? = nil,
+        environment: [String: String] = [:]
     ) -> String {
         let hexGrant = grant.grantID.map { String(format: "%02x", $0) }.joined()
         let exports = [
@@ -1690,7 +1703,8 @@ extension TeamOrchestrator {
             agentName: "leader",
             teamName: teamName,
             workingDirectory: workingDirectory,
-            systemPromptFile: systemPromptFile
+            systemPromptFile: systemPromptFile,
+            environment: environment
         )
         // `export` applies to the final CLI, unlike a shell assignment prefix
         // before `mkdir`, which would have scoped the grant to that one setup

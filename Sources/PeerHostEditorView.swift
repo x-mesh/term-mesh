@@ -23,6 +23,8 @@ struct PeerHostEditorView: View {
 
     /// Text mirror of the optional Int port (empty = nil).
     @State private var portText: String
+    /// KEY=VALUE per line — parsed into `profile.environment` on save.
+    @State private var environmentText: String
     @State private var validationError: String?
     @State private var discovered: [DiscoveredPeer] = []
     /// Held for the sheet's lifetime; started/stopped with appearance.
@@ -164,6 +166,10 @@ struct PeerHostEditorView: View {
         self.onSave = onSave
         self.onCancel = onCancel
         _portText = State(initialValue: context.profile.sshPort.map(String.init) ?? "")
+        _environmentText = State(initialValue: (context.profile.environment ?? [:])
+            .sorted { $0.key < $1.key }
+            .map { "\($0.key)=\($0.value)" }
+            .joined(separator: "\n"))
     }
 
     var body: some View {
@@ -214,6 +220,28 @@ struct PeerHostEditorView: View {
                             .help("Ask the machine whether this directory exists and which agent CLIs it has")
                         }
                         readinessSummary
+                    }
+                }
+                GridRow {
+                    Text("Environment")
+                    // KEY=VALUE per line, the same shape the CLI-profile
+                    // editor uses. Applied to everything term-mesh runs on
+                    // this machine: agent and leader launches, project setup
+                    // scripts. This is where the IS_SANDBOX=1 kind of
+                    // per-machine truth lives, instead of a hand-made
+                    // systemd drop-in on each box.
+                    VStack(alignment: .leading, spacing: 4) {
+                        TextEditor(text: $environmentText)
+                            .font(.system(size: 11, design: .monospaced))
+                            .frame(height: 52)
+                            .overlay(
+                                RoundedRectangle(cornerRadius: 4)
+                                    .stroke(Color(nsColor: .separatorColor), lineWidth: 1)
+                            )
+                            .accessibilityLabel("Environment variables, one KEY=VALUE per line")
+                        Text("KEY=VALUE per line — set for agent launches and project setup on this machine")
+                            .font(.system(size: 9))
+                            .foregroundColor(Color.secondary.opacity(0.8))
                     }
                 }
                 GridRow {
@@ -998,6 +1026,27 @@ struct PeerHostEditorView: View {
         draft.displayName = draft.displayName.trimmingCharacters(in: .whitespaces)
         draft.sshTarget = draft.sshTarget.trimmingCharacters(in: .whitespaces)
         draft.remoteSocket = draft.remoteSocket.trimmingCharacters(in: .whitespaces)
+
+        // KEY=VALUE per line; a line without `=` is noise, an invalid key is
+        // refused loudly rather than silently dropped at launch time.
+        var environment: [String: String] = [:]
+        for line in environmentText.split(separator: "\n") {
+            let trimmedLine = line.trimmingCharacters(in: .whitespaces)
+            guard !trimmedLine.isEmpty, !trimmedLine.hasPrefix("#") else { continue }
+            let kv = trimmedLine.split(separator: "=", maxSplits: 1)
+            guard kv.count == 2 else {
+                validationError = "Environment line needs KEY=VALUE: \(trimmedLine)"
+                return nil
+            }
+            let key = String(kv[0]).trimmingCharacters(in: .whitespaces)
+            let value = String(kv[1]).trimmingCharacters(in: .whitespaces)
+            guard PeerHostEnvironment.sanitized([key: value]).count == 1 else {
+                validationError = "Invalid environment variable name: \(key)"
+                return nil
+            }
+            environment[key] = value
+        }
+        draft.environment = environment.isEmpty ? nil : environment
         if let identity = draft.identityFile {
             let trimmed = identity.trimmingCharacters(in: .whitespaces)
             draft.identityFile = trimmed.isEmpty ? nil : trimmed

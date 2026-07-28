@@ -980,7 +980,11 @@ struct SidebarProjectsSection: View {
                 .buttonStyle(.plain)
                 .accessibilityIdentifier("sidebar.projects.add")
                 .accessibilityLabel("New Project")
-                .help("Start a project and the team that works on it…")
+                .help(
+                    KeyboardShortcutSettings.Action.newProject.tooltip(
+                        "Start a project and the team that works on it"
+                    )
+                )
             }
             .padding(.leading, 16)
             .padding(.trailing, 12)

@@ -693,16 +693,26 @@ private struct Mascot: View {
     let rows: [String]
     let fallbackAccent: Color
 
+    @ViewBuilder
     var body: some View {
-        VStack(alignment: .leading, spacing: 0) {
-            ForEach(Array(rows.enumerated()), id: \.offset) { rowIndex, row in
-                colored(row, at: rowIndex)
-                    .font(.system(size: 11, design: .monospaced))
-                    .lineSpacing(0)
-                    .fixedSize()
+        if cli.lowercased() == "codex" {
+            Image("CodexLogo")
+                .resizable()
+                .renderingMode(.original)
+                .scaledToFit()
+                .frame(width: 40, height: 40)
+                .accessibilityHidden(true)
+        } else {
+            VStack(alignment: .leading, spacing: 0) {
+                ForEach(Array(rows.enumerated()), id: \.offset) { rowIndex, row in
+                    colored(row, at: rowIndex)
+                        .font(.system(size: 11, design: .monospaced))
+                        .lineSpacing(0)
+                        .fixedSize()
+                }
             }
+            .accessibilityHidden(true)
         }
-        .accessibilityHidden(true)
     }
 
     private func colored(_ row: String, at rowIndex: Int) -> Text {

@@ -2633,6 +2633,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
             return true
         }
 
+        // New Project: Control+Option+Cmd+N by default.
+        // Handle this in the event monitor instead of relying on the menu key
+        // equivalent so the physical N key also works under CJK input sources
+        // where charactersIgnoringModifiers is not "n".
+        if matchShortcut(event: event, shortcut: KeyboardShortcutSettings.shortcut(for: .newProject)) {
+            NotificationCenter.default.post(name: .projectCreationRequested, object: nil)
+            return true
+        }
+
         // Check Show Notifications shortcut
         if matchShortcut(event: event, shortcut: KeyboardShortcutSettings.shortcut(for: .showNotifications)) {
             toggleNotificationsPopover(animated: false, anchorView: fullscreenControlsViewModel?.notificationsAnchorView)

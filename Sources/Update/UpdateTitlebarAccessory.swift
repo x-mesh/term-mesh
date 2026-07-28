@@ -130,9 +130,10 @@ final class TitlebarControlsViewModel: ObservableObject {
         // First, because on the project axis it is also what the button itself
         // does — the menu should not bury the primary action.
         if let onNewProject {
-            let projectItem = ClosureMenuItem(title: "New Project…", keyEquivalent: "") {
+            let projectItem = ClosureMenuItem(title: "New Project…", keyEquivalent: "n") {
                 onNewProject()
             }
+            projectItem.keyEquivalentModifierMask = [.command, .option, .control]
             menu.addItem(projectItem)
         }
 
@@ -569,7 +570,9 @@ struct TitlebarControlsView: View {
             .accessibilityIdentifier("titlebarControl.newTab")
             .accessibilityLabel(isProjectAxis ? "New Project" : "New Workspace")
             .help(isProjectAxis
-                  ? "New project (⌥-click for more)"
+                  ? KeyboardShortcutSettings.Action.newProject.tooltip(
+                      "New project (⌥-click for more)"
+                  )
                   : KeyboardShortcutSettings.Action.newTab.tooltip("New workspace (⌥-click for more)"))
             .overlay(
                 PlusMenuRightClickOverlay(

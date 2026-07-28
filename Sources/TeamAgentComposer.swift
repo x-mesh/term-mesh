@@ -38,6 +38,7 @@ struct TeamAgentComposer: View {
     var defaultHostDirectory = ""
     var inheritedAgentIDs: Set<UUID> = []
     var showsPlacementControls = true
+    var showsBulkPlacementControls = true
     var onAgentPlacementChanged: (_ agentID: UUID, _ inheritsDefault: Bool) -> Void = { _, _ in }
 
     @ObservedObject private var presetManager = AgentRolePresetManager.shared
@@ -124,7 +125,7 @@ struct TeamAgentComposer: View {
             // position beside the title pushed the machine controls beyond
             // the fixed-width New Project sheet, making them exist but
             // impossible to see or use.
-            if !agents.isEmpty {
+            if agents.count > 1 {
                 VStack(alignment: .leading, spacing: 6) {
                     HStack(spacing: 8) {
                         Text("Model")
@@ -169,7 +170,7 @@ struct TeamAgentComposer: View {
                         Spacer()
                     }
 
-                    if showsPlacementControls {
+                    if showsBulkPlacementControls {
                         HStack(spacing: 8) {
                             Text("Runs on")
                                 .font(.caption)
@@ -513,7 +514,7 @@ struct TeamAgentComposer: View {
                 .textFieldStyle(.roundedBorder)
                 .help("Primary project folder; an isolated agent worktree is created beside it")
             } else {
-                Text("Uses the project machine and destination")
+                Text("Uses Default · \(defaultMachineLabel)")
                     .font(.caption)
                     .foregroundStyle(.tertiary)
             }

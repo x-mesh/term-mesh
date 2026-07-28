@@ -30,6 +30,7 @@ struct TermMeshApp: App {
     @AppStorage(KeyboardShortcutSettings.Action.toggleSidebar.defaultsKey) private var toggleSidebarShortcutData = Data()
     @AppStorage(KeyboardShortcutSettings.Action.newTab.defaultsKey) private var newWorkspaceShortcutData = Data()
     @AppStorage(KeyboardShortcutSettings.Action.newWindow.defaultsKey) private var newWindowShortcutData = Data()
+    @AppStorage(KeyboardShortcutSettings.Action.newProject.defaultsKey) private var newProjectShortcutData = Data()
     @AppStorage(KeyboardShortcutSettings.Action.openPeerWorkspace.defaultsKey) private var openPeerWorkspaceShortcutData = Data()
     @AppStorage(KeyboardShortcutSettings.Action.showNotifications.defaultsKey) private var showNotificationsShortcutData = Data()
     @AppStorage(KeyboardShortcutSettings.Action.jumpToUnread.defaultsKey) private var jumpToUnreadShortcutData = Data()
@@ -448,17 +449,25 @@ struct TermMeshApp: App {
             .sheet(isPresented: $showProjectCreation) {
                 let activeTabManager = projectCreationTabManager ?? tabManager
                 NewProjectView(
-                    onCreate: { name, directory, rows, source, leader in
+                    onCreate: { name, directory, rows, source, leader, progress in
                         try await ProjectCreationFlow.create(
                             name: name,
                             directory: directory,
                             rows: rows,
                             source: source,
                             leader: leader,
+                            progress: progress,
                             tabManager: activeTabManager
                         )
                     },
-                    onClose: { showProjectCreation = false }
+                    onClose: { showProjectCreation = false },
+                    repositoryDirectories: (
+                        activeTabManager.tabs.map(\.currentDirectory)
+                        + TeamCreationRecentDirs.shared.current()
+                    ),
+                    repositorySearchRoots: [
+                        ProjectLocationSettings.expandedLocalProjectsRoot()
+                    ]
                 )
             }
             .sheet(isPresented: $showWatchConfig) {
@@ -851,6 +860,15 @@ struct TermMeshApp: App {
                 splitCommandButton(title: "New Workspace", shortcut: newWorkspaceMenuShortcut) {
                     activeTabManager.addTab()
                 }
+
+                // AppDelegate handles this by physical key code as well as characters,
+                // so the shortcut keeps working under CJK keyboard layouts.
+                splitCommandButton(title: "New Project…", shortcut: newProjectMenuShortcut, registerShortcut: false) {
+                    NotificationCenter.default.post(
+                        name: .projectCreationRequested,
+                        object: nil
+                    )
+                }
             }
 
             // Close tab/workspace
@@ -1191,6 +1209,13 @@ struct TermMeshApp: App {
 
     private var newWindowMenuShortcut: StoredShortcut {
         decodeShortcut(from: newWindowShortcutData, fallback: KeyboardShortcutSettings.Action.newWindow.defaultShortcut)
+    }
+
+    private var newProjectMenuShortcut: StoredShortcut {
+        decodeShortcut(
+            from: newProjectShortcutData,
+            fallback: KeyboardShortcutSettings.Action.newProject.defaultShortcut
+        )
     }
 
     private var openPeerWorkspaceMenuShortcut: StoredShortcut {

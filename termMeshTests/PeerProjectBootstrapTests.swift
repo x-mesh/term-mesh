@@ -826,6 +826,73 @@ final class PeerProjectBootstrapTests: XCTestCase {
         }
     }
 
+    /// The host profile's environment reaches a typed launch as an
+    /// assignment prefix on the CLI itself, values quoted, keys validated.
+    @MainActor
+    func test_remote_launch_carries_the_hosts_environment() {
+        let launch = TeamOrchestrator.remoteAgentCommand(
+            cli: "claude",
+            model: "sonnet",
+            agentName: "worker",
+            teamName: "demo",
+            workingDirectory: "/srv/demo",
+            environment: [
+                "IS_SANDBOX": "1",
+                "HTTP_PROXY": "http://proxy:3128",
+                "bad-key": "dropped",
+                "QUOTED": "it's",
+            ]
+        )
+        XCTAssertTrue(
+            launch.contains(
+                "HTTP_PROXY='http://proxy:3128' IS_SANDBOX='1' QUOTED='it'\\''s' claude"
+            ),
+            "sorted assignments, quoted values, directly before the CLI: \(launch)"
+        )
+        XCTAssertFalse(launch.contains("bad-key"), "invalid names never reach the shell")
+    }
+
+    /// The exact field-paste failure: a chat block with a URL inside it must
+    /// die in the form, not as `fatal: protocol 'available skills\n https'`
+    /// from a remote git.
+    func test_repository_url_rejects_pasted_prose() {
+        XCTAssertNotNil(PeerProjectBootstrap.repositoryURLProblem(
+            "available skills\n https://github.com/org/repo.git"
+        ))
+        XCTAssertNotNil(PeerProjectBootstrap.repositoryURLProblem("two words"))
+        XCTAssertNotNil(PeerProjectBootstrap.repositoryURLProblem("no-colon-no-path"))
+        XCTAssertNotNil(PeerProjectBootstrap.repositoryURLProblem("bad scheme://x"))
+    }
+
+    func test_repository_url_accepts_the_shapes_git_does() {
+        XCTAssertNil(PeerProjectBootstrap.repositoryURLProblem(""))
+        XCTAssertNil(PeerProjectBootstrap.repositoryURLProblem("  \n"))
+        XCTAssertNil(PeerProjectBootstrap.repositoryURLProblem(
+            "https://github.com/org/repo.git"
+        ))
+        XCTAssertNil(PeerProjectBootstrap.repositoryURLProblem(
+            "git@github.com:org/repo.git"
+        ))
+        XCTAssertNil(PeerProjectBootstrap.repositoryURLProblem(
+            "ssh://git@host:2222/org/repo.git"
+        ))
+        XCTAssertNil(PeerProjectBootstrap.repositoryURLProblem("/srv/git/repo.git"))
+        XCTAssertNil(PeerProjectBootstrap.repositoryURLProblem("~/repos/demo"))
+        // Leading/trailing paste debris is forgiven; interior junk is not.
+        XCTAssertNil(PeerProjectBootstrap.repositoryURLProblem(
+            "  https://github.com/org/repo.git\n"
+        ))
+    }
+
+    func test_inline_assignments_are_empty_for_no_valid_variables() {
+        XCTAssertEqual(PeerHostEnvironment.inlineAssignments([:]), "")
+        XCTAssertEqual(PeerHostEnvironment.inlineAssignments(["2bad": "x", "a-b": "y"]), "")
+        XCTAssertEqual(
+            PeerHostEnvironment.inlineAssignments(["_OK": "v"]),
+            "_OK='v'"
+        )
+    }
+
     /// The probe and the launch have to agree on where to look. Finding a CLI
     /// and then starting a shell that cannot is the worst of both outcomes:
     /// the guard passes and the pane dies with "command not found".
