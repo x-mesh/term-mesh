@@ -45,6 +45,21 @@ public enum PeerTeamCall {
         "team.task.get",
         "team.task.create",
         "team.task.update",
+        // Reading what a task changed, so a review can happen where the work
+        // is visible rather than only where it ran.
+        //
+        // This is the one method here that reaches the filesystem, so it is
+        // worth saying exactly how far: the host resolves the worktree from
+        // the task row the peer names — the peer supplies no path, no ref and
+        // no command — and runs a fixed read against it. There is no argument
+        // through which a caller can choose what runs or where, which is the
+        // line between this and the spawning methods below that stay out.
+        //
+        // It reads a working tree the same person's agent is writing, which
+        // the reads above already do by another route (`team.read` returns
+        // that agent's pane). The new exposure is the diff's content, not a
+        // new machine or a new directory.
+        "team.task.diff",
     ]
 
     /// Deliberately NOT allowed, kept explicit so the reasoning survives:

@@ -1247,6 +1247,11 @@ pub(crate) fn team_call_allowed(method: &str) -> bool {
             | "team.task.get"
             | "team.task.create"
             | "team.task.update"
+            // Reads what a task changed. The only method here that reaches the
+            // filesystem: the host resolves the worktree from the task row the
+            // peer names — no path, ref or command comes from the caller — and
+            // runs a fixed read. See the Swift mirror for the full reasoning.
+            | "team.task.diff"
     )
 }
 
@@ -2968,5 +2973,113 @@ mod team_leader_capability_tests {
             .capabilities
             .iter()
             .any(|cap| cap == capability::TEAM_CALL_V1));
+    }
+}
+
+#[cfg(test)]
+mod team_call_allow_list_tests {
+    use super::team_call_allowed;
+
+    /// The allow-list is the security boundary of `team.call.v1`, and it is
+    /// written twice — here and in the Swift host's `PeerTeamCall`. Two copies
+    /// of a security boundary drift; nothing was checking that they agree, so
+    /// a method added to one host would have been silently callable on one
+    /// machine and refused on the other.
+    ///
+    /// Reading the Swift source is crude but it is the only thing that can
+    /// actually fail when the two disagree.
+    #[test]
+    fn the_swift_mirror_lists_exactly_the_same_methods() {
+        let swift = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../swift/PeerProto/Sources/PeerProto/PeerTeamCall.swift");
+        let source = std::fs::read_to_string(&swift)
+            .unwrap_or_else(|e| panic!("read {}: {e}", swift.display()));
+        let body = source
+            .split_once("allowedMethods: Set<String> = [")
+            .expect("the allow-list literal")
+            .1
+            .split_once(']')
+            .expect("its closing bracket")
+            .0;
+
+        let mut mirrored: Vec<String> = body
+            .lines()
+            // Drop the rationale comments; only the quoted names are the list.
+            .filter_map(|line| {
+                let line = line.trim();
+                if line.starts_with("//") {
+                    return None;
+                }
+                let start = line.find('"')? + 1;
+                let end = start + line[start..].find('"')?;
+                Some(line[start..end].to_string())
+            })
+            .collect();
+        mirrored.sort();
+        assert!(!mirrored.is_empty(), "parsed nothing out of the Swift list");
+
+        for method in &mirrored {
+            assert!(
+                team_call_allowed(method),
+                "{method} is allowed by the Swift host but refused here"
+            );
+        }
+        // And the other direction: a method this host allows that Swift does
+        // not would be just as much of a split.
+        for method in KNOWN_METHODS {
+            assert_eq!(
+                team_call_allowed(method),
+                mirrored.iter().any(|m| m == method),
+                "{method} is allowed on one host and not the other"
+            );
+        }
+    }
+
+    /// Every method the boundary has an opinion about, so the comparison above
+    /// covers refusals too rather than only what happens to be listed.
+    const KNOWN_METHODS: &[&str] = &[
+        "team.status",
+        "team.list",
+        "team.read",
+        "team.collect",
+        "team.reports",
+        "team.inbox",
+        "team.message.list",
+        "team.send",
+        "team.broadcast",
+        "team.delegate",
+        "team.message.post",
+        "team.task.list",
+        "team.task.get",
+        "team.task.create",
+        "team.task.update",
+        "team.task.diff",
+        // Deliberately out: these spawn or tear down processes and take a
+        // working directory, so a peer holding one could start an arbitrary
+        // command anywhere on the host.
+        "team.create",
+        "team.destroy",
+        "team.attach",
+        "team.detach",
+        "team.add_agent",
+        "team.restart",
+    ];
+
+    /// The reason `team.task.diff` was allowed at all: it names no path and no
+    /// command. Guarding the refusals explicitly keeps a later "just one more
+    /// method" from quietly crossing the line.
+    #[test]
+    fn nothing_that_spawns_a_process_is_callable_by_a_peer() {
+        for method in [
+            "team.create",
+            "team.destroy",
+            "team.attach",
+            "team.detach",
+            "team.add_agent",
+            "team.restart",
+        ] {
+            assert!(!team_call_allowed(method), "{method} must stay out");
+        }
+        assert!(team_call_allowed("team.task.diff"));
     }
 }
