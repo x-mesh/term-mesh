@@ -133,6 +133,16 @@ final class ManagedPeerSurfaceStore {
         records.filter { $0.hostKey == hostKey }
     }
 
+    /// The team that spawned any of these surfaces, on any host. Surface IDs
+    /// are host-minted UUIDs, so matching without the host key cannot collide
+    /// in practice — and the caller (mirror team-home redirect) has a
+    /// `PeerPaneHostKey`, not the store's string key, which this sidesteps.
+    func teamName(forAnySurfaceID surfaceIDs: Set<Data>) -> String? {
+        records.first { record in
+            record.surfaceID.map(surfaceIDs.contains) == true
+        }?.teamName
+    }
+
     private func persist() {
         guard let data = try? JSONEncoder().encode(records) else { return }
         UserDefaults.standard.set(data, forKey: Self.storageKey)

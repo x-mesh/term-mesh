@@ -175,6 +175,15 @@ struct WorkspaceRetrievalChrome<Content: View>: View {
                 }
             }
             .animation(.easeOut(duration: 0.18), value: store.visiblePresentations)
+            // Safety pin: if any chrome row ever refuses to compress again,
+            // it must not inflate the VStack and re-center the terminal row
+            // over the Review Board. Hold the chrome to its slot, top-leading,
+            // so an oversized row overflows trailing while the panes stay put.
+            .frame(
+                width: proxy.size.width,
+                height: proxy.size.height,
+                alignment: .topLeading
+            )
         }
         .sheet(isPresented: closeGateBinding) {
             if let panelID = store.pendingClosePanelID,
@@ -251,97 +260,19 @@ private struct RetrievalActivityDrawer: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            HStack(spacing: 10) {
-                Picker("Remote Work", selection: $selectedTab) {
-                    ForEach(RetrievalDrawerTab.allCases, id: \.self) { tab in
-                        Text(tab == .incoming ? "Incoming \(store.incomingCount)" : tab.rawValue).tag(tab)
-                    }
+            // The toolbar's controls sum to ~620pt of minimum width. In a slot
+            // narrower than that (small window + Review Board) an HStack alone
+            // refuses to compress, inflating the chrome's VStack past its slot
+            // — which re-centered the terminal row and slid the panes out over
+            // the Review Board. Prefer the roomy layout, fall back to a
+            // horizontal scroll whose minimum is ~0 so the drawer always
+            // accepts the width it is given.
+            ViewThatFits(in: .horizontal) {
+                toolbar
+                ScrollView(.horizontal, showsIndicators: false) {
+                    toolbar
                 }
-                .pickerStyle(.segmented)
-                .frame(maxWidth: 440)
-
-                // Which pane the buttons act on. It was previously implicit —
-                // the last pane to register, or the first in the list — so a
-                // press could act on something other than what the user was
-                // looking at, with nothing on screen to say so.
-                if store.projectBindings.isEmpty {
-                    Text("No project bound")
-                        .font(.system(size: 11))
-                        .foregroundStyle(.secondary)
-                } else {
-                    Picker("Project", selection: Binding(
-                        get: { store.selectedBinding?.id },
-                        set: { store.selectedBindingID = $0 }
-                    )) {
-                        ForEach(store.projectBindings, id: \.id) { binding in
-                            Text("\(binding.peerID): \(binding.remoteRoot)").tag(Optional(binding.id))
-                        }
-                    }
-                    .frame(maxWidth: 260)
-                    .help("The project folder pair these actions act on.")
-                    .accessibilityIdentifier("retrieval.target")
-                }
-                Button {
-                    editingBinding = nil
-                    isEditingProject = true
-                } label: {
-                    Image(systemName: "plus")
-                }
-                .buttonStyle(.borderless)
-                .help("Bind a local folder to a folder on a peer.")
-                .accessibilityIdentifier("retrieval.addProject")
-                if let selected = store.selectedBinding {
-                    Button {
-                        editingBinding = selected
-                        isEditingProject = true
-                    } label: {
-                        Image(systemName: "pencil")
-                    }
-                    .buttonStyle(.borderless)
-                    .help("Change or remove this project's folders.")
-                    .accessibilityIdentifier("retrieval.editProject")
-                }
-
-                Spacer()
-
-                // Diagnostics live next to the buttons they explain: these
-                // actions cross a network and rewrite a Git worktree on another
-                // machine, and their preconditions refuse more often than they
-                // pass.
-                Toggle("Dry run", isOn: $store.dryRun)
-                    .toggleStyle(.checkbox)
-                    .help("Report what each action would do, without doing it.")
-                    .accessibilityIdentifier("retrieval.dryRun")
-                // A menu rather than segments: this is a setting that gets
-                // chosen once and then left alone, and segments spend width
-                // permanently displaying the option nobody picked.
-                Picker("", selection: $store.logLevel) {
-                    ForEach(RemoteWorkLogLevel.allCases) { level in
-                        Text(level.label).tag(level)
-                    }
-                }
-                .pickerStyle(.menu)
-                .frame(width: 96)
-                .help("How much the actions report into Live Activity.")
-
-                Button("Prepare Project") {
-                    Task { await workspace.seedRemoteProject() }
-                }
-                .disabled(store.selectedBinding == nil)
-                Button("Checkpoint Now") {
-                    Task { await workspace.checkpointProject() }
-                }
-                .disabled(store.selectedBinding == nil)
-                .accessibilityIdentifier("retrieval.checkpointNow")
-                Button {
-                    store.visiblePresentations.remove(.drawer)
-                } label: {
-                    Image(systemName: "chevron.down")
-                }
-                .buttonStyle(.plain)
-                .accessibilityLabel("Close Activity Drawer")
             }
-            .padding(.horizontal, 12)
             .frame(height: 38)
             .onAppear {
                 store.adoptLogSettings()
@@ -359,6 +290,7 @@ private struct RetrievalActivityDrawer: View {
                     editing: editingBinding
                 )
             }
+
 
             Divider()
 
@@ -403,6 +335,105 @@ private struct RetrievalActivityDrawer: View {
         .background(RetrievalChromePalette.panel)
         .overlay(alignment: .top) { Rectangle().fill(RetrievalChromePalette.separator).frame(height: 1) }
         .accessibilityIdentifier("retrieval.drawer")
+    }
+
+
+    /// The drawer's control row. Extracted so `body` can offer it to
+    /// `ViewThatFits` twice — once as-is, once inside a horizontal scroll —
+    /// without duplicating the controls.
+    private var toolbar: some View {
+        HStack(spacing: 10) {
+            Picker("Remote Work", selection: $selectedTab) {
+                ForEach(RetrievalDrawerTab.allCases, id: \.self) { tab in
+                    Text(tab == .incoming ? "Incoming \(store.incomingCount)" : tab.rawValue).tag(tab)
+                }
+            }
+            .pickerStyle(.segmented)
+            .frame(maxWidth: 440)
+
+            // Which pane the buttons act on. It was previously implicit —
+            // the last pane to register, or the first in the list — so a
+            // press could act on something other than what the user was
+            // looking at, with nothing on screen to say so.
+            if store.projectBindings.isEmpty {
+                Text("No project bound")
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
+            } else {
+                Picker("Project", selection: Binding(
+                    get: { store.selectedBinding?.id },
+                    set: { store.selectedBindingID = $0 }
+                )) {
+                    ForEach(store.projectBindings, id: \.id) { binding in
+                        Text("\(binding.peerID): \(binding.remoteRoot)").tag(Optional(binding.id))
+                    }
+                }
+                .frame(maxWidth: 260)
+                .help("The project folder pair these actions act on.")
+                .accessibilityIdentifier("retrieval.target")
+            }
+            Button {
+                editingBinding = nil
+                isEditingProject = true
+            } label: {
+                Image(systemName: "plus")
+            }
+            .buttonStyle(.borderless)
+            .help("Bind a local folder to a folder on a peer.")
+            .accessibilityIdentifier("retrieval.addProject")
+            if let selected = store.selectedBinding {
+                Button {
+                    editingBinding = selected
+                    isEditingProject = true
+                } label: {
+                    Image(systemName: "pencil")
+                }
+                .buttonStyle(.borderless)
+                .help("Change or remove this project's folders.")
+                .accessibilityIdentifier("retrieval.editProject")
+            }
+
+            Spacer()
+
+            // Diagnostics live next to the buttons they explain: these
+            // actions cross a network and rewrite a Git worktree on another
+            // machine, and their preconditions refuse more often than they
+            // pass.
+            Toggle("Dry run", isOn: $store.dryRun)
+                .toggleStyle(.checkbox)
+                .help("Report what each action would do, without doing it.")
+                .accessibilityIdentifier("retrieval.dryRun")
+            // A menu rather than segments: this is a setting that gets
+            // chosen once and then left alone, and segments spend width
+            // permanently displaying the option nobody picked.
+            Picker("", selection: $store.logLevel) {
+                ForEach(RemoteWorkLogLevel.allCases) { level in
+                    Text(level.label).tag(level)
+                }
+            }
+            .pickerStyle(.menu)
+            .frame(width: 96)
+            .help("How much the actions report into Live Activity.")
+
+            Button("Prepare Project") {
+                Task { await workspace.seedRemoteProject() }
+            }
+            .disabled(store.selectedBinding == nil)
+            Button("Checkpoint Now") {
+                Task { await workspace.checkpointProject() }
+            }
+            .disabled(store.selectedBinding == nil)
+            .accessibilityIdentifier("retrieval.checkpointNow")
+            Button {
+                store.visiblePresentations.remove(.drawer)
+            } label: {
+                Image(systemName: "chevron.down")
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("Close Activity Drawer")
+            }
+            .padding(.horizontal, 12)
+            .frame(height: 38)
     }
 
     private var activityList: some View {

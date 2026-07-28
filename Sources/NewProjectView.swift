@@ -1204,3 +1204,210 @@ private struct TeamPresetManagementRow: View {
         }
     }
 }
+
+/// Making the project the sheet describes.
+///
+/// This lived inside the sidebar's Projects header, which owned the sheet.
+/// The titlebar's + opens the same sheet, and it is on screen exactly when the
+/// sidebar is not — so the sheet moved to the app and the work it does had to
+/// come with it, as something neither presenter owns.
+enum ProjectCreationFlow {
+    /// Every machine selected in the form, prepared before launching anyone.
+    struct PreparedCheckouts {
+        var rows: [TeamAgentRow]
+        /// Primary checkout on this Mac, when either the source, leader or a
+        /// member runs here. The local team engine builds its own worktrees
+        /// from this root.
+        var localProjectPath: String?
+        /// Primary checkout on the leader's machine. nil tells a local leader
+        /// to use `localProjectPath`; a remote leader always receives a path.
+        var leaderProjectPath: String?
+    }
+
+    enum CreationError: LocalizedError {
+        case teamCreationFailed
+        case remoteHostUnavailable
+        case remotePathMissing
+        case remoteSetupFailed(host: String, detail: String)
+
+        var errorDescription: String? {
+            switch self {
+            case .teamCreationFailed:
+                "Could not create the project team."
+            case .remoteHostUnavailable:
+                "The selected remote machine is unavailable."
+            case .remotePathMissing:
+                "Enter a folder on the remote machine."
+            case .remoteSetupFailed(let host, let detail):
+                "Could not prepare \(host): \(detail)"
+            }
+        }
+    }
+
+    /// The whole of what "Create" means: the checkouts, the team, the board.
+    @MainActor
+    static func create(
+        name: String,
+        directory: String,
+        rows: [TeamAgentRow],
+        source: ProjectSource,
+        leader: ProjectLeader,
+        tabManager: TabManager
+    ) async throws {
+        // A name already in use means the project is open, not that something
+        // failed. Creating one silently returned nil and the sheet just
+        // closed, which reads as the button not working — so go to the one
+        // that is there.
+        if let existing = TeamOrchestrator.shared.teams[name],
+           let workspace = tabManager.tabs.first(where: { $0.id == existing.workspaceId }) {
+            tabManager.selectWorkspace(workspace)
+            return
+        }
+        // The checkouts have to exist before anyone is sent to work in them:
+        // an agent whose directory is not there starts in a shell that failed
+        // to `cd` and looks attached while being nothing of the kind.
+        let prepared = try await prepareCheckouts(
+            name: name,
+            rows: rows,
+            source: source,
+            leaderHostKey: leader.endpoint.hostKey
+        )
+        guard TeamOrchestrator.shared.createTeam(
+            named: name,
+            rows: prepared.rows,
+            workingDirectory: prepared.localProjectPath ?? directory,
+            leaderMode: leader.mode,
+            leaderModel: leader.model,
+            leaderEndpoint: leader.endpoint,
+            leaderWorkingDirectory: prepared.leaderProjectPath,
+            worktreeMode: source.isolateAgents
+                && prepared.rows.contains(where: { $0.hostKey == nil })
+                ? "isolated"
+                : "off",
+            projectSource: source,
+            tabManager: tabManager
+        ) != nil else {
+            throw CreationError.teamCreationFailed
+        }
+        // A project with agents in it is what the board is for, so making one
+        // puts it up.
+        ReviewBoardSettings.setVisible(true)
+    }
+
+    /// Prepare every machine selected in the form before launching anyone.
+    ///
+    /// Remote members receive the concrete worktree path made for them.
+    /// Local members stay host=nil and let the existing local team engine
+    /// create its worktrees from `localProjectPath`, avoiding a second,
+    /// competing local worktree implementation.
+    @MainActor
+    static func prepareCheckouts(
+        name: String,
+        rows: [TeamAgentRow],
+        source: ProjectSource,
+        leaderHostKey: String?
+    ) async throws -> PreparedCheckouts {
+        let placements = try PeerProjectBootstrap.placements(
+            source: source,
+            rows: rows,
+            leaderHostKey: leaderHostKey,
+            localProjectsRoot: ProjectLocationSettings.expandedLocalProjectsRoot()
+        ) { hostKey in
+            PeerHostProfileStore.shared.profiles
+                .first(where: { $0.stableKey == hostKey })?
+                .predictedProjectPath(
+                    forProjectNamed: URL(fileURLWithPath: source.projectPath).lastPathComponent
+                )
+                ?? RemoteProjectPaths.shared.path(
+                    host: hostKey, localRoot: source.projectPath
+                )
+        }
+
+        var prepared = rows
+        var localProjectPath: String?
+        var leaderProjectPath: String?
+        let gitURL = source.gitURL.trimmingCharacters(in: .whitespacesAndNewlines)
+        // One name for every copy. Each placement's directory is the host's own
+        // convention — deriving the id from it would give the same project a
+        // different mem-mesh identity on each machine.
+        let memMeshProjectID = PeerProjectBootstrap.memMeshProjectID(for: name)
+
+        for placement in placements {
+            let placedRows = placement.agentIndices.map { rows[$0] }
+            let plan = PeerProjectBootstrap.plan(
+                projectRoot: (placement.projectPath as NSString).deletingLastPathComponent,
+                projectName: (placement.projectPath as NSString).lastPathComponent,
+                agents: placedRows.map(\.preset.name),
+                isolateAgents: source.isolateAgents
+            )
+            let kind: ProjectSourceKind = placement.isSource
+                ? source.kind
+                : (gitURL.isEmpty ? source.kind : .clone)
+
+            if let hostKey = placement.hostKey {
+                guard let host = RemoteHostStore.shared.sortedHosts.first(where: { $0.id == hostKey }),
+                      let sshTarget = host.sshTarget, !sshTarget.isEmpty
+                else {
+                    throw CreationError.remoteHostUnavailable
+                }
+                do {
+                    try await PeerProjectBootstrap.run(
+                        sshTarget: sshTarget,
+                        port: host.sshPort,
+                        identityFile: host.identityFile,
+                        plan: plan,
+                        gitURL: gitURL.isEmpty ? nil : gitURL,
+                        sourceKind: kind,
+                        memMeshProjectID: memMeshProjectID
+                    )
+                } catch {
+                    let detail = PeerProjectBootstrap.remoteFailureDescription(
+                        error,
+                        gitURL: gitURL.isEmpty ? nil : gitURL
+                    )
+                    RemoteWorkLog.info(
+                        "Could not prepare \(name) on \(host.displayName): \(detail)"
+                    )
+                    throw CreationError.remoteSetupFailed(
+                        host: host.displayName,
+                        detail: detail
+                    )
+                }
+                for (offset, rowIndex) in placement.agentIndices.enumerated()
+                    where offset < plan.agentCheckouts.count {
+                    prepared[rowIndex].hostKey = hostKey
+                    prepared[rowIndex].hostDirectory = plan.agentCheckouts[offset].path
+                }
+                RemoteProjectPaths.shared.remember(
+                    host: hostKey,
+                    localRoot: source.projectPath,
+                    path: plan.primaryPath
+                )
+            } else {
+                // Local team creation owns local member worktrees. This step
+                // prepares only their shared primary checkout.
+                let primaryOnly = PeerProjectBootstrap.Plan(
+                    primaryPath: plan.primaryPath,
+                    agentCheckouts: []
+                )
+                try await PeerProjectBootstrap.runLocal(
+                    plan: primaryOnly,
+                    gitURL: gitURL.isEmpty ? nil : gitURL,
+                    sourceKind: kind,
+                    memMeshProjectID: memMeshProjectID
+                )
+                localProjectPath = plan.primaryPath
+            }
+
+            if placement.includesLeader {
+                leaderProjectPath = placement.hostKey == nil ? nil : plan.primaryPath
+            }
+        }
+
+        return PreparedCheckouts(
+            rows: prepared,
+            localProjectPath: localProjectPath,
+            leaderProjectPath: leaderProjectPath
+        )
+    }
+}

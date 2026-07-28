@@ -1289,6 +1289,10 @@ extension Notification.Name {
     static let browserFocusAddressBar = Notification.Name("browserFocusAddressBar")
     static let teamCreationRequested = Notification.Name("term-mesh.teamCreationRequested")
     static let spawnCLIRequested = Notification.Name("term-mesh.spawnCLIRequested")
+    /// Opens the New Project sheet. Posted by the sidebar's Projects header and
+    /// by the titlebar's + while the sidebar is showing the project axis — two
+    /// buttons, one sheet, owned by neither of them.
+    static let projectCreationRequested = Notification.Name("term-mesh.projectCreationRequested")
     /// P0-5: Posted with userInfo ["teamName": String, "workingDirectory": String]
     /// to open the Configure Watch sheet for the specified team.
     static let watchConfigRequested = Notification.Name("term-mesh.watchConfigRequested")

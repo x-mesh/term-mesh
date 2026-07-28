@@ -122,9 +122,19 @@ final class TitlebarControlsViewModel: ObservableObject {
     func showPlusMenu(
         onNewTab: @escaping () -> Void,
         onNewAgentTeam: (() -> Void)?,
-        onSpawnCLI: (() -> Void)?
+        onSpawnCLI: (() -> Void)?,
+        onNewProject: (() -> Void)? = nil
     ) {
         let menu = NSMenu()
+
+        // First, because on the project axis it is also what the button itself
+        // does — the menu should not bury the primary action.
+        if let onNewProject {
+            let projectItem = ClosureMenuItem(title: "New Project…", keyEquivalent: "") {
+                onNewProject()
+            }
+            menu.addItem(projectItem)
+        }
 
         let newWorkspaceItem = ClosureMenuItem(title: "New Workspace", keyEquivalent: "t") {
             onNewTab()
@@ -198,15 +208,18 @@ struct PlusMenuRightClickOverlay: NSViewRepresentable {
     let onNewTab: () -> Void
     let onNewAgentTeam: (() -> Void)?
     let onSpawnCLI: (() -> Void)?
+    /// nil on the host axis: there is no project entry to offer there.
+    let onNewProject: (() -> Void)?
     let viewModel: TitlebarControlsViewModel
 
     func makeNSView(context: Context) -> PlusMenuRightClickNSView {
         let view = PlusMenuRightClickNSView()
-        view.onRightClick = { [weak viewModel, onNewTab, onNewAgentTeam, onSpawnCLI] in
+        view.onRightClick = { [weak viewModel, onNewTab, onNewAgentTeam, onSpawnCLI, onNewProject] in
             viewModel?.showPlusMenu(
                 onNewTab: onNewTab,
                 onNewAgentTeam: onNewAgentTeam,
-                onSpawnCLI: onSpawnCLI
+                onSpawnCLI: onSpawnCLI,
+                onNewProject: onNewProject
             )
         }
         view.onLayout = { [weak view, weak viewModel] in
@@ -217,11 +230,12 @@ struct PlusMenuRightClickOverlay: NSViewRepresentable {
     }
 
     func updateNSView(_ nsView: PlusMenuRightClickNSView, context: Context) {
-        nsView.onRightClick = { [weak viewModel, onNewTab, onNewAgentTeam, onSpawnCLI] in
+        nsView.onRightClick = { [weak viewModel, onNewTab, onNewAgentTeam, onSpawnCLI, onNewProject] in
             viewModel?.showPlusMenu(
                 onNewTab: onNewTab,
                 onNewAgentTeam: onNewAgentTeam,
-                onSpawnCLI: onSpawnCLI
+                onSpawnCLI: onSpawnCLI,
+                onNewProject: onNewProject
             )
         }
     }
@@ -398,7 +412,12 @@ struct TitlebarControlsView: View {
     let onNewTab: () -> Void
     var onNewAgentTeam: (() -> Void)?
     var onSpawnCLI: (() -> Void)?
+    var onNewProject: (() -> Void)?
     @AppStorage("titlebarControlsStyle") private var styleRawValue = TitlebarControlsStyle.classic.rawValue
+    @AppStorage(SidebarAxisSettings.featureFlagKey)
+    private var isAxisControlEnabled = true
+    @AppStorage(SidebarAxisSettings.selectedAxisKey)
+    private var selectedAxisRaw = SidebarAxisSettings.defaultAxis.rawValue
     @AppStorage(ShortcutHintDebugSettings.titlebarHintXKey) private var titlebarShortcutHintXOffset = ShortcutHintDebugSettings.defaultTitlebarHintX
     @AppStorage(ShortcutHintDebugSettings.titlebarHintYKey) private var titlebarShortcutHintYOffset = ShortcutHintDebugSettings.defaultTitlebarHintY
     @AppStorage(ShortcutHintDebugSettings.alwaysShowHintsKey) private var alwaysShowShortcutHints = ShortcutHintDebugSettings.defaultAlwaysShowHints
@@ -436,6 +455,18 @@ struct TitlebarControlsView: View {
 
     private var shouldShowTitlebarShortcutHints: Bool {
         alwaysShowShortcutHints || commandKeyMonitor.isCommandPressed
+    }
+
+    /// What the + makes depends on what the sidebar is showing. On the project
+    /// axis a new workspace is the one thing that will NOT appear in the list
+    /// the button sits above, so there it makes a project instead.
+    ///
+    /// With the axis switch turned off the sidebar reads as Host no matter
+    /// what was stored, and this has to agree with it — same rule as
+    /// `VerticalTabsSidebar.axis`.
+    private var isProjectAxis: Bool {
+        guard isAxisControlEnabled, onNewProject != nil else { return false }
+        return SidebarAxisSettings.axis(from: selectedAxisRaw) == .project
     }
 
     var body: some View {
@@ -518,14 +549,17 @@ struct TitlebarControlsView: View {
 
             TitlebarControlButton(config: config, action: {
                 #if DEBUG
-                dlog("titlebar.newTab")
+                dlog("titlebar.newTab axis=\(isProjectAxis ? "project" : "host")")
                 #endif
                 if NSEvent.modifierFlags.contains(.option) {
                     viewModel.showPlusMenu(
                         onNewTab: onNewTab,
                         onNewAgentTeam: onNewAgentTeam,
-                        onSpawnCLI: onSpawnCLI
+                        onSpawnCLI: onSpawnCLI,
+                        onNewProject: isProjectAxis ? onNewProject : nil
                     )
+                } else if isProjectAxis, let onNewProject {
+                    onNewProject()
                 } else {
                     onNewTab()
                 }
@@ -533,13 +567,16 @@ struct TitlebarControlsView: View {
                 iconLabel(systemName: "plus", config: config)
             }
             .accessibilityIdentifier("titlebarControl.newTab")
-            .accessibilityLabel("New Workspace")
-            .help(KeyboardShortcutSettings.Action.newTab.tooltip("New workspace (⌥-click for more)"))
+            .accessibilityLabel(isProjectAxis ? "New Project" : "New Workspace")
+            .help(isProjectAxis
+                  ? "New project (⌥-click for more)"
+                  : KeyboardShortcutSettings.Action.newTab.tooltip("New workspace (⌥-click for more)"))
             .overlay(
                 PlusMenuRightClickOverlay(
                     onNewTab: onNewTab,
                     onNewAgentTeam: onNewAgentTeam,
                     onSpawnCLI: onSpawnCLI,
+                    onNewProject: isProjectAxis ? onNewProject : nil,
                     viewModel: viewModel
                 )
             )
@@ -602,7 +639,12 @@ struct TitlebarControlsView: View {
     ) -> [(action: KeyboardShortcutSettings.Action, shortcut: StoredShortcut, width: CGFloat, interval: ClosedRange<CGFloat>)] {
         guard shouldShowTitlebarShortcutHints else { return [] }
 
+        // ⌘T still makes a workspace, but on the project axis the button under
+        // the hint does not — showing it there would label the + with a
+        // shortcut that does something else. Positions come from
+        // `slot.rawValue`, so dropping one leaves the others where they were.
         return HintSlot.allCases.compactMap { slot in
+            guard !(isProjectAxis && slot == .newTab) else { return nil }
             let shortcut = KeyboardShortcutSettings.shortcut(for: slot.action)
             guard shortcut.command else { return nil }
 
@@ -865,6 +907,9 @@ final class TitlebarControlsAccessoryViewController: NSTitlebarAccessoryViewCont
         let spawnCLI = {
             NotificationCenter.default.post(name: .spawnCLIRequested, object: nil)
         }
+        let newProject = {
+            NotificationCenter.default.post(name: .projectCreationRequested, object: nil)
+        }
 
         hostingView = NonDraggableHostingView(
             rootView: TitlebarControlsView(
@@ -874,7 +919,8 @@ final class TitlebarControlsAccessoryViewController: NSTitlebarAccessoryViewCont
                 onToggleNotifications: toggleNotifications,
                 onNewTab: newTab,
                 onNewAgentTeam: newAgentTeam,
-                onSpawnCLI: spawnCLI
+                onSpawnCLI: spawnCLI,
+                onNewProject: newProject
             )
         )
 

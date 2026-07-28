@@ -590,6 +590,9 @@ struct ContentView: View {
             },
             onSpawnCLI: {
                 NotificationCenter.default.post(name: .spawnCLIRequested, object: nil)
+            },
+            onNewProject: {
+                NotificationCenter.default.post(name: .projectCreationRequested, object: nil)
             }
         )
     }

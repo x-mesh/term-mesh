@@ -55,6 +55,11 @@ struct TermMeshApp: App {
     /// Phase 2.5 — initial mode for next sheet presentation ("new" or "resume").
     /// Reset to "new" each time the sheet closes so subsequent menu opens behave normally.
     @State private var teamCreationInitialMode: String = "new"
+    /// New Project sheet. Owned here rather than by the sidebar's Projects
+    /// header, because the titlebar's + opens the same sheet and is on screen
+    /// precisely when the sidebar is not.
+    @State private var showProjectCreation = false
+    @State private var projectCreationTabManager: TabManager?
     @State private var ghosttyTheme = GhosttyTheme.current
     // P0-5: Configure Watch sheet state (triggered via palette or sidebar notification)
     @State private var showWatchConfig = false
@@ -394,6 +399,19 @@ struct TermMeshApp: App {
                 teamCreationInitialMode = note.name == .openCreateTeamSheetInResumeMode ? "resume" : "new"
                 showTeamCreation = true
             }
+            .onReceive(NotificationCenter.default.publisher(for: .projectCreationRequested)) { _ in
+                // Same capture-before-the-sheet-steals-focus rule as the team
+                // sheet above: whichever window asked is the one the project
+                // has to open in.
+                if let kw = NSApp.keyWindow, let ctx = AppDelegate.shared?.contextForMainWindow(kw) {
+                    projectCreationTabManager = ctx.tabManager
+                } else if let mw = NSApp.mainWindow, let ctx = AppDelegate.shared?.contextForMainWindow(mw) {
+                    projectCreationTabManager = ctx.tabManager
+                } else {
+                    projectCreationTabManager = nil
+                }
+                showProjectCreation = true
+            }
             .onReceive(NotificationCenter.default.publisher(for: .spawnCLIRequested)) { _ in
                 Task { @MainActor in
                     await showSpawnCLIDialog()
@@ -426,6 +444,22 @@ struct TermMeshApp: App {
             }
             .sheet(isPresented: $showTeamCreation) {
                 makeTeamCreationView()
+            }
+            .sheet(isPresented: $showProjectCreation) {
+                let activeTabManager = projectCreationTabManager ?? tabManager
+                NewProjectView(
+                    onCreate: { name, directory, rows, source, leader in
+                        try await ProjectCreationFlow.create(
+                            name: name,
+                            directory: directory,
+                            rows: rows,
+                            source: source,
+                            leader: leader,
+                            tabManager: activeTabManager
+                        )
+                    },
+                    onClose: { showProjectCreation = false }
+                )
             }
             .sheet(isPresented: $showWatchConfig) {
                 WatchConfigSheet(
