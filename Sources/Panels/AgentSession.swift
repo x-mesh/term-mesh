@@ -330,19 +330,73 @@ final class AgentSession: ObservableObject {
     /// side reads its own header out of this; the session does not interpret it.
     var onTurnEnd: ((String, TurnEnd, String?) -> Void)?
 
-    /// Everything that reads a process stream is serialized here. In
-    /// particular, termination queues its final read behind every readiness
-    /// read, then hands the complete tail to the main actor before finishing.
-    private final class StreamResources {
+    /// Lifecycle state is confined to `queue`. `ioLock` protects FileHandle reads
+    /// against asynchronous close; MainActor never waits on either synchronization
+    /// primitive.
+    private final class StreamResources: @unchecked Sendable {
         let output: FileHandle
         let error: FileHandle
         let queue = DispatchQueue(label: "com.termmesh.agent-session.stream")
+
         /// Read and written only on `queue`.
         var closed = false
+        var stdoutEOF = false
+        var terminationStatus: Int32?
+        var finishScheduled = false
+
+        /// Protects FileHandle read/notification/close operations only.
+        private let ioLock = NSLock()
+        private var handlesClosed = false
 
         init(output: FileHandle, error: FileHandle) {
             self.output = output
             self.error = error
+        }
+
+        /// Called by a Foundation readability callback, never by `queue`.
+        /// The callback must enqueue its event before this method releases the
+        /// lock, so a later EOF callback cannot overtake an earlier data callback.
+        func withAvailableData(
+            _ handle: FileHandle,
+            enqueue: (Data) -> Void
+        ) {
+            ioLock.lock()
+            defer { ioLock.unlock() }
+            guard !handlesClosed else { return }
+            enqueue(handle.availableData)
+        }
+
+        func stopOutputNotifications() {
+            ioLock.lock()
+            output.readabilityHandler = nil
+            ioLock.unlock()
+        }
+
+        func stopErrorNotifications() {
+            ioLock.lock()
+            error.readabilityHandler = nil
+            ioLock.unlock()
+        }
+
+        /// Called asynchronously from `queue`, never synchronously by MainActor.
+        func closeHandles() {
+            ioLock.lock()
+            defer { ioLock.unlock() }
+            guard !handlesClosed else { return }
+            handlesClosed = true
+            output.readabilityHandler = nil
+            error.readabilityHandler = nil
+            try? output.close()
+            try? error.close()
+        }
+
+        /// Called only on `queue`. Whichever signal arrives second claims the one
+        /// permitted natural-finish dispatch.
+        func takeFinishCodeIfReady() -> Int32? {
+            guard !closed, stdoutEOF, !finishScheduled,
+                  let terminationStatus else { return nil }
+            finishScheduled = true
+            return terminationStatus
         }
     }
 
@@ -617,34 +671,50 @@ final class AgentSession: ObservableObject {
             error: err.fileHandleForReading
         )
 
-        streams.output.readabilityHandler = { [weak self, weak p, streams] _ in
-            streams.queue.async {
-                guard !streams.closed else { return }
-                let data = streams.output.availableData
-                guard !data.isEmpty else { return }
-                // All of these blocks originate on the one serial queue, so the
-                // final finish block below cannot overtake a preceding consume.
-                DispatchQueue.main.async { [weak self, weak p] in
-                    guard let self, let p, self.process === p else { return }
-                    self.consume(data)
+        streams.output.readabilityHandler = { [weak self, weak p, streams] handle in
+            // The callback is invoked for readable data or EOF. Do not move this read
+            // onto `streams.queue`: only completed read events belong on that queue.
+            streams.withAvailableData(handle) { data in
+                streams.queue.async {
+                    guard !streams.closed else { return }
+                    if !data.isEmpty {
+                        DispatchQueue.main.async { [weak self, weak p] in
+                            guard let self, let p, self.process === p else { return }
+                            self.consume(data)
+                        }
+                        return
+                    }
+
+                    // Empty availableData is FileHandle's EOF signal. All earlier
+                    // stdout events were enqueued under ioLock before this event.
+                    streams.stopOutputNotifications()
+                    streams.stdoutEOF = true
+                    guard let code = streams.takeFinishCodeIfReady() else { return }
+                    DispatchQueue.main.async { [weak self, weak p] in
+                        guard let self, let p, self.process === p else { return }
+                        self.finish(process: p, code: code)
+                    }
                 }
             }
         }
         // Kept separate rather than merged into stdout: a warning is not an
         // event, and folding it in would make the stream unparseable exactly
         // when something has gone wrong.
-        streams.error.readabilityHandler = { [weak self, weak p, streams] _ in
-            streams.queue.async {
-                guard !streams.closed else { return }
-                let data = streams.error.availableData
-                guard !data.isEmpty,
-                      let text = String(data: data, encoding: .utf8)?
-                          .trimmingCharacters(in: .whitespacesAndNewlines),
-                      !text.isEmpty
-                else { return }
-                DispatchQueue.main.async { [weak self, weak p] in
-                    guard let self, let p, self.process === p else { return }
-                    self.append(.notice(id: UUID(), AgentSession.withoutAnsi(text)))
+        streams.error.readabilityHandler = { [weak self, weak p, streams] handle in
+            streams.withAvailableData(handle) { data in
+                streams.queue.async {
+                    guard !streams.closed else { return }
+                    guard !data.isEmpty else {
+                        streams.stopErrorNotifications()
+                        return
+                    }
+                    guard let text = String(data: data, encoding: .utf8)?
+                            .trimmingCharacters(in: .whitespacesAndNewlines),
+                          !text.isEmpty else { return }
+                    DispatchQueue.main.async { [weak self, weak p] in
+                        guard let self, let p, self.process === p else { return }
+                        self.append(.notice(id: UUID(), AgentSession.withoutAnsi(text)))
+                    }
                 }
             }
         }
@@ -652,12 +722,13 @@ final class AgentSession: ObservableObject {
             let code = proc.terminationStatus
             streams.queue.async {
                 guard !streams.closed else { return }
-                // No new readiness callbacks are needed: the blocking read is
-                // now behind all callbacks already queued and drains through EOF.
-                streams.output.readabilityHandler = nil
-                let tail = streams.output.readDataToEndOfFile()
+                streams.terminationStatus = code
+                // Do not remove the stdout handler here. It remains responsible for
+                // draining all data and observing EOF, even after the parent exits.
+                guard let code = streams.takeFinishCodeIfReady() else { return }
                 DispatchQueue.main.async { [weak self] in
-                    self?.finish(process: proc, code: code, finalOutput: tail)
+                    guard let self, self.process === proc else { return }
+                    self.finish(process: proc, code: code)
                 }
             }
         }
@@ -690,12 +761,11 @@ final class AgentSession: ObservableObject {
     /// The sole natural-exit entry point. The stream queue has already drained
     /// stdout through EOF; its dispatches to the main queue are FIFO, so this
     /// block runs after every preceding `consume` from that process.
-    private func finish(process expected: Process, code: Int32, finalOutput: Data) {
+    private func finish(process expected: Process, code: Int32) {
         guard process === expected else { return }
         // A result frame normally starts the next queued turn. This process has
         // exited, so keep that queue intact for finishAfterDrain to report.
         isRunning = false
-        if !finalOutput.isEmpty { consume(finalOutput) }
         guard teardown(process: expected, terminate: false) else { return }
         finishAfterDrain(code: code)
     }
@@ -712,23 +782,28 @@ final class AgentSession: ObservableObject {
         expected.terminationHandler = nil
         if terminate, expected.isRunning { expected.terminate() }
 
-        if let streams = streamResources {
-            streams.queue.sync {
-                guard !streams.closed else { return }
-                streams.closed = true
-                streams.output.readabilityHandler = nil
-                streams.error.readabilityHandler = nil
-                try? streams.output.close()
-                try? streams.error.close()
-            }
-        }
-        try? stdin?.close()
+        let streams = streamResources
+        let input = stdin
+
+        // Revoke actor-owned identity first. Any already-dispatched data or finish from
+        // this process fails its `self.process === expected` guard after this point.
         stdin = nil
         streamResources = nil
         process = nil
         carry.removeAll()
         isRunning = false
         canInterrupt = false
+
+        // Closing our stdin descriptor is a local close, not a drain or wait.
+        try? input?.close()
+
+        // Never synchronously wait from MainActor for stream cleanup. This queue only
+        // processes completed Data/EOF events, so cleanup always makes progress.
+        streams?.queue.async {
+            guard let streams, !streams.closed else { return }
+            streams.closed = true
+            streams.closeHandles()
+        }
         return true
     }
 
@@ -1127,7 +1202,7 @@ final class AgentSession: ObservableObject {
         onTurnEnd?(final, end, answered)
 
         // The next leader turn only now, so it gets a turn of its own.
-        if isRunning, !queued.isEmpty {
+        if isRunning, process?.isRunning == true, !queued.isEmpty {
             let next = queued.removeFirst()
             try? write(next.text, from: .leader, taskId: next.taskId)
         }

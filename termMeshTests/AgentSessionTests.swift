@@ -718,6 +718,36 @@ final class AgentSessionTests: XCTestCase {
         XCTAssertEqual(answers, ["first", "second"])
     }
 
+    /// If a spawned process leaves a grandchild holding the write end of
+    /// stdout open, natural EOF never arrives. A blocking tail read on
+    /// termination would then wedge the stream queue, and a `stop()` that
+    /// synchronously waits on that queue would freeze MainActor forever.
+    func testStopDoesNotWaitForInheritedStdoutWriter() async {
+        let s = AgentSession()
+        s.start(.init(
+            executable: "/bin/sh",
+            arguments: ["-c", "trap '' HUP; sleep 5 & exec /usr/bin/true"],
+            workingDirectory: NSTemporaryDirectory(),
+            environment: ProcessInfo.processInfo.environment
+        ))
+
+        // The owned process has exited; its descendant still owns stdout.
+        try? await Task.sleep(nanoseconds: 250_000_000)
+        let began = Date()
+        s.stop()
+        XCTAssertLessThan(Date().timeIntervalSince(began), 0.5)
+        XCTAssertFalse(s.isRunning)
+
+        // Teardown stays idempotent and actor-visible restart is immediate.
+        s.stop()
+        s.openTurnForTesting(from: .person)
+        s.start(shortProcess(output: event([
+            "type": "result", "stop_reason": "end_turn", "result": "restarted",
+        ])))
+        let stopped = await waitUntil { !s.isRunning }
+        XCTAssertTrue(stopped)
+    }
+
     private func shortProcess(output: String) -> AgentSession.Launch {
         .init(
             executable: "/bin/echo", arguments: [output],
