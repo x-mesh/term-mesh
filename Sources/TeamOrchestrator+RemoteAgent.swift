@@ -1220,6 +1220,7 @@ extension TeamOrchestrator {
         panel.session.onTurnEnd = { [teamName = team.id, agentName, agentInstanceId] final, _, taskId in
             Self.fileReport(
                 teamName: teamName, agentName: agentName,
+                agentInstanceId: agentInstanceId,
                 taskId: taskId, text: final
             )
             guard let taskId else { return }

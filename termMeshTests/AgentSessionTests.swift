@@ -54,6 +54,49 @@ final class AgentSessionTests: XCTestCase {
         XCTAssertTrue(directive.contains("canonical Leader Parallel Routing Policy"))
     }
 
+    /// Two same-named instances used to both write `<agent>-reply.md`,
+    /// silently losing whichever one finished first.
+    func testFileReportWritesPerInstanceAliasWhenInstanceIDIsKnown() {
+        let team = "fileReport-test-\(UUID().uuidString.prefix(8))"
+        let dir = URL(fileURLWithPath: NSHomeDirectory())
+            .appendingPathComponent(".term-mesh/results", isDirectory: true)
+            .appendingPathComponent(team, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+
+        TeamOrchestrator.fileReport(teamName: team, agentName: "reviewer",
+                                     agentInstanceId: "inst-1", taskId: nil, text: "first")
+        TeamOrchestrator.fileReport(teamName: team, agentName: "reviewer",
+                                     agentInstanceId: "inst-2", taskId: nil, text: "second")
+
+        let first = try? String(contentsOf: dir.appendingPathComponent("reviewer-inst-1-reply.md"), encoding: .utf8)
+        let second = try? String(contentsOf: dir.appendingPathComponent("reviewer-inst-2-reply.md"), encoding: .utf8)
+        XCTAssertEqual(first, "first")
+        XCTAssertEqual(second, "second")
+
+        let nameOnlyExists = FileManager.default.fileExists(
+            atPath: dir.appendingPathComponent("reviewer-reply.md").path)
+        XCTAssertFalse(nameOnlyExists,
+                       "an instance-identified report must not also write the collidable name-only file")
+    }
+
+    /// The name-only file remains the legacy path for an agent with no
+    /// instance ID to disambiguate — nothing else writes there to collide.
+    func testFileReportFallsBackToNameOnlyWithoutAnInstanceID() {
+        let team = "fileReport-test-\(UUID().uuidString.prefix(8))"
+        let dir = URL(fileURLWithPath: NSHomeDirectory())
+            .appendingPathComponent(".term-mesh/results", isDirectory: true)
+            .appendingPathComponent(team, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+
+        TeamOrchestrator.fileReport(teamName: team, agentName: "solo",
+                                     taskId: "task-123", text: "legacy")
+
+        let legacy = try? String(contentsOf: dir.appendingPathComponent("solo-reply.md"), encoding: .utf8)
+        let task = try? String(contentsOf: dir.appendingPathComponent("task-123.md"), encoding: .utf8)
+        XCTAssertEqual(legacy, "legacy")
+        XCTAssertEqual(task, "legacy")
+    }
+
     private func agentMember(name: String = "executor") -> TeamOrchestrator.AgentMember {
         TeamOrchestrator.AgentMember(
             id: "\(name)@identity-test",
