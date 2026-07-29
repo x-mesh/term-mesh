@@ -921,6 +921,12 @@ final class ReviewBoardCoordinatorService: ObservableObject {
     /// budget is measured against, so rebuilding it every refresh would reset
     /// the budget to zero every two seconds.
     private var cachedAutoPilotRunner: AutoPilotRunner?
+    /// Built once for the same reason: the runner refuses to start a second
+    /// merge for a queue item it is already merging, and that set lives on the
+    /// instance. A fresh runner per pass made the guard span one pass — which
+    /// is precisely the case it exists for, since two refreshes can both read
+    /// the entry as `queued` before either has reported it `running`.
+    private var cachedMergeRunner: ReviewBoardMergeRunner?
     /// Hosts the coordinator remembers, live or not. Empty whenever the
     /// integration is off, so every consumer degrades to peer-roster-only.
     @Published private(set) var knownHosts: [CoordinatorKnownHost] = []
@@ -1005,6 +1011,10 @@ final class ReviewBoardCoordinatorService: ObservableObject {
     func stop() {
         refreshTask?.cancel()
         refreshTask = nil
+        // `live(coordinator:)` reports back through a strong reference to this
+        // service, so holding the runner holds a cycle. Nothing merges after a
+        // stop anyway, and the next start builds a fresh one.
+        cachedMergeRunner = nil
         eventRefreshWorkItem?.cancel()
         eventRefreshWorkItem = nil
         hostObservationCancellable?.cancel()
@@ -1359,6 +1369,10 @@ final class ReviewBoardCoordinatorService: ObservableObject {
             let placementInputs = next.coordinatorOnline
                 ? try? await client.fetchPlacementInputs()
                 : nil
+            // Superseded by a newer refresh. Nothing below observed cancellation
+            // before, so a cancelled read still published its stale snapshot over
+            // the fresh one and then ran placement and auto pilot a second time.
+            if Task.isCancelled { return }
             await MainActor.run {
                 self?.snapshot = next
                 if let hosts { self?.knownHosts = hosts }
@@ -1371,15 +1385,17 @@ final class ReviewBoardCoordinatorService: ObservableObject {
             // has not been carried out yet. Riding the refresh rather than the
             // event stream is what makes a dropped frame or a reconnect cost
             // nothing: the next read sees the same placement still waiting.
+            // Unless a newer refresh already owns that job.
+            if Task.isCancelled { return }
             if let placementInputs {
                 await Self.placeUnplacedTasks(placementInputs.rows, client: client)
                 await self?.dispatchPlacements(placementInputs, client: client)
             }
-            // Auto pilot rides the same refresh for the same reason: a decision
-            // it declines this time it will reconsider on the next read, so a
-            // dropped event costs a beat rather than a stall. It is a no-op
-            // while the toggle is off.
-            await self?.runAutoPilot()
+            // Approving and merging ride the same refresh: a decision declined
+            // this time is reconsidered on the next read, so a dropped event
+            // costs a beat rather than a stall.
+            if Task.isCancelled { return }
+            await self?.advanceApprovedWork()
         }
     }
 
@@ -1390,25 +1406,34 @@ final class ReviewBoardCoordinatorService: ObservableObject {
     /// One pass, in that order, on the refresh — approving and then waiting a
     /// whole cycle to merge would make every automatic landing take two beats
     /// for no reason.
-    private func runAutoPilot() async {
+    ///
+    /// Only the *approving* half is auto pilot's, and only that half is behind
+    /// the toggle. Draining the queue is not: a person's click puts a row there
+    /// too, and nothing else in the app runs `worktree finish`. With the whole
+    /// method gated — and the toggle off by default — a human approval moved the
+    /// task to `queued_for_merge` and then sat on the board forever, merged by
+    /// nobody.
+    private func advanceApprovedWork() async {
         let policy = AutoPilotPolicy.load()
-        guard policy.isEnabled else { return }
 
-        let tasks = await MainActor.run { self.snapshot.tasks }
-        guard !tasks.isEmpty else { return }
-
-        let runner = autoPilotRunner()
-        let outcomes = await runner.sweep(tasks)
         // Which of the entries about to be merged auto pilot put there itself.
         // The queue does not record it — an automatic approval and a person's
         // are both stamped with the same user — and the two are held to
         // different rules below, so it is carried across from the sweep that
-        // made them.
-        let autoApproved = Set(outcomes.filter(\.approved).map(\.taskID))
-        if !autoApproved.isEmpty {
-            // The approvals just made are what the merge step looks at, and
-            // the snapshot in hand predates them.
-            await MainActor.run { self.refresh() }
+        // made them. Empty when auto pilot is off, which is what makes every
+        // queued entry a person's decision and lands it on its own parent.
+        var autoApproved: Set<String> = []
+        if policy.isEnabled {
+            let tasks = await MainActor.run { self.snapshot.tasks }
+            if !tasks.isEmpty {
+                let outcomes = await autoPilotRunner().sweep(tasks)
+                autoApproved = Set(outcomes.filter(\.approved).map(\.taskID))
+                if !autoApproved.isEmpty {
+                    // The approvals just made are what the merge step looks at,
+                    // and the snapshot in hand predates them.
+                    await MainActor.run { self.refresh() }
+                }
+            }
         }
         await mergeApprovedWork(policy: policy, autoApprovedTaskIDs: autoApproved)
     }
@@ -1439,6 +1464,17 @@ final class ReviewBoardCoordinatorService: ObservableObject {
         return runner
     }
 
+    /// The one merge runner, or nil when git-kit is not installed.
+    ///
+    /// Nil is not cached: git-kit can be installed while the app is running,
+    /// and remembering its absence would need a restart to notice.
+    private func mergeRunner() -> ReviewBoardMergeRunner? {
+        if let existing = cachedMergeRunner { return existing }
+        guard let runner = ReviewBoardMergeRunner.live(coordinator: self) else { return nil }
+        cachedMergeRunner = runner
+        return runner
+    }
+
     /// Merge what the queue is holding, recording where each branch stood
     /// first. The undo point is written before the merge because a merge that
     /// fails halfway is exactly when it is needed, and by then the target
@@ -1457,8 +1493,8 @@ final class ReviewBoardCoordinatorService: ObservableObject {
             (self.snapshot.mergeQueue.filter { $0.status == "queued" }, self.snapshot.tasks)
         }
         guard !queue.isEmpty else { return }
-        guard let merger = ReviewBoardMergeRunner.live(coordinator: self) else {
-            RemoteWorkLog.info("Auto pilot cannot merge: git-kit was not found.")
+        guard let merger = mergeRunner() else {
+            RemoteWorkLog.info("Approved work cannot be merged: git-kit was not found.")
             return
         }
 
