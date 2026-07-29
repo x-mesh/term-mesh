@@ -29,6 +29,7 @@ public final class DebugEventLog: @unchecked Sendable {
 
     private var fileHandle: FileHandle?
     private var flushTimer: DispatchSourceTimer?
+    private let outputPath: String
 
     // MARK: - Circuit breaker
     private enum CircuitState { case closed, open }
@@ -51,25 +52,45 @@ public final class DebugEventLog: @unchecked Sendable {
 
     // MARK: - Init
 
-    private init() {
+    init(outputPath: String = DebugEventLog.logPath, startsTimer: Bool = true) {
+        self.outputPath = outputPath
         ring = Array(repeating: "", count: ringCapacity)
         queue.async { [weak self] in
             self?.setupFileHandle()
-            self?.setupFlushTimer()
+            if startsTimer {
+                self?.setupFlushTimer()
+            }
         }
     }
 
     // MARK: - File setup
 
     private func setupFileHandle() {
-        let path = Self.logPath
-        if !FileManager.default.fileExists(atPath: path) {
-            FileManager.default.createFile(atPath: path, contents: nil)
+        closeFileHandle()
+
+        let url = URL(fileURLWithPath: outputPath)
+        let manager = FileManager.default
+        try? manager.createDirectory(
+            at: url.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        if !manager.fileExists(atPath: outputPath) {
+            manager.createFile(atPath: outputPath, contents: nil)
         }
-        if let handle = FileHandle(forWritingAtPath: path) {
-            handle.seekToEndOfFile()
+
+        do {
+            let handle = try FileHandle(forWritingTo: url)
+            try handle.seekToEnd()
             fileHandle = handle
+        } catch {
+            fileHandle = nil
         }
+    }
+
+    private func closeFileHandle() {
+        guard let handle = fileHandle else { return }
+        fileHandle = nil
+        try? handle.close()
     }
 
     private func setupFlushTimer() {
@@ -98,7 +119,7 @@ public final class DebugEventLog: @unchecked Sendable {
         queue.async {
             self.flushToFile()
             let content = self.ringEntries().joined(separator: "\n") + "\n"
-            try? content.write(toFile: Self.logPath, atomically: true, encoding: .utf8)
+            try? content.write(toFile: self.outputPath, atomically: true, encoding: .utf8)
             // `atomically: true` writes a temp file and renames it into place, so
             // the path now names a new inode while our persistent handle still
             // holds the old, unlinked one. Appends kept succeeding but landed in
@@ -107,8 +128,7 @@ public final class DebugEventLog: @unchecked Sendable {
             // flushToFile only re-opens when the handle is nil, and this one is
             // very much alive, so it cannot recover on its own. Re-point it at
             // the file that now exists. (rotateIfNeeded already does this.)
-            self.fileHandle?.closeFile()
-            self.fileHandle = nil
+            self.closeFileHandle()
             self.setupFileHandle()
         }
     }
@@ -206,20 +226,36 @@ public final class DebugEventLog: @unchecked Sendable {
 
         guard !pendingWrites.isEmpty else { return }
 
-        let lines = pendingWrites
-        pendingWrites.removeAll(keepingCapacity: true)
-
-        let combined = lines.joined(separator: "\n") + "\n"
+        let combined = pendingWrites.joined(separator: "\n") + "\n"
         guard let data = combined.data(using: .utf8), !data.isEmpty else { return }
 
         rotateIfNeeded()
-
-        guard let handle = fileHandle else {
-            setupFileHandle()
-            fileHandle?.write(data)
-            return
+        if writeToFile(data) {
+            pendingWrites.removeAll(keepingCapacity: true)
         }
-        handle.write(data)
+    }
+
+    /// Foundation's legacy `write(_:)` bridges to `-[NSFileHandle writeData:]`,
+    /// which raises an Objective-C exception for an invalid/closed descriptor
+    /// and terminates Swift before `try?` can help. The modern throwing API
+    /// lets us discard the stale handle, reopen the path and retry once.
+    private func writeToFile(_ data: Data) -> Bool {
+        for attempt in 0..<2 {
+            if fileHandle == nil {
+                setupFileHandle()
+            }
+            guard let handle = fileHandle else { return false }
+            do {
+                try handle.write(contentsOf: data)
+                return true
+            } catch {
+                closeFileHandle()
+                if attempt == 0 {
+                    continue
+                }
+            }
+        }
+        return false
     }
 
     /// Rotate file when it exceeds `maxFileSizeBytes`. Must be called on `queue`.
@@ -228,19 +264,34 @@ public final class DebugEventLog: @unchecked Sendable {
             setupFileHandle()
             return
         }
-        let currentSize = handle.seekToEndOfFile()
+        let currentSize: UInt64
+        do {
+            currentSize = try handle.seekToEnd()
+        } catch {
+            closeFileHandle()
+            setupFileHandle()
+            return
+        }
         guard currentSize > maxFileSizeBytes else { return }
 
-        handle.closeFile()
-        fileHandle = nil
+        closeFileHandle()
 
-        let path = Self.logPath
-        let rotatePath = path + ".1"
+        let rotatePath = outputPath + ".1"
         try? FileManager.default.removeItem(atPath: rotatePath)
-        try? FileManager.default.moveItem(atPath: path, toPath: rotatePath)
-        FileManager.default.createFile(atPath: path, contents: nil)
-        if let newHandle = FileHandle(forWritingAtPath: path) {
-            fileHandle = newHandle
+        try? FileManager.default.moveItem(atPath: outputPath, toPath: rotatePath)
+        setupFileHandle()
+    }
+
+    func flushForTesting() {
+        queue.sync {
+            flushToFile()
+        }
+    }
+
+    func invalidateFileHandleForTesting() {
+        queue.sync {
+            try? fileHandle?.close()
+            // Intentionally retain the closed object to reproduce the crash.
         }
     }
 

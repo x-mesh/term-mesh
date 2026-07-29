@@ -4,6 +4,31 @@ import AppKit
 import SwiftUI
 
 final class BonsplitTests: XCTestCase {
+#if DEBUG
+    func testDebugEventLogReopensAClosedFileHandleInsteadOfCrashing() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("DebugEventLogTests-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(
+            at: directory,
+            withIntermediateDirectories: true
+        )
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let logURL = directory.appendingPathComponent("events.log")
+        let log = DebugEventLog(outputPath: logURL.path, startsTimer: false)
+
+        log.log("before invalidation")
+        log.flushForTesting()
+        log.invalidateFileHandleForTesting()
+        log.log("after invalidation")
+        log.flushForTesting()
+
+        let contents = try String(contentsOf: logURL, encoding: .utf8)
+        XCTAssertTrue(contents.contains("before invalidation"))
+        XCTAssertTrue(contents.contains("after invalidation"))
+    }
+#endif
+
     @MainActor
     private final class LayoutProbeView: NSView {
         private(set) var sizeChangeCount = 0
