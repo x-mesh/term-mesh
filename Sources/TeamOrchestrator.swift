@@ -143,6 +143,14 @@ final class TeamOrchestrator: ObservableObject {
         /// until the explicit Delete Project action; ordinary pane/workspace
         /// close only detaches viewers and never removes them.
         var remoteProjectLocations: [RemoteProjectLocation] = []
+        /// New Project keeps terminal-backed peer members out of the host's
+        /// default/relay workspace. Generic ad-hoc teams preserve the existing
+        /// placement behavior.
+        var usesDedicatedRemoteWorkspaces: Bool = false
+        /// Host key → peer workspace id created for this project. This is
+        /// runtime ownership state: a project deletion removes these
+        /// workspaces after its attached surfaces have been closed.
+        var remoteWorkspaceIDs: [String: Data] = [:]
     }
 
     struct AgentPaneIdentity: Equatable {
@@ -172,6 +180,14 @@ final class TeamOrchestrator: ObservableObject {
         locations: [Team.RemoteProjectLocation]
     ) {
         teams[teamName]?.remoteProjectLocations = locations
+    }
+
+    func configureDedicatedRemoteWorkspaces(teamName: String, enabled: Bool) {
+        teams[teamName]?.usesDedicatedRemoteWorkspaces = enabled
+    }
+
+    func recordRemoteWorkspaceID(teamName: String, hostKey: String, workspaceID: Data) {
+        teams[teamName]?.remoteWorkspaceIDs[hostKey] = workspaceID
     }
 
     /// Install the remote pane that replaced the pending leader anchor. Kept

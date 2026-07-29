@@ -45,6 +45,7 @@ extension TeamOrchestrator {
         case duplicateName(String)
         case cliUnavailable(String, String)
         case promptStagingFailed(String)
+        case projectWorkspaceUnavailable(String)
         case partialShellClose(closed: Int, failed: Int, reason: String)
 
         var description: String {
@@ -61,15 +62,126 @@ extension TeamOrchestrator {
                 return "\(cli) is not installed on \(host)"
             case .promptStagingFailed(let host):
                 return "could not stage the leader prompt on \(host)"
+            case .projectWorkspaceUnavailable(let host):
+                return "could not prepare the project workspace on \(host)"
             case .partialShellClose(let closed, let failed, let reason):
                 return "closed \(closed) shell(s); \(failed) refused — \(reason)"
             }
         }
     }
 
-    func inspectPeerShells(host: HostEntry) async throws -> [PeerShellCleanupItem] {
+    private struct RemoteSurfacePlacement {
+        let sourceID: Data
+        let isDedicated: Bool
+        /// A dedicated workspace's first shell is guaranteed to be clean, so
+        /// the first project member can consume it directly. Later members
+        /// split an existing project surface and stay in the same workspace.
+        let useSourceDirectly: Bool
+    }
+
+    static func remoteProjectWorkspaceTitle(teamName: String) -> String {
+        let singleLine = teamName
+            .replacingOccurrences(of: "\n", with: " ")
+            .replacingOccurrences(of: "\r", with: " ")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return "Project · \(String(singleLine.prefix(72)))"
+    }
+
+    private func remoteSurfacePlacement(
+        teamName: String,
+        host: HostEntry,
+        fallbackSourceID: Data?
+    ) async throws -> RemoteSurfacePlacement? {
+        guard let team = teams[teamName],
+              team.usesDedicatedRemoteWorkspaces
+        else {
+            return fallbackSourceID.map {
+                RemoteSurfacePlacement(
+                    sourceID: $0,
+                    isDedicated: false,
+                    useSourceDirectly: false
+                )
+            }
+        }
+        guard !host.activeSockPath.isEmpty else {
+            throw RemoteAgentError.hostNotConnected(host.displayName)
+        }
+
+        let connection = try await PeerRelaySession.connect(hostSockPath: host.activeSockPath)
+        guard connection.hostCapabilities.has(PeerCapability.workspaceLifecycleV1) else {
+            await connection.cancel()
+            return fallbackSourceID.map {
+                RemoteSurfacePlacement(
+                    sourceID: $0,
+                    isDedicated: false,
+                    useSourceDirectly: false
+                )
+            }
+        }
+        do {
+            var workspaceID = team.remoteWorkspaceIDs[host.id]
+            var createdWorkspace = false
+            if workspaceID == nil {
+                workspaceID = try await connection.session.createWorkspace(
+                    title: Self.remoteProjectWorkspaceTitle(teamName: teamName)
+                )
+                createdWorkspace = true
+                if let workspaceID {
+                    recordRemoteWorkspaceID(
+                        teamName: teamName,
+                        hostKey: host.id,
+                        workspaceID: workspaceID
+                    )
+                }
+            }
+            guard let workspaceID else {
+                await connection.cancel()
+                throw RemoteAgentError.projectWorkspaceUnavailable(host.displayName)
+            }
+
+            let managedIDs = Set(
+                ManagedPeerSurfaceStore.shared.records(hostKey: host.id)
+                    .filter { $0.teamName == teamName }
+                    .compactMap(\.surfaceID)
+            )
+            var requestedSeed = false
+            for _ in 0..<15 {
+                let workspaces = try await connection.session.listWorkspaces()
+                if let workspace = workspaces.first(where: { $0.workspaceID == workspaceID }),
+                   let sourceID = peerPaneSummaries(workspace.hasLayout ? workspace.layout : nil)
+                    .map(\.id)
+                    .first {
+                    let hasManagedProjectSurface = managedIDs.contains(sourceID)
+                    await connection.cancel()
+                    return RemoteSurfacePlacement(
+                        sourceID: sourceID,
+                        isDedicated: true,
+                        useSourceDirectly: createdWorkspace || !hasManagedProjectSurface
+                    )
+                }
+                if !requestedSeed {
+                    try await connection.session.requestNewTab(workspaceID: workspaceID)
+                    requestedSeed = true
+                }
+                try await Task.sleep(nanoseconds: 200_000_000)
+            }
+            await connection.cancel()
+            throw RemoteAgentError.projectWorkspaceUnavailable(host.displayName)
+        } catch {
+            await connection.cancel()
+            throw error
+        }
+    }
+
+    func inspectPeerShells(
+        host: HostEntry,
+        workspaceID: Data? = nil
+    ) async throws -> [PeerShellCleanupItem] {
+        let workspaces = workspaceID.map { id in
+            host.workspaces.filter { $0.id == id }
+        } ?? host.workspaces
         let panes = Dictionary(
-            host.workspaces.flatMap(\.panes).map { ($0.id, $0) },
+            workspaces.flatMap(\.panes).map { ($0.id, $0) },
             uniquingKeysWith: { first, _ in first }
         )
         let claimed = claimedRemoteSurfaceIDs(host: host)
@@ -348,12 +460,24 @@ extension TeamOrchestrator {
             // Reserve a fresh shell exactly as remote agents do. Falling back
             // to an existing surface would recreate the credential leak this
             // path is preventing, so an old/full host must fail visibly.
-            guard let source = surfaces.first?.surfaceID,
-                  let chosen = try await PeerPaneSession.spawnSurface(
-                      on: lease,
-                      splitting: source
-                  )
-            else {
+            guard let placement = try await remoteSurfacePlacement(
+                teamName: teamName,
+                host: host,
+                fallbackSourceID: surfaces.first?.surfaceID
+            ) else {
+                throw RemoteAgentError.noFreshSurface(host.displayName)
+            }
+            let chosen: Termmesh_Peer_V1_SurfaceInfo?
+            if placement.useSourceDirectly {
+                let refreshed = try await PeerPaneSession.listSurfaces(on: lease)
+                chosen = refreshed.first { $0.surfaceID == placement.sourceID }
+            } else {
+                chosen = try await PeerPaneSession.spawnSurface(
+                    on: lease,
+                    splitting: placement.sourceID
+                )
+            }
+            guard let chosen else {
                 throw RemoteAgentError.noFreshSurface(host.displayName)
             }
             spawnedSurfaceID = chosen.surfaceID
@@ -761,18 +885,38 @@ extension TeamOrchestrator {
                     .filter { $0.hostKey == hostKey }
                     .compactMap(\.remoteSurfaceID)
             )
-            // The fallback for a host that will not spawn — an older one, or
-            // one at its ceiling: a surface nobody here holds is the best
-            // guess left, and a guess is all it is.
-            var chosen = surfaces.first { $0.attachable && !taken.contains($0.surfaceID) }
-            if let source = surfaces.first?.surfaceID,
-               let fresh = try await PeerPaneSession.spawnSurface(on: lease, splitting: source) {
-                chosen = fresh
+            let remotePlacement = try await remoteSurfacePlacement(
+                teamName: teamName,
+                host: host,
+                fallbackSourceID: surfaces.first?.surfaceID
+            )
+            let usesDedicatedWorkspace = remotePlacement?.isDedicated == true
+
+            // Legacy/generic teams retain the best-effort free-surface
+            // fallback. New Project is stricter: taking an arbitrary host
+            // surface would put the member back under relay/default, exactly
+            // the mixing the dedicated workspace exists to prevent.
+            var chosen = usesDedicatedWorkspace
+                ? nil
+                : surfaces.first { $0.attachable && !taken.contains($0.surfaceID) }
+            if let remotePlacement {
+                if remotePlacement.useSourceDirectly {
+                    let refreshed = try await PeerPaneSession.listSurfaces(on: lease)
+                    chosen = refreshed.first { $0.surfaceID == remotePlacement.sourceID }
+                } else if let fresh = try await PeerPaneSession.spawnSurface(
+                    on: lease,
+                    splitting: remotePlacement.sourceID
+                ) {
+                    chosen = fresh
+                }
+            }
+            if let chosen,
+               usesDedicatedWorkspace || !surfaces.contains(where: { $0.surfaceID == chosen.surfaceID }) {
                 spawnedSurface = true
-                spawnedSurfaceID = fresh.surfaceID
+                spawnedSurfaceID = chosen.surfaceID
                 ManagedPeerSurfaceStore.shared.remember(
                     hostKey: hostKey,
-                    surfaceID: fresh.surfaceID,
+                    surfaceID: chosen.surfaceID,
                     teamName: teamName,
                     role: agentName,
                     workingDirectory: workingDirectory
@@ -1358,6 +1502,8 @@ extension TeamOrchestrator {
         ) else { return nil }
 
         if let projectSource {
+            team.usesDedicatedRemoteWorkspaces = true
+            configureDedicatedRemoteWorkspaces(teamName: team.id, enabled: true)
             var locations: Set<Team.RemoteProjectLocation> = []
             if let hostKey = projectSource.hostKey {
                 locations.insert(.init(hostKey: hostKey, path: projectSource.projectPath))
@@ -1496,6 +1642,20 @@ extension TeamOrchestrator {
                 hostKey: remote.hostKey,
                 surfaceID: remote.surfaceID
             )
+        }
+
+        // The project owns these peer workspaces. Removing the project should
+        // remove their now-detached shell containers too; relay/default and
+        // user-created workspaces are never included in this map.
+        for (hostKey, workspaceID) in team.remoteWorkspaceIDs {
+            guard let host = RemoteHostStore.shared.sortedHosts.first(where: { $0.id == hostKey }),
+                  !host.activeSockPath.isEmpty
+            else { continue }
+            let connection = try await PeerRelaySession.connect(
+                hostSockPath: host.activeSockPath
+            )
+            try await connection.session.deleteWorkspace(workspaceID: workspaceID)
+            await connection.cancel()
         }
 
         try await Task.sleep(nanoseconds: 500_000_000)

@@ -735,6 +735,24 @@ final class PeerProjectBootstrapTests: XCTestCase {
         )
     }
 
+    @MainActor
+    func test_remote_project_workspace_title_is_distinct_and_single_line() {
+        XCTAssertEqual(
+            TeamOrchestrator.remoteProjectWorkspaceTitle(teamName: "term-mesh"),
+            "Project · term-mesh"
+        )
+        XCTAssertEqual(
+            TeamOrchestrator.remoteProjectWorkspaceTitle(teamName: "line one\nline two"),
+            "Project · line one line two"
+        )
+        XCTAssertLessThanOrEqual(
+            TeamOrchestrator.remoteProjectWorkspaceTitle(
+                teamName: String(repeating: "x", count: 100)
+            ).count,
+            "Project · ".count + 72
+        )
+    }
+
     func test_direct_local_peer_endpoint_is_rejected_before_attach() {
         let defaults = UserDefaults.standard
         let old = defaults.object(forKey: PeerFederationSettings.socketPathKey)

@@ -1998,6 +1998,7 @@ private struct SidebarProjectLocalRowView: View {
 
 private struct PeerShellCleanupSheet: View {
     let hostName: String
+    var scopeName: String? = nil
     let items: [TeamOrchestrator.PeerShellCleanupItem]
     let isLoading: Bool
     let error: String?
@@ -2007,14 +2008,13 @@ private struct PeerShellCleanupSheet: View {
     @Environment(\.dismiss) private var dismiss
 
     private var closeableCount: Int {
-        items.filter { $0.state != .inUse }.count
+        items.filter { $0.state != .inUse && !$0.isBusy }.count
     }
 
-    /// Every shell the host would actually close. `inUse` is excluded because
-    /// `closePeerShells` subtracts the claimed set anyway — selecting one would
-    /// inflate the button's count with work that never happens.
+    /// Running and claimed panes are never bulk-close candidates. A person can
+    /// stop the process first and refresh; the cleanup flow itself stays safe.
     private var closeableIDs: Set<Data> {
-        Set(items.filter { $0.state != .inUse }.map(\.id))
+        Set(items.filter { $0.state != .inUse && !$0.isBusy }.map(\.id))
     }
 
     private var allCloseableSelected: Bool {
@@ -2025,9 +2025,9 @@ private struct PeerShellCleanupSheet: View {
         VStack(alignment: .leading, spacing: 14) {
             HStack {
                 VStack(alignment: .leading, spacing: 3) {
-                    Text("Manage Project Shells")
+                    Text("Clean Up Panes")
                         .font(.headline)
-                    Text(hostName)
+                    Text([hostName, scopeName].compactMap { $0 }.joined(separator: " · "))
                         .font(.caption)
                         .foregroundColor(.secondary)
                 }
@@ -2038,7 +2038,7 @@ private struct PeerShellCleanupSheet: View {
                 }
             }
 
-            Text("Tracked shells are protected. Orphans and shells whose folder was deleted are selected automatically. Busy shells require an explicit selection — Select All counts as one.")
+            Text("Orphans and panes whose folder was deleted are selected automatically. Panes in use or running a command are always protected.")
                 .font(.caption)
                 .foregroundColor(.secondary)
 
@@ -2080,7 +2080,7 @@ private struct PeerShellCleanupSheet: View {
                         }
                     ))
                     .labelsHidden()
-                    .disabled(item.state == .inUse)
+                    .disabled(item.state == .inUse || item.isBusy)
 
                     VStack(alignment: .leading, spacing: 3) {
                         HStack(spacing: 6) {
@@ -2110,14 +2110,14 @@ private struct PeerShellCleanupSheet: View {
             .frame(minHeight: 300)
 
             HStack {
-                Text("\(items.count) shells · \(closeableCount) manageable")
+                Text("\(items.count) panes · \(closeableCount) safe to close")
                     .font(.caption)
                     .foregroundColor(.secondary)
                 Spacer()
                 Button("Refresh", action: onRefresh)
                     .disabled(isLoading)
                 Button("Cancel") { dismiss() }
-                Button("Close \(selection.count) Shells", role: .destructive, action: onClose)
+                Button("Close \(selection.count) Panes", role: .destructive, action: onClose)
                     .disabled(selection.isEmpty || isLoading)
             }
         }
@@ -2386,6 +2386,21 @@ struct RemoteHostGroupView: View {
             .accessibilityLabel(isExpanded ? "Collapse \(host.displayName)" : "Expand \(host.displayName)")
             .help(isExpanded ? "Collapse \(host.displayName)" : "Expand \(host.displayName)")
 
+            if host.isConnected {
+                Button {
+                    showShellCleanup = true
+                    Task { await loadShellCleanup() }
+                } label: {
+                    Image(systemName: "eraser")
+                        .font(.system(size: 8, weight: .semibold))
+                        .foregroundColor(.secondary)
+                        .frame(width: 16, height: 16)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .help("Clean Up Panes…")
+            }
+
             if host.isConnected, host.supportsWorkspaceLifecycle == true {
                 Button {
                     newWorkspaceTitle = ""
@@ -2423,7 +2438,7 @@ struct RemoteHostGroupView: View {
                 Button("Open Surface as Pane…") {
                     store.openSurfaceAsPane(host)
                 }
-                Button("Manage Project Shells…") {
+                Button("Clean Up Panes…") {
                     Task { @MainActor in
                         try? await Task.sleep(nanoseconds: 50_000_000)
                         showShellCleanup = true
@@ -2661,6 +2676,11 @@ struct RemoteWorkspaceRowView: View {
     @State private var isRenaming = false
     @State private var renameTitle = ""
     @State private var showDeleteConfirm = false
+    @State private var showShellCleanup = false
+    @State private var shellCleanupItems: [TeamOrchestrator.PeerShellCleanupItem] = []
+    @State private var shellCleanupSelection = Set<Data>()
+    @State private var shellCleanupLoading = false
+    @State private var shellCleanupError: String?
     @State private var panesExpanded = false
     @State private var manuallyCollapsedWhileSelected = false
     @FocusState private var renameFieldFocused: Bool
@@ -3061,6 +3081,10 @@ struct RemoteWorkspaceRowView: View {
             // live, users read the near-identical workspace as a broken
             // mirror. The code path stays for a future, clearer surface.
             Divider()
+            Button("Clean Up Panes…") {
+                showShellCleanup = true
+                Task { await loadShellCleanup() }
+            }
             // Rename opens Finder-style inline edit (no modal). Always
             // shown, disabled when the host hasn't negotiated
             // workspace.lifecycle.v1 — keeps the menu shape stable.
@@ -3110,5 +3134,65 @@ struct RemoteWorkspaceRowView: View {
                  ? "All panes on the host for this workspace are closed. This is the default workspace — another one is promoted in its place."
                  : "All panes on the host for this workspace are closed.")
         }
+        .sheet(isPresented: $showShellCleanup) {
+            PeerShellCleanupSheet(
+                hostName: host.displayName,
+                scopeName: workspace.title,
+                items: shellCleanupItems,
+                isLoading: shellCleanupLoading,
+                error: shellCleanupError,
+                selection: $shellCleanupSelection,
+                onRefresh: {
+                    Task { await loadShellCleanup() }
+                },
+                onClose: {
+                    Task { await closeSelectedShells() }
+                }
+            )
+        }
+    }
+
+    @MainActor
+    private func loadShellCleanup() async {
+        shellCleanupLoading = true
+        shellCleanupError = nil
+        do {
+            let items = try await TeamOrchestrator.shared.inspectPeerShells(
+                host: host,
+                workspaceID: workspace.id
+            )
+            shellCleanupItems = items
+            shellCleanupSelection = Set(items.compactMap { item in
+                guard !item.isBusy else { return nil }
+                switch item.state {
+                case .managedOrphan, .missingDirectory: return item.id
+                case .inUse, .unclaimed: return nil
+                }
+            })
+        } catch {
+            shellCleanupItems = []
+            shellCleanupSelection = []
+            shellCleanupError = String(describing: error)
+        }
+        shellCleanupLoading = false
+    }
+
+    @MainActor
+    private func closeSelectedShells() async {
+        shellCleanupLoading = true
+        shellCleanupError = nil
+        do {
+            _ = try await TeamOrchestrator.shared.closePeerShells(
+                host: host,
+                surfaceIDs: shellCleanupSelection
+            )
+            shellCleanupItems.removeAll { shellCleanupSelection.contains($0.id) }
+            shellCleanupSelection = []
+        } catch {
+            let message = String(describing: error)
+            await loadShellCleanup()
+            shellCleanupError = message
+        }
+        shellCleanupLoading = false
     }
 }
