@@ -5823,7 +5823,7 @@ class TerminalController {
 /// running the CLI command and clicking Approve in the same second can't
 /// double-finish a worktree), same dirty-worktree guard, same `git-kit wt
 /// finish` contract. See docs/design/mission-control-approval-queue.md §6.4.
-private enum WorktreeApprovalHelper {
+enum WorktreeApprovalHelper {
     enum Outcome {
         case success(mode: String?, removed: Bool?)
         case failure(String)
@@ -5925,7 +5925,7 @@ private enum WorktreeApprovalHelper {
     /// while this caller blocks in `waitUntilExit()` first is a deadlock, not
     /// a slow return — and git-kit output on a large repository can reach
     /// that in practice. Caller must already have called `process.run()`.
-    private static func runToCompletion(
+    static func runToCompletion(
         _ process: Process, stdout: Pipe, stderr: Pipe
     ) -> (stdout: Data, stderr: Data) {
         let drainQueue = DispatchQueue(label: "com.termmesh.process-drain")
