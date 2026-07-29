@@ -5901,9 +5901,7 @@ private enum WorktreeApprovalHelper {
         } catch {
             return .failure("failed to launch git-kit: \(error.localizedDescription)")
         }
-        process.waitUntilExit()
-        let outData = stdoutPipe.fileHandleForReading.readDataToEndOfFile()
-        let errData = stderrPipe.fileHandleForReading.readDataToEndOfFile()
+        let (outData, errData) = runToCompletion(process, stdout: stdoutPipe, stderr: stderrPipe)
         let errStr = String(data: errData, encoding: .utf8) ?? ""
 
         guard let obj = try? JSONSerialization.jsonObject(with: outData) as? [String: Any] else {
@@ -5919,6 +5917,44 @@ private enum WorktreeApprovalHelper {
         }
         let result = (obj["result"] as? [String: Any]) ?? obj
         return .success(mode: result["mode"] as? String, removed: result["removed"] as? Bool)
+    }
+
+    /// Runs `process` to completion, draining `stdout`/`stderr` concurrently
+    /// with execution rather than after `waitUntilExit()`. Once either pipe's
+    /// kernel buffer (commonly 64KB) fills, a child blocked in `write()`
+    /// while this caller blocks in `waitUntilExit()` first is a deadlock, not
+    /// a slow return — and git-kit output on a large repository can reach
+    /// that in practice. Caller must already have called `process.run()`.
+    private static func runToCompletion(
+        _ process: Process, stdout: Pipe, stderr: Pipe
+    ) -> (stdout: Data, stderr: Data) {
+        let drainQueue = DispatchQueue(label: "com.termmesh.process-drain")
+        var outData = Data()
+        var errData = Data()
+        let group = DispatchGroup()
+
+        func drain(_ pipe: Pipe, into accumulate: @escaping (Data) -> Void) {
+            group.enter()
+            pipe.fileHandleForReading.readabilityHandler = { handle in
+                // Read in the Foundation readiness callback itself — never on
+                // `drainQueue` — so this call never blocks waiting for bytes.
+                let chunk = handle.availableData
+                if chunk.isEmpty { handle.readabilityHandler = nil }
+                drainQueue.async {
+                    if chunk.isEmpty {
+                        group.leave()
+                    } else {
+                        accumulate(chunk)
+                    }
+                }
+            }
+        }
+        drain(stdout) { outData.append($0) }
+        drain(stderr) { errData.append($0) }
+
+        process.waitUntilExit()
+        group.wait()
+        return (outData, errData)
     }
 
     private static func acquireLock(teamName: String, taskId: String) -> Result<TaskWorktreeLock, String> {
@@ -5982,14 +6018,14 @@ private enum WorktreeApprovalHelper {
         process.executableURL = URL(fileURLWithPath: "/usr/bin/which")
         process.arguments = ["git-kit"]
         let pipe = Pipe()
+        let errPipe = Pipe()
         process.standardOutput = pipe
-        process.standardError = Pipe()
+        process.standardError = errPipe
         do {
             try process.run()
         } catch { return nil }
-        process.waitUntilExit()
+        let (data, _) = runToCompletion(process, stdout: pipe, stderr: errPipe)
         guard process.terminationStatus == 0 else { return nil }
-        let data = pipe.fileHandleForReading.readDataToEndOfFile()
         return String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfBlankTC
     }
 }

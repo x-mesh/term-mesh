@@ -354,6 +354,14 @@ enum AgentPipeTransport {
     /// PTY buffer until something reads them.
     private static let pipeReadyTimeout: TimeInterval = 5
 
+    /// How long an EAGAIN write retry may keep polling a reader that has
+    /// stopped consuming.
+    ///
+    /// A reader that is alive but paused looks identical, from EAGAIN alone,
+    /// to one that will never resume. Without a bound this loop never
+    /// returns, and the caller — holding the FIFO fd open — never does either.
+    private static let pipeWriteTimeout: TimeInterval = 5
+
     /// Put one user turn on the agent's stdin.
     ///
     /// The text goes as-is. Nothing is flattened — a task carrying newlines
@@ -391,6 +399,7 @@ enum AgentPipeTransport {
         defer { close(fd) }
 
         var written = 0
+        let writeDeadline = ProcessInfo.processInfo.systemUptime + pipeWriteTimeout
         try payload.withUnsafeBytes { raw in
             guard let base = raw.baseAddress else { return }
             while written < raw.count {
@@ -400,6 +409,10 @@ enum AgentPipeTransport {
                     continue
                 }
                 if n < 0, errno == EINTR || errno == EAGAIN {
+                    guard ProcessInfo.processInfo.systemUptime < writeDeadline else {
+                        throw DeliveryError.writeFailed(
+                            "write stalled after \(written)/\(raw.count)B (deadline exceeded)")
+                    }
                     usleep(2_000)
                     continue
                 }
