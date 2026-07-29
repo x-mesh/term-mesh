@@ -512,6 +512,12 @@ tm-agent brief <agent>
 # Distinct local/peer checkouts do not require an additional worktree; assign a branch owner and
 # serialize pushes to the same remote branch. Concurrent read-only work is allowed in one checkout.
 #
+# isolated-checkout-ref-contract, base sync: a worker branch is expected to be BEHIND the target,
+# not only differently named. When the leader says "sync your base to <SHA>", that is the assigned
+# action, not a precondition to verify — run it. Do not gate it behind
+# `git merge-base --is-ancestor <SHA> HEAD` and do not report BLOCKED because the SHA is not yet
+# in the branch; that is the normal state the sync exists to fix.
+#
 # Machine-readable status/task/collect/reports retain duplicate rows and expose body-free routing
 # telemetry (wave/task/agent_instance/host/checkout/delivery/synthesis). A hard timebox converges
 # on completed evidence and blocks/cancels/splits remaining work — timeout is never success.
@@ -623,6 +629,50 @@ When a task has a fix budget (set via `--auto-fix-budget N` on delegate):
 > tm-agent wait --timeout 30 --mode any
 > tm-agent read explorer --lines 50
 > ```
+
+### 병렬 수정 웨이브 분할 — 발견 단위가 아니라 파일 소유권 단위
+
+리뷰에서 나온 지적을 여러 에이전트에 나눠 고칠 때, **발견 건수로 자르지 말고 파일 소유권으로 자른다.**
+2026-07-29 feat/distributed-workspaces 수정 웨이브에서 확인된 결과:
+
+- P0 5건은 파일이 자연히 안 겹쳐서 그대로 4명에게 배분 → 옥토퍼스 머지 충돌 0, 첫 통합 빌드 컴파일 에러 0.
+- P1 14건은 같은 파일에 여러 건이 몰려 있었다(`ReviewBoardCoordinatorService.swift` 3건,
+  `TeamOrchestrator+RemoteAgent.swift` 3건). 발견 단위로 나눴다면 여러 에이전트가 같은 파일을
+  동시에 편집했을 것이다. 파일 소유권으로 5그룹으로 재구성하니 다시 충돌 0.
+
+각 태스크 캡슐에 반드시 세 가지를 명시한다:
+
+1. **소유 파일 목록** — 이것만 수정 가능
+2. **금지 파일과 그 이유** — "X는 executor가 동시에 고치는 중이니 열지 마라"
+3. **소유권 밖 정의를 만났을 때의 행동** — 임의로 열지 말고 리더에게 소유권 확장을 요청
+
+3번은 실제로 작동했다. 에이전트 2명이 소유 목록 밖의 타입 정의에 막혔을 때
+(`AutoPilotUndoPoint`가 `AutoPilotPolicy.swift`에, `MergeQueueItem`이 `model.rs`에 있었다)
+임의 편집 대신 리더에게 확장을 요청했다.
+
+> 리더는 그룹을 자르기 전에 **각 수정 대상이 참조하는 타입·모델 정의가 소유 목록 밖에 있는지**
+> 먼저 확인해라. 위 두 건이 그 패턴이다 — 고칠 코드와 그 코드가 쓰는 struct 정의가 다른 파일에
+> 산다. 미리 소유 목록에 넣거나, 최소한 확장 요청이 올 것을 예상해 둔다.
+
+### 피어 에이전트의 검증 한계 — 언어별로 다르다
+
+피어 호스트(Linux)에는 **Swift 툴체인이 없다.** Rust와 Python은 피어에서 완전히 검증된다.
+
+| 작업 언어 | 피어에서 가능한 것 | 리더가 해야 할 것 |
+|-----------|-------------------|------------------|
+| Rust / Python | 편집 + 빌드 + 테스트 | 결과 수용 |
+| Swift | **편집만** | 로컬 머신에서 통합 후 빌드·테스트 필수 |
+
+Swift 작업을 피어에 보낼 때는 태스크 캡슐에 다음을 넣는다(2026-07-29 웨이브에서 효과 확인):
+
+```
+- 이 호스트에 Swift 툴체인이 없다. xcodebuild/swift build 시도 금지(시간 낭비).
+- 대신 필수: 시그니처를 바꾼 뒤 `rg`로 호출부를 전부 찾아 갱신 누락이 없는지 확인하고,
+  그 확인 결과를 보고에 포함해라.
+```
+
+그리고 Swift 변경은 파이프라인에 **로컬 통합 빌드 단계를 반드시 넣는다.** 피어 에이전트의
+STATUS: DONE은 "편집 완료"이지 "빌드 통과"가 아니다.
 
 ### Reply Truncation Protocol
 
