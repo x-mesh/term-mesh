@@ -306,4 +306,95 @@ final class AutoPilotRunnerTests: XCTestCase {
         let bare = ReviewBoardTask(id: "t", teamName: "ws", title: "T", status: "review_ready")
         XCTAssertNil(AutoPilotCheck.verifyCommand(in: bare))
     }
+
+    // MARK: - The command that runs is the command the agent wrote
+
+    /// `result` is scrubbed for display: a path becomes `…/name`. Running that
+    /// runs a different command — usually a nonexistent one, which fails
+    /// safely, but sometimes one that succeeds for the wrong reason.
+    func testTheCommandIsReadFromTheRawReplyNotTheScrubbedOne() {
+        let task = task(verify: "/Users/agent/bin/check.sh")
+        XCTAssertTrue(
+            task.result?.contains("…/check.sh") == true,
+            "the display copy is expected to be scrubbed: \(task.result ?? "nil")"
+        )
+        XCTAssertEqual(
+            AutoPilotCheck.verifyCommand(in: task), "/Users/agent/bin/check.sh"
+        )
+    }
+
+    /// The display copy stops at 240 characters. A VERIFY line past that point
+    /// survives only in the raw reply, and half a command is not the command.
+    func testALongReplyDoesNotClipTheCommand() {
+        let command = "swift test --filter ReviewBoardEvidenceTests/testDigestCoversEveryByte"
+        let task = ReviewBoardTask(
+            id: "tsk_1", teamName: "ws", title: "Do the thing", status: "review_ready",
+            result: """
+            STATUS: DONE
+            FILES: \(Array(repeating: "Sources/Some/Long/Path/File.swift", count: 8).joined(separator: " "))
+            VERIFY: \(command)
+            NEXT: NONE
+            FULL_REPORT: n/a
+            """,
+            worktreeParent: "develop",
+            worktreePath: "/tmp/wt"
+        )
+        XCTAssertTrue(
+            task.result?.hasSuffix("…") == true,
+            "the display copy is expected to be clipped: \(task.result ?? "nil")"
+        )
+        XCTAssertEqual(AutoPilotCheck.verifyCommand(in: task), command)
+    }
+
+    /// A marker means the text was rewritten before it got here, so whatever it
+    /// now says is not evidence. `<token>` is the sharp case: `sh` reads it as
+    /// a redirection, so the command runs with its argument missing and can
+    /// succeed having checked nothing.
+    func testACommandCarryingARedactionMarkerIsRefusedAndNeverRun() async {
+        for marker in AutoPilotCheck.redactionMarkers {
+            let task = task(verify: "./check.sh \(marker)")
+            let refusal = AutoPilotCheck.refusal(for: task)
+            XCTAssertNotNil(refusal, "\(marker) must be refused")
+            XCTAssertEqual(refusal?.command, "./check.sh \(marker)")
+
+            // The checker is the only thing that reaches a shell, so proving it
+            // was never asked is proving nothing ran.
+            var checked = false
+            let fixedReview = review()
+            let runner = AutoPilotRunner(
+                policy: {
+                    AutoPilotPolicy(
+                        isEnabled: true, ceilingBranch: "develop",
+                        protectedBranches: AutoPilotPolicy.defaultProtectedBranches,
+                        maxAutoMerges: 10
+                    )
+                },
+                reviewer: { _ in fixedReview },
+                approver: { _, _ in XCTFail("a refused check must not reach an approval") },
+                checker: { _ in
+                    checked = true
+                    return nil
+                },
+                audit: journal(),
+                now: { 1 }
+            )
+            let outcomes = await runner.sweep([task])
+            XCTAssertFalse(checked, "\(marker) must not reach the shell")
+            XCTAssertEqual(outcomes.map(\.approved), [false])
+            XCTAssertTrue(
+                outcomes[0].reason.contains(marker),
+                "the reason should name what was found: \(outcomes[0].reason)"
+            )
+        }
+    }
+
+    /// Held rather than silently skipped: the refusal is the thing worth
+    /// reading afterwards, and it names the command it would not run.
+    func testARefusedCommandIsRecordedWithTheCommandItRefused() async {
+        let task = task(verify: "./check.sh <token>")
+        _ = await runner(evidence: evidence()).sweep([task])
+        let entry = AutoPilotJournal<AutoPilotAudit>(url: journalURL).entries().first
+        XCTAssertEqual(entry?.decision, "held")
+        XCTAssertEqual(entry?.checkCommand, "./check.sh <token>")
+    }
 }

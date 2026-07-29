@@ -565,6 +565,79 @@ final class ReviewBoardTaskMergeTests: XCTestCase {
             .merging(coordinator: coordinator(status: "suspect", reason: "heartbeat stale"))
         XCTAssertEqual(merged.blockedReason, "build failed")
     }
+
+    /// Merging rebuilds a task out of two already-parsed ones, so it is the
+    /// one place where the raw reply could be quietly replaced by the scrubbed
+    /// copy — which is what auto pilot reads its VERIFY command out of.
+    func testMergingKeepsTheRawReplyRatherThanTheScrubbedCopy() {
+        let reply = """
+        STATUS: DONE
+        FILES: a.swift
+        VERIFY: /Users/agent/bin/check.sh
+        NEXT: NONE
+        FULL_REPORT: n/a
+        """
+        let local = ReviewBoardTask(
+            id: "c259ab1f", teamName: "x-backup", title: "T", status: "completed",
+            result: reply
+        )
+        let merged = local.merging(
+            coordinator: ReviewBoardTask(
+                id: "c259ab1f", teamName: "Unknown team", title: "T", status: "review_ready"
+            )
+        )
+        XCTAssertEqual(merged.rawResult, reply)
+        XCTAssertTrue(
+            merged.result?.contains("…/check.sh") == true,
+            "the display copy stays scrubbed: \(merged.result ?? "nil")"
+        )
+    }
+
+    /// The merge target and the diff base are both git refs. `safeLabel`
+    /// rewrites a long enough word run to `<token>`, so the shown parent is not
+    /// a branch anyone can merge into.
+    func testTheRecordedParentSurvivesTheScrubberThatTheShownOneDoesNot() {
+        let branch = "feat/distributed-workspaces-review-followups"
+        let task = ReviewBoardTask(
+            id: "c259ab1f", teamName: "x-backup", title: "T", status: "review_ready",
+            worktreeParent: branch
+        )
+        XCTAssertEqual(task.rawWorktreeParent, branch)
+        XCTAssertTrue(
+            task.worktreeParent?.contains("<token>") == true,
+            "the display copy is expected to be scrubbed: \(task.worktreeParent ?? "nil")"
+        )
+    }
+
+    /// Merging rebuilds the task from an already-scrubbed parent, so it has to
+    /// carry the recorded one across rather than re-derive it.
+    func testMergingKeepsTheRecordedParent() {
+        let branch = "feat/distributed-workspaces-review-followups"
+        let merged = ReviewBoardTask(
+            id: "c259ab1f", teamName: "x-backup", title: "T", status: "completed",
+            worktreeParent: branch
+        ).merging(
+            coordinator: ReviewBoardTask(
+                id: "c259ab1f", teamName: "Unknown team", title: "T", status: "review_ready"
+            )
+        )
+        XCTAssertEqual(merged.rawWorktreeParent, branch)
+    }
+
+    /// The raw copy follows whichever side's reply won, so the two never
+    /// describe different replies.
+    func testMergingTakesTheRawReplyFromTheSideWhoseResultWon() {
+        let coordinatorReply = "STATUS: DONE\nVERIFY: /Users/agent/bin/peer.sh\nNEXT: NONE"
+        let merged = ReviewBoardTask(
+            id: "c259ab1f", teamName: "x-backup", title: "T", status: "completed"
+        ).merging(
+            coordinator: ReviewBoardTask(
+                id: "c259ab1f", teamName: "Unknown team", title: "T", status: "review_ready",
+                result: coordinatorReply
+            )
+        )
+        XCTAssertEqual(merged.rawResult, coordinatorReply)
+    }
 }
 
 final class ReviewBoardAgentReportTests: XCTestCase {

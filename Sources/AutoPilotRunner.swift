@@ -106,7 +106,11 @@ actor AutoPilotRunner {
         // full test run to refuse.
         let cheap = AutoPilotCandidate(
             taskID: task.rawID,
-            targetBranch: task.worktreeParent ?? "",
+            // The recorded parent, not the shown one: the policy compares this
+            // against the ceiling and the merge later uses the same string, so a
+            // scrubbed copy would approve against one branch and merge into
+            // another.
+            targetBranch: task.rawWorktreeParent ?? "",
             headSHA: patch.headSHA,
             // Stand-in: this pass is only meaningful for the checks that come
             // before evidence, and a `nil` here would short-circuit on the
@@ -121,6 +125,13 @@ actor AutoPilotRunner {
             return hold(task, reason, head: patch.headSHA, check: nil)
         }
 
+        // Before the check runs, not after: the point is that nothing is
+        // executed, and the reason a person reads has to say which command was
+        // refused rather than "nothing verified this".
+        if let refusal = AutoPilotCheck.refusal(for: task) {
+            return hold(task, refusal.reason, head: patch.headSHA, check: refusal.command)
+        }
+
         guard let evidence = await checker(task) else {
             return hold(
                 task,
@@ -132,7 +143,11 @@ actor AutoPilotRunner {
 
         let candidate = AutoPilotCandidate(
             taskID: task.rawID,
-            targetBranch: task.worktreeParent ?? "",
+            // The recorded parent, not the shown one: the policy compares this
+            // against the ceiling and the merge later uses the same string, so a
+            // scrubbed copy would approve against one branch and merge into
+            // another.
+            targetBranch: task.rawWorktreeParent ?? "",
             headSHA: patch.headSHA,
             checkEvidence: evidence,
             wouldPush: false,
@@ -205,6 +220,10 @@ enum AutoPilotCheck {
 
     static func live(timeout: TimeInterval = 900) -> AutoPilotRunner.Checker {
         { task in
+            // Asked again at the point of execution, not only where the
+            // decision is audited: this closure is what actually reaches
+            // `/bin/sh`, so this is the line that has to be true.
+            guard case .none = refusal(for: task) else { return nil }
             guard let command = verifyCommand(in: task) else { return nil }
             guard let path = task.worktreePath?
                 .trimmingCharacters(in: .whitespacesAndNewlines), !path.isEmpty,
@@ -239,10 +258,57 @@ enum AutoPilotCheck {
     /// The `VERIFY` line, or nothing. `n/a` is an agent saying there is no
     /// check — which is a reason to hand the task to a person, not a reason to
     /// treat "no check" as "check passed".
+    ///
+    /// Read from `rawResult`, never from `result`. `result` is the display
+    /// copy: it is clipped at 240 characters and has had paths and long tokens
+    /// replaced. Running that is not running the agent's command — it is
+    /// running a different one that happens to start the same way, and its exit
+    /// code is evidence about nothing.
     static func verifyCommand(in task: ReviewBoardTask) -> String? {
-        guard let verify = ReviewBoardAgentReport(result: task.result)?.verify else { return nil }
+        guard let verify = ReviewBoardAgentReport(result: task.rawResult)?.verify else { return nil }
         let trimmed = verify.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !skipValues.contains(trimmed.lowercased()) else { return nil }
         return trimmed
+    }
+
+    /// What `safeBody` leaves behind when it has rewritten a string. A command
+    /// carrying any of these is a scrubbed command, whatever it was read from.
+    static let redactionMarkers: [String] = ["…", "<token>", "<uuid>"]
+
+    /// Why this task's check must not be run, or nil when it may be.
+    ///
+    /// Two things are refused, and neither is "there is no check": that case
+    /// already has a route (`checker` returns nil and the task is held for a
+    /// person). What is refused here is running *something else* and calling
+    /// the exit code evidence.
+    ///
+    ///   - the raw reply was not kept, but the shown one has a VERIFY line, so
+    ///     the only command available is the scrubbed one;
+    ///   - the command still carries a redaction marker, which means the text
+    ///     it came from had been rewritten before it got here.
+    ///
+    /// A marker can also be something the agent genuinely typed. Refusing that
+    /// costs one hand-off to a person; running it when it is a rewrite costs an
+    /// unattended merge on evidence that was never produced.
+    static func refusal(for task: ReviewBoardTask) -> (reason: String, command: String?)? {
+        guard let command = verifyCommand(in: task) else {
+            guard let shown = ReviewBoardAgentReport(result: task.result)?.verify,
+                  !skipValues.contains(
+                      shown.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+                  ) else { return nil }
+            return (
+                "This task's reply was not kept in full, so its VERIFY command cannot be run as "
+                    + "the agent wrote it. Run it yourself and approve by hand.",
+                nil
+            )
+        }
+        guard let marker = redactionMarkers.first(where: { command.contains($0) }) else {
+            return nil
+        }
+        return (
+            "This task's VERIFY command still contains \(marker), so it is not the command the "
+                + "agent wrote. It was not run.",
+            command
+        )
     }
 }

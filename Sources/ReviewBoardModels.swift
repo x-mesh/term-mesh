@@ -178,9 +178,23 @@ struct ReviewBoardTask: Identifiable, Equatable, Sendable {
     let blockedReason: String?
     let reviewSummary: String?
     let result: String?
+    /// The agent's reply as the producer wrote it. `result` is scrubbed and
+    /// clipped for display — paths become `…/name`, long tokens become
+    /// `<token>`, and the whole thing stops at 240 characters — which is right
+    /// for a row on a board and wrong for anything that has to be *run*.
+    /// Auto pilot's VERIFY command is read from here and nowhere else; showing
+    /// this string is not allowed, which is why every view still reads
+    /// `result`.
+    let rawResult: String?
     let resultPath: String?
     let worktreeBranch: String?
     let worktreeParent: String?
+    /// The parent branch as recorded, not as shown. `worktreeParent` goes
+    /// through `safeLabel`, which rewrites any 32-character run of word
+    /// characters to `<token>` and clips at 120 — harmless on a row, ruinous as
+    /// a merge target, which is what this is for. Same reasoning as
+    /// `worktreePath`, which was never scrubbed for exactly this reason.
+    let rawWorktreeParent: String?
     /// Where the work actually is. Present on team-board rows only — a task
     /// the coordinator placed carries no worktree facts (its `attempts` row
     /// does, and that comes from `task.get`).
@@ -220,9 +234,17 @@ struct ReviewBoardTask: Identifiable, Equatable, Sendable {
         blockedReason: String? = nil,
         reviewSummary: String? = nil,
         result: String? = nil,
+        // Only passed explicitly by code that already holds a scrubbed
+        // `result` and must not re-derive the raw text from it — see
+        // `merging(coordinator:)`. Every parser hands the producer's own
+        // string to `result` and gets this filled in from it.
+        rawResult: String? = nil,
         resultPath: String? = nil,
         worktreeBranch: String? = nil,
         worktreeParent: String? = nil,
+        // Same rule as `rawResult`: only passed explicitly by code holding an
+        // already-scrubbed `worktreeParent`.
+        rawWorktreeParent: String? = nil,
         worktreePath: String? = nil,
         worktreeFinishMode: String? = nil,
         worktreeRemoved: Bool? = nil,
@@ -242,9 +264,17 @@ struct ReviewBoardTask: Identifiable, Equatable, Sendable {
         self.blockedReason = blockedReason.map { ReviewBoardText.safeBody($0) }
         self.reviewSummary = reviewSummary.map { ReviewBoardText.safeBody($0) }
         self.result = result.map { ReviewBoardText.safeBody($0) }
+        // Kept whole, deliberately: this is the copy a command is read out of,
+        // and a scrubbed command is a different command.
+        self.rawResult = (rawResult ?? result)
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .flatMap { $0.isEmpty ? nil : $0 }
         self.resultPath = resultPath.flatMap(ReviewBoardText.safePathLabel)
         self.worktreeBranch = worktreeBranch.map(ReviewBoardText.safeLabel)
         self.worktreeParent = worktreeParent.map(ReviewBoardText.safeLabel)
+        self.rawWorktreeParent = (rawWorktreeParent ?? worktreeParent)
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .flatMap { $0.isEmpty ? nil : $0 }
         // Not run through safeLabel: this is a path the app hands to git, not
         // a string it prints. Redacting it would make it unusable.
         self.worktreePath = worktreePath
@@ -403,9 +433,19 @@ extension ReviewBoardTask {
             blockedReason: blockedReason ?? other.blockedReason,
             reviewSummary: reviewSummary ?? other.reviewSummary,
             result: result ?? other.result,
+            // Follows whichever side's `result` won, so the raw text and the
+            // shown text always describe the same reply. Passed explicitly
+            // because `result` here is already scrubbed and re-deriving the
+            // raw copy from it would quietly turn a scrubbed string into "the
+            // original".
+            rawResult: result != nil ? rawResult : other.rawResult,
             resultPath: resultPath ?? other.resultPath,
             worktreeBranch: worktreeBranch,
             worktreeParent: worktreeParent,
+            // Passed explicitly for the same reason as `rawResult`: the value
+            // above has already been scrubbed, and letting it re-derive the raw
+            // copy would make a display string the merge target.
+            rawWorktreeParent: rawWorktreeParent,
             worktreePath: [worktreePath, other.worktreePath].compactMap { $0 }.first,
             worktreeFinishMode: worktreeFinishMode,
             worktreeRemoved: worktreeRemoved,
