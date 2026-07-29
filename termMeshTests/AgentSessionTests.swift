@@ -83,9 +83,9 @@ final class AgentSessionTests: XCTestCase {
         )
     }
 
-    /// A duplicate-name request must still be distinguishable before the
-    /// existing unique-name guard rejects it. Routing cannot use `panelId`:
-    /// pane recreation changes that value.
+    /// A duplicate role is a valid pool. Runtime resources cannot use
+    /// `role@team`: pane recreation changes panelId, while two live instances
+    /// need distinct transport paths at the same time.
     func testDuplicateNameCandidatesReceiveDistinctNonEmptyInstanceIDs() {
         let first = agentMember()
         let duplicate = agentMember()
@@ -94,6 +94,12 @@ final class AgentSessionTests: XCTestCase {
         XCTAssertFalse(first.agentInstanceId.isEmpty)
         XCTAssertFalse(duplicate.agentInstanceId.isEmpty)
         XCTAssertNotEqual(first.agentInstanceId, duplicate.agentInstanceId)
+        XCTAssertEqual(first.id, duplicate.id)
+        XCTAssertNotEqual(first.transportId, duplicate.transportId)
+        XCTAssertNotEqual(
+            AgentPipeTransport.fifoPath(agentId: first.transportId),
+            AgentPipeTransport.fifoPath(agentId: duplicate.transportId)
+        )
         XCTAssertNotNil(UUID(uuidString: first.agentInstanceId))
         XCTAssertNotNil(UUID(uuidString: duplicate.agentInstanceId))
     }
