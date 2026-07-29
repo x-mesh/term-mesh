@@ -330,8 +330,25 @@ final class AgentSession: ObservableObject {
     /// side reads its own header out of this; the session does not interpret it.
     var onTurnEnd: ((String, TurnEnd, String?) -> Void)?
 
+    /// Everything that reads a process stream is serialized here. In
+    /// particular, termination queues its final read behind every readiness
+    /// read, then hands the complete tail to the main actor before finishing.
+    private final class StreamResources {
+        let output: FileHandle
+        let error: FileHandle
+        let queue = DispatchQueue(label: "com.termmesh.agent-session.stream")
+        /// Read and written only on `queue`.
+        var closed = false
+
+        init(output: FileHandle, error: FileHandle) {
+            self.output = output
+            self.error = error
+        }
+    }
+
     private var process: Process?
     private var stdin: FileHandle?
+    private var streamResources: StreamResources?
     /// Bytes, not a string.
     ///
     /// A pipe read ends wherever the kernel handed the buffer over, which can
@@ -595,56 +612,128 @@ final class AgentSession: ObservableObject {
         p.standardOutput = out
         p.standardInput = input
         p.standardError = err
+        let streams = StreamResources(
+            output: out.fileHandleForReading,
+            error: err.fileHandleForReading
+        )
 
-        out.fileHandleForReading.readabilityHandler = { [weak self] handle in
-            let data = handle.availableData
-            guard !data.isEmpty else { return }
-            Task { @MainActor in self?.consume(data) }
+        streams.output.readabilityHandler = { [weak self, weak p, streams] _ in
+            streams.queue.async {
+                guard !streams.closed else { return }
+                let data = streams.output.availableData
+                guard !data.isEmpty else { return }
+                // All of these blocks originate on the one serial queue, so the
+                // final finish block below cannot overtake a preceding consume.
+                DispatchQueue.main.async { [weak self, weak p] in
+                    guard let self, let p, self.process === p else { return }
+                    self.consume(data)
+                }
+            }
         }
         // Kept separate rather than merged into stdout: a warning is not an
         // event, and folding it in would make the stream unparseable exactly
         // when something has gone wrong.
-        err.fileHandleForReading.readabilityHandler = { [weak self] handle in
-            let data = handle.availableData
-            guard !data.isEmpty,
-                  let text = String(data: data, encoding: .utf8)?
-                      .trimmingCharacters(in: .whitespacesAndNewlines),
-                  !text.isEmpty
-            else { return }
-            Task { @MainActor in
-                self?.append(.notice(id: UUID(), AgentSession.withoutAnsi(text)))
+        streams.error.readabilityHandler = { [weak self, weak p, streams] _ in
+            streams.queue.async {
+                guard !streams.closed else { return }
+                let data = streams.error.availableData
+                guard !data.isEmpty,
+                      let text = String(data: data, encoding: .utf8)?
+                          .trimmingCharacters(in: .whitespacesAndNewlines),
+                      !text.isEmpty
+                else { return }
+                DispatchQueue.main.async { [weak self, weak p] in
+                    guard let self, let p, self.process === p else { return }
+                    self.append(.notice(id: UUID(), AgentSession.withoutAnsi(text)))
+                }
             }
         }
-        p.terminationHandler = { [weak self] proc in
-            Task { @MainActor in self?.finish(code: proc.terminationStatus) }
+        p.terminationHandler = { [weak self, streams] proc in
+            let code = proc.terminationStatus
+            streams.queue.async {
+                guard !streams.closed else { return }
+                // No new readiness callbacks are needed: the blocking read is
+                // now behind all callbacks already queued and drains through EOF.
+                streams.output.readabilityHandler = nil
+                let tail = streams.output.readDataToEndOfFile()
+                DispatchQueue.main.async { [weak self] in
+                    self?.finish(process: proc, code: code, finalOutput: tail)
+                }
+            }
         }
 
+        // Publish ownership before run: a process can print and exit before
+        // `run()` returns, and its callbacks must already have an identity to
+        // compare against.
+        process = p
+        stdin = input.fileHandleForWriting
+        streamResources = streams
         do {
             try p.run()
         } catch {
+            _ = teardown(process: p, terminate: false)
             append(.notice(id: UUID(), "could not start the agent: \(error.localizedDescription)"))
             return
         }
-        process = p
-        stdin = input.fileHandleForWriting
         isRunning = true
         canInterrupt = launch.interruptible
     }
 
     func stop() {
-        (process?.standardOutput as? Pipe)?.fileHandleForReading.readabilityHandler = nil
-        (process?.standardError as? Pipe)?.fileHandleForReading.readabilityHandler = nil
-        try? stdin?.close()
-        process?.terminate()
-        process = nil
-        stdin = nil
-        isRunning = false
+        guard let process else { return }
+        _ = teardown(process: process, terminate: true)
+        isThinking = false
+        streamOpen.removeAll()
+        streamingIds.removeAll()
     }
 
-    private func finish(code: Int32) {
+    /// The sole natural-exit entry point. The stream queue has already drained
+    /// stdout through EOF; its dispatches to the main queue are FIFO, so this
+    /// block runs after every preceding `consume` from that process.
+    private func finish(process expected: Process, code: Int32, finalOutput: Data) {
+        guard process === expected else { return }
+        // A result frame normally starts the next queued turn. This process has
+        // exited, so keep that queue intact for finishAfterDrain to report.
         isRunning = false
-        isThinking = false
+        if !finalOutput.isEmpty { consume(finalOutput) }
+        guard teardown(process: expected, terminate: false) else { return }
+        finishAfterDrain(code: code)
+    }
+
+    /// Release process resources exactly once. The identity check makes a late
+    /// callback from an old process unable to tear down a restarted session;
+    /// clearing `process` makes repeated calls for one process harmless.
+    @discardableResult
+    private func teardown(process expected: Process, terminate: Bool) -> Bool {
+        guard process === expected else { return false }
+
+        // A deliberate stop owns completion and must not later become a second
+        // process-exited finish when Foundation reports the signal.
+        expected.terminationHandler = nil
+        if terminate, expected.isRunning { expected.terminate() }
+
+        if let streams = streamResources {
+            streams.queue.sync {
+                guard !streams.closed else { return }
+                streams.closed = true
+                streams.output.readabilityHandler = nil
+                streams.error.readabilityHandler = nil
+                try? streams.output.close()
+                try? streams.error.close()
+            }
+        }
+        try? stdin?.close()
+        stdin = nil
+        streamResources = nil
+        process = nil
+        carry.removeAll()
+        isRunning = false
         canInterrupt = false
+        return true
+    }
+
+    private func finishAfterDrain(code: Int32) {
+        isThinking = false
         streamOpen.removeAll()
         streamingIds.removeAll()
         if code != 0 {
@@ -1038,7 +1127,7 @@ final class AgentSession: ObservableObject {
         onTurnEnd?(final, end, answered)
 
         // The next leader turn only now, so it gets a turn of its own.
-        if !queued.isEmpty {
+        if isRunning, !queued.isEmpty {
             let next = queued.removeFirst()
             try? write(next.text, from: .leader, taskId: next.taskId)
         }
@@ -1137,6 +1226,6 @@ final class AgentSession: ObservableObject {
     func consumeForTesting(_ data: Data) { consume(data) }
 
     /// The process going away.
-    func finishForTesting(code: Int32) { finish(code: code) }
+    func finishForTesting(code: Int32) { finishAfterDrain(code: code) }
     #endif
 }

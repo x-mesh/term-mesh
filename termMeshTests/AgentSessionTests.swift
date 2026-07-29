@@ -654,6 +654,89 @@ final class AgentSessionTests: XCTestCase {
                        "NEEDS_REVIEW")
     }
 
+    /// Process termination and the last readability callback are independent.
+    /// The result must be consumed before exit is classified, exactly once.
+    func testNaturalExitDrainsTheFinalResultBeforeFinishing() async {
+        var reported: [(String, String, Bool)] = []
+        let s = AgentSession()
+        s.onTurnEnd = { text, end, _ in
+            reported.append((text, end.stop, end.failed))
+        }
+        s.openTurnForTesting(from: .leader, taskId: "drain-final-result")
+        s.start(shortProcess(output: event([
+            "type": "result", "stop_reason": "end_turn",
+            "result": "the final frame survived",
+        ])))
+
+        let stopped = await waitUntil { !s.isRunning }
+        XCTAssertTrue(stopped)
+        XCTAssertEqual(reported.count, 1, "exit must not emit a second turn end")
+        XCTAssertEqual(reported.first?.0, "the final frame survived")
+        XCTAssertEqual(reported.first?.1, "end_turn")
+        XCTAssertEqual(reported.first?.2, false)
+    }
+
+    /// Both natural finish and deliberate stop release `process`, so one model
+    /// can start another process instead of remaining permanently stopped.
+    func testFinishedAndStoppedSessionsCanRestart() async {
+        var answers: [String] = []
+        let s = AgentSession()
+        s.onTurnEnd = { text, _, _ in answers.append(text) }
+
+        s.openTurnForTesting(from: .person)
+        s.start(shortProcess(output: event([
+            "type": "result", "stop_reason": "end_turn", "result": "first",
+        ])))
+        let firstStopped = await waitUntil { !s.isRunning }
+        XCTAssertTrue(firstStopped)
+
+        s.start(.init(
+            executable: "/bin/sleep", arguments: ["30"],
+            workingDirectory: NSTemporaryDirectory(),
+            environment: ProcessInfo.processInfo.environment
+        ))
+        XCTAssertTrue(s.isRunning)
+        s.stop()
+        s.stop() // teardown is intentionally idempotent
+        XCTAssertFalse(s.isRunning)
+
+        // A synchronous launch error uses the same teardown and must not leave
+        // the session's process guard occupied either.
+        s.start(.init(
+            executable: "/definitely/not/a/real/agent", arguments: [],
+            workingDirectory: NSTemporaryDirectory(),
+            environment: ProcessInfo.processInfo.environment
+        ))
+        XCTAssertFalse(s.isRunning)
+
+        s.openTurnForTesting(from: .person)
+        s.start(shortProcess(output: event([
+            "type": "result", "stop_reason": "end_turn", "result": "second",
+        ])))
+        let secondStopped = await waitUntil { !s.isRunning }
+        XCTAssertTrue(secondStopped)
+        XCTAssertEqual(answers, ["first", "second"])
+    }
+
+    private func shortProcess(output: String) -> AgentSession.Launch {
+        .init(
+            executable: "/bin/echo", arguments: [output],
+            workingDirectory: NSTemporaryDirectory(),
+            environment: ProcessInfo.processInfo.environment
+        )
+    }
+
+    private func waitUntil(
+        timeout: TimeInterval = 2,
+        _ condition: @escaping @MainActor () -> Bool
+    ) async -> Bool {
+        let deadline = Date().addingTimeInterval(timeout)
+        while !condition(), Date() < deadline {
+            try? await Task.sleep(nanoseconds: 10_000_000)
+        }
+        return condition()
+    }
+
     /// The bridge command the terminal path builds had neither.
     func testTheTerminalBridgeCarriesTheModelAndThePath() {
         let cmd = AgentPipeTransport.bridgeLaunchCommand(
