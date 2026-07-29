@@ -236,7 +236,8 @@ final class AutoPilotMergeIntegrationTests: XCTestCase {
             return XCTFail("an advanced branch must refuse undo: \(result)")
         }
         XCTAssertTrue(reason.contains("advanced"), reason)
-        XCTAssertEqual(try await git(["rev-parse", "develop"]), advancedHead)
+        let developAfterRefusal = try await git(["rev-parse", "develop"])
+        XCTAssertEqual(developAfterRefusal, advancedHead)
     }
 
     /// The other half of that rule. A build artifact sitting in the checkout is
