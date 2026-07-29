@@ -164,6 +164,9 @@ impl Reducer {
                 project_id TEXT NOT NULL,
                 task_id TEXT NOT NULL,
                 attempt_id TEXT NOT NULL,
+                snapshot_id TEXT,
+                head_sha TEXT,
+                diff_digest TEXT,
                 status TEXT NOT NULL,
                 approved_by TEXT NOT NULL,
                 approved_at_ms INTEGER NOT NULL,
@@ -183,6 +186,15 @@ impl Reducer {
         let _ = self
             .conn
             .execute("ALTER TABLE tasks ADD COLUMN last_reason TEXT", []);
+        let _ = self
+            .conn
+            .execute("ALTER TABLE merge_queue ADD COLUMN snapshot_id TEXT", []);
+        let _ = self
+            .conn
+            .execute("ALTER TABLE merge_queue ADD COLUMN head_sha TEXT", []);
+        let _ = self
+            .conn
+            .execute("ALTER TABLE merge_queue ADD COLUMN diff_digest TEXT", []);
         // `total_slots` had to become nullable so "capacity unknown" stops
         // reading as "capacity zero", and no `ALTER TABLE` can relax a NOT
         // NULL. Recreating is safe here in a way it would not be for a table
@@ -488,6 +500,23 @@ impl Reducer {
             .map_err(Into::into)
     }
 
+    pub fn latest_review_snapshot_for_attempt(
+        &self,
+        task_id: &TaskId,
+        attempt_id: &AttemptId,
+    ) -> Result<Option<ReviewSnapshot>> {
+        self.conn
+            .query_row(
+                "SELECT snapshot_id,task_id,attempt_id,base_sha,head_sha,diff_digest,summary,files_json,created_at_ms
+                 FROM review_snapshots WHERE task_id=?1 AND attempt_id=?2
+                 ORDER BY created_at_ms DESC, rowid DESC LIMIT 1",
+                params![task_id.as_str(), attempt_id.as_str()],
+                row_to_review_snapshot,
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
     pub fn review_snapshot(&self, snapshot_id: &str) -> Result<Option<ReviewSnapshot>> {
         self.conn
             .query_row(
@@ -524,6 +553,20 @@ impl Reducer {
                  FROM merge_queue WHERE queue_id=?1",
                 params![queue_id.as_str()],
                 row_to_merge_queue_item,
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    pub fn merge_queue_evidence(
+        &self,
+        queue_id: &MergeQueueId,
+    ) -> Result<Option<(String, String, String)>> {
+        self.conn
+            .query_row(
+                "SELECT snapshot_id,head_sha,diff_digest FROM merge_queue WHERE queue_id=?1",
+                params![queue_id.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .optional()
             .map_err(Into::into)
@@ -736,6 +779,12 @@ impl Reducer {
         // reducer replays whatever the log already holds, so it repairs rather
         // than rejects: on a first placement there is nothing to cancel and
         // this updates no rows.
+        for old_attempt in self.attempts(&attempt.task_id)?.into_iter().filter(|old| {
+            old.attempt_id != attempt.attempt_id
+                && !matches!(old.status.as_str(), "merged" | "failed" | "cancelled")
+        }) {
+            self.release_host_slot(&old_attempt.host_id)?;
+        }
         self.conn.execute(
             "UPDATE attempts SET status='cancelled', updated_at_ms=?1 WHERE task_id=?2 AND attempt_id<>?3 AND status NOT IN ('merged','failed','cancelled')",
             params![event.ts_ms as i64, attempt.task_id.as_str(), attempt.attempt_id.as_str()],
@@ -847,7 +896,16 @@ impl Reducer {
             "UPDATE attempts SET status='approved', updated_at_ms=?1 WHERE attempt_id=?2",
             params![event.ts_ms as i64, queue.attempt_id.as_str()],
         )?;
-        self.insert_merge_queue(&queue)
+        let snapshot_id = required_str(&event.payload, "snapshot_id")?;
+        let snapshot = self
+            .review_snapshot(snapshot_id)?
+            .ok_or_else(|| anyhow::anyhow!("review snapshot not found"))?;
+        self.insert_merge_queue(
+            &queue,
+            snapshot_id,
+            &snapshot.head_sha,
+            &snapshot.diff_digest,
+        )
     }
 
     fn reduce_attempt_rejected(&self, event: &IntentEvent) -> Result<()> {
@@ -911,6 +969,14 @@ impl Reducer {
             MergeQueueStatus::Queued | MergeQueueStatus::Running => None,
         };
         if let Some(status) = terminal_status {
+            let attempt = self
+                .attempts(&item.task_id)?
+                .into_iter()
+                .find(|attempt| attempt.attempt_id == item.attempt_id)
+                .ok_or_else(|| anyhow::anyhow!("attempt not found"))?;
+            if !matches!(attempt.status.as_str(), "merged" | "failed" | "cancelled") {
+                self.release_host_slot(&attempt.host_id)?;
+            }
             self.conn.execute(
                 "UPDATE tasks SET status=?1, updated_at_ms=?2 WHERE task_id=?3",
                 params![status, event.ts_ms as i64, item.task_id.as_str()],
@@ -1006,15 +1072,43 @@ impl Reducer {
         Ok(())
     }
 
-    fn insert_merge_queue(&self, item: &MergeQueueItem) -> Result<()> {
+    fn release_host_slot(&self, host_id: &HostId) -> Result<()> {
+        let used_slots = self
+            .conn
+            .query_row(
+                "SELECT used_slots FROM hosts WHERE host_id=?1",
+                params![host_id.as_str()],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?;
+        if let Some(used_slots) = used_slots {
+            let remaining = (used_slots.max(0) as u32).saturating_sub(1);
+            self.conn.execute(
+                "UPDATE hosts SET used_slots=?1 WHERE host_id=?2",
+                params![remaining as i64, host_id.as_str()],
+            )?;
+        }
+        Ok(())
+    }
+
+    fn insert_merge_queue(
+        &self,
+        item: &MergeQueueItem,
+        snapshot_id: &str,
+        head_sha: &str,
+        diff_digest: &str,
+    ) -> Result<()> {
         self.conn.execute(
-            "INSERT OR IGNORE INTO merge_queue(queue_id,project_id,task_id,attempt_id,status,approved_by,approved_at_ms,last_error)
-             VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
+            "INSERT OR IGNORE INTO merge_queue(queue_id,project_id,task_id,attempt_id,snapshot_id,head_sha,diff_digest,status,approved_by,approved_at_ms,last_error)
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
             params![
                 item.queue_id.as_str(),
                 item.project_id.as_str(),
                 item.task_id.as_str(),
                 item.attempt_id.as_str(),
+                snapshot_id,
+                head_sha,
+                diff_digest,
                 status_string(&item.status)?,
                 item.approved_by,
                 item.approved_at_ms as i64,
