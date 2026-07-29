@@ -201,6 +201,10 @@ final class TeamOrchestrator: ObservableObject {
         teams[teamName]?.remoteWorkspaceIDs[hostKey] = workspaceID
     }
 
+    func forgetRemoteWorkspaceID(teamName: String, hostKey: String) {
+        teams[teamName]?.remoteWorkspaceIDs.removeValue(forKey: hostKey)
+    }
+
     /// Install the remote pane that replaced the pending leader anchor. Kept
     /// on the owning type because `teams` is intentionally read-only to extensions.
     func replaceLeaderEndpoint(

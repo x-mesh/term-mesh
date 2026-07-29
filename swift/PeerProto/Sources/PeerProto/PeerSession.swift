@@ -29,7 +29,45 @@ public enum PeerSessionError: Error, Equatable {
     case malformedEnsureResponse(String)
     case sessionClosed(reason: String)
     case concurrentReceiveOperation
+    case capabilityNotNegotiated(String)
+    case rpcTimedOut(operation: String)
     case unexpectedMessage(String)
+}
+
+private enum PeerRPCOutcome<Value: Sendable>: @unchecked Sendable {
+    case success(Value)
+    case failure(Error)
+
+    func get() throws -> Value {
+        switch self {
+        case .success(let value): return value
+        case .failure(let error): throw error
+        }
+    }
+}
+
+private actor PeerRPCResultGate<Value: Sendable> {
+    private var result: PeerRPCOutcome<Value>?
+    private var continuation: CheckedContinuation<Value, Error>?
+
+    func wait() async throws -> Value {
+        if let result { return try result.get() }
+        return try await withCheckedThrowingContinuation { continuation = $0 }
+    }
+
+    @discardableResult
+    func resolve(_ result: PeerRPCOutcome<Value>) -> Bool {
+        guard self.result == nil else { return false }
+        self.result = result
+        if let continuation {
+            self.continuation = nil
+            switch result {
+            case .success(let value): continuation.resume(returning: value)
+            case .failure(let error): continuation.resume(throwing: error)
+            }
+        }
+        return true
+    }
 }
 
 public struct PeerEnsureSurfaceOutcome: Sendable, Equatable {
@@ -156,6 +194,7 @@ public actor PeerSession {
     private var inboundTerminalError: Error?
     private var didCloseTransport = false
     private var directResponseRPCInFlight = false
+    private var negotiatedHostCapabilities: PeerCapabilities?
     private var inboundReadInProgress = false
 
     /// Heartbeat state. SSH `ServerAliveInterval` only catches dead
@@ -338,12 +377,14 @@ public actor PeerSession {
         _ = try await expectAuthChallenge()
         try await sendAuth(method: options.authMethod)
         let result = try await expectAuthResult()
+        let hostCapabilities = PeerCapabilities(host.capabilities)
+        negotiatedHostCapabilities = hostCapabilities
         return PeerSessionInfo(
             hostDisplayName: host.displayName,
             hostAppVersion: host.appVersion,
             hostProtocolVersion: host.protocolVersion,
             sessionID: result.sessionID,
-            hostCapabilities: PeerCapabilities(host.capabilities)
+            hostCapabilities: hostCapabilities
         )
     }
 
@@ -366,13 +407,23 @@ public actor PeerSession {
     /// each carrying a recursive split tree. Hosts that don't expose
     /// layouts return an empty list, in which case the caller should
     /// fall back to per-surface attach.
-    public func listWorkspaces() async throws -> [Termmesh_Peer_V1_Workspace] {
+    public func listWorkspaces(
+        timeoutSeconds: TimeInterval? = nil
+    ) async throws -> [Termmesh_Peer_V1_Workspace] {
         try beginDirectResponseRPC()
         defer { directResponseRPCInFlight = false }
         try await sendEnvelope { env in
             env.listWorkspaces = Termmesh_Peer_V1_ListWorkspaces()
         }
-        let reply = try await readFrame()
+        let reply: Termmesh_Peer_V1_Envelope
+        if let timeoutSeconds {
+            reply = try await readFrame(
+                timeoutSeconds: timeoutSeconds,
+                operation: "listWorkspaces"
+            )
+        } else {
+            reply = try await readFrame()
+        }
         guard case .workspaceList(let list) = reply.payload else {
             throw PeerSessionError.unexpectedMessage(String(describing: reply.payload))
         }
@@ -398,13 +449,19 @@ public actor PeerSession {
     /// Same single-reader contract as `listWorkspaces()`: it reads exactly
     /// one reply frame, so never call it on a session whose receive loop is
     /// already running.
-    public func listTeams() async throws -> [Termmesh_Peer_V1_Team] {
+    public func listTeams(
+        timeoutSeconds: TimeInterval = 10
+    ) async throws -> [Termmesh_Peer_V1_Team] {
+        try requireHostCapability(PeerCapability.teamRosterV1)
         try beginDirectResponseRPC()
         defer { directResponseRPCInFlight = false }
         try await sendEnvelope { env in
             env.listTeams = Termmesh_Peer_V1_ListTeams()
         }
-        let reply = try await readFrame()
+        let reply = try await readFrame(
+            timeoutSeconds: timeoutSeconds,
+            operation: "listTeams"
+        )
         guard case .teamList(let list) = reply.payload else {
             throw PeerSessionError.unexpectedMessage(String(describing: reply.payload))
         }
@@ -419,8 +476,10 @@ public actor PeerSession {
     /// host declining is information, not a broken connection.
     public func callTeam(
         method: String,
-        paramsJSON: String
+        paramsJSON: String,
+        timeoutSeconds: TimeInterval = 10
     ) async throws -> Termmesh_Peer_V1_TeamCallResponse {
+        try requireHostCapability(PeerCapability.teamCallV1)
         try beginDirectResponseRPC()
         defer { directResponseRPCInFlight = false }
         try await sendEnvelope { env in
@@ -429,7 +488,10 @@ public actor PeerSession {
             request.paramsJson = paramsJSON
             env.teamCallRequest = request
         }
-        let reply = try await readFrame()
+        let reply = try await readFrame(
+            timeoutSeconds: timeoutSeconds,
+            operation: "callTeam"
+        )
         guard case .teamCallResponse(let response) = reply.payload else {
             throw PeerSessionError.unexpectedMessage(String(describing: reply.payload))
         }
@@ -444,8 +506,10 @@ public actor PeerSession {
     public func bootstrapTeamLeader(
         projectID: String,
         placement: Termmesh_Peer_V1_TeamLeaderPlacement,
-        requestID: Data
+        requestID: Data,
+        timeoutSeconds: TimeInterval = 10
     ) async throws -> Termmesh_Peer_V1_TeamLeaderBootstrapResponse {
+        try requireHostCapability(PeerCapability.teamLeaderV1)
         var request = Termmesh_Peer_V1_TeamLeaderBootstrapRequest()
         request.projectID = projectID
         request.leaderPlacement = placement
@@ -461,7 +525,10 @@ public actor PeerSession {
         try await sendEnvelope { env in
             env.teamLeaderBootstrapRequest = request
         }
-        let reply = try await readFrame()
+        let reply = try await readFrame(
+            timeoutSeconds: timeoutSeconds,
+            operation: "bootstrapTeamLeader"
+        )
         guard case .teamLeaderBootstrapResponse(let response) = reply.payload else {
             throw PeerSessionError.unexpectedMessage(String(describing: reply.payload))
         }
@@ -475,8 +542,10 @@ public actor PeerSession {
         teamUUID: String,
         requestID: Data,
         method: String,
-        paramsJSON: String
+        paramsJSON: String,
+        timeoutSeconds: TimeInterval = 10
     ) async throws -> Termmesh_Peer_V1_TeamLeaderCommandResponse {
+        try requireHostCapability(PeerCapability.teamLeaderV1)
         var request = Termmesh_Peer_V1_TeamLeaderCommandRequest()
         request.grant = grant
         request.teamUuid = teamUUID
@@ -501,7 +570,10 @@ public actor PeerSession {
         try await sendEnvelope { env in
             env.teamLeaderCommandRequest = request
         }
-        let reply = try await readFrame()
+        let reply = try await readFrame(
+            timeoutSeconds: timeoutSeconds,
+            operation: "callTeamLeader"
+        )
         guard case .teamLeaderCommandResponse(let response) = reply.payload else {
             throw PeerSessionError.unexpectedMessage(String(describing: reply.payload))
         }
@@ -1211,6 +1283,43 @@ public actor PeerSession {
             if case .hostStats = env.payload { continue }
             return env
         }
+    }
+
+    private func requireHostCapability(_ capability: String) throws {
+        guard negotiatedHostCapabilities?.has(capability) == true else {
+            throw PeerSessionError.capabilityNotNegotiated(capability)
+        }
+    }
+
+    private func readFrame(
+        timeoutSeconds: TimeInterval,
+        operation: String
+    ) async throws -> Termmesh_Peer_V1_Envelope {
+        let gate = PeerRPCResultGate<Termmesh_Peer_V1_Envelope>()
+        let reader = Task {
+            do { await gate.resolve(.success(try await self.readFrame())) }
+            catch { await gate.resolve(.failure(error)) }
+        }
+        let timer = Task {
+            // Keep conversion total: NaN/infinity and huge values must not
+            // trap while constructing UInt64. Invalid values time out now;
+            // valid waits are capped at one day, well above every RPC default.
+            let boundedSeconds = timeoutSeconds.isFinite
+                ? min(max(0, timeoutSeconds), 86_400)
+                : 0
+            let nanoseconds = UInt64(boundedSeconds * 1_000_000_000)
+            try? await Task.sleep(nanoseconds: nanoseconds)
+            guard !Task.isCancelled else { return }
+            let error = PeerSessionError.rpcTimedOut(operation: operation)
+            if await gate.resolve(.failure(error)) {
+                await self.terminateInbound(with: error)
+            }
+        }
+        defer {
+            reader.cancel()
+            timer.cancel()
+        }
+        return try await gate.wait()
     }
 
     private func readAnyFrame() async throws -> Termmesh_Peer_V1_Envelope {

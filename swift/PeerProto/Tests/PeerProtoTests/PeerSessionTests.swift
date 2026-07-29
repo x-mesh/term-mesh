@@ -45,8 +45,10 @@ actor MockTransport {
     private var serverToClient: [Data] = []
     private var clientToServerWaiter: CheckedContinuation<Data, Never>?
     private var serverToClientWaiter: CheckedContinuation<Data, Never>?
+    private var clientWriteCount = 0
 
     func clientWrite(_ data: Data) {
+        clientWriteCount += 1
         if let waiter = serverToClientWaiter {
             // unused path
             _ = waiter
@@ -85,6 +87,17 @@ actor MockTransport {
             clientToServerWaiter = cont
         }
     }
+
+    func closeClientRead() {
+        if let waiter = serverToClientWaiter {
+            serverToClientWaiter = nil
+            waiter.resume(returning: Data())
+        } else {
+            serverToClient.append(Data())
+        }
+    }
+
+    func writtenFrameCount() -> Int { clientWriteCount }
 }
 
 /// Minimal server-side role for tests. Drives the opposite half of the
@@ -305,6 +318,69 @@ actor LifecycleMockHost {
     }
 }
 
+/// Handshakes with a selectable capability set and optionally consumes one
+/// post-handshake request without answering it. This models an older host and
+/// a mixed-version host that advertises an RPC but silently drops its payload.
+actor TeamRPCMockHost {
+    let transport: MockTransport
+    let capabilities: [String]
+    let consumeRequest: Bool
+    private var pendingInbound = Data()
+    private var seq: UInt64 = 0
+
+    init(
+        transport: MockTransport,
+        capabilities: [String],
+        consumeRequest: Bool = false
+    ) {
+        self.transport = transport
+        self.capabilities = capabilities
+        self.consumeRequest = consumeRequest
+    }
+
+    func run() async throws {
+        _ = try await readFrame() // client Hello
+        var hello = Termmesh_Peer_V1_Hello()
+        hello.protocolVersion = "1.0.0"
+        hello.displayName = "team-rpc-host"
+        hello.peerID = Data(count: 16)
+        hello.appVersion = "test"
+        hello.capabilities = capabilities
+        try await sendEnvelope { $0.hello = hello }
+
+        var challenge = Termmesh_Peer_V1_AuthChallenge()
+        challenge.nonce = Data(count: 32)
+        challenge.supportedMethods = ["ssh-passthrough"]
+        try await sendEnvelope { $0.authChallenge = challenge }
+        _ = try await readFrame() // client Auth
+
+        var result = Termmesh_Peer_V1_AuthResult()
+        result.accepted = true
+        result.sessionID = Data(count: 16)
+        try await sendEnvelope { $0.authResult = result }
+        if consumeRequest { _ = try await readFrame() }
+    }
+
+    private func sendEnvelope(
+        configure: (inout Termmesh_Peer_V1_Envelope) -> Void
+    ) async throws {
+        var envelope = Termmesh_Peer_V1_Envelope()
+        seq += 1
+        envelope.seq = seq
+        configure(&envelope)
+        await transport.serverWrite(try encodeFrame(envelope))
+    }
+
+    private func readFrame() async throws -> Termmesh_Peer_V1_Envelope {
+        while true {
+            if let envelope = try decodeFrame(from: &pendingInbound) { return envelope }
+            let chunk = await transport.serverRead()
+            if chunk.isEmpty { throw PeerSessionError.unexpectedEof }
+            pendingInbound.append(chunk)
+        }
+    }
+}
+
 final class PeerSessionTests: XCTestCase {
     func testHandshakeAndListRoundTrip() async throws {
         let transport = MockTransport()
@@ -420,6 +496,83 @@ final class PeerSessionTests: XCTestCase {
         }
 
         try await hostTask.value
+    }
+
+    func testTeamRPCsRequireNegotiatedCapabilitiesBeforeWriting() async throws {
+        let transport = MockTransport()
+        let host = TeamRPCMockHost(transport: transport, capabilities: [])
+        let hostTask = Task { try await host.run() }
+        let session = PeerSession(
+            read: { await transport.clientRead() },
+            write: { await transport.clientWrite($0) }
+        )
+        _ = try await session.handshake()
+        try await hostTask.value
+        var writtenFrameCount = await transport.writtenFrameCount()
+        XCTAssertEqual(writtenFrameCount, 2)
+
+        do {
+            _ = try await session.listTeams()
+            XCTFail("listTeams must reject an old host")
+        } catch PeerSessionError.capabilityNotNegotiated(let capability) {
+            XCTAssertEqual(capability, PeerCapability.teamRosterV1)
+        }
+        do {
+            _ = try await session.callTeam(method: "team.list", paramsJSON: "{}")
+            XCTFail("callTeam must reject an old host")
+        } catch PeerSessionError.capabilityNotNegotiated(let capability) {
+            XCTAssertEqual(capability, PeerCapability.teamCallV1)
+        }
+        do {
+            _ = try await session.bootstrapTeamLeader(
+                projectID: "name:demo",
+                placement: .local,
+                requestID: Data(count: PeerTeamLeader.requestIDBytes)
+            )
+            XCTFail("bootstrapTeamLeader must reject an old host")
+        } catch PeerSessionError.capabilityNotNegotiated(let capability) {
+            XCTAssertEqual(capability, PeerCapability.teamLeaderV1)
+        }
+        do {
+            _ = try await session.callTeamLeader(
+                grant: Termmesh_Peer_V1_TeamLeaderGrant(),
+                teamUUID: "team",
+                requestID: Data(count: PeerTeamLeader.requestIDBytes),
+                method: "team.delegate",
+                paramsJSON: "{}"
+            )
+            XCTFail("callTeamLeader must reject an old host")
+        } catch PeerSessionError.capabilityNotNegotiated(let capability) {
+            XCTAssertEqual(capability, PeerCapability.teamLeaderV1)
+        }
+        writtenFrameCount = await transport.writtenFrameCount()
+        XCTAssertEqual(writtenFrameCount, 2)
+    }
+
+    func testAdvertisedTeamRPCThatNeverRepliesTimesOut() async throws {
+        let transport = MockTransport()
+        let host = TeamRPCMockHost(
+            transport: transport,
+            capabilities: [PeerCapability.teamRosterV1],
+            consumeRequest: true
+        )
+        let hostTask = Task { try await host.run() }
+        let session = PeerSession(
+            read: { await transport.clientRead() },
+            write: { await transport.clientWrite($0) },
+            close: { await transport.closeClientRead() }
+        )
+        _ = try await session.handshake()
+
+        do {
+            _ = try await session.listTeams(timeoutSeconds: 0.05)
+            XCTFail("silent host must time out")
+        } catch PeerSessionError.rpcTimedOut(let operation) {
+            XCTAssertEqual(operation, "listTeams")
+        }
+        try await hostTask.value
+        let writtenFrameCount = await transport.writtenFrameCount()
+        XCTAssertEqual(writtenFrameCount, 3)
     }
 
     /// Heartbeat must fire `onDead` when the remote stops sending Pong.

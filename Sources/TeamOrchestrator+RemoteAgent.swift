@@ -48,6 +48,7 @@ extension TeamOrchestrator {
         case promptStagingFailed(String)
         case projectWorkspaceUnavailable(String)
         case unresolvedRemoteWorkingDirectory(host: String, path: String)
+        case projectDeletionIncomplete(String)
         case partialShellClose(closed: Int, failed: Int, reason: String)
 
         var description: String {
@@ -70,6 +71,8 @@ extension TeamOrchestrator {
             case .unresolvedRemoteWorkingDirectory(let host, let path):
                 return "could not resolve remote working directory for host \(host) "
                     + "from path \(path); specify --dir <remote-path> for that host"
+            case .projectDeletionIncomplete(let report):
+                return "project deletion incomplete: \(report)"
             case .partialShellClose(let closed, let failed, let reason):
                 return "closed \(closed) shell(s); \(failed) refused — \(reason)"
             }
@@ -113,6 +116,38 @@ extension TeamOrchestrator {
         return "Project · \(String(singleLine.prefix(72)))"
     }
 
+    private func waitForRemoteRemoval(
+        hostSockPath: String,
+        surfaceID: Data? = nil,
+        workspaceID: Data? = nil
+    ) async throws -> Bool {
+        for attempt in 0..<15 {
+            let probe = try await PeerRelaySession.connect(hostSockPath: hostSockPath)
+            let workspaces: [Termmesh_Peer_V1_Workspace]
+            do {
+                workspaces = try await probe.session.listWorkspaces(timeoutSeconds: 2)
+                await probe.cancel()
+            } catch {
+                await probe.cancel()
+                throw error
+            }
+            let workspaceStillExists = workspaceID.map { target in
+                workspaces.contains { $0.workspaceID == target }
+            } ?? false
+            let surfaceStillExists = surfaceID.map { target in
+                workspaces.contains { workspace in
+                    peerPaneSummaries(workspace.hasLayout ? workspace.layout : nil)
+                        .contains { $0.id == target }
+                }
+            } ?? false
+            if !workspaceStillExists && !surfaceStillExists { return true }
+            if attempt < 14 {
+                try await Task.sleep(nanoseconds: 200_000_000)
+            }
+        }
+        return false
+    }
+
     private func remoteSurfacePlacement(
         teamName: String,
         host: HostEntry,
@@ -144,21 +179,24 @@ extension TeamOrchestrator {
                 )
             }
         }
+        var workspaceID = team.remoteWorkspaceIDs[host.id]
+        var createdWorkspace = false
         do {
-            var workspaceID = team.remoteWorkspaceIDs[host.id]
-            var createdWorkspace = false
+            if let cachedWorkspaceID = workspaceID {
+                let workspaces = try await connection.session.listWorkspaces()
+                if !workspaces.contains(where: { $0.workspaceID == cachedWorkspaceID }) {
+                    // The host may have restarted or the user may have removed
+                    // the workspace outside this app. Do not keep sending seed
+                    // requests to an ID the authoritative roster no longer has.
+                    forgetRemoteWorkspaceID(teamName: teamName, hostKey: host.id)
+                    workspaceID = nil
+                }
+            }
             if workspaceID == nil {
                 workspaceID = try await connection.session.createWorkspace(
                     title: Self.remoteProjectWorkspaceTitle(teamName: teamName)
                 )
                 createdWorkspace = true
-                if let workspaceID {
-                    recordRemoteWorkspaceID(
-                        teamName: teamName,
-                        hostKey: host.id,
-                        workspaceID: workspaceID
-                    )
-                }
             }
             guard let workspaceID else {
                 await connection.cancel()
@@ -178,6 +216,13 @@ extension TeamOrchestrator {
                     .map(\.id)
                     .first {
                     let hasManagedProjectSurface = managedIDs.contains(sourceID)
+                    if createdWorkspace {
+                        recordRemoteWorkspaceID(
+                            teamName: teamName,
+                            hostKey: host.id,
+                            workspaceID: workspaceID
+                        )
+                    }
                     await connection.cancel()
                     return RemoteSurfacePlacement(
                         sourceID: sourceID,
@@ -191,9 +236,31 @@ extension TeamOrchestrator {
                 }
                 try await Task.sleep(nanoseconds: 200_000_000)
             }
-            await connection.cancel()
             throw RemoteAgentError.projectWorkspaceUnavailable(host.displayName)
         } catch {
+            if createdWorkspace, let workspaceID {
+                // Creation is not committed until a seed surface exists.
+                // Confirm compensation before dropping the connection. A
+                // write completing only proves that the request entered the
+                // socket, not that the host applied it.
+                do {
+                    try await connection.session.deleteWorkspace(workspaceID: workspaceID)
+                    await connection.cancel()
+                    guard try await waitForRemoteRemoval(
+                        hostSockPath: host.activeSockPath,
+                        workspaceID: workspaceID
+                    ) else {
+                        throw RemoteAgentError.projectDeletionIncomplete(
+                            "workspace compensation was not confirmed on \(host.displayName)"
+                        )
+                    }
+                } catch let cleanupError {
+                    await connection.cancel()
+                    throw RemoteAgentError.projectDeletionIncomplete(
+                        "workspace setup failed with \(error); compensation failed with \(cleanupError)"
+                    )
+                }
+            }
             await connection.cancel()
             throw error
         }
@@ -1444,6 +1511,7 @@ extension TeamOrchestrator {
         pairModel: String = "",
         pairSpec: String = "",
         projectSource: ProjectSource? = nil,
+        onRemoteAttachFailure: ((String) -> Void)? = nil,
         tabManager: TabManager
     ) -> Team? {
         // Peer attachment is asynchronous. Record the requested endpoint from
@@ -1602,6 +1670,7 @@ extension TeamOrchestrator {
                 } catch {
                     let description = "Could not start remote leader on \(hostKey): \(error)"
                     RemoteWorkLog.info(description)
+                    onRemoteAttachFailure?(description)
                     self.markRemoteLeaderFailed(
                         teamName: team.id,
                         description: description
@@ -1627,9 +1696,25 @@ extension TeamOrchestrator {
                         cli: row.preset.cli
                     )
                 } catch {
-                    RemoteWorkLog.info(
+                    let description =
                         "Could not start \(row.preset.name) on \(hostKey): \(error)"
-                    )
+                    RemoteWorkLog.info(description)
+                    onRemoteAttachFailure?(description)
+                    if let task = TeamDataStore.shared.createTask(
+                        teamName: team.id,
+                        title: "Remote attach failed: \(row.preset.name) @ \(hostKey)",
+                        details: description,
+                        labels: ["remote-attach", "failure"],
+                        priority: 1,
+                        createdBy: "term-mesh"
+                    ) {
+                        _ = TeamDataStore.shared.updateTask(
+                            teamName: team.id,
+                            taskId: task.id,
+                            status: "failed",
+                            result: description
+                        )
+                    }
                 }
             }
         }
@@ -1644,16 +1729,28 @@ extension TeamOrchestrator {
 
         let grouped = Dictionary(grouping: team.remoteProjectLocations, by: \.hostKey)
         var deletionJobs: [(host: HostEntry, script: String)] = []
+        var deleted: [String] = []
+        var remaining: [String] = []
+        var failures: [String] = []
         for (hostKey, locations) in grouped {
             guard let host = RemoteHostStore.shared.sortedHosts.first(where: { $0.id == hostKey })
             else {
-                throw RemoteAgentError.hostNotFound(hostKey)
+                failures.append("filesystem \(hostKey): host not found")
+                remaining.append(contentsOf: locations.map { "path \(hostKey):\($0.path)" })
+                continue
             }
             guard host.isConnected, let sshTarget = host.sshTarget, !sshTarget.isEmpty else {
-                throw RemoteAgentError.hostNotConnected(host.displayName)
+                failures.append("filesystem \(hostKey): host not connected")
+                remaining.append(contentsOf: locations.map { "path \(hostKey):\($0.path)" })
+                continue
             }
-            let script = try PeerProjectBootstrap.deletionScript(paths: locations.map(\.path))
-            deletionJobs.append((host, script))
+            do {
+                let script = try PeerProjectBootstrap.deletionScript(paths: locations.map(\.path))
+                deletionJobs.append((host, script))
+            } catch {
+                failures.append("filesystem \(hostKey): \(error)")
+                remaining.append(contentsOf: locations.map { "path \(hostKey):\($0.path)" })
+            }
         }
 
         let workspace = tabManager.tabs.first(where: { $0.id == team.workspaceId })
@@ -1682,48 +1779,116 @@ extension TeamOrchestrator {
             }
         }
 
-        for remote in remoteSurfaces where !remote.socket.isEmpty {
-            let connection = try await PeerRelaySession.connect(hostSockPath: remote.socket)
-            try await connection.session.requestClosePane(paneID: remote.surfaceID)
-            await connection.cancel()
-            ManagedPeerSurfaceStore.shared.forget(
-                hostKey: remote.hostKey,
-                surfaceID: remote.surfaceID
-            )
+        for remote in remoteSurfaces {
+            let label = "surface \(remote.hostKey):\(remote.surfaceID.base64EncodedString())"
+            guard !remote.socket.isEmpty else {
+                failures.append("\(label): host not connected")
+                remaining.append(label)
+                continue
+            }
+            do {
+                let connection = try await PeerRelaySession.connect(hostSockPath: remote.socket)
+                do {
+                    try await connection.session.requestClosePane(paneID: remote.surfaceID)
+                    await connection.cancel()
+                    guard try await waitForRemoteRemoval(
+                        hostSockPath: remote.socket,
+                        surfaceID: remote.surfaceID
+                    ) else {
+                        throw RemoteAgentError.projectDeletionIncomplete(
+                            "host did not confirm removal of \(label)"
+                        )
+                    }
+                    await connection.cancel()
+                } catch {
+                    await connection.cancel()
+                    throw error
+                }
+                ManagedPeerSurfaceStore.shared.forget(
+                    hostKey: remote.hostKey,
+                    surfaceID: remote.surfaceID
+                )
+                deleted.append(label)
+            } catch {
+                failures.append("\(label): \(error)")
+                remaining.append(label)
+            }
         }
 
         // The project owns these peer workspaces. Removing the project should
         // remove their now-detached shell containers too; relay/default and
         // user-created workspaces are never included in this map.
         for (hostKey, workspaceID) in team.remoteWorkspaceIDs {
+            let label = "workspace \(hostKey):\(workspaceID.base64EncodedString())"
             guard let host = RemoteHostStore.shared.sortedHosts.first(where: { $0.id == hostKey }),
                   !host.activeSockPath.isEmpty
-            else { continue }
-            let connection = try await PeerRelaySession.connect(
-                hostSockPath: host.activeSockPath
-            )
-            try await connection.session.deleteWorkspace(workspaceID: workspaceID)
-            await connection.cancel()
+            else {
+                failures.append("\(label): host not connected")
+                remaining.append(label)
+                continue
+            }
+            do {
+                let connection = try await PeerRelaySession.connect(
+                    hostSockPath: host.activeSockPath
+                )
+                do {
+                    try await connection.session.deleteWorkspace(workspaceID: workspaceID)
+                    await connection.cancel()
+                    guard try await waitForRemoteRemoval(
+                        hostSockPath: host.activeSockPath,
+                        workspaceID: workspaceID
+                    ) else {
+                        throw RemoteAgentError.projectDeletionIncomplete(
+                            "host did not confirm removal of \(label)"
+                        )
+                    }
+                    await connection.cancel()
+                } catch {
+                    await connection.cancel()
+                    throw error
+                }
+                forgetRemoteWorkspaceID(teamName: teamName, hostKey: hostKey)
+                deleted.append(label)
+            } catch {
+                failures.append("\(label): \(error)")
+                remaining.append(label)
+            }
         }
 
-        try await Task.sleep(nanoseconds: 500_000_000)
+        try? await Task.sleep(nanoseconds: 500_000_000)
         for job in deletionJobs {
-            guard let sshTarget = job.host.sshTarget else { continue }
-            try await PeerHostReadinessChecker.runScript(
-                sshTarget: sshTarget,
-                port: job.host.sshPort,
-                identityFile: job.host.identityFile,
-                script: job.script,
-                timeoutSeconds: 60
-            )
-        }
-        for hostKey in grouped.keys {
-            RemoteProjectPaths.shared.forget(
-                host: hostKey,
-                localRoot: team.workingDirectory
-            )
+            let hostKey = job.host.id
+            do {
+                guard let sshTarget = job.host.sshTarget else {
+                    throw RemoteAgentError.hostNotConnected(job.host.displayName)
+                }
+                try await PeerHostReadinessChecker.runScript(
+                    sshTarget: sshTarget,
+                    port: job.host.sshPort,
+                    identityFile: job.host.identityFile,
+                    script: job.script,
+                    timeoutSeconds: 60
+                )
+                let paths = grouped[hostKey, default: []].map(\.path)
+                deleted.append(contentsOf: paths.map { "path \(hostKey):\($0)" })
+                RemoteProjectPaths.shared.forget(
+                    host: hostKey,
+                    localRoot: team.workingDirectory
+                )
+            } catch {
+                failures.append("filesystem \(hostKey): \(error)")
+                remaining.append(contentsOf: grouped[hostKey, default: []].map {
+                    "path \(hostKey):\($0.path)"
+                })
+            }
         }
 
+        guard failures.isEmpty else {
+            let report = "deleted=[\(deleted.joined(separator: ", "))]; "
+                + "remaining=[\(remaining.joined(separator: ", "))]; "
+                + "failures=[\(failures.joined(separator: "; "))]"
+            throw RemoteAgentError.projectDeletionIncomplete(report)
+        }
         _ = destroyTeam(name: teamName, tabManager: tabManager, archive: false)
     }
 
