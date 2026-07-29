@@ -488,9 +488,14 @@ tm-agent wait --timeout 120 --mode any        # ALWAYS use this to wait; NEVER u
 tm-agent recycle <agent>                      # guarded hard restart for idle/stopped workers; drops transcript context
 tm-agent brief <agent>
 
-# LeaderParallelPolicy v1 — runtime-enforced (single source: `Sources/LeaderParallelPolicy.swift`)
+# LeaderParallelPolicy v3 — runtime-enforced (single source: `Sources/LeaderParallelPolicy.swift`)
+#   policy_version: 3
+#   policy_digest:  38e20ceeda482e65f681b3578b996736907908a978369b3030bc6e529dda4d11
 # Every local/peer leader receives the same policy_version and policy_digest. `status` exposes
 # source/version/digest plus policy state; injection failure is explicit `failed`, never silent.
+# The digest is SHA-256 over the rule text, so editing a rule in the source changes it. When that
+# happens, update the two values above in the same commit — a document that advertises a stale
+# digest is itself a policy-parity violation.
 # For substantive work, form a parallel wave by default. Claim or dispatch only DAG-ready tasks:
 # every `depends_on` task must be completed; failed/blocked dependencies never release a child.
 #
@@ -572,20 +577,27 @@ tm-agent research <topic> [options]       # Multi-agent research with board.json
 
 ### Leader: reading full agent reports
 
-Agent replies are truncated to 1500 chars over the socket. Full reports are saved to files:
+Only the content sent over the socket is truncated (~1500 chars). The reply an agent submitted is
+preserved whole in two files:
 
 ```bash
-# Read full report for a specific task
+# The submitted reply for a task
 cat ~/.term-mesh/results/<team>/<task_id>.md
 
-# Read an agent's latest reply
-cat ~/.term-mesh/results/<team>/<agent>-reply.md
-
-# Example: read architect's full report in my-team
-cat ~/.term-mesh/results/my-team/architect-reply.md
+# The same reply under the submitting instance
+cat ~/.term-mesh/results/<team>/<agent>-<agent_instance_id>-reply.md
 ```
 
-When `tm-agent collect` or `msg list` returns truncated content (ends with `...`), read the corresponding file from `~/.term-mesh/results/` for the full text. Files are auto-cleaned after 24 hours.
+These preserve what was submitted; they do not produce detail that was never written. If the agent
+submitted a summary, that is all these files hold — the detail lives only in whatever separate file
+its `FULL_REPORT` names. Read that first.
+
+Do not read the name-only alias `<agent>-reply.md`: instances sharing a name overwrite each other,
+so it is not a reliable answer to "what did this agent report". Use the `agent_instance_id` path or
+`<task_id>.md`.
+
+When `tm-agent collect` or `msg list` returns truncated content (ends with `...`), read the file
+`FULL_REPORT` points at for the full text. Files are auto-cleaned after 24 hours.
 
 ### Auto-Fix Budget protocol
 
@@ -676,44 +688,58 @@ STATUS: DONE은 "편집 완료"이지 "빌드 통과"가 아니다.
 
 ### Reply Truncation Protocol
 
-`tm-agent reply`와 `tm-agent collect`는 소켓 전송을 **1500자로 truncate**한다.
-풀 내용은 `~/.term-mesh/results/<team>/<agent>-reply.md`에 자동 저장되며, 24시간 후 자동 정리된다.
+`tm-agent reply`와 `tm-agent collect`는 socket/DB로 오가는 content만 **약 1500자로 truncate**한다.
+제출한 reply 전문은 두 파일에 자동 보존된다(24시간 후 자동 정리):
+
+- `~/.term-mesh/results/<team>/<task_id>.md`
+- `~/.term-mesh/results/<team>/<agent>-<agent_instance_id>-reply.md`
+
+**이 파일들은 상세를 만들어 주는 곳이 아니라 제출한 것을 그대로 보관하는 곳이다.**
+요약을 제출하면 그 파일에도 요약만 들어간다.
 
 #### 에이전트 의무
 
-- **응답이 1000자를 초과할 경우** Standard Header의 `FULL_REPORT`에 결과 파일 경로를 넣는다:
+- **응답이 1000자를 초과할 경우**, concise reply 밖에 상세를 두려면 **먼저 고유한 별도 파일을 직접
+  쓰고** `FULL_REPORT`가 그 파일을 가리킨다:
 
 ```
-FULL_REPORT: ~/.term-mesh/results/<team>/<agent>-reply.md
+FULL_REPORT: ~/.term-mesh/results/<team>/<고유한-이름>.md
 ```
 
 - `<team>`: `tm-agent status`의 team_name 필드
-- `<agent>`: 현재 agent name
+- 파일 이름은 태스크마다 고유해야 한다. 같은 이름을 재사용하면 다른 인스턴스의 결과를 덮어쓴다.
+- **자기참조 금지**: `FULL_REPORT`가 자기 reply alias나 `<task_id>.md`를 가리키면 안 된다.
+  그 파일들은 방금 제출한 reply 그 자체이므로, 요약이 자기 자신을 "전체 보고서"라고 가리키게 되고
+  항목 상세는 어디에도 존재하지 않게 된다. 2026-07-29 리뷰 웨이브에서 에이전트 2명이 이렇게
+  제출해 리더가 별도 파일 덤프를 다시 지시해야 했다.
 
 #### Leader가 풀 내용을 읽는 명령
 
 ```bash
-# 특정 task 전체 결과
+# 에이전트가 FULL_REPORT로 가리킨 상세 파일 — 상세가 실제로 있는 유일한 곳
+cat ~/.term-mesh/results/my-team/<FULL_REPORT가 가리킨 파일>.md
+
+# 제출된 reply 전문(요약이면 요약만 들어 있다)
 cat ~/.term-mesh/results/my-team/<task_id>.md
-
-# 에이전트의 최신 reply
-cat ~/.term-mesh/results/my-team/<agent>-reply.md
-
-# 예시: explorer의 탐색 결과 전문
-cat ~/.term-mesh/results/my-team/explorer-reply.md
+cat ~/.term-mesh/results/my-team/<agent>-<agent_instance_id>-reply.md
 ```
+
+- **name-only alias(`<agent>-reply.md`)로 읽지 마라.** 같은 이름의 인스턴스끼리 서로 덮어쓰므로
+  누구의 결과인지 보장되지 않는다. 항상 `agent_instance_id`가 붙은 경로나 `<task_id>.md`를 쓴다.
 
 > **BAD/GOOD 예시:**
 >
 > ```bash
-> # BAD — collect 결과가 "..." 로 끊겨 핵심 VERIFY 명령이 누락됨
+> # BAD — collect 결과가 "..." 로 끊겼는데 FULL_REPORT가 자기 reply를 가리켜
+> #       그 파일에도 같은 요약만 들어 있다
 > tm-agent collect --lines 100
 > # → "...확인 필요. VERIFY: xcodebuild -scheme term-mesh ..." (잘림)
+> cat ~/.term-mesh/results/my-team/executor-reply.md   # 같은 요약. 상세 없음
 >
-> # GOOD — truncation 감지 후 파일 직접 읽기
+> # GOOD — 에이전트가 먼저 별도 파일을 쓰고 FULL_REPORT가 그것을 가리킨다
 > tm-agent collect --lines 100
-> # 결과 끝이 "..." 이거나 FULL_REPORT가 n/a가 아니면:
-> cat ~/.term-mesh/results/my-team/executor-reply.md
+> # FULL_REPORT: ~/.term-mesh/results/my-team/p1-g1.md
+> cat ~/.term-mesh/results/my-team/p1-g1.md
 > ```
 
 ### Standard Reply Header
@@ -755,8 +781,8 @@ Standard Header가 **첫 블록**, 페르소나 고유 포맷이 **본문**이�
 # 전체 에이전트 collect 후 STATUS·NEXT만 추출
 tm-agent collect --lines 100 | grep -E "^(STATUS|NEXT):"
 
-# 특정 에이전트의 헤더만 확인
-cat ~/.term-mesh/results/my-team/<agent>-reply.md | head -5
+# 특정 에이전트의 헤더만 확인 — name-only alias는 인스턴스끼리 덮어쓰므로 쓰지 않는다
+cat ~/.term-mesh/results/my-team/<agent>-<agent_instance_id>-reply.md | head -5
 ```
 
 ## E2E tests
