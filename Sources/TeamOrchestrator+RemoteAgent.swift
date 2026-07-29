@@ -47,6 +47,7 @@ extension TeamOrchestrator {
         case cliUnavailable(String, String)
         case promptStagingFailed(String)
         case projectWorkspaceUnavailable(String)
+        case unresolvedRemoteWorkingDirectory(host: String, path: String)
         case partialShellClose(closed: Int, failed: Int, reason: String)
 
         var description: String {
@@ -66,10 +67,33 @@ extension TeamOrchestrator {
                 return "could not stage the leader prompt on \(host)"
             case .projectWorkspaceUnavailable(let host):
                 return "could not prepare the project workspace on \(host)"
+            case .unresolvedRemoteWorkingDirectory(let host, let path):
+                return "could not resolve remote working directory for host \(host) "
+                    + "from path \(path); specify --dir <remote-path> for that host"
             case .partialShellClose(let closed, let failed, let reason):
                 return "closed \(closed) shell(s); \(failed) refused — \(reason)"
             }
         }
+    }
+
+    static func requiredRemoteWorkingDirectory(
+        _ path: String?,
+        hostKey: String
+    ) throws -> String {
+        let resolved = path?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        guard !resolved.isEmpty else {
+            let suppliedPath: String
+            if let path, !path.isEmpty {
+                suppliedPath = String(reflecting: path)
+            } else {
+                suppliedPath = path == nil ? "<unset>" : "<empty>"
+            }
+            throw RemoteAgentError.unresolvedRemoteWorkingDirectory(
+                host: hostKey,
+                path: suppliedPath
+            )
+        }
+        return resolved
     }
 
     private struct RemoteSurfacePlacement {
@@ -1437,16 +1461,44 @@ extension TeamOrchestrator {
         // locally and moving them would start each CLI on the wrong machine
         // and then close it.
         let remoteRows = rows.filter { $0.hostKey != nil }
+        let resolvedRemoteRows: [(row: TeamAgentRow, workingDirectory: String)]
+        let resolvedRemoteLeaderWorkingDirectory: String?
+        do {
+            resolvedRemoteRows = try remoteRows.map { row in
+                guard let hostKey = row.hostKey else {
+                    preconditionFailure("remoteRows contains a local row")
+                }
+                return (
+                    row,
+                    try Self.requiredRemoteWorkingDirectory(
+                        row.hostDirectory,
+                        hostKey: hostKey
+                    )
+                )
+            }
+            if case let .peer(hostKey) = leaderEndpoint {
+                resolvedRemoteLeaderWorkingDirectory = try Self.requiredRemoteWorkingDirectory(
+                    leaderWorkingDirectory,
+                    hostKey: hostKey
+                )
+            } else {
+                resolvedRemoteLeaderWorkingDirectory = nil
+            }
+        } catch {
+            RemoteWorkLog.info("Could not create \(teamName): \(error)")
+            return nil
+        }
         let remoteLeaderSystemPrompt: String?
         if case let .peer(hostKey) = leaderEndpoint {
             let remoteSocketPath = RemoteHostStore.shared.sortedHosts
                 .first(where: { $0.id == hostKey })?
                 .remoteSockPath ?? "inherited from TERMMESH_SOCKET"
             if leaderMode.lowercased() == "claude" {
+                guard let resolvedRemoteLeaderWorkingDirectory else { return nil }
                 remoteLeaderSystemPrompt = Self.remoteLeaderClaudeSystemPrompt(
                     teamName: teamName,
                     rows: rows,
-                    remoteWorkingDirectory: leaderWorkingDirectory ?? workingDirectory,
+                    remoteWorkingDirectory: resolvedRemoteLeaderWorkingDirectory,
                     remoteSocketPath: remoteSocketPath
                 )
             } else {
@@ -1511,18 +1563,13 @@ extension TeamOrchestrator {
             if let hostKey = projectSource.hostKey {
                 locations.insert(.init(hostKey: hostKey, path: projectSource.projectPath))
             }
-            for row in remoteRows {
-                guard let hostKey = row.hostKey else { continue }
-                let path = row.hostDirectory.trimmingCharacters(in: .whitespacesAndNewlines)
-                guard !path.isEmpty else { continue }
-                locations.insert(.init(hostKey: hostKey, path: path))
+            for resolved in resolvedRemoteRows {
+                guard let hostKey = resolved.row.hostKey else { continue }
+                locations.insert(.init(hostKey: hostKey, path: resolved.workingDirectory))
             }
             if case let .peer(hostKey) = leaderEndpoint {
-                let path = (leaderWorkingDirectory ?? "")
-                    .trimmingCharacters(in: .whitespacesAndNewlines)
-                if !path.isEmpty {
-                    locations.insert(.init(hostKey: hostKey, path: path))
-                }
+                guard let resolvedRemoteLeaderWorkingDirectory else { return nil }
+                locations.insert(.init(hostKey: hostKey, path: resolvedRemoteLeaderWorkingDirectory))
             }
             team.remoteProjectLocations = locations.sorted {
                 ($0.hostKey, $0.path) < ($1.hostKey, $1.path)
@@ -1542,11 +1589,12 @@ extension TeamOrchestrator {
         // the shell could not find.
         Task { @MainActor in
             if case let .peer(hostKey) = leaderEndpoint {
+                guard let resolvedRemoteLeaderWorkingDirectory else { return }
                 do {
                     try await self.attachRemoteLeader(
                         teamName: team.id,
                         hostKey: hostKey,
-                        workingDirectory: leaderWorkingDirectory ?? workingDirectory,
+                        workingDirectory: resolvedRemoteLeaderWorkingDirectory,
                         cli: leaderMode,
                         model: leaderModel,
                         systemPrompt: remoteLeaderSystemPrompt
@@ -1565,18 +1613,15 @@ extension TeamOrchestrator {
                     )
                 }
             }
-            for row in remoteRows {
+            for resolved in resolvedRemoteRows {
+                let row = resolved.row
                 guard let hostKey = row.hostKey else { continue }
-                let directory = row.hostDirectory.trimmingCharacters(in: .whitespacesAndNewlines)
                 do {
                     _ = try await self.attachRemoteAgent(
                         teamName: team.id,
                         agentName: row.preset.name,
                         hostKey: hostKey,
-                        // Its own path when one was given; the team's
-                        // otherwise, which is right when both machines lay the
-                        // project out the same way and visibly wrong when not.
-                        workingDirectory: directory.isEmpty ? workingDirectory : directory,
+                        workingDirectory: resolved.workingDirectory,
                         agentType: row.preset.name,
                         model: row.preset.model,
                         cli: row.preset.cli

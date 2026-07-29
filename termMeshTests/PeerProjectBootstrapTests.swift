@@ -8,6 +8,30 @@ import PeerProto
 #endif
 
 final class PeerProjectBootstrapTests: XCTestCase {
+    func test_remoteWorkingDirectoryRequiresHostResolvedPath() throws {
+        XCTAssertEqual(
+            try TeamOrchestrator.requiredRemoteWorkingDirectory(
+                "  /srv/project  ",
+                hostKey: "ssh:builder"
+            ),
+            "/srv/project"
+        )
+
+        for path: String? in [nil, "", "   "] {
+            XCTAssertThrowsError(
+                try TeamOrchestrator.requiredRemoteWorkingDirectory(
+                    path,
+                    hostKey: "ssh:builder"
+                )
+            ) { error in
+                let message = String(describing: error)
+                XCTAssertTrue(message.contains("ssh:builder"))
+                XCTAssertTrue(message.contains("path"))
+                XCTAssertTrue(message.contains("--dir <remote-path>"))
+            }
+        }
+    }
+
     private func row(
         _ name: String,
         hostKey: String?,
