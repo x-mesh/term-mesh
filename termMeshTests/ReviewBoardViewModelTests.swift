@@ -390,6 +390,72 @@ final class ReviewBoardViewModelTests: XCTestCase {
         XCTAssertNil(model.review)
     }
 
+    /// The panel starts a read from `.task(id: task.rawID)`, which fires once
+    /// per id. A read refused because another was still out therefore had
+    /// nothing left to retrigger it, and the newly selected task sat with no
+    /// review and no spinner until the selection moved twice.
+    @MainActor
+    func test_reading_another_task_supersedes_a_read_still_in_flight() async {
+        let model = ReviewBoardViewModel(
+            initialSnapshot: .empty, selectedTaskID: nil, snapshotProvider: { .empty }
+        )
+        var releaseFirst: CheckedContinuation<Void, Never>?
+        model.setActions(ReviewBoardActions(
+            review: { task in
+                if task.rawID == "tsk_1" {
+                    await withCheckedContinuation { releaseFirst = $0 }
+                }
+                return self.review(taskID: task.rawID)
+            },
+            approve: { _ in XCTFail("no decision here") },
+            reject: { _, _ in XCTFail("no decision here") }
+        ))
+
+        async let firstRead: Void = model.loadReview(for: task("tsk_1"))
+        // Let the first read reach its suspension point.
+        for _ in 0..<1000 where releaseFirst == nil { await Task.yield() }
+        XCTAssertNotNil(releaseFirst, "the first read should be parked at its continuation")
+
+        // This is the whole point: it must not be refused.
+        await model.loadReview(for: task("tsk_2"))
+        XCTAssertEqual(model.review?.taskID, "tsk_2")
+
+        releaseFirst?.resume()
+        await firstRead
+        XCTAssertEqual(
+            model.review?.taskID, "tsk_2",
+            "the superseded read must not land on top of the newer one"
+        )
+        XCTAssertFalse(model.actionInFlight)
+    }
+
+    /// What was read belongs to the task that was selected. Both the review and
+    /// the "already read this one" marker go, or the next read is refused as
+    /// redundant and the panel stays blank.
+    @MainActor
+    func test_selecting_a_different_task_drops_what_was_read() async {
+        var reads = 0
+        let model = ReviewBoardViewModel(
+            initialSnapshot: .empty, selectedTaskID: nil, snapshotProvider: { .empty }
+        )
+        model.setActions(ReviewBoardActions(
+            review: { task in reads += 1; return self.review(taskID: task.rawID) },
+            approve: { _ in }, reject: { _, _ in }
+        ))
+
+        await model.loadReview(for: task("tsk_1"))
+        XCTAssertEqual(model.review?.taskID, "tsk_1")
+
+        model.selectTask(id: "tsk_2")
+        XCTAssertNil(model.review, "a stale review must not sit under a new header")
+
+        // And coming back re-reads rather than being refused as already in hand.
+        model.selectTask(id: "tsk_1")
+        await model.loadReview(for: task("tsk_1"))
+        XCTAssertEqual(reads, 2)
+        XCTAssertEqual(model.review?.taskID, "tsk_1")
+    }
+
     /// Nothing wired: the board says so instead of throwing an opaque error.
     @MainActor
     func test_an_unwired_board_reports_that_the_coordinator_is_off() async {

@@ -138,7 +138,7 @@ final class AutoPilotMergeIntegrationTests: XCTestCase {
             "the undo point must name the checkout that outlives --cleanup"
         )
         let point = AutoPilotUndoPoint(
-            branch: "develop", sha: developBefore, taskID: "tsk_1",
+            branch: "develop", sha: developBefore, mergedSHA: head, taskID: "tsk_1",
             repositoryPath: repositoryRoot!, recordedAtMS: 1
         )
 
@@ -174,7 +174,7 @@ final class AutoPilotMergeIntegrationTests: XCTestCase {
     /// Uncommitted work in the checkout stops the undo. Discarding it would
     /// make undoing auto pilot cost someone their own edits.
     func testUncommittedWorkInTheCheckoutRefusesTheUndo() async throws {
-        let (worktree, _) = try await makeWorkToMerge()
+        let (worktree, head) = try await makeWorkToMerge()
         let developBefore = try await git(["rev-parse", "develop"])
 
         let runner = ReviewBoardMergeRunner(
@@ -191,7 +191,7 @@ final class AutoPilotMergeIntegrationTests: XCTestCase {
             to: root.appendingPathComponent("a.txt"), atomically: true, encoding: .utf8
         )
         let point = AutoPilotUndoPoint(
-            branch: "develop", sha: developBefore, taskID: "tsk_1",
+            branch: "develop", sha: developBefore, mergedSHA: head, taskID: "tsk_1",
             repositoryPath: repository, recordedAtMS: 1
         )
         let placement = await AutoPilotUndo.placement(of: "develop", in: repository)
@@ -210,11 +210,40 @@ final class AutoPilotMergeIntegrationTests: XCTestCase {
         XCTAssertEqual(stillMine, "mine", "the refusal must leave the edits alone")
     }
 
+    func testACommitAfterTheMergeIsNotDiscardedByUndo() async throws {
+        let (worktree, mergedHead) = try await makeWorkToMerge()
+        let developBefore = try await git(["rev-parse", "develop"])
+        let runner = ReviewBoardMergeRunner(
+            command: { arguments, _ in try await self.gitKit(arguments, in: self.repository) },
+            report: { _, _, _ in }
+        )
+        _ = await runner.process(ReviewBoardMergeRunner.Job(
+            queueID: "mrq_1", taskID: "tsk_1", worktreePath: worktree, target: "develop"
+        ))
+        try await git(["commit", "-q", "--allow-empty", "-m", "human work after merge"])
+        let advancedHead = try await git(["rev-parse", "develop"])
+
+        let point = AutoPilotUndoPoint(
+            branch: "develop", sha: developBefore, mergedSHA: mergedHead,
+            taskID: "tsk_1", repositoryPath: repository, recordedAtMS: 1
+        )
+        let placement = await AutoPilotUndo.placement(of: "develop", in: repository)
+        let result = await AutoPilotUndo.apply(
+            AutoPilotUndo.plan(for: point, placement: placement)
+        )
+
+        guard case .failed(let reason) = result else {
+            return XCTFail("an advanced branch must refuse undo: \(result)")
+        }
+        XCTAssertTrue(reason.contains("advanced"), reason)
+        XCTAssertEqual(try await git(["rev-parse", "develop"]), advancedHead)
+    }
+
     /// The other half of that rule. A build artifact sitting in the checkout is
     /// not something `reset --hard` could destroy, and refusing on one would
     /// make undo unusable in any repository anyone actually works in.
     func testAnUntrackedFileDoesNotBlockTheUndo() async throws {
-        let (worktree, _) = try await makeWorkToMerge()
+        let (worktree, head) = try await makeWorkToMerge()
         let developBefore = try await git(["rev-parse", "develop"])
 
         let runner = ReviewBoardMergeRunner(
@@ -232,7 +261,7 @@ final class AutoPilotMergeIntegrationTests: XCTestCase {
         XCTAssertFalse(placement.isDirty, "an untracked file is not blocking dirtiness")
 
         let point = AutoPilotUndoPoint(
-            branch: "develop", sha: developBefore, taskID: "tsk_1",
+            branch: "develop", sha: developBefore, mergedSHA: head, taskID: "tsk_1",
             repositoryPath: repository, recordedAtMS: 1
         )
         let result = await AutoPilotUndo.apply(

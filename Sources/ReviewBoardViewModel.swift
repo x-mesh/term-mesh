@@ -61,6 +61,15 @@ final class ReviewBoardViewModel: ObservableObject {
     private let defaults: UserDefaults
     private var actions: ReviewBoardActions = .unavailable
     private var reviewedTaskID: String?
+    /// Which task's evidence is being read right now, if any.
+    ///
+    /// Kept apart from `actionInFlight` — which the panel watches and which is
+    /// true for a read of *any* task — so that a read for one task can be
+    /// superseded by a read for another instead of blocking it.
+    private var loadingTaskID: String?
+    /// True only while an approval or rejection is landing. `actionInFlight`
+    /// covers reads as well, so it cannot answer "is a decision in flight".
+    private var decisionInFlight = false
     private var teamCancellable: AnyCancellable?
     private var activityTicker: Timer?
 
@@ -183,21 +192,36 @@ final class ReviewBoardViewModel: ObservableObject {
     /// Keyed on which task was read, so re-appearing or a refresh tick does
     /// not re-run git for a task already in hand — reading a patch is a
     /// subprocess, not a property.
+    ///
+    /// A second read for a *different* task supersedes the one in flight rather
+    /// than being refused. Refusing it was the bug: the panel starts a read from
+    /// `.task(id: task.rawID)`, which fires once per id, so a read dropped
+    /// because another was out had nothing left to retrigger it — the newly
+    /// selected task sat with no review, no spinner, and no way back short of
+    /// selecting something else and returning.
     func loadReview(for task: ReviewBoardTask, force: Bool = false) async {
         guard force || reviewedTaskID != task.rawID else { return }
-        guard !actionInFlight else { return }
+        // A decision owns the model while it is landing; reading under it would
+        // race the approval it is about to invalidate.
+        guard !decisionInFlight else { return }
+        // Already reading this one. Not `actionInFlight`, which is true for any
+        // task's read.
+        guard loadingTaskID != task.rawID else { return }
+        loadingTaskID = task.rawID
         actionInFlight = true
         actionError = nil
         let result = await actions.review(task)
-        // The selection can move while a read is in flight; a result for a
+        // Superseded while this read was out: a newer read owns both the model
+        // and the in-flight flag, and clearing either here would cut its
+        // spinner short and let this stale result land after it.
+        guard loadingTaskID == task.rawID else { return }
+        loadingTaskID = nil
+        actionInFlight = false
+        // The selection can move without a new read starting; a result for a
         // task nobody is looking at must not replace what is on screen.
-        guard selectedTaskID == nil || task.id == selectedTaskID else {
-            actionInFlight = false
-            return
-        }
+        guard selectedTaskID == nil || task.id == selectedTaskID else { return }
         reviewedTaskID = task.rawID
         review = result
-        actionInFlight = false
     }
 
     /// Approve what was read. Returns whether it landed, so a view can close
@@ -223,6 +247,7 @@ final class ReviewBoardViewModel: ObservableObject {
             return false
         }
         actionInFlight = true
+        decisionInFlight = true
         actionError = nil
         do {
             try await body(review)
@@ -231,11 +256,13 @@ final class ReviewBoardViewModel: ObservableObject {
             // second decision on a decided task.
             reviewedTaskID = nil
             self.review = nil
+            decisionInFlight = false
             actionInFlight = false
             refresh()
             return true
         } catch {
             actionError = Self.message(for: error)
+            decisionInFlight = false
             actionInFlight = false
             return false
         }
@@ -257,8 +284,20 @@ final class ReviewBoardViewModel: ObservableObject {
     }
 
     func selectTask(id: String) {
+        guard id != selectedTaskID else { return }
         selectedTaskID = id
+        // What was read belongs to the task that was selected. Both go
+        // together: dropping the review without dropping `reviewedTaskID`
+        // would leave the next read refused as "already in hand" and the panel
+        // blank for good.
+        dropLoadedReview()
         UserDefaults.standard.set(id, forKey: ReviewBoardSettings.selectedTaskIDKey)
+    }
+
+    /// Forget what is on screen, so the next look reads afresh.
+    private func dropLoadedReview() {
+        review = nil
+        reviewedTaskID = nil
     }
 
     // MARK: - Auto pilot
@@ -401,7 +440,12 @@ final class ReviewBoardViewModel: ObservableObject {
     private func keepSelectionValid() {
         let ids = Set(snapshot.tasks.map(\.id))
         if let selectedTaskID, ids.contains(selectedTaskID) { return }
-        selectedTaskID = tasks.first?.id
+        let next = tasks.first?.id
+        // The other way the selection moves. A task dropping off the board
+        // leaves its review behind exactly as a click would, so it is dropped
+        // here too — same reason as `selectTask`.
+        if next != selectedTaskID { dropLoadedReview() }
+        selectedTaskID = next
     }
 
     private func mergeText(for task: ReviewBoardTask) -> String {

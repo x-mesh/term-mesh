@@ -46,13 +46,30 @@ enum AutoPilotUndo {
         let checkedOutAt: String?
         /// Whether that checkout has uncommitted changes.
         let isDirty: Bool
+        /// The branch ref now, regardless of whether it is checked out.
+        let currentTip: String?
 
-        static let notCheckedOut = Placement(checkedOutAt: nil, isDirty: false)
+        static let notCheckedOut = Placement(
+            checkedOutAt: nil, isDirty: false, currentTip: nil
+        )
     }
 
     static func plan(for point: AutoPilotUndoPoint, placement: Placement) -> Plan {
         guard !point.sha.isEmpty else {
             return .refuse("No commit was recorded for this merge, so there is nowhere to go back to.")
+        }
+        guard let mergedSHA = point.mergedSHA, !mergedSHA.isEmpty else {
+            return .refuse(
+                "No post-merge commit was recorded for \(point.branch), so undo cannot prove that the branch has not advanced."
+            )
+        }
+        guard let currentTip = placement.currentTip, !currentTip.isEmpty else {
+            return .refuse("The current tip of \(point.branch) could not be read, so undo was refused.")
+        }
+        guard currentTip == mergedSHA else {
+            return .refuse(
+                "\(point.branch) advanced after the automatic merge (expected \(mergedSHA.prefix(8)), now \(currentTip.prefix(8))). Undo was refused to preserve later commits."
+            )
         }
         guard let path = placement.checkedOutAt else {
             return .updateRef(
@@ -105,12 +122,20 @@ enum AutoPilotUndo {
             )
         }
     ) async -> Placement {
+        let tipOutput = await run([
+            "-C", repository, "rev-parse", "--verify", "refs/heads/\(branch)",
+        ])
+        let tip = tipOutput.flatMap { output -> String? in
+            guard output.status == 0 else { return nil }
+            let value = output.stdoutText.trimmingCharacters(in: .whitespacesAndNewlines)
+            return value.isEmpty ? nil : value
+        }
         guard let listing = await run(["-C", repository, "worktree", "list", "--porcelain"]),
               listing.status == 0 else {
-            return .notCheckedOut
+            return Placement(checkedOutAt: nil, isDirty: false, currentTip: tip)
         }
         guard let path = checkoutPath(of: branch, inPorcelain: listing.stdoutText) else {
-            return .notCheckedOut
+            return Placement(checkedOutAt: nil, isDirty: false, currentTip: tip)
         }
         // Tracked changes only. `reset --hard` moves HEAD and overwrites
         // tracked files; it does not touch untracked ones, so a stray build
@@ -120,7 +145,7 @@ enum AutoPilotUndo {
         let dirty = (status?.stdoutText ?? "")
             .trimmingCharacters(in: .whitespacesAndNewlines)
             .isEmpty == false
-        return Placement(checkedOutAt: path, isDirty: dirty)
+        return Placement(checkedOutAt: path, isDirty: dirty, currentTip: tip)
     }
 
     /// `worktree list --porcelain` is stanzas separated by blank lines, each

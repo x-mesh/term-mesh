@@ -834,6 +834,20 @@ impl Api {
             {
                 bail!("snapshot evidence mismatch");
             }
+            let latest = reducer
+                .latest_review_snapshot_for_attempt(&p.task_id, &p.attempt_id)?
+                .ok_or_else(|| anyhow::anyhow!("review snapshot not found"))?;
+            if latest.snapshot_id != p.snapshot_id {
+                bail!("stale review snapshot");
+            }
+            let attempt = reducer
+                .attempts(&p.task_id)?
+                .into_iter()
+                .find(|attempt| attempt.attempt_id == p.attempt_id)
+                .ok_or_else(|| anyhow::anyhow!("attempt not found"))?;
+            if attempt.head_sha.as_deref() != Some(snapshot.head_sha.as_str()) {
+                bail!("snapshot head is not the attempt's current head");
+            }
             let task = reducer
                 .task(&p.task_id)?
                 .ok_or_else(|| anyhow::anyhow!("task not found"))?;
@@ -842,6 +856,9 @@ impl Api {
                 project_id: task.project_id,
                 task_id: p.task_id.clone(),
                 attempt_id: p.attempt_id.clone(),
+                snapshot_id: p.snapshot_id.clone(),
+                head_sha: p.head_sha.clone(),
+                diff_digest: p.diff_digest.clone(),
                 status: MergeQueueStatus::Queued,
                 approved_by: p.reviewer.clone(),
                 approved_at_ms: now_ms(),

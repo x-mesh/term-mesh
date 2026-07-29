@@ -203,13 +203,15 @@ async fn git(dir: &str, args: &[&str], label: &str) -> Result<String, TaskDiffEr
 /// survive a round trip through `String`, and a digest that changes depending
 /// on whether the bytes happened to decode is not evidence of anything.
 async fn git_bytes(dir: &str, args: &[&str], label: &str) -> Result<Vec<u8>, TaskDiffError> {
-    let run = Command::new("git")
+    let mut command = Command::new("git");
+    command
         .args(args)
         .current_dir(dir)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .output();
+        .kill_on_drop(true);
+    let run = command.output();
 
     let output = match tokio::time::timeout(GIT_TIMEOUT, run).await {
         Err(_) => return Err(TaskDiffError::TimedOut(label.to_string())),

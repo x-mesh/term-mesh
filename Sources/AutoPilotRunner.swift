@@ -52,6 +52,12 @@ actor AutoPilotRunner {
     /// Approvals this runner has issued, which is what the policy's budget
     /// counts.
     private(set) var approvalsThisSession = 0
+    /// Actor isolation does not prevent another sweep entering while this one
+    /// is suspended in review or checking.
+    private var isSweeping = false
+    /// Defence in depth for any future path that considers tasks outside the
+    /// sweep gate.
+    private var inFlightTaskIDs: Set<String> = []
     /// The last reason each task was held for. The board refreshes every two
     /// seconds; without this the audit log would be the same sentence ten
     /// thousand times and the one entry that mattered would be unfindable.
@@ -85,17 +91,28 @@ actor AutoPilotRunner {
     /// "declined" — it is simply not up for a decision yet, and auditing that
     /// would bury the tasks that are.
     func sweep(_ tasks: [ReviewBoardTask]) async -> [Outcome] {
+        guard !isSweeping else { return [] }
+        isSweeping = true
+        defer { isSweeping = false }
+
         let current = policy()
         guard current.isEnabled else { return [] }
 
         var outcomes: [Outcome] = []
         for task in tasks where task.status == "review_ready" {
-            outcomes.append(await consider(task, policy: current))
+            if let outcome = await consider(task, policy: current) {
+                outcomes.append(outcome)
+            }
         }
         return outcomes
     }
 
-    private func consider(_ task: ReviewBoardTask, policy current: AutoPilotPolicy) async -> Outcome {
+    private func consider(
+        _ task: ReviewBoardTask, policy current: AutoPilotPolicy
+    ) async -> Outcome? {
+        guard inFlightTaskIDs.insert(task.rawID).inserted else { return nil }
+        defer { inFlightTaskIDs.remove(task.rawID) }
+
         let review = await reviewer(task)
         guard let patch = review.patch else {
             return hold(task, review.blocker ?? "There is no patch to look at yet.", head: nil, check: nil)
@@ -141,6 +158,9 @@ actor AutoPilotRunner {
             )
         }
 
+        // Review and checking suspend the actor. Budget and policy must be read
+        // again at the final decision, not trusted from sweep entry.
+        let approvalPolicy = policy()
         let candidate = AutoPilotCandidate(
             taskID: task.rawID,
             // The recorded parent, not the shown one: the policy compares this
@@ -153,12 +173,12 @@ actor AutoPilotRunner {
             wouldPush: false,
             autoMergesSoFar: approvalsThisSession
         )
-        if let reason = current.evaluate(candidate).reason {
+        if let reason = approvalPolicy.evaluate(candidate).reason {
             return hold(task, reason, head: patch.headSHA, check: evidence.command)
         }
 
         let summary = "Auto pilot: \(evidence.command) passed at "
-            + "\(patch.headSHA.prefix(8)); merging into \(current.ceilingBranch)."
+            + "\(patch.headSHA.prefix(8)); merging into \(approvalPolicy.ceilingBranch)."
         do {
             try await approver(review, summary)
         } catch {
