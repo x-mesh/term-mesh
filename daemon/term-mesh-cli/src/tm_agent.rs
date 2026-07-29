@@ -226,6 +226,142 @@ mod project_sync_cli_tests {
             assert!(help.contains(flag), "missing {flag} from help: {help}");
         }
     }
+
+    #[test]
+    fn delegate_parses_deps_after_panel_and_forwards_them_to_unified_rpc() {
+        let parsed = Cli::try_parse_from([
+            "tm-agent",
+            "delegate",
+            "builder",
+            "--panel",
+            "panel-2",
+            "--deps",
+            "337a5e71",
+            "--title",
+            "Build after review",
+            "run the build",
+        ])
+        .unwrap();
+        let Commands::Delegate {
+            agent,
+            text,
+            title,
+            deps,
+            panel,
+            ..
+        } = parsed.command
+        else {
+            panic!("expected delegate command");
+        };
+        assert_eq!(agent, "builder");
+        assert_eq!(text, "run the build");
+        assert_eq!(title.as_deref(), Some("Build after review"));
+        assert_eq!(deps, vec!["337a5e71"]);
+        assert_eq!(panel.as_deref(), Some("panel-2"));
+
+        let params = delegate_rpc_params(
+            "team-a",
+            &agent,
+            &text,
+            title.as_deref().unwrap(),
+            1,
+            &[],
+            &deps,
+            None,
+            None,
+            None,
+            panel.as_deref(),
+            Some("instance-2"),
+        );
+        assert_eq!(params["depends_on"], json!(["337a5e71"]));
+        assert_eq!(params["panel_id"], "panel-2");
+        assert_eq!(params["agent_instance_id"], "instance-2");
+    }
+
+    #[test]
+    fn instance_scoped_commands_parse_supported_selectors() {
+        let send = Cli::try_parse_from([
+            "tm-agent", "send", "--panel", "panel-2", "reviewer", "message",
+        ])
+        .unwrap();
+        assert!(matches!(
+            send.command,
+            Commands::Send {
+                panel: Some(ref panel),
+                agent_instance_id: None,
+                ..
+            } if panel == "panel-2"
+        ));
+
+        let remove = Cli::try_parse_from([
+            "tm-agent",
+            "remove",
+            "builder",
+            "--agent-instance-id",
+            "instance-2",
+        ])
+        .unwrap();
+        assert!(matches!(
+            remove.command,
+            Commands::Remove {
+                panel: None,
+                agent_instance_id: Some(ref id),
+                ..
+            } if id == "instance-2"
+        ));
+
+        let detach = Cli::try_parse_from([
+            "tm-agent", "detach", "builder", "--panel", "panel-2",
+        ])
+        .unwrap();
+        assert!(matches!(
+            detach.command,
+            Commands::Detach {
+                panel: Some(ref panel),
+                agent_instance_id: None,
+                ..
+            } if panel == "panel-2"
+        ));
+
+        assert!(Cli::try_parse_from([
+            "tm-agent",
+            "send",
+            "reviewer",
+            "message",
+            "--panel",
+            "panel-2",
+            "--agent-instance-id",
+            "instance-2",
+        ])
+        .is_err());
+    }
+
+    #[test]
+    fn panel_resolves_one_duplicate_name_to_its_durable_instance() {
+        let agents = vec![
+            json!({
+                "name": "reviewer",
+                "panel_id": "panel-1",
+                "agent_instance_id": "instance-1",
+            }),
+            json!({
+                "name": "reviewer",
+                "panel_id": "panel-2",
+                "agent_instance_id": "instance-2",
+            }),
+        ];
+
+        assert_eq!(
+            instance_id_from_agents(&agents, "reviewer", Some("panel-2")).unwrap(),
+            Some("instance-2".to_string())
+        );
+        assert_eq!(
+            instance_id_from_agents(&agents, "reviewer", None).unwrap(),
+            None
+        );
+        let error = instance_id_from_agents(&agents, "reviewer", Some("missing")).unwrap_err();
+        assert!(error.contains("--agent-instance-id"), "{error}");
+    }
 }
 
 fn worktree_policy_name(policy: WorktreePolicyArg) -> &'static str {
@@ -652,6 +788,12 @@ enum Commands {
     Detach {
         /// Agent name to detach
         agent_name: String,
+        /// Target a specific pane when the agent name is duplicated
+        #[arg(long, conflicts_with = "agent_instance_id")]
+        panel: Option<String>,
+        /// Durable agent instance selector (required for a duplicated name without --panel)
+        #[arg(long = "agent-instance-id")]
+        agent_instance_id: Option<String>,
     },
     /// Remove an agent from a named GUI team by team name.
     ///
@@ -665,6 +807,12 @@ enum Commands {
         /// Force removal even if the agent is busy (default: true)
         #[arg(long, default_value_t = true)]
         force: bool,
+        /// Target a specific pane when the agent name is duplicated
+        #[arg(long, conflicts_with = "agent_instance_id")]
+        panel: Option<String>,
+        /// Durable agent instance selector (required for a duplicated name without --panel)
+        #[arg(long = "agent-instance-id")]
+        agent_instance_id: Option<String>,
     },
     /// Preset operations (list)
     #[command(subcommand)]
@@ -676,8 +824,11 @@ enum Commands {
         #[arg(long)]
         no_report: bool,
         /// Target a specific pane by panel_id (deterministic; overrides name round-robin)
-        #[arg(long)]
+        #[arg(long, conflicts_with = "agent_instance_id")]
         panel: Option<String>,
+        /// Durable agent instance selector (alternative to --panel for duplicated names)
+        #[arg(long = "agent-instance-id")]
+        agent_instance_id: Option<String>,
     },
     /// Broadcast instruction to all agents
     Broadcast {
@@ -4849,13 +5000,61 @@ fn selected_agent_instance_id(
 ) -> Option<String> {
     let status = rpc_call(sock, "team.status", json!({ "team_name": team })).ok()?;
     let agents = status["result"]["agents"].as_array()?;
-    let matches = agents.iter().filter(|agent| {
-        agent["name"].as_str() == Some(target)
-            && panel_id.map_or(true, |panel| agent["panel_id"].as_str() == Some(panel))
-    }).collect::<Vec<_>>();
-    (matches.len() == 1)
-        .then(|| matches[0]["agent_instance_id"].as_str().map(str::to_owned))
-        .flatten()
+    instance_id_from_agents(agents, target, panel_id).ok().flatten()
+}
+
+/// Resolve an optional panel selector to the durable instance selector used by
+/// every subsequent RPC. Explicit instance IDs need no name lookup; panel IDs
+/// must identify exactly one same-name member or the command fails before it
+/// can fall back to the server's ambiguous name path.
+fn command_agent_instance_id(
+    sock: &PathBuf,
+    team: &str,
+    target: &str,
+    panel_id: Option<&str>,
+    explicit_instance_id: Option<&str>,
+) -> Result<Option<String>, String> {
+    if let Some(instance_id) = explicit_instance_id {
+        return Ok(Some(instance_id.to_string()));
+    }
+    let Some(panel_id) = panel_id else {
+        return Ok(None);
+    };
+    let status = rpc_call(sock, "team.status", json!({ "team_name": team }))?;
+    let agents = status["result"]["agents"]
+        .as_array()
+        .ok_or_else(|| "team.status response has no agents array".to_string())?;
+    instance_id_from_agents(agents, target, Some(panel_id))
+}
+
+fn instance_id_from_agents(
+    agents: &[Value],
+    target: &str,
+    panel_id: Option<&str>,
+) -> Result<Option<String>, String> {
+    let matches = agents
+        .iter()
+        .filter(|agent| {
+            agent["name"].as_str() == Some(target)
+                && panel_id.map_or(true, |panel| agent["panel_id"].as_str() == Some(panel))
+        })
+        .collect::<Vec<_>>();
+    match matches.as_slice() {
+        [agent] => agent["agent_instance_id"]
+            .as_str()
+            .map(|id| Some(id.to_string()))
+            .ok_or_else(|| format!("agent {target} has no agent_instance_id")),
+        [] if panel_id.is_some() => Err(format!(
+            "no agent named {target} matches panel {}; pass --agent-instance-id instead",
+            panel_id.unwrap_or_default()
+        )),
+        [] => Ok(None),
+        _ if panel_id.is_some() => Err(format!(
+            "panel {} matches multiple agents named {target}; pass --agent-instance-id",
+            panel_id.unwrap_or_default()
+        )),
+        _ => Ok(None),
+    }
 }
 
 fn truncate_summary(content: &str, max_chars: usize) -> String {
@@ -6238,21 +6437,42 @@ fn main() {
             run_attach(&sock, &agent_type, &agent_name, &model, &cli);
             return;
         }
-        Commands::Detach { agent_name } => {
+        Commands::Detach {
+            agent_name,
+            panel,
+            agent_instance_id,
+        } => {
             if let Err(e) = validate_agent_name(&agent_name) {
                 eprintln!("Error: {}", e);
                 process::exit(1);
             }
-            run_detach(&sock, &agent_name);
+            run_detach(
+                &sock,
+                &agent_name,
+                panel.as_deref(),
+                agent_instance_id.as_deref(),
+            );
             return;
         }
-        Commands::Remove { agent_name, force } => {
+        Commands::Remove {
+            agent_name,
+            force,
+            panel,
+            agent_instance_id,
+        } => {
             if let Err(e) = validate_agent_name(&agent_name) {
                 eprintln!("Error: {}", e);
                 process::exit(1);
             }
             let gui_team = resolve_workspace_team_name().unwrap_or_else(|_| team.clone());
-            run_remove_gui(&sock, &gui_team, &agent_name, force);
+            run_remove_gui(
+                &sock,
+                &gui_team,
+                &agent_name,
+                force,
+                panel.as_deref(),
+                agent_instance_id.as_deref(),
+            );
             return;
         }
         Commands::Preset(sub) => match sub {
@@ -6353,6 +6573,7 @@ fn main() {
             text,
             no_report,
             panel,
+            agent_instance_id,
         } => {
             let text = append_report_suffix(&text, no_report);
             // Check if agent is headless — route to daemon socket
@@ -6369,8 +6590,19 @@ fn main() {
                     return;
                 }
             }
-            // panel_id is DELIVERY-ONLY: targets a specific pane deterministically,
-            // overriding name round-robin. None falls back to name-based selection.
+            let selected_instance_id = match command_agent_instance_id(
+                &sock,
+                &team,
+                target,
+                panel.as_deref(),
+                agent_instance_id.as_deref(),
+            ) {
+                Ok(id) => id,
+                Err(e) => {
+                    eprintln!("Error: {e}");
+                    process::exit(1);
+                }
+            };
             let send_result = rpc_call(
                 &sock,
                 "team.send",
@@ -6378,6 +6610,7 @@ fn main() {
                     "team_name": team, "agent_name": target,
                     "text": format!("{text}\n"),
                     "panel_id": panel,
+                    "agent_instance_id": selected_instance_id,
                 }),
             );
             // Send Return key via team.send_key (reliable sendNamedKey path).
@@ -6395,7 +6628,7 @@ fn main() {
                     text_delivered,
                     "team.send",
                     panel.as_deref(),
-                    None,
+                    selected_instance_id.as_deref(),
                 );
             }
             print_result(send_result);
@@ -8659,7 +8892,12 @@ fn run_attach(sock: &PathBuf, agent_type: &str, agent_name: &str, model: &str, c
 }
 
 /// Detach a single agent from the caller's workspace-local team via `team.detach` RPC.
-fn run_detach(sock: &PathBuf, agent_name: &str) {
+fn run_detach(
+    sock: &PathBuf,
+    agent_name: &str,
+    panel_id: Option<&str>,
+    explicit_instance_id: Option<&str>,
+) {
     let (workspace_id, _panel_id, window_id) = match require_termmesh_context() {
         Ok(t) => t,
         Err(e) => {
@@ -8674,6 +8912,19 @@ fn run_detach(sock: &PathBuf, agent_name: &str) {
             process::exit(1);
         }
     };
+    let agent_instance_id = match command_agent_instance_id(
+        sock,
+        &team_name,
+        agent_name,
+        panel_id,
+        explicit_instance_id,
+    ) {
+        Ok(id) => id,
+        Err(e) => {
+            eprintln!("Error: {e}");
+            process::exit(1);
+        }
+    };
 
     eprintln!(
         "Detaching agent '{}' from team '{}'...",
@@ -8684,6 +8935,8 @@ fn run_detach(sock: &PathBuf, agent_name: &str) {
         "agent_name": agent_name,
         "team_name": team_name,
         "workspace_id": workspace_id,
+        "panel_id": panel_id,
+        "agent_instance_id": agent_instance_id,
     });
     if let Some(wid) = window_id {
         params["window_id"] = json!(wid);
@@ -8831,16 +9084,38 @@ fn run_add_gui(
 ///
 /// Unlike `run_detach` (workspace-local), this variant looks up the team by name
 /// and does not require TERMMESH_WORKSPACE_ID or PANEL_ID.
-fn run_remove_gui(sock: &PathBuf, team_name: &str, agent_name: &str, force: bool) {
+fn run_remove_gui(
+    sock: &PathBuf,
+    team_name: &str,
+    agent_name: &str,
+    force: bool,
+    panel_id: Option<&str>,
+    explicit_instance_id: Option<&str>,
+) {
     eprintln!(
         "Removing agent '{}' from GUI team '{}'...",
         agent_name, team_name
     );
 
+    let agent_instance_id = match command_agent_instance_id(
+        sock,
+        team_name,
+        agent_name,
+        panel_id,
+        explicit_instance_id,
+    ) {
+        Ok(id) => id,
+        Err(e) => {
+            eprintln!("Error: {e}");
+            process::exit(1);
+        }
+    };
     let params = json!({
         "team_name": team_name,
         "agent_name": agent_name,
         "force": force,
+        "panel_id": panel_id,
+        "agent_instance_id": agent_instance_id,
     });
 
     let resp = match rpc_call_timeout(sock, "team.detach", params, 10) {
@@ -8880,6 +9155,7 @@ fn run_remove_gui(sock: &PathBuf, team_name: &str, agent_name: &str, force: bool
         let msg = resp["error"]["message"].as_str().unwrap_or("remove failed");
         let hint = match code {
             "agent_busy" => "\nHint: Agent has an active task — pass --force to close anyway, or finish/block the task first.".to_string(),
+            "ambiguous_agent" => "\nHint: Pass --panel <PANEL_ID> or --agent-instance-id <ID> to select the instance.".to_string(),
             _ => String::new(),
         };
         eprintln!("Error [{}]: {}{}", code, msg, hint);
@@ -9444,26 +9720,21 @@ fn run_delegate_result(
         );
     }
 
-    // Try unified team.delegate RPC first (single round-trip)
-    let mut delegate_params = json!({
-        "team": team,
-        "agent": target,
-        "text": text,
-        "task_title": resolved_title,
-        "priority": resolved_priority,
-        "agent_instance_id": selected_instance_id,
-    });
-    if let Some(ctx) = context {
-        delegate_params["context"] = json!(ctx);
-    }
-    if let Some(fb) = fix_budget {
-        delegate_params["fix_budget"] = json!(fb);
-    }
-    // panel_id is DELIVERY-ONLY: it steers which pane the paste lands on, but the
-    // task assignee stays the agent name (see task.create params below).
-    if let Some(pid) = panel_id {
-        delegate_params["panel_id"] = json!(pid);
-    }
+    // Try unified team.delegate RPC first (single round-trip).
+    let delegate_params = delegate_rpc_params(
+        team,
+        target,
+        text,
+        &resolved_title,
+        resolved_priority,
+        accept,
+        deps,
+        desc.as_deref(),
+        context,
+        fix_budget,
+        panel_id,
+        selected_instance_id.as_deref(),
+    );
     if let Ok(v) = rpc_call(sock, "team.delegate", delegate_params) {
         if v["ok"].as_bool().unwrap_or(false) {
             // Check if text was actually delivered to the agent's terminal
@@ -9756,6 +10027,49 @@ fn run_delegate_result(
     }
 
     Ok(json!({ "task": task, "send": sent }))
+}
+
+fn delegate_rpc_params(
+    team: &str,
+    target: &str,
+    text: &str,
+    title: &str,
+    priority: u32,
+    accept: &[String],
+    deps: &[String],
+    desc: Option<&str>,
+    context: Option<&str>,
+    fix_budget: Option<u8>,
+    panel_id: Option<&str>,
+    agent_instance_id: Option<&str>,
+) -> Value {
+    let mut params = json!({
+        "team": team,
+        "agent": target,
+        "text": text,
+        "task_title": title,
+        "priority": priority,
+        "agent_instance_id": agent_instance_id,
+    });
+    if !accept.is_empty() {
+        params["acceptance_criteria"] = json!(accept);
+    }
+    if !deps.is_empty() {
+        params["depends_on"] = json!(deps);
+    }
+    if let Some(description) = desc {
+        params["description"] = json!(description);
+    }
+    if let Some(ctx) = context {
+        params["context"] = json!(ctx);
+    }
+    if let Some(fb) = fix_budget {
+        params["fix_budget"] = json!(fb);
+    }
+    if let Some(pid) = panel_id {
+        params["panel_id"] = json!(pid);
+    }
+    params
 }
 
 #[derive(Debug, Clone)]
