@@ -76,7 +76,7 @@ extension TeamOrchestrator {
         }
     }
 
-    static func requiredRemoteWorkingDirectory(
+    nonisolated static func requiredRemoteWorkingDirectory(
         _ path: String?,
         hostKey: String
     ) throws -> String {
