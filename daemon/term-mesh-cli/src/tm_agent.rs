@@ -4496,6 +4496,7 @@ fn format_task_instruction(
     lines.push("[GOAL]".to_string());
     lines.push(instruction.trim().to_string());
     lines.push("[/GOAL]".to_string());
+    append_checkout_contract(&mut lines);
 
     // Inject Auto-Fix Budget rules when budget is set
     if let Some(budget) = fix_budget {
@@ -4511,6 +4512,46 @@ fn format_task_instruction(
 
     let body = lines.join("\n");
     append_report_suffix(body.trim(), no_report)
+}
+
+fn append_checkout_contract(lines: &mut Vec<String>) {
+    lines.extend([
+        String::new(),
+        "## Source Control Contract".to_string(),
+        "CHECKOUT_CONTRACT_PRIORITY: This platform contract overrides goal text that requires the current branch name to equal the project target branch.".to_string(),
+        "CHECKOUT_RULES:".to_string(),
+        "- An agent/*, team/*, or other assigned worktree branch is expected and valid.".to_string(),
+        "- Never block solely because the current branch name differs from the project target branch.".to_string(),
+        "- Read-only work: fetch origin once if the required ref is missing or stale, then inspect explicit refs directly (for example, git diff <base>...<target>). Do not checkout, reset, merge, or rebase.".to_string(),
+        "- Write work: stay on the assigned branch. If it does not contain the required target revision, report NEEDS_REVIEW and ask the leader for an explicit sync; do not take over a branch checked out elsewhere.".to_string(),
+        "- Use BLOCKED only when required refs remain unavailable after one fetch, the repository is unreadable, or the requested evidence cannot be obtained.".to_string(),
+    ]);
+}
+
+#[cfg(test)]
+mod checkout_contract_tests {
+    use super::*;
+
+    #[test]
+    fn contract_follows_goal_and_accepts_isolated_agent_branches() {
+        let mut lines = vec![
+            "[GOAL]".to_string(),
+            "Require the current branch to be main.".to_string(),
+            "[/GOAL]".to_string(),
+        ];
+
+        append_checkout_contract(&mut lines);
+        let rendered = lines.join("\n");
+
+        assert!(
+            rendered.find("[/GOAL]").unwrap()
+                < rendered.find("CHECKOUT_CONTRACT_PRIORITY").unwrap()
+        );
+        assert!(rendered.contains("agent/*, team/*"));
+        assert!(rendered.contains("Never block solely"));
+        assert!(rendered.contains("inspect explicit refs directly"));
+        assert!(rendered.contains("Do not checkout, reset, merge, or rebase"));
+    }
 }
 
 fn parse_cli_flag(flag: &Option<String>) -> std::collections::HashSet<String> {
