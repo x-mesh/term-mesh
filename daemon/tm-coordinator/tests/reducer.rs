@@ -5,9 +5,7 @@ use anyhow::{bail, Result};
 use serde_json::json;
 use tempfile::tempdir;
 use tm_coordinator::event_log::LocalJournalEventLog;
-use tm_coordinator::model::{
-    FencingToken, HostId, IntentEvent, MergeQueueId, ProjectId, TaskId,
-};
+use tm_coordinator::model::{FencingToken, HostId, IntentEvent, ProjectId, TaskId};
 use tm_coordinator::{Api, Config, EventLog, Reducer};
 
 struct FailingReadLog;
@@ -682,15 +680,26 @@ fn stale_snapshot_approval_is_rejected_and_latest_evidence_is_persisted() {
             json!({"request_id":"approve-latest","task_id":task_id,"attempt_id":attempt_id,"fencing_token":token,"reviewer":"reviewer","snapshot_id":second_id,"head_sha":"head-2","diff_digest":"sha256:second"}),
         )
         .unwrap();
-    let queue_id: MergeQueueId = serde_json::from_value(
-        approved["event"]["payload"]["merge_queue_item"]["queue_id"].clone(),
-    )
-    .unwrap();
-    let replayed = Reducer::replay(&log.read_all().unwrap()).unwrap();
-    let evidence = replayed.merge_queue_evidence(&queue_id).unwrap().unwrap();
-    assert_eq!(evidence.0, second_id.as_str().unwrap());
-    assert_eq!(evidence.1, "head-2");
-    assert_eq!(evidence.2, "sha256:second");
+    assert_eq!(
+        approved["event"]["payload"]["merge_queue_item"]["snapshot_id"],
+        second_id
+    );
+    let mut legacy_events = log.read_all().unwrap();
+    let legacy_queue = legacy_events
+        .iter_mut()
+        .find(|event| event.kind == "attempt_approved")
+        .unwrap()
+        .payload["merge_queue_item"]
+        .as_object_mut()
+        .unwrap();
+    legacy_queue.remove("snapshot_id");
+    legacy_queue.remove("head_sha");
+    legacy_queue.remove("diff_digest");
+    let replayed = Reducer::replay(&legacy_events).unwrap();
+    let queue = replayed.merge_queue(None, None).unwrap();
+    assert_eq!(queue[0].snapshot_id.as_str(), second_id.as_str().unwrap());
+    assert_eq!(queue[0].head_sha, "head-2");
+    assert_eq!(queue[0].diff_digest, "sha256:second");
 }
 
 #[test]

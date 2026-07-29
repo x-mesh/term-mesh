@@ -195,6 +195,27 @@ impl Reducer {
         let _ = self
             .conn
             .execute("ALTER TABLE merge_queue ADD COLUMN diff_digest TEXT", []);
+        // Existing projections predate evidence on `MergeQueueItem`. Recover
+        // the exact approved snapshot from the journal event, then its head
+        // and digest from the snapshot projection. Fresh projections and new
+        // events already populate all three columns directly.
+        self.conn.execute_batch(
+            r#"
+            UPDATE merge_queue
+               SET snapshot_id = (
+                   SELECT json_extract(events.event_json, '$.payload.snapshot_id')
+                     FROM events
+                    WHERE events.kind = 'attempt_approved'
+                      AND json_extract(events.event_json, '$.payload.merge_queue_item.queue_id') = merge_queue.queue_id
+                    LIMIT 1
+               )
+             WHERE snapshot_id IS NULL;
+            UPDATE merge_queue
+               SET head_sha = (SELECT head_sha FROM review_snapshots WHERE snapshot_id = merge_queue.snapshot_id),
+                   diff_digest = (SELECT diff_digest FROM review_snapshots WHERE snapshot_id = merge_queue.snapshot_id)
+             WHERE head_sha IS NULL OR diff_digest IS NULL;
+            "#,
+        )?;
         // `total_slots` had to become nullable so "capacity unknown" stops
         // reading as "capacity zero", and no `ALTER TABLE` can relax a NOT
         // NULL. Recreating is safe here in a way it would not be for a table
@@ -549,24 +570,10 @@ impl Reducer {
         // table nothing ever deletes from.
         self.conn
             .query_row(
-                "SELECT queue_id,project_id,task_id,attempt_id,status,approved_by,approved_at_ms,last_error
+                "SELECT queue_id,project_id,task_id,attempt_id,snapshot_id,head_sha,diff_digest,status,approved_by,approved_at_ms,last_error
                  FROM merge_queue WHERE queue_id=?1",
                 params![queue_id.as_str()],
                 row_to_merge_queue_item,
-            )
-            .optional()
-            .map_err(Into::into)
-    }
-
-    pub fn merge_queue_evidence(
-        &self,
-        queue_id: &MergeQueueId,
-    ) -> Result<Option<(String, String, String)>> {
-        self.conn
-            .query_row(
-                "SELECT snapshot_id,head_sha,diff_digest FROM merge_queue WHERE queue_id=?1",
-                params![queue_id.as_str()],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .optional()
             .map_err(Into::into)
@@ -875,13 +882,27 @@ impl Reducer {
     }
 
     fn reduce_attempt_approved(&self, event: &IntentEvent) -> Result<()> {
-        let queue: MergeQueueItem = serde_json::from_value(
-            event
-                .payload
-                .get("merge_queue_item")
-                .cloned()
-                .ok_or_else(|| anyhow::anyhow!("missing merge_queue_item"))?,
-        )?;
+        let mut queue_value = event
+            .payload
+            .get("merge_queue_item")
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("missing merge_queue_item"))?;
+        // Events written before approval evidence became part of the queue
+        // model still carry the exact snapshot id at payload level. Hydrate
+        // those fields before deserializing so journal replay remains valid.
+        if queue_value.get("snapshot_id").is_none() {
+            let snapshot_id = required_str(&event.payload, "snapshot_id")?;
+            let snapshot = self
+                .review_snapshot(snapshot_id)?
+                .ok_or_else(|| anyhow::anyhow!("review snapshot not found"))?;
+            let queue_object = queue_value
+                .as_object_mut()
+                .ok_or_else(|| anyhow::anyhow!("merge_queue_item must be an object"))?;
+            queue_object.insert("snapshot_id".to_string(), snapshot_id.into());
+            queue_object.insert("head_sha".to_string(), snapshot.head_sha.into());
+            queue_object.insert("diff_digest".to_string(), snapshot.diff_digest.into());
+        }
+        let queue: MergeQueueItem = serde_json::from_value(queue_value)?;
         let task = self
             .task(&queue.task_id)?
             .ok_or_else(|| anyhow::anyhow!("task not found"))?;
@@ -896,16 +917,7 @@ impl Reducer {
             "UPDATE attempts SET status='approved', updated_at_ms=?1 WHERE attempt_id=?2",
             params![event.ts_ms as i64, queue.attempt_id.as_str()],
         )?;
-        let snapshot_id = required_str(&event.payload, "snapshot_id")?;
-        let snapshot = self
-            .review_snapshot(snapshot_id)?
-            .ok_or_else(|| anyhow::anyhow!("review snapshot not found"))?;
-        self.insert_merge_queue(
-            &queue,
-            snapshot_id,
-            &snapshot.head_sha,
-            &snapshot.diff_digest,
-        )
+        self.insert_merge_queue(&queue)
     }
 
     fn reduce_attempt_rejected(&self, event: &IntentEvent) -> Result<()> {
@@ -1091,13 +1103,7 @@ impl Reducer {
         Ok(())
     }
 
-    fn insert_merge_queue(
-        &self,
-        item: &MergeQueueItem,
-        snapshot_id: &str,
-        head_sha: &str,
-        diff_digest: &str,
-    ) -> Result<()> {
+    fn insert_merge_queue(&self, item: &MergeQueueItem) -> Result<()> {
         self.conn.execute(
             "INSERT OR IGNORE INTO merge_queue(queue_id,project_id,task_id,attempt_id,snapshot_id,head_sha,diff_digest,status,approved_by,approved_at_ms,last_error)
              VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
@@ -1106,9 +1112,9 @@ impl Reducer {
                 item.project_id.as_str(),
                 item.task_id.as_str(),
                 item.attempt_id.as_str(),
-                snapshot_id,
-                head_sha,
-                diff_digest,
+                item.snapshot_id.as_str(),
+                item.head_sha,
+                item.diff_digest,
                 status_string(&item.status)?,
                 item.approved_by,
                 item.approved_at_ms as i64,
@@ -1120,7 +1126,7 @@ impl Reducer {
 
     fn all_merge_queue(&self) -> Result<Vec<MergeQueueItem>> {
         let mut stmt = self.conn.prepare(
-            "SELECT queue_id,project_id,task_id,attempt_id,status,approved_by,approved_at_ms,last_error
+            "SELECT queue_id,project_id,task_id,attempt_id,snapshot_id,head_sha,diff_digest,status,approved_by,approved_at_ms,last_error
              FROM merge_queue ORDER BY approved_at_ms",
         )?;
         let rows = stmt.query_map([], row_to_merge_queue_item)?;
@@ -1223,16 +1229,20 @@ fn row_to_review_snapshot(row: &rusqlite::Row<'_>) -> rusqlite::Result<ReviewSna
 
 fn row_to_merge_queue_item(row: &rusqlite::Row<'_>) -> rusqlite::Result<MergeQueueItem> {
     let status: MergeQueueStatus =
-        serde_json::from_str(&format!("\"{}\"", row.get::<_, String>(4)?)).map_err(to_sql_err)?;
+        serde_json::from_str(&format!("\"{}\"", row.get::<_, String>(7)?)).map_err(to_sql_err)?;
     Ok(MergeQueueItem {
         queue_id: MergeQueueId::from_str(&row.get::<_, String>(0)?).map_err(to_sql_err)?,
         project_id: ProjectId::from_str(&row.get::<_, String>(1)?).map_err(to_sql_err)?,
         task_id: TaskId::from_str(&row.get::<_, String>(2)?).map_err(to_sql_err)?,
         attempt_id: AttemptId::from_str(&row.get::<_, String>(3)?).map_err(to_sql_err)?,
+        snapshot_id: crate::model::ReviewSnapshotId::from_str(&row.get::<_, String>(4)?)
+            .map_err(to_sql_err)?,
+        head_sha: row.get(5)?,
+        diff_digest: row.get(6)?,
         status,
-        approved_by: row.get(5)?,
-        approved_at_ms: row.get::<_, i64>(6)? as u64,
-        last_error: row.get(7)?,
+        approved_by: row.get(8)?,
+        approved_at_ms: row.get::<_, i64>(9)? as u64,
+        last_error: row.get(10)?,
     })
 }
 
