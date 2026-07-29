@@ -1400,7 +1400,7 @@ private struct TeamIndicatorBlock: View {
 
             if let team = activeTeam {
                 HStack(spacing: 3) {
-                    ForEach(team.agents, id: \.id) { agent in
+                    ForEach(team.agents, id: \.agentInstanceId) { agent in
                         agentDotBuilder(agent)
                     }
                 }
@@ -1499,7 +1499,7 @@ private struct ExpandedTeamAgentList: View {
             if team.leaderMode == "claude" {
                 ExpandedLeaderRow(teamName: team.id, leaderMode: team.leaderMode)
             }
-            ForEach(team.agents, id: \.id) { agent in
+            ForEach(team.agents, id: \.agentInstanceId) { agent in
                 ExpandedAgentRow(teamName: team.id, agent: agent)
             }
         }

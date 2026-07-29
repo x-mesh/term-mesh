@@ -1718,8 +1718,8 @@ private struct SidebarPeerProjectsView: View {
                 VStack(spacing: 4) {
                     HStack(spacing: 5) {
                         Text(group.identity.label)
-                            .font(.system(size: 9, weight: .semibold))
-                            .foregroundColor(Color.secondary.opacity(0.75))
+                            .font(.system(size: 12, weight: .semibold))
+                            .foregroundColor(Color.primary.opacity(0.92))
                             .lineLimit(1)
                             .truncationMode(.tail)
                             .accessibilityLabel("Project \(group.identity.label)")
@@ -1728,8 +1728,8 @@ private struct SidebarPeerProjectsView: View {
                     }
                     .padding(.leading, 16)
                     .padding(.trailing, 12)
-                    .padding(.top, 4)
-                    .padding(.bottom, 1)
+                    .padding(.top, 7)
+                    .padding(.bottom, 2)
                     // Delegating from the project's own row means the target
                     // is already chosen — nothing to pick again, nothing to
                     // pick wrongly.
@@ -1823,8 +1823,8 @@ private struct SidebarPeerProjectsView: View {
         VStack(spacing: 4) {
             HStack(spacing: 5) {
                 Text(project.identity.label)
-                    .font(.system(size: 9, weight: .semibold))
-                    .foregroundColor(Color.secondary.opacity(0.55))
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundColor(Color.secondary.opacity(0.68))
                     .lineLimit(1)
                     .truncationMode(.tail)
                 Image(systemName: "clock.arrow.circlepath")
@@ -1834,8 +1834,8 @@ private struct SidebarPeerProjectsView: View {
             }
             .padding(.leading, 16)
             .padding(.trailing, 12)
-            .padding(.top, 4)
-            .padding(.bottom, 1)
+            .padding(.top, 7)
+            .padding(.bottom, 2)
 
             Button {
                 if let host = hosts.first(where: { $0.id == project.hostKey }) {

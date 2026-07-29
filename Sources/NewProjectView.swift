@@ -884,15 +884,33 @@ struct NewProjectView: View {
                 } else {
                     GridRow {
                         Text("Destination")
-                        HStack(spacing: 8) {
-                            Text(trimmedDirectory.isEmpty ? "Choose a leader machine and name" : trimmedDirectory)
-                                .foregroundStyle(trimmedDirectory.isEmpty ? .secondary : .primary)
-                                .lineLimit(1)
-                                .truncationMode(.middle)
-                            Spacer()
-                            Text("Automatic")
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
+                        VStack(alignment: .leading, spacing: 5) {
+                            HStack(spacing: 8) {
+                                TextField(folderPlaceholder, text: Binding(
+                                    get: { directory },
+                                    set: { directory = $0; folderEdited = true }
+                                ))
+                                .textFieldStyle(.roundedBorder)
+                                .focused($focusedField, equals: .directory)
+
+                                if runsOnHostKey == nil {
+                                    Button("Choose…", action: chooseFolder)
+                                }
+
+                                if folderEdited {
+                                    Button("Use default") {
+                                        folderEdited = false
+                                        applyDerivedDestination()
+                                    }
+                                }
+                            }
+
+                            if !folderEdited {
+                                Text(automaticDestinationDescription)
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                                    .help(automaticDestinationHelp)
+                            }
                         }
                     }
                 }
@@ -927,18 +945,6 @@ struct NewProjectView: View {
                             ))
                             .textFieldStyle(.roundedBorder)
                             .focused($focusedField, equals: .name)
-                        }
-                    }
-
-                    if sourceKind != .existingFolder {
-                        GridRow {
-                            Text("Destination")
-                            TextField(folderPlaceholder, text: Binding(
-                                get: { directory },
-                                set: { directory = $0; folderEdited = true }
-                            ))
-                            .textFieldStyle(.roundedBorder)
-                            .focused($focusedField, equals: .directory)
                         }
                     }
 
@@ -1229,6 +1235,26 @@ struct NewProjectView: View {
             ? ""
             : (root as NSString).appendingPathComponent(projectName)
         syncInheritedAgentPlacements()
+    }
+
+    private var automaticDestinationDescription: String {
+        if runsOnHostKey == nil {
+            return "Automatic · \(ProjectLocationSettings.localProjectsRoot)"
+        }
+        if let hostKey = runsOnHostKey,
+           let configured = PeerHostProfileStore.shared.profiles
+            .first(where: { $0.stableKey == hostKey })?
+            .projectRootPath?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !configured.isEmpty {
+            return "Automatic · \(configured)"
+        }
+        return "Automatic · Set a project root for this host"
+    }
+
+    private var automaticDestinationHelp: String {
+        runsOnHostKey == nil
+            ? "Change the default in Settings → Agent Teams → Projects Under."
+            : "Change the default in this host's Projects Under setting."
     }
 
     /// Stands in for a project name that has not been given yet, so the
@@ -1857,6 +1883,7 @@ struct NewProjectView: View {
         panel.message = "Choose a folder for this project"
         guard panel.runModal() == .OK, let url = panel.url else { return }
         directory = url.path
+        folderEdited = true
         if sourceKind == .existingFolder {
             name = url.lastPathComponent
             Task {

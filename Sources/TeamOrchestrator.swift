@@ -82,6 +82,13 @@ final class TeamOrchestrator: ObservableObject {
         var autoRecycleEvery: Int? = nil
         /// Running count of tasks completed by this agent (reset on recycle).
         var completedTaskCount: Int = 0
+
+        /// Per-process transport identity. `id` remains the readable legacy
+        /// `role@team` key, while duplicate role instances need separate FIFO
+        /// and completion resources.
+        var transportId: String {
+            "\(id)#\(agentInstanceId)"
+        }
     }
 
     struct Team: Identifiable {
@@ -836,12 +843,16 @@ final class TeamOrchestrator: ObservableObject {
         /// Other CLIs (codex/kiro/gemini) currently ignore this; resume
         /// support for them is a follow-up.
         resumeSessionId: String? = nil,
+        /// Hard restart keeps the durable process identity; a fresh attach
+        /// leaves this nil and receives a new instance.
+        agentInstanceId existingAgentInstanceId: String? = nil,
         extraArgs: [String] = [],
         extraEnv: [String: String] = [:],
         tabManager: TabManager
     ) -> AgentMember? {
         let agentId = "\(agentName)@\(teamName)"
-        let agentInstanceId = UUID().uuidString
+        let agentInstanceId = existingAgentInstanceId ?? UUID().uuidString
+        let transportId = "\(agentId)#\(agentInstanceId)"
 
         // Build CLI-specific invocation
         var agentCommand: String
@@ -897,7 +908,7 @@ final class TeamOrchestrator: ObservableObject {
                 AgentPipeTransport.prepareDirectory()
                 agentCommand = AgentPipeTransport.launchCommand(
                     claudePath: cliPath,
-                    fifoPath: AgentPipeTransport.fifoPath(agentId: agentId),
+                    fifoPath: AgentPipeTransport.fifoPath(agentId: transportId),
                     model: Self.resolveClaudeModelArg(agentModel),
                     instructions: agentInstructions,
                     extraArgs: extraArgs,
@@ -907,7 +918,7 @@ final class TeamOrchestrator: ObservableObject {
                 )
                 // This pane's transport, settled here so delivery never has to
                 // infer it from a file that does not exist yet.
-                AgentPipeTransport.markDriven(agentId: agentId)
+                AgentPipeTransport.markDriven(agentId: transportId)
             }
         }
 
@@ -920,7 +931,7 @@ final class TeamOrchestrator: ObservableObject {
             AgentPipeTransport.prepareDirectory()
             agentCommand = AgentPipeTransport.bridgeLaunchCommand(
                 cli: agentCli,
-                fifoPath: AgentPipeTransport.fifoPath(agentId: agentId),
+                fifoPath: AgentPipeTransport.fifoPath(agentId: transportId),
                 // Same translation the native path does. A stored tier reaches
                 // codex as `--model sonnet`, which it accepts and then answers
                 // nothing at all — measured.
@@ -934,7 +945,7 @@ final class TeamOrchestrator: ObservableObject {
             )
             // This pane's transport, settled here so delivery never has to
             // infer it from a file that does not exist yet.
-            AgentPipeTransport.markDriven(agentId: agentId)
+            AgentPipeTransport.markDriven(agentId: transportId)
         }
 
         // Wrap so the terminal stays open (drops to shell) if the CLI exits.
@@ -1106,7 +1117,7 @@ final class TeamOrchestrator: ObservableObject {
             // Structural completion for this agent: the turn announces its own
             // end, so nothing has to watch its screen for one.
             AgentPipeCompletion.shared.watch(
-                agentId: agentId, teamName: teamName, agentName: agentName,
+                agentId: transportId, teamName: teamName, agentName: agentName,
                 agentInstanceId: agentInstanceId
             )
         }
@@ -2068,10 +2079,6 @@ final class TeamOrchestrator: ObservableObject {
             if existing.workspaceId != workspaceId {
                 return .failure(.teamInOtherWorkspace(name: teamName))
             }
-            // Agent name uniqueness within the existing team (R6)
-            if existing.agents.contains(where: { $0.name == agentName }) {
-                return .failure(.agentNameConflict(name: agentName, team: teamName))
-            }
             team = existing
         } else {
             let workspaceDirectory = workspace.currentDirectory
@@ -2244,7 +2251,7 @@ final class TeamOrchestrator: ObservableObject {
         }
 
         let agent = team.agents[agentIndex]
-        Self.releaseTransport(agentId: agent.id)
+        Self.releaseTransport(agentId: agent.transportId)
 
         // D3-A P2 (b): release any pending claude-sid watcher slot so the
         // FSEventStream tears down promptly. Safe to call regardless of cli.
@@ -2376,10 +2383,8 @@ final class TeamOrchestrator: ObservableObject {
             return .failure(.teamNotFound(name: teamName))
         }
 
-        // 2. Reject duplicate name within the team
-        if team.agents.contains(where: { $0.name == agentName }) {
-            return .failure(.duplicateName(name: agentName, team: teamName))
-        }
+        // Names are role-pool labels rather than instance identities. Multiple
+        // reviewers with different CLIs/models are valid in one team.
 
         // 3. Resolve TabManager from team.workspaceId (no caller env required)
         guard let tabManager = AppDelegate.shared?.tabManagerFor(tabId: team.workspaceId) else {
@@ -3102,13 +3107,13 @@ final class TeamOrchestrator: ObservableObject {
         // terminal fork after it would type at nothing.
         if let panelId = agent.panelId,
            let agentPanel = nativeAgentPanel(workspaceId: agent.workspaceId, panelId: panelId) {
-            return deliverNatively(agentPanel, agentId: agent.id, text: text,
+            return deliverNatively(agentPanel, agentId: agent.transportId, text: text,
                                    completion: completion)
         }
-        if AgentPipeTransport.isDriven(agentId: agent.id) {
+        if AgentPipeTransport.isDriven(agentId: agent.transportId) {
             do {
-                AgentPipeCompletion.shared.expect(agentId: agent.id, instruction: text)
-                let n = try AgentPipeTransport.deliver(text: text, agentId: agent.id)
+                AgentPipeCompletion.shared.expect(agentId: agent.transportId, instruction: text)
+                let n = try AgentPipeTransport.deliver(text: text, agentId: agent.transportId)
                 #if DEBUG
                 dlog("agent.pipe.deliver agent=\(agent.id) bytes=\(n) via=name task=\(AgentPipeCompletion.taskId(in: text) ?? "-")")
                 #endif
@@ -3173,7 +3178,7 @@ final class TeamOrchestrator: ObservableObject {
     private func pipeDrivenAgent(teamName: String, panelId: UUID) -> AgentMember? {
         guard let team = teams[teamName],
               let agent = team.agents.first(where: { $0.panelId == panelId }),
-              AgentPipeTransport.isDriven(agentId: agent.id)
+              AgentPipeTransport.isDriven(agentId: agent.transportId)
         else { return nil }
         return agent
     }
@@ -3197,8 +3202,8 @@ final class TeamOrchestrator: ObservableObject {
         }
         if let agent = pipeDrivenAgent(teamName: teamName, panelId: panelId) {
             do {
-                AgentPipeCompletion.shared.expect(agentId: agent.id, instruction: text)
-                let n = try AgentPipeTransport.deliver(text: text, agentId: agent.id)
+                AgentPipeCompletion.shared.expect(agentId: agent.transportId, instruction: text)
+                let n = try AgentPipeTransport.deliver(text: text, agentId: agent.transportId)
                 #if DEBUG
                 dlog("agent.pipe.deliver agent=\(agent.id) bytes=\(n) task=\(AgentPipeCompletion.taskId(in: text) ?? "-")")
                 #endif
@@ -4075,7 +4080,9 @@ final class TeamOrchestrator: ObservableObject {
     /// direct write would quietly skip.
     func adoptAgentMember(_ member: AgentMember, teamName: String) -> Bool {
         guard var team = teams[teamName] else { return false }
-        guard !team.agents.contains(where: { $0.name == member.name }) else { return false }
+        guard !team.agents.contains(where: {
+            $0.agentInstanceId == member.agentInstanceId
+        }) else { return false }
         team.agents.append(member)
         teams[teamName] = team
         TeamDataStore.shared.registerTeam(teamName, agents: team.agents.map { .init(name: $0.name, instanceId: $0.agentInstanceId) })
@@ -4434,6 +4441,7 @@ final class TeamOrchestrator: ObservableObject {
             splitFrom: splitFrom,
             orientation: orientation,
             insertFirst: insertFirst,
+            agentInstanceId: old.agentInstanceId,
             extraArgs: restartExtraArgs,
             extraEnv: restartExtraEnv,
             tabManager: tabManager
@@ -4470,7 +4478,6 @@ final class TeamOrchestrator: ObservableObject {
         // Both single (recycleAgent) and bulk (recycleAllAgents) paths go through here,
         // so no external post-restart reset is needed or correct.
         var memberToSwap = newMember
-        memberToSwap.agentInstanceId = old.agentInstanceId
         memberToSwap.completedTaskCount = 0
         team.agents[idx] = memberToSwap
         teams[teamName] = team
@@ -5066,7 +5073,7 @@ final class TeamOrchestrator: ObservableObject {
 
         // D3-A P2 (b): release any pending claude-sid watcher slots so
         // FSEventStream(s) for this team's workdirs tear down promptly.
-        for agent in team.agents { Self.releaseTransport(agentId: agent.id) }
+        for agent in team.agents { Self.releaseTransport(agentId: agent.transportId) }
         for agent in team.agents where agent.cli == "claude" {
             let workDir = agent.worktreePath ?? agent.originalAgentWorkDir ?? team.workingDirectory
             ClaudeSessionWatcher.shared.unregisterPendingClaudePane(

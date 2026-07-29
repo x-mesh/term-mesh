@@ -43,6 +43,7 @@ extension TeamOrchestrator {
         case workspaceGone
         case paneCreationFailed
         case duplicateName(String)
+        case duplicateInstance(String)
         case cliUnavailable(String, String)
         case promptStagingFailed(String)
         case projectWorkspaceUnavailable(String)
@@ -58,6 +59,7 @@ extension TeamOrchestrator {
             case .workspaceGone: return "the team's workspace is gone"
             case .paneCreationFailed: return "could not open the remote pane"
             case .duplicateName(let name): return "the team already has an agent named \(name)"
+            case .duplicateInstance(let id): return "the team already has agent instance \(id)"
             case .cliUnavailable(let cli, let host):
                 return "\(cli) is not installed on \(host)"
             case .promptStagingFailed(let host):
@@ -784,9 +786,6 @@ extension TeamOrchestrator {
         cli: String = "claude"
     ) async throws -> AgentMember {
         guard let team = teams[teamName] else { throw RemoteAgentError.teamNotFound(teamName) }
-        if team.agents.contains(where: { $0.name == agentName }) {
-            throw RemoteAgentError.duplicateName(agentName)
-        }
         guard let host = RemoteHostStore.shared.sortedHosts.first(where: { $0.id == hostKey }) else {
             throw RemoteAgentError.hostNotFound(hostKey)
         }
@@ -994,7 +993,7 @@ extension TeamOrchestrator {
                     surfaceID: spawnedSurfaceID
                 )
             }
-            throw RemoteAgentError.duplicateName(agentName)
+            throw RemoteAgentError.duplicateInstance(member.agentInstanceId)
         }
         scheduleAgentGridEqualization(workspace: workspace)
         // Remembered on success rather than on typing, so a path that turned
@@ -1164,7 +1163,7 @@ extension TeamOrchestrator {
         )
         guard adoptAgentMember(member, teamName: team.id) else {
             _ = workspace.closePanel(panel.id, force: true)
-            throw RemoteAgentError.duplicateName(agentName)
+            throw RemoteAgentError.duplicateInstance(member.agentInstanceId)
         }
         scheduleAgentGridEqualization(workspace: workspace)
         RemoteProjectPaths.shared.remember(
