@@ -387,25 +387,34 @@ impl TerminalResponseFilter {
         out
     }
 
-    /// True when the filter is holding a lone ESC waiting for a
-    /// follow-up byte. Read loops use this to schedule a short poll
-    /// timeout so a user-typed Escape that has no follow-up is
-    /// flushed promptly without forwarding it eagerly when the very
-    /// next read might complete an OSC/CSI sequence.
-    fn has_pending_escape(&self) -> bool {
-        self.state == ResponseFilterState::Escape && self.pending == b"\x1B"
+    /// True while the filter is holding any incomplete escape sequence.
+    ///
+    /// A terminal response can be truncated between PTY reads (or lose its
+    /// terminator when a mirrored TUI changes modes). Waiting forever in Csi /
+    /// Osc would then absorb every later user key, making an interactive trust
+    /// or permission prompt look frozen. The read loop gives every incomplete
+    /// sequence the same short completion window as a lone Escape.
+    fn has_pending_sequence(&self) -> bool {
+        self.state != ResponseFilterState::Ground && !self.pending.is_empty()
     }
 
-    /// Drain a lone pending ESC as user input. The caller is expected
-    /// to invoke this when a poll timeout indicates no follow-up byte
-    /// is arriving. No-op when the filter is in any other state.
-    fn flush_pending_escape(&mut self) -> Vec<u8> {
-        if self.has_pending_escape() {
-            self.pending.clear();
-            self.state = ResponseFilterState::Ground;
-            return vec![0x1B];
+    /// Drain an incomplete sequence after its completion window expires.
+    ///
+    /// `OscEsc` has consumed the possible ST-leading Escape without placing it
+    /// in `pending`, so preserve that byte as well. Returning the bytes rather
+    /// than dropping them is the conservative choice for user-generated Alt /
+    /// Escape input; known complete terminal responses are still removed by
+    /// `process`.
+    fn flush_pending_sequence(&mut self) -> Vec<u8> {
+        if !self.has_pending_sequence() {
+            return Vec::new();
         }
-        Vec::new()
+        let mut drained = std::mem::take(&mut self.pending);
+        if self.state == ResponseFilterState::OscEsc {
+            drained.push(0x1B);
+        }
+        self.state = ResponseFilterState::Ground;
+        drained
     }
 }
 
@@ -788,21 +797,18 @@ fn main() {
     });
 
     // stdin reader thread: sends keystrokes to socket. Uses poll(2)
-    // so a lone ESC held by `TerminalResponseFilter` (waiting to see
-    // if it's the start of a CSI/OSC sequence) can be flushed after
-    // a short timeout — the standard "Escape timing" trick TUIs use
-    // to disambiguate Esc-by-itself from `Esc[A` arrow keys without
-    // racing read boundaries. Without poll, we'd either flush every
-    // ESC eagerly (the original code, which lets a CSI/OSC reply
-    // split as `[ESC][[2;1R]` slip through as raw input) or hold ESC
-    // forever (which makes vim's `<Esc>` to leave insert mode hang).
+    // so any incomplete sequence held by `TerminalResponseFilter` can
+    // be flushed after a short timeout. This is both the standard
+    // Escape-key disambiguation trick and a recovery boundary for a
+    // truncated CSI/OSC terminal response; without it that filter state
+    // can absorb every later key and freeze an interactive prompt.
     let tx_stdin = tx.clone();
     let stdin_handle = std::thread::spawn(move || {
-        // Bounded delay between seeing a lone ESC and forwarding it
-        // as user input. 100 ms is well above any same-burst
-        // PTY read-fragmentation jitter and well below human Escape
-        // perception latency.
-        const ESC_FLUSH_TIMEOUT_MS: i32 = 100;
+        // Bounded delay between seeing an incomplete sequence and forwarding
+        // it as user input. 100 ms is well above same-burst PTY
+        // read-fragmentation jitter and well below human Escape perception
+        // latency.
+        const SEQUENCE_FLUSH_TIMEOUT_MS: i32 = 100;
 
         let stdin_fd = libc::STDIN_FILENO;
         let mut buf = [0u8; 1024];
@@ -820,8 +826,8 @@ fn main() {
         };
 
         loop {
-            let timeout_ms = if response_filter.has_pending_escape() {
-                ESC_FLUSH_TIMEOUT_MS
+            let timeout_ms = if response_filter.has_pending_sequence() {
+                SEQUENCE_FLUSH_TIMEOUT_MS
             } else {
                 -1
             };
@@ -840,9 +846,9 @@ fn main() {
                 break;
             }
             if ret == 0 {
-                let flushed = response_filter.flush_pending_escape();
+                let flushed = response_filter.flush_pending_sequence();
                 if !send_frame(&tx_stdin, &flushed) {
-                    rlog("stdin exit: send_frame failed (channel closed) after esc flush");
+                    rlog("stdin exit: send_frame failed (channel closed) after sequence flush");
                     break;
                 }
                 continue;
@@ -1083,20 +1089,35 @@ mod tests {
         // A lone ESC must NOT be flushed inside `process` — that would
         // turn a CSI/OSC reply split across read boundaries (ESC, then
         // `[2;1R` on the next read) into ordinary input. The read loop
-        // arms a poll timeout to flush these via `flush_pending_escape`.
+        // arms a poll timeout to flush these via `flush_pending_sequence`.
         assert!(f.process(b"\x1B").is_empty());
-        assert!(f.has_pending_escape());
-        assert_eq!(f.flush_pending_escape(), b"\x1B");
-        assert!(!f.has_pending_escape());
+        assert!(f.has_pending_sequence());
+        assert_eq!(f.flush_pending_sequence(), b"\x1B");
+        assert!(!f.has_pending_sequence());
     }
 
     #[test]
-    fn flush_pending_escape_is_noop_when_idle() {
+    fn flush_pending_sequence_is_noop_when_idle() {
         let mut f = TerminalResponseFilter::default();
-        assert!(f.flush_pending_escape().is_empty());
-        // Mid-CSI must not be flushed by the timeout helper either.
-        let _ = f.process(b"\x1B[");
-        assert!(f.flush_pending_escape().is_empty());
+        assert!(f.flush_pending_sequence().is_empty());
+    }
+
+    #[test]
+    fn flushes_truncated_csi_before_it_can_absorb_later_keys() {
+        let mut f = TerminalResponseFilter::default();
+        assert!(f.process(b"\x1B[13;").is_empty());
+        assert!(f.has_pending_sequence());
+        assert_eq!(f.flush_pending_sequence(), b"\x1B[13;");
+        assert_eq!(f.process(b"\r"), b"\r");
+    }
+
+    #[test]
+    fn flushes_truncated_osc_and_preserves_possible_st_escape() {
+        let mut f = TerminalResponseFilter::default();
+        assert!(f.process(b"\x1B]11;rgb:ffff\x1B").is_empty());
+        assert!(f.has_pending_sequence());
+        assert_eq!(f.flush_pending_sequence(), b"\x1B]11;rgb:ffff\x1B");
+        assert_eq!(f.process(b"\r"), b"\r");
     }
 
     #[test]
