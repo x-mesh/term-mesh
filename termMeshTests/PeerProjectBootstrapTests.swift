@@ -8,6 +8,30 @@ import PeerProto
 #endif
 
 final class PeerProjectBootstrapTests: XCTestCase {
+    func test_lateRemoteAgentIsolationPolicyCoversRecordedAndOccupiedDirectories() {
+        XCTAssertTrue(
+            TeamOrchestrator.requiresIsolatedLateAgentCheckout(
+                requestedDirectory: " /app/tm-projects/project-reviewer ",
+                recordedDirectories: ["/app/tm-projects/project-reviewer"],
+                occupiedDirectories: []
+            )
+        )
+        XCTAssertTrue(
+            TeamOrchestrator.requiresIsolatedLateAgentCheckout(
+                requestedDirectory: "/app/tm-projects/project-reviewer",
+                recordedDirectories: [],
+                occupiedDirectories: [" /app/tm-projects/project-reviewer "]
+            )
+        )
+        XCTAssertFalse(
+            TeamOrchestrator.requiresIsolatedLateAgentCheckout(
+                requestedDirectory: "/srv/custom-unoccupied",
+                recordedDirectories: [],
+                occupiedDirectories: []
+            )
+        )
+    }
+
     func test_remoteWorkingDirectoryRequiresHostResolvedPath() throws {
         XCTAssertEqual(
             try TeamOrchestrator.requiredRemoteWorkingDirectory(
