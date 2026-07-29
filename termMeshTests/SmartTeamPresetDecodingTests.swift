@@ -359,4 +359,29 @@ final class SmartTeamPresetDecodingTests: XCTestCase {
         try manager.renameCustom(id: id, name: "   ")
         XCTAssertEqual(manager.template(for: id)?.name, "After")
     }
+
+    func testBuiltInSmartPresetOverridePersistsAsCurrentPresetChanges() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let fileURL = directory.appendingPathComponent("team-templates.custom.json")
+        let manager = TeamTemplateManager(catalog: .fallback, fileURL: fileURL)
+        guard let template = manager.templates.first(where: {
+            $0.origin == .builtIn && $0.id.category == .smart
+        }), case .smart(var preset) = template.payload else {
+            return XCTFail("expected a built-in smart preset")
+        }
+
+        preset.leaderMode = "codex"
+        preset.leaderModel = "gpt-5.6-sol"
+        manager.saveOverride(for: template.id, payload: .smart(preset))
+
+        let reloaded = TeamTemplateManager(catalog: .fallback, fileURL: fileURL)
+        XCTAssertTrue(reloaded.isOverridden(template.id))
+        guard case .smart(let saved) = reloaded.effectivePayload(for: template.id) else {
+            return XCTFail("expected the saved built-in override")
+        }
+        XCTAssertEqual(saved.leaderMode, "codex")
+        XCTAssertEqual(saved.leaderModel, "gpt-5.6-sol")
+    }
 }

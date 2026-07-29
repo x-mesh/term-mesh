@@ -470,12 +470,13 @@ struct NewProjectView: View {
                     .accessibilityIdentifier("newProject.teamPreset")
 
                     if isTeamCustomized {
-                        if selectedTeamPresetIsCustom {
+                        if selectedTeamPresetId != nil {
                             Button("Save changes") {
                                 saveChangesToSelectedPreset()
                             }
                             .buttonStyle(.borderedProminent)
                             .controlSize(.small)
+                            .help("Update \(teamPresetDisplayName) with the current team")
                             .accessibilityIdentifier("newProject.savePresetChanges")
                         } else {
                             Button("Save as new…") {
@@ -587,11 +588,6 @@ struct NewProjectView: View {
             return name
         }
         return isTeamCustomized ? "Customized" : "Default · 1 Executor"
-    }
-
-    private var selectedTeamPresetIsCustom: Bool {
-        guard let selectedTeamPresetId else { return false }
-        return teamTemplateManager.template(for: selectedTeamPresetId)?.origin == .custom
     }
 
     private var suggestedPresetName: String {
@@ -1429,48 +1425,55 @@ struct NewProjectView: View {
     }
 
     private var footer: some View {
-        HStack {
+        HStack(spacing: 12) {
             if showsCreationProgress {
                 Text(creationError == nil
                     ? "Keep this window open while the project starts."
                     : "Review the failed step, then retry or change the settings.")
                     .font(.caption)
                     .foregroundStyle(creationError == nil ? Color.secondary : Color.red)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .layoutPriority(0)
             } else {
                 Text(creationError ?? creationSummary)
                     .font(.caption)
                     .foregroundStyle(creationError == nil ? Color.secondary : Color.red)
                     .lineLimit(creationError == nil ? 1 : 2)
                     .fixedSize(horizontal: false, vertical: creationError != nil)
-                    .layoutPriority(1)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .layoutPriority(0)
                     .help(creationError ?? creationSummary)
             }
-            Spacer()
-            if showsCreationProgress {
-                if creationError != nil {
-                    Button("Back to settings") {
-                        showsCreationProgress = false
-                        creationError = nil
+            HStack(spacing: 10) {
+                if showsCreationProgress {
+                    if creationError != nil {
+                        Button("Back to settings") {
+                            showsCreationProgress = false
+                            creationError = nil
+                        }
+                        .keyboardShortcut(.cancelAction)
+                        Button("Retry project") {
+                            startCreation()
+                        }
+                        .keyboardShortcut(.defaultAction)
+                    } else {
+                        Button("Starting…") {}
+                            .disabled(true)
                     }
-                    .keyboardShortcut(.cancelAction)
-                    Button("Retry project") {
+                } else {
+                    Button("Cancel", action: onClose)
+                        .keyboardShortcut(.cancelAction)
+                    Button(createActionLabel) {
                         startCreation()
                     }
                     .keyboardShortcut(.defaultAction)
-                } else {
-                    Button("Starting…") {}
-                        .disabled(true)
+                    .disabled(!canCreate || !placementHostsAreReady)
                 }
-            } else {
-                Button("Cancel", action: onClose)
-                    .keyboardShortcut(.cancelAction)
-                Button(createActionLabel) {
-                    startCreation()
-                }
-                .keyboardShortcut(.defaultAction)
-                .disabled(!canCreate || !placementHostsAreReady)
             }
+            .fixedSize(horizontal: true, vertical: false)
+            .layoutPriority(2)
         }
+        .frame(maxWidth: .infinity)
         .padding(.horizontal, 20)
         .padding(.vertical, 14)
     }
@@ -1778,21 +1781,35 @@ struct NewProjectView: View {
 
     private func saveChangesToSelectedPreset() {
         guard let selectedTeamPresetId,
-              var template = teamTemplateManager.template(for: selectedTeamPresetId),
-              template.origin == .custom,
-              case .smart(var preset) = template.payload else { return }
+              var template = teamTemplateManager.template(for: selectedTeamPresetId) else { return }
+        let sourcePayload = template.origin == .builtIn
+            ? (teamTemplateManager.effectivePayload(for: selectedTeamPresetId) ?? template.payload)
+            : template.payload
+        guard case .smart(var preset) = sourcePayload else { return }
         preset.leaderMode = leaderCli
         preset.leaderModel = leaderCli == "repl" ? nil : leaderModel
         preset.agents = currentProviderPreferences
         preset.description = "\(agents.count) agent\(agents.count == 1 ? "" : "s")"
-        template.payload = .smart(preset)
-        do {
-            try teamTemplateManager.updateCustom(template)
-            appliedTeamSignature = currentTeamSignature
-            showPresetSavedConfirmation("Saved")
-        } catch {
-            presetError = error.localizedDescription
+        let updatedPayload = TeamTemplatePayload.smart(preset)
+
+        switch template.origin {
+        case .custom:
+            template.payload = updatedPayload
+            do {
+                try teamTemplateManager.updateCustom(template)
+            } catch {
+                presetError = error.localizedDescription
+                return
+            }
+        case .builtIn:
+            teamTemplateManager.saveOverride(
+                for: selectedTeamPresetId,
+                payload: updatedPayload
+            )
         }
+
+        appliedTeamSignature = currentTeamSignature
+        showPresetSavedConfirmation("Saved to \(template.name)")
     }
 
     private func revertCurrentTeamChanges() {
