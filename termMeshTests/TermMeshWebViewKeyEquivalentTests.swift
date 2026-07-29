@@ -6164,6 +6164,52 @@ final class TerminalControllerSidebarDedupeTests: XCTestCase {
     }
 }
 
+final class TerminalControllerRemoteAgentAddTests: XCTestCase {
+    private let hosts = [
+        (key: "ssh:root@jw-server", displayName: "Build Server", sshTarget: Optional("root@jw-server"))
+    ]
+
+    func testHostResolutionAcceptsKeyDisplayNameFullTargetAndHostname() {
+        for input in ["ssh:root@jw-server", "build server", "root@jw-server", "jw-server"] {
+            XCTAssertEqual(
+                TerminalController.remoteAgentHostKey(for: input, candidates: hosts),
+                "ssh:root@jw-server"
+            )
+        }
+    }
+
+    func testHostResolutionRejectsUnknownName() {
+        XCTAssertNil(TerminalController.remoteAgentHostKey(for: "other", candidates: hosts))
+    }
+
+    func testUnknownHostErrorListsUsableConnectedKeys() {
+        XCTAssertEqual(
+            TerminalController.remoteAgentHostNotFoundMessage(
+                input: "other",
+                connectedKeys: ["ssh:root@jw-server", "ssh:builder@mac-mini"]
+            ),
+            "no connected host named other; connected host keys: "
+                + "ssh:root@jw-server, ssh:builder@mac-mini"
+        )
+    }
+
+    func testRemoteAgentResponseUsesActualCheckoutAndReportsReuse() {
+        let isolated = TerminalController.remoteAgentResponseWorkingDirectory(
+            requested: "/app/tm-projects/term-mesh-reviewer-260729-c741",
+            memberWorkingDirectory: "/app/tm-projects/term-mesh-fixer-260729-b4c7"
+        )
+        XCTAssertEqual(isolated.directory, "/app/tm-projects/term-mesh-fixer-260729-b4c7")
+        XCTAssertFalse(isolated.reused)
+
+        let reused = TerminalController.remoteAgentResponseWorkingDirectory(
+            requested: "/app/tm-projects/term-mesh-reviewer-260729-c741",
+            memberWorkingDirectory: nil
+        )
+        XCTAssertEqual(reused.directory, "/app/tm-projects/term-mesh-reviewer-260729-c741")
+        XCTAssertTrue(reused.reused)
+    }
+}
+
 final class TerminalControllerSocketTextChunkTests: XCTestCase {
     func testSocketTextChunksReturnsSingleChunkForPlainText() {
         XCTAssertEqual(

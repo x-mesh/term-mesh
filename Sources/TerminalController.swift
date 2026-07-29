@@ -309,6 +309,58 @@ class TerminalController {
         return trimmed
     }
 
+    nonisolated static func remoteAgentHostKey(
+        for input: String,
+        candidates: [(key: String, displayName: String, sshTarget: String?)]
+    ) -> String? {
+        let needle = input.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !needle.isEmpty else { return nil }
+        if let exactKey = candidates.first(where: { $0.key == needle }) {
+            return exactKey.key
+        }
+        if let displayName = candidates.first(where: {
+            $0.displayName.caseInsensitiveCompare(needle) == .orderedSame
+        }) {
+            return displayName.key
+        }
+        if let fullTarget = candidates.first(where: {
+            $0.sshTarget?.caseInsensitiveCompare(needle) == .orderedSame
+        }) {
+            return fullTarget.key
+        }
+        return candidates.first { candidate in
+            guard var hostname = candidate.sshTarget?
+                .trimmingCharacters(in: .whitespacesAndNewlines),
+                  !hostname.isEmpty
+            else { return false }
+            if let at = hostname.lastIndex(of: "@") {
+                hostname = String(hostname[hostname.index(after: at)...])
+            }
+            return hostname.caseInsensitiveCompare(needle) == .orderedSame
+        }?.key
+    }
+
+    nonisolated static func remoteAgentResponseWorkingDirectory(
+        requested: String,
+        memberWorkingDirectory: String?
+    ) -> (directory: String, reused: Bool) {
+        let requested = requested.trimmingCharacters(in: .whitespacesAndNewlines)
+        let member = memberWorkingDirectory?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let actual = member.isEmpty ? requested : member
+        return (directory: actual, reused: actual == requested)
+    }
+
+    nonisolated static func remoteAgentHostNotFoundMessage(
+        input: String,
+        connectedKeys: [String]
+    ) -> String {
+        let available = connectedKeys.isEmpty
+            ? "no hosts are connected"
+            : "connected host keys: \(connectedKeys.joined(separator: ", "))"
+        return "no connected host named \(input); \(available)"
+    }
+
     /// Update which window's TabManager receives socket commands.
     /// This is used when the user switches between multiple terminal windows.
     func setActiveTabManager(_ tabManager: TabManager?) {
@@ -2619,15 +2671,17 @@ class TerminalController {
     ) async -> String {
         enum Resolution {
             case ok(key: String, directory: String)
-            case noSuchHost
+            case noSuchHost(connectedKeys: [String])
             case noDirectory(host: String)
         }
         let resolution: Resolution = await MainActor.run {
-            let hosts = RemoteHostStore.shared.sortedHosts
-            let match = hosts.first { $0.id == host }
-                ?? hosts.first { $0.displayName.caseInsensitiveCompare(host) == .orderedSame }
-                ?? hosts.first { $0.sshTarget?.caseInsensitiveCompare(host) == .orderedSame }
-            guard let match else { return .noSuchHost }
+            let hosts = RemoteHostStore.shared.sortedHosts.filter(\.isConnected)
+            let candidates = hosts.map {
+                (key: $0.id, displayName: $0.displayName, sshTarget: $0.sshTarget)
+            }
+            guard let hostKey = Self.remoteAgentHostKey(for: host, candidates: candidates),
+                  let match = hosts.first(where: { $0.id == hostKey })
+            else { return .noSuchHost(connectedKeys: hosts.map(\.id)) }
             // An explicit directory wins, because the caller is the only one
             // who can know where a project lives on a machine that has not
             // said. Two machines rarely lay a checkout out the same way, so
@@ -2666,8 +2720,15 @@ class TerminalController {
         switch resolution {
         case .ok(let key, let dir):
             resolved = (key, dir)
-        case .noSuchHost:
-            return v2Error(id: id, code: "not_found", message: "no connected host named \(host)")
+        case .noSuchHost(let connectedKeys):
+            return v2Error(
+                id: id,
+                code: "not_found",
+                message: Self.remoteAgentHostNotFoundMessage(
+                    input: host,
+                    connectedKeys: connectedKeys
+                )
+            )
         case .noDirectory(let name):
             return v2Error(
                 id: id,
@@ -2685,6 +2746,10 @@ class TerminalController {
                 model: agentModel,
                 cli: agentCli
             )
+            let checkout = Self.remoteAgentResponseWorkingDirectory(
+                requested: resolved.directory,
+                memberWorkingDirectory: member.originalAgentWorkDir
+            )
             var payload: [String: Any] = [
                 "team_name": teamName,
                 "agent_name": member.name,
@@ -2693,7 +2758,8 @@ class TerminalController {
                 "cli": member.cli,
                 "model": member.model,
                 "host": resolved.key,
-                "working_directory": resolved.directory,
+                "working_directory": checkout.directory,
+                "checkout_reused": checkout.reused,
             ]
             if let pid = member.panelId { payload["panel_id"] = pid.uuidString }
             return v2Result(id: id, .ok(payload))
