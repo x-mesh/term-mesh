@@ -264,11 +264,111 @@ final class PeerProjectBootstrapTests: XCTestCase {
         )
         let text = try! XCTUnwrap(PeerProjectBootstrap.script(for: plan, gitURL: "u"))
         // Every step is guarded on its own result already existing.
-        XCTAssertTrue(text.contains("test -d '/app/p/x'/.git ||"))
+        XCTAssertTrue(text.contains("if test -d '/app/p/x'/.git; then :; else"))
         XCTAssertTrue(text.contains("git -C '/app/p/x-a' rev-parse --git-dir"))
         // A branch left over from a previous run is the normal second visit.
         XCTAssertTrue(text.contains("show-ref --verify --quiet refs/heads/'agent/a'"))
         XCTAssertTrue(text.contains("worktree add '/app/p/x-a' 'agent/a'"))
+    }
+
+    func test_failed_bootstrap_rolls_back_owned_artifacts_and_preserves_existing_targets() throws {
+        let root = try Self.makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(atPath: root) }
+        let primary = (root as NSString).appendingPathComponent("x")
+        let first = (root as NSString).appendingPathComponent("x-a")
+        let existing = (root as NSString).appendingPathComponent("x-b")
+        try FileManager.default.createDirectory(
+            atPath: primary,
+            withIntermediateDirectories: true
+        )
+        try FileManager.default.createDirectory(
+            atPath: existing,
+            withIntermediateDirectories: true
+        )
+        let marker = (existing as NSString).appendingPathComponent("keep.txt")
+        XCTAssertTrue(FileManager.default.createFile(atPath: marker, contents: Data("keep".utf8)))
+        XCTAssertEqual(Self.shellStatus("git -C \(Self.quoted(primary)) init -q"), 0)
+        XCTAssertEqual(
+            Self.shellStatus(
+                "git -C \(Self.quoted(primary)) -c user.name=test "
+                    + "-c user.email=test@example.invalid commit --allow-empty -qm initial"
+            ),
+            0
+        )
+
+        let plan = PeerProjectBootstrap.Plan(
+            primaryPath: primary,
+            agentCheckouts: [
+                (agent: "a", path: first, branch: "agent/a"),
+                (agent: "b", path: existing, branch: "agent/b"),
+            ]
+        )
+        let text = try XCTUnwrap(
+            PeerProjectBootstrap.script(for: plan, gitURL: nil, sourceKind: .existingFolder)
+        )
+        XCTAssertTrue(text.contains("trap tm_rollback EXIT"))
+        XCTAssertNotEqual(Self.shellStatus(text), 0)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: first))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: marker))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: (primary as NSString).appendingPathComponent(".git")))
+        XCTAssertNotEqual(
+            Self.shellStatus(
+                "git -C \(Self.quoted(primary)) show-ref --verify --quiet refs/heads/\(Self.quoted("agent/a"))"
+            ),
+            0
+        )
+    }
+
+    func test_bootstrap_rollback_is_emitted_in_reverse_creation_order() throws {
+        let plan = PeerProjectBootstrap.plan(
+            projectRoot: "/app/p",
+            projectName: "x",
+            agents: ["a", "b"],
+            isolateAgents: true
+        )
+        let text = try XCTUnwrap(PeerProjectBootstrap.script(for: plan, gitURL: "u"))
+        let second = try XCTUnwrap(text.range(of: "worktree remove --force '/app/p/x-b'"))
+        let first = try XCTUnwrap(text.range(of: "worktree remove --force '/app/p/x-a'"))
+        let primary = try XCTUnwrap(text.range(of: "else rm -rf -- '/app/p/x'; fi; fi"))
+        XCTAssertLessThan(second.lowerBound, first.lowerBound)
+        XCTAssertLessThan(first.lowerBound, primary.lowerBound)
+    }
+
+    func test_failed_bootstrap_restores_a_preexisting_unborn_repository() throws {
+        let root = try Self.makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(atPath: root) }
+        let primary = (root as NSString).appendingPathComponent("x")
+        let blockedWorktree = (root as NSString).appendingPathComponent("x-a")
+        try FileManager.default.createDirectory(
+            atPath: primary,
+            withIntermediateDirectories: true
+        )
+        try FileManager.default.createDirectory(
+            atPath: blockedWorktree,
+            withIntermediateDirectories: true
+        )
+        XCTAssertTrue(FileManager.default.createFile(
+            atPath: (blockedWorktree as NSString).appendingPathComponent("keep.txt"),
+            contents: Data("keep".utf8)
+        ))
+        XCTAssertEqual(Self.shellStatus("git -C \(Self.quoted(primary)) init -q"), 0)
+
+        let plan = PeerProjectBootstrap.Plan(
+            primaryPath: primary,
+            agentCheckouts: [(agent: "a", path: blockedWorktree, branch: "agent/a")]
+        )
+        let text = try XCTUnwrap(
+            PeerProjectBootstrap.script(for: plan, gitURL: nil, sourceKind: .empty)
+        )
+        XCTAssertNotEqual(Self.shellStatus(text), 0)
+        XCTAssertTrue(FileManager.default.fileExists(
+            atPath: (primary as NSString).appendingPathComponent(".git")
+        ))
+        XCTAssertNotEqual(
+            Self.shellStatus("git -C \(Self.quoted(primary)) rev-parse --verify HEAD"),
+            0,
+            "the initial commit created by the failed run must be removed"
+        )
     }
 
     func test_empty_project_initializes_and_commits_before_adding_worktrees() {
