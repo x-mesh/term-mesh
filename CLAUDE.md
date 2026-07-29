@@ -122,12 +122,30 @@ Named CLI profile sets (path + extraArgs + env + modelOverride) stored in `~/Lib
 
 - pipe transport(`agentPipeTransport.enabled`)와 native panel(`agentPipeTransport.nativePanel`)이 함께 켜진다. 하나만 켜는 UI는 없다.
 - 에이전트 UI는 `AgentPanelView`(SwiftUI) — 지시문, streaming 답변, 접을 수 있는 tool row, 턴 종료 cost/시간.
+- 파일 편집은 `ChangeRow`가 diff로 그린다: 접힌 줄에 `경로 +N −M`, 펼치면 `+`/`−` 색상 diff. 파싱은 `Sources/Panels/AgentDiff.swift`(순수 함수, `CollectionDifference` 기반)가 `tool_use.input`에서 하며 **뷰 body에서는 절대 계산하지 않는다**. 인식하는 input 모양은 `unified_diff`(브리지 정본, `@@` 헤더의 라인 번호 유지) / `old_string`+`new_string` / `edits[]` / `content`. tool 이름이 아니라 input 모양으로 분기한다. 브리지는 `input`에 `command` 키를 넣으면 안 된다 — `AgentSession.openTool()`이 그걸 먼저 골라 `file_path`를 가린다.
 - `tm-agent delegate` / `send` / `broadcast`는 CLI 이름 그대로; delivery만 paste+Return → pipe/native stdin으로 바뀐다.
 - 턴 완료는 `AgentPipeCompletion`이 `<fifo>.events`의 `{"type":"result"}`를 읽는다. Standard Reply Header(5-field) 계약은 동일.
 - 지원 CLI: claude(직접 NDJSON), codex/kiro/cursor/agy(`scripts/spike/tm-agent-bridge.py`).
 - Shell Integration health: native agent pane은 **agentMode**(파란색) — shell integration N/A.
 
 Spike 상세: `docs/spike/agent-pipe-render.md`
+
+### Remote native agent environment
+
+Remote native agents start through the account's Bourne-compatible login shell.
+The load order is:
+
+1. the shell's normal login profile;
+2. `~/.profile` when Bash or zsh would otherwise skip that literal file;
+3. optional `~/.config/term-mesh/agent-env`;
+4. explicit environment values configured for the peer host.
+
+`agent-env` is sourced as a Bourne-compatible shell fragment. Prefer simple
+`KEY=value` or `export KEY=value` entries and do not print output from it.
+Explicit peer-host values win over profile and `agent-env` values. term-mesh
+uses a fixed remote `PATH`, so configure CLI paths explicitly rather than
+overriding `PATH` in these files. A profile or `agent-env` load failure is
+reported in the native agent pane without including environment values.
 
 VERIFY (stale CLI 이름·동작 불일치):
 

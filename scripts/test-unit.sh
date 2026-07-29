@@ -13,6 +13,8 @@ if [ "$#" -eq 0 ]; then
   set -- test
 fi
 
+python3 -m unittest scripts/spike/test_tm_agent_bridge.py
+
 exec xcodebuild \
   -project "$PROJECT" \
   -scheme "$SCHEME" \

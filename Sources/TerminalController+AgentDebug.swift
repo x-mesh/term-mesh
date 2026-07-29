@@ -56,9 +56,20 @@ extension TerminalController {
         case .thought(_, let body):
             return ["kind": "thought", "text": body ?? ""]
         case .tool(_, let call):
-            return ["kind": "tool", "name": call.name, "headline": call.headline,
-                    "result": call.result ?? "", "failed": call.failed,
-                    "running": call.isRunning]
+            var described: [String: Any] = [
+                "kind": "tool", "name": call.name, "headline": call.headline,
+                "result": call.result ?? "", "failed": call.failed,
+                "running": call.isRunning]
+            // A diff can be right in the model and stale on screen, and only a
+            // screenshot tells those apart. Reporting what the model holds is
+            // what makes the screenshot worth taking.
+            if let change = call.change {
+                described["change"] = [
+                    "path": change.path, "added": change.added,
+                    "removed": change.removed, "lines": change.lines.count,
+                    "elided": change.elided, "everywhere": change.everywhere]
+            }
+            return described
         case .turnEnded(_, let end):
             return ["kind": "turn_ended", "stop": end.stop, "failed": end.failed,
                     "cost": end.cost ?? 0, "duration": end.duration ?? 0,

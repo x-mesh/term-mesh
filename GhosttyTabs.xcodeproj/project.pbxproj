@@ -185,6 +185,7 @@
 		A5009006 /* AgentPanel.swift in Sources */ = {isa = PBXBuildFile; fileRef = A5009009 /* AgentPanel.swift */; };
 		A5009007 /* AgentPanelView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A500900A /* AgentPanelView.swift */; };
 		A5009080 /* AgentMarkdown.swift in Sources */ = {isa = PBXBuildFile; fileRef = A5009081 /* AgentMarkdown.swift */; };
+		A5009090 /* AgentDiff.swift in Sources */ = {isa = PBXBuildFile; fileRef = A5009091 /* AgentDiff.swift */; };
 		A5001405 /* PanelContentView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A5001415 /* PanelContentView.swift */; };
 		A5001406 /* Workspace.swift in Sources */ = {isa = PBXBuildFile; fileRef = A5001416 /* Workspace.swift */; };
 		A5001407 /* WorkspaceContentView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A5001417 /* WorkspaceContentView.swift */; };
@@ -498,6 +499,7 @@
 		A5009009 /* AgentPanel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Panels/AgentPanel.swift; sourceTree = "<group>"; };
 		A500900A /* AgentPanelView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Panels/AgentPanelView.swift; sourceTree = "<group>"; };
 		A5009081 /* AgentMarkdown.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Panels/AgentMarkdown.swift; sourceTree = "<group>"; };
+		A5009091 /* AgentDiff.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Panels/AgentDiff.swift; sourceTree = "<group>"; };
 		A5001415 /* PanelContentView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Panels/PanelContentView.swift; sourceTree = "<group>"; };
 		A5001416 /* Workspace.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Workspace.swift; sourceTree = "<group>"; };
 		A5001417 /* WorkspaceContentView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WorkspaceContentView.swift; sourceTree = "<group>"; };
@@ -843,6 +845,7 @@ A1740000000000000000000C /* ProcessRun.swift */,
 				A5009009 /* AgentPanel.swift */,
 				A500900A /* AgentPanelView.swift */,
 				A5009081 /* AgentMarkdown.swift */,
+				A5009091 /* AgentDiff.swift */,
 				A5001510 /* TermMeshWebView.swift */,
 				A5009910 /* EnvCompat.swift */,
 				A5001415 /* PanelContentView.swift */,
@@ -1269,6 +1272,7 @@ A1740000000000000000000B /* ProcessRun.swift in Sources */,
 				A5009006 /* AgentPanel.swift in Sources */,
 				A5009007 /* AgentPanelView.swift in Sources */,
 				A5009080 /* AgentMarkdown.swift in Sources */,
+				A5009090 /* AgentDiff.swift in Sources */,
 				A5001500 /* TermMeshWebView.swift in Sources */,
 				A5009900 /* EnvCompat.swift in Sources */,
 				A5001405 /* PanelContentView.swift in Sources */,
