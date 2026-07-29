@@ -897,28 +897,41 @@ extension TeamOrchestrator {
         // an agent but only contains "command not found".
         try await Self.ensureRemoteCLIAvailable(cli: cli, host: host)
 
-        // Every late remote member gets an instance-tagged worktree. The
-        // requested path may itself be another member's worktree, so derive
-        // the primary repository through --git-common-dir before planning.
-        // Isolation failure is fatal: falling back would silently put two
-        // writers in one checkout.
+        // A late member joining one of this project's own checkouts gets an
+        // instance-tagged worktree. The requested path may be the prefilled
+        // primary or another member's worktree — both are recorded in
+        // `remoteProjectLocations` — so derive the primary repository through
+        // --git-common-dir before planning. Isolation failure is fatal here:
+        // falling back would silently put two writers in one checkout.
+        //
+        // A path the project did not create stays exactly as typed. That is
+        // the documented `--dir` contract, and it is what keeps non-git
+        // directories (and projects created without isolation) reachable —
+        // the caller who names a custom directory owns its sharing rules.
         let requestedDirectory = try Self.requiredRemoteWorkingDirectory(
             workingDirectory,
             hostKey: hostKey
         )
-        let isolated = try await Self.prepareLateAgentCheckout(
-            host: host,
-            hostKey: hostKey,
-            agentName: agentName,
-            requestedDirectory: requestedDirectory
-        )
-        let workingDirectory = isolated.path
-        var locations = team.remoteProjectLocations
-        locations.append(.init(hostKey: hostKey, path: isolated.path))
-        recordRemoteProjectLocations(
-            teamName: teamName,
-            locations: locations.sorted { ($0.hostKey, $0.path) < ($1.hostKey, $1.path) }
-        )
+        let workingDirectory: String
+        if team.remoteProjectLocations.contains(
+            .init(hostKey: hostKey, path: requestedDirectory)
+        ) {
+            let isolated = try await Self.prepareLateAgentCheckout(
+                host: host,
+                hostKey: hostKey,
+                agentName: agentName,
+                requestedDirectory: requestedDirectory
+            )
+            workingDirectory = isolated.path
+            var locations = team.remoteProjectLocations
+            locations.append(.init(hostKey: hostKey, path: isolated.path))
+            recordRemoteProjectLocations(
+                teamName: teamName,
+                locations: locations.sorted { ($0.hostKey, $0.path) < ($1.hostKey, $1.path) }
+            )
+        } else {
+            workingDirectory = requestedDirectory
+        }
 
         // Use the same incremental grid growth as local `add`/`attach`.
         let placement = nextAgentSplitPlacement(team: team, workspace: workspace)
@@ -1383,7 +1396,9 @@ extension TeamOrchestrator {
 
     /// A late-added agent's own checkout, prepared on the host.
     ///
-    /// The primary is derived from the requested directory over ssh
+    /// Called only for directories recorded as this project's
+    /// (`remoteProjectLocations`); an explicitly custom path never reaches
+    /// here. The primary is derived from the requested directory over ssh
     /// (`--git-common-dir`), so a request pointing at an existing member's
     /// worktree still creates a new sibling checkout. Every failure is
     /// surfaced because falling back would violate checkout isolation.
