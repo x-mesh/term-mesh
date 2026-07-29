@@ -230,67 +230,95 @@ struct AgentPanelView: View {
     // MARK: - Transcript
 
     private var transcript: some View {
-        ScrollViewReader { proxy in
-            ScrollView {
-                // Rows arrive with their identity and spacing already decided
-                // (`AgentSession.Row`). Deriving either here — enumerating the
-                // entries per body evaluation, keying on a path through the
-                // enum, or reaching back to `entries[index - 1]` for the gap —
-                // is what made this LazyVStack's placement pass re-enter itself
-                // and spin the main thread.
-                LazyVStack(alignment: .leading, spacing: 0) {
-                    banner
-                    if session.rows.isEmpty { emptyState }
-                    ForEach(session.rows) { item in
-                        row(item.entry)
-                            .padding(.top, item.topGap)
-                            .id(item.id)
-                    }
-                    // Anchors the auto-scroll, and doubles as the test for
-                    // whether the bottom is on screen at all.
-                    Color.clear.frame(height: 1)
-                        .id(Self.bottom)
-                        .onAppear { following = true }
-                        .onDisappear {
-                            // Content growing pushes this off screen too, and
-                            // that is not the user walking away — only a
-                            // disappearance with no recent append is.
-                            if Date().timeIntervalSince(grewAt) > 0.4 { following = false }
+        GeometryReader { viewport in
+            ScrollViewReader { proxy in
+                ScrollView {
+                    // This deliberately is not lazy. Instruments caught the
+                    // main thread permanently inside
+                    // `LazyStack.place(subviews:)` while streamed rows changed
+                    // height. `AgentSession` bounds this mounted window, so a
+                    // regular stack is finite and avoids that placement path.
+                    VStack(alignment: .leading, spacing: 0) {
+                        banner
+                        if session.omittedEntryCount > 0 {
+                            Text("Showing latest \(session.rows.count) events · "
+                                 + "\(session.omittedEntryCount) earlier events hidden")
+                                .font(.system(size: 10))
+                                .foregroundStyle(.tertiary)
+                                .padding(.top, 10)
+                                .accessibilityLabel(
+                                    "\(session.omittedEntryCount) earlier transcript events hidden"
+                                )
                         }
-                }
-                .padding(12)
-                .frame(maxWidth: .infinity, alignment: .leading)
-            }
-            // Every mutation, not every append: a streamed answer grows a row
-            // that already exists, and keying on the count meant the text ran
-            // off the bottom while the view sat still.
-            .onChange(of: session.revision) { _, _ in
-                grewAt = Date()
-                guard following else { return }
-                // Unanimated on purpose. A 250-delta answer animating each step
-                // is not a smooth scroll, it is a stutter.
-                proxy.scrollTo(Self.bottom, anchor: .bottom)
-            }
-            .overlay(alignment: .bottomTrailing) {
-                if !following {
-                    Button {
-                        following = true
-                        withAnimation { proxy.scrollTo(Self.bottom, anchor: .bottom) }
-                    } label: {
-                        Label("Latest", systemImage: "arrow.down")
-                            .font(.system(size: 10, weight: .medium))
-                            .padding(.horizontal, 8)
-                            .padding(.vertical, 4)
-                            .background(.regularMaterial, in: Capsule())
+                        if session.rows.isEmpty { emptyState }
+                        ForEach(session.rows) { item in
+                            row(item.entry)
+                                .padding(.top, item.topGap)
+                                .id(item.id)
+                        }
+                        // A normal VStack mounts this marker even while it is
+                        // off screen, so visibility is measured in the scroll
+                        // coordinate space rather than inferred from onAppear.
+                        GeometryReader { marker in
+                            Color.clear.preference(
+                                key: TranscriptBottomPreferenceKey.self,
+                                value: marker.frame(in: .named(Self.scrollSpace)).maxY
+                            )
+                        }
+                        .frame(height: 1)
+                        .id(Self.bottom)
                     }
-                    .buttonStyle(.plain)
-                    .padding(10)
+                    .padding(12)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                .coordinateSpace(name: Self.scrollSpace)
+                .onPreferenceChange(TranscriptBottomPreferenceKey.self) { bottomY in
+                    // Preferences are delivered during a view update. Mutating
+                    // @State in that pass asks NSHostingView to lay itself out
+                    // reentrantly, so apply the observation on the next main
+                    // run-loop turn.
+                    let viewportHeight = viewport.size.height
+                    DispatchQueue.main.async {
+                        let isAtBottom = bottomY <= viewportHeight + 2
+                        if isAtBottom {
+                            if !following { following = true }
+                        } else if following, Date().timeIntervalSince(grewAt) > 0.4 {
+                            following = false
+                        }
+                    }
+                }
+                // Every mutation, not every append: a streamed answer grows a
+                // row that already exists, and keying on the count meant the
+                // text ran off the bottom while the view sat still.
+                .onChange(of: session.revision) { _, _ in
+                    grewAt = Date()
+                    guard following else { return }
+                    // Unanimated on purpose. A 250-delta answer animating each
+                    // step is not a smooth scroll, it is a stutter.
+                    proxy.scrollTo(Self.bottom, anchor: .bottom)
+                }
+                .overlay(alignment: .bottomTrailing) {
+                    if !following {
+                        Button {
+                            following = true
+                            withAnimation { proxy.scrollTo(Self.bottom, anchor: .bottom) }
+                        } label: {
+                            Label("Latest", systemImage: "arrow.down")
+                                .font(.system(size: 10, weight: .medium))
+                                .padding(.horizontal, 8)
+                                .padding(.vertical, 4)
+                                .background(.regularMaterial, in: Capsule())
+                        }
+                        .buttonStyle(.plain)
+                        .padding(10)
+                    }
                 }
             }
         }
     }
 
     private static let bottom = "bottom"
+    private static let scrollSpace = "agent-transcript-scroll"
 
     // How much air a row needs above it is `AgentSession.topGap` — decided once
     // per mutation with the row, not per layout pass from its neighbour.
@@ -455,6 +483,14 @@ struct AgentPanelView: View {
             // exists to stop making.
             NSSound.beep()
         }
+    }
+}
+
+private struct TranscriptBottomPreferenceKey: PreferenceKey {
+    static let defaultValue: CGFloat = 0
+
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
+        value = nextValue()
     }
 }
 

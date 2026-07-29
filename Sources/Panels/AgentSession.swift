@@ -216,7 +216,9 @@ final class AgentSession: ObservableObject {
             // Before `revision`, never after: the announcement is what makes a
             // body re-run, and it must not find rows that describe the previous
             // entries.
-            rows = Self.rows(for: entries)
+            let display = Self.displayRows(for: entries)
+            rows = display.rows
+            omittedEntryCount = display.omitted
             revision &+= 1
         }
     }
@@ -245,8 +247,14 @@ final class AgentSession: ObservableObject {
         let entry: Entry
     }
 
-    /// The transcript as the view consumes it. Rebuilt with `entries`.
+    /// The recent transcript window as the view consumes it.
+    ///
+    /// The complete, capped transcript remains in `entries` for result parsing
+    /// and diagnostics. Rendering every retained entry in a non-lazy stack
+    /// would trade the `LazyVStack` placement spin for an increasingly heavy
+    /// view tree, so the panel only keeps a bounded recent window mounted.
     private(set) var rows: [Row] = []
+    private(set) var omittedEntryCount = 0
 
     /// Spacing is uniform no longer: a turn runs instruction → thinking → tools
     /// → answer → footer, and at one gap for everything those five read as five
@@ -272,6 +280,17 @@ final class AgentSession: ObservableObject {
                        entry: entry)
         }
     }
+
+    /// Keep SwiftUI's mounted transcript bounded while retaining the longer
+    /// model history above. A native agent can emit hundreds of tool events in
+    /// one task; mounting all 2,000 rich rows makes every streamed delta more
+    /// expensive even after lazy placement is removed.
+    static func displayRows(for entries: [Entry]) -> (omitted: Int, rows: [Row]) {
+        let omitted = max(0, entries.count - maxRenderedEntries)
+        return (omitted, rows(for: Array(entries.suffix(maxRenderedEntries))))
+    }
+
+    static let maxRenderedEntries = 300
 
     /// Changes on every mutation, not just every append.
     ///

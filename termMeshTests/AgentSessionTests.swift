@@ -734,6 +734,24 @@ final class AgentSessionTests: XCTestCase {
         XCTAssertTrue(AgentSession.rows(for: []).isEmpty)
     }
 
+    /// The panel uses a regular VStack to avoid SwiftUI's non-converging lazy
+    /// placement path. Keep its mounted view tree bounded independently from
+    /// the longer model transcript.
+    func testDisplayedRowsKeepOnlyTheRecentBoundedWindow() {
+        let entries = (0..<(AgentSession.maxRenderedEntries + 17)).map { index in
+            AgentSession.Entry.said(id: UUID(), .leader, "instruction \(index)")
+        }
+
+        let display = AgentSession.displayRows(for: entries)
+
+        XCTAssertEqual(display.omitted, 17)
+        XCTAssertEqual(display.rows.count, AgentSession.maxRenderedEntries)
+        XCTAssertEqual(display.rows.map(\.id),
+                       Array(entries.suffix(AgentSession.maxRenderedEntries)).map(\.id))
+        XCTAssertEqual(display.rows.first?.topGap,
+                       AgentSession.topGap(before: entries[17], after: nil))
+    }
+
     /// A streamed delta must announce itself once. `AgentPanel` forwards every
     /// `objectWillChange` the session sends, so publishing both `entries` and
     /// `revision` for one mutation rebuilt the whole transcript twice per
