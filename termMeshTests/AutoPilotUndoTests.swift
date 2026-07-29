@@ -10,6 +10,7 @@ final class AutoPilotUndoTests: XCTestCase {
     private let point = AutoPilotUndoPoint(
         branch: "develop",
         sha: "deadbeef1234",
+        mergedSHA: "mergeface1234",
         taskID: "tsk_1",
         repositoryPath: "/repo",
         recordedAtMS: 1
@@ -20,7 +21,12 @@ final class AutoPilotUndoTests: XCTestCase {
     /// Nothing has the branch: moving the ref is safe and leaves no working
     /// tree disagreeing with HEAD.
     func testABranchNobodyHasCheckedOutIsMovedByRef() {
-        let plan = AutoPilotUndo.plan(for: point, placement: .notCheckedOut)
+        let plan = AutoPilotUndo.plan(
+            for: point,
+            placement: .init(
+                checkedOutAt: nil, isDirty: false, currentTip: "mergeface1234"
+            )
+        )
         XCTAssertEqual(
             plan,
             .updateRef(repository: "/repo", branch: "develop", sha: "deadbeef1234")
@@ -37,7 +43,10 @@ final class AutoPilotUndoTests: XCTestCase {
     func testACheckedOutBranchIsResetInItsOwnWorktree() {
         let plan = AutoPilotUndo.plan(
             for: point,
-            placement: .init(checkedOutAt: "/work/develop", isDirty: false)
+            placement: .init(
+                checkedOutAt: "/work/develop", isDirty: false,
+                currentTip: "mergeface1234"
+            )
         )
         XCTAssertEqual(plan, .resetWorktree(path: "/work/develop", sha: "deadbeef1234"))
         XCTAssertEqual(
@@ -50,7 +59,10 @@ final class AutoPilotUndoTests: XCTestCase {
     func testUncommittedWorkStopsTheUndoInsteadOfBeingDiscarded() {
         let plan = AutoPilotUndo.plan(
             for: point,
-            placement: .init(checkedOutAt: "/work/develop", isDirty: true)
+            placement: .init(
+                checkedOutAt: "/work/develop", isDirty: true,
+                currentTip: "mergeface1234"
+            )
         )
         guard case .refuse(let reason) = plan else { return XCTFail("expected a refusal") }
         XCTAssertTrue(reason.contains("/work/develop"), reason)
@@ -65,6 +77,30 @@ final class AutoPilotUndoTests: XCTestCase {
         guard case .refuse(let reason) = AutoPilotUndo.plan(for: empty, placement: .notCheckedOut)
         else { return XCTFail("expected a refusal") }
         XCTAssertTrue(reason.contains("nowhere to go back to"), reason)
+    }
+
+    func testAnUndoPointWithoutThePostMergeCommitIsRefused() {
+        let old = AutoPilotUndoPoint(
+            branch: "develop", sha: "before", taskID: "t",
+            repositoryPath: "/repo", recordedAtMS: 1
+        )
+        let placement = AutoPilotUndo.Placement(
+            checkedOutAt: nil, isDirty: false, currentTip: "after"
+        )
+        guard case .refuse(let reason) = AutoPilotUndo.plan(for: old, placement: placement)
+        else { return XCTFail("expected a refusal") }
+        XCTAssertTrue(reason.contains("post-merge"), reason)
+    }
+
+    func testACommitAfterTheMergeStopsUndo() {
+        let placement = AutoPilotUndo.Placement(
+            checkedOutAt: "/work/develop", isDirty: false,
+            currentTip: "a-human-commit-after-the-merge"
+        )
+        guard case .refuse(let reason) = AutoPilotUndo.plan(for: point, placement: placement)
+        else { return XCTFail("expected a refusal") }
+        XCTAssertTrue(reason.contains("advanced"), reason)
+        XCTAssertTrue(reason.contains("later commits"), reason)
     }
 
     // MARK: - Reading where the branch lives
@@ -106,6 +142,12 @@ final class AutoPilotUndoTests: XCTestCase {
         var seen: [[String]] = []
         let placement = await AutoPilotUndo.placement(of: "develop", in: "/repo") { arguments in
             seen.append(arguments)
+            if arguments.contains("rev-parse") {
+                return ProcessRun.Output(
+                    status: 0, stdout: Data("mergeface1234\n".utf8),
+                    stderr: Data(), timedOut: false
+                )
+            }
             if arguments.contains("worktree") {
                 return ProcessRun.Output(
                     status: 0,
@@ -117,7 +159,9 @@ final class AutoPilotUndoTests: XCTestCase {
                 status: 0, stdout: Data(" M a.swift\n".utf8), stderr: Data(), timedOut: false
             )
         }
-        XCTAssertEqual(placement, .init(checkedOutAt: "/work/dev", isDirty: true))
+        XCTAssertEqual(placement, .init(
+            checkedOutAt: "/work/dev", isDirty: true, currentTip: "mergeface1234"
+        ))
         // Dirtiness is asked of the worktree that has the branch, not the
         // repository the merge was recorded against.
         XCTAssertEqual(

@@ -153,6 +153,7 @@ final class AutoPilotPolicyTests: XCTestCase {
         let point = AutoPilotUndoPoint(
             branch: "develop",
             sha: "deadbeef1234",
+            mergedSHA: "mergeface1234",
             taskID: "tsk_1",
             repositoryPath: "/Users/me/some repo",
             recordedAtMS: 1_784_882_974_390
@@ -162,6 +163,7 @@ final class AutoPilotPolicyTests: XCTestCase {
         // A different instance: the app that most needs this has crashed.
         let reopened = AutoPilotUndoLog(url: url)
         XCTAssertEqual(reopened.latest(forTask: "tsk_1"), point)
+        XCTAssertEqual(reopened.latest(forTask: "tsk_1")?.mergedSHA, "mergeface1234")
         XCTAssertEqual(
             point.restoreCommand,
             "git -C '/Users/me/some repo' update-ref refs/heads/develop deadbeef1234"
@@ -171,11 +173,27 @@ final class AutoPilotPolicyTests: XCTestCase {
         // Newest first, so "undo the last thing it did" reads off the front.
         var second = point
         second = AutoPilotUndoPoint(
-            branch: "develop", sha: "cafe0000", taskID: "tsk_2",
+            branch: "develop", sha: "cafe0000", mergedSHA: "aftercafe", taskID: "tsk_2",
             repositoryPath: "/Users/me/some repo", recordedAtMS: 1_784_882_999_999
         )
         reopened.record(second)
         XCTAssertEqual(AutoPilotUndoLog(url: url).points().map(\.taskID), ["tsk_2", "tsk_1"])
+    }
+
+    func testAnOldUndoPointDecodesWithoutAStoredMergeSHA() throws {
+        let data = Data("""
+        {
+          "branch": "develop",
+          "sha": "before",
+          "taskID": "tsk_old",
+          "repositoryPath": "/repo",
+          "recordedAtMS": 1
+        }
+        """.utf8)
+
+        let point = try JSONDecoder().decode(AutoPilotUndoPoint.self, from: data)
+
+        XCTAssertNil(point.mergedSHA)
     }
 
     /// A path with a quote in it must not end the shell word.

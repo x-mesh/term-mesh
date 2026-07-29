@@ -6,6 +6,29 @@ import XCTest
 @testable import term_mesh
 #endif
 
+private actor AutoPilotSweepGate {
+    private var entered = false
+    private var enteredContinuation: CheckedContinuation<Void, Never>?
+    private var releaseContinuation: CheckedContinuation<Void, Never>?
+
+    func pause() async {
+        entered = true
+        enteredContinuation?.resume()
+        enteredContinuation = nil
+        await withCheckedContinuation { releaseContinuation = $0 }
+    }
+
+    func waitUntilEntered() async {
+        if entered { return }
+        await withCheckedContinuation { enteredContinuation = $0 }
+    }
+
+    func open() {
+        releaseContinuation?.resume()
+        releaseContinuation = nil
+    }
+}
+
 final class AutoPilotRunnerTests: XCTestCase {
     private var journalURL: URL!
 
@@ -191,6 +214,40 @@ final class AutoPilotRunnerTests: XCTestCase {
         XCTAssertEqual(approvals, 2)
         XCTAssertEqual(outcomes.map(\.approved), [true, true, false])
         XCTAssertTrue(outcomes[2].reason.contains("limit 2"), outcomes[2].reason)
+    }
+
+    func testAnOverlappingSweepCannotApproveTheSameTaskTwice() async {
+        let gate = AutoPilotSweepGate()
+        var approvals = 0
+        let runner = AutoPilotRunner(
+            policy: {
+                AutoPilotPolicy(
+                    isEnabled: true, ceilingBranch: "develop",
+                    protectedBranches: AutoPilotPolicy.defaultProtectedBranches,
+                    maxAutoMerges: 1
+                )
+            },
+            reviewer: { _ in self.review() },
+            approver: { _, _ in approvals += 1 },
+            checker: { _ in
+                await gate.pause()
+                return self.evidence()
+            },
+            audit: journal(),
+            now: { 1 }
+        )
+
+        async let first = runner.sweep([task()])
+        await gate.waitUntilEntered()
+        let overlapping = await runner.sweep([task()])
+        await gate.open()
+        let firstOutcomes = await first
+
+        XCTAssertTrue(overlapping.isEmpty)
+        XCTAssertEqual(firstOutcomes.map(\.approved), [true])
+        XCTAssertEqual(approvals, 1)
+        let approvalCount = await runner.approvalsThisSession
+        XCTAssertEqual(approvalCount, 1)
     }
 
     // MARK: - Turned off, and other states
