@@ -1535,4 +1535,288 @@ final class AgentSessionTests: XCTestCase {
         }
         XCTAssertFalse(misplaced, "a trimmed-away call's result must not be written into another row")
     }
+
+    // MARK: - A change is a diff
+
+    private func change(_ tool: String, _ input: [String: Any]) -> AgentDiff.Change? {
+        AgentDiff.change(tool: tool, input: input)
+    }
+
+    private func edit(_ old: String, _ new: String,
+                      replaceAll: Bool = false) -> AgentDiff.Change? {
+        change("Edit", ["file_path": "/repo/a.swift", "old_string": old,
+                        "new_string": new, "replace_all": replaceAll])
+    }
+
+    private func texts(_ change: AgentDiff.Change) -> [String] {
+        change.lines.compactMap { line in
+            switch line {
+            case .added(_, let text): return "+" + text
+            case .removed(_, let text): return "-" + text
+            case .context(_, _, let text): return " " + text
+            case .gap, .site: return nil
+            }
+        }
+    }
+
+    func testAnEditCarriesBothSidesOfWhatItChanged() throws {
+        let change = try XCTUnwrap(edit("one\ntwo\n", "one\nTWO\n"))
+
+        XCTAssertEqual(change.path, "/repo/a.swift")
+        XCTAssertEqual(change.kind, .edit)
+        XCTAssertEqual(texts(change), [" one", "-two", "+TWO"])
+    }
+
+    /// Painting the whole of `old_string` red and the whole of `new_string`
+    /// green is wrong in the ordinary case, not the rare one: it reports a
+    /// five-line change where one line moved, and hands the reader the job of
+    /// finding it.
+    func testOnlyTheLinesThatMovedAreCounted() throws {
+        let old = "a\nb\nc\nd\ne\n"
+        let new = "a\nb\nCHANGED\nd\ne\n"
+
+        let change = try XCTUnwrap(edit(old, new))
+
+        XCTAssertEqual(change.added, 1)
+        XCTAssertEqual(change.removed, 1)
+    }
+
+    func testAWriteIsAllAddition() throws {
+        let change = try XCTUnwrap(
+            self.change("Write", ["file_path": "/repo/new.swift",
+                                  "content": "one\ntwo\nthree\n"]))
+
+        XCTAssertEqual(change.added, 3)
+        XCTAssertEqual(change.removed, 0)
+        XCTAssertEqual(change.kind, .write(created: nil))
+    }
+
+    /// Nearly every file ends in a newline, and splitting on "\n" alone gives
+    /// it one line more than it has.
+    func testATrailingNewlineDoesNotGainAPhantomLine() throws {
+        let change = try XCTUnwrap(
+            self.change("Write", ["file_path": "/repo/a.swift", "content": "a\nb\n"]))
+
+        XCTAssertEqual(change.added, 2)
+    }
+
+    func testCrlfDoesNotLeaveACarriageReturnInTheDiff() throws {
+        let change = try XCTUnwrap(edit("a\r\nb\r\n", "a\r\nB\r\n"))
+
+        XCTAssertEqual(texts(change), [" a", "-b", "+B"])
+    }
+
+    func testMultiEditIsOneRowWithEverySiteInIt() throws {
+        let change = try XCTUnwrap(self.change("MultiEdit", [
+            "file_path": "/repo/a.swift",
+            "edits": [["old_string": "one\n", "new_string": "ONE\n"],
+                      ["old_string": "two\n", "new_string": "TWO\n"]]]))
+
+        XCTAssertEqual(change.kind, .multiEdit(sites: 2))
+        XCTAssertEqual(change.added, 2)
+        XCTAssertEqual(change.removed, 2)
+        XCTAssertTrue(change.lines.contains(.site(1)))
+    }
+
+    /// Applied everywhere, any single line number is a fiction — and so is the
+    /// total, which is the per-site count times a number nobody reported.
+    func testReplaceAllRefusesToClaimALineNumber() throws {
+        let change = try XCTUnwrap(edit("x\n", "y\n", replaceAll: true))
+
+        XCTAssertTrue(change.everywhere)
+        for line in change.lines {
+            switch line {
+            case .added(let new, _): XCTAssertNil(new)
+            case .removed(let old, _): XCTAssertNil(old)
+            case .context(let old, let new, _):
+                XCTAssertNil(old)
+                XCTAssertNil(new)
+            case .gap, .site: break
+            }
+        }
+    }
+
+    func testAToolThatEditsNothingCarriesNoChange() {
+        XCTAssertNil(change("Bash", ["command": "ls -l"]))
+        XCTAssertNil(change("Read", ["file_path": "/repo/a.swift"]))
+        XCTAssertNil(change("Grep", ["pattern": "foo", "path": "/repo"]))
+    }
+
+    func testAnEditThatChangedNothingIsNotDrawnAsADiff() {
+        XCTAssertNil(edit("same\n", "same\n"))
+    }
+
+    /// The body is cut; the counts are not. A clipped diff that also under-
+    /// reports its size is worse than no diff, because it looks complete.
+    func testAHugeDiffIsCutButItsCountIsNot() throws {
+        let content = (0..<5000).map { "line \($0)" }.joined(separator: "\n") + "\n"
+
+        let change = try XCTUnwrap(
+            self.change("Write", ["file_path": "/repo/big.txt", "content": content]))
+
+        XCTAssertEqual(change.added, 5000)
+        XCTAssertLessThanOrEqual(change.lines.count, AgentDiff.maxLines)
+        XCTAssertEqual(change.lines.count + change.elided, 5000)
+    }
+
+    func testAVeryLongLineIsCutAtItsEnd() throws {
+        let long = String(repeating: "x", count: 50_000)
+
+        let change = try XCTUnwrap(
+            self.change("Write", ["file_path": "/repo/min.js", "content": long + "\n"]))
+
+        guard case .added(_, let text) = try XCTUnwrap(change.lines.first) else {
+            return XCTFail("expected an added line")
+        }
+        XCTAssertEqual(text.count, AgentDiff.maxLineLength)
+    }
+
+    func testAUnifiedDiffFromTheBridgeKeepsItsLineNumbers() throws {
+        let patch = """
+        --- a/Sources/Foo.swift
+        +++ b/Sources/Foo.swift
+        @@ -241,3 +241,4 @@ func peerRow
+         before
+        -let label = host.name
+        +let label = host.displayName
+        +let badge = "●"
+        """
+
+        let change = try XCTUnwrap(self.change("edit", [
+            "file_path": "/repo/Sources/Foo.swift", "kind": "update",
+            "unified_diff": patch]))
+
+        XCTAssertEqual(change.added, 2)
+        XCTAssertEqual(change.removed, 1)
+        guard case .context(let old, let new, _) = try XCTUnwrap(change.lines.first) else {
+            return XCTFail("expected the hunk to open on context")
+        }
+        XCTAssertEqual(old, 241)
+        XCTAssertEqual(new, 241)
+    }
+
+    /// A hunk header is a claim by a subprocess, not a measurement. Reading it
+    /// as one is how a printed number becomes an allocation.
+    func testAHunkHeaderIsNotTrusted() throws {
+        let patch = "@@ -1,99999999 +1,99999999 @@\n-a\n+b\n"
+
+        let change = try XCTUnwrap(self.change("edit", [
+            "file_path": "/repo/a.swift", "unified_diff": patch]))
+
+        XCTAssertEqual(change.lines.count, 2)
+        XCTAssertEqual(change.added, 1)
+    }
+
+    func testAUnifiedDiffWithoutAHunkHeaderIsRefused() {
+        XCTAssertNil(change("edit", ["file_path": "/repo/a.swift",
+                                     "unified_diff": "not a patch at all\n"]))
+        XCTAssertNil(change("edit", ["file_path": "/repo/a.swift",
+                                     "unified_diff": "+orphan line\n"]))
+    }
+
+    func testADeleteFromTheBridgeIsNamedAsOne() throws {
+        let change = try XCTUnwrap(self.change("delete", [
+            "file_path": "/repo/gone.swift", "kind": "delete",
+            "unified_diff": "@@ -1,2 +0,0 @@\n-one\n-two\n"]))
+
+        XCTAssertEqual(change.kind, .delete)
+        XCTAssertEqual(change.removed, 2)
+        XCTAssertEqual(change.added, 0)
+    }
+
+    /// The contract between the bridge and this side: the same edit described
+    /// either way has to come out saying the same thing happened.
+    func testTheBridgeShapeAndTheClaudeShapeAgree() throws {
+        let claude = try XCTUnwrap(edit("one\ntwo\nthree\n", "one\nTWO\nthree\n"))
+        let bridged = try XCTUnwrap(self.change("edit", [
+            "file_path": "/repo/a.swift",
+            "unified_diff": "@@ -1,3 +1,3 @@\n one\n-two\n+TWO\n three\n"]))
+
+        XCTAssertEqual(claude.added, bridged.added)
+        XCTAssertEqual(claude.removed, bridged.removed)
+        XCTAssertEqual(texts(claude), texts(bridged))
+    }
+
+    func testAPathIsShownRelativeToWhereTheAgentIsWorking() {
+        XCTAssertEqual(AgentDiff.short("/repo/Sources/A.swift", relativeTo: "/repo"),
+                       "Sources/A.swift")
+        XCTAssertEqual(AgentDiff.short("/elsewhere/A.swift", relativeTo: "/repo"),
+                       "/elsewhere/A.swift")
+        XCTAssertEqual(AgentDiff.short("/repo/A.swift", relativeTo: ""), "/repo/A.swift")
+    }
+
+    /// The row exists as soon as the call does. Waiting for the result meant a
+    /// long edit showed nothing at all while it was being made.
+    func testADiffIsVisibleBeforeTheToolHasFinished() throws {
+        let s = session([event(["type": "assistant", "message": ["content": [
+            ["type": "tool_use", "id": "t1", "name": "Edit",
+             "input": ["file_path": "/repo/a.swift",
+                       "old_string": "a\n", "new_string": "b\n"]]]]])])
+
+        guard case .tool(_, let call) = try XCTUnwrap(s.entries.first) else {
+            return XCTFail("expected a tool row")
+        }
+        XCTAssertTrue(call.isRunning)
+        XCTAssertEqual(call.change?.added, 1)
+        XCTAssertTrue(call.canExpand)
+    }
+
+    func testAWriteThatOverwroteSaysSo() throws {
+        let s = session([
+            event(["type": "assistant", "message": ["content": [
+                ["type": "tool_use", "id": "t1", "name": "Write",
+                 "input": ["file_path": "/repo/a.swift", "content": "one\n"]]]]]),
+            event(["type": "user", "message": ["content": [
+                ["type": "tool_result", "tool_use_id": "t1",
+                 "content": "The file /repo/a.swift has been updated successfully."]]]]),
+        ])
+
+        guard case .tool(_, let call) = try XCTUnwrap(s.entries.first) else {
+            return XCTFail("expected a tool row")
+        }
+        XCTAssertEqual(call.change?.kind, .write(created: false))
+    }
+
+    func testAWriteThatCreatedSaysSo() throws {
+        let s = session([
+            event(["type": "assistant", "message": ["content": [
+                ["type": "tool_use", "id": "t1", "name": "Write",
+                 "input": ["file_path": "/repo/a.swift", "content": "one\n"]]]]]),
+            event(["type": "user", "message": ["content": [
+                ["type": "tool_result", "tool_use_id": "t1",
+                 "content": "File created successfully at: /repo/a.swift"]]]]),
+        ])
+
+        guard case .tool(_, let call) = try XCTUnwrap(s.entries.first) else {
+            return XCTFail("expected a tool row")
+        }
+        XCTAssertEqual(call.change?.kind, .write(created: true))
+    }
+
+    /// A turn that ends with a call still open closes it with an empty result,
+    /// and testing that alone took the disclosure control off rows holding a
+    /// whole diff.
+    func testAnEditRowStillOffersItsBodyWhenTheResultIsEmpty() throws {
+        let s = session([
+            event(["type": "assistant", "message": ["content": [
+                ["type": "tool_use", "id": "t1", "name": "Edit",
+                 "input": ["file_path": "/repo/a.swift",
+                           "old_string": "a\n", "new_string": "b\n"]]]]]),
+            event(["type": "user", "message": ["content": [
+                ["type": "tool_result", "tool_use_id": "t1", "content": ""]]]]),
+        ])
+
+        guard case .tool(_, let call) = try XCTUnwrap(s.entries.first) else {
+            return XCTFail("expected a tool row")
+        }
+        XCTAssertFalse(call.isRunning)
+        XCTAssertTrue(call.canExpand)
+        XCTAssertNotNil(call.change)
+    }
+
+    func testACallWithNeitherDiffNorResultOffersNothing() {
+        let call = AgentSession.ToolCall(name: "Bash", headline: "ls", result: "")
+
+        XCTAssertFalse(call.canExpand)
+    }
 }

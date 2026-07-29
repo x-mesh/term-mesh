@@ -25,6 +25,12 @@ struct AgentPanelView: View {
     /// When the last append happened, so the bottom leaving the screen because
     /// *we* grew the content is not mistaken for the user scrolling away.
     @State private var grewAt = Date.distantPast
+    /// Which tool rows are open, held here rather than in the rows themselves.
+    /// A `@State` inside a row of a `LazyVStack` is discarded when the row
+    /// scrolls out of view, so an opened diff quietly closed itself on the way
+    /// back — barely visible on a one-line result, impossible to miss on a
+    /// diff someone was reading.
+    @State private var openTools: Set<UUID> = []
 
     private var session: AgentSession { panel.session }
 
@@ -322,8 +328,13 @@ struct AgentPanelView: View {
         case .thought(let id, let body):
             label("✻", (body?.isEmpty == false ? body! : "thinking"),
                   muted: true, streaming: session.streamingIds.contains(id))
-        case .tool(_, let call):
-            ToolRow(call: call)
+        case .tool(let id, let call):
+            if let change = call.change {
+                ChangeRow(call: call, change: change,
+                          root: panel.workingDirectory, open: openBinding(id))
+            } else {
+                ToolRow(call: call, open: openBinding(id))
+            }
         case .turnEnded(_, let end):
             turnEnd(end)
         case .notice(_, let text):
@@ -333,6 +344,18 @@ struct AgentPanelView: View {
 
     private func said(_ speaker: AgentSession.Speaker, _ text: String) -> some View {
         Instruction(speaker: speaker, read: AgentSession.read(instruction: text))
+    }
+
+    /// Opening a row grows the transcript exactly as an append does, and the
+    /// bottom anchor cannot tell the two apart. Without touching `grewAt` the
+    /// anchor reads its own disappearance as the user scrolling away, and the
+    /// "Latest" pill appears because somebody expanded a diff.
+    private func openBinding(_ id: UUID) -> Binding<Bool> {
+        Binding(get: { openTools.contains(id) },
+                set: { open in
+                    grewAt = Date()
+                    if open { openTools.insert(id) } else { openTools.remove(id) }
+                })
     }
 
     private func label(_ glyph: String, _ text: String, muted: Bool,
@@ -1100,7 +1123,7 @@ private struct Caret: View {
 /// A tool call, which a terminal could only ever show as two unrelated lines.
 private struct ToolRow: View {
     let call: AgentSession.ToolCall
-    @State private var expanded = false
+    @Binding var open: Bool
 
     var body: some View {
         VStack(alignment: .leading, spacing: 4) {
@@ -1113,14 +1136,14 @@ private struct ToolRow: View {
                     .lineLimit(1)
                     .truncationMode(.middle)
                 Spacer(minLength: 0)
-                if call.result?.isEmpty == false {
-                    Button(expanded ? "hide" : "show") { expanded.toggle() }
+                if call.canExpand {
+                    Button(open ? "hide" : "show") { open.toggle() }
                         .buttonStyle(.plain)
                         .font(.system(size: 10))
                         .foregroundStyle(.tint)
                 }
             }
-            if expanded, let result = call.result {
+            if open, let result = call.result {
                 // Folded by default. A tool result can be thousands of lines,
                 // and in a terminal all of them are in the way of the answer.
                 ScrollView(.horizontal) {
@@ -1144,5 +1167,279 @@ private struct ToolRow: View {
                 .font(.system(size: 10))
                 .foregroundStyle(call.failed ? Color.red : Color.green)
         }
+    }
+}
+
+/// An edit, drawn as what changed rather than as which file.
+///
+/// A tool row could say a file was touched, and that is where this pane stopped
+/// — the name of a file and nothing about what happened inside it. The line
+/// that is always on screen answers the question you actually have while six
+/// panes are working: which file, how much. The fold answers the one you have
+/// when that answer is surprising.
+private struct ChangeRow: View {
+    let call: AgentSession.ToolCall
+    let change: AgentDiff.Change
+    let root: String
+    @Binding var open: Bool
+    @Environment(\.colorScheme) private var colorScheme
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack(spacing: 6) {
+                mark
+                Text(call.name).font(.system(size: 11, weight: .medium))
+                // Truncated from the head, not the middle: a path that has to
+                // give ground should give up its directories and keep the
+                // filename, which is the part being talked about.
+                Text(AgentDiff.short(change.path, relativeTo: root))
+                    .font(.system(size: 11).monospaced())
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .truncationMode(.head)
+                Spacer(minLength: 4)
+                if let note {
+                    Text(note)
+                        .font(.system(size: 9))
+                        .foregroundStyle(.tertiary)
+                        .lineLimit(1)
+                        .fixedSize()
+                }
+                counts
+                Button(open ? "hide" : "show") { open.toggle() }
+                    .buttonStyle(.plain)
+                    .font(.system(size: 10))
+                    .foregroundStyle(.tint)
+                    .fixedSize()
+            }
+            if open {
+                DiffBody(change: change)
+                HStack(spacing: 10) {
+                    Button("copy diff") { copy() }
+                        .buttonStyle(.plain)
+                        .font(.system(size: 9))
+                        .foregroundStyle(.tint)
+                    if let result = call.result, !result.isEmpty, call.failed {
+                        // A successful edit's result is one sentence saying it
+                        // worked, and the diff above says it better. A failed
+                        // one is the only thing worth reading.
+                        Text(result)
+                            .font(.system(size: 9).monospaced())
+                            .foregroundStyle(.red)
+                            .lineLimit(3)
+                    }
+                }
+            }
+        }
+    }
+
+    /// `+12 −3`, kept whole while the path beside it truncates: the numbers are
+    /// the reason the row is legible at a glance, and they are three characters.
+    private var counts: some View {
+        HStack(spacing: 5) {
+            if change.added > 0 {
+                Text("+\(change.added)")
+                    .foregroundStyle(DiffPalette.added(colorScheme).text)
+            }
+            if change.removed > 0 {
+                Text("−\(change.removed)")
+                    .foregroundStyle(DiffPalette.removed(colorScheme).text)
+            }
+        }
+        .font(.system(size: 10, weight: .medium).monospacedDigit())
+        .fixedSize()
+        .layoutPriority(2)
+    }
+
+    /// What makes the counts honest when they are not the whole story.
+    private var note: String? {
+        // Applied everywhere, so the counts are per site and the total is a
+        // number we were never told. Saying "all" is the honest version of a
+        // multiplication we cannot do.
+        if change.everywhere { return "all" }
+        switch change.kind {
+        case .write(let created?): return created ? "new file" : "overwrite"
+        case .write(nil): return nil
+        case .delete: return "deleted"
+        case .multiEdit(let sites): return sites > 1 ? "\(sites) sites" : nil
+        case .notebook(let cell): return cell == nil ? nil : "cell"
+        case .edit: return nil
+        }
+    }
+
+    private func copy() {
+        let board = NSPasteboard.general
+        board.clearContents()
+        board.setString(AgentDiff.text(change), forType: .string)
+    }
+
+    @ViewBuilder
+    private var mark: some View {
+        if call.isRunning {
+            ProgressView().controlSize(.small).scaleEffect(0.5).frame(width: 12)
+        } else {
+            Image(systemName: call.failed ? "xmark.circle.fill" : "checkmark.circle.fill")
+                .font(.system(size: 10))
+                .foregroundStyle(call.failed ? Color.red : Color.green)
+        }
+    }
+}
+
+/// The diff itself.
+///
+/// One horizontal scroller around the whole column, so a long line never drags
+/// its own row out of alignment with the gutter beside it. Deliberately no
+/// vertical scroller and no `maxHeight`: a same-axis scroll view nested inside
+/// the transcript's `LazyVStack` is the geometry that made this view's
+/// placement pass re-enter itself. Length is controlled by showing fewer lines,
+/// not by putting a window over them.
+private struct DiffBody: View {
+    let change: AgentDiff.Change
+    @State private var all = false
+
+    /// Enough to see what an edit did without the row becoming the transcript.
+    private static let preview = 120
+
+    var body: some View {
+        let shown = all ? change.lines : Array(change.lines.prefix(Self.preview))
+        let hidden = change.lines.count - shown.count + change.elided
+        VStack(alignment: .leading, spacing: 0) {
+            ScrollView(.horizontal) {
+                VStack(alignment: .leading, spacing: 0) {
+                    ForEach(Array(shown.enumerated()), id: \.offset) { _, line in
+                        DiffLineRow(line: line, gutter: gutter)
+                    }
+                }
+            }
+            if hidden > 0 {
+                HStack(spacing: 6) {
+                    Text("\(hidden) more lines")
+                        .font(.system(size: 9))
+                        .foregroundStyle(.tertiary)
+                    // `elided` was dropped when the diff was read and is not
+                    // here to be shown; offering to reveal it would be a button
+                    // that cannot keep its promise.
+                    if !all, change.lines.count > shown.count {
+                        Button("show all") { all = true }
+                            .buttonStyle(.plain)
+                            .font(.system(size: 9))
+                            .foregroundStyle(.tint)
+                    }
+                }
+                .padding(.top, 4)
+                .padding(.leading, 6)
+            }
+        }
+        .padding(.vertical, 4)
+        .background(Color.primary.opacity(0.03), in: RoundedRectangle(cornerRadius: 4))
+    }
+
+    /// Width of the line-number column, or zero when there are no numbers.
+    ///
+    /// An `Edit` hands over a fragment of a file and never says where in the
+    /// file it sits, so most diffs here have no numbers at all and the column
+    /// should not be reserved. Walked here rather than in `ChangeRow` because
+    /// this view only exists while the row is open — a folded row pays nothing.
+    private var gutter: CGFloat {
+        var widest = 0
+        for line in change.lines {
+            switch line {
+            case .context(let old, let new, _): widest = max(widest, old ?? 0, new ?? 0)
+            case .added(let new, _): widest = max(widest, new ?? 0)
+            case .removed(let old, _): widest = max(widest, old ?? 0)
+            case .gap, .site: break
+            }
+        }
+        guard widest > 0 else { return 0 }
+        return CGFloat(String(widest).count) * 6.5 + 6
+    }
+}
+
+private struct DiffLineRow: View {
+    let line: AgentDiff.Line
+    let gutter: CGFloat
+    @Environment(\.colorScheme) private var colorScheme
+
+    var body: some View {
+        switch line {
+        case .context(let old, _, let text):
+            row(" ", number: old, text: text, tone: nil)
+        case .added(let new, let text):
+            row("+", number: new, text: text, tone: DiffPalette.added(colorScheme))
+        case .removed(let old, let text):
+            row("−", number: old, text: text, tone: DiffPalette.removed(colorScheme))
+        case .gap(let count):
+            marker(count > 0 ? "⋯ \(count) unchanged" : "⋯")
+        case .site(let index):
+            marker("edit \(index + 1)")
+        }
+    }
+
+    private func row(_ sign: String, number: Int?, text: String,
+                     tone: (text: Color, wash: Color)?) -> some View {
+        HStack(spacing: 0) {
+            if gutter > 0 {
+                Text(number.map(String.init) ?? "")
+                    .frame(width: gutter, alignment: .trailing)
+                    .foregroundStyle(.tertiary)
+            }
+            // The sign column carries the meaning on its own, so the colour is
+            // reinforcement rather than the only signal — which is what makes
+            // this readable without colour vision.
+            Text(sign)
+                .frame(width: 12, alignment: .center)
+                .foregroundStyle(tone?.text ?? Color.secondary)
+            // Tabs jump by a variable width in a monospaced Text and pull the
+            // gutter out of line. Expanded to four, the same way the copy
+            // button writes them out.
+            Text(text.replacingOccurrences(of: "\t", with: "    "))
+                .foregroundStyle(tone?.text ?? Color.primary)
+            Spacer(minLength: 0)
+        }
+        .font(.system(size: 10).monospaced())
+        .textSelection(.enabled)
+        .padding(.vertical, 0.5)
+        // Inside a horizontal scroller the tint ends where the line does, since
+        // nothing here proposes a width to stretch to. Left as is: the sign
+        // column already says which side a line is on, so the colour is
+        // reinforcement, and matching every row's width would mean measuring
+        // the longest one and feeding it back through a preference — a layout
+        // round trip in the one view that must not have any.
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(tone?.wash ?? .clear)
+    }
+
+    private func marker(_ text: String) -> some View {
+        Text(text)
+            .font(.system(size: 9).monospaced())
+            .foregroundStyle(.tertiary)
+            .padding(.leading, gutter + 12)
+            .padding(.vertical, 2)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(Color.primary.opacity(0.03))
+    }
+}
+
+/// Green and red that survive both appearances.
+///
+/// The system colours are too light against a light background to read as text
+/// and too saturated behind it to sit under one; and a 0.10 wash over a dark
+/// pane is not a colour, it is a rumour. So each side has a text tone and a
+/// wash chosen per appearance, the way `ProviderIdentity.readableAccent` does.
+private enum DiffPalette {
+    static func added(_ scheme: ColorScheme) -> (text: Color, wash: Color) {
+        scheme == .dark
+            ? (Color(red: 0.55, green: 0.87, blue: 0.62),
+               Color(red: 0.28, green: 0.78, blue: 0.44).opacity(0.16))
+            : (Color(red: 0.08, green: 0.42, blue: 0.19),
+               Color(red: 0.20, green: 0.68, blue: 0.35).opacity(0.10))
+    }
+
+    static func removed(_ scheme: ColorScheme) -> (text: Color, wash: Color) {
+        scheme == .dark
+            ? (Color(red: 0.95, green: 0.55, blue: 0.55),
+               Color(red: 0.88, green: 0.30, blue: 0.32).opacity(0.16))
+            : (Color(red: 0.60, green: 0.11, blue: 0.13),
+               Color(red: 0.85, green: 0.25, blue: 0.28).opacity(0.10))
     }
 }

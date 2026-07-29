@@ -57,9 +57,21 @@ final class AgentSession: ObservableObject {
     struct ToolCall: Equatable {
         let name: String
         let headline: String
+        /// What this call did to a file, when it did something to a file.
+        ///
+        /// Held beside the headline rather than instead of it: a tool row is
+        /// still a tool row — it spins, it fails, it is closed by the id its
+        /// result carries — and a diff is one more thing it can say about
+        /// itself.
+        var change: AgentDiff.Change?
         var result: String?
         var failed: Bool = false
         var isRunning: Bool { result == nil }
+
+        /// Whether there is anything under the fold. `result` is the empty
+        /// string for a call whose turn ended without one, and testing that
+        /// alone hid the control on rows that had a whole diff to show.
+        var canExpand: Bool { change != nil || result?.isEmpty == false }
     }
 
     struct TurnEnd: Equatable {
@@ -933,7 +945,12 @@ final class AgentSession: ObservableObject {
         // buries it in schema.
         let headline = (args["command"] ?? args["file_path"] ?? args["pattern"]
                         ?? args["path"] ?? args["description"]) as? String ?? ""
-        append(.tool(id: UUID(), ToolCall(name: name, headline: headline)))
+        // The input already carries everything a diff needs; this was pulling
+        // one string out of it and dropping the rest on the floor. Worked out
+        // here, once, because a view's body is the one place it must never be.
+        let change = AgentDiff.change(tool: name, input: args)
+        append(.tool(id: UUID(),
+                     ToolCall(name: name, headline: headline, change: change)))
         if let id = block["id"] as? String { openTools[id] = entries.count - 1 }
     }
 
@@ -949,6 +966,10 @@ final class AgentSession: ObservableObject {
         }
         call.result = body as? String ?? ""
         call.failed = block["is_error"] as? Bool ?? false
+        if let change = call.change {
+            call.change = AgentDiff.refined(change, result: call.result ?? "",
+                                            failed: call.failed)
+        }
         entries[index] = .tool(id: entryId, call)
     }
 
