@@ -8,6 +8,20 @@ import PeerProto
 #endif
 
 final class PeerProjectBootstrapTests: XCTestCase {
+    func test_lateRemoteAgentCheckoutPlanIsDistinctFromRequestedCheckout() {
+        let requested = "/app/tm-projects/term-mesh-reviewer-260729-c741"
+        let plan = TeamOrchestrator.lateRemoteAgentCheckoutPlan(
+            primaryRepository: "/app/tm-projects/term-mesh",
+            agentName: "fixer",
+            instanceTag: "260729-b4c7"
+        )
+
+        XCTAssertEqual(plan.agentCheckouts.count, 1)
+        XCTAssertNotEqual(plan.agentCheckouts[0].path, requested)
+        XCTAssertEqual(plan.agentCheckouts[0].path, "/app/tm-projects/term-mesh-fixer-260729-b4c7")
+        XCTAssertEqual(plan.agentCheckouts[0].branch, "agent/fixer-260729-b4c7")
+    }
+
     func test_remoteWorkingDirectoryRequiresHostResolvedPath() throws {
         XCTAssertEqual(
             try TeamOrchestrator.requiredRemoteWorkingDirectory(

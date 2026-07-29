@@ -48,6 +48,7 @@ extension TeamOrchestrator {
         case promptStagingFailed(String)
         case projectWorkspaceUnavailable(String)
         case unresolvedRemoteWorkingDirectory(host: String, path: String)
+        case checkoutIsolationFailed(host: String, path: String, reason: String)
         case projectDeletionIncomplete(String)
         case partialShellClose(closed: Int, failed: Int, reason: String)
 
@@ -71,6 +72,9 @@ extension TeamOrchestrator {
             case .unresolvedRemoteWorkingDirectory(let host, let path):
                 return "could not resolve remote working directory for host \(host) "
                     + "from path \(path); specify --dir <remote-path> for that host"
+            case .checkoutIsolationFailed(let host, let path, let reason):
+                return "could not provision a dedicated checkout on \(host) from \(path): \(reason); "
+                    + "refusing to reuse the requested checkout"
             case .projectDeletionIncomplete(let report):
                 return "project deletion incomplete: \(report)"
             case .partialShellClose(let closed, let failed, let reason):
@@ -893,31 +897,28 @@ extension TeamOrchestrator {
         // an agent but only contains "command not found".
         try await Self.ensureRemoteCLIAvailable(cli: cli, host: host)
 
-        // The project's checkout convention applies to late joiners too.
-        // Creation gives every agent an instance-tagged worktree; this path
-        // used to drop a later agent straight into whatever directory was
-        // typed — which the sheet prefills with the project PRIMARY, i.e.
-        // the leader's own checkout. Two writers, one working tree: the
-        // collision the worktrees exist to prevent, back through the side
-        // door. When the requested directory is one this project created,
-        // carve the newcomer its own station beside it instead. Anything
-        // not recorded as the project's stays exactly as typed.
-        var workingDirectory = workingDirectory
-        if let isolated = await Self.prepareLateAgentCheckout(
-            team: team,
+        // Every late remote member gets an instance-tagged worktree. The
+        // requested path may itself be another member's worktree, so derive
+        // the primary repository through --git-common-dir before planning.
+        // Isolation failure is fatal: falling back would silently put two
+        // writers in one checkout.
+        let requestedDirectory = try Self.requiredRemoteWorkingDirectory(
+            workingDirectory,
+            hostKey: hostKey
+        )
+        let isolated = try await Self.prepareLateAgentCheckout(
             host: host,
             hostKey: hostKey,
             agentName: agentName,
-            requestedDirectory: workingDirectory
-        ) {
-            workingDirectory = isolated.path
-            var locations = team.remoteProjectLocations
-            locations.append(.init(hostKey: hostKey, path: isolated.path))
-            recordRemoteProjectLocations(
-                teamName: teamName,
-                locations: locations.sorted { ($0.hostKey, $0.path) < ($1.hostKey, $1.path) }
-            )
-        }
+            requestedDirectory: requestedDirectory
+        )
+        let workingDirectory = isolated.path
+        var locations = team.remoteProjectLocations
+        locations.append(.init(hostKey: hostKey, path: isolated.path))
+        recordRemoteProjectLocations(
+            teamName: teamName,
+            locations: locations.sorted { ($0.hostKey, $0.path) < ($1.hostKey, $1.path) }
+        )
 
         // Use the same incremental grid growth as local `add`/`attach`.
         let placement = nextAgentSplitPlacement(team: team, workspace: workspace)
@@ -1379,55 +1380,86 @@ extension TeamOrchestrator {
         }
     }
 
-    /// A late-added agent's own checkout, prepared on the host — or nil to
-    /// use the requested directory exactly as given.
+    /// A late-added agent's own checkout, prepared on the host.
     ///
-    /// Applies only when the requested directory is recorded as one of this
-    /// project's (`remoteProjectLocations`) — a team without project records,
-    /// or an explicitly custom path, keeps today's behavior. The primary is
-    /// derived from the directory itself over ssh (`--git-common-dir`), so a
-    /// recorded worktree path resolves to the same primary its siblings came
-    /// from. The checkout uses the same instance-tag scheme as creation; the
-    /// mem-mesh identity needs no re-pinning because `--local` git config is
-    /// shared with every worktree of the repository. Best effort on purpose:
-    /// any failure falls back to the requested directory, which is exactly
-    /// what this path always did.
+    /// The primary is derived from the requested directory over ssh
+    /// (`--git-common-dir`), so a request pointing at an existing member's
+    /// worktree still creates a new sibling checkout. Every failure is
+    /// surfaced because falling back would violate checkout isolation.
+    nonisolated static func lateRemoteAgentCheckoutPlan(
+        primaryRepository: String,
+        agentName: String,
+        instanceTag: String
+    ) -> PeerProjectBootstrap.Plan {
+        PeerProjectBootstrap.plan(
+            projectRoot: (primaryRepository as NSString).deletingLastPathComponent,
+            projectName: (primaryRepository as NSString).lastPathComponent,
+            agents: [agentName],
+            isolateAgents: true,
+            instanceTag: instanceTag
+        )
+    }
+
     static func prepareLateAgentCheckout(
-        team: Team,
         host: HostEntry,
         hostKey: String,
         agentName: String,
         requestedDirectory: String
-    ) async -> (path: String, branch: String)? {
+    ) async throws -> (path: String, branch: String) {
         let requested = requestedDirectory.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !requested.isEmpty,
-              let sshTarget = host.sshTarget, !sshTarget.isEmpty,
-              team.remoteProjectLocations.contains(
-                  Team.RemoteProjectLocation(hostKey: hostKey, path: requested)
-              )
-        else { return nil }
+        guard !requested.isEmpty, let sshTarget = host.sshTarget, !sshTarget.isEmpty else {
+            throw RemoteAgentError.checkoutIsolationFailed(
+                host: host.displayName,
+                path: requested,
+                reason: "the connected host has no SSH provisioning route"
+            )
+        }
 
         let quoted = "'" + requested.replacingOccurrences(of: "'", with: "'\\''") + "'"
-        guard let commonDir = try? await PeerHostReadinessChecker.runScript(
-            sshTarget: sshTarget,
-            port: host.sshPort,
-            identityFile: host.identityFile,
-            script: "git -C \(quoted) rev-parse --path-format=absolute --git-common-dir 2>/dev/null",
-            timeoutSeconds: 30
-        ).trimmingCharacters(in: .whitespacesAndNewlines),
-              commonDir.hasSuffix("/.git")
-        else { return nil }
+        let commonDir: String
+        do {
+            commonDir = try await PeerHostReadinessChecker.runScript(
+                sshTarget: sshTarget,
+                port: host.sshPort,
+                identityFile: host.identityFile,
+                script: "git -C \(quoted) rev-parse --path-format=absolute --git-common-dir 2>/dev/null",
+                timeoutSeconds: 30
+            ).trimmingCharacters(in: .whitespacesAndNewlines)
+        } catch {
+            throw RemoteAgentError.checkoutIsolationFailed(
+                host: host.displayName,
+                path: requested,
+                reason: "the requested directory is not a reachable Git checkout"
+            )
+        }
+        guard commonDir.hasSuffix("/.git") else {
+            throw RemoteAgentError.checkoutIsolationFailed(
+                host: host.displayName,
+                path: requested,
+                reason: "Git did not report a primary repository"
+            )
+        }
         let primary = String(commonDir.dropLast("/.git".count))
-        guard !primary.isEmpty, primary != "/" else { return nil }
+        guard !primary.isEmpty, primary != "/" else {
+            throw RemoteAgentError.checkoutIsolationFailed(
+                host: host.displayName,
+                path: requested,
+                reason: "Git reported an invalid primary repository"
+            )
+        }
 
-        let plan = PeerProjectBootstrap.plan(
-            projectRoot: (primary as NSString).deletingLastPathComponent,
-            projectName: (primary as NSString).lastPathComponent,
-            agents: [agentName],
-            isolateAgents: true,
+        let plan = Self.lateRemoteAgentCheckoutPlan(
+            primaryRepository: primary,
+            agentName: agentName,
             instanceTag: PeerProjectBootstrap.makeInstanceTag()
         )
-        guard let checkout = plan.agentCheckouts.first else { return nil }
+        guard let checkout = plan.agentCheckouts.first else {
+            throw RemoteAgentError.checkoutIsolationFailed(
+                host: host.displayName,
+                path: requested,
+                reason: "checkout planning produced no agent checkout"
+            )
+        }
         do {
             try await PeerProjectBootstrap.run(
                 sshTarget: sshTarget,
@@ -1440,10 +1472,11 @@ extension TeamOrchestrator {
                 environment: PeerHostEnvironment.stored(forHostKey: hostKey)
             )
         } catch {
-            RemoteWorkLog.info(
-                "Could not carve a worktree for \(agentName) on \(host.displayName) — using \(requested): \(error)"
+            throw RemoteAgentError.checkoutIsolationFailed(
+                host: host.displayName,
+                path: requested,
+                reason: String(describing: error)
             )
-            return nil
         }
         RemoteWorkLog.info(
             "\(agentName) joins in its own checkout on \(host.displayName): \(checkout.path) (\(checkout.branch))"
