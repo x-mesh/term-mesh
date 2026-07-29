@@ -5,7 +5,7 @@ import Foundation
 /// renderer consumes `renderedInstructions`; no renderer owns a fork of these
 /// scheduling rules.
 enum LeaderParallelPolicy {
-    static let version = "1"
+    static let version = "2"
     static let activation = "runtime-enforced"
 
     /// Ordered rules are both the canonical policy and the digest input.  Do
@@ -31,6 +31,10 @@ enum LeaderParallelPolicy {
         (
             "branch-merge-boundary",
             "Do not create an extra worktree merely because checkouts differ. Give each write task a branch owner and serialize pushes to the same remote branch; make merge and push boundaries explicit."
+        ),
+        (
+            "isolated-checkout-ref-contract",
+            "An isolated worker branch is expected to differ from the project target branch. Never require branch-name equality and never block for that difference alone. For read-only work, fetch once when needed and inspect explicit base/target refs without checkout, reset, merge, or rebase. For write work, keep the assigned branch and request an explicit sync when its base is stale."
         ),
         (
             "policy-parity",

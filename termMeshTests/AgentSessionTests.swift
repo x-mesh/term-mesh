@@ -19,12 +19,12 @@ final class AgentSessionTests: XCTestCase {
         let first = LeaderParallelPolicy.renderedInstructions
         let second = LeaderParallelPolicy.renderedInstructions
 
-        XCTAssertEqual(LeaderParallelPolicy.version, "1")
+        XCTAssertEqual(LeaderParallelPolicy.version, "2")
         XCTAssertEqual(LeaderParallelPolicy.activation, "runtime-enforced")
         XCTAssertEqual(first, second)
         XCTAssertEqual(LeaderParallelPolicy.digest.count, 64)
         XCTAssertTrue(LeaderParallelPolicy.digest.allSatisfy { $0.isHexDigit })
-        XCTAssertTrue(first.contains("policy_version: 1"))
+        XCTAssertTrue(first.contains("policy_version: 2"))
         XCTAssertTrue(first.contains("policy_digest: \(LeaderParallelPolicy.digest)"))
         XCTAssertTrue(first.contains("policy_activation: runtime-enforced"))
     }
@@ -38,6 +38,7 @@ final class AgentSessionTests: XCTestCase {
             "unified-placement-pool",
             "same-checkout-isolation",
             "branch-merge-boundary",
+            "isolated-checkout-ref-contract",
             "policy-parity",
             "timebox-convergence",
         ].forEach { XCTAssertTrue(policy.contains("[\($0)]"), "missing \($0)") }
@@ -112,6 +113,21 @@ final class AgentSessionTests: XCTestCase {
 
         XCTAssertEqual(recycled.agentInstanceId, original.agentInstanceId)
         XCTAssertNotEqual(reattached.agentInstanceId, original.agentInstanceId)
+    }
+
+    func testCheckoutContractUsesRefsWithoutRejectingIsolatedBranch() {
+        let lines = TeamOrchestrator.checkoutContractLines(
+            targetBranch: "feat/distributed-workspaces",
+            checkoutBranch: "agent/reviewer-260729",
+            checkoutPath: "/app/tm-projects/term-mesh-reviewer-260729"
+        )
+        let contract = lines.joined(separator: "\n")
+
+        XCTAssertTrue(contract.contains("PROJECT_TARGET_REF: origin/feat/distributed-workspaces"))
+        XCTAssertTrue(contract.contains("AGENT_CHECKOUT_BRANCH: agent/reviewer-260729"))
+        XCTAssertTrue(contract.contains("Never block solely because"))
+        XCTAssertTrue(contract.contains("inspect explicit refs directly"))
+        XCTAssertTrue(contract.contains("Do not checkout, reset, merge, or rebase"))
     }
 
     func testRemoteClaudeLaunchUsesSSHAndKeepsRemoteDirectoryOutOfLocalProcess() {

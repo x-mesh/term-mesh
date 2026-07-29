@@ -1502,6 +1502,10 @@ extension TeamOrchestrator {
 
         if let projectSource {
             team.usesDedicatedRemoteWorkspaces = true
+            let targetBranch = projectSource.gitBranch
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            team.projectTargetBranch = targetBranch.isEmpty ? nil : targetBranch
+            setProjectTargetBranch(teamName: team.id, branch: team.projectTargetBranch)
             configureDedicatedRemoteWorkspaces(teamName: team.id, enabled: true)
             var locations: Set<Team.RemoteProjectLocation> = []
             if let hostKey = projectSource.hostKey {

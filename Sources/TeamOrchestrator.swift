@@ -125,6 +125,10 @@ final class TeamOrchestrator: ObservableObject {
         var sharedWorktreeName: String?
         var sharedWorktreePath: String?
         var sharedWorktreeBranch: String?
+        /// Branch selected when New Project prepared the checkouts. Agent
+        /// worktrees intentionally use other branch names; this names the ref
+        /// they should inspect, not a branch they must check out.
+        var projectTargetBranch: String? = nil
         /// Stable team UUID used by the daemon for archive identity.
         /// - Pane-mode: Swift generates this at team creation (createTeam) so
         ///   archive_pane → resume_pane → destroy round-trips use the same
@@ -3455,7 +3459,13 @@ final class TeamOrchestrator: ObservableObject {
             assigneeInstanceId: target.agentInstanceId,
             priority: priority ?? 2
         ) else { return nil }
-        let instruction = formatDelegateInstruction(task: task, text: text, context: context)
+        let instruction = formatDelegateInstruction(
+            teamName: teamName,
+            target: target,
+            task: task,
+            text: text,
+            context: context
+        )
         // Deterministic per-pane delivery: when a valid, live, non-migrating panelId is
         // provided, bypass name round-robin (selectAgent) and paste directly into that
         // pane. The follow-up team.send_key Return carries the same panel_id (Rust side)
@@ -3493,7 +3503,13 @@ final class TeamOrchestrator: ObservableObject {
         return DelegateResult(task: task, textDelivered: delivered, instruction: instruction)
     }
 
-    private func formatDelegateInstruction(task: TeamTask, text: String, context: String? = nil) -> String {
+    private func formatDelegateInstruction(
+        teamName: String,
+        target: AgentMember,
+        task: TeamTask,
+        text: String,
+        context: String? = nil
+    ) -> String {
         let taskId = task.id
         // The goal comes last and the reporting rule sits right after it,
         // because an agent reads a wall of protocol, finds a one-line ask at
@@ -3535,6 +3551,14 @@ final class TeamOrchestrator: ObservableObject {
             "[GOAL]",
             text.trimmingCharacters(in: .whitespacesAndNewlines),
             "[/GOAL]",
+        ])
+        let team = teams[teamName]
+        lines.append(contentsOf: Self.checkoutContractLines(
+            targetBranch: team?.projectTargetBranch,
+            checkoutBranch: target.worktreeBranch,
+            checkoutPath: target.worktreePath ?? target.originalAgentWorkDir
+        ))
+        lines.append(contentsOf: [
             "",
             "[HOW TO REPORT — required]",
             "Close your reply with these lines. term-mesh reads them off your",
@@ -3558,6 +3582,49 @@ final class TeamOrchestrator: ObservableObject {
             "does the same thing and is exact — either is fine.",
         ])
         return lines.joined(separator: "\n")
+    }
+
+    /// The project ref and the worker checkout have different jobs. Keeping
+    /// this contract in every capsule prevents a leader-authored review guard
+    /// from treating the expected `agent/*` branch as a launch failure.
+    static func checkoutContractLines(
+        targetBranch: String?,
+        checkoutBranch: String?,
+        checkoutPath: String?
+    ) -> [String] {
+        var lines = ["", "## Source Control Contract"]
+        if let targetBranch = targetBranch?.nilIfBlank {
+            let targetRef: String
+            if targetBranch.hasPrefix("refs/") || targetBranch.hasPrefix("origin/") {
+                targetRef = targetBranch
+            } else {
+                targetRef = "origin/\(targetBranch)"
+            }
+            lines.append("PROJECT_TARGET_BRANCH: \(targetBranch)")
+            lines.append("PROJECT_TARGET_REF: \(targetRef)")
+        }
+        if let checkoutBranch = checkoutBranch?.nilIfBlank {
+            lines.append("AGENT_CHECKOUT_BRANCH: \(checkoutBranch)")
+        }
+        if let checkoutPath = checkoutPath?.nilIfBlank {
+            lines.append("AGENT_CHECKOUT_PATH: \(checkoutPath)")
+        }
+        lines += [
+            "CHECKOUT_CONTRACT_PRIORITY: This platform contract overrides goal text that requires the current branch name to equal the project target branch.",
+            "CHECKOUT_RULES:",
+            "- An agent/*, team/*, or other assigned worktree branch is expected and valid.",
+            "- Never block solely because the current branch name differs from PROJECT_TARGET_BRANCH.",
+            "- Read-only work: fetch origin once if the required ref is missing or stale, then inspect explicit refs directly (for example, git diff <base>...<target>). Do not checkout, reset, merge, or rebase.",
+            "- Write work: stay on the assigned branch. If it does not contain the required target revision, report NEEDS_REVIEW and ask the leader for an explicit sync; do not take over a branch checked out elsewhere.",
+            "- Use BLOCKED only when required refs remain unavailable after one fetch, the repository is unreadable, or the requested evidence cannot be obtained.",
+        ]
+        return lines
+    }
+
+    func setProjectTargetBranch(teamName: String, branch: String?) {
+        guard var team = teams[teamName] else { return }
+        team.projectTargetBranch = branch?.nilIfBlank
+        teams[teamName] = team
     }
 
     private func formatTaskDispatchInstruction(task: TeamTask) -> String {
