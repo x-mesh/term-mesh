@@ -207,7 +207,7 @@ public actor PeerTeamLeaderControlPlane {
     private struct RegisteredGrant {
         let value: Termmesh_Peer_V1_TeamLeaderGrant
         let audiencePeerID: Data?
-        var validUntilUnixSeconds: UInt64
+        var validUntilLeaseSeconds: UInt64
         let renewalLifetimeSeconds: UInt64?
     }
 
@@ -268,12 +268,20 @@ public actor PeerTeamLeaderControlPlane {
     public func bootstrap(
         _ request: Termmesh_Peer_V1_TeamLeaderBootstrapRequest,
         encodedBytes: Int,
-        nowUnixSeconds: UInt64 = UInt64(Date().timeIntervalSince1970),
+        nowUnixSeconds: UInt64? = nil,
+        nowLeaseSeconds: UInt64? = nil,
         grantLifetimeSeconds: UInt64 = 3_600,
         audiencePeerID: Data? = nil,
         resolveTeamUUID: @escaping @Sendable (String) async -> String?
     ) async -> Termmesh_Peer_V1_TeamLeaderBootstrapResponse {
-        purgeExpired(nowUnixSeconds: nowUnixSeconds)
+        let wallNow = nowUnixSeconds ?? Self.wallClockSeconds()
+        let leaseNow = nowLeaseSeconds
+            ?? nowUnixSeconds
+            ?? Self.awakeClockSeconds()
+        purgeExpired(
+            nowUnixSeconds: wallNow,
+            nowLeaseSeconds: leaseNow
+        )
         let validation = PeerTeamLeader.validateBootstrap(
             request,
             encodedBytes: encodedBytes
@@ -284,7 +292,7 @@ public actor PeerTeamLeaderControlPlane {
         guard bootstrapRequestIDs[request.requestID] == nil else {
             return bootstrapFailure(.replayedRequest)
         }
-        bootstrapRequestIDs[request.requestID] = nowUnixSeconds &+ grantLifetimeSeconds
+        bootstrapRequestIDs[request.requestID] = wallNow &+ grantLifetimeSeconds
         bootstrapOrder.append(request.requestID)
         trimBootstrapRegistry()
         guard let teamUUID = await resolveTeamUUID(request.projectID),
@@ -297,11 +305,12 @@ public actor PeerTeamLeaderControlPlane {
         grant.projectID = request.projectID
         grant.teamUuid = teamUUID
         grant.role = .leader
-        grant.expiresAtUnixSecs = nowUnixSeconds &+ grantLifetimeSeconds
+        grant.expiresAtUnixSecs = wallNow &+ grantLifetimeSeconds
         storeGrant(
             grant,
             audiencePeerID: audiencePeerID,
-            renewalLifetimeSeconds: grantLifetimeSeconds
+            renewalLifetimeSeconds: grantLifetimeSeconds,
+            validUntilLeaseSeconds: leaseNow &+ grantLifetimeSeconds
         )
 
         var response = Termmesh_Peer_V1_TeamLeaderBootstrapResponse()
@@ -314,18 +323,26 @@ public actor PeerTeamLeaderControlPlane {
     public func execute(
         _ request: Termmesh_Peer_V1_TeamLeaderCommandRequest,
         encodedBytes: Int,
-        nowUnixSeconds: UInt64 = UInt64(Date().timeIntervalSince1970),
+        nowUnixSeconds: UInt64? = nil,
+        nowLeaseSeconds: UInt64? = nil,
         audiencePeerID: Data? = nil,
         dispatch: @escaping Dispatcher
     ) async -> Termmesh_Peer_V1_TeamLeaderCommandResponse {
-        purgeExpired(nowUnixSeconds: nowUnixSeconds)
+        let wallNow = nowUnixSeconds ?? Self.wallClockSeconds()
+        let leaseNow = nowLeaseSeconds
+            ?? nowUnixSeconds
+            ?? Self.awakeClockSeconds()
+        purgeExpired(
+            nowUnixSeconds: wallNow,
+            nowLeaseSeconds: leaseNow
+        )
         let registered = grants[request.grant.grantID]
         let validation = PeerTeamLeader.validateCommand(
             request,
             registeredGrant: registered?.value,
-            registeredValidUntilUnixSeconds: registered?.validUntilUnixSeconds,
+            registeredValidUntilUnixSeconds: registered?.validUntilLeaseSeconds,
             encodedBytes: encodedBytes,
-            nowUnixSeconds: nowUnixSeconds
+            nowUnixSeconds: leaseNow
         )
         if case .failure(let error) = validation {
             let response = failureResponse(
@@ -338,7 +355,7 @@ public actor PeerTeamLeaderControlPlane {
                 accepted: false,
                 replayed: false,
                 errorCode: error.rawValue,
-                now: nowUnixSeconds
+                now: wallNow
             )
             return response
         }
@@ -354,11 +371,11 @@ public actor PeerTeamLeaderControlPlane {
                 accepted: false,
                 replayed: false,
                 errorCode: PeerTeamLeader.ValidationError.wrongAudience.rawValue,
-                now: nowUnixSeconds
+                now: wallNow
             )
             return response
         }
-        touchGrant(request.grant.grantID, nowUnixSeconds: nowUnixSeconds)
+        touchGrant(request.grant.grantID, nowLeaseSeconds: leaseNow)
 
         let key = RequestKey(
             grantID: request.grant.grantID,
@@ -372,7 +389,7 @@ public actor PeerTeamLeaderControlPlane {
                 accepted: cached.ok,
                 replayed: true,
                 errorCode: cached.ok ? nil : cached.errorCode,
-                now: nowUnixSeconds
+                now: wallNow
             )
             return cached
         }
@@ -389,7 +406,7 @@ public actor PeerTeamLeaderControlPlane {
                 accepted: response.ok,
                 replayed: true,
                 errorCode: response.ok ? nil : response.errorCode,
-                now: nowUnixSeconds
+                now: wallNow
             )
             return response
         }
@@ -411,7 +428,7 @@ public actor PeerTeamLeaderControlPlane {
             accepted: response.ok,
             replayed: false,
             errorCode: response.ok ? nil : response.errorCode,
-            now: nowUnixSeconds
+            now: wallNow
         )
         return response
     }
@@ -419,14 +436,16 @@ public actor PeerTeamLeaderControlPlane {
     private func storeGrant(
         _ grant: Termmesh_Peer_V1_TeamLeaderGrant,
         audiencePeerID: Data?,
-        renewalLifetimeSeconds: UInt64?
+        renewalLifetimeSeconds: UInt64?,
+        validUntilLeaseSeconds: UInt64? = nil
     ) {
         grantOrder.removeAll { $0 == grant.grantID }
         grantOrder.append(grant.grantID)
         grants[grant.grantID] = RegisteredGrant(
             value: grant,
             audiencePeerID: audiencePeerID,
-            validUntilUnixSeconds: grant.expiresAtUnixSecs,
+            validUntilLeaseSeconds: validUntilLeaseSeconds
+                ?? grant.expiresAtUnixSecs,
             renewalLifetimeSeconds: renewalLifetimeSeconds
         )
         while grantOrder.count > maxGrantEntries {
@@ -434,12 +453,12 @@ public actor PeerTeamLeaderControlPlane {
         }
     }
 
-    private func touchGrant(_ grantID: Data, nowUnixSeconds: UInt64) {
+    private func touchGrant(_ grantID: Data, nowLeaseSeconds: UInt64) {
         guard var registered = grants[grantID] else { return }
         if let lifetime = registered.renewalLifetimeSeconds {
-            let (deadline, overflow) = nowUnixSeconds.addingReportingOverflow(lifetime)
-            registered.validUntilUnixSeconds = max(
-                registered.validUntilUnixSeconds,
+            let (deadline, overflow) = nowLeaseSeconds.addingReportingOverflow(lifetime)
+            registered.validUntilLeaseSeconds = max(
+                registered.validUntilLeaseSeconds,
                 overflow ? UInt64.max : deadline
             )
             grants[grantID] = registered
@@ -448,7 +467,10 @@ public actor PeerTeamLeaderControlPlane {
         grantOrder.append(grantID)
     }
 
-    private func purgeExpired(nowUnixSeconds: UInt64) {
+    private func purgeExpired(
+        nowUnixSeconds: UInt64,
+        nowLeaseSeconds: UInt64
+    ) {
         let expiredRequests = bootstrapRequestIDs.compactMap { id, expiry in
             expiry <= nowUnixSeconds ? id : nil
         }
@@ -460,7 +482,7 @@ public actor PeerTeamLeaderControlPlane {
         }
 
         let expiredGrants = grants.compactMap { id, grant in
-            grant.validUntilUnixSeconds <= nowUnixSeconds ? id : nil
+            grant.validUntilLeaseSeconds <= nowLeaseSeconds ? id : nil
         }
         for id in expiredGrants {
             grants.removeValue(forKey: id)
@@ -468,6 +490,18 @@ public actor PeerTeamLeaderControlPlane {
         if !expiredGrants.isEmpty {
             grantOrder.removeAll { grants[$0] == nil }
         }
+    }
+
+    /// Wall time stays on the wire for tamper detection and audit records.
+    /// The renewable server lease deliberately uses system uptime instead:
+    /// `systemUptime` advances while the Mac is awake but not while it sleeps,
+    /// so an overnight sleep cannot consume an otherwise active leader lease.
+    private static func wallClockSeconds() -> UInt64 {
+        UInt64(Date().timeIntervalSince1970)
+    }
+
+    private static func awakeClockSeconds() -> UInt64 {
+        UInt64(ProcessInfo.processInfo.systemUptime)
     }
 
     private func trimBootstrapRegistry() {

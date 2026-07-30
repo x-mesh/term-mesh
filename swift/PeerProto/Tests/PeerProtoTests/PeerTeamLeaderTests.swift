@@ -397,6 +397,42 @@ final class PeerTeamLeaderTests: XCTestCase {
         )
     }
 
+    func testSystemSleepDoesNotConsumeTheServerLease() async {
+        let controlPlane = PeerTeamLeaderControlPlane()
+        let bootstrap = await controlPlane.bootstrap(
+            validRequest(),
+            encodedBytes: 64,
+            nowUnixSeconds: 1_000,
+            nowLeaseSeconds: 10,
+            grantLifetimeSeconds: 10
+        ) { _ in "team-uuid" }
+        XCTAssertTrue(bootstrap.ok)
+        XCTAssertEqual(bootstrap.grant.expiresAtUnixSecs, 1_010)
+
+        let afterWake = await controlPlane.execute(
+            validCommand(grant: bootstrap.grant, requestByte: 91),
+            encodedBytes: 128,
+            nowUnixSeconds: 10_000,
+            nowLeaseSeconds: 11
+        ) { _, _, _ in .success("{}") }
+        XCTAssertTrue(
+            afterWake.ok,
+            "wall-clock time spent asleep must not expire an active leader"
+        )
+
+        let expiredWhileAwake = await controlPlane.execute(
+            validCommand(grant: bootstrap.grant, requestByte: 92),
+            encodedBytes: 128,
+            nowUnixSeconds: 10_011,
+            nowLeaseSeconds: 22
+        ) { _, _, _ in .success("{}") }
+        XCTAssertFalse(expiredWhileAwake.ok)
+        XCTAssertEqual(
+            expiredWhileAwake.errorCode,
+            PeerTeamLeader.ValidationError.unknownGrant.rawValue
+        )
+    }
+
     private func validRequest() -> Termmesh_Peer_V1_TeamLeaderBootstrapRequest {
         var request = Termmesh_Peer_V1_TeamLeaderBootstrapRequest()
         request.projectID = "name:demo"
