@@ -955,6 +955,51 @@ final class PeerProjectBootstrapTests: XCTestCase {
     }
 
     @MainActor
+    func test_remote_leader_restore_selects_latest_exact_managed_surface() {
+        let older = ManagedPeerSurfaceStore.Record(
+            hostKey: "ssh:mac-sub",
+            surfaceIDBase64: Data([0x01]).base64EncodedString(),
+            teamName: "term-mesh",
+            role: "leader",
+            workingDirectory: "/old",
+            createdAt: Date(timeIntervalSince1970: 10)
+        )
+        let latest = ManagedPeerSurfaceStore.Record(
+            hostKey: "ssh:mac-sub",
+            surfaceIDBase64: Data([0x02]).base64EncodedString(),
+            teamName: "term-mesh",
+            role: "leader",
+            workingDirectory: "/current",
+            createdAt: Date(timeIntervalSince1970: 20)
+        )
+        let otherRole = ManagedPeerSurfaceStore.Record(
+            hostKey: "ssh:mac-sub",
+            surfaceIDBase64: Data([0x03]).base64EncodedString(),
+            teamName: "term-mesh",
+            role: "executor",
+            workingDirectory: "/agent",
+            createdAt: Date(timeIntervalSince1970: 30)
+        )
+        let otherTeam = ManagedPeerSurfaceStore.Record(
+            hostKey: "ssh:mac-sub",
+            surfaceIDBase64: Data([0x04]).base64EncodedString(),
+            teamName: "other",
+            role: "leader",
+            workingDirectory: "/other",
+            createdAt: Date(timeIntervalSince1970: 40)
+        )
+
+        let selected = ManagedPeerSurfaceStore.leaderRecord(
+            in: [older, latest, otherRole, otherTeam],
+            hostKey: "ssh:mac-sub",
+            teamName: "term-mesh"
+        )
+
+        XCTAssertEqual(selected?.surfaceID, Data([0x02]))
+        XCTAssertEqual(selected?.workingDirectory, "/current")
+    }
+
+    @MainActor
     func test_remote_claude_leader_launch_injects_term_mesh_prompt() {
         var grant = Termmesh_Peer_V1_TeamLeaderGrant()
         grant.grantID = Data(repeating: 0xcd, count: 32)

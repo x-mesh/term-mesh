@@ -185,6 +185,9 @@ final class TeamOrchestrator: ObservableObject {
     }
 
     @Published private(set) var teams: [String: Team] = [:]
+    /// Prevent repeated project clicks from attaching multiple local viewers
+    /// to the same persistent remote leader surface.
+    var remoteLeaderReattachInFlight: Set<String> = []
 
     func recordRemoteProjectLocations(
         teamName: String,
@@ -228,6 +231,18 @@ final class TeamOrchestrator: ObservableObject {
         team.leaderWorkspaceId = nil
         teams[teamName] = team
         syncTeamStateToDaemon()
+    }
+
+    func isLeaderPaneAttached(teamName: String) -> Bool {
+        guard let team = teams[teamName] else { return false }
+        if case .peer = team.leaderEndpoint {
+            guard let located = AppDelegate.shared?.locateSurface(surfaceId: team.leaderPanelId),
+                  let workspace = located.tabManager.tabs.first(where: { $0.id == located.workspaceId }),
+                  let session = workspace.terminalPanel(for: team.leaderPanelId)?.peerPaneSession
+            else { return false }
+            return !session.isTorndown
+        }
+        return AppDelegate.shared?.locateSurface(surfaceId: team.leaderPanelId) != nil
     }
 
     func markRemoteLeaderFailed(teamName: String, description: String) {
@@ -4964,6 +4979,7 @@ final class TeamOrchestrator: ObservableObject {
                 "leader_panel_id": team.leaderPanelId.uuidString,
                 "leader_endpoint": leaderEndpoint,
                 "leader_ready": team.leaderReady,
+                "leader_pane_attached": isLeaderPaneAttached(teamName: team.id),
                 "leader_failure": team.leaderFailureDescription as Any? ?? NSNull(),
                 "leader_policy_version": LeaderParallelPolicy.version,
                 "leader_policy_digest": LeaderParallelPolicy.digest,
@@ -5083,6 +5099,7 @@ final class TeamOrchestrator: ObservableObject {
             "team_name": team.id,
             "leader_session_id": team.leaderSessionId,
             "leader_ready": team.leaderReady,
+            "leader_pane_attached": isLeaderPaneAttached(teamName: team.id),
             "leader_failure": team.leaderFailureDescription as Any? ?? NSNull(),
             "leader_policy_version": LeaderParallelPolicy.version,
             "leader_policy_digest": LeaderParallelPolicy.digest,
@@ -5154,6 +5171,7 @@ final class TeamOrchestrator: ObservableObject {
         if archive {
             archivePaneTeamIfApplicable(team)
         }
+        closeRemoteLeaderSurfaceIfNeeded(teamName: name)
 
         // D3-A P2 (b): release any pending claude-sid watcher slots so
         // FSEventStream(s) for this team's workdirs tear down promptly.

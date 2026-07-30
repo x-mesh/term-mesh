@@ -734,6 +734,19 @@ extension TerminalController {
         return .ok(["started": true])
     }
 
+    func v2DebugProjectReattachLeader(params: [String: Any]) -> V2CallResult {
+        guard let team = params["team"] as? String, !team.isEmpty else {
+            return .err(code: "invalid_params", message: "team is required", data: nil)
+        }
+        Task { @MainActor in
+            let attached = await TeamOrchestrator.shared.reattachRemoteLeaderIfNeeded(
+                teamName: team
+            )
+            dlog("debug.project.reattach_leader team=\(team) attached=\(attached)")
+        }
+        return .ok(["started": true])
+    }
+
     func v2DebugPeerShellInspect(params: [String: Any]) -> V2CallResult {
         guard let handle = params["host"] as? String, !handle.isEmpty,
               let host = RemoteHostStore.shared.sortedHosts.first(where: {
@@ -759,6 +772,46 @@ extension TerminalController {
                         ] as [String: Any]
                     },
                 ]
+            } catch {
+                debugPeerShellInspection = [
+                    "ok": false,
+                    "error": String(describing: error),
+                ]
+            }
+        }
+        return .ok(["started": true])
+    }
+
+    func v2DebugPeerShellClose(params: [String: Any]) -> V2CallResult {
+        guard let handle = params["host"] as? String, !handle.isEmpty,
+              let encodedIDs = params["surface_ids"] as? [String], !encodedIDs.isEmpty,
+              let host = RemoteHostStore.shared.sortedHosts.first(where: {
+                  $0.id == handle
+                      || $0.displayName.caseInsensitiveCompare(handle) == .orderedSame
+              })
+        else {
+            return .err(
+                code: "invalid_params",
+                message: "connected host and surface_ids are required",
+                data: nil
+            )
+        }
+        let surfaceIDs = Set(encodedIDs.compactMap { Data(base64Encoded: $0) })
+        guard surfaceIDs.count == encodedIDs.count else {
+            return .err(
+                code: "invalid_params",
+                message: "surface_ids must be base64 encoded",
+                data: nil
+            )
+        }
+        debugPeerShellInspection = nil
+        Task { @MainActor in
+            do {
+                let closed = try await TeamOrchestrator.shared.closePeerShells(
+                    host: host,
+                    surfaceIDs: surfaceIDs
+                )
+                debugPeerShellInspection = ["ok": true, "closed": closed]
             } catch {
                 debugPeerShellInspection = [
                     "ok": false,

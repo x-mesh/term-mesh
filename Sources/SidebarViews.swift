@@ -1989,7 +1989,16 @@ private struct SidebarProjectLocalRowView: View {
         .padding(.horizontal, usesSeparatedPresentation ? 10 : 8)
         .contentShape(Rectangle())
         .onHover { isHovering = $0 }
-        .onTapGesture { tabManager.selectedTabId = workspace.id }
+        .onTapGesture {
+            tabManager.selectedTabId = workspace.id
+            if let ledTeamName {
+                Task { @MainActor in
+                    _ = await orchestrator.reattachRemoteLeaderIfNeeded(
+                        teamName: ledTeamName
+                    )
+                }
+            }
+        }
         .help(workspace.currentDirectory)
         .accessibilityElement(children: .combine)
         .accessibilityAddTraits(isSelected ? [.isButton, .isSelected] : .isButton)

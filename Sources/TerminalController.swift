@@ -1298,8 +1298,12 @@ class TerminalController {
             return v2Result(id: id, self.v2DebugProjectCreate(params: params))
         case "debug.project.delete":
             return v2Result(id: id, self.v2DebugProjectDelete(params: params))
+        case "debug.project.reattach_leader":
+            return v2Result(id: id, self.v2DebugProjectReattachLeader(params: params))
         case "debug.peer.shells.inspect":
             return v2Result(id: id, self.v2DebugPeerShellInspect(params: params))
+        case "debug.peer.shells.close":
+            return v2Result(id: id, self.v2DebugPeerShellClose(params: params))
         case "debug.peer.shells.status":
             return v2Result(id: id, self.v2DebugPeerShellStatus())
         case "debug.reviewboard.delegate":

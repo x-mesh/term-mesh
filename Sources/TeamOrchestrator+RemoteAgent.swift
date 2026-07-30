@@ -635,12 +635,22 @@ extension TeamOrchestrator {
                 .compactMap(\.remoteSurfaceID)
         )
         for team in teams.values {
-            guard team.leaderEndpoint == .peer(hostKey: hostKey),
-                  let located = AppDelegate.shared?.locateSurface(surfaceId: team.leaderPanelId),
-                  let workspace = located.tabManager.tabs.first(where: { $0.id == located.workspaceId }),
-                  let session = workspace.terminalPanel(for: team.leaderPanelId)?.peerPaneSession
-            else { continue }
-            result.insert(session.originSurface.surfaceID)
+            guard team.leaderEndpoint == .peer(hostKey: hostKey) else { continue }
+            if let record = ManagedPeerSurfaceStore.shared.leaderRecord(
+                hostKey: hostKey,
+                teamName: team.id
+            ), let surfaceID = record.surfaceID {
+                // The project owns the remote leader surface even when no
+                // local viewer is attached. Never offer it as an orphan while
+                // the project/team record is still live.
+                result.insert(surfaceID)
+                continue
+            }
+            if let located = AppDelegate.shared?.locateSurface(surfaceId: team.leaderPanelId),
+               let workspace = located.tabManager.tabs.first(where: { $0.id == located.workspaceId }),
+               let session = workspace.terminalPanel(for: team.leaderPanelId)?.peerPaneSession {
+                result.insert(session.originSurface.surfaceID)
+            }
         }
         result.formUnion(
             peerPaneSessions(hostKey: host.paneHostSpec.hostKey)
@@ -811,7 +821,8 @@ extension TeamOrchestrator {
 
         guard let panel = workspace.replaceTerminalPaneWithRemote(
             panelId: team.leaderPanelId,
-            session: session
+            session: session,
+            lifetime: .keepAlive
         ) else {
             await abandonSpawnedLeader()
             throw RemoteAgentError.paneCreationFailed
@@ -888,6 +899,120 @@ extension TeamOrchestrator {
             panelID: panel.id,
             endpoint: .peer(hostKey: hostKey)
         )
+    }
+
+    /// Reattach the project's local leader viewer to the exact remote surface
+    /// it already owns. The remote process/surface outlives any one local pane;
+    /// this path restores presentation without spawning a second leader or
+    /// replaying bootstrap credentials.
+    @discardableResult
+    func reattachRemoteLeaderIfNeeded(teamName: String) async -> Bool {
+        guard let team = teams[teamName],
+              case let .peer(hostKey) = team.leaderEndpoint
+        else { return false }
+        if isLeaderPaneAttached(teamName: teamName) { return true }
+        guard !remoteLeaderReattachInFlight.contains(teamName) else { return false }
+        remoteLeaderReattachInFlight.insert(teamName)
+        defer { remoteLeaderReattachInFlight.remove(teamName) }
+
+        guard let record = ManagedPeerSurfaceStore.shared.leaderRecord(
+            hostKey: hostKey,
+            teamName: teamName
+        ), let surfaceID = record.surfaceID else {
+            RemoteWorkLog.info("Cannot restore \(teamName) leader: its remote surface identity is missing")
+            return false
+        }
+        guard let host = RemoteHostStore.shared.sortedHosts.first(where: { $0.id == hostKey }),
+              host.isConnected else {
+            RemoteWorkLog.info("Cannot restore \(teamName) leader: \(hostKey) is disconnected")
+            return false
+        }
+        guard let tabManager = AppDelegate.shared?.tabManagerFor(tabId: team.workspaceId),
+              let workspace = tabManager.tabs.first(where: { $0.id == team.workspaceId })
+        else { return false }
+
+        let lease: PeerPaneHostLease
+        do {
+            lease = try await PeerPaneHostRegistry.shared.acquire(host.paneHostSpec)
+        } catch {
+            RemoteWorkLog.info("Cannot restore \(teamName) leader: \(error)")
+            return false
+        }
+
+        let session: PeerPaneSession
+        do {
+            let surfaces = try await PeerPaneSession.listSurfaces(on: lease)
+            guard let surface = surfaces.first(where: { $0.surfaceID == surfaceID }) else {
+                PeerPaneHostRegistry.shared.release(lease)
+                markRemoteLeaderFailed(
+                    teamName: teamName,
+                    description: "Remote leader surface no longer exists on \(host.displayName)"
+                )
+                return false
+            }
+            session = try await PeerPaneSession.attach(
+                lease: lease,
+                surface: surface,
+                title: "Leader",
+                spec: host.paneHostSpec
+            )
+        } catch {
+            PeerPaneHostRegistry.shared.release(lease)
+            RemoteWorkLog.info("Cannot restore \(teamName) leader: \(error)")
+            return false
+        }
+        PeerPaneHostRegistry.shared.release(lease)
+
+        guard let panel = workspace.openRemotePane(
+            session: session,
+            focus: false,
+            lifetime: .keepAlive
+        ) else {
+            session.teardown()
+            RemoteWorkLog.info("Cannot restore \(teamName) leader: no local pane can host it")
+            return false
+        }
+        workspace.setPanelCustomTitle(
+            panelId: panel.id,
+            title: "👑 Leader (\(team.leaderMode.capitalized)) @\(host.displayName)"
+        )
+        replaceLeaderEndpoint(
+            teamName: teamName,
+            panelID: panel.id,
+            endpoint: .peer(hostKey: hostKey)
+        )
+#if DEBUG
+        dlog(
+            "leader.reattach.ok team=\(teamName) host=\(hostKey) "
+                + "surface=\(surfaceID.base64EncodedString()) "
+                + "panel=\(panel.id.uuidString.prefix(8))"
+        )
+#endif
+        return true
+    }
+
+    /// A team destroy is an explicit end-of-lifecycle action, unlike closing
+    /// its local viewer. Tear down the project-owned remote surface even when
+    /// that viewer was detached earlier.
+    func closeRemoteLeaderSurfaceIfNeeded(teamName: String) {
+        guard let team = teams[teamName],
+              case let .peer(hostKey) = team.leaderEndpoint,
+              let record = ManagedPeerSurfaceStore.shared.leaderRecord(
+                  hostKey: hostKey,
+                  teamName: teamName
+              ),
+              let surfaceID = record.surfaceID,
+              let host = RemoteHostStore.shared.sortedHosts.first(where: { $0.id == hostKey }),
+              !host.activeSockPath.isEmpty
+        else { return }
+
+        Task { @MainActor in
+            await Self.closeManagedRemoteSurface(
+                hostSockPath: host.activeSockPath,
+                hostKey: hostKey,
+                surfaceID: surfaceID
+            )
+        }
     }
 
     private static func closeManagedRemoteSurface(
@@ -2117,15 +2242,21 @@ extension TeamOrchestrator {
         let workspace = tabManager.tabs.first(where: { $0.id == team.workspaceId })
         var remoteSurfaces: [(socket: String, hostKey: String, surfaceID: Data)] = []
         if case let .peer(hostKey) = team.leaderEndpoint,
-           let host = RemoteHostStore.shared.sortedHosts.first(where: { $0.id == hostKey }),
-           let panel = workspace?.terminalPanel(for: team.leaderPanelId),
-           let session = panel.peerPaneSession {
-            TerminalController.shared.sendNamedKeyWithRetry(
-                on: panel.surface, keyName: "ctrl-c"
-            ) { _, _ in }
-            remoteSurfaces.append((
-                host.activeSockPath, hostKey, session.originSurface.surfaceID
-            ))
+           let host = RemoteHostStore.shared.sortedHosts.first(where: { $0.id == hostKey }) {
+            let panel = workspace?.terminalPanel(for: team.leaderPanelId)
+            if let panel, panel.peerPaneSession != nil {
+                TerminalController.shared.sendNamedKeyWithRetry(
+                    on: panel.surface, keyName: "ctrl-c"
+                ) { _, _ in }
+            }
+            let surfaceID = panel?.peerPaneSession?.originSurface.surfaceID
+                ?? ManagedPeerSurfaceStore.shared.leaderRecord(
+                    hostKey: hostKey,
+                    teamName: teamName
+                )?.surfaceID
+            if let surfaceID {
+                remoteSurfaces.append((host.activeSockPath, hostKey, surfaceID))
+            }
         }
 
         for agent in team.agents {

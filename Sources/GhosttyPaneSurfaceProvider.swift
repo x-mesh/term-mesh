@@ -894,20 +894,12 @@ final class GhosttyPaneSurfaceProvider: PeerSurfaceProvider {
     private func performClose(paneIDBytes: Data) {
         guard let panelUUID = uuidFromSurfaceID(paneIDBytes),
               let workspace = workspaceContaining(panelUUID: panelUUID),
-              let panel = workspace.panels[panelUUID]
+              workspace.panels[panelUUID] != nil
         else { return }
-        // Use bonsplit's pane-id derivation: find the pane that holds
-        // the tab whose ID matches this terminal surface, then close it.
-        if let tabID = workspace.surfaceIdFromPanelId(panelUUID) {
-            for paneId in workspace.bonsplitController.allPaneIds {
-                let tabs = workspace.bonsplitController.tabs(inPane: paneId)
-                if tabs.contains(where: { $0.id == tabID }) {
-                    _ = workspace.bonsplitController.closeTab(tabID, inPane: paneId)
-                    return
-                }
-            }
-        }
-        _ = panel  // silence unused
+        // `bonsplitController.closeTab` only updates the split tree. It skips
+        // Workspace's panel teardown, leaving the Ghostty surface and its PTY
+        // child alive after the peer roster says the pane is gone.
+        _ = workspace.closePanel(panelUUID, force: true)
     }
 
     /// Create in the window the host already considers current, but do not

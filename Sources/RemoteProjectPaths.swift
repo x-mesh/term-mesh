@@ -133,6 +133,25 @@ final class ManagedPeerSurfaceStore {
         records.filter { $0.hostKey == hostKey }
     }
 
+    func leaderRecord(hostKey: String, teamName: String) -> Record? {
+        Self.leaderRecord(in: records, hostKey: hostKey, teamName: teamName)
+    }
+
+    static func leaderRecord(
+        in records: [Record],
+        hostKey: String,
+        teamName: String
+    ) -> Record? {
+        records
+            .filter {
+                $0.hostKey == hostKey
+                    && $0.teamName == teamName
+                    && $0.role == "leader"
+                    && $0.surfaceID != nil
+            }
+            .max { $0.createdAt < $1.createdAt }
+    }
+
     /// The team that spawned any of these surfaces, on any host. Surface IDs
     /// are host-minted UUIDs, so matching without the host key cannot collide
     /// in practice — and the caller (mirror team-home redirect) has a
