@@ -126,14 +126,35 @@ extension TeamOrchestrator {
         workspaceID: Data? = nil
     ) async throws -> Bool {
         for attempt in 0..<15 {
-            let probe = try await PeerRelaySession.connect(hostSockPath: hostSockPath)
+            let isLastAttempt = attempt == 14
+            // One failed probe is a missed observation, not a verdict — a
+            // reconnect blip mid-poll must not abort a confirmation the next
+            // attempt would have delivered. Only the final failure propagates.
             let workspaces: [Termmesh_Peer_V1_Workspace]
             do {
-                workspaces = try await probe.session.listWorkspaces(timeoutSeconds: 2)
-                await probe.cancel()
+                let probe = try await PeerRelaySession.connect(hostSockPath: hostSockPath)
+                do {
+                    workspaces = try await probe.session.listWorkspaces(timeoutSeconds: 2)
+                    await probe.cancel()
+                } catch {
+                    await probe.cancel()
+                    throw error
+                }
             } catch {
-                await probe.cancel()
-                throw error
+                guard !isLastAttempt else { throw error }
+                try await Task.sleep(nanoseconds: 200_000_000)
+                continue
+            }
+            if surfaceID != nil, !workspaces.isEmpty,
+               !workspaces.contains(where: \.hasLayout) {
+                // This host exposes no layouts, so its panes can never be
+                // observed here — every poll would "confirm" removal no
+                // matter what the host did. Proceed, but say so instead of
+                // minting a confirmation the roster cannot back.
+                RemoteWorkLog.info(
+                    "Surface removal on \(hostSockPath) is unverifiable: the host lists no workspace layouts."
+                )
+                return true
             }
             let workspaceStillExists = workspaceID.map { target in
                 workspaces.contains { $0.workspaceID == target }
@@ -145,7 +166,7 @@ extension TeamOrchestrator {
                 }
             } ?? false
             if !workspaceStillExists && !surfaceStillExists { return true }
-            if attempt < 14 {
+            if !isLastAttempt {
                 try await Task.sleep(nanoseconds: 200_000_000)
             }
         }
@@ -187,7 +208,7 @@ extension TeamOrchestrator {
         var createdWorkspace = false
         do {
             if let cachedWorkspaceID = workspaceID {
-                let workspaces = try await connection.session.listWorkspaces()
+                let workspaces = try await connection.session.listWorkspaces(timeoutSeconds: 10)
                 if !workspaces.contains(where: { $0.workspaceID == cachedWorkspaceID }) {
                     // The host may have restarted or the user may have removed
                     // the workspace outside this app. Do not keep sending seed
@@ -214,7 +235,7 @@ extension TeamOrchestrator {
             )
             var requestedSeed = false
             for _ in 0..<15 {
-                let workspaces = try await connection.session.listWorkspaces()
+                let workspaces = try await connection.session.listWorkspaces(timeoutSeconds: 10)
                 if let workspace = workspaces.first(where: { $0.workspaceID == workspaceID }),
                    let sourceID = peerPaneSummaries(workspace.hasLayout ? workspace.layout : nil)
                     .map(\.id)
@@ -249,7 +270,14 @@ extension TeamOrchestrator {
                 // socket, not that the host applied it.
                 do {
                     try await connection.session.deleteWorkspace(workspaceID: workspaceID)
+                } catch let cleanupError {
                     await connection.cancel()
+                    throw RemoteAgentError.projectDeletionIncomplete(
+                        "workspace setup failed with \(error); compensation failed with \(cleanupError)"
+                    )
+                }
+                await connection.cancel()
+                do {
                     guard try await waitForRemoteRemoval(
                         hostSockPath: host.activeSockPath,
                         workspaceID: workspaceID
@@ -259,11 +287,11 @@ extension TeamOrchestrator {
                         )
                     }
                 } catch let cleanupError {
-                    await connection.cancel()
                     throw RemoteAgentError.projectDeletionIncomplete(
                         "workspace setup failed with \(error); compensation failed with \(cleanupError)"
                     )
                 }
+                throw error
             }
             await connection.cancel()
             throw error
@@ -1839,19 +1867,20 @@ extension TeamOrchestrator {
                 let connection = try await PeerRelaySession.connect(hostSockPath: remote.socket)
                 do {
                     try await connection.session.requestClosePane(paneID: remote.surfaceID)
-                    await connection.cancel()
-                    guard try await waitForRemoteRemoval(
-                        hostSockPath: remote.socket,
-                        surfaceID: remote.surfaceID
-                    ) else {
-                        throw RemoteAgentError.projectDeletionIncomplete(
-                            "host did not confirm removal of \(label)"
-                        )
-                    }
-                    await connection.cancel()
                 } catch {
                     await connection.cancel()
                     throw error
+                }
+                // Cancelled exactly once, before confirmation: the removal
+                // poll opens its own probes.
+                await connection.cancel()
+                guard try await waitForRemoteRemoval(
+                    hostSockPath: remote.socket,
+                    surfaceID: remote.surfaceID
+                ) else {
+                    throw RemoteAgentError.projectDeletionIncomplete(
+                        "host did not confirm removal of \(label)"
+                    )
                 }
                 ManagedPeerSurfaceStore.shared.forget(
                     hostKey: remote.hostKey,
@@ -1882,19 +1911,20 @@ extension TeamOrchestrator {
                 )
                 do {
                     try await connection.session.deleteWorkspace(workspaceID: workspaceID)
-                    await connection.cancel()
-                    guard try await waitForRemoteRemoval(
-                        hostSockPath: host.activeSockPath,
-                        workspaceID: workspaceID
-                    ) else {
-                        throw RemoteAgentError.projectDeletionIncomplete(
-                            "host did not confirm removal of \(label)"
-                        )
-                    }
-                    await connection.cancel()
                 } catch {
                     await connection.cancel()
                     throw error
+                }
+                // Cancelled exactly once, before confirmation: the removal
+                // poll opens its own probes.
+                await connection.cancel()
+                guard try await waitForRemoteRemoval(
+                    hostSockPath: host.activeSockPath,
+                    workspaceID: workspaceID
+                ) else {
+                    throw RemoteAgentError.projectDeletionIncomplete(
+                        "host did not confirm removal of \(label)"
+                    )
                 }
                 forgetRemoteWorkspaceID(teamName: teamName, hostKey: hostKey)
                 deleted.append(label)
