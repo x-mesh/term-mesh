@@ -56,6 +56,13 @@ final class AgentPipeCompletion {
     }
 
     func watch(agentId: String, teamName: String, agentName: String, agentInstanceId: String? = nil) {
+        // A hard restart reuses the agent's transport id, so the events file the
+        // pane that just died left behind is indistinguishable from a live one —
+        // and a fresh watch reads it from byte 0. Every finished turn in it then
+        // replays, each `result` carrying no task to answer, and each closing
+        // whichever task happened to be newest. The file belongs to the process
+        // that writes it, so it starts empty with that process.
+        try? FileManager.default.removeItem(atPath: Self.eventsPath(agentId: agentId))
         watches[agentId] = Watch(
             teamName: teamName, agentName: agentName, agentInstanceId: agentInstanceId,
             path: Self.eventsPath(agentId: agentId)
@@ -113,10 +120,27 @@ final class AgentPipeCompletion {
             guard let handle = FileHandle(forReadingAtPath: watch.path) else { continue }
             defer { try? handle.close() }
             do {
-                try handle.seek(toOffset: watch.offset)
-                guard let chunk = try handle.readToEnd(), !chunk.isEmpty else { continue }
-                watches[agentId]?.offset = watch.offset + UInt64(chunk.count)
-                var buffer = watch.carry
+                // The file can be replaced underneath a watch: `tee` truncates
+                // it at launch and the bridge appends to whatever is there, so
+                // an offset carried over from a previous process sits past the
+                // new end. `seek` past EOF is legal and reads nothing, which
+                // left the watch permanently deaf — every real completion for
+                // the restarted agent missed. A file that shrank is a new file.
+                var offset = watch.offset
+                var carry = watch.carry
+                let end = try handle.seekToEnd()
+                if end < offset {
+                    offset = 0
+                    carry = Data()
+                }
+                try handle.seek(toOffset: offset)
+                guard let chunk = try handle.readToEnd(), !chunk.isEmpty else {
+                    watches[agentId]?.offset = offset
+                    watches[agentId]?.carry = carry
+                    continue
+                }
+                watches[agentId]?.offset = offset + UInt64(chunk.count)
+                var buffer = carry
                 buffer.append(chunk)
                 while let newline = buffer.firstIndex(of: 0x0A) {
                     let lineData = Data(buffer[buffer.startIndex..<newline])
@@ -149,11 +173,23 @@ final class AgentPipeCompletion {
         // The turn is over — that part is stated. What the agent decided is
         // still its own words, read here from a clean string.
         let event = Self.headerEvent(from: finalText)
+        // Only a turn whose task is known may close one. Without a task
+        // `AutoReplyEmit` falls back to guessing the newest open one, and that
+        // guess was measured completing work this turn had nothing to do with —
+        // a broadcast carries no `TASK_ID`, and a replayed file carries no
+        // expectation at all. The native path already refuses this; so does
+        // this one now.
+        guard let pendingTaskId = watch.pendingTaskId else {
+            #if DEBUG
+            dlog("agent.pipe.result.untracked agent=\(agentId) status=\(event.status)")
+            #endif
+            return
+        }
         AutoReplyEmit.emit(
             teamName: watch.teamName,
             agentName: watch.agentName,
             event: event,
-            preferredTaskId: watch.pendingTaskId,
+            preferredTaskId: pendingTaskId,
             agentInstanceId: watch.agentInstanceId
         )
         watches[agentId]?.pendingTaskId = nil
@@ -219,4 +255,21 @@ final class AgentPipeCompletion {
             raw: text
         )
     }
+
+    // MARK: - Testing
+
+    #if DEBUG
+    /// One read of every watched file, as the timer would do it.
+    func tickForTesting() { tick() }
+
+    /// Which task the next `result` from this agent would answer, if any.
+    func pendingTaskIdForTesting(agentId: String) -> String? {
+        watches[agentId]?.pendingTaskId
+    }
+
+    /// How far into its events file this watch has read.
+    func offsetForTesting(agentId: String) -> UInt64? {
+        watches[agentId]?.offset
+    }
+    #endif
 }

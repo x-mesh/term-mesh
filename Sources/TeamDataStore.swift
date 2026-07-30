@@ -574,6 +574,57 @@ final class TeamDataStore: ObservableObject, @unchecked Sendable {
 
     // MARK: - Tasks
 
+    /// Resolve a task assignment without guessing between duplicate agent names.
+    /// Caller must hold `lock`.
+    private func resolveAssigneeUnsafe(
+        teamName: String,
+        assignee: String?,
+        assigneeInstanceId: String?,
+        allowNameOnlyAutoPin: Bool = false
+    ) -> (assignee: String?, instanceId: String?)? {
+        let normalizedAssignee = assignee?.teamDataNilIfBlank
+        let normalizedInstanceId = assigneeInstanceId?.teamDataNilIfBlank
+        guard let normalizedAssignee else {
+            return normalizedInstanceId == nil ? (nil, nil) : nil
+        }
+        let candidates = teamRegistry[teamName, default: []].filter { $0.name == normalizedAssignee }
+        if let normalizedInstanceId {
+            guard candidates.contains(where: { $0.instanceId == normalizedInstanceId }) else { return nil }
+            return (normalizedAssignee, normalizedInstanceId)
+        }
+        if allowNameOnlyAutoPin {
+            // Picking one of several is a guess, and a guess nobody is told
+            // about is how work lands on the wrong instance and looks fine.
+            // The caller that can act on it gets `duplicateNameWarning`; this
+            // is for whoever reads the log afterwards asking why.
+            if candidates.count > 1 {
+                Logger.team.warning(
+                    "[task.assign] \(candidates.count, privacy: .public) agents named '\(normalizedAssignee, privacy: .public)' in team '\(teamName, privacy: .public)'; pinned the first. Pass agent_instance_id to choose."
+                )
+            }
+            return (normalizedAssignee, candidates.first?.instanceId)
+        }
+        guard candidates.count == 1 else { return nil }
+        return (normalizedAssignee, candidates[0].instanceId)
+    }
+
+    /// Why a name-only assignment for this team was a choice rather than a
+    /// lookup, or nil when the name is unambiguous.
+    ///
+    /// Read separately from the assignment itself so the socket layer can put
+    /// it in its answer without `updateTask` and `reassignTask` having to
+    /// change what they return — every one of their callers would otherwise
+    /// have to learn a new shape to carry a string that only two of them show.
+    func duplicateNameWarning(teamName: String, assignee: String?) -> String? {
+        guard let name = assignee?.teamDataNilIfBlank else { return nil }
+        lock.lock()
+        defer { lock.unlock() }
+        let candidates = teamRegistry[teamName, default: []].filter { $0.name == name }
+        guard candidates.count > 1 else { return nil }
+        return "\(candidates.count) agents are named '\(name)'; the first was used."
+            + " Pass agent_instance_id to pick one."
+    }
+
     @discardableResult
     func createTask(
         teamName: String,
@@ -593,14 +644,20 @@ final class TeamDataStore: ObservableObject, @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         guard teamRegistry[teamName] != nil else { return nil }
+        guard let resolvedAssignee = resolveAssigneeUnsafe(
+            teamName: teamName,
+            assignee: assignee,
+            assigneeInstanceId: assigneeInstanceId,
+            allowNameOnlyAutoPin: true
+        ) else { return nil }
         let now = Date()
-        let normalizedAssignee = assignee?.teamDataNilIfBlank
         let normalizedCreatedBy = createdBy.teamDataNilIfBlank ?? "leader"
         // Dedup dashboard-created tasks
         if normalizedCreatedBy.contains("dashboard"),
            let duplicate = taskBoards[teamName, default: []].last(where: {
                $0.title == title &&
-               $0.assignee == normalizedAssignee &&
+               $0.assignee == resolvedAssignee.assignee &&
+               $0.assigneeInstanceId == resolvedAssignee.instanceId &&
                $0.createdBy == normalizedCreatedBy &&
                now.timeIntervalSince($0.createdAt) < 5
            }) {
@@ -630,11 +687,9 @@ final class TeamDataStore: ObservableObject, @unchecked Sendable {
             acceptanceCriteria: acceptanceCriteria.compactMap(\.teamDataNilIfBlank),
             labels: labels.compactMap(\.teamDataNilIfBlank),
             estimatedSize: estimatedSize,
-            assignee: normalizedAssignee,
-            assigneeInstanceId: assigneeInstanceId ?? normalizedAssignee.flatMap { agentName in
-                teamRegistry[teamName]?.first(where: { $0.name == agentName })?.instanceId
-            },
-            status: normalizedAssignee == nil ? "queued" : "assigned",
+            assignee: resolvedAssignee.assignee,
+            assigneeInstanceId: resolvedAssignee.instanceId,
+            status: resolvedAssignee.assignee == nil ? "queued" : "assigned",
             priority: max(1, min(priority, 3)),
             dependsOn: validatedDependsOn,
             parentTaskId: parentTaskId?.teamDataNilIfBlank,
@@ -675,6 +730,7 @@ final class TeamDataStore: ObservableObject, @unchecked Sendable {
         result: String? = nil,
         resultPath: String? = nil,
         assignee: String? = nil,
+        assigneeInstanceId: String? = nil,
         blockedReason: String? = nil,
         reviewSummary: String? = nil,
         progressNote: String? = nil,
@@ -695,13 +751,27 @@ final class TeamDataStore: ObservableObject, @unchecked Sendable {
               let idx = tasks.firstIndex(where: { $0.id == taskId }) else { return nil }
         let now = Date()
         if let assignee {
-            tasks[idx].assignee = assignee.teamDataNilIfBlank
-            tasks[idx].assigneeInstanceId = tasks[idx].assignee.flatMap { agentName in
-                teamRegistry[teamName]?.first(where: { $0.name == agentName })?.instanceId
-            }
+            guard let resolvedAssignee = resolveAssigneeUnsafe(
+                teamName: teamName,
+                assignee: assignee,
+                assigneeInstanceId: assigneeInstanceId,
+                // Same contract `createTask` has always had. A name the
+                // registry does not know still assigns — agents are named
+                // before they register, and refusing here turned an ordinary
+                // `tm-agent task update` into "Task not found", which reads as
+                // the task being gone rather than the name being unfamiliar.
+                // An explicit `assigneeInstanceId` is still checked above:
+                // strictness belongs where the caller asked for a specific
+                // instance, not where it named a role.
+                allowNameOnlyAutoPin: true
+            ) else { return nil }
+            tasks[idx].assignee = resolvedAssignee.assignee
+            tasks[idx].assigneeInstanceId = resolvedAssignee.instanceId
             if tasks[idx].status == "queued", tasks[idx].assignee != nil {
                 tasks[idx].status = "assigned"
             }
+        } else if let assigneeInstanceId = assigneeInstanceId?.teamDataNilIfBlank {
+            guard tasks[idx].assigneeInstanceId == assigneeInstanceId else { return nil }
         }
         if let blockedReason {
             tasks[idx].blockedReason = blockedReason.teamDataNilIfBlank
@@ -782,24 +852,39 @@ final class TeamDataStore: ObservableObject, @unchecked Sendable {
     }
 
     @discardableResult
-    func reassignTask(teamName: String, taskId: String, assignee: String?) -> TeamOrchestrator.TeamTask? {
+    func reassignTask(
+        teamName: String,
+        taskId: String,
+        assignee: String?,
+        assigneeInstanceId: String? = nil
+    ) -> TeamOrchestrator.TeamTask? {
         lock.lock()
         defer { lock.unlock() }
         guard var tasks = taskBoards[teamName],
               let idx = tasks.firstIndex(where: { $0.id == taskId }) else { return nil }
+        guard let resolvedAssignee = resolveAssigneeUnsafe(
+            teamName: teamName,
+            assignee: assignee,
+            assigneeInstanceId: assigneeInstanceId,
+            // As above. Rejecting a review sends the work back by name — that
+            // is all the Reject button has — so refusing an unregistered or
+            // duplicated name made the reassignment fail silently and left the
+            // task sitting in the review queue it had just been rejected from.
+            allowNameOnlyAutoPin: true
+        ) else { return nil }
         let now = Date()
         let previousAssignee = tasks[idx].assignee
-        tasks[idx].assignee = assignee?.teamDataNilIfBlank
-        tasks[idx].assigneeInstanceId = tasks[idx].assignee.flatMap { agentName in
-            teamRegistry[teamName]?.first(where: { $0.name == agentName })?.instanceId
-        }
+        let previousAssigneeInstanceId = tasks[idx].assigneeInstanceId
+        tasks[idx].assignee = resolvedAssignee.assignee
+        tasks[idx].assigneeInstanceId = resolvedAssignee.instanceId
         tasks[idx].status = tasks[idx].assignee == nil ? "queued" : "assigned"
         tasks[idx].blockedReason = nil
         tasks[idx].reviewSummary = nil
         tasks[idx].completedAt = nil
         tasks[idx].updatedAt = now
         tasks[idx].lastProgressAt = now
-        if previousAssignee != tasks[idx].assignee {
+        if previousAssignee != tasks[idx].assignee
+            || previousAssigneeInstanceId != tasks[idx].assigneeInstanceId {
             tasks[idx].reassignmentCount += 1
         }
         taskBoards[teamName] = tasks

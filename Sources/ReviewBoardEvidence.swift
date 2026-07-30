@@ -87,11 +87,35 @@ enum ReviewBoardEvidence {
                   !headSHA.isEmpty, !baseSHA.isEmpty, digest.hasPrefix("sha256:") else {
                 return nil
             }
+            let patch = object["patch"] as? String ?? ""
+            let truncated = object["truncated"] as? Bool ?? false
+            // A digest nobody can check is a digest that proves nothing. When
+            // the peer sent the whole patch, this side holds the bytes it
+            // claims to have hashed, so hash them and compare: approving
+            // evidence that describes something other than the diff on screen
+            // is exactly what the digest exists to prevent.
+            //
+            // Only when untruncated. An excerpt cannot reproduce a digest taken
+            // over the full patch, and refusing those would refuse every large
+            // review — the case the excerpt exists for.
+            //
+            // This is deliberately fail-closed, and it narrows one case. The
+            // peer hashes raw `git diff` bytes but sends the patch as a JSON
+            // string, so a patch that is not valid UTF-8 — a file in another
+            // encoding — arrives lossily decoded and can no longer reproduce
+            // its own digest. Such a review stops being approvable from the
+            // board and has to be read and approved by hand. That is the right
+            // way round: the alternative is skipping the check whenever the
+            // bytes look lossy, which anyone sending a patch could arrange.
+            if !truncated,
+               ReviewBoardEvidence.digest(forPatch: Data(patch.utf8)) != digest {
+                return nil
+            }
             self.headSHA = headSHA
             self.baseSHA = baseSHA
             self.digest = digest
-            text = object["patch"] as? String ?? ""
-            isTruncated = object["truncated"] as? Bool ?? false
+            text = patch
+            isTruncated = truncated
             files = ReviewBoardEvidence.summarize(
                 numstat: object["numstat"] as? String ?? "",
                 nameStatus: object["name_status"] as? String ?? ""

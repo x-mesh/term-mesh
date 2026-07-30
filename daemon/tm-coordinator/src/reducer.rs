@@ -855,6 +855,22 @@ impl Reducer {
 
     fn reduce_review_snapshot_recorded(&self, event: &IntentEvent) -> Result<()> {
         let snapshot: ReviewSnapshot = serde_json::from_value(event.payload.clone())?;
+        // Recording a snapshot moves the task to `review_ready`, and that has to
+        // obey the same state machine every other reduction here checks. It did
+        // not, and a terminal task was therefore not terminal: a `merged` task
+        // still has its `current_attempt_id` and an unexpired fence, so the same
+        // holder could record a second snapshot, land back in `review_ready` and
+        // be approved again — two merge-queue rows for one piece of work, which
+        // is precisely what `Merged | Failed | Cancelled -> _` exists to stop.
+        let task = self
+            .task(&snapshot.task_id)?
+            .ok_or_else(|| anyhow::anyhow!("task not found"))?;
+        if !task.status.can_transition_to(&TaskStatus::ReviewReady) {
+            bail!(
+                "invalid task transition {:?} -> review_ready",
+                task.status
+            );
+        }
         self.conn.execute(
             "INSERT OR IGNORE INTO review_snapshots(snapshot_id,task_id,attempt_id,base_sha,head_sha,diff_digest,summary,files_json,created_at_ms)
              VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",
@@ -1261,4 +1277,141 @@ fn status_string<T: serde::Serialize>(value: &T) -> Result<String> {
 
 fn to_sql_err<E: std::fmt::Display>(err: E) -> rusqlite::Error {
     rusqlite::Error::ToSqlConversionFailure(err.to_string().into())
+}
+
+#[cfg(test)]
+mod review_ready_transition_tests {
+    use super::*;
+    use crate::model::ReviewSnapshotId;
+
+    fn reducer_with_task() -> (Reducer, ProjectId, TaskId) {
+        let reducer = Reducer::in_memory().unwrap();
+        let project_id = ProjectId::new_random();
+        let task_id = TaskId::new_random();
+        reducer
+            .apply(&IntentEvent::new(
+                "project_added",
+                Some("project".to_string()),
+                Some(project_id.clone()),
+                serde_json::json!({"root_path": "/tmp/repo", "name": "repo"}),
+            ))
+            .unwrap();
+        reducer
+            .apply(&IntentEvent::new(
+                "task_created",
+                Some("task".to_string()),
+                Some(project_id.clone()),
+                serde_json::json!({"task_id": task_id, "title": "slice", "body": ""}),
+            ))
+            .unwrap();
+        (reducer, project_id, task_id)
+    }
+
+    fn move_task(reducer: &Reducer, task_id: &TaskId, request_id: &str, status: &str) {
+        reducer
+            .apply(&IntentEvent::new(
+                "task_status_changed",
+                Some(request_id.to_string()),
+                None,
+                serde_json::json!({"task_id": task_id, "status": status}),
+            ))
+            .unwrap();
+    }
+
+    fn snapshot_event(task_id: &TaskId, request_id: &str, head_sha: &str) -> IntentEvent {
+        IntentEvent::new(
+            "review_snapshot_recorded",
+            Some(request_id.to_string()),
+            None,
+            serde_json::json!({
+                "snapshot_id": ReviewSnapshotId::new_random(),
+                "task_id": task_id,
+                "attempt_id": AttemptId::new_random(),
+                "base_sha": "base",
+                "head_sha": head_sha,
+                "diff_digest": "sha256:aa",
+                "summary": "",
+                "files": [],
+                "created_at_ms": 1_u64
+            }),
+        )
+    }
+
+    fn status_of(reducer: &Reducer, task_id: &TaskId) -> TaskStatus {
+        reducer.task(task_id).unwrap().expect("task").status
+    }
+
+    /// A terminal task must stay terminal. `merged` still carries its
+    /// `current_attempt_id` and an unexpired fence, so the holder could record a
+    /// second snapshot, return to `review_ready` and be approved again — two
+    /// merge-queue rows for one piece of work.
+    #[test]
+    fn a_merged_task_refuses_a_second_review_snapshot() {
+        let (reducer, _project_id, task_id) = reducer_with_task();
+        move_task(&reducer, &task_id, "placed", "placed");
+        move_task(&reducer, &task_id, "review", "review_ready");
+        move_task(&reducer, &task_id, "approved", "approved");
+        move_task(&reducer, &task_id, "merged", "merged");
+        assert_eq!(status_of(&reducer, &task_id), TaskStatus::Merged);
+
+        let error = reducer
+            .apply(&snapshot_event(&task_id, "snapshot-after-merge", "head2"))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("invalid task transition") && error.contains("review_ready"),
+            "{error}"
+        );
+        // Rejected as a whole: `apply` is transactional, so neither the task nor
+        // the snapshot row may survive a refused reduction.
+        assert_eq!(status_of(&reducer, &task_id), TaskStatus::Merged);
+        assert!(reducer
+            .latest_review_snapshot(&task_id)
+            .unwrap()
+            .is_none());
+    }
+
+    /// The other terminal states close the same door.
+    #[test]
+    fn failed_and_cancelled_tasks_refuse_a_review_snapshot() {
+        for (index, terminal) in ["failed", "cancelled"].into_iter().enumerate() {
+            let (reducer, _project_id, task_id) = reducer_with_task();
+            move_task(&reducer, &task_id, "placed", "placed");
+            move_task(&reducer, &task_id, "running", "in_progress");
+            move_task(&reducer, &task_id, "terminal", terminal);
+
+            let error = reducer
+                .apply(&snapshot_event(&task_id, &format!("snap-{index}"), "head"))
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("invalid task transition"), "{terminal}: {error}");
+        }
+    }
+
+    /// The legal path is untouched: a placed task still reaches `review_ready`,
+    /// and a repeat snapshot on a task already there stays legal (the status
+    /// machine lets a state repeat).
+    #[test]
+    fn a_placed_task_still_records_a_snapshot() {
+        let (reducer, _project_id, task_id) = reducer_with_task();
+        move_task(&reducer, &task_id, "placed", "placed");
+
+        reducer
+            .apply(&snapshot_event(&task_id, "first", "head"))
+            .unwrap();
+        assert_eq!(status_of(&reducer, &task_id), TaskStatus::ReviewReady);
+        assert_eq!(
+            reducer
+                .latest_review_snapshot(&task_id)
+                .unwrap()
+                .expect("snapshot")
+                .head_sha,
+            "head"
+        );
+
+        reducer
+            .apply(&snapshot_event(&task_id, "second", "head2"))
+            .unwrap();
+        assert_eq!(status_of(&reducer, &task_id), TaskStatus::ReviewReady);
+    }
 }

@@ -252,6 +252,16 @@
 				F8000000A1B2C3D4E5F60718 /* IMESendKeyTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = F8000001A1B2C3D4E5F60718 /* IMESendKeyTests.swift */; };
 				F9000000A1B2C3D4E5F60718 /* AutoReplyDetectorTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = F9000001A1B2C3D4E5F60718 /* AutoReplyDetectorTests.swift */; };
 		APCT000000000000000003 /* AgentPipeCompletionTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = APCT000000000000000006 /* AgentPipeCompletionTests.swift */; };
+		RB169000000000000003 /* ReviewBoardMergeSafetyRegression169Tests.swift in Sources */ = {isa = PBXBuildFile; fileRef = RB169000000000000006 /* ReviewBoardMergeSafetyRegression169Tests.swift */; };
+		AP169000000000000003 /* AgentPaneRegression169Tests.swift in Sources */ = {isa = PBXBuildFile; fileRef = AP169000000000000006 /* AgentPaneRegression169Tests.swift */; };
+		IR169000000000000003 /* InstanceRoutingRegression169Tests.swift in Sources */ = {isa = PBXBuildFile; fileRef = IR169000000000000006 /* InstanceRoutingRegression169Tests.swift */; };
+		RL169000000000000003 /* RemoteLaunchCompensationRegression169Tests.swift in Sources */ = {isa = PBXBuildFile; fileRef = RL169000000000000006 /* RemoteLaunchCompensationRegression169Tests.swift */; };
+		WD169000000000000003 /* WatchDriftRoutingTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = WD169000000000000006 /* WatchDriftRoutingTests.swift */; };
+		RE169000000000000003 /* ReviewBoardEvidenceHardeningRegression169Tests.swift in Sources */ = {isa = PBXBuildFile; fileRef = RE169000000000000006 /* ReviewBoardEvidenceHardeningRegression169Tests.swift */; };
+		IC169000000000000003 /* InstanceRoutingCompatRegression169Tests.swift in Sources */ = {isa = PBXBuildFile; fileRef = IC169000000000000006 /* InstanceRoutingCompatRegression169Tests.swift */; };
+		AT169000000000000003 /* AgentTransportHardeningRegression169Tests.swift in Sources */ = {isa = PBXBuildFile; fileRef = AT169000000000000006 /* AgentTransportHardeningRegression169Tests.swift */; };
+		PB169000000000000003 /* ProjectBootstrapTransactionRegression169Tests.swift in Sources */ = {isa = PBXBuildFile; fileRef = PB169000000000000006 /* ProjectBootstrapTransactionRegression169Tests.swift */; };
+		PW169000000000000003 /* PipeWriteDeadlineRegression169Tests.swift in Sources */ = {isa = PBXBuildFile; fileRef = PW169000000000000006 /* PipeWriteDeadlineRegression169Tests.swift */; };
 		A5009020 /* AgentSessionTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A5009021 /* AgentSessionTests.swift */; };
 		A5009040 /* WorktreeApprovalHelperTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A5009041 /* WorktreeApprovalHelperTests.swift */; };
 				F9000010A1B2C3D4E5F60718 /* WorkspaceRetrievalDirectoryTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = F9000011A1B2C3D4E5F60718 /* WorkspaceRetrievalDirectoryTests.swift */; };
@@ -564,6 +574,16 @@
 			F8000001A1B2C3D4E5F60718 /* IMESendKeyTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = IMESendKeyTests.swift; sourceTree = "<group>"; };
 			F9000001A1B2C3D4E5F60718 /* AutoReplyDetectorTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AutoReplyDetectorTests.swift; sourceTree = "<group>"; };
 			APCT000000000000000006 /* AgentPipeCompletionTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AgentPipeCompletionTests.swift; sourceTree = "<group>"; };
+		RB169000000000000006 /* ReviewBoardMergeSafetyRegression169Tests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ReviewBoardMergeSafetyRegression169Tests.swift; sourceTree = "<group>"; };
+		AP169000000000000006 /* AgentPaneRegression169Tests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AgentPaneRegression169Tests.swift; sourceTree = "<group>"; };
+		IR169000000000000006 /* InstanceRoutingRegression169Tests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = InstanceRoutingRegression169Tests.swift; sourceTree = "<group>"; };
+		RL169000000000000006 /* RemoteLaunchCompensationRegression169Tests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RemoteLaunchCompensationRegression169Tests.swift; sourceTree = "<group>"; };
+		WD169000000000000006 /* WatchDriftRoutingTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WatchDriftRoutingTests.swift; sourceTree = "<group>"; };
+		RE169000000000000006 /* ReviewBoardEvidenceHardeningRegression169Tests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ReviewBoardEvidenceHardeningRegression169Tests.swift; sourceTree = "<group>"; };
+		IC169000000000000006 /* InstanceRoutingCompatRegression169Tests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = InstanceRoutingCompatRegression169Tests.swift; sourceTree = "<group>"; };
+		AT169000000000000006 /* AgentTransportHardeningRegression169Tests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AgentTransportHardeningRegression169Tests.swift; sourceTree = "<group>"; };
+		PB169000000000000006 /* ProjectBootstrapTransactionRegression169Tests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ProjectBootstrapTransactionRegression169Tests.swift; sourceTree = "<group>"; };
+		PW169000000000000006 /* PipeWriteDeadlineRegression169Tests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PipeWriteDeadlineRegression169Tests.swift; sourceTree = "<group>"; };
 		A5009021 /* AgentSessionTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AgentSessionTests.swift; sourceTree = "<group>"; };
 		A5009041 /* WorktreeApprovalHelperTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WorktreeApprovalHelperTests.swift; sourceTree = "<group>"; };
 			F9000011A1B2C3D4E5F60718 /* WorkspaceRetrievalDirectoryTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WorkspaceRetrievalDirectoryTests.swift; sourceTree = "<group>"; };
@@ -931,6 +951,16 @@ A1740000000000000000000C /* ProcessRun.swift */,
 				F8000001A1B2C3D4E5F60718 /* IMESendKeyTests.swift */,
 				F9000001A1B2C3D4E5F60718 /* AutoReplyDetectorTests.swift */,
 				APCT000000000000000006 /* AgentPipeCompletionTests.swift */,
+				RB169000000000000006 /* ReviewBoardMergeSafetyRegression169Tests.swift */,
+				AP169000000000000006 /* AgentPaneRegression169Tests.swift */,
+				IR169000000000000006 /* InstanceRoutingRegression169Tests.swift */,
+				RL169000000000000006 /* RemoteLaunchCompensationRegression169Tests.swift */,
+				WD169000000000000006 /* WatchDriftRoutingTests.swift */,
+				RE169000000000000006 /* ReviewBoardEvidenceHardeningRegression169Tests.swift */,
+				IC169000000000000006 /* InstanceRoutingCompatRegression169Tests.swift */,
+				AT169000000000000006 /* AgentTransportHardeningRegression169Tests.swift */,
+				PB169000000000000006 /* ProjectBootstrapTransactionRegression169Tests.swift */,
+				PW169000000000000006 /* PipeWriteDeadlineRegression169Tests.swift */,
 				A5009021 /* AgentSessionTests.swift */,
 				A5009041 /* WorktreeApprovalHelperTests.swift */,
 				F9000011A1B2C3D4E5F60718 /* WorkspaceRetrievalDirectoryTests.swift */,
@@ -1328,6 +1358,16 @@ A1740000000000000000000B /* ProcessRun.swift in Sources */,
 				F8000000A1B2C3D4E5F60718 /* IMESendKeyTests.swift in Sources */,
 				F9000000A1B2C3D4E5F60718 /* AutoReplyDetectorTests.swift in Sources */,
 				APCT000000000000000003 /* AgentPipeCompletionTests.swift in Sources */,
+				RB169000000000000003 /* ReviewBoardMergeSafetyRegression169Tests.swift in Sources */,
+				AP169000000000000003 /* AgentPaneRegression169Tests.swift in Sources */,
+				IR169000000000000003 /* InstanceRoutingRegression169Tests.swift in Sources */,
+				RL169000000000000003 /* RemoteLaunchCompensationRegression169Tests.swift in Sources */,
+				WD169000000000000003 /* WatchDriftRoutingTests.swift in Sources */,
+				RE169000000000000003 /* ReviewBoardEvidenceHardeningRegression169Tests.swift in Sources */,
+				IC169000000000000003 /* InstanceRoutingCompatRegression169Tests.swift in Sources */,
+				AT169000000000000003 /* AgentTransportHardeningRegression169Tests.swift in Sources */,
+				PB169000000000000003 /* ProjectBootstrapTransactionRegression169Tests.swift in Sources */,
+				PW169000000000000003 /* PipeWriteDeadlineRegression169Tests.swift in Sources */,
 				A5009020 /* AgentSessionTests.swift in Sources */,
 				A5009040 /* WorktreeApprovalHelperTests.swift in Sources */,
 				F9000010A1B2C3D4E5F60718 /* WorkspaceRetrievalDirectoryTests.swift in Sources */,

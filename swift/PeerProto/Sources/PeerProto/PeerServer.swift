@@ -188,8 +188,9 @@ public protocol PeerSurfaceProvider: AnyObject, Sendable {
     /// panes are arranged — so a client asking "where does this project's
     /// leader sit" has no other way to find out. Read-only: no command
     /// crosses this call. Gated behind capability "team.roster.v1"; the
-    /// default empty list is what a provider with no teams reports, and
-    /// such a host never advertises the capability.
+    /// default empty list is what a provider with no teams reports. Team
+    /// capabilities describe server support and remain advertised even when
+    /// this snapshot is empty.
     func listTeams() async -> [Termmesh_Peer_V1_Team]
 
     /// Run one allow-listed `team.*` method and return its JSON result.
@@ -1157,23 +1158,16 @@ actor PeerServerSession {
             }
             clientCapabilities = PeerCapabilities(clientHello.capabilities)
             clientPeerID = clientHello.peerID
-            // Only a provider that can actually answer ListTeams advertises
-            // the roster capability — otherwise the flag invites a question
-            // this host cannot answer. Resolved before building the Hello,
-            // since the envelope builder is synchronous.
+            // Capabilities describe implemented protocol support, not whether
+            // the current team roster happens to contain any rows.
             //
-            // Leader bootstrap is deliberately not in that set. Standing up a
-            // leader is what one does on a host that has no teams yet, so
-            // gating it on having one is a deadlock: no capability, so no
-            // leader; no leader, so never a team. A host that reached this
-            // point can host a leader whether or not it is hosting one now.
-            let rosterCapabilities = [
-                PeerCapability.teamRosterV1,
-                PeerCapability.teamCallV1,
-            ]
-            let advertisedCapabilities = await provider.listTeams().isEmpty
-                ? PeerCapability.supported.filter { !rosterCapabilities.contains($0) }
-                : PeerCapability.supported
+            // Gating them on a non-empty roster deadlocked the one flow they
+            // exist for: standing up a leader is what one does on a host that
+            // has no teams yet, so the client refused to bootstrap because the
+            // host advertised nothing, and the host had nothing to advertise
+            // because no leader had been bootstrapped. Observed as a project
+            // that never finished creating on a peer whose team list was empty.
+            let advertisedCapabilities = PeerCapability.supported
             try await sendEnvelope { env in
                 var h = Termmesh_Peer_V1_Hello()
                 h.protocolVersion = self.config.protocolVersion

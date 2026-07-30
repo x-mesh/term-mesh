@@ -1010,6 +1010,7 @@ extension TeamOrchestrator {
             hostKey: hostKey
         )
         let workingDirectory: String
+        var isolatedCheckout: String?
         if team.remoteProjectLocations.contains(
             .init(hostKey: hostKey, path: requestedDirectory)
         ) {
@@ -1020,15 +1021,33 @@ extension TeamOrchestrator {
                 requestedDirectory: requestedDirectory
             )
             workingDirectory = isolated.path
-            var locations = team.remoteProjectLocations
-            locations.append(.init(hostKey: hostKey, path: isolated.path))
+            isolatedCheckout = isolated.path
+        } else {
+            workingDirectory = requestedDirectory
+        }
+
+        func recordIsolatedCheckout() {
+            guard let path = isolatedCheckout else { return }
+            var locations = teams[teamName]?.remoteProjectLocations ?? []
+            let location = Team.RemoteProjectLocation(hostKey: hostKey, path: path)
+            if !locations.contains(location) {
+                locations.append(location)
+            }
             recordRemoteProjectLocations(
                 teamName: teamName,
                 locations: locations.sorted { ($0.hostKey, $0.path) < ($1.hostKey, $1.path) }
             )
-        } else {
-            workingDirectory = requestedDirectory
         }
+
+        // Captured for the launch task below, which outlives this call and so
+        // reads plain values rather than the local `var` and the host entry.
+        let createdCheckout = isolatedCheckout
+        let hostName = host.displayName
+        let hostSSHTarget = host.sshTarget
+        let hostSSHPort = host.sshPort
+        let hostIdentityFile = host.identityFile
+
+        do {
 
         // Use the same incremental grid growth as local `add`/`attach`.
         let placement = nextAgentSplitPlacement(team: team, workspace: workspace)
@@ -1039,7 +1058,7 @@ extension TeamOrchestrator {
         // channel, so it keeps the terminal relay path below.
         if AgentPipeTransport.canHoldNatively(cli: cli),
            let sshTarget = host.sshTarget, !sshTarget.isEmpty {
-            return try attachRemoteNativeAgent(
+            let member = try attachRemoteNativeAgent(
                 team: team,
                 workspace: workspace,
                 tabManager: tabManager,
@@ -1053,6 +1072,8 @@ extension TeamOrchestrator {
                 model: model,
                 cli: cli
             )
+            recordIsolatedCheckout()
+            return member
         }
 
         let registry = PeerPaneHostRegistry.shared
@@ -1229,11 +1250,113 @@ extension TeamOrchestrator {
                 text: command,
                 tabManager: tabManager,
                 withReturn: true,
-                recordPendingReturnFor: agentName
+                recordPendingReturnFor: agentName,
+                // The launch line is the last thing this attach owes the agent,
+                // and it is typed after the function has already returned — so
+                // a failure here lands outside the `catch` below, which is how
+                // a checkout made for an agent that never started was left on
+                // the peer with a location record still pointing at it.
+                //
+                // Only a *reported* failure compensates. `sendTextToPanel`
+                // answers `false` synchronously on its first miss and then
+                // retries; it calls back with `false` only once it has given
+                // up finding the pane, which means the line was never typed.
+                completion: { delivered in
+                    guard !delivered else { return }
+                    Task { @MainActor in
+                        await self.abandonIsolatedRemoteCheckout(
+                            teamName: teamName,
+                            hostKey: hostKey,
+                            agentName: agentName,
+                            hostName: hostName,
+                            sshTarget: hostSSHTarget,
+                            sshPort: hostSSHPort,
+                            identityFile: hostIdentityFile,
+                            path: createdCheckout,
+                            reason: "its pane was gone before the launch line could be typed"
+                        )
+                    }
+                }
             )
         }
 
+        recordIsolatedCheckout()
         return member
+        } catch {
+            await abandonIsolatedRemoteCheckout(
+                teamName: teamName,
+                hostKey: hostKey,
+                agentName: agentName,
+                hostName: host.displayName,
+                sshTarget: host.sshTarget,
+                sshPort: host.sshPort,
+                identityFile: host.identityFile,
+                path: isolatedCheckout,
+                reason: error.localizedDescription
+            )
+            throw error
+        }
+    }
+
+    /// Give back a checkout this attach made, when the agent it was made for
+    /// never started.
+    ///
+    /// Two callers, one order, and the order is the point. The location record
+    /// goes first because `reapDetachedAgentWorktree` gates on it: with the
+    /// record gone, detaching the half-attached member later cannot reap the
+    /// same path a second time. Then the reap itself, which is best effort by
+    /// design — the remote script refuses anything that is not a clean linked
+    /// worktree, so a checkout that did get used is kept rather than deleted.
+    ///
+    /// `path` is nil whenever this attach did not create a checkout, which is
+    /// the case that matters most: a directory the caller named, or one
+    /// another member already owns, is never reaped by a failure here.
+    @MainActor
+    private func abandonIsolatedRemoteCheckout(
+        teamName: String,
+        hostKey: String,
+        agentName: String,
+        hostName: String,
+        sshTarget: String?,
+        sshPort: Int?,
+        identityFile: String?,
+        path: String?,
+        reason: String
+    ) async {
+        guard let path else { return }
+        if let locations = teams[teamName]?.remoteProjectLocations {
+            let remaining = Self.remoteProjectLocations(
+                locations, abandoning: path, onHost: hostKey
+            )
+            if remaining.count != locations.count {
+                recordRemoteProjectLocations(teamName: teamName, locations: remaining)
+            }
+        }
+        guard let sshTarget, !sshTarget.isEmpty else { return }
+        RemoteWorkLog.info(
+            "\(agentName) never started on \(hostName) (\(reason)); "
+                + "reclaiming \(path) (kept if it held uncommitted work)."
+        )
+        await PeerProjectBootstrap.reapWorktree(
+            sshTarget: sshTarget,
+            port: sshPort,
+            identityFile: identityFile,
+            path: path
+        )
+    }
+
+    /// The team's locations with one checkout's entry taken out.
+    ///
+    /// Matched on host *and* path together: two machines routinely lay a
+    /// project out at the same path, and dropping every entry with that path
+    /// would disarm the detach-time reap for a member on another host that is
+    /// still running.
+    nonisolated static func remoteProjectLocations(
+        _ locations: [Team.RemoteProjectLocation],
+        abandoning path: String,
+        onHost hostKey: String
+    ) -> [Team.RemoteProjectLocation] {
+        locations.filter { !($0.hostKey == hostKey && $0.path == path) }
     }
 
     @MainActor
@@ -2204,30 +2327,31 @@ extension TeamOrchestrator {
         // IS_SANDBOX or proxy reaches a typed launch.
         let assignments = PeerHostEnvironment.inlineAssignments(environment)
         let envPrefix = assignments.isEmpty ? "" : assignments + " "
+        let quotedModel = shellQuoted(model)
         switch cli {
         case "claude":
             guard let systemPromptFile else {
-                return "\(enter) && \(envPrefix)claude --model \(model) --dangerously-skip-permissions"
+                return "\(enter) && \(envPrefix)claude --model \(quotedModel) --dangerously-skip-permissions"
             }
             let quotedFile = shellQuoted(systemPromptFile)
             return "\(enter) && TERMMESH_LEADER_PROMPT=$(cat \(quotedFile))"
                 + " && rm -f \(quotedFile)"
-                + " && \(envPrefix)claude --model \(model)"
+                + " && \(envPrefix)claude --model \(quotedModel)"
                 + " --system-prompt \"$TERMMESH_LEADER_PROMPT\""
                 + " --dangerously-skip-permissions"
         case "codex", "kiro", "gemini":
             guard let systemPromptFile else {
-                return "\(enter) && \(envPrefix)\(cli) --model \(model)"
+                return "\(enter) && \(envPrefix)\(cli) --model \(quotedModel)"
             }
             let directive = LeaderParallelPolicy.launchDirective(promptFile: systemPromptFile)
             switch cli {
             case "kiro":
-                return "\(enter) && \(envPrefix)kiro chat --model \(model) \(shellQuoted(directive))"
+                return "\(enter) && \(envPrefix)kiro chat --model \(quotedModel) \(shellQuoted(directive))"
             default:
-                return "\(enter) && \(envPrefix)\(cli) --model \(model) \(shellQuoted(directive))"
+                return "\(enter) && \(envPrefix)\(cli) --model \(quotedModel) \(shellQuoted(directive))"
             }
         default:
-            return "\(enter) && \(envPrefix)\(cli) --model \(model)"
+            return "\(enter) && \(envPrefix)\(cli) --model \(quotedModel)"
         }
     }
 

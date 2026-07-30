@@ -721,9 +721,13 @@ final class PeerServerTests: XCTestCase {
         XCTAssertEqual(teams[0].projectRoot, "/Users/x/work/demo")
     }
 
-    /// A host with no teams must not advertise the capability, or a client
-    /// would ask a question it cannot usefully answer.
-    func testHostWithoutTeamsDoesNotAdvertiseRoster() async throws {
+    /// Capabilities describe server support, independent of the current roster.
+    ///
+    /// Leader bootstrap is the one that made this concrete: it is only ever
+    /// used from a host that has no teams yet, so gating it on having one was
+    /// a deadlock — no capability, so no leader; no leader, so never a team.
+    /// Observed as a project that never finished creating on an empty peer.
+    func testHostWithoutTeamsAdvertisesTeamCapabilities() async throws {
         let sockPath = "/tmp/tm-peer-swift-noteams-\(UUID().uuidString.prefix(8)).sock"
         defer { try? FileManager.default.removeItem(atPath: sockPath) }
 
@@ -743,38 +747,8 @@ final class PeerServerTests: XCTestCase {
             write: { try await transport.write($0) }
         )
         let hello = try await session.handshake()
-        XCTAssertFalse(hello.hasHostCapability(PeerCapability.teamRosterV1))
-        XCTAssertFalse(hello.hasHostCapability(PeerCapability.teamCallV1))
-    }
-
-    /// Leader bootstrap must be offered by a host with no teams, because that
-    /// is the only state it is ever used from.
-    ///
-    /// Gating it alongside the roster capabilities deadlocked the one flow it
-    /// exists for: the client refused to bootstrap because the host advertised
-    /// nothing, and the host had nothing to advertise because no leader had
-    /// been bootstrapped. Observed as a project that never finished creating
-    /// on a peer whose team list happened to be empty.
-    func testHostWithoutTeamsStillAdvertisesLeaderBootstrap() async throws {
-        let sockPath = "/tmp/tm-peer-swift-leadercap-\(UUID().uuidString.prefix(8)).sock"
-        defer { try? FileManager.default.removeItem(atPath: sockPath) }
-
-        let server = PeerServer(socketPath: sockPath, provider: TeamRosterProvider(teams: []))
-        try await server.start()
-        defer { Task { await server.stop() } }
-
-        let deadline = Date().addingTimeInterval(2)
-        while !FileManager.default.fileExists(atPath: sockPath) {
-            if Date() > deadline { return XCTFail("no socket") }
-            try await Task.sleep(nanoseconds: 50_000_000)
-        }
-
-        let transport = try await UnixSocketTransport.connect(socketPath: sockPath)
-        let session = PeerSession(
-            read: { try await transport.read() },
-            write: { try await transport.write($0) }
-        )
-        let hello = try await session.handshake()
+        XCTAssertTrue(hello.hasHostCapability(PeerCapability.teamRosterV1))
+        XCTAssertTrue(hello.hasHostCapability(PeerCapability.teamCallV1))
         XCTAssertTrue(
             hello.hasHostCapability(PeerCapability.teamLeaderV1),
             "an empty host must still accept a leader, or no team can ever start there"

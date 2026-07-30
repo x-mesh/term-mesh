@@ -1,3 +1,4 @@
+import CryptoKit
 import Foundation
 
 /// What auto pilot is allowed to do without a person watching.
@@ -190,7 +191,7 @@ extension AutoPilotPolicy {
 /// Recorded before the merge, not after — a merge that fails halfway is
 /// exactly when this is needed, and by then there is no ceiling SHA left to
 /// read.
-struct AutoPilotUndoPoint: Equatable, Codable {
+struct AutoPilotUndoPoint: Equatable, Codable, Identifiable {
     let branch: String
     let sha: String
     /// The target branch tip immediately after the automatic merge. Existing
@@ -214,6 +215,21 @@ struct AutoPilotUndoPoint: Equatable, Codable {
         self.taskID = taskID
         self.repositoryPath = repositoryPath
         self.recordedAtMS = recordedAtMS
+    }
+
+    /// Distinct per recorded point, which `sha` alone is not.
+    ///
+    /// `sha` is where the branch stood *before* the merge, and a merge that
+    /// failed leaves it standing there — so the next entry for the same branch
+    /// records the same value. Two rows under one id is a list that draws one
+    /// of them wrong.
+    ///
+    /// Not `Codable`: it is derived, and writing it would put a field in the
+    /// journal that older builds would then have to ignore.
+    var id: String { "\(taskID)|\(sha)|\(recordedAtMS)" }
+
+    private enum CodingKeys: String, CodingKey {
+        case branch, sha, mergedSHA, taskID, repositoryPath, recordedAtMS
     }
 
     /// What a person runs to put the branch back. Spelled out rather than
@@ -245,7 +261,41 @@ final class AutoPilotJournal<Entry: Codable & Equatable> {
     convenience init(teamName: String, kind: String, limit: Int = 50) {
         let base = FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent(".term-mesh/autopilot", isDirectory: true)
-        self.init(url: base.appendingPathComponent("\(teamName)-\(kind).json"), limit: limit)
+        self.init(
+            url: base.appendingPathComponent("\(Self.fileSlug(teamName))-\(kind).json"),
+            limit: limit
+        )
+    }
+
+    /// A team name reduced to one path component.
+    ///
+    /// The name reaches here having been through `safeLabel`, which rewrites
+    /// long tokens and clips — and leaves `/` and `..` exactly as they were,
+    /// because it is written for something a person reads, not for a filename.
+    /// `appendingPathComponent` does not normalise either, so a team or project
+    /// called `../../foo` put this journal wherever that resolved to.
+    ///
+    /// Anything outside a conservative set becomes `_`, and a name that is not
+    /// a plain component after that — empty, all dots — is replaced by a hash
+    /// of the original. Hashing only the awkward cases keeps the common file
+    /// name readable, which is the whole reason it carries the team name.
+    static func fileSlug(_ teamName: String) -> String {
+        let allowed = CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "-_ "))
+        let mapped = String(teamName.unicodeScalars.map { allowed.contains($0) ? Character($0) : "_" })
+        let trimmed = mapped.trimmingCharacters(in: .whitespaces)
+        // `.` never survives the mapping above, so `.`/`..` cannot appear here;
+        // what is left to reject is a name that mapped to nothing usable.
+        guard !trimmed.isEmpty, trimmed.count <= 64 else {
+            return "team-" + stableHash(teamName)
+        }
+        return trimmed
+    }
+
+    private static func stableHash(_ value: String) -> String {
+        SHA256.hash(data: Data(value.utf8))
+            .prefix(8)
+            .map { String(format: "%02x", $0) }
+            .joined()
     }
 
     func record(_ entry: Entry) {

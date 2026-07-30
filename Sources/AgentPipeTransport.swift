@@ -362,6 +362,101 @@ enum AgentPipeTransport {
     /// returns, and the caller — holding the FIFO fd open — never does either.
     private static let pipeWriteTimeout: TimeInterval = 5
 
+    enum WriteAttempt: Equatable {
+        case written(Int)
+        case interrupted
+        case wouldBlock
+        case failed(Int32)
+    }
+
+    /// One line onto the pipe, whole — or bounded and ended honestly.
+    ///
+    /// Two properties have to hold at once, and each was once held alone.
+    ///
+    /// *No truncated NDJSON.* A line abandoned halfway leaves a fragment of a
+    /// JSON object in the pipe, and the next delivery is appended straight
+    /// onto it: two instructions destroyed rather than one.
+    ///
+    /// *No unbounded wait.* This runs on the main actor — `deliver`'s callers
+    /// are `TeamOrchestrator`, which is `@MainActor` — so a loop that only
+    /// exits when the reader resumes is the whole app waiting on a process
+    /// that may be gone. "Finish the committed line, whatever it takes" was
+    /// exactly that loop: past the first byte the deadline was never consulted
+    /// again.
+    ///
+    /// They only look contradictory while "don't truncate" is read as "must
+    /// finish". A fragment is harmless once it is *terminated*: the newline
+    /// makes it a line of its own, so the reader fails to parse that one line
+    /// and resynchronises, instead of swallowing the next instruction with it.
+    /// So the budget is bounded in every case, and a line that runs out of it
+    /// after committing bytes is closed before the error is raised.
+    ///
+    /// The clock measures a reader that has stopped, not one that is slow:
+    /// every byte accepted restarts it, and a signal interruption says nothing
+    /// about the reader and so consumes none of it.
+    static func writeWholeLine(
+        byteCount: Int,
+        timeout: TimeInterval = pipeWriteTimeout,
+        now: () -> TimeInterval = { ProcessInfo.processInfo.systemUptime },
+        pause: () -> Void = { usleep(2_000) },
+        terminateLine: () -> Bool = { false },
+        attempt: (_ offset: Int, _ remaining: Int) -> WriteAttempt
+    ) throws -> Int {
+        var written = 0
+        var deadline = now() + timeout
+        while written < byteCount {
+            switch attempt(written, byteCount - written) {
+            case .written(let count):
+                guard count > 0 else {
+                    throw DeliveryError.writeFailed("write returned zero after \(written)B")
+                }
+                written += count
+                // Progress restarts the clock: a large payload drained slowly
+                // is the reader working, not the reader stuck.
+                deadline = now() + timeout
+            case .interrupted:
+                continue
+            case .wouldBlock:
+                guard now() < deadline else {
+                    guard written > 0 else {
+                        throw DeliveryError.writeFailed(
+                            "write stalled before line commit (deadline exceeded)")
+                    }
+                    let terminated = terminateLine()
+                    throw DeliveryError.writeFailed(
+                        "write stalled after \(written)/\(byteCount)B (deadline exceeded); "
+                            + (terminated
+                                ? "the partial line was terminated for the reader"
+                                : "the partial line could not be terminated"))
+                }
+                pause()
+            case .failed(let failure):
+                throw DeliveryError.writeFailed("errno \(failure) after \(written)B")
+            }
+        }
+        return written
+    }
+
+    /// End a line the reader never let us finish.
+    ///
+    /// Bounded on purpose, and small: this runs after a stall has already been
+    /// declared, so it must not become a second wait. A newline that cannot be
+    /// placed in 50ms is one the pipe has no room for at all, and the caller
+    /// is told which of the two happened.
+    private static func terminateLine(fd: Int32, attempts: Int = 25) -> Bool {
+        var newline: UInt8 = 0x0A
+        for _ in 0..<attempts {
+            let count = write(fd, &newline, 1)
+            if count == 1 { return true }
+            if count < 0, errno == EINTR || errno == EAGAIN {
+                usleep(2_000)
+                continue
+            }
+            return false
+        }
+        return false
+    }
+
     /// Put one user turn on the agent's stdin.
     ///
     /// The text goes as-is. Nothing is flattened — a task carrying newlines
@@ -398,37 +493,19 @@ enum AgentPipeTransport {
         }
         defer { close(fd) }
 
-        var written = 0
-        var writeDeadline = ProcessInfo.processInfo.systemUptime + pipeWriteTimeout
-        try payload.withUnsafeBytes { raw in
-            guard let base = raw.baseAddress else { return }
-            while written < raw.count {
-                let n = write(fd, base.advanced(by: written), raw.count - written)
-                if n > 0 {
-                    written += n
-                    // Progress restarts the clock. The deadline bounds a
-                    // reader that stopped consuming; a large payload drained
-                    // slowly is the reader working, not the reader stuck.
-                    writeDeadline = ProcessInfo.processInfo.systemUptime + pipeWriteTimeout
-                    continue
-                }
-                if n < 0, errno == EINTR {
-                    // A signal interrupt says nothing about the reader;
-                    // retry without consuming the stall budget.
-                    continue
-                }
-                if n < 0, errno == EAGAIN {
-                    guard ProcessInfo.processInfo.systemUptime < writeDeadline else {
-                        throw DeliveryError.writeFailed(
-                            "write stalled after \(written)/\(raw.count)B (deadline exceeded)")
-                    }
-                    usleep(2_000)
-                    continue
-                }
-                throw DeliveryError.writeFailed("errno \(errno) after \(written)B")
+        return try payload.withUnsafeBytes { raw in
+            guard let base = raw.baseAddress else { return 0 }
+            return try writeWholeLine(
+                byteCount: raw.count,
+                terminateLine: { terminateLine(fd: fd) }
+            ) { offset, remaining in
+                let count = write(fd, base.advanced(by: offset), remaining)
+                if count > 0 { return .written(count) }
+                if count < 0, errno == EINTR { return .interrupted }
+                if count < 0, errno == EAGAIN { return .wouldBlock }
+                return .failed(errno)
             }
         }
-        return written
     }
 
     /// One NDJSON line in the shape claude's stream-json input expects.
