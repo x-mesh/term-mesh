@@ -126,6 +126,42 @@ extension TerminalController {
         return resp == "OK" ? .ok([:]) : .err(code: "internal_error", message: resp, data: nil)
     }
 
+    /// What this process is actually running.
+    ///
+    /// Every other way of asking reports the wrong thing at least sometimes.
+    /// `--version` reads the file on disk, which a package manager may have
+    /// replaced under a process that kept the old image; the bundle's
+    /// Info.plist has the same problem; and `strings` on the binary finds
+    /// nothing useful because most of the code lives outside it. All three
+    /// misled a debugging session on 2026-07-30 — an hour went into "did that
+    /// fix get built or not".
+    ///
+    /// These values are baked in at compile time, so they describe the code
+    /// that is executing rather than whatever is on disk now.
+    func v2DebugAppBuild() -> V2CallResult {
+        let info = Bundle.main.infoDictionary
+        var payload: [String: Any] = [
+            "version": info?["CFBundleShortVersionString"] as? String ?? "unknown",
+            "build": info?["CFBundleVersion"] as? String ?? "unknown",
+            "bundle_id": Bundle.main.bundleIdentifier ?? "unknown",
+            "executable": Bundle.main.executablePath ?? "unknown",
+            "started_at": ISO8601DateFormatter().string(from: Self.processStart),
+        ]
+        if let path = Bundle.main.executablePath,
+           let attrs = try? FileManager.default.attributesOfItem(atPath: path),
+           let modified = attrs[.modificationDate] as? Date {
+            // When this is newer than `started_at`, the file was replaced
+            // underneath a still-running process: the code answering you is
+            // not the code on disk.
+            payload["executable_mtime"] = ISO8601DateFormatter().string(from: modified)
+            payload["stale_process"] = modified > Self.processStart
+        }
+        return .ok(payload)
+    }
+
+    /// When this process began, captured on first touch of the type.
+    static let processStart = Date()
+
     func v2DebugToggleCommandPalette(params: [String: Any]) -> V2CallResult {
         let requestedWindowId = v2UUID(params, "window_id")
         var result: V2CallResult = .ok([:])

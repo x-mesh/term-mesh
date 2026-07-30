@@ -10,6 +10,7 @@ enum ProjectSourceKind: String, Codable, CaseIterable {
 enum ProjectLocationSettings {
     static let localProjectsRootKey = "termMesh.localProjectsRoot"
     static let defaultLocalProjectsRoot = "~/work/project"
+    static let repositorySearchRootsKey = "termMesh.repositorySearchRoots"
 
     static var localProjectsRoot: String {
         let saved = UserDefaults.standard.string(forKey: localProjectsRootKey)?
@@ -19,6 +20,29 @@ enum ProjectLocationSettings {
 
     static func expandedLocalProjectsRoot() -> String {
         (localProjectsRoot as NSString).expandingTildeInPath
+    }
+
+    /// Where to look for repositories this machine has already cloned.
+    ///
+    /// Kept apart from `localProjectsRoot`, which answers a different
+    /// question — where a *new* project should be put. Using one setting for
+    /// both meant that pointing new projects at a fresh directory also hid
+    /// every checkout living anywhere else, and the suggestion list quietly
+    /// shrank to whatever happened to be open.
+    ///
+    /// One path per line. Empty falls back to the project root, which is what
+    /// this did before the split.
+    static var repositorySearchRoots: [String] {
+        let saved = UserDefaults.standard.string(forKey: repositorySearchRootsKey) ?? ""
+        let entries = saved
+            .split(whereSeparator: \.isNewline)
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .filter { !$0.isEmpty }
+        let roots = entries.isEmpty ? [localProjectsRoot] : entries
+        var seen = Set<String>()
+        return roots
+            .map { ($0 as NSString).expandingTildeInPath }
+            .filter { seen.insert($0).inserted }
     }
 }
 

@@ -172,7 +172,13 @@ final class ReviewBoardViewModel: ObservableObject {
     }
 
     func refresh() {
-        snapshot = snapshotProvider()
+        // Same reason the service gates its own publish: the ticker calls this
+        // on a fixed beat, and re-publishing an unchanged board costs a
+        // re-evaluation and the layout pass under it for nothing. Selection is
+        // still revalidated — it can go stale for reasons other than a new
+        // snapshot, such as the selected task leaving the list.
+        let next = snapshotProvider()
+        if snapshot != next { snapshot = next }
         keepSelectionValid()
     }
 

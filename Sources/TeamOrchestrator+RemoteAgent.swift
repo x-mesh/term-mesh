@@ -50,6 +50,7 @@ extension TeamOrchestrator {
         case unresolvedRemoteWorkingDirectory(host: String, path: String)
         case checkoutIsolationFailed(host: String, path: String, reason: String)
         case projectDeletionIncomplete(String)
+        case leaderAttachTimedOut(host: String, seconds: TimeInterval)
         case partialShellClose(closed: Int, failed: Int, reason: String)
 
         var description: String {
@@ -77,6 +78,9 @@ extension TeamOrchestrator {
                     + "refusing to reuse the requested checkout"
             case .projectDeletionIncomplete(let report):
                 return "project deletion incomplete: \(report)"
+            case .leaderAttachTimedOut(let host, let seconds):
+                return "the leader on \(host) did not finish starting within "
+                    + "\(Int(seconds))s; the host may be unreachable or the CLI may not be launching"
             case .partialShellClose(let closed, let failed, let reason):
                 return "closed \(closed) shell(s); \(failed) refused — \(reason)"
             }
@@ -118,6 +122,71 @@ extension TeamOrchestrator {
             .replacingOccurrences(of: "\r", with: " ")
             .trimmingCharacters(in: .whitespacesAndNewlines)
         return "Project · \(String(singleLine.prefix(72)))"
+    }
+
+    /// How long the whole remote-leader attach may take before it is called a
+    /// failure. Generous — it covers an ssh dial, a clone-sized wait on a
+    /// cold host, and a CLI's first launch — because the point is to bound a
+    /// stall, not to race a slow but working host.
+    static let leaderAttachTimeout: TimeInterval = 180
+
+    /// Settles on whichever of two outcomes arrives first and ignores the
+    /// other. Deliberately not a task group: a group waits for every child
+    /// before its scope may exit, so a child that ignores cancellation holds
+    /// the timeout inside with it — the deadline fires, and nobody hears it.
+    private actor AttachOutcome {
+        private var result: Result<Void, Error>?
+        private var waiter: CheckedContinuation<Void, Error>?
+
+        func wait() async throws {
+            if let result { return try result.get() }
+            try await withCheckedThrowingContinuation { waiter = $0 }
+        }
+
+        func settle(_ outcome: Result<Void, Error>) {
+            guard result == nil else { return }
+            result = outcome
+            guard let waiter else { return }
+            self.waiter = nil
+            waiter.resume(with: outcome)
+        }
+    }
+
+    /// Runs `body`, failing with `.leaderAttachTimedOut` if it has not
+    /// finished within `leaderAttachTimeout`.
+    ///
+    /// A timed-out attach is abandoned rather than awaited. Cancellation is
+    /// still requested, but this path reaches ssh and a remote shell, and
+    /// waiting for those to notice is exactly the hang being bounded.
+    static func withLeaderAttachDeadline(
+        hostKey: String,
+        timeout: TimeInterval = leaderAttachTimeout,
+        _ body: @escaping @Sendable () async throws -> Void
+    ) async throws {
+        let outcome = AttachOutcome()
+        let work = Task {
+            do {
+                try await body()
+                await outcome.settle(.success(()))
+            } catch {
+                await outcome.settle(.failure(error))
+            }
+        }
+        let timer = Task {
+            try? await Task.sleep(nanoseconds: UInt64(timeout * 1_000_000_000))
+            guard !Task.isCancelled else { return }
+#if DEBUG
+            dlog("leader.deadline.fired host=\(hostKey)")
+#endif
+            await outcome.settle(
+                .failure(RemoteAgentError.leaderAttachTimedOut(host: hostKey, seconds: timeout))
+            )
+        }
+        defer {
+            work.cancel()
+            timer.cancel()
+        }
+        try await outcome.wait()
     }
 
     private func waitForRemoteRemoval(
@@ -1857,17 +1926,45 @@ extension TeamOrchestrator {
         // the shell could not find.
         Task { @MainActor in
             if case let .peer(hostKey) = leaderEndpoint {
-                guard let resolvedRemoteLeaderWorkingDirectory else { return }
+#if DEBUG
+                dlog("leader.attach.enter host=\(hostKey) "
+                    + "wd=\(resolvedRemoteLeaderWorkingDirectory ?? "nil")")
+#endif
+                guard let resolvedRemoteLeaderWorkingDirectory else {
+#if DEBUG
+                    dlog("leader.attach.skip reason=noRemoteWorkingDirectory host=\(hostKey)")
+#endif
+                    return
+                }
                 do {
-                    try await self.attachRemoteLeader(
-                        teamName: team.id,
-                        hostKey: hostKey,
-                        workingDirectory: resolvedRemoteLeaderWorkingDirectory,
-                        cli: leaderMode,
-                        model: leaderModel,
-                        systemPrompt: remoteLeaderSystemPrompt
-                    )
+                    // Bounded as a whole rather than step by step. This path
+                    // crosses a tunnel, a relay session, an ssh command and a
+                    // shell handshake, and a stall in any one of them used to
+                    // leave the pane on "Connecting remote leader…" with no
+                    // error, no retry and nothing written to the team — the
+                    // failure handling below never ran because nothing ever
+                    // threw. A ceiling turns every such stall into the
+                    // reported failure it already knows how to show.
+#if DEBUG
+                    dlog("leader.attach.begin host=\(hostKey) cli=\(leaderMode)")
+#endif
+                    try await Self.withLeaderAttachDeadline(hostKey: hostKey) {
+                        try await self.attachRemoteLeader(
+                            teamName: team.id,
+                            hostKey: hostKey,
+                            workingDirectory: resolvedRemoteLeaderWorkingDirectory,
+                            cli: leaderMode,
+                            model: leaderModel,
+                            systemPrompt: remoteLeaderSystemPrompt
+                        )
+                    }
+#if DEBUG
+                    dlog("leader.attach.ok host=\(hostKey)")
+#endif
                 } catch {
+#if DEBUG
+                    dlog("leader.attach.threw host=\(hostKey) error=\(error)")
+#endif
                     let description = "Could not start remote leader on \(hostKey): \(error)"
                     RemoteWorkLog.info(description)
                     onRemoteAttachFailure?(description)

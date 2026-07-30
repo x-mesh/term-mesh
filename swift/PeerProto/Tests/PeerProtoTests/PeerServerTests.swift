@@ -300,6 +300,7 @@ final class PeerServerTests: XCTestCase {
     }
 
     /// End-to-end: real `PeerServer` dispatch of
+    /// `CreateWorkspaceRequest` (paired) plus
     /// `RenameWorkspaceRequest`/`DeleteWorkspaceRequest` (fire-and-forget,
     /// per peer.proto's "Workspace lifecycle" section) reaches the
     /// provider with the exact wire arguments, and `PeerServer
@@ -332,7 +333,10 @@ final class PeerServerTests: XCTestCase {
         )
         _ = try await session.handshake()
 
-        let workspaceID = Data(repeating: 0x5A, count: 16)
+        let workspaceID = try await session.createWorkspace(title: "created-via-server")
+        XCTAssertEqual(workspaceID, RecordingWorkspaceProvider.workspaceID)
+        let createdTitle = await provider.createdTitle
+        XCTAssertEqual(createdTitle, "created-via-server")
         try await session.renameWorkspace(workspaceID: workspaceID, title: "renamed-via-server")
         try await session.deleteWorkspace(workspaceID: workspaceID)
 
@@ -718,6 +722,11 @@ final class PeerServerTests: XCTestCase {
     }
 
     /// Capabilities describe server support, independent of the current roster.
+    ///
+    /// Leader bootstrap is the one that made this concrete: it is only ever
+    /// used from a host that has no teams yet, so gating it on having one was
+    /// a deadlock — no capability, so no leader; no leader, so never a team.
+    /// Observed as a project that never finished creating on an empty peer.
     func testHostWithoutTeamsAdvertisesTeamCapabilities() async throws {
         let sockPath = "/tmp/tm-peer-swift-noteams-\(UUID().uuidString.prefix(8)).sock"
         defer { try? FileManager.default.removeItem(atPath: sockPath) }
@@ -740,7 +749,10 @@ final class PeerServerTests: XCTestCase {
         let hello = try await session.handshake()
         XCTAssertTrue(hello.hasHostCapability(PeerCapability.teamRosterV1))
         XCTAssertTrue(hello.hasHostCapability(PeerCapability.teamCallV1))
-        XCTAssertTrue(hello.hasHostCapability(PeerCapability.teamLeaderV1))
+        XCTAssertTrue(
+            hello.hasHostCapability(PeerCapability.teamLeaderV1),
+            "an empty host must still accept a leader, or no team can ever start there"
+        )
     }
 }
 
@@ -785,6 +797,8 @@ private actor RecordingAttachProvider: PeerSurfaceProvider {
 /// this package) to prove `PeerServerSession.dispatch` actually invokes
 /// the provider with the wire-decoded arguments.
 private actor RecordingWorkspaceProvider: PeerSurfaceProvider {
+    static let workspaceID = Data(repeating: 0x5A, count: 16)
+    private(set) var createdTitle: String?
     private(set) var renamed: (id: Data, title: String)?
     private(set) var deleted: Data?
 
@@ -796,6 +810,11 @@ private actor RecordingWorkspaceProvider: PeerSurfaceProvider {
         clientRows: UInt32,
         resumeFromSeq: UInt64
     ) async -> PeerSurfaceAttachment? { nil }
+
+    func createWorkspace(title: String) async -> Data? {
+        createdTitle = title
+        return Self.workspaceID
+    }
 
     func renameWorkspace(id workspaceID: Data, title: String) async -> Bool {
         renamed = (workspaceID, title)
