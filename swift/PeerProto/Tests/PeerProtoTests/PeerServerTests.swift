@@ -717,9 +717,8 @@ final class PeerServerTests: XCTestCase {
         XCTAssertEqual(teams[0].projectRoot, "/Users/x/work/demo")
     }
 
-    /// A host with no teams must not advertise the capability, or a client
-    /// would ask a question it cannot usefully answer.
-    func testHostWithoutTeamsDoesNotAdvertiseRoster() async throws {
+    /// Capabilities describe server support, independent of the current roster.
+    func testHostWithoutTeamsAdvertisesTeamCapabilities() async throws {
         let sockPath = "/tmp/tm-peer-swift-noteams-\(UUID().uuidString.prefix(8)).sock"
         defer { try? FileManager.default.removeItem(atPath: sockPath) }
 
@@ -739,7 +738,9 @@ final class PeerServerTests: XCTestCase {
             write: { try await transport.write($0) }
         )
         let hello = try await session.handshake()
-        XCTAssertFalse(hello.hasHostCapability(PeerCapability.teamRosterV1))
+        XCTAssertTrue(hello.hasHostCapability(PeerCapability.teamRosterV1))
+        XCTAssertTrue(hello.hasHostCapability(PeerCapability.teamCallV1))
+        XCTAssertTrue(hello.hasHostCapability(PeerCapability.teamLeaderV1))
     }
 }
 

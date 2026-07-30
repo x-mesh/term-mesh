@@ -579,7 +579,8 @@ final class TeamDataStore: ObservableObject, @unchecked Sendable {
     private func resolveAssigneeUnsafe(
         teamName: String,
         assignee: String?,
-        assigneeInstanceId: String?
+        assigneeInstanceId: String?,
+        allowNameOnlyAutoPin: Bool = false
     ) -> (assignee: String?, instanceId: String?)? {
         let normalizedAssignee = assignee?.teamDataNilIfBlank
         let normalizedInstanceId = assigneeInstanceId?.teamDataNilIfBlank
@@ -590,6 +591,9 @@ final class TeamDataStore: ObservableObject, @unchecked Sendable {
         if let normalizedInstanceId {
             guard candidates.contains(where: { $0.instanceId == normalizedInstanceId }) else { return nil }
             return (normalizedAssignee, normalizedInstanceId)
+        }
+        if allowNameOnlyAutoPin {
+            return (normalizedAssignee, candidates.first?.instanceId)
         }
         guard candidates.count == 1 else { return nil }
         return (normalizedAssignee, candidates[0].instanceId)
@@ -617,7 +621,8 @@ final class TeamDataStore: ObservableObject, @unchecked Sendable {
         guard let resolvedAssignee = resolveAssigneeUnsafe(
             teamName: teamName,
             assignee: assignee,
-            assigneeInstanceId: assigneeInstanceId
+            assigneeInstanceId: assigneeInstanceId,
+            allowNameOnlyAutoPin: true
         ) else { return nil }
         let now = Date()
         let normalizedCreatedBy = createdBy.teamDataNilIfBlank ?? "leader"
