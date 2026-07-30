@@ -19,12 +19,12 @@ final class AgentSessionTests: XCTestCase {
         let first = LeaderParallelPolicy.renderedInstructions
         let second = LeaderParallelPolicy.renderedInstructions
 
-        XCTAssertEqual(LeaderParallelPolicy.version, "2")
+        XCTAssertEqual(LeaderParallelPolicy.version, "3")
         XCTAssertEqual(LeaderParallelPolicy.activation, "runtime-enforced")
         XCTAssertEqual(first, second)
         XCTAssertEqual(LeaderParallelPolicy.digest.count, 64)
         XCTAssertTrue(LeaderParallelPolicy.digest.allSatisfy { $0.isHexDigit })
-        XCTAssertTrue(first.contains("policy_version: 2"))
+        XCTAssertTrue(first.contains("policy_version: 3"))
         XCTAssertTrue(first.contains("policy_digest: \(LeaderParallelPolicy.digest)"))
         XCTAssertTrue(first.contains("policy_activation: runtime-enforced"))
     }
@@ -52,6 +52,49 @@ final class AgentSessionTests: XCTestCase {
         XCTAssertTrue(directive.contains("version \(LeaderParallelPolicy.version)"))
         XCTAssertTrue(directive.contains("digest \(LeaderParallelPolicy.digest)"))
         XCTAssertTrue(directive.contains("canonical Leader Parallel Routing Policy"))
+    }
+
+    /// Two same-named instances used to both write `<agent>-reply.md`,
+    /// silently losing whichever one finished first.
+    func testFileReportWritesPerInstanceAliasWhenInstanceIDIsKnown() {
+        let team = "fileReport-test-\(UUID().uuidString.prefix(8))"
+        let dir = URL(fileURLWithPath: NSHomeDirectory())
+            .appendingPathComponent(".term-mesh/results", isDirectory: true)
+            .appendingPathComponent(team, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+
+        TeamOrchestrator.fileReport(teamName: team, agentName: "reviewer",
+                                     agentInstanceId: "inst-1", taskId: nil, text: "first")
+        TeamOrchestrator.fileReport(teamName: team, agentName: "reviewer",
+                                     agentInstanceId: "inst-2", taskId: nil, text: "second")
+
+        let first = try? String(contentsOf: dir.appendingPathComponent("reviewer-inst-1-reply.md"), encoding: .utf8)
+        let second = try? String(contentsOf: dir.appendingPathComponent("reviewer-inst-2-reply.md"), encoding: .utf8)
+        XCTAssertEqual(first, "first")
+        XCTAssertEqual(second, "second")
+
+        let nameOnlyExists = FileManager.default.fileExists(
+            atPath: dir.appendingPathComponent("reviewer-reply.md").path)
+        XCTAssertFalse(nameOnlyExists,
+                       "an instance-identified report must not also write the collidable name-only file")
+    }
+
+    /// The name-only file remains the legacy path for an agent with no
+    /// instance ID to disambiguate — nothing else writes there to collide.
+    func testFileReportFallsBackToNameOnlyWithoutAnInstanceID() {
+        let team = "fileReport-test-\(UUID().uuidString.prefix(8))"
+        let dir = URL(fileURLWithPath: NSHomeDirectory())
+            .appendingPathComponent(".term-mesh/results", isDirectory: true)
+            .appendingPathComponent(team, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+
+        TeamOrchestrator.fileReport(teamName: team, agentName: "solo",
+                                     taskId: "task-123", text: "legacy")
+
+        let legacy = try? String(contentsOf: dir.appendingPathComponent("solo-reply.md"), encoding: .utf8)
+        let task = try? String(contentsOf: dir.appendingPathComponent("task-123.md"), encoding: .utf8)
+        XCTAssertEqual(legacy, "legacy")
+        XCTAssertEqual(task, "legacy")
     }
 
     private func agentMember(name: String = "executor") -> TeamOrchestrator.AgentMember {
@@ -652,6 +695,119 @@ final class AgentSessionTests: XCTestCase {
         // success: nobody said it worked and the agent is not there to say.
         XCTAssertEqual(AgentPipeCompletion.headerEvent(from: reported.first!.0).status,
                        "NEEDS_REVIEW")
+    }
+
+    /// Process termination and the last readability callback are independent.
+    /// The result must be consumed before exit is classified, exactly once.
+    func testNaturalExitDrainsTheFinalResultBeforeFinishing() async {
+        var reported: [(String, String, Bool)] = []
+        let s = AgentSession()
+        s.onTurnEnd = { text, end, _ in
+            reported.append((text, end.stop, end.failed))
+        }
+        s.openTurnForTesting(from: .leader, taskId: "drain-final-result")
+        s.start(shortProcess(output: event([
+            "type": "result", "stop_reason": "end_turn",
+            "result": "the final frame survived",
+        ])))
+
+        let stopped = await waitUntil { !s.isRunning }
+        XCTAssertTrue(stopped)
+        XCTAssertEqual(reported.count, 1, "exit must not emit a second turn end")
+        XCTAssertEqual(reported.first?.0, "the final frame survived")
+        XCTAssertEqual(reported.first?.1, "end_turn")
+        XCTAssertEqual(reported.first?.2, false)
+    }
+
+    /// Both natural finish and deliberate stop release `process`, so one model
+    /// can start another process instead of remaining permanently stopped.
+    func testFinishedAndStoppedSessionsCanRestart() async {
+        var answers: [String] = []
+        let s = AgentSession()
+        s.onTurnEnd = { text, _, _ in answers.append(text) }
+
+        s.openTurnForTesting(from: .person)
+        s.start(shortProcess(output: event([
+            "type": "result", "stop_reason": "end_turn", "result": "first",
+        ])))
+        let firstStopped = await waitUntil { !s.isRunning }
+        XCTAssertTrue(firstStopped)
+
+        s.start(.init(
+            executable: "/bin/sleep", arguments: ["30"],
+            workingDirectory: NSTemporaryDirectory(),
+            environment: ProcessInfo.processInfo.environment
+        ))
+        XCTAssertTrue(s.isRunning)
+        s.stop()
+        s.stop() // teardown is intentionally idempotent
+        XCTAssertFalse(s.isRunning)
+
+        // A synchronous launch error uses the same teardown and must not leave
+        // the session's process guard occupied either.
+        s.start(.init(
+            executable: "/definitely/not/a/real/agent", arguments: [],
+            workingDirectory: NSTemporaryDirectory(),
+            environment: ProcessInfo.processInfo.environment
+        ))
+        XCTAssertFalse(s.isRunning)
+
+        s.openTurnForTesting(from: .person)
+        s.start(shortProcess(output: event([
+            "type": "result", "stop_reason": "end_turn", "result": "second",
+        ])))
+        let secondStopped = await waitUntil { !s.isRunning }
+        XCTAssertTrue(secondStopped)
+        XCTAssertEqual(answers, ["first", "second"])
+    }
+
+    /// If a spawned process leaves a grandchild holding the write end of
+    /// stdout open, natural EOF never arrives. A blocking tail read on
+    /// termination would then wedge the stream queue, and a `stop()` that
+    /// synchronously waits on that queue would freeze MainActor forever.
+    func testStopDoesNotWaitForInheritedStdoutWriter() async {
+        let s = AgentSession()
+        s.start(.init(
+            executable: "/bin/sh",
+            arguments: ["-c", "trap '' HUP; sleep 5 & exec /usr/bin/true"],
+            workingDirectory: NSTemporaryDirectory(),
+            environment: ProcessInfo.processInfo.environment
+        ))
+
+        // The owned process has exited; its descendant still owns stdout.
+        try? await Task.sleep(nanoseconds: 250_000_000)
+        let began = Date()
+        s.stop()
+        XCTAssertLessThan(Date().timeIntervalSince(began), 0.5)
+        XCTAssertFalse(s.isRunning)
+
+        // Teardown stays idempotent and actor-visible restart is immediate.
+        s.stop()
+        s.openTurnForTesting(from: .person)
+        s.start(shortProcess(output: event([
+            "type": "result", "stop_reason": "end_turn", "result": "restarted",
+        ])))
+        let stopped = await waitUntil { !s.isRunning }
+        XCTAssertTrue(stopped)
+    }
+
+    private func shortProcess(output: String) -> AgentSession.Launch {
+        .init(
+            executable: "/bin/echo", arguments: [output],
+            workingDirectory: NSTemporaryDirectory(),
+            environment: ProcessInfo.processInfo.environment
+        )
+    }
+
+    private func waitUntil(
+        timeout: TimeInterval = 2,
+        _ condition: @escaping @MainActor () -> Bool
+    ) async -> Bool {
+        let deadline = Date().addingTimeInterval(timeout)
+        while !condition(), Date() < deadline {
+            try? await Task.sleep(nanoseconds: 10_000_000)
+        }
+        return condition()
     }
 
     /// The bridge command the terminal path builds had neither.

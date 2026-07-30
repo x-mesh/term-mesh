@@ -226,6 +226,142 @@ mod project_sync_cli_tests {
             assert!(help.contains(flag), "missing {flag} from help: {help}");
         }
     }
+
+    #[test]
+    fn delegate_parses_deps_after_panel_and_forwards_them_to_unified_rpc() {
+        let parsed = Cli::try_parse_from([
+            "tm-agent",
+            "delegate",
+            "builder",
+            "--panel",
+            "panel-2",
+            "--deps",
+            "337a5e71",
+            "--title",
+            "Build after review",
+            "run the build",
+        ])
+        .unwrap();
+        let Commands::Delegate {
+            agent,
+            text,
+            title,
+            deps,
+            panel,
+            ..
+        } = parsed.command
+        else {
+            panic!("expected delegate command");
+        };
+        assert_eq!(agent, "builder");
+        assert_eq!(text, "run the build");
+        assert_eq!(title.as_deref(), Some("Build after review"));
+        assert_eq!(deps, vec!["337a5e71"]);
+        assert_eq!(panel.as_deref(), Some("panel-2"));
+
+        let params = delegate_rpc_params(
+            "team-a",
+            &agent,
+            &text,
+            title.as_deref().unwrap(),
+            1,
+            &[],
+            &deps,
+            None,
+            None,
+            None,
+            panel.as_deref(),
+            Some("instance-2"),
+        );
+        assert_eq!(params["depends_on"], json!(["337a5e71"]));
+        assert_eq!(params["panel_id"], "panel-2");
+        assert_eq!(params["agent_instance_id"], "instance-2");
+    }
+
+    #[test]
+    fn instance_scoped_commands_parse_supported_selectors() {
+        let send = Cli::try_parse_from([
+            "tm-agent", "send", "--panel", "panel-2", "reviewer", "message",
+        ])
+        .unwrap();
+        assert!(matches!(
+            send.command,
+            Commands::Send {
+                panel: Some(ref panel),
+                agent_instance_id: None,
+                ..
+            } if panel == "panel-2"
+        ));
+
+        let remove = Cli::try_parse_from([
+            "tm-agent",
+            "remove",
+            "builder",
+            "--agent-instance-id",
+            "instance-2",
+        ])
+        .unwrap();
+        assert!(matches!(
+            remove.command,
+            Commands::Remove {
+                panel: None,
+                agent_instance_id: Some(ref id),
+                ..
+            } if id == "instance-2"
+        ));
+
+        let detach = Cli::try_parse_from([
+            "tm-agent", "detach", "builder", "--panel", "panel-2",
+        ])
+        .unwrap();
+        assert!(matches!(
+            detach.command,
+            Commands::Detach {
+                panel: Some(ref panel),
+                agent_instance_id: None,
+                ..
+            } if panel == "panel-2"
+        ));
+
+        assert!(Cli::try_parse_from([
+            "tm-agent",
+            "send",
+            "reviewer",
+            "message",
+            "--panel",
+            "panel-2",
+            "--agent-instance-id",
+            "instance-2",
+        ])
+        .is_err());
+    }
+
+    #[test]
+    fn panel_resolves_one_duplicate_name_to_its_durable_instance() {
+        let agents = vec![
+            json!({
+                "name": "reviewer",
+                "panel_id": "panel-1",
+                "agent_instance_id": "instance-1",
+            }),
+            json!({
+                "name": "reviewer",
+                "panel_id": "panel-2",
+                "agent_instance_id": "instance-2",
+            }),
+        ];
+
+        assert_eq!(
+            instance_id_from_agents(&agents, "reviewer", Some("panel-2")).unwrap(),
+            Some("instance-2".to_string())
+        );
+        assert_eq!(
+            instance_id_from_agents(&agents, "reviewer", None).unwrap(),
+            None
+        );
+        let error = instance_id_from_agents(&agents, "reviewer", Some("missing")).unwrap_err();
+        assert!(error.contains("--agent-instance-id"), "{error}");
+    }
 }
 
 fn worktree_policy_name(policy: WorktreePolicyArg) -> &'static str {
@@ -367,9 +503,12 @@ FULL_REPORT: <absolute result path or \"n/a\">\n\
 \n\
 ## Reply Truncation\n\
 \n\
-Replies are truncated to ~1500 chars over the socket but the daemon auto-saves your full\n\
-reply to ~/.term-mesh/results/<team>/<agent>-reply.md. If your reply body exceeds 1000 chars,\n\
-set FULL_REPORT to that path instead of adding a separate line above the header.\n\
+Replies are truncated to ~1500 chars over the socket. `tm-agent reply` preserves the submitted\n\
+reply verbatim as `<task_id>.md` and `<agent>-<agent_instance_id>-reply.md`; those files are\n\
+durable copies, not full-report generators. For long detail, first write a separate unique file\n\
+(recommended `~/.term-mesh/results/<team>/<task_id>-full.md`, or the task-assigned path), then\n\
+point FULL_REPORT at it. Never use a reply alias or `<task_id>.md` as FULL_REPORT; use `n/a` when\n\
+there is no separate detail file.\n\
 \n\
 Communication:\n\
 - Send message to leader: `tm-agent msg send '<text>'`\n\
@@ -652,6 +791,12 @@ enum Commands {
     Detach {
         /// Agent name to detach
         agent_name: String,
+        /// Target a specific pane when the agent name is duplicated
+        #[arg(long, conflicts_with = "agent_instance_id")]
+        panel: Option<String>,
+        /// Durable agent instance selector (required for a duplicated name without --panel)
+        #[arg(long = "agent-instance-id")]
+        agent_instance_id: Option<String>,
     },
     /// Remove an agent from a named GUI team by team name.
     ///
@@ -665,6 +810,12 @@ enum Commands {
         /// Force removal even if the agent is busy (default: true)
         #[arg(long, default_value_t = true)]
         force: bool,
+        /// Target a specific pane when the agent name is duplicated
+        #[arg(long, conflicts_with = "agent_instance_id")]
+        panel: Option<String>,
+        /// Durable agent instance selector (required for a duplicated name without --panel)
+        #[arg(long = "agent-instance-id")]
+        agent_instance_id: Option<String>,
     },
     /// Preset operations (list)
     #[command(subcommand)]
@@ -676,8 +827,11 @@ enum Commands {
         #[arg(long)]
         no_report: bool,
         /// Target a specific pane by panel_id (deterministic; overrides name round-robin)
-        #[arg(long)]
+        #[arg(long, conflicts_with = "agent_instance_id")]
         panel: Option<String>,
+        /// Durable agent instance selector (alternative to --panel for duplicated names)
+        #[arg(long = "agent-instance-id")]
+        agent_instance_id: Option<String>,
     },
     /// Broadcast instruction to all agents
     Broadcast {
@@ -2983,6 +3137,21 @@ mod runbook_tests {
     }
 
     #[test]
+    fn runbook_prompt_requires_a_separate_unique_full_report_file() {
+        let prompt = agent_init_prompt(
+            "reviewer",
+            "reviewer",
+            "test-team",
+            "/tmp/project",
+            "/tmp/socket",
+        );
+        assert!(prompt.contains("<task_id>-full.md"));
+        assert!(prompt.contains("durable copies, not full-report generators"));
+        assert!(prompt.contains("Never use a reply alias or `<task_id>.md` as FULL_REPORT"));
+        assert!(!prompt.contains("set FULL_REPORT to that path"));
+    }
+
+    #[test]
     fn runbook_projection_state_detects_outdated_managed_files() {
         let unique = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -3217,6 +3386,66 @@ mod runbook_tests {
     }
 
     #[test]
+    fn instance_scoped_reply_alias_and_result_candidates_exclude_name_only_alias() {
+        assert_eq!(
+            reply_alias_filename("reviewer", Some("instance-2")),
+            "reviewer-instance-2-reply.md"
+        );
+        assert_eq!(reply_alias_filename("reviewer", None), "reviewer-reply.md");
+
+        let instance_candidates =
+            task_result_candidates("team-a", "task-a", "reviewer", Some("instance-2"));
+        let instance_names = instance_candidates
+            .iter()
+            .filter_map(|path| path.file_name().and_then(|name| name.to_str()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            instance_names,
+            vec!["task-a.md", "reviewer-instance-2-reply.md"]
+        );
+        assert!(!instance_names.contains(&"reviewer-reply.md"));
+
+        let legacy_candidates = task_result_candidates("team-a", "task-a", "reviewer", None);
+        assert_eq!(
+            legacy_candidates[1]
+                .file_name()
+                .and_then(|name| name.to_str()),
+            Some("reviewer-reply.md")
+        );
+    }
+
+    #[test]
+    fn self_referential_full_report_is_normalized_for_both_durable_copies() {
+        let alias = PathBuf::from("/tmp/results/reviewer-instance-2-reply.md");
+        let canonical = PathBuf::from("/tmp/results/task-a.md");
+        for self_path in [&alias, &canonical] {
+            let content = format!(
+                "STATUS: DONE\nFILES: none\nVERIFY: n/a\nNEXT: NONE\nFULL_REPORT: {}\n\nsummary",
+                self_path.display()
+            );
+            let (normalized, rejected) = normalize_self_referential_full_report(
+                &content,
+                &[alias.clone(), canonical.clone()],
+            );
+            assert_eq!(
+                rejected.as_deref(),
+                Some(self_path.to_string_lossy().as_ref())
+            );
+            assert!(normalized.contains("FULL_REPORT: n/a"));
+            assert!(!normalized.contains(&self_path.to_string_lossy().to_string()));
+        }
+
+        let separate = "/tmp/results/task-a-full.md";
+        let content = format!(
+            "STATUS: DONE\nFILES: none\nVERIFY: n/a\nNEXT: NONE\nFULL_REPORT: {separate}\n\nsummary"
+        );
+        let (unchanged, rejected) =
+            normalize_self_referential_full_report(&content, &[alias.clone(), canonical.clone()]);
+        assert_eq!(unchanged, content);
+        assert_eq!(rejected, None);
+    }
+
+    #[test]
     fn result_collect_compaction_removes_full_content() {
         let resp = json!({
             "ok": true,
@@ -3261,8 +3490,8 @@ mod runbook_tests {
     }
 
     #[test]
-    fn collect_result_path_overrides_header_full_report() {
-        // When task has result_path from DB, it should win over the reply-header FULL_REPORT.
+    fn collect_result_path_does_not_override_separate_full_report() {
+        // result_path is the durable reply copy, not the separately authored FULL_REPORT.
         let resp = json!({
             "result": {
                 "results": [{
@@ -3276,8 +3505,12 @@ mod runbook_tests {
         let item = &compact["result"]["results"][0];
         assert_eq!(
             item["headers"]["full_report"].as_str(),
-            Some("/home/user/.term-mesh/results/team/executor-reply.md"),
-            "result_path from DB must override header FULL_REPORT"
+            Some("/tmp/header-path.md"),
+            "durable result_path must not replace header FULL_REPORT"
+        );
+        assert_eq!(
+            item["result_path"].as_str(),
+            Some("/home/user/.term-mesh/results/team/executor-reply.md")
         );
     }
 
@@ -4574,23 +4807,112 @@ fn results_dir(team: &str) -> PathBuf {
     PathBuf::from(home).join(".term-mesh/results").join(team)
 }
 
-fn write_result_file(team: &str, filename: &str, content: &str) -> Result<PathBuf, String> {
-    // Sanitize filename to prevent path traversal
+fn sanitized_result_filename(filename: &str) -> String {
     let safe_filename: String = filename
         .chars()
         .filter(|c| c.is_alphanumeric() || *c == '-' || *c == '_' || *c == '.')
         .collect();
-    let safe_filename = if safe_filename.is_empty() {
+    if safe_filename.is_empty() {
         "unknown.md".to_string()
     } else {
         safe_filename
-    };
-    let filename = safe_filename.as_str();
-    let dir = results_dir(team);
-    std::fs::create_dir_all(&dir).map_err(|e| format!("mkdir: {e}"))?;
-    let path = dir.join(filename);
+    }
+}
+
+fn result_file_path(team: &str, filename: &str) -> PathBuf {
+    results_dir(team).join(sanitized_result_filename(filename))
+}
+
+fn reply_alias_filename(agent_name: &str, agent_instance_id: Option<&str>) -> String {
+    agent_instance_id
+        .filter(|id| !id.is_empty())
+        .map(|id| format!("{agent_name}-{id}-reply.md"))
+        .unwrap_or_else(|| format!("{agent_name}-reply.md"))
+}
+
+fn write_result_file(team: &str, filename: &str, content: &str) -> Result<PathBuf, String> {
+    let path = result_file_path(team, filename);
     atomic_write_file(&path, content)?;
     Ok(path)
+}
+
+fn lexical_absolute_path(path: &Path) -> PathBuf {
+    use std::path::Component;
+
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("/"))
+            .join(path)
+    };
+    let mut normalized = PathBuf::new();
+    for component in absolute.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                normalized.pop();
+            }
+            other => normalized.push(other.as_os_str()),
+        }
+    }
+    normalized
+}
+
+fn expanded_report_path(raw: &str) -> PathBuf {
+    let raw = raw.trim().trim_matches(|c| matches!(c, '`' | '\'' | '"'));
+    let home = env::var("HOME").unwrap_or_default();
+    let expanded = raw
+        .strip_prefix("~/")
+        .map(|rest| PathBuf::from(&home).join(rest))
+        .or_else(|| {
+            raw.strip_prefix("$HOME/")
+                .map(|rest| PathBuf::from(&home).join(rest))
+        })
+        .or_else(|| {
+            raw.strip_prefix("${HOME}/")
+                .map(|rest| PathBuf::from(&home).join(rest))
+        })
+        .unwrap_or_else(|| PathBuf::from(raw));
+    lexical_absolute_path(&expanded)
+}
+
+/// A reply alias and `<task_id>.md` are durable copies of the submitted reply,
+/// not separate detailed reports. Rejecting those paths prevents FULL_REPORT
+/// from pointing back to the reply that contains the header itself.
+fn normalize_self_referential_full_report(
+    content: &str,
+    durable_copy_paths: &[PathBuf],
+) -> (String, Option<String>) {
+    let (headers, _) = reply_header_and_summary(content, 0);
+    let full_report = headers["full_report"].as_str().unwrap_or("n/a").trim();
+    let is_self_reference = !full_report.eq_ignore_ascii_case("n/a")
+        && !full_report.eq_ignore_ascii_case("none")
+        && durable_copy_paths
+            .iter()
+            .map(|path| lexical_absolute_path(path))
+            .any(|path| expanded_report_path(full_report) == path);
+    if !is_self_reference {
+        return (content.to_string(), None);
+    }
+
+    let normalized = split_inline_headers(
+        content,
+        &["STATUS", "FILES", "VERIFY", "NEXT", "FULL_REPORT"],
+    )
+    .lines()
+    .map(|line| {
+        let trimmed = line.trim_start();
+        if trimmed.strip_prefix("FULL_REPORT:").is_some() {
+            let indent = &line[..line.len() - trimmed.len()];
+            format!("{indent}FULL_REPORT: n/a")
+        } else {
+            line.to_string()
+        }
+    })
+    .collect::<Vec<_>>()
+    .join("\n");
+    (normalized, Some(full_report.to_string()))
 }
 
 fn atomic_write_file(path: &Path, content: &str) -> Result<(), String> {
@@ -4849,13 +5171,61 @@ fn selected_agent_instance_id(
 ) -> Option<String> {
     let status = rpc_call(sock, "team.status", json!({ "team_name": team })).ok()?;
     let agents = status["result"]["agents"].as_array()?;
-    let matches = agents.iter().filter(|agent| {
-        agent["name"].as_str() == Some(target)
-            && panel_id.map_or(true, |panel| agent["panel_id"].as_str() == Some(panel))
-    }).collect::<Vec<_>>();
-    (matches.len() == 1)
-        .then(|| matches[0]["agent_instance_id"].as_str().map(str::to_owned))
-        .flatten()
+    instance_id_from_agents(agents, target, panel_id).ok().flatten()
+}
+
+/// Resolve an optional panel selector to the durable instance selector used by
+/// every subsequent RPC. Explicit instance IDs need no name lookup; panel IDs
+/// must identify exactly one same-name member or the command fails before it
+/// can fall back to the server's ambiguous name path.
+fn command_agent_instance_id(
+    sock: &PathBuf,
+    team: &str,
+    target: &str,
+    panel_id: Option<&str>,
+    explicit_instance_id: Option<&str>,
+) -> Result<Option<String>, String> {
+    if let Some(instance_id) = explicit_instance_id {
+        return Ok(Some(instance_id.to_string()));
+    }
+    let Some(panel_id) = panel_id else {
+        return Ok(None);
+    };
+    let status = rpc_call(sock, "team.status", json!({ "team_name": team }))?;
+    let agents = status["result"]["agents"]
+        .as_array()
+        .ok_or_else(|| "team.status response has no agents array".to_string())?;
+    instance_id_from_agents(agents, target, Some(panel_id))
+}
+
+fn instance_id_from_agents(
+    agents: &[Value],
+    target: &str,
+    panel_id: Option<&str>,
+) -> Result<Option<String>, String> {
+    let matches = agents
+        .iter()
+        .filter(|agent| {
+            agent["name"].as_str() == Some(target)
+                && panel_id.map_or(true, |panel| agent["panel_id"].as_str() == Some(panel))
+        })
+        .collect::<Vec<_>>();
+    match matches.as_slice() {
+        [agent] => agent["agent_instance_id"]
+            .as_str()
+            .map(|id| Some(id.to_string()))
+            .ok_or_else(|| format!("agent {target} has no agent_instance_id")),
+        [] if panel_id.is_some() => Err(format!(
+            "no agent named {target} matches panel {}; pass --agent-instance-id instead",
+            panel_id.unwrap_or_default()
+        )),
+        [] => Ok(None),
+        _ if panel_id.is_some() => Err(format!(
+            "panel {} matches multiple agents named {target}; pass --agent-instance-id",
+            panel_id.unwrap_or_default()
+        )),
+        _ => Ok(None),
+    }
 }
 
 fn truncate_summary(content: &str, max_chars: usize) -> String {
@@ -4970,14 +5340,10 @@ fn compact_result_collect_response(mut resp: Value, include_summary: bool) -> Va
                     .and_then(|v| v.as_str())
                     .unwrap_or("")
                     .to_string();
-                let (mut headers, summary) = reply_header_and_summary(&content, 700);
-                // Prefer task.result_path from the DB over the reply-header FULL_REPORT field
-                // (header may be truncated; DB value is the canonical disk path).
-                if let Some(rp) = obj.get("result_path").and_then(|v| v.as_str()) {
-                    if !rp.is_empty() && !rp.eq_ignore_ascii_case("n/a") {
-                        headers["full_report"] = json!(rp);
-                    }
-                }
+                let (headers, summary) = reply_header_and_summary(&content, 700);
+                // result_path is the canonical durable copy of this reply. Keep
+                // it as separate metadata; it is not a FULL_REPORT and must not
+                // replace the separately-authored path in the submitted header.
                 obj.insert("headers".to_string(), headers);
                 if include_summary {
                     obj.insert("summary".to_string(), json!(summary));
@@ -6238,21 +6604,42 @@ fn main() {
             run_attach(&sock, &agent_type, &agent_name, &model, &cli);
             return;
         }
-        Commands::Detach { agent_name } => {
+        Commands::Detach {
+            agent_name,
+            panel,
+            agent_instance_id,
+        } => {
             if let Err(e) = validate_agent_name(&agent_name) {
                 eprintln!("Error: {}", e);
                 process::exit(1);
             }
-            run_detach(&sock, &agent_name);
+            run_detach(
+                &sock,
+                &agent_name,
+                panel.as_deref(),
+                agent_instance_id.as_deref(),
+            );
             return;
         }
-        Commands::Remove { agent_name, force } => {
+        Commands::Remove {
+            agent_name,
+            force,
+            panel,
+            agent_instance_id,
+        } => {
             if let Err(e) = validate_agent_name(&agent_name) {
                 eprintln!("Error: {}", e);
                 process::exit(1);
             }
             let gui_team = resolve_workspace_team_name().unwrap_or_else(|_| team.clone());
-            run_remove_gui(&sock, &gui_team, &agent_name, force);
+            run_remove_gui(
+                &sock,
+                &gui_team,
+                &agent_name,
+                force,
+                panel.as_deref(),
+                agent_instance_id.as_deref(),
+            );
             return;
         }
         Commands::Preset(sub) => match sub {
@@ -6353,24 +6740,41 @@ fn main() {
             text,
             no_report,
             panel,
+            agent_instance_id,
         } => {
             let text = append_report_suffix(&text, no_report);
-            // Check if agent is headless — route to daemon socket
-            if let Some(daemon_sock) = detect_daemon_socket() {
-                if let Some(agent_id) = is_headless_agent(&daemon_sock, &team, target) {
-                    print_result(rpc_call(
-                        &daemon_sock,
-                        "headless.send",
-                        json!({
-                            "agent_id": agent_id,
-                            "text": format!("{text}\n"),
-                        }),
-                    ));
-                    return;
+            // Check if agent is headless — route to daemon socket. An
+            // explicit --panel/--agent-instance-id names a GUI pane, so it
+            // must reach the GUI resolution path below rather than being
+            // silently dropped by the headless route.
+            if panel.is_none() && agent_instance_id.is_none() {
+                if let Some(daemon_sock) = detect_daemon_socket() {
+                    if let Some(agent_id) = is_headless_agent(&daemon_sock, &team, target) {
+                        print_result(rpc_call(
+                            &daemon_sock,
+                            "headless.send",
+                            json!({
+                                "agent_id": agent_id,
+                                "text": format!("{text}\n"),
+                            }),
+                        ));
+                        return;
+                    }
                 }
             }
-            // panel_id is DELIVERY-ONLY: targets a specific pane deterministically,
-            // overriding name round-robin. None falls back to name-based selection.
+            let selected_instance_id = match command_agent_instance_id(
+                &sock,
+                &team,
+                target,
+                panel.as_deref(),
+                agent_instance_id.as_deref(),
+            ) {
+                Ok(id) => id,
+                Err(e) => {
+                    eprintln!("Error: {e}");
+                    process::exit(1);
+                }
+            };
             let send_result = rpc_call(
                 &sock,
                 "team.send",
@@ -6378,6 +6782,7 @@ fn main() {
                     "team_name": team, "agent_name": target,
                     "text": format!("{text}\n"),
                     "panel_id": panel,
+                    "agent_instance_id": selected_instance_id,
                 }),
             );
             // Send Return key via team.send_key (reliable sendNamedKey path).
@@ -6395,7 +6800,7 @@ fn main() {
                     text_delivered,
                     "team.send",
                     panel.as_deref(),
-                    None,
+                    selected_instance_id.as_deref(),
                 );
             }
             print_result(send_result);
@@ -6771,9 +7176,19 @@ fn main() {
                 Ok(instance) => instance,
                 Err(message) => { eprintln!("reply for {sender}: {message}"); process::exit(2); }
             };
-            let alias_name = reply_instance_id.as_deref()
-                .map(|id| format!("{sender}-{id}-reply.md"))
-                .unwrap_or_else(|| format!("{sender}-reply.md"));
+            let alias_name = reply_alias_filename(&sender, reply_instance_id.as_deref());
+            let mut durable_copy_paths = vec![result_file_path(&team, &alias_name)];
+            if let Some(tid) = reply_task_id.as_deref() {
+                durable_copy_paths.push(result_file_path(&team, &format!("{tid}.md")));
+            }
+            let (normalized_content, rejected_full_report) =
+                normalize_self_referential_full_report(&content, &durable_copy_paths);
+            if let Some(path) = rejected_full_report {
+                eprintln!(
+                    "Warning: FULL_REPORT points to this reply's durable copy ({path}); normalized to n/a. Write detail to a separate unique file first."
+                );
+            }
+            content = normalized_content;
             let alias_result_path = write_result_file(&team, &alias_name, &content).ok();
             let task_result_path = reply_task_id
                 .as_deref()
@@ -8659,7 +9074,12 @@ fn run_attach(sock: &PathBuf, agent_type: &str, agent_name: &str, model: &str, c
 }
 
 /// Detach a single agent from the caller's workspace-local team via `team.detach` RPC.
-fn run_detach(sock: &PathBuf, agent_name: &str) {
+fn run_detach(
+    sock: &PathBuf,
+    agent_name: &str,
+    panel_id: Option<&str>,
+    explicit_instance_id: Option<&str>,
+) {
     let (workspace_id, _panel_id, window_id) = match require_termmesh_context() {
         Ok(t) => t,
         Err(e) => {
@@ -8674,6 +9094,19 @@ fn run_detach(sock: &PathBuf, agent_name: &str) {
             process::exit(1);
         }
     };
+    let agent_instance_id = match command_agent_instance_id(
+        sock,
+        &team_name,
+        agent_name,
+        panel_id,
+        explicit_instance_id,
+    ) {
+        Ok(id) => id,
+        Err(e) => {
+            eprintln!("Error: {e}");
+            process::exit(1);
+        }
+    };
 
     eprintln!(
         "Detaching agent '{}' from team '{}'...",
@@ -8684,6 +9117,8 @@ fn run_detach(sock: &PathBuf, agent_name: &str) {
         "agent_name": agent_name,
         "team_name": team_name,
         "workspace_id": workspace_id,
+        "panel_id": panel_id,
+        "agent_instance_id": agent_instance_id,
     });
     if let Some(wid) = window_id {
         params["window_id"] = json!(wid);
@@ -8831,16 +9266,38 @@ fn run_add_gui(
 ///
 /// Unlike `run_detach` (workspace-local), this variant looks up the team by name
 /// and does not require TERMMESH_WORKSPACE_ID or PANEL_ID.
-fn run_remove_gui(sock: &PathBuf, team_name: &str, agent_name: &str, force: bool) {
+fn run_remove_gui(
+    sock: &PathBuf,
+    team_name: &str,
+    agent_name: &str,
+    force: bool,
+    panel_id: Option<&str>,
+    explicit_instance_id: Option<&str>,
+) {
     eprintln!(
         "Removing agent '{}' from GUI team '{}'...",
         agent_name, team_name
     );
 
+    let agent_instance_id = match command_agent_instance_id(
+        sock,
+        team_name,
+        agent_name,
+        panel_id,
+        explicit_instance_id,
+    ) {
+        Ok(id) => id,
+        Err(e) => {
+            eprintln!("Error: {e}");
+            process::exit(1);
+        }
+    };
     let params = json!({
         "team_name": team_name,
         "agent_name": agent_name,
         "force": force,
+        "panel_id": panel_id,
+        "agent_instance_id": agent_instance_id,
     });
 
     let resp = match rpc_call_timeout(sock, "team.detach", params, 10) {
@@ -8880,6 +9337,7 @@ fn run_remove_gui(sock: &PathBuf, team_name: &str, agent_name: &str, force: bool
         let msg = resp["error"]["message"].as_str().unwrap_or("remove failed");
         let hint = match code {
             "agent_busy" => "\nHint: Agent has an active task — pass --force to close anyway, or finish/block the task first.".to_string(),
+            "ambiguous_agent" => "\nHint: Pass --panel <PANEL_ID> or --agent-instance-id <ID> to select the instance.".to_string(),
             _ => String::new(),
         };
         eprintln!("Error [{}]: {}{}", code, msg, hint);
@@ -9444,26 +9902,21 @@ fn run_delegate_result(
         );
     }
 
-    // Try unified team.delegate RPC first (single round-trip)
-    let mut delegate_params = json!({
-        "team": team,
-        "agent": target,
-        "text": text,
-        "task_title": resolved_title,
-        "priority": resolved_priority,
-        "agent_instance_id": selected_instance_id,
-    });
-    if let Some(ctx) = context {
-        delegate_params["context"] = json!(ctx);
-    }
-    if let Some(fb) = fix_budget {
-        delegate_params["fix_budget"] = json!(fb);
-    }
-    // panel_id is DELIVERY-ONLY: it steers which pane the paste lands on, but the
-    // task assignee stays the agent name (see task.create params below).
-    if let Some(pid) = panel_id {
-        delegate_params["panel_id"] = json!(pid);
-    }
+    // Try unified team.delegate RPC first (single round-trip).
+    let delegate_params = delegate_rpc_params(
+        team,
+        target,
+        text,
+        &resolved_title,
+        resolved_priority,
+        accept,
+        deps,
+        desc.as_deref(),
+        context,
+        fix_budget,
+        panel_id,
+        selected_instance_id.as_deref(),
+    );
     if let Ok(v) = rpc_call(sock, "team.delegate", delegate_params) {
         if v["ok"].as_bool().unwrap_or(false) {
             // Check if text was actually delivered to the agent's terminal
@@ -9756,6 +10209,49 @@ fn run_delegate_result(
     }
 
     Ok(json!({ "task": task, "send": sent }))
+}
+
+fn delegate_rpc_params(
+    team: &str,
+    target: &str,
+    text: &str,
+    title: &str,
+    priority: u32,
+    accept: &[String],
+    deps: &[String],
+    desc: Option<&str>,
+    context: Option<&str>,
+    fix_budget: Option<u8>,
+    panel_id: Option<&str>,
+    agent_instance_id: Option<&str>,
+) -> Value {
+    let mut params = json!({
+        "team": team,
+        "agent": target,
+        "text": text,
+        "task_title": title,
+        "priority": priority,
+        "agent_instance_id": agent_instance_id,
+    });
+    if !accept.is_empty() {
+        params["acceptance_criteria"] = json!(accept);
+    }
+    if !deps.is_empty() {
+        params["depends_on"] = json!(deps);
+    }
+    if let Some(description) = desc {
+        params["description"] = json!(description);
+    }
+    if let Some(ctx) = context {
+        params["context"] = json!(ctx);
+    }
+    if let Some(fb) = fix_budget {
+        params["fix_budget"] = json!(fb);
+    }
+    if let Some(pid) = panel_id {
+        params["panel_id"] = json!(pid);
+    }
+    params
 }
 
 #[derive(Debug, Clone)]
@@ -10282,6 +10778,7 @@ fn run_delegate_autonomous(
         }
     };
     let task_id = task["id"].as_str().unwrap_or("").to_string();
+    let task_agent_instance_id = task["agent_instance_id"].as_str().map(str::to_string);
 
     // Step 2: Format instruction for autonomous mode (no lifecycle commands, no report suffix).
     // The monitor process handles task completion and result reporting.
@@ -10404,6 +10901,7 @@ fn run_delegate_autonomous(
     let team_str = team.to_string();
     let target_str = target.to_string();
     let task_id_clone = task_id.clone();
+    let task_agent_instance_id_clone = task_agent_instance_id.clone();
     let stdout_path_clone = stdout_file_path.clone();
 
     let handle = std::thread::spawn(move || {
@@ -10419,11 +10917,9 @@ fn run_delegate_autonomous(
         let stdout_content = std::fs::read_to_string(&stdout_path_clone).unwrap_or_default();
         if !stdout_content.trim().is_empty() {
             let _ = write_result_file(&team_str, &format!("{task_id_clone}.md"), &stdout_content);
-            let _ = write_result_file(
-                &team_str,
-                &format!("{target_str}-reply.md"),
-                &stdout_content,
-            );
+            let alias_name =
+                reply_alias_filename(&target_str, task_agent_instance_id_clone.as_deref());
+            let _ = write_result_file(&team_str, &alias_name, &stdout_content);
         }
         let _ = std::fs::remove_file(&stdout_path_clone);
 
@@ -13341,15 +13837,15 @@ fn wait_for_tasks(
 }
 
 /// Dispatch delegates with stagger and wait for completion.
-/// Returns (agent_name, task_id) for dispatched tasks.
+/// Returns (agent_name, task_id, agent_instance_id) for dispatched tasks.
 fn dispatch_and_wait(
     sock: &PathBuf,
     team: &str,
     timeout_secs: u64,
     agents_and_prompts: Vec<(String, String, String)>, // (agent_name, prompt, title)
     label: &str,
-) -> Vec<(String, String)> {
-    // (agent_name, task_id) for dispatched tasks
+) -> Vec<(String, String, Option<String>)> {
+    // (agent_name, task_id, agent_instance_id) for dispatched tasks
     let mut handles = Vec::new();
     for (i, (name, prompt, title)) in agents_and_prompts.into_iter().enumerate() {
         if i > 0 {
@@ -13385,14 +13881,17 @@ fn dispatch_and_wait(
         .map(|h| h.join().expect("thread panicked"))
         .collect();
 
-    let mut agent_task_pairs: Vec<(String, String)> = Vec::new();
+    let mut agent_task_pairs: Vec<(String, String, Option<String>)> = Vec::new();
     let mut task_ids: Vec<String> = Vec::new();
     for (name, result) in &results {
         match result {
             Ok(v) => {
                 if let Some(tid) = v["result"]["task"]["id"].as_str() {
                     task_ids.push(tid.to_string());
-                    agent_task_pairs.push((name.clone(), tid.to_string()));
+                    let instance_id = v["result"]["task"]["agent_instance_id"]
+                        .as_str()
+                        .map(str::to_string);
+                    agent_task_pairs.push((name.clone(), tid.to_string(), instance_id));
                 }
             }
             Err(e) => {
@@ -13406,19 +13905,32 @@ fn dispatch_and_wait(
     agent_task_pairs
 }
 
-/// Read a task's result from the result file (task_id.md or agent-reply.md fallback).
-fn read_task_result(team: &str, task_id: &str, agent_name: &str) -> String {
-    let home = std::env::var("HOME").unwrap_or_default();
-    let result_file = format!("{}/.term-mesh/results/{}/{}.md", home, team, task_id);
-    std::fs::read_to_string(&result_file)
-        .or_else(|_| {
-            let reply_file = format!(
-                "{}/.term-mesh/results/{}/{}-reply.md",
-                home, team, agent_name
-            );
-            std::fs::read_to_string(&reply_file)
-        })
-        .unwrap_or_else(|_| "(no response)".to_string())
+fn task_result_candidates(
+    team: &str,
+    task_id: &str,
+    agent_name: &str,
+    agent_instance_id: Option<&str>,
+) -> Vec<PathBuf> {
+    let mut candidates = vec![result_file_path(team, &format!("{task_id}.md"))];
+    candidates.push(result_file_path(
+        team,
+        &reply_alias_filename(agent_name, agent_instance_id),
+    ));
+    candidates
+}
+
+/// Read canonical task output first, then its instance alias. Name-only alias
+/// fallback is retained only for legacy tasks that have no durable instance id.
+fn read_task_result(
+    team: &str,
+    task_id: &str,
+    agent_name: &str,
+    agent_instance_id: Option<&str>,
+) -> String {
+    task_result_candidates(team, task_id, agent_name, agent_instance_id)
+        .into_iter()
+        .find_map(|path| std::fs::read_to_string(path).ok())
+        .unwrap_or_else(|| "(no response)".to_string())
 }
 
 fn synthesize_board(board_path: &PathBuf, board_path_str: &str) {
@@ -13778,7 +14290,12 @@ fn run_autonomous(
 
             let cross_texts: Vec<(String, String)> = cross_pairs
                 .iter()
-                .map(|(name, tid)| (name.clone(), read_task_result(team, tid, name)))
+                .map(|(name, tid, instance_id)| {
+                    (
+                        name.clone(),
+                        read_task_result(team, tid, name, instance_id.as_deref()),
+                    )
+                })
                 .collect();
 
             for (name, text) in &cross_texts {
@@ -13808,8 +14325,8 @@ fn run_autonomous(
                     dispatch_and_wait(sock, team, discuss_timeout, synth_tasks, "synthesis");
 
                 eprintln!("\n══ Discussion Results ══");
-                for (name, tid) in &synth_pairs {
-                    let text = read_task_result(team, tid, name);
+                for (name, tid, instance_id) in &synth_pairs {
+                    let text = read_task_result(team, tid, name, instance_id.as_deref());
                     eprintln!("[{name}] synthesis:\n{text}\n");
                 }
             }

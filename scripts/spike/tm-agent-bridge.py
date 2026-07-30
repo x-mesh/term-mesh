@@ -191,6 +191,39 @@ def log(msg: str) -> None:
         print(f"[bridge] {msg}", flush=True)
 
 
+def stop_process(p: subprocess.Popen, timeout: float = 5) -> None:
+    """Stop, reap, and close a child; safe to call more than once."""
+    try:
+        if p.poll() is None:
+            try:
+                p.terminate()
+            except (OSError, ProcessLookupError):
+                pass
+            try:
+                p.wait(timeout=timeout)
+            except subprocess.TimeoutExpired:
+                try:
+                    p.kill()
+                except (OSError, ProcessLookupError):
+                    pass
+                try:
+                    p.wait()
+                except (OSError, ChildProcessError):
+                    pass
+        else:
+            try:
+                p.wait()
+            except (OSError, ChildProcessError):
+                pass
+    finally:
+        for stream in (p.stdin, p.stdout):
+            if stream is not None:
+                try:
+                    stream.close()
+                except (OSError, ValueError):
+                    pass
+
+
 class Child:
     """An agent CLI whose stdio this process owns."""
 
@@ -236,14 +269,7 @@ class Child:
             return self.p.poll()
 
     def stop(self) -> None:
-        try:
-            self.p.terminate()
-            self.p.wait(timeout=5)
-        except Exception:
-            try:
-                self.p.kill()
-            except Exception:
-                pass
+        stop_process(self.p)
 
 
 class Emitter:
@@ -420,10 +446,13 @@ class JsonRpc:
         before anything else, because everything queued behind one is waiting
         too.
         """
-        deadline = time.time() + timeout
-        while time.time() < deadline:
+        deadline = time.monotonic() + timeout
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
             try:
-                obj = self.child.inbox.get(timeout=0.25)
+                obj = self.child.inbox.get(timeout=min(0.25, remaining))
             except queue.Empty:
                 if not self.child.alive:
                     self._record_exit_failure()
@@ -531,13 +560,43 @@ class PerTurnBridge:
                             stop="spawn_failed", failed=True)
             return
 
-        said = self._read_cursor(p) if self.cli == "cursor" else self._read_agy(p)
+        deadline = time.monotonic() + timeout
+        read_done: queue.Queue[tuple[str, BaseException | None]] = queue.Queue()
+
+        def read_stdout() -> None:
+            try:
+                said = (self._read_cursor(p) if self.cli == "cursor"
+                        else self._read_agy(p))
+                read_done.put((said, None))
+            except BaseException as exc:
+                read_done.put(("", exc))
+
+        reader = threading.Thread(target=read_stdout, daemon=True)
+        reader.start()
         try:
-            code = p.wait(timeout=timeout)
+            code = p.wait(timeout=max(0, deadline - time.monotonic()))
         except subprocess.TimeoutExpired:
-            p.kill()
-            self.out.result(f"{self.cli} did not finish in {timeout:.0f}s",
+            stop_process(p, timeout=0.1)
+            reader.join(timeout=0.1)
+            self.out.result(f"{self.cli} did not finish in {timeout:g}s",
                             stop="timeout", failed=True)
+            return
+
+        remaining = deadline - time.monotonic()
+        try:
+            said, read_error = read_done.get(timeout=max(0, remaining))
+        except queue.Empty:
+            stop_process(p, timeout=0.1)
+            self.out.result(f"{self.cli} did not finish in {timeout:g}s",
+                            stop="timeout", failed=True)
+            return
+        finally:
+            if not p.stdout.closed:
+                p.stdout.close()
+
+        if read_error is not None:
+            self.out.result(f"could not read {self.cli} output: {read_error}",
+                            stop="read_failed", failed=True)
             return
 
         failure = remote_launch_failure(code)
@@ -853,7 +912,8 @@ class CodexBridge:
         # `turn/completed` carries `{threadId, turn}` and no usage at all, so
         # there is no cost to report here. Reading one out of a key that does
         # not exist looked like the number was simply always zero.
-        self.out.result(final, stop="end_turn" if done else "timeout")
+        self.out.result(final, stop="end_turn" if done else "timeout",
+                        failed=done is None)
 
     CHANGE_TOOL = {"add": "write", "update": "edit", "delete": "delete"}
 
@@ -991,7 +1051,7 @@ class AcpBridge:
         self.out.block_done()
         final = "".join(said)
         stop = ((resp or {}).get("result") or {}).get("stopReason") or "timeout"
-        self.out.result(final, stop=stop)
+        self.out.result(final, stop=stop, failed=resp is None)
 
     @property
     def alive(self) -> bool:

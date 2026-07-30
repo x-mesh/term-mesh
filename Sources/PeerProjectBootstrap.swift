@@ -254,9 +254,9 @@ enum PeerProjectBootstrap {
     /// do because the project is a plain directory with no isolation asked for.
     ///
     /// Every step is conditional on its result not already being there, so
-    /// running it twice is running it once. The `||` on the branch switch is
-    /// deliberate: an agent's branch surviving from a previous run is the
-    /// normal case on the second visit, not a failure.
+    /// running it twice is running it once. Artifacts created by this run are
+    /// marked as they commit; the EXIT trap removes only those artifacts, in
+    /// reverse order, when a later setup step fails.
     static func script(
         for plan: Plan,
         gitURL: String?,
@@ -265,15 +265,28 @@ enum PeerProjectBootstrap {
         memMeshProjectID: String? = nil
     ) -> String? {
         var steps: [String] = []
+        var rollbackVariables: [String] = []
+        var rollbackSteps: [String] = []
         let primary = quote(plan.primaryPath)
         if let gitURL, !gitURL.isEmpty {
             let branch = gitBranch?
                 .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
             let branchArgument = branch.isEmpty ? "" : " --branch \(quote(branch))"
+            rollbackVariables.append("tm_primary_owned=0; tm_primary_existed=0")
+            rollbackSteps.append(
+                "if [ \"$tm_primary_owned\" -eq 1 ]; then "
+                    + "if [ \"$tm_primary_existed\" -eq 1 ]; then "
+                    + "find \(primary) -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +; "
+                    + "else rm -rf -- \(primary); fi; fi"
+            )
             steps.append(
-                "test -d \(primary)/.git || "
+                "if test -d \(primary)/.git; then :; else "
+                    + "if test -e \(primary); then tm_primary_existed=1; "
+                    + "test -d \(primary) "
+                    + "&& test -z \"$(find \(primary) -mindepth 1 -maxdepth 1 -print -quit)\"; "
+                    + "fi; tm_primary_owned=1; "
                     + "GIT_SSH_COMMAND=\(quote(nonInteractiveGitSSHCommand)) "
-                    + "git clone\(branchArgument) \(quote(gitURL)) \(primary)"
+                    + "git clone\(branchArgument) \(quote(gitURL)) \(primary); fi"
             )
         } else {
             if sourceKind == .existingFolder {
@@ -282,17 +295,34 @@ enum PeerProjectBootstrap {
                 // error instead of launching panes whose `cd` already failed.
                 steps.append("test -d \(primary)")
             } else {
-                steps.append("mkdir -p \(primary)")
-            }
-            if sourceKind == .empty {
-                steps.append(
-                    "git -C \(primary) rev-parse --git-dir >/dev/null 2>&1 "
-                        + "|| git -C \(primary) init"
+                rollbackVariables.append("tm_primary_owned=0")
+                rollbackSteps.append(
+                    "if [ \"$tm_primary_owned\" -eq 1 ]; then rm -rf -- \(primary); fi"
                 )
                 steps.append(
-                    "git -C \(primary) rev-parse --verify HEAD >/dev/null 2>&1 "
-                        + "|| git -C \(primary) -c user.name=term-mesh "
-                        + "-c user.email=term-mesh@local commit --allow-empty -m 'Initial commit'"
+                    "if test -e \(primary); then test -d \(primary); "
+                        + "else tm_primary_owned=1; mkdir -p \(primary); fi"
+                )
+            }
+            if sourceKind == .empty {
+                rollbackVariables.append("tm_git_owned=0")
+                rollbackSteps.append(
+                    "if [ \"$tm_git_owned\" -eq 1 ]; then rm -rf -- \(primary)/.git; fi"
+                )
+                steps.append(
+                    "if git -C \(primary) rev-parse --git-dir >/dev/null 2>&1; then :; "
+                        + "else tm_git_owned=1; git -C \(primary) init; fi"
+                )
+                rollbackVariables.append("tm_initial_commit_owned=0")
+                rollbackSteps.append(
+                    "if [ \"$tm_initial_commit_owned\" -eq 1 ]; then "
+                        + "git -C \(primary) update-ref -d HEAD; fi"
+                )
+                steps.append(
+                    "if git -C \(primary) rev-parse --verify HEAD >/dev/null 2>&1; then :; "
+                        + "else tm_initial_commit_owned=1; "
+                        + "git -C \(primary) -c user.name=term-mesh "
+                        + "-c user.email=term-mesh@local commit --allow-empty -m 'Initial commit'; fi"
                 )
             } else if plan.agentCheckouts.contains(where: { $0.path != plan.primaryPath }) {
                 // A brand-new project has no repository to clone yet. Make
@@ -304,10 +334,14 @@ enum PeerProjectBootstrap {
                 // repository: cloning it would omit every untracked file and
                 // give agents checkouts that look valid but contain none of
                 // the project.
+                rollbackVariables.append("tm_git_owned=0")
+                rollbackSteps.append(
+                    "if [ \"$tm_git_owned\" -eq 1 ]; then rm -rf -- \(primary)/.git; fi"
+                )
                 steps.append(
-                    "(git -C \(primary) rev-parse --git-dir >/dev/null 2>&1 "
-                        + "|| (test -z \"$(find \(primary) -mindepth 1 -maxdepth 1 "
-                        + "-print -quit)\" && git -C \(primary) init))"
+                    "if git -C \(primary) rev-parse --git-dir >/dev/null 2>&1; then :; "
+                        + "else test -z \"$(find \(primary) -mindepth 1 -maxdepth 1 "
+                        + "-print -quit)\"; tm_git_owned=1; git -C \(primary) init; fi"
                 )
             }
         }
@@ -319,15 +353,35 @@ enum PeerProjectBootstrap {
             // that checkout names carry an instance tag.
             steps.append("git -C \(primary) worktree prune 2>/dev/null || true")
         }
-        for checkout in plan.agentCheckouts where checkout.path != plan.primaryPath {
+        for (index, checkout) in plan.agentCheckouts.enumerated()
+            where checkout.path != plan.primaryPath {
             let path = quote(checkout.path)
             let branch = quote(checkout.branch)
+            let worktreeOwned = "tm_worktree_\(index)_owned"
+            let worktreeExisted = "tm_worktree_\(index)_existed"
+            let branchOwned = "tm_branch_\(index)_owned"
+            rollbackVariables.append(
+                "\(worktreeOwned)=0; \(worktreeExisted)=0; \(branchOwned)=0"
+            )
+            rollbackSteps.append(
+                "if [ \"$\(worktreeOwned)\" -eq 1 ]; then "
+                    + "git -C \(primary) worktree remove --force \(path) >/dev/null 2>&1 "
+                    + "|| rm -rf -- \(path); "
+                    + "if [ \"$\(worktreeExisted)\" -eq 1 ]; then mkdir -p \(path); fi; fi; "
+                    + "if [ \"$\(branchOwned)\" -eq 1 ]; then "
+                    + "git -C \(primary) branch -D \(branch) >/dev/null 2>&1 || true; fi"
+            )
             steps.append(
-                "(git -C \(path) rev-parse --git-dir >/dev/null 2>&1 "
-                    + "|| (git -C \(primary) show-ref --verify --quiet refs/heads/\(branch) "
-                    + "&& git -C \(primary) worktree add \(path) \(branch) "
-                    + "|| git -C \(primary) worktree add -b \(branch) \(path) HEAD))"
-                )
+                "if git -C \(path) rev-parse --git-dir >/dev/null 2>&1; then :; else "
+                    + "if test -e \(path); then \(worktreeExisted)=1; "
+                    + "test -d \(path) "
+                    + "&& test -z \"$(find \(path) -mindepth 1 -maxdepth 1 -print -quit)\"; fi; "
+                    + "\(worktreeOwned)=1; "
+                    + "if git -C \(primary) show-ref --verify --quiet refs/heads/\(branch); "
+                    + "then git -C \(primary) worktree add \(path) \(branch); "
+                    + "else \(branchOwned)=1; "
+                    + "git -C \(primary) worktree add -b \(branch) \(path) HEAD; fi; fi"
+            )
         }
         guard steps.count > 1
                 || gitURL?.isEmpty == false
@@ -338,7 +392,14 @@ enum PeerProjectBootstrap {
         if let memMeshProjectID, !memMeshProjectID.isEmpty {
             steps.append(memMeshIdentityStep(primary: primary, projectID: memMeshProjectID))
         }
-        return steps.joined(separator: " && ")
+        let setup = steps.joined(separator: " && ")
+        guard !rollbackSteps.isEmpty else { return setup }
+        let rollback = rollbackSteps.reversed().joined(separator: "; ")
+        return "set -e; \(rollbackVariables.joined(separator: "; ")); "
+            + "tm_rollback() { tm_status=$?; trap - EXIT; "
+            + "if [ \"$tm_status\" -ne 0 ]; then set +e; \(rollback); fi; "
+            + "exit \"$tm_status\"; }; trap tm_rollback EXIT; "
+            + setup
     }
 
     /// Why this Repository URL cannot work, or nil when it can (or when it

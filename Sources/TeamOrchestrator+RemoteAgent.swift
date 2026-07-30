@@ -47,6 +47,9 @@ extension TeamOrchestrator {
         case cliUnavailable(String, String)
         case promptStagingFailed(String)
         case projectWorkspaceUnavailable(String)
+        case unresolvedRemoteWorkingDirectory(host: String, path: String)
+        case checkoutIsolationFailed(host: String, path: String, reason: String)
+        case projectDeletionIncomplete(String)
         case partialShellClose(closed: Int, failed: Int, reason: String)
 
         var description: String {
@@ -66,10 +69,38 @@ extension TeamOrchestrator {
                 return "could not stage the leader prompt on \(host)"
             case .projectWorkspaceUnavailable(let host):
                 return "could not prepare the project workspace on \(host)"
+            case .unresolvedRemoteWorkingDirectory(let host, let path):
+                return "could not resolve remote working directory for host \(host) "
+                    + "from path \(path); specify --dir <remote-path> for that host"
+            case .checkoutIsolationFailed(let host, let path, let reason):
+                return "could not provision a dedicated checkout on \(host) from \(path): \(reason); "
+                    + "refusing to reuse the requested checkout"
+            case .projectDeletionIncomplete(let report):
+                return "project deletion incomplete: \(report)"
             case .partialShellClose(let closed, let failed, let reason):
                 return "closed \(closed) shell(s); \(failed) refused — \(reason)"
             }
         }
+    }
+
+    nonisolated static func requiredRemoteWorkingDirectory(
+        _ path: String?,
+        hostKey: String
+    ) throws -> String {
+        let resolved = path?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        guard !resolved.isEmpty else {
+            let suppliedPath: String
+            if let path, !path.isEmpty {
+                suppliedPath = String(reflecting: path)
+            } else {
+                suppliedPath = path == nil ? "<unset>" : "<empty>"
+            }
+            throw RemoteAgentError.unresolvedRemoteWorkingDirectory(
+                host: hostKey,
+                path: suppliedPath
+            )
+        }
+        return resolved
     }
 
     private struct RemoteSurfacePlacement {
@@ -87,6 +118,59 @@ extension TeamOrchestrator {
             .replacingOccurrences(of: "\r", with: " ")
             .trimmingCharacters(in: .whitespacesAndNewlines)
         return "Project · \(String(singleLine.prefix(72)))"
+    }
+
+    private func waitForRemoteRemoval(
+        hostSockPath: String,
+        surfaceID: Data? = nil,
+        workspaceID: Data? = nil
+    ) async throws -> Bool {
+        for attempt in 0..<15 {
+            let isLastAttempt = attempt == 14
+            // One failed probe is a missed observation, not a verdict — a
+            // reconnect blip mid-poll must not abort a confirmation the next
+            // attempt would have delivered. Only the final failure propagates.
+            let workspaces: [Termmesh_Peer_V1_Workspace]
+            do {
+                let probe = try await PeerRelaySession.connect(hostSockPath: hostSockPath)
+                do {
+                    workspaces = try await probe.session.listWorkspaces(timeoutSeconds: 2)
+                    await probe.cancel()
+                } catch {
+                    await probe.cancel()
+                    throw error
+                }
+            } catch {
+                guard !isLastAttempt else { throw error }
+                try await Task.sleep(nanoseconds: 200_000_000)
+                continue
+            }
+            if surfaceID != nil, !workspaces.isEmpty,
+               !workspaces.contains(where: \.hasLayout) {
+                // This host exposes no layouts, so its panes can never be
+                // observed here — every poll would "confirm" removal no
+                // matter what the host did. Proceed, but say so instead of
+                // minting a confirmation the roster cannot back.
+                RemoteWorkLog.info(
+                    "Surface removal on \(hostSockPath) is unverifiable: the host lists no workspace layouts."
+                )
+                return true
+            }
+            let workspaceStillExists = workspaceID.map { target in
+                workspaces.contains { $0.workspaceID == target }
+            } ?? false
+            let surfaceStillExists = surfaceID.map { target in
+                workspaces.contains { workspace in
+                    peerPaneSummaries(workspace.hasLayout ? workspace.layout : nil)
+                        .contains { $0.id == target }
+                }
+            } ?? false
+            if !workspaceStillExists && !surfaceStillExists { return true }
+            if !isLastAttempt {
+                try await Task.sleep(nanoseconds: 200_000_000)
+            }
+        }
+        return false
     }
 
     private func remoteSurfacePlacement(
@@ -120,21 +204,24 @@ extension TeamOrchestrator {
                 )
             }
         }
+        var workspaceID = team.remoteWorkspaceIDs[host.id]
+        var createdWorkspace = false
         do {
-            var workspaceID = team.remoteWorkspaceIDs[host.id]
-            var createdWorkspace = false
+            if let cachedWorkspaceID = workspaceID {
+                let workspaces = try await connection.session.listWorkspaces(timeoutSeconds: 10)
+                if !workspaces.contains(where: { $0.workspaceID == cachedWorkspaceID }) {
+                    // The host may have restarted or the user may have removed
+                    // the workspace outside this app. Do not keep sending seed
+                    // requests to an ID the authoritative roster no longer has.
+                    forgetRemoteWorkspaceID(teamName: teamName, hostKey: host.id)
+                    workspaceID = nil
+                }
+            }
             if workspaceID == nil {
                 workspaceID = try await connection.session.createWorkspace(
                     title: Self.remoteProjectWorkspaceTitle(teamName: teamName)
                 )
                 createdWorkspace = true
-                if let workspaceID {
-                    recordRemoteWorkspaceID(
-                        teamName: teamName,
-                        hostKey: host.id,
-                        workspaceID: workspaceID
-                    )
-                }
             }
             guard let workspaceID else {
                 await connection.cancel()
@@ -148,12 +235,19 @@ extension TeamOrchestrator {
             )
             var requestedSeed = false
             for _ in 0..<15 {
-                let workspaces = try await connection.session.listWorkspaces()
+                let workspaces = try await connection.session.listWorkspaces(timeoutSeconds: 10)
                 if let workspace = workspaces.first(where: { $0.workspaceID == workspaceID }),
                    let sourceID = peerPaneSummaries(workspace.hasLayout ? workspace.layout : nil)
                     .map(\.id)
                     .first {
                     let hasManagedProjectSurface = managedIDs.contains(sourceID)
+                    if createdWorkspace {
+                        recordRemoteWorkspaceID(
+                            teamName: teamName,
+                            hostKey: host.id,
+                            workspaceID: workspaceID
+                        )
+                    }
                     await connection.cancel()
                     return RemoteSurfacePlacement(
                         sourceID: sourceID,
@@ -167,9 +261,38 @@ extension TeamOrchestrator {
                 }
                 try await Task.sleep(nanoseconds: 200_000_000)
             }
-            await connection.cancel()
             throw RemoteAgentError.projectWorkspaceUnavailable(host.displayName)
         } catch {
+            if createdWorkspace, let workspaceID {
+                // Creation is not committed until a seed surface exists.
+                // Confirm compensation before dropping the connection. A
+                // write completing only proves that the request entered the
+                // socket, not that the host applied it.
+                do {
+                    try await connection.session.deleteWorkspace(workspaceID: workspaceID)
+                } catch let cleanupError {
+                    await connection.cancel()
+                    throw RemoteAgentError.projectDeletionIncomplete(
+                        "workspace setup failed with \(error); compensation failed with \(cleanupError)"
+                    )
+                }
+                await connection.cancel()
+                do {
+                    guard try await waitForRemoteRemoval(
+                        hostSockPath: host.activeSockPath,
+                        workspaceID: workspaceID
+                    ) else {
+                        throw RemoteAgentError.projectDeletionIncomplete(
+                            "workspace compensation was not confirmed on \(host.displayName)"
+                        )
+                    }
+                } catch let cleanupError {
+                    throw RemoteAgentError.projectDeletionIncomplete(
+                        "workspace setup failed with \(error); compensation failed with \(cleanupError)"
+                    )
+                }
+                throw error
+            }
             await connection.cancel()
             throw error
         }
@@ -802,23 +925,31 @@ extension TeamOrchestrator {
         // an agent but only contains "command not found".
         try await Self.ensureRemoteCLIAvailable(cli: cli, host: host)
 
-        // The project's checkout convention applies to late joiners too.
-        // Creation gives every agent an instance-tagged worktree; this path
-        // used to drop a later agent straight into whatever directory was
-        // typed — which the sheet prefills with the project PRIMARY, i.e.
-        // the leader's own checkout. Two writers, one working tree: the
-        // collision the worktrees exist to prevent, back through the side
-        // door. When the requested directory is one this project created,
-        // carve the newcomer its own station beside it instead. Anything
-        // not recorded as the project's stays exactly as typed.
-        var workingDirectory = workingDirectory
-        if let isolated = await Self.prepareLateAgentCheckout(
-            team: team,
-            host: host,
-            hostKey: hostKey,
-            agentName: agentName,
-            requestedDirectory: workingDirectory
+        // A late member joining one of this project's own checkouts gets an
+        // instance-tagged worktree. The requested path may be the prefilled
+        // primary or another member's worktree — both are recorded in
+        // `remoteProjectLocations` — so derive the primary repository through
+        // --git-common-dir before planning. Isolation failure is fatal here:
+        // falling back would silently put two writers in one checkout.
+        //
+        // A path the project did not create stays exactly as typed. That is
+        // the documented `--dir` contract, and it is what keeps non-git
+        // directories (and projects created without isolation) reachable —
+        // the caller who names a custom directory owns its sharing rules.
+        let requestedDirectory = try Self.requiredRemoteWorkingDirectory(
+            workingDirectory,
+            hostKey: hostKey
+        )
+        let workingDirectory: String
+        if team.remoteProjectLocations.contains(
+            .init(hostKey: hostKey, path: requestedDirectory)
         ) {
+            let isolated = try await Self.prepareLateAgentCheckout(
+                host: host,
+                hostKey: hostKey,
+                agentName: agentName,
+                requestedDirectory: requestedDirectory
+            )
             workingDirectory = isolated.path
             var locations = team.remoteProjectLocations
             locations.append(.init(hostKey: hostKey, path: isolated.path))
@@ -826,6 +957,8 @@ extension TeamOrchestrator {
                 teamName: teamName,
                 locations: locations.sorted { ($0.hostKey, $0.path) < ($1.hostKey, $1.path) }
             )
+        } else {
+            workingDirectory = requestedDirectory
         }
 
         // Use the same incremental grid growth as local `add`/`attach`.
@@ -1128,6 +1261,7 @@ extension TeamOrchestrator {
         panel.session.onTurnEnd = { [teamName = team.id, agentName, agentInstanceId] final, _, taskId in
             Self.fileReport(
                 teamName: teamName, agentName: agentName,
+                agentInstanceId: agentInstanceId,
                 taskId: taskId, text: final
             )
             guard let taskId else { return }
@@ -1288,55 +1422,88 @@ extension TeamOrchestrator {
         }
     }
 
-    /// A late-added agent's own checkout, prepared on the host — or nil to
-    /// use the requested directory exactly as given.
+    /// A late-added agent's own checkout, prepared on the host.
     ///
-    /// Applies only when the requested directory is recorded as one of this
-    /// project's (`remoteProjectLocations`) — a team without project records,
-    /// or an explicitly custom path, keeps today's behavior. The primary is
-    /// derived from the directory itself over ssh (`--git-common-dir`), so a
-    /// recorded worktree path resolves to the same primary its siblings came
-    /// from. The checkout uses the same instance-tag scheme as creation; the
-    /// mem-mesh identity needs no re-pinning because `--local` git config is
-    /// shared with every worktree of the repository. Best effort on purpose:
-    /// any failure falls back to the requested directory, which is exactly
-    /// what this path always did.
+    /// Called only for directories recorded as this project's
+    /// (`remoteProjectLocations`); an explicitly custom path never reaches
+    /// here. The primary is derived from the requested directory over ssh
+    /// (`--git-common-dir`), so a request pointing at an existing member's
+    /// worktree still creates a new sibling checkout. Every failure is
+    /// surfaced because falling back would violate checkout isolation.
+    nonisolated static func lateRemoteAgentCheckoutPlan(
+        primaryRepository: String,
+        agentName: String,
+        instanceTag: String
+    ) -> PeerProjectBootstrap.Plan {
+        PeerProjectBootstrap.plan(
+            projectRoot: (primaryRepository as NSString).deletingLastPathComponent,
+            projectName: (primaryRepository as NSString).lastPathComponent,
+            agents: [agentName],
+            isolateAgents: true,
+            instanceTag: instanceTag
+        )
+    }
+
     static func prepareLateAgentCheckout(
-        team: Team,
         host: HostEntry,
         hostKey: String,
         agentName: String,
         requestedDirectory: String
-    ) async -> (path: String, branch: String)? {
+    ) async throws -> (path: String, branch: String) {
         let requested = requestedDirectory.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !requested.isEmpty,
-              let sshTarget = host.sshTarget, !sshTarget.isEmpty,
-              team.remoteProjectLocations.contains(
-                  Team.RemoteProjectLocation(hostKey: hostKey, path: requested)
-              )
-        else { return nil }
+        guard !requested.isEmpty, let sshTarget = host.sshTarget, !sshTarget.isEmpty else {
+            throw RemoteAgentError.checkoutIsolationFailed(
+                host: host.displayName,
+                path: requested,
+                reason: "the connected host has no SSH provisioning route"
+            )
+        }
 
         let quoted = "'" + requested.replacingOccurrences(of: "'", with: "'\\''") + "'"
-        guard let commonDir = try? await PeerHostReadinessChecker.runScript(
-            sshTarget: sshTarget,
-            port: host.sshPort,
-            identityFile: host.identityFile,
-            script: "git -C \(quoted) rev-parse --path-format=absolute --git-common-dir 2>/dev/null",
-            timeoutSeconds: 30
-        ).trimmingCharacters(in: .whitespacesAndNewlines),
-              commonDir.hasSuffix("/.git")
-        else { return nil }
+        let commonDir: String
+        do {
+            commonDir = try await PeerHostReadinessChecker.runScript(
+                sshTarget: sshTarget,
+                port: host.sshPort,
+                identityFile: host.identityFile,
+                script: "git -C \(quoted) rev-parse --path-format=absolute --git-common-dir 2>/dev/null",
+                timeoutSeconds: 30
+            ).trimmingCharacters(in: .whitespacesAndNewlines)
+        } catch {
+            throw RemoteAgentError.checkoutIsolationFailed(
+                host: host.displayName,
+                path: requested,
+                reason: "the requested directory is not a reachable Git checkout"
+            )
+        }
+        guard commonDir.hasSuffix("/.git") else {
+            throw RemoteAgentError.checkoutIsolationFailed(
+                host: host.displayName,
+                path: requested,
+                reason: "Git did not report a primary repository"
+            )
+        }
         let primary = String(commonDir.dropLast("/.git".count))
-        guard !primary.isEmpty, primary != "/" else { return nil }
+        guard !primary.isEmpty, primary != "/" else {
+            throw RemoteAgentError.checkoutIsolationFailed(
+                host: host.displayName,
+                path: requested,
+                reason: "Git reported an invalid primary repository"
+            )
+        }
 
-        let plan = PeerProjectBootstrap.plan(
-            projectRoot: (primary as NSString).deletingLastPathComponent,
-            projectName: (primary as NSString).lastPathComponent,
-            agents: [agentName],
-            isolateAgents: true,
+        let plan = Self.lateRemoteAgentCheckoutPlan(
+            primaryRepository: primary,
+            agentName: agentName,
             instanceTag: PeerProjectBootstrap.makeInstanceTag()
         )
-        guard let checkout = plan.agentCheckouts.first else { return nil }
+        guard let checkout = plan.agentCheckouts.first else {
+            throw RemoteAgentError.checkoutIsolationFailed(
+                host: host.displayName,
+                path: requested,
+                reason: "checkout planning produced no agent checkout"
+            )
+        }
         do {
             try await PeerProjectBootstrap.run(
                 sshTarget: sshTarget,
@@ -1349,10 +1516,11 @@ extension TeamOrchestrator {
                 environment: PeerHostEnvironment.stored(forHostKey: hostKey)
             )
         } catch {
-            RemoteWorkLog.info(
-                "Could not carve a worktree for \(agentName) on \(host.displayName) — using \(requested): \(error)"
+            throw RemoteAgentError.checkoutIsolationFailed(
+                host: host.displayName,
+                path: requested,
+                reason: String(describing: error)
             )
-            return nil
         }
         RemoteWorkLog.info(
             "\(agentName) joins in its own checkout on \(host.displayName): \(checkout.path) (\(checkout.branch))"
@@ -1420,6 +1588,7 @@ extension TeamOrchestrator {
         pairModel: String = "",
         pairSpec: String = "",
         projectSource: ProjectSource? = nil,
+        onRemoteAttachFailure: ((String) -> Void)? = nil,
         tabManager: TabManager
     ) -> Team? {
         // Peer attachment is asynchronous. Record the requested endpoint from
@@ -1437,16 +1606,44 @@ extension TeamOrchestrator {
         // locally and moving them would start each CLI on the wrong machine
         // and then close it.
         let remoteRows = rows.filter { $0.hostKey != nil }
+        let resolvedRemoteRows: [(row: TeamAgentRow, workingDirectory: String)]
+        let resolvedRemoteLeaderWorkingDirectory: String?
+        do {
+            resolvedRemoteRows = try remoteRows.map { row in
+                guard let hostKey = row.hostKey else {
+                    preconditionFailure("remoteRows contains a local row")
+                }
+                return (
+                    row,
+                    try Self.requiredRemoteWorkingDirectory(
+                        row.hostDirectory,
+                        hostKey: hostKey
+                    )
+                )
+            }
+            if case let .peer(hostKey) = leaderEndpoint {
+                resolvedRemoteLeaderWorkingDirectory = try Self.requiredRemoteWorkingDirectory(
+                    leaderWorkingDirectory,
+                    hostKey: hostKey
+                )
+            } else {
+                resolvedRemoteLeaderWorkingDirectory = nil
+            }
+        } catch {
+            RemoteWorkLog.info("Could not create \(teamName): \(error)")
+            return nil
+        }
         let remoteLeaderSystemPrompt: String?
         if case let .peer(hostKey) = leaderEndpoint {
             let remoteSocketPath = RemoteHostStore.shared.sortedHosts
                 .first(where: { $0.id == hostKey })?
                 .remoteSockPath ?? "inherited from TERMMESH_SOCKET"
             if leaderMode.lowercased() == "claude" {
+                guard let resolvedRemoteLeaderWorkingDirectory else { return nil }
                 remoteLeaderSystemPrompt = Self.remoteLeaderClaudeSystemPrompt(
                     teamName: teamName,
                     rows: rows,
-                    remoteWorkingDirectory: leaderWorkingDirectory ?? workingDirectory,
+                    remoteWorkingDirectory: resolvedRemoteLeaderWorkingDirectory,
                     remoteSocketPath: remoteSocketPath
                 )
             } else {
@@ -1511,18 +1708,13 @@ extension TeamOrchestrator {
             if let hostKey = projectSource.hostKey {
                 locations.insert(.init(hostKey: hostKey, path: projectSource.projectPath))
             }
-            for row in remoteRows {
-                guard let hostKey = row.hostKey else { continue }
-                let path = row.hostDirectory.trimmingCharacters(in: .whitespacesAndNewlines)
-                guard !path.isEmpty else { continue }
-                locations.insert(.init(hostKey: hostKey, path: path))
+            for resolved in resolvedRemoteRows {
+                guard let hostKey = resolved.row.hostKey else { continue }
+                locations.insert(.init(hostKey: hostKey, path: resolved.workingDirectory))
             }
             if case let .peer(hostKey) = leaderEndpoint {
-                let path = (leaderWorkingDirectory ?? "")
-                    .trimmingCharacters(in: .whitespacesAndNewlines)
-                if !path.isEmpty {
-                    locations.insert(.init(hostKey: hostKey, path: path))
-                }
+                guard let resolvedRemoteLeaderWorkingDirectory else { return nil }
+                locations.insert(.init(hostKey: hostKey, path: resolvedRemoteLeaderWorkingDirectory))
             }
             team.remoteProjectLocations = locations.sorted {
                 ($0.hostKey, $0.path) < ($1.hostKey, $1.path)
@@ -1542,11 +1734,12 @@ extension TeamOrchestrator {
         // the shell could not find.
         Task { @MainActor in
             if case let .peer(hostKey) = leaderEndpoint {
+                guard let resolvedRemoteLeaderWorkingDirectory else { return }
                 do {
                     try await self.attachRemoteLeader(
                         teamName: team.id,
                         hostKey: hostKey,
-                        workingDirectory: leaderWorkingDirectory ?? workingDirectory,
+                        workingDirectory: resolvedRemoteLeaderWorkingDirectory,
                         cli: leaderMode,
                         model: leaderModel,
                         systemPrompt: remoteLeaderSystemPrompt
@@ -1554,6 +1747,7 @@ extension TeamOrchestrator {
                 } catch {
                     let description = "Could not start remote leader on \(hostKey): \(error)"
                     RemoteWorkLog.info(description)
+                    onRemoteAttachFailure?(description)
                     self.markRemoteLeaderFailed(
                         teamName: team.id,
                         description: description
@@ -1565,26 +1759,39 @@ extension TeamOrchestrator {
                     )
                 }
             }
-            for row in remoteRows {
+            for resolved in resolvedRemoteRows {
+                let row = resolved.row
                 guard let hostKey = row.hostKey else { continue }
-                let directory = row.hostDirectory.trimmingCharacters(in: .whitespacesAndNewlines)
                 do {
                     _ = try await self.attachRemoteAgent(
                         teamName: team.id,
                         agentName: row.preset.name,
                         hostKey: hostKey,
-                        // Its own path when one was given; the team's
-                        // otherwise, which is right when both machines lay the
-                        // project out the same way and visibly wrong when not.
-                        workingDirectory: directory.isEmpty ? workingDirectory : directory,
+                        workingDirectory: resolved.workingDirectory,
                         agentType: row.preset.name,
                         model: row.preset.model,
                         cli: row.preset.cli
                     )
                 } catch {
-                    RemoteWorkLog.info(
+                    let description =
                         "Could not start \(row.preset.name) on \(hostKey): \(error)"
-                    )
+                    RemoteWorkLog.info(description)
+                    onRemoteAttachFailure?(description)
+                    if let task = TeamDataStore.shared.createTask(
+                        teamName: team.id,
+                        title: "Remote attach failed: \(row.preset.name) @ \(hostKey)",
+                        details: description,
+                        labels: ["remote-attach", "failure"],
+                        priority: 1,
+                        createdBy: "term-mesh"
+                    ) {
+                        _ = TeamDataStore.shared.updateTask(
+                            teamName: team.id,
+                            taskId: task.id,
+                            status: "failed",
+                            result: description
+                        )
+                    }
                 }
             }
         }
@@ -1599,16 +1806,28 @@ extension TeamOrchestrator {
 
         let grouped = Dictionary(grouping: team.remoteProjectLocations, by: \.hostKey)
         var deletionJobs: [(host: HostEntry, script: String)] = []
+        var deleted: [String] = []
+        var remaining: [String] = []
+        var failures: [String] = []
         for (hostKey, locations) in grouped {
             guard let host = RemoteHostStore.shared.sortedHosts.first(where: { $0.id == hostKey })
             else {
-                throw RemoteAgentError.hostNotFound(hostKey)
+                failures.append("filesystem \(hostKey): host not found")
+                remaining.append(contentsOf: locations.map { "path \(hostKey):\($0.path)" })
+                continue
             }
             guard host.isConnected, let sshTarget = host.sshTarget, !sshTarget.isEmpty else {
-                throw RemoteAgentError.hostNotConnected(host.displayName)
+                failures.append("filesystem \(hostKey): host not connected")
+                remaining.append(contentsOf: locations.map { "path \(hostKey):\($0.path)" })
+                continue
             }
-            let script = try PeerProjectBootstrap.deletionScript(paths: locations.map(\.path))
-            deletionJobs.append((host, script))
+            do {
+                let script = try PeerProjectBootstrap.deletionScript(paths: locations.map(\.path))
+                deletionJobs.append((host, script))
+            } catch {
+                failures.append("filesystem \(hostKey): \(error)")
+                remaining.append(contentsOf: locations.map { "path \(hostKey):\($0.path)" })
+            }
         }
 
         let workspace = tabManager.tabs.first(where: { $0.id == team.workspaceId })
@@ -1637,48 +1856,118 @@ extension TeamOrchestrator {
             }
         }
 
-        for remote in remoteSurfaces where !remote.socket.isEmpty {
-            let connection = try await PeerRelaySession.connect(hostSockPath: remote.socket)
-            try await connection.session.requestClosePane(paneID: remote.surfaceID)
-            await connection.cancel()
-            ManagedPeerSurfaceStore.shared.forget(
-                hostKey: remote.hostKey,
-                surfaceID: remote.surfaceID
-            )
+        for remote in remoteSurfaces {
+            let label = "surface \(remote.hostKey):\(remote.surfaceID.base64EncodedString())"
+            guard !remote.socket.isEmpty else {
+                failures.append("\(label): host not connected")
+                remaining.append(label)
+                continue
+            }
+            do {
+                let connection = try await PeerRelaySession.connect(hostSockPath: remote.socket)
+                do {
+                    try await connection.session.requestClosePane(paneID: remote.surfaceID)
+                } catch {
+                    await connection.cancel()
+                    throw error
+                }
+                // Cancelled exactly once, before confirmation: the removal
+                // poll opens its own probes.
+                await connection.cancel()
+                guard try await waitForRemoteRemoval(
+                    hostSockPath: remote.socket,
+                    surfaceID: remote.surfaceID
+                ) else {
+                    throw RemoteAgentError.projectDeletionIncomplete(
+                        "host did not confirm removal of \(label)"
+                    )
+                }
+                ManagedPeerSurfaceStore.shared.forget(
+                    hostKey: remote.hostKey,
+                    surfaceID: remote.surfaceID
+                )
+                deleted.append(label)
+            } catch {
+                failures.append("\(label): \(error)")
+                remaining.append(label)
+            }
         }
 
         // The project owns these peer workspaces. Removing the project should
         // remove their now-detached shell containers too; relay/default and
         // user-created workspaces are never included in this map.
         for (hostKey, workspaceID) in team.remoteWorkspaceIDs {
+            let label = "workspace \(hostKey):\(workspaceID.base64EncodedString())"
             guard let host = RemoteHostStore.shared.sortedHosts.first(where: { $0.id == hostKey }),
                   !host.activeSockPath.isEmpty
-            else { continue }
-            let connection = try await PeerRelaySession.connect(
-                hostSockPath: host.activeSockPath
-            )
-            try await connection.session.deleteWorkspace(workspaceID: workspaceID)
-            await connection.cancel()
+            else {
+                failures.append("\(label): host not connected")
+                remaining.append(label)
+                continue
+            }
+            do {
+                let connection = try await PeerRelaySession.connect(
+                    hostSockPath: host.activeSockPath
+                )
+                do {
+                    try await connection.session.deleteWorkspace(workspaceID: workspaceID)
+                } catch {
+                    await connection.cancel()
+                    throw error
+                }
+                // Cancelled exactly once, before confirmation: the removal
+                // poll opens its own probes.
+                await connection.cancel()
+                guard try await waitForRemoteRemoval(
+                    hostSockPath: host.activeSockPath,
+                    workspaceID: workspaceID
+                ) else {
+                    throw RemoteAgentError.projectDeletionIncomplete(
+                        "host did not confirm removal of \(label)"
+                    )
+                }
+                forgetRemoteWorkspaceID(teamName: teamName, hostKey: hostKey)
+                deleted.append(label)
+            } catch {
+                failures.append("\(label): \(error)")
+                remaining.append(label)
+            }
         }
 
-        try await Task.sleep(nanoseconds: 500_000_000)
+        try? await Task.sleep(nanoseconds: 500_000_000)
         for job in deletionJobs {
-            guard let sshTarget = job.host.sshTarget else { continue }
-            try await PeerHostReadinessChecker.runScript(
-                sshTarget: sshTarget,
-                port: job.host.sshPort,
-                identityFile: job.host.identityFile,
-                script: job.script,
-                timeoutSeconds: 60
-            )
-        }
-        for hostKey in grouped.keys {
-            RemoteProjectPaths.shared.forget(
-                host: hostKey,
-                localRoot: team.workingDirectory
-            )
+            let hostKey = job.host.id
+            do {
+                guard let sshTarget = job.host.sshTarget else {
+                    throw RemoteAgentError.hostNotConnected(job.host.displayName)
+                }
+                try await PeerHostReadinessChecker.runScript(
+                    sshTarget: sshTarget,
+                    port: job.host.sshPort,
+                    identityFile: job.host.identityFile,
+                    script: job.script,
+                    timeoutSeconds: 60
+                )
+                let paths = grouped[hostKey, default: []].map(\.path)
+                deleted.append(contentsOf: paths.map { "path \(hostKey):\($0)" })
+                RemoteProjectPaths.shared.forget(
+                    host: hostKey,
+                    localRoot: team.workingDirectory
+                )
+            } catch {
+                failures.append("filesystem \(hostKey): \(error)")
+                remaining.append(contentsOf: grouped[hostKey, default: []].map {
+                    "path \(hostKey):\($0.path)"
+                })
+            }
         }
 
+        guard failures.isEmpty else {
+            let report = "deleted=[\(deleted.joined(separator: ", "))]; "
+                + "remaining=[\(remaining.joined(separator: ", "))]; "
+                + "failures=[\(failures.joined(separator: "; "))]"
+            throw RemoteAgentError.projectDeletionIncomplete(report)
+        }
         _ = destroyTeam(name: teamName, tabManager: tabManager, archive: false)
     }
 

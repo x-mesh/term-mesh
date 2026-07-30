@@ -193,9 +193,28 @@ extension AutoPilotPolicy {
 struct AutoPilotUndoPoint: Equatable, Codable {
     let branch: String
     let sha: String
+    /// The target branch tip immediately after the automatic merge. Existing
+    /// journal entries decode this as nil and therefore fail closed on undo.
+    let mergedSHA: String?
     let taskID: String
     let repositoryPath: String
     let recordedAtMS: Int64
+
+    init(
+        branch: String,
+        sha: String,
+        mergedSHA: String? = nil,
+        taskID: String,
+        repositoryPath: String,
+        recordedAtMS: Int64
+    ) {
+        self.branch = branch
+        self.sha = sha
+        self.mergedSHA = mergedSHA
+        self.taskID = taskID
+        self.repositoryPath = repositoryPath
+        self.recordedAtMS = recordedAtMS
+    }
 
     /// What a person runs to put the branch back. Spelled out rather than
     /// performed, because undoing someone's merge is their call to make.

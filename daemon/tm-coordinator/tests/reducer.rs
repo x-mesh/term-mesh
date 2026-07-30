@@ -621,6 +621,143 @@ fn review_approve_enqueues_merge_and_validates_snapshot_evidence() {
     assert_eq!(queue["items"][0]["status"], "queued");
 }
 
+#[test]
+fn stale_snapshot_approval_is_rejected_and_latest_evidence_is_persisted() {
+    let dir = tempdir().unwrap();
+    let log: Arc<dyn EventLog> =
+        Arc::new(LocalJournalEventLog::new(dir.path().join("events.ndjson")));
+    let api = Api::for_tests(log.clone()).unwrap();
+    let project = api
+        .handle(
+            "project.add",
+            json!({"request_id":"stale-project","root_path":"/tmp/repo","name":"repo"}),
+        )
+        .unwrap();
+    let project_id = project["event"]["project_id"].clone();
+    let task = api
+        .handle(
+            "task.create",
+            json!({"request_id":"stale-task","project_id":project_id,"title":"slice","body":""}),
+        )
+        .unwrap();
+    let task_id = task["event"]["payload"]["task_id"].clone();
+    let host = observe_host(&api, "stale-host", "hst_stale", 0.1, 0, vec!["/tmp/repo"]);
+    let placed = api
+        .handle(
+            "task.place",
+            json!({"request_id":"stale-place","task_id":task_id,"host_id":host}),
+        )
+        .unwrap();
+    let attempt_id = placed["event"]["payload"]["attempt_id"].clone();
+    let token = placed["event"]["payload"]["token"].clone();
+    let first = api
+        .handle(
+            "review.snapshot",
+            json!({"request_id":"snapshot-1","task_id":task_id,"attempt_id":attempt_id,"fencing_token":token,"base_sha":"base","head_sha":"head-1","diff_digest":"sha256:first"}),
+        )
+        .unwrap();
+    let first_id = first["event"]["payload"]["snapshot_id"].clone();
+    let second = api
+        .handle(
+            "review.snapshot",
+            json!({"request_id":"snapshot-2","task_id":task_id,"attempt_id":attempt_id,"fencing_token":token,"base_sha":"base","head_sha":"head-2","diff_digest":"sha256:second"}),
+        )
+        .unwrap();
+    let second_id = second["event"]["payload"]["snapshot_id"].clone();
+
+    let stale = api
+        .handle(
+            "approve",
+            json!({"request_id":"approve-stale","task_id":task_id,"attempt_id":attempt_id,"fencing_token":token,"reviewer":"reviewer","snapshot_id":first_id,"head_sha":"head-1","diff_digest":"sha256:first"}),
+        )
+        .unwrap_err()
+        .to_string();
+    assert!(stale.contains("stale review snapshot"), "{stale}");
+
+    let approved = api
+        .handle(
+            "approve",
+            json!({"request_id":"approve-latest","task_id":task_id,"attempt_id":attempt_id,"fencing_token":token,"reviewer":"reviewer","snapshot_id":second_id,"head_sha":"head-2","diff_digest":"sha256:second"}),
+        )
+        .unwrap();
+    assert_eq!(
+        approved["event"]["payload"]["merge_queue_item"]["snapshot_id"],
+        second_id
+    );
+    let mut legacy_events = log.read_all().unwrap();
+    let legacy_queue = legacy_events
+        .iter_mut()
+        .find(|event| event.kind == "attempt_approved")
+        .unwrap()
+        .payload["merge_queue_item"]
+        .as_object_mut()
+        .unwrap();
+    legacy_queue.remove("snapshot_id");
+    legacy_queue.remove("head_sha");
+    legacy_queue.remove("diff_digest");
+    let replayed = Reducer::replay(&legacy_events).unwrap();
+    let queue = replayed.merge_queue(None, None).unwrap();
+    assert_eq!(
+        queue[0].snapshot_id.as_ref().map(|id| id.as_str()),
+        second_id.as_str()
+    );
+    assert_eq!(queue[0].head_sha.as_deref(), Some("head-2"));
+    assert_eq!(queue[0].diff_digest.as_deref(), Some("sha256:second"));
+}
+
+#[test]
+fn reassignment_releases_previous_host_slot() {
+    let (api, _project_id, task_id) = api_with_project_task();
+    let first = observe_host(&api, "slot-h1", "hst_slot1", 0.1, 0, vec!["/tmp/repo"]);
+    let second = observe_host(&api, "slot-h2", "hst_slot2", 0.2, 0, vec!["/tmp/repo"]);
+    api.handle(
+        "task.place",
+        json!({"request_id":"slot-place","task_id":task_id,"host_id":first}),
+    )
+    .unwrap();
+    api.handle(
+        "task.suspect",
+        json!({"request_id":"slot-suspect","task_id":task_id}),
+    )
+    .unwrap();
+    api.handle(
+        "task.reassign",
+        json!({"request_id":"slot-reassign","task_id":task_id,"host_id":second}),
+    )
+    .unwrap();
+
+    let hosts = api.handle("host.list", json!({})).unwrap();
+    let rows = hosts["hosts"].as_array().unwrap();
+    let old = rows.iter().find(|host| host["host_id"] == "hst_slot1").unwrap();
+    let new = rows.iter().find(|host| host["host_id"] == "hst_slot2").unwrap();
+    assert_eq!(old["used_slots"], 0);
+    assert_eq!(new["used_slots"], 1);
+}
+
+#[test]
+fn terminal_merge_transition_releases_current_host_slot() {
+    let (api, _task_id, _attempt_id, queue_id) = approved_queue_fixture("slotterminal");
+    api.handle(
+        "merge.queue.transition",
+        json!({"request_id":"slot-running","queue_id":queue_id,"status":"running"}),
+    )
+    .unwrap();
+    api.handle(
+        "merge.queue.transition",
+        json!({"request_id":"slot-merged","queue_id":queue_id,"status":"merged"}),
+    )
+    .unwrap();
+
+    let hosts = api.handle("host.list", json!({})).unwrap();
+    let host = hosts["hosts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|host| host["host_id"] == "hst_slotterminal")
+        .unwrap();
+    assert_eq!(host["used_slots"], 0);
+}
+
 fn approved_queue_fixture(
     suffix: &str,
 ) -> (Arc<Api>, TaskId, serde_json::Value, serde_json::Value) {

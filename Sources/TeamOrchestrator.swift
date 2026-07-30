@@ -201,6 +201,10 @@ final class TeamOrchestrator: ObservableObject {
         teams[teamName]?.remoteWorkspaceIDs[hostKey] = workspaceID
     }
 
+    func forgetRemoteWorkspaceID(teamName: String, hostKey: String) {
+        teams[teamName]?.remoteWorkspaceIDs.removeValue(forKey: hostKey)
+    }
+
     /// Install the remote pane that replaced the pending leader anchor. Kept
     /// on the owning type because `teams` is intentionally read-only to extensions.
     func replaceLeaderEndpoint(
@@ -1047,6 +1051,7 @@ final class TeamOrchestrator: ObservableObject {
             }
             agentPanel.session.onTurnEnd = { [teamName, agentName, agentInstanceId] final, _, taskId in
                 Self.fileReport(teamName: teamName, agentName: agentName,
+                                agentInstanceId: agentInstanceId,
                                 taskId: taskId, text: final)
                 // A turn with no task behind it must not close somebody
                 // else's. Broadcasts and anything typed in the composer carry
@@ -3842,12 +3847,21 @@ final class TeamOrchestrator: ObservableObject {
     ///
     /// Both names, as the CLI writes them: the task's, and the agent's latest.
     static func fileReport(teamName: String, agentName: String,
+                           agentInstanceId: String? = nil,
                            taskId: String?, text: String) {
         let dir = URL(fileURLWithPath: NSHomeDirectory())
             .appendingPathComponent(".term-mesh/results", isDirectory: true)
             .appendingPathComponent(safeFilename(teamName), isDirectory: true)
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        var names = ["\(safeFilename(agentName))-reply.md"]
+        // A name-only reply file is safe only when there is no instance to
+        // collide with: two same-named instances both writing it would let
+        // whichever finishes last silently overwrite the other's report.
+        var names: [String]
+        if let agentInstanceId, !agentInstanceId.isEmpty {
+            names = ["\(safeFilename(agentName))-\(safeFilename(agentInstanceId))-reply.md"]
+        } else {
+            names = ["\(safeFilename(agentName))-reply.md"]
+        }
         if let taskId, !taskId.isEmpty { names.append("\(safeFilename(taskId)).md") }
         for name in names {
             try? text.write(to: dir.appendingPathComponent(name),

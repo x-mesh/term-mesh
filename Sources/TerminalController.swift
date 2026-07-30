@@ -309,6 +309,58 @@ class TerminalController {
         return trimmed
     }
 
+    nonisolated static func remoteAgentHostKey(
+        for input: String,
+        candidates: [(key: String, displayName: String, sshTarget: String?)]
+    ) -> String? {
+        let needle = input.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !needle.isEmpty else { return nil }
+        if let exactKey = candidates.first(where: { $0.key == needle }) {
+            return exactKey.key
+        }
+        if let displayName = candidates.first(where: {
+            $0.displayName.caseInsensitiveCompare(needle) == .orderedSame
+        }) {
+            return displayName.key
+        }
+        if let fullTarget = candidates.first(where: {
+            $0.sshTarget?.caseInsensitiveCompare(needle) == .orderedSame
+        }) {
+            return fullTarget.key
+        }
+        return candidates.first { candidate in
+            guard var hostname = candidate.sshTarget?
+                .trimmingCharacters(in: .whitespacesAndNewlines),
+                  !hostname.isEmpty
+            else { return false }
+            if let at = hostname.lastIndex(of: "@") {
+                hostname = String(hostname[hostname.index(after: at)...])
+            }
+            return hostname.caseInsensitiveCompare(needle) == .orderedSame
+        }?.key
+    }
+
+    nonisolated static func remoteAgentResponseWorkingDirectory(
+        requested: String,
+        memberWorkingDirectory: String?
+    ) -> (directory: String, reused: Bool) {
+        let requested = requested.trimmingCharacters(in: .whitespacesAndNewlines)
+        let member = memberWorkingDirectory?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let actual = member.isEmpty ? requested : member
+        return (directory: actual, reused: actual == requested)
+    }
+
+    nonisolated static func remoteAgentHostNotFoundMessage(
+        input: String,
+        connectedKeys: [String]
+    ) -> String {
+        let available = connectedKeys.isEmpty
+            ? "no hosts are connected"
+            : "connected host keys: \(connectedKeys.joined(separator: ", "))"
+        return "no connected host named \(input); \(available)"
+    }
+
     /// Update which window's TabManager receives socket commands.
     /// This is used when the user switches between multiple terminal windows.
     func setActiveTabManager(_ tabManager: TabManager?) {
@@ -2619,15 +2671,17 @@ class TerminalController {
     ) async -> String {
         enum Resolution {
             case ok(key: String, directory: String)
-            case noSuchHost
+            case noSuchHost(connectedKeys: [String])
             case noDirectory(host: String)
         }
         let resolution: Resolution = await MainActor.run {
-            let hosts = RemoteHostStore.shared.sortedHosts
-            let match = hosts.first { $0.id == host }
-                ?? hosts.first { $0.displayName.caseInsensitiveCompare(host) == .orderedSame }
-                ?? hosts.first { $0.sshTarget?.caseInsensitiveCompare(host) == .orderedSame }
-            guard let match else { return .noSuchHost }
+            let hosts = RemoteHostStore.shared.sortedHosts.filter(\.isConnected)
+            let candidates = hosts.map {
+                (key: $0.id, displayName: $0.displayName, sshTarget: $0.sshTarget)
+            }
+            guard let hostKey = Self.remoteAgentHostKey(for: host, candidates: candidates),
+                  let match = hosts.first(where: { $0.id == hostKey })
+            else { return .noSuchHost(connectedKeys: hosts.map(\.id)) }
             // An explicit directory wins, because the caller is the only one
             // who can know where a project lives on a machine that has not
             // said. Two machines rarely lay a checkout out the same way, so
@@ -2666,8 +2720,15 @@ class TerminalController {
         switch resolution {
         case .ok(let key, let dir):
             resolved = (key, dir)
-        case .noSuchHost:
-            return v2Error(id: id, code: "not_found", message: "no connected host named \(host)")
+        case .noSuchHost(let connectedKeys):
+            return v2Error(
+                id: id,
+                code: "not_found",
+                message: Self.remoteAgentHostNotFoundMessage(
+                    input: host,
+                    connectedKeys: connectedKeys
+                )
+            )
         case .noDirectory(let name):
             return v2Error(
                 id: id,
@@ -2685,6 +2746,10 @@ class TerminalController {
                 model: agentModel,
                 cli: agentCli
             )
+            let checkout = Self.remoteAgentResponseWorkingDirectory(
+                requested: resolved.directory,
+                memberWorkingDirectory: member.originalAgentWorkDir
+            )
             var payload: [String: Any] = [
                 "team_name": teamName,
                 "agent_name": member.name,
@@ -2693,7 +2758,8 @@ class TerminalController {
                 "cli": member.cli,
                 "model": member.model,
                 "host": resolved.key,
-                "working_directory": resolved.directory,
+                "working_directory": checkout.directory,
+                "checkout_reused": checkout.reused,
             ]
             if let pid = member.panelId { payload["panel_id"] = pid.uuidString }
             return v2Result(id: id, .ok(payload))
@@ -5823,7 +5889,7 @@ class TerminalController {
 /// running the CLI command and clicking Approve in the same second can't
 /// double-finish a worktree), same dirty-worktree guard, same `git-kit wt
 /// finish` contract. See docs/design/mission-control-approval-queue.md §6.4.
-private enum WorktreeApprovalHelper {
+enum WorktreeApprovalHelper {
     enum Outcome {
         case success(mode: String?, removed: Bool?)
         case failure(String)
@@ -5901,9 +5967,7 @@ private enum WorktreeApprovalHelper {
         } catch {
             return .failure("failed to launch git-kit: \(error.localizedDescription)")
         }
-        process.waitUntilExit()
-        let outData = stdoutPipe.fileHandleForReading.readDataToEndOfFile()
-        let errData = stderrPipe.fileHandleForReading.readDataToEndOfFile()
+        let (outData, errData) = runToCompletion(process, stdout: stdoutPipe, stderr: stderrPipe)
         let errStr = String(data: errData, encoding: .utf8) ?? ""
 
         guard let obj = try? JSONSerialization.jsonObject(with: outData) as? [String: Any] else {
@@ -5919,6 +5983,44 @@ private enum WorktreeApprovalHelper {
         }
         let result = (obj["result"] as? [String: Any]) ?? obj
         return .success(mode: result["mode"] as? String, removed: result["removed"] as? Bool)
+    }
+
+    /// Runs `process` to completion, draining `stdout`/`stderr` concurrently
+    /// with execution rather than after `waitUntilExit()`. Once either pipe's
+    /// kernel buffer (commonly 64KB) fills, a child blocked in `write()`
+    /// while this caller blocks in `waitUntilExit()` first is a deadlock, not
+    /// a slow return — and git-kit output on a large repository can reach
+    /// that in practice. Caller must already have called `process.run()`.
+    static func runToCompletion(
+        _ process: Process, stdout: Pipe, stderr: Pipe
+    ) -> (stdout: Data, stderr: Data) {
+        let drainQueue = DispatchQueue(label: "com.termmesh.process-drain")
+        var outData = Data()
+        var errData = Data()
+        let group = DispatchGroup()
+
+        func drain(_ pipe: Pipe, into accumulate: @escaping (Data) -> Void) {
+            group.enter()
+            pipe.fileHandleForReading.readabilityHandler = { handle in
+                // Read in the Foundation readiness callback itself — never on
+                // `drainQueue` — so this call never blocks waiting for bytes.
+                let chunk = handle.availableData
+                if chunk.isEmpty { handle.readabilityHandler = nil }
+                drainQueue.async {
+                    if chunk.isEmpty {
+                        group.leave()
+                    } else {
+                        accumulate(chunk)
+                    }
+                }
+            }
+        }
+        drain(stdout) { outData.append($0) }
+        drain(stderr) { errData.append($0) }
+
+        process.waitUntilExit()
+        group.wait()
+        return (outData, errData)
     }
 
     private static func acquireLock(teamName: String, taskId: String) -> Result<TaskWorktreeLock, String> {
@@ -5982,14 +6084,14 @@ private enum WorktreeApprovalHelper {
         process.executableURL = URL(fileURLWithPath: "/usr/bin/which")
         process.arguments = ["git-kit"]
         let pipe = Pipe()
+        let errPipe = Pipe()
         process.standardOutput = pipe
-        process.standardError = Pipe()
+        process.standardError = errPipe
         do {
             try process.run()
         } catch { return nil }
-        process.waitUntilExit()
+        let (data, _) = runToCompletion(process, stdout: pipe, stderr: errPipe)
         guard process.terminationStatus == 0 else { return nil }
-        let data = pipe.fileHandleForReading.readDataToEndOfFile()
         return String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfBlankTC
     }
 }

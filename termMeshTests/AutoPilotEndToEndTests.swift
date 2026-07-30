@@ -174,7 +174,8 @@ final class AutoPilotEndToEndTests: XCTestCase {
         let resolvedRoot = await AutoPilotUndo.repositoryRoot(containing: task.worktreePath!)
         let repositoryRoot = try XCTUnwrap(resolvedRoot)
         let undoPoint = AutoPilotUndoPoint(
-            branch: "develop", sha: developBefore, taskID: task.rawID,
+            branch: "develop", sha: developBefore, mergedSHA: worktreeHead,
+            taskID: task.rawID,
             repositoryPath: repositoryRoot, recordedAtMS: 1
         )
 

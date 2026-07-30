@@ -686,11 +686,19 @@ final class ReviewBoardCoordinatorServiceTests: XCTestCase {
             task.cancel()
         }
 
+        // Kept alive so the subscription can be stopped below — `subscribeEvents`'s
+        // retry loop captures its token strongly and otherwise never exits, leaking
+        // a GCD `.utility` worker thread in `Thread.sleep` for the rest of the
+        // process (see testSubscribeEventsKeepsTryingUntilTheCoordinatorIsListening,
+        // which was starved into a 906-second failure by exactly this leak).
+        let client = ReviewBoardCoordinatorClient(socketPath: socketPath)
+        defer { client.stopSubscribing() }
+
         let expectation = expectation(description: "relevant coordinator events")
         expectation.expectedFulfillmentCount = 5
         expectation.assertForOverFulfill = true
 
-        ReviewBoardCoordinatorClient(socketPath: socketPath).subscribeEvents {
+        client.subscribeEvents {
             expectation.fulfill()
         }
 

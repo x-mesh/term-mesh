@@ -375,6 +375,12 @@ pub struct MergeQueueItem {
     pub project_id: ProjectId,
     pub task_id: TaskId,
     pub attempt_id: AttemptId,
+    /// Approval evidence. `None` only on rows that predate evidence and whose
+    /// backfill found no journal event or snapshot to recover it from — a
+    /// reader must treat that as "no evidence", never as a match.
+    pub snapshot_id: Option<ReviewSnapshotId>,
+    pub head_sha: Option<String>,
+    pub diff_digest: Option<String>,
     pub status: MergeQueueStatus,
     pub approved_by: String,
     pub approved_at_ms: u64,

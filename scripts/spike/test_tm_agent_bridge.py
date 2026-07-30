@@ -4,7 +4,9 @@ from pathlib import Path
 import queue
 import shutil
 import subprocess
+import sys
 import tempfile
+import time
 import unittest
 from unittest.mock import patch
 
@@ -253,6 +255,19 @@ def codex_bridge(frames=()) -> tuple:
     return bridge, child, emitter
 
 
+def acp_bridge(frames=()) -> tuple:
+    """An AcpBridge over a scripted child, without spawning anything."""
+    bridge = BRIDGE.AcpBridge.__new__(BRIDGE.AcpBridge)
+    child = ScriptedChild(frames)
+    emitter = CapturedEmitter()
+    bridge.child = child
+    bridge.out = emitter
+    bridge.session = "session-1"
+    bridge.tool_output = {}
+    bridge.rpc = BRIDGE.JsonRpc(child, emitter)
+    return bridge, child, emitter
+
+
 FILE_CHANGE_ITEM = {
     "type": "fileChange",
     "id": "item-9",
@@ -443,6 +458,73 @@ class ThreadStartTests(unittest.TestCase):
         self.assertTrue(started)
         self.assertEqual(len(requests), 2)
         self.assertEqual(requests[1]["params"], {"cwd": "/tmp/project"})
+
+
+class TimeoutTests(unittest.TestCase):
+    def test_hung_per_turn_child_is_stopped_within_its_deadline(self):
+        out = CapturedEmitter()
+        bridge = BRIDGE.PerTurnBridge("agy", "/tmp", None, out)
+        command = [
+            sys.executable,
+            "-c",
+            "import sys,time; print('partial', flush=True); time.sleep(30)",
+        ]
+
+        started = time.monotonic()
+        with patch.object(bridge, "_argv", return_value=command):
+            bridge.turn("wait forever", timeout=0.15)
+        elapsed = time.monotonic() - started
+
+        self.assertLess(elapsed, 1.0)
+        result = [e for e in out.events if e.get("type") == "result"][-1]
+        self.assertEqual(result["stop_reason"], "timeout")
+        self.assertTrue(result["is_error"])
+
+    def test_codex_timeout_is_failed_and_preserves_partial_text(self):
+        bridge, _, out = codex_bridge([
+            {"jsonrpc": "2.0", "id": 1, "result": {}},
+            {"jsonrpc": "2.0", "method": "item/agentMessage/delta",
+             "params": {"delta": "partial codex answer"}},
+        ])
+
+        bridge.turn("do work", timeout=0.05)
+
+        result = [e for e in out.events if e.get("type") == "result"][-1]
+        self.assertEqual(result["stop_reason"], "timeout")
+        self.assertTrue(result["is_error"])
+        self.assertEqual(result["result"], "partial codex answer")
+
+    def test_acp_timeout_is_failed_and_preserves_partial_text(self):
+        bridge, _, out = acp_bridge([
+            {"jsonrpc": "2.0", "method": "session/update", "params": {
+                "update": {"sessionUpdate": "agent_message_chunk",
+                           "content": {"text": "partial acp answer"}}}},
+        ])
+
+        bridge.turn("do work", timeout=0.05)
+
+        result = [e for e in out.events if e.get("type") == "result"][-1]
+        self.assertEqual(result["stop_reason"], "timeout")
+        self.assertTrue(result["is_error"])
+        self.assertEqual(result["result"], "partial acp answer")
+
+    def test_stop_process_kills_reaps_and_closes_streams_idempotently(self):
+        child = subprocess.Popen(
+            [sys.executable, "-c",
+             "import signal,time; signal.signal(signal.SIGTERM, "
+             "signal.SIG_IGN); print('ready', flush=True); time.sleep(30)"],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            text=True,
+        )
+        self.assertEqual(child.stdout.readline().strip(), "ready")
+
+        BRIDGE.stop_process(child, timeout=0.05)
+        BRIDGE.stop_process(child, timeout=0.05)
+
+        self.assertIsNotNone(child.returncode)
+        self.assertTrue(child.stdin.closed)
+        self.assertTrue(child.stdout.closed)
 
 
 class ClampTests(unittest.TestCase):
