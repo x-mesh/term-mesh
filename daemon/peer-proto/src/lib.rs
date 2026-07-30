@@ -159,6 +159,7 @@ pub mod team_leader {
     pub fn validate_grant(
         presented: &TeamLeaderGrant,
         registered: Option<&TeamLeaderGrant>,
+        registered_valid_until_unix_seconds: Option<u64>,
         expected_project_id: &str,
         expected_team_uuid: &str,
         now_unix_seconds: u64,
@@ -184,8 +185,13 @@ pub mod team_leader {
         {
             return Err(ValidationError::InvalidRole);
         }
+        // Keep the issued wire expiry immutable for tamper detection. The
+        // authoritative server may renew a separate lease deadline without
+        // needing to mutate the long-running leader process environment.
+        let valid_until =
+            registered_valid_until_unix_seconds.unwrap_or(registered.expires_at_unix_secs);
         if presented.expires_at_unix_secs != registered.expires_at_unix_secs
-            || presented.expires_at_unix_secs <= now_unix_seconds
+            || valid_until <= now_unix_seconds
         {
             return Err(ValidationError::ExpiredGrant);
         }
@@ -197,8 +203,7 @@ pub mod team_leader {
         !bytes.is_empty()
             && bytes.len() <= max_bytes
             && bytes.iter().all(|byte| {
-                byte.is_ascii_alphanumeric()
-                    || matches!(byte, b'-' | b'.' | b':' | b'_')
+                byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b':' | b'_')
             })
     }
 
@@ -254,9 +259,7 @@ mod team_leader_tests {
         validate_bootstrap, validate_grant, ReplayGuard, ValidationError, GRANT_ID_BYTES,
         MAX_BOOTSTRAP_PAYLOAD_BYTES, REQUEST_ID_BYTES,
     };
-    use super::{
-        TeamLeaderBootstrapRequest, TeamLeaderGrant, TeamLeaderPlacement, TeamLeaderRole,
-    };
+    use super::{TeamLeaderBootstrapRequest, TeamLeaderGrant, TeamLeaderPlacement, TeamLeaderRole};
 
     fn request() -> TeamLeaderBootstrapRequest {
         TeamLeaderBootstrapRequest {
@@ -315,6 +318,7 @@ mod team_leader_tests {
             validate_grant(
                 &registered,
                 Some(&registered),
+                None,
                 "name:demo",
                 "team-uuid",
                 99
@@ -325,14 +329,28 @@ mod team_leader_tests {
         let mut forged = registered.clone();
         forged.project_id = "name:other".into();
         assert_eq!(
-            validate_grant(&forged, Some(&registered), "name:demo", "team-uuid", 99),
+            validate_grant(
+                &forged,
+                Some(&registered),
+                None,
+                "name:demo",
+                "team-uuid",
+                99
+            ),
             Err(ValidationError::ForgedProject)
         );
 
         let mut forged = registered.clone();
         forged.team_uuid = "other-team".into();
         assert_eq!(
-            validate_grant(&forged, Some(&registered), "name:demo", "team-uuid", 99),
+            validate_grant(
+                &forged,
+                Some(&registered),
+                None,
+                "name:demo",
+                "team-uuid",
+                99
+            ),
             Err(ValidationError::ForgedTeam)
         );
 
@@ -342,6 +360,7 @@ mod team_leader_tests {
             validate_grant(
                 &wrong_role,
                 Some(&registered),
+                None,
                 "name:demo",
                 "team-uuid",
                 99
@@ -352,6 +371,7 @@ mod team_leader_tests {
             validate_grant(
                 &registered,
                 Some(&registered),
+                None,
                 "name:demo",
                 "team-uuid",
                 100
@@ -359,8 +379,22 @@ mod team_leader_tests {
             Err(ValidationError::ExpiredGrant)
         );
         assert_eq!(
-            validate_grant(&registered, None, "name:demo", "team-uuid", 99),
+            validate_grant(&registered, None, None, "name:demo", "team-uuid", 99),
             Err(ValidationError::UnknownGrant)
+        );
+
+        let mut renewed = registered.clone();
+        renewed.expires_at_unix_secs = 110;
+        assert_eq!(
+            validate_grant(
+                &registered,
+                Some(&registered),
+                Some(renewed.expires_at_unix_secs),
+                "name:demo",
+                "team-uuid",
+                105
+            ),
+            Ok(())
         );
     }
 

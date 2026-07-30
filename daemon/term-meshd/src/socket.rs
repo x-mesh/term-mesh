@@ -2528,6 +2528,7 @@ async fn dispatch(req: &Request, ctx: &Context) -> Response {
                                 if let Err(error) = peer_proto::team_leader::validate_grant(
                                     &grant,
                                     Some(&grant),
+                                    Some(u64::MAX),
                                     &grant.project_id,
                                     &p.team_uuid,
                                     now,

@@ -52,6 +52,7 @@ public enum PeerTeamLeader {
     public static func validateGrant(
         _ presented: Termmesh_Peer_V1_TeamLeaderGrant,
         registered: Termmesh_Peer_V1_TeamLeaderGrant?,
+        registeredValidUntilUnixSeconds: UInt64? = nil,
         expectedProjectID: String,
         expectedTeamUUID: String,
         nowUnixSeconds: UInt64
@@ -74,8 +75,14 @@ public enum PeerTeamLeader {
         guard presented.role == .leader, registered.role == .leader else {
             return .failure(.invalidRole)
         }
+        // The wire expiry remains bound to the originally issued grant so a
+        // caller cannot forge it. Active grants may have a later, server-only
+        // lease deadline; that authority is never copied into the leader
+        // process environment.
+        let validUntil = registeredValidUntilUnixSeconds
+            ?? registered.expiresAtUnixSecs
         guard presented.expiresAtUnixSecs == registered.expiresAtUnixSecs,
-              presented.expiresAtUnixSecs > nowUnixSeconds else {
+              validUntil > nowUnixSeconds else {
             return .failure(.expiredGrant)
         }
         return .success(())
@@ -87,6 +94,7 @@ public enum PeerTeamLeader {
     public static func validateCommand(
         _ request: Termmesh_Peer_V1_TeamLeaderCommandRequest,
         registeredGrant: Termmesh_Peer_V1_TeamLeaderGrant?,
+        registeredValidUntilUnixSeconds: UInt64? = nil,
         encodedBytes: Int,
         nowUnixSeconds: UInt64
     ) -> Result<Void, ValidationError> {
@@ -109,6 +117,7 @@ public enum PeerTeamLeader {
         let grantValidation = validateGrant(
             request.grant,
             registered: registeredGrant,
+            registeredValidUntilUnixSeconds: registeredValidUntilUnixSeconds,
             expectedProjectID: request.grant.projectID,
             expectedTeamUUID: request.teamUuid,
             nowUnixSeconds: nowUnixSeconds
@@ -198,6 +207,8 @@ public actor PeerTeamLeaderControlPlane {
     private struct RegisteredGrant {
         let value: Termmesh_Peer_V1_TeamLeaderGrant
         let audiencePeerID: Data?
+        var validUntilUnixSeconds: UInt64
+        let renewalLifetimeSeconds: UInt64?
     }
 
     private let maxCacheEntries: Int
@@ -232,10 +243,15 @@ public actor PeerTeamLeaderControlPlane {
     /// expiry/role fixtures.
     public func registerGrant(
         _ grant: Termmesh_Peer_V1_TeamLeaderGrant,
-        audiencePeerID: Data? = nil
+        audiencePeerID: Data? = nil,
+        renewalLifetimeSeconds: UInt64? = nil
     ) {
         guard grant.grantID.count == PeerTeamLeader.grantIDBytes else { return }
-        storeGrant(grant, audiencePeerID: audiencePeerID)
+        storeGrant(
+            grant,
+            audiencePeerID: audiencePeerID,
+            renewalLifetimeSeconds: renewalLifetimeSeconds
+        )
     }
 
     public func revokeGrant(id: Data) {
@@ -282,7 +298,11 @@ public actor PeerTeamLeaderControlPlane {
         grant.teamUuid = teamUUID
         grant.role = .leader
         grant.expiresAtUnixSecs = nowUnixSeconds &+ grantLifetimeSeconds
-        storeGrant(grant, audiencePeerID: audiencePeerID)
+        storeGrant(
+            grant,
+            audiencePeerID: audiencePeerID,
+            renewalLifetimeSeconds: grantLifetimeSeconds
+        )
 
         var response = Termmesh_Peer_V1_TeamLeaderBootstrapResponse()
         response.ok = true
@@ -303,6 +323,7 @@ public actor PeerTeamLeaderControlPlane {
         let validation = PeerTeamLeader.validateCommand(
             request,
             registeredGrant: registered?.value,
+            registeredValidUntilUnixSeconds: registered?.validUntilUnixSeconds,
             encodedBytes: encodedBytes,
             nowUnixSeconds: nowUnixSeconds
         )
@@ -337,7 +358,7 @@ public actor PeerTeamLeaderControlPlane {
             )
             return response
         }
-        touchGrant(request.grant.grantID)
+        touchGrant(request.grant.grantID, nowUnixSeconds: nowUnixSeconds)
 
         let key = RequestKey(
             grantID: request.grant.grantID,
@@ -397,21 +418,32 @@ public actor PeerTeamLeaderControlPlane {
 
     private func storeGrant(
         _ grant: Termmesh_Peer_V1_TeamLeaderGrant,
-        audiencePeerID: Data?
+        audiencePeerID: Data?,
+        renewalLifetimeSeconds: UInt64?
     ) {
         grantOrder.removeAll { $0 == grant.grantID }
         grantOrder.append(grant.grantID)
         grants[grant.grantID] = RegisteredGrant(
             value: grant,
-            audiencePeerID: audiencePeerID
+            audiencePeerID: audiencePeerID,
+            validUntilUnixSeconds: grant.expiresAtUnixSecs,
+            renewalLifetimeSeconds: renewalLifetimeSeconds
         )
         while grantOrder.count > maxGrantEntries {
             grants.removeValue(forKey: grantOrder.removeFirst())
         }
     }
 
-    private func touchGrant(_ grantID: Data) {
-        guard grants[grantID] != nil else { return }
+    private func touchGrant(_ grantID: Data, nowUnixSeconds: UInt64) {
+        guard var registered = grants[grantID] else { return }
+        if let lifetime = registered.renewalLifetimeSeconds {
+            let (deadline, overflow) = nowUnixSeconds.addingReportingOverflow(lifetime)
+            registered.validUntilUnixSeconds = max(
+                registered.validUntilUnixSeconds,
+                overflow ? UInt64.max : deadline
+            )
+            grants[grantID] = registered
+        }
         grantOrder.removeAll { $0 == grantID }
         grantOrder.append(grantID)
     }
@@ -428,7 +460,7 @@ public actor PeerTeamLeaderControlPlane {
         }
 
         let expiredGrants = grants.compactMap { id, grant in
-            grant.value.expiresAtUnixSecs <= nowUnixSeconds ? id : nil
+            grant.validUntilUnixSeconds <= nowUnixSeconds ? id : nil
         }
         for id in expiredGrants {
             grants.removeValue(forKey: id)
