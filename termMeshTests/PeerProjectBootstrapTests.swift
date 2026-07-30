@@ -926,7 +926,10 @@ final class PeerProjectBootstrapTests: XCTestCase {
         XCTAssertEqual(prepare, "unset HISTFILE; stty -echo")
         XCTAssertTrue(launch.hasPrefix("export TERMMESH_LEADER_GRANT_ID="))
         XCTAssertTrue(launch.contains("; exec /bin/sh -lc "))
-        XCTAssertTrue(launch.contains("codex --model gpt-5"))
+        // The model is shell-quoted, and this whole launch is then quoted again
+        // for `sh -lc` — so the inner quotes arrive escaped. One level is
+        // consumed by that shell, leaving the CLI with `--model gpt-5`.
+        XCTAssertTrue(launch.contains(#"codex --model '\''gpt-5'\''"#))
     }
 
     @MainActor
@@ -946,7 +949,9 @@ final class PeerProjectBootstrapTests: XCTestCase {
             systemPromptFile: "/tmp/term-mesh-leader-prompt-team-uuid.txt"
         )
 
-        XCTAssertTrue(launch.contains("claude --model sonnet"))
+        // Escaped for the same reason as the codex leader above: quoted once
+        // for the CLI, then again by `exec /bin/sh -lc`.
+        XCTAssertTrue(launch.contains(#"claude --model '\''sonnet'\''"#))
         XCTAssertTrue(launch.contains("--system-prompt"))
         XCTAssertTrue(launch.contains("TERMMESH_LEADER_PROMPT=$(cat"))
         XCTAssertTrue(launch.contains("rm -f"))
@@ -961,9 +966,12 @@ final class PeerProjectBootstrapTests: XCTestCase {
         XCTAssertTrue(directive.contains("digest \(LeaderParallelPolicy.digest)"))
 
         for (cli, expectedLaunch) in [
-            ("codex", "codex --model gpt-5"),
-            ("kiro", "kiro chat --model gpt-5"),
-            ("gemini", "gemini --model gpt-5"),
+            // Read straight off `remoteAgentCommand`, so the model carries the
+            // single level of quoting it is built with — no `sh -lc` wrapper
+            // here to escape it a second time.
+            ("codex", "codex --model 'gpt-5'"),
+            ("kiro", "kiro chat --model 'gpt-5'"),
+            ("gemini", "gemini --model 'gpt-5'"),
         ] {
             let launch = TeamOrchestrator.remoteAgentCommand(
                 cli: cli,
