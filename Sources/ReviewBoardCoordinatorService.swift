@@ -1374,11 +1374,26 @@ final class ReviewBoardCoordinatorService: ObservableObject {
             // the fresh one and then ran placement and auto pilot a second time.
             if Task.isCancelled { return }
             await MainActor.run {
-                self?.snapshot = next
-                if let hosts { self?.knownHosts = hosts }
-                NotificationCenter.default.post(name: .reviewBoardSnapshotDidChange, object: nil)
+                guard let self else { return }
+                // A poll that read the same board is the common case — the
+                // work it describes takes minutes, the read repeats every two
+                // seconds. Assigning anyway would publish on every tick, and
+                // each publish costs a SwiftUI re-evaluation plus the AppKit
+                // layout pass underneath it, for a board nobody changed.
+                let snapshotChanged = self.snapshot != next
+                if snapshotChanged { self.snapshot = next }
+                if let hosts, self.knownHosts != hosts { self.knownHosts = hosts }
+                // The notification drives `ReviewBoardViewModel.refresh()`, so
+                // it carries the same cost a second time and is gated the same
+                // way. Elapsed-time labels ride the view model's own ticker,
+                // not this.
+                if snapshotChanged {
+                    NotificationCenter.default.post(
+                        name: .reviewBoardSnapshotDidChange, object: nil
+                    )
+                }
                 if !next.coordinatorOnline, attempt < Self.onlineRetryDelays.count {
-                    self?.scheduleOnlineRetry(attempt: attempt)
+                    self.scheduleOnlineRetry(attempt: attempt)
                 }
             }
             // Every refresh re-reads what is placed and carries out whatever
