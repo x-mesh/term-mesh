@@ -108,10 +108,16 @@ actor MockHost {
     var pendingInbound = Data()
     var seq: UInt64 = 0
     let surfaces: [Termmesh_Peer_V1_SurfaceInfo]
+    let pushWorkspaceUpdateBeforeSurfaceList: Bool
 
-    init(transport: MockTransport, surfaces: [Termmesh_Peer_V1_SurfaceInfo]) {
+    init(
+        transport: MockTransport,
+        surfaces: [Termmesh_Peer_V1_SurfaceInfo],
+        pushWorkspaceUpdateBeforeSurfaceList: Bool = false
+    ) {
         self.transport = transport
         self.surfaces = surfaces
+        self.pushWorkspaceUpdateBeforeSurfaceList = pushWorkspaceUpdateBeforeSurfaceList
     }
 
     func run() async throws {
@@ -148,6 +154,13 @@ actor MockHost {
         // 6. Handle ListSurfaces
         _ = try await readExpecting { env in
             if case .listSurfaces = env.payload { return true } else { return false }
+        }
+        if pushWorkspaceUpdateBeforeSurfaceList {
+            var removed = Termmesh_Peer_V1_WorkspaceRemoved()
+            removed.workspaceID = Data(repeating: 0xD1, count: 16)
+            var update = Termmesh_Peer_V1_WorkspaceUpdate()
+            update.workspaceRemoved = removed
+            try await sendEnvelope { $0.workspaceUpdate = update }
         }
         var list = Termmesh_Peer_V1_SurfaceList()
         list.surfaces = surfaces
@@ -199,6 +212,7 @@ actor LifecycleMockHost {
     let assignedWorkspaceID: Data
     let createAccepted: Bool
     let createRejectReason: String
+    let respondToCreate: Bool
 
     private(set) var receivedCreateTitle: String?
     private(set) var receivedRename: (workspaceID: Data, title: String)?
@@ -208,12 +222,14 @@ actor LifecycleMockHost {
         transport: MockTransport,
         assignedWorkspaceID: Data,
         createAccepted: Bool = true,
-        createRejectReason: String = ""
+        createRejectReason: String = "",
+        respondToCreate: Bool = true
     ) {
         self.transport = transport
         self.assignedWorkspaceID = assignedWorkspaceID
         self.createAccepted = createAccepted
         self.createRejectReason = createRejectReason
+        self.respondToCreate = respondToCreate
     }
 
     func run() async throws {
@@ -249,6 +265,7 @@ actor LifecycleMockHost {
             throw PeerSessionError.unexpectedMessage("expected CreateWorkspaceRequest")
         }
         receivedCreateTitle = createReq.title
+        guard respondToCreate else { return }
         var resp = Termmesh_Peer_V1_CreateWorkspaceResponse()
         resp.accepted = createAccepted
         if createAccepted {
@@ -429,6 +446,30 @@ final class PeerSessionTests: XCTestCase {
         try await hostTask.value
     }
 
+    func testListSurfacesSkipsWorkspacePushThatRacesResponse() async throws {
+        let transport = MockTransport()
+        var surface = Termmesh_Peer_V1_SurfaceInfo()
+        surface.surfaceID = Data(repeating: 0xA2, count: 16)
+        surface.title = "after-push"
+        surface.attachable = true
+
+        let host = MockHost(
+            transport: transport,
+            surfaces: [surface],
+            pushWorkspaceUpdateBeforeSurfaceList: true
+        )
+        let hostTask = Task { try await host.run() }
+        let session = PeerSession(
+            read: { await transport.clientRead() },
+            write: { await transport.clientWrite($0) }
+        )
+        _ = try await session.handshake()
+
+        let surfaces = try await session.listSurfaces()
+        XCTAssertEqual(surfaces.map(\.title), ["after-push"])
+        try await hostTask.value
+    }
+
     /// Round-trips the three workspace-lifecycle RPCs added for t5:
     /// `createWorkspace` (response-waiting), `renameWorkspace` /
     /// `deleteWorkspace` (fire-and-forget), and confirms the resulting
@@ -495,6 +536,33 @@ final class PeerSessionTests: XCTestCase {
             XCTAssertEqual(reason, "quota exceeded")
         }
 
+        try await hostTask.value
+    }
+
+    func testAdvertisedWorkspaceLifecycleThatNeverRepliesTimesOut() async throws {
+        let transport = MockTransport()
+        let host = LifecycleMockHost(
+            transport: transport,
+            assignedWorkspaceID: Data(),
+            respondToCreate: false
+        )
+        let hostTask = Task { try await host.run() }
+        let session = PeerSession(
+            read: { await transport.clientRead() },
+            write: { await transport.clientWrite($0) },
+            close: { await transport.closeClientRead() }
+        )
+        _ = try await session.handshake()
+
+        do {
+            _ = try await session.createWorkspace(
+                title: "scratch",
+                timeoutSeconds: 0.05
+            )
+            XCTFail("silent host must time out")
+        } catch PeerSessionError.rpcTimedOut(let operation) {
+            XCTAssertEqual(operation, "createWorkspace")
+        }
         try await hostTask.value
     }
 

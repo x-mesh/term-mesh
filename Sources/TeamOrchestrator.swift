@@ -1938,7 +1938,10 @@ final class TeamOrchestrator: ObservableObject {
 
         // For non-Claude CLI leaders (kiro, codex, gemini), inject team instructions.
         // Claude leaders get instructions via --system-prompt in team-leader-claude.sh.
-        if leaderMode != "repl" && leaderMode != "claude" {
+        if Self.shouldInjectLocalLeaderPrompt(
+            launchLeaderLocally: launchLeaderLocally,
+            leaderMode: leaderMode
+        ) {
             let scriptDir = Self.findScriptsDir(workingDirectory: workingDirectory)
             let prompt = buildTeamLeaderPrompt(
                 teamName: name,

@@ -592,7 +592,10 @@ public actor PeerSession {
     /// never on a live workspace-mirror subscription session.
     ///
     /// Returns the host-assigned workspace id on success.
-    public func createWorkspace(title: String) async throws -> Data {
+    public func createWorkspace(
+        title: String,
+        timeoutSeconds: TimeInterval = 10
+    ) async throws -> Data {
         try beginDirectResponseRPC()
         defer { directResponseRPCInFlight = false }
         try await sendEnvelope { env in
@@ -600,7 +603,10 @@ public actor PeerSession {
             req.title = title
             env.createWorkspaceRequest = req
         }
-        let reply = try await readFrame()
+        let reply = try await readFrame(
+            timeoutSeconds: timeoutSeconds,
+            operation: "createWorkspace"
+        )
         guard case .createWorkspaceResponse(let r) = reply.payload else {
             throw PeerSessionError.unexpectedMessage(
                 "expected CreateWorkspaceResponse, got \(String(describing: reply.payload))"
@@ -1274,14 +1280,20 @@ public actor PeerSession {
     /// listing behind the pane picker, which made a host unreachable
     /// outright.
     ///
-    /// Only stats are dropped. An `Error` frame still surfaces, and every
-    /// other push is left alone rather than quietly discarded here, where
-    /// no caller would ever see it.
+    /// One-shot direct-response connections have no push consumer. Drop the
+    /// host's telemetry and workspace roster/layout pushes while waiting for
+    /// the requested reply; these can race a response immediately after a
+    /// split or new-tab request. An `Error` frame and reverse leader request
+    /// still surface rather than disappearing here.
     private func readFrame() async throws -> Termmesh_Peer_V1_Envelope {
         while true {
             let env = try await readAnyFrame()
-            if case .hostStats = env.payload { continue }
-            return env
+            switch env.payload {
+            case .hostStats, .workspaceUpdate, .workspaceListChanged:
+                continue
+            default:
+                return env
+            }
         }
     }
 

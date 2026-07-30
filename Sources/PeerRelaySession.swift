@@ -895,6 +895,18 @@ final class PeerRelaySession {
         return true
     }
 
+    /// Send bytes straight to this attached remote PTY.
+    ///
+    /// Bootstrap commands must not depend on Ghostty synthesizing Return:
+    /// a relay surface can accept the local key event while the remote PTY
+    /// never receives it. Going through the authenticated peer session makes
+    /// command + CR one ordered input frame.
+    func sendRemoteKeys(_ keys: Data) async throws -> Bool {
+        guard let session else { return false }
+        try await session.sendInput(surfaceID: surfaceID, keys: keys)
+        return true
+    }
+
     // ── Stale-socket sweep ──────────────────────────────────────────
     //
     // Per-session sockets land in a private per-user directory.

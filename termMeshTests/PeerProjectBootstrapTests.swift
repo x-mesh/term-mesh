@@ -933,6 +933,28 @@ final class PeerProjectBootstrapTests: XCTestCase {
     }
 
     @MainActor
+    func test_remote_leader_does_not_inject_policy_into_local_anchor_shell() {
+        XCTAssertTrue(
+            TeamOrchestrator.shouldInjectLocalLeaderPrompt(
+                launchLeaderLocally: true,
+                leaderMode: "codex"
+            )
+        )
+        XCTAssertFalse(
+            TeamOrchestrator.shouldInjectLocalLeaderPrompt(
+                launchLeaderLocally: false,
+                leaderMode: "codex"
+            )
+        )
+        XCTAssertFalse(
+            TeamOrchestrator.shouldInjectLocalLeaderPrompt(
+                launchLeaderLocally: true,
+                leaderMode: "claude"
+            )
+        )
+    }
+
+    @MainActor
     func test_remote_claude_leader_launch_injects_term_mesh_prompt() {
         var grant = Termmesh_Peer_V1_TeamLeaderGrant()
         grant.grantID = Data(repeating: 0xcd, count: 32)
