@@ -412,7 +412,12 @@ enum AgentPipeTransport {
                     writeDeadline = ProcessInfo.processInfo.systemUptime + pipeWriteTimeout
                     continue
                 }
-                if n < 0, errno == EINTR || errno == EAGAIN {
+                if n < 0, errno == EINTR {
+                    // A signal interrupt says nothing about the reader;
+                    // retry without consuming the stall budget.
+                    continue
+                }
+                if n < 0, errno == EAGAIN {
                     guard ProcessInfo.processInfo.systemUptime < writeDeadline else {
                         throw DeliveryError.writeFailed(
                             "write stalled after \(written)/\(raw.count)B (deadline exceeded)")
