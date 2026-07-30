@@ -838,10 +838,14 @@ class TerminalController {
             let info = Bundle.main.infoDictionary ?? [:]
             let version = info["CFBundleShortVersionString"] as? String ?? "?"
             let build = info["CFBundleVersion"] as? String ?? "?"
+            // The build phase stamps TermMeshCommit into the built plist
+            // after compilation. BuildInfo.swift is therefore a one-build
+            // fallback, not the runtime source of truth.
+            let gitSHA = info["TermMeshCommit"] as? String ?? BuildInfo.gitSHA
             return v2Ok(id: id, result: [
                 "app_version": version,
                 "build_number": build,
-                "git_sha": BuildInfo.gitSHA,
+                "git_sha": gitSHA,
             ])
         case "system.identify":
             return v2Ok(id: id, result: v2Identify(params: params))
