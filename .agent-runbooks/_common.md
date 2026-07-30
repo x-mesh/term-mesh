@@ -40,8 +40,18 @@ leader가 작업의 종료를 알 수 있는 유일한 신호이기 때문이다
 
 ### 응답이 1000자 초과인 경우
 
-`FULL_REPORT: ~/.term-mesh/results/<team>/<agent>-reply.md` 경로를 헤더에 명시.
-소켓 전송은 1500자 truncate 되므로 풀 내용은 파일로만 보존된다.
+소켓 전송은 1500자 truncate 되므로 상세는 파일로 남긴다. **먼저 고유 파일을 직접 쓰고**,
+그 경로를 헤더에 명시한다:
+
+```
+~/.term-mesh/results/<team>/<task_id>-full.md   # 권장 이름
+FULL_REPORT: <위에서 쓴 그 경로>
+```
+
+- ❌ `<agent>-reply.md` / `<agent>-<instance>-reply.md` / `<task_id>.md` 를 FULL_REPORT로 쓰지 말 것.
+  이 셋은 `tm-agent reply`가 **제출 내용으로 통째 덮어쓰는 envelope 보존본**이다(append 아님).
+  여기에 상세를 먼저 써 두면 뒤이은 reply가 그대로 지운다 — 실제로 ADR 본문이 이렇게 유실됐다.
+- 상세 파일이 따로 없으면 `FULL_REPORT: n/a`.
 
 ---
 

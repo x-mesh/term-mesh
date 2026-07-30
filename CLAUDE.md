@@ -572,20 +572,23 @@ tm-agent research <topic> [options]       # Multi-agent research with board.json
 
 ### Leader: reading full agent reports
 
-Agent replies are truncated to 1500 chars over the socket. Full reports are saved to files:
+Agent replies are truncated to 1500 chars over the socket. The submitted reply is preserved on disk:
 
 ```bash
-# Read full report for a specific task
+# The submitted reply for a task (canonical envelope)
 cat ~/.term-mesh/results/<team>/<task_id>.md
 
-# Read an agent's latest reply
-cat ~/.term-mesh/results/<team>/<agent>-reply.md
+# That instance's latest reply alias
+cat ~/.term-mesh/results/<team>/<agent>-<agent_instance_id>-reply.md
 
-# Example: read architect's full report in my-team
-cat ~/.term-mesh/results/my-team/architect-reply.md
+# Detail the header points at — open the FULL_REPORT path verbatim
+cat ~/.term-mesh/results/<team>/<task_id>-full.md
 ```
 
 When `tm-agent collect` or `msg list` returns truncated content (ends with `...`), read the corresponding file from `~/.term-mesh/results/` for the full text. Files are auto-cleaned after 24 hours.
+
+Both `<task_id>.md` and the reply alias are **replaced wholesale by each `tm-agent reply`**, so detail
+must live in a separate unique file — see the Reply Truncation Protocol below.
 
 ### Auto-Fix Budget protocol
 
@@ -677,30 +680,44 @@ STATUS: DONE은 "편집 완료"이지 "빌드 통과"가 아니다.
 ### Reply Truncation Protocol
 
 `tm-agent reply`와 `tm-agent collect`는 소켓 전송을 **1500자로 truncate**한다.
-풀 내용은 `~/.term-mesh/results/<team>/<agent>-reply.md`에 자동 저장되며, 24시간 후 자동 정리된다.
+제출한 reply 자체는 `~/.term-mesh/results/<team>/` 아래 두 곳에 보존되며 24시간 후 자동 정리된다:
+
+| 파일 | 성격 |
+|---|---|
+| `<task_id>.md` | 활성 task가 있을 때의 정본 |
+| `<agent>-<agent_instance_id>-reply.md` | 그 인스턴스의 최신 reply alias (instance id가 없으면 `<agent>-reply.md`) |
+
+**이 둘은 envelope 보존본이지 상세 저장소가 아니다.** `tm-agent reply`는 매번
+`atomic_write_file`(임시파일 + rename)로 **통째 교체**한다 — append가 아니다.
 
 #### 에이전트 의무
 
-- **응답이 1000자를 초과할 경우** Standard Header의 `FULL_REPORT`에 결과 파일 경로를 넣는다:
+- **응답이 1000자를 초과할 경우** 상세를 **고유 파일에 먼저 직접 쓰고**, 그 경로를 헤더에 넣는다:
 
 ```
-FULL_REPORT: ~/.term-mesh/results/<team>/<agent>-reply.md
+~/.term-mesh/results/<team>/<task_id>-full.md   # 권장 이름
+FULL_REPORT: <위에서 쓴 그 경로>
 ```
 
 - `<team>`: `tm-agent status`의 team_name 필드
-- `<agent>`: 현재 agent name
+- 상세 파일이 없으면 `FULL_REPORT: n/a`
+
+> **절대 하지 말 것:** `<agent>-reply.md` / `<agent>-<instance>-reply.md` / `<task_id>.md` 를
+> FULL_REPORT 경로로 쓰는 것. 상세를 거기 먼저 써 두면 **뒤이은 `tm-agent reply`가 그대로 덮어써
+> 본문이 사라진다.** 13efe520의 자기참조 검사는 헤더를 `n/a`로 정규화해 dangling pointer만 막을
+> 뿐, 파일 교체 자체는 막지 않는다. 2026-07-30 architect ADR 유실이 정확히 이 경로였다.
 
 #### Leader가 풀 내용을 읽는 명령
 
 ```bash
-# 특정 task 전체 결과
+# 제출된 reply 정본 (envelope)
 cat ~/.term-mesh/results/my-team/<task_id>.md
 
-# 에이전트의 최신 reply
-cat ~/.term-mesh/results/my-team/<agent>-reply.md
+# 그 인스턴스의 최신 reply alias
+cat ~/.term-mesh/results/my-team/<agent>-<agent_instance_id>-reply.md
 
-# 예시: explorer의 탐색 결과 전문
-cat ~/.term-mesh/results/my-team/explorer-reply.md
+# 헤더가 가리키는 상세 본문 — FULL_REPORT 경로를 그대로 연다
+cat ~/.term-mesh/results/my-team/<task_id>-full.md
 ```
 
 > **BAD/GOOD 예시:**
@@ -756,7 +773,7 @@ Standard Header가 **첫 블록**, 페르소나 고유 포맷이 **본문**이�
 tm-agent collect --lines 100 | grep -E "^(STATUS|NEXT):"
 
 # 특정 에이전트의 헤더만 확인
-cat ~/.term-mesh/results/my-team/<agent>-reply.md | head -5
+cat ~/.term-mesh/results/my-team/<agent>-<agent_instance_id>-reply.md | head -5
 ```
 
 ## E2E tests
