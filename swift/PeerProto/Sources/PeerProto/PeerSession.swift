@@ -206,7 +206,12 @@ public actor PeerSession {
     /// until the kernel TCP keepalive fires (default 2 hours on
     /// macOS).
     private var heartbeatTask: Task<Void, Never>?
-    private var lastPongAt: Date = Date()
+    // Use awake-time rather than wall time. `Date` advances while macOS is
+    // asleep, so the first heartbeat tick after wake used to see the whole
+    // sleep interval as host silence and tear down a healthy remote pane.
+    // `systemUptime` is backed by the suspending monotonic clock and excludes
+    // time spent asleep.
+    private var lastPongUptime: TimeInterval = ProcessInfo.processInfo.systemUptime
     /// Timestamp of the most recent inbound bytes from the host (ANY frame,
     /// not just a processed Pong). Under a heavy host→client output flood the
     /// pump loop can be blocked draining PtyData to the relay, so a Pong
@@ -215,7 +220,7 @@ public actor PeerSession {
     /// keys off this so backpressure can no longer be misread as a dead
     /// session and kill a healthy relay pane (measured pane-close root cause).
     /// See `tickHeartbeat` and `readFrame`.
-    private var lastInboundAt: Date = Date()
+    private var lastInboundUptime: TimeInterval = ProcessInfo.processInfo.systemUptime
     private var pingCounter: UInt64 = 0
     /// Set once `tickHeartbeat` observes a tick with no Pong since the
     /// previous one, and cleared as soon as a fresh Pong lands. Bounds
@@ -280,8 +285,9 @@ public actor PeerSession {
         onDead: @escaping @Sendable () -> Void
     ) {
         heartbeatTask?.cancel()
-        lastPongAt = Date()
-        lastInboundAt = Date()
+        let nowUptime = ProcessInfo.processInfo.systemUptime
+        lastPongUptime = nowUptime
+        lastInboundUptime = nowUptime
         missNotified = false
         pongSeenSinceLastTick = true
         let intervalNs = UInt64(max(intervalSeconds, 0.1) * 1_000_000_000)
@@ -327,12 +333,13 @@ public actor PeerSession {
         // Only declare the session dead when BOTH the last processed Pong AND
         // the last inbound bytes are older than the deadline. A sustained
         // host→client flood blocks the pump loop from *processing* the Pong in
-        // time, but bytes are still arriving, so `lastInboundAt` stays fresh —
+        // time, but bytes are still arriving, so `lastInboundUptime` stays fresh —
         // backpressure no longer false-positives as death (which used to send a
-        // Goodbye and close a perfectly healthy relay pane).
-        let now = Date()
-        if now.timeIntervalSince(lastPongAt) > deadAfterSeconds
-            && now.timeIntervalSince(lastInboundAt) > deadAfterSeconds {
+        // Goodbye and close a perfectly healthy relay pane). Awake-time also
+        // prevents a local Mac sleep from counting as remote host silence.
+        let nowUptime = ProcessInfo.processInfo.systemUptime
+        if nowUptime - lastPongUptime > deadAfterSeconds
+            && nowUptime - lastInboundUptime > deadAfterSeconds {
             return .dead
         }
         var result: HeartbeatTick = .alive
@@ -1050,7 +1057,7 @@ public actor PeerSession {
             // P6 first-miss/recovered edge detection (see
             // `pongSeenSinceLastTick`). Surfaced to callers as `.other`
             // since they don't need to act on it.
-            lastPongAt = Date()
+            lastPongUptime = ProcessInfo.processInfo.systemUptime
             pongSeenSinceLastTick = true
             return .other
         case .ptyData(let p):
@@ -1351,7 +1358,7 @@ public actor PeerSession {
             // Inbound liveness: any bytes from the host prove the session is
             // alive, even when the pump loop is too backpressured to reach the
             // Pong buried behind a PtyData flood. See `tickHeartbeat`.
-            lastInboundAt = Date()
+            lastInboundUptime = ProcessInfo.processInfo.systemUptime
         }
     }
 }
