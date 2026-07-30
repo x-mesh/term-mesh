@@ -401,6 +401,16 @@ extension ReviewBoardTask {
         "merged",
     ]
 
+    /// How `merging` says "there is no raw copy" to an initialiser whose `nil`
+    /// means something else.
+    ///
+    /// `init` fills a missing `rawResult` in from `result`, which is right for
+    /// every parser — they hand it the producer's own string. It is wrong here,
+    /// where `result` has already been through `safeBody`: the fallback would
+    /// turn a display string into the command that runs. An empty string is
+    /// dropped to nil by that same initialiser, which is the outcome wanted.
+    static let noRawResult = ""
+
     /// A local completion closes execution. When the coordinator has already
     /// advanced that same work to review, its status is the newer phase.
     ///
@@ -433,12 +443,28 @@ extension ReviewBoardTask {
             blockedReason: blockedReason ?? other.blockedReason,
             reviewSummary: reviewSummary ?? other.reviewSummary,
             result: result ?? other.result,
-            // Follows whichever side's `result` won, so the raw text and the
-            // shown text always describe the same reply. Passed explicitly
-            // because `result` here is already scrubbed and re-deriving the
-            // raw copy from it would quietly turn a scrubbed string into "the
-            // original".
-            rawResult: result != nil ? rawResult : other.rawResult,
+            // The raw copy is the one a VERIFY command is read out of and then
+            // run in `worktreePath`, so the two have to come off the same
+            // machine. The coordinator's copy does not always: for work placed
+            // on a peer it holds that peer's own reply, carried back as
+            // `last_reason`. Inheriting it here while `worktreePath` below
+            // keeps the local row's directory is how a command written on one
+            // machine got a shell on another.
+            //
+            // So the coordinator's raw text is taken only when this side has
+            // no worktree to run it in. The scrubbed `result` above still
+            // shows it — reading a peer's answer is the point — but nothing
+            // executes it, and `AutoPilotCheck.refusal` then hands the task to
+            // a person because the shown reply has a VERIFY line the raw copy
+            // cannot back.
+            //
+            // Passed explicitly rather than left to the init's fallback:
+            // `result` here is already scrubbed, and letting the raw copy be
+            // re-derived from it would quietly make a display string the
+            // command.
+            rawResult: result != nil
+                ? rawResult
+                : (worktreePath == nil ? other.rawResult : Self.noRawResult),
             resultPath: resultPath ?? other.resultPath,
             worktreeBranch: worktreeBranch,
             worktreeParent: worktreeParent,
