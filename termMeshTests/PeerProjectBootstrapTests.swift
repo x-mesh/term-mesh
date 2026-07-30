@@ -1325,4 +1325,13 @@ final class PeerProjectBootstrapTests: XCTestCase {
         XCTAssertNotEqual(output.status, 0)
         XCTAssertLessThan(Date().timeIntervalSince(started), 3)
     }
+
+    func test_remote_leader_hex_route_decodes_exact_width_only() {
+        XCTAssertEqual(
+            TerminalController.decodeFixedHex("0011aaff", byteCount: 4),
+            Data([0x00, 0x11, 0xAA, 0xFF])
+        )
+        XCTAssertNil(TerminalController.decodeFixedHex("0011aa", byteCount: 4))
+        XCTAssertNil(TerminalController.decodeFixedHex("0011zzff", byteCount: 4))
+    }
 }

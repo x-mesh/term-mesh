@@ -340,6 +340,9 @@ public enum PeerServerError: Error, Equatable {
     case acceptFailed(errno: Int32)
     case alreadyRunning
     case notRunning
+    case noMatchingLeaderSession
+    case leaderCallTimedOut
+    case leaderSessionClosed
 }
 
 public struct PeerServerConfig: Sendable {
@@ -532,6 +535,25 @@ public actor PeerServer {
         for session in activeSessions {
             try? await session.pushWorkspaceListChanged(workspaces)
         }
+    }
+
+    /// Route a command from a leader process running on this host back to the
+    /// viewer that owns the team. The viewer's stable peer id is part of the
+    /// grant environment, so an unrelated connected peer can never receive
+    /// the request.
+    public func callTeamLeader(
+        _ request: Termmesh_Peer_V1_TeamLeaderCommandRequest,
+        targetPeerID: Data,
+        timeoutSeconds: TimeInterval = 10
+    ) async throws -> Termmesh_Peer_V1_TeamLeaderCommandResponse {
+        for session in activeSessions
+        where await session.canRouteTeamLeaderCommand(to: targetPeerID) {
+            return try await session.callTeamLeader(
+                request,
+                timeoutSeconds: timeoutSeconds
+            )
+        }
+        throw PeerServerError.noMatchingLeaderSession
     }
 
     fileprivate func register(_ session: PeerServerSession) {
@@ -1041,6 +1063,9 @@ actor PeerServerSession {
     /// leader grants are bound to it so reconnects from the same install work
     /// while another peer cannot replay a captured grant.
     private var clientPeerID = Data()
+    private var pendingLeaderCalls: [
+        UInt64: CheckedContinuation<Termmesh_Peer_V1_TeamLeaderCommandResponse, Error>
+    ] = [:]
 
     /// Whether the connected client advertised `capability` in its Hello.
     func hasClientCapability(_ capability: String) -> Bool {
@@ -1071,13 +1096,98 @@ actor PeerServerSession {
         } catch {
             // Stream ended or protocol error — session terminates.
         }
+        failPendingLeaderCalls(with: PeerServerError.leaderSessionClosed)
         await teardownAttachments()
         await connection.close()
     }
 
     func close() async {
+        failPendingLeaderCalls(with: PeerServerError.leaderSessionClosed)
         await teardownAttachments()
         await connection.close()
+    }
+
+    func canRouteTeamLeaderCommand(to peerID: Data) -> Bool {
+        state == .ready
+            && peerID.count == PeerIdentity.byteCount
+            && clientPeerID == peerID
+            && clientCapabilities.has(PeerCapability.teamLeaderV1)
+            // Only an attached relay has a long-lived receive pump. One-shot
+            // list/bootstrap sessions also advertise the capability but stop
+            // reading after their direct response; routing to one would wait
+            // until timeout while the visible pane remained idle.
+            && !attachments.isEmpty
+    }
+
+    /// Reverse RPC over the session's existing single-reader pump. The run
+    /// loop remains the only frame reader; this method registers a
+    /// correlation waiter, writes the request, and is resumed by dispatch
+    /// when the viewer sends TeamLeaderCommandResponse.
+    func callTeamLeader(
+        _ request: Termmesh_Peer_V1_TeamLeaderCommandRequest,
+        timeoutSeconds: TimeInterval
+    ) async throws -> Termmesh_Peer_V1_TeamLeaderCommandResponse {
+        guard state == .ready,
+              clientCapabilities.has(PeerCapability.teamLeaderV1) else {
+            throw PeerServerError.noMatchingLeaderSession
+        }
+        let encodedBytes = (try? request.serializedData().count)
+            ?? (PeerTeamLeader.maxCommandPayloadBytes + 1)
+        guard case .success = PeerTeamLeader.validateCommand(
+            request,
+            registeredGrant: request.grant,
+            encodedBytes: encodedBytes,
+            nowUnixSeconds: UInt64(Date().timeIntervalSince1970)
+        ) else {
+            throw PeerServerError.noMatchingLeaderSession
+        }
+
+        let requestSeq = nextSeq()
+        var envelope = Termmesh_Peer_V1_Envelope()
+        envelope.seq = requestSeq
+        envelope.teamLeaderCommandRequest = request
+        let frame = try encodeFrame(envelope)
+        let boundedTimeout = timeoutSeconds.isFinite
+            ? min(max(timeoutSeconds, 0.05), 60)
+            : 10
+
+        return try await withCheckedThrowingContinuation { continuation in
+            pendingLeaderCalls[requestSeq] = continuation
+            Task { [weak self] in
+                guard let self else { return }
+                do {
+                    try await self.writeLeaderCallFrame(frame)
+                } catch {
+                    await self.failPendingLeaderCall(requestSeq, with: error)
+                }
+            }
+            Task { [weak self] in
+                try? await Task.sleep(
+                    nanoseconds: UInt64(boundedTimeout * 1_000_000_000)
+                )
+                await self?.failPendingLeaderCall(
+                    requestSeq,
+                    with: PeerServerError.leaderCallTimedOut
+                )
+            }
+        }
+    }
+
+    private func writeLeaderCallFrame(_ frame: Data) async throws {
+        try await connection.write(frame)
+    }
+
+    private func failPendingLeaderCall(_ correlationID: UInt64, with error: Error) {
+        pendingLeaderCalls.removeValue(forKey: correlationID)?
+            .resume(throwing: error)
+    }
+
+    private func failPendingLeaderCalls(with error: Error) {
+        let pending = pendingLeaderCalls.values
+        pendingLeaderCalls.removeAll()
+        for continuation in pending {
+            continuation.resume(throwing: error)
+        }
     }
 
     /// Server-initiated push of a workspace layout change. Sent only
@@ -1321,6 +1431,19 @@ actor PeerServerSession {
             try await sendEnvelopeWithCorrelation(env.seq) { inner in
                 inner.teamLeaderCommandResponse = response
             }
+
+        case (.ready, .teamLeaderCommandResponse(let response)):
+            guard env.correlationID != 0,
+                  let continuation = pendingLeaderCalls.removeValue(
+                    forKey: env.correlationID
+                  ) else {
+                try await sendError(
+                    code: 103,
+                    message: "unexpected team leader command response"
+                )
+                return
+            }
+            continuation.resume(returning: response)
 
         case (.ready, .workspaceControl(let ctl)):
             // Fire-and-forget; the resulting layout update flows back

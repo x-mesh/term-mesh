@@ -686,6 +686,103 @@ final class PeerServerTests: XCTestCase {
         await server.stop()
     }
 
+    func testServerRoutesReverseLeaderCommandToMatchingViewerSession() async throws {
+        let sockPath = "/tmp/tm-peer-reverse-leader-\(UUID().uuidString.prefix(8)).sock"
+        defer { try? FileManager.default.removeItem(atPath: sockPath) }
+        var surface = Termmesh_Peer_V1_SurfaceInfo()
+        surface.surfaceID = Data(repeating: 0x73, count: 16)
+        surface.title = "leader"
+        surface.cols = 80
+        surface.rows = 24
+        surface.attachable = true
+        let server = PeerServer(
+            socketPath: sockPath,
+            provider: EchoSurfaceProvider(surfaces: [surface])
+        )
+        try await server.start()
+        defer { Task { await server.stop() } }
+
+        let viewerPeerID = Data(
+            repeating: 0x7A,
+            count: PeerIdentity.byteCount
+        )
+        let transport = try await UnixSocketTransport.connect(socketPath: sockPath)
+        let viewer = PeerSession(
+            read: { try await transport.read() },
+            write: { try await transport.write($0) }
+        )
+        var options = PeerSessionOptions()
+        options.peerID = viewerPeerID
+        _ = try await viewer.handshake(options: options)
+        _ = try await viewer.attachSurface(
+            id: surface.surfaceID,
+            cols: 80,
+            rows: 24
+        )
+
+        var grant = Termmesh_Peer_V1_TeamLeaderGrant()
+        grant.grantID = Data(
+            repeating: 0x91,
+            count: PeerTeamLeader.grantIDBytes
+        )
+        grant.projectID = "name:demo"
+        grant.teamUuid = "team-uuid"
+        grant.role = .leader
+        grant.expiresAtUnixSecs = UInt64(Date().timeIntervalSince1970) + 60
+        var request = Termmesh_Peer_V1_TeamLeaderCommandRequest()
+        request.grant = grant
+        request.teamUuid = grant.teamUuid
+        request.requestID = Data(
+            repeating: 0x92,
+            count: PeerTeamLeader.requestIDBytes
+        )
+        request.method = "team.status"
+        request.paramsJson = "{}"
+
+        let leaderRequest = request
+        async let routedResponse = server.callTeamLeader(
+            leaderRequest,
+            targetPeerID: viewerPeerID,
+            timeoutSeconds: 2
+        )
+        guard case .teamLeaderCommandRequest(
+            let received,
+            let correlationID
+        ) = try await viewer.receiveNextMessage() else {
+            return XCTFail("expected reverse team leader request")
+        }
+        XCTAssertEqual(received.requestID, request.requestID)
+        XCTAssertEqual(received.method, "team.status")
+
+        var response = Termmesh_Peer_V1_TeamLeaderCommandResponse()
+        response.ok = true
+        response.resultJson = #"{"team_name":"demo"}"#
+        try await viewer.sendTeamLeaderCommandResponse(
+            response,
+            correlationID: correlationID
+        )
+        let completed = try await routedResponse
+        XCTAssertTrue(completed.ok)
+        XCTAssertEqual(completed.resultJson, #"{"team_name":"demo"}"#)
+
+        do {
+            _ = try await server.callTeamLeader(
+                request,
+                targetPeerID: Data(
+                    repeating: 0xEE,
+                    count: PeerIdentity.byteCount
+                ),
+                timeoutSeconds: 0.1
+            )
+            XCTFail("wrong viewer identity must not receive the request")
+        } catch {
+            XCTAssertEqual(error as? PeerServerError, .noMatchingLeaderSession)
+        }
+
+        try await viewer.sendGoodbye(reason: "reverse leader test done")
+        await transport.close()
+    }
+
     /// A Mac host is where a team leader usually sits, so its roster is the
     /// answer to "where does this project's leader run" — and it only exists
     /// on the wire, never in the layout tree.

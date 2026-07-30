@@ -4,6 +4,7 @@ import Darwin
 import Foundation
 import os
 import Bonsplit
+import PeerProto
 import WebKit
 
 // The worktree-lock helpers below return `Result<_, String>`, using a String
@@ -796,6 +797,14 @@ class TerminalController {
 
         guard !method.isEmpty else {
             return v2Error(id: id, code: "invalid_request", message: "Missing method")
+        }
+
+        // A remote leader process lives beside this app but its authoritative
+        // team lives on the connected viewer. Route the scoped reverse RPC
+        // before the generic team dispatcher; `peer.leader.call` is not a
+        // local team mutation.
+        if method == "peer.leader.call" {
+            return dispatchPeerLeaderCall(params: params, id: id)
         }
 
         // ── Approach D: Async Team Dispatch ─────────────────────────────
@@ -1786,6 +1795,123 @@ class TerminalController {
         // Ensure single-line responses for the line-oriented socket protocol.
         s = s.replacingOccurrences(of: "\n", with: "\\n")
         return s
+    }
+
+    private func dispatchPeerLeaderCall(
+        params: [String: Any],
+        id: Any?
+    ) -> String {
+        guard let grantID = Self.decodeFixedHex(
+            params["grant_id_hex"] as? String,
+            byteCount: PeerTeamLeader.grantIDBytes
+        ),
+        let targetPeerID = Self.decodeFixedHex(
+            params["target_peer_id_hex"] as? String,
+            byteCount: PeerIdentity.byteCount
+        ),
+        let requestID = Self.decodeFixedHex(
+            params["request_id_hex"] as? String,
+            byteCount: PeerTeamLeader.requestIDBytes
+        ),
+        let projectID = params["project_id"] as? String,
+        let teamUUID = params["team_uuid"] as? String,
+        let method = params["method"] as? String,
+        let paramsJSON = params["params_json"] as? String,
+        let expiresNumber = params["expires_at_unix_secs"] as? NSNumber else {
+            return v2Error(
+                id: id,
+                code: "invalid_params",
+                message: "invalid remote leader route"
+            )
+        }
+
+        var grant = Termmesh_Peer_V1_TeamLeaderGrant()
+        grant.grantID = grantID
+        grant.projectID = projectID
+        grant.teamUuid = teamUUID
+        grant.role = .leader
+        grant.expiresAtUnixSecs = expiresNumber.uint64Value
+        var request = Termmesh_Peer_V1_TeamLeaderCommandRequest()
+        request.grant = grant
+        request.teamUuid = teamUUID
+        request.requestID = requestID
+        request.method = method
+        request.paramsJson = paramsJSON
+
+        let semaphore = DispatchSemaphore(value: 0)
+        nonisolated(unsafe) var outcome:
+            Result<Termmesh_Peer_V1_TeamLeaderCommandResponse, Error>?
+        let task = Task {
+            defer { semaphore.signal() }
+            do {
+                outcome = .success(
+                    try await PeerHostCoordinator.shared.callTeamLeader(
+                        request,
+                        targetPeerID: targetPeerID,
+                        timeoutSeconds: 10
+                    )
+                )
+            } catch {
+                outcome = .failure(error)
+            }
+        }
+        if semaphore.wait(timeout: .now() + 12) == .timedOut {
+            task.cancel()
+            return v2Error(
+                id: id,
+                code: "timeout",
+                message: "remote leader proxy timed out"
+            )
+        }
+        guard let outcome else {
+            return v2Error(
+                id: id,
+                code: "internal_error",
+                message: "remote leader proxy produced no result"
+            )
+        }
+        switch outcome {
+        case .failure(let error):
+            return v2Error(
+                id: id,
+                code: "peer_leader_unavailable",
+                message: String(describing: error)
+            )
+        case .success(let response):
+            let result: Any
+            if let data = response.resultJson.data(using: .utf8),
+               let decoded = try? JSONSerialization.jsonObject(with: data) {
+                result = decoded
+            } else {
+                result = [:]
+            }
+            return v2Ok(id: id, result: [
+                "ok": response.ok,
+                "cached": response.cached,
+                "result": result,
+                "error_code": response.errorCode,
+                "error_message": response.errorMessage,
+            ])
+        }
+    }
+
+    nonisolated static func decodeFixedHex(
+        _ value: String?,
+        byteCount: Int
+    ) -> Data? {
+        guard let value, value.utf8.count == byteCount * 2 else { return nil }
+        var bytes = [UInt8]()
+        bytes.reserveCapacity(byteCount)
+        var index = value.startIndex
+        for _ in 0..<byteCount {
+            let next = value.index(index, offsetBy: 2)
+            guard let byte = UInt8(value[index..<next], radix: 16) else {
+                return nil
+            }
+            bytes.append(byte)
+            index = next
+        }
+        return Data(bytes)
     }
 
     func v2EnsureHandleRef(kind: V2HandleKind, uuid: UUID) -> String {
