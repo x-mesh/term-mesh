@@ -20,6 +20,10 @@ actor ReviewBoardMergeRunner {
         let taskID: String
         /// Where the task did its work. `nil` when the board never recorded one.
         let worktreePath: String?
+        /// Canonical root shared by worktrees that can move the same target.
+        /// Resolved by the coordinator before this actor is entered so the
+        /// merge lock can be acquired without suspending first.
+        let repositoryPath: String?
         /// Passed to `--to` verbatim: `parent`, `base`, or a branch name.
         let target: String
         /// The commit the approval was recorded against, when the coordinator
@@ -32,12 +36,14 @@ actor ReviewBoardMergeRunner {
             queueID: String,
             taskID: String,
             worktreePath: String?,
+            repositoryPath: String? = nil,
             target: String = "parent",
             approvedHeadSHA: String? = nil
         ) {
             self.queueID = queueID
             self.taskID = taskID
             self.worktreePath = worktreePath
+            self.repositoryPath = repositoryPath
             self.target = target
             self.approvedHeadSHA = approvedHeadSHA
         }
@@ -78,6 +84,14 @@ actor ReviewBoardMergeRunner {
     /// for the same item cannot get past this set while the first is awaiting
     /// the merge.
     private var inFlight: Set<String> = []
+    /// Different queue entries can still mutate the same target branch. The
+    /// repository is part of the key so unrelated repositories remain free to
+    /// progress independently.
+    private struct MergeLock: Hashable {
+        let repository: String
+        let target: String
+    }
+    private var mergeLocks: Set<MergeLock> = []
 
     init(
         timeout: TimeInterval = 300,
@@ -133,7 +147,19 @@ actor ReviewBoardMergeRunner {
 
     @discardableResult
     func process(_ job: Job) async -> Outcome {
-        guard !inFlight.contains(job.queueID) else { return .alreadyRunning }
+        // Both locks are acquired before the first await. Swift actors are
+        // reentrant at suspension points: validating evidence first allowed a
+        // second refresh to pass the guard and start an overlapping merge.
+        let mergeLock = lock(for: job)
+        guard !inFlight.contains(job.queueID), !mergeLocks.contains(mergeLock) else {
+            return .alreadyRunning
+        }
+        inFlight.insert(job.queueID)
+        mergeLocks.insert(mergeLock)
+        defer {
+            inFlight.remove(job.queueID)
+            mergeLocks.remove(mergeLock)
+        }
 
         // Everything that can be known without running anything is checked
         // first, so a hopeless merge is refused rather than half-attempted.
@@ -147,9 +173,6 @@ actor ReviewBoardMergeRunner {
         if let reason = await evidenceGap(job, at: path) {
             return await fail(job, reason)
         }
-
-        inFlight.insert(job.queueID)
-        defer { inFlight.remove(job.queueID) }
 
         await report(job.queueID, "running", nil)
 
@@ -176,6 +199,20 @@ actor ReviewBoardMergeRunner {
         }
 
         return await interpret(output, for: job)
+    }
+
+    /// Synchronous by design: deriving this key must not open an actor
+    /// reentrancy window before it is inserted into `mergeLocks`.
+    private func lock(for job: Job) -> MergeLock {
+        let raw = job.repositoryPath ?? job.worktreePath ?? "queue:(job.queueID)"
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        let repository = trimmed.hasPrefix("/")
+            ? (trimmed as NSString).standardizingPath
+            : trimmed
+        return MergeLock(
+            repository: repository,
+            target: job.target.trimmingCharacters(in: .whitespacesAndNewlines)
+        )
     }
 
     /// Why the tree in front of us is not the tree that was approved, or nil
@@ -318,6 +355,7 @@ extension ReviewBoardMergeRunner.Job {
     init?(
         item: ReviewBoardMergeQueueItem,
         tasks: [ReviewBoardTask],
+        repositoryPath: String? = nil,
         target: String = "parent",
         approvedHeadSHA: String? = nil
     ) {
@@ -326,6 +364,7 @@ extension ReviewBoardMergeRunner.Job {
             queueID: item.id,
             taskID: item.taskRawID,
             worktreePath: task.worktreePath,
+            repositoryPath: repositoryPath,
             target: target,
             approvedHeadSHA: approvedHeadSHA
         )
