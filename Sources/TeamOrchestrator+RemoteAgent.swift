@@ -970,6 +970,14 @@ extension TeamOrchestrator {
             )
         }
 
+        // Captured for the launch task below, which outlives this call and so
+        // reads plain values rather than the local `var` and the host entry.
+        let createdCheckout = isolatedCheckout
+        let hostName = host.displayName
+        let hostSSHTarget = host.sshTarget
+        let hostSSHPort = host.sshPort
+        let hostIdentityFile = host.identityFile
+
         do {
 
         // Use the same incremental grid growth as local `add`/`attach`.
@@ -1173,24 +1181,113 @@ extension TeamOrchestrator {
                 text: command,
                 tabManager: tabManager,
                 withReturn: true,
-                recordPendingReturnFor: agentName
+                recordPendingReturnFor: agentName,
+                // The launch line is the last thing this attach owes the agent,
+                // and it is typed after the function has already returned — so
+                // a failure here lands outside the `catch` below, which is how
+                // a checkout made for an agent that never started was left on
+                // the peer with a location record still pointing at it.
+                //
+                // Only a *reported* failure compensates. `sendTextToPanel`
+                // answers `false` synchronously on its first miss and then
+                // retries; it calls back with `false` only once it has given
+                // up finding the pane, which means the line was never typed.
+                completion: { delivered in
+                    guard !delivered else { return }
+                    Task { @MainActor in
+                        await self.abandonIsolatedRemoteCheckout(
+                            teamName: teamName,
+                            hostKey: hostKey,
+                            agentName: agentName,
+                            hostName: hostName,
+                            sshTarget: hostSSHTarget,
+                            sshPort: hostSSHPort,
+                            identityFile: hostIdentityFile,
+                            path: createdCheckout,
+                            reason: "its pane was gone before the launch line could be typed"
+                        )
+                    }
+                }
             )
         }
 
         recordIsolatedCheckout()
         return member
         } catch {
-            if let path = isolatedCheckout,
-               let sshTarget = host.sshTarget, !sshTarget.isEmpty {
-                await PeerProjectBootstrap.reapWorktree(
-                    sshTarget: sshTarget,
-                    port: host.sshPort,
-                    identityFile: host.identityFile,
-                    path: path
-                )
-            }
+            await abandonIsolatedRemoteCheckout(
+                teamName: teamName,
+                hostKey: hostKey,
+                agentName: agentName,
+                hostName: host.displayName,
+                sshTarget: host.sshTarget,
+                sshPort: host.sshPort,
+                identityFile: host.identityFile,
+                path: isolatedCheckout,
+                reason: error.localizedDescription
+            )
             throw error
         }
+    }
+
+    /// Give back a checkout this attach made, when the agent it was made for
+    /// never started.
+    ///
+    /// Two callers, one order, and the order is the point. The location record
+    /// goes first because `reapDetachedAgentWorktree` gates on it: with the
+    /// record gone, detaching the half-attached member later cannot reap the
+    /// same path a second time. Then the reap itself, which is best effort by
+    /// design — the remote script refuses anything that is not a clean linked
+    /// worktree, so a checkout that did get used is kept rather than deleted.
+    ///
+    /// `path` is nil whenever this attach did not create a checkout, which is
+    /// the case that matters most: a directory the caller named, or one
+    /// another member already owns, is never reaped by a failure here.
+    @MainActor
+    private func abandonIsolatedRemoteCheckout(
+        teamName: String,
+        hostKey: String,
+        agentName: String,
+        hostName: String,
+        sshTarget: String?,
+        sshPort: Int?,
+        identityFile: String?,
+        path: String?,
+        reason: String
+    ) async {
+        guard let path else { return }
+        if let locations = teams[teamName]?.remoteProjectLocations {
+            let remaining = Self.remoteProjectLocations(
+                locations, abandoning: path, onHost: hostKey
+            )
+            if remaining.count != locations.count {
+                recordRemoteProjectLocations(teamName: teamName, locations: remaining)
+            }
+        }
+        guard let sshTarget, !sshTarget.isEmpty else { return }
+        RemoteWorkLog.info(
+            "\(agentName) never started on \(hostName) (\(reason)); "
+                + "reclaiming \(path) (kept if it held uncommitted work)."
+        )
+        await PeerProjectBootstrap.reapWorktree(
+            sshTarget: sshTarget,
+            port: sshPort,
+            identityFile: identityFile,
+            path: path
+        )
+    }
+
+    /// The team's locations with one checkout's entry taken out.
+    ///
+    /// Matched on host *and* path together: two machines routinely lay a
+    /// project out at the same path, and dropping every entry with that path
+    /// would disarm the detach-time reap for a member on another host that is
+    /// still running.
+    nonisolated static func remoteProjectLocations(
+        _ locations: [Team.RemoteProjectLocation],
+        abandoning path: String,
+        onHost hostKey: String
+    ) -> [Team.RemoteProjectLocation] {
+        locations.filter { !($0.hostKey == hostKey && $0.path == path) }
     }
 
     @MainActor
