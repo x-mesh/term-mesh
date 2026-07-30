@@ -124,6 +124,173 @@ extension TeamOrchestrator {
         return "Project · \(String(singleLine.prefix(72)))"
     }
 
+    struct LeaderAttachGeneration: Equatable, Sendable {
+        let teamName: String
+        let value: UInt64
+    }
+
+    @MainActor
+    final class LeaderAttachGenerationGate {
+        static let shared = LeaderAttachGenerationGate()
+        private var generations: [String: UInt64] = [:]
+
+        func begin(teamName: String) -> LeaderAttachGeneration {
+            let value = (generations[teamName] ?? 0) &+ 1
+            generations[teamName] = value
+            return LeaderAttachGeneration(teamName: teamName, value: value)
+        }
+
+        func isCurrent(_ generation: LeaderAttachGeneration) -> Bool {
+            generations[generation.teamName] == generation.value
+        }
+
+        func invalidate(_ generation: LeaderAttachGeneration) {
+            guard isCurrent(generation) else { return }
+            generations[generation.teamName] = generation.value &+ 1
+        }
+    }
+
+    @MainActor
+    final class LeaderAttachAttempt {
+        let generation: LeaderAttachGeneration
+        private var cleanup: (@MainActor () async -> Void)?
+        private var cleanupStarted = false
+        private var committed = false
+
+        init(generation: LeaderAttachGeneration) {
+            self.generation = generation
+        }
+
+        func installCleanup(_ cleanup: @escaping @MainActor () async -> Void) {
+            self.cleanup = cleanup
+        }
+
+        var mayCommit: Bool {
+            !cleanupStarted
+                && !committed
+                && !Task.isCancelled
+                && LeaderAttachGenerationGate.shared.isCurrent(generation)
+        }
+
+        func ensureCurrent() async throws {
+            guard mayCommit else {
+                await compensate()
+                throw CancellationError()
+            }
+        }
+
+        func commit() {
+            precondition(mayCommit, "stale remote-leader attach attempted to commit")
+            committed = true
+            cleanup = nil
+        }
+
+        func timeout() {
+            LeaderAttachGenerationGate.shared.invalidate(generation)
+            guard let cleanup = beginCompensation() else { return }
+            Task { @MainActor in await cleanup() }
+        }
+
+        func compensate() async {
+            guard let cleanup = beginCompensation() else { return }
+            await cleanup()
+        }
+
+        private func beginCompensation() -> (@MainActor () async -> Void)? {
+            guard !committed, !cleanupStarted, let cleanup else { return nil }
+            cleanupStarted = true
+            return cleanup
+        }
+    }
+
+    @MainActor
+    private final class LeaderAttachResources {
+        let host: HostEntry
+        let hostKey: String
+        let workspace: Workspace
+        let promptFile: String?
+        var hostSockPath: String
+        var surfaceID: Data?
+        var session: PeerPaneSession?
+        var panelID: UUID?
+        var grantID: Data?
+
+        init(
+            host: HostEntry,
+            hostKey: String,
+            workspace: Workspace,
+            promptFile: String?
+        ) {
+            self.host = host
+            self.hostKey = hostKey
+            self.workspace = workspace
+            self.promptFile = promptFile
+            hostSockPath = host.activeSockPath
+        }
+
+        func cleanup() async {
+            if let panelID {
+                _ = workspace.closePanel(panelID, force: true)
+            } else {
+                session?.teardown()
+            }
+            if let grantID {
+                await PeerTeamLeaderControlPlane.shared.revokeGrant(id: grantID)
+            }
+            if let surfaceID {
+                await TeamOrchestrator.closeManagedRemoteSurface(
+                    hostSockPath: hostSockPath,
+                    hostKey: hostKey,
+                    surfaceID: surfaceID
+                )
+            }
+            if let promptFile {
+                await TeamOrchestrator.removeRemoteLeaderPrompt(
+                    host: host,
+                    promptFile: promptFile
+                )
+            }
+        }
+    }
+
+    @MainActor
+    private final class DetachedRestoreProgress {
+        let workspace: Workspace
+        let anchorPanelID: UUID?
+        var leaderPanelID: UUID?
+        var agentPanelIDs: [String: UUID] = [:]
+
+        init(workspace: Workspace) {
+            self.workspace = workspace
+            anchorPanelID = workspace.focusedPanelId
+        }
+    }
+
+    @MainActor
+    private enum DetachedRestoreRegistry {
+        static var progressByTeam: [String: DetachedRestoreProgress] = [:]
+    }
+
+    nonisolated static func newlyCreatedWorkspaceIDs(
+        before: [Termmesh_Peer_V1_Workspace],
+        after: [Termmesh_Peer_V1_Workspace],
+        expectedTitle: String
+    ) -> [Data] {
+        let existing = Set(before.map(\.workspaceID))
+        return after.compactMap { workspace in
+            workspace.title == expectedTitle && !existing.contains(workspace.workspaceID)
+                ? workspace.workspaceID
+                : nil
+        }
+    }
+
+    nonisolated static func missingRestoredAgentIDs(
+        expected: [String],
+        attached: Set<String>
+    ) -> [String] {
+        expected.filter { !attached.contains($0) }
+    }
+
     /// How long the whole remote-leader attach may take before it is called a
     /// failure. Generous — it covers an ssh dial, a clone-sized wait on a
     /// cold host, and a CLI's first launch — because the point is to bound a
@@ -159,25 +326,30 @@ extension TeamOrchestrator {
     /// still requested, but this path reaches ssh and a remote shell, and
     /// waiting for those to notice is exactly the hang being bounded.
     static func withLeaderAttachDeadline(
+        teamName: String,
         hostKey: String,
         timeout: TimeInterval = leaderAttachTimeout,
-        _ body: @escaping @Sendable () async throws -> Void
+        _ body: @escaping @MainActor @Sendable (LeaderAttachAttempt) async throws -> Void
     ) async throws {
         let outcome = AttachOutcome()
-        let work = Task {
+        let generation = LeaderAttachGenerationGate.shared.begin(teamName: teamName)
+        let attempt = LeaderAttachAttempt(generation: generation)
+        let work = Task { @MainActor in
             do {
-                try await body()
+                try await body(attempt)
                 await outcome.settle(.success(()))
             } catch {
+                await attempt.compensate()
                 await outcome.settle(.failure(error))
             }
         }
-        let timer = Task {
+        let timer = Task { @MainActor in
             try? await Task.sleep(nanoseconds: UInt64(timeout * 1_000_000_000))
             guard !Task.isCancelled else { return }
 #if DEBUG
             dlog("leader.deadline.fired host=\(hostKey)")
 #endif
+            attempt.timeout()
             await outcome.settle(
                 .failure(RemoteAgentError.leaderAttachTimedOut(host: hostKey, seconds: timeout))
             )
@@ -246,7 +418,8 @@ extension TeamOrchestrator {
         teamName: String,
         host: HostEntry,
         fallbackSourceID: Data?,
-        controlSockPath: String? = nil
+        controlSockPath: String? = nil,
+        leaderAttempt: LeaderAttachAttempt? = nil
     ) async throws -> RemoteSurfacePlacement? {
         guard let team = teams[teamName],
               team.usesDedicatedRemoteWorkspaces
@@ -269,6 +442,7 @@ extension TeamOrchestrator {
         // reconnectable tunnel and can be stale even though the newly acquired
         // pane lease has just completed a successful ListSurfaces handshake.
         let connection = try await PeerRelaySession.connect(hostSockPath: hostSockPath)
+        try await leaderAttempt?.ensureCurrent()
 #if DEBUG
         dlog("leader.placement.stage connected host=\(host.id)")
 #endif
@@ -290,6 +464,7 @@ extension TeamOrchestrator {
                 dlog("leader.placement.stage cached.list host=\(host.id)")
 #endif
                 let workspaces = try await connection.session.listWorkspaces(timeoutSeconds: 10)
+                try await leaderAttempt?.ensureCurrent()
                 if !workspaces.contains(where: { $0.workspaceID == cachedWorkspaceID }) {
                     // The host may have restarted or the user may have removed
                     // the workspace outside this app. Do not keep sending seed
@@ -302,21 +477,28 @@ extension TeamOrchestrator {
 #if DEBUG
                 dlog("leader.placement.stage create.begin host=\(host.id)")
 #endif
+                let workspaceTitle = Self.remoteProjectWorkspaceTitle(teamName: teamName)
+                let workspacesBeforeCreate = try await connection.session.listWorkspaces(
+                    timeoutSeconds: 10
+                )
+                try await leaderAttempt?.ensureCurrent()
                 do {
                     workspaceID = try await connection.session.createWorkspace(
-                        title: Self.remoteProjectWorkspaceTitle(teamName: teamName),
+                        title: workspaceTitle,
                         timeoutSeconds: 5
                     )
                 } catch PeerSessionError.rpcTimedOut(_) {
-                    // Some older Swift hosts advertised workspace.lifecycle.v1
-                    // before they handled CreateWorkspaceRequest. Treat that
-                    // version-skew case like a host without the capability:
-                    // use a fresh surface in its existing workspace instead of
-                    // holding the whole project creation for 180 seconds.
                     await connection.cancel()
+                    try await reconcileTimedOutWorkspaceCreation(
+                        hostSockPath: hostSockPath,
+                        host: host,
+                        title: workspaceTitle,
+                        workspacesBeforeCreate: workspacesBeforeCreate,
+                        leaderAttempt: leaderAttempt
+                    )
                     RemoteWorkLog.info(
                         "\(host.displayName) did not answer createWorkspace; "
-                            + "using its existing workspace for \(teamName)"
+                            + "reconciled the timed-out request before falling back"
                     )
                     return fallbackSourceID.map {
                         RemoteSurfacePlacement(
@@ -326,6 +508,7 @@ extension TeamOrchestrator {
                         )
                     }
                 }
+                try await leaderAttempt?.ensureCurrent()
                 createdWorkspace = true
 #if DEBUG
                 dlog("leader.placement.stage create.ok host=\(host.id)")
@@ -347,6 +530,7 @@ extension TeamOrchestrator {
                 dlog("leader.placement.stage list host=\(host.id) attempt=\(attempt)")
 #endif
                 let workspaces = try await connection.session.listWorkspaces(timeoutSeconds: 10)
+                try await leaderAttempt?.ensureCurrent()
                 if let workspace = workspaces.first(where: { $0.workspaceID == workspaceID }),
                    let sourceID = peerPaneSummaries(workspace.hasLayout ? workspace.layout : nil)
                     .map(\.id)
@@ -371,6 +555,7 @@ extension TeamOrchestrator {
                     dlog("leader.placement.stage seed host=\(host.id)")
 #endif
                     try await connection.session.requestNewTab(workspaceID: workspaceID)
+                    try await leaderAttempt?.ensureCurrent()
                     requestedSeed = true
                 }
                 try await Task.sleep(nanoseconds: 200_000_000)
@@ -410,6 +595,54 @@ extension TeamOrchestrator {
             await connection.cancel()
             throw error
         }
+    }
+
+    private func reconcileTimedOutWorkspaceCreation(
+        hostSockPath: String,
+        host: HostEntry,
+        title: String,
+        workspacesBeforeCreate: [Termmesh_Peer_V1_Workspace],
+        leaderAttempt: LeaderAttachAttempt?
+    ) async throws {
+        var reconciledIDs = Set<Data>()
+        for attempt in 0..<20 {
+            try await leaderAttempt?.ensureCurrent()
+            let probe = try await PeerRelaySession.connect(hostSockPath: hostSockPath)
+            do {
+                let current = try await probe.session.listWorkspaces(timeoutSeconds: 2)
+                let candidates = Self.newlyCreatedWorkspaceIDs(
+                    before: workspacesBeforeCreate,
+                    after: current,
+                    expectedTitle: title
+                )
+                for workspaceID in candidates where reconciledIDs.insert(workspaceID).inserted {
+                    try await probe.session.deleteWorkspace(workspaceID: workspaceID)
+                }
+                await probe.cancel()
+                if !candidates.isEmpty {
+                    for workspaceID in candidates {
+                        guard try await waitForRemoteRemoval(
+                            hostSockPath: hostSockPath,
+                            workspaceID: workspaceID
+                        ) else {
+                            throw RemoteAgentError.projectDeletionIncomplete(
+                                "timed-out workspace creation was not removed on \(host.displayName)"
+                            )
+                        }
+                    }
+                    return
+                }
+            } catch {
+                await probe.cancel()
+                throw error
+            }
+            if attempt < 19 {
+                try await Task.sleep(nanoseconds: 250_000_000)
+            }
+        }
+        throw RemoteAgentError.projectDeletionIncomplete(
+            "timed-out workspace creation could not be reconciled on \(host.displayName)"
+        )
     }
 
     func inspectPeerShells(
@@ -679,6 +912,7 @@ extension TeamOrchestrator {
         workingDirectory: String,
         cli: String,
         model: String,
+        attempt: LeaderAttachAttempt,
         systemPrompt: String? = nil
     ) async throws {
         guard let team = teams[teamName] else { throw RemoteAgentError.teamNotFound(teamName) }
@@ -694,15 +928,25 @@ extension TeamOrchestrator {
               let workspace = tabManager.tabs.first(where: { $0.id == team.workspaceId }) else {
             throw RemoteAgentError.workspaceGone
         }
+        let resources = LeaderAttachResources(
+            host: host,
+            hostKey: hostKey,
+            workspace: workspace,
+            promptFile: promptFile
+        )
+        attempt.installCleanup { await resources.cleanup() }
+        try await attempt.ensureCurrent()
 
         let lease = try await PeerPaneHostRegistry.shared.acquire(host.paneHostSpec)
+        resources.hostSockPath = lease.hostSockPath
+        try await attempt.ensureCurrent()
 #if DEBUG
         dlog("leader.attach.stage acquired host=\(hostKey)")
 #endif
         let session: PeerPaneSession
-        let spawnedSurfaceID: Data
         do {
             let surfaces = try await PeerPaneSession.listSurfaces(on: lease)
+            try await attempt.ensureCurrent()
 #if DEBUG
             dlog("leader.attach.stage listed host=\(hostKey) surfaces=\(surfaces.count)")
 #endif
@@ -719,7 +963,8 @@ extension TeamOrchestrator {
                 teamName: teamName,
                 host: host,
                 fallbackSourceID: surfaces.first?.surfaceID,
-                controlSockPath: lease.hostSockPath
+                controlSockPath: lease.hostSockPath,
+                leaderAttempt: attempt
             ) else {
                 throw RemoteAgentError.noFreshSurface(host.displayName)
             }
@@ -729,12 +974,14 @@ extension TeamOrchestrator {
             let chosen: Termmesh_Peer_V1_SurfaceInfo?
             if placement.useSourceDirectly {
                 let refreshed = try await PeerPaneSession.listSurfaces(on: lease)
+                try await attempt.ensureCurrent()
                 chosen = refreshed.first { $0.surfaceID == placement.sourceID }
             } else {
                 chosen = try await PeerPaneSession.spawnSurface(
                     on: lease,
                     splitting: placement.sourceID
                 )
+                try await attempt.ensureCurrent()
             }
             guard let chosen else {
                 throw RemoteAgentError.noFreshSurface(host.displayName)
@@ -742,7 +989,7 @@ extension TeamOrchestrator {
 #if DEBUG
             dlog("leader.attach.stage spawned host=\(hostKey)")
 #endif
-            spawnedSurfaceID = chosen.surfaceID
+            resources.surfaceID = chosen.surfaceID
             ManagedPeerSurfaceStore.shared.remember(
                 hostKey: hostKey,
                 surfaceID: chosen.surfaceID,
@@ -756,30 +1003,17 @@ extension TeamOrchestrator {
                 title: "Leader",
                 spec: host.paneHostSpec
             )
+            resources.session = session
+            try await attempt.ensureCurrent()
 #if DEBUG
             dlog("leader.attach.stage session host=\(hostKey)")
 #endif
         } catch {
+            await attempt.compensate()
             PeerPaneHostRegistry.shared.release(lease)
             throw error
         }
         PeerPaneHostRegistry.shared.release(lease)
-
-        func abandonSpawnedLeader(panelID: UUID? = nil) async {
-            if let panelID {
-                _ = workspace.closePanel(panelID, force: true)
-            } else {
-                session.teardown()
-            }
-            await Self.closeManagedRemoteSurface(
-                hostSockPath: host.activeSockPath,
-                hostKey: hostKey,
-                surfaceID: spawnedSurfaceID
-            )
-            if let promptFile {
-                await Self.removeRemoteLeaderPrompt(host: host, promptFile: promptFile)
-            }
-        }
 
         do {
 #if DEBUG
@@ -791,11 +1025,12 @@ extension TeamOrchestrator {
                 systemPrompt: systemPrompt,
                 promptFile: promptFile
             )
+            try await attempt.ensureCurrent()
 #if DEBUG
             dlog("leader.attach.stage prepare.ok host=\(hostKey)")
 #endif
         } catch {
-            await abandonSpawnedLeader()
+            await attempt.compensate()
             throw error
         }
 
@@ -812,32 +1047,17 @@ extension TeamOrchestrator {
             projectID == "name:\(teamName)" ? teamUUID : nil
         }
         guard grantResponse.ok else {
-            await abandonSpawnedLeader()
+            await attempt.compensate()
             throw RemoteAgentError.paneCreationFailed
         }
+        resources.grantID = grantResponse.grant.grantID
+        try await attempt.ensureCurrent()
 #if DEBUG
         dlog("leader.attach.stage bootstrap.ok host=\(hostKey)")
 #endif
 
-        guard let panel = workspace.replaceTerminalPaneWithRemote(
-            panelId: team.leaderPanelId,
-            session: session,
-            lifetime: .keepAlive
-        ) else {
-            await abandonSpawnedLeader()
-            throw RemoteAgentError.paneCreationFailed
-        }
-        replaceLeaderAnchorPanel(teamName: teamName, panelID: panel.id)
-        panel.surface.resetTerminal()
-#if DEBUG
-        dlog("leader.attach.stage panel.replaced host=\(hostKey) panel=\(panel.id.uuidString.prefix(8))")
-#endif
-
-        workspace.setPanelCustomTitle(
-            panelId: panel.id,
-            title: "👑 Leader (\(cli.capitalized)) @\(host.displayName)"
-        )
         await Self.waitForRemoteShell(session: session)
+        try await attempt.ensureCurrent()
 #if DEBUG
         dlog("leader.attach.stage shell.ready host=\(hostKey)")
 #endif
@@ -851,7 +1071,7 @@ extension TeamOrchestrator {
             session: session,
             text: prepare
         ) else {
-            await abandonSpawnedLeader(panelID: panel.id)
+            await attempt.compensate()
             throw RemoteAgentError.paneCreationFailed
         }
 #if DEBUG
@@ -874,31 +1094,41 @@ extension TeamOrchestrator {
         if !launched {
             // Best-effort recovery for the only stage that can leave a shell
             // with echo disabled. This command carries no credential either.
-            _ = sendToAgentByPanel(
-                teamName: teamName,
-                panelId: panel.id,
-                workspaceId: workspace.id,
-                text: "stty echo",
-                tabManager: tabManager,
-                withReturn: true
-            )
-            await abandonSpawnedLeader(panelID: panel.id)
+            _ = await sendRemoteLeaderStage(session: session, text: "stty echo")
+            await attempt.compensate()
             throw RemoteAgentError.paneCreationFailed
         }
+        try await attempt.ensureCurrent()
 #if DEBUG
         dlog("leader.attach.stage launch.sent host=\(hostKey)")
 #endif
 
+        // No await between this generation check and the synchronous UI/team
+        // commit: both run on MainActor, so a timeout generation cannot slip
+        // between them and publish a stale attach.
+        try await attempt.ensureCurrent()
+        guard let panel = workspace.replaceTerminalPaneWithRemote(
+            panelId: team.leaderPanelId,
+            session: session,
+            lifetime: .keepAlive
+        ) else {
+            await attempt.compensate()
+            throw RemoteAgentError.paneCreationFailed
+        }
+        resources.panelID = panel.id
+        replaceLeaderAnchorPanel(teamName: teamName, panelID: panel.id)
+        panel.surface.resetTerminal()
+        workspace.setPanelCustomTitle(
+            panelId: panel.id,
+            title: "👑 Leader (\(cli.capitalized)) @\(host.displayName)"
+        )
         markLeaderPolicyState(teamName: teamName, state: "injected")
-
-        // Publish the peer endpoint only after the remote pane accepts its
-        // launch command. Until then the same pane remains visibly pending,
-        // without creating or removing a transient split.
         replaceLeaderEndpoint(
             teamName: teamName,
             panelID: panel.id,
             endpoint: .peer(hostKey: hostKey)
         )
+        attempt.commit()
     }
 
     /// Reattach the project's local leader viewer to the exact remote surface
@@ -1039,93 +1269,96 @@ extension TeamOrchestrator {
             return false
         }
 
-        let workspace = tabManager.addWorkspace(
-            workingDirectory: original.workingDirectory,
-            select: true
+        let progress: DetachedRestoreProgress
+        if let existing = DetachedRestoreRegistry.progressByTeam[teamName],
+           tabManager.tabs.contains(where: { $0.id == existing.workspace.id }) {
+            progress = existing
+        } else {
+            let workspace = tabManager.addWorkspace(
+                workingDirectory: original.workingDirectory,
+                select: true
+            )
+            workspace.customTitle = "[\(teamName)]"
+            workspace.title = "[\(teamName)]"
+            progress = DetachedRestoreProgress(workspace: workspace)
+            DetachedRestoreRegistry.progressByTeam[teamName] = progress
+        }
+        let workspace = progress.workspace
+
+        if progress.leaderPanelID == nil,
+           case let .peer(leaderHostKey) = original.leaderEndpoint,
+           let leaderSurfaceID = ManagedPeerSurfaceStore.shared.leaderRecord(
+               hostKey: leaderHostKey,
+               teamName: teamName
+           )?.surfaceID,
+           let panelID = await attachRestoredRemoteSurface(
+               hostKey: leaderHostKey,
+               surfaceID: leaderSurfaceID,
+               title: "Leader",
+               panelTitle: "👑 Leader (\(original.leaderMode.capitalized))",
+               workspace: workspace
+           ) {
+            progress.leaderPanelID = panelID
+        }
+
+        let missingAgentIDs = Self.missingRestoredAgentIDs(
+            expected: original.agents.map(\.agentInstanceId),
+            attached: Set(progress.agentPanelIDs.keys)
         )
-        let anchorPanelID = workspace.focusedPanelId
-        workspace.customTitle = "[\(teamName)]"
-        workspace.title = "[\(teamName)]"
-        WorkspaceProjectNames.shared.declare(
-            workspaceId: workspace.id,
-            projectName: teamName
-        )
-        guard beginProjectPresentationRestore(
-            teamName: teamName,
-            workspaceID: workspace.id
-        ) else {
+        for originalAgent in original.agents
+        where missingAgentIDs.contains(originalAgent.agentInstanceId) {
+            guard let hostKey = originalAgent.hostKey,
+                  let surfaceID = originalAgent.remoteSurfaceID
+            else { continue }
+            if let panelID = await attachRestoredRemoteSurface(
+                hostKey: hostKey,
+                surfaceID: surfaceID,
+                title: originalAgent.name,
+                panelTitle: "\(Self.colorEmoji(originalAgent.color)) \(originalAgent.name)",
+                workspace: workspace
+            ) {
+                progress.agentPanelIDs[originalAgent.agentInstanceId] = panelID
+            }
+        }
+
+        let complete = progress.leaderPanelID != nil
+            && progress.agentPanelIDs.count == original.agents.count
+        guard complete, let leaderPanelID = progress.leaderPanelID else {
+            RemoteWorkLog.info(
+                "Restore of \(teamName) is incomplete; a retry will attach only missing panes"
+            )
             return false
         }
 
-        let leaderAttached = await reattachRemoteLeaderIfNeeded(teamName: teamName)
-        var attachedAgents = 0
-
+        // Commit presentation addresses only after every remote surface is
+        // attached. These helpers are synchronous MainActor operations, so no
+        // retry can observe the new workspace ID with a partial agent list.
+        guard beginProjectPresentationRestore(
+            teamName: teamName,
+            workspaceID: workspace.id
+        ) else { return false }
+        replaceLeaderEndpoint(
+            teamName: teamName,
+            panelID: leaderPanelID,
+            endpoint: original.leaderEndpoint
+        )
         for originalAgent in original.agents {
-            guard let hostKey = originalAgent.hostKey,
-                  let surfaceID = originalAgent.remoteSurfaceID,
-                  let host = RemoteHostStore.shared.sortedHosts.first(where: {
-                      $0.id == hostKey
-                  }),
-                  host.isConnected
-            else { continue }
-
-            let lease: PeerPaneHostLease
-            do {
-                lease = try await PeerPaneHostRegistry.shared.acquire(host.paneHostSpec)
-            } catch {
-                RemoteWorkLog.info(
-                    "Cannot restore \(teamName)/\(originalAgent.name): \(error)"
-                )
-                continue
+            guard let panelID = progress.agentPanelIDs[originalAgent.agentInstanceId] else {
+                return false
             }
-
-            let session: PeerPaneSession
-            do {
-                let surfaces = try await PeerPaneSession.listSurfaces(on: lease)
-                guard let surface = surfaces.first(where: {
-                    $0.surfaceID == surfaceID
-                }) else {
-                    PeerPaneHostRegistry.shared.release(lease)
-                    continue
-                }
-                session = try await PeerPaneSession.attach(
-                    lease: lease,
-                    surface: surface,
-                    title: originalAgent.name,
-                    spec: host.paneHostSpec
-                )
-            } catch {
-                PeerPaneHostRegistry.shared.release(lease)
-                RemoteWorkLog.info(
-                    "Cannot restore \(teamName)/\(originalAgent.name): \(error)"
-                )
-                continue
-            }
-            PeerPaneHostRegistry.shared.release(lease)
-
-            guard let panel = workspace.openRemotePane(
-                session: session,
-                focus: false,
-                lifetime: .keepAlive
-            ) else {
-                session.teardown()
-                continue
-            }
-            workspace.setPanelCustomTitle(
-                panelId: panel.id,
-                title: "\(Self.colorEmoji(originalAgent.color)) "
-                    + "\(originalAgent.name) @\(host.displayName)"
-            )
             replaceRemoteAgentPresentation(
                 teamName: teamName,
                 agentInstanceID: originalAgent.agentInstanceId,
                 workspaceID: workspace.id,
-                panelID: panel.id
+                panelID: panelID
             )
-            attachedAgents += 1
         }
-
-        if let anchorPanelID, workspace.panels.count > 1 {
+        DetachedRestoreRegistry.progressByTeam.removeValue(forKey: teamName)
+        WorkspaceProjectNames.shared.declare(
+            workspaceId: workspace.id,
+            projectName: teamName
+        )
+        if let anchorPanelID = progress.anchorPanelID, workspace.panels.count > 1 {
             _ = workspace.closePanel(anchorPanelID, force: true)
         }
         scheduleAgentGridEqualization(workspace: workspace)
@@ -1134,10 +1367,60 @@ extension TeamOrchestrator {
         dlog(
             "project.presentation.restore team=\(teamName) "
                 + "workspace=\(workspace.id.uuidString.prefix(8)) "
-                + "leader=\(leaderAttached) agents=\(attachedAgents)/\(original.agents.count)"
+                + "leader=true agents=\(progress.agentPanelIDs.count)/\(original.agents.count)"
         )
 #endif
-        return leaderAttached && attachedAgents == original.agents.count
+        return true
+    }
+
+    private func attachRestoredRemoteSurface(
+        hostKey: String,
+        surfaceID: Data,
+        title: String,
+        panelTitle: String,
+        workspace: Workspace
+    ) async -> UUID? {
+        guard let host = RemoteHostStore.shared.sortedHosts.first(where: { $0.id == hostKey }),
+              host.isConnected else { return nil }
+        let lease: PeerPaneHostLease
+        do {
+            lease = try await PeerPaneHostRegistry.shared.acquire(host.paneHostSpec)
+        } catch {
+            RemoteWorkLog.info("Cannot restore \(title) on \(hostKey): \(error)")
+            return nil
+        }
+        let session: PeerPaneSession
+        do {
+            let surfaces = try await PeerPaneSession.listSurfaces(on: lease)
+            guard let surface = surfaces.first(where: { $0.surfaceID == surfaceID }) else {
+                PeerPaneHostRegistry.shared.release(lease)
+                return nil
+            }
+            session = try await PeerPaneSession.attach(
+                lease: lease,
+                surface: surface,
+                title: title,
+                spec: host.paneHostSpec
+            )
+        } catch {
+            PeerPaneHostRegistry.shared.release(lease)
+            RemoteWorkLog.info("Cannot restore \(title) on \(hostKey): \(error)")
+            return nil
+        }
+        PeerPaneHostRegistry.shared.release(lease)
+        guard let panel = workspace.openRemotePane(
+            session: session,
+            focus: false,
+            lifetime: .keepAlive
+        ) else {
+            session.teardown()
+            return nil
+        }
+        workspace.setPanelCustomTitle(
+            panelId: panel.id,
+            title: "\(panelTitle) @\(host.displayName)"
+        )
+        return panel.id
     }
 
     /// A team destroy is an explicit end-of-lifecycle action, unlike closing
@@ -2287,13 +2570,17 @@ extension TeamOrchestrator {
 #if DEBUG
                     dlog("leader.attach.begin host=\(hostKey) cli=\(leaderMode)")
 #endif
-                    try await Self.withLeaderAttachDeadline(hostKey: hostKey) {
+                    try await Self.withLeaderAttachDeadline(
+                        teamName: team.id,
+                        hostKey: hostKey
+                    ) { attempt in
                         try await self.attachRemoteLeader(
                             teamName: team.id,
                             hostKey: hostKey,
                             workingDirectory: resolvedRemoteLeaderWorkingDirectory,
                             cli: leaderMode,
                             model: leaderModel,
+                            attempt: attempt,
                             systemPrompt: remoteLeaderSystemPrompt
                         )
                     }
