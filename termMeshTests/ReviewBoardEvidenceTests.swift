@@ -265,14 +265,11 @@ final class ReviewBoardEvidenceTests: XCTestCase {
         XCTAssertEqual(patch.files.map(\.del), [1, 9])
     }
 
-    /// A truncated patch has to say so. The digest still covers everything,
-    /// which is the only reason showing an excerpt is safe.
-    func testATruncatedPeerPatchKeepsTheDigestOverTheWhole() throws {
+    /// An excerpt cannot prove what the omitted suffix contains, even when it
+    /// carries a digest allegedly computed over the whole patch.
+    func testATruncatedPeerPatchIsRejected() {
         let json = #"{"head_sha":"b","base_sha":"a","diff_digest":"sha256:ff","patch":"...","truncated":true}"#
-        let patch = try XCTUnwrap(ReviewBoardEvidence.Patch(peerResponse: json))
-        XCTAssertTrue(patch.isTruncated)
-        XCTAssertEqual(patch.digest, "sha256:ff")
-        XCTAssertTrue(patch.isEmpty, "no numstat means no files, which reads as nothing to review")
+        XCTAssertNil(ReviewBoardEvidence.Patch(peerResponse: json))
     }
 
     /// A payload without a usable digest is refused rather than decoded into a

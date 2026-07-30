@@ -1121,6 +1121,23 @@ final class PeerProjectBootstrapTests: XCTestCase {
     }
 
     @MainActor
+    func test_window_close_notification_cleanup_uses_only_closed_workspaces() {
+        let preserved = UUID()
+        let closed = UUID()
+
+        let notificationCleanup = AppDelegate.workspaceIDsClosedWithWindow(
+            preserved: [preserved],
+            remaining: [preserved, closed]
+        )
+
+        XCTAssertEqual(notificationCleanup, [closed])
+        XCTAssertFalse(
+            notificationCleanup.contains(preserved),
+            "a preserved live project still owns notifications that can be opened later"
+        )
+    }
+
+    @MainActor
     func test_remote_claude_leader_launch_injects_term_mesh_prompt() {
         var grant = Termmesh_Peer_V1_TeamLeaderGrant()
         grant.grantID = Data(repeating: 0xcd, count: 32)

@@ -107,7 +107,9 @@ final class ReviewBoardMergeSafetyRegression169Tests: XCTestCase {
             head: "cafebabecafebabecafebabecafebabecafebabe"
         )
 
-        let outcome = await runner.process(job())
+        let outcome = await runner.process(
+            job(approvedHeadSHA: "cafebabecafebabecafebabecafebabecafebabe")
+        )
 
         guard case .failed(let reason) = outcome else {
             return XCTFail("a dirty worktree must not merge, got \(outcome)")
@@ -148,6 +150,28 @@ final class ReviewBoardMergeSafetyRegression169Tests: XCTestCase {
         XCTAssertEqual(ran, 0)
     }
 
+    func testMissingApprovedCommitIsRefusedBeforeGitKitRuns() async {
+        let reports = Reports()
+        let invocations = Invocations()
+        let runner = runner(
+            reports: reports,
+            invocations: invocations,
+            porcelain: "",
+            head: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        )
+
+        let outcome = await runner.process(job())
+
+        guard case .failed(let reason) = outcome else {
+            return XCTFail("missing approval evidence must fail closed, got \(outcome)")
+        }
+        XCTAssertTrue(reason.contains("approved commit"), reason)
+        let ran = await invocations.count
+        XCTAssertEqual(ran, 0)
+        let statuses = await reports.statuses
+        XCTAssertEqual(statuses, ["failed"])
+    }
+
     /// The guard must not refuse the ordinary case, or it would simply stop
     /// the feature instead of making it safe.
     func testACleanWorktreeAtTheApprovedCommitStillMerges() async {
@@ -182,7 +206,9 @@ final class ReviewBoardMergeSafetyRegression169Tests: XCTestCase {
             head: "cafebabecafebabecafebabecafebabecafebabe"
         )
 
-        guard case .failed = await runner.process(job()) else {
+        guard case .failed = await runner.process(
+            job(approvedHeadSHA: "cafebabecafebabecafebabecafebabecafebabe")
+        ) else {
             return XCTFail("an untracked file is uncommitted work too")
         }
         let ran = await invocations.count
