@@ -5045,6 +5045,13 @@ fn select_reply_task(
     let Some(tasks) = task_resp["result"]["tasks"].as_array() else {
         return (None, Vec::new());
     };
+    select_reply_task_from_tasks(tasks, agent_instance_id)
+}
+
+fn select_reply_task_from_tasks(
+    tasks: &[Value],
+    agent_instance_id: Option<&str>,
+) -> (Option<String>, Vec<String>) {
     let mut candidates: Vec<&Value> = tasks
         .iter()
         .filter(|t| {
@@ -5074,6 +5081,57 @@ fn select_reply_task(
         .collect();
     let selected = all.first().cloned();
     (selected, all)
+}
+
+/// Resolve the current pane to its durable instance before a bare reply scans
+/// the task board. This is deliberately best-effort: an unavailable or stale
+/// roster must preserve the existing ambiguity path, not prevent the reply
+/// from being recorded.
+fn current_reply_instance_id(sock: &PathBuf, team: &str, sender: &str) -> Option<String> {
+    if let Some(instance_id) = env::var("TERMMESH_AGENT_INSTANCE_ID")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+    {
+        return Some(instance_id);
+    }
+    let panel_id = env::var("TERMMESH_PANEL_ID")
+        .ok()
+        .filter(|value| !value.trim().is_empty());
+    let workspace_id = env::var("TERMMESH_WORKSPACE_ID")
+        .ok()
+        .filter(|value| !value.trim().is_empty());
+    if panel_id.is_none() && workspace_id.is_none() {
+        return None;
+    }
+    let status = rpc_call(sock, "team.status", json!({ "team_name": team })).ok()?;
+    let agents = status["result"]["agents"].as_array()?;
+    instance_id_from_current_pane(agents, sender, panel_id.as_deref(), workspace_id.as_deref())
+}
+
+fn instance_id_from_current_pane(
+    agents: &[Value],
+    sender: &str,
+    panel_id: Option<&str>,
+    workspace_id: Option<&str>,
+) -> Option<String> {
+    let matches = agents.iter().filter(|agent| {
+        agent["name"].as_str() == Some(sender)
+            && panel_id.map_or_else(
+                || {
+                    workspace_id
+                        .map(|workspace| agent["workspace_id"].as_str() == Some(workspace))
+                        .unwrap_or(false)
+                },
+                |panel| agent["panel_id"].as_str() == Some(panel),
+            )
+    });
+    let instance_ids = matches
+        .filter_map(|agent| agent["agent_instance_id"].as_str())
+        .collect::<Vec<_>>();
+    match instance_ids.as_slice() {
+        [instance_id] => Some((*instance_id).to_string()),
+        _ => None,
+    }
 }
 
 /// Resolve the durable instance that owns a reply. A task id is itself an
@@ -7228,20 +7286,23 @@ fn main() {
             // an unrelated task lingering on a recycled watcher pane. An explicit
             // --task-id still wins for the rare case the leader assigned one.
             let is_stateless_watcher = sender == "watcher" || sender.starts_with("watcher");
-            // Instance resolution is best-effort, and it reads the task board
-            // only. It used to run first and fatally, through `team.status`: a
-            // duplicated agent name returned an error, and `team.status` is the
-            // MainActor command the comment above `task.update` says must not be
-            // on this path at all. Either one exited before anything was written
+            // Instance resolution is best-effort. The pane environment supplies
+            // a durable instance directly when available; older panes resolve
+            // their panel/workspace through the roster. It used to run fatally:
+            // a duplicated agent name or a `team.status` timeout exited before
+            // anything was written
             // — no result file, no report, no task.update, and a leader waiting
             // on a reply that no longer existed. Every instruction the daemon
             // injects (REQUIRED_FINAL_STEP_BLOCK, REPORT_SUFFIX,
             // BROADCAST_SUFFIX, agent_init_prompt) tells the agent to run the
             // bare form, so the bare form has to survive both.
+            let default_reply_instance_id = explicit_agent_instance_id
+                .clone()
+                .or_else(|| current_reply_instance_id(&sock, &team, &sender));
             let (selected, candidates) = if explicit_task_id.is_some() || is_stateless_watcher {
                 (None, Vec::new())
             } else {
-                select_reply_task(&sock, &team, &sender, explicit_agent_instance_id.as_deref())
+                select_reply_task(&sock, &team, &sender, default_reply_instance_id.as_deref())
             };
             // Ambiguity withholds the task transition, never the record of the
             // reply. Closing the wrong agent's task is destructive and stays
@@ -7262,7 +7323,7 @@ fn main() {
             // role without asking `team.status` who the siblings are. When it
             // cannot be resolved, a name-scoped alias is the fallback: a reply
             // filed under a slightly less precise name still reaches the leader.
-            let mut reply_instance_id = explicit_agent_instance_id.clone();
+            let mut reply_instance_id = default_reply_instance_id;
             if let Some(tid) = reply_task_id.clone() {
                 match reply_agent_instance_id(
                     &sock,
@@ -14966,6 +15027,60 @@ mod auto_watch_tests {
 #[cfg(test)]
 mod reply_completion_regression_169_tests {
     use super::*;
+
+    #[test]
+    fn bare_reply_closes_only_the_current_duplicate_name_instance_task() {
+        let agents = vec![
+            json!({
+                "name": "executor",
+                "panel_id": "panel-a",
+                "workspace_id": "workspace-a",
+                "agent_instance_id": "instance-a",
+            }),
+            json!({
+                "name": "executor",
+                "panel_id": "panel-b",
+                "workspace_id": "workspace-b",
+                "agent_instance_id": "instance-b",
+            }),
+        ];
+        let tasks = vec![
+            json!({
+                "id": "task-a", "status": "in_progress",
+                "agent_instance_id": "instance-a", "created_at": "2026-07-30T01:00:00Z",
+            }),
+            json!({
+                "id": "task-b", "status": "in_progress",
+                "agent_instance_id": "instance-b", "created_at": "2026-07-30T02:00:00Z",
+            }),
+        ];
+
+        let current_instance = instance_id_from_current_pane(
+            &agents,
+            "executor",
+            Some("panel-a"),
+            Some("workspace-a"),
+        );
+        assert_eq!(current_instance.as_deref(), Some("instance-a"));
+        let (selected, candidates) =
+            select_reply_task_from_tasks(&tasks, current_instance.as_deref());
+        assert_eq!(candidates, vec!["task-a"]);
+        let (task_id, withheld) = reply_task_decision(selected, &candidates);
+        assert_eq!(task_id.as_deref(), Some("task-a"));
+        assert_eq!(withheld, None);
+    }
+
+    #[test]
+    fn unresolved_current_instance_preserves_duplicate_task_ambiguity() {
+        let tasks = vec![
+            json!({"id": "task-a", "status": "in_progress", "agent_instance_id": "instance-a"}),
+            json!({"id": "task-b", "status": "in_progress", "agent_instance_id": "instance-b"}),
+        ];
+        let (selected, candidates) = select_reply_task_from_tasks(&tasks, None);
+        let (task_id, withheld) = reply_task_decision(selected, &candidates);
+        assert_eq!(task_id, None);
+        assert!(withheld.expect("ambiguity reason").contains("--task-id"));
+    }
 
     /// One live task closes normally even when the sender's name is duplicated:
     /// the task row itself names the instance that was given the work.
