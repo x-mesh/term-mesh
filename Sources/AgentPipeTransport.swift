@@ -399,13 +399,17 @@ enum AgentPipeTransport {
         defer { close(fd) }
 
         var written = 0
-        let writeDeadline = ProcessInfo.processInfo.systemUptime + pipeWriteTimeout
+        var writeDeadline = ProcessInfo.processInfo.systemUptime + pipeWriteTimeout
         try payload.withUnsafeBytes { raw in
             guard let base = raw.baseAddress else { return }
             while written < raw.count {
                 let n = write(fd, base.advanced(by: written), raw.count - written)
                 if n > 0 {
                     written += n
+                    // Progress restarts the clock. The deadline bounds a
+                    // reader that stopped consuming; a large payload drained
+                    // slowly is the reader working, not the reader stuck.
+                    writeDeadline = ProcessInfo.processInfo.systemUptime + pipeWriteTimeout
                     continue
                 }
                 if n < 0, errno == EINTR || errno == EAGAIN {
