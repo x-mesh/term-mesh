@@ -941,6 +941,7 @@ extension TeamOrchestrator {
             hostKey: hostKey
         )
         let workingDirectory: String
+        var isolatedCheckout: String?
         if team.remoteProjectLocations.contains(
             .init(hostKey: hostKey, path: requestedDirectory)
         ) {
@@ -951,15 +952,25 @@ extension TeamOrchestrator {
                 requestedDirectory: requestedDirectory
             )
             workingDirectory = isolated.path
-            var locations = team.remoteProjectLocations
-            locations.append(.init(hostKey: hostKey, path: isolated.path))
+            isolatedCheckout = isolated.path
+        } else {
+            workingDirectory = requestedDirectory
+        }
+
+        func recordIsolatedCheckout() {
+            guard let path = isolatedCheckout else { return }
+            var locations = teams[teamName]?.remoteProjectLocations ?? []
+            let location = Team.RemoteProjectLocation(hostKey: hostKey, path: path)
+            if !locations.contains(location) {
+                locations.append(location)
+            }
             recordRemoteProjectLocations(
                 teamName: teamName,
                 locations: locations.sorted { ($0.hostKey, $0.path) < ($1.hostKey, $1.path) }
             )
-        } else {
-            workingDirectory = requestedDirectory
         }
+
+        do {
 
         // Use the same incremental grid growth as local `add`/`attach`.
         let placement = nextAgentSplitPlacement(team: team, workspace: workspace)
@@ -970,7 +981,7 @@ extension TeamOrchestrator {
         // channel, so it keeps the terminal relay path below.
         if AgentPipeTransport.canHoldNatively(cli: cli),
            let sshTarget = host.sshTarget, !sshTarget.isEmpty {
-            return try attachRemoteNativeAgent(
+            let member = try attachRemoteNativeAgent(
                 team: team,
                 workspace: workspace,
                 tabManager: tabManager,
@@ -984,6 +995,8 @@ extension TeamOrchestrator {
                 model: model,
                 cli: cli
             )
+            recordIsolatedCheckout()
+            return member
         }
 
         let registry = PeerPaneHostRegistry.shared
@@ -1164,7 +1177,20 @@ extension TeamOrchestrator {
             )
         }
 
+        recordIsolatedCheckout()
         return member
+        } catch {
+            if let path = isolatedCheckout,
+               let sshTarget = host.sshTarget, !sshTarget.isEmpty {
+                await PeerProjectBootstrap.reapWorktree(
+                    sshTarget: sshTarget,
+                    port: host.sshPort,
+                    identityFile: host.identityFile,
+                    path: path
+                )
+            }
+            throw error
+        }
     }
 
     @MainActor
@@ -2107,30 +2133,31 @@ extension TeamOrchestrator {
         // IS_SANDBOX or proxy reaches a typed launch.
         let assignments = PeerHostEnvironment.inlineAssignments(environment)
         let envPrefix = assignments.isEmpty ? "" : assignments + " "
+        let quotedModel = shellQuoted(model)
         switch cli {
         case "claude":
             guard let systemPromptFile else {
-                return "\(enter) && \(envPrefix)claude --model \(model) --dangerously-skip-permissions"
+                return "\(enter) && \(envPrefix)claude --model \(quotedModel) --dangerously-skip-permissions"
             }
             let quotedFile = shellQuoted(systemPromptFile)
             return "\(enter) && TERMMESH_LEADER_PROMPT=$(cat \(quotedFile))"
                 + " && rm -f \(quotedFile)"
-                + " && \(envPrefix)claude --model \(model)"
+                + " && \(envPrefix)claude --model \(quotedModel)"
                 + " --system-prompt \"$TERMMESH_LEADER_PROMPT\""
                 + " --dangerously-skip-permissions"
         case "codex", "kiro", "gemini":
             guard let systemPromptFile else {
-                return "\(enter) && \(envPrefix)\(cli) --model \(model)"
+                return "\(enter) && \(envPrefix)\(cli) --model \(quotedModel)"
             }
             let directive = LeaderParallelPolicy.launchDirective(promptFile: systemPromptFile)
             switch cli {
             case "kiro":
-                return "\(enter) && \(envPrefix)kiro chat --model \(model) \(shellQuoted(directive))"
+                return "\(enter) && \(envPrefix)kiro chat --model \(quotedModel) \(shellQuoted(directive))"
             default:
-                return "\(enter) && \(envPrefix)\(cli) --model \(model) \(shellQuoted(directive))"
+                return "\(enter) && \(envPrefix)\(cli) --model \(quotedModel) \(shellQuoted(directive))"
             }
         default:
-            return "\(enter) && \(envPrefix)\(cli) --model \(model)"
+            return "\(enter) && \(envPrefix)\(cli) --model \(quotedModel)"
         }
     }
 

@@ -1098,4 +1098,31 @@ final class PeerProjectBootstrapTests: XCTestCase {
         XCTAssertTrue(launch.contains("'/srv/it'\\''s here'"))
         XCTAssertFalse(launch.contains("cd '/srv/it's here'"), "an unescaped quote would end the argument early")
     }
+
+    @MainActor
+    func test_remote_launch_shell_quotes_the_model() {
+        let launch = TeamOrchestrator.remoteAgentCommand(
+            cli: "claude",
+            model: "sonnet; touch /tmp/term-mesh-injected #",
+            agentName: "worker",
+            teamName: "demo",
+            workingDirectory: "/srv/demo"
+        )
+
+        XCTAssertTrue(launch.contains("--model 'sonnet; touch /tmp/term-mesh-injected #'"))
+        XCTAssertFalse(launch.contains("--model sonnet;"))
+    }
+
+    func test_process_run_timeout_escalates_to_sigkill() async throws {
+        let started = Date()
+        let output = try await ProcessRun.capture(
+            executable: "/bin/sh",
+            arguments: ["-c", "trap '' TERM; while :; do :; done"],
+            timeout: 0.05
+        )
+
+        XCTAssertTrue(output.timedOut)
+        XCTAssertNotEqual(output.status, 0)
+        XCTAssertLessThan(Date().timeIntervalSince(started), 3)
+    }
 }
