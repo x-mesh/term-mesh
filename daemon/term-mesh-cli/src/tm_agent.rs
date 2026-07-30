@@ -5092,6 +5092,24 @@ fn unambiguous_reply_task(candidates: &[String]) -> Result<Option<String>, Strin
     }
 }
 
+/// Which task a bare `reply` closes, and the reason it closes none.
+///
+/// Returns `(task_to_close, withheld_reason)`. Ambiguity is a withheld
+/// transition, not a refused reply: the caller records the reply either way and
+/// only skips `team.task.update`, because closing another instance's task is
+/// destructive while losing the verdict strands whoever is waiting for it.
+///
+/// Split from the command so the decision is testable without a socket.
+fn reply_task_decision(
+    selected: Option<String>,
+    candidates: &[String],
+) -> (Option<String>, Option<String>) {
+    match unambiguous_reply_task(candidates) {
+        Ok(task_id) => (task_id.or(selected), None),
+        Err(message) => (None, Some(message)),
+    }
+}
+
 fn return_retry_delays_ms(text_delivered: bool, context: &str) -> &'static [u64] {
     // Long-paste contexts (init prompt, delegate payload) used to need an
     // 800ms first delay to avoid the paste truncation race. That race is
@@ -7151,38 +7169,69 @@ fn main() {
             // an unrelated task lingering on a recycled watcher pane. An explicit
             // --task-id still wins for the rare case the leader assigned one.
             let is_stateless_watcher = sender == "watcher" || sender.starts_with("watcher");
-            let reply_task_id = if let Some(tid) = explicit_task_id {
+            // Instance resolution is best-effort, and it reads the task board
+            // only. It used to run first and fatally, through `team.status`: a
+            // duplicated agent name returned an error, and `team.status` is the
+            // MainActor command the comment above `task.update` says must not be
+            // on this path at all. Either one exited before anything was written
+            // — no result file, no report, no task.update, and a leader waiting
+            // on a reply that no longer existed. Every instruction the daemon
+            // injects (REQUIRED_FINAL_STEP_BLOCK, REPORT_SUFFIX,
+            // BROADCAST_SUFFIX, agent_init_prompt) tells the agent to run the
+            // bare form, so the bare form has to survive both.
+            let (selected, candidates) = if explicit_task_id.is_some() || is_stateless_watcher {
+                (None, Vec::new())
+            } else {
+                select_reply_task(&sock, &team, &sender, explicit_agent_instance_id.as_deref())
+            };
+            // Ambiguity withholds the task transition, never the record of the
+            // reply. Closing the wrong agent's task is destructive and stays
+            // refused; losing the verdict is not a safer outcome, it is the
+            // worse one, so the files and the report are written either way.
+            let mut withheld_task: Option<String> = None;
+            let mut reply_task_id = if let Some(tid) = explicit_task_id {
                 Some(tid)
             } else if is_stateless_watcher {
                 None
             } else {
-                let selected_instance_id = match reply_agent_instance_id(
-                    &sock, &team, &sender, explicit_agent_instance_id.as_deref(), None,
+                let (task_id, withheld) = reply_task_decision(selected, &candidates);
+                withheld_task = withheld;
+                task_id
+            };
+            // A task row is authoritative attribution — it names the instance
+            // that was given the work — so one live task resolves a duplicated
+            // role without asking `team.status` who the siblings are. When it
+            // cannot be resolved, a name-scoped alias is the fallback: a reply
+            // filed under a slightly less precise name still reaches the leader.
+            let mut reply_instance_id = explicit_agent_instance_id.clone();
+            if let Some(tid) = reply_task_id.clone() {
+                match reply_agent_instance_id(
+                    &sock,
+                    &team,
+                    &sender,
+                    explicit_agent_instance_id.as_deref(),
+                    Some(&tid),
                 ) {
-                    Ok(instance) => instance,
-                    Err(message) => { eprintln!("reply for {sender}: {message}"); process::exit(2); }
-                };
-                let (selected, candidates) = select_reply_task(
-                    &sock, &team, &sender, selected_instance_id.as_deref(),
-                );
-                match unambiguous_reply_task(&candidates) {
-                    Ok(task_id) => task_id.or(selected),
+                    Ok(instance) => reply_instance_id = instance,
+                    // An explicit selector the task contradicts is a false claim
+                    // about whose work this is, so the transition is withheld
+                    // rather than applied under the wrong instance — the same
+                    // treatment ambiguity gets, and for the same reason.
+                    Err(message) if explicit_agent_instance_id.is_some() => {
+                        withheld_task = Some(message);
+                        reply_task_id = None;
+                    }
+                    // Nothing was claimed and the task is already scoped to this
+                    // sender by assignee, so only the instance label is missing.
+                    // A name-scoped alias plus a closed task beats a lost reply.
                     Err(message) => {
-                        eprintln!("reply for {sender} is {message}");
-                        std::process::exit(2);
+                        eprintln!(
+                            "  Warning: could not resolve the instance for {sender} ({message}); \
+                             writing a name-scoped reply alias"
+                        );
                     }
                 }
-            };
-            let reply_instance_id = match reply_agent_instance_id(
-                &sock,
-                &team,
-                &sender,
-                explicit_agent_instance_id.as_deref(),
-                reply_task_id.as_deref(),
-            ) {
-                Ok(instance) => instance,
-                Err(message) => { eprintln!("reply for {sender}: {message}"); process::exit(2); }
-            };
+            }
             let alias_name = reply_alias_filename(&sender, reply_instance_id.as_deref());
             let mut durable_copy_paths = vec![result_file_path(&team, &alias_name)];
             if let Some(tid) = reply_task_id.as_deref() {
@@ -7280,6 +7329,22 @@ fn main() {
                 // this is success — not the exit-2 path non-watcher roles take when
                 // a task they were expected to own is missing.
                 eprintln!("watcher reply recorded (no task to close)");
+            } else if let Some(message) = withheld_task {
+                // The reply is on disk and in the leader's inbox by now; only the
+                // transition was withheld, and the flag that resolves it is named
+                // in `message`. Still exit 2 so a leader-side parser and the
+                // agent both see that no task was closed.
+                let err = json!({
+                    "ok": false,
+                    "error": {
+                        "code": "ambiguous_active_task",
+                        "message": format!("{message}; recorded the reply without closing a task"),
+                        "sender": sender,
+                    }
+                });
+                eprintln!("{}", pretty(&err));
+                eprintln!("  Warning: reply for {sender} is {message}");
+                process::exit(2);
             } else {
                 // Emit a structured JSON error so leader-side parsers can
                 // recognize the condition (and exit 2 to distinguish from
@@ -14781,5 +14846,69 @@ mod auto_watch_tests {
         assert!(!delegate_return_already_submitted(&json!({
             "result": { "return_submitted": false },
         })));
+    }
+}
+
+/// The bare `tm-agent reply` contract: nothing about resolving *who* replied may
+/// stop the reply from being recorded. The daemon injects the bare form in
+/// `REQUIRED_FINAL_STEP_BLOCK`, `REPORT_SUFFIX`, `BROADCAST_SUFFIX` and
+/// `agent_init_prompt`, so that form has to survive a duplicated agent name and
+/// an instance it cannot resolve.
+#[cfg(test)]
+mod reply_completion_regression_169_tests {
+    use super::*;
+
+    /// One live task closes normally even when the sender's name is duplicated:
+    /// the task row itself names the instance that was given the work.
+    #[test]
+    fn a_single_live_task_still_closes() {
+        let candidates = vec!["task-a".to_string()];
+        let (task_id, withheld) = reply_task_decision(Some("task-a".to_string()), &candidates);
+        assert_eq!(task_id.as_deref(), Some("task-a"));
+        assert_eq!(withheld, None);
+    }
+
+    /// Two live tasks withhold the transition and say why — but they return a
+    /// reason instead of ending the process, so the caller still writes the
+    /// durable copies and posts the report.
+    #[test]
+    fn ambiguity_withholds_the_transition_instead_of_aborting() {
+        let candidates = vec!["task-a".to_string(), "task-b".to_string()];
+        let (task_id, withheld) = reply_task_decision(Some("task-a".to_string()), &candidates);
+        assert_eq!(task_id, None, "no task may be closed on a guess");
+        let reason = withheld.expect("a withheld transition must explain itself");
+        assert!(reason.contains("--task-id"), "{reason}");
+        assert!(reason.contains("task-a") && reason.contains("task-b"), "{reason}");
+    }
+
+    /// No live task at all is not ambiguous; it falls through to whatever the
+    /// board selected (`None` here), which the command reports as
+    /// `no_active_task` after writing the alias.
+    #[test]
+    fn no_candidates_is_not_ambiguous() {
+        let (task_id, withheld) = reply_task_decision(None, &[]);
+        assert_eq!(task_id, None);
+        assert_eq!(withheld, None);
+    }
+
+    /// An unresolved instance degrades the alias, it does not lose the reply.
+    /// Both filenames stay inside the results directory, so either one is a
+    /// legitimate durable copy for the leader to read.
+    #[test]
+    fn an_unresolved_instance_falls_back_to_a_name_scoped_alias() {
+        assert_eq!(
+            reply_alias_filename("executor", Some("inst-2")),
+            "executor-inst-2-reply.md"
+        );
+        assert_eq!(reply_alias_filename("executor", None), "executor-reply.md");
+        // Empty is the same answer as absent: an instance id nobody could
+        // resolve must not produce an `executor--reply.md`.
+        assert_eq!(reply_alias_filename("executor", Some("")), "executor-reply.md");
+
+        let names = task_result_candidates("team-a", "task-a", "executor", None)
+            .iter()
+            .filter_map(|path| path.file_name().and_then(|name| name.to_str().map(str::to_owned)))
+            .collect::<Vec<_>>();
+        assert_eq!(names, vec!["task-a.md", "executor-reply.md"]);
     }
 }

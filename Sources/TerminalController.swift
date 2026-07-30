@@ -3388,10 +3388,12 @@ class TerminalController {
             return v2Error(id: id, code: "invalid_params", message: "Missing task_id")
         }
         let assignee = params["assignee"] as? String
+        let assigneeInstanceId = params["agent_instance_id"] as? String
         let store = TeamDataStore.shared
 
         guard let task = store.reassignTask(
-            teamName: teamName, taskId: taskId, assignee: assignee
+            teamName: teamName, taskId: taskId, assignee: assignee,
+            assigneeInstanceId: assigneeInstanceId
         ) else {
             return v2Error(id: id, code: "not_found", message: "Task not found")
         }
@@ -3403,7 +3405,17 @@ class TerminalController {
                 teamName: teamName, task: task, tabManager: tabManager
             )
         }
-        return v2Ok(id: id, result: ["task": store.taskDictionary(task), "dispatched": dispatched])
+        var result: [String: Any] = [
+            "task": store.taskDictionary(task), "dispatched": dispatched,
+        ]
+        // Assigning by name when several agents answer to it picks the first.
+        // The caller asked for a role and got an instance, and this is the only
+        // place that can say so before they act on the answer.
+        if assigneeInstanceId?.nilIfBlankTC == nil,
+           let warning = store.duplicateNameWarning(teamName: teamName, assignee: assignee) {
+            result["duplicate_name_warning"] = warning
+        }
+        return v2Ok(id: id, result: result)
     }
 
     private func asyncTeamTaskUnblock(params: [String: Any], id: Any?) async -> String {
@@ -3545,7 +3557,16 @@ class TerminalController {
                     id: nil
                 )
             }
-            return v2Ok(id: id, result: ["task": store.taskDictionary(task), "dispatched": dispatched])
+            var result: [String: Any] = [
+                "task": store.taskDictionary(task), "dispatched": dispatched,
+            ]
+            // `reassign_to` is a name — the Reject button has nothing else to
+            // give — so the same first-match choice applies and the same
+            // warning is owed.
+            if let warning = store.duplicateNameWarning(teamName: teamName, assignee: reassignTo) {
+                result["duplicate_name_warning"] = warning
+            }
+            return v2Ok(id: id, result: result)
         }
 
         guard let task = store.updateTask(
@@ -4470,7 +4491,12 @@ class TerminalController {
         let worktreeRemoved = params["worktree_removed"] as? Bool
         let agentInstanceId = params["agent_instance_id"] as? String
 
-        if let agentInstanceId,
+        // A caller that names an instance is asserting which one holds this
+        // task, and being told "Task not found" when the assertion fails says
+        // the wrong thing entirely — the task is there, it is somebody else's.
+        // Kept ahead of the update so the refusal has its own code even when
+        // `assignee` is absent and the store would only answer nil.
+        if let agentInstanceId = agentInstanceId?.nilIfBlankTC,
            let task = store.getTask(teamName: teamName, taskId: taskId),
            task.assigneeInstanceId != agentInstanceId {
             return v2Error(id: id, code: "task_identity_mismatch",
@@ -4487,6 +4513,7 @@ class TerminalController {
             result: taskResult,
             resultPath: resultPath,
             assignee: assignee,
+            assigneeInstanceId: agentInstanceId,
             blockedReason: blockedReason,
             reviewSummary: reviewSummary,
             progressNote: progressNote,
@@ -5376,14 +5403,16 @@ class TerminalController {
             return .err(code: "invalid_params", message: "Missing task_id", data: nil)
         }
         let assignee = params["assignee"] as? String
+        let assigneeInstanceId = params["agent_instance_id"] as? String
         let tabManager = v2ResolveTabManager(params: params)
 
         var result: V2CallResult = .err(code: "not_found", message: "Task not found", data: nil)
         v2MainSync {
-            guard let task = TeamOrchestrator.shared.reassignTask(
+            guard let task = TeamDataStore.shared.reassignTask(
                 teamName: teamName,
                 taskId: taskId,
-                assignee: assignee
+                assignee: assignee,
+                assigneeInstanceId: assigneeInstanceId
             ) else { return }
             let dispatched = tabManager.flatMap {
                 TeamOrchestrator.shared.dispatchTaskToAssignee(

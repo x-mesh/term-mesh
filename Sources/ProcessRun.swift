@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 
 /// Running a command and getting all of its output back.
@@ -85,7 +86,16 @@ enum ProcessRun {
                     errorOutput = stderr.fileHandleForReading.readDataToEndOfFile()
                     stderrDone.leave()
                 }
-                let watchdog = DispatchWorkItem { if process.isRunning { process.terminate() } }
+                let escalation = DispatchWorkItem {
+                    if process.isRunning {
+                        Darwin.kill(process.processIdentifier, SIGKILL)
+                    }
+                }
+                let watchdog = DispatchWorkItem {
+                    guard process.isRunning else { return }
+                    process.terminate()
+                    stderrQueue.asyncAfter(deadline: .now() + 1, execute: escalation)
+                }
                 stderrQueue.asyncAfter(deadline: .now() + timeout, execute: watchdog)
 
                 let output = stdout.fileHandleForReading.readDataToEndOfFile()
@@ -94,6 +104,7 @@ enum ProcessRun {
                 let timedOut = !watchdog.isCancelled
                     && process.terminationReason == .uncaughtSignal
                 watchdog.cancel()
+                escalation.cancel()
 
                 continuation.resume(returning: Output(
                     status: process.terminationStatus,

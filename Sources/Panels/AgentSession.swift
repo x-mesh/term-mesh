@@ -416,6 +416,19 @@ final class AgentSession: ObservableObject {
     /// A line that never arrives must not grow forever. Far above any real
     /// event: a long tool result is tens of kilobytes.
     private static let maxLineBytes = 8 * 1024 * 1024
+
+    /// How long stdout may stay open after the agent itself has gone.
+    ///
+    /// EOF is the right signal and it is not a guaranteed one: a descendant
+    /// that inherited the write end — a server a Bash tool left running, a
+    /// stalled `ssh` — holds the pipe open after the process it belonged to
+    /// exited. Waiting for EOF unconditionally then means the turn never ends,
+    /// the task sits `in_progress`, and every instruction behind it waits on a
+    /// queue nothing will drain. Long enough that a normal exit is never cut
+    /// short (EOF arrives with the exit, not seconds after it), short enough
+    /// that nobody is left watching a pane that has already finished.
+    static let drainGrace: TimeInterval = 2
+
     /// Tool calls waiting for their result, keyed by the id the events use.
     private var openTools: [String: Int] = [:]
     /// Assistant text for the turn in flight, so `result` can be trusted to
@@ -725,10 +738,26 @@ final class AgentSession: ObservableObject {
                 streams.terminationStatus = code
                 // Do not remove the stdout handler here. It remains responsible for
                 // draining all data and observing EOF, even after the parent exits.
-                guard let code = streams.takeFinishCodeIfReady() else { return }
-                DispatchQueue.main.async { [weak self] in
-                    guard let self, self.process === proc else { return }
-                    self.finish(process: proc, code: code)
+                if let code = streams.takeFinishCodeIfReady() {
+                    DispatchQueue.main.async { [weak self] in
+                        guard let self, self.process === proc else { return }
+                        self.finish(process: proc, code: code)
+                    }
+                    return
+                }
+                // EOF has not arrived, and it may never: see `drainGrace`. The
+                // fallback runs on the same serial queue as every other stream
+                // event, so it cannot race the EOF it is covering for —
+                // whichever gets there first takes the one permitted finish.
+                streams.queue.asyncAfter(deadline: .now() + AgentSession.drainGrace) {
+                    guard !streams.closed, !streams.stdoutEOF else { return }
+                    streams.stopOutputNotifications()
+                    streams.stdoutEOF = true
+                    guard let code = streams.takeFinishCodeIfReady() else { return }
+                    DispatchQueue.main.async { [weak self] in
+                        guard let self, self.process === proc else { return }
+                        self.finish(process: proc, code: code, drainedFully: false)
+                    }
                 }
             }
         }
@@ -753,20 +782,36 @@ final class AgentSession: ObservableObject {
     func stop() {
         guard let process else { return }
         _ = teardown(process: process, terminate: true)
-        isThinking = false
-        streamOpen.removeAll()
-        streamingIds.removeAll()
+        // A deliberate stop is still the end of whatever turn was running, and
+        // the same thing `finishAfterDrain` was written for is true of it: the
+        // turn is not going to end on its own, so its task would sit
+        // `in_progress` for a pane that has gone while every instruction behind
+        // it waited on a queue nothing will drain. Closing a pane mid-turn was
+        // measured leaving exactly that. Nobody said the work succeeded, so it
+        // reports as NEEDS_REVIEW — the same verdict a process that died gets.
+        finishAfterDrain(code: 0, stopped: true)
     }
 
     /// The sole natural-exit entry point. The stream queue has already drained
     /// stdout through EOF; its dispatches to the main queue are FIFO, so this
     /// block runs after every preceding `consume` from that process.
-    private func finish(process expected: Process, code: Int32) {
+    ///
+    /// `drainedFully` is false when the grace above ended the wait rather than
+    /// EOF: the agent's last words may be missing, and a pane that quietly
+    /// dropped them would be indistinguishable from one that had nothing more
+    /// to say.
+    private func finish(process expected: Process, code: Int32,
+                        drainedFully: Bool = true) {
         guard process === expected else { return }
         // A result frame normally starts the next queued turn. This process has
         // exited, so keep that queue intact for finishAfterDrain to report.
         isRunning = false
         guard teardown(process: expected, terminate: false) else { return }
+        if !drainedFully {
+            append(.notice(id: UUID(),
+                           "the agent exited but something still holds its output open; "
+                               + "finished after \(Int(Self.drainGrace))s without the rest of it"))
+        }
         finishAfterDrain(code: code)
     }
 
@@ -807,7 +852,7 @@ final class AgentSession: ObservableObject {
         return true
     }
 
-    private func finishAfterDrain(code: Int32) {
+    private func finishAfterDrain(code: Int32, stopped: Bool = false) {
         isThinking = false
         streamOpen.removeAll()
         streamingIds.removeAll()
@@ -818,7 +863,8 @@ final class AgentSession: ObservableObject {
         // its own, and its task would sit `in_progress` forever while every
         // instruction behind it waited on a queue that will never drain.
         if turnInFlight {
-            let end = TurnEnd(stop: "process_exited", failed: true, cost: nil,
+            let end = TurnEnd(stop: stopped ? "session_stopped" : "process_exited",
+                              failed: true, cost: nil,
                               duration: nil, tokensIn: nil, tokensOut: nil)
             append(.turnEnded(id: UUID(), end))
             let answered = currentTaskId
@@ -826,7 +872,9 @@ final class AgentSession: ObservableObject {
             turnInFlight = false
             // No STATUS, so this reads as NEEDS_REVIEW rather than a success —
             // nobody said it worked, and the agent is not there to say.
-            onTurnEnd?("the agent exited before finishing this turn", end, answered)
+            onTurnEnd?(stopped ? "the session was stopped before this turn finished"
+                               : "the agent exited before finishing this turn",
+                       end, answered)
         }
         if !queued.isEmpty {
             append(.notice(id: UUID(),
