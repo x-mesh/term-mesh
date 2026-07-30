@@ -1,4 +1,5 @@
 import Foundation
+import os
 import Bonsplit
 
 /// Closing a task on what the agent said, not on what its screen looked like.
@@ -34,6 +35,12 @@ final class AgentPipeCompletion {
         let agentInstanceId: String?
         let path: String
         var offset: UInt64 = 0
+        /// Which file `offset` counts into. `tee` may not have replaced the
+        /// previous pane's events file yet when the watch is created, so the
+        /// offset seeded then can belong to a file that is about to be thrown
+        /// away — and a shrink is only visible if the replacement happens to
+        /// be shorter. The identity says so either way.
+        var fileID: FileID?
         /// Bytes, for the same reason `AgentSession` keeps bytes: a read ends
         /// where the kernel handed it over, which can be mid-character, and
         /// decoding a partial chunk loses the whole thing.
@@ -55,17 +62,45 @@ final class AgentPipeCompletion {
         AgentPipeTransport.fifoPath(agentId: agentId) + ".events"
     }
 
+    /// Which file a path currently names, as the filesystem counts it.
+    struct FileID: Equatable {
+        let device: Int
+        let inode: Int
+    }
+
+    static func fileID(atPath path: String) -> FileID? {
+        guard let attributes = try? FileManager.default.attributesOfItem(atPath: path),
+              let device = attributes[.systemNumber] as? Int,
+              let inode = attributes[.systemFileNumber] as? Int
+        else { return nil }
+        return FileID(device: device, inode: inode)
+    }
+
     func watch(agentId: String, teamName: String, agentName: String, agentInstanceId: String? = nil) {
+        let path = Self.eventsPath(agentId: agentId)
         // A hard restart reuses the agent's transport id, so the events file the
         // pane that just died left behind is indistinguishable from a live one —
-        // and a fresh watch reads it from byte 0. Every finished turn in it then
-        // replays, each `result` carrying no task to answer, and each closing
-        // whichever task happened to be newest. The file belongs to the process
-        // that writes it, so it starts empty with that process.
-        try? FileManager.default.removeItem(atPath: Self.eventsPath(agentId: agentId))
+        // and a fresh watch reading it from byte 0 replays every finished turn
+        // in it. Start at whatever is already there instead: those bytes belong
+        // to a process that is gone, and nothing after them does.
+        //
+        // Deleting the file did the same job and could take the live one with
+        // it. `watch` is called *after* the pane's shell is launched, and the
+        // tail of that command is `| tee <fifo>.events`. If tee opens first the
+        // unlink hits the inode it holds, tee keeps writing to a file with no
+        // name, and every later `FileHandle(forReadingAtPath:)` here returns
+        // nil — the agent's completions are then lost for the life of the pane,
+        // which is the same hang this seeding exists to prevent. Truncation is
+        // already tee's job (no `-a`), and a file that shrinks under a live
+        // watch is handled in `tick`.
+        var offset: UInt64 = 0
+        if let handle = FileHandle(forReadingAtPath: path) {
+            offset = (try? handle.seekToEnd()) ?? 0
+            try? handle.close()
+        }
         watches[agentId] = Watch(
             teamName: teamName, agentName: agentName, agentInstanceId: agentInstanceId,
-            path: Self.eventsPath(agentId: agentId)
+            path: path, offset: offset, fileID: Self.fileID(atPath: path)
         )
         start()
     }
@@ -75,9 +110,19 @@ final class AgentPipeCompletion {
     /// The capsule already names it — `TASK_ID: …` — and this side is the one
     /// writing that text, so the correlation the screen path could never make
     /// is free here.
+    ///
+    /// Only a turn that names a task moves the expectation. This is not the
+    /// delegate-only entry point it reads as: every delivery goes through it,
+    /// so `send` and `broadcast` arrive here too, and they carry no `TASK_ID`.
+    /// Writing their `nil` over a delegate's pending id erased the one thing
+    /// that could close that task — `consume` now refuses to guess, so the
+    /// result was dropped outright and the task sat `in_progress` until a
+    /// leader's `tm-agent wait` timed out. A turn with no task to answer says
+    /// nothing about the turn already waiting for one.
     func expect(agentId: String, instruction: String) {
         guard watches[agentId] != nil else { return }
-        watches[agentId]?.pendingTaskId = Self.taskId(in: instruction)
+        guard let taskId = Self.taskId(in: instruction) else { return }
+        watches[agentId]?.pendingTaskId = taskId
     }
 
     static func taskId(in text: String) -> String? {
@@ -125,14 +170,24 @@ final class AgentPipeCompletion {
                 // an offset carried over from a previous process sits past the
                 // new end. `seek` past EOF is legal and reads nothing, which
                 // left the watch permanently deaf — every real completion for
-                // the restarted agent missed. A file that shrank is a new file.
+                // the restarted agent missed.
+                //
+                // Two ways to notice. A file that shrank is a new file, which
+                // covers a truncation seen after the fact. Identity covers the
+                // rest: the offset seeded in `watch` may belong to the file the
+                // *previous* pane wrote, and if tee's replacement grows past
+                // that mark before the first tick, size alone says nothing.
                 var offset = watch.offset
                 var carry = watch.carry
+                let currentID = Self.fileID(atPath: watch.path)
+                let replaced = watch.fileID != nil && currentID != nil
+                    && watch.fileID != currentID
                 let end = try handle.seekToEnd()
-                if end < offset {
+                if replaced || end < offset {
                     offset = 0
                     carry = Data()
                 }
+                watches[agentId]?.fileID = currentID ?? watch.fileID
                 try handle.seek(toOffset: offset)
                 guard let chunk = try handle.readToEnd(), !chunk.isEmpty else {
                     watches[agentId]?.offset = offset
@@ -183,6 +238,14 @@ final class AgentPipeCompletion {
             #if DEBUG
             dlog("agent.pipe.result.untracked agent=\(agentId) status=\(event.status)")
             #endif
+            // Outside DEBUG too: dropping a turn is the correct move here and
+            // an invisible one, and a leader watching a task that never closes
+            // has nothing else to look at. No prompt, no result body — the
+            // agent name and its own verdict are enough to tell a stray
+            // broadcast apart from a delegate whose id went missing.
+            Logger.team.notice(
+                "[agent.pipe] \(watch.agentName, privacy: .public) ended a turn with no task to answer (status \(event.status, privacy: .public)); result not recorded"
+            )
             return
         }
         AutoReplyEmit.emit(
