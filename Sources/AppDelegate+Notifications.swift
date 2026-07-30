@@ -243,11 +243,14 @@ extension AppDelegate {
         // sidebar. Explicit team/project teardown still owns process shutdown.
         let projectWorkspaceIDs = TeamOrchestrator.shared
             .preserveProjectPresentations(from: removed.tabManager)
+        let closedWorkspaceIDs = Self.workspaceIDsClosedWithWindow(
+            preserved: projectWorkspaceIDs,
+            remaining: removed.tabManager.tabs.map(\.id)
+        )
 
         // Avoid stale notifications that can no longer be opened once the owning window is gone.
         if let store = notificationStore {
-            for workspaceID in projectWorkspaceIDs
-                + removed.tabManager.tabs.map(\.id) {
+            for workspaceID in closedWorkspaceIDs {
                 store.clearNotifications(forTabId: workspaceID)
             }
         }
@@ -268,10 +271,7 @@ extension AppDelegate {
         // ids as removed drops the remote leader's scoped team route; a
         // subsequent `tm-agent list` then sees no GUI team and can create a
         // same-name team on the peer host (split-brain).
-        for workspaceID in Self.workspaceIDsClosedWithWindow(
-            preserved: projectWorkspaceIDs,
-            remaining: removed.tabManager.tabs.map(\.id)
-        ) {
+        for workspaceID in closedWorkspaceIDs {
             NotificationCenter.default.post(
                 name: .peerWorkspaceDidClose,
                 object: nil,
