@@ -1461,14 +1461,22 @@ struct NewProjectView: View {
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .layoutPriority(0)
             } else {
-                Text(creationError ?? creationSummary)
+                // A disabled button with no stated reason reads as a bug. When
+                // placement is what blocks it, say so here rather than leaving
+                // the summary to describe a run that cannot start.
+                let blocker = creationError ?? placementBlockerMessage
+                Text(blocker ?? creationSummary)
                     .font(.caption)
-                    .foregroundStyle(creationError == nil ? Color.secondary : Color.red)
-                    .lineLimit(creationError == nil ? 1 : 2)
-                    .fixedSize(horizontal: false, vertical: creationError != nil)
+                    .foregroundStyle(
+                        creationError != nil
+                            ? Color.red
+                            : (blocker != nil ? Color.orange : Color.secondary)
+                    )
+                    .lineLimit(blocker == nil ? 1 : 2)
+                    .fixedSize(horizontal: false, vertical: blocker != nil)
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .layoutPriority(0)
-                    .help(creationError ?? creationSummary)
+                    .help(blocker ?? creationSummary)
             }
             HStack(spacing: 10) {
                 if showsCreationProgress {
@@ -1685,8 +1693,52 @@ struct NewProjectView: View {
             [runsOnHostKey].compactMap { $0 }
                 + agents.compactMap(\.hostKey)
         )
-        return remoteKeys.allSatisfy { hostKey in
+        let allConnected = remoteKeys.allSatisfy { hostKey in
             selectablePeers.first(where: { $0.id == hostKey })?.isConnected == true
+        }
+        return allConnected && agentsMissingHostDirectory.isEmpty
+    }
+
+    /// Why the create button is off, when placement is the reason.
+    private var placementBlockerMessage: String? {
+        let missing = agentsMissingHostDirectory
+        if !missing.isEmpty {
+            let names = missing.map(\.preset.displayName).joined(separator: ", ")
+            return missing.count == 1
+                ? "\(names) runs on another machine but has no project folder yet."
+                : "These agents run on another machine but have no project folder yet: \(names)."
+        }
+        let offline = Set([runsOnHostKey].compactMap { $0 } + agents.compactMap(\.hostKey))
+            .filter { hostKey in
+                selectablePeers.first(where: { $0.id == hostKey })?.isConnected != true
+            }
+        guard !offline.isEmpty else { return nil }
+        let labels = offline.map { machineLabel($0) }.sorted().joined(separator: ", ")
+        return offline.count == 1
+            ? "\(labels) is not connected."
+            : "These machines are not connected: \(labels)."
+    }
+
+    /// Peer-bound agents whose project folder is still blank.
+    ///
+    /// A remote agent without a directory fails at creation — the host, not
+    /// this app, decides where a checkout lives, and there is no local path to
+    /// borrow. Refusing here turns that into a disabled button with a reason
+    /// instead of a run that dies partway.
+    private var agentsMissingHostDirectory: [TeamAgentRow] {
+        agents.filter { agent in
+            let hostKey = Self.resolvedAgentHostKey(
+                mode: agentPlacementMode,
+                leaderHostKey: runsOnHostKey,
+                allAgentsHostKey: allAgentsHostKey,
+                explicitHostKey: agent.hostKey,
+                inheritsDefault: inheritedAgentIDs.contains(agent.id)
+            )
+            guard hostKey != nil else { return false }
+            let resolved = agent.hostDirectory.isEmpty
+                ? defaultAgentHostDirectory
+                : agent.hostDirectory
+            return resolved.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
         }
     }
 

@@ -56,6 +56,10 @@ struct TeamAgentComposer: View {
     @State private var bulkHostDirectory: String = ""
     @State private var bulkUsesDefaultPlacement = true
     @State private var expandedAgentIDs: Set<UUID> = []
+    /// Which row's directory field should take the keyboard. Set when a peer
+    /// choice leaves the directory empty, so the field the user now has to
+    /// fill is the one already focused.
+    @FocusState private var focusedDirectoryAgentID: UUID?
 
     private static let defaultPlacementTag = "__term_mesh_default__"
     private static let localPlacementTag = "__term_mesh_local__"
@@ -277,6 +281,10 @@ struct TeamAgentComposer: View {
             Text("Role").frame(width: 148, alignment: .leading)
             Text("CLI").frame(width: 90, alignment: .leading)
             Text("Model").frame(width: 142, alignment: .leading)
+            if showsPlacementControls {
+                Text("Runs on").frame(width: 168, alignment: .leading)
+                Text("Folder").frame(maxWidth: 200, alignment: .leading)
+            }
             Text("Status")
             Spacer(minLength: 0)
             Color.clear.frame(width: 50)
@@ -374,6 +382,13 @@ struct TeamAgentComposer: View {
                 .labelsHidden()
                 .frame(width: 142)
 
+                if showsPlacementControls {
+                    placementPicker(index: index, agent: agent, width: 168)
+                    placementDirectorySummary(index: index, agent: agent)
+                        .font(.caption2)
+                        .frame(maxWidth: 200, alignment: .leading)
+                }
+
                 compactStatus(for: agent, hasCustomInstructions: hasCustomInstructions)
 
                 Spacer(minLength: 0)
@@ -416,8 +431,10 @@ struct TeamAgentComposer: View {
                     .padding(.leading, 46)
 
                 VStack(alignment: .leading, spacing: 12) {
+                    // The picker itself sits in the compact row above; only
+                    // the directory it may require is left to expand into.
                     if showsPlacementControls {
-                        agentPlacementRow(index: index, agent: agent)
+                        agentPlacementDirectoryRow(index: index, agent: agent)
                             .padding(.leading, -48)
                     }
 
@@ -767,6 +784,104 @@ struct TeamAgentComposer: View {
         }
     }
 
+    /// True when this row runs on a peer and therefore owes a directory.
+    /// A row inheriting the default owes nothing — the default carries its own.
+    private func needsExplicitHostDirectory(index: Int, agent: TeamAgentRow) -> Bool {
+        agents[index].hostKey != nil
+            && !(supportsDefaultPlacement && inheritedAgentIDs.contains(agent.id))
+    }
+
+    /// The one place a placement choice is applied, so the compact picker and
+    /// the expanded one cannot drift into different behavior.
+    ///
+    /// Picking a peer guesses its directory. The guess fails on a machine this
+    /// project has never run on, and an empty directory is a creation-time
+    /// error rather than a default — so a failed guess opens the row and puts
+    /// the field on screen. A successful one leaves the row closed: that is
+    /// the whole point of having the picker up here.
+    private func applyPlacement(selection: String, index: Int, agent: TeamAgentRow) {
+        if selection == Self.defaultPlacementTag {
+            agents[index].hostKey = defaultHostKey
+            agents[index].hostDirectory = defaultHostKey == nil ? "" : defaultHostDirectory
+            onAgentPlacementChanged(agent.id, true)
+            return
+        }
+        let newHost = selection == Self.localPlacementTag ? nil : selection
+        agents[index].hostKey = newHost
+        agents[index].hostDirectory = newHost
+            .map { defaultDirectory(forHost: $0, excluding: index) } ?? ""
+        connectHostIfNeeded(newHost)
+        onAgentPlacementChanged(agent.id, false)
+        if newHost != nil && agents[index].hostDirectory.isEmpty {
+            withAnimation(.easeOut(duration: 0.16)) {
+                expandedAgentIDs.insert(agent.id)
+            }
+            focusedDirectoryAgentID = agent.id
+        }
+    }
+
+    private func placementSelection(index: Int, agent: TeamAgentRow) -> String {
+        if supportsDefaultPlacement && inheritedAgentIDs.contains(agent.id) {
+            return Self.defaultPlacementTag
+        }
+        return agents[index].hostKey ?? Self.localPlacementTag
+    }
+
+    @ViewBuilder
+    private func placementPicker(index: Int, agent: TeamAgentRow, width: CGFloat) -> some View {
+        Picker("", selection: Binding(
+            get: { placementSelection(index: index, agent: agent) },
+            set: { applyPlacement(selection: $0, index: index, agent: agent) }
+        )) {
+            if supportsDefaultPlacement {
+                Text("Default · \(defaultMachineLabel)")
+                    .tag(Self.defaultPlacementTag)
+            }
+            Text("This Mac").tag(Self.localPlacementTag)
+            ForEach(selectablePeers, id: \.id) { host in
+                Text(host.isConnected ? host.displayName : "\(host.displayName) — offline")
+                    .tag(host.id)
+            }
+        }
+        .labelsHidden()
+        .frame(width: width)
+    }
+
+    private func hostDirectoryField(index: Int, agent: TeamAgentRow) -> some View {
+        TextField("Project folder on that machine", text: Binding(
+            get: { agents[index].hostDirectory },
+            set: {
+                agents[index].hostDirectory = $0
+                onAgentPlacementChanged(agent.id, false)
+            }
+        ))
+        .textFieldStyle(.roundedBorder)
+        .focused($focusedDirectoryAgentID, equals: agent.id)
+        .help("Primary project folder; an isolated agent worktree is created beside it")
+        .accessibilityIdentifier("teamAgentComposer.agentDirectory.\(agent.id.uuidString)")
+    }
+
+    /// The compact row's directory readout. It exists so a closed row still
+    /// answers "where on that machine" — without it, moving the picker up here
+    /// would hide the answer behind a disclosure the user no longer has to open.
+    @ViewBuilder
+    private func placementDirectorySummary(index: Int, agent: TeamAgentRow) -> some View {
+        if needsExplicitHostDirectory(index: index, agent: agent) {
+            let directory = agents[index].hostDirectory
+            if directory.isEmpty {
+                Label("Needs a folder", systemImage: "exclamationmark.triangle.fill")
+                    .foregroundStyle(.orange)
+                    .lineLimit(1)
+            } else {
+                Text(directory)
+                    .foregroundStyle(.tertiary)
+                    .lineLimit(1)
+                    .truncationMode(.head)
+                    .help(directory)
+            }
+        }
+    }
+
     private func agentPlacementRow(index: Int, agent: TeamAgentRow) -> some View {
         HStack(spacing: 8) {
             Text("Runs on")
@@ -774,51 +889,10 @@ struct TeamAgentComposer: View {
                 .foregroundStyle(.secondary)
                 .frame(width: 64, alignment: .leading)
 
-            Picker("", selection: Binding(
-                get: {
-                    if supportsDefaultPlacement && inheritedAgentIDs.contains(agent.id) {
-                        return Self.defaultPlacementTag
-                    }
-                    return agents[index].hostKey ?? Self.localPlacementTag
-                },
-                set: { selection in
-                    if selection == Self.defaultPlacementTag {
-                        agents[index].hostKey = defaultHostKey
-                        agents[index].hostDirectory = defaultHostKey == nil ? "" : defaultHostDirectory
-                        onAgentPlacementChanged(agent.id, true)
-                    } else {
-                        let newHost = selection == Self.localPlacementTag ? nil : selection
-                        agents[index].hostKey = newHost
-                        agents[index].hostDirectory = newHost
-                            .map { defaultDirectory(forHost: $0, excluding: index) } ?? ""
-                        connectHostIfNeeded(newHost)
-                        onAgentPlacementChanged(agent.id, false)
-                    }
-                }
-            )) {
-                if supportsDefaultPlacement {
-                    Text("Default · \(defaultMachineLabel)")
-                        .tag(Self.defaultPlacementTag)
-                }
-                Text("This Mac").tag(Self.localPlacementTag)
-                ForEach(selectablePeers, id: \.id) { host in
-                    Text(host.isConnected ? host.displayName : "\(host.displayName) — offline")
-                        .tag(host.id)
-                }
-            }
-            .frame(width: 180)
+            placementPicker(index: index, agent: agent, width: 180)
 
-            if agents[index].hostKey != nil
-                && !(supportsDefaultPlacement && inheritedAgentIDs.contains(agent.id)) {
-                TextField("Project folder on that machine", text: Binding(
-                    get: { agents[index].hostDirectory },
-                    set: {
-                        agents[index].hostDirectory = $0
-                        onAgentPlacementChanged(agent.id, false)
-                    }
-                ))
-                .textFieldStyle(.roundedBorder)
-                .help("Primary project folder; an isolated agent worktree is created beside it")
+            if needsExplicitHostDirectory(index: index, agent: agent) {
+                hostDirectoryField(index: index, agent: agent)
             } else {
                 Text("Uses Default · \(defaultMachineLabel)")
                     .font(.caption)
@@ -829,6 +903,27 @@ struct TeamAgentComposer: View {
         }
         .padding(.leading, 48)
         .accessibilityIdentifier("teamAgentComposer.agentPlacement.\(agent.id.uuidString)")
+    }
+
+    /// The expanded half of placement once the picker lives in the compact
+    /// row: the directory only. Shown for a peer row, absent otherwise —
+    /// there is nothing to say about a machine that carries its own path.
+    @ViewBuilder
+    private func agentPlacementDirectoryRow(index: Int, agent: TeamAgentRow) -> some View {
+        if needsExplicitHostDirectory(index: index, agent: agent) {
+            HStack(spacing: 8) {
+                Text("Folder")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .frame(width: 64, alignment: .leading)
+
+                hostDirectoryField(index: index, agent: agent)
+
+                Spacer(minLength: 0)
+            }
+            .padding(.leading, 48)
+            .accessibilityIdentifier("teamAgentComposer.agentPlacement.\(agent.id.uuidString)")
+        }
     }
 
     // MARK: - Quick Presets (legacy, simple role-only)
