@@ -1245,6 +1245,8 @@ class TerminalController {
             return v2Result(id: id, self.v2DebugType(params: params))
         case "debug.app.activate":
             return v2Result(id: id, self.v2DebugActivateApp())
+        case "debug.app.build":
+            return v2Result(id: id, self.v2DebugAppBuild())
         case "debug.command_palette.toggle":
             return v2Result(id: id, self.v2DebugToggleCommandPalette(params: params))
         case "debug.agent.transcript":
@@ -1534,6 +1536,7 @@ class TerminalController {
             "debug.shortcut.simulate",
             "debug.type",
             "debug.app.activate",
+            "debug.app.build",
             "debug.command_palette.toggle",
             "debug.agent.transcript",
             "debug.command_palette.rename_tab.open",
