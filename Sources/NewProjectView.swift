@@ -2255,6 +2255,13 @@ enum GitHubRepositoryCatalog {
             withIntermediateDirectories: true
         )
         try? data.write(to: cacheURL, options: .atomic)
+        // Owner-only: the list names private repositories. `.atomic` replaces
+        // the file, so the mode is reapplied on every write rather than once
+        // at creation.
+        try? FileManager.default.setAttributes(
+            [.posixPermissions: 0o600],
+            ofItemAtPath: cacheURL.path
+        )
     }
 
     private static func fetchPage(_ page: Int, token: String) async -> [String]? {
