@@ -32,6 +32,18 @@ leader가 작업의 종료를 알 수 있는 유일한 신호이기 때문이다
 3. **`tm-agent inbox` / `tm-agent msg list`**
    - 받은 후속 지시 확인은 **reply 이후**. reply 전에 inbox 작업을 하지 않는다.
 
+### 메시지·inbox 호출이 실패할 때
+
+`tm-agent reply`가 **유일하게 보장된 전달 경로**다. `msg send` / `inbox` / `task *`는
+`no_app`·connection reset·non-zero exit로 실패할 수 있다 — **피어 호스트에서 실행 중인
+에이전트에는 앱으로 되돌아오는 인가된 경로가 없다.**
+
+실패하면:
+
+- ❌ 재시도 루프를 돌지 않는다. 몇 번을 불러도 결과는 같다.
+- ❌ BLOCKED로 보고하지 않는다. 작업이 막힌 게 아니다.
+- ✅ 전하려던 내용을 **reply 본문에 담고** 하던 일을 계속한다.
+
 ### 금지 패턴 (anti-pattern)
 
 - ❌ `tm-agent msg send` 한 줄만 보내고 종료 — leader 입장에서 task는 여전히 assigned/in-progress.

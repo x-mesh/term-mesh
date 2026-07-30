@@ -511,11 +511,18 @@ point FULL_REPORT at it. Never use a reply alias or `<task_id>.md` as FULL_REPOR
 there is no separate detail file.\n\
 \n\
 Communication:\n\
+- `tm-agent reply` is the channel of record. Anything the leader must see belongs in\n\
+  the reply body — it is delivered even when the calls below cannot reach the app.\n\
 - Send message to leader: `tm-agent msg send '<text>'`\n\
 - Send message to another agent: `tm-agent msg send '<text>' --to <agent_name>`\n\
 - Check your inbox: `tm-agent inbox`\n\
 - Check team status: `tm-agent status`\n\
 - Check tasks: `tm-agent task list`\n\
+\n\
+If a message/inbox/task call fails (`no_app`, connection reset, non-zero exit), do NOT\n\
+retry it and do NOT treat it as a blocker. An agent running on a peer host has no\n\
+authorized route back to the app for these; only `reply` is guaranteed. Put the content\n\
+in your reply body and continue.\n\
 \n\
 Environment:\n\
 - Working directory: {workdir}\n\

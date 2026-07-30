@@ -657,6 +657,31 @@ When a task has a fix budget (set via `--auto-fix-budget N` on delegate):
 > 먼저 확인해라. 위 두 건이 그 패턴이다 — 고칠 코드와 그 코드가 쓰는 struct 정의가 다른 파일에
 > 산다. 미리 소유 목록에 넣거나, 최소한 확장 요청이 올 것을 예상해 둔다.
 
+### 피어 에이전트의 통신 한계 — reply만 보장된다
+
+피어 호스트에서 도는 에이전트에는 **앱으로 되돌아오는 인가된 RPC 경로가 없다.** 역방향
+프록시(`remote_leader_rpc_call`)는 `TERMMESH_LEADER_GRANT_ID`를 받은 remote leader 전용이고,
+일반 워커에는 그 grant가 발급되지 않는다. 워커에 주입되는 `TERMMESH_SOCKET`은 피어 호스트의
+소켓이라 Mac의 팀을 모른다.
+
+| 호출 | 피어 워커에서 |
+|------|--------------|
+| `tm-agent reply` | **동작** — 앱이 pane 출력(`onTurnEnd` / `AutoReplyPoller`)에서 회수 |
+| `tm-agent msg send` / `inbox` / `task *` | `no_app`·connection reset으로 실패 |
+
+`reply`가 되는 건 RPC가 성공해서가 아니라 앱이 pane 출력에서 헤더를 주워 담기 때문이다
+(설계 의도, `TeamOrchestrator+RemoteAgent.swift:892-900`). 그래서 **결과는 전부 reply 본문에
+들어가야 한다.** 피어 위임 캡슐에 다음을 넣는다:
+
+```
+- 이 호스트에서는 tm-agent msg send / inbox / task 호출이 실패한다. 재시도하지 말고
+  BLOCKED로 보고하지도 마라. 전할 내용은 전부 tm-agent reply 본문에 담아라.
+- 파일에 상세를 쓸 거면 <task_id>-full.md 같은 고유 파일로. reply alias에 쓰면 지워진다.
+```
+
+> grant 스코프를 워커까지 확장하는 건 별건이다 — 현 grant는 `team.delegate`/`broadcast`/`send`
+> 까지 포함하는 리더 권한이라 워커에 그대로 줄 수 없다.
+
 ### 피어 에이전트의 검증 한계 — 언어별로 다르다
 
 피어 호스트(Linux)에는 **Swift 툴체인이 없다.** Rust와 Python은 피어에서 완전히 검증된다.
