@@ -9,6 +9,27 @@ import Foundation
 
 /// Tests for watch_drift.post RPC routing and schema consistency.
 /// Catches regression bugs from Phase 5 (drift visibility) implementation.
+///
+/// This file was never listed in `project.pbxproj`, so it had never been
+/// compiled and none of it had ever run. Registering it surfaced two things:
+///
+/// 1. Every case here called `TerminalController()`, but that type is a
+///    `@MainActor` singleton with `private init()`
+///    (`Sources/TerminalController.swift:136`) — the only handle is
+///    `TerminalController.shared`.
+/// 2. The handler it wants, `v2TeamWatchDriftPost`, is `private`
+///    (`Sources/TerminalController.swift:5666`), and `@testable import` raises
+///    `internal` to public — it does **not** reach `private`. So no test can
+///    call it, whatever instance it holds.
+///
+/// The store-level cases below need neither and are therefore live: they cover
+/// the half of the regression that is observable through `TeamDataStore` — the
+/// inbox item's `drift_type` key, the check-id upsert, and the summary format.
+/// The three handler-level cases (parameter name, routing, parameter
+/// validation) live in `WatchDriftHandlerRoutingTests` at the bottom, compiled
+/// only under `TERMMESH_TESTABLE_V2_HANDLERS`, because they cannot compile
+/// until `v2TeamWatchDriftPost` is `internal`. They are kept verbatim so
+/// dropping `private` and defining that flag is all it takes to run them.
 final class WatchDriftRoutingTests: XCTestCase {
 
     // MARK: - Setup / Teardown
@@ -21,38 +42,13 @@ final class WatchDriftRoutingTests: XCTestCase {
 
     override func tearDown() {
         super.tearDown()
-        // Clean up test team
+        // Clean up test team. `unregisterTeam` also drops this team's
+        // `watchDrifts`, which is what keeps the per-item counts below exact
+        // when the whole suite runs in one process.
         TeamDataStore.shared.unregisterTeam("test-team-drift")
     }
 
     // MARK: - Test 1: Schema Consistency (drift_type parameter)
-
-    /// Verifies that team.watch_drift.post accepts drift_type (daemon convention, not drift_kind).
-    /// Regression test for bug: daemon sends drift_type, handler was reading drift_kind.
-    func testWatchDriftPostAcceptsDriftTypeParameter() {
-        let params: [String: Any] = [
-            "team_name": "test-team-drift",
-            "target": "watch-test",
-            "drift_type": "execution",  // daemon sends "drift_type", not "drift_kind"
-            "severity": "high",
-            "finding": "Test finding",
-            "spec_clause": "test-clause",
-            "check_id": "check-001"
-        ]
-
-        // Call the handler (synchronous)
-        let controller = TerminalController()
-        let result = controller.v2TeamWatchDriftPost(params: params)
-
-        // Should succeed, not return "Missing drift_type" or "Missing drift_kind"
-        switch result {
-        case .ok(let payload):
-            XCTAssertTrue(payload["posted"] as? Bool == true, "Should successfully post drift")
-            XCTAssertEqual(payload["check_id"] as? String, "check-001")
-        case .err(let code, let message, _):
-            XCTFail("Handler should accept drift_type parameter, got error: \(code) - \(message)")
-        }
-    }
 
     /// Verifies that drift_type value is preserved in inbox items (not lost or renamed).
     func testWatchDriftInboxItemPreservesDriftType() {
@@ -86,43 +82,7 @@ final class WatchDriftRoutingTests: XCTestCase {
         XCTAssertEqual(driftItem["target"] as? String, "watch-test-2")
     }
 
-    // MARK: - Test 2: Routing Consistency (procesV2Command → dispatchTeamDataCommandDirect)
-
-    /// Verifies that team.watch_drift.post is correctly routed and returns ok response, not "Unknown team command".
-    /// Regression test for bug: case was in dead switch, unreachable from actual routing path.
-    func testWatchDriftPostRoutingSucceeds() {
-        let params: [String: Any] = [
-            "team_name": "test-team-drift",
-            "target": "routing-test",
-            "drift_type": "execution",
-            "severity": "low",
-            "finding": "Routing test finding",
-            "spec_clause": "routing-clause",
-            "check_id": "check-routing-001"
-        ]
-
-        let controller = TerminalController()
-        let result = controller.v2TeamWatchDriftPost(params: params)
-
-        // Should NOT return "Unknown team command" error
-        switch result {
-        case .ok(let payload):
-            XCTAssertTrue(payload["posted"] as? Bool == true)
-            XCTAssertEqual(payload["team_name"] as? String, "test-team-drift")
-        case .err(let code, _, _):
-            XCTFail("Routing failed with error code: \(code). Should not be 'unknown_method'")
-        }
-
-        // Verify inbox item was actually created
-        let items = TeamDataStore.shared.inboxItems(teamName: "test-team-drift")
-        let found = items.contains {
-            ($0["kind"] as? String) == "watch_drift" &&
-            ($0["check_id"] as? String) == "check-routing-001"
-        }
-        XCTAssertTrue(found, "Inbox should contain the posted watch_drift item")
-    }
-
-    // MARK: - Test 3: Deduplication (same check_id should not duplicate)
+    // MARK: - Test 2: Deduplication (same check_id should not duplicate)
 
     /// Verifies that posting the same check_id twice results in one inbox item (upsert, not append).
     /// Prevents duplicate entries when scheduler retries a check.
@@ -167,7 +127,7 @@ final class WatchDriftRoutingTests: XCTestCase {
         }
     }
 
-    // MARK: - Test 4: Watch Drift Item Priority and Summary Format
+    // MARK: - Test 3: Watch Drift Item Priority and Summary Format
 
     /// Verifies that watch_drift items have correct priority (2) and summary format.
     func testWatchDriftItemFormatting() {
@@ -199,11 +159,131 @@ final class WatchDriftRoutingTests: XCTestCase {
                      "Summary should include finding text")
     }
 
-    // MARK: - Test 5: Error Handling
+    // MARK: - Test 4: An unregistered team is refused
+
+    /// The handler cases below assert `invalid_params` for a missing
+    /// `team_name`; the store's own half of that contract — a team it does not
+    /// know is refused rather than silently accumulating drift — is reachable
+    /// here, so it is checked here.
+    func testWatchDriftPostRefusesUnknownTeam() {
+        let posted = TeamDataStore.shared.postWatchDrift(
+            teamName: "team-that-was-never-registered",
+            checkId: "check-unknown-001",
+            target: "unknown-test",
+            driftKind: "execution",
+            severity: "high",
+            finding: "Should not be stored",
+            specClause: "clause"
+        )
+        XCTAssertFalse(posted, "An unregistered team must not accept a drift post")
+        XCTAssertTrue(
+            TeamDataStore.shared.inboxItems(teamName: "team-that-was-never-registered").isEmpty,
+            "Nothing may be stored for a team the store does not know"
+        )
+    }
+}
+
+// The handler-level cases. `v2TeamWatchDriftPost` is `private`, so these do not
+// compile as things stand — see the note on `WatchDriftRoutingTests`. Enabling
+// them is two edits, both outside this file and neither made here:
+//
+//   1. `Sources/TerminalController.swift:5666`
+//      `private func v2TeamWatchDriftPost` → `func v2TeamWatchDriftPost`
+//      (internal is all `@testable import` needs; nothing outside the module
+//      gains access).
+//   2. Add `TERMMESH_TESTABLE_V2_HANDLERS` to the test target's
+//      `SWIFT_ACTIVE_COMPILATION_CONDITIONS`.
+//
+// Kept compiling-ready rather than deleted: these three are the only cases that
+// cover the parameter name the daemon actually sends, the routing entry that was
+// once dead, and the handler's own validation. Two changes were needed to make
+// them buildable at all and both are made below: `TerminalController.shared`
+// instead of `TerminalController()`, and a cast of `V2CallResult.ok`'s payload,
+// whose associated value is `Any` and cannot be subscripted directly.
+#if TERMMESH_TESTABLE_V2_HANDLERS
+final class WatchDriftHandlerRoutingTests: XCTestCase {
+
+    override func setUp() {
+        super.setUp()
+        TeamDataStore.shared.registerTeam("test-team-drift", agentNames: ["executor", "reviewer"])
+    }
+
+    override func tearDown() {
+        super.tearDown()
+        TeamDataStore.shared.unregisterTeam("test-team-drift")
+    }
+
+    /// Verifies that team.watch_drift.post accepts drift_type (daemon convention, not drift_kind).
+    /// Regression test for bug: daemon sends drift_type, handler was reading drift_kind.
+    @MainActor
+    func testWatchDriftPostAcceptsDriftTypeParameter() {
+        let params: [String: Any] = [
+            "team_name": "test-team-drift",
+            "target": "watch-test",
+            "drift_type": "execution",  // daemon sends "drift_type", not "drift_kind"
+            "severity": "high",
+            "finding": "Test finding",
+            "spec_clause": "test-clause",
+            "check_id": "check-001"
+        ]
+
+        // Call the handler (synchronous). `shared` because the initializer is
+        // private — the type is a singleton.
+        let controller = TerminalController.shared
+        let result = controller.v2TeamWatchDriftPost(params: params)
+
+        // Should succeed, not return "Missing drift_type" or "Missing drift_kind"
+        switch result {
+        case .ok(let payload):
+            let fields = payload as? [String: Any]
+            XCTAssertNotNil(fields, "ok payload should be a dictionary")
+            XCTAssertTrue(fields?["posted"] as? Bool == true, "Should successfully post drift")
+            XCTAssertEqual(fields?["check_id"] as? String, "check-001")
+        case .err(let code, let message, _):
+            XCTFail("Handler should accept drift_type parameter, got error: \(code) - \(message)")
+        }
+    }
+
+    /// Verifies that team.watch_drift.post is correctly routed and returns ok response, not "Unknown team command".
+    /// Regression test for bug: case was in dead switch, unreachable from actual routing path.
+    @MainActor
+    func testWatchDriftPostRoutingSucceeds() {
+        let params: [String: Any] = [
+            "team_name": "test-team-drift",
+            "target": "routing-test",
+            "drift_type": "execution",
+            "severity": "low",
+            "finding": "Routing test finding",
+            "spec_clause": "routing-clause",
+            "check_id": "check-routing-001"
+        ]
+
+        let controller = TerminalController.shared
+        let result = controller.v2TeamWatchDriftPost(params: params)
+
+        // Should NOT return "Unknown team command" error
+        switch result {
+        case .ok(let payload):
+            let fields = payload as? [String: Any]
+            XCTAssertTrue(fields?["posted"] as? Bool == true)
+            XCTAssertEqual(fields?["team_name"] as? String, "test-team-drift")
+        case .err(let code, _, _):
+            XCTFail("Routing failed with error code: \(code). Should not be 'unknown_method'")
+        }
+
+        // Verify inbox item was actually created
+        let items = TeamDataStore.shared.inboxItems(teamName: "test-team-drift")
+        let found = items.contains {
+            ($0["kind"] as? String) == "watch_drift" &&
+            ($0["check_id"] as? String) == "check-routing-001"
+        }
+        XCTAssertTrue(found, "Inbox should contain the posted watch_drift item")
+    }
 
     /// Verifies that missing required parameters are properly rejected.
+    @MainActor
     func testWatchDriftPostValidatesRequiredParams() {
-        let controller = TerminalController()
+        let controller = TerminalController.shared
 
         // Missing team_name
         var params: [String: Any] = [
@@ -237,3 +317,4 @@ final class WatchDriftRoutingTests: XCTestCase {
         }
     }
 }
+#endif

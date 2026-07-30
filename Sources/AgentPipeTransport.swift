@@ -362,6 +362,47 @@ enum AgentPipeTransport {
     /// returns, and the caller — holding the FIFO fd open — never does either.
     private static let pipeWriteTimeout: TimeInterval = 5
 
+    enum WriteAttempt: Equatable {
+        case written(Int)
+        case interrupted
+        case wouldBlock
+        case failed(Int32)
+    }
+
+    /// A line may time out only before its first byte is visible. Once a FIFO
+    /// accepts any bytes, returning an error would strand truncated NDJSON for
+    /// the next read, so that committed line is always finished.
+    static func writeWholeLine(
+        byteCount: Int,
+        timeout: TimeInterval = pipeWriteTimeout,
+        now: () -> TimeInterval = { ProcessInfo.processInfo.systemUptime },
+        pause: () -> Void = { usleep(2_000) },
+        attempt: (_ offset: Int, _ remaining: Int) -> WriteAttempt
+    ) throws -> Int {
+        var written = 0
+        let deadline = now() + timeout
+        while written < byteCount {
+            switch attempt(written, byteCount - written) {
+            case .written(let count):
+                guard count > 0 else {
+                    throw DeliveryError.writeFailed("write returned zero after \(written)B")
+                }
+                written += count
+            case .interrupted:
+                continue
+            case .wouldBlock:
+                guard written > 0 || now() < deadline else {
+                    throw DeliveryError.writeFailed(
+                        "write stalled before line commit (deadline exceeded)")
+                }
+                pause()
+            case .failed(let failure):
+                throw DeliveryError.writeFailed("errno \(failure) after \(written)B")
+            }
+        }
+        return written
+    }
+
     /// Put one user turn on the agent's stdin.
     ///
     /// The text goes as-is. Nothing is flattened — a task carrying newlines
@@ -398,37 +439,16 @@ enum AgentPipeTransport {
         }
         defer { close(fd) }
 
-        var written = 0
-        var writeDeadline = ProcessInfo.processInfo.systemUptime + pipeWriteTimeout
-        try payload.withUnsafeBytes { raw in
-            guard let base = raw.baseAddress else { return }
-            while written < raw.count {
-                let n = write(fd, base.advanced(by: written), raw.count - written)
-                if n > 0 {
-                    written += n
-                    // Progress restarts the clock. The deadline bounds a
-                    // reader that stopped consuming; a large payload drained
-                    // slowly is the reader working, not the reader stuck.
-                    writeDeadline = ProcessInfo.processInfo.systemUptime + pipeWriteTimeout
-                    continue
-                }
-                if n < 0, errno == EINTR {
-                    // A signal interrupt says nothing about the reader;
-                    // retry without consuming the stall budget.
-                    continue
-                }
-                if n < 0, errno == EAGAIN {
-                    guard ProcessInfo.processInfo.systemUptime < writeDeadline else {
-                        throw DeliveryError.writeFailed(
-                            "write stalled after \(written)/\(raw.count)B (deadline exceeded)")
-                    }
-                    usleep(2_000)
-                    continue
-                }
-                throw DeliveryError.writeFailed("errno \(errno) after \(written)B")
+        return try payload.withUnsafeBytes { raw in
+            guard let base = raw.baseAddress else { return 0 }
+            return try writeWholeLine(byteCount: raw.count) { offset, remaining in
+                let count = write(fd, base.advanced(by: offset), remaining)
+                if count > 0 { return .written(count) }
+                if count < 0, errno == EINTR { return .interrupted }
+                if count < 0, errno == EAGAIN { return .wouldBlock }
+                return .failed(errno)
             }
         }
-        return written
     }
 
     /// One NDJSON line in the shape claude's stream-json input expects.

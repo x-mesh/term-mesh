@@ -508,7 +508,9 @@ struct ReviewBoardPanelView: View {
     private var undoList: some View {
         VStack(alignment: .leading, spacing: 5) {
             sectionTitle("Undo")
-            ForEach(viewModel.autoPilotUndoPoints.prefix(3), id: \.sha) { point in
+            // `id: \.sha` collided: a failed merge leaves the branch where it
+            // was, so the next point records the same pre-merge sha.
+            ForEach(viewModel.autoPilotUndoPoints.prefix(3)) { point in
                 HStack(spacing: 6) {
                     VStack(alignment: .leading, spacing: 1) {
                         Text("\(point.branch) → \(point.sha.prefix(8))")

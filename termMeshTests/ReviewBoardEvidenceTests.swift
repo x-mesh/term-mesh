@@ -233,12 +233,20 @@ final class ReviewBoardEvidenceTests: XCTestCase {
     func testAPeerPayloadDecodesToTheSameShapeALocalReadProduces() throws {
         // Built rather than pasted: git's numstat and name-status are
         // tab-separated, and a literal tab inside a JSON string is not JSON.
+        let body = "diff --git a/Sources/a.swift b/Sources/a.swift\n"
+        // Computed, not written down. An untruncated payload now has to carry a
+        // digest that covers its own patch — the decoder recomputes and refuses
+        // one that does not — so a literal here would be a value to keep in
+        // step with the bytes beside it, and it was not kept.
+        // Not circular: `digest(forPatch:)` is pinned against a SHA-256 taken
+        // in the test above, so a broken definition fails there, not here.
+        let digest = ReviewBoardEvidence.digest(forPatch: Data(body.utf8))
         let payload: [String: Any] = [
             "head_sha": "bbbb2222", "base_sha": "aaaa1111", "branch": "feat/thing",
-            "diff_digest": "sha256:cafebabe",
+            "diff_digest": digest,
             "numstat": ["3\t1\tSources/a.swift", "0\t9\tdocs/old.md"].joined(separator: "\n"),
             "name_status": ["M\tSources/a.swift", "D\tdocs/old.md"].joined(separator: "\n"),
-            "patch": "diff --git a/Sources/a.swift b/Sources/a.swift\n",
+            "patch": body,
             "truncated": false,
         ]
         let json = String(
@@ -248,7 +256,7 @@ final class ReviewBoardEvidenceTests: XCTestCase {
 
         XCTAssertEqual(patch.headSHA, "bbbb2222")
         XCTAssertEqual(patch.baseSHA, "aaaa1111")
-        XCTAssertEqual(patch.digest, "sha256:cafebabe")
+        XCTAssertEqual(patch.digest, digest)
         XCTAssertFalse(patch.isTruncated)
         XCTAssertFalse(patch.isEmpty)
         XCTAssertEqual(patch.files.map(\.path), ["Sources/a.swift", "docs/old.md"])

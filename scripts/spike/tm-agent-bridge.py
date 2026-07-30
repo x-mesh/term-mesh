@@ -39,8 +39,10 @@ import os
 import queue
 import re
 import shlex
+import stat
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 
@@ -506,9 +508,8 @@ class PerTurnBridge:
         self.out = emitter
         self.thread: str | None = None
         self.opened = False
-        self.log_path = os.path.join(
-            os.path.dirname(emitter.path or "") or "/tmp",
-            f"agy-{os.getpid()}.log")
+        self.log_dir: str | None = None
+        self.log_path: str | None = None
 
     # Nothing is running between turns, so there is nothing to be dead.
     alive = True
@@ -534,6 +535,7 @@ class PerTurnBridge:
         # `--print` is a string flag: it swallows the next token as the prompt,
         # so `agy --print --dangerously-skip-permissions "…"` asks agy to
         # explain that flag. Everything else has to come first.
+        self._ensure_agy_log()
         argv = [self.exe or "agy", "--dangerously-skip-permissions",
                 "--log-file", self.log_path]
         if self.thread:
@@ -723,15 +725,55 @@ class PerTurnBridge:
         return said
 
     def _agy_thread(self) -> str | None:
+        if not self.log_path:
+            return None
         try:
-            with open(self.log_path, encoding="utf-8", errors="replace") as fh:
+            flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+            fd = os.open(self.log_path, flags)
+            metadata = os.fstat(fd)
+            if (not stat.S_ISREG(metadata.st_mode)
+                    or metadata.st_uid != os.getuid()
+                    or stat.S_IMODE(metadata.st_mode) & 0o077):
+                os.close(fd)
+                return None
+            with os.fdopen(fd, encoding="utf-8", errors="replace") as fh:
                 found = self.AGY_CONVERSATION.findall(fh.read())
         except OSError:
             return None
         return found[-1] if found else None
 
+    def _ensure_agy_log(self) -> None:
+        if self.log_path:
+            return
+        directory = tempfile.mkdtemp(
+            prefix=f"term-mesh-agy-{os.getuid()}-",
+            dir=tempfile.gettempdir(),
+        )
+        os.chmod(directory, 0o700)
+        try:
+            fd, path = tempfile.mkstemp(
+                prefix="conversation-", suffix=".log", dir=directory)
+            os.fchmod(fd, 0o600)
+            os.close(fd)
+        except BaseException:
+            os.rmdir(directory)
+            raise
+        self.log_dir = directory
+        self.log_path = path
+
     def stop(self) -> None:
-        pass
+        if self.log_path:
+            try:
+                os.unlink(self.log_path)
+            except OSError:
+                pass
+        if self.log_dir:
+            try:
+                os.rmdir(self.log_dir)
+            except OSError:
+                pass
+        self.log_path = None
+        self.log_dir = None
 
 
 # ── codex: initialize → thread/start → turn/start … turn/completed ──────────
