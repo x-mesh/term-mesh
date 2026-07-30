@@ -3388,10 +3388,12 @@ class TerminalController {
             return v2Error(id: id, code: "invalid_params", message: "Missing task_id")
         }
         let assignee = params["assignee"] as? String
+        let assigneeInstanceId = params["agent_instance_id"] as? String
         let store = TeamDataStore.shared
 
         guard let task = store.reassignTask(
-            teamName: teamName, taskId: taskId, assignee: assignee
+            teamName: teamName, taskId: taskId, assignee: assignee,
+            assigneeInstanceId: assigneeInstanceId
         ) else {
             return v2Error(id: id, code: "not_found", message: "Task not found")
         }
@@ -4470,13 +4472,6 @@ class TerminalController {
         let worktreeRemoved = params["worktree_removed"] as? Bool
         let agentInstanceId = params["agent_instance_id"] as? String
 
-        if let agentInstanceId,
-           let task = store.getTask(teamName: teamName, taskId: taskId),
-           task.assigneeInstanceId != agentInstanceId {
-            return v2Error(id: id, code: "task_identity_mismatch",
-                           message: "Task assignment does not match agent_instance_id")
-        }
-
         // Snapshot prev status before update so events.publish can include it.
         let prevStatus = store.getTask(teamName: teamName, taskId: taskId)?.status ?? ""
 
@@ -4487,6 +4482,7 @@ class TerminalController {
             result: taskResult,
             resultPath: resultPath,
             assignee: assignee,
+            assigneeInstanceId: agentInstanceId,
             blockedReason: blockedReason,
             reviewSummary: reviewSummary,
             progressNote: progressNote,
@@ -5376,14 +5372,16 @@ class TerminalController {
             return .err(code: "invalid_params", message: "Missing task_id", data: nil)
         }
         let assignee = params["assignee"] as? String
+        let assigneeInstanceId = params["agent_instance_id"] as? String
         let tabManager = v2ResolveTabManager(params: params)
 
         var result: V2CallResult = .err(code: "not_found", message: "Task not found", data: nil)
         v2MainSync {
-            guard let task = TeamOrchestrator.shared.reassignTask(
+            guard let task = TeamDataStore.shared.reassignTask(
                 teamName: teamName,
                 taskId: taskId,
-                assignee: assignee
+                assignee: assignee,
+                assigneeInstanceId: assigneeInstanceId
             ) else { return }
             let dispatched = tabManager.flatMap {
                 TeamOrchestrator.shared.dispatchTaskToAssignee(
