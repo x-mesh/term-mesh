@@ -53,6 +53,13 @@ After making code changes, always run the build:
 xcodebuild -project GhosttyTabs.xcodeproj -scheme term-mesh -configuration Debug -destination 'platform=macOS' build
 ```
 
+Swift unit tests belong to the `term-mesh-unit` scheme; the `term-mesh` scheme contains
+`termMeshUITests`, not `termMeshTests`. Use `term-mesh-unit` with
+`-only-testing:termMeshTests/...`. A new test file must also be registered in
+`GhosttyTabs.xcodeproj/project.pbxproj` before it counts as complete: Xcode can silently run zero
+tests when `-only-testing` names an unregistered file, without reporting an error. Confirm both the
+project registration and the executed test count.
+
 When rebuilding GhosttyKit.xcframework, always use Release optimizations.
 Clean any xcframework-* tags first to avoid zig build crashes:
 
@@ -65,6 +72,11 @@ When rebuilding term-meshd (the Rust daemon):
 ```bash
 cd daemon && cargo build --release
 ```
+
+Run build and test commands so their own exit status is visible. Do not use pipelines such as
+`cargo build | tail` without `set -o pipefail`: a successful `tail` masks a missing or failed
+`cargo` as exit 0. Check tool availability (including `~/.cargo/bin`) and the build/test command's
+exit code directly before reporting success.
 
 `reload` = kill and launch the Debug app only (tag required):
 
@@ -151,7 +163,7 @@ VERIFY (stale CLI 이름·동작 불일치):
 
 ```bash
 rg -n 'agentPipeTransport|Agent Panes|Native Agent|cursor-agent|tm-agent-bridge' AGENTS.md CLAUDE.md CHANGELOG.md docs/spike/agent-pipe-render.md
-xcodebuild -project GhosttyTabs.xcodeproj -scheme term-mesh -configuration Debug -destination 'platform=macOS' -only-testing:termMeshTests/AgentSessionTests -only-testing:termMeshTests/AgentPipeCompletionTests test
+xcodebuild -project GhosttyTabs.xcodeproj -scheme term-mesh-unit -configuration Debug -destination 'platform=macOS' -only-testing:termMeshTests/AgentSessionTests -only-testing:termMeshTests/AgentPipeCompletionTests test
 ```
 
 ## Debug event log
@@ -700,7 +712,10 @@ Swift 작업을 피어에 보낼 때는 태스크 캡슐에 다음을 넣는다(
 ```
 
 그리고 Swift 변경은 파이프라인에 **로컬 통합 빌드 단계를 반드시 넣는다.** 피어 에이전트의
-STATUS: DONE은 "편집 완료"이지 "빌드 통과"가 아니다.
+STATUS: DONE은 "편집 완료"이지 "빌드 통과"가 아니다. v0.169 웨이브 1에서는 피어의 두
+그룹이 기존 테스트 6케이스를 깨뜨렸지만 Swift를 컴파일할 수 없어 로컬 통합 단계에서야
+발견됐다. 통합 담당자가 대신 고치지 말고, 실패한 변경은 해당 파일 소유자에게 돌려보내
+수정·재검증하게 한다.
 
 ### Reply Truncation Protocol
 
