@@ -1470,6 +1470,7 @@ private struct SidebarPeerProjectGroup: Identifiable {
 private struct SidebarPeerProjectsView: View {
     @EnvironmentObject private var tabManager: TabManager
     @ObservedObject private var coordinator = ReviewBoardCoordinatorService.shared
+    @ObservedObject private var orchestrator = TeamOrchestrator.shared
     let hosts: [HostEntry]
     let store: RemoteHostStore
     let usesSeparatedPresentation: Bool
@@ -1484,6 +1485,8 @@ private struct SidebarPeerProjectsView: View {
     @State private var remoteAgentTarget: SidebarRemoteAgentTarget?
     @State private var deletionTarget: SidebarProjectDeletionTarget?
     @State private var deletionFailure: String?
+    @State private var presentationRestoreFailure: String?
+    @State private var restoringTeamNames: Set<String> = []
 
     private var connectedHosts: [HostEntry] {
         hosts.filter { $0.isConnected && !$0.workspaces.isEmpty }
@@ -1571,6 +1574,86 @@ private struct SidebarPeerProjectsView: View {
             $0.identity.label.localizedCaseInsensitiveCompare($1.identity.label) == .orderedAscending
         }
         return (sorted, unassigned)
+    }
+
+    /// Live projects outlive any individual NSWindow. When their former
+    /// workspace has no registered window, keep them visible so a new window
+    /// can attach fresh viewers to the same peer-owned surfaces.
+    private var detachedTeams: [TeamOrchestrator.Team] {
+        return orchestrator.teams.values
+            .filter { team in
+                AppDelegate.shared?.contextContainingTabId(team.workspaceId) == nil
+            }
+            .sorted {
+                $0.id.localizedCaseInsensitiveCompare($1.id) == .orderedAscending
+            }
+    }
+
+    private func detachedProjectRow(
+        _ team: TeamOrchestrator.Team,
+        showsHeader: Bool = true
+    ) -> some View {
+        VStack(spacing: 4) {
+            if showsHeader {
+                HStack(spacing: 5) {
+                    Text(team.id)
+                        .font(.system(size: 12, weight: .semibold))
+                        .foregroundColor(Color.primary.opacity(0.92))
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+                    Image(systemName: "rectangle.on.rectangle")
+                        .font(.system(size: 8))
+                        .foregroundColor(Color.orange.opacity(0.8))
+                    Spacer(minLength: 0)
+                }
+                .padding(.leading, 16)
+                .padding(.trailing, 12)
+                .padding(.top, 7)
+                .padding(.bottom, 2)
+            }
+
+            Button {
+                guard !restoringTeamNames.contains(team.id) else { return }
+                restoringTeamNames.insert(team.id)
+                Task { @MainActor in
+                    let restored = await orchestrator.restoreDetachedProjectPresentation(
+                        teamName: team.id,
+                        tabManager: tabManager
+                    )
+                    restoringTeamNames.remove(team.id)
+                    if !restored {
+                        presentationRestoreFailure =
+                            "The live project could not be attached to this window."
+                    }
+                }
+            } label: {
+                HStack(spacing: 6) {
+                    if restoringTeamNames.contains(team.id) {
+                        ProgressView()
+                            .controlSize(.small)
+                    } else {
+                        Image(systemName: "arrow.down.left.and.arrow.up.right")
+                            .font(.system(size: 9))
+                    }
+                    VStack(alignment: .leading, spacing: 1) {
+                        Text("Open live project")
+                            .font(.system(size: 11))
+                        Text("\(team.agents.count) agents · processes still running")
+                            .font(.system(size: 9))
+                    }
+                    Spacer(minLength: 4)
+                }
+                .foregroundColor(.secondary)
+                .padding(.horizontal, 8)
+                .padding(.vertical, 4)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .disabled(restoringTeamNames.contains(team.id))
+            .padding(.horizontal, usesSeparatedPresentation ? 10 : 8)
+            .accessibilityIdentifier("sidebar.projects.detached.\(team.id)")
+            .help("Attach this project's existing leader and agents to the current window")
+        }
     }
 
     @ViewBuilder
@@ -1690,8 +1773,10 @@ private struct SidebarPeerProjectsView: View {
 
     var body: some View {
         let grouped = groupedWorkspaces
+        let detached = detachedTeams
+        let groupedLabels = Set(grouped.projects.map { $0.identity.label })
         return VStack(spacing: usesSeparatedPresentation ? 8 : 0) {
-            if grouped.projects.isEmpty {
+            if grouped.projects.isEmpty && detached.isEmpty {
                 VStack(alignment: .leading, spacing: 2) {
                     Text("No projects yet")
                         .font(.system(size: 10, weight: .semibold))
@@ -1746,7 +1831,16 @@ private struct SidebarPeerProjectsView: View {
                         workspaceRow(item)
                             .contextMenu { projectActions(for: group) }
                     }
+                    if let detachedTeam = detached.first(where: {
+                        $0.id == group.identity.label
+                    }) {
+                        detachedProjectRow(detachedTeam, showsHeader: false)
+                    }
                 }
+            }
+
+            ForEach(detached.filter { !groupedLabels.contains($0.id) }) { team in
+                detachedProjectRow(team)
             }
 
             let remembered = ReviewBoardCoordinatorService.rememberedProjects(
@@ -1810,6 +1904,17 @@ private struct SidebarPeerProjectsView: View {
             Button("OK") { deletionFailure = nil }
         } message: {
             Text(deletionFailure ?? "")
+        }
+        .alert(
+            "Couldn’t Open Project",
+            isPresented: Binding(
+                get: { presentationRestoreFailure != nil },
+                set: { if !$0 { presentationRestoreFailure = nil } }
+            )
+        ) {
+            Button("OK") { presentationRestoreFailure = nil }
+        } message: {
+            Text(presentationRestoreFailure ?? "")
         }
     }
 

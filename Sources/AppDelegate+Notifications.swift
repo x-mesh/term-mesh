@@ -236,10 +236,19 @@ extension AppDelegate {
         commandPaletteSelectionByWindowId.removeValue(forKey: removed.windowId)
         commandPaletteSnapshotByWindowId.removeValue(forKey: removed.windowId)
 
+        // A main window is a viewer, not the owner of a live project. Move
+        // project workspaces out before this context is released so native
+        // AgentSession processes and remote pane bindings survive unchanged.
+        // A later window adopts the same Workspace object from the Projects
+        // sidebar. Explicit team/project teardown still owns process shutdown.
+        let projectWorkspaceIDs = TeamOrchestrator.shared
+            .preserveProjectPresentations(from: removed.tabManager)
+
         // Avoid stale notifications that can no longer be opened once the owning window is gone.
         if let store = notificationStore {
-            for tab in removed.tabManager.tabs {
-                store.clearNotifications(forTabId: tab.id)
+            for workspaceID in projectWorkspaceIDs
+                + removed.tabManager.tabs.map(\.id) {
+                store.clearNotifications(forTabId: workspaceID)
             }
         }
 
@@ -253,11 +262,12 @@ extension AppDelegate {
         // bridge broadcasts WorkspaceRemoved for each. Harmless during app
         // quit (no peer server left listening by then, or a no-op broadcast
         // to zero sessions).
-        for tab in removed.tabManager.tabs {
+        for workspaceID in projectWorkspaceIDs
+            + removed.tabManager.tabs.map(\.id) {
             NotificationCenter.default.post(
                 name: .peerWorkspaceDidClose,
                 object: nil,
-                userInfo: ["workspaceID": tab.id]
+                userInfo: ["workspaceID": workspaceID]
             )
         }
 

@@ -991,6 +991,155 @@ extension TeamOrchestrator {
         return true
     }
 
+    /// Rebuild the local workspace for a live peer-backed project whose
+    /// previous window was closed. Remote processes and surfaces are reused
+    /// exactly; this never launches a second leader or agent.
+    @discardableResult
+    func restoreDetachedProjectPresentation(
+        teamName: String,
+        tabManager: TabManager
+    ) async -> Bool {
+        guard let original = teams[teamName] else { return false }
+
+        if let existing = AppDelegate.shared?.contextContainingTabId(original.workspaceId) {
+            existing.window?.makeKeyAndOrderFront(nil)
+            return await reattachRemoteLeaderIfNeeded(teamName: teamName)
+        }
+
+        // Normal window-close recovery: adopt the exact Workspace that the
+        // closing window preserved. This is lossless for both remote terminal
+        // panes and native AgentPanels because no process/session is restarted.
+        if let preserved = takePreservedProjectPresentation(teamName: teamName) {
+            tabManager.attachWorkspace(preserved, select: true)
+            WorkspaceProjectNames.shared.declare(
+                workspaceId: preserved.id,
+                projectName: teamName
+            )
+#if DEBUG
+            dlog(
+                "project.presentation.adopted team=\(teamName) "
+                    + "workspace=\(preserved.id.uuidString.prefix(8)) "
+                    + "panels=\(preserved.panels.count)"
+            )
+#endif
+            return true
+        }
+
+        // Compatibility recovery for a project detached before Workspace
+        // preservation existed. Only terminal-backed peer agents have a
+        // durable surface identity that can be reattached losslessly. Native
+        // agents are owned by their preserved AgentSession and must never
+        // enter this fallback as a partial 0/N reconstruction.
+        guard original.agents.allSatisfy({
+            $0.hostKey != nil && $0.remoteSurfaceID != nil
+        }) else {
+            RemoteWorkLog.info(
+                "Cannot restore \(teamName): its exact native/local presentation is unavailable"
+            )
+            return false
+        }
+
+        let workspace = tabManager.addWorkspace(
+            workingDirectory: original.workingDirectory,
+            select: true
+        )
+        let anchorPanelID = workspace.focusedPanelId
+        workspace.customTitle = "[\(teamName)]"
+        workspace.title = "[\(teamName)]"
+        WorkspaceProjectNames.shared.declare(
+            workspaceId: workspace.id,
+            projectName: teamName
+        )
+        guard beginProjectPresentationRestore(
+            teamName: teamName,
+            workspaceID: workspace.id
+        ) else {
+            return false
+        }
+
+        let leaderAttached = await reattachRemoteLeaderIfNeeded(teamName: teamName)
+        var attachedAgents = 0
+
+        for originalAgent in original.agents {
+            guard let hostKey = originalAgent.hostKey,
+                  let surfaceID = originalAgent.remoteSurfaceID,
+                  let host = RemoteHostStore.shared.sortedHosts.first(where: {
+                      $0.id == hostKey
+                  }),
+                  host.isConnected
+            else { continue }
+
+            let lease: PeerPaneHostLease
+            do {
+                lease = try await PeerPaneHostRegistry.shared.acquire(host.paneHostSpec)
+            } catch {
+                RemoteWorkLog.info(
+                    "Cannot restore \(teamName)/\(originalAgent.name): \(error)"
+                )
+                continue
+            }
+
+            let session: PeerPaneSession
+            do {
+                let surfaces = try await PeerPaneSession.listSurfaces(on: lease)
+                guard let surface = surfaces.first(where: {
+                    $0.surfaceID == surfaceID
+                }) else {
+                    PeerPaneHostRegistry.shared.release(lease)
+                    continue
+                }
+                session = try await PeerPaneSession.attach(
+                    lease: lease,
+                    surface: surface,
+                    title: originalAgent.name,
+                    spec: host.paneHostSpec
+                )
+            } catch {
+                PeerPaneHostRegistry.shared.release(lease)
+                RemoteWorkLog.info(
+                    "Cannot restore \(teamName)/\(originalAgent.name): \(error)"
+                )
+                continue
+            }
+            PeerPaneHostRegistry.shared.release(lease)
+
+            guard let panel = workspace.openRemotePane(
+                session: session,
+                focus: false,
+                lifetime: .keepAlive
+            ) else {
+                session.teardown()
+                continue
+            }
+            workspace.setPanelCustomTitle(
+                panelId: panel.id,
+                title: "\(Self.colorEmoji(originalAgent.color)) "
+                    + "\(originalAgent.name) @\(host.displayName)"
+            )
+            replaceRemoteAgentPresentation(
+                teamName: teamName,
+                agentInstanceID: originalAgent.agentInstanceId,
+                workspaceID: workspace.id,
+                panelID: panel.id
+            )
+            attachedAgents += 1
+        }
+
+        if let anchorPanelID, workspace.panels.count > 1 {
+            _ = workspace.closePanel(anchorPanelID, force: true)
+        }
+        scheduleAgentGridEqualization(workspace: workspace)
+
+#if DEBUG
+        dlog(
+            "project.presentation.restore team=\(teamName) "
+                + "workspace=\(workspace.id.uuidString.prefix(8)) "
+                + "leader=\(leaderAttached) agents=\(attachedAgents)/\(original.agents.count)"
+        )
+#endif
+        return leaderAttached && attachedAgents == original.agents.count
+    }
+
     /// A team destroy is an explicit end-of-lifecycle action, unlike closing
     /// its local viewer. Tear down the project-owned remote surface even when
     /// that viewer was detached earlier.
@@ -1348,7 +1497,8 @@ extension TeamOrchestrator {
                 session: session,
                 orientation: placement.orientation,
                 focus: false,
-                from: placement.panelId
+                from: placement.panelId,
+                lifetime: .keepAlive
             ) else {
                 session.teardown()
                 throw RemoteAgentError.paneCreationFailed

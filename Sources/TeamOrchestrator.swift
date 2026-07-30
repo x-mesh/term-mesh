@@ -9,6 +9,14 @@ import os
 final class TeamOrchestrator: ObservableObject {
     static let shared = TeamOrchestrator()
 
+    /// Live project workspaces whose last local window was closed.
+    ///
+    /// A window is only a viewer for a project. Retaining the Workspace keeps
+    /// native AgentSession processes and remote pane bindings alive until a
+    /// later window adopts the exact same presentation. Explicit team/project
+    /// teardown remains the operation that ends those processes.
+    private var detachedProjectWorkspaces: [String: Workspace] = [:]
+
     struct AgentMember: Identifiable {
         let id: String           // agent-name@team-name (legacy routing key)
         /// Team-scoped durable identity. Unlike `panelId`, this survives a
@@ -22,7 +30,7 @@ final class TeamOrchestrator: ObservableObject {
         let agentType: String    // "Explore", "executor", etc.
         let color: String        // terminal color
         let instructions: String // role description for leader routing
-        let workspaceId: UUID
+        var workspaceId: UUID
         /// nil for headless agents (no GUI pane); set for pane-mode agents.
         /// Mutable so hard restart (pane close + respawn) can rewrite the panel
         /// without rebuilding the AgentMember from scratch.
@@ -117,7 +125,7 @@ final class TeamOrchestrator: ObservableObject {
         var leaderPolicyState: String = "pending"
         var leaderPolicyFailureDescription: String? = nil
         let workingDirectory: String
-        let workspaceId: UUID     // agent workspace (may differ from leader workspace in "adopted" mode)
+        var workspaceId: UUID     // agent workspace (may differ from leader workspace in "adopted" mode)
         var agents: [AgentMember]
         let createdAt: Date
         var gitRepoRoot: String?  // for worktree cleanup
@@ -229,6 +237,107 @@ final class TeamOrchestrator: ObservableObject {
         guard var team = teams[teamName] else { return }
         team.leaderPanelId = panelID
         team.leaderWorkspaceId = nil
+        teams[teamName] = team
+        syncTeamStateToDaemon()
+    }
+
+    /// Move a still-running project's presentation into a newly-created
+    /// workspace after its former window was closed. Process identity remains
+    /// with the peer surfaces; only local workspace/panel addresses change.
+    static func projectPresentationTeam(
+        _ team: Team,
+        movedTo workspaceID: UUID
+    ) -> Team {
+        var moved = team
+        moved.workspaceId = workspaceID
+        moved.leaderWorkspaceId = nil
+        for index in moved.agents.indices {
+            moved.agents[index].workspaceId = workspaceID
+            moved.agents[index].panelId = nil
+        }
+        return moved
+    }
+
+    /// Detach every live project workspace from a window that is closing and
+    /// retain it as a window-independent presentation.
+    ///
+    /// `TabManager.detachWorkspace` deliberately does not call `Panel.close`,
+    /// so native AgentSession processes and peer bindings survive unchanged.
+    /// Returning the original IDs lets AppDelegate still announce that these
+    /// workspaces are no longer exported by that particular window.
+    @discardableResult
+    func preserveProjectPresentations(from tabManager: TabManager) -> [UUID] {
+        let candidates = teams.values
+            .filter { team in
+                tabManager.tabs.contains(where: { $0.id == team.workspaceId })
+            }
+            .map { ($0.id, $0.workspaceId) }
+
+        var preserved: [UUID] = []
+        for (teamName, workspaceID) in candidates {
+            guard let workspace = tabManager.detachWorkspace(tabId: workspaceID) else {
+                continue
+            }
+            rememberPreservedProjectPresentation(
+                teamName: teamName,
+                workspace: workspace
+            )
+            preserved.append(workspaceID)
+#if DEBUG
+            dlog(
+                "project.presentation.preserved team=\(teamName) "
+                    + "workspace=\(workspaceID.uuidString.prefix(8)) "
+                    + "panels=\(workspace.panels.count)"
+            )
+#endif
+        }
+        return preserved
+    }
+
+    func takePreservedProjectPresentation(teamName: String) -> Workspace? {
+        let workspace = detachedProjectWorkspaces.removeValue(forKey: teamName)
+        if workspace != nil {
+            objectWillChange.send()
+        }
+        return workspace
+    }
+
+    func rememberPreservedProjectPresentation(
+        teamName: String,
+        workspace: Workspace
+    ) {
+        detachedProjectWorkspaces[teamName] = workspace
+        objectWillChange.send()
+    }
+
+    func hasPreservedProjectPresentation(teamName: String) -> Bool {
+        detachedProjectWorkspaces[teamName] != nil
+    }
+
+    func beginProjectPresentationRestore(teamName: String, workspaceID: UUID) -> Bool {
+        guard let team = teams[teamName] else { return false }
+        teams[teamName] = Self.projectPresentationTeam(
+            team,
+            movedTo: workspaceID
+        )
+        syncTeamStateToDaemon()
+        return true
+    }
+
+    /// Publish the new local viewer for one existing peer agent.
+    func replaceRemoteAgentPresentation(
+        teamName: String,
+        agentInstanceID: String,
+        workspaceID: UUID,
+        panelID: UUID
+    ) {
+        guard var team = teams[teamName],
+              let index = team.agents.firstIndex(where: {
+                  $0.agentInstanceId == agentInstanceID
+              })
+        else { return }
+        team.agents[index].workspaceId = workspaceID
+        team.agents[index].panelId = panelID
         teams[teamName] = team
         syncTeamStateToDaemon()
     }
@@ -5164,6 +5273,13 @@ final class TeamOrchestrator: ObservableObject {
         archive: Bool = true
     ) -> Bool {
         guard let team = teams[name] else { return false }
+        // A detached project still owns a live Workspace. Move it into the
+        // caller's manager so the normal explicit teardown below closes every
+        // panel/session instead of only deleting the team metadata.
+        if AppDelegate.shared?.tabManagerFor(tabId: team.workspaceId) == nil,
+           let preserved = detachedProjectWorkspaces.removeValue(forKey: name) {
+            tabManager.attachWorkspace(preserved, select: false)
+        }
         // Phase 2 (pane-mode resume): persist a `mode: "pane"` archive so this
         // team shows up in `Resume from previous team`. Best-effort — failures
         // don't block destroy. Headless teams are archived daemon-side by

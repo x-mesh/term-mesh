@@ -1000,6 +1000,113 @@ final class PeerProjectBootstrapTests: XCTestCase {
     }
 
     @MainActor
+    func test_project_presentation_move_preserves_remote_identity_and_clears_old_viewers() {
+        let oldWorkspaceID = UUID()
+        let newWorkspaceID = UUID()
+        let oldPanelID = UUID()
+        let instanceID = UUID().uuidString
+        let surfaceID = Data([0xaa, 0xbb])
+        let member = TeamOrchestrator.AgentMember(
+            id: "reviewer@term-mesh",
+            agentInstanceId: instanceID,
+            name: "reviewer",
+            teamName: "term-mesh",
+            cli: "claude",
+            launchCommand: "claude",
+            model: "opus",
+            agentType: "reviewer",
+            color: "blue",
+            instructions: "",
+            workspaceId: oldWorkspaceID,
+            panelId: oldPanelID,
+            createdAt: Date(),
+            remoteSurfaceID: surfaceID,
+            remoteSurfaceSpawned: true,
+            hostKey: "ssh:mac-sub"
+        )
+        let team = TeamOrchestrator.Team(
+            id: "term-mesh",
+            leaderSessionId: UUID().uuidString,
+            leaderMode: "claude",
+            leaderModel: "opus",
+            leaderCli: "claude",
+            leaderPanelId: UUID(),
+            leaderWorkspaceId: oldWorkspaceID,
+            leaderEndpoint: .peer(hostKey: "ssh:mac-sub"),
+            workingDirectory: "/project/term-mesh",
+            workspaceId: oldWorkspaceID,
+            agents: [member],
+            createdAt: Date(),
+            worktreeMode: "isolated"
+        )
+
+        let moved = TeamOrchestrator.projectPresentationTeam(
+            team,
+            movedTo: newWorkspaceID
+        )
+
+        XCTAssertEqual(moved.workspaceId, newWorkspaceID)
+        XCTAssertNil(moved.leaderWorkspaceId)
+        XCTAssertEqual(moved.agents[0].workspaceId, newWorkspaceID)
+        XCTAssertNil(moved.agents[0].panelId)
+        XCTAssertEqual(moved.agents[0].agentInstanceId, instanceID)
+        XCTAssertEqual(moved.agents[0].remoteSurfaceID, surfaceID)
+        XCTAssertEqual(moved.agents[0].hostKey, "ssh:mac-sub")
+    }
+
+    @MainActor
+    func test_window_close_preserves_and_re_adopts_exact_project_workspace() {
+        let orchestrator = TeamOrchestrator.shared
+        let teamName = "preserve-\(UUID().uuidString)"
+        let source = TabManager()
+        let destination = TabManager()
+        let workspace = source.addWorkspace(
+            workingDirectory: "/tmp/\(teamName)",
+            select: true
+        )
+        guard let anchorPanelID = workspace.focusedPanelId,
+              let nativeAgent = workspace.newAgentSplit(
+                  from: anchorPanelID,
+                  orientation: .horizontal,
+                  agentName: "executor",
+                  teamName: teamName,
+                  workingDirectory: "/tmp/\(teamName)"
+              )
+        else {
+            XCTFail("expected native agent panel")
+            return
+        }
+        let nativeSession = nativeAgent.session
+        defer {
+            _ = orchestrator.takePreservedProjectPresentation(teamName: teamName)
+        }
+
+        let panelIDs = Set(workspace.panels.keys)
+        let detached = source.detachWorkspace(tabId: workspace.id)
+        XCTAssertTrue(detached === workspace)
+        orchestrator.rememberPreservedProjectPresentation(
+            teamName: teamName,
+            workspace: workspace
+        )
+
+        XCTAssertFalse(source.tabs.contains(where: { $0.id == workspace.id }))
+        XCTAssertTrue(orchestrator.hasPreservedProjectPresentation(teamName: teamName))
+
+        let adopted = orchestrator.takePreservedProjectPresentation(teamName: teamName)
+        XCTAssertTrue(adopted === workspace)
+        guard let adopted else {
+            XCTFail("expected preserved workspace")
+            return
+        }
+        destination.attachWorkspace(adopted, select: true)
+
+        XCTAssertTrue(destination.tabs.contains(where: { $0 === workspace }))
+        XCTAssertEqual(Set(adopted.panels.keys), panelIDs)
+        XCTAssertTrue(adopted.agentPanel(for: nativeAgent.id) === nativeAgent)
+        XCTAssertTrue(adopted.agentPanel(for: nativeAgent.id)?.session === nativeSession)
+    }
+
+    @MainActor
     func test_remote_claude_leader_launch_injects_term_mesh_prompt() {
         var grant = Termmesh_Peer_V1_TeamLeaderGrant()
         grant.grantID = Data(repeating: 0xcd, count: 32)

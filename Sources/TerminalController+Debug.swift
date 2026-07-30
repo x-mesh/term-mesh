@@ -747,6 +747,22 @@ extension TerminalController {
         return .ok(["started": true])
     }
 
+    func v2DebugProjectRestorePresentation(params: [String: Any]) -> V2CallResult {
+        guard let team = params["team"] as? String, !team.isEmpty,
+              let tabManager
+        else {
+            return .err(code: "invalid_params", message: "team is required", data: nil)
+        }
+        Task { @MainActor in
+            let restored = await TeamOrchestrator.shared.restoreDetachedProjectPresentation(
+                teamName: team,
+                tabManager: tabManager
+            )
+            dlog("debug.project.restore_presentation team=\(team) restored=\(restored)")
+        }
+        return .ok(["started": true])
+    }
+
     func v2DebugPeerShellInspect(params: [String: Any]) -> V2CallResult {
         guard let handle = params["host"] as? String, !handle.isEmpty,
               let host = RemoteHostStore.shared.sortedHosts.first(where: {
