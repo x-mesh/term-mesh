@@ -43,8 +43,54 @@ final class TeamDataStore: ObservableObject, @unchecked Sendable {
     /// map under the assumption it changes on the main thread.
     @Published var agentUsage: [String: [String: AgentUsageSnapshot]] = [:]
 
-    // Team registry: name → agent names (synced from TeamOrchestrator on create/destroy)
-    private var teamRegistry: [String: [String]] = [:]
+    /// Bumped whenever a team's task board changes. The board views read the
+    /// tasks through `listTasks`, which is lock-guarded and therefore cannot
+    /// be `@Published` itself; this is the change signal they subscribe to.
+    /// Without it a task could be created, assigned and finished while every
+    /// view of the task board sat exactly as it was at launch.
+    @Published private(set) var taskRevision: Int = 0
+
+    /// Safe to call with the store's lock held: the bump is dispatched.
+    func noteTasksChanged() {
+        DispatchQueue.main.async { [weak self] in
+            self?.taskRevision &+= 1
+        }
+    }
+
+    struct AgentRegistration: Equatable {
+        let name: String
+        let instanceId: String?
+    }
+
+    // Team registry: name → agents. `name` is a legacy routing alias; result
+    // ownership uses the durable per-pane instance id whenever it is known.
+    private var teamRegistry: [String: [AgentRegistration]] = [:]
+
+    /// The one gate `writeResult` and `AutoReplyEmit.emit` both call before
+    /// attributing a report to a task, so the two paths cannot drift apart
+    /// on what counts as a match.
+    ///
+    /// A task that tracked a real instance (any duplicate-role assignment)
+    /// must match it exactly — that is what tells siblings apart, and a
+    /// `nil` report against it is a miss, not a pass. A task that tracked
+    /// none is the legacy/unique-name case, and a `nil` report only clears
+    /// it when the registry currently shows exactly one agent under that
+    /// name: two duplicates both missing an instance id would be
+    /// indistinguishable from each other, so that is refused rather than
+    /// guessed at.
+    func agentIdentityMatches(
+        teamName: String, agentName: String,
+        expectedInstanceId: String?, reportedInstanceId: String?
+    ) -> Bool {
+        if let expectedInstanceId {
+            return expectedInstanceId == reportedInstanceId
+        }
+        guard reportedInstanceId == nil else { return false }
+        lock.lock()
+        let count = teamRegistry[teamName]?.filter { $0.name == agentName }.count ?? 0
+        lock.unlock()
+        return count == 1
+    }
 
     struct ContextEntry {
         var key: String
@@ -62,6 +108,10 @@ final class TeamDataStore: ObservableObject, @unchecked Sendable {
     /// (`agents/<name>.json:parked`). Set via `setAgentParked` whenever the
     /// daemon emits a parked-state update.
     private var parkedAgents: [String: Set<String>] = [:]
+    /// Busy identity is instance-first. A legacy name entry remains supported
+    /// for callers that cannot yet identify their pane, but never collapses
+    /// instance-specific callers into the same pool member.
+    private var busyAgents: [String: Set<String>] = [:]
 
     /// Watch drift finding in the leader inbox. Deduped by checkId; idempotent on post.
     struct WatchDriftItem {
@@ -107,8 +157,12 @@ final class TeamDataStore: ObservableObject, @unchecked Sendable {
     // MARK: - Team Registry
 
     func registerTeam(_ name: String, agentNames: [String]) {
+        registerTeam(name, agents: agentNames.map { AgentRegistration(name: $0, instanceId: nil) })
+    }
+
+    func registerTeam(_ name: String, agents: [AgentRegistration]) {
         lock.lock()
-        teamRegistry[name] = agentNames
+        teamRegistry[name] = agents
         lock.unlock()
         notifyChanged()
     }
@@ -304,6 +358,7 @@ final class TeamDataStore: ObservableObject, @unchecked Sendable {
 
         lock.lock()
         taskBoards[teamName] = restored
+        noteTasksChanged()
         if !context.isEmpty {
             contextStore[teamName] = context
         }
@@ -344,6 +399,64 @@ final class TeamDataStore: ObservableObject, @unchecked Sendable {
         }
         lock.unlock()
         if changed { notifyChanged() }
+    }
+
+    // MARK: - Turn in flight
+
+    /// Agents with a turn actually running, published by the app.
+    ///
+    /// Every other state here is derived from the task board, and a broadcast
+    /// creates no task — so a whole team mid-answer read as `idle` and "has
+    /// everyone replied?" had no way to be asked. A natively-held agent knows
+    /// the real answer, but it knows it on the main actor, and `team.status` is
+    /// served off it. So the app pushes the fact here, where an off-main reader
+    /// can see it.
+    func setAgentBusy(
+        teamName: String,
+        agentName: String,
+        agentInstanceId: String? = nil,
+        busy: Bool
+    ) {
+        lock.lock()
+        let key = agentInstanceId?.teamDataNilIfBlank ?? agentName
+        let had = busyAgents[teamName]?.contains(key) ?? false
+        if busy { busyAgents[teamName, default: []].insert(key) }
+        else { busyAgents[teamName]?.remove(key) }
+        let changed = had != busy
+        lock.unlock()
+        if changed { notifyChanged() }
+    }
+
+    func clearBusyAgents(teamName: String) {
+        lock.lock()
+        let changed = busyAgents.removeValue(forKey: teamName) != nil
+        lock.unlock()
+        if changed { notifyChanged() }
+    }
+
+    private func isAgentBusyUnsafe(teamName: String, agentName: String, agentInstanceId: String? = nil) -> Bool {
+        let busy = busyAgents[teamName] ?? []
+        // Name-only reports predate per-pane identity and must remain
+        // conservative. An instance-specific report only blocks that pane.
+        return busy.contains(agentName) || agentInstanceId.map(busy.contains) == true
+    }
+
+    func isAgentBusy(teamName: String, agentName: String, agentInstanceId: String) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        let busy = busyAgents[teamName] ?? []
+        // A legacy name-only busy report is conservative: it still blocks the
+        // pool until that caller upgrades to an instance id.
+        return busy.contains(agentInstanceId) || busy.contains(agentName)
+    }
+
+    func hasActiveTask(teamName: String, agentInstanceId: String) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        let terminal: Set<String> = ["completed", "failed", "abandoned", "cancelled"]
+        return taskBoards[teamName, default: []].contains {
+            $0.assigneeInstanceId == agentInstanceId && !terminal.contains($0.status)
+        }
     }
 
     /// Public, lock-acquiring query for callers outside the data store.
@@ -396,7 +509,13 @@ final class TeamDataStore: ObservableObject, @unchecked Sendable {
     func agentNames(for teamName: String) -> [String] {
         lock.lock()
         defer { lock.unlock() }
-        return teamRegistry[teamName] ?? []
+        return (teamRegistry[teamName] ?? []).map(\.name)
+    }
+
+    func agentInstanceId(teamName: String, agentName: String) -> String? {
+        lock.lock()
+        defer { lock.unlock() }
+        return teamRegistry[teamName]?.first(where: { $0.name == agentName })?.instanceId
     }
 
     func registeredTeamNames() -> [String] {
@@ -461,6 +580,7 @@ final class TeamDataStore: ObservableObject, @unchecked Sendable {
         title: String,
         details: String? = nil,
         assignee: String? = nil,
+        assigneeInstanceId: String? = nil,
         acceptanceCriteria: [String] = [],
         labels: [String] = [],
         estimatedSize: Int? = nil,
@@ -511,6 +631,9 @@ final class TeamDataStore: ObservableObject, @unchecked Sendable {
             labels: labels.compactMap(\.teamDataNilIfBlank),
             estimatedSize: estimatedSize,
             assignee: normalizedAssignee,
+            assigneeInstanceId: assigneeInstanceId ?? normalizedAssignee.flatMap { agentName in
+                teamRegistry[teamName]?.first(where: { $0.name == agentName })?.instanceId
+            },
             status: normalizedAssignee == nil ? "queued" : "assigned",
             priority: max(1, min(priority, 3)),
             dependsOn: validatedDependsOn,
@@ -531,12 +654,14 @@ final class TeamDataStore: ObservableObject, @unchecked Sendable {
             lastProgressAt: nil
         )
         taskBoards[teamName, default: []].append(task)
+        noteTasksChanged()
         if let parentTaskId,
            var tasks = taskBoards[teamName],
            let parentIdx = tasks.firstIndex(where: { $0.id == parentTaskId }) {
             tasks[parentIdx].childTaskIds.append(task.id)
             tasks[parentIdx].updatedAt = now
             taskBoards[teamName] = tasks
+            noteTasksChanged()
         }
         notifyChanged()
         return task
@@ -571,6 +696,9 @@ final class TeamDataStore: ObservableObject, @unchecked Sendable {
         let now = Date()
         if let assignee {
             tasks[idx].assignee = assignee.teamDataNilIfBlank
+            tasks[idx].assigneeInstanceId = tasks[idx].assignee.flatMap { agentName in
+                teamRegistry[teamName]?.first(where: { $0.name == agentName })?.instanceId
+            }
             if tasks[idx].status == "queued", tasks[idx].assignee != nil {
                 tasks[idx].status = "assigned"
             }
@@ -642,6 +770,7 @@ final class TeamDataStore: ObservableObject, @unchecked Sendable {
         }
         tasks[idx].updatedAt = now
         taskBoards[teamName] = tasks
+        noteTasksChanged()
         notifyChanged()
         return tasks[idx]
     }
@@ -661,6 +790,9 @@ final class TeamDataStore: ObservableObject, @unchecked Sendable {
         let now = Date()
         let previousAssignee = tasks[idx].assignee
         tasks[idx].assignee = assignee?.teamDataNilIfBlank
+        tasks[idx].assigneeInstanceId = tasks[idx].assignee.flatMap { agentName in
+            teamRegistry[teamName]?.first(where: { $0.name == agentName })?.instanceId
+        }
         tasks[idx].status = tasks[idx].assignee == nil ? "queued" : "assigned"
         tasks[idx].blockedReason = nil
         tasks[idx].reviewSummary = nil
@@ -671,6 +803,7 @@ final class TeamDataStore: ObservableObject, @unchecked Sendable {
             tasks[idx].reassignmentCount += 1
         }
         taskBoards[teamName] = tasks
+        noteTasksChanged()
         notifyChanged()
         return tasks[idx]
     }
@@ -696,10 +829,32 @@ final class TeamDataStore: ObservableObject, @unchecked Sendable {
     /// whose dependencies are all completed and assign it to the given agent
     /// (status → assigned). Returns nil if no claimable task exists.
     @discardableResult
-    func claimTask(teamName: String, agentName: String) -> TeamOrchestrator.TeamTask? {
+    func claimTask(
+        teamName: String,
+        agentName: String,
+        agentInstanceId: String? = nil
+    ) -> TeamOrchestrator.TeamTask? {
         lock.lock()
         defer { lock.unlock() }
         guard var tasks = taskBoards[teamName] else { return nil }
+        let resolvedInstanceId: String?
+        if let agentInstanceId = agentInstanceId?.teamDataNilIfBlank {
+            guard teamRegistry[teamName]?.contains(where: {
+                $0.name == agentName && $0.instanceId == agentInstanceId
+            }) == true,
+            !isAgentBusyUnsafe(teamName: teamName, agentName: agentName, agentInstanceId: agentInstanceId),
+            !tasks.contains(where: {
+                $0.assigneeInstanceId == agentInstanceId
+                    && !["completed", "failed", "abandoned", "cancelled"].contains($0.status)
+            }) else { return nil }
+            resolvedInstanceId = agentInstanceId
+        } else {
+            // Legacy callers must not mutate an arbitrary duplicate role.
+            let candidates = teamRegistry[teamName, default: []].filter { $0.name == agentName }
+            guard candidates.count == 1,
+                  !isAgentBusyUnsafe(teamName: teamName, agentName: agentName) else { return nil }
+            resolvedInstanceId = candidates[0].instanceId
+        }
         // Find pending tasks with no assignee AND satisfied dependencies, sorted
         // by priority descending then createdAt ascending. The dependency gate
         // keeps an autonomous claim loop from pulling a task whose inputs aren't
@@ -715,10 +870,35 @@ final class TeamDataStore: ObservableObject, @unchecked Sendable {
         }).first else { return nil }
         let now = Date()
         tasks[idx].assignee = agentName
+        tasks[idx].assigneeInstanceId = resolvedInstanceId
         tasks[idx].status = "assigned"
         tasks[idx].updatedAt = now
         tasks[idx].lastProgressAt = now
         taskBoards[teamName] = tasks
+        noteTasksChanged()
+        notifyChanged()
+        return tasks[idx]
+    }
+
+    /// Undo a claim only while the same instance still owns it. A late paste
+    /// acknowledgement must never unassign work that was subsequently rerouted.
+    @discardableResult
+    func releaseClaim(teamName: String, taskId: String, assigneeInstanceId: String) -> TeamOrchestrator.TeamTask? {
+        lock.lock()
+        defer { lock.unlock() }
+        guard var tasks = taskBoards[teamName],
+              let idx = tasks.firstIndex(where: { $0.id == taskId }),
+              tasks[idx].assigneeInstanceId == assigneeInstanceId,
+              ["assigned", "in_progress"].contains(tasks[idx].status) else { return nil }
+        let now = Date()
+        tasks[idx].assignee = nil
+        tasks[idx].assigneeInstanceId = nil
+        tasks[idx].status = "queued"
+        tasks[idx].updatedAt = now
+        tasks[idx].lastProgressAt = now
+        tasks[idx].reassignmentCount += 1
+        taskBoards[teamName] = tasks
+        noteTasksChanged()
         notifyChanged()
         return tasks[idx]
     }
@@ -741,8 +921,40 @@ final class TeamDataStore: ObservableObject, @unchecked Sendable {
         tasks[idx].updatedAt = now
         tasks[idx].lastProgressAt = now
         taskBoards[teamName] = tasks
+        noteTasksChanged()
         notifyChanged()
         return tasks[idx]
+    }
+
+    /// Converge one parallel wave at a hard deadline. A deadline is evidence
+    /// of incompleteness, never evidence of success: only already-completed
+    /// tasks remain completed; every other selected task is explicitly blocked.
+    @discardableResult
+    func convergeTimebox(
+        teamName: String,
+        taskIds: [String]? = nil,
+        reason: String = "Timebox hard deadline reached; converge on completed evidence."
+    ) -> [TeamOrchestrator.TeamTask] {
+        lock.lock()
+        defer { lock.unlock() }
+        guard var tasks = taskBoards[teamName] else { return [] }
+        let selected = taskIds.map(Set.init)
+        let terminal: Set<String> = ["completed", "failed", "abandoned", "cancelled"]
+        let now = Date()
+        var changed: [TeamOrchestrator.TeamTask] = []
+        for index in tasks.indices where selected?.contains(tasks[index].id) ?? true {
+            guard !terminal.contains(tasks[index].status) else { continue }
+            tasks[index].status = "blocked"
+            tasks[index].blockedReason = reason
+            tasks[index].lastProgressAt = now
+            tasks[index].updatedAt = now
+            changed.append(tasks[index])
+        }
+        guard !changed.isEmpty else { return [] }
+        taskBoards[teamName] = tasks
+        noteTasksChanged()
+        notifyChanged()
+        return changed
     }
 
     @discardableResult
@@ -828,6 +1040,7 @@ final class TeamDataStore: ObservableObject, @unchecked Sendable {
            let idx = tasks.firstIndex(where: { $0.assignee == agentName && nonTerminalStatuses.contains($0.status) }) {
             tasks[idx].lastProgressAt = now
             taskBoards[teamName] = tasks
+            noteTasksChanged()
         }
         lock.unlock()
         notifyChanged()
@@ -1000,7 +1213,11 @@ final class TeamDataStore: ObservableObject, @unchecked Sendable {
 
     /// Returns data-layer enrichment for a given agent, avoiding MainActor.
     /// Includes active task, heartbeat, and runtime state derived from task status.
-    func agentDataEnrichment(teamName: String, agentName: String) -> [String: Any] {
+    func agentDataEnrichment(
+        teamName: String,
+        agentName: String,
+        agentInstanceId: String? = nil
+    ) -> [String: Any] {
         lock.lock()
         defer { lock.unlock() }
 
@@ -1011,7 +1228,11 @@ final class TeamDataStore: ObservableObject, @unchecked Sendable {
         // derived filter is the single source of truth).
         let terminalStatuses: Set<String> = ["completed", "failed", "abandoned", "cancelled"]
         let activeTask = taskBoards[teamName, default: []]
-            .filter { $0.assignee == agentName && !terminalStatuses.contains($0.status) }
+            .filter {
+                $0.assignee == agentName
+                    && (agentInstanceId == nil || $0.assigneeInstanceId == agentInstanceId)
+                    && !terminalStatuses.contains($0.status)
+            }
             .sorted { $0.updatedAt > $1.updatedAt }
             .first
 
@@ -1038,7 +1259,7 @@ final class TeamDataStore: ObservableObject, @unchecked Sendable {
         // Sidebar renders this as an amber/⏳ indicator. Derived locally;
         // daemon may also push the same label via an anomaly event in the
         // future — both paths converge on the same case string.
-        let agentState: String
+        var agentState: String
         if isAgentParkedUnsafe(teamName: teamName, agentName: agentName) {
             agentState = "parked"
         } else if let task = activeTask {
@@ -1056,6 +1277,11 @@ final class TeamDataStore: ObservableObject, @unchecked Sendable {
             }
         } else {
             agentState = "idle"
+        }
+        // A turn in flight outranks anything the board can say: the board knows
+        // about tasks, and this agent may simply have been asked a question.
+        if isAgentBusyUnsafe(teamName: teamName, agentName: agentName, agentInstanceId: agentInstanceId) {
+            agentState = "running"
         }
 
         // Heartbeat
@@ -1137,15 +1363,39 @@ final class TeamDataStore: ObservableObject, @unchecked Sendable {
         "/tmp/term-mesh-team-\(teamName)"
     }
 
-    func writeResult(teamName: String, agentName: String, content: String, resultPath: String? = nil) -> Bool {
+    /// Persist a result. A task result is keyed by `taskId`, never by a role
+    /// name: two executor panes may share that alias. The name-keyed file is
+    /// retained only as a legacy read fallback for reports without a task.
+    func writeResult(
+        teamName: String,
+        agentName: String,
+        agentInstanceId: String? = nil,
+        taskId: String? = nil,
+        content: String,
+        resultPath: String? = nil
+    ) -> Bool {
+        if let taskId {
+            lock.lock()
+            let task = taskBoards[teamName]?.first(where: { $0.id == taskId })
+            lock.unlock()
+            guard let task, task.assignee == agentName,
+                  agentIdentityMatches(
+                      teamName: teamName, agentName: agentName,
+                      expectedInstanceId: task.assigneeInstanceId,
+                      reportedInstanceId: agentInstanceId)
+            else { return false }
+        }
         let dir = Self.resultDirectory(teamName: teamName)
         try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
-        let path = (dir as NSString).appendingPathComponent("\(agentName).result.json")
+        let primaryKey = taskId ?? agentName
+        let path = (dir as NSString).appendingPathComponent("\(primaryKey).result.json")
         var payload: [String: Any] = [
             "agent": agentName,
             "content": content,
             "timestamp": ISO8601DateFormatter().string(from: Date()),
         ]
+        if let taskId { payload["task_id"] = taskId }
+        if let agentInstanceId { payload["agent_instance_id"] = agentInstanceId }
         if let rp = resultPath, !rp.isEmpty {
             payload["result_path"] = rp
         }
@@ -1155,12 +1405,18 @@ final class TeamDataStore: ObservableObject, @unchecked Sendable {
         return FileManager.default.createFile(atPath: path, contents: data)
     }
 
-    func readResult(teamName: String, agentName: String) -> [String: Any]? {
+    func readResult(teamName: String, taskId: String, agentName: String? = nil) -> [String: Any]? {
         let dir = Self.resultDirectory(teamName: teamName)
-        let path = (dir as NSString).appendingPathComponent("\(agentName).result.json")
+        let path = (dir as NSString).appendingPathComponent("\(taskId).result.json")
         guard let data = FileManager.default.contents(atPath: path),
               let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-            return nil
+            // Legacy reports did not have a task id and were keyed by role.
+            guard let agentName else { return nil }
+            let legacy = (dir as NSString).appendingPathComponent("\(agentName).result.json")
+            guard let legacyData = FileManager.default.contents(atPath: legacy),
+                  let legacyObj = try? JSONSerialization.jsonObject(with: legacyData) as? [String: Any]
+            else { return nil }
+            return legacyObj
         }
         return obj
     }
@@ -1177,26 +1433,46 @@ final class TeamDataStore: ObservableObject, @unchecked Sendable {
         agentFilter: [String]? = nil,
         activeOnly: Bool = false
     ) -> [String: Any] {
-        let allAgents = agentNames(for: teamName)
+        lock.lock()
+        let allAgents = teamRegistry[teamName, default: []]
+        let tasks = taskBoards[teamName, default: []]
+        lock.unlock()
         guard !allAgents.isEmpty else { return [:] }
-        let agents: [String]
+        let agents: [AgentRegistration]
         if let filter = agentFilter, !filter.isEmpty {
             let filterSet = Set(filter)
-            agents = allAgents.filter { filterSet.contains($0) }
+            agents = allAgents.filter { filterSet.contains($0.name) }
         } else if activeOnly {
-            let activeAssignees = agentsWithActiveTask(teamName: teamName)
-            agents = allAgents.filter { activeAssignees.contains($0) }
+            let terminalStatuses: Set<String> = ["completed", "failed", "abandoned", "cancelled"]
+            let activeInstances = Set(tasks.compactMap { task in
+                !terminalStatuses.contains(task.status) ? task.assigneeInstanceId : nil
+            })
+            agents = allAgents.filter { registration in
+                registration.instanceId.map(activeInstances.contains) == true
+            }
         } else {
             agents = allAgents
         }
         let dir = Self.resultDirectory(teamName: teamName)
         var agentStatus: [[String: Any]] = []
-        for name in agents {
-            let path = (dir as NSString).appendingPathComponent("\(name).result.json")
-            agentStatus.append([
-                "agent_name": name,
+        for agent in agents {
+            let assignedTask = tasks
+                .filter { $0.assignee == agent.name && $0.assigneeInstanceId == agent.instanceId }
+                .sorted { $0.updatedAt > $1.updatedAt }
+                .first
+            let path = assignedTask.map { task in
+                (dir as NSString).appendingPathComponent("\(task.id).result.json")
+            } ?? (dir as NSString).appendingPathComponent("\(agent.name).result.json")
+            var row: [String: Any] = [
+                "agent_name": agent.name,
                 "has_result": FileManager.default.fileExists(atPath: path),
-            ])
+                "task_id": assignedTask?.id as Any? ?? NSNull(),
+                "agent_instance_id": agent.instanceId as Any? ?? NSNull(),
+            ]
+            if let assignedTask {
+                row["parallel_telemetry"] = Self.parallelTelemetry(for: assignedTask)
+            }
+            agentStatus.append(row)
         }
         let completed = agentStatus.filter { $0["has_result"] as? Bool == true }.count
         let total = agents.count
@@ -1211,23 +1487,35 @@ final class TeamDataStore: ObservableObject, @unchecked Sendable {
         ]
     }
 
-    /// Names of agents in `teamName` that currently have a non-terminal task assigned.
-    private func agentsWithActiveTask(teamName: String) -> Set<String> {
-        lock.lock()
-        defer { lock.unlock() }
-        let terminalStatuses: Set<String> = ["completed", "failed", "abandoned", "cancelled"]
-        var result: Set<String> = []
-        for task in taskBoards[teamName, default: []] {
-            if let assignee = task.assignee, !terminalStatuses.contains(task.status) {
-                result.insert(assignee)
+    func collectResults(teamName: String) -> [[String: Any]] {
+        // One row per task/instance. Name aliases are only a fallback for
+        // old result files, never the primary collect key.
+        let tasks = listTasks(teamName: teamName, status: nil, assignee: nil,
+                              needsAttention: false, priority: nil, staleOnly: false, dependsOn: nil)
+        var results: [[String: Any]] = []
+        var seen = Set<String>()
+        for task in tasks where task.assignee != nil {
+            guard let result = readResult(teamName: teamName, taskId: task.id, agentName: task.assignee) else { continue }
+            guard let instance = result["agent_instance_id"] as? String else {
+                // Legacy fallback is only safe for a task with an unambiguous alias.
+                if tasks.filter({ $0.assignee == task.assignee }).count != 1 { continue }
+                var enriched = result
+                enriched["parallel_telemetry"] = Self.parallelTelemetry(for: task)
+                enriched["content_bytes"] = (result["content"] as? String)?.lengthOfBytes(using: .utf8) ?? 0
+                results.append(enriched)
+                continue
             }
+            guard instance == task.assigneeInstanceId, seen.insert(task.id).inserted else { continue }
+            var enriched = result
+            enriched["parallel_telemetry"] = Self.parallelTelemetry(for: task)
+            enriched["content_bytes"] = (result["content"] as? String)?.lengthOfBytes(using: .utf8) ?? 0
+            results.append(enriched)
         }
-        return result
+        return results.sorted { ($0["task_id"] as? String ?? "") < ($1["task_id"] as? String ?? "") }
     }
 
-    func collectResults(teamName: String) -> [[String: Any]] {
-        let agents = agentNames(for: teamName)
-        return agents.compactMap { readResult(teamName: teamName, agentName: $0) }
+    func clearResults(teamName: String) {
+        try? FileManager.default.removeItem(atPath: Self.resultDirectory(teamName: teamName))
     }
 
     // MARK: - Task Dictionary (for JSON responses)
@@ -1248,6 +1536,8 @@ final class TeamDataStore: ObservableObject, @unchecked Sendable {
             "reassignment_count": task.reassignmentCount,
             "superseded_by": task.supersededBy as Any? ?? NSNull(),
             "assignee": task.assignee as Any? ?? NSNull(),
+            "agent_instance_id": task.assigneeInstanceId as Any? ?? NSNull(),
+            "parallel_telemetry": Self.parallelTelemetry(for: task),
             "blocked_reason": task.blockedReason as Any? ?? NSNull(),
             "review_summary": task.reviewSummary as Any? ?? NSNull(),
             "created_by": task.createdBy,
@@ -1285,6 +1575,21 @@ final class TeamDataStore: ObservableObject, @unchecked Sendable {
             dict["stale_seconds"] = NSNull()
         }
         return dict
+    }
+
+    /// Additive, body-free routing telemetry for machine readers. Values are
+    /// identifiers, digests/status strings, and byte counts only; task details,
+    /// prompts, reports, and result bodies never enter this object.
+    private static func parallelTelemetry(for task: TeamOrchestrator.TeamTask) -> [String: Any] {
+        [
+            "wave_id": task.parentTaskId ?? task.id,
+            "task_id": task.id,
+            "agent_instance_id": task.assigneeInstanceId as Any? ?? NSNull(),
+            "host": NSNull(),
+            "checkout": task.worktreePath ?? task.worktreeBranch ?? NSNull(),
+            "delivery": task.status == "assigned" || task.status == "in_progress" ? "scheduled" : task.status,
+            "synthesis": task.reviewSummary == nil ? "pending" : "available",
+        ]
     }
 
     func messageDictionary(_ message: TeamOrchestrator.TeamMessage) -> [String: Any] {

@@ -46,9 +46,12 @@ struct ContentView: View {
     @Environment(\.daemonService) private var daemonService
     @Environment(\.configProvider) private var configProvider
     @Environment(\.browserHistoryService) private var browserHistory
+    @Environment(\.reviewBoardCoordinatorService) private var reviewBoardCoordinator
     // Live width stays @State (avoids a defaults write per drag frame);
     // the persisted value is read once here and committed on drag end.
     @State private var sidebarWidth: CGFloat = SidebarLayoutSettings.loadWidth() ?? 200
+    @State private var reviewBoardWidth: CGFloat = ReviewBoardSettings.loadWidth()
+    @State private var reviewBoardDragStartWidth: CGFloat?
     @State private var lastClampedWidth: CGFloat = 0
     @State private var hoveredResizerHandles: Set<SidebarResizerHandle> = []
     @State private var isResizerDragging = false
@@ -102,6 +105,7 @@ struct ContentView: View {
     private var commandPaletteRenameSelectAllOnFocus = CommandPaletteRenameSelectionSettings.defaultSelectAllOnFocus
     @FocusState private var isCommandPaletteSearchFocused: Bool
     @FocusState private var isCommandPaletteRenameFocused: Bool
+    @StateObject private var reviewBoardViewModel = ReviewBoardViewModel()
 
     private static let fixedSidebarResizeCursor = NSCursor(
         image: NSCursor.resizeLeftRight.image,
@@ -425,7 +429,7 @@ struct ContentView: View {
                     let isVisible = isSelectedWorkspace || isRetiringWorkspace
                     let portalPriority = isSelectedWorkspace ? 2 : (isRetiringWorkspace ? 1 : 0)
                     WorkspaceRetrievalChrome(workspace: tab) {
-                        WorkspaceContentView(
+                        SelectedWorkspaceContentView(
                             workspace: tab,
                             isWorkspaceVisible: isVisible,
                             isWorkspaceInputActive: isInputActive,
@@ -475,7 +479,61 @@ struct ContentView: View {
             }
     }
 
+    private var terminalContentWithReviewBoard: some View {
+        HStack(spacing: 0) {
+            terminalContentWithSidebarDropOverlay
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            if isReviewBoardEnabled && !isReviewBoardClosed {
+                reviewBoardResizer
+                ReviewBoardPanelView(
+                    viewModel: reviewBoardViewModel,
+                    onClose: { ReviewBoardSettings.setVisible(false) }
+                )
+                .frame(width: reviewBoardWidth)
+                .transition(.move(edge: .trailing).combined(with: .opacity))
+            }
+        }
+        .animation(.easeOut(duration: 0.16), value: isReviewBoardEnabled && !isReviewBoardClosed)
+    }
+
+    private var reviewBoardResizer: some View {
+        Rectangle()
+            .fill(Color(nsColor: .separatorColor))
+            .frame(width: 1)
+            .overlay {
+                Color.clear
+                    .frame(width: 9)
+                    .contentShape(Rectangle())
+                    .onHover { hovering in
+                        hovering ? Self.fixedSidebarResizeCursor.set() : NSCursor.arrow.set()
+                    }
+                    .gesture(
+                        DragGesture(minimumDistance: 0, coordinateSpace: .global)
+                            .onChanged { value in
+                                if reviewBoardDragStartWidth == nil {
+                                    reviewBoardDragStartWidth = reviewBoardWidth
+                                }
+                                let startWidth = reviewBoardDragStartWidth ?? reviewBoardWidth
+                                withTransaction(Transaction(animation: nil)) {
+                                    reviewBoardWidth = ReviewBoardSettings.clampedWidth(startWidth - value.translation.width)
+                                }
+                                Self.fixedSidebarResizeCursor.set()
+                            }
+                            .onEnded { _ in
+                                reviewBoardDragStartWidth = nil
+                                ReviewBoardSettings.saveWidth(reviewBoardWidth)
+                                NSCursor.arrow.set()
+                            }
+                    )
+                    .accessibilityLabel("Review Board resizer")
+                    .accessibilityIdentifier("ReviewBoardResizer")
+            }
+    }
+
     @AppStorage("sidebarBlendMode") private var sidebarBlendMode = SidebarBlendModeOption.withinWindow.rawValue
+    @AppStorage(ReviewBoardSettings.enabledKey)
+    private var isReviewBoardEnabled = ReviewBoardSettings.defaultEnabled
+    @AppStorage(ReviewBoardSettings.isClosedKey) private var isReviewBoardClosed = false
     @AppStorage("hideWelcomeScreen") private var hideWelcomeScreen: Bool = false
     @AppStorage("showStatusBar") private var showStatusBar: Bool = true
     @AppStorage(AppearanceSettings.appearanceModeKey) private var appearanceMode = AppearanceSettings.defaultMode.rawValue
@@ -533,6 +591,9 @@ struct ContentView: View {
             },
             onSpawnCLI: {
                 NotificationCenter.default.post(name: .spawnCLIRequested, object: nil)
+            },
+            onNewProject: {
+                NotificationCenter.default.post(name: .projectCreationRequested, object: nil)
             }
         )
     }
@@ -794,8 +855,38 @@ struct ContentView: View {
             Text(Self.appVersion)
                 .font(.system(size: 11, design: .monospaced))
                 .foregroundColor(titlebarColor(opacity: 0.4))
+
+            // Somewhere to click. The board's close button was the only
+            // control it had and closing was one-way; a menu item and a
+            // shortcut fix that for anyone who goes looking, which is not how
+            // a person finds their way back to a panel they dismissed by
+            // accident.
+            //
+            // Last in the row, on the same side as the panel it opens, and
+            // not inside the agent-rendering cluster where it would read as
+            // another thing about agents. Shown whether or not a team exists,
+            // because someone who closed the board needs the way back
+            // regardless of what is running.
+            titlebarInfoSeparator
+            Button(action: { ReviewBoardSettings.toggleVisible() }) {
+                Image(systemName: isReviewBoardShowing ? "sidebar.right" : "sidebar.squares.right")
+                    .font(.system(size: 11))
+                    .foregroundColor(isReviewBoardShowing
+                        ? .accentColor.opacity(0.9)
+                        : titlebarColor(opacity: 0.5))
+            }
+            .buttonStyle(.plain)
+            .help(isReviewBoardShowing ? "Hide Review Board (⌃⌘B)" : "Show Review Board (⌃⌘B)")
+            .accessibilityIdentifier("titlebar.reviewBoardToggle")
         }
         .lineLimit(1)
+    }
+
+    /// Whether the board is on screen, read from the same two keys
+    /// `ReviewBoardSettings` writes, so the button's look never disagrees with
+    /// what is actually showing.
+    private var isReviewBoardShowing: Bool {
+        isReviewBoardEnabled && !isReviewBoardClosed
     }
 
     private static let appVersion: String = {
@@ -1383,7 +1474,7 @@ struct ContentView: View {
             // This allows withinWindow blur to see the terminal content
             layout = AnyView(
                 ZStack(alignment: .leading) {
-                    terminalContentWithSidebarDropOverlay
+                    terminalContentWithReviewBoard
                         .padding(.leading, sidebarState.isVisible ? sidebarWidth : 0)
                     if sidebarState.isVisible {
                         sidebarView
@@ -1397,7 +1488,7 @@ struct ContentView: View {
                     if sidebarState.isVisible {
                         sidebarView
                     }
-                    terminalContentWithSidebarDropOverlay
+                    terminalContentWithReviewBoard
                 }
             )
         }
@@ -1454,6 +1545,22 @@ struct ContentView: View {
                 lastSidebarSelectionIndex = tabManager.tabs.firstIndex { $0.id == selectedId }
             }
             updateTitlebarText()
+            reviewBoardWidth = ReviewBoardSettings.loadWidth()
+            let coordinator = reviewBoardCoordinator ?? ReviewBoardCoordinatorService.shared
+            coordinator.startIfNeeded()
+            reviewBoardViewModel.setSnapshotProvider {
+                coordinator.providerSnapshot()
+            }
+            // The reviewer's name is what the coordinator records on the merge
+            // queue entry, and it has no notion of accounts — the login name
+            // is the only thing here that identifies a person.
+            let reviewer = NSUserName()
+            reviewBoardViewModel.setActions(ReviewBoardActions(
+                review: { await coordinator.review(task: $0) },
+                approve: { try await coordinator.approve($0, reviewer: reviewer) },
+                reject: { try await coordinator.reject($0, reviewer: reviewer, reason: $1) }
+            ))
+            reviewBoardViewModel.refresh()
         })
 
         view = AnyView(view.onChange(of: tabManager.selectedTabId) { newValue in
@@ -1659,6 +1766,25 @@ struct ContentView: View {
         // little and cannot deadlock itself.
         view = AnyView(view.onReceive(RemoteHostStore.shared.objectWillChange) { _ in
             peerStoreRevision &+= 1
+        })
+
+        view = AnyView(view.onReceive(NotificationCenter.default.publisher(for: .reviewBoardTaskSelected)) { notification in
+            reviewBoardViewModel.refresh()
+            if let taskID = notification.userInfo?["task_id"] as? String {
+                reviewBoardViewModel.selectTask(id: ReviewBoardText.safeIdentifier(taskID))
+            }
+            if isReviewBoardEnabled {
+                isReviewBoardClosed = false
+            }
+        })
+
+        view = AnyView(view.onReceive(NotificationCenter.default.publisher(for: .reviewBoardSnapshotDidChange)) { _ in
+            reviewBoardViewModel.refresh()
+        })
+
+        view = AnyView(view.onChange(of: isReviewBoardEnabled) { _ in
+            (reviewBoardCoordinator ?? ReviewBoardCoordinatorService.shared).startIfNeeded()
+            reviewBoardViewModel.refresh()
         })
 
         view = AnyView(view.onReceive(NotificationCenter.default.publisher(for: .worktreeWorkspaceRequested)) { notification in

@@ -27,3 +27,6 @@ anyhow = "1"
 # Terminal emulator for `peer snapshot` — renders the replay stream into the
 # current screen grid instead of dumping raw output history.
 vt100 = "0.16"
+
+[dev-dependencies]
+tempfile = "3"

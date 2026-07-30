@@ -663,6 +663,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         }
     }
 
+    /// Give agents on other machines a moment to be told the app is leaving.
+    ///
+    /// Only when there are any, and never for longer than `quitGrace` — a
+    /// tidy exit is worth a second, not a quit that hangs because a peer
+    /// stopped answering.
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        guard TeamOrchestrator.shared.releaseAllRemoteAgentsForQuit() else {
+            return .terminateNow
+        }
+#if DEBUG
+        dlog("[app.shouldTerminate] waiting on remote agent shutdown")
+#endif
+        DispatchQueue.main.asyncAfter(
+            deadline: .now() + TeamOrchestrator.quitGrace
+        ) {
+            NSApp.reply(toApplicationShouldTerminate: true)
+        }
+        return .terminateLater
+    }
+
     func applicationWillTerminate(_ notification: Notification) {
         #if DEBUG
         dlog("[app.willTerminate] fired — archiving live pane teams before daemon shutdown")
@@ -2610,6 +2630,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         // consume the key equivalent without firing the action closure.
         if matchShortcut(event: event, shortcut: KeyboardShortcutSettings.shortcut(for: .newWindow)) {
             openNewMainWindow(nil)
+            return true
+        }
+
+        // New Project: Control+Option+Cmd+N by default.
+        // Handle this in the event monitor instead of relying on the menu key
+        // equivalent so the physical N key also works under CJK input sources
+        // where charactersIgnoringModifiers is not "n".
+        if matchShortcut(event: event, shortcut: KeyboardShortcutSettings.shortcut(for: .newProject)) {
+            NotificationCenter.default.post(name: .projectCreationRequested, object: nil)
             return true
         }
 

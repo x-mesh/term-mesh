@@ -31,10 +31,21 @@ struct VerticalTabsSidebar: View {
     private var localTabsCollapsed = false
     @AppStorage(SidebarPresentationSettings.separatedSectionsEnabledKey)
     private var sidebarSeparatedSectionsEnabled = SidebarPresentationSettings.defaultSeparatedSectionsEnabled
+    @AppStorage(SidebarAxisSettings.featureFlagKey)
+    private var isAxisControlEnabled = true
+    @AppStorage(SidebarAxisSettings.selectedAxisKey)
+    private var selectedAxisRaw = SidebarAxisSettings.defaultAxis.rawValue
 
     /// Space at top of sidebar for traffic light buttons
     private let trafficLightPadding: CGFloat = 28
     private let tabRowSpacing: CGFloat = 2
+
+    /// With the switch turned off there is no way to reach the Project view,
+    /// so the axis has to read as Host no matter what was stored.
+    private var axis: SidebarAxis {
+        guard isAxisControlEnabled else { return .host }
+        return SidebarAxisSettings.axis(from: selectedAxisRaw)
+    }
 
     private var visibleLocalWorkspaceIds: [UUID] {
         SidebarPresentationSettings.visibleLocalWorkspaceIDs(
@@ -52,43 +63,62 @@ struct VerticalTabsSidebar: View {
                         Spacer()
                             .frame(height: trafficLightPadding)
 
-                        SidebarSectionHeader(
-                            title: sidebarSeparatedSectionsEnabled ? "Local Workspaces" : "Workspaces",
-                            isCollapsed: $localTabsCollapsed
-                        )
-                        .padding(.top, sidebarSeparatedSectionsEnabled ? 6 : 4)
-
-                        if !localTabsCollapsed {
-                            LazyVStack(spacing: tabRowSpacing) {
-                                ForEach(Array(tabManager.tabs.enumerated()), id: \.element.id) { index, tab in
-                                    if SidebarPresentationSettings.includesInLocalWorkspaces(
-                                        isPeerMirror: tab.isPeerMirror,
-                                        separatedSectionsEnabled: sidebarSeparatedSectionsEnabled
-                                    ) {
-                                        TabItemView(
-                                            tab: tab,
-                                            index: index,
-                                            visibleTabIds: visibleLocalWorkspaceIds,
-                                            rowSpacing: tabRowSpacing,
-                                            selection: $selection,
-                                            selectedTabIds: $selectedTabIds,
-                                            lastSidebarSelectionIndex: $lastSidebarSelectionIndex,
-                                            showsCommandShortcutHints: commandKeyMonitor.isCommandPressed,
-                                            dragAutoScrollController: dragAutoScrollController,
-                                            draggedTabId: $draggedTabId,
-                                            dropIndicator: $dropIndicator
-                                        )
-                                    }
-                                }
-                            }
-                            .padding(.bottom, 8)
-                            .padding(.top, 2)
+                        if isAxisControlEnabled {
+                            SidebarAxisPicker(selection: $selectedAxisRaw)
+                                .padding(.top, 2)
+                                .padding(.bottom, 2)
                         }
 
-                        SidebarRemoteHostsSection(
-                            store: remoteHostStore,
-                            usesSeparatedPresentation: sidebarSeparatedSectionsEnabled
-                        )
+                        // The two axes are alternatives, not layers. Leaving
+                        // Local Workspaces mounted under the Project view was
+                        // the whole complaint: the switch appeared to change
+                        // what the sidebar was about while the section above
+                        // it — selection highlight and all — never moved.
+                        switch axis {
+                        case .host:
+                            SidebarSectionHeader(
+                                title: sidebarSeparatedSectionsEnabled ? "Local Workspaces" : "Workspaces",
+                                isCollapsed: $localTabsCollapsed
+                            )
+                            .padding(.top, sidebarSeparatedSectionsEnabled ? 6 : 4)
+
+                            if !localTabsCollapsed {
+                                LazyVStack(spacing: tabRowSpacing) {
+                                    ForEach(Array(tabManager.tabs.enumerated()), id: \.element.id) { index, tab in
+                                        if SidebarPresentationSettings.includesInLocalWorkspaces(
+                                            isPeerMirror: tab.isPeerMirror,
+                                            separatedSectionsEnabled: sidebarSeparatedSectionsEnabled
+                                        ) {
+                                            TabItemView(
+                                                tab: tab,
+                                                index: index,
+                                                visibleTabIds: visibleLocalWorkspaceIds,
+                                                rowSpacing: tabRowSpacing,
+                                                selection: $selection,
+                                                selectedTabIds: $selectedTabIds,
+                                                lastSidebarSelectionIndex: $lastSidebarSelectionIndex,
+                                                showsCommandShortcutHints: commandKeyMonitor.isCommandPressed,
+                                                dragAutoScrollController: dragAutoScrollController,
+                                                draggedTabId: $draggedTabId,
+                                                dropIndicator: $dropIndicator
+                                            )
+                                        }
+                                    }
+                                }
+                                .padding(.bottom, 8)
+                                .padding(.top, 2)
+                            }
+
+                            SidebarRemoteHostsSection(
+                                store: remoteHostStore,
+                                usesSeparatedPresentation: sidebarSeparatedSectionsEnabled
+                            )
+                        case .project:
+                            SidebarProjectsSection(
+                                store: remoteHostStore,
+                                usesSeparatedPresentation: sidebarSeparatedSectionsEnabled
+                            )
+                        }
 
                         if let selectedWorkspace = tabManager.tabs.first(where: { $0.id == tabManager.selectedTabId }) {
                             WorkspaceRetrievalSidebarSection(workspace: selectedWorkspace)
@@ -867,6 +897,113 @@ private enum PeerSidebarPalette {
     }
 }
 
+/// The sidebar's top-level switch. It sits above every section on purpose:
+/// as a control tucked inside the Peer Hosts header it looked like it governed
+/// the sidebar but only regrouped one section of it.
+struct SidebarAxisPicker: View {
+    @Binding var selection: String
+
+    var body: some View {
+        Picker("", selection: $selection) {
+            ForEach(SidebarAxis.allCases) { axis in
+                Text(axis.title)
+                    .accessibilityLabel(axis.accessibilityDescription)
+                    .tag(axis.rawValue)
+            }
+        }
+        .pickerStyle(.segmented)
+        .controlSize(.small)
+        .labelsHidden()
+        .padding(.horizontal, 12)
+        .accessibilityIdentifier("sidebar.axis")
+        .accessibilityLabel("Sidebar grouping")
+        .help("Group the sidebar by host or by project")
+    }
+}
+
+/// The Project axis: every workspace this app can see, local and peer, grouped
+/// by the project it works inside.
+struct SidebarProjectsSection: View {
+    @ObservedObject var store: RemoteHostStore
+    let usesSeparatedPresentation: Bool
+    @AppStorage(SidebarLayoutSettings.localTabsCollapsedKey)
+    private var isCollapsed = false
+
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack(spacing: 6) {
+                Button {
+                    withAnimation(.easeInOut(duration: 0.15)) { isCollapsed.toggle() }
+                } label: {
+                    HStack(spacing: 4) {
+                        Image(systemName: "chevron.right")
+                            .font(.system(size: 8, weight: .semibold))
+                            .rotationEffect(.degrees(isCollapsed ? 0 : 90))
+                            .foregroundColor(Color.secondary.opacity(0.7))
+                        Text("Projects")
+                            .font(.system(size: 10, weight: .semibold))
+                            .foregroundColor(.secondary)
+                            .lineLimit(1)
+                    }
+                    .frame(minWidth: 0, maxWidth: .infinity, alignment: .leading)
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("Projects")
+
+                // Under the Host axis this same corner adds a peer host. Here
+                // it has to add a project, which is what the button's position
+                // promises — a project is not a thing to register, though, it
+                // is where work happens, so opening a folder is how one starts
+                // existing.
+                Button {
+                    // A project's own questions, and the same agent composer
+                    // the team sheet uses for the rest. Pointing this at the
+                    // team sheet was closer than the duplicate before it, but
+                    // it still asked about pair mode and worktree isolation of
+                    // someone who had not chosen a folder yet.
+                    //
+                    // The sheet itself belongs to the app, not to this header:
+                    // the titlebar's + opens the same one, and it is visible
+                    // exactly when the sidebar — and so this button — is not.
+                    NotificationCenter.default.post(
+                        name: .projectCreationRequested,
+                        object: nil
+                    )
+                } label: {
+                    Image(systemName: "plus")
+                        .font(.system(size: 9, weight: .semibold))
+                        .foregroundColor(.secondary)
+                        .frame(width: 18, height: 18)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .accessibilityIdentifier("sidebar.projects.add")
+                .accessibilityLabel("New Project")
+                .help(
+                    KeyboardShortcutSettings.Action.newProject.tooltip(
+                        "Start a project and the team that works on it"
+                    )
+                )
+            }
+            .padding(.leading, 16)
+            .padding(.trailing, 12)
+            .padding(.vertical, 4)
+
+            if !isCollapsed {
+                SidebarPeerProjectsView(
+                    hosts: store.sortedHosts,
+                    store: store,
+                    usesSeparatedPresentation: usesSeparatedPresentation,
+                    paneExpansionCommand: PeerPaneExpansionCommand(isExpanded: false, generation: 0)
+                )
+            }
+        }
+        .padding(.bottom, 4)
+    }
+}
+
+
 struct SidebarRemoteHostsSection: View {
     @ObservedObject var store: RemoteHostStore
     let usesSeparatedPresentation: Bool
@@ -904,46 +1041,64 @@ struct SidebarRemoteHostsSection: View {
             // "Peer Hosts", not "Remote Hosts" — plain "hosts" read as
             // direct-SSH terminal access; these entries are term-mesh
             // peer daemons (Peer menu / Peer Connections vocabulary).
-            SidebarSectionHeader(title: "Peer Hosts", isCollapsed: $isCollapsed)
-                .overlay(alignment: .trailing) {
-                    HStack(spacing: 2) {
-                        if !isCollapsed, hasPeerPaneDetails {
-                            Button(action: toggleAllPaneDetails) {
-                                Image(systemName: areAllPaneDetailsExpanded
-                                      ? "chevron.up"
-                                      : "chevron.down")
-                                    .font(.system(size: 8, weight: .semibold))
-                                    .foregroundColor(.secondary)
-                                    .frame(width: 18, height: 18)
-                                    .contentShape(Rectangle())
-                            }
-                            .buttonStyle(.plain)
-                            .accessibilityLabel(areAllPaneDetailsExpanded
-                                                ? "Collapse all peer pane details"
-                                                : "Expand all peer pane details")
-                            .help(areAllPaneDetailsExpanded
-                                  ? "Collapse all peer pane details"
-                                  : "Expand all peer pane details")
-                        }
-
-                        Button {
-                            editorContext = PeerHostEditorContext(
-                                profile: PeerHostProfile(sshTarget: ""),
-                                isNew: true
-                            )
-                        } label: {
-                            Image(systemName: "plus")
-                                .font(.system(size: 9, weight: .semibold))
-                                .foregroundColor(.secondary)
-                                .frame(width: 18, height: 18)
-                                .contentShape(Rectangle())
-                        }
-                        .buttonStyle(.plain)
-                        .accessibilityLabel("Add Peer Host")
-                        .help("Add Peer Host…")
+            HStack(spacing: 6) {
+                Button {
+                    withAnimation(.easeInOut(duration: 0.15)) { isCollapsed.toggle() }
+                } label: {
+                    HStack(spacing: 4) {
+                        Image(systemName: "chevron.right")
+                            .font(.system(size: 8, weight: .semibold))
+                            .rotationEffect(.degrees(isCollapsed ? 0 : 90))
+                            .foregroundColor(Color.secondary.opacity(0.7))
+                        Text("Peer Hosts")
+                            .font(.system(size: 10, weight: .semibold))
+                            .foregroundColor(.secondary)
+                            .lineLimit(1)
                     }
-                    .padding(.trailing, 12)
+                    .frame(minWidth: 0, maxWidth: .infinity, alignment: .leading)
+                    .contentShape(Rectangle())
                 }
+                .buttonStyle(.plain)
+                .accessibilityLabel("Peer Hosts")
+
+                if !isCollapsed, hasPeerPaneDetails {
+                    Button(action: toggleAllPaneDetails) {
+                        Image(systemName: areAllPaneDetailsExpanded
+                              ? "chevron.up"
+                              : "chevron.down")
+                            .font(.system(size: 8, weight: .semibold))
+                            .foregroundColor(.secondary)
+                            .frame(width: 18, height: 18)
+                            .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel(areAllPaneDetailsExpanded
+                                        ? "Collapse all peer pane details"
+                                        : "Expand all peer pane details")
+                    .help(areAllPaneDetailsExpanded
+                          ? "Collapse all peer pane details"
+                          : "Expand all peer pane details")
+                }
+
+                Button {
+                    editorContext = PeerHostEditorContext(
+                        profile: PeerHostProfile(sshTarget: ""),
+                        isNew: true
+                    )
+                } label: {
+                    Image(systemName: "plus")
+                        .font(.system(size: 9, weight: .semibold))
+                        .foregroundColor(.secondary)
+                        .frame(width: 18, height: 18)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("Add Peer Host")
+                .help("Add Peer Host…")
+            }
+            .padding(.leading, 16)
+            .padding(.trailing, 12)
+            .padding(.vertical, 4)
 
             if !isCollapsed {
                 if store.sortedHosts.isEmpty {
@@ -955,6 +1110,8 @@ struct SidebarRemoteHostsSection: View {
                         .padding(.horizontal, 16)
                         .padding(.vertical, 4)
                 } else {
+                    // Hosts only. Grouping by project is now the sidebar's own
+                    // axis, chosen above this section rather than inside it.
                     VStack(spacing: usesSeparatedPresentation ? 8 : 0) {
                         ForEach(store.sortedHosts) { host in
                             RemoteHostGroupView(
@@ -995,6 +1152,997 @@ struct SidebarRemoteHostsSection: View {
     }
 }
 
+struct SidebarProjectDelegateTarget: Identifiable {
+    let label: String
+    let rootPath: String?
+    var id: String { rootPath ?? label }
+}
+
+/// Hand a project some work. The coordinator picks which machine runs it, so
+/// this asks for the work and nothing about where — choosing a host here would
+/// re-decide, by hand and with less information, the one thing the coordinator
+/// exists to decide.
+/// Which project is getting a member, and where that member should run.
+struct SidebarRemoteAgentTarget: Identifiable {
+    let projectLabel: String
+    /// The team the member joins. Nil when the project has no team here, which
+    /// is the one case this cannot serve — a member needs teammates.
+    let teamName: String?
+    var id: String { projectLabel }
+}
+
+private struct SidebarProjectDeletionTarget: Identifiable {
+    let label: String
+    let teamName: String
+    let locations: [TeamOrchestrator.Team.RemoteProjectLocation]
+    var id: String { teamName }
+}
+
+/// Put a member of this project's team on another machine.
+///
+/// The delegate sheet beside this one deliberately asks nothing about where —
+/// the coordinator picks a host, and choosing one by hand would re-decide with
+/// less information. This is the opposite case, and the reason both exist: the
+/// machine IS the request. Tests want the Mac; a build may want the Linux box.
+///
+/// The directory is asked for rather than inferred. Two machines rarely lay a
+/// checkout out the same way, so the local path is not an answer; what the host
+/// reports about itself is, and that is what prefills the field.
+struct SidebarRemoteAgentSheet: View {
+    let target: SidebarRemoteAgentTarget
+    let onClose: () -> Void
+
+    @ObservedObject private var store = RemoteHostStore.shared
+    @State private var hostKey: String = ""
+    @State private var directory: String = ""
+    @State private var role: String = "executor"
+    @State private var failure: String?
+    @State private var isAdding = false
+
+    private var connectedHosts: [HostEntry] {
+        store.sortedHosts.filter(\.isConnected)
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            VStack(alignment: .leading, spacing: 3) {
+                Text("Add Agent on Another Machine")
+                    .font(.system(size: 14, weight: .semibold))
+                Text(target.projectLabel)
+                    .font(.system(size: 11))
+                    .foregroundColor(.secondary)
+            }
+
+            if connectedHosts.isEmpty {
+                Text("No peer is connected. Connect one from the Host list first.")
+                    .font(.system(size: 11))
+                    .foregroundColor(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            } else {
+                VStack(alignment: .leading, spacing: 5) {
+                    Text("Machine")
+                        .font(.system(size: 10, weight: .semibold))
+                        .foregroundColor(.secondary)
+                    Picker("", selection: $hostKey) {
+                        ForEach(connectedHosts, id: \.id) { host in
+                            Text(host.displayName).tag(host.id)
+                        }
+                    }
+                    .labelsHidden()
+                    .onChange(of: hostKey) { _, _ in prefillDirectory() }
+                }
+
+                VStack(alignment: .leading, spacing: 5) {
+                    Text("Working directory on that machine")
+                        .font(.system(size: 10, weight: .semibold))
+                        .foregroundColor(.secondary)
+                    TextField("/root/project", text: $directory)
+                        .textFieldStyle(.roundedBorder)
+                    // The same convention creation uses: an agent never
+                    // shares the project's checkout with the leader.
+                    Text("A folder this project owns gets the agent its own dated worktree beside it; any other path is used as typed.")
+                        .font(.system(size: 9))
+                        .foregroundColor(Color.secondary.opacity(0.8))
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+
+                VStack(alignment: .leading, spacing: 5) {
+                    Text("Role")
+                        .font(.system(size: 10, weight: .semibold))
+                        .foregroundColor(.secondary)
+                    TextField("executor", text: $role)
+                        .textFieldStyle(.roundedBorder)
+                }
+            }
+
+            if let failure {
+                Text(failure)
+                    .font(.system(size: 11))
+                    .foregroundColor(.red)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            HStack {
+                Text("The pane opens here, beside its team.")
+                    .font(.system(size: 10))
+                    .foregroundColor(Color.secondary.opacity(0.8))
+                Spacer()
+                Button("Cancel", action: onClose)
+                    .keyboardShortcut(.cancelAction)
+                Button(isAdding ? "Adding…" : "Add", action: add)
+                    .keyboardShortcut(.defaultAction)
+                    .disabled(isAdding || !isReady)
+            }
+        }
+        .padding(18)
+        .frame(width: 420)
+        .onAppear {
+            if hostKey.isEmpty { hostKey = connectedHosts.first?.id ?? "" }
+            prefillDirectory()
+        }
+        .accessibilityIdentifier("sidebar.project.addRemoteAgent")
+    }
+
+    private var isReady: Bool {
+        target.teamName != nil
+            && !hostKey.isEmpty
+            && !directory.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            && !role.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    /// Offer what the machine says about itself, preferring a folder named the
+    /// same as this project. A wrong guess here is cheap — the field is right
+    /// there — but a blank one makes the person go and look it up.
+    private func prefillDirectory() {
+        guard let host = connectedHosts.first(where: { $0.id == hostKey }) else { return }
+        var roots = host.workspaces
+            .flatMap(\.panes)
+            .compactMap(\.projectRootPath)
+            .filter { !$0.isEmpty }
+        roots.append(contentsOf: host.teams.compactMap(\.projectRootPath).filter { !$0.isEmpty })
+        let byName = roots.first {
+            URL(fileURLWithPath: $0).lastPathComponent == target.projectLabel
+        }
+        directory = byName ?? roots.first ?? ""
+    }
+
+    private func add() {
+        guard let teamName = target.teamName else {
+            failure = "This project has no team here to join."
+            return
+        }
+        isAdding = true
+        failure = nil
+        let name = role.trimmingCharacters(in: .whitespacesAndNewlines)
+        let dir = directory.trimmingCharacters(in: .whitespacesAndNewlines)
+        let key = hostKey
+        Task { @MainActor in
+            do {
+                _ = try await TeamOrchestrator.shared.attachRemoteAgent(
+                    teamName: teamName,
+                    agentName: name,
+                    hostKey: key,
+                    workingDirectory: dir,
+                    agentType: name
+                )
+                onClose()
+            } catch {
+                isAdding = false
+                failure = String(describing: error)
+            }
+        }
+    }
+}
+
+struct SidebarProjectDelegateSheet: View {
+    let target: SidebarProjectDelegateTarget
+    let onClose: () -> Void
+
+    @State private var title = ""
+    @State private var body_ = ""
+    @State private var failure: String?
+    @State private var isSending = false
+    @FocusState private var titleFocused: Bool
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            VStack(alignment: .leading, spacing: 3) {
+                Text("Delegate Work")
+                    .font(.system(size: 14, weight: .semibold))
+                Text(target.label)
+                    .font(.system(size: 11))
+                    .foregroundColor(.secondary)
+            }
+
+            VStack(alignment: .leading, spacing: 5) {
+                Text("What needs doing")
+                    .font(.system(size: 10, weight: .semibold))
+                    .foregroundColor(.secondary)
+                TextField("Add a retry to the peer reconnect", text: $title)
+                    .textFieldStyle(.roundedBorder)
+                    .focused($titleFocused)
+            }
+
+            VStack(alignment: .leading, spacing: 5) {
+                Text("Detail (optional)")
+                    .font(.system(size: 10, weight: .semibold))
+                    .foregroundColor(.secondary)
+                TextEditor(text: $body_)
+                    .font(.system(size: 12))
+                    .frame(height: 110)
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 5)
+                            .stroke(Color(nsColor: .separatorColor), lineWidth: 1)
+                    )
+            }
+
+            if let failure {
+                Text(failure)
+                    .font(.system(size: 11))
+                    .foregroundColor(.red)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            HStack {
+                Text("A host is chosen for you.")
+                    .font(.system(size: 10))
+                    .foregroundColor(Color.secondary.opacity(0.8))
+                Spacer()
+                Button("Cancel", action: onClose)
+                    .keyboardShortcut(.cancelAction)
+                Button(isSending ? "Sending…" : "Delegate", action: send)
+                    .keyboardShortcut(.defaultAction)
+                    .disabled(isSending || title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+            }
+        }
+        .padding(18)
+        .frame(width: 420)
+        .onAppear { titleFocused = true }
+        .accessibilityIdentifier("sidebar.project.delegate")
+    }
+
+    private func send() {
+        guard let rootPath = target.rootPath else {
+            failure = "This project has no folder on this machine to delegate into."
+            return
+        }
+        isSending = true
+        failure = nil
+        Task {
+            do {
+                let coordinator = ReviewBoardCoordinatorService.shared
+                try await coordinator.delegate(
+                    projectRoot: rootPath,
+                    projectName: target.label,
+                    title: title.trimmingCharacters(in: .whitespacesAndNewlines),
+                    body: body_
+                )
+                await MainActor.run { onClose() }
+            } catch {
+                await MainActor.run {
+                    isSending = false
+                    // Placement fails for a reason worth reading — no host has
+                    // the project checked out, every host is full — so the
+                    // coordinator's own words go straight through.
+                    failure = error.localizedDescription
+                }
+            }
+        }
+    }
+}
+
+private struct SidebarPeerProjectGroup: Identifiable {
+    /// A project is a place work happens, not a place work is hosted, so the
+    /// same group holds workspaces from either side of the wire.
+    enum WorkspaceItem: Identifiable {
+        case local(Workspace)
+        case peer(host: HostEntry, workspace: WorkspaceSummary)
+
+        var id: String {
+            switch self {
+            case .local(let workspace):
+                return "local:\(workspace.id.uuidString)"
+            case .peer(let host, let workspace):
+                return "\(host.id):\(workspace.id.base64EncodedString())"
+            }
+        }
+
+        var isLocal: Bool {
+            if case .local = self { return true }
+            return false
+        }
+    }
+
+    let identity: PeerProjectIdentity
+    var items: [WorkspaceItem]
+
+    var id: String { identity.id }
+
+    /// Which sides of the wire this project spans — drives the header badges.
+    var spansLocal: Bool { items.contains { $0.isLocal } }
+    var spansPeer: Bool { items.contains { !$0.isLocal } }
+}
+
+/// Project-axis rendering of the peer section. Deliberately shows NOTHING but
+/// projects: a host that contributes no workspace has no place on this axis,
+/// and listing it here just reproduced the Host view one toggle away. Host
+/// lifecycle (connect, retry, edit, delete) lives in the Host view alone.
+private struct SidebarPeerProjectsView: View {
+    @EnvironmentObject private var tabManager: TabManager
+    @ObservedObject private var coordinator = ReviewBoardCoordinatorService.shared
+    let hosts: [HostEntry]
+    let store: RemoteHostStore
+    let usesSeparatedPresentation: Bool
+    let paneExpansionCommand: PeerPaneExpansionCommand
+    /// The same key the switch above writes, so the unassigned footer can send
+    /// the user to the view that actually lists those workspaces.
+    @AppStorage(SidebarAxisSettings.selectedAxisKey)
+    private var selectedAxisRaw = SidebarAxisSettings.defaultAxis.rawValue
+    /// Non-nil presents the delegate sheet.
+    @State private var delegateTarget: SidebarProjectDelegateTarget?
+    /// Non-nil presents the remote-agent sheet.
+    @State private var remoteAgentTarget: SidebarRemoteAgentTarget?
+    @State private var deletionTarget: SidebarProjectDeletionTarget?
+    @State private var deletionFailure: String?
+
+    private var connectedHosts: [HostEntry] {
+        hosts.filter { $0.isConnected && !$0.workspaces.isEmpty }
+    }
+
+    /// Every local workspace, paired with the project it belongs to — or an
+    /// unknown identity when it belongs to none. A peer mirror is excluded on
+    /// purpose: it is a view onto someone else's workspace, already
+    /// represented by that peer's own row, and counting it here would list one
+    /// remote workspace twice. Matches the rule the Local Workspaces section
+    /// applies (`SidebarPresentationSettings`).
+    ///
+    /// A local workspace naming no project is counted rather than listed: the
+    /// Host view already shows it under Workspaces, so a second copy here was
+    /// duplication. What it contributes is the footer's count — the one thing
+    /// the Host view cannot say from over there.
+    private var localMembers: [(Workspace, PeerProjectIdentity)] {
+        tabManager.tabs.compactMap { workspace in
+            guard !workspace.isPeerMirror else { return nil }
+            // A project that named itself is not up for reinterpretation. Only
+            // workspaces nobody declared fall through to the path rule.
+            let declared = WorkspaceProjectNames.shared.identity(for: workspace.id)
+            return (
+                workspace,
+                declared
+                    ?? projectIdentity(forWorkingDirectories: localWorkingDirectories(workspace))
+            )
+        }
+    }
+
+    private func localWorkingDirectories(_ workspace: Workspace) -> [String] {
+        let panelPaths = workspace.panelDirectories.values.filter { !$0.isEmpty }
+        if !panelPaths.isEmpty { return Array(panelPaths) }
+        return workspace.currentDirectory.isEmpty ? [] : [workspace.currentDirectory]
+    }
+
+    /// Split the connected roster into named projects and the leftovers.
+    /// A workspace whose panes do not name a project (a shell sitting in the
+    /// home directory, panes spread across unrelated trees) is NOT given a
+    /// group header — calling it a project would be a lie — and it is not
+    /// listed either: the Host view is where those live. Only the count
+    /// survives, so the axis admits what it is leaving out.
+    private var groupedWorkspaces: (
+        projects: [SidebarPeerProjectGroup],
+        unassigned: [SidebarPeerProjectGroup.WorkspaceItem]
+    ) {
+        var indexes: [PeerProjectIdentity: Int] = [:]
+        var groups: [SidebarPeerProjectGroup] = []
+        var unassigned: [SidebarPeerProjectGroup.WorkspaceItem] = []
+
+        func append(_ item: SidebarPeerProjectGroup.WorkspaceItem, to identity: PeerProjectIdentity) {
+            if let index = indexes[identity] {
+                groups[index].items.append(item)
+            } else {
+                indexes[identity] = groups.count
+                groups.append(SidebarPeerProjectGroup(identity: identity, items: [item]))
+            }
+        }
+
+        // Local first so a project the user is working on locally leads its
+        // own group instead of trailing the peers that joined it.
+        for (workspace, identity) in localMembers {
+            let item = SidebarPeerProjectGroup.WorkspaceItem.local(workspace)
+            guard !identity.isUnknown else {
+                unassigned.append(item)
+                continue
+            }
+            append(item, to: identity)
+        }
+        for host in connectedHosts {
+            for workspace in host.workspaces {
+                let identity = peerProjectIdentity(for: workspace.panes)
+                let item = SidebarPeerProjectGroup.WorkspaceItem.peer(
+                    host: host,
+                    workspace: workspace
+                )
+                guard !identity.isUnknown else {
+                    unassigned.append(item)
+                    continue
+                }
+                append(item, to: identity)
+            }
+        }
+        let sorted = groups.sorted {
+            $0.identity.label.localizedCaseInsensitiveCompare($1.identity.label) == .orderedAscending
+        }
+        return (sorted, unassigned)
+    }
+
+    @ViewBuilder
+    private func workspaceRow(
+        _ item: SidebarPeerProjectGroup.WorkspaceItem
+    ) -> some View {
+        switch item {
+        case .local(let workspace):
+            SidebarProjectLocalRowView(
+                workspace: workspace,
+                usesSeparatedPresentation: usesSeparatedPresentation
+            )
+        case .peer(let host, let workspace):
+            RemoteWorkspaceRowView(
+                workspace: workspace,
+                host: host,
+                store: store,
+                usesSeparatedPresentation: usesSeparatedPresentation,
+                paneExpansionCommand: paneExpansionCommand
+            )
+        }
+    }
+
+    /// `⌂` / `▣` badges telling, at a glance, whether a project lives here,
+    /// out there, or both — the question the Host axis used to answer by
+    /// nesting workspaces under a host.
+    @ViewBuilder
+    private func spanBadges(_ group: SidebarPeerProjectGroup) -> some View {
+        HStack(spacing: 3) {
+            if group.spansLocal {
+                Image(systemName: "house")
+                    .accessibilityLabel("Has local workspaces")
+            }
+            if group.spansPeer {
+                Image(systemName: "rectangle.inset.filled")
+                    .accessibilityLabel("Has peer workspaces")
+            }
+            // A leader on a peer machine can only be known through the
+            // coordinator; the local row's own star covers the local case.
+            if !group.spansLocal, coordinatorLeaderIdentities.contains(group.identity) {
+                Image(systemName: "star.fill")
+                    .foregroundColor(.orange)
+                    .accessibilityLabel("Team leader runs on a peer host")
+            }
+        }
+        .font(.system(size: 8))
+        .foregroundColor(Color.secondary.opacity(0.6))
+    }
+
+    private var coordinatorLeaderIdentities: Set<PeerProjectIdentity> {
+        coordinator.leaderProjectIdentities
+    }
+
+    /// The absolute path the coordinator will register this project under.
+    /// A project the sidebar groups purely from peer panes has no path this
+    /// machine can name, so delegation is offered only where one exists.
+    /// What can be done to a project, wherever it is right-clicked.
+    @ViewBuilder
+    private func projectActions(for group: SidebarPeerProjectGroup) -> some View {
+        Button("Delegate Work to \(group.identity.label)…") {
+            delegateTarget = SidebarProjectDelegateTarget(
+                label: group.identity.label,
+                rootPath: delegateRootPath(for: group)
+            )
+        }
+        .disabled(delegateRootPath(for: group) == nil)
+        // Under the delegate item because it answers the other half of the
+        // same question: that one asks what needs doing and lets the
+        // coordinator pick a machine, this one is for when the machine is
+        // the point.
+        Button("Add Agent on Another Machine…") {
+            remoteAgentTarget = SidebarRemoteAgentTarget(
+                projectLabel: group.identity.label,
+                teamName: teamName(for: group)
+            )
+        }
+        .disabled(teamName(for: group) == nil)
+        Divider()
+        Button("Delete Project…", role: .destructive) {
+            guard let teamName = teamName(for: group),
+                  let team = TeamOrchestrator.shared.teams[teamName]
+            else { return }
+            deletionTarget = SidebarProjectDeletionTarget(
+                label: group.identity.label,
+                teamName: teamName,
+                locations: team.remoteProjectLocations
+            )
+        }
+        .disabled(teamName(for: group) == nil)
+    }
+
+
+    /// The team running in this project on this machine, if there is one.
+    /// A remote member joins an existing team — there is no such thing as a
+    /// team with only a member somewhere else.
+    private func teamName(for group: SidebarPeerProjectGroup) -> String? {
+        let workspaceIDs = Set(group.items.compactMap { item -> UUID? in
+            guard case .local(let workspace) = item else { return nil }
+            return workspace.id
+        })
+        guard !workspaceIDs.isEmpty else { return nil }
+        return TeamOrchestrator.shared.teams.values
+            .first { workspaceIDs.contains($0.workspaceId) }?
+            .id
+    }
+
+    private func delegateRootPath(for group: SidebarPeerProjectGroup) -> String? {
+        for item in group.items {
+            guard case .local(let workspace) = item else { continue }
+            let directories = localWorkingDirectories(workspace)
+            if let root = directories.first(where: { !$0.isEmpty }) {
+                return root
+            }
+        }
+        return nil
+    }
+
+    var body: some View {
+        let grouped = groupedWorkspaces
+        return VStack(spacing: usesSeparatedPresentation ? 8 : 0) {
+            if grouped.projects.isEmpty {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("No projects yet")
+                        .font(.system(size: 10, weight: .semibold))
+                        .foregroundColor(.secondary)
+                    // The empty state is the only place this view mentions
+                    // hosts at all — without it a peerless Project view would
+                    // be a dead end with no route to connecting one. Once
+                    // there ARE workspaces the footer below already accounts
+                    // for them, so this line only has to say what to do next.
+                    Text(grouped.unassigned.isEmpty
+                         ? "Click + to start a project, or connect a peer in the Host view."
+                         : "Click + to start one.")
+                        .font(.system(size: 9))
+                        .foregroundColor(Color.secondary.opacity(0.72))
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.horizontal, 16)
+                .padding(.top, 6)
+                .padding(.bottom, 4)
+            }
+
+            ForEach(grouped.projects) { group in
+                VStack(spacing: 4) {
+                    HStack(spacing: 5) {
+                        Text(group.identity.label)
+                            .font(.system(size: 12, weight: .semibold))
+                            .foregroundColor(Color.primary.opacity(0.92))
+                            .lineLimit(1)
+                            .truncationMode(.tail)
+                            .accessibilityLabel("Project \(group.identity.label)")
+                        spanBadges(group)
+                        Spacer(minLength: 0)
+                    }
+                    .padding(.leading, 16)
+                    .padding(.trailing, 12)
+                    .padding(.top, 7)
+                    .padding(.bottom, 2)
+                    // Delegating from the project's own row means the target
+                    // is already chosen — nothing to pick again, nothing to
+                    // pick wrongly.
+                    .contentShape(Rectangle())
+                    .contextMenu { projectActions(for: group) }
+                    ForEach(group.items) { item in
+                        // The same two actions on the rows themselves. They
+                        // were on the group's header alone, which is a thin
+                        // grey label that does not read as a row — so the
+                        // menu was on the one thing nobody right-clicks,
+                        // while the workspace beneath it, which is what
+                        // people actually aim at, had nothing to say about
+                        // its own project.
+                        workspaceRow(item)
+                            .contextMenu { projectActions(for: group) }
+                    }
+                }
+            }
+
+            let remembered = ReviewBoardCoordinatorService.rememberedProjects(
+                knownHosts: coordinator.knownHosts,
+                sidebarHosts: hosts,
+                liveIdentities: Set(grouped.projects.map(\.identity))
+            )
+            ForEach(remembered, id: \.identity) { project in
+                rememberedProjectRow(project)
+            }
+
+            if !grouped.unassigned.isEmpty {
+                unassignedFooter(grouped.unassigned)
+            }
+        }
+        .sheet(item: $delegateTarget) { target in
+            SidebarProjectDelegateSheet(target: target) { delegateTarget = nil }
+        }
+        .sheet(item: $remoteAgentTarget) { target in
+            SidebarRemoteAgentSheet(target: target) { remoteAgentTarget = nil }
+        }
+        .alert(
+            "Delete “\(deletionTarget?.label ?? "Project")”?",
+            isPresented: Binding(
+                get: { deletionTarget != nil },
+                set: { if !$0 { deletionTarget = nil } }
+            ),
+            presenting: deletionTarget
+        ) { target in
+            Button("Delete Project", role: .destructive) {
+                deletionTarget = nil
+                Task { @MainActor in
+                    do {
+                        try await TeamOrchestrator.shared.deleteProject(
+                            teamName: target.teamName,
+                            tabManager: tabManager
+                        )
+                    } catch {
+                        deletionFailure = error.localizedDescription
+                    }
+                }
+            }
+            Button("Cancel", role: .cancel) { deletionTarget = nil }
+        } message: { target in
+            if target.locations.isEmpty {
+                Text("The project and its panes will close. Local folders are kept.")
+            } else {
+                let paths = target.locations
+                    .map { "\($0.hostKey): \($0.path)" }
+                    .joined(separator: "\n")
+                Text("The leader and agents will stop. These remote folders will be permanently deleted:\n\n\(paths)")
+            }
+        }
+        .alert(
+            "Couldn’t Delete Project",
+            isPresented: Binding(
+                get: { deletionFailure != nil },
+                set: { if !$0 { deletionFailure = nil } }
+            )
+        ) {
+            Button("OK") { deletionFailure = nil }
+        } message: {
+            Text(deletionFailure ?? "")
+        }
+    }
+
+    /// A project the coordinator remembers on a host that is currently off.
+    /// Dimmed, and not expandable — there is no live workspace to expand —
+    /// but clicking reconnects the machine it was last seen on, which is the
+    /// only useful action here.
+    private func rememberedProjectRow(
+        _ project: ReviewBoardCoordinatorService.RememberedProject
+    ) -> some View {
+        VStack(spacing: 4) {
+            HStack(spacing: 5) {
+                Text(project.identity.label)
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundColor(Color.secondary.opacity(0.68))
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+                Image(systemName: "clock.arrow.circlepath")
+                    .font(.system(size: 8))
+                    .foregroundColor(Color.secondary.opacity(0.45))
+                Spacer(minLength: 0)
+            }
+            .padding(.leading, 16)
+            .padding(.trailing, 12)
+            .padding(.top, 7)
+            .padding(.bottom, 2)
+
+            Button {
+                if let host = hosts.first(where: { $0.id == project.hostKey }) {
+                    store.connectSavedHost(host)
+                }
+            } label: {
+                HStack(spacing: 6) {
+                    Image(systemName: "bolt.horizontal.circle")
+                        .font(.system(size: 9))
+                    VStack(alignment: .leading, spacing: 1) {
+                        Text(project.hostDisplayName)
+                            .font(.system(size: 11))
+                            .lineLimit(1)
+                        Text("Last seen · not connected")
+                            .font(.system(size: 9))
+                            .lineLimit(1)
+                    }
+                    Spacer(minLength: 4)
+                }
+                .foregroundColor(Color.secondary.opacity(0.7))
+                .padding(.horizontal, 8)
+                .padding(.vertical, 4)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .padding(.horizontal, usesSeparatedPresentation ? 10 : 8)
+            .help("Reconnect \(project.hostDisplayName) to open \(project.identity.label)")
+            .accessibilityLabel("\(project.identity.label) on \(project.hostDisplayName), not connected")
+        }
+    }
+
+    /// What this axis is leaving out, in one line.
+    ///
+    /// These workspaces used to be listed here in an expandable section, which
+    /// was the Host view's roster reprinted under a heading saying the opposite
+    /// of what its rows are. The count still has to be said — a workspace
+    /// silently missing from the sidebar reads as lost — but saying it once,
+    /// next to the way to go and see them, does that job without turning the
+    /// project axis back into the host one.
+    private func unassignedFooter(
+        _ items: [SidebarPeerProjectGroup.WorkspaceItem]
+    ) -> some View {
+        let count = items.count
+        let noun = count == 1 ? "workspace" : "workspaces"
+        return Button {
+            selectedAxisRaw = SidebarAxis.host.rawValue
+        } label: {
+            HStack(spacing: 4) {
+                Text("\(count) \(noun) without a project")
+                    .font(.system(size: 9))
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+                Image(systemName: "chevron.right")
+                    .font(.system(size: 7, weight: .semibold))
+                Spacer(minLength: 0)
+            }
+            .foregroundColor(Color.secondary.opacity(0.6))
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .padding(.leading, 16)
+        .padding(.trailing, 12)
+        .padding(.top, 6)
+        .padding(.bottom, 1)
+        .accessibilityIdentifier("sidebar.projects.unassignedLink")
+        .accessibilityLabel("\(count) \(noun) without a project — show the Host view")
+        .help("Listed under Workspaces and Peer Hosts in the Host view")
+    }
+}
+
+/// A local workspace as it appears on the project axis. Deliberately NOT
+/// `TabItemView`: that row carries the local list's drag-reorder, multi-select
+/// and index bookkeeping, none of which mean anything under a project header
+/// (reordering across projects would be reordering across hosts). This row
+/// does the two things that do make sense here — show where it is working,
+/// and select it.
+private struct SidebarProjectLocalRowView: View {
+    @EnvironmentObject private var tabManager: TabManager
+    @ObservedObject private var orchestrator = TeamOrchestrator.shared
+    @ObservedObject var workspace: Workspace
+    let usesSeparatedPresentation: Bool
+    @State private var isHovering = false
+
+    private var isSelected: Bool { tabManager.selectedTabId == workspace.id }
+
+    /// The team whose leader pane lives in THIS workspace. In adopted mode the
+    /// leader sits in its own workspace, apart from the agents, so the leader
+    /// workspace takes precedence over the agent one.
+    private var ledTeamName: String? {
+        orchestrator.teams.values.first {
+            ($0.leaderWorkspaceId ?? $0.workspaceId) == workspace.id
+        }?.id
+    }
+
+    private var directoryName: String? {
+        let path = workspace.currentDirectory
+        guard !path.isEmpty else { return nil }
+        let name = (path as NSString).lastPathComponent
+        return name.isEmpty ? nil : name
+    }
+
+    private var background: Color {
+        if isSelected { return Color.accentColor.opacity(0.22) }
+        return isHovering ? Color.secondary.opacity(0.12) : Color.clear
+    }
+
+    var body: some View {
+        HStack(spacing: 6) {
+            Image(systemName: "house")
+                .font(.system(size: 9))
+                .foregroundColor(isSelected ? .primary : .secondary)
+                .accessibilityLabel("Local workspace")
+            VStack(alignment: .leading, spacing: 1) {
+                HStack(spacing: 4) {
+                    Text(workspace.title)
+                        .font(.system(size: 11.5))
+                        .foregroundColor(.primary)
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+                    // Where the leader sits is the first thing you need when a
+                    // project spans machines. Only local teams can be answered
+                    // today — a peer-hosted leader has no reporting path yet.
+                    if let ledTeamName {
+                        Image(systemName: "star.fill")
+                            .font(.system(size: 7))
+                            .foregroundColor(.orange)
+                            .help("Team leader: \(ledTeamName)")
+                            .accessibilityLabel("Team leader for \(ledTeamName)")
+                    }
+                }
+                if let directoryName {
+                    HStack(spacing: 4) {
+                        Image(systemName: "folder")
+                            .font(.system(size: 8))
+                        Text(directoryName)
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                    }
+                    .font(.system(size: 9))
+                    .foregroundColor(Color.secondary.opacity(0.75))
+                }
+            }
+            Spacer(minLength: 4)
+        }
+        .padding(.horizontal, 8)
+        .padding(.vertical, 4)
+        .background(
+            RoundedRectangle(cornerRadius: 6).fill(background)
+        )
+        .padding(.horizontal, usesSeparatedPresentation ? 10 : 8)
+        .contentShape(Rectangle())
+        .onHover { isHovering = $0 }
+        .onTapGesture { tabManager.selectedTabId = workspace.id }
+        .help(workspace.currentDirectory)
+        .accessibilityElement(children: .combine)
+        .accessibilityAddTraits(isSelected ? [.isButton, .isSelected] : .isButton)
+    }
+}
+
+private struct PeerShellCleanupSheet: View {
+    let hostName: String
+    var scopeName: String? = nil
+    let items: [TeamOrchestrator.PeerShellCleanupItem]
+    let isLoading: Bool
+    let error: String?
+    @Binding var selection: Set<Data>
+    let onRefresh: () -> Void
+    let onClose: () -> Void
+    @Environment(\.dismiss) private var dismiss
+
+    private var closeableCount: Int {
+        items.filter { $0.state != .inUse && !$0.isBusy }.count
+    }
+
+    /// Running and claimed panes are never bulk-close candidates. A person can
+    /// stop the process first and refresh; the cleanup flow itself stays safe.
+    private var closeableIDs: Set<Data> {
+        Set(items.filter { $0.state != .inUse && !$0.isBusy }.map(\.id))
+    }
+
+    private var allCloseableSelected: Bool {
+        !closeableIDs.isEmpty && closeableIDs.isSubset(of: selection)
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            HStack {
+                VStack(alignment: .leading, spacing: 3) {
+                    Text("Clean Up Panes")
+                        .font(.headline)
+                    Text([hostName, scopeName].compactMap { $0 }.joined(separator: " · "))
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                }
+                Spacer()
+                if isLoading {
+                    ProgressView()
+                        .controlSize(.small)
+                }
+            }
+
+            Text("Orphans and panes whose folder was deleted are selected automatically. Panes in use or running a command are always protected.")
+                .font(.caption)
+                .foregroundColor(.secondary)
+
+            if let error {
+                Text(error)
+                    .font(.caption)
+                    .foregroundColor(.red)
+            }
+
+            // A host accumulates a shell per project run, so the list is
+            // routinely dozens long and the automatic selection covers only the
+            // two states it can prove are dead. Clearing the rest one checkbox
+            // at a time is the whole reason this sheet felt unusable.
+            HStack(spacing: 10) {
+                Button(allCloseableSelected ? "Deselect All" : "Select All") {
+                    if allCloseableSelected {
+                        selection.subtract(closeableIDs)
+                    } else {
+                        selection.formUnion(closeableIDs)
+                    }
+                }
+                .disabled(closeableIDs.isEmpty || isLoading)
+                Text("\(selection.count) of \(closeableCount) selected")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+                Spacer()
+            }
+
+            List(items) { item in
+                HStack(spacing: 10) {
+                    Toggle("", isOn: Binding(
+                        get: { selection.contains(item.id) },
+                        set: { selected in
+                            if selected {
+                                selection.insert(item.id)
+                            } else {
+                                selection.remove(item.id)
+                            }
+                        }
+                    ))
+                    .labelsHidden()
+                    .disabled(item.state == .inUse || item.isBusy)
+
+                    VStack(alignment: .leading, spacing: 3) {
+                        HStack(spacing: 6) {
+                            Text(item.title.isEmpty ? "Shell" : item.title)
+                                .lineLimit(1)
+                            Text(item.idLabel)
+                                .font(.system(.caption2, design: .monospaced))
+                                .foregroundColor(.secondary)
+                        }
+                        Text(item.workingDirectory.isEmpty ? "Unknown folder" : item.workingDirectory)
+                            .font(.system(.caption, design: .monospaced))
+                            .foregroundColor(.secondary)
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                    }
+
+                    Spacer()
+                    if item.isBusy {
+                        Text("busy")
+                            .foregroundColor(.orange)
+                    }
+                    Text(stateLabel(item.state))
+                        .foregroundColor(stateColor(item.state))
+                }
+                .font(.caption)
+            }
+            .frame(minHeight: 300)
+
+            HStack {
+                Text("\(items.count) panes · \(closeableCount) safe to close")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+                Spacer()
+                Button("Refresh", action: onRefresh)
+                    .disabled(isLoading)
+                Button("Cancel") { dismiss() }
+                Button("Close \(selection.count) Panes", role: .destructive, action: onClose)
+                    .disabled(selection.isEmpty || isLoading)
+            }
+        }
+        .padding(18)
+        .frame(minWidth: 680, minHeight: 430)
+    }
+
+    private func stateLabel(_ state: TeamOrchestrator.PeerShellCleanupItem.State) -> String {
+        switch state {
+        case .inUse: return "in use"
+        case .managedOrphan: return "orphan"
+        case .missingDirectory: return "folder deleted"
+        case .unclaimed: return "unclaimed"
+        }
+    }
+
+    private func stateColor(_ state: TeamOrchestrator.PeerShellCleanupItem.State) -> Color {
+        switch state {
+        case .inUse: return .green
+        case .managedOrphan, .missingDirectory: return .orange
+        case .unclaimed: return .secondary
+        }
+    }
+}
+
 struct RemoteHostGroupView: View {
     @Environment(\.colorScheme) private var colorScheme
     let host: HostEntry
@@ -1008,6 +2156,11 @@ struct RemoteHostGroupView: View {
     @State private var showNewWorkspaceAlert = false
     @State private var newWorkspaceTitle = ""
     @State private var showForceDisconnectConfirm = false
+    @State private var showShellCleanup = false
+    @State private var shellCleanupItems: [TeamOrchestrator.PeerShellCleanupItem] = []
+    @State private var shellCleanupSelection = Set<Data>()
+    @State private var shellCleanupLoading = false
+    @State private var shellCleanupError: String?
 
     init(host: HostEntry, store: RemoteHostStore,
          usesSeparatedPresentation: Bool,
@@ -1029,16 +2182,29 @@ struct RemoteHostGroupView: View {
            let profile = PeerHostProfileStore.shared.profile(id: profileID) {
             Divider()
             Button("Edit…") {
-                onEdit(PeerHostEditorContext(profile: profile, isNew: false))
+                Task { @MainActor in
+                    // Let AppKit finish its nested context-menu event loop
+                    // before presenting a SwiftUI sheet. Presenting inline
+                    // re-enters AttributeGraph while the menu is still
+                    // tracking and can spin the main thread indefinitely.
+                    try? await Task.sleep(nanoseconds: 50_000_000)
+                    onEdit(PeerHostEditorContext(profile: profile, isNew: false))
+                }
             }
             Button("Delete…", role: .destructive) {
-                showDeleteConfirm = true
+                Task { @MainActor in
+                    try? await Task.sleep(nanoseconds: 50_000_000)
+                    showDeleteConfirm = true
+                }
             }
         } else if let draft = store.profileDraft(for: host) {
             // Ad-hoc SSH connection → offer promotion to a saved host.
             Divider()
             Button("Save as Host…") {
-                onEdit(PeerHostEditorContext(profile: draft, isNew: true))
+                Task { @MainActor in
+                    try? await Task.sleep(nanoseconds: 50_000_000)
+                    onEdit(PeerHostEditorContext(profile: draft, isNew: true))
+                }
             }
         }
     }
@@ -1220,6 +2386,21 @@ struct RemoteHostGroupView: View {
             .accessibilityLabel(isExpanded ? "Collapse \(host.displayName)" : "Expand \(host.displayName)")
             .help(isExpanded ? "Collapse \(host.displayName)" : "Expand \(host.displayName)")
 
+            if host.isConnected {
+                Button {
+                    showShellCleanup = true
+                    Task { await loadShellCleanup() }
+                } label: {
+                    Image(systemName: "eraser")
+                        .font(.system(size: 8, weight: .semibold))
+                        .foregroundColor(.secondary)
+                        .frame(width: 16, height: 16)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .help("Clean Up Panes…")
+            }
+
             if host.isConnected, host.supportsWorkspaceLifecycle == true {
                 Button {
                     newWorkspaceTitle = ""
@@ -1257,16 +2438,29 @@ struct RemoteHostGroupView: View {
                 Button("Open Surface as Pane…") {
                     store.openSurfaceAsPane(host)
                 }
+                Button("Clean Up Panes…") {
+                    Task { @MainActor in
+                        try? await Task.sleep(nanoseconds: 50_000_000)
+                        showShellCleanup = true
+                        await loadShellCleanup()
+                    }
+                }
                 Button("New Workspace…") {
-                    newWorkspaceTitle = ""
-                    showNewWorkspaceAlert = true
+                    Task { @MainActor in
+                        try? await Task.sleep(nanoseconds: 50_000_000)
+                        newWorkspaceTitle = ""
+                        showNewWorkspaceAlert = true
+                    }
                 }
                 .disabled(host.supportsWorkspaceLifecycle != true)
                 if store.hasSidebarLease(for: host.id) {
                     Button("Disconnect") { store.disconnectSavedHost(host) }
                 }
                 Button("Force Disconnect (Close All Panes)…") {
-                    showForceDisconnectConfirm = true
+                    Task { @MainActor in
+                        try? await Task.sleep(nanoseconds: 50_000_000)
+                        showForceDisconnectConfirm = true
+                    }
                 }
             case .connecting:
                 Button("Cancel Connection") { store.cancelConnectingHost(host) }
@@ -1390,6 +2584,21 @@ struct RemoteHostGroupView: View {
         } message: {
             Text("Creates a new workspace on \"\(host.displayName)\".")
         }
+        .sheet(isPresented: $showShellCleanup) {
+            PeerShellCleanupSheet(
+                hostName: host.displayName,
+                items: shellCleanupItems,
+                isLoading: shellCleanupLoading,
+                error: shellCleanupError,
+                selection: $shellCleanupSelection,
+                onRefresh: {
+                    Task { await loadShellCleanup() }
+                },
+                onClose: {
+                    Task { await closeSelectedShells() }
+                }
+            )
+        }
         .padding(.horizontal, usesSeparatedPresentation ? 0 : 6)
         .onChange(of: isExpanded) { newValue in
             SidebarLayoutSettings.setHostCollapsed(host.id, !newValue)
@@ -1397,6 +2606,50 @@ struct RemoteHostGroupView: View {
         .onChange(of: store.expandSignal) { signal in
             if signal.key == host.id { isExpanded = true }
         }
+    }
+
+    @MainActor
+    private func loadShellCleanup() async {
+        shellCleanupLoading = true
+        shellCleanupError = nil
+        do {
+            let items = try await TeamOrchestrator.shared.inspectPeerShells(host: host)
+            shellCleanupItems = items
+            shellCleanupSelection = Set(items.compactMap { item in
+                guard !item.isBusy else { return nil }
+                switch item.state {
+                case .managedOrphan, .missingDirectory: return item.id
+                case .inUse, .unclaimed: return nil
+                }
+            })
+        } catch {
+            shellCleanupItems = []
+            shellCleanupSelection = []
+            shellCleanupError = String(describing: error)
+        }
+        shellCleanupLoading = false
+    }
+
+    @MainActor
+    private func closeSelectedShells() async {
+        shellCleanupLoading = true
+        shellCleanupError = nil
+        do {
+            _ = try await TeamOrchestrator.shared.closePeerShells(
+                host: host,
+                surfaceIDs: shellCleanupSelection
+            )
+            shellCleanupItems.removeAll { shellCleanupSelection.contains($0.id) }
+            shellCleanupSelection = []
+        } catch {
+            // Part of the sweep may have landed before the failure, so the list
+            // on screen no longer describes the host. Re-read it, then restore
+            // the message the refresh clears on its way in.
+            let message = String(describing: error)
+            await loadShellCleanup()
+            shellCleanupError = message
+        }
+        shellCleanupLoading = false
     }
 }
 
@@ -1423,6 +2676,11 @@ struct RemoteWorkspaceRowView: View {
     @State private var isRenaming = false
     @State private var renameTitle = ""
     @State private var showDeleteConfirm = false
+    @State private var showShellCleanup = false
+    @State private var shellCleanupItems: [TeamOrchestrator.PeerShellCleanupItem] = []
+    @State private var shellCleanupSelection = Set<Data>()
+    @State private var shellCleanupLoading = false
+    @State private var shellCleanupError: String?
     @State private var panesExpanded = false
     @State private var manuallyCollapsedWhileSelected = false
     @FocusState private var renameFieldFocused: Bool
@@ -1430,10 +2688,12 @@ struct RemoteWorkspaceRowView: View {
     private var canManage: Bool { host.supportsWorkspaceLifecycle == true }
 
     private var mirroredWorkspace: Workspace? {
+        // App-wide on purpose: one app holds one view of a host workspace,
+        // so the row reads "open" in every window and clicking it goes to
+        // wherever that view lives.
         PeerClientCoordinator.shared.mirroredWorkspace(
             forHostKey: host.paneHostSpec.hostKey,
-            hostWorkspaceID: workspace.id,
-            in: tabManager
+            hostWorkspaceID: workspace.id
         )
     }
 
@@ -1821,6 +3081,10 @@ struct RemoteWorkspaceRowView: View {
             // live, users read the near-identical workspace as a broken
             // mirror. The code path stays for a future, clearer surface.
             Divider()
+            Button("Clean Up Panes…") {
+                showShellCleanup = true
+                Task { await loadShellCleanup() }
+            }
             // Rename opens Finder-style inline edit (no modal). Always
             // shown, disabled when the host hasn't negotiated
             // workspace.lifecycle.v1 — keeps the menu shape stable.
@@ -1870,5 +3134,65 @@ struct RemoteWorkspaceRowView: View {
                  ? "All panes on the host for this workspace are closed. This is the default workspace — another one is promoted in its place."
                  : "All panes on the host for this workspace are closed.")
         }
+        .sheet(isPresented: $showShellCleanup) {
+            PeerShellCleanupSheet(
+                hostName: host.displayName,
+                scopeName: workspace.title,
+                items: shellCleanupItems,
+                isLoading: shellCleanupLoading,
+                error: shellCleanupError,
+                selection: $shellCleanupSelection,
+                onRefresh: {
+                    Task { await loadShellCleanup() }
+                },
+                onClose: {
+                    Task { await closeSelectedShells() }
+                }
+            )
+        }
+    }
+
+    @MainActor
+    private func loadShellCleanup() async {
+        shellCleanupLoading = true
+        shellCleanupError = nil
+        do {
+            let items = try await TeamOrchestrator.shared.inspectPeerShells(
+                host: host,
+                workspaceID: workspace.id
+            )
+            shellCleanupItems = items
+            shellCleanupSelection = Set(items.compactMap { item in
+                guard !item.isBusy else { return nil }
+                switch item.state {
+                case .managedOrphan, .missingDirectory: return item.id
+                case .inUse, .unclaimed: return nil
+                }
+            })
+        } catch {
+            shellCleanupItems = []
+            shellCleanupSelection = []
+            shellCleanupError = String(describing: error)
+        }
+        shellCleanupLoading = false
+    }
+
+    @MainActor
+    private func closeSelectedShells() async {
+        shellCleanupLoading = true
+        shellCleanupError = nil
+        do {
+            _ = try await TeamOrchestrator.shared.closePeerShells(
+                host: host,
+                surfaceIDs: shellCleanupSelection
+            )
+            shellCleanupItems.removeAll { shellCleanupSelection.contains($0.id) }
+            shellCleanupSelection = []
+        } catch {
+            let message = String(describing: error)
+            await loadShellCleanup()
+            shellCleanupError = message
+        }
+        shellCleanupLoading = false
     }
 }

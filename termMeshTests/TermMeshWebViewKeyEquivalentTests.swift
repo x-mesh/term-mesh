@@ -794,6 +794,47 @@ final class BrowserDeveloperToolsShortcutDefaultsTests: XCTestCase {
 }
 
 final class WorkspaceRenameShortcutDefaultsTests: XCTestCase {
+    func testNewProjectShortcutDefaultsToControlOptionCommandN() {
+        XCTAssertEqual(KeyboardShortcutSettings.Action.newProject.label, "New Project")
+        XCTAssertEqual(
+            KeyboardShortcutSettings.Action.newProject.defaultsKey,
+            "shortcut.newProject"
+        )
+
+        let shortcut = KeyboardShortcutSettings.Action.newProject.defaultShortcut
+        XCTAssertEqual(shortcut.key, "n")
+        XCTAssertTrue(shortcut.command)
+        XCTAssertTrue(shortcut.option)
+        XCTAssertFalse(shortcut.shift)
+        XCTAssertTrue(shortcut.control)
+    }
+
+    @MainActor
+    func testNewProjectShortcutMatchesPhysicalNKeyUnderKoreanInputSource() {
+        _ = NSApplication.shared
+        let app = AppDelegate()
+        let event = NSEvent.keyEvent(
+            with: .keyDown,
+            location: .zero,
+            modifierFlags: [.command, .option, .control],
+            timestamp: ProcessInfo.processInfo.systemUptime,
+            windowNumber: 0,
+            context: nil,
+            characters: "ㅜ",
+            charactersIgnoringModifiers: "ㅜ",
+            isARepeat: false,
+            keyCode: 45
+        )
+
+        XCTAssertNotNil(event)
+        XCTAssertTrue(
+            app.matchShortcut(
+                event: event!,
+                shortcut: KeyboardShortcutSettings.Action.newProject.defaultShortcut
+            )
+        )
+    }
+
     func testRenameTabShortcutDefaultsAndMetadata() {
         XCTAssertEqual(KeyboardShortcutSettings.Action.renameTab.label, "Rename Tab")
         XCTAssertEqual(KeyboardShortcutSettings.Action.renameTab.defaultsKey, "shortcut.renameTab")
@@ -2114,7 +2155,7 @@ final class SidebarBranchLayoutSettingsTests: XCTestCase {
 }
 
 final class SidebarPresentationSettingsTests: XCTestCase {
-    func testSeparatedSectionsAreDisabledByDefault() {
+    func testSeparatedSectionsAreEnabledByDefault() {
         let suiteName = "SidebarPresentationSettingsTests.Default.\(UUID().uuidString)"
         guard let defaults = UserDefaults(suiteName: suiteName) else {
             XCTFail("Failed to create isolated UserDefaults suite")
@@ -2123,7 +2164,7 @@ final class SidebarPresentationSettingsTests: XCTestCase {
         defer { defaults.removePersistentDomain(forName: suiteName) }
 
         XCTAssertNil(defaults.object(forKey: SidebarPresentationSettings.separatedSectionsEnabledKey))
-        XCTAssertFalse(SidebarPresentationSettings.usesSeparatedSections(defaults: defaults))
+        XCTAssertTrue(SidebarPresentationSettings.usesSeparatedSections(defaults: defaults))
     }
 
     func testStoredPreferencePersistsAcrossDefaultsInstances() {
@@ -6120,6 +6161,52 @@ final class TerminalControllerSidebarDedupeTests: XCTestCase {
             TerminalController.normalizeReportedDirectory("  file://bad host  "),
             "file://bad host"
         )
+    }
+}
+
+final class TerminalControllerRemoteAgentAddTests: XCTestCase {
+    private let hosts = [
+        (key: "ssh:root@jw-server", displayName: "Build Server", sshTarget: Optional("root@jw-server"))
+    ]
+
+    func testHostResolutionAcceptsKeyDisplayNameFullTargetAndHostname() {
+        for input in ["ssh:root@jw-server", "build server", "root@jw-server", "jw-server"] {
+            XCTAssertEqual(
+                TerminalController.remoteAgentHostKey(for: input, candidates: hosts),
+                "ssh:root@jw-server"
+            )
+        }
+    }
+
+    func testHostResolutionRejectsUnknownName() {
+        XCTAssertNil(TerminalController.remoteAgentHostKey(for: "other", candidates: hosts))
+    }
+
+    func testUnknownHostErrorListsUsableConnectedKeys() {
+        XCTAssertEqual(
+            TerminalController.remoteAgentHostNotFoundMessage(
+                input: "other",
+                connectedKeys: ["ssh:root@jw-server", "ssh:builder@mac-mini"]
+            ),
+            "no connected host named other; connected host keys: "
+                + "ssh:root@jw-server, ssh:builder@mac-mini"
+        )
+    }
+
+    func testRemoteAgentResponseUsesActualCheckoutAndReportsReuse() {
+        let isolated = TerminalController.remoteAgentResponseWorkingDirectory(
+            requested: "/app/tm-projects/term-mesh-reviewer-260729-c741",
+            memberWorkingDirectory: "/app/tm-projects/term-mesh-fixer-260729-b4c7"
+        )
+        XCTAssertEqual(isolated.directory, "/app/tm-projects/term-mesh-fixer-260729-b4c7")
+        XCTAssertFalse(isolated.reused)
+
+        let reused = TerminalController.remoteAgentResponseWorkingDirectory(
+            requested: "/app/tm-projects/term-mesh-reviewer-260729-c741",
+            memberWorkingDirectory: nil
+        )
+        XCTAssertEqual(reused.directory, "/app/tm-projects/term-mesh-reviewer-260729-c741")
+        XCTAssertTrue(reused.reused)
     }
 }
 

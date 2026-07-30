@@ -10,11 +10,15 @@
 import Foundation
 
 enum PeerHostTestResult: Equatable {
-    /// SSH + daemon socket both reachable.
+    /// SSH tunnel + peer protocol handshake both succeeded.
     case ok(socketPath: String)
     /// SSH reached the host but no live peer socket was found —
     /// term-meshd is likely not installed/running. Install is offered.
     case daemonMissing
+    /// A socket file exists, but the SSH forward or peer protocol handshake
+    /// could not reach a live compatible server. Kept separate from
+    /// `sshFailed` so a stale socket never produces a false-green result.
+    case relayFailed(socketPath: String, message: String)
     /// SSH itself failed (auth, DNS, timeout…).
     case sshFailed(String)
 }
@@ -293,24 +297,73 @@ enum PeerHostDoctor {
         return summary
     }
 
-    /// Test reachability: SSH + peer-socket presence. An explicit
-    /// `remoteSocket` is NOT trusted blindly — the probe checks the
-    /// default candidates, which covers the explicit path's host too;
-    /// what matters here is "is a daemon listening", not path equality.
+    /// Test the connection path an actual remote pane uses:
+    /// SSH → remote socket → local Unix-socket forward → peer handshake.
+    ///
+    /// Socket discovery alone is intentionally not considered success.
+    /// `[ -S ]` also matches a stale filesystem entry; only a completed
+    /// protocol handshake proves that the relay route is usable.
     static func test(
         sshTarget: String,
         port: Int?,
-        identityFile: String?
+        identityFile: String?,
+        remoteSocket: String? = nil
     ) async -> PeerHostTestResult {
+        let socketPath: String
         do {
-            let path = try await PeerSocketProber.probe(
-                sshTarget: sshTarget, port: port, identityFile: identityFile
-            )
-            return .ok(socketPath: path)
+            if let explicit = remoteSocket?
+                .trimmingCharacters(in: .whitespacesAndNewlines),
+               !explicit.isEmpty {
+                try PeerSSHTunnel.validateRemoteSockPath(explicit)
+                // A custom socket may sit outside every auto-detect
+                // candidate. Run discovery only as an SSH reachability
+                // check: `noSocketFound` still proves SSH worked, while
+                // auth/DNS/timeout failures remain correctly classified
+                // as SSH failures instead of relay failures.
+                do {
+                    _ = try await PeerSocketProber.probe(
+                        sshTarget: sshTarget, port: port,
+                        identityFile: identityFile
+                    )
+                } catch PeerSocketProbeError.noSocketFound {
+                    // Expected for a valid custom path.
+                }
+                socketPath = explicit
+            } else {
+                socketPath = try await PeerSocketProber.probe(
+                    sshTarget: sshTarget, port: port, identityFile: identityFile
+                )
+            }
         } catch PeerSocketProbeError.noSocketFound {
             return .daemonMissing
         } catch {
             return .sshFailed(String(describing: error))
+        }
+
+        let tunnel = PeerSSHTunnel(
+            sshTarget: sshTarget,
+            remoteSockPath: socketPath,
+            port: port,
+            identityFile: identityFile
+        )
+        do {
+            try await tunnel.start()
+            let connection = try await PeerRelaySession.connect(
+                hostSockPath: tunnel.localSockPath
+            )
+            await connection.cancel()
+            tunnel.stop()
+            RemoteWorkLog.debugOffMain(
+                "Relay health check passed for \(sshTarget) via \(socketPath)"
+            )
+            return .ok(socketPath: socketPath)
+        } catch {
+            tunnel.stop()
+            let message = String(describing: error)
+            RemoteWorkLog.infoOffMain(
+                "Relay health check failed for \(sshTarget) via \(socketPath): \(message)"
+            )
+            return .relayFailed(socketPath: socketPath, message: message)
         }
     }
 

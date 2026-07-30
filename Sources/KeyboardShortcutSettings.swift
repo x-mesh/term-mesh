@@ -8,6 +8,7 @@ enum KeyboardShortcutSettings {
         case toggleSidebar
         case newTab
         case newWindow
+        case newProject
         case closeWindow
         case showNotifications
         case jumpToUnread
@@ -54,6 +55,7 @@ enum KeyboardShortcutSettings {
             case .toggleSidebar: return "Toggle Sidebar"
             case .newTab: return "New Workspace"
             case .newWindow: return "New Window"
+            case .newProject: return "New Project"
             case .closeWindow: return "Close Window"
             case .showNotifications: return "Show Notifications"
             case .jumpToUnread: return "Jump to Latest Unread"
@@ -90,6 +92,7 @@ enum KeyboardShortcutSettings {
             case .toggleSidebar: return "shortcut.toggleSidebar"
             case .newTab: return "shortcut.newTab"
             case .newWindow: return "shortcut.newWindow"
+            case .newProject: return "shortcut.newProject"
             case .closeWindow: return "shortcut.closeWindow"
             case .showNotifications: return "shortcut.showNotifications"
             case .jumpToUnread: return "shortcut.jumpToUnread"
@@ -129,6 +132,8 @@ enum KeyboardShortcutSettings {
                 return StoredShortcut(key: "n", command: true, shift: false, option: false, control: false)
             case .newWindow:
                 return StoredShortcut(key: "n", command: true, shift: true, option: false, control: false)
+            case .newProject:
+                return StoredShortcut(key: "n", command: true, shift: false, option: true, control: true)
             case .closeWindow:
                 return StoredShortcut(key: "w", command: true, shift: false, option: false, control: true)
             case .showNotifications:

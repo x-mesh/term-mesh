@@ -24,15 +24,36 @@ struct WorkspaceSummary: Identifiable, Equatable {
     /// running). 0 on hosts that predate the `busy` field.
     let busyCount: Int
     /// Left-to-right pane inventory for the sidebar's expandable detail.
-    /// Only the final cwd component is retained so the UI never exposes a
-    /// remote host's full path.
+    /// Retains the full remote cwd for project grouping while the visible
+    /// pane detail label stays shortened to the final path component.
     let panes: [RemotePaneSummary]
+}
+
+/// An agent team running on a peer host. A team is invisible in the layout
+/// tree — which pane leads which work is not a fact about how panes are
+/// arranged — so this arrives over its own RPC and is the only way to know
+/// where a project's leader sits on a machine that is not this one.
+struct RemoteTeamSummary: Identifiable, Equatable {
+    let name: String
+    let teamUUID: String
+    let workingDirectory: String
+    /// Repository root the host resolved for `workingDirectory`, empty when
+    /// the team was not created inside one.
+    let projectRootPath: String?
+    let agentNames: [String]
+
+    var id: String { teamUUID.isEmpty ? name : teamUUID }
 }
 
 struct RemotePaneSummary: Identifiable, Equatable {
     let id: Data
     let title: String
+    let workingDirectoryPath: String?
     let workingDirectoryName: String?
+    /// Repository root the host resolved for this pane, when it reported one.
+    /// nil on hosts predating the field — project grouping then falls back to
+    /// guessing from the cwd.
+    let projectRootPath: String?
     let tabCount: Int
     let columns: Int
     let rows: Int
@@ -57,7 +78,9 @@ func peerPaneSummaries(
             return [RemotePaneSummary(
                 id: pane.surfaceID,
                 title: pane.title.isEmpty ? "Shell" : pane.title,
+                workingDirectoryPath: pane.cwd.isEmpty ? nil : pane.cwd,
                 workingDirectoryName: shortDirectoryName(pane.cwd),
+                projectRootPath: pane.projectRoot.isEmpty ? nil : pane.projectRoot,
                 tabCount: max(pane.tabs.count, 1),
                 columns: Int(pane.cols),
                 rows: Int(pane.rows),
@@ -131,6 +154,159 @@ func groupWorkspacesByWindow<T>(
     return groups
 }
 
+struct PeerProjectIdentity: Identifiable, Equatable, Hashable {
+    let key: String
+    let label: String
+    let isUnknown: Bool
+
+    var id: String { key }
+
+    static let unknown = PeerProjectIdentity(
+        key: "unknown",
+        label: "Unknown Project",
+        isUnknown: true
+    )
+}
+
+/// What the whole sidebar is organised by. This began as a grouping control
+/// inside the Peer Hosts section, which is why the stored key still says so —
+/// but a control that only regrouped peers while the local sections stayed put
+/// read as a global switch and behaved as a local one. The two are now
+/// alternative views of everything: Host answers "which machine is this on",
+/// Project answers "what is this work part of".
+enum SidebarAxis: String, CaseIterable, Identifiable {
+    case host
+    case project
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .host: return "Host"
+        case .project: return "Project"
+        }
+    }
+
+    var accessibilityDescription: String {
+        switch self {
+        case .host: return "Group the sidebar by machine"
+        case .project: return "Group the sidebar by project"
+        }
+    }
+}
+
+enum SidebarAxisSettings {
+    /// Off pins the sidebar to Host and hides the switch entirely — the
+    /// escape hatch from when the Project view was new.
+    static let featureFlagKey = "sidebar.peerHosts.groupingControl.enabled"
+    /// Deliberately still the old key: the stored values (`host` / `project`)
+    /// did not change, and renaming it would silently reset every existing
+    /// install to the default for no gain.
+    static let selectedAxisKey = "sidebar.peerHosts.groupingMode"
+    static let defaultAxis = SidebarAxis.host
+
+    static func axis(from raw: String) -> SidebarAxis {
+        SidebarAxis(rawValue: raw) ?? defaultAxis
+    }
+}
+
+func peerProjectIdentity(for panes: [RemotePaneSummary]) -> PeerProjectIdentity {
+    // A reported repo root is an answer, not a guess, so it wins outright.
+    // With real roots in hand a majority vote is meaningful: panes in two
+    // repos genuinely put the workspace in the one it mostly works on,
+    // whereas voting on cwds would be voting on subdirectory names.
+    let roots = panes.compactMap(\.projectRootPath)
+    if let winner = mostCommonProjectRoot(roots) {
+        return projectIdentity(forWorkingDirectories: [winner])
+    }
+    return projectIdentity(forWorkingDirectories: panes.compactMap(\.workingDirectoryPath))
+}
+
+/// The repo root most panes report, ties going to the leftmost pane.
+/// nil when no pane reported one (a host predating `project_root`).
+private func mostCommonProjectRoot(_ roots: [String]) -> String? {
+    var counts: [String: Int] = [:]
+    var order: [String] = []
+    for root in roots.compactMap(peerNormalizeRemotePath) {
+        if counts[root] == nil { order.append(root) }
+        counts[root, default: 0] += 1
+    }
+    guard var best = order.first else { return nil }
+    for root in order.dropFirst() where counts[root, default: 0] > counts[best, default: 0] {
+        best = root
+    }
+    return best
+}
+
+/// Project identity for a set of working directories, whatever produced them
+/// — peer pane cwds off the wire, or a local workspace's panel directories.
+/// Both axes must agree on what counts as a project, or the same checkout
+/// would group differently depending on which side reported it.
+func projectIdentity(forWorkingDirectories rawPaths: [String]) -> PeerProjectIdentity {
+    let paths = rawPaths.compactMap(peerNormalizeRemotePath)
+    guard !paths.isEmpty else { return .unknown }
+
+    // Panes working in unrelated trees collapse the common ancestor up to a
+    // home or a system root, which is NOT a project — a peer shelling in
+    // `/root` would otherwise surface a bogus "root" project grouping every
+    // one of its workspaces. Refusing to name it leaves the workspace
+    // unassigned, which is the honest answer: cwd alone cannot tell us where
+    // the project root is (that needs the host's git root — see `docs/`).
+    let root = peerCommonProjectPath(paths)
+    guard peerPathNamesProject(root),
+          let name = root.split(separator: "/").last.map(String.init),
+          !name.isEmpty else {
+        return .unknown
+    }
+    // Keyed by folder name, not by absolute path: the same project checked
+    // out at `~/work/project/term-mesh` locally and `/root/term-mesh` on a
+    // peer is ONE project, and a path key would split it in two.
+    return PeerProjectIdentity(
+        key: "name:\(name.lowercased())",
+        label: name,
+        isUnknown: false
+    )
+}
+
+/// Path prefixes that only ever contain homes or system state, so their
+/// direct children name a user or a mount rather than a project.
+/// `/root/term-mesh` still qualifies — `root` here IS the home, not a prefix.
+private let peerNonProjectPrefixes: Set<String> = [
+    "Users", "home", "private", "var", "tmp", "mnt", "media", "Volumes",
+]
+
+/// Whether a normalized absolute path's last component can stand for a
+/// project. Rejects `/`, any bare top-level directory (`/root`, `/tmp`), and
+/// a home directory itself (`/Users/jinwoo`, `/home/ubuntu`).
+private func peerPathNamesProject(_ path: String) -> Bool {
+    let parts = path.split(separator: "/").map(String.init)
+    guard parts.count >= 2 else { return false }
+    if parts.count == 2, peerNonProjectPrefixes.contains(parts[0]) { return false }
+    return true
+}
+
+private func peerNormalizeRemotePath(_ path: String) -> String? {
+    let trimmed = path.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !trimmed.isEmpty else { return nil }
+    let unified = trimmed.replacingOccurrences(of: "\\", with: "/")
+    let parts = unified
+        .split(separator: "/", omittingEmptySubsequences: true)
+        .map(String.init)
+        .filter { $0 != "." }
+    guard !parts.isEmpty else { return "/" }
+    return "/" + parts.joined(separator: "/")
+}
+
+private func peerCommonProjectPath(_ paths: [String]) -> String {
+    guard var common = paths.first?.split(separator: "/").map(String.init) else { return "/" }
+    for path in paths.dropFirst() {
+        let parts = path.split(separator: "/").map(String.init)
+        common = Array(zip(common, parts).prefix { $0 == $1 }.map { $0.0 })
+        if common.isEmpty { return "/" }
+    }
+    return "/" + common.joined(separator: "/")
+}
+
 /// Sidebar-visible lifecycle of a host entry. `saved` covers both a
 /// never-connected profile and a disconnected one; `failed` carries the
 /// short reason shown inline (row icon + tooltip — never an NSAlert,
@@ -147,6 +323,9 @@ struct HostEntry: Identifiable {
     var displayName: String
     var connectionState: HostConnectionState
     var workspaces: [WorkspaceSummary]
+    /// Agent teams the host reported, empty on hosts predating
+    /// `team.roster.v1` or running none.
+    var teams: [RemoteTeamSummary] = []
     /// The most-recently-used ephemeral sock path. Updated on each reconnect so
     /// that fetchWorkspaces always connects over the current live tunnel.
     var activeSockPath: String
@@ -220,6 +399,10 @@ final class RemoteHostStore: ObservableObject {
 
     private var observer: NSObjectProtocol?
     private var fetchTasks: [String: Task<Void, Never>] = [:]
+    /// One long-lived, receive-only roster stream per sidebar host. It never
+    /// shares a session with a response-waiting RPC: `WorkspaceListChanged`
+    /// frames are pushed asynchronously and PeerSession has one reader.
+    private var rosterSubscriptionTasks: [String: Task<Void, Never>] = [:]
     /// Sidebar-held lease per host key: one ref that keeps the tunnel
     /// alive while the user browses workspaces. Panes/mirrors opened
     /// from here hold their own refs, so a sidebar disconnect never
@@ -280,7 +463,7 @@ final class RemoteHostStore: ObservableObject {
                     workspaces: [],
                     activeSockPath: "",
                     sshTarget: p.sshTarget,
-                    remoteSockPath: p.remoteSocket.isEmpty ? nil : p.remoteSocket,
+                    remoteSockPath: p.connectionSocket,
                     sshPort: p.sshPort,
                     identityFile: p.identityFile,
                     profileID: p.id,
@@ -294,16 +477,16 @@ final class RemoteHostStore: ObservableObject {
                 hosts[key]?.symbolName = p.symbolName
                 hosts[key]?.sshPort = p.sshPort
                 hosts[key]?.identityFile = p.identityFile
-                // A non-empty profile socket is the user's explicit choice
-                // and must WIN over whatever this row cached from an earlier
-                // resolution — the old nil-only fill meant editing the
-                // socket path in the profile editor never reached the
-                // sidebar row, which kept tunneling to the stale path.
-                // An empty profile socket means auto-detect: keep the
-                // resolved path so reconnects skip a redundant probe.
-                if !p.remoteSocket.isEmpty {
-                    hosts[key]?.remoteSockPath = p.remoteSocket
-                }
+                // A coordinator-discovered row may predate its saved profile
+                // and therefore have no SSH route. Keep the route in sync too:
+                // placement pickers intentionally hide entries that cannot be
+                // reached over SSH to prepare their project checkout.
+                hosts[key]?.sshTarget = p.sshTarget
+                // Always replace the row's route from the profile. This is
+                // what makes clearing an explicit socket observable: upsert
+                // invalidates `lastResolvedSocket`, so this assignment turns
+                // the old row cache into nil and the next connect probes.
+                hosts[key]?.remoteSockPath = p.connectionSocket
             }
         }
         for (key, entry) in hosts where entry.profileID != nil && !profileKeys.contains(key) {
@@ -543,6 +726,7 @@ final class RemoteHostStore: ObservableObject {
         connectingLeaseKeys[key] = nil
         fetchTasks[key]?.cancel()
         fetchTasks[key] = nil
+        stopWorkspaceSubscription(for: key)
         hosts[key]?.workspaces = []
         hosts[key]?.activeSockPath = ""
         hosts[key]?.supportsWorkspaceLifecycle = nil
@@ -581,6 +765,7 @@ final class RemoteHostStore: ObservableObject {
         connectingLeaseKeys[key] = nil
         fetchTasks[key]?.cancel()
         fetchTasks[key] = nil
+        stopWorkspaceSubscription(for: key)
         hosts[key]?.workspaces = []
         hosts[key]?.activeSockPath = ""
         hosts[key]?.supportsWorkspaceLifecycle = nil
@@ -667,6 +852,7 @@ final class RemoteHostStore: ObservableObject {
         connectingLeaseKeys[key] = nil
         fetchTasks[key]?.cancel()
         fetchTasks[key] = nil
+        stopWorkspaceSubscription(for: key)
         hosts[key]?.workspaces = []
         hosts[key]?.activeSockPath = ""
         hosts[key]?.supportsWorkspaceLifecycle = nil
@@ -724,6 +910,7 @@ final class RemoteHostStore: ObservableObject {
         sidebarLeases[key] = nil
         PeerPaneHostRegistry.shared.release(lease)
         fetchTasks[key]?.cancel()
+        stopWorkspaceSubscription(for: key)
         hosts[key]?.workspaces = []
         hosts[key]?.activeSockPath = ""
         hosts[key]?.supportsWorkspaceLifecycle = nil
@@ -750,9 +937,12 @@ final class RemoteHostStore: ObservableObject {
 
     private func fetchWorkspaces(for hostSockPath: String, key: String) {
         fetchTasks[key]?.cancel()
+        stopWorkspaceSubscription(for: key)
         let path = hostSockPath
+        fetchInFlight.insert(key)
         // Task inherits @MainActor; await suspensions yield main without blocking it.
         fetchTasks[key] = Task {
+            defer { self.fetchInFlight.remove(key) }
             do {
                 let conn = try await PeerRelaySession.connect(hostSockPath: path)
                 // Record capability regardless of what listWorkspaces below does —
@@ -768,6 +958,24 @@ final class RemoteHostStore: ObservableObject {
                 } catch {
                     await conn.cancel()
                     return
+                }
+                // Same connection, same round trip: a team roster is only
+                // meaningful next to the workspaces it leads, and opening a
+                // second connection to ask would race the first one's teardown.
+                // Hosts predating team.roster.v1 are never asked.
+                var teams: [RemoteTeamSummary] = []
+                if conn.hostCapabilities.has(PeerCapability.teamRosterV1) {
+                    if let reported = try? await conn.session.listTeams() {
+                        teams = reported.map { team in
+                            RemoteTeamSummary(
+                                name: team.name,
+                                teamUUID: team.teamUuid,
+                                workingDirectory: team.workingDirectory,
+                                projectRootPath: team.projectRoot.isEmpty ? nil : team.projectRoot,
+                                agentNames: team.agentNames
+                            )
+                        }
+                    }
                 }
                 await conn.cancel()
                 // Stale-path guard: a reconnect may have superseded this fetch with a
@@ -793,10 +1001,124 @@ final class RemoteHostStore: ObservableObject {
                     )
                 }
                 self.hosts[key]?.workspaces = summaries
+                self.hosts[key]?.teams = teams
+                if conn.hostCapabilities.has(PeerCapability.workspaceListSubscribeV1) {
+                    self.startWorkspaceSubscription(for: path, key: key)
+                }
             } catch {
-                // Host disconnected between detection and fetch — ignore.
+                // A refresh that cannot open a connection has learned
+                // something, and dropping it on the floor was how a host could
+                // sit there reading `connected` with nothing at the other end.
+                // Everything downstream believes that word: the sidebar shows
+                // the machine as fine, its agents as idle rather than
+                // unreachable, and their tasks stay assigned with no reason
+                // given. Say it instead.
+                //
+                // Only for a host this app currently believes is up, and only
+                // when it is still the same connection — a fetch racing a
+                // deliberate disconnect must not resurrect a state the user
+                // just changed.
+                if !Task.isCancelled,
+                   self.hosts[key]?.activeSockPath == path,
+                   self.hosts[key]?.isConnected == true {
+                    self.hosts[key]?.connectionState = .failed(Self.unreachableReason)
+                    self.hosts[key]?.workspaces = []
+                    self.hosts[key]?.teams = []
+                    TeamOrchestrator.shared.markRemoteAgentsUnreachable(
+                        hostKey: key,
+                        reason: Self.unreachableReason
+                    )
+                }
             }
         }
+    }
+
+    /// What a host is told to say when a refresh cannot reach it. Its own
+    /// wording would be a socket error, which describes the plumbing rather
+    /// than the situation.
+    static let unreachableReason = "stopped responding"
+
+    /// Hosts whose roster is being read right now. A refresh cancels the fetch
+    /// before it, which is right when the user just did something and wrong on
+    /// a timer: over a slow link the next tick would keep restarting a fetch
+    /// that never gets to finish.
+    private var fetchInFlight: Set<String> = []
+
+    /// Open one receive-only roster stream. The initial complete snapshot is
+    /// sent by the host immediately after subscription; later snapshots are
+    /// replacement values, which makes tunnel reconnects converge without
+    /// local delta/replay bookkeeping.
+    private func startWorkspaceSubscription(for path: String, key: String) {
+        rosterSubscriptionTasks[key]?.cancel()
+        rosterSubscriptionTasks[key] = Task { [weak self] in
+            guard let self else { return }
+            do {
+                let connection = try await PeerRelaySession.connect(hostSockPath: path)
+                guard connection.hostCapabilities.has(PeerCapability.workspaceListSubscribeV1) else {
+                    await connection.cancel()
+                    return
+                }
+                try await connection.session.subscribeWorkspaceList()
+                while !Task.isCancelled {
+                    let message = try await connection.session.receiveNextMessage()
+                    guard case .workspaceListChanged(let workspaces) = message else { continue }
+                    guard self.hosts[key]?.activeSockPath == path,
+                          self.hosts[key]?.isConnected == true
+                    else { continue }
+                    self.applyWorkspaceRoster(workspaces, hostSockPath: path, key: key)
+                }
+                await connection.cancel()
+            } catch is CancellationError {
+                // Replacement/disconnect owns cleanup; never mark its newer
+                // socket path stale.
+            } catch {
+                self.workspaceSubscriptionLost(key: key, path: path, error: error)
+            }
+        }
+    }
+
+    private func stopWorkspaceSubscription(for key: String) {
+        rosterSubscriptionTasks[key]?.cancel()
+        rosterSubscriptionTasks[key] = nil
+    }
+
+    private func applyWorkspaceRoster(
+        _ workspaces: [Termmesh_Peer_V1_Workspace],
+        hostSockPath: String,
+        key: String
+    ) {
+        hosts[key]?.workspaces = workspaces.map { ws in
+            let layout = ws.hasLayout ? ws.layout : nil
+            let counts = peerLayoutCounts(layout)
+            return WorkspaceSummary(
+                id: ws.workspaceID,
+                title: ws.title.isEmpty ? "<workspace>" : ws.title,
+                hostSockPath: hostSockPath,
+                windowID: ws.windowID,
+                windowTitle: ws.windowTitle,
+                isDefault: ws.isDefault,
+                paneCount: counts.panes,
+                surfaceCount: counts.surfaces,
+                busyCount: counts.busy,
+                panes: peerPaneSummaries(layout)
+            )
+        }
+    }
+
+    /// A dead subscription is a stale sidebar, not an empty remote machine.
+    /// Preserve the latest snapshot for context but surface the row as failed;
+    /// an SSH tunnel reconnect updates activeSockPath through `rebuild()`, at
+    /// which point `fetchWorkspaces` establishes a fresh stream.
+    private func workspaceSubscriptionLost(key: String, path: String, error: Error) {
+        guard hosts[key]?.activeSockPath == path,
+              hosts[key]?.isConnected == true
+        else { return }
+        hosts[key]?.connectionState = .failed(Self.unreachableReason)
+        TeamOrchestrator.shared.markRemoteAgentsUnreachable(
+            hostKey: key,
+            reason: Self.unreachableReason
+        )
+        RemoteWorkLog.info("Workspace roster stream stopped for \(hosts[key]?.displayName ?? key): \(error.localizedDescription)")
     }
 
     /// Keep sidebar pane details and busy state in lockstep with an open live

@@ -44,6 +44,8 @@ pub mod capability {
     /// advertised this — older daemons silently drop them via the
     /// Ready-state unhandled-payload path instead of acting on them.
     pub const WORKSPACE_LIFECYCLE_V1: &str = "workspace.lifecycle.v1";
+    /// Complete workspace-roster snapshots pushed after a client subscribes.
+    pub const WORKSPACE_LIST_SUBSCRIBE_V1: &str = "workspace.list.subscribe.v1";
     /// The host can deterministically create or reuse a daemon-owned PTY
     /// surface from an explicit `EnsureSurfaceRequest` specification.
     pub const SURFACE_ENSURE_V1: &str = "surface.ensure.v1";
@@ -66,6 +68,22 @@ pub mod capability {
     /// infer from an untyped byte stream.
     pub const GRID_SNAPSHOT_V1: &str = "grid.snapshot.v1";
 
+    /// The host answers `ListTeams` with the agent teams it is running.
+    /// A team is not visible in the layout tree — knowing which machine
+    /// holds a project's leader needs a team-level read, and this is it.
+    /// Advertised by the HOST, since only a host with a team manager can
+    /// answer; a client asks a host that did not advertise it nothing.
+    pub const TEAM_ROSTER_V1: &str = "team.roster.v1";
+
+    /// The host runs allow-listed `team.*` methods on behalf of a client.
+    /// Advertised by the HOST. Unlike the roster this CHANGES things, so the
+    /// allow-list — not the capability — is what bounds it. Kept in lockstep
+    /// with the Swift host's `PeerTeamCall` allow-list.
+    pub const TEAM_CALL_V1: &str = "team.call.v1";
+    /// Project-bound remote leader bootstrap with scoped, expiring grants.
+    /// Kept separate so it cannot widen `team.call.v1`'s lifecycle boundary.
+    pub const TEAM_LEADER_V1: &str = "team.leader.v1";
+
     /// Every capability this build supports. Single source of truth for
     /// populating outgoing `Hello.capabilities` — callers should use
     /// [`supported_vec`] rather than hand-rolling the list.
@@ -74,15 +92,131 @@ pub mod capability {
         REPLAY_RING_V1,
         WORKSPACE_CONTROL_V1,
         WORKSPACE_LIFECYCLE_V1,
+        WORKSPACE_LIST_SUBSCRIBE_V1,
         SURFACE_ENSURE_V1,
         SURFACE_TERMINATE_V1,
         HOST_STATS_V1,
         GRID_SNAPSHOT_V1,
+        TEAM_ROSTER_V1,
+        TEAM_CALL_V1,
+        TEAM_LEADER_V1,
     ];
 
     /// `Hello.capabilities` value for an outgoing handshake message.
     pub fn supported_vec() -> Vec<String> {
         SUPPORTED.iter().map(|s| (*s).to_string()).collect()
+    }
+}
+
+/// Security limits and pure validators for `team.leader.v1`.
+///
+/// These values and validation order mirror Swift's `PeerTeamLeader`.
+pub mod team_leader {
+    use super::{TeamLeaderBootstrapRequest, TeamLeaderGrant, TeamLeaderPlacement, TeamLeaderRole};
+    use std::collections::HashSet;
+
+    pub const MAX_PROJECT_ID_BYTES: usize = 128;
+    pub const MAX_TEAM_UUID_BYTES: usize = 128;
+    pub const REQUEST_ID_BYTES: usize = 16;
+    pub const GRANT_ID_BYTES: usize = 32;
+    pub const MAX_BOOTSTRAP_PAYLOAD_BYTES: usize = 512;
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum ValidationError {
+        PayloadTooLarge,
+        InvalidProject,
+        InvalidPlacement,
+        InvalidRequestId,
+        ReplayedRequest,
+        UnknownGrant,
+        ForgedProject,
+        ForgedTeam,
+        InvalidRole,
+        ExpiredGrant,
+    }
+
+    pub fn validate_bootstrap(
+        request: &TeamLeaderBootstrapRequest,
+        encoded_bytes: Option<usize>,
+    ) -> Result<(), ValidationError> {
+        if encoded_bytes.is_some_and(|size| size > MAX_BOOTSTRAP_PAYLOAD_BYTES) {
+            return Err(ValidationError::PayloadTooLarge);
+        }
+        if !safe_identifier(&request.project_id, MAX_PROJECT_ID_BYTES) {
+            return Err(ValidationError::InvalidProject);
+        }
+        if request.leader_placement != TeamLeaderPlacement::Local as i32
+            && request.leader_placement != TeamLeaderPlacement::Peer as i32
+        {
+            return Err(ValidationError::InvalidPlacement);
+        }
+        if request.request_id.len() != REQUEST_ID_BYTES {
+            return Err(ValidationError::InvalidRequestId);
+        }
+        Ok(())
+    }
+
+    pub fn validate_grant(
+        presented: &TeamLeaderGrant,
+        registered: Option<&TeamLeaderGrant>,
+        expected_project_id: &str,
+        expected_team_uuid: &str,
+        now_unix_seconds: u64,
+    ) -> Result<(), ValidationError> {
+        let Some(registered) = registered.filter(|grant| {
+            presented.grant_id.len() == GRANT_ID_BYTES && grant.grant_id == presented.grant_id
+        }) else {
+            return Err(ValidationError::UnknownGrant);
+        };
+        if presented.project_id != registered.project_id
+            || presented.project_id != expected_project_id
+        {
+            return Err(ValidationError::ForgedProject);
+        }
+        if presented.team_uuid != registered.team_uuid
+            || presented.team_uuid != expected_team_uuid
+            || !safe_identifier(&presented.team_uuid, MAX_TEAM_UUID_BYTES)
+        {
+            return Err(ValidationError::ForgedTeam);
+        }
+        if presented.role != TeamLeaderRole::Leader as i32
+            || registered.role != TeamLeaderRole::Leader as i32
+        {
+            return Err(ValidationError::InvalidRole);
+        }
+        if presented.expires_at_unix_secs != registered.expires_at_unix_secs
+            || presented.expires_at_unix_secs <= now_unix_seconds
+        {
+            return Err(ValidationError::ExpiredGrant);
+        }
+        Ok(())
+    }
+
+    fn safe_identifier(value: &str, max_bytes: usize) -> bool {
+        let bytes = value.as_bytes();
+        !bytes.is_empty()
+            && bytes.len() <= max_bytes
+            && bytes.iter().all(|byte| {
+                byte.is_ascii_alphanumeric()
+                    || matches!(byte, b'-' | b'.' | b':' | b'_')
+            })
+    }
+
+    #[derive(Debug, Default)]
+    pub struct ReplayGuard {
+        consumed: HashSet<Vec<u8>>,
+    }
+
+    impl ReplayGuard {
+        pub fn consume(&mut self, request_id: &[u8]) -> Result<(), ValidationError> {
+            if request_id.len() != REQUEST_ID_BYTES {
+                return Err(ValidationError::InvalidRequestId);
+            }
+            if !self.consumed.insert(request_id.to_vec()) {
+                return Err(ValidationError::ReplayedRequest);
+            }
+            Ok(())
+        }
     }
 }
 
@@ -111,6 +245,134 @@ impl PeerCapabilities {
     /// Whether the peer that sent this `Hello` advertised `capability`.
     pub fn has(&self, capability: &str) -> bool {
         self.0.contains(capability)
+    }
+}
+
+#[cfg(test)]
+mod team_leader_tests {
+    use super::team_leader::{
+        validate_bootstrap, validate_grant, ReplayGuard, ValidationError, GRANT_ID_BYTES,
+        MAX_BOOTSTRAP_PAYLOAD_BYTES, REQUEST_ID_BYTES,
+    };
+    use super::{
+        TeamLeaderBootstrapRequest, TeamLeaderGrant, TeamLeaderPlacement, TeamLeaderRole,
+    };
+
+    fn request() -> TeamLeaderBootstrapRequest {
+        TeamLeaderBootstrapRequest {
+            project_id: "name:demo".into(),
+            leader_placement: TeamLeaderPlacement::Peer as i32,
+            request_id: vec![1; REQUEST_ID_BYTES],
+        }
+    }
+
+    fn grant() -> TeamLeaderGrant {
+        TeamLeaderGrant {
+            grant_id: vec![2; GRANT_ID_BYTES],
+            project_id: "name:demo".into(),
+            team_uuid: "team-uuid".into(),
+            role: TeamLeaderRole::Leader as i32,
+            expires_at_unix_secs: 100,
+        }
+    }
+
+    #[test]
+    fn bootstrap_rejects_oversize_invalid_placement_and_executable_injection() {
+        assert_eq!(validate_bootstrap(&request(), Some(64)), Ok(()));
+        assert_eq!(
+            validate_bootstrap(&request(), Some(MAX_BOOTSTRAP_PAYLOAD_BYTES + 1)),
+            Err(ValidationError::PayloadTooLarge)
+        );
+
+        let mut invalid = request();
+        invalid.leader_placement = TeamLeaderPlacement::Unspecified as i32;
+        assert_eq!(
+            validate_bootstrap(&invalid, None),
+            Err(ValidationError::InvalidPlacement)
+        );
+
+        for injected in [
+            "/tmp/project",
+            "name:demo\ncommand=/bin/sh",
+            "name:demo --cli codex",
+            "name:demo$HOME",
+            "name:demo env=TOKEN",
+        ] {
+            let mut invalid = request();
+            invalid.project_id = injected.into();
+            assert_eq!(
+                validate_bootstrap(&invalid, None),
+                Err(ValidationError::InvalidProject),
+                "accepted executable-field injection: {injected}"
+            );
+        }
+    }
+
+    #[test]
+    fn grant_rejects_forged_project_team_role_and_expiry() {
+        let registered = grant();
+        assert_eq!(
+            validate_grant(
+                &registered,
+                Some(&registered),
+                "name:demo",
+                "team-uuid",
+                99
+            ),
+            Ok(())
+        );
+
+        let mut forged = registered.clone();
+        forged.project_id = "name:other".into();
+        assert_eq!(
+            validate_grant(&forged, Some(&registered), "name:demo", "team-uuid", 99),
+            Err(ValidationError::ForgedProject)
+        );
+
+        let mut forged = registered.clone();
+        forged.team_uuid = "other-team".into();
+        assert_eq!(
+            validate_grant(&forged, Some(&registered), "name:demo", "team-uuid", 99),
+            Err(ValidationError::ForgedTeam)
+        );
+
+        let mut wrong_role = registered.clone();
+        wrong_role.role = TeamLeaderRole::Unspecified as i32;
+        assert_eq!(
+            validate_grant(
+                &wrong_role,
+                Some(&registered),
+                "name:demo",
+                "team-uuid",
+                99
+            ),
+            Err(ValidationError::InvalidRole)
+        );
+        assert_eq!(
+            validate_grant(
+                &registered,
+                Some(&registered),
+                "name:demo",
+                "team-uuid",
+                100
+            ),
+            Err(ValidationError::ExpiredGrant)
+        );
+        assert_eq!(
+            validate_grant(&registered, None, "name:demo", "team-uuid", 99),
+            Err(ValidationError::UnknownGrant)
+        );
+    }
+
+    #[test]
+    fn request_replay_is_rejected() {
+        let mut replay = ReplayGuard::default();
+        let request_id = vec![7; REQUEST_ID_BYTES];
+        assert_eq!(replay.consume(&request_id), Ok(()));
+        assert_eq!(
+            replay.consume(&request_id),
+            Err(ValidationError::ReplayedRequest)
+        );
     }
 }
 

@@ -85,6 +85,10 @@ pub struct AgentMeta {
     pub schema: u32,
     pub team_uuid: String,
     pub name: String,
+    /// Durable, team-scoped identity. Absent only in legacy metadata and
+    /// migrated on the next persistence/resume write.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_instance_id: Option<String>,
     pub agent_type: String,
     pub cli: String,
     pub model: String,

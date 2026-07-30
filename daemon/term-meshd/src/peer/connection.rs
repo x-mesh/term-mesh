@@ -9,7 +9,7 @@
 //! into the connection's outgoing channel wrapped as `PtyData` frames.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -21,7 +21,9 @@ use peer_proto::v1::{
     GridSnapshot, Hello, ScrollbackChunk,
     HostStats, Pong, PtyData, SurfaceList, TerminateSurfaceError as WireTerminateError,
     TerminateSurfaceErrorCode, TerminateSurfaceRequest, TerminateSurfaceResponse,
-    TerminateSurfaceResult, Workspace, WorkspaceList, WorkspaceMeta, WorkspaceUpdate,
+    Team, TeamCallResponse, TeamList, TerminateSurfaceResult, Workspace, WorkspaceList,
+    WorkspaceListChanged,
+    WorkspaceMeta, WorkspaceUpdate,
 };
 use peer_proto::{capability, PeerCapabilities};
 use sha2::{Digest, Sha256};
@@ -109,7 +111,10 @@ async fn reader_loop(
     // RAII registration with the layout broadcaster; populated when the
     // handshake reaches Ready, dropped (= unregistered) with this frame.
     // Underscore: the binding exists for its Drop, it is never read.
-    let mut _broadcast_guard: Option<layout::BroadcastGuard> = None;
+    let mut broadcast_guard: Option<layout::BroadcastGuard> = None;
+    // Shared with the Broadcaster so a roster push can skip connections that
+    // never subscribed. Written here, read there.
+    let wants_workspace_roster = Arc::new(AtomicBool::new(false));
     // Started at Ready for a client that asked for stats; aborted when this
     // loop returns, on every exit path (see the abort below).
     let mut host_stats_task: Option<JoinHandle<()>> = None;
@@ -122,6 +127,7 @@ async fn reader_loop(
     // sending Hello never reaches any arm that would consult it either.
     #[allow(unused_assignments)]
     let mut peer_capabilities = PeerCapabilities::default();
+    let mut peer_id = Vec::new();
 
     loop {
         let env = match read_envelope(&mut reader).await {
@@ -160,6 +166,11 @@ async fn reader_loop(
                     hello.display_name,
                     hello.app_version
                 );
+                if hello.peer_id.len() != 16 {
+                    send_error(&outgoing_tx, 102, "peer_id must be 16 bytes").await;
+                    break;
+                }
+                peer_id = hello.peer_id;
                 peer_capabilities = PeerCapabilities::from_hello(hello.capabilities);
                 tracing::debug!(
                     "peer capabilities: {:?} (ptydata.coalesce.v1={} replay.ring.v1={})",
@@ -168,7 +179,11 @@ async fn reader_loop(
                     peer_capabilities.has(capability::REPLAY_RING_V1)
                 );
 
-                send(&outgoing_tx, host_hello(&seq_counter)).await?;
+                send(
+                    &outgoing_tx,
+                    host_hello(&seq_counter, host.team_manager().is_some()),
+                )
+                .await?;
                 let challenge = Envelope {
                     seq: next_seq(&seq_counter),
                     correlation_id: 0,
@@ -214,10 +229,12 @@ async fn reader_loop(
                 // From Ready on, this connection receives layout pushes
                 // triggered by any connection's WorkspaceControl. The guard
                 // unregisters on connection teardown (any exit path).
-                _broadcast_guard = Some(
-                    host.clients
-                        .register(outgoing_tx.clone(), seq_counter.clone()),
-                );
+                broadcast_guard = Some(host.clients.register_with_roster_flag(
+                    outgoing_tx.clone(),
+                    seq_counter.clone(),
+                    peer_id.clone(),
+                    Arc::clone(&wants_workspace_roster),
+                ));
                 // Only for a client that advertised host.stats.v1; everyone
                 // else costs nothing. Aborted on teardown below rather than
                 // left to notice the closed channel on its next sample.
@@ -271,6 +288,100 @@ async fn reader_loop(
                 .await?;
             }
 
+            (HandshakeState::Ready, Payload::ListTeams(_)) => {
+                // A team is invisible in the layout tree — it is a fact about
+                // which pane leads which work, not about how panes are
+                // arranged — so a client that wants to know where a project's
+                // leader sits has no way to derive it from workspaces alone.
+                // This answers that and nothing else: no command crosses here.
+                let teams = match host.team_manager() {
+                    Some(manager) => {
+                        let guard = manager.lock().await;
+                        guard
+                            .list_teams()
+                            .into_iter()
+                            .map(|team| Team {
+                                name: team.name.clone(),
+                                team_uuid: team.team_uuid.clone(),
+                                working_directory: team.working_directory.clone(),
+                                project_root: super::layout::project_root_for(
+                                    &team.working_directory,
+                                ),
+                                agent_names: team.agents.clone(),
+                                created_at_unix_secs: team.created_at,
+                            })
+                            .collect()
+                    }
+                    // A host built without a team manager advertises no
+                    // team.roster.v1, so this is only reachable from a client
+                    // that asked anyway; an empty roster is the honest answer.
+                    None => Vec::new(),
+                };
+                let reply = Envelope {
+                    seq: next_seq(&seq_counter),
+                    correlation_id: env.seq,
+                    payload: Some(Payload::TeamList(TeamList { teams })),
+                };
+                send(&outgoing_tx, reply).await?;
+            }
+
+            (HandshakeState::Ready, Payload::TeamCallRequest(request)) => {
+                // The allow-list is the security boundary of team.call.v1,
+                // uniform across host types (mirror of the Swift host's
+                // PeerTeamCall). It is checked HERE, before anything touches
+                // the manager: a refusal must not depend on the translation
+                // below being reached.
+                let response = if !team_call_allowed(&request.method) {
+                    TeamCallResponse {
+                        ok: false,
+                        result_json: String::new(),
+                        error_code: "method_not_allowed".to_string(),
+                        error_message: format!(
+                            "{} is not callable by a peer",
+                            request.method
+                        ),
+                    }
+                } else if let Some(manager) = host.team_manager() {
+                    run_headless_team_call(
+                        &manager,
+                        host.agent_store().as_ref(),
+                        &request.method,
+                        &request.params_json,
+                    )
+                        .await
+                } else {
+                    TeamCallResponse {
+                        ok: false,
+                        result_json: String::new(),
+                        error_code: "host_error".to_string(),
+                        error_message: "host has no team subsystem".to_string(),
+                    }
+                };
+                let reply = Envelope {
+                    seq: next_seq(&seq_counter),
+                    correlation_id: env.seq,
+                    payload: Some(Payload::TeamCallResponse(response)),
+                };
+                send(&outgoing_tx, reply).await?;
+            }
+
+            (HandshakeState::Ready, Payload::TeamLeaderCommandResponse(response)) => {
+                // Only the exact connection that received the reverse request
+                // may satisfy it, and it must echo that request envelope's seq
+                // as correlation_id. A sibling or hostile viewer cannot win a
+                // request_id race.
+                if let Some(guard) = &broadcast_guard {
+                    let accepted = host.clients.resolve_team_leader(
+                        guard.connection_id(),
+                        env.correlation_id,
+                        response,
+                    );
+                    if !accepted {
+                        tracing::warn!("ignored mismatched peer leader response");
+                    }
+                }
+            }
+
             (HandshakeState::Ready, Payload::ListWorkspaces(_)) => {
                 // A daemon-only host has no bonsplit windows to mirror — it
                 // owns a flat set of forkpty surfaces arranged into one or
@@ -309,6 +420,30 @@ async fn reader_loop(
                     payload: Some(Payload::WorkspaceList(WorkspaceList { workspaces })),
                 };
                 send(&outgoing_tx, reply).await?;
+            }
+
+            (HandshakeState::Ready, Payload::SubscribeWorkspaceList(_)) => {
+                // The first pushed snapshot is the subscription acknowledgement
+                // and authoritative baseline. It avoids a response RPC racing
+                // the receive loop that will consume future pushes.
+                if !peer_capabilities.has(capability::WORKSPACE_LIST_SUBSCRIBE_V1) {
+                    send_error(&outgoing_tx, 106, "workspace roster subscription not negotiated").await;
+                    continue;
+                }
+                // Flip before the baseline goes out. Layout pushes only reach
+                // subscribers now, so a connection that never asks stays out
+                // of the roster fan-out entirely.
+                wants_workspace_roster.store(true, Ordering::Relaxed);
+                let workspaces = host.workspace_roster();
+                send(
+                    &outgoing_tx,
+                    Envelope {
+                        seq: next_seq(&seq_counter),
+                        correlation_id: 0,
+                        payload: Some(Payload::WorkspaceListChanged(WorkspaceListChanged { workspaces })),
+                    },
+                )
+                .await?;
             }
 
             // Gated behind capability "workspace.lifecycle.v1" (see
@@ -604,6 +739,7 @@ async fn reader_loop(
                     mode_prefix,
                     snapshot_floor,
                 );
+                host.pty.note_attached(&req.surface_id);
                 attached.insert(req.surface_id, entry);
             }
 
@@ -641,6 +777,7 @@ async fn reader_loop(
 
             (HandshakeState::Ready, Payload::DetachSurface(det)) => {
                 if let Some(entry) = attached.remove(&det.surface_id) {
+                    reap_if_abandoned(&host, &det.surface_id);
                     entry.surface.drop_size_request(size_requester);
                     entry.cancel.notify_one();
                     let _ = entry.task.await;
@@ -654,11 +791,18 @@ async fn reader_loop(
                 };
                 match input.kind {
                     Some(peer_proto::v1::input::Kind::Keys(keys)) => {
+                        // Typing marks this connection as the one driving the
+                        // PTY, which is what wins winsize arbitration — see
+                        // `PtySurface::note_input`. Before the write, so a
+                        // size-sensitive redraw the input provokes already
+                        // happens at the typist's size.
+                        entry.surface.note_input(size_requester);
                         if let Err(e) = write_surface_input(entry.surface.clone(), keys).await {
                             tracing::warn!("PTY write failed: {e}");
                         }
                     }
                     Some(peer_proto::v1::input::Kind::Paste(p)) => {
+                        entry.surface.note_input(size_requester);
                         if let Err(e) = write_surface_input(entry.surface.clone(), p.text).await {
                             tracing::warn!("PTY paste-write failed: {e}");
                         }
@@ -702,10 +846,13 @@ async fn reader_loop(
         }
     }
 
-    for (_, entry) in attached.drain() {
+    for (surface_id, entry) in attached.drain() {
         entry.surface.drop_size_request(size_requester);
         entry.cancel.notify_one();
         let _ = entry.task.await;
+        // Whether the peer said goodbye or its process vanished, this
+        // connection is no longer holding the surface.
+        reap_if_abandoned(&host, &surface_id);
     }
     // Aborted rather than awaited: it is parked on the monitor's next
     // sample, which is seconds away, and it holds nothing that needs
@@ -1019,7 +1166,248 @@ fn spawn_attach_relay(
     }
 }
 
-fn host_hello(seq_counter: &AtomicU64) -> Envelope {
+/// Mirror of the Swift host's `PeerTeamCall.allowedMethods`
+/// (swift/PeerProto/Sources/PeerProto/PeerTeamCall.swift). The two MUST stay
+/// in lockstep: this is the security boundary of team.call.v1, and it has to
+/// mean the same thing whichever host answers. Everything here acts inside a
+/// team the host already owns — nothing spawns a process, names a path, or
+/// creates/destroys a team.
+/// How long an abandoned surface is kept before it is reclaimed.
+///
+/// Long enough that a client reconnecting — a dropped link, an app restart —
+/// finds its pane still there. Short enough that a client which is never
+/// coming back does not leave a shell running for days.
+fn abandoned_surface_grace() -> std::time::Duration {
+    // Overridable so a test can watch a reap happen instead of asserting that
+    // a timer was set. Operators get the default; nothing documents the knob.
+    std::env::var("TERMMESH_PEER_ABANDONED_GRACE_MS")
+        .ok()
+        .and_then(|raw| raw.parse::<u64>().ok())
+        .map(std::time::Duration::from_millis)
+        .unwrap_or(std::time::Duration::from_secs(60))
+}
+
+/// Reclaim a surface this host spawned once nobody is attached to it.
+///
+/// A surface created on a peer's request exists for whoever asked. When they
+/// all go, nothing refers to it, and until now the shell inside ran until the
+/// daemon did — one per client crash, each still holding whatever had been
+/// started in it. Declared surfaces are left alone: the operator published
+/// those for anyone to attach to, and an empty one is simply idle.
+///
+/// The wait matters as much as the reap. Detaching is not the same as leaving
+/// for good, and killing on the last detach would take the pane away from
+/// someone whose network hiccuped. The count is checked again at the end of
+/// it, so a reconnect inside the grace cancels the whole thing.
+pub(crate) fn reap_if_abandoned(host: &Arc<PeerHost>, surface_id: &[u8]) {
+    if host.pty.attacher_count(surface_id) > 0 {
+        return;
+    }
+    if !host.pty.is_ephemeral(surface_id) {
+        return;
+    }
+    let host = Arc::downgrade(host);
+    let sid = surface_id.to_vec();
+    let grace = abandoned_surface_grace();
+    tokio::spawn(async move {
+        tokio::time::sleep(grace).await;
+        let Some(host) = host.upgrade() else { return };
+        if host.pty.attacher_count(&sid) > 0 {
+            return;
+        }
+        if !host.pty.is_ephemeral(&sid) {
+            return;
+        }
+        tracing::info!(
+            "reclaiming abandoned surface {:?} — no peer attached for {:?}",
+            &sid[..sid.len().min(4)],
+            grace
+        );
+        // Killing the process is the whole job: its death wakes the ephemeral
+        // watcher already parked on it, which takes the surface out of the
+        // workspace tree, the roster and the reverse index, and pushes the new
+        // layout. Doing any of that here would be a second implementation of
+        // the same cleanup, racing the first.
+        host.pty.remove(&sid);
+    });
+}
+
+/// The `team.*` methods a peer may call — the Rust half of the contract in
+/// `PeerTeamCall.swift`, which carries the full reasoning.
+///
+/// A ceiling, not a scope: it bounds what a peer may do to what the local
+/// control socket can already do, and deliberately does not bound WHICH team
+/// it does it to (the team is named in the request and resolved as given).
+/// Sound only because a peer is always another machine the same person owns;
+/// `team.leader.v1` scopes its caller with a registered grant because that
+/// caller is an autonomous process rather than a person.
+pub(crate) fn team_call_allowed(method: &str) -> bool {
+    matches!(
+        method,
+        "team.status"
+            | "team.list"
+            | "team.read"
+            | "team.collect"
+            | "team.reports"
+            | "team.inbox"
+            | "team.message.list"
+            | "team.send"
+            | "team.broadcast"
+            | "team.delegate"
+            | "team.message.post"
+            | "team.task.list"
+            | "team.task.get"
+            | "team.task.create"
+            | "team.task.update"
+            // Reads what a task changed. The only method here that reaches the
+            // filesystem: the host resolves the worktree from the task row the
+            // peer names — no path, ref or command comes from the caller — and
+            // runs a fixed read. See the Swift mirror for the full reasoning.
+            | "team.task.diff"
+    )
+}
+
+/// Run one allow-listed `team.*` method against a headless team manager.
+///
+/// The peer speaks one vocabulary (`team.*`) regardless of host type, so a
+/// headless host translates each call into its own `headless.*` terms. Only
+/// the methods that ARE single daemon operations are implemented; the rest of
+/// the allow-list is app-composed (delegate fans out sends; collect gathers
+/// many reads) and is honestly reported as unsupported here rather than faked.
+async fn run_headless_team_call(
+    manager: &Arc<tokio::sync::Mutex<crate::headless::HeadlessManager>>,
+    agents: Option<&Arc<crate::agent::AgentSessionManager>>,
+    method: &str,
+    params_json: &str,
+) -> TeamCallResponse {
+    fn ok(result: serde_json::Value) -> TeamCallResponse {
+        TeamCallResponse {
+            ok: true,
+            result_json: result.to_string(),
+            error_code: String::new(),
+            error_message: String::new(),
+        }
+    }
+    fn err(code: &str, message: String) -> TeamCallResponse {
+        TeamCallResponse {
+            ok: false,
+            result_json: String::new(),
+            error_code: code.to_string(),
+            error_message: message,
+        }
+    }
+
+    let params: serde_json::Value = if params_json.trim().is_empty() {
+        serde_json::json!({})
+    } else {
+        match serde_json::from_str(params_json) {
+            Ok(v) => v,
+            Err(e) => return err("invalid_params", format!("params_json: {e}")),
+        }
+    };
+    let team = params.get("team_name").and_then(|v| v.as_str());
+    let agent = params.get("agent_name").and_then(|v| v.as_str());
+
+    match method {
+        "team.list" => {
+            let mgr = manager.lock().await;
+            ok(serde_json::json!({ "teams": mgr.list_teams() }))
+        }
+        "team.send" => {
+            let (Some(team), Some(agent)) = (team, agent) else {
+                return err("invalid_params", "team.send needs team_name and agent_name".into());
+            };
+            let Some(text) = params.get("text").and_then(|v| v.as_str()) else {
+                return err("invalid_params", "team.send needs text".into());
+            };
+            let mut mgr = manager.lock().await;
+            let Some(agent_id) = mgr.resolve_agent_id(team, agent) else {
+                return err("host_error", format!("no such agent: {team}/{agent}"));
+            };
+            match mgr.send_message(&agent_id, &format!("{text}\n")).await {
+                Ok(()) => ok(serde_json::json!({ "status": "ok" })),
+                Err(e) => err("host_error", e),
+            }
+        }
+        "team.read" => {
+            let (Some(team), Some(agent)) = (team, agent) else {
+                return err("invalid_params", "team.read needs team_name and agent_name".into());
+            };
+            let lines = params
+                .get("lines")
+                .and_then(|v| v.as_u64())
+                .map(|n| n as usize)
+                .unwrap_or(50);
+            let mut mgr = manager.lock().await;
+            let Some(agent_id) = mgr.resolve_agent_id(team, agent) else {
+                return err("host_error", format!("no such agent: {team}/{agent}"));
+            };
+            match mgr.read_output(&agent_id, lines).await {
+                Ok(rows) => ok(serde_json::json!({ "lines": rows })),
+                Err(e) => err("host_error", e),
+            }
+        }
+        "team.status" => {
+            let (Some(team), Some(agent)) = (team, agent) else {
+                return err("invalid_params", "team.status needs team_name and agent_name".into());
+            };
+            let mut mgr = manager.lock().await;
+            let Some(agent_id) = mgr.resolve_agent_id(team, agent) else {
+                return err("host_error", format!("no such agent: {team}/{agent}"));
+            };
+            match mgr.status(&agent_id).await {
+                Ok(info) => match serde_json::to_value(info) {
+                    Ok(value) => ok(value),
+                    Err(e) => err("host_error", e.to_string()),
+                },
+                Err(e) => err("host_error", e),
+            }
+        }
+        // The one method that reads a repository. What makes it safe is what
+        // it does NOT accept: the caller names a task, and this host resolves
+        // the directory from its own board. A path parameter would let a peer
+        // read any repository on this machine; an argument parameter would let
+        // it run git with flags that write.
+        "team.task.diff" => {
+            let Some(task_id) = params.get("task_id").and_then(|v| v.as_str()) else {
+                return err("invalid_params", "team.task.diff needs task_id".into());
+            };
+            let Some(agents) = agents else {
+                return err(
+                    "unsupported_on_host",
+                    "this host has no task board to read a worktree from".into(),
+                );
+            };
+            let task = match agents.task_get(task_id) {
+                Ok(task) => task,
+                Err(e) => return err("host_error", e),
+            };
+            match crate::task_diff::read(
+                task.worktree_path.as_deref(),
+                task.worktree_parent.as_deref(),
+            )
+            .await
+            {
+                Ok(diff) => match serde_json::to_value(diff) {
+                    Ok(value) => ok(value),
+                    Err(e) => err("host_error", e.to_string()),
+                },
+                // A task with no worktree, or one whose worktree is gone, is an
+                // error with a reason — never an empty success that a caller
+                // would read as "nothing changed" and approve.
+                Err(e) => err(e.code(), e.message()),
+            }
+        }
+        // Allowed in the shared vocabulary, but not a single daemon op — the
+        // app composes these from many sends/reads. Honest beats faked.
+        other => err(
+            "unsupported_on_host",
+            format!("{other} is not implemented by a headless host"),
+        ),
+    }
+}
+
+fn host_hello(seq_counter: &AtomicU64, has_teams: bool) -> Envelope {
     let display = std::env::var(HOST_DISPLAY_NAME_ENV)
         .or_else(|_| std::env::var("HOSTNAME"))
         .unwrap_or_else(|_| "term-mesh-host".into());
@@ -1031,7 +1419,16 @@ fn host_hello(seq_counter: &AtomicU64) -> Envelope {
             protocol_version: PROTOCOL_VERSION.into(),
             peer_id,
             display_name: display,
-            capabilities: capability::supported_vec(),
+            // Only a host that actually has a team manager can answer
+            // ListTeams; advertising it otherwise would invite a client to
+            // ask a question this process cannot answer.
+            capabilities: capability::supported_vec()
+                .into_iter()
+                .filter(|c| {
+                    has_teams
+                        || (c != capability::TEAM_ROSTER_V1 && c != capability::TEAM_CALL_V1)
+                })
+                .collect(),
             app_version: env!("CARGO_PKG_VERSION").into(),
         })),
     }
@@ -2594,5 +2991,250 @@ mod resume_tests {
     fn old_client_default_of_no_capability_and_zero_seq_is_a_fresh_attach() {
         let caps = PeerCapabilities::default();
         assert_eq!(effective_resume_from_seq(&caps, 0), 0);
+    }
+}
+
+#[cfg(test)]
+mod team_leader_capability_tests {
+    use std::sync::atomic::AtomicU64;
+
+    use peer_proto::{capability, v1::envelope::Payload};
+
+    use super::host_hello;
+
+    #[test]
+    fn no_team_host_still_advertises_reverse_remote_leader_route() {
+        let hello = host_hello(&AtomicU64::new(0), false);
+        let Some(Payload::Hello(hello)) = hello.payload else {
+            panic!("host hello must contain Hello payload");
+        };
+
+        assert!(
+            hello.capabilities.iter().any(|cap| cap == capability::TEAM_LEADER_V1),
+            "a daemon without a local team manager still routes scoped leader calls back to the viewer"
+        );
+        assert!(!hello
+            .capabilities
+            .iter()
+            .any(|cap| cap == capability::TEAM_ROSTER_V1));
+        assert!(!hello
+            .capabilities
+            .iter()
+            .any(|cap| cap == capability::TEAM_CALL_V1));
+    }
+}
+
+#[cfg(test)]
+mod team_call_allow_list_tests {
+    use super::team_call_allowed;
+
+    /// The allow-list is the security boundary of `team.call.v1`, and it is
+    /// written twice — here and in the Swift host's `PeerTeamCall`. Two copies
+    /// of a security boundary drift; nothing was checking that they agree, so
+    /// a method added to one host would have been silently callable on one
+    /// machine and refused on the other.
+    ///
+    /// Reading the Swift source is crude but it is the only thing that can
+    /// actually fail when the two disagree.
+    #[test]
+    fn the_swift_mirror_lists_exactly_the_same_methods() {
+        let swift = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../swift/PeerProto/Sources/PeerProto/PeerTeamCall.swift");
+        let source = std::fs::read_to_string(&swift)
+            .unwrap_or_else(|e| panic!("read {}: {e}", swift.display()));
+        let body = source
+            .split_once("allowedMethods: Set<String> = [")
+            .expect("the allow-list literal")
+            .1
+            .split_once(']')
+            .expect("its closing bracket")
+            .0;
+
+        let mut mirrored: Vec<String> = body
+            .lines()
+            // Drop the rationale comments; only the quoted names are the list.
+            .filter_map(|line| {
+                let line = line.trim();
+                if line.starts_with("//") {
+                    return None;
+                }
+                let start = line.find('"')? + 1;
+                let end = start + line[start..].find('"')?;
+                Some(line[start..end].to_string())
+            })
+            .collect();
+        mirrored.sort();
+        assert!(!mirrored.is_empty(), "parsed nothing out of the Swift list");
+
+        for method in &mirrored {
+            assert!(
+                team_call_allowed(method),
+                "{method} is allowed by the Swift host but refused here"
+            );
+        }
+        // And the other direction: a method this host allows that Swift does
+        // not would be just as much of a split.
+        for method in KNOWN_METHODS {
+            assert_eq!(
+                team_call_allowed(method),
+                mirrored.iter().any(|m| m == method),
+                "{method} is allowed on one host and not the other"
+            );
+        }
+    }
+
+    /// Every method the boundary has an opinion about, so the comparison above
+    /// covers refusals too rather than only what happens to be listed.
+    const KNOWN_METHODS: &[&str] = &[
+        "team.status",
+        "team.list",
+        "team.read",
+        "team.collect",
+        "team.reports",
+        "team.inbox",
+        "team.message.list",
+        "team.send",
+        "team.broadcast",
+        "team.delegate",
+        "team.message.post",
+        "team.task.list",
+        "team.task.get",
+        "team.task.create",
+        "team.task.update",
+        "team.task.diff",
+        // Deliberately out: these spawn or tear down processes and take a
+        // working directory, so a peer holding one could start an arbitrary
+        // command anywhere on the host.
+        "team.create",
+        "team.destroy",
+        "team.attach",
+        "team.detach",
+        "team.add_agent",
+        "team.restart",
+    ];
+
+    /// The reason `team.task.diff` was allowed at all: it names no path and no
+    /// command. Guarding the refusals explicitly keeps a later "just one more
+    /// method" from quietly crossing the line.
+    #[test]
+    fn nothing_that_spawns_a_process_is_callable_by_a_peer() {
+        for method in [
+            "team.create",
+            "team.destroy",
+            "team.attach",
+            "team.detach",
+            "team.add_agent",
+            "team.restart",
+        ] {
+            assert!(!team_call_allowed(method), "{method} must stay out");
+        }
+        assert!(team_call_allowed("team.task.diff"));
+    }
+}
+
+/// `team.task.diff` as a peer actually reaches it.
+///
+/// The module-level tests below the allow-list prove the method is *callable*;
+/// these prove what it does with what a caller can control — which is only a
+/// task id, by design.
+#[cfg(test)]
+mod team_task_diff_tests {
+    use super::*;
+
+    fn manager() -> Arc<tokio::sync::Mutex<crate::headless::HeadlessManager>> {
+        Arc::new(tokio::sync::Mutex::new(
+            crate::headless::HeadlessManager::new(),
+        ))
+    }
+
+    fn board() -> Arc<crate::agent::AgentSessionManager> {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.keep().join("agents.db");
+        Arc::new(crate::agent::AgentSessionManager::new(path).expect("agent db"))
+    }
+
+    #[tokio::test]
+    async fn it_needs_a_task_id_and_nothing_else_is_accepted() {
+        let board = board();
+        // A path is not a parameter. Passing one must not make it a parameter:
+        // the call still fails for the missing task id rather than reading the
+        // directory the caller named.
+        let response = run_headless_team_call(
+            &manager(),
+            Some(&board),
+            "team.task.diff",
+            r#"{"team_name":"ws","worktree_path":"/etc"}"#,
+        )
+        .await;
+        assert!(!response.ok);
+        assert_eq!(response.error_code, "invalid_params");
+        assert!(
+            response.error_message.contains("task_id"),
+            "{}",
+            response.error_message
+        );
+    }
+
+    #[tokio::test]
+    async fn a_host_with_no_task_board_says_so_rather_than_guessing_a_directory() {
+        let response = run_headless_team_call(
+            &manager(),
+            None,
+            "team.task.diff",
+            r#"{"task_id":"tsk_1"}"#,
+        )
+        .await;
+        assert!(!response.ok);
+        assert_eq!(response.error_code, "unsupported_on_host");
+    }
+
+    #[tokio::test]
+    async fn a_task_this_host_does_not_have_is_an_error_not_an_empty_diff() {
+        let board = board();
+        let response = run_headless_team_call(
+            &manager(),
+            Some(&board),
+            "team.task.diff",
+            r#"{"task_id":"tsk_nobody"}"#,
+        )
+        .await;
+        assert!(!response.ok, "result was {}", response.result_json);
+        assert_eq!(response.error_code, "host_error");
+        assert!(response.result_json.is_empty());
+    }
+
+    /// A task the board has but that never got a worktree. The failure has to
+    /// carry a reason: an empty success here would read to the review board as
+    /// "nothing changed", which is an approvable state.
+    #[tokio::test]
+    async fn a_task_with_no_worktree_reports_why() {
+        let board = board();
+        let task = board
+            .task_create(crate::agent::TaskCreateParams {
+                title: "no worktree".into(),
+                description: None,
+                priority: None,
+                created_by: None,
+                deps: None,
+                fix_budget: None,
+                worktree_policy: None,
+            })
+            .expect("task");
+
+        let response = run_headless_team_call(
+            &manager(),
+            Some(&board),
+            "team.task.diff",
+            &format!(r#"{{"task_id":"{}"}}"#, task.id),
+        )
+        .await;
+
+        assert!(!response.ok);
+        assert_eq!(response.error_code, "no_worktree");
+        assert!(
+            response.error_message.contains("no worktree recorded"),
+            "{}",
+            response.error_message
+        );
     }
 }

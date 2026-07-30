@@ -101,6 +101,14 @@ final class DashboardController: NSObject, WKNavigationDelegate {
         trackingTimer?.invalidate()
         trackingTimer = nil
         notifiedAlertPIDs.removeAll()
+        let daemon = self.daemon
+        let paths = Set(watchedProjects.values)
+        watchedProjects.removeAll()
+        for path in paths {
+            DispatchQueue.global(qos: .utility).async {
+                daemon.unwatchPath(path)
+            }
+        }
     }
 
     // MARK: - Dashboard Window
@@ -540,10 +548,12 @@ final class DashboardController: NSObject, WKNavigationDelegate {
             // Find the project root from the tab's current directory
             let projectRoot = findProjectRoot(from: cwd) ?? cwd
 
-            // Skip dangerous/broad paths
-            guard isSafeToWatch(projectRoot) else { continue }
+            // Normalize and skip dangerous/broad paths. TermMeshDaemon repeats
+            // this validation at the client boundary and term-meshd enforces it
+            // again at the socket boundary.
+            guard let safeProjectRoot = TermMeshDaemon.safeWatchPath(projectRoot) else { continue }
 
-            currentTabProjects[workspace.id] = projectRoot
+            currentTabProjects[workspace.id] = safeProjectRoot
         }
 
         let daemon = self.daemon
@@ -602,13 +612,6 @@ final class DashboardController: NSObject, WKNavigationDelegate {
             current = (current as NSString).deletingLastPathComponent
         }
         return nil
-    }
-
-    /// Reject paths that are too broad to watch recursively.
-    private func isSafeToWatch(_ path: String) -> Bool {
-        let home = FileManager.default.homeDirectoryForCurrentUser.path
-        let dangerous = ["/", "/Users", "/tmp", "/var", "/private", home]
-        return !dangerous.contains(path)
     }
 
     // MARK: - Data Push (WKWebView only)

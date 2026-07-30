@@ -101,10 +101,18 @@ final class PeerHostProfileStore: ObservableObject {
         _ profiles: [PeerHostProfile], with profile: PeerHostProfile
     ) -> [PeerHostProfile] {
         var result = profiles
+        var profile = profile
         if !profile.sshTarget.isEmpty {
             result.removeAll { $0.sshTarget == profile.sshTarget && $0.id != profile.id }
         }
         if let idx = result.firstIndex(where: { $0.id == profile.id }) {
+            // An edited explicit socket is a new instruction. In particular,
+            // non-empty → empty means "return to auto-detect", so retaining
+            // the previous resolved cache would make Apply appear to ignore
+            // the deletion. Clear for either deletion or replacement.
+            if result[idx].remoteSocket != profile.remoteSocket {
+                profile.lastResolvedSocket = nil
+            }
             result[idx] = profile
         } else {
             result.append(profile)
@@ -121,14 +129,15 @@ final class PeerHostProfileStore: ObservableObject {
         return profiles.filter { $0.sshTarget != target }
     }
 
-    /// Record a successful connect: bump `lastConnectedAt` and cache
-    /// the resolved remote socket so the next connect skips the probe.
+    /// Record a successful connect: bump `lastConnectedAt` and cache an
+    /// auto-detected remote socket separately from the user's explicit
+    /// `remoteSocket` field.
     /// No-op when no profile matches the target (ad-hoc connections).
     func recordConnection(sshTarget: String, resolvedSocket: String?) {
         guard let idx = profiles.firstIndex(where: { $0.sshTarget == sshTarget }) else { return }
         profiles[idx].lastConnectedAt = Date()
         if let resolvedSocket, !resolvedSocket.isEmpty, profiles[idx].remoteSocket.isEmpty {
-            profiles[idx].remoteSocket = resolvedSocket
+            profiles[idx].lastResolvedSocket = resolvedSocket
         }
         persist()
     }

@@ -107,6 +107,27 @@ top=htop'
 Surfaces respawn on their own: if a shell exits, the next attach brings it back
 from the same spec (`PtyManager::get_or_respawn`).
 
+#### Connection ceiling
+
+`TERMMESH_PEER_MAX_CONNECTIONS` caps how many peer connections the host will
+hold at once (default 64). This is not a pane limit, but it acts as one: each
+attached pane holds a connection for its whole lifetime, and workspace mirrors,
+consoles and short-lived surface probes draw from the same pool — so the panes
+a client can keep open is this number minus whatever else it has connected.
+
+Raise it on a host you drive with many panes at once. When the ceiling is hit
+the daemon closes the new client immediately, and the client sees only its
+handshake read returning EOF (`unexpectedEof`) — indistinguishable from a dead
+host, so the daemon log is the only place the real cause is recorded:
+
+```
+peer connection limit reached (64); closing new client — raise
+TERMMESH_PEER_MAX_CONNECTIONS to allow more
+```
+
+Read once at startup, so a change needs a daemon restart. A value that is not a
+positive integer is ignored with a warning and the default is used.
+
 For a real tmux replacement without the installer, register it under systemd
 by hand the same way `install-linux.sh` does:
 

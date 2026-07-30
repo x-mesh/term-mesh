@@ -12,6 +12,28 @@ The runtime rules agents actually need at execution time ship inside the plugins
 (`x-agent/skills/agent/references/term-mesh-backend.md`), so any session with the xm plugins
 installed has them regardless of which repo is checked out.
 
+## Runtime orchestration contract
+
+`LeaderParallelPolicy` v1 is runtime-enforced from the canonical Swift source
+`Sources/LeaderParallelPolicy.swift`. Local and peer leaders receive the same policy version and
+SHA-256 digest; `team.status` exposes the source, version, digest, and injection state. A failed
+or unverifiable injection is explicit `failed` state; policy guidance requires degraded situations
+to be reported explicitly rather than silently falling back.
+
+Substantive work is parallel-by-default, but only DAG-ready tasks may start: every dependency must
+be `completed`; failed or blocked dependencies do not release a child. Local and peer agents are
+ranked in one pool using placement and checkout metadata. Routing and observability preserve the
+stable `task_id + agent_instance_id` key, including duplicate role/name rows. Ambiguous name-only
+selection is rejected; unique-name callers remain compatible.
+
+Auto-claim-next is exact-instance work stealing: the instance that completed work claims the next
+ready unassigned task. Failed delivery releases that claim back to the unassigned pool. Concurrent
+writes need ownership/worktree isolation only when they share a checkout; distinct peer/local
+checkouts need no extra worktree, but pushes to one branch remain serialized. Machine-readable
+telemetry carries routing IDs/digests/byte counts rather than prompt or result bodies. Hard-timebox
+convergence uses completed evidence only and explicitly blocks, cancels, splits, or continues the
+rest — a timeout is never success.
+
 ## What term-mesh provides
 
 | Surface | Used for |

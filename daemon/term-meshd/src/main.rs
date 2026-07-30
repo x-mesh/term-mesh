@@ -16,6 +16,7 @@ mod paste_cleanup;
 mod peer;
 mod socket;
 mod supervisor;
+mod task_diff;
 #[allow(dead_code)]
 mod sync;
 mod tokens;
@@ -35,12 +36,52 @@ mod worktree;
 
 use std::net::SocketAddr;
 use std::sync::{Arc, RwLock};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio::sync::watch;
 use tracing_subscriber::EnvFilter;
 
 /// Global start time for uptime reporting.
 static START_TIME: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+/// GUI owner PID, when the daemon was launched as an app child. Standalone and
+/// headless daemon launches intentionally leave this unset.
+static OWNER_PID: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
+
+fn parse_owner_pid(value: Option<&str>, daemon_pid: u32) -> Option<u32> {
+    value
+        .and_then(|raw| raw.parse::<u32>().ok())
+        .filter(|pid| *pid > 1 && *pid != daemon_pid)
+}
+
+pub(crate) fn configured_owner_pid() -> Option<u32> {
+    *OWNER_PID.get_or_init(|| {
+        parse_owner_pid(
+            std::env::var("TERMMESH_OWNER_PID").ok().as_deref(),
+            std::process::id(),
+        )
+    })
+}
+
+fn process_exists(pid: u32) -> bool {
+    // Signal 0 performs existence/permission checking without delivering a
+    // signal. EPERM still means the process exists.
+    let result = unsafe { libc::kill(pid as libc::pid_t, 0) };
+    result == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+async fn wait_for_owner_exit(owner_pid: Option<u32>) {
+    let Some(owner_pid) = owner_pid else {
+        std::future::pending::<()>().await;
+        return;
+    };
+
+    let mut interval = tokio::time::interval(Duration::from_millis(500));
+    loop {
+        interval.tick().await;
+        if !process_exists(owner_pid) {
+            return;
+        }
+    }
+}
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -57,6 +98,12 @@ async fn main() -> anyhow::Result<()> {
 
     START_TIME.get_or_init(Instant::now);
     tracing::info!("term-meshd starting");
+    let owner_pid = configured_owner_pid();
+    if let Some(pid) = owner_pid {
+        tracing::info!("GUI owner supervision enabled (pid: {pid})");
+    } else {
+        tracing::info!("standalone daemon mode (no GUI owner PID)");
+    }
 
     // Peer PTY-surface replay buffer capacity (TERMMESH_PEER_REPLAY_BYTES
     // env override; further adjustable at runtime via the
@@ -330,7 +377,15 @@ async fn main() -> anyhow::Result<()> {
             .ok()
             .filter(|s| !s.is_empty())
             .map(std::path::PathBuf::from)
-            .map(|path| tokio::spawn(peer::serve(path, shutdown_rx.clone(), monitor_rx.clone())));
+            .map(|path| {
+                tokio::spawn(peer::serve(
+                    path,
+                    shutdown_rx.clone(),
+                    monitor_rx.clone(),
+                    headless_manager.clone(),
+                    agent_manager.clone(),
+                ))
+            });
     if peer_task.is_some() {
         tracing::info!("peer-federation server enabled");
     }
@@ -353,10 +408,32 @@ async fn main() -> anyhow::Result<()> {
         shutdown_rx,
     ));
 
-    // 6. Wait for shutdown signal (Ctrl-C or SIGTERM)
+    // 6. Wait for a shutdown signal — OR for the control socket to die.
+    // `socket::serve` loops forever on success, so if it ever RETURNS, it
+    // failed. Dropping its JoinHandle (the previous behavior) meant the
+    // daemon kept running with a dead control plane, answering nothing while
+    // still looking alive: the exact shape a corrupt sync DB produced. Select
+    // on it too, so control-socket death is a clean, logged exit instead of a
+    // silent zombie.
+    let owner_exit = wait_for_owner_exit(owner_pid);
+    tokio::pin!(owner_exit);
     let shutdown_reason = tokio::select! {
         _ = tokio::signal::ctrl_c() => "SIGINT (Ctrl-C)",
         _ = sigterm() => "SIGTERM",
+        _ = &mut owner_exit => "GUI owner process exited",
+        result = socket_task => {
+            match result {
+                Ok(Ok(())) => "control socket closed",
+                Ok(Err(error)) => {
+                    tracing::error!("control socket server failed: {error:?}");
+                    "control socket server error"
+                }
+                Err(join_error) => {
+                    tracing::error!("control socket task panicked: {join_error}");
+                    "control socket task panic"
+                }
+            }
+        }
     };
     tracing::info!("received {shutdown_reason}, initiating graceful shutdown...");
 
@@ -384,10 +461,11 @@ async fn main() -> anyhow::Result<()> {
         tracing::info!("resumed {resumed} stopped process(es)");
     }
 
-    // d. Wait for servers to finish (with timeout)
+    // d. Wait for servers to finish (with timeout). `socket_task` was already
+    // consumed by the select above (that is how control-socket death is
+    // observed), so only the remaining servers are joined here.
     let timeout = tokio::time::Duration::from_secs(5);
     match tokio::time::timeout(timeout, async {
-        let _ = socket_task.await;
         let _ = http_task.await;
         if let Some(t) = peer_task {
             let _ = t.await;
@@ -413,4 +491,25 @@ async fn sigterm() {
     use tokio::signal::unix::{signal, SignalKind};
     let mut sig = signal(SignalKind::terminate()).expect("failed to register SIGTERM handler");
     sig.recv().await;
+}
+
+#[cfg(test)]
+mod owner_tests {
+    use super::*;
+
+    #[test]
+    fn owner_pid_parser_rejects_invalid_and_self_values() {
+        assert_eq!(parse_owner_pid(None, 42), None);
+        assert_eq!(parse_owner_pid(Some(""), 42), None);
+        assert_eq!(parse_owner_pid(Some("abc"), 42), None);
+        assert_eq!(parse_owner_pid(Some("0"), 42), None);
+        assert_eq!(parse_owner_pid(Some("1"), 42), None);
+        assert_eq!(parse_owner_pid(Some("42"), 42), None);
+        assert_eq!(parse_owner_pid(Some("99"), 42), Some(99));
+    }
+
+    #[test]
+    fn current_process_is_detected_as_alive() {
+        assert!(process_exists(std::process::id()));
+    }
 }

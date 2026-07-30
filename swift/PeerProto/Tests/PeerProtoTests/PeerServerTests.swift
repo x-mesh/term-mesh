@@ -2,6 +2,36 @@ import XCTest
 @testable import PeerProto
 
 final class PeerServerTests: XCTestCase {
+    func testWorkspaceRosterSubscriptionReceivesInitialAndChangedSnapshots() async throws {
+        let sockPath = "/tmp/tm-peer-roster-\(UUID().uuidString.prefix(8)).sock"
+        defer { try? FileManager.default.removeItem(atPath: sockPath) }
+        let server = PeerServer(socketPath: sockPath, provider: StaticSurfaceProvider(surfaces: []))
+        try await server.start()
+        defer { Task { await server.stop() } }
+
+        let transport = try await UnixSocketTransport.connect(socketPath: sockPath)
+        let session = PeerSession(transport: transport)
+        let info = try await session.handshake()
+        XCTAssertTrue(info.hasHostCapability(PeerCapability.workspaceListSubscribeV1))
+
+        try await session.subscribeWorkspaceList()
+        guard case .workspaceListChanged(let initial) = try await session.receiveNextMessage() else {
+            return XCTFail("expected initial workspace roster snapshot")
+        }
+        XCTAssertTrue(initial.isEmpty)
+
+        var workspace = Termmesh_Peer_V1_Workspace()
+        workspace.workspaceID = Data(repeating: 0xC4, count: 16)
+        workspace.title = "New Project"
+        await server.broadcastWorkspaceListChanged([workspace])
+        guard case .workspaceListChanged(let changed) = try await session.receiveNextMessage() else {
+            return XCTFail("expected changed workspace roster snapshot")
+        }
+        XCTAssertEqual(changed.map(\.title), ["New Project"])
+        try await session.sendGoodbye(reason: "roster test done")
+        await transport.close()
+    }
+
     /// End-to-end: Swift `PeerServer` accepts a Swift `PeerSession`
     /// client over a real Unix socket, completes the handshake, and
     /// answers ListSurfaces with the static set we seeded. Exercises
@@ -406,6 +436,311 @@ final class PeerServerTests: XCTestCase {
         await transport.close()
         await server.stop()
     }
+
+    /// The allow-list is the security boundary of team.call.v1: everything
+    /// on it acts inside a team the host already owns, and the refusal has
+    /// to happen in the server, not in each provider.
+    func testTeamCallRunsAllowedMethodAndRefusesTheRest() async throws {
+        let sockPath = "/tmp/tm-peer-swift-call-\(UUID().uuidString.prefix(8)).sock"
+        defer { try? FileManager.default.removeItem(atPath: sockPath) }
+
+        let provider = TeamCallProvider()
+        let server = PeerServer(socketPath: sockPath, provider: provider)
+        try await server.start()
+        defer { Task { await server.stop() } }
+
+        let deadline = Date().addingTimeInterval(2)
+        while !FileManager.default.fileExists(atPath: sockPath) {
+            if Date() > deadline { return XCTFail("no socket") }
+            try await Task.sleep(nanoseconds: 50_000_000)
+        }
+
+        let transport = try await UnixSocketTransport.connect(socketPath: sockPath)
+        let session = PeerSession(
+            read: { try await transport.read() },
+            write: { try await transport.write($0) }
+        )
+        _ = try await session.handshake()
+
+        let allowed = try await session.callTeam(
+            method: "team.send",
+            paramsJSON: #"{"agent":"explorer","text":"hi"}"#
+        )
+        XCTAssertTrue(allowed.ok)
+        XCTAssertEqual(allowed.resultJson, #"{"sent":true}"#)
+        let seen = await provider.lastCall
+        XCTAssertEqual(seen?.method, "team.send")
+
+        // Creating a team takes a working directory and spawns processes —
+        // exactly what a peer must not be able to reach.
+        let refused = try await session.callTeam(method: "team.create", paramsJSON: "{}")
+        XCTAssertFalse(refused.ok)
+        XCTAssertEqual(refused.errorCode, PeerTeamCall.ErrorCode.methodNotAllowed)
+        // The provider must never even see a refused method.
+        let afterRefusal = await provider.lastCall
+        XCTAssertEqual(afterRefusal?.method, "team.send")
+    }
+
+    func testTeamCallAllowListExcludesLifecycleAndSpawn() {
+        for method in [
+            "team.create", "team.destroy", "team.attach", "team.detach",
+            "team.add_agent", "team.restart", "headless.spawn",
+        ] {
+            XCTAssertFalse(
+                PeerTeamCall.isAllowed(method),
+                "\(method) must not be reachable from a peer"
+            )
+        }
+        for method in ["team.send", "team.delegate", "team.read", "team.status"] {
+            XCTAssertTrue(PeerTeamCall.isAllowed(method))
+        }
+    }
+
+    /// Full `team.leader.v1` loopback over a real Unix socket.
+    ///
+    /// The control plane is injected once into the server and therefore
+    /// survives client reconnects. Retrying the same delegate request after
+    /// reconnect must return the cached response without creating a second
+    /// task, pasting text twice, or submitting a second Return. The provider's
+    /// focus/selection snapshot stands in for the app-layer state that this
+    /// non-focus protocol is forbidden to mutate.
+    func testTeamLeaderLocalAndPeerBootstrapReconnectDelegateIsIdempotentAndFocusNeutral() async throws {
+        let sockPath = "/tmp/tm-peer-swift-leader-\(UUID().uuidString.prefix(8)).sock"
+        defer { try? FileManager.default.removeItem(atPath: sockPath) }
+
+        let provider = TeamLeaderE2EProvider()
+        let controlPlane = PeerTeamLeaderControlPlane()
+        let server = PeerServer(
+            socketPath: sockPath,
+            provider: provider,
+            teamLeaderControlPlane: controlPlane
+        )
+        try await server.start()
+        defer { Task { await server.stop() } }
+
+        let deadline = Date().addingTimeInterval(2)
+        while !FileManager.default.fileExists(atPath: sockPath) {
+            if Date() > deadline { return XCTFail("no socket") }
+            try await Task.sleep(nanoseconds: 50_000_000)
+        }
+
+        func connect(
+            peerID: Data = PeerIdentity.defaultPeerID()
+        ) async throws -> (PeerSession, UnixSocketTransport) {
+            let transport = try await UnixSocketTransport.connect(socketPath: sockPath)
+            let session = PeerSession(
+                read: { try await transport.read() },
+                write: { try await transport.write($0) }
+            )
+            var options = PeerSessionOptions()
+            options.peerID = peerID
+            let hello = try await session.handshake(options: options)
+            XCTAssertTrue(hello.hasHostCapability(PeerCapability.teamLeaderV1))
+            return (session, transport)
+        }
+
+        let initialSnapshot = await provider.focusSelectionSnapshot()
+        let (firstSession, firstTransport) = try await connect()
+
+        let localBootstrap = try await firstSession.bootstrapTeamLeader(
+            projectID: "name:demo",
+            placement: .local,
+            requestID: Data(repeating: 0x31, count: PeerTeamLeader.requestIDBytes)
+        )
+        XCTAssertTrue(localBootstrap.ok)
+        XCTAssertEqual(localBootstrap.teamUuid, "team-uuid")
+        XCTAssertEqual(localBootstrap.grant.role, .leader)
+
+        let peerBootstrap = try await firstSession.bootstrapTeamLeader(
+            projectID: "name:demo",
+            placement: .peer,
+            requestID: Data(repeating: 0x32, count: PeerTeamLeader.requestIDBytes)
+        )
+        XCTAssertTrue(peerBootstrap.ok)
+        XCTAssertEqual(peerBootstrap.teamUuid, "team-uuid")
+
+        // Lifecycle remains outside the generic peer surface even when this
+        // connection also holds a scoped leader grant.
+        let lifecycle = try await firstSession.callTeam(
+            method: "team.create",
+            paramsJSON: "{}"
+        )
+        XCTAssertFalse(lifecycle.ok)
+        XCTAssertEqual(lifecycle.errorCode, PeerTeamCall.ErrorCode.methodNotAllowed)
+
+        let delegateRequestID = Data(
+            repeating: 0x41,
+            count: PeerTeamLeader.requestIDBytes
+        )
+        let delegateParams = #"""
+        {"agent_name":"executor","text":"inspect relay","submit_return":true,"team_name":"forged"}
+        """#
+        let firstDelegate = try await firstSession.callTeamLeader(
+            grant: peerBootstrap.grant,
+            teamUUID: peerBootstrap.teamUuid,
+            requestID: delegateRequestID,
+            method: "team.delegate",
+            paramsJSON: delegateParams
+        )
+        XCTAssertTrue(firstDelegate.ok)
+        XCTAssertFalse(firstDelegate.cached)
+
+        // The same grant id with a peer-forged project must reach the server
+        // and be rejected against the registered grant before dispatch.
+        var forgedGrant = peerBootstrap.grant
+        forgedGrant.projectID = "name:other"
+        let denied = try await firstSession.callTeamLeader(
+            grant: forgedGrant,
+            teamUUID: peerBootstrap.teamUuid,
+            requestID: Data(repeating: 0x42, count: PeerTeamLeader.requestIDBytes),
+            method: "team.task.create",
+            paramsJSON: #"{"title":"must-not-exist"}"#
+        )
+        XCTAssertFalse(denied.ok)
+        XCTAssertEqual(
+            denied.errorCode,
+            PeerTeamLeader.ValidationError.forgedProject.rawValue
+        )
+
+        // Bypass the client's matching preflight to prove the socket server
+        // independently rejects an expired wire grant before provider dispatch.
+        var expiredGrant = peerBootstrap.grant
+        expiredGrant.expiresAtUnixSecs = 1
+        var expiredRequest = Termmesh_Peer_V1_TeamLeaderCommandRequest()
+        expiredRequest.grant = expiredGrant
+        expiredRequest.teamUuid = expiredGrant.teamUuid
+        expiredRequest.requestID = Data(
+            repeating: 0x44,
+            count: PeerTeamLeader.requestIDBytes
+        )
+        expiredRequest.method = "team.task.create"
+        expiredRequest.paramsJson = #"{"title":"must-not-exist"}"#
+        var expiredEnvelope = Termmesh_Peer_V1_Envelope()
+        expiredEnvelope.seq = 900
+        expiredEnvelope.teamLeaderCommandRequest = expiredRequest
+        try await firstTransport.write(encodeFrame(expiredEnvelope))
+        var expiredResponseBytes = Data()
+        var expiredResponse: Termmesh_Peer_V1_TeamLeaderCommandResponse?
+        while expiredResponse == nil {
+            expiredResponseBytes.append(try await firstTransport.read())
+            if let envelope = try decodeFrame(from: &expiredResponseBytes),
+               case .teamLeaderCommandResponse(let response) = envelope.payload {
+                expiredResponse = response
+            }
+        }
+        XCTAssertFalse(expiredResponse?.ok ?? true)
+        XCTAssertEqual(
+            expiredResponse?.errorCode,
+            PeerTeamLeader.ValidationError.expiredGrant.rawValue
+        )
+
+        try await firstSession.sendGoodbye(reason: "force reconnect")
+        await firstTransport.close()
+
+        let (reconnectedSession, reconnectedTransport) = try await connect()
+        let replayedDelegate = try await reconnectedSession.callTeamLeader(
+            grant: peerBootstrap.grant,
+            teamUUID: peerBootstrap.teamUuid,
+            requestID: delegateRequestID,
+            method: "team.delegate",
+            paramsJSON: delegateParams
+        )
+        XCTAssertTrue(replayedDelegate.ok)
+        XCTAssertTrue(replayedDelegate.cached)
+        XCTAssertEqual(replayedDelegate.resultJson, firstDelegate.resultJson)
+
+        // A different authenticated install may know the grant bytes and
+        // request id, but the bootstrap audience binding still rejects it.
+        let (attackerSession, attackerTransport) = try await connect(
+            peerID: Data(repeating: 0xEE, count: PeerIdentity.byteCount)
+        )
+        let hijack = try await attackerSession.callTeamLeader(
+            grant: peerBootstrap.grant,
+            teamUUID: peerBootstrap.teamUuid,
+            requestID: delegateRequestID,
+            method: "team.delegate",
+            paramsJSON: delegateParams
+        )
+        XCTAssertFalse(hijack.ok)
+        XCTAssertEqual(
+            hijack.errorCode,
+            PeerTeamLeader.ValidationError.wrongAudience.rawValue
+        )
+        try await attackerSession.sendGoodbye(reason: "hijack refused")
+        await attackerTransport.close()
+
+        let effects = await provider.delegateEffects()
+        XCTAssertEqual(effects.dispatches, 1)
+        XCTAssertEqual(effects.textPastes, 1)
+        XCTAssertEqual(effects.returnSubmissions, 1)
+        XCTAssertEqual(effects.lastTeamUUID, "team-uuid")
+        let finalSnapshot = await provider.focusSelectionSnapshot()
+        XCTAssertEqual(finalSnapshot, initialSnapshot)
+
+        try await reconnectedSession.sendGoodbye(reason: "leader e2e done")
+        await reconnectedTransport.close()
+        await server.stop()
+    }
+
+    /// A Mac host is where a team leader usually sits, so its roster is the
+    /// answer to "where does this project's leader run" — and it only exists
+    /// on the wire, never in the layout tree.
+    func testTeamRosterIsServedAndGatedByCapability() async throws {
+        let sockPath = "/tmp/tm-peer-swift-teams-\(UUID().uuidString.prefix(8)).sock"
+        defer { try? FileManager.default.removeItem(atPath: sockPath) }
+
+        let provider = TeamRosterProvider(teams: [("live-team", "/Users/x/work/demo")])
+        let server = PeerServer(socketPath: sockPath, provider: provider)
+        try await server.start()
+        defer { Task { await server.stop() } }
+
+        let deadline = Date().addingTimeInterval(2)
+        while !FileManager.default.fileExists(atPath: sockPath) {
+            if Date() > deadline { return XCTFail("no socket") }
+            try await Task.sleep(nanoseconds: 50_000_000)
+        }
+
+        let transport = try await UnixSocketTransport.connect(socketPath: sockPath)
+        let session = PeerSession(
+            read: { try await transport.read() },
+            write: { try await transport.write($0) }
+        )
+        let hello = try await session.handshake()
+        XCTAssertTrue(
+            hello.hasHostCapability(PeerCapability.teamRosterV1),
+            "a host with teams must advertise the roster capability"
+        )
+
+        let teams = try await session.listTeams()
+        XCTAssertEqual(teams.count, 1)
+        XCTAssertEqual(teams[0].name, "live-team")
+        XCTAssertEqual(teams[0].projectRoot, "/Users/x/work/demo")
+    }
+
+    /// A host with no teams must not advertise the capability, or a client
+    /// would ask a question it cannot usefully answer.
+    func testHostWithoutTeamsDoesNotAdvertiseRoster() async throws {
+        let sockPath = "/tmp/tm-peer-swift-noteams-\(UUID().uuidString.prefix(8)).sock"
+        defer { try? FileManager.default.removeItem(atPath: sockPath) }
+
+        let server = PeerServer(socketPath: sockPath, provider: TeamRosterProvider(teams: []))
+        try await server.start()
+        defer { Task { await server.stop() } }
+
+        let deadline = Date().addingTimeInterval(2)
+        while !FileManager.default.fileExists(atPath: sockPath) {
+            if Date() > deadline { return XCTFail("no socket") }
+            try await Task.sleep(nanoseconds: 50_000_000)
+        }
+
+        let transport = try await UnixSocketTransport.connect(socketPath: sockPath)
+        let session = PeerSession(
+            read: { try await transport.read() },
+            write: { try await transport.write($0) }
+        )
+        let hello = try await session.handshake()
+        XCTAssertFalse(hello.hasHostCapability(PeerCapability.teamRosterV1))
+    }
 }
 
 /// Test-only `PeerSurfaceProvider` that records the `resumeFromSeq` it was
@@ -440,6 +775,7 @@ private actor RecordingAttachProvider: PeerSurfaceProvider {
             detach: {}
         )
     }
+
 }
 
 /// Test-only `PeerSurfaceProvider` that records `renameWorkspace`/
@@ -468,5 +804,134 @@ private actor RecordingWorkspaceProvider: PeerSurfaceProvider {
     func deleteWorkspace(id workspaceID: Data) async -> Bool {
         deleted = workspaceID
         return true
+    }
+}
+
+private actor TeamRosterProvider: PeerSurfaceProvider {
+    private let teams: [(String, String)]
+
+    init(teams: [(String, String)]) { self.teams = teams }
+
+    func listSurfaces() async -> [Termmesh_Peer_V1_SurfaceInfo] { [] }
+
+    func attach(
+        surfaceID: Data,
+        clientCols: UInt32,
+        clientRows: UInt32,
+        resumeFromSeq: UInt64
+    ) async -> PeerSurfaceAttachment? { nil }
+
+    func listTeams() async -> [Termmesh_Peer_V1_Team] {
+        teams.map { name, root in
+            var team = Termmesh_Peer_V1_Team()
+            team.name = name
+            team.projectRoot = root
+            return team
+        }
+    }
+}
+
+private actor TeamCallProvider: PeerSurfaceProvider {
+    private(set) var lastCall: (method: String, paramsJSON: String)?
+
+    func listSurfaces() async -> [Termmesh_Peer_V1_SurfaceInfo] { [] }
+
+    func attach(
+        surfaceID: Data,
+        clientCols: UInt32,
+        clientRows: UInt32,
+        resumeFromSeq: UInt64
+    ) async -> PeerSurfaceAttachment? { nil }
+
+    func listTeams() async -> [Termmesh_Peer_V1_Team] {
+        var team = Termmesh_Peer_V1_Team()
+        team.name = "live-team"
+        return [team]
+    }
+
+    func callTeamMethod(
+        _ method: String,
+        paramsJSON: String
+    ) async -> Result<String, PeerTeamCallFailure>? {
+        lastCall = (method, paramsJSON)
+        return .success(#"{"sent":true}"#)
+    }
+}
+
+private actor TeamLeaderE2EProvider: PeerSurfaceProvider {
+    private let projectID = "name:demo"
+    private let teamUUID = "team-uuid"
+    private var selectedWorkspace = "workspace-before"
+    private var focusedPane = "pane-before"
+    private var dispatchCount = 0
+    private var textPasteCount = 0
+    private var returnSubmissionCount = 0
+    private var lastScopedTeamUUID: String?
+
+    func listSurfaces() async -> [Termmesh_Peer_V1_SurfaceInfo] { [] }
+
+    func attach(
+        surfaceID: Data,
+        clientCols: UInt32,
+        clientRows: UInt32,
+        resumeFromSeq: UInt64
+    ) async -> PeerSurfaceAttachment? { nil }
+
+    func listTeams() async -> [Termmesh_Peer_V1_Team] {
+        var team = Termmesh_Peer_V1_Team()
+        team.name = "demo"
+        return [team]
+    }
+
+    func resolveTeamLeaderProject(_ projectID: String) async -> String? {
+        projectID == self.projectID ? teamUUID : nil
+    }
+
+    func callScopedTeamLeaderMethod(
+        _ method: String,
+        paramsJSON: String,
+        teamUUID: String
+    ) async -> Result<String, PeerTeamCallFailure>? {
+        dispatchCount += 1
+        lastScopedTeamUUID = teamUUID
+        guard teamUUID == self.teamUUID else {
+            return .failure(PeerTeamCallFailure(
+                code: "wrong_scope",
+                message: "unexpected authoritative team"
+            ))
+        }
+        guard method == "team.delegate",
+              let data = paramsJSON.data(using: .utf8),
+              let params = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              params["text"] as? String == "inspect relay",
+              params["submit_return"] as? Bool == true else {
+            return .failure(PeerTeamCallFailure(
+                code: "invalid_delegate",
+                message: "delegate must atomically paste and submit"
+            ))
+        }
+        textPasteCount += 1
+        returnSubmissionCount += 1
+        return .success(
+            #"{"task":{"id":"task-1"},"text_delivered":true,"return_submitted":true}"#
+        )
+    }
+
+    func focusSelectionSnapshot() -> String {
+        "\(selectedWorkspace)|\(focusedPane)"
+    }
+
+    func delegateEffects() -> (
+        dispatches: Int,
+        textPastes: Int,
+        returnSubmissions: Int,
+        lastTeamUUID: String?
+    ) {
+        (
+            dispatchCount,
+            textPasteCount,
+            returnSubmissionCount,
+            lastScopedTeamUUID
+        )
     }
 }

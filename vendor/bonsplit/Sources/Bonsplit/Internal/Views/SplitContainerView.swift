@@ -471,6 +471,8 @@ struct SplitContainerView<Content: View, EmptyContent: View>: NSViewRepresentabl
         /// Retain hosting controllers so SwiftUI content stays alive
         var firstHostingController: NSHostingController<AnyView>?
         var secondHostingController: NSHostingController<AnyView>?
+        private var lastPassiveGeometryFrames: [CGRect] = []
+        private var passiveGeometryNotificationPending = false
 
         init(
             splitState: SplitState,
@@ -837,10 +839,19 @@ struct SplitContainerView<Content: View, EmptyContent: View>: NSViewRepresentabl
                     // reentrant NSHostingView layout which SwiftUI silently skips — causing panes
                     // to "disappear" (their frame never gets updated).
                     self.syncPosition(statePosition, in: splitView, layout: false)
-                    // Defer geometry notification to avoid reentrant SwiftUI state mutation
-                    // during the current layout pass.
+                    // A passive resize can be reported repeatedly with identical
+                    // frames while SwiftUI reconciles hosted native panes. Sending
+                    // every duplicate back through didChangeGeometry creates a
+                    // layout → notification → layout loop.
+                    let frames = [splitView.bounds] + splitView.arrangedSubviews.map(\.frame)
+                    guard frames != lastPassiveGeometryFrames else { return }
+                    lastPassiveGeometryFrames = frames
+                    guard !passiveGeometryNotificationPending else { return }
+                    passiveGeometryNotificationPending = true
                     DispatchQueue.main.async { [weak self] in
-                        self?.onGeometryChange?(false)
+                        guard let self else { return }
+                        self.passiveGeometryNotificationPending = false
+                        self.onGeometryChange?(false)
                     }
                     return
                 }

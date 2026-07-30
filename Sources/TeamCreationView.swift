@@ -172,6 +172,16 @@ struct TeamAgentRow: Identifiable, Equatable {
     var preset: AgentRolePreset
     var customInstructions: String  // overrides preset instructions if non-empty
     var providerBadge: ProviderBadge = .none
+    /// The peer this agent runs on, or nil for this machine.
+    ///
+    /// A team is often more than one machine's: tests want the Mac, a build
+    /// may want the Linux box. That is a property of the member rather than of
+    /// the team, so it is chosen per row — and it belongs in the form that
+    /// composes the team, not only in a command typed afterwards.
+    var hostKey: String?
+    /// Where on that machine. Two machines rarely lay a checkout out the same
+    /// way, so the local path is not an answer for the remote one.
+    var hostDirectory: String = ""
 
     enum ProviderBadge: Equatable {
         case none
@@ -343,6 +353,17 @@ struct ResumableTeam: Identifiable, Hashable {
 struct TeamCreationView: View {
     @Environment(\.dismiss) private var dismiss
     @ObservedObject var presetManager = AgentRolePresetManager.shared
+    @ObservedObject private var hostStore = RemoteHostStore.shared
+    /// The machine and path the "Apply to All" beside them writes into every
+    /// row. Composing a team that runs on one peer meant typing its path once
+    /// per member, which is the same answer asked three times.
+    @State private var bulkHostKey: String?
+    @State private var bulkHostDirectory: String = ""
+
+    /// Peers that could take a member right now.
+    private var connectedPeers: [HostEntry] {
+        hostStore.sortedHosts.filter(\.isConnected)
+    }
     @ObservedObject var savedTemplateManager = SavedTeamTemplateManager.shared
     @ObservedObject var teamTemplateManager = TeamTemplateManager.shared
     @ObservedObject var providerDetector = ProviderDetector.shared
@@ -409,8 +430,6 @@ struct TeamCreationView: View {
     @State private var recentSessions: [ClaudeSession] = []
     @State private var selectedSessionId: String?
     @State private var manualSessionId = ""
-    @State private var runbookStatus = AgentRunbookService.shared.status()
-
     // MARK: - Phase 2 Resume state
 
     /// "new" (fresh team) or "resume" (rehydrate a previously-destroyed team).
@@ -447,9 +466,6 @@ struct TeamCreationView: View {
     }
 
     /// Models shown in the bulk picker — defaults to Claude models.
-    private var bulkModels: [String] {
-        AgentRolePreset.models(for: bulkCli)
-    }
     @State private var bulkCli = "claude"
 
     @State private var workingDirectory: String = ""
@@ -475,7 +491,17 @@ struct TeamCreationView: View {
                         Divider().padding(.vertical, 2)
                         presetButtons
                         Divider().padding(.vertical, 2)
-                        agentList
+                        TeamAgentComposer(
+                agents: $agents,
+                workingDirectory: workingDirectory,
+                onComposionChanged: persistSelectedSmartPresetOverride,
+                defaultModel: defaultModel,
+                // Re-applying a smart preset needs the preset this sheet has
+                // selected, which the composer has no way to know.
+                onMaxCost: applyMaxCost,
+                onBalanced: applyBalanced,
+                onMinCost: applyMinCost
+            )
                         Divider().padding(.vertical, 2)
                         workflowButtons
                     }
@@ -506,7 +532,6 @@ struct TeamCreationView: View {
                 leaderModel = AgentRolePreset.defaultModel(for: leaderMode)
             }
             validateWorkingDirectory()
-            refreshRunbookStatus()
             // Phase 2.5 — honor caller's requested initial mode (sidebar
             // resumable footer opens us directly into resume picker).
             if initialMode == "resume" && creationMode != "resume" {
@@ -516,7 +541,6 @@ struct TeamCreationView: View {
         }
         .onChange(of: workingDirectory) { _ in
             validateWorkingDirectory()
-            refreshRunbookStatus()
             // Clear session state tied to the previous cwd so createTeam cannot
             // submit (new cwd + stale sessionId) and produce wrong rehydration.
             recentSessions = []
@@ -827,7 +851,7 @@ struct TeamCreationView: View {
                     ForEach(team.agents) { agent in
                         HStack(spacing: 6) {
                             Circle()
-                                .fill(agentColor(agent.color))
+                                .fill(TeamAgentComposer.agentColor(agent.color))
                                 .frame(width: 8, height: 8)
                             Text(agent.name)
                                 .font(.caption)
@@ -1204,7 +1228,10 @@ struct TeamCreationView: View {
                             DispatchQueue.main.async { leaderModel = fallback }
                             return fallback
                         },
-                        set: { leaderModel = $0 }
+                        set: {
+                            leaderModel = $0
+                            persistSelectedSmartPresetOverride()
+                        }
                     )) {
                         ForEach(AgentRolePreset.models(for: leaderMode), id: \.self) { m in
                             Text(AgentRolePreset.modelDisplayLabel(m, for: leaderMode)).tag(m)
@@ -1578,317 +1605,6 @@ struct TeamCreationView: View {
 
     // MARK: - Agent List
 
-    private var agentList: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            HStack {
-                Text("Agents")
-                    .font(.subheadline.bold())
-                Spacer()
-
-                // 3-mode cost toggle
-                if !agents.isEmpty {
-                    HStack(spacing: 4) {
-                        Button(action: applyMaxCost) {
-                            Label("최대 성능", systemImage: "diamond.fill")
-                                .font(.caption)
-                        }
-                        .help("All agents → opus tier (highest cost, best quality)")
-                        Button(action: applyBalanced) {
-                            Label("균형", systemImage: "scale.3d")
-                                .font(.caption)
-                        }
-                        .help("Restore per-role tiers from current Smart Preset (or sonnet for all if none active)")
-                        Button(action: applyMinCost) {
-                            Label("최소 비용", systemImage: "leaf.fill")
-                                .font(.caption)
-                        }
-                        .help("All agents → haiku tier (lowest cost)")
-                    }
-                    .disabled(agents.isEmpty)
-                }
-
-                // Bulk model selector — only applies on explicit button click
-                if !agents.isEmpty {
-                    Button(action: applyModelToAll) {
-                        Label("Apply to All", systemImage: "arrow.triangle.2.circlepath")
-                            .font(.caption)
-                    }
-                    .buttonStyle(.borderless)
-                    .help("Change all \(bulkCli) agents' model to \(bulkModel)")
-                    Picker("", selection: Binding(
-                        get: { bulkCli },
-                        set: { newCli in
-                            bulkCli = newCli
-                            bulkModel = AgentRolePreset.defaultModel(for: newCli)
-                        }
-                    )) {
-                        ForEach(AgentRolePreset.supportedCLIs, id: \.self) { cli in
-                            Text(cli).tag(cli)
-                        }
-                    }
-                    .frame(width: 85)
-                    // Self-healing binding mirrors the leader picker pattern so
-                    // bulkModel can never be visually empty when bulkCli changes.
-                    Picker("", selection: Binding(
-                        get: {
-                            let opts = bulkModels
-                            if opts.contains(bulkModel) { return bulkModel }
-                            let fallback = AgentRolePreset.defaultModel(for: bulkCli)
-                            DispatchQueue.main.async { bulkModel = fallback }
-                            return fallback
-                        },
-                        set: { bulkModel = $0 }
-                    )) {
-                        ForEach(bulkModels, id: \.self) { m in
-                            Text(AgentRolePreset.modelDisplayLabel(m, for: bulkCli)).tag(m)
-                        }
-                    }
-                    .frame(width: 130)
-                }
-
-                Text("\(agents.count)")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .padding(.horizontal, 8)
-                    .padding(.vertical, 2)
-                    .background(Capsule().fill(.quaternary))
-            }
-
-            ForEach(Array(agents.enumerated()), id: \.element.id) { index, agent in
-                agentCard(index: index, agent: agent)
-            }
-            .onMove { source, destination in
-                agents.move(fromOffsets: source, toOffset: destination)
-                persistSelectedSmartPresetOverride()
-            }
-
-            Button(action: addAgent) {
-                Label("Add Agent", systemImage: "plus.circle.fill")
-                    .font(.subheadline)
-            }
-            .buttonStyle(.borderless)
-        }
-    }
-
-    private func agentCard(index: Int, agent: TeamAgentRow) -> some View {
-        let isCustomized = !agent.customInstructions.isEmpty &&
-            agent.customInstructions != agent.preset.instructions
-        let isHovered = hoveredAgentId == agent.id
-
-        return VStack(alignment: .leading, spacing: 6) {
-            HStack(spacing: 6) {
-                // Drag handle
-                Image(systemName: "line.3.horizontal")
-                    .font(.caption)
-                    .foregroundStyle(.tertiary)
-                    .frame(width: 14)
-
-                // Agent number badge
-                Text("#\(index + 1)")
-                    .font(.caption2.bold())
-                    .foregroundStyle(.secondary)
-                    .frame(width: 20)
-
-                // Color dot
-                Circle()
-                    .fill(agentColor(agent.preset.color))
-                    .frame(width: 8, height: 8)
-
-                // Role picker
-                Picker("", selection: Binding(
-                    get: { agent.preset.id },
-                    set: { newId in
-                        if let preset = presetManager.presets.first(where: { $0.id == newId }) {
-                            agents[index].preset = preset
-                            agents[index].customInstructions = ""
-                            persistSelectedSmartPresetOverride()
-                        }
-                    }
-                )) {
-                    ForEach(presetManager.presets) { preset in
-                        Text(preset.displayName).tag(preset.id)
-                    }
-                }
-                .frame(width: 120)
-
-                // CLI picker
-                Picker("", selection: Binding(
-                    get: { agent.preset.cli },
-                    set: { newCli in
-                        let oldCli = agents[index].preset.cli
-                        agents[index].preset.cli = newCli
-                        agents[index].providerBadge = .none  // clear badge on manual change
-                        // Reset model to CLI default when switching CLI families
-                        if AgentRolePreset.models(for: oldCli) != AgentRolePreset.models(for: newCli) {
-                            agents[index].preset.model = AgentRolePreset.defaultModel(for: newCli)
-                        }
-                        persistSelectedSmartPresetOverride()
-                    }
-                )) {
-                    ForEach(AgentRolePreset.supportedCLIs, id: \.self) { cli in
-                        Text(cli).tag(cli)
-                    }
-                }
-                .frame(width: 90)
-
-                // Model picker — shows CLI-appropriate models.
-                // Self-healing: when the agent's CLI flips (e.g. claude→codex), the
-                // previously-stored model tier may no longer be valid for the new CLI.
-                // Returning a fallback in get + scheduling a state correction keeps
-                // the picker from rendering empty before onChange handlers re-sync.
-                Picker("", selection: Binding(
-                    get: {
-                        let opts = AgentRolePreset.models(for: agent.preset.cli)
-                        let normalized = AgentRolePreset.normalizeModel(agent.preset.model, for: agent.preset.cli)
-                        if opts.contains(normalized) {
-                            if normalized != agent.preset.model {
-                                DispatchQueue.main.async {
-                                    guard index < agents.count else { return }
-                                    agents[index].preset.model = normalized
-                                }
-                            }
-                            return normalized
-                        }
-                        let fallback = AgentRolePreset.defaultModel(for: agent.preset.cli)
-                        DispatchQueue.main.async {
-                            guard index < agents.count else { return }
-                            agents[index].preset.model = fallback
-                        }
-                        return fallback
-                    },
-                    set: {
-                        agents[index].preset.model = $0
-                        persistSelectedSmartPresetOverride()
-                    }
-                )) {
-                    ForEach(AgentRolePreset.models(for: agent.preset.cli), id: \.self) { m in
-                        Text(AgentRolePreset.modelDisplayLabel(m, for: agent.preset.cli)).tag(m)
-                    }
-                }
-                .frame(width: 130)
-
-                // Provider badge
-                switch agent.providerBadge {
-                case .best(let reason):
-                    HStack(spacing: 2) {
-                        Text("\u{26A1}")
-                            .font(.system(size: 9))
-                        Text(reason)
-                            .font(.system(size: 9))
-                            .foregroundStyle(.green)
-                    }
-                    .padding(.horizontal, 5)
-                    .padding(.vertical, 1)
-                    .background(RoundedRectangle(cornerRadius: 4).fill(Color.green.opacity(0.1)))
-                    .help("Optimal provider for this role")
-                case .fallback(let wanted):
-                    HStack(spacing: 2) {
-                        Text("\u{21A9}")
-                            .font(.system(size: 9))
-                        Text("install \(wanted)")
-                            .font(.system(size: 9))
-                            .foregroundStyle(.orange)
-                    }
-                    .padding(.horizontal, 5)
-                    .padding(.vertical, 1)
-                    .background(RoundedRectangle(cornerRadius: 4).fill(Color.orange.opacity(0.1)))
-                    .help("Install \(wanted) CLI for optimal performance")
-                case .none:
-                    EmptyView()
-                }
-
-                runbookBadge(for: agent)
-
-                Spacer()
-
-                // Remove button
-                Button(action: {
-                    agents.remove(at: index)
-                    persistSelectedSmartPresetOverride()
-                }) {
-                    Image(systemName: "minus.circle")
-                        .foregroundStyle(.red.opacity(0.7))
-                }
-                .buttonStyle(.borderless)
-                .disabled(agents.count <= 1)
-            }
-
-            // Custom instructions (collapsible)
-            DisclosureGroup {
-                VStack(alignment: .leading, spacing: 4) {
-                    ZStack(alignment: .topLeading) {
-                        if (agent.customInstructions.isEmpty ? agent.preset.instructions : agent.customInstructions).isEmpty {
-                            Text("Enter custom instructions…")
-                                .font(.system(.caption, design: .monospaced))
-                                .foregroundStyle(.tertiary)
-                                .padding(.top, 4)
-                                .padding(.leading, 4)
-                                .allowsHitTesting(false)
-                        }
-                        TextEditor(text: Binding(
-                            get: {
-                                agent.customInstructions.isEmpty
-                                    ? agent.preset.instructions
-                                    : agent.customInstructions
-                            },
-                            set: {
-                                agents[index].customInstructions = $0
-                                persistSelectedSmartPresetOverride()
-                            }
-                        ))
-                        .font(.system(.caption, design: .monospaced))
-                        .frame(height: 80)
-                        .overlay(
-                            RoundedRectangle(cornerRadius: 4)
-                                .stroke(Color.secondary.opacity(0.2), lineWidth: 1)
-                        )
-                    }
-                    if isCustomized {
-                        Button(action: {
-                            agents[index].customInstructions = ""
-                            persistSelectedSmartPresetOverride()
-                        }) {
-                            Label("Reset to default", systemImage: "arrow.counterclockwise")
-                                .font(.caption2)
-                        }
-                        .buttonStyle(.borderless)
-                        .foregroundStyle(.secondary)
-                    }
-                }
-            } label: {
-                HStack(spacing: 4) {
-                    // Watcher's custom instructions are the oversight spec — label
-                    // it accordingly so users know what to paste here.
-                    Text(agent.preset.name == "watcher" ? "Watcher Spec" : "Instructions")
-                    if isCustomized {
-                        Text("(customized)")
-                            .foregroundStyle(.orange.opacity(0.8))
-                    }
-                }
-            }
-            .font(.caption)
-            .foregroundStyle(.secondary)
-
-            resolvedPromptDisclosure(for: agent)
-        }
-        .padding(10)
-        .background(
-            RoundedRectangle(cornerRadius: 8)
-                .fill(.quaternary.opacity(isHovered ? 0.8 : 0.5))
-        )
-        .overlay(
-            RoundedRectangle(cornerRadius: 8)
-                .stroke(isHovered ? Color.secondary.opacity(0.2) : Color.clear, lineWidth: 1)
-        )
-        .onHover { hovering in
-            withAnimation(.easeInOut(duration: 0.1)) {
-                hoveredAgentId = hovering ? agent.id : nil
-            }
-        }
-    }
-
-    // MARK: - Quick Presets (legacy, simple role-only)
-
     private var workflowButtons: some View {
         VStack(alignment: .leading, spacing: 8) {
             Text("Workflow Presets")
@@ -2042,7 +1758,9 @@ struct TeamCreationView: View {
         } else {
             displayPreset = preset
         }
-        let resolved = displayPreset.resolve(with: providerDetector)
+        let resolved = displayPreset.usesExactResolution
+            ? displayPreset.resolveExactly()
+            : displayPreset.resolve(with: providerDetector)
         let bestCount = resolved.filter { $0.status == .best }.count
         let fbCount = resolved.filter { if case .fallback = $0.status { return true }; return false }.count
         let isSelected = selectedSmartPresetId == preset.id
@@ -2148,7 +1866,12 @@ struct TeamCreationView: View {
         .frame(maxWidth: .infinity, alignment: .leading)
         .contentShape(Rectangle())
         .onTapGesture {
-            if !isEditingName { applySmartPreset(displayPreset) }
+            if !isEditingName {
+                applySmartPreset(
+                    displayPreset,
+                    resolveProviders: !displayPreset.usesExactResolution
+                )
+            }
         }
         .onHover { hovered in
             hoveredSmartPresetId = hovered ? preset.id : (hoveredSmartPresetId == preset.id ? nil : hoveredSmartPresetId)
@@ -2343,202 +2066,12 @@ struct TeamCreationView: View {
 
     // MARK: - Actions
 
-    private func addAgent() {
-        let available = presetManager.presets
-        var preset = available[agents.count % available.count]
-        preset.model = defaultModel
-        let row = TeamAgentRow(preset: preset, customInstructions: "")
-        agents.append(row)
-        persistSelectedSmartPresetOverride()
-    }
-
-    private func applyQuickPreset(count: Int) {
-        let available = presetManager.presets
-        agents = (0..<min(count, available.count)).map { i in
-            var preset = available[i]
-            preset.model = defaultModel
-            return TeamAgentRow(preset: preset, customInstructions: "")
-        }
-    }
-
-    private func applyInitialPreset() {
-        let initialId = teamTemplateManager.pinnedId ?? teamTemplateManager.lastSelectedId
-        if let initialId,
-           initialId.category == .smart,
-           let template = teamTemplateManager.template(for: initialId),
-           teamTemplateManager.builtInTemplate(for: initialId) != nil {
-            applyTemplate(template)
-        } else {
-            applyQuickPreset(count: 2)
-        }
-    }
-
-    private func showPreview(for id: TemplateID) {
-        previewTemplate = teamTemplateManager.template(for: id)
-    }
-
-    private func applyTemplate(_ template: TeamTemplate) {
-        try? TeamTemplateManager.shared.setLastSelected(id: template.id)
-        let payload = template.origin == .builtIn
-            ? (teamTemplateManager.effectivePayload(for: template.id) ?? template.payload)
-            : template.payload
-        switch payload {
-        case .smart(let preset):
-            applySmartPreset(preset)
-        case .workflow(let preset):
-            applyWorkflowPreset(preset)
-        case .quick(let preset):
-            applyTeamPreset(preset)
-        }
-    }
-
-    private func customizeTemplate(_ template: TeamTemplate) {
-        _ = template
-    }
-
-    private func applySmartPreset(_ preset: SmartTeamPreset, useEffectivePayload: Bool = true) {
-        let available = presetManager.presets
-        let templateId = TemplateID(category: .smart, slug: preset.id)
-        let effectivePreset: SmartTeamPreset
-        if useEffectivePayload,
-           case .smart(let overridePreset) = teamTemplateManager.effectivePayload(for: templateId) {
-            effectivePreset = overridePreset
-        } else {
-            effectivePreset = preset
-        }
-        let resolved = effectivePreset.resolve(with: providerDetector)
-        selectedSmartPresetId = effectivePreset.id
-        selectedWorkflowName = nil
-        leaderMode = effectivePreset.leaderMode
-        if !AgentRolePreset.models(for: effectivePreset.leaderMode).contains(leaderModel) {
-            leaderModel = AgentRolePreset.defaultModel(for: effectivePreset.leaderMode)
-        }
-        try? TeamTemplateManager.shared.setLastSelected(id: templateId)
-
-        agents = resolved.compactMap { agent in
-            guard var rolePreset = available.first(where: { $0.name == agent.role })
-                    ?? available.first else { return nil as TeamAgentRow? }
-            rolePreset.cli = agent.cli
-            rolePreset.model = agent.model
-
-            let badge: TeamAgentRow.ProviderBadge
-            switch agent.status {
-            case .best:
-                badge = .best(reason: agent.reason)
-            case .fallback(let wanted):
-                badge = .fallback(wanted: wanted)
-            case .normal:
-                badge = .none
-            }
-            return TeamAgentRow(preset: rolePreset, customInstructions: "", providerBadge: badge)
-        }
-
-        if teamName == "my-team" || teamName.isEmpty {
-            teamName = effectivePreset.id
-        }
-        syncBulkFromAgents()
-    }
-
-    private func applyTeamPreset(_ preset: TeamPreset) {
-        let available = presetManager.presets
-        selectedWorkflowName = nil
-        selectedSmartPresetId = nil
-        try? TeamTemplateManager.shared.setLastSelected(id: TemplateID(category: .quick, slug: preset.slug))
-        agents = preset.roles.compactMap { roleName in
-            guard var p = available.first(where: { $0.name == roleName })
-                    ?? available.first else { return nil as TeamAgentRow? }
-            p.cli = bulkCli
-            p.model = bulkModel
-            return TeamAgentRow(preset: p, customInstructions: "")
-        }
-    }
-
-    private func applyWorkflowPreset(_ preset: WorkflowPresetDefinition) {
-        let available = presetManager.presets
-        selectedWorkflowName = preset.name
-        selectedSmartPresetId = nil
-        leaderMode = preset.leaderMode
-        if !AgentRolePreset.models(for: leaderMode).contains(leaderModel) {
-            leaderModel = AgentRolePreset.defaultModel(for: leaderMode)
-        }
-        try? TeamTemplateManager.shared.setLastSelected(id: TemplateID(category: .workflow, slug: preset.id))
-        agents = preset.roles.compactMap { roleName in
-            guard var p = available.first(where: { $0.name == roleName })
-                    ?? available.first else { return nil as TeamAgentRow? }
-            p.cli = bulkCli
-            p.model = bulkModel
-            return TeamAgentRow(preset: p, customInstructions: "")
-        }
-        if teamName == "my-team" || teamName.isEmpty {
-            teamName = preset.id
-        }
-        syncBulkFromAgents()
-    }
-
-    private func saveCurrentAsTemplate() {
-        guard !saveTemplateName.isEmpty, !agents.isEmpty else { return }
-        let slots = agents.map { row in
-            SavedTeamTemplate.AgentSlot(
-                roleName: row.preset.name,
-                cli: row.preset.cli,
-                model: row.preset.model,
-                customInstructions: row.customInstructions
-            )
-        }
-        let template = SavedTeamTemplate(name: saveTemplateName, leaderMode: leaderMode, agents: slots)
-        savedTemplateManager.add(template)
-    }
-
-    private func loadTemplate(_ template: SavedTeamTemplate) {
-        teamName = template.name
-        leaderMode = template.leaderMode
-        if !AgentRolePreset.models(for: leaderMode).contains(leaderModel) {
-            leaderModel = AgentRolePreset.defaultModel(for: leaderMode)
-        }
-        let available = presetManager.presets
-        agents = template.agents.compactMap { slot in
-            let preset = available.first(where: { $0.name == slot.roleName })
-                ?? available.first
-            guard var p = preset else { return nil as TeamAgentRow? }
-            p.cli = slot.cli
-            p.model = slot.model
-            return TeamAgentRow(preset: p, customInstructions: slot.customInstructions)
-        }
-        syncBulkFromAgents()
-    }
-
-    private func applyLeaderCLIToAll() {
-        guard leaderMode != "repl" else { return }
-        for i in agents.indices {
-            agents[i].preset.cli = leaderMode
-        }
-        persistSelectedSmartPresetOverride()
-    }
-
-    private func applyModelToAll() {
-        for i in agents.indices {
-            agents[i].preset.cli = bulkCli
-            agents[i].preset.model = bulkModel
-            agents[i].providerBadge = .none
-        }
-        persistSelectedSmartPresetOverride()
-    }
 
     private func applyMaxCost() {
         for i in agents.indices {
             agents[i].preset.model = "opus"
             agents[i].providerBadge = .none
         }
-        syncBulkFromAgents()
-        persistSelectedSmartPresetOverride()
-    }
-
-    private func applyMinCost() {
-        for i in agents.indices {
-            agents[i].preset.model = "haiku"
-            agents[i].providerBadge = .none
-        }
-        syncBulkFromAgents()
         persistSelectedSmartPresetOverride()
     }
 
@@ -2574,17 +2107,214 @@ struct TeamCreationView: View {
                     agents[i].providerBadge = .none
                 }
             }
-            syncBulkFromAgents()
             persistSelectedSmartPresetOverride()
         } else {
             for i in agents.indices {
                 agents[i].preset.model = "sonnet"
                 agents[i].providerBadge = .none
             }
-            syncBulkFromAgents()
             persistSelectedSmartPresetOverride()
         }
     }
+
+    private func applyMinCost() {
+        for i in agents.indices {
+            agents[i].preset.model = "haiku"
+            agents[i].providerBadge = .none
+        }
+        persistSelectedSmartPresetOverride()
+    }
+
+    private func applyQuickPreset(count: Int) {
+        let available = presetManager.presets
+        agents = (0..<min(count, available.count)).map { i in
+            var preset = available[i]
+            preset.model = defaultModel
+            return TeamAgentRow(preset: preset, customInstructions: "")
+        }
+    }
+
+    private func applyInitialPreset() {
+        let initialId = teamTemplateManager.pinnedId ?? teamTemplateManager.lastSelectedId
+        if let initialId,
+           initialId.category == .smart,
+           let template = teamTemplateManager.template(for: initialId),
+           teamTemplateManager.builtInTemplate(for: initialId) != nil {
+            applyTemplate(template)
+        } else {
+            applyQuickPreset(count: 2)
+        }
+    }
+
+    private func showPreview(for id: TemplateID) {
+        previewTemplate = teamTemplateManager.template(for: id)
+    }
+
+    private func applyTemplate(_ template: TeamTemplate) {
+        try? TeamTemplateManager.shared.setLastSelected(id: template.id)
+        let payload = template.origin == .builtIn
+            ? (teamTemplateManager.effectivePayload(for: template.id) ?? template.payload)
+            : template.payload
+        switch payload {
+        case .smart(let preset):
+            applySmartPreset(preset, resolveProviders: !preset.usesExactResolution)
+        case .workflow(let preset):
+            applyWorkflowPreset(preset)
+        case .quick(let preset):
+            applyTeamPreset(preset)
+        }
+    }
+
+    private func customizeTemplate(_ template: TeamTemplate) {
+        _ = template
+    }
+
+    private func applySmartPreset(
+        _ preset: SmartTeamPreset,
+        useEffectivePayload: Bool = true,
+        resolveProviders: Bool = true
+    ) {
+        let available = presetManager.presets
+        let templateId = TemplateID(category: .smart, slug: preset.id)
+        let effectivePreset: SmartTeamPreset
+        if useEffectivePayload,
+           case .smart(let overridePreset) = teamTemplateManager.effectivePayload(for: templateId) {
+            effectivePreset = overridePreset
+        } else {
+            effectivePreset = preset
+        }
+        let resolved = resolveProviders
+            ? effectivePreset.resolve(with: providerDetector)
+            : effectivePreset.resolveExactly()
+        selectedSmartPresetId = effectivePreset.id
+        selectedWorkflowName = nil
+        leaderMode = effectivePreset.leaderMode
+        if let presetLeaderModel = effectivePreset.leaderModel,
+           AgentRolePreset.models(for: effectivePreset.leaderMode).contains(presetLeaderModel) {
+            leaderModel = presetLeaderModel
+        } else if !AgentRolePreset.models(for: effectivePreset.leaderMode).contains(leaderModel) {
+            leaderModel = AgentRolePreset.defaultModel(for: effectivePreset.leaderMode)
+        }
+        try? TeamTemplateManager.shared.setLastSelected(id: templateId)
+
+        agents = resolved.compactMap { agent in
+            guard var rolePreset = available.first(where: { $0.name == agent.role })
+                    ?? available.first else { return nil as TeamAgentRow? }
+            rolePreset.cli = agent.cli
+            rolePreset.model = agent.model
+
+            let badge: TeamAgentRow.ProviderBadge
+            switch agent.status {
+            case .best:
+                badge = .best(reason: agent.reason)
+            case .fallback(let wanted):
+                badge = .fallback(wanted: wanted)
+            case .normal:
+                badge = .none
+            }
+            return TeamAgentRow(
+                preset: rolePreset,
+                customInstructions: agent.customInstructions,
+                providerBadge: badge
+            )
+        }
+
+        if teamName == "my-team" || teamName.isEmpty {
+            teamName = effectivePreset.id
+        }
+    }
+
+    private func applyTeamPreset(_ preset: TeamPreset) {
+        let available = presetManager.presets
+        selectedWorkflowName = nil
+        selectedSmartPresetId = nil
+        try? TeamTemplateManager.shared.setLastSelected(id: TemplateID(category: .quick, slug: preset.slug))
+        agents = preset.roles.compactMap { roleName in
+            guard var p = available.first(where: { $0.name == roleName })
+                    ?? available.first else { return nil as TeamAgentRow? }
+            p.cli = bulkCli
+            p.model = bulkModel
+            return TeamAgentRow(preset: p, customInstructions: "")
+        }
+    }
+
+    private func applyWorkflowPreset(_ preset: WorkflowPresetDefinition) {
+        let available = presetManager.presets
+        selectedWorkflowName = preset.name
+        selectedSmartPresetId = nil
+        leaderMode = preset.leaderMode
+        if !AgentRolePreset.models(for: leaderMode).contains(leaderModel) {
+            leaderModel = AgentRolePreset.defaultModel(for: leaderMode)
+        }
+        try? TeamTemplateManager.shared.setLastSelected(id: TemplateID(category: .workflow, slug: preset.id))
+        agents = preset.roles.compactMap { roleName in
+            guard var p = available.first(where: { $0.name == roleName })
+                    ?? available.first else { return nil as TeamAgentRow? }
+            p.cli = bulkCli
+            p.model = bulkModel
+            return TeamAgentRow(preset: p, customInstructions: "")
+        }
+        if teamName == "my-team" || teamName.isEmpty {
+            teamName = preset.id
+        }
+    }
+
+    private func saveCurrentAsTemplate() {
+        guard !saveTemplateName.isEmpty, !agents.isEmpty else { return }
+        let slots = agents.map { row in
+            SavedTeamTemplate.AgentSlot(
+                roleName: row.preset.name,
+                cli: row.preset.cli,
+                model: row.preset.model,
+                customInstructions: row.customInstructions
+            )
+        }
+        let template = SavedTeamTemplate(name: saveTemplateName, leaderMode: leaderMode, agents: slots)
+        savedTemplateManager.add(template)
+    }
+
+    private func loadTemplate(_ template: SavedTeamTemplate) {
+        teamName = template.name
+        leaderMode = template.leaderMode
+        if !AgentRolePreset.models(for: leaderMode).contains(leaderModel) {
+            leaderModel = AgentRolePreset.defaultModel(for: leaderMode)
+        }
+        let available = presetManager.presets
+        agents = template.agents.compactMap { slot in
+            let preset = available.first(where: { $0.name == slot.roleName })
+                ?? available.first
+            guard var p = preset else { return nil as TeamAgentRow? }
+            p.cli = slot.cli
+            p.model = slot.model
+            return TeamAgentRow(preset: p, customInstructions: slot.customInstructions)
+        }
+    }
+
+    private func applyLeaderCLIToAll() {
+        guard leaderMode != "repl" else { return }
+        for i in agents.indices {
+            agents[i].preset.cli = leaderMode
+        }
+        persistSelectedSmartPresetOverride()
+    }
+
+    /// A path to start from when a row is moved to a machine.
+    ///
+    /// Another row already on that machine wins: a team usually works on one
+    /// checkout, and the person answering for the second member has already
+    /// answered for the first. Otherwise what the machine reports about
+    /// itself, preferring a folder named like this project — a guess, but one
+    /// sitting in an editable field rather than acted on silently.
+
+    /// Put every agent on the chosen machine, at the chosen path.
+    ///
+    /// Scoped to both together because a path only means anything on the
+    /// machine it is a path on — applying one without the other would leave
+    /// rows pointing at a directory that is not theirs.
+
+
+
+
 
     private func resetSelectedSmartPresetOverride() {
         guard let smartPresetId = selectedSmartPresetId else { return }
@@ -2612,6 +2342,7 @@ struct TeamCreationView: View {
             // agents + leaderMode are overwritten.
             guard case .smart(var preset) = template.payload else { return }
             preset.leaderMode = leaderMode
+            preset.leaderModel = leaderMode == "repl" ? nil : leaderModel
             preset.agents = liveProviderPreferences()
             var updated = template
             updated.payload = .smart(preset)
@@ -2635,7 +2366,8 @@ struct TeamCreationView: View {
                 primaryModel: row.preset.model,
                 fallbackCli: row.preset.cli,
                 fallbackModel: row.preset.model,
-                reason: "Inline edit"
+                reason: "Inline edit",
+                customInstructions: row.customInstructions.isEmpty ? nil : row.customInstructions
             )
         }
     }
@@ -2645,115 +2377,16 @@ struct TeamCreationView: View {
             for: TemplateID(category: .smart, slug: presetId)
         )?.payload else { return nil }
         preset.leaderMode = leaderMode
+        preset.leaderModel = leaderMode == "repl" ? nil : leaderModel
         preset.agents = liveProviderPreferences()
         return preset
     }
 
-    private func syncBulkFromAgents() {
-        guard !agents.isEmpty else { return }
-        let cliCounts = Dictionary(grouping: agents, by: { $0.preset.cli }).mapValues(\.count)
-        let modelCounts = Dictionary(grouping: agents, by: { $0.preset.model }).mapValues(\.count)
-        bulkCli = cliCounts.max(by: { $0.value < $1.value })?.key ?? bulkCli
-        bulkModel = modelCounts.max(by: { $0.value < $1.value })?.key ?? bulkModel
-    }
 
-    private func refreshRunbookStatus() {
-        runbookStatus = AgentRunbookService.shared.status(workingDirectory: workingDirectory)
-    }
 
-    private func runbookBadge(for agent: TeamAgentRow) -> some View {
-        let hasCustom = !agent.customInstructions.isEmpty && agent.customInstructions != agent.preset.instructions
-        let state = runbookStatus.role(agent.preset.name)?.sourceState ?? .missing
-        let label = hasCustom ? "custom" : (state == .missing ? "preset" : "runbook")
-        let color: Color = hasCustom ? .orange : (state == .missing ? .secondary : .green)
-        return Text(label)
-            .font(.system(size: 9, weight: .medium))
-            .foregroundStyle(color)
-            .padding(.horizontal, 5)
-            .padding(.vertical, 1)
-            .background(RoundedRectangle(cornerRadius: 4).fill(color.opacity(0.1)))
-            .help(hasCustom ? "Team-specific custom instructions" : (state == .missing ? "Using role preset instructions" : "Repo-local runbook will be included"))
-    }
 
-    private func resolvedPromptDisclosure(for agent: TeamAgentRow) -> some View {
-        DisclosureGroup {
-            VStack(alignment: .leading, spacing: 6) {
-                HStack(spacing: 6) {
-                    runbookBadge(for: agent)
-                    Text(runbookPreviewSummary(for: agent))
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .lineLimit(1)
-                    Spacer()
-                    Button {
-                        refreshRunbookStatus()
-                    } label: {
-                        Image(systemName: "arrow.clockwise")
-                    }
-                    .buttonStyle(.borderless)
-                    .help("Refresh runbook status")
-                }
 
-                ScrollView {
-                    Text(effectiveRunbookPrompt(for: agent))
-                        .font(.system(.caption2, design: .monospaced))
-                        .foregroundStyle(.secondary)
-                        .textSelection(.enabled)
-                        .frame(maxWidth: .infinity, alignment: .topLeading)
-                        .padding(8)
-                }
-                .frame(height: 112)
-                .background(
-                    RoundedRectangle(cornerRadius: 6)
-                        .fill(Color(nsColor: .textBackgroundColor).opacity(0.35))
-                )
-                .overlay(
-                    RoundedRectangle(cornerRadius: 6)
-                        .stroke(Color.secondary.opacity(0.14), lineWidth: 1)
-                )
-            }
-            .padding(.top, 4)
-        } label: {
-            HStack(spacing: 6) {
-                Label("Resolved Prompt", systemImage: "doc.text.magnifyingglass")
-                Text("Read-only")
-                    .font(.system(size: 9, weight: .medium))
-                    .foregroundStyle(.secondary)
-                    .padding(.horizontal, 5)
-                    .padding(.vertical, 1)
-                    .background(RoundedRectangle(cornerRadius: 4).fill(Color.secondary.opacity(0.1)))
-            }
-        }
-        .font(.caption)
-        .foregroundStyle(.secondary)
-    }
 
-    private func effectiveRunbookPrompt(for agent: TeamAgentRow) -> String {
-        let customInstructions = agent.customInstructions == agent.preset.instructions
-            ? ""
-            : agent.customInstructions
-        return AgentRunbookService.shared.composeInstructions(
-            roleName: agent.preset.name,
-            presetInstructions: agent.preset.instructions,
-            customInstructions: customInstructions,
-            workingDirectory: workingDirectory
-        )
-    }
-
-    private func runbookPreviewSummary(for agent: TeamAgentRow) -> String {
-        let hasCustom = !agent.customInstructions.isEmpty && agent.customInstructions != agent.preset.instructions
-        let state = runbookStatus.role(agent.preset.name)?.sourceState ?? .missing
-        if hasCustom && state != .missing {
-            return "Role preset, repo runbook, and team custom instructions will be merged."
-        }
-        if hasCustom {
-            return "Role preset and team custom instructions will be merged."
-        }
-        if state != .missing {
-            return "Role preset and repo runbook will be merged."
-        }
-        return "Role preset only. No repo-local runbook exists for this role."
-    }
 
     /// Resolve the current project's working directory from the key window's active tab.
     private func validateWorkingDirectory() {
@@ -2930,17 +2563,6 @@ struct TeamCreationView: View {
         dismiss()
     }
 
-    private func agentColor(_ name: String) -> Color {
-        switch name {
-        case "green":   return .green
-        case "blue":    return .blue
-        case "yellow":  return .yellow
-        case "red":     return .red
-        case "cyan":    return .cyan
-        case "magenta": return .purple
-        default:        return .gray
-        }
-    }
 }
 
 private struct TeamTemplatePreviewPanel: View {

@@ -23,6 +23,8 @@ struct PeerHostEditorView: View {
 
     /// Text mirror of the optional Int port (empty = nil).
     @State private var portText: String
+    /// KEY=VALUE per line — parsed into `profile.environment` on save.
+    @State private var environmentText: String
     @State private var validationError: String?
     @State private var discovered: [DiscoveredPeer] = []
     /// Held for the sheet's lifetime; started/stopped with appearance.
@@ -37,6 +39,7 @@ struct PeerHostEditorView: View {
         case testing
         case ok(String)              // live socket path
         case daemonMissing           // SSH fine, no term-meshd → offer install
+        case relayFailed(socket: String, message: String)
         case sshFailed(String)
         case installing
         case installFailed(String)
@@ -101,6 +104,10 @@ struct PeerHostEditorView: View {
     /// fresher state (SwiftUI state writes alone can't prevent an
     /// already-in-flight Task from waking up later and writing anyway).
     @State private var doctorGeneration = 0
+    @State private var readiness: PeerHostReadiness?
+    @State private var readinessError: String?
+    @State private var isCheckingReadiness = false
+    @State private var isCreatingProjectRoot = false
     /// True for exactly as long as the remote install/update SSH script
     /// is actually running — from `runInstall()`'s launch of
     /// `PeerHostDoctor.install` until that call returns, success or
@@ -159,6 +166,10 @@ struct PeerHostEditorView: View {
         self.onSave = onSave
         self.onCancel = onCancel
         _portText = State(initialValue: context.profile.sshPort.map(String.init) ?? "")
+        _environmentText = State(initialValue: (context.profile.environment ?? [:])
+            .sorted { $0.key < $1.key }
+            .map { "\($0.key)=\($0.value)" }
+            .joined(separator: "\n"))
     }
 
     var body: some View {
@@ -193,6 +204,47 @@ struct PeerHostEditorView: View {
                     TextField("leave empty to auto-detect", text: $profile.remoteSocket)
                 }
                 GridRow {
+                    Text("Projects Under")
+                    // Where this machine keeps its checkouts. With it, a
+                    // project's directory over there is predictable — the root
+                    // and the project's own folder name — which is the same
+                    // guess a person makes, and it answers the first time,
+                    // before there is anything to remember.
+                    VStack(alignment: .leading, spacing: 6) {
+                        HStack(spacing: 6) {
+                            TextField("/app/projects — optional", text: optionalBinding(\.projectRootPath))
+                            Button(isCheckingReadiness ? "Checking…" : "Check Host") {
+                                Task { await checkReadiness() }
+                            }
+                            .disabled(isCheckingReadiness || profile.sshTarget.isEmpty)
+                            .help("Ask the machine whether this directory exists and which agent CLIs it has")
+                        }
+                        readinessSummary
+                    }
+                }
+                GridRow {
+                    Text("Environment")
+                    // KEY=VALUE per line, the same shape the CLI-profile
+                    // editor uses. Applied to everything term-mesh runs on
+                    // this machine: agent and leader launches, project setup
+                    // scripts. This is where the IS_SANDBOX=1 kind of
+                    // per-machine truth lives, instead of a hand-made
+                    // systemd drop-in on each box.
+                    VStack(alignment: .leading, spacing: 4) {
+                        TextEditor(text: $environmentText)
+                            .font(.system(size: 11, design: .monospaced))
+                            .frame(height: 52)
+                            .overlay(
+                                RoundedRectangle(cornerRadius: 4)
+                                    .stroke(Color(nsColor: .separatorColor), lineWidth: 1)
+                            )
+                            .accessibilityLabel("Environment variables, one KEY=VALUE per line")
+                        Text("KEY=VALUE per line — set for agent launches and project setup on this machine")
+                            .font(.system(size: 9))
+                            .foregroundColor(Color.secondary.opacity(0.8))
+                    }
+                }
+                GridRow {
                     Text("Color")
                     colorSwatches
                 }
@@ -215,9 +267,10 @@ struct PeerHostEditorView: View {
             agentStackStatusLine
 
             HStack {
-                Button("Test", action: runTest)
+                Button("Test Relay", action: runTest)
                     .disabled(doctorBusy
                               || profile.sshTarget.trimmingCharacters(in: .whitespaces).isEmpty)
+                    .help("Open the SSH tunnel and complete a peer protocol handshake")
                 if case .daemonMissing = doctorState, testedDraft != nil {
                     Button("Install term-meshd…") { showInstallConfirm = true }
                         .disabled(doctorBusy)
@@ -331,10 +384,11 @@ struct PeerHostEditorView: View {
         case .idle:
             EmptyView()
         case .testing:
-            Label("Testing connection…", systemImage: "ellipsis.circle")
+            Label("Testing SSH tunnel and peer handshake…", systemImage: "ellipsis.circle")
                 .font(.caption).foregroundColor(.secondary)
         case .ok(let path):
-            Label("Connected — daemon socket: \(path)", systemImage: "checkmark.circle.fill")
+            Label("Relay ready — peer handshake succeeded via \(path)",
+                  systemImage: "checkmark.circle.fill")
                 .font(.caption).foregroundColor(.green)
         case .daemonMissing:
             Label(daemonMissingStatusText,
@@ -354,9 +408,18 @@ struct PeerHostEditorView: View {
                 systemImage: "exclamationmark.arrow.circlepath"
             )
         case .okVersionUnknown(let path):
-            Label("Connected — daemon socket: \(path) — version unknown",
+            Label("Relay ready via \(path) — server version unknown",
                   systemImage: "questionmark.circle")
                 .font(.caption).foregroundColor(.secondary)
+        case .relayFailed(let socket, let message):
+            VStack(alignment: .leading, spacing: 2) {
+                Label("Relay failed after finding \(socket)",
+                      systemImage: "point.3.connected.trianglepath.dotted")
+                    .font(.caption).foregroundColor(.red)
+                Text(message)
+                    .font(.caption2).foregroundColor(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
         case .sshFailed(let msg):
             Label("SSH failed: \(msg)", systemImage: "xmark.circle.fill")
                 .font(.caption).foregroundColor(.red)
@@ -468,6 +531,92 @@ struct PeerHostEditorView: View {
     /// there is no automatic remote-update button (see
     /// `showsUpdateButton`) — a secondary hint pointing at the manual
     /// `brew upgrade --cask term-mesh` path.
+    /// What the machine said, in the order it matters: the directory an agent
+    /// would work in, then what it could be run with.
+    @ViewBuilder
+    private var readinessSummary: some View {
+        if let readinessError {
+            Label(readinessError, systemImage: "exclamationmark.triangle")
+                .font(.caption)
+                .foregroundStyle(.orange)
+                .fixedSize(horizontal: false, vertical: true)
+        } else if let readiness {
+            VStack(alignment: .leading, spacing: 4) {
+                HStack(spacing: 6) {
+                    if readiness.projectRootExists {
+                        Label("\(readiness.projectRoot) exists", systemImage: "checkmark.circle")
+                            .font(.caption)
+                            .foregroundStyle(.green)
+                    } else {
+                        Label("\(readiness.projectRoot) is not there", systemImage: "questionmark.circle")
+                            .font(.caption)
+                            .foregroundStyle(.orange)
+                        // Offered rather than done. This side may be wrong
+                        // about which machine it is talking to, and mkdir is
+                        // not the kind of thing to do on a hunch.
+                        Button(isCreatingProjectRoot ? "Creating…" : "Create it") {
+                            Task { await createProjectRoot() }
+                        }
+                        .disabled(isCreatingProjectRoot)
+                    }
+                }
+                if readiness.installedCLIs.isEmpty {
+                    Label(
+                        "no agent CLI found — an agent started here would have nothing to run",
+                        systemImage: "exclamationmark.triangle"
+                    )
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+                    .fixedSize(horizontal: false, vertical: true)
+                } else {
+                    Label(
+                        "agents: \(readiness.installedCLIs.joined(separator: ", "))"
+                            + (readiness.missingCLIs.isEmpty
+                                ? ""
+                                : "  ·  missing: \(readiness.missingCLIs.joined(separator: ", "))"),
+                        systemImage: "terminal"
+                    )
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+        }
+    }
+
+    private func checkReadiness() async {
+        isCheckingReadiness = true
+        readinessError = nil
+        defer { isCheckingReadiness = false }
+        do {
+            readiness = try await PeerHostReadinessChecker.check(
+                sshTarget: profile.sshTarget,
+                port: profile.sshPort,
+                identityFile: profile.identityFile,
+                projectRoot: profile.projectRootPath ?? ""
+            )
+        } catch {
+            readiness = nil
+            readinessError = String(describing: error)
+        }
+    }
+
+    private func createProjectRoot() async {
+        isCreatingProjectRoot = true
+        defer { isCreatingProjectRoot = false }
+        do {
+            try await PeerHostReadinessChecker.createProjectRoot(
+                sshTarget: profile.sshTarget,
+                port: profile.sshPort,
+                identityFile: profile.identityFile,
+                projectRoot: profile.projectRootPath ?? ""
+            )
+            await checkReadiness()
+        } catch {
+            readinessError = String(describing: error)
+        }
+    }
+
     @ViewBuilder
     private func doctorMessageWithMacHint(_ text: String, systemImage: String) -> some View {
         VStack(alignment: .leading, spacing: 2) {
@@ -538,7 +687,8 @@ struct PeerHostEditorView: View {
         Task {
             let result = await PeerHostDoctor.test(
                 sshTarget: draft.sshTarget, port: draft.sshPort,
-                identityFile: draft.identityFile
+                identityFile: draft.identityFile,
+                remoteSocket: draft.remoteSocket
             )
             // A field edit (→ invalidateDoctorState) or a fresh Test
             // could have superseded this response while it was in
@@ -575,6 +725,8 @@ struct PeerHostEditorView: View {
                 // answering — a host can carry the scripts and hooks
                 // before its daemon is ever installed.
                 await refreshAgentStack(draft: draft, gen: gen)
+            case .relayFailed(let socket, let message):
+                doctorState = .relayFailed(socket: socket, message: message)
             case .sshFailed(let msg): doctorState = .sshFailed(msg)
             }
         }
@@ -622,7 +774,8 @@ struct PeerHostEditorView: View {
             // (e.g. release binary built against a newer glibc).
             let result = await PeerHostDoctor.test(
                 sshTarget: draft.sshTarget, port: draft.sshPort,
-                identityFile: draft.identityFile
+                identityFile: draft.identityFile,
+                remoteSocket: draft.remoteSocket
             )
             guard gen == doctorGeneration else { return }
             switch result {
@@ -638,6 +791,8 @@ struct PeerHostEditorView: View {
                 )
                 guard gen == doctorGeneration else { return }
                 doctorState = .diagnosed(PeerHostDoctor.summarizeDiagnosis(raw))
+            case .relayFailed(let socket, let message):
+                doctorState = .relayFailed(socket: socket, message: message)
             case .sshFailed(let msg):
                 doctorState = .sshFailed(msg)
             }
@@ -871,6 +1026,27 @@ struct PeerHostEditorView: View {
         draft.displayName = draft.displayName.trimmingCharacters(in: .whitespaces)
         draft.sshTarget = draft.sshTarget.trimmingCharacters(in: .whitespaces)
         draft.remoteSocket = draft.remoteSocket.trimmingCharacters(in: .whitespaces)
+
+        // KEY=VALUE per line; a line without `=` is noise, an invalid key is
+        // refused loudly rather than silently dropped at launch time.
+        var environment: [String: String] = [:]
+        for line in environmentText.split(separator: "\n") {
+            let trimmedLine = line.trimmingCharacters(in: .whitespaces)
+            guard !trimmedLine.isEmpty, !trimmedLine.hasPrefix("#") else { continue }
+            let kv = trimmedLine.split(separator: "=", maxSplits: 1)
+            guard kv.count == 2 else {
+                validationError = "Environment line needs KEY=VALUE: \(trimmedLine)"
+                return nil
+            }
+            let key = String(kv[0]).trimmingCharacters(in: .whitespaces)
+            let value = String(kv[1]).trimmingCharacters(in: .whitespaces)
+            guard PeerHostEnvironment.sanitized([key: value]).count == 1 else {
+                validationError = "Invalid environment variable name: \(key)"
+                return nil
+            }
+            environment[key] = value
+        }
+        draft.environment = environment.isEmpty ? nil : environment
         if let identity = draft.identityFile {
             let trimmed = identity.trimmingCharacters(in: .whitespaces)
             draft.identityFile = trimmed.isEmpty ? nil : trimmed

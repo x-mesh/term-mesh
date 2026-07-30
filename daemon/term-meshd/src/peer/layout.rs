@@ -16,17 +16,18 @@
 //! outside the lock.
 
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
 use peer_proto::v1::{
     envelope::Payload, workspace_control, workspace_layout, workspace_update, Envelope, PaneTab,
-    WorkspaceControl, WorkspaceLayout, WorkspaceLayoutChanged, WorkspacePane, WorkspaceRemoved,
-    WorkspaceSplit, WorkspaceUpdate,
+    Workspace, WorkspaceControl, WorkspaceLayout, WorkspaceLayoutChanged, WorkspaceListChanged,
+    WorkspacePane, WorkspaceRemoved,
+    TeamLeaderCommandRequest, TeamLeaderCommandResponse, WorkspaceSplit, WorkspaceUpdate,
 };
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{mpsc, oneshot, watch};
 
 use crate::monitor::SystemSnapshot;
 use super::persist::PersistedWorkspace;
@@ -74,6 +75,93 @@ fn split_id_bytes(id: u64) -> Vec<u8> {
 /// create/remove without dumping the full 16 bytes.
 fn hex_prefix(id: &[u8]) -> String {
     id.iter().take(4).map(|b| format!("{b:02x}")).collect()
+}
+
+/// Nearest ancestor of `cwd` holding a `.git` entry, or empty when the pane
+/// is not inside a repository. Only the host can answer this — a client
+/// staring at `/srv/app/backend` cannot tell a project root from one of its
+/// subdirectories — so it rides the layout snapshot the wire already builds.
+///
+/// Memoized per cwd: a pane's directory changes rarely while layout
+/// snapshots fire on every split, resize and tab switch, and the walk costs
+/// one `exists()` per ancestor. The map is bounded and cleared wholesale
+/// when it fills, since a stale entry only outlives an actual `git init`
+/// (or a repo being deleted) under that exact path.
+pub(super) fn project_root_for(cwd: &str) -> String {
+    const MAX_CACHED: usize = 512;
+    static CACHE: Mutex<Option<HashMap<String, String>>> = Mutex::new(None);
+
+    if cwd.is_empty() {
+        return String::new();
+    }
+    if let Ok(mut guard) = CACHE.lock() {
+        let cache = guard.get_or_insert_with(HashMap::new);
+        if let Some(hit) = cache.get(cwd) {
+            return hit.clone();
+        }
+        let resolved = walk_to_git_root(cwd);
+        if cache.len() >= MAX_CACHED {
+            cache.clear();
+        }
+        cache.insert(cwd.to_string(), resolved.clone());
+        return resolved;
+    }
+    // Poisoned lock: answering without the cache beats poisoning the wire.
+    walk_to_git_root(cwd)
+}
+
+fn walk_to_git_root(cwd: &str) -> String {
+    let mut dir = PathBuf::from(cwd);
+    if !dir.is_absolute() {
+        return String::new();
+    }
+    loop {
+        // `.git` is a directory in a normal clone and a FILE in a worktree
+        // or submodule, so test for existence rather than for a directory —
+        // term-mesh's own worktrees would otherwise report no project.
+        let dotgit = dir.join(".git");
+        if dotgit.exists() {
+            // A linked worktree is a temporary station of its primary
+            // project, not a project of its own: an agent working in
+            // `demo-executor-260728-a3f2` is working on `demo`, and
+            // reporting the worktree path fragmented the sidebar's project
+            // grouping into one ghost project per agent. Resolve it to the
+            // primary. A submodule's `.git` is also a file but points into
+            // `.git/modules/…` — that one IS its own project (ghostty inside
+            // term-mesh), so it keeps its own root.
+            if let Some(primary) = linked_worktree_primary(&dotgit) {
+                return primary;
+            }
+            return dir.to_string_lossy().into_owned();
+        }
+        if !dir.pop() {
+            return String::new();
+        }
+    }
+}
+
+/// The primary checkout's root when `.git` is a linked-worktree pointer
+/// file (`gitdir: <primary>/.git/worktrees/<name>`), else None. Reads the
+/// file rather than running git: this sits on the layout-snapshot path.
+fn linked_worktree_primary(dotgit: &Path) -> Option<String> {
+    if !dotgit.is_file() {
+        return None;
+    }
+    let text = std::fs::read_to_string(dotgit).ok()?;
+    let target = text.strip_prefix("gitdir:")?.trim();
+    // `<primary>/.git/worktrees/<name>` — anything else (a submodule's
+    // `.git/modules/…`, an unrecognised layout) is not a linked worktree.
+    let target_path = Path::new(target);
+    let worktrees_dir = target_path.parent()?; // …/.git/worktrees
+    let git_dir = worktrees_dir.parent()?; // …/.git
+    if worktrees_dir.file_name()? != "worktrees" || git_dir.file_name()? != ".git" {
+        return None;
+    }
+    let primary = git_dir.parent()?;
+    if !primary.is_absolute() {
+        return None;
+    }
+    Some(primary.to_string_lossy().into_owned())
 }
 
 #[derive(Debug)]
@@ -449,6 +537,7 @@ impl LayoutStore {
                     meta_map.get(sid).cloned().unwrap_or_default()
                 };
                 let (title, cols, rows, cwd, busy) = meta(active);
+                let project_root = project_root_for(&cwd);
                 WorkspaceLayout {
                     node: Some(workspace_layout::Node::Pane(WorkspacePane {
                         surface_id: active.clone(),
@@ -464,6 +553,7 @@ impl LayoutStore {
                             })
                             .collect(),
                         busy,
+                        project_root,
                     })),
                 }
             }
@@ -600,14 +690,30 @@ pub const DAEMON_WORKSPACE: &str = "term-meshd";
 pub struct Broadcaster {
     clients: Mutex<HashMap<u64, RegisteredClient>>,
     next_id: AtomicU64,
+    leader_pending: Mutex<HashMap<Vec<u8>, PendingLeaderResponse>>,
 }
 
 #[derive(Clone)]
 struct RegisteredClient {
     tx: mpsc::Sender<Envelope>,
+    peer_id: Vec<u8>,
     /// The connection's own outgoing seq counter — pushes must continue
     /// each connection's monotonic sequence, not share a global one.
     seq: Arc<AtomicU64>,
+    /// Set once this connection sends `SubscribeWorkspaceList`.
+    ///
+    /// Shared with the connection task, which is the only writer: the
+    /// subscription arrives on its receive loop, long after registration.
+    /// Without it the roster went to every client on every layout push —
+    /// including a viewer watching one pane, which had already been sent
+    /// the scoped delta it actually needed.
+    wants_roster: Arc<AtomicBool>,
+}
+
+struct PendingLeaderResponse {
+    connection_id: u64,
+    correlation_id: u64,
+    sender: oneshot::Sender<TeamLeaderCommandResponse>,
 }
 
 impl Broadcaster {
@@ -615,6 +721,7 @@ impl Broadcaster {
         Self {
             clients: Mutex::new(HashMap::new()),
             next_id: AtomicU64::new(1),
+            leader_pending: Mutex::new(HashMap::new()),
         }
     }
 
@@ -622,12 +729,30 @@ impl Broadcaster {
         self: &Arc<Self>,
         tx: mpsc::Sender<Envelope>,
         seq: Arc<AtomicU64>,
+        peer_id: Vec<u8>,
+    ) -> BroadcastGuard {
+        self.register_with_roster_flag(tx, seq, peer_id, Arc::new(AtomicBool::new(false)))
+    }
+
+    /// `register`, plus the handle the connection flips when it subscribes to
+    /// the workspace roster.
+    pub fn register_with_roster_flag(
+        self: &Arc<Self>,
+        tx: mpsc::Sender<Envelope>,
+        seq: Arc<AtomicU64>,
+        peer_id: Vec<u8>,
+        wants_roster: Arc<AtomicBool>,
     ) -> BroadcastGuard {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        self.clients
-            .lock()
-            .unwrap()
-            .insert(id, RegisteredClient { tx, seq });
+        self.clients.lock().unwrap().insert(
+            id,
+            RegisteredClient {
+                tx,
+                peer_id,
+                seq,
+                wants_roster,
+            },
+        );
         BroadcastGuard {
             broadcaster: Arc::clone(self),
             id,
@@ -637,9 +762,43 @@ impl Broadcaster {
     /// Fan a payload out to every registered connection, stamping each
     /// envelope with that connection's next seq. Clone-then-send: the
     /// guard is released before any channel interaction.
+    /// Whether anyone has asked for the workspace roster.
+    ///
+    /// Checked before the roster is built, not after: assembling it walks
+    /// every workspace's pane tree, so with no subscriber the cheapest
+    /// correct thing is to never start.
+    pub fn has_roster_subscriber(&self) -> bool {
+        self.clients
+            .lock()
+            .unwrap()
+            .values()
+            .any(|client| client.wants_roster.load(Ordering::Relaxed))
+    }
+
+    /// Send only to connections that subscribed to the roster.
+    pub fn broadcast_to_roster_subscribers(&self, payload: &peer_proto::v1::envelope::Payload) {
+        let clients: Vec<RegisteredClient> = self
+            .clients
+            .lock()
+            .unwrap()
+            .values()
+            .filter(|client| client.wants_roster.load(Ordering::Relaxed))
+            .cloned()
+            .collect();
+        self.send_to(clients, payload);
+    }
+
     pub fn broadcast(&self, payload: &peer_proto::v1::envelope::Payload) {
         let clients: Vec<RegisteredClient> =
             self.clients.lock().unwrap().values().cloned().collect();
+        self.send_to(clients, payload);
+    }
+
+    fn send_to(
+        &self,
+        clients: Vec<RegisteredClient>,
+        payload: &peer_proto::v1::envelope::Payload,
+    ) {
         for client in clients {
             let env = Envelope {
                 seq: client.seq.fetch_add(1, Ordering::Relaxed) + 1,
@@ -651,11 +810,103 @@ impl Broadcaster {
             }
         }
     }
+
+    /// Send a scoped remote-leader command to an authenticated viewer and
+    /// wait for its authoritative control-plane response. The request itself
+    /// carries the expiring grant; this router never accepts a lifecycle
+    /// method or a filesystem/process field.
+    pub async fn call_team_leader(
+        &self,
+        request: TeamLeaderCommandRequest,
+        target_peer_id: &[u8],
+    ) -> Result<TeamLeaderCommandResponse, String> {
+        if request.request_id.len() != peer_proto::team_leader::REQUEST_ID_BYTES {
+            return Err("invalid request_id".into());
+        }
+        let target = self
+            .clients
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, client)| client.peer_id == target_peer_id)
+            .max_by_key(|(id, _)| *id)
+            .map(|(id, client)| (*id, client.clone()))
+            .ok_or_else(|| "authorized peer viewer is not connected".to_string())?;
+        let correlation_id = target.1.seq.fetch_add(1, Ordering::Relaxed) + 1;
+        let (tx, rx) = oneshot::channel();
+        {
+            let mut pending = self.leader_pending.lock().unwrap();
+            if pending.contains_key(&request.request_id) {
+                return Err("request_id already in flight".into());
+            }
+            pending.insert(
+                request.request_id.clone(),
+                PendingLeaderResponse {
+                    connection_id: target.0,
+                    correlation_id,
+                    sender: tx,
+                },
+            );
+        }
+        let envelope = Envelope {
+            seq: correlation_id,
+            correlation_id: 0,
+            payload: Some(Payload::TeamLeaderCommandRequest(request.clone())),
+        };
+        if target.1.tx.try_send(envelope).is_err() {
+            self.leader_pending
+                .lock()
+                .unwrap()
+                .remove(&request.request_id);
+            return Err("authorized peer viewer is unavailable".into());
+        }
+        match tokio::time::timeout(Duration::from_secs(15), rx).await {
+            Ok(Ok(response)) => Ok(response),
+            Ok(Err(_)) => Err("peer viewer dropped the command response".into()),
+            Err(_) => {
+                self.leader_pending
+                    .lock()
+                    .unwrap()
+                    .remove(&request.request_id);
+                Err("peer leader command timed out".into())
+            }
+        }
+    }
+
+    /// Complete a pending reverse request. Duplicate responses are expected
+    /// when several attached panes share the same viewer; only the first one
+    /// wins, while the local control-plane's request cache prevents duplicate
+    /// mutation on the viewer side.
+    pub fn resolve_team_leader(
+        &self,
+        connection_id: u64,
+        correlation_id: u64,
+        response: TeamLeaderCommandResponse,
+    ) -> bool {
+        let mut pending = self.leader_pending.lock().unwrap();
+        let Some(expected) = pending.get(&response.request_id) else {
+            return false;
+        };
+        if expected.connection_id != connection_id || expected.correlation_id != correlation_id {
+            return false;
+        }
+        let Some(expected) = pending.remove(&response.request_id) else {
+            return false;
+        };
+        let _ = expected.sender.send(response);
+        true
+    }
 }
 
 pub struct BroadcastGuard {
     broadcaster: Arc<Broadcaster>,
     id: u64,
+}
+
+impl BroadcastGuard {
+    pub fn connection_id(&self) -> u64 {
+        self.id
+    }
 }
 
 impl Drop for BroadcastGuard {
@@ -752,6 +1003,19 @@ pub struct PeerHost {
     /// sees when talking to a daemon too old to have it. Set by
     /// `server::serve` right after construction, mirroring `persist_path`.
     monitor: Mutex<Option<watch::Receiver<Option<SystemSnapshot>>>>,
+    /// The daemon's agent-team manager, when one was wired in. `None` for
+    /// every host built without it (tests, embedders), which is exactly what
+    /// a client sees from a daemon too old to answer `ListTeams` — so the
+    /// capability is advertised only when this is set.
+    teams: Mutex<Option<Arc<tokio::sync::Mutex<crate::headless::HeadlessManager>>>>,
+    /// The daemon's task board, when one was wired in.
+    ///
+    /// Separate from `teams` because they answer different questions: the team
+    /// manager knows about running agents, the task board knows where a task
+    /// did its work. `team.task.diff` needs the second and nothing else, and a
+    /// host without a board answers that method honestly rather than guessing
+    /// at a directory.
+    agents: Mutex<Option<Arc<crate::agent::AgentSessionManager>>>,
 }
 
 /// Debounce window for layout pushes. Mirrors the Swift host's 120 ms
@@ -862,6 +1126,8 @@ impl PeerHost {
             workspace_persistence: Mutex::new(()),
             surface_lifecycle: Mutex::new(HashMap::new()),
             monitor: Mutex::new(None),
+            teams: Mutex::new(None),
+            agents: Mutex::new(None),
         }
     }
 
@@ -899,6 +1165,27 @@ impl PeerHost {
     /// gate already gives an older client.
     pub fn set_monitor(&self, monitor: watch::Receiver<Option<SystemSnapshot>>) {
         *self.monitor.lock().unwrap() = Some(monitor);
+    }
+
+    pub fn set_teams(&self, teams: Arc<tokio::sync::Mutex<crate::headless::HeadlessManager>>) {
+        *self.teams.lock().unwrap() = Some(teams);
+    }
+
+    /// The team manager, if one was wired in. Cloned out of the lock so the
+    /// caller can await on the manager's own mutex without holding this one.
+    pub fn team_manager(
+        &self,
+    ) -> Option<Arc<tokio::sync::Mutex<crate::headless::HeadlessManager>>> {
+        self.teams.lock().unwrap().clone()
+    }
+
+    pub fn set_agents(&self, agents: Arc<crate::agent::AgentSessionManager>) {
+        *self.agents.lock().unwrap() = Some(agents);
+    }
+
+    /// The task board, if one was wired in.
+    pub fn agent_store(&self) -> Option<Arc<crate::agent::AgentSessionManager>> {
+        self.agents.lock().unwrap().clone()
     }
 
     /// A receiver for the live system stats, if a monitor was wired in.
@@ -1099,6 +1386,7 @@ impl PeerHost {
                     workspace_id: workspace_id.to_vec(),
                 })),
             }));
+        self.broadcast_workspace_roster();
         Ok(())
     }
 
@@ -1201,6 +1489,7 @@ impl PeerHost {
         };
         if renamed {
             self.persist_workspaces();
+            self.broadcast_workspace_roster();
         }
         renamed
     }
@@ -1589,7 +1878,44 @@ impl PeerHost {
                 )),
             });
             host.clients.broadcast(&payload);
+            // A roster subscriber needs layout-derived pane metadata too;
+            // publish the complete post-debounce roster alongside the focused
+            // layout delta so it converges after reconnect or missed frames.
+            host.broadcast_workspace_roster();
         });
+    }
+
+    /// Complete workspace roster for `SubscribeWorkspaceList` snapshots and
+    /// change pushes. Reusing `list_workspaces` guarantees the same IDs,
+    /// titles, default flag and layouts as the synchronous discovery RPC.
+    pub fn workspace_roster(&self) -> Vec<Workspace> {
+        self.list_workspaces()
+            .into_iter()
+            .map(|entry| Workspace {
+                workspace_id: entry.id,
+                title: entry.title,
+                layout: entry.layout,
+                window_id: Vec::new(),
+                window_title: String::new(),
+                is_default: entry.is_default,
+            })
+            .collect()
+    }
+
+    pub fn broadcast_workspace_roster(&self) {
+        // `workspace_roster` rebuilds a layout snapshot for EVERY workspace,
+        // each a recursive walk of its pane tree. With nobody subscribed that
+        // is pure waste, and this runs on every debounced layout push — which
+        // fires throughout a divider drag.
+        if !self.clients.has_roster_subscriber() {
+            return;
+        }
+        self.clients
+            .broadcast_to_roster_subscribers(&Payload::WorkspaceListChanged(
+                WorkspaceListChanged {
+                    workspaces: self.workspace_roster(),
+                },
+            ));
     }
 
     /// Wire snapshot of any single workspace's tree by id — the generic
@@ -1660,6 +1986,146 @@ mod tests {
 
     fn sid(name: &str) -> SurfaceId {
         surface_id_from_name(name)
+    }
+
+    #[tokio::test]
+    async fn leader_reverse_route_targets_one_peer_and_rejects_spoofed_response() {
+        let router = Arc::new(Broadcaster::new());
+        let (authorized_tx, mut authorized_rx) = mpsc::channel(4);
+        let (attacker_tx, mut attacker_rx) = mpsc::channel(4);
+        let authorized =
+            router.register(authorized_tx, Arc::new(AtomicU64::new(10)), vec![0xA1; 16]);
+        let attacker = router.register(attacker_tx, Arc::new(AtomicU64::new(20)), vec![0xB1; 16]);
+        let request = TeamLeaderCommandRequest {
+            request_id: vec![0x41; peer_proto::team_leader::REQUEST_ID_BYTES],
+            method: "team.delegate".into(),
+            params_json: r#"{"submit_return":true}"#.into(),
+            ..Default::default()
+        };
+
+        let pending_router = Arc::clone(&router);
+        let pending_request = request.clone();
+        let call = tokio::spawn(async move {
+            pending_router
+                .call_team_leader(pending_request, &[0xA1; 16])
+                .await
+        });
+
+        let envelope = authorized_rx.recv().await.expect("targeted request");
+        assert!(
+            attacker_rx.try_recv().is_err(),
+            "non-target peer must not receive the scoped grant"
+        );
+        let correlation_id = envelope.seq;
+        let response = TeamLeaderCommandResponse {
+            request_id: request.request_id,
+            ok: true,
+            result_json: r#"{"return_submitted":true}"#.into(),
+            ..Default::default()
+        };
+
+        assert!(
+            !router.resolve_team_leader(attacker.connection_id(), correlation_id, response.clone()),
+            "another connection cannot win the response race"
+        );
+        assert!(
+            !router.resolve_team_leader(
+                authorized.connection_id(),
+                correlation_id + 1,
+                response.clone()
+            ),
+            "the target must echo the exact request correlation"
+        );
+        assert!(router.resolve_team_leader(authorized.connection_id(), correlation_id, response));
+        assert!(call.await.unwrap().unwrap().ok);
+    }
+
+    #[test]
+    fn project_root_walks_up_to_the_repo() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let repo = tmp.path().join("myproject");
+        let nested = repo.join("daemon").join("src");
+        std::fs::create_dir_all(&nested).expect("mkdir");
+        std::fs::create_dir(repo.join(".git")).expect("mkdir .git");
+
+        assert_eq!(walk_to_git_root(nested.to_str().unwrap()), repo.to_string_lossy());
+        assert_eq!(walk_to_git_root(repo.to_str().unwrap()), repo.to_string_lossy());
+    }
+
+    #[test]
+    fn project_root_accepts_a_git_file_for_worktrees() {
+        // A `.git` FILE whose pointer is not a recognisable linked-worktree
+        // gitdir still marks a repo root of its own.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let worktree = tmp.path().join("feature-branch");
+        std::fs::create_dir_all(worktree.join("Sources")).expect("mkdir");
+        std::fs::write(worktree.join(".git"), "gitdir: /elsewhere\n").expect("write");
+
+        assert_eq!(
+            walk_to_git_root(worktree.join("Sources").to_str().unwrap()),
+            worktree.to_string_lossy()
+        );
+    }
+
+    #[test]
+    fn project_root_resolves_a_linked_worktree_to_its_primary() {
+        // An agent's instance-tagged worktree is a temporary station of the
+        // primary project — it must group under `demo`, not appear as a
+        // ghost project called `demo-executor-260728-a3f2`.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let primary = tmp.path().join("demo");
+        let worktree = tmp.path().join("demo-executor-260728-a3f2");
+        std::fs::create_dir_all(worktree.join("src")).expect("mkdir");
+        std::fs::write(
+            worktree.join(".git"),
+            format!(
+                "gitdir: {}\n",
+                primary.join(".git/worktrees/demo-executor").display()
+            ),
+        )
+        .expect("write");
+
+        assert_eq!(
+            walk_to_git_root(worktree.join("src").to_str().unwrap()),
+            primary.to_string_lossy()
+        );
+    }
+
+    #[test]
+    fn project_root_keeps_a_submodule_as_its_own_project() {
+        // A submodule's `.git` file points into `.git/modules/…` — it is a
+        // repository in its own right (ghostty inside term-mesh), so panes
+        // working in it stay grouped under the submodule, never absorbed
+        // into the superproject.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let superproject = tmp.path().join("term-mesh");
+        let submodule = superproject.join("ghostty");
+        std::fs::create_dir_all(submodule.join("src")).expect("mkdir");
+        std::fs::write(
+            submodule.join(".git"),
+            format!(
+                "gitdir: {}\n",
+                superproject.join(".git/modules/ghostty").display()
+            ),
+        )
+        .expect("write");
+
+        assert_eq!(
+            walk_to_git_root(submodule.join("src").to_str().unwrap()),
+            submodule.to_string_lossy()
+        );
+    }
+
+    #[test]
+    fn project_root_is_empty_outside_a_repo_and_for_bad_input() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let plain = tmp.path().join("no-repo-here");
+        std::fs::create_dir_all(&plain).expect("mkdir");
+
+        // tempdir lives under /tmp (or /var/folders); neither is a repo.
+        assert_eq!(walk_to_git_root(plain.to_str().unwrap()), "");
+        assert_eq!(walk_to_git_root("relative/path"), "");
+        assert_eq!(project_root_for(""), "");
     }
 
     /// Build a store with N single-tab panes without spawning PTYs.
@@ -2647,6 +3113,60 @@ mod tests {
         );
     }
 
+    /// A client that never subscribed to the roster is not sent one, and
+    /// with no subscriber at all the roster is never even assembled.
+    ///
+    /// Building it walks every workspace's pane tree, and this runs on every
+    /// debounced layout push — which fires repeatedly throughout a divider
+    /// drag. A viewer watching a single pane was receiving the whole roster
+    /// each time, right after the scoped delta it actually asked for.
+    #[tokio::test]
+    async fn workspace_roster_reaches_only_subscribers() {
+        let manager = Arc::new(PtyManager::new());
+        let host = Arc::new(PeerHost::new(Arc::clone(&manager)));
+
+        let (plain_tx, mut plain_rx) = mpsc::channel(8);
+        let _plain = host.clients.register(
+            plain_tx,
+            Arc::new(AtomicU64::new(0)),
+            vec![0xC1; 16],
+        );
+        assert!(
+            !host.clients.has_roster_subscriber(),
+            "registering alone must not imply a subscription"
+        );
+
+        host.broadcast_workspace_roster();
+        assert!(
+            plain_rx.try_recv().is_err(),
+            "a non-subscriber must receive nothing"
+        );
+
+        let (sub_tx, mut sub_rx) = mpsc::channel(8);
+        let wants = Arc::new(AtomicBool::new(false));
+        let _sub = host.clients.register_with_roster_flag(
+            sub_tx,
+            Arc::new(AtomicU64::new(0)),
+            vec![0xD1; 16],
+            Arc::clone(&wants),
+        );
+        wants.store(true, Ordering::Relaxed);
+        assert!(host.clients.has_roster_subscriber());
+
+        host.broadcast_workspace_roster();
+        assert!(
+            matches!(
+                sub_rx.try_recv().ok().and_then(|env| env.payload),
+                Some(Payload::WorkspaceListChanged(_))
+            ),
+            "the subscriber must get the roster"
+        );
+        assert!(
+            plain_rx.try_recv().is_err(),
+            "the non-subscriber must still receive nothing"
+        );
+    }
+
     /// `remove_workspace` on a non-default workspace with live surfaces
     /// must drop every one of them from `pty`, drop their reverse-index
     /// entries, and broadcast a `WorkspaceRemoved` push to every
@@ -2687,7 +3207,9 @@ mod tests {
             .insert(sid("extra"), ws2_id.clone());
 
         let (tx, mut rx) = mpsc::channel(8);
-        let guard = host.clients.register(tx, Arc::new(AtomicU64::new(0)));
+        let guard = host
+            .clients
+            .register(tx, Arc::new(AtomicU64::new(0)), vec![0x11; 16]);
 
         assert_eq!(host.remove_workspace(&ws2_id), Ok(()));
 

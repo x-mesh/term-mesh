@@ -59,15 +59,7 @@ public enum PeerIdentity {
         cacheLock.lock()
         defer { cacheLock.unlock() }
         if let cachedID { return cachedID }
-        // TERMMESH_PEER_IDENTITY_EPHEMERAL=1: skip the keychain entirely and
-        // use a process-lifetime random ID. Tagged dev builds are re-signed
-        // on every rebuild, so the keychain ACL re-prompts each launch — and
-        // an unanswered prompt deadlocks the app (warmUp holds this lock
-        // inside the securityd IPC while the main thread waits on it in a
-        // handshake default argument). Ephemeral identity trades a stable
-        // peer ID for a keychain-free dev loop; production launches never
-        // set the variable.
-        if ProcessInfo.processInfo.environment["TERMMESH_PEER_IDENTITY_EPHEMERAL"] == "1" {
+        if usesEphemeralIdentity() {
             let id = (try? makeRandomID()) ?? Data(count: byteCount)
             cachedID = id
             return id
@@ -75,6 +67,33 @@ public enum PeerIdentity {
         let id = (try? loadOrCreate()) ?? ((try? makeRandomID()) ?? Data(count: byteCount))
         cachedID = id
         return id
+    }
+
+    /// Whether to skip the keychain and use a process-lifetime random ID.
+    ///
+    /// Dev builds are re-signed on every rebuild, so the keychain ACL treats
+    /// each one as a new app and re-prompts — and an unanswered prompt
+    /// deadlocks startup (`warmUp` holds the cache lock inside the securityd
+    /// IPC while the main thread waits on it in a handshake default
+    /// argument). Ephemeral identity trades a stable peer ID for a
+    /// keychain-free dev loop.
+    ///
+    /// The bundle identifier decides it, not just the environment variable:
+    /// `reload.sh` can inject the variable, but an `xcodebuild test` run
+    /// launches the same dev app without it and would prompt anyway.
+    static func usesEphemeralIdentity(
+        environment: [String: String] = ProcessInfo.processInfo.environment,
+        bundleIdentifier: String? = Bundle.main.bundleIdentifier,
+        isRunningTests: Bool = NSClassFromString("XCTestCase") != nil
+    ) -> Bool {
+        if environment["TERMMESH_PEER_IDENTITY_EPHEMERAL"] == "1" { return true }
+        // Escape hatch for dev work that genuinely needs a stable peer ID
+        // (verifying a peer recognizes this Mac across relaunches).
+        if environment["TERMMESH_PEER_IDENTITY_KEYCHAIN"] == "1" { return false }
+        if isRunningTests { return true }
+        // Release bundles are `com.termmesh.app`; every dev build carries a
+        // `.debug` component, tagged ones appending the tag after it.
+        return (bundleIdentifier ?? "").contains(".debug")
     }
 
     /// Prime the keychain-backed cache off the critical path (call from

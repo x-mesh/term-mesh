@@ -570,6 +570,9 @@ final class WindowTerminalPortal: NSObject {
 
     private var entriesByHostedId: [ObjectIdentifier: Entry] = [:]
     private var hostedByAnchorId: [ObjectIdentifier: ObjectIdentifier] = [:]
+    /// One observer per anchor, so a SwiftUI layout change reaches the
+    /// terminals hosted on top of it. See `observeAnchorGeometry`.
+    private var anchorObservers: [ObjectIdentifier: NSObjectProtocol] = [:]
 
     init(window: NSWindow) {
         self.window = window
@@ -641,11 +644,47 @@ final class WindowTerminalPortal: NSObject {
         })
     }
 
+    /// Follow the SwiftUI view a terminal is pinned to.
+    ///
+    /// The portal's own reference is the window's content view, so its host
+    /// frame only changes when the window does. Everything inside is placed
+    /// from each entry's anchor — and the anchors move for reasons the window
+    /// never hears about: a side panel opening, a sidebar widening, any
+    /// SwiftUI relayout at a fixed window size. Nothing was watching them, so
+    /// the hosted terminals stayed at their old frames and were left sitting
+    /// over whatever had taken their space.
+    ///
+    /// Cheap to keep: one observer per anchor, dropped when the entry goes,
+    /// and the sync it triggers is already coalesced to one pass per runloop
+    /// turn by `scheduleExternalGeometrySynchronize`.
+    private func observeAnchorGeometry(_ anchorView: NSView, id anchorId: ObjectIdentifier) {
+        guard anchorObservers[anchorId] == nil else { return }
+        anchorView.postsFrameChangedNotifications = true
+        anchorObservers[anchorId] = NotificationCenter.default.addObserver(
+            forName: NSView.frameDidChangeNotification,
+            object: anchorView,
+            queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated {
+                self?.scheduleExternalGeometrySynchronize()
+            }
+        }
+    }
+
+    private func stopObservingAnchor(id anchorId: ObjectIdentifier) {
+        guard let observer = anchorObservers.removeValue(forKey: anchorId) else { return }
+        NotificationCenter.default.removeObserver(observer)
+    }
+
     private func removeGeometryObservers() {
         for observer in geometryObservers {
             NotificationCenter.default.removeObserver(observer)
         }
         geometryObservers.removeAll()
+        for observer in anchorObservers.values {
+            NotificationCenter.default.removeObserver(observer)
+        }
+        anchorObservers.removeAll()
     }
 
     private func scheduleExternalGeometrySynchronize(after delay: TimeInterval = 0) {
@@ -961,7 +1000,9 @@ final class WindowTerminalPortal: NSObject {
     func detachHostedView(withId hostedId: ObjectIdentifier) {
         guard let entry = entriesByHostedId.removeValue(forKey: hostedId) else { return }
         if let anchor = entry.anchorView {
-            hostedByAnchorId.removeValue(forKey: ObjectIdentifier(anchor))
+            let anchorId = ObjectIdentifier(anchor)
+            hostedByAnchorId.removeValue(forKey: anchorId)
+            stopObservingAnchor(id: anchorId)
         }
 #if DEBUG
         let hadSuperview = (entry.hostedView?.superview === hostView) ? 1 : 0
@@ -1044,7 +1085,9 @@ final class WindowTerminalPortal: NSObject {
         if let oldEntry = entriesByHostedId[hostedId],
            let oldAnchor = oldEntry.anchorView,
            oldAnchor !== anchorView {
-            hostedByAnchorId.removeValue(forKey: ObjectIdentifier(oldAnchor))
+            let oldAnchorId = ObjectIdentifier(oldAnchor)
+            hostedByAnchorId.removeValue(forKey: oldAnchorId)
+            stopObservingAnchor(id: oldAnchorId)
         }
 
         hostedByAnchorId[anchorId] = hostedId
@@ -1072,6 +1115,7 @@ final class WindowTerminalPortal: NSObject {
         }
 #endif
 
+        observeAnchorGeometry(anchorView, id: anchorId)
         _ = synchronizeHostFrameToReference()
 
         // Seed frame/bounds before entering the window so a freshly reparented

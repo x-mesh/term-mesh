@@ -460,6 +460,312 @@ extension TerminalController {
         return resp == "OK" ? .ok([:]) : .err(code: "internal_error", message: resp, data: nil)
     }
 
+    /// Exercises exactly what the board row's "show pane" does.
+    func v2DebugReviewBoardReveal(params: [String: Any]) -> V2CallResult {
+        guard let team = params["team_name"] as? String,
+              let agent = params["agent_name"] as? String else {
+            return .err(code: "invalid_params", message: "team_name and agent_name are required", data: nil)
+        }
+        var revealed = false
+        let completed = v2MainExec(timeout: 2) {
+            revealed = TeamOrchestrator.shared.revealAgentPane(teamName: team, agentName: agent)
+        }
+        if !completed { return .err(code: "timeout", message: "Main thread busy", data: nil) }
+        return .ok(["revealed": revealed])
+    }
+
+    func v2DebugTeamAttachRemote(params: [String: Any]) -> V2CallResult {
+        guard let team = params["team"] as? String, !team.isEmpty,
+              let host = params["host"] as? String, !host.isEmpty,
+              let dir = params["dir"] as? String, !dir.isEmpty else {
+            return .err(code: "invalid_params", message: "team, host and dir are required", data: nil)
+        }
+        let name = params["name"] as? String ?? "remote"
+        let model = params["model"] as? String ?? "sonnet"
+        let cli = params["cli"] as? String ?? "claude"
+        Task { @MainActor in
+            do {
+                _ = try await TeamOrchestrator.shared.attachRemoteAgent(
+                    teamName: team,
+                    agentName: name,
+                    hostKey: host,
+                    workingDirectory: dir,
+                    model: model,
+                    cli: cli
+                )
+            } catch {
+                #if DEBUG
+                dlog("attachRemoteAgent failed: \(error)")
+                #endif
+            }
+        }
+        return .ok(["started": true])
+    }
+
+    /// Drive what the New Project sheet's Create button does, without the
+    /// sheet. The interesting half is the wiring — a workspace opened and a
+    /// team standing in it — and that is unreachable from a socket otherwise.
+    func v2DebugProjectCreate(params: [String: Any]) -> V2CallResult {
+        guard let directory = params["directory"] as? String, !directory.isEmpty else {
+            return .err(code: "invalid_params", message: "directory is required", data: nil)
+        }
+        let templateName = params["template"] as? String
+        let leaderMode = params["leader_cli"] as? String ?? "claude"
+        let leaderModel = params["leader_model"] as? String ?? AgentRolePreset.defaultModel(for: leaderMode)
+        let leaderEndpoint: LeaderEndpoint = if let hostKey = params["leader_host"] as? String,
+                                                !hostKey.isEmpty {
+            .peer(hostKey: hostKey)
+        } else {
+            .local
+        }
+        var result: V2CallResult = .err(code: "internal_error", message: "not run", data: nil)
+        _ = v2MainExec(timeout: 20) {
+            MainActor.assumeIsolated {
+                // Mirrors what New Project's Create does: rows in, one
+                // workspace and one team out.
+                if let roles = (params["roles"] as? [String]), !roles.isEmpty {
+                    // Mirrors New Project's Create for a remote project too:
+                    // prepare the checkouts, then create the team pointed at
+                    // what was made.
+                    if let hostKey = params["host"] as? String,
+                       let remotePath = params["remote_path"] as? String,
+                       let host = RemoteHostStore.shared.sortedHosts.first(where: { $0.id == hostKey }),
+                       let sshTarget = host.sshTarget {
+                        let plan = PeerProjectBootstrap.plan(
+                            projectRoot: (remotePath as NSString).deletingLastPathComponent,
+                            projectName: (remotePath as NSString).lastPathComponent,
+                            agents: roles,
+                            isolateAgents: (params["isolate"] as? Bool) ?? true
+                        )
+                        let gitURL = params["git_url"] as? String
+                        let presets = AgentRolePresetManager.shared.presets
+                        guard let tabManager = self.tabManager else {
+                            result = .err(code: "unavailable", message: "no TabManager", data: nil)
+                            return
+                        }
+                        Task { @MainActor in
+                            try? await PeerProjectBootstrap.run(
+                                sshTarget: sshTarget, port: host.sshPort,
+                                identityFile: host.identityFile,
+                                plan: plan, gitURL: (gitURL?.isEmpty ?? true) ? nil : gitURL,
+                                // The project's name, the same one the team is
+                                // created under below — not `remotePath`'s leaf,
+                                // which is the host's own directory convention
+                                // and would pin a different id on every machine.
+                                memMeshProjectID: PeerProjectBootstrap.memMeshProjectID(
+                                    for: URL(fileURLWithPath: directory).lastPathComponent
+                                )
+                            )
+                            let rows: [TeamAgentRow] = plan.agentCheckouts.compactMap { checkout in
+                                guard let preset = presets.first(where: { $0.name == checkout.agent })
+                                else { return nil }
+                                var row = TeamAgentRow(preset: preset, customInstructions: "")
+                                row.hostKey = hostKey
+                                row.hostDirectory = checkout.path
+                                return row
+                            }
+                            TeamOrchestrator.shared.createTeam(
+                                named: URL(fileURLWithPath: directory).lastPathComponent,
+                                rows: rows,
+                                workingDirectory: directory,
+                                leaderMode: leaderMode,
+                                leaderModel: leaderModel,
+                                leaderEndpoint: leaderEndpoint,
+                                leaderWorkingDirectory: remotePath,
+                                projectSource: ProjectSource(
+                                    hostKey: hostKey,
+                                    projectPath: remotePath,
+                                    gitURL: gitURL ?? "",
+                                    isolateAgents: (params["isolate"] as? Bool) ?? true
+                                ),
+                                tabManager: tabManager
+                            )
+                        }
+                        result = .ok([
+                            "primary": plan.primaryPath,
+                            "checkouts": plan.agentCheckouts.map { ["agent": $0.agent, "path": $0.path, "branch": $0.branch] },
+                        ])
+                        return
+                    }
+                    let presets = AgentRolePresetManager.shared.presets
+                    let rows: [TeamAgentRow] = roles.compactMap { role in
+                        guard let preset = presets.first(where: { $0.name == role }) else { return nil }
+                        return TeamAgentRow(preset: preset, customInstructions: "")
+                    }
+                    guard let tabManager = self.tabManager else {
+                        result = .err(code: "unavailable", message: "no TabManager", data: nil)
+                        return
+                    }
+                    let team = TeamOrchestrator.shared.createTeam(
+                        named: URL(fileURLWithPath: directory).lastPathComponent,
+                        rows: rows,
+                        workingDirectory: directory,
+                        leaderMode: leaderMode,
+                        leaderModel: leaderModel,
+                        leaderEndpoint: leaderEndpoint,
+                        tabManager: tabManager
+                    )
+                    result = .ok([
+                        "team": team?.id ?? "",
+                        "workspace_id": team?.workspaceId.uuidString ?? "",
+                        "rows": rows.map(\.preset.name),
+                    ])
+                    return
+                }
+                let manager = SavedTeamTemplateManager.shared
+                let template: SavedTeamTemplate? = templateName.flatMap { name in
+                    manager.templates.first { $0.name == name }
+                } ?? manager.templates.first
+                guard let tabManager = self.tabManager else {
+                    result = .err(code: "unavailable", message: "no TabManager", data: nil)
+                    return
+                }
+                // `createTeam` opens the workspace itself. Opening one here
+                // too is what left an orphan beside every project.
+                var payload: [String: Any] = [
+                    "templates_available": manager.templates.map(\.name),
+                ]
+                if let template {
+                    let remoteSlots = template.agents.filter { ($0.hostKey ?? "").isEmpty == false }
+                    let agents = template.agents.filter { ($0.hostKey ?? "").isEmpty }.map { slot in
+                        (
+                            name: slot.roleName,
+                            cli: slot.cli,
+                            model: slot.model,
+                            agentType: slot.roleName,
+                            color: AgentRolePresetManager.shared.presets
+                                .first { $0.name == slot.roleName }?.color ?? "green",
+                            instructions: "",
+                            customInstructions: slot.customInstructions
+                        )
+                    }
+                    let team = TeamOrchestrator.shared.createTeam(
+                        name: URL(fileURLWithPath: directory).lastPathComponent,
+                        agents: agents,
+                        workingDirectory: directory,
+                        leaderSessionId: UUID().uuidString,
+                        leaderMode: template.leaderMode,
+                        tabManager: tabManager
+                    )
+                    payload["template"] = template.name
+                    payload["team"] = team?.id ?? ""
+                    payload["workspace_id"] = team?.workspaceId.uuidString ?? ""
+                    if let team {
+                        payload["remote_slots"] = remoteSlots.map(\.roleName)
+                        for slot in remoteSlots {
+                            guard let hostKey = slot.hostKey else { continue }
+                            let dir = slot.hostDirectory ?? ""
+                            Task { @MainActor in
+                                _ = try? await TeamOrchestrator.shared.attachRemoteAgent(
+                                    teamName: team.id,
+                                    agentName: slot.roleName,
+                                    hostKey: hostKey,
+                                    workingDirectory: dir.isEmpty ? directory : dir,
+                                    agentType: slot.roleName,
+                                    model: slot.model,
+                                    cli: slot.cli
+                                )
+                            }
+                        }
+                    }
+                }
+                result = .ok(payload)
+            }
+        }
+        return result
+    }
+
+    func v2DebugProjectDelete(params: [String: Any]) -> V2CallResult {
+        guard let team = params["team"] as? String, !team.isEmpty,
+              let tabManager else {
+            return .err(code: "invalid_params", message: "team is required", data: nil)
+        }
+        Task { @MainActor in
+            do {
+                try await TeamOrchestrator.shared.deleteProject(
+                    teamName: team,
+                    tabManager: tabManager
+                )
+                #if DEBUG
+                dlog("debug.project.delete complete team=\(team)")
+                #endif
+            } catch {
+                #if DEBUG
+                dlog("debug.project.delete failed team=\(team) error=\(error)")
+                #endif
+            }
+        }
+        return .ok(["started": true])
+    }
+
+    func v2DebugPeerShellInspect(params: [String: Any]) -> V2CallResult {
+        guard let handle = params["host"] as? String, !handle.isEmpty,
+              let host = RemoteHostStore.shared.sortedHosts.first(where: {
+                  $0.id == handle
+                      || $0.displayName.caseInsensitiveCompare(handle) == .orderedSame
+              })
+        else {
+            return .err(code: "invalid_params", message: "connected host is required", data: nil)
+        }
+        debugPeerShellInspection = nil
+        Task { @MainActor in
+            do {
+                let items = try await TeamOrchestrator.shared.inspectPeerShells(host: host)
+                debugPeerShellInspection = [
+                    "ok": true,
+                    "items": items.map { item in
+                        [
+                            "id": item.id.base64EncodedString(),
+                            "title": item.title,
+                            "directory": item.workingDirectory,
+                            "busy": item.isBusy,
+                            "state": Self.peerShellStateLabel(item.state),
+                        ] as [String: Any]
+                    },
+                ]
+            } catch {
+                debugPeerShellInspection = [
+                    "ok": false,
+                    "error": String(describing: error),
+                ]
+            }
+        }
+        return .ok(["started": true])
+    }
+
+    func v2DebugPeerShellStatus() -> V2CallResult {
+        .ok(debugPeerShellInspection ?? ["pending": true])
+    }
+
+    private static func peerShellStateLabel(
+        _ state: TeamOrchestrator.PeerShellCleanupItem.State
+    ) -> String {
+        switch state {
+        case .inUse: return "in_use"
+        case .managedOrphan: return "managed_orphan"
+        case .missingDirectory: return "missing_directory"
+        case .unclaimed: return "unclaimed"
+        }
+    }
+
+    func v2DebugReviewBoardDelegate(params: [String: Any]) -> V2CallResult {
+        guard let root = params["root"] as? String, !root.isEmpty,
+              let title = params["title"] as? String, !title.isEmpty else {
+            return .err(code: "invalid_params", message: "root and title are required", data: nil)
+        }
+        let name = params["name"] as? String ?? URL(fileURLWithPath: root).lastPathComponent
+        let body = params["body"] as? String ?? ""
+        Task { @MainActor in
+            try? await ReviewBoardCoordinatorService.shared.delegate(
+                projectRoot: root,
+                projectName: name,
+                title: title,
+                body: body
+            )
+        }
+        return .ok(["started": true])
+    }
+
     func v2DebugFocusNotification(params: [String: Any]) -> V2CallResult {
         guard let wsId = v2String(params, "workspace_id") else {
             return .err(code: "invalid_params", message: "Missing workspace_id", data: nil)

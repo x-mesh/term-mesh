@@ -1103,6 +1103,7 @@ impl HeadlessManager {
                 schema: meta::SCHEMA_VERSION,
                 team_uuid: team_uuid.clone(),
                 name: spec.name.clone(),
+                agent_instance_id: Some(meta::new_uuid()),
                 agent_type: spec.agent_type.clone().unwrap_or_else(|| spec.name.clone()),
                 cli: spec.cli.clone(),
                 model: spec.model.clone(),
@@ -1471,6 +1472,7 @@ impl HeadlessManager {
                 schema: meta::SCHEMA_VERSION,
                 team_uuid: team_uuid.clone(),
                 name: a.name.clone(),
+                agent_instance_id: a.agent_instance_id.clone().filter(|id| !id.trim().is_empty()).or_else(|| Some(meta::new_uuid())),
                 agent_type: a.agent_type.clone(),
                 cli: a.cli.clone(),
                 model: a.model.clone(),
@@ -1579,6 +1581,7 @@ impl HeadlessManager {
                 schema: meta::SCHEMA_VERSION,
                 team_uuid: team_uuid.clone(),
                 name: a.name.clone(),
+                agent_instance_id: a.agent_instance_id.clone().filter(|id| !id.trim().is_empty()).or_else(|| Some(meta::new_uuid())),
                 agent_type: a.agent_type.clone(),
                 cli: a.cli.clone(),
                 model: a.model.clone(),
@@ -1731,6 +1734,7 @@ impl HeadlessManager {
             };
             agents.push(ResumePaneAgent {
                 name: am.name,
+                agent_instance_id: am.agent_instance_id,
                 agent_type: am.agent_type,
                 cli: am.cli,
                 model: am.model,
@@ -1785,6 +1789,30 @@ impl HeadlessManager {
             team_uuid,
             deleted: true,
         })
+    }
+
+    /// Seed a team without spawning any agent process. Test-only: the peer
+    /// roster path needs a manager holding a team, and standing up real CLI
+    /// children to assert a read-only RPC would test the spawner instead.
+    #[cfg(test)]
+    pub fn insert_team_for_tests(
+        &mut self,
+        name: &str,
+        team_uuid: &str,
+        working_directory: &str,
+        agents: Vec<String>,
+    ) {
+        self.teams.insert(
+            name.to_string(),
+            HeadlessTeam {
+                name: name.to_string(),
+                team_uuid: team_uuid.to_string(),
+                agents,
+                working_directory: working_directory.to_string(),
+                leader_session_id: String::new(),
+                created_at: 0,
+            },
+        );
     }
 
     pub fn list_teams(&self) -> Vec<&HeadlessTeam> {
@@ -1982,6 +2010,7 @@ impl HeadlessManager {
                 schema: meta::SCHEMA_VERSION,
                 team_uuid: team_uuid.clone(),
                 name: spec.name.clone(),
+                agent_instance_id: Some(meta::new_uuid()),
                 agent_type: spec.agent_type.clone().unwrap_or_else(|| spec.name.clone()),
                 cli: spec.cli.clone(),
                 model: spec.model.clone(),
@@ -3033,6 +3062,7 @@ pub struct ArchivePaneParams {
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct ArchivePaneAgent {
     pub name: String,
+    #[serde(default)] pub agent_instance_id: Option<String>,
     pub cli: String,
     pub model: String,
     pub agent_type: String,
@@ -3096,6 +3126,7 @@ pub struct SnapshotPaneParams {
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct SnapshotPaneAgent {
     pub name: String,
+    #[serde(default)] pub agent_instance_id: Option<String>,
     pub cli: String,
     pub model: String,
     pub agent_type: String,
@@ -3164,6 +3195,7 @@ pub struct ResumePaneResult {
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct ResumePaneAgent {
     pub name: String,
+    pub agent_instance_id: Option<String>,
     pub agent_type: String,
     pub cli: String,
     pub model: String,
@@ -3616,6 +3648,7 @@ mod tests {
             schema: meta::SCHEMA_VERSION,
             team_uuid: team_uuid.clone(),
             name: "explorer".into(),
+            agent_instance_id: None,
             agent_type: "explorer".into(),
             cli: "claude".into(),
             model: "sonnet".into(),
@@ -3704,6 +3737,7 @@ mod tests {
             schema: meta::SCHEMA_VERSION,
             team_uuid: team_uuid.clone(),
             name: "explorer".into(),
+            agent_instance_id: None,
             agent_type: "explorer".into(),
             cli: "claude".into(),
             model: "sonnet".into(),
@@ -3874,6 +3908,7 @@ mod tests {
             schema: meta::SCHEMA_VERSION,
             team_uuid: team_uuid.into(),
             name: "executor".into(),
+            agent_instance_id: Some("instance-test".into()),
             agent_type: "executor".into(),
             cli: "claude".into(),
             model: "sonnet".into(),
@@ -3946,6 +3981,7 @@ mod tests {
             worktree_branch: None,
             agents: vec![ArchivePaneAgent {
                 name: "explorer".into(),
+                agent_instance_id: None,
                 cli: "claude".into(),
                 model: "sonnet".into(),
                 agent_type: "explorer".into(),
@@ -4019,6 +4055,7 @@ mod tests {
             agents: vec![
                 SnapshotPaneAgent {
                     name: "explorer".into(),
+                    agent_instance_id: None,
                     cli: "claude".into(),
                     model: "sonnet".into(),
                     agent_type: "explorer".into(),
@@ -4032,6 +4069,7 @@ mod tests {
                 },
                 SnapshotPaneAgent {
                     name: "reviewer".into(),
+                    agent_instance_id: None,
                     cli: "codex".into(),
                     model: "gpt".into(),
                     agent_type: "reviewer".into(),
@@ -4090,6 +4128,27 @@ mod tests {
         assert!(m2.last_snapshot_at >= m1.last_snapshot_at);
         assert_eq!(r2.team_uuid, team_uuid);
         assert!(meta::list_archived_teams().unwrap().is_empty());
+    }
+
+    #[test]
+    fn pane_instance_identity_migrates_and_round_trips() {
+        let _scope = scoped_root();
+        let mut mgr = HeadlessManager::new();
+        let team_uuid = "45454545-5555-4666-8777-888888888888";
+
+        // Missing is a legacy payload: snapshot persistence assigns exactly one
+        // durable UUID and writes it back to agent metadata.
+        mgr.snapshot_pane_team(sample_snapshot_params(team_uuid)).unwrap();
+        let migrated = meta::read_agent_meta(team_uuid, "explorer").unwrap();
+        let instance_id = migrated.agent_instance_id.clone().expect("legacy ID migrated");
+        assert!(uuid::Uuid::parse_str(&instance_id).is_ok());
+
+        // A subsequent archive/resume exposes the persisted same identity.
+        let mut archive = sample_archive_params(Some(team_uuid.into()));
+        archive.agents[0].agent_instance_id = Some(instance_id.clone());
+        let archived = mgr.archive_pane_team(archive).unwrap();
+        let resumed = mgr.resume_pane(ResumePaneParams { team_uuid: archived.team_uuid }).unwrap();
+        assert_eq!(resumed.agents[0].agent_instance_id.as_deref(), Some(instance_id.as_str()));
     }
 
     #[test]
@@ -4274,6 +4333,7 @@ mod tests {
             schema: meta::SCHEMA_VERSION,
             team_uuid: team_uuid.clone(),
             name: "a".into(),
+            agent_instance_id: None,
             agent_type: "explorer".into(),
             cli: "claude".into(),
             model: "sonnet".into(),

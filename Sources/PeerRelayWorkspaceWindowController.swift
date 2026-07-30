@@ -82,7 +82,7 @@ private final class WorkspaceSplitWatcher: NSObject, NSSplitViewDelegate {
 }
 
 @MainActor
-private final class PeerRelayStatusOverlay: NSView {
+final class PeerRelayStatusOverlay: NSView {
     private let stack = NSStackView()
     private let titleLabel = NSTextField(labelWithString: "")
     private let detailLabel = NSTextField(labelWithString: "")
@@ -164,6 +164,98 @@ private final class PeerRelayStatusOverlay: NSView {
     @objc private func actionTapped() {
         actionHandler?()
     }
+}
+
+/// Reusable AppKit host for the peer-workspace split renderer.
+///
+/// Pane/session ownership remains in the controller. This view owns only the
+/// presentation tree, so it can be mounted in the legacy relay `NSWindow` or
+/// through `PeerRelayWorkspaceRendererBridge` without rebuilding surfaces.
+@MainActor
+final class PeerRelayWorkspaceRendererHostView: NSView {
+    let banner = PeerRelayBanner(frame: .zero)
+    let splitRoot = NSView()
+    let splitContent = NSView()
+    let statusOverlay = PeerRelayStatusOverlay(frame: .zero)
+    private(set) var sidebarHostingView: NSHostingView<PeerRelayWorkspaceSidebarView>?
+
+    init(sidebarModel: PeerRelayWorkspaceSidebarModel?) {
+        super.init(frame: .zero)
+
+        banner.translatesAutoresizingMaskIntoConstraints = false
+        splitRoot.translatesAutoresizingMaskIntoConstraints = false
+        splitContent.translatesAutoresizingMaskIntoConstraints = false
+
+        addSubview(banner)
+        addSubview(splitRoot)
+        splitRoot.addSubview(splitContent)
+        splitRoot.addSubview(statusOverlay)
+
+        var contentLeading = splitRoot.leadingAnchor
+        if let sidebarModel {
+            let sidebar = NSHostingView(
+                rootView: PeerRelayWorkspaceSidebarView(model: sidebarModel)
+            )
+            sidebar.translatesAutoresizingMaskIntoConstraints = false
+            sidebarHostingView = sidebar
+
+            let separator = NSView()
+            separator.translatesAutoresizingMaskIntoConstraints = false
+            separator.wantsLayer = true
+            separator.layer?.backgroundColor = NSColor.separatorColor.cgColor
+
+            splitRoot.addSubview(sidebar, positioned: .below, relativeTo: splitContent)
+            splitRoot.addSubview(separator, positioned: .below, relativeTo: splitContent)
+            contentLeading = separator.trailingAnchor
+            NSLayoutConstraint.activate([
+                sidebar.topAnchor.constraint(equalTo: splitRoot.topAnchor),
+                sidebar.bottomAnchor.constraint(equalTo: splitRoot.bottomAnchor),
+                sidebar.leadingAnchor.constraint(equalTo: splitRoot.leadingAnchor),
+                sidebar.widthAnchor.constraint(equalToConstant: 160),
+                separator.topAnchor.constraint(equalTo: splitRoot.topAnchor),
+                separator.bottomAnchor.constraint(equalTo: splitRoot.bottomAnchor),
+                separator.leadingAnchor.constraint(equalTo: sidebar.trailingAnchor),
+                separator.widthAnchor.constraint(equalToConstant: 1),
+            ])
+        }
+
+        NSLayoutConstraint.activate([
+            banner.topAnchor.constraint(equalTo: topAnchor),
+            banner.leadingAnchor.constraint(equalTo: leadingAnchor),
+            banner.trailingAnchor.constraint(equalTo: trailingAnchor),
+            splitRoot.topAnchor.constraint(equalTo: banner.bottomAnchor),
+            splitRoot.bottomAnchor.constraint(equalTo: bottomAnchor),
+            splitRoot.leadingAnchor.constraint(equalTo: leadingAnchor),
+            splitRoot.trailingAnchor.constraint(equalTo: trailingAnchor),
+            splitContent.topAnchor.constraint(equalTo: splitRoot.topAnchor),
+            splitContent.bottomAnchor.constraint(equalTo: splitRoot.bottomAnchor),
+            splitContent.leadingAnchor.constraint(equalTo: contentLeading),
+            splitContent.trailingAnchor.constraint(equalTo: splitRoot.trailingAnchor),
+            statusOverlay.topAnchor.constraint(equalTo: splitRoot.topAnchor),
+            statusOverlay.bottomAnchor.constraint(equalTo: splitRoot.bottomAnchor),
+            statusOverlay.leadingAnchor.constraint(equalTo: splitRoot.leadingAnchor),
+            statusOverlay.trailingAnchor.constraint(equalTo: splitRoot.trailingAnchor),
+        ])
+    }
+
+    required init?(coder: NSCoder) { fatalError("not used") }
+}
+
+/// SwiftUI portal for a renderer host owned by a longer-lived controller.
+/// Updates are driven directly by peer layout events, avoiding SwiftUI
+/// identity churn and first-responder changes.
+@MainActor
+struct PeerRelayWorkspaceRendererBridge: NSViewRepresentable {
+    let renderer: PeerRelayWorkspaceRendererHostView
+
+    func makeNSView(context: Context) -> PeerRelayWorkspaceRendererHostView {
+        renderer
+    }
+
+    func updateNSView(
+        _ nsView: PeerRelayWorkspaceRendererHostView,
+        context: Context
+    ) {}
 }
 
 @MainActor
@@ -351,6 +443,7 @@ final class PeerRelayWorkspaceWindowController: NSWindowController, NSWindowDele
     /// True once `ensureBodyStack` has installed the banner and
     /// splitRoot container into the window's contentView.
     private var bodyInstalled = false
+    private var rendererHostView: PeerRelayWorkspaceRendererHostView?
     private var splitRootContainer: NSView?
     private var splitContentContainer: NSView?
     private var statusOverlay: PeerRelayStatusOverlay?
@@ -1330,72 +1423,24 @@ final class PeerRelayWorkspaceWindowController: NSWindowController, NSWindowDele
         if window.contentView == nil { window.contentView = container }
         for sub in container.subviews { sub.removeFromSuperview() }
 
-        let bannerView = PeerRelayBanner(frame: .zero)
-        self.banner = bannerView
-        self.bannerPresenter = PeerRelayBannerPresenter(banner: bannerView)
-        let split = NSView()
-        split.translatesAutoresizingMaskIntoConstraints = false
-        self.splitRootContainer = split
-
-        let splitContent = NSView()
-        splitContent.translatesAutoresizingMaskIntoConstraints = false
-        self.splitContentContainer = splitContent
-        let overlay = PeerRelayStatusOverlay(frame: .zero)
-        self.statusOverlay = overlay
-
-        // Sidebar — 160 pt left column, 1 pt separator, then split tree.
         let model = sidebarModel ?? PeerRelayWorkspaceSidebarModel()
         if sidebarModel == nil { sidebarModel = model }
-        let sidebarView = PeerRelayWorkspaceSidebarView(model: model)
-        let hosting = NSHostingView(rootView: sidebarView)
-        hosting.translatesAutoresizingMaskIntoConstraints = false
-        self.sidebarHostingView = hosting
+        let renderer = PeerRelayWorkspaceRendererHostView(sidebarModel: model)
+        renderer.translatesAutoresizingMaskIntoConstraints = false
+        rendererHostView = renderer
+        banner = renderer.banner
+        bannerPresenter = PeerRelayBannerPresenter(banner: renderer.banner)
+        splitRootContainer = renderer.splitRoot
+        splitContentContainer = renderer.splitContent
+        statusOverlay = renderer.statusOverlay
+        sidebarHostingView = renderer.sidebarHostingView
 
-        let separator = NSView()
-        separator.translatesAutoresizingMaskIntoConstraints = false
-        separator.wantsLayer = true
-        separator.layer?.backgroundColor = NSColor.separatorColor.cgColor
-
-        split.addSubview(hosting)
-        split.addSubview(separator)
-        split.addSubview(splitContent)
-        split.addSubview(overlay)
-
-        container.addSubview(bannerView)
-        container.addSubview(split)
+        container.addSubview(renderer)
         NSLayoutConstraint.activate([
-            bannerView.topAnchor.constraint(equalTo: container.topAnchor),
-            bannerView.leadingAnchor.constraint(equalTo: container.leadingAnchor),
-            bannerView.trailingAnchor.constraint(equalTo: container.trailingAnchor),
-
-            split.topAnchor.constraint(equalTo: bannerView.bottomAnchor),
-            split.bottomAnchor.constraint(equalTo: container.bottomAnchor),
-            split.leadingAnchor.constraint(equalTo: container.leadingAnchor),
-            split.trailingAnchor.constraint(equalTo: container.trailingAnchor),
-
-            // Sidebar column.
-            hosting.topAnchor.constraint(equalTo: split.topAnchor),
-            hosting.bottomAnchor.constraint(equalTo: split.bottomAnchor),
-            hosting.leadingAnchor.constraint(equalTo: split.leadingAnchor),
-            hosting.widthAnchor.constraint(equalToConstant: 160),
-
-            // 1 pt separator.
-            separator.topAnchor.constraint(equalTo: split.topAnchor),
-            separator.bottomAnchor.constraint(equalTo: split.bottomAnchor),
-            separator.leadingAnchor.constraint(equalTo: hosting.trailingAnchor),
-            separator.widthAnchor.constraint(equalToConstant: 1),
-
-            // Terminal area.
-            splitContent.topAnchor.constraint(equalTo: split.topAnchor),
-            splitContent.bottomAnchor.constraint(equalTo: split.bottomAnchor),
-            splitContent.leadingAnchor.constraint(equalTo: separator.trailingAnchor),
-            splitContent.trailingAnchor.constraint(equalTo: split.trailingAnchor),
-
-            // Overlay covers the whole split area (including sidebar).
-            overlay.topAnchor.constraint(equalTo: split.topAnchor),
-            overlay.bottomAnchor.constraint(equalTo: split.bottomAnchor),
-            overlay.leadingAnchor.constraint(equalTo: split.leadingAnchor),
-            overlay.trailingAnchor.constraint(equalTo: split.trailingAnchor),
+            renderer.topAnchor.constraint(equalTo: container.topAnchor),
+            renderer.bottomAnchor.constraint(equalTo: container.bottomAnchor),
+            renderer.leadingAnchor.constraint(equalTo: container.leadingAnchor),
+            renderer.trailingAnchor.constraint(equalTo: container.trailingAnchor),
         ])
         bodyInstalled = true
     }

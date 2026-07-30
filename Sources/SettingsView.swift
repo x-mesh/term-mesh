@@ -80,13 +80,13 @@ enum SettingsSection: String, CaseIterable, Identifiable {
 
     var searchKeywords: [String] {
         switch self {
-        case .app: return ["app", "theme", "appearance", "dark", "light", "workspace", "placement", "session", "restore", "dock", "badge", "quit", "warn", "rename", "sidebar", "branch", "reorder", "notification", "experimental", "mirror", "peer hosts"]
+        case .app: return ["app", "theme", "appearance", "dark", "light", "workspace", "placement", "session", "restore", "dock", "badge", "quit", "warn", "rename", "sidebar", "branch", "reorder", "notification", "experimental", "mirror", "peer hosts", "distributed", "coordinator", "review board"]
         case .terminal: return ["terminal", "font", "size", "theme", "monospace", "family"]
         case .workspaceColors: return ["workspace", "color", "indicator", "palette", "custom"]
         case .automation: return ["automation", "socket", "claude", "port", "integration", "password"]
         case .agentTeams: return ["agent", "team", "leader", "model", "directory", "rendering", "interval", "refresh", "recycle", "auto"]
         case .agentRunbooks: return ["agent", "runbook", "skill", "claude", "codex", "opencode", "install", "role"]
-        case .agentCLIPaths: return ["cli", "path", "claude", "kiro", "codex", "gemini", "binary", "agent"]
+        case .agentCLIPaths: return ["cli", "path", "binary", "agent"] + AgentRolePreset.knownCLIs
         case .agentModels: return ["model", "custom", "version", "gemini", "codex", "kiro", "claude", "preview"]
         case .worktrees: return ["worktrees", "worktree", "base directory", "cleanup", "auto"]
         case .dashboard: return ["dashboard", "http", "localhost", "port", "remote"]
@@ -142,9 +142,28 @@ struct SettingsView: View {
     private var sidebarSeparatedSectionsEnabled = SidebarPresentationSettings.defaultSeparatedSectionsEnabled
     @AppStorage(SidebarActiveTabIndicatorSettings.styleKey)
     private var sidebarActiveTabIndicatorStyle = SidebarActiveTabIndicatorSettings.defaultStyle.rawValue
+    // The two UserDefaults halves of the coordinator gate. The env half
+    // (TERMMESH_COORDINATOR_ENABLED) is intentionally NOT here: a release
+    // build never sets it, so flipping this toggle in a shipped app enables
+    // the cross-host UI without ever launching a coordinator — safe until the
+    // feature is ready to ship on by itself.
+    @AppStorage(ReviewBoardCoordinatorSettings.distributedFeatureKey)
+    private var distributedWorkspacesEnabled = ReviewBoardCoordinatorSettings.defaultDistributedWorkspacesEnabled
+    @AppStorage(ReviewBoardSettings.enabledKey)
+    private var reviewBoardEnabled = ReviewBoardSettings.defaultEnabled
     @AppStorage("teamDefaultLeaderMode") private var teamDefaultLeaderMode = "claude"
+
+    /// Whether agents get a pane the app draws instead of a terminal.
+    ///
+    /// Stored under the pane key; the transport key is written alongside it,
+    /// because a native pane *is* the pipe transport with no terminal around
+    /// it and turning on one without the other does nothing.
+    @AppStorage(AgentPipeTransport.nativePanelKey)
+    private var agentNativePanes = AgentPipeTransport.defaultNativePanel
     @AppStorage("teamDefaultModel") private var teamDefaultModel = "sonnet"
     @AppStorage("teamDefaultWorkingDirectory") private var teamDefaultWorkingDirectory = ""
+    @AppStorage(ProjectLocationSettings.localProjectsRootKey)
+    private var localProjectsRoot = ProjectLocationSettings.defaultLocalProjectsRoot
     @AppStorage("agentRenderingInterval") private var agentRenderingInterval = 3
     // Phase 2 headless: idle-park threshold (0 = disabled, max 1440 min/24h)
     @AppStorage("headlessIdleParkMinutes") private var headlessIdleParkMinutes = 60
@@ -827,7 +846,48 @@ struct SettingsView: View {
                         }
                         }
 
+                        if settingsMatch("distributed", "coordinator", "experimental", "review board", "peer hosts") {
+                        SettingsCardDivider()
+
+                        SettingsCardRow(
+                            "Distributed Workspaces (Experimental)",
+                            subtitle: distributedWorkspacesActive
+                                ? "Tracks projects, hosts, and team leaders across machines via the coordinator."
+                                : "Tracks projects and team leaders across machines. Needs TERMMESH_COORDINATOR_ENABLED=1 in the environment to actually launch the coordinator."
+                        ) {
+                            Toggle("", isOn: distributedWorkspacesBinding)
+                                .labelsHidden()
+                                .controlSize(.small)
+                                .accessibilityLabel("Enable distributed workspaces")
+                        }
+                        }
+
         }
+    }
+
+    /// Both UserDefaults halves of the coordinator gate, flipped as one — the
+    /// gate is an AND of the two, so a single switch is the honest control.
+    private var distributedWorkspacesBinding: Binding<Bool> {
+        // Reading the @AppStorage vars keeps the toggle reactive; writing
+        // goes through the shared setter so the two-keys-as-one rule lives in
+        // one place (and is unit-tested there).
+        Binding(
+            get: { distributedWorkspacesEnabled && reviewBoardEnabled },
+            set: { on in
+                distributedWorkspacesEnabled = on
+                reviewBoardEnabled = on
+                // Turning it on here has to actually show it. Writing only
+                // `enabled` left a board that had been dismissed still
+                // dismissed, so the switch read as broken.
+                ReviewBoardSettings.setVisible(on)
+            }
+        )
+    }
+
+    /// Whether the gate is fully open — the env half is out of the UI's
+    /// hands, so the subtitle tells the user when the toggle is not enough.
+    private var distributedWorkspacesActive: Bool {
+        ReviewBoardCoordinatorSettings.isIntegrationEnabled()
     }
 
     // MARK: - Section: Terminal
@@ -1251,6 +1311,32 @@ struct SettingsView: View {
     @ViewBuilder
     private var sectionAgentTeams: some View {
         SettingsCard {
+                        if settingsMatch("agent", "pane", "native", "terminal",
+                                         "surface", "stream", "team") {
+                        SettingsCardRow(
+                            "Agent Panes",
+                            subtitle: agentNativePanes
+                                ? "Agents run in the app and are drawn by it — streamed text, tool calls that fold, a message box. No terminal."
+                                : "Agents run a CLI inside a terminal pane, as they always have.",
+                            controlWidth: pickerColumnWidth
+                        ) {
+                            Picker("", selection: $agentNativePanes) {
+                                Text("Terminal").tag(false)
+                                Text("Native").tag(true)
+                            }
+                            .labelsHidden()
+                            .pickerStyle(.segmented)
+                        }
+                        // Two keys, one decision: the native pane is the pipe
+                        // transport without a terminal around it, and turning
+                        // on the pane alone would do nothing at all.
+                        .onChange(of: agentNativePanes) { _, on in
+                            UserDefaults.standard.set(on, forKey: AgentPipeTransport.enabledKey)
+                        }
+
+                        SettingsCardDivider()
+                        }
+
                         if settingsMatch("leader", "mode", "repl", "claude", "agent", "team") {
                         SettingsCardRow(
                             "Default Leader Mode",
@@ -1287,6 +1373,32 @@ struct SettingsView: View {
                         }
 
                         if settingsMatch("directory", "working", "path", "agent", "team") {
+                        SettingsCardDivider()
+
+                        SettingsCardRow(
+                            "Projects Under",
+                            subtitle: "Default parent folder for new projects on This Mac."
+                        ) {
+                            HStack(spacing: 8) {
+                                TextField("~/work/project", text: $localProjectsRoot)
+                                    .textFieldStyle(.roundedBorder)
+                                    .frame(width: 170)
+                                Button("Browse…") {
+                                    let panel = NSOpenPanel()
+                                    panel.canChooseDirectories = true
+                                    panel.canChooseFiles = false
+                                    panel.allowsMultipleSelection = false
+                                    panel.presentAsSheet { response in
+                                        if response == .OK, let url = panel.url {
+                                            localProjectsRoot = url.path
+                                        }
+                                    }
+                                }
+                                .buttonStyle(.bordered)
+                                .controlSize(.small)
+                            }
+                        }
+
                         SettingsCardDivider()
 
                         SettingsCardRow(
@@ -1435,7 +1547,7 @@ struct SettingsView: View {
 
     @ViewBuilder
     private var sectionAgentModels: some View {
-        ForEach(AgentRolePreset.supportedCLIs, id: \.self) { cli in
+        ForEach(AgentRolePreset.knownCLIs, id: \.self) { cli in
             CLICustomModelsSection(cli: cli)
         }
         SettingsCardNote("Add custom model names per CLI. These appear alongside built-in models in the team creation picker.")
@@ -3565,6 +3677,19 @@ enum CLIPathSettings {
                 (home as NSString).appendingPathComponent(".npm-global/bin/gemini"),
                 (home as NSString).appendingPathComponent(".volta/bin/gemini"),
                 "/opt/homebrew/opt/node/bin/gemini",
+            ]
+        case "cursor":
+            // The binary is `cursor-agent`; plain `cursor` is the editor.
+            candidates = [
+                (home as NSString).appendingPathComponent(".local/bin/cursor-agent"),
+                "/usr/local/bin/cursor-agent",
+                "/opt/homebrew/bin/cursor-agent",
+            ]
+        case "agy":
+            candidates = [
+                (home as NSString).appendingPathComponent(".local/bin/agy"),
+                "/usr/local/bin/agy",
+                "/opt/homebrew/bin/agy",
             ]
         default:
             candidates = []

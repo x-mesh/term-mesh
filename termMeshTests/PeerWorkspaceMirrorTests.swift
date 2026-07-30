@@ -48,6 +48,155 @@ final class PeerWorkspaceMirrorTests: XCTestCase {
         return workspace
     }
 
+    private func remotePane(
+        _ id: UInt8,
+        cwd: String?,
+        projectRoot: String? = nil
+    ) -> RemotePaneSummary {
+        RemotePaneSummary(
+            id: Data([id]),
+            title: "pane-\(id)",
+            workingDirectoryPath: cwd,
+            workingDirectoryName: cwd.flatMap { ($0 as NSString).lastPathComponent },
+            projectRootPath: projectRoot,
+            tabCount: 1,
+            columns: 80,
+            rows: 24,
+            isBusy: false
+        )
+    }
+
+    // MARK: - peerProjectIdentity
+
+    func test_peerProjectIdentity_usesCommonAncestorForSiblingPaneDirectories() {
+        let identity = peerProjectIdentity(for: [
+            remotePane(1, cwd: "/Users/jinwoo/work/project/term-mesh/Sources"),
+            remotePane(2, cwd: "/Users/jinwoo/work/project/term-mesh/termMeshTests"),
+        ])
+
+        XCTAssertEqual(identity.label, "term-mesh")
+        XCTAssertFalse(identity.isUnknown)
+    }
+
+    func test_peerProjectIdentity_normalizesTrailingSlashesAndCaseForKey() {
+        let a = peerProjectIdentity(for: [
+            remotePane(1, cwd: "/Users/jinwoo/work/project/Term-Mesh///Sources"),
+            remotePane(2, cwd: "/Users/jinwoo/work/project/Term-Mesh/Tests"),
+        ])
+        let b = peerProjectIdentity(for: [
+            remotePane(3, cwd: "/users/jinwoo/work/project/term-mesh/src"),
+            remotePane(4, cwd: "/users/jinwoo/work/project/term-mesh/tests"),
+        ])
+
+        XCTAssertEqual(a.key, b.key)
+        XCTAssertEqual(a.label, "Term-Mesh")
+    }
+
+    func test_peerProjectIdentity_fallsBackToUnknownWithoutCwd() {
+        let identity = peerProjectIdentity(for: [
+            remotePane(1, cwd: nil),
+            remotePane(2, cwd: ""),
+        ])
+
+        XCTAssertEqual(identity, .unknown)
+    }
+
+    func test_peerProjectIdentity_homeDirectoryIsNotAProject() {
+        // A peer shelling in `/root` used to surface a "root" project.
+        XCTAssertEqual(peerProjectIdentity(for: [remotePane(1, cwd: "/root")]), .unknown)
+        XCTAssertEqual(peerProjectIdentity(for: [remotePane(2, cwd: "/Users/jinwoo")]), .unknown)
+        XCTAssertEqual(peerProjectIdentity(for: [remotePane(3, cwd: "/home/ubuntu")]), .unknown)
+        XCTAssertEqual(peerProjectIdentity(for: [remotePane(4, cwd: "/")]), .unknown)
+    }
+
+    func test_peerProjectIdentity_unrelatedPanesCollapseToUnknownNotTheHome() {
+        let identity = peerProjectIdentity(for: [
+            remotePane(1, cwd: "/root/term-mesh"),
+            remotePane(2, cwd: "/root/x-kit"),
+        ])
+
+        XCTAssertEqual(identity, .unknown)
+    }
+
+    func test_peerProjectIdentity_homeChildIsAProject() {
+        let identity = peerProjectIdentity(for: [remotePane(1, cwd: "/root/term-mesh")])
+
+        XCTAssertEqual(identity.label, "term-mesh")
+        XCTAssertFalse(identity.isUnknown)
+    }
+
+    /// Without a reported root, cwd alone cannot locate the project, so a
+    /// lone pane in a subdirectory names that subdirectory. This is the
+    /// fallback path for hosts predating `project_root`.
+    func test_peerProjectIdentity_loneSubdirectoryPaneNamesTheSubdirectory() {
+        let identity = peerProjectIdentity(for: [remotePane(1, cwd: "/root/term-mesh/daemon")])
+
+        XCTAssertEqual(identity.label, "daemon")
+    }
+
+    func test_peerProjectIdentity_reportedRootBeatsTheCwdGuess() {
+        let identity = peerProjectIdentity(for: [
+            remotePane(1, cwd: "/root/term-mesh/daemon", projectRoot: "/root/term-mesh"),
+        ])
+
+        XCTAssertEqual(identity.label, "term-mesh")
+        XCTAssertFalse(identity.isUnknown)
+    }
+
+    func test_peerProjectIdentity_rootedPanesInUnrelatedTreesDoNotCollapse() {
+        // Without roots these two would share only `/root` and go unassigned.
+        let identity = peerProjectIdentity(for: [
+            remotePane(1, cwd: "/root/term-mesh/Sources", projectRoot: "/root/term-mesh"),
+            remotePane(2, cwd: "/root/term-mesh/daemon", projectRoot: "/root/term-mesh"),
+            remotePane(3, cwd: "/root/x-kit", projectRoot: "/root/x-kit"),
+        ])
+
+        XCTAssertEqual(identity.label, "term-mesh")
+    }
+
+    func test_peerProjectIdentity_rootTieGoesToTheFirstPane() {
+        let identity = peerProjectIdentity(for: [
+            remotePane(1, cwd: "/root/x-kit", projectRoot: "/root/x-kit"),
+            remotePane(2, cwd: "/root/term-mesh", projectRoot: "/root/term-mesh"),
+        ])
+
+        XCTAssertEqual(identity.label, "x-kit")
+    }
+
+    func test_peerProjectIdentity_paneOutsideARepoFallsBackToCwd() {
+        // Host reported no root for this pane (empty → nil), so the cwd
+        // heuristic still applies and a bare home stays unassigned.
+        XCTAssertEqual(peerProjectIdentity(for: [remotePane(1, cwd: "/root")]), .unknown)
+    }
+
+    /// The local axis feeds raw panel directories through the same entry
+    /// point, so both sides must agree on what counts as a project.
+    func test_projectIdentity_localPanelDirectoriesUseTheSameRules() {
+        let local = projectIdentity(forWorkingDirectories: [
+            "/Users/jinwoo/work/project/term-mesh",
+            "/Users/jinwoo/work/project/term-mesh/daemon",
+        ])
+        let peer = peerProjectIdentity(for: [remotePane(1, cwd: "/root/term-mesh")])
+
+        XCTAssertEqual(local.label, "term-mesh")
+        XCTAssertEqual(local.key, peer.key)
+        XCTAssertEqual(projectIdentity(forWorkingDirectories: ["/Users/jinwoo"]), .unknown)
+        XCTAssertEqual(projectIdentity(forWorkingDirectories: []), .unknown)
+    }
+
+    func test_peerProjectIdentity_sameProjectAcrossHostsSharesKey() {
+        // Local checkout and a peer checkout of one project must land in the
+        // same group even though their absolute paths differ.
+        let local = peerProjectIdentity(for: [
+            remotePane(1, cwd: "/Users/jinwoo/work/project/term-mesh/Sources"),
+            remotePane(2, cwd: "/Users/jinwoo/work/project/term-mesh/daemon"),
+        ])
+        let peer = peerProjectIdentity(for: [remotePane(3, cwd: "/root/term-mesh")])
+
+        XCTAssertEqual(local.key, peer.key)
+        XCTAssertFalse(local.isUnknown)
+    }
+
     // MARK: - preorderLeaves / shapeHash
 
     func test_preorderLeaves_ordersDepthFirst() {

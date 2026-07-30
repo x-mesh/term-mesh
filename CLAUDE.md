@@ -104,7 +104,7 @@ Before launching a new tagged run, clean up any older tags you started in this s
 
 Named CLI profile sets (path + extraArgs + env + modelOverride) stored in `~/Library/Application Support/term-mesh/cli-profiles.json`.
 
-**Settings에서 만들기:** Settings → CLI Paths에서 각 CLI(claude / kiro / codex / gemini)별로 프로파일을 추가하고 이름, 실행 경로, 추가 인수(extraArgs), 환경 변수, 모델 override를 지정. 경로 필드에는 자동 감지된 경로와 최근 사용 경로가 dropdown으로 표시됨.
+**Settings에서 만들기:** Settings → CLI Paths에서 각 CLI(claude / kiro / codex / gemini / cursor / agy)별로 프로파일을 추가하고 이름, 실행 경로, 추가 인수(extraArgs), 환경 변수, 모델 override를 지정. 경로 필드에는 자동 감지된 경로와 최근 사용 경로가 dropdown으로 표시됨.
 
 **메뉴바에서 전환:** 메뉴바 아이콘 → CLI Profile 서브메뉴에서 CLI별 프로파일을 라디오 버튼으로 즉시 전환. "Apply to Active Pane (Restart)"를 선택하면 현재 pane을 새 프로파일로 hard restart.
 
@@ -113,6 +113,46 @@ Named CLI profile sets (path + extraArgs + env + modelOverride) stored in `~/Lib
 **extraArgs 주의:** `--model`, `--resume`, `--session-id`, `--dangerously-skip-permissions`, `--print`, `--append-system-prompt`는 term-mesh가 자동으로 주입하므로 extraArgs에 넣지 말 것(경고 표시됨).
 
 **헤드리스 모드:** `tm-agent create` / `tm-agent attach` 시에도 활성 프로파일의 extraArgs / env / modelOverride가 동일하게 적용됨.
+
+**cursor / agy:** Settings → CLI Paths에는 항상 경로 필드가 있다(`cursor-agent`, `agy`). 에이전트 role/attach CLI picker에는 **Native Agent Panes**가 켜져 있을 때만 나타난다 — 둘 다 대화형 TUI·stdin 채널이 없어 터미널 pane으로는 실행할 수 없다.
+
+## Native Agent Panes (experimental)
+
+기본값은 **Native**다. Settings → Agent Teams → **Agent Panes**에서 기존 Ghostty pane이 필요하면 **Terminal**로 바꿀 수 있다. Native에서는:
+
+- pipe transport(`agentPipeTransport.enabled`)와 native panel(`agentPipeTransport.nativePanel`)이 함께 켜진다. 하나만 켜는 UI는 없다.
+- 에이전트 UI는 `AgentPanelView`(SwiftUI) — 지시문, streaming 답변, 접을 수 있는 tool row, 턴 종료 cost/시간.
+- 파일 편집은 `ChangeRow`가 diff로 그린다: 접힌 줄에 `경로 +N −M`, 펼치면 `+`/`−` 색상 diff. 파싱은 `Sources/Panels/AgentDiff.swift`(순수 함수, `CollectionDifference` 기반)가 `tool_use.input`에서 하며 **뷰 body에서는 절대 계산하지 않는다**. 인식하는 input 모양은 `unified_diff`(브리지 정본, `@@` 헤더의 라인 번호 유지) / `old_string`+`new_string` / `edits[]` / `content`. tool 이름이 아니라 input 모양으로 분기한다. 브리지는 `input`에 `command` 키를 넣으면 안 된다 — `AgentSession.openTool()`이 그걸 먼저 골라 `file_path`를 가린다.
+- `tm-agent delegate` / `send` / `broadcast`는 CLI 이름 그대로; delivery만 paste+Return → pipe/native stdin으로 바뀐다.
+- 턴 완료는 `AgentPipeCompletion`이 `<fifo>.events`의 `{"type":"result"}`를 읽는다. Standard Reply Header(5-field) 계약은 동일.
+- 지원 CLI: claude(직접 NDJSON), codex/kiro/cursor/agy(`scripts/spike/tm-agent-bridge.py`).
+- Shell Integration health: native agent pane은 **agentMode**(파란색) — shell integration N/A.
+
+Spike 상세: `docs/spike/agent-pipe-render.md`
+
+### Remote native agent environment
+
+Remote native agents start through the account's Bourne-compatible login shell.
+The load order is:
+
+1. the shell's normal login profile;
+2. `~/.profile` when Bash or zsh would otherwise skip that literal file;
+3. optional `~/.config/term-mesh/agent-env`;
+4. explicit environment values configured for the peer host.
+
+`agent-env` is sourced as a Bourne-compatible shell fragment. Prefer simple
+`KEY=value` or `export KEY=value` entries and do not print output from it.
+Explicit peer-host values win over profile and `agent-env` values. term-mesh
+uses a fixed remote `PATH`, so configure CLI paths explicitly rather than
+overriding `PATH` in these files. A profile or `agent-env` load failure is
+reported in the native agent pane without including environment values.
+
+VERIFY (stale CLI 이름·동작 불일치):
+
+```bash
+rg -n 'agentPipeTransport|Agent Panes|Native Agent|cursor-agent|tm-agent-bridge' AGENTS.md CLAUDE.md CHANGELOG.md docs/spike/agent-pipe-render.md
+xcodebuild -project GhosttyTabs.xcodeproj -scheme term-mesh -configuration Debug -destination 'platform=macOS' -only-testing:termMeshTests/AgentSessionTests -only-testing:termMeshTests/AgentPipeCompletionTests test
+```
 
 ## Debug event log
 
@@ -378,6 +418,7 @@ pending→in_progress→completed/blocked). leader는 `.xm/…/status.json` 폴�
 /team add reviewer         # attach default claude/sonnet reviewer
 /team add executor --model opus  # attach with opus model
 /team add reviewer --cli codex   # attach codex-backed reviewer
+/team add builder --host jw-server --dir /root/build  # run this member on a peer
 /team remove writer        # detach writer
 /team swap executor opus   # change executor model
 /team ensure reviewer security  # idempotent — add only if missing
@@ -404,10 +445,18 @@ tm-agent runbook install --tool claude|codex|opencode|all [--agent <role>] [--dr
 
 # Team-scoped add/remove (works for headless AND GUI teams — no workspace ID required)
 tm-agent add <role> [--name N] [--model M] [--cli claude|codex|kiro|gemini]
+tm-agent add <role> --host <peer> [--dir <remote path>]   # member runs on a peer
 tm-agent remove <agent_name> [--force]
 # Examples:
 #   tm-agent add reviewer                   # add reviewer to current team (any team type)
 #   tm-agent add executor --model opus      # add executor with opus model
+#   tm-agent add builder --host jw-server --dir /root/build
+#     A mixed team: the pane opens here beside its teammates, the shell behind
+#     it belongs to the peer. `--host` takes the sidebar's name (jw-server) or
+#     the stored key (ssh:root@jw-server). `--dir` says where on that machine —
+#     needed unless the host reports a project of its own, since two machines
+#     rarely lay a checkout out the same way. Delegating, reading the reply and
+#     revealing the pane all work exactly as they do for a local member.
 #   tm-agent remove reviewer               # remove agent from team (--force default: true)
 # `add` routes to team.add_agent Swift RPC; rejects duplicate name within team.
 # `remove` routes to team.detach Swift RPC; team-name–scoped (not workspace-panel–scoped).
@@ -439,38 +488,42 @@ tm-agent wait --timeout 120 --mode any        # ALWAYS use this to wait; NEVER u
 tm-agent recycle <agent>                      # guarded hard restart for idle/stopped workers; drops transcript context
 tm-agent brief <agent>
 
-# Parallel delegation pattern — round-robin routing (active since d69c9d0c)
-# Sequential delegate routes to DIFFERENT panels automatically:
-#   1. tm-agent delegate executor 'task A'   # → executor panel 1
-#   2. tm-agent delegate executor 'task B'   # → executor panel 2 (round-robin)
-# Both-idle race: if both panels are idle simultaneously, add a 0.5–1s gap or
-# use the work-pool pattern (unassigned task create + tm-agent claim).
-# Do NOT delegate the same task twice — that always produces duplicate work.
+# LeaderParallelPolicy v1 — runtime-enforced (single source: `Sources/LeaderParallelPolicy.swift`)
+# Every local/peer leader receives the same policy_version and policy_digest. `status` exposes
+# source/version/digest plus policy state; injection failure is explicit `failed`, never silent.
+# For substantive work, form a parallel wave by default. Claim or dispatch only DAG-ready tasks:
+# every `depends_on` task must be completed; failed/blocked dependencies never release a child.
 #
-# Work-pool / autonomous claim pattern (GAP-4 claim-push active since 3b312b7a):
+# Placement is one unified local+peer pool. A task's stable correlation key is
+# `task_id + agent_instance_id`; the same role/name may have multiple instances.
+# Name-only selectors are rejected when ambiguous, while unique-name callers remain compatible.
+# Idle-first deterministic routing selects an eligible exact instance and never collapses sibling rows.
+#
+# Work-pool / autonomous claim pattern:
 #   tm-agent task create 'task A'            # unassigned — enters pool
 #   tm-agent task create 'task B'            # unassigned — enters pool
-#   tm-agent broadcast 'tm-agent claim'       # Option A: all panels claim simultaneously (preferred)
-#   tm-agent send executor 'tm-agent claim'; sleep 0.5; tm-agent send executor 'tm-agent claim'  # Option B: round-robin sequential
-#   tm-agent task finish-worktree <task_id> --to parent --cleanup  # finish gk wt attached to a task
+#   tm-agent broadcast 'tm-agent claim'      # one initial kick
+# AUTO-CLAIM-NEXT: a completed, non-recycled exact instance claims the next ready
+# unassigned task itself. If delivery fails, that same instance's claim is released back to
+# the unassigned pool; no sibling is reassigned accidentally. Directed delegate/fan-out tasks
+# are already assigned and are therefore not consumed by the pool.
 #
-# AUTO-CLAIM-NEXT (self-draining pool — Tier 1 work-stealing): when an agent
-# finishes a task and is NOT being auto-recycled, it AUTOMATICALLY claims the
-# next task from the UNASSIGNED pool and is pushed its instruction — no second
-# `tm-agent claim` broadcast needed per wave. So for the work-pool pattern you
-# now kick it ONCE; idle agents drain the pool on their own until it is empty:
-#   tm-agent task create 'task A'; tm-agent task create 'task B'; tm-agent task create 'task C'
-#   tm-agent broadcast 'tm-agent claim'   # one kick — each agent then auto-pulls the next on finish
-# Scope: only consumes UNASSIGNED tasks, so directed delegate/fan-out (which
-# create already-ASSIGNED tasks) are unaffected. Dependency-aware: a pooled task
-# is only auto-claimed once every task it `dependsOn` has COMPLETED (a failed dep
-# does not release it). Auto-claim is skipped on the recycle wave (the pane hard
-# restarts). Duplicate-named agents: the push routes by name (round-robin), so a
-# sibling pane may receive it — exact per-pane delivery awaits the panel_id fix.
+# Same-checkout concurrent writes require explicit disjoint ownership or worktree isolation.
+# Distinct local/peer checkouts do not require an additional worktree; assign a branch owner and
+# serialize pushes to the same remote branch. Concurrent read-only work is allowed in one checkout.
 #
-# Broadcast reaches ALL panels including duplicate-named agents (BUG-3 fix d69c9d0c):
-#   tm-agent broadcast 'msg'   # every pane receives — no name-based collapse
+# isolated-checkout-ref-contract, base sync: a worker branch is expected to be BEHIND the target,
+# not only differently named. When the leader says "sync your base to <SHA>", that is the assigned
+# action, not a precondition to verify — run it. Do not gate it behind
+# `git merge-base --is-ancestor <SHA> HEAD` and do not report BLOCKED because the SHA is not yet
+# in the branch; that is the normal state the sync exists to fix.
 #
+# Machine-readable status/task/collect/reports retain duplicate rows and expose body-free routing
+# telemetry (wave/task/agent_instance/host/checkout/delivery/synthesis). A hard timebox converges
+# on completed evidence and blocks/cancels/splits remaining work — timeout is never success.
+#
+# Broadcast reaches ALL panels including duplicate-named agents:
+#   tm-agent broadcast 'msg'
 # Regression test: ./scripts/test-parallel.sh --skip-team-create
 
 # Agent task lifecycle
@@ -576,6 +629,50 @@ When a task has a fix budget (set via `--auto-fix-budget N` on delegate):
 > tm-agent wait --timeout 30 --mode any
 > tm-agent read explorer --lines 50
 > ```
+
+### 병렬 수정 웨이브 분할 — 발견 단위가 아니라 파일 소유권 단위
+
+리뷰에서 나온 지적을 여러 에이전트에 나눠 고칠 때, **발견 건수로 자르지 말고 파일 소유권으로 자른다.**
+2026-07-29 feat/distributed-workspaces 수정 웨이브에서 확인된 결과:
+
+- P0 5건은 파일이 자연히 안 겹쳐서 그대로 4명에게 배분 → 옥토퍼스 머지 충돌 0, 첫 통합 빌드 컴파일 에러 0.
+- P1 14건은 같은 파일에 여러 건이 몰려 있었다(`ReviewBoardCoordinatorService.swift` 3건,
+  `TeamOrchestrator+RemoteAgent.swift` 3건). 발견 단위로 나눴다면 여러 에이전트가 같은 파일을
+  동시에 편집했을 것이다. 파일 소유권으로 5그룹으로 재구성하니 다시 충돌 0.
+
+각 태스크 캡슐에 반드시 세 가지를 명시한다:
+
+1. **소유 파일 목록** — 이것만 수정 가능
+2. **금지 파일과 그 이유** — "X는 executor가 동시에 고치는 중이니 열지 마라"
+3. **소유권 밖 정의를 만났을 때의 행동** — 임의로 열지 말고 리더에게 소유권 확장을 요청
+
+3번은 실제로 작동했다. 에이전트 2명이 소유 목록 밖의 타입 정의에 막혔을 때
+(`AutoPilotUndoPoint`가 `AutoPilotPolicy.swift`에, `MergeQueueItem`이 `model.rs`에 있었다)
+임의 편집 대신 리더에게 확장을 요청했다.
+
+> 리더는 그룹을 자르기 전에 **각 수정 대상이 참조하는 타입·모델 정의가 소유 목록 밖에 있는지**
+> 먼저 확인해라. 위 두 건이 그 패턴이다 — 고칠 코드와 그 코드가 쓰는 struct 정의가 다른 파일에
+> 산다. 미리 소유 목록에 넣거나, 최소한 확장 요청이 올 것을 예상해 둔다.
+
+### 피어 에이전트의 검증 한계 — 언어별로 다르다
+
+피어 호스트(Linux)에는 **Swift 툴체인이 없다.** Rust와 Python은 피어에서 완전히 검증된다.
+
+| 작업 언어 | 피어에서 가능한 것 | 리더가 해야 할 것 |
+|-----------|-------------------|------------------|
+| Rust / Python | 편집 + 빌드 + 테스트 | 결과 수용 |
+| Swift | **편집만** | 로컬 머신에서 통합 후 빌드·테스트 필수 |
+
+Swift 작업을 피어에 보낼 때는 태스크 캡슐에 다음을 넣는다(2026-07-29 웨이브에서 효과 확인):
+
+```
+- 이 호스트에 Swift 툴체인이 없다. xcodebuild/swift build 시도 금지(시간 낭비).
+- 대신 필수: 시그니처를 바꾼 뒤 `rg`로 호출부를 전부 찾아 갱신 누락이 없는지 확인하고,
+  그 확인 결과를 보고에 포함해라.
+```
+
+그리고 Swift 변경은 파이프라인에 **로컬 통합 빌드 단계를 반드시 넣는다.** 피어 에이전트의
+STATUS: DONE은 "편집 완료"이지 "빌드 통과"가 아니다.
 
 ### Reply Truncation Protocol
 

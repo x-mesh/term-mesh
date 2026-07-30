@@ -30,6 +30,7 @@ struct TermMeshApp: App {
     @AppStorage(KeyboardShortcutSettings.Action.toggleSidebar.defaultsKey) private var toggleSidebarShortcutData = Data()
     @AppStorage(KeyboardShortcutSettings.Action.newTab.defaultsKey) private var newWorkspaceShortcutData = Data()
     @AppStorage(KeyboardShortcutSettings.Action.newWindow.defaultsKey) private var newWindowShortcutData = Data()
+    @AppStorage(KeyboardShortcutSettings.Action.newProject.defaultsKey) private var newProjectShortcutData = Data()
     @AppStorage(KeyboardShortcutSettings.Action.openPeerWorkspace.defaultsKey) private var openPeerWorkspaceShortcutData = Data()
     @AppStorage(KeyboardShortcutSettings.Action.showNotifications.defaultsKey) private var showNotificationsShortcutData = Data()
     @AppStorage(KeyboardShortcutSettings.Action.jumpToUnread.defaultsKey) private var jumpToUnreadShortcutData = Data()
@@ -55,6 +56,11 @@ struct TermMeshApp: App {
     /// Phase 2.5 — initial mode for next sheet presentation ("new" or "resume").
     /// Reset to "new" each time the sheet closes so subsequent menu opens behave normally.
     @State private var teamCreationInitialMode: String = "new"
+    /// New Project sheet. Owned here rather than by the sidebar's Projects
+    /// header, because the titlebar's + opens the same sheet and is on screen
+    /// precisely when the sidebar is not.
+    @State private var showProjectCreation = false
+    @State private var projectCreationTabManager: TabManager?
     @State private var ghosttyTheme = GhosttyTheme.current
     // P0-5: Configure Watch sheet state (triggered via palette or sidebar notification)
     @State private var showWatchConfig = false
@@ -248,47 +254,20 @@ struct TermMeshApp: App {
         let (defaultDir, defaultSource) = resolveDefaultWorkingDirectory(activeTabManager: activeTabManager)
         return TeamCreationView(
             onCreate: { teamName, leaderMode, leaderModel, agents, worktreeMode, executionMode, resumeSessionId, pairMode, pairModel, pairSpec, workingDirectory in
-                let agentTuples: [(name: String, cli: String, model: String, agentType: String, color: String, instructions: String, customInstructions: String)] = agents.map { row in
-                    let customInstructions = row.customInstructions == row.preset.instructions
-                        ? ""
-                        : row.customInstructions
-                    let effectiveInstructions = AgentRunbookService.shared.composeInstructions(
-                        roleName: row.preset.name,
-                        presetInstructions: row.preset.instructions,
-                        customInstructions: customInstructions,
-                        workingDirectory: workingDirectory,
-                        mode: .digest
-                    )
-                    return (
-                        name: row.preset.name,
-                        cli: row.preset.cli,
-                        model: row.preset.model,
-                        agentType: row.preset.name,
-                        color: row.preset.color,
-                        // GUI composes the custom instructions into `instructions`
-                        // above; pass empty here so createTeam's compose step does
-                        // not append the same spec a second time.
-                        instructions: effectiveInstructions,
-                        customInstructions: ""
-                    )
-                }
-                let leaderSessionId = UUID().uuidString
-                let team = TeamOrchestrator.shared.createTeam(
-                    name: teamName,
-                    agents: agentTuples,
+                TeamOrchestrator.shared.createTeam(
+                    named: teamName,
+                    rows: agents,
                     workingDirectory: workingDirectory,
-                    leaderSessionId: leaderSessionId,
                     leaderMode: leaderMode,
                     leaderModel: leaderModel,
+                    worktreeMode: worktreeMode,
+                    executionMode: executionMode,
+                    resumeSessionId: resumeSessionId,
                     pairMode: pairMode,
                     pairModel: pairModel,
                     pairSpec: pairSpec,
-                    resumeSessionId: resumeSessionId,
-                    worktreeMode: worktreeMode,
-                    executionMode: executionMode,
                     tabManager: activeTabManager
-                )
-                return team != nil
+                ) != nil
             },
             onResume: { (result: [String: Any]) in
                 // The picker tags pane-mode resumes so we route to a separate
@@ -421,6 +400,19 @@ struct TermMeshApp: App {
                 teamCreationInitialMode = note.name == .openCreateTeamSheetInResumeMode ? "resume" : "new"
                 showTeamCreation = true
             }
+            .onReceive(NotificationCenter.default.publisher(for: .projectCreationRequested)) { _ in
+                // Same capture-before-the-sheet-steals-focus rule as the team
+                // sheet above: whichever window asked is the one the project
+                // has to open in.
+                if let kw = NSApp.keyWindow, let ctx = AppDelegate.shared?.contextForMainWindow(kw) {
+                    projectCreationTabManager = ctx.tabManager
+                } else if let mw = NSApp.mainWindow, let ctx = AppDelegate.shared?.contextForMainWindow(mw) {
+                    projectCreationTabManager = ctx.tabManager
+                } else {
+                    projectCreationTabManager = nil
+                }
+                showProjectCreation = true
+            }
             .onReceive(NotificationCenter.default.publisher(for: .spawnCLIRequested)) { _ in
                 Task { @MainActor in
                     await showSpawnCLIDialog()
@@ -453,6 +445,30 @@ struct TermMeshApp: App {
             }
             .sheet(isPresented: $showTeamCreation) {
                 makeTeamCreationView()
+            }
+            .sheet(isPresented: $showProjectCreation) {
+                let activeTabManager = projectCreationTabManager ?? tabManager
+                NewProjectView(
+                    onCreate: { name, directory, rows, source, leader, progress in
+                        try await ProjectCreationFlow.create(
+                            name: name,
+                            directory: directory,
+                            rows: rows,
+                            source: source,
+                            leader: leader,
+                            progress: progress,
+                            tabManager: activeTabManager
+                        )
+                    },
+                    onClose: { showProjectCreation = false },
+                    repositoryDirectories: (
+                        activeTabManager.tabs.map(\.currentDirectory)
+                        + TeamCreationRecentDirs.shared.current()
+                    ),
+                    repositorySearchRoots: [
+                        ProjectLocationSettings.expandedLocalProjectsRoot()
+                    ]
+                )
             }
             .sheet(isPresented: $showWatchConfig) {
                 WatchConfigSheet(
@@ -744,6 +760,11 @@ struct TermMeshApp: App {
             }
 
             CommandMenu("Remote Work") {
+                Button("Toggle Review Board") {
+                    ReviewBoardSettings.toggleVisible()
+                }
+                .keyboardShortcut("b", modifiers: [.command, .control])
+
                 Button("Toggle Activity Drawer") {
                     AppDelegate.shared?.tabManager?.selectedWorkspace?
                         .retrievalStore.togglePresentation(.drawer)
@@ -838,6 +859,15 @@ struct TermMeshApp: App {
 
                 splitCommandButton(title: "New Workspace", shortcut: newWorkspaceMenuShortcut) {
                     activeTabManager.addTab()
+                }
+
+                // AppDelegate handles this by physical key code as well as characters,
+                // so the shortcut keeps working under CJK keyboard layouts.
+                splitCommandButton(title: "New Project…", shortcut: newProjectMenuShortcut, registerShortcut: false) {
+                    NotificationCenter.default.post(
+                        name: .projectCreationRequested,
+                        object: nil
+                    )
                 }
             }
 
@@ -1181,6 +1211,13 @@ struct TermMeshApp: App {
         decodeShortcut(from: newWindowShortcutData, fallback: KeyboardShortcutSettings.Action.newWindow.defaultShortcut)
     }
 
+    private var newProjectMenuShortcut: StoredShortcut {
+        decodeShortcut(
+            from: newProjectShortcutData,
+            fallback: KeyboardShortcutSettings.Action.newProject.defaultShortcut
+        )
+    }
+
     private var openPeerWorkspaceMenuShortcut: StoredShortcut {
         decodeShortcut(
             from: openPeerWorkspaceShortcutData,
@@ -1519,7 +1556,7 @@ struct TermMeshApp: App {
         alert.addButton(withTitle: "Cancel")
 
         // Build available commands from CLI path settings
-        let cliNames = ["claude", "kiro", "codex", "gemini"]
+        let cliNames = AgentRolePreset.knownCLIs
         var availableCommands: [String] = ["(shell only)"]
         for cli in cliNames {
             if CLIPathSettings.resolvedPath(for: cli) != nil {

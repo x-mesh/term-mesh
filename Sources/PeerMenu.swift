@@ -213,20 +213,24 @@ final class PeerClientCoordinator: NSObject, NSMenuDelegate {
         openWorkspaceMirrors.first { $0.workspace?.id == id }
     }
 
-    /// Resolve an open live mirror by its host-owned identity within one
-    /// window. Sidebar presentation uses this to show remote state without
-    /// treating the backing Workspace as a local card.
+    /// Resolve an open live mirror by its host-owned identity, wherever in
+    /// this app it lives. Sidebar presentation uses this to show remote state
+    /// without treating the backing Workspace as a local card.
+    ///
+    /// App-wide on purpose: a terminal's new window is a new shell, not a
+    /// copy of the old one. One app holds one view of a host workspace, and
+    /// another window's click goes to it — mirroring is for crossing a
+    /// machine boundary, which another window of the same app never does.
     func mirroredWorkspace(
         forHostKey hostKey: PeerPaneHostKey,
-        hostWorkspaceID: Data,
-        in tabManager: TabManager?
+        hostWorkspaceID: Data
     ) -> Workspace? {
         openWorkspaceMirrors.first { mirror in
             guard !mirror.isTornDown,
                   mirror.lease.key == hostKey,
-                  mirror.matchesHostWorkspaceID(hostWorkspaceID),
-                  let workspace = mirror.workspace else { return false }
-            return AppDelegate.shared?.tabManagerFor(tabId: workspace.id) === tabManager
+                  mirror.matchesHostWorkspaceID(hostWorkspaceID)
+            else { return false }
+            return mirror.workspace != nil
         }?.workspace
     }
 
@@ -731,6 +735,18 @@ final class PeerClientCoordinator: NSObject, NSMenuDelegate {
     /// be scoped after the fact.
     @discardableResult
     private func openRemotePaneFlow(spec: PeerPaneHostSpec, workspaceID: Data? = nil) async -> Bool {
+        // A direct connection back into this app is not a remote pane.  Apart
+        // from wasting a relay, it creates a self-attach loop whose output is
+        // fed back into the same Ghostty surface.  Cross-host re-export is
+        // blocked at the provider as well; this catches the local fast path
+        // before a connection is even opened.
+        guard !spec.targetsLocalPeerServer else {
+            self.showAlert(
+                title: "Cannot Attach Local Peer",
+                body: "Choose a different peer host; a terminal cannot be attached to itself."
+            )
+            return false
+        }
         let lease: PeerPaneHostLease
         do {
             lease = try await PeerPaneHostRegistry.shared.acquire(spec)
@@ -974,34 +990,34 @@ final class PeerClientCoordinator: NSObject, NSMenuDelegate {
         // focus drifted to.
         let targetTabManager = AppDelegate.shared?.tabManager
 
-        // Live-mirror dedupe, scoped PER WINDOW: re-clicking the row in the
-        // window that already shows this mirror focuses that tab; a click in
-        // a different window falls through and materializes its own mirror
-        // there. Concurrent mirrors of one host workspace are fine now that
-        // the daemon arbitrates the PTY winsize across attachers (min per
-        // axis, tmux-style) instead of last-writer-wins.
+        // Live-mirror dedupe, APP-WIDE: one app holds one view of a host
+        // workspace, whichever window it lives in. A click in another window
+        // used to materialize a second mirror there (b581635a), which read as
+        // a broken copy of the first — a terminal's new window is a new
+        // shell, not a clone. Mirrors are for crossing a machine boundary;
+        // within one app the answer to "show me that workspace" is to go to
+        // where it already is.
         if live, let workspaceID,
            let mirrorWorkspace = mirroredWorkspace(
                forHostKey: spec.hostKey,
-               hostWorkspaceID: workspaceID,
-               in: targetTabManager
+               hostWorkspaceID: workspaceID
            ) {
-            // Per-window target from develop, gated by `select` so the socket
-            // path still refuses to move the user's focus.
+            // Gated by `select` so the socket path still refuses to move the
+            // user's focus — cross-window focus doubly so.
             if select {
-                targetTabManager?.selectWorkspace(mirrorWorkspace)
+                revealLocalWorkspace(id: mirrorWorkspace.id)
             }
             #if DEBUG
-            dlog("peer.mirror.dedupe host=\(spec.hostKey) sameWindow=1")
+            dlog("peer.mirror.dedupe host=\(spec.hostKey) appWide=1")
             #endif
             return
         }
 
-        // In-flight guard is per (host, window): the same window double-
-        // clicking must still coalesce, while a second window opening its
-        // own mirror of the same host must not be blocked by the first.
-        let windowKey = targetTabManager.map { String(UInt(bitPattern: ObjectIdentifier($0).hashValue)) } ?? "none"
-        let flowKey = "\(spec.hostKey.description)#\(windowKey)"
+        // In-flight guard, app-wide per (host, workspace) to match the
+        // dedupe's scope: any window double-clicking coalesces, and two
+        // windows racing to open the same workspace produce one mirror —
+        // the loser's next click lands in the dedupe above.
+        let flowKey = "\(spec.hostKey.description)#\(workspaceID?.base64EncodedString() ?? "pick")"
         guard !mirrorOpensInFlight.contains(flowKey) else { return }
         mirrorOpensInFlight.insert(flowKey)
         defer { mirrorOpensInFlight.remove(flowKey) }
@@ -1072,6 +1088,31 @@ final class PeerClientCoordinator: NSObject, NSMenuDelegate {
         }
         guard let chosen else {
             registry.release(lease)
+            return
+        }
+
+        // A host workspace whose surfaces this app's own team spawned is that
+        // team's home, not something to re-open as a raw mirror. The team's
+        // window already shows those panes with their agent identity — native
+        // panels included, which a daemon-layout mirror cannot reproduce,
+        // because a pipe-transport member has no host surface at all. Go to
+        // the team instead. (Another machine mirroring this workspace is
+        // unaffected: its app has no such team.)
+        if live,
+           let teamWorkspaceID = Self.localTeamWorkspaceID(
+               owningLeaves: Set(Self.collectLeafPanes(chosen.layout).map(\.surfaceID))
+           ) {
+            registry.release(lease)
+            if select {
+                revealLocalWorkspace(id: teamWorkspaceID)
+            } else {
+                RemoteWorkLog.info(
+                    "Mirror skipped: workspace belongs to a local team (its panes are already open here)"
+                )
+            }
+            #if DEBUG
+            dlog("peer.mirror.teamHomeRedirect host=\(spec.hostKey)")
+            #endif
             return
         }
 
@@ -1334,6 +1375,45 @@ final class PeerClientCoordinator: NSObject, NSMenuDelegate {
         case .split(let split):
             return collectLeafPanes(split.first) + collectLeafPanes(split.second)
         case .none: return []
+        }
+    }
+
+    /// The workspace of the local team that spawned any of these host
+    /// surfaces, or nil when no team did. Leader and terminal members are
+    /// remembered per-surface at spawn (`AgentMember.remoteSurfaceID`,
+    /// `ManagedPeerSurfaceStore` with the leader's role); native pipe
+    /// members have no host surface, so they neither match nor need to —
+    /// their siblings do the identifying.
+    private static func localTeamWorkspaceID(owningLeaves: Set<Data>) -> UUID? {
+        guard !owningLeaves.isEmpty else { return nil }
+        let orchestrator = TeamOrchestrator.shared
+        for team in orchestrator.teams.values {
+            let agentMatch = team.agents.contains { agent in
+                agent.remoteSurfaceID.map(owningLeaves.contains) == true
+            }
+            if agentMatch {
+                return team.leaderWorkspaceId ?? team.workspaceId
+            }
+        }
+        if let teamName = ManagedPeerSurfaceStore.shared.teamName(
+            forAnySurfaceID: owningLeaves
+        ), let team = orchestrator.teams[teamName] {
+            return team.leaderWorkspaceId ?? team.workspaceId
+        }
+        return nil
+    }
+
+    /// Select a workspace in whichever window holds it, and bring that
+    /// window forward. Callers gate this on focus intent (`select`).
+    private func revealLocalWorkspace(id: UUID) {
+        guard let appDelegate = AppDelegate.shared,
+              let tabManager = appDelegate.tabManagerFor(tabId: id),
+              let workspace = tabManager.tabs.first(where: { $0.id == id })
+        else { return }
+        tabManager.selectWorkspace(workspace)
+        if let windowId = appDelegate.windowId(for: tabManager),
+           let window = appDelegate.mainWindow(for: windowId) {
+            window.makeKeyAndOrderFront(nil)
         }
     }
 

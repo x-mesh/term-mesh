@@ -157,6 +157,7 @@ final class Workspace: Identifiable, ObservableObject {
     enum SurfaceKind {
         static let terminal = "terminal"
         static let browser = "browser"
+        static let agent = "agent"
     }
 
     // MARK: - Initialization
@@ -485,6 +486,8 @@ final class Workspace: Identifiable, ObservableObject {
             return SurfaceKind.terminal
         case .browser:
             return SurfaceKind.browser
+        case .agent:
+            return SurfaceKind.agent
         }
     }
 
@@ -1409,6 +1412,80 @@ final class Workspace: Identifiable, ObservableObject {
         return browserPanel
     }
 
+    /// Split off a pane that holds an agent directly, with no terminal in it.
+    ///
+    /// Deliberately the browser path with the browser parts removed: the split
+    /// tree only needs a panel and a tab kind, which is the point — a pane's
+    /// content has never been the tree's business.
+    func newAgentSplit(
+        from panelId: UUID,
+        orientation: SplitOrientation,
+        insertFirst: Bool = false,
+        agentName: String,
+        teamName: String,
+        workingDirectory: String,
+        cli: String = "claude",
+        color: String = "",
+        focus: Bool = false
+    ) -> AgentPanel? {
+        guard let sourceTabId = surfaceIdFromPanelId(panelId) else { return nil }
+        var sourcePaneId: PaneID?
+        for paneId in bonsplitController.allPaneIds
+        where bonsplitController.tabs(inPane: paneId).contains(where: { $0.id == sourceTabId }) {
+            sourcePaneId = paneId
+            break
+        }
+        guard let paneId = sourcePaneId else { return nil }
+
+        let agentPanel = AgentPanel(agentName: agentName, teamName: teamName,
+                                    workingDirectory: workingDirectory,
+                                    cli: cli, color: color)
+        panels[agentPanel.id] = agentPanel
+        panelTitles[agentPanel.id] = agentPanel.displayTitle
+
+        let newTab = Bonsplit.Tab(
+            title: agentPanel.displayTitle,
+            icon: agentPanel.displayIcon,
+            kind: SurfaceKind.agent,
+            isDirty: false,
+            isLoading: false,
+            isPinned: false
+        )
+        surfaceIdToPanelId[newTab.id] = agentPanel.id
+        let previousFocusedPanelId = focusedPanelId
+
+        // Programmatic, so didSplitPane does not also conjure a terminal.
+        isProgrammaticSplit = true
+        defer { isProgrammaticSplit = false }
+        guard bonsplitController.splitPane(paneId, orientation: orientation,
+                                           withTab: newTab, insertFirst: insertFirst) != nil else {
+            surfaceIdToPanelId.removeValue(forKey: newTab.id)
+            panels.removeValue(forKey: agentPanel.id)
+            panelTitles.removeValue(forKey: agentPanel.id)
+            return nil
+        }
+
+        let previousHostedView = focusedTerminalPanel?.hostedView
+        if focus {
+            previousHostedView?.suppressReparentFocus()
+            focusPanel(agentPanel.id)
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
+                previousHostedView?.clearSuppressReparentFocus()
+            }
+        } else {
+            preserveFocusAfterNonFocusSplit(
+                preferredPanelId: previousFocusedPanelId,
+                splitPanelId: agentPanel.id,
+                previousHostedView: previousHostedView
+            )
+        }
+        return agentPanel
+    }
+
+    func agentPanel(for panelId: UUID) -> AgentPanel? {
+        panels[panelId] as? AgentPanel
+    }
+
     /// Create a new browser surface in the specified pane.
     /// - Parameter focus: nil = focus only if the target pane is already focused (default UI behavior),
     ///                    true = force focus/selection of the new surface,
@@ -2190,6 +2267,89 @@ final class Workspace: Identifiable, ObservableObject {
             bindingRole: bindingRole
         )
         return panel
+    }
+
+    /// Replace an existing terminal panel in-place with a remote relay panel.
+    ///
+    /// The Bonsplit tab and pane identities stay unchanged, so callers that
+    /// are turning a connection placeholder into a remote terminal do not
+    /// flash a second split and then collapse the first one.
+    func replaceTerminalPaneWithRemote(
+        panelId: UUID,
+        session: PeerPaneSession,
+        lifetime: RemotePaneLifetime = .temporary,
+        bindingRole: PaneBindingRole = .owned
+    ) -> TerminalPanel? {
+        guard let oldPanel = panels[panelId] as? TerminalPanel,
+              let tabId = surfaceIdFromPanelId(panelId),
+              let paneId = paneId(forPanelId: panelId)
+        else { return nil }
+
+        let inheritedConfig = inheritedTerminalConfig(
+            preferredPanelId: panelId,
+            inPane: paneId
+        )
+        let replacement = TerminalPanel(
+            workspaceId: id,
+            context: GHOSTTY_SURFACE_CONTEXT_TAB,
+            configTemplate: inheritedConfig,
+            portOrdinal: portOrdinal,
+            command: session.relayLaunchCommand,
+            environment: session.relayEnvironment
+        )
+
+        panels[replacement.id] = replacement
+        panelTitles[replacement.id] = replacement.displayTitle
+        seedTerminalInheritanceFontPoints(
+            panelId: replacement.id,
+            configTemplate: inheritedConfig
+        )
+        surfaceIdToPanelId[tabId] = replacement.id
+        bonsplitController.updateTab(
+            tabId,
+            title: replacement.displayTitle,
+            icon: .some(replacement.displayIcon),
+            iconImageData: .some(nil),
+            kind: .some(SurfaceKind.terminal),
+            hasCustomTitle: false,
+            isDirty: replacement.isDirty,
+            showsNotificationBadge: false,
+            isLoading: false,
+            isPinned: false
+        )
+
+        AutoReplyPoller.shared.forget(panelId: panelId)
+        PeerHostCoordinator.shared.invalidateTapHub(forSurfaceId: panelId)
+        TerminalController.shared.v2CleanupSurface(panelId)
+        retrievalStore.removeBinding(panelID: panelId)
+        panels.removeValue(forKey: panelId)
+        panelDirectories.removeValue(forKey: panelId)
+        panelGitBranches.removeValue(forKey: panelId)
+        panelTitles.removeValue(forKey: panelId)
+        panelCustomTitles.removeValue(forKey: panelId)
+        pinnedPanelIds.remove(panelId)
+        manualUnreadPanelIds.remove(panelId)
+        manualUnreadMarkedAt.removeValue(forKey: panelId)
+        panelSubscriptions.removeValue(forKey: panelId)
+        surfaceTTYNames.removeValue(forKey: panelId)
+        surfaceListeningPorts.removeValue(forKey: panelId)
+        PortScanner.shared.unregisterPanel(workspaceId: id, panelId: panelId)
+        terminalInheritanceFontPointsByPanelId.removeValue(forKey: panelId)
+        if lastTerminalConfigInheritancePanelId == panelId {
+            lastTerminalConfigInheritancePanelId = nil
+        }
+        oldPanel.close()
+
+        bindRemotePane(
+            session: session,
+            to: replacement,
+            lifetime: lifetime,
+            bindingRole: bindingRole
+        )
+        if bonsplitController.selectedTab(inPane: paneId)?.id == tabId {
+            applyTabSelection(tabId: tabId, inPane: paneId)
+        }
+        return replacement
     }
 
     /// Wire a remote session to a panel whose Ghostty surface was

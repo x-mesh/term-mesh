@@ -23,11 +23,51 @@ public enum PeerSessionError: Error, Equatable {
     case attachRejected(reason: String)
     case createWorkspaceRejected(reason: String)
     case invalidEnsureRequest(String)
+    case invalidTeamLeaderBootstrap(String)
+    case invalidTeamLeaderCommand(String)
     case duplicateEnsureRequestID
     case malformedEnsureResponse(String)
     case sessionClosed(reason: String)
     case concurrentReceiveOperation
+    case capabilityNotNegotiated(String)
+    case rpcTimedOut(operation: String)
     case unexpectedMessage(String)
+}
+
+private enum PeerRPCOutcome<Value: Sendable>: @unchecked Sendable {
+    case success(Value)
+    case failure(Error)
+
+    func get() throws -> Value {
+        switch self {
+        case .success(let value): return value
+        case .failure(let error): throw error
+        }
+    }
+}
+
+private actor PeerRPCResultGate<Value: Sendable> {
+    private var result: PeerRPCOutcome<Value>?
+    private var continuation: CheckedContinuation<Value, Error>?
+
+    func wait() async throws -> Value {
+        if let result { return try result.get() }
+        return try await withCheckedThrowingContinuation { continuation = $0 }
+    }
+
+    @discardableResult
+    func resolve(_ result: PeerRPCOutcome<Value>) -> Bool {
+        guard self.result == nil else { return false }
+        self.result = result
+        if let continuation {
+            self.continuation = nil
+            switch result {
+            case .success(let value): continuation.resume(returning: value)
+            case .failure(let error): continuation.resume(throwing: error)
+            }
+        }
+        return true
+    }
 }
 
 public struct PeerEnsureSurfaceOutcome: Sendable, Equatable {
@@ -71,10 +111,22 @@ public enum PeerIncomingMessage: Sendable {
     /// Pushed when a workspace itself (not a pane inside one) was deleted
     /// on the host. Gated behind capability "workspace.lifecycle.v1".
     case workspaceRemoved(workspaceID: Data)
+    /// Complete sidebar roster snapshot delivered after
+    /// `subscribeWorkspaceList()` and whenever the host's roster changes.
+    /// Consumers replace (rather than merge) their cached rows so a tunnel
+    /// reconnect cannot leave a removed workspace behind.
+    case workspaceListChanged([Termmesh_Peer_V1_Workspace])
     /// How loaded the host machine is, pushed on the host's own sampling
     /// cadence. Gated behind capability "host.stats.v1", so a host that
     /// predates it simply never sends one.
     case hostStats(Termmesh_Peer_V1_HostStats)
+    /// Reverse request emitted by a remote host's local `tm-agent` proxy.
+    /// `correlationID` is the host envelope sequence and must be echoed by
+    /// `sendTeamLeaderCommandResponse`.
+    case teamLeaderCommandRequest(
+        Termmesh_Peer_V1_TeamLeaderCommandRequest,
+        correlationID: UInt64
+    )
     case error(code: UInt32, message: String)
     case goodbye(reason: String)
     case other
@@ -142,6 +194,7 @@ public actor PeerSession {
     private var inboundTerminalError: Error?
     private var didCloseTransport = false
     private var directResponseRPCInFlight = false
+    private var negotiatedHostCapabilities: PeerCapabilities?
     private var inboundReadInProgress = false
 
     /// Heartbeat state. SSH `ServerAliveInterval` only catches dead
@@ -324,12 +377,14 @@ public actor PeerSession {
         _ = try await expectAuthChallenge()
         try await sendAuth(method: options.authMethod)
         let result = try await expectAuthResult()
+        let hostCapabilities = PeerCapabilities(host.capabilities)
+        negotiatedHostCapabilities = hostCapabilities
         return PeerSessionInfo(
             hostDisplayName: host.displayName,
             hostAppVersion: host.appVersion,
             hostProtocolVersion: host.protocolVersion,
             sessionID: result.sessionID,
-            hostCapabilities: PeerCapabilities(host.capabilities)
+            hostCapabilities: hostCapabilities
         )
     }
 
@@ -352,17 +407,177 @@ public actor PeerSession {
     /// each carrying a recursive split tree. Hosts that don't expose
     /// layouts return an empty list, in which case the caller should
     /// fall back to per-surface attach.
-    public func listWorkspaces() async throws -> [Termmesh_Peer_V1_Workspace] {
+    public func listWorkspaces(
+        timeoutSeconds: TimeInterval? = nil
+    ) async throws -> [Termmesh_Peer_V1_Workspace] {
         try beginDirectResponseRPC()
         defer { directResponseRPCInFlight = false }
         try await sendEnvelope { env in
             env.listWorkspaces = Termmesh_Peer_V1_ListWorkspaces()
         }
-        let reply = try await readFrame()
+        let reply: Termmesh_Peer_V1_Envelope
+        if let timeoutSeconds {
+            reply = try await readFrame(
+                timeoutSeconds: timeoutSeconds,
+                operation: "listWorkspaces"
+            )
+        } else {
+            reply = try await readFrame()
+        }
         guard case .workspaceList(let list) = reply.payload else {
             throw PeerSessionError.unexpectedMessage(String(describing: reply.payload))
         }
         return list.workspaces
+    }
+
+    /// Opt into host-pushed complete workspace rosters. This is deliberately
+    /// write-only: the first `WorkspaceListChanged` arrives on the normal
+    /// receive stream, preserving the session's single-reader invariant.
+    /// Call only after `handshake()` and before starting the receive loop.
+    public func subscribeWorkspaceList() async throws {
+        try await sendEnvelope { env in
+            env.subscribeWorkspaceList = Termmesh_Peer_V1_SubscribeWorkspaceList()
+        }
+    }
+
+    /// The agent teams this host is running, when it advertised
+    /// `team.roster.v1`. A team is invisible in the layout tree — which pane
+    /// leads which work is not a fact about how panes are arranged — so this
+    /// is the only way to learn where a project's leader sits on a machine
+    /// that is not this one.
+    ///
+    /// Same single-reader contract as `listWorkspaces()`: it reads exactly
+    /// one reply frame, so never call it on a session whose receive loop is
+    /// already running.
+    public func listTeams(
+        timeoutSeconds: TimeInterval = 10
+    ) async throws -> [Termmesh_Peer_V1_Team] {
+        try requireHostCapability(PeerCapability.teamRosterV1)
+        try beginDirectResponseRPC()
+        defer { directResponseRPCInFlight = false }
+        try await sendEnvelope { env in
+            env.listTeams = Termmesh_Peer_V1_ListTeams()
+        }
+        let reply = try await readFrame(
+            timeoutSeconds: timeoutSeconds,
+            operation: "listTeams"
+        )
+        guard case .teamList(let list) = reply.payload else {
+            throw PeerSessionError.unexpectedMessage(String(describing: reply.payload))
+        }
+        return list.teams
+    }
+
+    /// Run one allow-listed `team.*` method on the host and get its JSON
+    /// result. Same single-reader contract as `listTeams()`.
+    ///
+    /// A refusal comes back as a normal response with `ok == false` and
+    /// `error_code == method_not_allowed`, not as a transport error: the
+    /// host declining is information, not a broken connection.
+    public func callTeam(
+        method: String,
+        paramsJSON: String,
+        timeoutSeconds: TimeInterval = 10
+    ) async throws -> Termmesh_Peer_V1_TeamCallResponse {
+        try requireHostCapability(PeerCapability.teamCallV1)
+        try beginDirectResponseRPC()
+        defer { directResponseRPCInFlight = false }
+        try await sendEnvelope { env in
+            var request = Termmesh_Peer_V1_TeamCallRequest()
+            request.method = method
+            request.paramsJson = paramsJSON
+            env.teamCallRequest = request
+        }
+        let reply = try await readFrame(
+            timeoutSeconds: timeoutSeconds,
+            operation: "callTeam"
+        )
+        guard case .teamCallResponse(let response) = reply.payload else {
+            throw PeerSessionError.unexpectedMessage(String(describing: reply.payload))
+        }
+        return response
+    }
+
+    /// Request project-bound leader bootstrap from the authoritative host.
+    ///
+    /// The signature mirrors the wire contract on purpose: callers cannot
+    /// supply a cwd, executable, CLI, arguments or environment. The host
+    /// resolves all of those from its registered `projectID`.
+    public func bootstrapTeamLeader(
+        projectID: String,
+        placement: Termmesh_Peer_V1_TeamLeaderPlacement,
+        requestID: Data,
+        timeoutSeconds: TimeInterval = 10
+    ) async throws -> Termmesh_Peer_V1_TeamLeaderBootstrapResponse {
+        try requireHostCapability(PeerCapability.teamLeaderV1)
+        var request = Termmesh_Peer_V1_TeamLeaderBootstrapRequest()
+        request.projectID = projectID
+        request.leaderPlacement = placement
+        request.requestID = requestID
+        guard case .success = PeerTeamLeader.validateBootstrap(request) else {
+            throw PeerSessionError.invalidTeamLeaderBootstrap(
+                "project_id, leader_placement or request_id is invalid"
+            )
+        }
+
+        try beginDirectResponseRPC()
+        defer { directResponseRPCInFlight = false }
+        try await sendEnvelope { env in
+            env.teamLeaderBootstrapRequest = request
+        }
+        let reply = try await readFrame(
+            timeoutSeconds: timeoutSeconds,
+            operation: "bootstrapTeamLeader"
+        )
+        guard case .teamLeaderBootstrapResponse(let response) = reply.payload else {
+            throw PeerSessionError.unexpectedMessage(String(describing: reply.payload))
+        }
+        return response
+    }
+
+    /// Send one grant-scoped command back to the authoritative team owner.
+    /// The request cannot name a cwd, process or leader lifecycle method.
+    public func callTeamLeader(
+        grant: Termmesh_Peer_V1_TeamLeaderGrant,
+        teamUUID: String,
+        requestID: Data,
+        method: String,
+        paramsJSON: String,
+        timeoutSeconds: TimeInterval = 10
+    ) async throws -> Termmesh_Peer_V1_TeamLeaderCommandResponse {
+        try requireHostCapability(PeerCapability.teamLeaderV1)
+        var request = Termmesh_Peer_V1_TeamLeaderCommandRequest()
+        request.grant = grant
+        request.teamUuid = teamUUID
+        request.requestID = requestID
+        request.method = method
+        request.paramsJson = paramsJSON
+        let encodedBytes = (try? request.serializedData().count)
+            ?? (PeerTeamLeader.maxCommandPayloadBytes + 1)
+        guard case .success = PeerTeamLeader.validateCommand(
+            request,
+            registeredGrant: grant,
+            encodedBytes: encodedBytes,
+            nowUnixSeconds: UInt64(Date().timeIntervalSince1970)
+        ) else {
+            throw PeerSessionError.invalidTeamLeaderCommand(
+                "grant, team_uuid, request_id, method or params_json is invalid"
+            )
+        }
+
+        try beginDirectResponseRPC()
+        defer { directResponseRPCInFlight = false }
+        try await sendEnvelope { env in
+            env.teamLeaderCommandRequest = request
+        }
+        let reply = try await readFrame(
+            timeoutSeconds: timeoutSeconds,
+            operation: "callTeamLeader"
+        )
+        guard case .teamLeaderCommandResponse(let response) = reply.payload else {
+            throw PeerSessionError.unexpectedMessage(String(describing: reply.payload))
+        }
+        return response
     }
 
     // MARK: - Workspace lifecycle (create / rename / delete)
@@ -871,8 +1086,12 @@ public actor PeerSession {
             default:
                 return .other
             }
+        case .workspaceListChanged(let changed):
+            return .workspaceListChanged(changed.workspaces)
         case .hostStats(let s):
             return .hostStats(s)
+        case .teamLeaderCommandRequest(let request):
+            return .teamLeaderCommandRequest(request, correlationID: env.seq)
         case .error(let e):
             return .error(code: e.code, message: e.message)
         case .goodbye(let g):
@@ -905,6 +1124,25 @@ public actor PeerSession {
             input.kind = .keys(keys)
             env.input = input
         }
+    }
+
+    /// Answer a reverse scoped-leader request on the same authenticated peer
+    /// session. This does not expose an app socket to the remote process.
+    public func sendTeamLeaderCommandResponse(
+        _ response: Termmesh_Peer_V1_TeamLeaderCommandResponse,
+        correlationID: UInt64
+    ) async throws {
+        var env = Termmesh_Peer_V1_Envelope()
+        env.seq = nextSeq()
+        env.correlationID = correlationID
+        env.teamLeaderCommandResponse = response
+        let frame: Data
+        do {
+            frame = try encodeFrame(env)
+        } catch let err as PeerFramingError {
+            throw PeerSessionError.framing(err)
+        }
+        try await write(frame)
     }
 
     /// Paste a block of text as a single Input frame.
@@ -1045,6 +1283,43 @@ public actor PeerSession {
             if case .hostStats = env.payload { continue }
             return env
         }
+    }
+
+    private func requireHostCapability(_ capability: String) throws {
+        guard negotiatedHostCapabilities?.has(capability) == true else {
+            throw PeerSessionError.capabilityNotNegotiated(capability)
+        }
+    }
+
+    private func readFrame(
+        timeoutSeconds: TimeInterval,
+        operation: String
+    ) async throws -> Termmesh_Peer_V1_Envelope {
+        let gate = PeerRPCResultGate<Termmesh_Peer_V1_Envelope>()
+        let reader = Task {
+            do { await gate.resolve(.success(try await self.readFrame())) }
+            catch { await gate.resolve(.failure(error)) }
+        }
+        let timer = Task {
+            // Keep conversion total: NaN/infinity and huge values must not
+            // trap while constructing UInt64. Invalid values time out now;
+            // valid waits are capped at one day, well above every RPC default.
+            let boundedSeconds = timeoutSeconds.isFinite
+                ? min(max(0, timeoutSeconds), 86_400)
+                : 0
+            let nanoseconds = UInt64(boundedSeconds * 1_000_000_000)
+            try? await Task.sleep(nanoseconds: nanoseconds)
+            guard !Task.isCancelled else { return }
+            let error = PeerSessionError.rpcTimedOut(operation: operation)
+            if await gate.resolve(.failure(error)) {
+                await self.terminateInbound(with: error)
+            }
+        }
+        defer {
+            reader.cancel()
+            timer.cancel()
+        }
+        return try await gate.wait()
     }
 
     private func readAnyFrame() async throws -> Termmesh_Peer_V1_Envelope {

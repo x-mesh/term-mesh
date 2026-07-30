@@ -339,6 +339,10 @@ final class PeerHostCoordinator: NSObject {
                 workspaceID: idBytes,
                 layout: updated.layout
             )
+            // Sidebar subscribers use complete snapshots, not layout deltas:
+            // a newly created workspace or a locally renamed tab has no
+            // pre-existing mirror session to carry the change.
+            await server.broadcastWorkspaceListChanged(workspaces)
             await MainActor.run { [weak self] in
                 self?.layoutBroadcastDebounce.removeValue(forKey: workspaceID)
             }
@@ -377,11 +381,18 @@ final class PeerHostCoordinator: NSObject {
             // call and closes the narrow theoretical window where an
             // in-flight broadcast Task races this one on the wire.
             self?.layoutBroadcastDebounce.removeValue(forKey: workspaceID)?.cancel()
+            let provider = self?.provider
             let idBytes = withUnsafeBytes(of: workspaceID.uuid) { Data($0) }
             #if DEBUG
             dlog("peer.host.broadcastWorkspaceRemoved id=\(workspaceID.uuidString.prefix(8))")
             #endif
-            Task { await server.broadcastWorkspaceRemoved(workspaceID: idBytes) }
+            Task {
+                await server.broadcastWorkspaceRemoved(workspaceID: idBytes)
+                // Re-read after TabManager's synchronous removal so every
+                // subscriber converges even if it missed the tombstone while
+                // its tunnel was being recreated.
+                await server.broadcastWorkspaceListChanged(await provider?.listWorkspaces() ?? [])
+            }
         }
     }
 

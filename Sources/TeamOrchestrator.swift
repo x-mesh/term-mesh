@@ -10,7 +10,10 @@ final class TeamOrchestrator: ObservableObject {
     static let shared = TeamOrchestrator()
 
     struct AgentMember: Identifiable {
-        let id: String           // agent-name@team-name (stable identity across hard restart)
+        let id: String           // agent-name@team-name (legacy routing key)
+        /// Team-scoped durable identity. Unlike `panelId`, this survives a
+        /// hard restart; unlike `id`, it does not depend on a role/name.
+        var agentInstanceId: String = UUID().uuidString
         let name: String         // e.g. "executor", "reviewer"
         let teamName: String
         let cli: String          // "claude", "kiro" (which CLI to run)
@@ -39,6 +42,32 @@ final class TeamOrchestrator: ObservableObject {
         var worktreeName: String?
         var worktreePath: String?
         var worktreeBranch: String?
+        /// The remote surface this agent's pane is attached to, when it runs
+        /// on a peer.
+        ///
+        /// A host's surface list says whether a surface *may* be attached, not
+        /// whether one already is — attaching twice is allowed on purpose, so
+        /// two people can watch the same terminal. That makes it indistinguishable
+        /// from a free one over the wire, and a second agent quietly landed in
+        /// the first one's shell: same pane, same directory, two agents typing
+        /// over each other. What this side attached, this side can remember.
+        var remoteSurfaceID: Data?
+        /// Whether this side asked the host to create that surface. A borrowed
+        /// surface is the operator's — one of the shells the host publishes —
+        /// and closing it would take away something they offered to everyone.
+        /// One we asked for is ours to clean up.
+        var remoteSurfaceSpawned: Bool = false
+        /// The peer this agent's pane runs on (`ssh:root@jw-server`), or nil
+        /// when it runs here.
+        ///
+        /// A team was implicitly one machine's: an agent had a workspace and a
+        /// panel, both local, and nothing to say otherwise. But the machine an
+        /// agent needs is a property of the work — tests want the Mac, a build
+        /// may want the Linux box — so it belongs to the member rather than to
+        /// the team. The pane is local either way: a peer pane is attached
+        /// into this workspace, so `panelId` still addresses it and everything
+        /// keyed on that (send, scrollback, reveal) is unchanged.
+        var hostKey: String?
         /// Full CLI invocation captured at spawn time (binary + model flag + system
         /// prompt + agent-type flags). Retyped on soft restart to recover original
         /// agent context rather than the bare binary name. nil for headless agents
@@ -53,16 +82,40 @@ final class TeamOrchestrator: ObservableObject {
         var autoRecycleEvery: Int? = nil
         /// Running count of tasks completed by this agent (reset on recycle).
         var completedTaskCount: Int = 0
+
+        /// Per-process transport identity. `id` remains the readable legacy
+        /// `role@team` key, while duplicate role instances need separate FIFO
+        /// and completion resources.
+        var transportId: String {
+            "\(id)#\(agentInstanceId)"
+        }
     }
 
     struct Team: Identifiable {
+        struct RemoteProjectLocation: Hashable {
+            let hostKey: String
+            let path: String
+        }
+
         let id: String            // team name
         let leaderSessionId: String
         let leaderMode: String    // "repl", "claude", "kiro", "codex", "gemini", "adopted"
         let leaderModel: String   // e.g. "sonnet", "opus", "haiku"
         let leaderCli: String?    // detected CLI for adopted leader; nil otherwise
-        let leaderPanelId: UUID   // leader pane for sending instructions
-        let leaderWorkspaceId: UUID?  // only set in "adopted" mode (leader lives in a separate workspace)
+        var leaderPanelId: UUID   // leader pane for sending instructions
+        var leaderWorkspaceId: UUID?  // only set in "adopted" mode (leader lives in a separate workspace)
+        /// The leader's host namespace.  Older teams did not carry this
+        /// field; its default preserves their established local behaviour.
+        var leaderEndpoint: LeaderEndpoint = .local
+        /// False while a requested peer leader is still connecting or failed
+        /// to launch. A placeholder pane may exist locally, but it must never
+        /// receive leader instructions as if it were a running CLI.
+        var leaderReady: Bool = true
+        var leaderFailureDescription: String? = nil
+        /// Observable policy injection state. `failed`/`degraded` are never
+        /// silently treated as a normal ready leader.
+        var leaderPolicyState: String = "pending"
+        var leaderPolicyFailureDescription: String? = nil
         let workingDirectory: String
         let workspaceId: UUID     // agent workspace (may differ from leader workspace in "adopted" mode)
         var agents: [AgentMember]
@@ -72,6 +125,10 @@ final class TeamOrchestrator: ObservableObject {
         var sharedWorktreeName: String?
         var sharedWorktreePath: String?
         var sharedWorktreeBranch: String?
+        /// Branch selected when New Project prepared the checkouts. Agent
+        /// worktrees intentionally use other branch names; this names the ref
+        /// they should inspect, not a branch they must check out.
+        var projectTargetBranch: String? = nil
         /// Stable team UUID used by the daemon for archive identity.
         /// - Pane-mode: Swift generates this at team creation (createTeam) so
         ///   archive_pane → resume_pane → destroy round-trips use the same
@@ -93,6 +150,18 @@ final class TeamOrchestrator: ObservableObject {
         /// Team-wide auto-recycle default: recycle an agent every N completed tasks.
         /// nil = disabled; per-agent autoRecycleEvery overrides this.
         var defaultAutoRecycleEvery: Int? = nil
+        /// Remote directories created for this project. These are retained
+        /// until the explicit Delete Project action; ordinary pane/workspace
+        /// close only detaches viewers and never removes them.
+        var remoteProjectLocations: [RemoteProjectLocation] = []
+        /// New Project keeps terminal-backed peer members out of the host's
+        /// default/relay workspace. Generic ad-hoc teams preserve the existing
+        /// placement behavior.
+        var usesDedicatedRemoteWorkspaces: Bool = false
+        /// Host key → peer workspace id created for this project. This is
+        /// runtime ownership state: a project deletion removes these
+        /// workspaces after its attached surfaces have been closed.
+        var remoteWorkspaceIDs: [String: Data] = [:]
     }
 
     struct AgentPaneIdentity: Equatable {
@@ -116,8 +185,82 @@ final class TeamOrchestrator: ObservableObject {
     }
 
     @Published private(set) var teams: [String: Team] = [:]
+
+    func recordRemoteProjectLocations(
+        teamName: String,
+        locations: [Team.RemoteProjectLocation]
+    ) {
+        teams[teamName]?.remoteProjectLocations = locations
+    }
+
+    func configureDedicatedRemoteWorkspaces(teamName: String, enabled: Bool) {
+        teams[teamName]?.usesDedicatedRemoteWorkspaces = enabled
+    }
+
+    func recordRemoteWorkspaceID(teamName: String, hostKey: String, workspaceID: Data) {
+        teams[teamName]?.remoteWorkspaceIDs[hostKey] = workspaceID
+    }
+
+    func forgetRemoteWorkspaceID(teamName: String, hostKey: String) {
+        teams[teamName]?.remoteWorkspaceIDs.removeValue(forKey: hostKey)
+    }
+
+    /// Install the remote pane that replaced the pending leader anchor. Kept
+    /// on the owning type because `teams` is intentionally read-only to extensions.
+    func replaceLeaderEndpoint(
+        teamName: String,
+        panelID: UUID,
+        endpoint: LeaderEndpoint
+    ) {
+        guard var team = teams[teamName] else { return }
+        team.leaderPanelId = panelID
+        team.leaderWorkspaceId = nil
+        team.leaderEndpoint = endpoint
+        team.leaderReady = true
+        team.leaderFailureDescription = nil
+        teams[teamName] = team
+        syncTeamStateToDaemon()
+    }
+
+    func replaceLeaderAnchorPanel(teamName: String, panelID: UUID) {
+        guard var team = teams[teamName] else { return }
+        team.leaderPanelId = panelID
+        team.leaderWorkspaceId = nil
+        teams[teamName] = team
+        syncTeamStateToDaemon()
+    }
+
+    func markRemoteLeaderFailed(teamName: String, description: String) {
+        guard var team = teams[teamName] else { return }
+        team.leaderReady = false
+        team.leaderFailureDescription = description
+        teams[teamName] = team
+        if let located = AppDelegate.shared?.locateSurface(surfaceId: team.leaderPanelId),
+           let workspace = located.tabManager.tabs.first(where: { $0.id == located.workspaceId }) {
+            workspace.setPanelCustomTitle(
+                panelId: team.leaderPanelId,
+                title: "⚠ Remote leader failed"
+            )
+        }
+        syncTeamStateToDaemon()
+    }
+
+    func markLeaderPolicyState(
+        teamName: String,
+        state: String,
+        failureDescription: String? = nil
+    ) {
+        guard var team = teams[teamName] else { return }
+        team.leaderPolicyState = state
+        team.leaderPolicyFailureDescription = failureDescription
+        teams[teamName] = team
+        syncTeamStateToDaemon()
+    }
     // Round-robin counter per "teamName/agentName" key — cycles across duplicate-named agents.
     private var agentSendRoundRobin: [String: Int] = [:]
+    /// Assignment cursor is deliberately separate from ad-hoc `team.send`.
+    /// Scheduling a task must not be perturbed by status pings or messages.
+    private var agentAssignmentRoundRobin: [String: Int] = [:]
     // Last paste target awaiting a separate Return, keyed by "teamName/agentName".
     // Needed when duplicate-named agents are round-robined: the follow-up
     // team.send_key must hit the pane that received the text, not the first name match.
@@ -307,6 +450,9 @@ final class TeamOrchestrator: ObservableObject {
         var labels: [String]
         var estimatedSize: Int?
         var assignee: String?
+        /// Immutable identity of the assignee selected when this task was
+        /// assigned. Names are routing aliases and may be duplicated.
+        var assigneeInstanceId: String? = nil
         var status: String     // "queued", "assigned", "in_progress", "blocked", "review_ready", "completed", "failed", "abandoned"
         var priority: Int
         var dependsOn: [String]
@@ -340,7 +486,11 @@ final class TeamOrchestrator: ObservableObject {
     var daemon: any DaemonService = TermMeshDaemon.shared
 
     private(set) var messages: [String: [TeamMessage]] = [:]   // team_name → messages
-    private(set) var taskBoards: [String: [TeamTask]] = [:]    // team_name → tasks
+    /// Published because the board reads it. Without this a task could be
+    /// created, assigned, worked and finished while every view showing the
+    /// task board sat unchanged — the data was right and nothing was ever told
+    /// to look at it again.
+    @Published private(set) var taskBoards: [String: [TeamTask]] = [:]    // team_name → tasks
     /// Maximum messages retained per team. Oldest messages are pruned on insert.
     private let maxMessagesPerTeam = 500
     private var heartbeats: [String: [String: (at: Date, summary: String?)]] = [:]
@@ -348,6 +498,79 @@ final class TeamOrchestrator: ObservableObject {
     private let staleHeartbeatThreshold: TimeInterval = 5 * 60
 
     // MARK: - Aspect-Ratio-Aware Grid Layout
+
+    struct AgentPaneCandidate {
+        let panelId: UUID
+        let width: Double
+        let height: Double
+    }
+
+    struct AgentSplitPlacement {
+        let panelId: UUID
+        let orientation: SplitOrientation
+    }
+
+    /// Pick the existing agent pane that has the most room, then divide it
+    /// along its longest axis. Late `add`/`attach` calls arrive one at a time,
+    /// so they cannot use the batch creator's precomputed grid. Growing the
+    /// largest cell gives the same balanced result incrementally instead of
+    /// chaining every newcomer below the previous pane.
+    static func nextAgentSplitPlacement(
+        leaderPanelId: UUID,
+        candidates: [AgentPaneCandidate]
+    ) -> AgentSplitPlacement {
+        guard var largest = candidates.first else {
+            return AgentSplitPlacement(panelId: leaderPanelId, orientation: .horizontal)
+        }
+
+        var largestArea = largest.width * largest.height
+        for candidate in candidates.dropFirst() {
+            let area = candidate.width * candidate.height
+            if area > largestArea {
+                largest = candidate
+                largestArea = area
+            }
+        }
+
+        return AgentSplitPlacement(
+            panelId: largest.panelId,
+            orientation: largest.width >= largest.height ? .horizontal : .vertical
+        )
+    }
+
+    func nextAgentSplitPlacement(team: Team, workspace: Workspace) -> AgentSplitPlacement {
+        let frameByPaneId = Dictionary(
+            uniqueKeysWithValues: workspace.bonsplitController.layoutSnapshot().panes.map {
+                ($0.paneId, $0.frame)
+            }
+        )
+        let candidates = team.agents.compactMap { agent -> AgentPaneCandidate? in
+            guard let panelId = agent.panelId,
+                  let paneId = workspace.paneId(forPanelId: panelId),
+                  let frame = frameByPaneId[paneId.id.uuidString] else {
+                return nil
+            }
+            return AgentPaneCandidate(
+                panelId: panelId,
+                width: frame.width,
+                height: frame.height
+            )
+        }
+
+        // Geometry may briefly be unavailable during a layout pass. Preserve
+        // the old target as a deterministic fallback, but use the pane count
+        // to avoid recreating an endless downward chain.
+        if candidates.isEmpty, let lastPanelId = team.agents.last?.panelId {
+            return AgentSplitPlacement(
+                panelId: lastPanelId,
+                orientation: team.agents.count == 1 ? .vertical : .horizontal
+            )
+        }
+        return Self.nextAgentSplitPlacement(
+            leaderPanelId: team.leaderPanelId,
+            candidates: candidates
+        )
+    }
 
     /// Compute optimal (cols, rows) so each pane's aspect ratio is closest to 1:1 (square).
     /// Falls back to fixed column logic when container size is unavailable.
@@ -447,6 +670,18 @@ final class TeamOrchestrator: ObservableObject {
             #if DEBUG
             dlog("[equalize] ERROR: tree root is not a split (single pane?)")
             #endif
+        }
+    }
+
+    /// Bonsplit applies split mutations over multiple layout passes. Re-run
+    /// equalization after each pass so both terminal and native late joiners
+    /// settle into the same balanced agent grid.
+    func scheduleAgentGridEqualization(workspace: Workspace) {
+        for delay in [0.05, 0.3, 0.8] {
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self, weak workspace] in
+                guard let workspace else { return }
+                self?.equalizeAgentGrid(workspace: workspace)
+            }
         }
     }
 
@@ -616,11 +851,16 @@ final class TeamOrchestrator: ObservableObject {
         /// Other CLIs (codex/kiro/gemini) currently ignore this; resume
         /// support for them is a follow-up.
         resumeSessionId: String? = nil,
+        /// Hard restart keeps the durable process identity; a fresh attach
+        /// leaves this nil and receives a new instance.
+        agentInstanceId existingAgentInstanceId: String? = nil,
         extraArgs: [String] = [],
         extraEnv: [String: String] = [:],
         tabManager: TabManager
     ) -> AgentMember? {
         let agentId = "\(agentName)@\(teamName)"
+        let agentInstanceId = existingAgentInstanceId ?? UUID().uuidString
+        let transportId = "\(agentId)#\(agentInstanceId)"
 
         // Build CLI-specific invocation
         var agentCommand: String
@@ -669,6 +909,51 @@ final class TeamOrchestrator: ObservableObject {
                 // `--resume <sid>` so claude re-attaches to its prior session.
                 agentCommand.append(" --resume \(sid)")
             }
+            // Native agent panes take turns over a pipe instead of synthetic
+            // paste+Return. Terminal remains an explicit Settings fallback.
+            // See `AgentPipeTransport`.
+            if AgentPipeTransport.canDrive(cli: agentCli) {
+                AgentPipeTransport.prepareDirectory()
+                agentCommand = AgentPipeTransport.launchCommand(
+                    claudePath: cliPath,
+                    fifoPath: AgentPipeTransport.fifoPath(agentId: transportId),
+                    model: Self.resolveClaudeModelArg(agentModel),
+                    instructions: agentInstructions,
+                    extraArgs: extraArgs,
+                    rendererPath: AgentPipeTransport.rendersOutput
+                        ? AgentPipeTransport.rendererPath(workingDirectory: agentWorkDir)
+                        : nil
+                )
+                // This pane's transport, settled here so delivery never has to
+                // infer it from a file that does not exist yet.
+                AgentPipeTransport.markDriven(agentId: transportId)
+            }
+        }
+
+        // A CLI that has to be spoken to rather than written at runs behind the
+        // bridge, which owns its stdio, speaks its protocol, and emits claude's
+        // event shape so nothing upstream has to learn a second vocabulary.
+        if AgentPipeTransport.canDrive(cli: agentCli),
+           AgentPipeTransport.needsBridge(cli: agentCli),
+           let bridge = AgentPipeTransport.bridgePath(workingDirectory: agentWorkDir) {
+            AgentPipeTransport.prepareDirectory()
+            agentCommand = AgentPipeTransport.bridgeLaunchCommand(
+                cli: agentCli,
+                fifoPath: AgentPipeTransport.fifoPath(agentId: transportId),
+                // Same translation the native path does. A stored tier reaches
+                // codex as `--model sonnet`, which it accepts and then answers
+                // nothing at all — measured.
+                model: Self.bridgeModelArg(cli: agentCli, model: agentModel),
+                cliPath: cliPath,
+                bridgePath: bridge,
+                rendererPath: AgentPipeTransport.rendersOutput
+                    ? AgentPipeTransport.rendererPath(workingDirectory: agentWorkDir)
+                    : nil,
+                workingDirectory: agentWorkDir
+            )
+            // This pane's transport, settled here so delivery never has to
+            // infer it from a file that does not exist yet.
+            AgentPipeTransport.markDriven(agentId: transportId)
         }
 
         // Wrap so the terminal stays open (drops to shell) if the CLI exits.
@@ -699,6 +984,117 @@ final class TeamOrchestrator: ObservableObject {
             paneEnv.merge(extraEnv) { _, new in new }
         }
 
+        // No terminal at all: the agent is held in the pane, not run inside a
+        // shell inside a PTY inside it. Everything below — the shell wrapper,
+        // the pane env, the FIFO — is what a terminal host needs; a native pane
+        // needs a process and somewhere to draw it.
+        // A bridged CLI with no bridge script on disk cannot be held here, and
+        // falling through to the terminal is the right answer rather than
+        // opening a pane with nothing in it.
+        let bridgeReady = !AgentPipeTransport.needsBridge(cli: agentCli)
+            || AgentPipeTransport.bridgePath(workingDirectory: agentWorkDir) != nil
+        if AgentPipeTransport.canHoldNatively(cli: agentCli), bridgeReady,
+           let agentPanel = workspace.newAgentSplit(
+               from: splitFrom,
+               orientation: orientation,
+               insertFirst: insertFirst,
+               agentName: agentName,
+               teamName: teamName,
+               workingDirectory: agentWorkDir,
+               cli: agentCli,
+               color: agentColor
+           ) {
+            if AgentPipeTransport.needsBridge(cli: agentCli),
+               let bridge = AgentPipeTransport.bridgePath(workingDirectory: agentWorkDir) {
+                agentPanel.start(
+                    bridgedCli: agentCli, bridgePath: bridge,
+                    model: Self.bridgeModelArg(cli: agentCli, model: agentModel),
+                    cliPath: cliPath
+                )
+                // A bridged CLI has no `--append-system-prompt`, and none of
+                // them agree on an equivalent, so its role has to arrive as a
+                // turn. Nothing was sending that turn: measured, two codex
+                // agents sat with zero turns received, running but with no idea
+                // what they were. Claude never showed it because its role rides
+                // in on the launch line.
+                //
+                // Written straight away rather than waited for: the process is
+                // up, the bridge reads stdin once its handshake finishes, and
+                // a pipe holds what was written in the meantime.
+                if !agentInstructions.isEmpty {
+                    // Asked for as a briefing, not a job. Claude reads its role
+                    // from the launch line and never answers it; a bridged CLI
+                    // receives the same text as a *turn* and sets about doing
+                    // it — measured, one spent a minute writing analysis while
+                    // the team's first broadcast sat queued behind it. The
+                    // confirm line is the one `create` already uses.
+                    let briefing = Self.withoutTerminalProtocol(agentInstructions)
+                        + "\n\nThis is your standing brief, not a task. "
+                        + "Do no work now: reply with exactly "
+                        + "\"Agent \(agentName) ready.\" and wait."
+                    try? agentPanel.session.send(briefing, from: .leader)
+                }
+            } else {
+                agentPanel.start(
+                    claudePath: cliPath,
+                    model: Self.resolveClaudeModelArg(agentModel),
+                    instructions: agentInstructions,
+                    extraArgs: extraArgs
+                )
+            }
+            // The turn states its own end and carries its final text, so the
+            // reply is read from that rather than scraped off a screen.
+            agentPanel.session.onBusyChanged = { [teamName, agentName, agentInstanceId] busy in
+                TeamDataStore.shared.setAgentBusy(
+                    teamName: teamName, agentName: agentName,
+                    agentInstanceId: agentInstanceId, busy: busy)
+            }
+            agentPanel.session.onTurnEnd = { [teamName, agentName, agentInstanceId] final, _, taskId in
+                Self.fileReport(teamName: teamName, agentName: agentName,
+                                agentInstanceId: agentInstanceId,
+                                taskId: taskId, text: final)
+                // A turn with no task behind it must not close somebody
+                // else's. Broadcasts and anything typed in the composer carry
+                // no `TASK_ID`, and `selectTask` would then guess — the newest
+                // open task — so answering a question could mark an unrelated
+                // assigned task completed. The report is still filed; only the
+                // board is left alone.
+                guard let taskId else { return }
+                AutoReplyEmit.emit(
+                    teamName: teamName,
+                    agentName: agentName,
+                    event: AgentPipeCompletion.headerEvent(from: final),
+                    preferredTaskId: taskId,
+                    agentInstanceId: agentInstanceId
+                )
+            }
+            let colorEmoji = Self.colorEmoji(agentColor)
+            workspace.setPanelCustomTitle(panelId: agentPanel.id,
+                                          title: "\(colorEmoji) \(agentName)")
+            return AgentMember(
+                id: agentId,
+                agentInstanceId: agentInstanceId,
+                name: agentName,
+                teamName: teamName,
+                cli: agentCli,
+                launchCommand: Self.defaultLaunchCommand(for: agentCli),
+                model: agentModel,
+                agentType: agentType,
+                color: agentColor,
+                instructions: agentInstructions,
+                workspaceId: workspace.id,
+                panelId: agentPanel.id,
+                parentSessionId: leaderSessionId,
+                claudeSessionId: nil,
+                createdAt: Date(),
+                worktreeName: worktreeName,
+                worktreePath: worktreePath,
+                worktreeBranch: worktreeBranch,
+                originalSpawnCommand: agentCommand,
+                originalAgentWorkDir: agentWorkDir
+            )
+        }
+
         // Spawn the split pane. `insertFirst` lets hard-restart respawn into the
         // exact slot the dead pane occupied within its parent split.
         guard let panel = workspace.newTerminalSplit(
@@ -726,6 +1122,15 @@ final class TeamOrchestrator: ObservableObject {
         // id (written to <sid>.jsonl) can be captured asynchronously and
         // back-filled into `claudeSessionId`. Other CLIs skip this — they
         // don't write into ~/.claude/projects/.
+        if AgentPipeTransport.canDrive(cli: agentCli) {
+            // Structural completion for this agent: the turn announces its own
+            // end, so nothing has to watch its screen for one.
+            AgentPipeCompletion.shared.watch(
+                agentId: transportId, teamName: teamName, agentName: agentName,
+                agentInstanceId: agentInstanceId
+            )
+        }
+
         if agentCli == "claude" {
             ClaudeSessionWatcher.shared.bindIfNeeded()
             ClaudeSessionWatcher.shared.registerPendingClaudePane(
@@ -737,6 +1142,7 @@ final class TeamOrchestrator: ObservableObject {
 
         return AgentMember(
             id: agentId,
+            agentInstanceId: agentInstanceId,
             name: agentName,
             teamName: teamName,
             cli: agentCli,
@@ -777,6 +1183,8 @@ final class TeamOrchestrator: ObservableObject {
         resumeSessionId: String? = nil,
         worktreeMode: String = "off",
         executionMode: String = "pane",
+        leaderEndpoint: LeaderEndpoint = .local,
+        launchLeaderLocally: Bool = true,
         adoptedLeaderSurfaceId: UUID? = nil,
         skipRunbookPromptForInteractiveAgents: Bool = false,
         /// Phase 2 (pane-mode resume): agent name → claude session id, used to
@@ -785,7 +1193,17 @@ final class TeamOrchestrator: ObservableObject {
         agentResumeSessionIds: [String: String]? = nil,
         tabManager: TabManager
     ) -> Team? {
-        guard !agents.isEmpty else { return nil }
+        // A team may start with no agents but its leader. That is the normal
+        // opening state when someone enters a project to work in it: they talk
+        // to the leader, and the leader adds whoever the work turns out to
+        // need. Requiring agents up front forced a guess about the work before
+        // anyone had described it — and left an idle pane burning context when
+        // the guess was wrong.
+        //
+        // Adopted mode is the exception: it contributes no pane of its own, so
+        // a team with neither a leader pane nor an agent would have nothing in
+        // it at all.
+        guard !agents.isEmpty || leaderMode != "adopted" else { return nil }
 
         // Pair = `/watch` entry point. When the GUI selects a pair CLI,
         // prepend a watcher-role agent at index 0 so the existing grid
@@ -851,7 +1269,9 @@ final class TeamOrchestrator: ObservableObject {
             cliPaths[cli] = path
         }
 
-        let colors = ["green", "blue", "yellow", "magenta", "cyan", "red"]
+        // Colours belong to roles now, so the loop carries what it has used
+        // rather than counting slots.
+        var takenColors: Set<String> = []
         var members: [AgentMember] = []
 
         // Create a single workspace for the team
@@ -859,9 +1279,19 @@ final class TeamOrchestrator: ObservableObject {
             workingDirectory: workingDirectory,
             select: true
         )
+        // The workspace is this team's, and the team's name is the project's.
+        // Declared here rather than at the New Project sheet because every
+        // route that makes a team makes the same fact — and because the
+        // sidebar's other way of knowing, reading the panes' directories,
+        // cannot see a project whose work is on another machine.
+        WorkspaceProjectNames.shared.declare(workspaceId: workspace.id, projectName: name)
+
         if executionMode == "headless" {
-            workspace.customTitle = "[\(name)] \(agents.count) headless"
-            workspace.title = "[\(name)] \(agents.count) headless"
+            // "0 headless" would be a strange thing to read on a tab; a team
+            // that is only its leader is described by its name alone.
+            let suffix = agents.isEmpty ? "" : " \(agents.count) headless"
+            workspace.customTitle = "[\(name)]\(suffix)"
+            workspace.title = "[\(name)]\(suffix)"
         } else {
             workspace.customTitle = "[\(name)]"
             workspace.title = "[\(name)]"
@@ -971,7 +1401,21 @@ final class TeamOrchestrator: ObservableObject {
         let leaderWorkspaceId: UUID?
         var detectedLeaderCli: String? = nil
 
-        if leaderMode == "adopted" {
+        if !launchLeaderLocally {
+            leaderWorkspaceId = nil
+            leaderPanelId = defaultPanelId
+            switch leaderMode {
+            case "claude": detectedLeaderCli = "claude"
+            case "codex": detectedLeaderCli = "codex"
+            case "kiro": detectedLeaderCli = "kiro"
+            case "gemini": detectedLeaderCli = "gemini"
+            default: detectedLeaderCli = nil
+            }
+            workspace.setPanelCustomTitle(
+                panelId: leaderPanelId,
+                title: "Connecting remote leader…"
+            )
+        } else if leaderMode == "adopted" {
             guard let adoptedSurfaceId = adoptedLeaderSurfaceId else {
                 Logger.team.error("[team] adopted mode requires adoptedLeaderSurfaceId")
                 return nil
@@ -1019,7 +1463,21 @@ final class TeamOrchestrator: ObservableObject {
             switch leaderMode {
             case "repl":
                 let scriptPath = leaderScriptPath(mode: "repl", workingDirectory: workingDirectory)
-                leaderCommand = scriptPath.map { "\($0) \(socketPath) \(name)" }
+                // Quoted, because all three parts can contain a space and this
+                // string is handed to a shell. The app bundle is the one that
+                // bites: `term-mesh DEV.app` splits into `…/Debug/term-mesh`
+                // plus arguments — and that path is a real file, the CLI, so
+                // the shell runs it, it prints `Unknown command: DEV`, and
+                // exits. The leader pane dies half a second after opening.
+                //
+                // A team with agent panes survives that, which is why it went
+                // unnoticed: the workspace still has something in it. A team
+                // whose members are all on another machine has nothing else
+                // yet, so the workspace closes with the leader and the team
+                // has nowhere to attach to.
+                leaderCommand = scriptPath.map {
+                    "\(Self.shellQuoted($0)) \(Self.shellQuoted(socketPath)) \(Self.shellQuoted(name))"
+                }
             case "claude":
                 if let claudePath = agentBinaryPath(cli: "claude") {
                     // Build system prompt from input agent specs (available before panes are created)
@@ -1217,10 +1675,13 @@ final class TeamOrchestrator: ObservableObject {
             }
 
             // Build headless members (no panelId — they're daemon subprocesses)
-            let colors = ["green", "blue", "yellow", "magenta", "cyan", "red"]
+            var takenColors: Set<String> = []
             var headlessMembers: [AgentMember] = []
             for (index, agent) in agents.enumerated() {
-                let agentColor = agent.color.isEmpty ? colors[index % colors.count] : agent.color
+                let agentColor = agent.color.isEmpty
+                    ? Self.agentColor(forRole: agent.agentType, taken: takenColors)
+                    : agent.color
+                takenColors.insert(agentColor)
                 let agentCli = agent.cli.isEmpty ? "claude" : agent.cli
                 let effectiveInstructions = AgentRunbookService.shared.composeInstructions(
                     roleName: agent.agentType,
@@ -1264,7 +1725,7 @@ final class TeamOrchestrator: ObservableObject {
                 }
             }
 
-            let team = Team(
+            var team = Team(
                 id: name,
                 leaderSessionId: leaderSessionId,
                 leaderMode: leaderMode,
@@ -1272,6 +1733,7 @@ final class TeamOrchestrator: ObservableObject {
                 leaderCli: detectedLeaderCli,
                 leaderPanelId: leaderPanelId,
                 leaderWorkspaceId: leaderWorkspaceId,
+                leaderEndpoint: leaderEndpoint,
                 workingDirectory: workingDirectory,
                 workspaceId: workspace.id,
                 agents: headlessMembers,
@@ -1282,8 +1744,10 @@ final class TeamOrchestrator: ObservableObject {
                 sharedWorktreePath: nil,
                 sharedWorktreeBranch: nil
             )
+            team.leaderReady = launchLeaderLocally
+            team.leaderPolicyState = leaderMode == "claude" ? "injected" : "pending"
             teams[name] = team
-            TeamDataStore.shared.registerTeam(name, agentNames: headlessMembers.map(\.name))
+            TeamDataStore.shared.registerTeam(name, agents: headlessMembers.map { .init(name: $0.name, instanceId: $0.agentInstanceId) })
             syncTeamStateToDaemon()
             Logger.team.info("created headless team '\(name, privacy: .public)' with \(headlessMembers.count, privacy: .public) agent(s) + leader console")
             return team
@@ -1306,7 +1770,10 @@ final class TeamOrchestrator: ObservableObject {
         // Build agent panes with Claude running directly via command parameter
         // This bypasses shell init (.zshrc/.zprofile) entirely for reliable startup.
         for (index, agent) in agents.enumerated() {
-            let agentColor = agent.color.isEmpty ? colors[index % colors.count] : agent.color
+            let agentColor = agent.color.isEmpty
+                ? Self.agentColor(forRole: agent.agentType, taken: takenColors)
+                : agent.color
+            takenColors.insert(agentColor)
 
             // Worktree for this agent
             var agentWorkDir = sharedWorkDir ?? workingDirectory
@@ -1429,13 +1896,7 @@ final class TeamOrchestrator: ObservableObject {
             )
         }
 
-        // Equalize splits multiple times: bonsplit needs layout passes to settle.
-        // First pass immediate, then delayed passes for robustness.
-        for delay in [0.05, 0.3, 0.8] {
-            DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
-                self?.equalizeAgentGrid(workspace: workspace)
-            }
-        }
+        scheduleAgentGridEqualization(workspace: workspace)
 
         // D3-A P1-A: fresh pane teams must carry a stable teamUuid from
         // creation. Without it, archive_pane sends an empty team_uuid and
@@ -1444,7 +1905,7 @@ final class TeamOrchestrator: ObservableObject {
         // of overwriting the prior one. Headless teams skip this branch and
         // get their uuid backfilled by `headless.create_team` (line ~1085).
         let paneTeamUuid = UUID().uuidString
-        let team = Team(
+        var team = Team(
             id: name,
             leaderSessionId: leaderSessionId,
             leaderMode: leaderMode,
@@ -1452,6 +1913,7 @@ final class TeamOrchestrator: ObservableObject {
             leaderCli: detectedLeaderCli,
             leaderPanelId: leaderPanelId,
             leaderWorkspaceId: leaderWorkspaceId,
+            leaderEndpoint: leaderEndpoint,
             workingDirectory: workingDirectory,
             workspaceId: workspace.id,
             agents: members,
@@ -1466,9 +1928,11 @@ final class TeamOrchestrator: ObservableObject {
             pairModel: pairEligible ? pairModel : "",
             pairPanelId: pairEligible ? members.first?.panelId : nil
         )
+        team.leaderReady = launchLeaderLocally
+        team.leaderPolicyState = leaderMode == "claude" ? "injected" : "pending"
         teams[name] = team
         // Register in thread-safe data store for off-main access (approach C: dual queue)
-        TeamDataStore.shared.registerTeam(name, agentNames: members.map(\.name))
+        TeamDataStore.shared.registerTeam(name, agents: members.map { .init(name: $0.name, instanceId: $0.agentInstanceId) })
         syncTeamStateToDaemon()
         Logger.team.info("created team '\(name, privacy: .public)' with \(members.count, privacy: .public) agent(s) + leader console")
 
@@ -1498,17 +1962,22 @@ final class TeamOrchestrator: ObservableObject {
                 #if DEBUG
                 dlog("[team] kiro leader prompt file written to \(promptFile) (profile-directed, no delay)")
                 #endif
+                markLeaderPolicyState(teamName: name, state: "injected")
             } else {
                 // codex/gemini: still need delayed TUI injection
                 let delay: Double = 5.0
                 DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
                     guard let self else { return }
-                    let msg = "Read the file \(promptFile) — it contains your team leader instructions with agent list and tm-agent commands. Follow those instructions for all team coordination."
                     let sent = self.sendTextToPanel(
                         workspaceId: workspace.id,
                         panelId: leaderPanelId,
-                        text: msg,
+                        text: LeaderParallelPolicy.launchDirective(promptFile: promptFile),
                         tabManager: tabManager
+                    )
+                    self.markLeaderPolicyState(
+                        teamName: name,
+                        state: sent ? "injected" : "failed",
+                        failureDescription: sent ? nil : "Could not deliver the canonical leader policy to the \(leaderMode) leader pane."
                     )
                     #if DEBUG
                     dlog("[team] leader prompt injection \(sent ? "OK" : "FAILED") for \(leaderMode) leader in team '\(name)'")
@@ -1619,10 +2088,6 @@ final class TeamOrchestrator: ObservableObject {
             if existing.workspaceId != workspaceId {
                 return .failure(.teamInOtherWorkspace(name: teamName))
             }
-            // Agent name uniqueness within the existing team (R6)
-            if existing.agents.contains(where: { $0.name == agentName }) {
-                return .failure(.agentNameConflict(name: agentName, team: teamName))
-            }
             team = existing
         } else {
             let workspaceDirectory = workspace.currentDirectory
@@ -1682,22 +2147,12 @@ final class TeamOrchestrator: ObservableObject {
             return .failure(.cliBinaryNotFound(cli: normalizedCli))
         }
 
-        // 6. Pick a color deterministically based on current agent count
-        let colorList = ["green", "blue", "yellow", "magenta", "cyan", "red"]
-        let agentColor = colorList[team.agents.count % colorList.count]
+        // 6. The role's colour, so it is the same one next time
+        let agentColor = Self.agentColor(forRole: agentType,
+                                         taken: Set(team.agents.map(\.color)))
 
-        // 7. Choose split target and orientation
-        // - First agent: split RIGHT from the leader pane (horizontal) — consistent with createTeam layout
-        // - Subsequent: split DOWN from the last existing agent (vertical) — stacks under prior agents
-        let splitFrom: UUID
-        let orientation: SplitOrientation
-        if let lastAgent = team.agents.last, let lastPanel = lastAgent.panelId {
-            splitFrom = lastPanel
-            orientation = .vertical
-        } else {
-            splitFrom = team.leaderPanelId
-            orientation = .horizontal
-        }
+        // 7. Grow the agent area by splitting its largest existing cell.
+        let placement = nextAgentSplitPlacement(team: team, workspace: workspace)
 
         // 8. Delegate pane construction to the shared helper
         let attachProfile = CLIPathSettings.activeProfile(for: normalizedCli)
@@ -1720,8 +2175,8 @@ final class TeamOrchestrator: ObservableObject {
             worktreeName: nil,
             worktreePath: nil,
             worktreeBranch: nil,
-            splitFrom: splitFrom,
-            orientation: orientation,
+            splitFrom: placement.panelId,
+            orientation: placement.orientation,
             extraArgs: attachExtraArgs,
             extraEnv: attachExtraEnv,
             tabManager: tabManager
@@ -1732,8 +2187,9 @@ final class TeamOrchestrator: ObservableObject {
         // 9. Commit updated team state
         team.agents.append(member)
         teams[teamName] = team
-        TeamDataStore.shared.registerTeam(teamName, agentNames: team.agents.map(\.name))
+        TeamDataStore.shared.registerTeam(teamName, agents: team.agents.map { .init(name: $0.name, instanceId: $0.agentInstanceId) })
         syncTeamStateToDaemon()
+        scheduleAgentGridEqualization(workspace: workspace)
         Logger.team.info("attached agent '\(agentName, privacy: .public)' to team '\(teamName, privacy: .public)' (\(team.agents.count, privacy: .public) total)")
 
         return .success((team: team, newAgent: member))
@@ -1779,6 +2235,7 @@ final class TeamOrchestrator: ObservableObject {
     func detachAgent(
         teamName: String,
         agentName: String,
+        agentInstanceId: String? = nil,
         tabManager: TabManager,
         force: Bool = true,
         /// When true, a last-agent detach preserves the (now empty) team record
@@ -1793,7 +2250,9 @@ final class TeamOrchestrator: ObservableObject {
         guard var team = teams[teamName] else {
             return .failure(.teamNotFound(name: teamName))
         }
-        guard let agentIndex = team.agents.firstIndex(where: { $0.name == agentName }) else {
+        guard let agentIndex = team.agents.firstIndex(where: {
+            $0.name == agentName && (agentInstanceId == nil || $0.agentInstanceId == agentInstanceId)
+        }) else {
             return .failure(.agentNotFound(
                 name: agentName,
                 available: team.agents.map(\.name)
@@ -1801,6 +2260,7 @@ final class TeamOrchestrator: ObservableObject {
         }
 
         let agent = team.agents[agentIndex]
+        Self.releaseTransport(agentId: agent.transportId)
 
         // D3-A P2 (b): release any pending claude-sid watcher slot so the
         // FSEventStream tears down promptly. Safe to call regardless of cli.
@@ -1818,8 +2278,14 @@ final class TeamOrchestrator: ObservableObject {
         // has already been closed (user-initiated or otherwise), which we
         // treat as successful detach.
         // TODO: when force=false, check daemon task state for agent_busy before closing
-        if let workspace = tabManager.tabs.first(where: { $0.id == team.workspaceId }),
-           let pid = agent.panelId {
+        let workspace = tabManager.tabs.first { $0.id == team.workspaceId }
+        if agent.hostKey != nil {
+            // A remote agent leaves a process behind on someone else's
+            // machine, and the only way to reach it is through the pane — so
+            // the pane has to outlive the interrupt. `releaseRemoteAgent`
+            // closes it once that is done.
+            releaseRemoteAgent(agent, closing: workspace, teamName: teamName)
+        } else if let workspace, let pid = agent.panelId {
             _ = workspace.closePanel(pid, force: force)
         }
 
@@ -1834,7 +2300,7 @@ final class TeamOrchestrator: ObservableObject {
                 // pane from the preserved leader. The team is briefly visible with
                 // agent_count 0 in status/daemon sync until the add fills it.
                 teams[teamName] = team
-                TeamDataStore.shared.registerTeam(teamName, agentNames: [])
+                TeamDataStore.shared.registerTeam(teamName, agents: [])
                 syncTeamStateToDaemon()
                 Logger.team.info("detached last agent '\(agentName, privacy: .public)' from team '\(teamName, privacy: .public)' — empty team preserved (keepTeamIfEmpty)")
                 return .success(DetachResult(
@@ -1858,7 +2324,7 @@ final class TeamOrchestrator: ObservableObject {
             ))
         } else {
             teams[teamName] = team
-            TeamDataStore.shared.registerTeam(teamName, agentNames: team.agents.map(\.name))
+            TeamDataStore.shared.registerTeam(teamName, agents: team.agents.map { .init(name: $0.name, instanceId: $0.agentInstanceId) })
             syncTeamStateToDaemon()
             Logger.team.info("detached agent '\(agentName, privacy: .public)' from team '\(teamName, privacy: .public)' (\(remaining, privacy: .public) remaining)")
             return .success(DetachResult(
@@ -1926,10 +2392,8 @@ final class TeamOrchestrator: ObservableObject {
             return .failure(.teamNotFound(name: teamName))
         }
 
-        // 2. Reject duplicate name within the team
-        if team.agents.contains(where: { $0.name == agentName }) {
-            return .failure(.duplicateName(name: agentName, team: teamName))
-        }
+        // Names are role-pool labels rather than instance identities. Multiple
+        // reviewers with different CLIs/models are valid in one team.
 
         // 3. Resolve TabManager from team.workspaceId (no caller env required)
         guard let tabManager = AppDelegate.shared?.tabManagerFor(tabId: team.workspaceId) else {
@@ -1956,20 +2420,12 @@ final class TeamOrchestrator: ObservableObject {
             mode: .digest
         )
 
-        // 7. Pick color deterministically from current agent count
-        let colorList = ["green", "blue", "yellow", "magenta", "cyan", "red"]
-        let agentColor = colorList[team.agents.count % colorList.count]
+        // 7. The role's colour, so it is the same one next time
+        let agentColor = Self.agentColor(forRole: agentType,
+                                         taken: Set(team.agents.map(\.color)))
 
-        // 8. Choose split target — last agent pane or leader pane
-        let splitFrom: UUID
-        let orientation: SplitOrientation
-        if let lastAgent = team.agents.last, let lastPanel = lastAgent.panelId {
-            splitFrom = lastPanel
-            orientation = .vertical
-        } else {
-            splitFrom = team.leaderPanelId
-            orientation = .horizontal
-        }
+        // 8. Grow the agent area by splitting its largest existing cell.
+        let placement = nextAgentSplitPlacement(team: team, workspace: workspace)
 
         // 9. Apply active CLI profile overrides (extraArgs / env / modelOverride)
         let profile = CLIPathSettings.activeProfile(for: normalizedCli)
@@ -1994,8 +2450,8 @@ final class TeamOrchestrator: ObservableObject {
             worktreeName: nil,
             worktreePath: nil,
             worktreeBranch: nil,
-            splitFrom: splitFrom,
-            orientation: orientation,
+            splitFrom: placement.panelId,
+            orientation: placement.orientation,
             extraArgs: extraArgs,
             extraEnv: extraEnv,
             tabManager: tabManager
@@ -2006,8 +2462,9 @@ final class TeamOrchestrator: ObservableObject {
         // 11. Commit updated team state
         team.agents.append(member)
         teams[teamName] = team
-        TeamDataStore.shared.registerTeam(teamName, agentNames: team.agents.map(\.name))
+        TeamDataStore.shared.registerTeam(teamName, agents: team.agents.map { .init(name: $0.name, instanceId: $0.agentInstanceId) })
         syncTeamStateToDaemon()
+        scheduleAgentGridEqualization(workspace: workspace)
         Logger.team.info("add_agent: added '\(agentName, privacy: .public)' to team '\(teamName, privacy: .public)' (\(team.agents.count, privacy: .public) total)")
 
         return .success(member)
@@ -2051,6 +2508,11 @@ final class TeamOrchestrator: ObservableObject {
                 }
             }
         }
+    }
+
+    /// A string a shell will read back as exactly one argument.
+    static func shellQuoted(_ value: String) -> String {
+        "'" + value.replacingOccurrences(of: "'", with: "'\\''") + "'"
     }
 
     /// Find the leader script for the given mode.
@@ -2200,6 +2662,8 @@ final class TeamOrchestrator: ObservableObject {
         When multiple agents are available, prefer parallel delegation over serial.
         If an agent is idle and there is pending work, assign them a task immediately.
 
+        \(LeaderParallelPolicy.renderedInstructions)
+
         \(runbookSection)
 
         ## How to Command Agents
@@ -2322,6 +2786,49 @@ final class TeamOrchestrator: ObservableObject {
         """
     }
 
+    /// The same leader contract used by a local Claude pane, assembled before
+    /// remote members have been attached to the team record.
+    ///
+    /// `attachRemoteLeader` runs first so the project opens around its leader;
+    /// reading `team.agents` there would therefore produce an empty roster and
+    /// teach Claude to use its built-in Agent tool. The rows are the source of
+    /// truth at that point.
+    static func remoteLeaderClaudeSystemPrompt(
+        teamName: String,
+        rows: [TeamAgentRow],
+        remoteWorkingDirectory: String,
+        remoteSocketPath: String
+    ) -> String {
+        let agentList = rows.enumerated().map { index, row in
+            let instructions = row.customInstructions
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            let source = instructions.isEmpty ? row.preset.instructions : instructions
+            let summary = oneLinerFromInstructions(source)
+            return summary.isEmpty
+                ? "  \(index + 1). \(row.preset.name) (\(row.preset.name))"
+                : "  \(index + 1). \(row.preset.name) (\(row.preset.name)) — \(summary)"
+        }.joined(separator: "\n")
+        let remoteRunbooks = """
+        ## Agent Runbooks
+
+        Source of truth on this machine: `.agent-runbooks/<role>.md` under \(remoteWorkingDirectory).
+        Each worker receives its composed role brief when its pane starts.
+
+        Useful commands:
+        ```
+        tm-agent runbook status
+        tm-agent runbook install --tool all
+        ```
+        """
+        return buildLeaderClaudeSystemPrompt(
+            teamName: teamName,
+            agentList: agentList,
+            runbookSection: remoteRunbooks,
+            tmAgent: "tm-agent",
+            socketPath: remoteSocketPath
+        )
+    }
+
     /// Build team leader instructions for non-Claude CLI leaders (kiro, codex, gemini).
     /// These CLIs lack a --system-prompt flag, so we inject instructions as the first message.
     private func buildTeamLeaderPrompt(
@@ -2408,6 +2915,8 @@ final class TeamOrchestrator: ObservableObject {
         Match each task to the agent whose specialty fits best.
         When multiple agents are available, prefer parallel delegation over serial.
         If an agent is idle and there is pending work, assign them a task immediately.
+
+        \(LeaderParallelPolicy.renderedInstructions)
 
         \(runbookSection)
 
@@ -2504,24 +3013,130 @@ final class TeamOrchestrator: ObservableObject {
         return candidates[idx]
     }
 
+    /// Returns the first eligible position at/after `cursor`, wrapping once.
+    /// Keeping the primitive data-only makes the duplicate-pool scheduling
+    /// contract directly regression-testable without creating terminal panes.
+    static func nextEligiblePoolIndex(
+        candidateCount: Int,
+        cursor: Int,
+        isEligible: (Int) -> Bool
+    ) -> (index: Int, nextCursor: Int)? {
+        guard candidateCount > 0 else { return nil }
+        let start = ((cursor % candidateCount) + candidateCount) % candidateCount
+        for offset in 0..<candidateCount {
+            let index = (start + offset) % candidateCount
+            if isEligible(index) {
+                return (index, (index + 1) % candidateCount)
+            }
+        }
+        return nil
+    }
+
+    /// Schedules a role pool by durable instance identity. Candidate order is
+    /// the team's stable roster order; the cursor is scoped to team+role.
+    private func selectIdleAgent(in team: Team, role: String) -> AgentMember? {
+        let candidates = team.agents.filter { $0.name == role }
+        let key = "\(team.id)/\(role)"
+        let cursor = agentAssignmentRoundRobin[key] ?? 0
+        guard let choice = Self.nextEligiblePoolIndex(
+            candidateCount: candidates.count,
+            cursor: cursor,
+            isEligible: { [weak self] index in
+                guard let self else { return false }
+                let agent = candidates[index]
+                guard agent.panelId != nil,
+                      !self.migratingAgents.contains(self.agentOperationKey(teamName: team.id, agentInstanceId: agent.agentInstanceId)),
+                      !TeamDataStore.shared.isAgentParked(teamName: team.id, agentName: agent.name),
+                      !TeamDataStore.shared.isAgentBusy(teamName: team.id, agentName: agent.name, agentInstanceId: agent.agentInstanceId),
+                      !TeamDataStore.shared.hasActiveTask(teamName: team.id, agentInstanceId: agent.agentInstanceId)
+                else { return false }
+                if let panelId = agent.panelId,
+                   let panel = self.nativeAgentPanel(workspaceId: agent.workspaceId, panelId: panelId),
+                   panel.session.isThinking { return false }
+                return true
+            }
+        ) else { return nil }
+        agentAssignmentRoundRobin[key] = choice.nextCursor
+        return candidates[choice.index]
+    }
+
+    /// Resolves a team member for an RPC operation without round-robin.  The
+    /// durable instance selector is additive: a unique legacy name continues
+    /// to work, while duplicate names require `agent_instance_id` so a mutating
+    /// request can never affect an arbitrary sibling.
+    func resolveAgentForRPC(
+        teamName: String,
+        agentName: String,
+        agentInstanceId: String?
+    ) -> (agent: AgentMember?, candidates: [AgentMember]) {
+        guard let team = teams[teamName] else { return (nil, []) }
+        let named = team.agents.filter { $0.name == agentName }
+        if let agentInstanceId, !agentInstanceId.isEmpty {
+            return (named.first { $0.agentInstanceId == agentInstanceId }, named)
+        }
+        return named.count == 1 ? (named[0], named) : (nil, named)
+    }
+
+    /// A durable instance is the only key allowed to survive an async gap.
+    /// Pane, pipe, host, and workspace locators are read from the current
+    /// roster immediately before delivery, since restart replaces them.
+    private func agentOperationKey(teamName: String, agentInstanceId: String) -> String {
+        "\(teamName)/\(agentInstanceId)"
+    }
+
     /// Send text to a specific agent in a team.
     /// When multiple agents share the same name, round-robins across them.
     /// Maintains an in-flight counter and a panelId snapshot so a concurrent
     /// hard restart can either drain (preferred) or detect mid-flight migration.
-    func sendToAgent(teamName: String, agentName: String, text: String, tabManager: TabManager, withReturn: Bool = true, completion: ((Bool) -> Void)? = nil) -> Bool {
+    func sendToAgent(teamName: String, agentName: String, agentInstanceId: String? = nil, text: String, tabManager: TabManager, withReturn: Bool = true, completion: ((Bool) -> Void)? = nil) -> Bool {
         guard let team = teams[teamName] else {
             #if DEBUG
             dlog("[team.sendToAgent] DROP reason=team_not_found team=\(teamName) agent=\(agentName)")
             #endif
             completion?(false); return false
         }
-        guard let agent = selectAgent(in: team.agents, name: agentName) else {
+        let agent: AgentMember? = if let agentInstanceId {
+            resolveAgentForRPC(teamName: teamName, agentName: agentName, agentInstanceId: agentInstanceId).agent
+        } else {
+            selectAgent(in: team.agents, name: agentName)
+        }
+        guard let agent else {
             #if DEBUG
             dlog("[team.sendToAgent] DROP reason=agent_not_found team=\(teamName) agent=\(agentName) agentCount=\(team.agents.count)")
             #endif
             completion?(false); return false
         }
-        let teamAgentKey = "\(teamName)/\(agentName)"
+        // Same fork as the panel-targeted path: an agent on a pipe takes its
+        // turn there. Both entry points need it — `team.send` resolves by name
+        // and never reaches the panel-targeted one, so wiring only that left
+        // delivery quietly on the typing path while reporting success.
+        // A natively-held agent has no pipe and no pane to type into: the
+        // process is right here, so the turn is a write to its stdin. This has
+        // to come first — the FIFO fork below would find no FIFO and the
+        // terminal fork after it would type at nothing.
+        if let panelId = agent.panelId,
+           let agentPanel = nativeAgentPanel(workspaceId: agent.workspaceId, panelId: panelId) {
+            return deliverNatively(agentPanel, agentId: agent.transportId, text: text,
+                                   completion: completion)
+        }
+        if AgentPipeTransport.isDriven(agentId: agent.transportId) {
+            do {
+                AgentPipeCompletion.shared.expect(agentId: agent.transportId, instruction: text)
+                let n = try AgentPipeTransport.deliver(text: text, agentId: agent.transportId)
+                #if DEBUG
+                dlog("agent.pipe.deliver agent=\(agent.id) bytes=\(n) via=name task=\(AgentPipeCompletion.taskId(in: text) ?? "-")")
+                #endif
+                completion?(true)
+                return true
+            } catch {
+                #if DEBUG
+                dlog("agent.pipe.deliver.FAILED agent=\(agent.id) err=\(error)")
+                #endif
+                completion?(false)
+                return false
+            }
+        }
+        let teamAgentKey = agentOperationKey(teamName: teamName, agentInstanceId: agent.agentInstanceId)
         if migratingAgents.contains(teamAgentKey) {
             #if DEBUG
             dlog("[team.sendToAgent] aborted reason=migration_in_flight team=\(teamName) agent=\(agentName)")
@@ -2541,6 +3156,7 @@ final class TeamOrchestrator: ObservableObject {
         activeSends[teamAgentKey, default: 0] += 1
         if !withReturn, let identity = agentIdentity(for: agent) {
             pendingReturnTargets[teamAgentKey] = identity
+            scheduleOwedReturn(teamName: teamName, agentName: agent.agentInstanceId, panelId: pid)
         }
         return sendTextToPanel(
             workspaceId: agent.workspaceId,
@@ -2561,27 +3177,77 @@ final class TeamOrchestrator: ObservableObject {
         }
     }
 
+    /// The agent behind this pane, when it is one this build drives by pipe.
+    ///
+    /// Answered from what the agent's pane was launched with, not from the
+    /// option's current value or the FIFO's presence. An agent created before
+    /// the option was turned on has no pipe, and one created a moment ago has
+    /// not made its FIFO yet — both are the launch line's business, and it is
+    /// the launch line that records the answer.
+    private func pipeDrivenAgent(teamName: String, panelId: UUID) -> AgentMember? {
+        guard let team = teams[teamName],
+              let agent = team.agents.first(where: { $0.panelId == panelId }),
+              AgentPipeTransport.isDriven(agentId: agent.transportId)
+        else { return nil }
+        return agent
+    }
+
     /// Send text to an agent by its unique panelId (skips name lookup entirely).
     /// Used by broadcast and asyncTeamBroadcast to avoid duplicate-name collapse.
     /// When `recordPendingReturnFor` is set and `withReturn` is false, records the
-    /// pasted pane as the pending Return target keyed by "<team>/<agentName>" so a
+    /// pasted pane as the pending Return target keyed by "<team>/<instance>" so a
     /// separate team.send_key Return lands on the SAME pane (used by panel-targeted
     /// team.send / team.delegate for deterministic duplicate-name addressing).
     @discardableResult
     func sendToAgentByPanel(teamName: String, panelId: UUID, workspaceId: UUID, text: String, tabManager: TabManager, withReturn: Bool = true, recordPendingReturnFor agentName: String? = nil, completion: ((Bool) -> Void)? = nil) -> Bool {
+        // An agent driven by a pipe takes its turn there, and none of what
+        // follows applies to it: no paste queue, no pending-Return target, no
+        // in-flight accounting to keep a restart from cutting a paste in half.
+        // Those exist to get text through a terminal intact; a write to a FIFO
+        // either lands whole or reports why it did not.
+        if let native = nativeAgentPanel(workspaceId: workspaceId, panelId: panelId) {
+            return deliverNatively(native, agentId: native.agentName, text: text,
+                                   completion: completion)
+        }
+        if let agent = pipeDrivenAgent(teamName: teamName, panelId: panelId) {
+            do {
+                AgentPipeCompletion.shared.expect(agentId: agent.transportId, instruction: text)
+                let n = try AgentPipeTransport.deliver(text: text, agentId: agent.transportId)
+                #if DEBUG
+                dlog("agent.pipe.deliver agent=\(agent.id) bytes=\(n) task=\(AgentPipeCompletion.taskId(in: text) ?? "-")")
+                #endif
+                completion?(true)
+                return true
+            } catch {
+                // Falling back to typing would hide the failure behind a path
+                // that usually works, and the point of this option is to see
+                // whether the pipe holds.
+                Logger.team.error(
+                    "pipe delivery failed for \(agent.id, privacy: .public): \(String(describing: error), privacy: .public)"
+                )
+                #if DEBUG
+                dlog("agent.pipe.deliver.FAILED agent=\(agent.id) err=\(error)")
+                #endif
+                completion?(false)
+                return false
+            }
+        }
         if !withReturn,
-           let agentName,
+           agentName != nil,
            let team = teams[teamName],
-           let agent = team.agents.first(where: { $0.panelId == panelId && $0.name == agentName }),
+           let agent = team.agents.first(where: { $0.panelId == panelId }),
            let identity = agentIdentity(for: agent) {
-            pendingReturnTargets["\(teamName)/\(agentName)"] = identity
+            let operationKey = agentOperationKey(teamName: teamName, agentInstanceId: agent.agentInstanceId)
+            pendingReturnTargets[operationKey] = identity
+            scheduleOwedReturn(teamName: teamName, agentName: agent.agentInstanceId, panelId: panelId)
         }
         // When an agentName is provided (panel-targeted send/delegate, incl. /tm
         // fan-out), mirror sendToAgent's in-flight accounting so a concurrent
         // name-keyed hard restart drains the paste before tearing the pane down,
         // instead of closing it mid-paste. Broadcast callers pass agentName=nil and
         // keep the original untracked fast path.
-        let teamAgentKey = agentName.map { "\(teamName)/\($0)" }
+        let teamAgentKey = teams[teamName]?.agents.first(where: { $0.panelId == panelId })
+            .map { agentOperationKey(teamName: teamName, agentInstanceId: $0.agentInstanceId) }
         if let teamAgentKey { activeSends[teamAgentKey, default: 0] += 1 }
         return sendTextToPanel(workspaceId: workspaceId, panelId: panelId, text: text, tabManager: tabManager, withReturn: withReturn) { [weak self] sent in
             if let self, let teamAgentKey {
@@ -2598,18 +3264,77 @@ final class TeamOrchestrator: ObservableObject {
 
     /// Send text to an agent without requiring a tabManager.
     /// Uses AppDelegate.locateSurface to find the agent's panel across all windows.
-    /// Must be called on the main thread.
+    /// Bring an agent's pane to the front. Focusing where the work is running
+    /// belongs here rather than in a view: the panel that owns it is a team
+    /// fact, and more than one surface wants to point at it.
     @discardableResult
-    func sendToAgentAutoLocate(teamName: String, agentName: String, text: String) -> Bool {
+    func revealAgentPane(teamName: String, agentName: String) -> Bool {
         guard let team = teams[teamName],
               let agent = selectAgent(in: team.agents, name: agentName),
+              let panelId = agent.panelId,
+              let located = AppDelegate.shared?.locateSurface(surfaceId: panelId),
+              let workspace = located.tabManager.tabs.first(where: { $0.id == located.workspaceId })
+        else { return false }
+        located.tabManager.selectedTabId = workspace.id
+        workspace.focusPanel(panelId)
+        return true
+    }
+
+    /// Must be called on the main thread.
+    @discardableResult
+    func sendToAgentAutoLocate(
+        teamName: String,
+        agentName: String,
+        agentInstanceId: String? = nil,
+        text: String,
+        completion: ((Bool) -> Void)? = nil
+    ) -> Bool {
+        guard let team = teams[teamName],
+              let agent = agentInstanceId.flatMap({ id in
+                  team.agents.first { $0.name == agentName && $0.agentInstanceId == id }
+              }) ?? (agentInstanceId == nil ? selectAgent(in: team.agents, name: agentName) : nil),
               let pid = agent.panelId,
-              let located = AppDelegate.shared?.locateSurface(surfaceId: pid) else { return false }
-        return sendTextToPanel(workspaceId: agent.workspaceId, panelId: pid, text: text, tabManager: located.tabManager)
+              let located = AppDelegate.shared?.locateSurface(surfaceId: pid) else {
+            completion?(false)
+            return false
+        }
+        return sendTextToPanel(
+            workspaceId: agent.workspaceId,
+            panelId: pid,
+            text: text,
+            tabManager: located.tabManager,
+            completion: completion
+        )
     }
 
     func sendToLeader(teamName: String, text: String, tabManager: TabManager) -> Bool {
-        guard let team = teams[teamName] else { return false }
+        guard let team = teams[teamName], team.leaderReady else { return false }
+        if case .peer = team.leaderEndpoint {
+            guard let located = AppDelegate.shared?.locateSurface(surfaceId: team.leaderPanelId),
+                  let workspace = located.tabManager.tabs.first(where: { $0.id == located.workspaceId }),
+                  let panel = workspace.terminalPanel(for: team.leaderPanelId),
+                  let surface = panel.surface.surface
+            else { return false }
+
+            // Bracketed paste is unreliable when the viewer pane itself is a
+            // peer relay: Ghostty can report the local paste drained while the
+            // remote Claude composer never receives it. Socket-style key text
+            // traverses the same relay reliably. Keep Return separate so the
+            // relay PTY has time to flush the text before Claude submits it.
+            let normalized = text
+                .replacingOccurrences(of: "\r\n", with: " ")
+                .replacingOccurrences(of: "\n", with: " ")
+                .replacingOccurrences(of: "\r", with: " ")
+            TerminalController.shared.sendSocketText(normalized, surface: surface)
+            panel.surface.forceRefresh()
+            DispatchQueue.main.asyncAfter(deadline: .now() + Self.remoteLeaderReturnGap) {
+                TerminalController.shared.sendNamedKeyWithRetry(
+                    on: panel.surface,
+                    keyName: "return"
+                ) { _, _ in }
+            }
+            return true
+        }
         // Adopted mode: leader lives in a different workspace than the agent workspace.
         // Use AppDelegate to locate the leader panel across all windows.
         if let leaderWsId = team.leaderWorkspaceId {
@@ -2636,7 +3361,9 @@ final class TeamOrchestrator: ObservableObject {
         #endif
         guard let assignee = task.assignee?.nilIfBlank else { return true }
         let assigneeNotice = formatTaskAssignmentInstruction(task: task)
-        return sendToAgent(teamName: teamName, agentName: assignee, text: assigneeNotice, tabManager: tabManager)
+        return sendToAgent(teamName: teamName, agentName: assignee,
+                           agentInstanceId: task.assigneeInstanceId,
+                           text: assigneeNotice, tabManager: tabManager)
     }
 
     @discardableResult
@@ -2678,7 +3405,9 @@ final class TeamOrchestrator: ObservableObject {
     func dispatchTaskToAssignee(teamName: String, task: TeamTask, tabManager: TabManager) -> Bool {
         guard let assignee = task.assignee?.nilIfBlank else { return false }
         let instruction = formatTaskDispatchInstruction(task: task)
-        let dispatched = sendToAgent(teamName: teamName, agentName: assignee, text: instruction, tabManager: tabManager)
+        let dispatched = sendToAgent(teamName: teamName, agentName: assignee,
+                                     agentInstanceId: task.assigneeInstanceId,
+                                     text: instruction, tabManager: tabManager)
         // Skip leader stdin injection — leader gets notifications via tm-agent wait/inbox
         let event = dispatched ? "started" : "start_failed"
         Logger.team.info("[dispatchTask] \(event, privacy: .public) task=\(task.id.prefix(8), privacy: .public) assignee=\(assignee, privacy: .public)")
@@ -2704,6 +3433,7 @@ final class TeamOrchestrator: ObservableObject {
     func delegateToAgent(
         teamName: String,
         agentName: String,
+        agentInstanceId: String? = nil,
         text: String,
         taskTitle: String? = nil,
         priority: Int? = nil,
@@ -2714,44 +3444,62 @@ final class TeamOrchestrator: ObservableObject {
         completion: ((Bool) -> Void)? = nil
     ) -> DelegateResult? {
         let title = taskTitle?.nilIfBlank ?? String(text.prefix(80))
-        // Task assignee stays the agent NAME even when delivery is panel-targeted —
-        // panel_id is DELIVERY-ONLY so wait/collect/reports keyed on name are unaffected.
+        let target: AgentMember? = {
+            guard let team = teams[teamName] else { return nil }
+            if let agentInstanceId {
+                return resolveAgentForRPC(
+                    teamName: teamName, agentName: agentName, agentInstanceId: agentInstanceId
+                ).agent
+            }
+            if let panelId {
+                return team.agents.first(where: { $0.name == agentName && $0.panelId == panelId })
+            }
+            return selectIdleAgent(in: team, role: agentName)
+        }()
+        guard let target else { return nil }
         guard let task = TeamDataStore.shared.createTask(
             teamName: teamName,
             title: title,
             assignee: agentName,
+            assigneeInstanceId: target.agentInstanceId,
             priority: priority ?? 2
         ) else { return nil }
-        let instruction = formatDelegateInstruction(task: task, text: text, context: context)
+        let instruction = formatDelegateInstruction(
+            teamName: teamName,
+            target: target,
+            task: task,
+            text: text,
+            context: context
+        )
         // Deterministic per-pane delivery: when a valid, live, non-migrating panelId is
         // provided, bypass name round-robin (selectAgent) and paste directly into that
         // pane. The follow-up team.send_key Return carries the same panel_id (Rust side)
         // AND pendingReturnTargets is keyed to that exact pane.
-        let teamAgentKey = "\(teamName)/\(agentName)"
-        if let pid = panelId,
-           !migratingAgents.contains(teamAgentKey),
-           let team = teams[teamName],
-           let agent = team.agents.first(where: { $0.panelId == pid && $0.name == agentName }) {
+        let teamAgentKey = agentOperationKey(teamName: teamName, agentInstanceId: target.agentInstanceId)
+        if let pid = target.panelId,
+           !migratingAgents.contains(teamAgentKey) {
             // pendingReturnTargets is recorded inside sendToAgentByPanel via
             // recordPendingReturnFor when withReturn==false.
             let delivered = sendToAgentByPanel(
                 teamName: teamName,
                 panelId: pid,
-                workspaceId: agent.workspaceId,
+                workspaceId: target.workspaceId,
                 text: instruction,
                 tabManager: tabManager,
                 withReturn: submit,
-                recordPendingReturnFor: agentName,
+                recordPendingReturnFor: target.agentInstanceId,
                 completion: completion
             )
             return DelegateResult(task: task, textDelivered: delivered, instruction: instruction)
         }
         // CLI callers keep submit=false and send Return separately after paste ack.
         // GUI callers can submit=true to use the IME paste path's inline Return.
-        // No panelId (or stale/migrating) → name-based round-robin (backward compat).
+        // A target is selected exactly once above; never make a second
+        // round-robin decision after the task has been assigned.
         let delivered = sendToAgent(
             teamName: teamName,
             agentName: agentName,
+            agentInstanceId: target.agentInstanceId,
             text: instruction,
             tabManager: tabManager,
             withReturn: submit,
@@ -2760,27 +3508,26 @@ final class TeamOrchestrator: ObservableObject {
         return DelegateResult(task: task, textDelivered: delivered, instruction: instruction)
     }
 
-    private func formatDelegateInstruction(task: TeamTask, text: String, context: String? = nil) -> String {
+    private func formatDelegateInstruction(
+        teamName: String,
+        target: AgentMember,
+        task: TeamTask,
+        text: String,
+        context: String? = nil
+    ) -> String {
         let taskId = task.id
-        // Top-of-prompt mandatory step: agents (especially TUI CLIs like Claude/Codex)
-        // often print the STATUS header in their response but never run the actual
-        // shell command, leaving the task stuck in "assigned" and wait timing out.
-        // Putting the explicit command literal at the top + closing reminder reduces
-        // the miss rate. The scrollback auto-detector (Phase B) is the safety net
-        // for cases where the command is still omitted.
+        // The goal comes last and the reporting rule sits right after it,
+        // because an agent reads a wall of protocol, finds a one-line ask at
+        // the bottom, answers it and stops — which is exactly what happened
+        // when the whole preamble came first.
+        //
+        // And printing the header IS enough: the scrollback detector
+        // (AutoReplyDetector) watches every agent pane for it and completes
+        // the task. The capsule used to say the opposite — "printing is NOT
+        // enough" — which talked agents out of the one thing that reliably
+        // works. Running the command is still offered, because it is exact,
+        // but it is no longer presented as the only way.
         var lines: [String] = [
-            "[REQUIRED FINAL STEP — you MUST run this shell command before stopping]",
-            "```",
-            "tm-agent reply 'STATUS: DONE|BLOCKED|NEEDS_REVIEW",
-            "FILES: <changed paths, space-separated, or none>",
-            "VERIFY: <single shell command to verify result, or n/a>",
-            "NEXT: <one-line action for leader, or NONE>",
-            "FULL_REPORT: <path to full result file, or n/a>",
-            "",
-            "<concise summary body here>'",
-            "```",
-            "Without running this command the leader cannot detect completion — the task hangs and wait times out. Printing the header text in your response is NOT enough; you must invoke the `tm-agent reply` shell command yourself.",
-            "",
             "## Task Capsule",
             "TASK_ID: \(taskId)",
             "TASK_TITLE: \(task.title)",
@@ -2810,8 +3557,79 @@ final class TeamOrchestrator: ObservableObject {
             text.trimmingCharacters(in: .whitespacesAndNewlines),
             "[/GOAL]",
         ])
-        let body = lines.joined(separator: "\n")
-        return body + "\n\n[REMINDER] Finish by actually running the `tm-agent reply '...'` shell command shown at the top — not by printing the header in your reply."
+        let team = teams[teamName]
+        lines.append(contentsOf: Self.checkoutContractLines(
+            targetBranch: team?.projectTargetBranch,
+            checkoutBranch: target.worktreeBranch,
+            checkoutPath: target.worktreePath ?? target.originalAgentWorkDir
+        ))
+        lines.append(contentsOf: [
+            "",
+            "[HOW TO REPORT — required]",
+            "Close your reply with these lines. term-mesh reads them off your",
+            "pane and closes the task; without them it stays open and the",
+            "leader waits.",
+            "",
+            "STATUS: DONE|BLOCKED|NEEDS_REVIEW",
+            "FILES: <changed paths, space-separated, or none>",
+            "VERIFY: <single shell command to verify the result, or n/a>",
+            "NEXT: <one-line action for the leader, or NONE>",
+            "FULL_REPORT: <path to a full result file, or n/a>",
+            "",
+            // Anything written above the header is not captured — the reply is
+            // read from STATUS onward — so an answer put before it is lost to
+            // everything but the pane. Asking for it after the header is what
+            // puts the outcome on the board next to the task.
+            "Then one last line: the answer or outcome in a sentence. Put it",
+            "after the header, not before — text above STATUS is not captured.",
+            "",
+            "Running `tm-agent reply '<the same header>'` as a shell command",
+            "does the same thing and is exact — either is fine.",
+        ])
+        return lines.joined(separator: "\n")
+    }
+
+    /// The project ref and the worker checkout have different jobs. Keeping
+    /// this contract in every capsule prevents a leader-authored review guard
+    /// from treating the expected `agent/*` branch as a launch failure.
+    static func checkoutContractLines(
+        targetBranch: String?,
+        checkoutBranch: String?,
+        checkoutPath: String?
+    ) -> [String] {
+        var lines = ["", "## Source Control Contract"]
+        if let targetBranch = targetBranch?.nilIfBlank {
+            let targetRef: String
+            if targetBranch.hasPrefix("refs/") || targetBranch.hasPrefix("origin/") {
+                targetRef = targetBranch
+            } else {
+                targetRef = "origin/\(targetBranch)"
+            }
+            lines.append("PROJECT_TARGET_BRANCH: \(targetBranch)")
+            lines.append("PROJECT_TARGET_REF: \(targetRef)")
+        }
+        if let checkoutBranch = checkoutBranch?.nilIfBlank {
+            lines.append("AGENT_CHECKOUT_BRANCH: \(checkoutBranch)")
+        }
+        if let checkoutPath = checkoutPath?.nilIfBlank {
+            lines.append("AGENT_CHECKOUT_PATH: \(checkoutPath)")
+        }
+        lines += [
+            "CHECKOUT_CONTRACT_PRIORITY: This platform contract overrides goal text that requires the current branch name to equal the project target branch.",
+            "CHECKOUT_RULES:",
+            "- An agent/*, team/*, or other assigned worktree branch is expected and valid.",
+            "- Never block solely because the current branch name differs from PROJECT_TARGET_BRANCH.",
+            "- Read-only work: fetch origin once if the required ref is missing or stale, then inspect explicit refs directly (for example, git diff <base>...<target>). Do not checkout, reset, merge, or rebase.",
+            "- Write work: stay on the assigned branch. If it does not contain the required target revision, report NEEDS_REVIEW and ask the leader for an explicit sync; do not take over a branch checked out elsewhere.",
+            "- Use BLOCKED only when required refs remain unavailable after one fetch, the repository is unreadable, or the requested evidence cannot be obtained.",
+        ]
+        return lines
+    }
+
+    func setProjectTargetBranch(teamName: String, branch: String?) {
+        guard var team = teams[teamName] else { return }
+        team.projectTargetBranch = branch?.nilIfBlank
+        teams[teamName] = team
     }
 
     private func formatTaskDispatchInstruction(task: TeamTask) -> String {
@@ -2904,6 +3722,211 @@ final class TeamOrchestrator: ObservableObject {
     /// 4 attempts: 50 → 150 → 400 → 800 ms (total ~1.4 s before final failure).
     private static let sendTextRetryDelaysMs: [Double] = [50, 150, 400, 800]
 
+    /// Hand a turn to an agent this side is holding.
+    ///
+    /// Both entry points need it. `team.send` resolves by name; broadcast and
+    /// panel-targeted delegate resolve by panel — and only the first had this,
+    /// so the others fell through to the pipe fork, found no FIFO, waited out
+    /// the readiness timeout and failed.
+    private func deliverNatively(_ panel: AgentPanel, agentId: String, text: String,
+                                 completion: ((Bool) -> Void)?) -> Bool {
+        do {
+            _ = try panel.session.send(Self.withoutTerminalProtocol(text), from: .leader)
+            #if DEBUG
+            dlog("agent.native.deliver agent=\(agentId) chars=\(text.count)")
+            #endif
+            completion?(true)
+            return true
+        } catch {
+            #if DEBUG
+            dlog("agent.native.deliver.FAILED agent=\(agentId) err=\(error)")
+            #endif
+            completion?(false)
+            return false
+        }
+    }
+
+    /// Drop the "you MUST run `tm-agent reply`" block from an instruction.
+    ///
+    /// That block exists for one reason, and its own comment says so: the pane
+    /// path cannot detect completion, so the agent is told to announce it by
+    /// running a shell command. Here the turn announces its own end and the
+    /// task is already closed by the time the agent could run anything —
+    /// measured, the agent ran it anyway and got `no_active_task` back, a
+    /// guaranteed-failing tool call on every single turn.
+    ///
+    /// It is not merely noise, it is false: it tells the agent the leader
+    /// cannot see it finish. What the header is *for* still matters, so the
+    /// block is replaced rather than deleted — the verdict is the agent's and
+    /// nothing else can supply it.
+    static func withoutTerminalProtocol(_ text: String) -> String {
+        var lines = text.components(separatedBy: "\n")
+
+        // The runbook says the same thing in prose rather than in a block —
+        // "CRITICAL: … you MUST invoke `tm-agent reply` … the leader cannot
+        // detect completion and the team stalls" — and it reaches the agent in
+        // its very first turn. Same falsehood, different shape, so it is
+        // corrected rather than dropped: the requirement is real, the shell
+        // command is not.
+        for i in lines.indices where lines[i].hasPrefix("CRITICAL:")
+            && lines[i].contains("tm-agent reply") {
+            lines[i] = "CRITICAL: End every reply with the 5-field header "
+                + "(STATUS/FILES/VERIFY/NEXT/FULL_REPORT), one field per line. "
+                + "The leader reads it directly — do not run a shell command to send it."
+        }
+
+        // The digest mandates the same command in three more places, which now
+        // contradicts the line above — and an agent told both will do both,
+        // which is how the failing call got measured in the first place. The
+        // mandates go; the corrected line is left as the only authority.
+        lines.removeAll { line in
+            guard line.contains("tm-agent reply") else { return false }
+            return line.contains("When done") || line.contains("Finish with")
+        }
+        // This one is about the header's *shape*, which is still wanted — only
+        // the command it hangs off is gone.
+        for i in lines.indices {
+            lines[i] = lines[i].replacingOccurrences(
+                of: "`tm-agent reply` body", with: "reply")
+            // The runbook prints the alternation too, and it is the same trap:
+            // codex read the bar as a field separator and packed the whole
+            // header onto one line. Correcting only the delegate template left
+            // the runbook still teaching it.
+            lines[i] = lines[i].replacingOccurrences(
+                of: "STATUS: DONE|BLOCKED|NEEDS_REVIEW",
+                with: "STATUS: <DONE, BLOCKED, or NEEDS_REVIEW>")
+        }
+
+        guard let start = lines.firstIndex(where: {
+            $0.hasPrefix("[REQUIRED FINAL STEP")
+        }) else { return lines.joined(separator: "\n") }
+
+        // A bracketed line, a fenced example, then one paragraph of prose about
+        // why the command matters. Read by shape rather than by matching the
+        // wording, because there are three copies of it — two in the Rust CLI,
+        // one here — and they do not agree word for word.
+        var end = start + 1
+        var fences = 0
+        while end < lines.count, fences < 2 {
+            if lines[end].hasPrefix("```") { fences += 1 }
+            end += 1
+        }
+        guard fences == 2 else { return text }
+        while end < lines.count,
+              !lines[end].trimmingCharacters(in: .whitespaces).isEmpty {
+            end += 1
+        }
+
+        lines.replaceSubrange(start..<end, with: [
+            "[FINAL LINE — end your reply with this header, one field per line]",
+            // Not `DONE|BLOCKED|NEEDS_REVIEW`: measured, codex read the
+            // alternation bar as a field separator and answered with the whole
+            // header on one line — `STATUS: DONE|FILES: none|…` — which parses
+            // the status as everything after it.
+            "STATUS: <DONE, BLOCKED, or NEEDS_REVIEW>",
+            "FILES: <changed paths or none>",
+            "VERIFY: <single shell command or n/a>",
+            "NEXT: <action or NONE>",
+            "FULL_REPORT: <result file path or n/a>",
+        ])
+        // The capsule closes by repeating the demand — "not by printing the
+        // header in your reply" — which is now the opposite of what is wanted.
+        lines.removeAll { $0.hasPrefix("[REMINDER]") && $0.contains("tm-agent reply") }
+        return lines.joined(separator: "\n")
+    }
+
+    /// File a turn's full text where the leader looks for it.
+    ///
+    /// Written by the CLI until now, as a side effect of the agent running
+    /// `tm-agent reply`. Dropping that command from the instruction — because
+    /// it can only fail here — took the file with it, and the leader's
+    /// documented way to read a full report is `cat
+    /// ~/.term-mesh/results/<team>/<task_id>.md`. Replies are truncated to
+    /// 1500 characters over the socket, so without the file a long report is
+    /// simply gone.
+    ///
+    /// Both names, as the CLI writes them: the task's, and the agent's latest.
+    static func fileReport(teamName: String, agentName: String,
+                           agentInstanceId: String? = nil,
+                           taskId: String?, text: String) {
+        let dir = URL(fileURLWithPath: NSHomeDirectory())
+            .appendingPathComponent(".term-mesh/results", isDirectory: true)
+            .appendingPathComponent(safeFilename(teamName), isDirectory: true)
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        // A name-only reply file is safe only when there is no instance to
+        // collide with: two same-named instances both writing it would let
+        // whichever finishes last silently overwrite the other's report.
+        var names: [String]
+        if let agentInstanceId, !agentInstanceId.isEmpty {
+            names = ["\(safeFilename(agentName))-\(safeFilename(agentInstanceId))-reply.md"]
+        } else {
+            names = ["\(safeFilename(agentName))-reply.md"]
+        }
+        if let taskId, !taskId.isEmpty { names.append("\(safeFilename(taskId)).md") }
+        for name in names {
+            try? text.write(to: dir.appendingPathComponent(name),
+                            atomically: true, encoding: .utf8)
+        }
+    }
+
+    /// Same character set the CLI allows, so a name written by one side is
+    /// found by the other.
+    private static func safeFilename(_ value: String) -> String {
+        let safe = value.filter { $0.isLetter || $0.isNumber || $0 == "-" || $0 == "_" || $0 == "." }
+        return safe.isEmpty ? "unknown" : safe
+    }
+
+    /// Let go of everything an agent's transport set up.
+    ///
+    /// `markDriven` had no counterpart: an agent name kept its pipe
+    /// registration after its pane was gone, so re-attaching the same name —
+    /// even with Agent Panes switched back to Terminal — routed every send to
+    /// a FIFO that no longer existed. The completion watcher and the FIFO
+    /// files leaked with it.
+    static func releaseTransport(agentId: String) {
+        AgentPipeTransport.discard(agentId: agentId)
+        AgentPipeCompletion.shared.forget(agentId: agentId)
+    }
+
+    /// Whether a turn to this agent still needs a Return pressed after it.
+    ///
+    /// It never did for the agent's sake — the Return is there because the
+    /// transport is a terminal and a TUI composer submits on one. An agent held
+    /// natively has no composer: the write to its stdin *is* the turn, complete
+    /// the moment it lands.
+    ///
+    /// Asked when the Return arrives rather than announced with the text: the
+    /// CLI's first attempt is already a round trip, so answering it there is
+    /// one mechanism instead of two, and it covers every caller — including the
+    /// ones that never learn about a new response field.
+    func agentNeedsReturn(teamName: String, agentName: String, agentInstanceId: String? = nil) -> Bool {
+        guard let team = teams[teamName],
+              let agent = agentInstanceId.flatMap({
+                  resolveAgentForRPC(teamName: teamName, agentName: agentName, agentInstanceId: $0).agent
+              }) ?? selectAgent(in: team.agents, name: agentName),
+              let panelId = agent.panelId,
+              nativeAgentPanel(workspaceId: agent.workspaceId, panelId: panelId) != nil
+        else { return true }
+        return false
+    }
+
+    /// The panel behind a natively-held agent, if that is what it is.
+    ///
+    /// Same two-step lookup `sendTextToPanel` uses: the agent's own workspace
+    /// first, then a global surface lookup, because a broadcast can reach a
+    /// team whose panes live in another window.
+    private func nativeAgentPanel(workspaceId: UUID, panelId: UUID) -> AgentPanel? {
+        if let tabManager = AppDelegate.shared?.tabManagerFor(tabId: workspaceId),
+           let workspace = tabManager.tabs.first(where: { $0.id == workspaceId }),
+           let panel = workspace.agentPanel(for: panelId) {
+            return panel
+        }
+        guard let located = AppDelegate.shared?.locateSurface(surfaceId: panelId),
+              let workspace = located.tabManager.tabs.first(where: { $0.id == located.workspaceId })
+        else { return nil }
+        return workspace.agentPanel(for: panelId)
+    }
+
     private func sendTextToPanel(workspaceId: UUID, panelId: UUID, text: String, tabManager: TabManager, withReturn: Bool = true, retryCount: Int = 0, completion: ((Bool) -> Void)? = nil) -> Bool {
         // Try the provided tabManager first, then fall back to global surface lookup
         // for cross-window scenarios (e.g. broadcast when agents are in a different window).
@@ -2982,6 +4005,45 @@ final class TeamOrchestrator: ObservableObject {
             return false
         }
 
+        // Someone's unsent words are in the way. Pasting over them makes one
+        // garbled prompt out of two thoughts, so the draft goes first — and
+        // is said out loud, because it was a person's and it is being thrown
+        // away. Ctrl+U only goes out when there is something to clear, which
+        // keeps a stray control character off the normal path.
+        if let draft = AutoReplyPoller.shared.composerDraft(panelId: panelId) {
+            Logger.team.warning(
+                "[sendTextToPanel] discarding unsent composer draft in \(panelId.uuidString.prefix(8), privacy: .public): \(draft, privacy: .public)"
+            )
+#if DEBUG
+            dlog("composer.cleared panel=\(panelId.uuidString.prefix(8)) draft=\(draft.prefix(60).debugDescription)")
+#endif
+            TerminalController.shared.sendNamedKeyWithRetry(
+                on: panel.surface,
+                keyName: "ctrl-u"
+            ) { _, _ in }
+        }
+
+        // A remote pane's composer is on another machine, and the inline form
+        // puts 5ms between the text and the Return — generous for a local PTY,
+        // nothing at all across a network. The Return arrives first and submits
+        // an empty prompt while the words are still in flight. It happened to
+        // work often enough to look fine, which is the worst way for a race to
+        // behave. Same two keystrokes, far enough apart to arrive in order.
+        if withReturn, panel.remoteHostKey != nil {
+            let delivered = sendTextToPanel(
+                workspaceId: workspaceId, panelId: panelId, text: text,
+                tabManager: tabManager, withReturn: false, retryCount: retryCount
+            ) { sent in
+                guard sent else { completion?(false); return }
+                DispatchQueue.main.asyncAfter(deadline: .now() + Self.remoteReturnGap) {
+                    TerminalController.shared.sendNamedKeyWithRetry(
+                        on: panel.surface, keyName: "return"
+                    ) { ok, _ in completion?(ok) }
+                }
+            }
+            return delivered
+        }
+
         // Normalize and send text via sendIMEText.
         // Note: when withReturn=false (team.delegate), only text is pasted — the Rust
         // CLI sends Return separately via team.send_key RPC using the reliable
@@ -3047,10 +4109,12 @@ final class TeamOrchestrator: ObservableObject {
     /// Send Ctrl+C (ETX) to a specific agent's terminal, interrupting the current operation.
     /// Unlike sendToAgent which types text into the prompt, this sends a raw interrupt signal
     /// that works even when the agent is busy (thinking/running tools).
-    func interruptAgent(teamName: String, agentName: String, tabManager: TabManager) -> Bool {
+    func interruptAgent(teamName: String, agentName: String, agentInstanceId: String? = nil, tabManager: TabManager) -> Bool {
         guard let team = teams[teamName],
-              let agent = team.agents.first(where: { $0.name == agentName }) else { return false }
-        guard let panel = agentPanel(teamName: teamName, agentName: agentName, tabManager: tabManager) else { return false }
+              let agent = (agentInstanceId.flatMap { instanceId in
+                  resolveAgentForRPC(teamName: teamName, agentName: agentName, agentInstanceId: instanceId).agent
+              } ?? team.agents.first(where: { $0.name == agentName })) else { return false }
+        guard let panel = agentPanel(teamName: teamName, agentName: agentName, agentInstanceId: agent.agentInstanceId, tabManager: tabManager) else { return false }
         // Send ETX byte (0x03 = Ctrl+C) directly to PTY — bypasses TUI input handling
         panel.sendText("\u{03}")
         #if DEBUG
@@ -3089,9 +4153,34 @@ final class TeamOrchestrator: ObservableObject {
         migratingAgents.contains("\(teamName)/\(agentName)")
     }
 
+    /// Add a member to a team that already exists.
+    ///
+    /// `teams` stays `private(set)` — a roster that anything can assign to is
+    /// how two views of a team drift apart. This is the one seam, so every
+    /// addition also registers with the data store and the daemon, which a
+    /// direct write would quietly skip.
+    func adoptAgentMember(_ member: AgentMember, teamName: String) -> Bool {
+        guard var team = teams[teamName] else { return false }
+        guard !team.agents.contains(where: {
+            $0.agentInstanceId == member.agentInstanceId
+        }) else { return false }
+        team.agents.append(member)
+        teams[teamName] = team
+        TeamDataStore.shared.registerTeam(teamName, agents: team.agents.map { .init(name: $0.name, instanceId: $0.agentInstanceId) })
+        syncTeamStateToDaemon()
+        return true
+    }
+
     func agentIdentity(teamName: String, agentName: String) -> AgentPaneIdentity? {
         guard let team = teams[teamName],
               let agent = team.agents.first(where: { $0.name == agentName }) else { return nil }
+        return agentIdentity(for: agent)
+    }
+
+    func agentIdentity(teamName: String, agentName: String, agentInstanceId: String) -> AgentPaneIdentity? {
+        guard let agent = resolveAgentForRPC(
+            teamName: teamName, agentName: agentName, agentInstanceId: agentInstanceId
+        ).agent else { return nil }
         return agentIdentity(for: agent)
     }
 
@@ -3099,8 +4188,61 @@ final class TeamOrchestrator: ObservableObject {
         pendingReturnTargets["\(teamName)/\(agentName)"]
     }
 
-    func clearPendingReturnTarget(teamName: String, agentName: String, panelId: UUID? = nil) {
+    /// How long to leave between text and Return on a remote pane, so they
+    /// arrive in that order. Well past a peer round trip, well under the
+    /// unsubmitted-paste deadline below.
+    private static let remoteReturnGap: TimeInterval = 1.5
+    private static let remoteLeaderReturnGap: TimeInterval = 5.0
+
+    /// How long a paste may sit unsubmitted before this side presses Return.
+    ///
+    /// Generous on purpose: the CLI's own follow-up lands in about a tenth of
+    /// a second, so this never races it — it only catches the case where the
+    /// second half never comes at all.
+    private static let owedReturnGrace: TimeInterval = 4.0
+
+    /// Press Return on a paste nobody came back to submit.
+    ///
+    /// `team.send`/`team.delegate` paste without Return by design: the CLI
+    /// sends it separately once the paste is acknowledged, because firing it
+    /// early truncates a long instruction. That makes submitting the work a
+    /// two-party contract, and the second party is a different process. When
+    /// it does not come — a caller that speaks the socket directly, a CLI that
+    /// dies between the two calls — the capsule sits in the composer, the
+    /// agent never starts, and the board shows `assigned` forever with no
+    /// error anywhere. It has cost this project the same afternoon more than
+    /// once.
+    ///
+    /// So the promise is kept from this side too. The owed Return is already
+    /// recorded; this just gives it a deadline.
+    private func scheduleOwedReturn(teamName: String, agentName: String, panelId: UUID) {
         let key = "\(teamName)/\(agentName)"
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.owedReturnGrace) { [weak self] in
+            guard let self else { return }
+            // Someone kept the promise, or the pane moved on to another paste.
+            guard let owed = self.pendingReturnTargets[key], owed.panelId == panelId else { return }
+            guard let located = AppDelegate.shared?.locateSurface(surfaceId: panelId),
+                  let workspace = located.tabManager.tabs.first(where: { $0.id == located.workspaceId }),
+                  let panel = workspace.terminalPanel(for: panelId) else {
+                self.pendingReturnTargets.removeValue(forKey: key)
+                return
+            }
+            self.pendingReturnTargets.removeValue(forKey: key)
+#if DEBUG
+            dlog("owedReturn.fire team=\(teamName) agent=\(agentName) panel=\(panelId.uuidString.prefix(8))")
+#endif
+            _ = panel.surface.sendIMEText("", withReturn: true)
+        }
+    }
+
+    func clearPendingReturnTarget(
+        teamName: String,
+        agentName: String,
+        agentInstanceId: String? = nil,
+        panelId: UUID? = nil
+    ) {
+        let key = agentInstanceId.map { agentOperationKey(teamName: teamName, agentInstanceId: $0) }
+            ?? "\(teamName)/\(agentName)"
         guard let panelId else {
             pendingReturnTargets.removeValue(forKey: key)
             return
@@ -3304,10 +4446,10 @@ final class TeamOrchestrator: ObservableObject {
         guard let oldPid = old.panelId else {
             return .failure(.headlessNoPane)
         }
-        // Use panelId-based key when available so duplicate-named agents each get
-        // their own migration slot and don't block each other (P2-1 fix).
-        let teamAgentKey = disambiguatePanelId.map { "\(teamName)/\($0.uuidString)" }
-            ?? "\(teamName)/\(agentName)"
+        // The pane id is replaced by this operation.  The durable instance id
+        // keeps migration, paste draining and the post-restart refresh tied to
+        // this member rather than a stale pane or duplicate-name sibling.
+        let teamAgentKey = agentOperationKey(teamName: teamName, agentInstanceId: old.agentInstanceId)
         if migratingAgents.contains(teamAgentKey) {
             return .failure(.alreadyMigrating)
         }
@@ -3380,6 +4522,7 @@ final class TeamOrchestrator: ObservableObject {
             splitFrom: splitFrom,
             orientation: orientation,
             insertFirst: insertFirst,
+            agentInstanceId: old.agentInstanceId,
             extraArgs: restartExtraArgs,
             extraEnv: restartExtraEnv,
             tabManager: tabManager
@@ -3419,7 +4562,7 @@ final class TeamOrchestrator: ObservableObject {
         memberToSwap.completedTaskCount = 0
         team.agents[idx] = memberToSwap
         teams[teamName] = team
-        TeamDataStore.shared.registerTeam(teamName, agentNames: team.agents.map(\.name))
+        TeamDataStore.shared.registerTeam(teamName, agents: team.agents.map { .init(name: $0.name, instanceId: $0.agentInstanceId) })
         syncTeamStateToDaemon()
         migratingAgents.remove(teamAgentKey)
 
@@ -3522,9 +4665,16 @@ final class TeamOrchestrator: ObservableObject {
     /// Called when an agent's task transitions to "completed". Increments the
     /// agent's completedTaskCount and triggers a guard recycle when the count
     /// reaches the effective threshold (agent override → team default → nil = off).
-    func handleTaskCompletionForAutoRecycle(teamName: String, agentName: String) {
+    func handleTaskCompletionForAutoRecycle(
+        teamName: String,
+        agentName: String,
+        agentInstanceId: String? = nil
+    ) {
         guard var team = teams[teamName],
-              let agentIdx = team.agents.firstIndex(where: { $0.name == agentName }) else {
+              let agentIdx = team.agents.firstIndex(where: {
+                  $0.name == agentName
+                      && (agentInstanceId == nil || $0.agentInstanceId == agentInstanceId)
+              }) else {
             #if DEBUG
             dlog("autoRecycle.handleCompletion teamName=\(teamName) agentName=\(agentName) skip=team_or_agent_not_found")
             #endif
@@ -3549,10 +4699,23 @@ final class TeamOrchestrator: ObservableObject {
             // next → report). It is intentionally NOT done on the recycle branch,
             // because recycleAgent hard-restarts the pane (drops context) and a task
             // claimed into it would be interrupted by the restart.
-            autoClaimNext(teamName: teamName, agentName: agentName)
+            autoClaimNext(
+                teamName: teamName,
+                agentName: agentName,
+                agentInstanceId: team.agents[agentIdx].agentInstanceId
+            )
             return
         }
-        recycleAgent(teamName: teamName, agentName: agentName, force: false)
+        // `recycleAgent(name:)` is a legacy UI entry point and may resolve a
+        // duplicate sibling. Completion already selected this exact instance,
+        // so retain that identity through the restart too.
+        if let panelId = team.agents[agentIdx].panelId {
+            Task { @MainActor in
+                _ = await self.restartAgentPaneHard(panelId: panelId)
+            }
+        } else {
+            recycleAgent(teamName: teamName, agentName: agentName, force: false)
+        }
     }
 
     /// Continuous work-stealing: when an agent finishes a task (and is not being
@@ -3568,33 +4731,47 @@ final class TeamOrchestrator: ObservableObject {
     /// turning "leader broadcasts `tm-agent claim` every wave" into "idle agents
     /// drain the pool on their own".
     ///
-    /// Duplicate-named caveat: the push routes by agent NAME via `notifyTaskCreated`
-    /// → `selectAgent` round-robin. For the common case of uniquely-named agents
-    /// this targets the exact pane that just freed up. When several panes share a
-    /// name, round-robin may push to a sibling pane; correct per-pane addressing
-    /// needs the panel_id field tracked as the Tier-3 BUG-2 fix.
-    private func autoClaimNext(teamName: String, agentName: String) {
-        guard let claimed = TeamDataStore.shared.claimTask(teamName: teamName, agentName: agentName) else {
+    /// The completed pane's durable instance id remains bound across claim and
+    /// delivery; duplicate role siblings are never eligible as a side effect.
+    private func autoClaimNext(teamName: String, agentName: String, agentInstanceId: String) {
+        guard let claimed = TeamDataStore.shared.claimTask(
+            teamName: teamName, agentName: agentName, agentInstanceId: agentInstanceId
+        ) else {
             return  // empty pool or all deps unmet — nothing to pull
         }
         #if DEBUG
         dlog("[autoClaimNext] team=\(teamName) agent=\(agentName) claimed task=\(claimed.id.prefix(8)) title=\(claimed.title.prefix(40))")
         #endif
-        // Push via the auto-locating sender: it makes exactly one selectAgent
-        // (round-robin) decision and resolves the owning tabManager itself through
-        // AppDelegate.locateSurface, so it reaches the pane even for multi-window
-        // teams without a second, possibly-divergent agent lookup.
         let instruction = formatTaskAssignmentInstruction(task: claimed)
-        let pushed = sendToAgentAutoLocate(teamName: teamName, agentName: agentName, text: instruction)
+        let pushed = sendToAgentAutoLocate(
+            teamName: teamName,
+            agentName: agentName,
+            agentInstanceId: agentInstanceId,
+            text: instruction,
+            completion: { [weak self] delivered in
+                guard !delivered else { return }
+                self?.compensateAutoClaimDelivery(
+                    teamName: teamName, taskId: claimed.id, agentInstanceId: agentInstanceId
+                )
+            }
+        )
         if !pushed {
-            // Delivery failed (pane gone / migrating) — release the task so another
-            // idle agent (or a manual claim) can pick it up instead of it sitting
-            // assigned-but-undelivered.
-            _ = TeamDataStore.shared.reassignTask(teamName: teamName, taskId: claimed.id, assignee: nil)
+            compensateAutoClaimDelivery(
+                teamName: teamName, taskId: claimed.id, agentInstanceId: agentInstanceId
+            )
             #if DEBUG
             dlog("[autoClaimNext] push FAILED task=\(claimed.id.prefix(8)) — returned to pool team=\(teamName) agent=\(agentName)")
             #endif
         }
+    }
+
+    private func compensateAutoClaimDelivery(teamName: String, taskId: String, agentInstanceId: String) {
+        guard TeamDataStore.shared.releaseClaim(
+            teamName: teamName, taskId: taskId, assigneeInstanceId: agentInstanceId
+        ) != nil else { return }
+        #if DEBUG
+        dlog("[autoClaimNext] delivery FAILED task=\(taskId.prefix(8)) — returned exact claim to pool team=\(teamName) instance=\(agentInstanceId.prefix(8))")
+        #endif
     }
 
     /// Snapshot of a pane's position in the bonsplit tree, captured before
@@ -3733,6 +4910,12 @@ final class TeamOrchestrator: ObservableObject {
     func listTeams() -> [[String: Any]] {
         teams.values.map { team in
             let teamInbox = inboxItems(teamName: team.id)
+            let leaderEndpoint: [String: Any] = switch team.leaderEndpoint {
+            case .local:
+                ["kind": "local"]
+            case let .peer(hostKey):
+                ["kind": "peer", "host_key": hostKey]
+            }
             return [
                 "team_name": team.id,
                 "leader_session_id": team.leaderSessionId,
@@ -3775,16 +4958,36 @@ final class TeamOrchestrator: ObservableObject {
                 // usage-tick broadcaster can attribute token usage to the leader
                 // (the leader is intentionally NOT part of the `agents` array).
                 "leader_cli": team.leaderMode,
-                "leader_panel_id": team.leaderPanelId.uuidString
+                "leader_panel_id": team.leaderPanelId.uuidString,
+                "leader_endpoint": leaderEndpoint,
+                "leader_ready": team.leaderReady,
+                "leader_failure": team.leaderFailureDescription as Any? ?? NSNull(),
+                "leader_policy_version": LeaderParallelPolicy.version,
+                "leader_policy_digest": LeaderParallelPolicy.digest,
+                "leader_policy_source": "LeaderParallelPolicy",
+                "leader_policy_state": team.leaderPolicyState,
+                "leader_policy_failure": team.leaderPolicyFailureDescription as Any? ?? NSNull(),
             ] as [String: Any]
         }
     }
 
     private func daemonPayload() -> [String: Any] {
         let teamData = listTeams()
+        // Tasks live in TeamDataStore — that is where `tm-agent`, the socket
+        // handlers and the agents themselves write, and what `team.task.list`
+        // and `team.status` read back. This used to read the orchestrator's own
+        // `taskBoards`, which nothing on those paths writes, so every view fed
+        // by `fleetState` — the review board above all — showed an empty task
+        // list while work was being created, assigned and finished.
+        //
+        // `taskBoards` is still consulted for anything recorded through the
+        // orchestrator directly, and duplicates are dropped by id.
         let teamTasks = teamData.flatMap { team -> [[String: Any]] in
             guard let teamName = team["team_name"] as? String else { return [] }
-            return listTasks(teamName: teamName).map { task in
+            var seen = Set<String>()
+            let stored = TeamDataStore.shared.listTasks(teamName: teamName)
+            return (stored + listTasks(teamName: teamName)).compactMap { task in
+                guard seen.insert(task.id).inserted else { return nil }
                 var dict = taskDictionary(task)
                 dict["team_name"] = teamName
                 return dict
@@ -3876,22 +5079,32 @@ final class TeamOrchestrator: ObservableObject {
         return [
             "team_name": team.id,
             "leader_session_id": team.leaderSessionId,
+            "leader_ready": team.leaderReady,
+            "leader_failure": team.leaderFailureDescription as Any? ?? NSNull(),
+            "leader_policy_version": LeaderParallelPolicy.version,
+            "leader_policy_digest": LeaderParallelPolicy.digest,
+            "leader_policy_source": "LeaderParallelPolicy",
+            "leader_policy_state": team.leaderPolicyState,
+            "leader_policy_failure": team.leaderPolicyFailureDescription as Any? ?? NSNull(),
             "workspace_id": team.workspaceId.uuidString,
             "agent_count": team.agents.count,
             "agents": team.agents.map { agent in
-                let activeTask = activeTask(for: team.id, agentName: agent.name)
+                let enrichment = TeamDataStore.shared.agentDataEnrichment(
+                    teamName: team.id, agentName: agent.name, agentInstanceId: agent.agentInstanceId
+                )
                 let heartbeat = heartbeats[team.id]?[agent.name]
                 var info: [String: Any] = [
                     "id": agent.id,
                     "name": agent.name,
+                    "agent_instance_id": agent.agentInstanceId,
                     "cli": agent.cli,
                     "model": agent.model,
                     "agent_type": agent.agentType,
-                    "active_task_id": activeTask?.id as Any? ?? NSNull(),
-                    "active_task_title": activeTask?.title as Any? ?? NSNull(),
-                    "active_task_status": activeTask?.status as Any? ?? NSNull(),
-                    "active_task_is_stale": activeTask.map(isTaskStale) ?? false,
-                    "agent_state": agentRuntimeState(teamName: team.id, agentName: agent.name),
+                    "active_task_id": enrichment["active_task_id"] ?? NSNull(),
+                    "active_task_title": enrichment["active_task_title"] ?? NSNull(),
+                    "active_task_status": enrichment["active_task_status"] ?? NSNull(),
+                    "active_task_is_stale": enrichment["active_task_is_stale"] ?? false,
+                    "agent_state": enrichment["agent_state"] ?? agentRuntimeState(teamName: team.id, agentName: agent.name),
                     "waiting_input": agentIsWaitingInput(agent),
                     "heartbeat_age_seconds": heartbeatAgeSeconds(teamName: team.id, agentName: agent.name) as Any? ?? NSNull(),
                     "last_heartbeat_summary": heartbeat?.summary as Any? ?? NSNull(),
@@ -3908,6 +5121,15 @@ final class TeamOrchestrator: ObservableObject {
                 if let path = agent.worktreePath {
                     info["worktree_path"] = path
                 }
+                info["parallel_telemetry"] = [
+                    "wave_id": (enrichment["active_task_id"] as? String) ?? agent.agentInstanceId,
+                    "task_id": enrichment["active_task_id"] ?? NSNull(),
+                    "agent_instance_id": agent.agentInstanceId,
+                    "host": agent.hostKey as Any? ?? NSNull(),
+                    "checkout": agent.worktreePath ?? agent.worktreeBranch ?? agent.workspaceId.uuidString,
+                    "delivery": enrichment["agent_state"] ?? "unknown",
+                    "synthesis": "pending",
+                ]
                 return info as [String: Any]
             },
             "attention_count": teamInbox.count,
@@ -3916,16 +5138,23 @@ final class TeamOrchestrator: ObservableObject {
     }
 
     /// Destroy a team — send Ctrl-C to all agents and close the workspace.
-    func destroyTeam(name: String, tabManager: TabManager) -> Bool {
+    func destroyTeam(
+        name: String,
+        tabManager: TabManager,
+        archive: Bool = true
+    ) -> Bool {
         guard let team = teams[name] else { return false }
         // Phase 2 (pane-mode resume): persist a `mode: "pane"` archive so this
         // team shows up in `Resume from previous team`. Best-effort — failures
         // don't block destroy. Headless teams are archived daemon-side by
         // `headless.destroy_team` and never enter this code path.
-        archivePaneTeamIfApplicable(team)
+        if archive {
+            archivePaneTeamIfApplicable(team)
+        }
 
         // D3-A P2 (b): release any pending claude-sid watcher slots so
         // FSEventStream(s) for this team's workdirs tear down promptly.
+        for agent in team.agents { Self.releaseTransport(agentId: agent.transportId) }
         for agent in team.agents where agent.cli == "claude" {
             let workDir = agent.worktreePath ?? agent.originalAgentWorkDir ?? team.workingDirectory
             ClaudeSessionWatcher.shared.unregisterPendingClaudePane(
@@ -4143,21 +5372,36 @@ final class TeamOrchestrator: ObservableObject {
                 // (in_progress tasks are normalized to assigned inside).
                 TeamDataStore.shared.loadBoard(teamName: teamName, teamUuid: uuid)
             }
-            // Map archived agents by name and copy session_id back.
+            // Names remain the legacy routing key; restore the durable
+            // instance UUID independently of the mutable panel locator.
             var archivedSessionsByName: [String: String] = [:]
-            for a in agentsArr {
-                guard let name = a["name"] as? String,
-                      let sid = a["session_id"] as? String,
-                      !sid.isEmpty else { continue }
-                archivedSessionsByName[name] = sid
+            let archivedInstanceIDs: [String?] = agentsArr.map { a in
+                guard let instanceID = a["agent_instance_id"] as? String,
+                      !instanceID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                    return nil
+                }
+                return instanceID
             }
-            if !archivedSessionsByName.isEmpty {
-                t.agents = t.agents.map { member in
+            for a in agentsArr {
+                guard let name = a["name"] as? String else { continue }
+                if let sid = a["session_id"] as? String, !sid.isEmpty {
+                    archivedSessionsByName[name] = sid
+                }
+            }
+            if !archivedSessionsByName.isEmpty || !archivedInstanceIDs.isEmpty {
+                t.agents = t.agents.enumerated().map { index, member in
                     var m = member
                     if let sid = archivedSessionsByName[member.name] {
                         // Store as claudeSessionId (the real Claude sid).
                         // parentSessionId stays as the term-mesh routing UUID.
                         m.claudeSessionId = sid
+                    }
+                    // A modern archive carries the IDs in roster order, so
+                    // duplicate names never collapse. A wholly legacy archive
+                    // has no IDs and deliberately retains generated values.
+                    if index < archivedInstanceIDs.count,
+                       let instanceID = archivedInstanceIDs[index] {
+                        m.agentInstanceId = instanceID
                     }
                     return m
                 }
@@ -4216,7 +5460,6 @@ final class TeamOrchestrator: ObservableObject {
         // ("<name>@<team>"). We don't have full per-agent metadata in the
         // resume result envelope, so cli/model/color/instructions default
         // sensibly until the daemon emits state updates.
-        let colors = ["green", "blue", "yellow", "magenta", "cyan", "red"]
         let members: [AgentMember] = agentIds.enumerated().map { index, fullId in
             let name = String(fullId.split(separator: "@").first ?? Substring(fullId))
             return AgentMember(
@@ -4227,7 +5470,7 @@ final class TeamOrchestrator: ObservableObject {
                 launchCommand: Self.defaultLaunchCommand(for: "claude"),
                 model: "sonnet",
                 agentType: name,
-                color: colors[index % colors.count],
+                color: Self.agentColor(forRole: name, taken: []),
                 instructions: "",
                 workspaceId: workspace.id,
                 panelId: nil, // headless — no real panel (resumed team)
@@ -4262,7 +5505,7 @@ final class TeamOrchestrator: ObservableObject {
             teamUuid: teamUuid
         )
         teams[teamName] = team
-        TeamDataStore.shared.registerTeam(teamName, agentNames: members.map(\.name))
+        TeamDataStore.shared.registerTeam(teamName, agents: members.map { .init(name: $0.name, instanceId: $0.agentInstanceId) })
         syncTeamStateToDaemon()
         Logger.team.info("[headless] adopted resumed team '\(teamName, privacy: .public)' uuid=\(teamUuid ?? "?", privacy: .public)")
         return team
@@ -4369,6 +5612,7 @@ final class TeamOrchestrator: ObservableObject {
             "agents": team.agents.map { a -> [String: Any] in
                 var row: [String: Any] = [
                     "name": a.name,
+                    "agent_instance_id": a.agentInstanceId,
                     "cli": a.cli,
                     "model": a.model,
                     "agent_type": a.agentType,
@@ -4566,6 +5810,7 @@ final class TeamOrchestrator: ObservableObject {
             "agents": team.agents.map { a -> [String: Any] in
                 var row: [String: Any] = [
                     "name": a.name,
+                    "agent_instance_id": a.agentInstanceId,
                     "cli": a.cli,
                     "model": a.model,
                     "agent_type": a.agentType,
@@ -4594,6 +5839,15 @@ final class TeamOrchestrator: ObservableObject {
                 return row
             },
         ]
+        // Keep the requested host placement in the live snapshot. The remote
+        // bootstrap layer can attach its pane reference later without ever
+        // guessing that a peer leader belongs to this Mac.
+        payload["leader_endpoint"] = switch team.leaderEndpoint {
+        case .local:
+            ["kind": "local"]
+        case let .peer(hostKey):
+            ["kind": "peer", "host_key": hostKey]
+        }
         if let root = team.gitRepoRoot?.nilIfBlank
             ?? TermMeshDaemon.shared.findGitRoot(from: team.workingDirectory) {
             payload["git_root"] = root
@@ -4744,20 +5998,36 @@ final class TeamOrchestrator: ObservableObject {
         return "'" + s.replacingOccurrences(of: "'", with: "'\\''") + "'"
     }
 
-    /// Map term-mesh tier names to the exact `--model` argument Claude CLI expects.
-    /// "opus" and legacy "opus-1m" both map to claude-opus-4-8[1m].
+    /// Map term-mesh tier names to the `--model` argument Claude CLI expects.
+    ///
+    /// Tiers pass through untouched. The CLI accepts them itself — its alias
+    /// list is `sonnet`, `opus`, `haiku`, `fable`, `best`, their `[1m]` forms,
+    /// and `opusplan` — and resolves each to the current model in that family.
+    /// This used to rewrite `opus` to a pinned `claude-opus-4-8[1m]`, which
+    /// quietly held every agent on the previous Opus once Opus 5 shipped: the
+    /// pin kept working, so nothing surfaced the staleness. Resolving the tier
+    /// is the CLI's job, and it does it at launch rather than at build time.
+    ///
+    /// The `[1m]` suffix is not carried over either. It asked for a 1M context
+    /// window on a model whose default was smaller; the models the tiers now
+    /// resolve to are natively 1M.
     static func resolveClaudeModelArg(_ model: String) -> String {
         switch model {
-        case "opus", "opus-1m": return "claude-opus-4-8[1m]"
-        default:                return model
+        // Stored before the tier list settled; `opus` is what it meant.
+        case "opus-1m": return "opus"
+        default:        return model
         }
     }
 
     /// Map short model names (used internally) to kiro-cli model identifiers.
+    ///
+    /// kiro takes exact ids rather than tiers, so unlike the Claude CLI it
+    /// cannot resolve a family itself — every release has to be written down
+    /// here. Names below are from kiro's own `Available models` list.
     private static func kiroModelName(_ shortName: String) -> String {
         switch shortName.lowercased() {
-        case "opus":   return "claude-opus-4.8"
-        case "sonnet": return "claude-sonnet-4.6"
+        case "opus":   return "claude-opus-5"
+        case "sonnet": return "claude-sonnet-5"
         case "haiku":  return "claude-haiku-4.5"
         default:       return shortName  // pass through if already full name
         }
@@ -4820,16 +6090,12 @@ final class TeamOrchestrator: ObservableObject {
 
         let defaultPrompt: String
         if isLeader {
-            // Leader profile tells kiro to read the prompt file on startup.
-            // The file is written after agents are created (by createTeam).
-            defaultPrompt = """
-            You are a team leader in term-mesh. \
-            On startup, immediately read /tmp/term-mesh-leader-\(teamName).md — \
-            it contains your full team instructions with agent list and tm-agent commands. \
-            Follow those instructions for all team coordination. \
-            Rules: 1) Be concise. 2) Delegate work, don't do it yourself. \
-            3) Always read agent results before responding. 4) Use short, clear instructions.
-            """
+            // The file is written after panes are created. The read directive
+            // itself comes from the canonical policy source, not a copied
+            // launch-specific instruction string.
+            defaultPrompt = LeaderParallelPolicy.launchDirective(
+                promptFile: "/tmp/term-mesh-leader-\(teamName).md"
+            )
         } else {
             defaultPrompt = """
             You are a focused worker agent named '\(agentName)' in team '\(teamName)'. \
@@ -4866,12 +6132,70 @@ final class TeamOrchestrator: ObservableObject {
         return parts.joined(separator: " ")
     }
 
+    /// The model name a bridged CLI will actually accept.
+    ///
+    /// Team models are stored as claude's tiers — sonnet, opus, haiku — because
+    /// that is what the picker offers for every CLI. The pane path translates
+    /// per CLI on the way into the launch line; the native path was handing the
+    /// tier straight through, and measured, codex took `--model sonnet`,
+    /// accepted the turn, and ended it having said nothing.
+    ///
+    /// Reasoning effort is *not* carried, so the three tiers collapse to one
+    /// model here. The pane path differentiates them with a codex-specific
+    /// effort flag, and inventing that param on `turn/start` without measuring
+    /// it would be a guess.
+    static func bridgeModelArg(cli: String, model: String) -> String {
+        switch cli {
+        case "codex": return codexModelName(model)
+        case "cursor", "agy":
+            // Neither knows claude's tiers, and a name a CLI does not recognise
+            // is worse than none — measured on codex, which took `--model
+            // sonnet`, accepted the turn, and said nothing. Empty means the
+            // flag is not passed at all, which is what both were measured
+            // working with.
+            return codexReasoningEffort(model) == nil ? model : ""
+        default: return model
+        }
+    }
+
+    /// A colour that belongs to the role rather than to the order it arrived in.
+    ///
+    /// It was `colorList[team.agents.count % 6]` — the slot, not the agent. So
+    /// `reviewer` was blue in one team and yellow in the next, which makes a
+    /// colour something to re-learn per team instead of something to
+    /// recognise. Hashing the role name fixes that: reviewer is the same
+    /// colour every time, in every team, on every machine.
+    ///
+    /// Deliberately not per CLI. Which provider is behind a pane is already
+    /// said twice — the chip and the mascot — and spending the colour on it too
+    /// would leave two agents of the same role indistinguishable, which is the
+    /// thing you actually need to tell apart.
+    ///
+    /// Six colours and more roles than that means collisions, so a colour
+    /// already taken in this team steps to the next free one. Stability across
+    /// teams for the common case; never a duplicate within one.
+    static func agentColor(forRole role: String, taken: Set<String>) -> String {
+        let palette = ["green", "blue", "yellow", "magenta", "cyan", "red"]
+        var hash = 5381
+        for byte in role.lowercased().utf8 { hash = (hash &* 33) &+ Int(byte) }
+        let start = abs(hash) % palette.count
+        for offset in 0..<palette.count {
+            let candidate = palette[(start + offset) % palette.count]
+            if !taken.contains(candidate) { return candidate }
+        }
+        return palette[start]
+    }
+
     /// Map short model names to Codex CLI model identifiers.
-    /// All short tiers map to gpt-5.5; differentiation happens via reasoning effort
-    /// (see codexReasoningEffort). New-style names pass through directly.
+    /// All short tiers map to gpt-5.6-sol; differentiation happens via reasoning
+    /// effort (see codexReasoningEffort). New-style names pass through directly.
+    ///
+    /// Sol is the top entry in the CLI's own catalog (`~/.codex/models_cache.json`,
+    /// priority 1, "Latest frontier agentic coding model") and carries the whole
+    /// effort ladder the tiers need — low through max, plus ultra.
     private static func codexModelName(_ shortName: String) -> String {
         switch shortName.lowercased() {
-        case "opus", "sonnet", "haiku": return "gpt-5.5"
+        case "opus", "sonnet", "haiku": return "gpt-5.6-sol"
         default: return shortName
         }
     }
@@ -4951,7 +6275,7 @@ final class TeamOrchestrator: ObservableObject {
         return parts.joined(separator: " ")
     }
 
-    private static func colorEmoji(_ color: String) -> String {
+    static func colorEmoji(_ color: String) -> String {
         switch color {
         case "green":   return "🟢"
         case "blue":    return "🔵"
@@ -5027,7 +6351,7 @@ final class TeamOrchestrator: ObservableObject {
 
     /// Read terminal text from a specific agent's pane.
     /// Returns the panel for external callers to use with readTerminalTextBase64.
-    func agentPanel(teamName: String, agentName: String, tabManager: TabManager) -> TerminalPanel? {
+    func agentPanel(teamName: String, agentName: String, agentInstanceId: String? = nil, tabManager: TabManager) -> TerminalPanel? {
         guard let team = teams[teamName] else { return nil }
         // Leader-as-watch-target: the leader lives in `leaderPanelId`, outside the
         // `agents[]` array. Resolve it explicitly so `tm-agent read leader` and a
@@ -5047,21 +6371,23 @@ final class TeamOrchestrator: ObservableObject {
             }
             return nil
         }
-        guard let agent = team.agents.first(where: { $0.name == agentName }) else { return nil }
+        guard let agent = agentInstanceId.flatMap({ instanceId in
+            resolveAgentForRPC(teamName: teamName, agentName: agentName, agentInstanceId: instanceId).agent
+        }) ?? team.agents.first(where: { $0.name == agentName }) else { return nil }
         guard let pid = agent.panelId else { return nil }
         guard let workspace = tabManager.tabs.first(where: { $0.id == agent.workspaceId }) else { return nil }
         return workspace.terminalPanel(for: pid)
     }
 
     /// Get all agent panels for a team.
-    func allAgentPanels(teamName: String, tabManager: TabManager) -> [(name: String, panel: TerminalPanel)] {
+    func allAgentPanels(teamName: String, tabManager: TabManager) -> [(name: String, instanceId: String, panel: TerminalPanel)] {
         guard let team = teams[teamName] else { return [] }
-        var results: [(name: String, panel: TerminalPanel)] = []
+        var results: [(name: String, instanceId: String, panel: TerminalPanel)] = []
         for agent in team.agents {
             guard let pid = agent.panelId,
                   let workspace = tabManager.tabs.first(where: { $0.id == agent.workspaceId }),
                   let panel = workspace.terminalPanel(for: pid) else { continue }
-            results.append((name: agent.name, panel: panel))
+            results.append((name: agent.name, instanceId: agent.agentInstanceId, panel: panel))
         }
         return results
     }
@@ -5147,6 +6473,9 @@ final class TeamOrchestrator: ObservableObject {
             labels: labels.compactMap(\.nilIfBlank),
             estimatedSize: estimatedSize,
             assignee: normalizedAssignee,
+            assigneeInstanceId: normalizedAssignee.flatMap { name in
+                teams[teamName]?.agents.first(where: { $0.name == name })?.agentInstanceId
+            },
             status: normalizedAssignee == nil ? "queued" : "assigned",
             priority: max(1, min(priority, 3)),
             dependsOn: dependsOn.compactMap(\.nilIfBlank),
@@ -5206,6 +6535,9 @@ final class TeamOrchestrator: ObservableObject {
         let now = Date()
         if let assignee {
             tasks[idx].assignee = assignee.nilIfBlank
+            tasks[idx].assigneeInstanceId = tasks[idx].assignee.flatMap { agentName in
+                teams[teamName]?.agents.first(where: { $0.name == agentName })?.agentInstanceId
+            }
             if tasks[idx].status == "queued", tasks[idx].assignee != nil {
                 tasks[idx].status = "assigned"
             }
@@ -5282,6 +6614,9 @@ final class TeamOrchestrator: ObservableObject {
         let now = Date()
         let previousAssignee = tasks[idx].assignee
         tasks[idx].assignee = assignee?.nilIfBlank
+        tasks[idx].assigneeInstanceId = tasks[idx].assignee.flatMap { agentName in
+            teams[teamName]?.agents.first(where: { $0.name == agentName })?.agentInstanceId
+        }
         tasks[idx].status = tasks[idx].assignee == nil ? "queued" : "assigned"
         tasks[idx].blockedReason = nil
         tasks[idx].reviewSummary = nil
@@ -5498,6 +6833,7 @@ final class TeamOrchestrator: ObservableObject {
             "reassignment_count": task.reassignmentCount,
             "superseded_by": task.supersededBy as Any? ?? NSNull(),
             "assignee": task.assignee as Any? ?? NSNull(),
+            "agent_instance_id": task.assigneeInstanceId as Any? ?? NSNull(),
             "blocked_reason": task.blockedReason as Any? ?? NSNull(),
             "review_summary": task.reviewSummary as Any? ?? NSNull(),
             "created_by": task.createdBy,
@@ -5829,13 +7165,53 @@ final class TeamOrchestrator: ObservableObject {
         restorableFleets.removeAll { $0.teamUuid == teamUuid }
     }
 
+    /// Whether this agent is mid-turn, from the process rather than the board.
+    ///
+    /// The one signal the terminal path never had. There, "busy" could only be
+    /// guessed from a task's status or from the screen still changing; here the
+    /// turn began when a line was written and ends when `result` arrives.
+    func isNativeTurnInFlight(teamName: String, agentName: String) -> Bool {
+        guard let team = teams[teamName],
+              let agent = selectAgent(in: team.agents, name: agentName),
+              let panelId = agent.panelId,
+              let panel = nativeAgentPanel(workspaceId: agent.workspaceId, panelId: panelId)
+        else { return false }
+        return panel.session.isThinking
+    }
+
+    #if DEBUG
+    func agentRuntimeStateForTesting(teamName: String, agentName: String) -> String {
+        agentRuntimeState(teamName: teamName, agentName: agentName)
+    }
+    #endif
+
     private func agentRuntimeState(teamName: String, agentName: String) -> String {
         // Phase 2: parked is daemon-authoritative — overrides task-derived state
         // because the subprocess is not live regardless of task board entry.
         if TeamDataStore.shared.isAgentParked(teamName: teamName, agentName: agentName) {
             return "parked"
         }
-        guard let task = activeTask(for: teamName, agentName: agentName) else { return "idle" }
+        // Two ways to know an agent is busy, and the task board is neither.
+        //
+        // A task stays `assigned` from hand-off until a result is filed, so on
+        // the board alone an agent halfway through the work and an agent that
+        // never started are the same thing — and a broadcast creates no task
+        // at all, so a whole team mid-answer reads as idle.
+        //
+        // A natively-held agent knows exactly: its turn is either in flight or
+        // it is not, so that answer is taken first. A terminal pane can only be
+        // watched, and a pane that is printing is working whatever the board
+        // says.
+        if isNativeTurnInFlight(teamName: teamName, agentName: agentName) {
+            return "running"
+        }
+        let paneIsWorking = teams[teamName]?
+            .agents.first { $0.name == agentName }?
+            .panelId
+            .map { AutoReplyPoller.shared.isPaneActive(panelId: $0) } ?? false
+        guard let task = activeTask(for: teamName, agentName: agentName) else {
+            return paneIsWorking ? "running" : "idle"
+        }
         // Phase E Wave 1: an assigned/queued task that has gone stale past the
         // threshold surfaces as `assigned_stale` so the sidebar can render an
         // amber/⏳ indicator. Daemon may also push the same label via an
@@ -5852,7 +7228,7 @@ final class TeamOrchestrator: ObservableObject {
         case "failed":
             return "error"
         case "queued", "assigned":
-            return "idle"
+            return paneIsWorking ? "running" : "idle"
         case "parked":
             return "parked"
         default:

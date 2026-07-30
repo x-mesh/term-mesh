@@ -714,4 +714,178 @@ final class RemoteHostForceDisconnectOrderTests: XCTestCase {
             ["pane-1", "pane-2"]
         )
     }
+
+}
+
+/// The leftover-shell sweep: what it counts, and what it reports when part
+/// of the batch refuses to close.
+final class PeerShellSweepTests: XCTestCase {
+
+    private func ids(_ n: Int) -> Set<Data> {
+        Set((0..<n).map { Data([UInt8($0)]) })
+    }
+
+    private struct Refused: Error {}
+
+    @MainActor
+    func test_every_target_closed_is_counted() async throws {
+        var seen: [Data] = []
+        let closed = try await TeamOrchestrator.sweepClose(
+            targets: ids(5),
+            send: { _ in },
+            onClosed: { seen.append($0) }
+        )
+        XCTAssertEqual(closed, 5)
+        XCTAssertEqual(seen.count, 5, "the completion runs once per closed shell, not per target")
+    }
+
+    /// One refusal must not strand the shells behind it — the whole point of
+    /// the sweep. Before this, the first failure aborted the batch.
+    @MainActor
+    func test_one_refusal_does_not_strand_the_rest() async throws {
+        let targets = ids(6)
+        let doomed = targets.sorted { $0.lexicographicallyPrecedes($1) }[2]
+        var attempted = 0
+        var closedIDs: [Data] = []
+
+        do {
+            _ = try await TeamOrchestrator.sweepClose(
+                targets: targets,
+                send: { id in
+                    attempted += 1
+                    if id == doomed { throw Refused() }
+                },
+                onClosed: { closedIDs.append($0) }
+            )
+            XCTFail("a refusal must surface as an error")
+        } catch let error as TeamOrchestrator.RemoteAgentError {
+            guard case .partialShellClose(let closed, let failed, _) = error else {
+                return XCTFail("expected partialShellClose, got \(error)")
+            }
+            XCTAssertEqual(closed, 5)
+            XCTAssertEqual(failed, 1)
+            XCTAssertEqual(closed + failed, targets.count, "every target is accounted for")
+        }
+
+        XCTAssertEqual(attempted, 6, "the sweep must not stop at the failure")
+        XCTAssertFalse(closedIDs.contains(doomed), "a refused shell must not be marked closed")
+    }
+
+    /// "Nothing closed" and "most of them did" have to be distinguishable —
+    /// the caller shows the count to the user.
+    @MainActor
+    func test_a_total_failure_reports_zero_closed() async throws {
+        do {
+            _ = try await TeamOrchestrator.sweepClose(
+                targets: ids(4),
+                send: { _ in throw Refused() }
+            )
+            XCTFail("expected an error")
+        } catch let error as TeamOrchestrator.RemoteAgentError {
+            guard case .partialShellClose(let closed, let failed, _) = error else {
+                return XCTFail("expected partialShellClose, got \(error)")
+            }
+            XCTAssertEqual(closed, 0)
+            XCTAssertEqual(failed, 4)
+        }
+    }
+
+    /// Only the first failure is reported. A dozen identical refusals should
+    /// not bury the one reason the user needs to read.
+    @MainActor
+    func test_the_first_failure_is_the_one_reported() async throws {
+        struct First: Error {}
+        struct Later: Error {}
+        var call = 0
+        do {
+            _ = try await TeamOrchestrator.sweepClose(
+                targets: ids(3),
+                send: { _ in
+                    call += 1
+                    throw call == 1 ? First() : Later()
+                }
+            )
+            XCTFail("expected an error")
+        } catch let error as TeamOrchestrator.RemoteAgentError {
+            guard case .partialShellClose(_, _, let reason) = error else {
+                return XCTFail("expected partialShellClose, got \(error)")
+            }
+            XCTAssertTrue(reason.contains("First"), "got \(reason)")
+        }
+    }
+
+    /// An empty batch is a no-op, not an error. `closePeerShells` reaches this
+    /// when every selected shell turned out to be protected.
+    @MainActor
+    func test_an_empty_sweep_closes_nothing_and_does_not_throw() async throws {
+        var sendCalled = false
+        let closed = try await TeamOrchestrator.sweepClose(
+            targets: [],
+            send: { _ in sendCalled = true }
+        )
+        XCTAssertEqual(closed, 0)
+        XCTAssertFalse(sendCalled)
+    }
+}
+
+/// One PTY, two windows onto it — the size arbitration between a local pane
+/// and an attached remote viewer.
+final class RemoteViewerSizeArbitrationTests: XCTestCase {
+
+    /// While both are on screen the smaller wins, so neither has to render a
+    /// line wrapped for a width it does not have.
+    ///
+    /// The loser of this arbitration does not merely look wrong: its shell
+    /// wraps at a column that is no longer the edge and keeps a cursor the
+    /// screen does not show there, which is where the next keystroke lands.
+    /// Margin, by contrast, loses nothing.
+    func test_both_on_screen_takes_the_smaller_of_the_two() {
+        let size = TerminalSurface.resolvePixelSize(
+            local: (w: 1200, h: 800),
+            remote: (w: 900, h: 1000),
+            localOnScreen: true,
+            fallback: (w: 0, h: 0)
+        )
+        XCTAssertEqual(size.w, 900, "the narrower width wins")
+        XCTAssertEqual(size.h, 800, "each dimension is decided on its own")
+    }
+
+    /// A pane parked in an unselected workspace has nobody reading it, so
+    /// there is no one to accommodate and the viewer gets what it asked for.
+    func test_a_hidden_local_pane_yields_entirely_to_the_viewer() {
+        let size = TerminalSurface.resolvePixelSize(
+            local: (w: 400, h: 300),
+            remote: (w: 1600, h: 1200),
+            localOnScreen: false,
+            fallback: (w: 0, h: 0)
+        )
+        XCTAssertEqual(size.w, 1600)
+        XCTAssertEqual(size.h, 1200)
+    }
+
+    /// With no viewer attached the local pane is unconstrained — the previous
+    /// arbitration must not linger and keep it small.
+    func test_without_a_viewer_the_local_size_stands() {
+        let size = TerminalSurface.resolvePixelSize(
+            local: (w: 1200, h: 800),
+            remote: nil,
+            localOnScreen: true,
+            fallback: (w: 10, h: 10)
+        )
+        XCTAssertEqual(size.w, 1200)
+        XCTAssertEqual(size.h, 800)
+    }
+
+    /// A viewer can attach before the local pane has ever been laid out; its
+    /// size is the only real answer available then.
+    func test_a_viewer_arriving_before_any_local_layout_is_used_as_is() {
+        let size = TerminalSurface.resolvePixelSize(
+            local: nil,
+            remote: (w: 640, h: 480),
+            localOnScreen: true,
+            fallback: (w: 10, h: 10)
+        )
+        XCTAssertEqual(size.w, 640)
+        XCTAssertEqual(size.h, 480)
+    }
 }

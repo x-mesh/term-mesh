@@ -12,25 +12,71 @@ struct AgentRolePreset: Identifiable, Codable, Equatable {
     var isBuiltIn: Bool       // built-in presets can't be deleted
 
     /// Supported CLI types for agent execution.
-    static let supportedCLIs = ["claude", "kiro", "codex", "gemini"]
+    /// The CLIs a picker may offer.
+    ///
+    /// Cursor and agy are here only when the native pane is on, and that is not
+    /// a policy choice: they have no interactive UI to host and no stdin to
+    /// type into, so a terminal pane has nothing to run. Offering them there
+    /// would be offering a pane that opens empty.
+    static var supportedCLIs: [String] {
+        let base = ["claude", "kiro", "codex", "gemini"]
+        return AgentPipeTransport.usesNativePanel ? base + ["cursor", "agy"] : base
+    }
+
+    /// Every CLI the app knows, whether or not it can be selected right now.
+    /// Settings lists paths for all of them, so a path can be set before the
+    /// option that makes it usable is turned on.
+    static let knownCLIs = ["claude", "kiro", "codex", "gemini", "cursor", "agy"]
 
     /// Built-in default models per CLI type.
     static func builtInModels(for cli: String) -> [String] {
         switch cli {
         case "claude":
-            // "opus" maps to claude-opus-4-8[1m] (Opus 4.8, 1M context).
-            return ["sonnet", "opus", "haiku"]
+            // The CLI's own alias set, which it resolves to the current model in
+            // each family — `latest_per_family` in the Claude Code binary reads
+            // fable → claude-fable-5, opus → claude-opus-5,
+            // sonnet → claude-sonnet-5, haiku → claude-haiku-4-5.
+            // Listing tiers rather than pinned ids is what keeps this from
+            // going stale on every model release.
+            return ["sonnet", "opus", "fable", "haiku"]
         case "kiro":
-            return ["sonnet", "opus", "haiku"]
-        case "codex":
+            // Tiers first (they are what the rest of the app stores), then the
+            // newest of each family kiro actually lists. `auto` is its own
+            // default — it picks per task.
             return ["sonnet", "opus", "haiku",
-                    "gpt-5.5", "gpt-5.3-codex", "gpt-5.2-codex", "gpt-5.2",
-                    "gpt-5.1-codex-max", "gpt-5.1-codex-mini"]
+                    "auto", "claude-opus-5", "claude-sonnet-5", "claude-haiku-4.5",
+                    "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"]
+        case "codex":
+            // From the CLI's own catalog (`~/.codex/models_cache.json`), in its
+            // priority order. Excludes the two entries it will not run from a
+            // `--model` flag: gpt-5.3-codex-spark (`supported_in_api: false`)
+            // and codex-auto-review (`visibility: hide`).
+            return ["sonnet", "opus", "haiku",
+                    "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna",
+                    "gpt-5.5", "gpt-5.4", "gpt-5.4-mini"]
         case "gemini":
             return ["sonnet", "opus", "haiku",
                     "gemini-3.1-pro-preview", "gemini-3-flash-preview",
                     "gemini-3.1-flash-lite-preview",
                     "gemini-2.5-pro", "gemini-2.5-flash", "gemini-2.5-flash-lite"]
+        case "cursor":
+            // The newest of each family cursor lists. Claude's tiers are absent
+            // because cursor does not know them, and a tier passed through was
+            // measured ending a turn in silence on the CLI that behaves the
+            // same way. Cursor spells effort into the id rather than taking a
+            // separate flag, so each entry names one — `high` is its own label
+            // for the unqualified model ("Opus 5 1M"), not an escalation.
+            return ["auto",
+                    "claude-opus-5-thinking-high", "claude-sonnet-5-thinking-high",
+                    "claude-fable-5-thinking-high",
+                    "gpt-5.6-sol-high", "gpt-5.6-terra-high", "gpt-5.6-luna-high",
+                    "composer-2.5", "gemini-3.1-pro"]
+        case "agy":
+            // The newest of each family agy lists. Like cursor it carries the
+            // reasoning level in the id.
+            return ["gemini-3.1-pro-high", "gemini-3.6-flash-high",
+                    "claude-opus-4-6-thinking", "claude-sonnet-4-6",
+                    "gpt-oss-120b-medium"]
         default:
             return ["sonnet", "opus", "haiku"]
         }
@@ -39,12 +85,23 @@ struct AgentRolePreset: Identifiable, Codable, Equatable {
     /// User-facing label for a model in a given CLI context.
     /// Internal storage may use tier names ("opus"/"sonnet"/"haiku") for cross-CLI uniformity,
     /// but UI shows CLI-native text.
+    ///
+    /// These name the model each tier resolves to today. They are the one place
+    /// a version number is still written down, and only as text — the launch
+    /// path passes the tier through, so a label left behind by a release is
+    /// wrong in the picker and nowhere else.
     static func modelDisplayLabel(_ model: String, for cli: String) -> String {
         switch (cli.lowercased(), model.lowercased()) {
-        case ("claude", "opus"):  return "Opus 4.8 (1M context)"
-        case ("codex", "opus"):   return "gpt-5.5 (high)"
-        case ("codex", "sonnet"): return "gpt-5.5 (medium)"
-        case ("codex", "haiku"):  return "gpt-5.5 (low)"
+        case ("claude", "fable"):  return "Fable 5"
+        case ("claude", "opus"):   return "Opus 5"
+        case ("claude", "sonnet"): return "Sonnet 5"
+        case ("claude", "haiku"):  return "Haiku 4.5"
+        case ("codex", "opus"):   return "gpt-5.6-sol (high)"
+        case ("codex", "sonnet"): return "gpt-5.6-sol (medium)"
+        case ("codex", "haiku"):  return "gpt-5.6-sol (low)"
+        case ("kiro", "opus"):   return "claude-opus-5"
+        case ("kiro", "sonnet"): return "claude-sonnet-5"
+        case ("kiro", "haiku"):  return "claude-haiku-4.5"
         case ("gemini", "opus"):   return "gemini-3.1-pro-preview"
         case ("gemini", "sonnet"): return "gemini-3-flash-preview"
         case ("gemini", "haiku"):  return "gemini-3.1-flash-lite-preview"
@@ -63,8 +120,11 @@ struct AgentRolePreset: Identifiable, Codable, Equatable {
     /// Default model for a given CLI.
     static func defaultModel(for cli: String) -> String {
         switch cli {
-        case "codex":  return "gpt-5.5"
+        case "codex":  return "gpt-5.6-sol"
         case "gemini": return "gemini-3.1-pro-preview"
+        // Empty means "do not pass --model", which is what both were measured
+        // working with. A claude tier would be a name neither recognises.
+        case "cursor", "agy": return ""
         default:       return "sonnet"
         }
     }
@@ -1048,6 +1108,11 @@ struct SavedTeamTemplate: Identifiable, Codable, Equatable {
         var cli: String             // "claude", "kiro", "codex", or "gemini"
         var model: String
         var customInstructions: String
+        /// The peer this member runs on, or nil for this machine. Optional so
+        /// templates saved before mixed teams existed still decode.
+        var hostKey: String?
+        /// Where on that machine, when it is not this one.
+        var hostDirectory: String?
     }
 
     init(id: UUID = UUID(), name: String, leaderMode: String = "repl", agents: [AgentSlot]) {
@@ -1071,7 +1136,35 @@ class SavedTeamTemplateManager: ObservableObject {
         return dir.appendingPathComponent("team-templates.json")
     }()
 
-    init() { load() }
+    init() {
+        load()
+        if templates.isEmpty {
+            templates = Self.builtInTemplates
+            save()
+        }
+    }
+
+    /// What a project gets when nobody has said otherwise.
+    ///
+    /// The list started empty, which made "choose a team" a choice between
+    /// nothing and nothing — and a new project inert, since every action on
+    /// one needs a team. A default is the whole point of offering the choice:
+    /// one executor on the CLI and model this app uses everywhere else, which
+    /// is what almost every project wants and what anyone wanting more will
+    /// edit rather than invent.
+    static let builtInTemplates: [SavedTeamTemplate] = [
+        SavedTeamTemplate(
+            name: "Default",
+            agents: [
+                SavedTeamTemplate.AgentSlot(
+                    roleName: "executor",
+                    cli: "claude",
+                    model: "sonnet",
+                    customInstructions: ""
+                )
+            ]
+        )
+    ]
 
     func save() {
         if let data = try? JSONEncoder().encode(templates) {
@@ -1577,6 +1670,45 @@ class TeamTemplateManager: ObservableObject {
         return customId
     }
 
+    /// Create a complete Smart preset in one write.
+    ///
+    /// New Project uses this instead of creating a blank and patching it in a
+    /// second step so cancelling or crashing cannot leave an abandoned entry
+    /// in the preset catalog.
+    @discardableResult
+    func createSmartPreset(
+        name: String,
+        leaderMode: String,
+        leaderModel: String?,
+        agents: [ProviderPreference]
+    ) -> TemplateID {
+        let displayName = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        let customId = TemplateID(
+            category: .smart,
+            slug: nextAvailableSlug(category: .smart, base: displayName.isEmpty ? "new-preset" : displayName)
+        )
+        let preset = SmartTeamPreset(
+            id: customId.slug,
+            name: displayName,
+            icon: "person.3",
+            description: "\(agents.count) agent\(agents.count == 1 ? "" : "s")",
+            leaderMode: leaderMode,
+            leaderModel: leaderModel,
+            resolutionMode: .exact,
+            agents: agents
+        )
+        store.customs.append(TeamTemplate(
+            id: customId,
+            origin: .custom,
+            name: displayName,
+            payload: .smart(preset)
+        ))
+        store.lastSelectedId = customId
+        save()
+        rebuildTemplates()
+        return customId
+    }
+
     func deleteCustom(id: TemplateID) throws {
         guard let index = store.customs.firstIndex(where: { $0.id == id && $0.origin == .custom }) else {
             throw TeamTemplateManagerError.customNotFound(id)
@@ -1600,6 +1732,18 @@ class TeamTemplateManager: ObservableObject {
         store.customs[index] = template
         save()
         rebuildTemplates()
+    }
+
+    func renameCustom(id: TemplateID, name: String) throws {
+        let displayName = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !displayName.isEmpty else { return }
+        try updateCustom(id: id) { template in
+            template.name = displayName
+            if case .smart(var preset) = template.payload {
+                preset.name = displayName
+                template.payload = .smart(preset)
+            }
+        }
     }
 
     func pin(id: TemplateID) throws {
@@ -1874,7 +2018,7 @@ class ProviderDetector: ObservableObject {
 
     @Published private(set) var available: Set<String> = ["claude"]
 
-    static let allCLIs = ["claude", "codex", "gemini", "kiro"]
+    static let allCLIs = ["claude", "codex", "gemini", "kiro", "cursor", "agy"]
 
     private static let searchPaths: [String: [String]] = {
         let home = NSHomeDirectory()
@@ -1907,6 +2051,18 @@ class ProviderDetector: ObservableObject {
                 (home as NSString).appendingPathComponent(".local/bin/kiro-cli"),
                 "/usr/local/bin/kiro-cli",
                 "/opt/homebrew/bin/kiro-cli",
+            ],
+            // The binary is `cursor-agent`, not `cursor` — the latter is the
+            // editor.
+            "cursor": [
+                (home as NSString).appendingPathComponent(".local/bin/cursor-agent"),
+                "/usr/local/bin/cursor-agent",
+                "/opt/homebrew/bin/cursor-agent",
+            ],
+            "agy": [
+                (home as NSString).appendingPathComponent(".local/bin/agy"),
+                "/usr/local/bin/agy",
+                "/opt/homebrew/bin/agy",
             ],
         ]
     }()
@@ -1961,6 +2117,14 @@ struct ProviderPreference: Codable, Equatable {
     var fallbackCli: String
     var fallbackModel: String?  // nil = use CLI default
     var reason: String          // why this provider is optimal for this role
+    /// Optional so schema-1 built-ins and existing user presets continue to
+    /// decode. Placement is deliberately not part of a team preset.
+    var customInstructions: String? = nil
+}
+
+enum SmartPresetResolutionMode: String, Codable {
+    case smart
+    case exact
 }
 
 /// Resolved agent slot after provider detection.
@@ -1970,6 +2134,7 @@ struct ResolvedAgent {
     let model: String
     let status: Status
     let reason: String
+    let customInstructions: String
 
     enum Status: Equatable {
         case normal                     // primary == fallback (no badge)
@@ -1985,7 +2150,34 @@ struct SmartTeamPreset: Identifiable, Codable, Equatable {
     var icon: String
     var description: String
     var leaderMode: String
+    /// The leader model was not part of schema 1. nil means the CLI default.
+    var leaderModel: String? = nil
+    /// Legacy presets and customized built-ins omit this and retain provider
+    /// fallback behavior. New Project snapshots opt into exact restoration.
+    var resolutionMode: SmartPresetResolutionMode? = nil
     var agents: [ProviderPreference]
+
+    var usesExactResolution: Bool {
+        resolutionMode == .exact
+    }
+
+    /// Restore an exact snapshot without provider substitution.
+    ///
+    /// If a selected CLI is missing, the form still shows what was saved so the
+    /// user can install it or edit it. Provider-aware presets continue to use
+    /// `resolve(with:)`.
+    func resolveExactly() -> [ResolvedAgent] {
+        agents.map { pref in
+            ResolvedAgent(
+                role: pref.role,
+                cli: pref.primaryCli,
+                model: pref.primaryModel ?? AgentRolePreset.defaultModel(for: pref.primaryCli),
+                status: .normal,
+                reason: pref.reason,
+                customInstructions: pref.customInstructions ?? ""
+            )
+        }
+    }
 
     /// Resolve all agent slots against detected providers.
     func resolve(with detector: ProviderDetector) -> [ResolvedAgent] {
@@ -2009,7 +2201,8 @@ struct SmartTeamPreset: Identifiable, Codable, Equatable {
 
             return ResolvedAgent(
                 role: pref.role, cli: usedCli, model: usedModel,
-                status: status, reason: pref.reason
+                status: status, reason: pref.reason,
+                customInstructions: pref.customInstructions ?? ""
             )
         }
     }

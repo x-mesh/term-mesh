@@ -273,6 +273,12 @@ final class TerminalSurface: Identifiable, ObservableObject {
     private let surfaceView: GhosttyNSView
     private var lastPixelWidth: UInt32 = 0
     private var lastPixelHeight: UInt32 = 0
+    /// What the local pane's own layout last asked for, kept even when a
+    /// viewer is currently winning, so the surface can return to it the moment
+    /// the viewer detaches.
+    private var localPixelSize: (w: UInt32, h: UInt32)?
+    /// What an attached remote viewer asked for, nil when nobody is attached.
+    private var remoteViewerPixelSize: (w: UInt32, h: UInt32)?
     private var lastXScale: CGFloat = 0
     private var lastYScale: CGFloat = 0
     private var pendingTextQueue: [Data] = []
@@ -977,11 +983,13 @@ final class TerminalSurface: Identifiable, ObservableObject {
         let hpx = pixelDimension(from: resolvedBackingHeight)
         guard wpx > 0, hpx > 0 else { return }
 
+        localPixelSize = (wpx, hpx)
+        let resolved = resolvedPixelSize()
         let scaleChanged = !scaleApproximatelyEqual(xScale, lastXScale) || !scaleApproximatelyEqual(yScale, lastYScale)
-        let sizeChanged = wpx != lastPixelWidth || hpx != lastPixelHeight
+        let sizeChanged = resolved.w != lastPixelWidth || resolved.h != lastPixelHeight
 
         #if DEBUG
-        Self.sizeLog("updateSize-call surface=\(id.uuidString.prefix(8)) size=\(wpx)x\(hpx) prev=\(lastPixelWidth)x\(lastPixelHeight) changed=\((scaleChanged || sizeChanged) ? 1 : 0)")
+        Self.sizeLog("updateSize-call surface=\(id.uuidString.prefix(8)) size=\(resolved.w)x\(resolved.h) prev=\(lastPixelWidth)x\(lastPixelHeight) changed=\((scaleChanged || sizeChanged) ? 1 : 0)")
         #endif
 
         guard scaleChanged || sizeChanged else { return }
@@ -989,7 +997,7 @@ final class TerminalSurface: Identifiable, ObservableObject {
         #if DEBUG
         if sizeChanged {
             let win = attachedView?.window != nil ? "1" : "0"
-            Self.sizeLog("updateSize surface=\(id.uuidString.prefix(8)) size=\(wpx)x\(hpx) prev=\(lastPixelWidth)x\(lastPixelHeight) win=\(win)")
+            Self.sizeLog("updateSize surface=\(id.uuidString.prefix(8)) size=\(resolved.w)x\(resolved.h) prev=\(lastPixelWidth)x\(lastPixelHeight) win=\(win)")
         }
         #endif
 
@@ -1000,12 +1008,96 @@ final class TerminalSurface: Identifiable, ObservableObject {
         }
 
         if sizeChanged {
-            ghostty_surface_set_size(surface, wpx, hpx)
-            lastPixelWidth = wpx
-            lastPixelHeight = hpx
+            applyResolvedSize(resolved, to: surface)
         }
 
         // Let Ghostty continue rendering on its own wakeups for steady-state frames.
+    }
+
+    /// Adopt the size a remote viewer asked for. Returns whether the surface
+    /// actually changed, which the caller needs: a viewer only has to be sent
+    /// a fresh screen when it did.
+    ///
+    /// Routed through here rather than calling `ghostty_surface_set_size`
+    /// directly so the local pane's cache stays true. When the two paths each
+    /// set the size behind the other's back, `updateSize` compares against a
+    /// value the surface no longer has, concludes nothing changed, and the
+    /// two views drift apart silently.
+    @discardableResult
+    func applyRemoteViewerPixelSize(width: UInt32, height: UInt32) -> Bool {
+        guard let surface = surface, width > 0, height > 0 else { return false }
+        remoteViewerPixelSize = (width, height)
+        let resolved = resolvedPixelSize()
+        guard resolved.w != lastPixelWidth || resolved.h != lastPixelHeight else { return false }
+        #if DEBUG
+        Self.sizeLog(
+            "viewerSize surface=\(id.uuidString.prefix(8)) asked=\(width)x\(height) "
+                + "resolved=\(resolved.w)x\(resolved.h) prev=\(lastPixelWidth)x\(lastPixelHeight) "
+                + "localOnScreen=\(isLocallyOnScreen ? 1 : 0)"
+        )
+        #endif
+        applyResolvedSize(resolved, to: surface)
+        return true
+    }
+
+    /// The viewer is gone; the local pane gets its own size back.
+    func clearRemoteViewerPixelSize() {
+        guard remoteViewerPixelSize != nil else { return }
+        remoteViewerPixelSize = nil
+        guard let surface = surface else { return }
+        let resolved = resolvedPixelSize()
+        guard resolved.w != lastPixelWidth || resolved.h != lastPixelHeight else { return }
+        applyResolvedSize(resolved, to: surface)
+    }
+
+    private func applyResolvedSize(_ size: (w: UInt32, h: UInt32), to surface: ghostty_surface_t) {
+        ghostty_surface_set_size(surface, size.w, size.h)
+        lastPixelWidth = size.w
+        lastPixelHeight = size.h
+    }
+
+    /// One PTY, two windows onto it — so one size has to win.
+    ///
+    /// Whoever loses renders a grid that does not match what the shell drew
+    /// into it: lines wrapped at a column that is no longer the edge, and a
+    /// cursor the shell believes is somewhere the screen does not show. That
+    /// last part is not cosmetic — it is where the next typed character
+    /// lands, which is how a keystroke ends up in the middle of the prompt.
+    ///
+    /// So the smaller of the two wins while both are on screen. A short line
+    /// never has to be re-wrapped to fit a narrow grid; it just leaves margin,
+    /// and margin is the one failure mode here that loses nothing. When the
+    /// local pane is not on screen there is nobody to shortchange, and the
+    /// viewer gets exactly what it asked for.
+    private func resolvedPixelSize() -> (w: UInt32, h: UInt32) {
+        Self.resolvePixelSize(
+            local: localPixelSize,
+            remote: remoteViewerPixelSize,
+            localOnScreen: isLocallyOnScreen,
+            fallback: (lastPixelWidth, lastPixelHeight)
+        )
+    }
+
+    /// The rule itself, separated from the surface so it can be tested
+    /// without one.
+    static func resolvePixelSize(
+        local: (w: UInt32, h: UInt32)?,
+        remote: (w: UInt32, h: UInt32)?,
+        localOnScreen: Bool,
+        fallback: (w: UInt32, h: UInt32)
+    ) -> (w: UInt32, h: UInt32) {
+        guard let remote else { return local ?? fallback }
+        guard let local, localOnScreen else { return remote }
+        return (min(local.w, remote.w), min(local.h, remote.h))
+    }
+
+    /// Whether a person could actually be looking at the local pane. A pane
+    /// parked in an unselected workspace has a view but no window, and one
+    /// hidden behind a portal swap is marked not-visible; neither is somebody
+    /// whose reading the viewer has to accommodate.
+    private var isLocallyOnScreen: Bool {
+        guard let view = attachedView else { return false }
+        return view.isVisibleInUI && view.window != nil
     }
 
     /// Force a full size recalculation and surface redraw.
@@ -1365,6 +1457,7 @@ final class TerminalSurface: Identifiable, ObservableObject {
     /// Marked @atomic via NSLock for strict ordering on weakly-ordered hosts.
     private var _hasReceivedPtyOutput: Bool = false
     private var _ptyOutputFirstAt: TimeInterval = 0
+    private var _ptyOutputLastAt: TimeInterval = 0
     private var _ptyOutputTotalBytes: Int = 0
     private let ptyOutputLock = NSLock()
     var hasReceivedPtyOutput: Bool {
@@ -1387,12 +1480,22 @@ final class TerminalSurface: Identifiable, ObservableObject {
         ptyOutputLock.lock(); defer { ptyOutputLock.unlock() }
         return _ptyOutputTotalBytes
     }
+    /// How long the pty has been silent, in seconds. A TUI that has finished
+    /// painting its startup screen and is sitting at its prompt stops writing;
+    /// one still booting does not. Returns nil before any output.
+    var ptyOutputQuietFor: TimeInterval? {
+        ptyOutputLock.lock(); defer { ptyOutputLock.unlock() }
+        guard _hasReceivedPtyOutput else { return nil }
+        return ProcessInfo.processInfo.systemUptime - _ptyOutputLastAt
+    }
     fileprivate func recordPtyOutput(byteCount: Int) {
         ptyOutputLock.lock(); defer { ptyOutputLock.unlock() }
+        let now = ProcessInfo.processInfo.systemUptime
         if !_hasReceivedPtyOutput {
             _hasReceivedPtyOutput = true
-            _ptyOutputFirstAt = ProcessInfo.processInfo.systemUptime
+            _ptyOutputFirstAt = now
         }
+        _ptyOutputLastAt = now
         _ptyOutputTotalBytes &+= byteCount
     }
     private static let maxPasteQueueDepth = 16
@@ -1535,12 +1638,39 @@ final class TerminalSurface: Identifiable, ObservableObject {
         // Cadence: 100 ms polls, capped at 40 attempts (~4 s) so a silent
         // startup doesn't deadlock paste forever — but the cap is rare;
         // typical Claude/Codex hits 500 bytes well within 1.5 s.
+        // Fourth condition: the pty has gone quiet. Age and bytes both measure
+        // that a TUI *started* talking, and Claude Code clears both within a
+        // second or so of launch — its banner streams immediately while the
+        // composer is still coming up. Pasting into that window put the text
+        // in the prompt and let the Return fall on the floor: ghostty reports
+        // the key as handled, so every retry below sees success while nothing
+        // was submitted. A TUI that has finished painting and is waiting on
+        // input stops writing, and that silence is the part that actually
+        // means ready.
+        // The byte threshold assumes a CLI booting into this pane: Claude
+        // streams a banner over several hundred bytes before its stdin reader
+        // is up, so "a lot has been printed and then it stopped" is what ready
+        // looks like. A pane attached to a shell that is ALREADY running —
+        // every peer agent pane — never looks like that. It prints one prompt,
+        // about 170 bytes, and waits, which is as ready as anything gets. The
+        // gate could only ever time out on it, and a paste that goes out on a
+        // timer rather than a signal is the enter-swallow this exists to
+        // prevent, just with the odds moved.
+        //
+        // So a long enough silence stands in for the volume. It cannot fire
+        // early on a booting CLI that is mid-banner, because mid-banner is not
+        // silent; and it is still well inside the deferral cap, so the worst
+        // it can do is send what the cap would have sent anyway, sooner.
         let coldSettleSeconds: TimeInterval = 1.5
         let coldByteThreshold = 500
+        let coldQuietSeconds: TimeInterval = 0.6
+        let coldQuietStandsInAfter: TimeInterval = 2.0
         let coldDeferCap = 40
         let coldReady: Bool = {
             guard let age = ptyOutputAge else { return false }
-            return age >= coldSettleSeconds && ptyOutputBytes >= coldByteThreshold
+            guard let quiet = ptyOutputQuietFor else { return false }
+            guard age >= coldSettleSeconds, quiet >= coldQuietSeconds else { return false }
+            return ptyOutputBytes >= coldByteThreshold || quiet >= coldQuietStandsInAfter
         }()
         if !hasCompletedPaste, !coldReady, p.tuiReadyDeferCount < coldDeferCap {
             pasteInFlight = false  // unlock the queue so drain can re-enter
@@ -1563,9 +1693,9 @@ final class TerminalSurface: Identifiable, ObservableObject {
             let ageMs = (ptyOutputAge ?? 0) * 1000
             let bytes = ptyOutputBytes
             if coldReady {
-                dlog("paste.cold.ready panel=\(id.uuidString.prefix(8)) defers=\(p.tuiReadyDeferCount) ptyAgeMs=\(Int(ageMs)) ptyBytes=\(bytes) textLen=\(p.text.count)")
+                dlog("paste.cold.ready panel=\(id.uuidString.prefix(8)) defers=\(p.tuiReadyDeferCount) ptyAgeMs=\(Int(ageMs)) ptyBytes=\(bytes) quietMs=\(Int((ptyOutputQuietFor ?? 0) * 1000)) textLen=\(p.text.count)")
             } else {
-                dlog("paste.cold.fallback panel=\(id.uuidString.prefix(8)) defers=\(p.tuiReadyDeferCount) ptyAgeMs=\(Int(ageMs)) ptyBytes=\(bytes) textLen=\(p.text.count) (deadline reached, proceeding)")
+                dlog("paste.cold.fallback panel=\(id.uuidString.prefix(8)) defers=\(p.tuiReadyDeferCount) ptyAgeMs=\(Int(ageMs)) ptyBytes=\(bytes) quietMs=\(Int((ptyOutputQuietFor ?? 0) * 1000)) textLen=\(p.text.count) (deadline reached, proceeding)")
             }
         }
         #endif
@@ -1833,6 +1963,28 @@ final class TerminalSurface: Identifiable, ObservableObject {
         return action.withCString { cString in
             ghostty_surface_binding_action(surface, cString, UInt(strlen(cString)))
         }
+    }
+
+    /// Put a terminal left in a program's modes back to a plain one.
+    ///
+    /// A TUI turns on mouse reporting, the alternate screen and bracketed
+    /// paste, and turns them off again when it exits. A program that does not
+    /// exit — a crash, a `kill -9`, a link dropped mid-run — never gets to ask,
+    /// and the request stands. What is left on a peer pane is a plain shell at
+    /// the far end and a terminal here still reporting: every movement of the
+    /// pointer across the pane is sent over as `ESC [ < 35;47;44M`, the far
+    /// shell's line editor swallows the escape it does not know and keeps the
+    /// digits, and a mouse dragged across the pane arrives there as commands.
+    /// `35: command not found`, once per sample, for as long as it is stuck.
+    ///
+    /// The modes are held *here*, so this is a local repair — nothing is sent
+    /// to the far end, which has its own state and is not the thing that is
+    /// wrong. Ghostty's own action, the one behind the `reset` command: it
+    /// clears the mode set along with the screen, which is what makes it safe
+    /// to run more than once.
+    @discardableResult
+    func resetTerminal() -> Bool {
+        performBindingAction("reset")
     }
 
     func hasSelection() -> Bool {

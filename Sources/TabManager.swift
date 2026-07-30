@@ -318,13 +318,6 @@ class TabManager: ObservableObject {
             environment: environment
         )
 
-        // term-mesh: Auto-watch the working directory for file heatmap
-        if let cwd = workingDirectory, !cwd.isEmpty {
-            DispatchQueue.global(qos: .utility).async {
-                self.daemon.watchPath(cwd)
-            }
-        }
-
         // term-mesh: Async worktree setup — creates worktree sandbox without blocking UI
         if worktreeEnabled, let cwd = worktreeCwd {
             let daemon = self.daemon

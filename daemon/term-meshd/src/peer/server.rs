@@ -17,7 +17,54 @@ use super::persist;
 use super::surface::PtyManager;
 use crate::supervisor::{shutdown_supervised, spawn_supervised};
 
-const MAX_PEER_CONNECTIONS: usize = 16;
+/// Default ceiling on concurrent peer-federation connections.
+///
+/// This is not a pane limit, but it behaves like one: every attached pane
+/// holds a connection for its whole lifetime, and workspace mirrors,
+/// consoles and short-lived surface probes draw from the same pool. So the
+/// real number of panes a client can hold open on this host is this value
+/// minus whatever else it has connected.
+///
+/// 16 was low enough to be reached in ordinary use — a workspace with a
+/// dozen remote panes could not open one more connection, which broke the
+/// shell-cleanup sweep at exactly the moment a crowded host needed it.
+/// The cap still exists to bound what a single client can make the daemon
+/// hold; it is not meant to be a limit anyone reaches by working normally.
+///
+/// Override at startup with `TERMMESH_PEER_MAX_CONNECTIONS`.
+const DEFAULT_MAX_PEER_CONNECTIONS: usize = 64;
+
+/// The configured connection ceiling. Read once at accept-loop start:
+/// the semaphore is sized from it, so a later change to the environment
+/// would not be honoured anyway.
+///
+/// A malformed or zero value falls back to the default rather than
+/// refusing to boot — a host that comes up with the wrong ceiling is far
+/// easier to notice and correct than one that does not come up at all.
+fn max_peer_connections() -> usize {
+    parse_max_peer_connections(std::env::var(MAX_CONNECTIONS_VAR).ok().as_deref())
+}
+
+const MAX_CONNECTIONS_VAR: &str = "TERMMESH_PEER_MAX_CONNECTIONS";
+
+/// Split from `max_peer_connections` so the parse is testable without
+/// mutating process-wide environment from a test that runs in parallel
+/// with every other test in this module.
+fn parse_max_peer_connections(raw: Option<&str>) -> usize {
+    let Some(raw) = raw else {
+        return DEFAULT_MAX_PEER_CONNECTIONS;
+    };
+    match raw.trim().parse::<usize>() {
+        Ok(value) if value > 0 => value,
+        _ => {
+            tracing::warn!(
+                "{MAX_CONNECTIONS_VAR}={raw:?} is not a positive integer; \
+                 using {DEFAULT_MAX_PEER_CONNECTIONS}"
+            );
+            DEFAULT_MAX_PEER_CONNECTIONS
+        }
+    }
+}
 
 /// Production entry point (the only caller is `main.rs`). Unlike
 /// `serve_with_manager` (used throughout this module's own tests, and by
@@ -32,6 +79,8 @@ pub async fn serve(
     path: PathBuf,
     shutdown_rx: watch::Receiver<bool>,
     monitor_rx: watch::Receiver<Option<crate::monitor::SystemSnapshot>>,
+    teams: Arc<tokio::sync::Mutex<crate::headless::HeadlessManager>>,
+    agents: Arc<crate::agent::AgentSessionManager>,
 ) -> anyhow::Result<()> {
     let manager = Arc::new(PtyManager::new());
     manager.spawn_from_config();
@@ -39,6 +88,7 @@ pub async fn serve(
     let default_name_fallback = connection::hostname_or(DAEMON_WORKSPACE);
     let entries = persist::boot(&workspaces_path, &default_name_fallback);
     let host = Arc::new(PeerHost::with_workspaces(manager, entries));
+    super::install_remote_leader_router(&host.clients);
     // Restored non-default workspaces come back with an empty tree
     // (only {id, name} is persisted — shells are daemon children). Seed
     // each a first pane so every workspace is immediately attachable,
@@ -51,6 +101,13 @@ pub async fn serve(
     // Only the daemon has a monitor; the test/embedder constructors below
     // leave the host without one and simply never push HostStats.
     host.set_monitor(monitor_rx);
+    // Only the daemon has agent teams; without this the host answers no
+    // ListTeams and never advertises team.roster.v1.
+    host.set_teams(teams);
+    // And the task board, which is what `team.task.diff` reads a worktree path
+    // out of. Wired here for the same reason as the manager above: only the
+    // daemon has one, and a host without it says so rather than guessing.
+    host.set_agents(agents);
     serve_with_host(path, shutdown_rx, host).await
 }
 
@@ -82,6 +139,7 @@ async fn serve_with_host(
     mut shutdown_rx: watch::Receiver<bool>,
     host: Arc<PeerHost>,
 ) -> anyhow::Result<()> {
+    super::install_remote_leader_router(&host.clients);
     if path.exists() {
         std::fs::remove_file(&path)?;
     }
@@ -98,7 +156,9 @@ async fn serve_with_host(
     let listener = bind_with_tight_umask(&path)?;
     harden_socket_permissions(&path);
     tracing::info!("peer-federation listening on {}", path.display());
-    let connection_permits = Arc::new(Semaphore::new(MAX_PEER_CONNECTIONS));
+    let max_connections = max_peer_connections();
+    tracing::info!("peer-federation connection ceiling: {max_connections}");
+    let connection_permits = Arc::new(Semaphore::new(max_connections));
     let owner_uid = current_uid();
     let mut connection_tasks = JoinSet::new();
 
@@ -120,7 +180,15 @@ async fn serve_with_host(
                             continue;
                         }
                         let Ok(permit) = connection_permits.clone().try_acquire_owned() else {
-                            tracing::warn!("peer connection limit reached; closing new client");
+                            // Name the ceiling and the way out. The client
+                            // sees only its handshake read returning EOF,
+                            // which is indistinguishable from a dead host —
+                            // this line is the sole record of the real cause.
+                            tracing::warn!(
+                                "peer connection limit reached ({max_connections}); \
+                                 closing new client — raise {MAX_CONNECTIONS_VAR} \
+                                 to allow more"
+                            );
                             drop(stream);
                             continue;
                         };
@@ -371,6 +439,100 @@ fn peer_uid_matches(_stream: &tokio::net::UnixStream, _expected_uid: u32) -> boo
 #[cfg(test)]
 mod integration_tests {
     use super::*;
+
+    /// A ceiling read from the environment, and the reasons to ignore one.
+    ///
+    /// Zero is rejected rather than honoured: a semaphore with no permits
+    /// refuses every client, so a host booted that way would look exactly
+    /// like a host that is down, with nothing to distinguish the two.
+    #[test]
+    fn connection_ceiling_falls_back_on_anything_unusable() {
+        assert_eq!(parse_max_peer_connections(Some("128")), 128);
+        assert_eq!(parse_max_peer_connections(Some("  128  ")), 128);
+        for unusable in [None, Some(""), Some("0"), Some("-1"), Some("many")] {
+            assert_eq!(
+                parse_max_peer_connections(unusable),
+                DEFAULT_MAX_PEER_CONNECTIONS,
+                "expected fallback for {unusable:?}"
+            );
+        }
+    }
+    /// A surface the host made on request goes away once nobody holds it, and
+    /// one the operator declared does not.
+    ///
+    /// The distinction is the whole point: a spawned shell exists for whoever
+    /// asked, and when their app dies nothing else refers to it — that is how
+    /// a machine ends up carrying login shells days old, one per crash. A
+    /// declared surface is published for anyone, and an empty one is idle.
+    #[tokio::test]
+    async fn reaps_a_spawned_surface_once_nobody_is_attached() {
+        std::env::set_var("TERMMESH_PEER_ABANDONED_GRACE_MS", "150");
+        let manager = Arc::new(crate::peer::surface::PtyManager::new());
+        let declared = b"declared-surface".to_vec();
+        let spawned = b"spawned-surface".to_vec();
+        let spec = |title: &str| crate::peer::surface::SpawnSpec {
+            title: title.into(),
+            command: "/bin/cat".into(),
+            args: vec![],
+            cols: 80,
+            rows: 24,
+            cwd: None,
+        };
+        manager.register_and_spawn(declared.clone(), spec("declared"));
+        manager.register_and_spawn_ephemeral(spawned.clone(), spec("spawned"));
+        let host = Arc::new(PeerHost::new(manager.clone()));
+
+        for id in [&declared, &spawned] {
+            manager.note_attached(id);
+            assert_eq!(manager.note_detached(id), 0);
+            crate::peer::connection::reap_if_abandoned(&host, id);
+        }
+
+        tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+        let alive = |id: &[u8]| manager.list().iter().any(|s| s.surface_id == id);
+        assert!(
+            alive(&declared),
+            "a declared surface is the operator's, not ours to reclaim"
+        );
+        assert!(
+            !alive(&spawned),
+            "a surface we asked the host to make must not outlive the asking"
+        );
+        std::env::remove_var("TERMMESH_PEER_ABANDONED_GRACE_MS");
+    }
+
+    /// Detaching is not leaving for good. A client that comes back inside the
+    /// grace — a dropped link, a restart — finds its pane still there.
+    #[tokio::test]
+    async fn a_reconnect_inside_the_grace_saves_the_surface() {
+        std::env::set_var("TERMMESH_PEER_ABANDONED_GRACE_MS", "300");
+        let manager = Arc::new(crate::peer::surface::PtyManager::new());
+        let sid = b"rejoined-surface".to_vec();
+        manager.register_and_spawn_ephemeral(
+            sid.clone(),
+            crate::peer::surface::SpawnSpec {
+                title: "rejoined".into(),
+                command: "/bin/cat".into(),
+                args: vec![],
+                cols: 80,
+                rows: 24,
+                cwd: None,
+            },
+        );
+        let host = Arc::new(PeerHost::new(manager.clone()));
+        manager.note_attached(&sid);
+        assert_eq!(manager.note_detached(&sid), 0);
+        crate::peer::connection::reap_if_abandoned(&host, &sid);
+        manager.note_attached(&sid);
+
+        tokio::time::sleep(std::time::Duration::from_millis(700)).await;
+        assert!(
+            manager.list().iter().any(|s| s.surface_id == sid),
+            "a reconnect inside the grace must cancel the reap"
+        );
+        std::env::remove_var("TERMMESH_PEER_ABANDONED_GRACE_MS");
+    }
+
     use peer_proto::v1::envelope::Payload;
     use peer_proto::v1::{
         AttachMode, AttachSurface, Auth, Envelope, Hello, Input, ListSurfaces, ScrollbackRequest,
@@ -406,6 +568,634 @@ mod integration_tests {
     /// Attach to a long-lived `/bin/cat` PTY; send keystrokes as Input and
     /// verify they come back through PtyData. This exercises the full
     /// bidirectional path plus AsyncFd's cancellation behavior at test end.
+    /// team.call.v1 over the real wire: the allow-list refuses lifecycle,
+    /// the shared vocabulary translates to headless terms, and a method that
+    /// is allowed but not a single daemon op is reported honestly.
+    #[tokio::test]
+    async fn team_call_enforces_allow_list_and_translates_over_the_wire() {
+        let tmp = TempDir::new().unwrap();
+        let sock_path = tmp.path().join("peer.sock");
+
+        let manager = cat_manager();
+        let host = Arc::new(PeerHost::new(manager));
+        let teams = Arc::new(tokio::sync::Mutex::new(
+            crate::headless::HeadlessManager::new(),
+        ));
+        teams
+            .lock()
+            .await
+            .insert_team_for_tests("remote-demo", "uuid-1", "/root/demo", vec![]);
+        host.set_teams(teams);
+
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let sock_path_task = sock_path.clone();
+        let host_task = host.clone();
+        let server_task = tokio::spawn(async move {
+            serve_with_host(sock_path_task, shutdown_rx, host_task)
+                .await
+                .unwrap();
+        });
+        for _ in 0..50 {
+            if sock_path.exists() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+
+        let stream = UnixStream::connect(&sock_path).await.unwrap();
+        let (mut reader, mut writer) = stream.into_split();
+        write_envelope(
+            &mut writer,
+            &Envelope {
+                seq: 1,
+                correlation_id: 0,
+                payload: Some(Payload::Hello(Hello {
+                    protocol_version: PROTOCOL_VERSION.into(),
+                    peer_id: vec![0x11; 16],
+                    display_name: "integration-test".into(),
+                    capabilities: peer_proto::capability::supported_vec(),
+                    app_version: "test".into(),
+                })),
+            },
+        )
+        .await
+        .unwrap();
+        let host_hello = read_envelope(&mut reader).await.unwrap();
+        match host_hello.payload {
+            Some(Payload::Hello(h)) => assert!(
+                h.capabilities
+                    .iter()
+                    .any(|c| c == peer_proto::capability::TEAM_CALL_V1),
+                "host with a team manager must advertise team.call.v1"
+            ),
+            other => panic!("expected Hello, got {other:?}"),
+        }
+        let _ = read_envelope(&mut reader).await.unwrap();
+        write_envelope(
+            &mut writer,
+            &Envelope {
+                seq: 2,
+                correlation_id: 0,
+                payload: Some(Payload::Auth(Auth {
+                    method: "ssh-passthrough".into(),
+                    token_id: vec![],
+                    signature: vec![],
+                })),
+            },
+        )
+        .await
+        .unwrap();
+        let _ = read_envelope(&mut reader).await.unwrap();
+
+        async fn team_call(
+            reader: &mut (impl tokio::io::AsyncRead + Unpin),
+            writer: &mut (impl tokio::io::AsyncWrite + Unpin),
+            seq: u64,
+            method: &str,
+            params_json: &str,
+        ) -> peer_proto::v1::TeamCallResponse {
+            write_envelope(
+                writer,
+                &Envelope {
+                    seq,
+                    correlation_id: 0,
+                    payload: Some(Payload::TeamCallRequest(
+                        peer_proto::v1::TeamCallRequest {
+                            method: method.into(),
+                            params_json: params_json.into(),
+                        },
+                    )),
+                },
+            )
+            .await
+            .unwrap();
+            match read_envelope(reader).await.unwrap().payload {
+                Some(Payload::TeamCallResponse(r)) => r,
+                other => panic!("expected TeamCallResponse, got {other:?}"),
+            }
+        }
+
+        // Refused: creating a team spawns processes and takes a directory.
+        let refused = team_call(&mut reader, &mut writer, 3, "team.create", "{}").await;
+        assert!(!refused.ok);
+        assert_eq!(refused.error_code, "method_not_allowed");
+
+        // Translated: team.list maps to the headless roster.
+        let listed = team_call(&mut reader, &mut writer, 4, "team.list", "{}").await;
+        assert!(listed.ok, "team.list failed: {}", listed.error_message);
+        assert!(listed.result_json.contains("remote-demo"));
+
+        // Translated but the agent does not exist — a host error, not a
+        // refusal: the method was allowed, the target was simply absent.
+        let missing = team_call(
+            &mut reader,
+            &mut writer,
+            5,
+            "team.send",
+            r#"{"team_name":"remote-demo","agent_name":"ghost","text":"hi"}"#,
+        )
+        .await;
+        assert!(!missing.ok);
+        assert_eq!(missing.error_code, "host_error");
+
+        // Allowed in vocabulary, not a single daemon op.
+        let unsupported = team_call(&mut reader, &mut writer, 6, "team.collect", "{}").await;
+        assert!(!unsupported.ok);
+        assert_eq!(unsupported.error_code, "unsupported_on_host");
+
+        let _ = shutdown_tx.send(true);
+        server_task.abort();
+    }
+
+    /// `team.task.diff` over the real wire, against a real repository.
+    ///
+    /// This is the whole point of the method: work done on this machine is
+    /// reviewable from another one. So the host gets a task board holding a
+    /// task with a real worktree, and the caller — which knows only a task id —
+    /// gets back a patch it could compute a digest against.
+    #[tokio::test]
+    async fn task_diff_travels_the_wire_and_refuses_what_it_cannot_read() {
+        use std::process::Command as SyncCommand;
+
+        fn git(dir: &std::path::Path, args: &[&str]) {
+            let out = SyncCommand::new("git")
+                .args(args)
+                .current_dir(dir)
+                .env("GIT_AUTHOR_NAME", "T")
+                .env("GIT_AUTHOR_EMAIL", "t@t")
+                .env("GIT_COMMITTER_NAME", "T")
+                .env("GIT_COMMITTER_EMAIL", "t@t")
+                .output()
+                .expect("git");
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+
+        let tmp = TempDir::new().unwrap();
+        let sock_path = tmp.path().join("peer.sock");
+
+        // The work, on this machine.
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        git(&repo, &["init", "-q", "-b", "main"]);
+        std::fs::write(repo.join("a.txt"), "one\n").unwrap();
+        git(&repo, &["add", "-A"]);
+        git(&repo, &["commit", "-qm", "base"]);
+        git(&repo, &["checkout", "-q", "-b", "feat/thing"]);
+        std::fs::write(repo.join("a.txt"), "one\ntwo\n").unwrap();
+        git(&repo, &["commit", "-qam", "the work"]);
+
+        // The board that knows where it is. Only the host reads this; the
+        // caller never names the directory.
+        let board = Arc::new(
+            crate::agent::AgentSessionManager::new(tmp.path().join("agents.db"))
+                .expect("agent db"),
+        );
+        let task = board
+            .task_create(crate::agent::TaskCreateParams {
+                title: "the work".into(),
+                description: None,
+                priority: None,
+                created_by: None,
+                deps: None,
+                fix_budget: None,
+                worktree_policy: None,
+            })
+            .expect("task");
+        board
+            .task_update(crate::agent::TaskUpdateParams {
+                id: task.id.clone(),
+                title: None,
+                description: None,
+                status: None,
+                priority: None,
+                assignee: None,
+                worktree_policy: None,
+                worktree_path: Some(repo.to_str().unwrap().to_string()),
+                worktree_branch: Some("feat/thing".into()),
+                worktree_parent: Some("main".into()),
+                worktree_created: None,
+                worktree_reused: None,
+                worktree_init: None,
+                worktree_finished_at_ms: None,
+                worktree_finish_mode: None,
+                worktree_removed: None,
+            })
+            .expect("worktree recorded");
+
+        let host = Arc::new(PeerHost::new(cat_manager()));
+        let teams = Arc::new(tokio::sync::Mutex::new(
+            crate::headless::HeadlessManager::new(),
+        ));
+        host.set_teams(teams);
+        host.set_agents(board);
+
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let sock_path_task = sock_path.clone();
+        let host_task = host.clone();
+        let server_task = tokio::spawn(async move {
+            serve_with_host(sock_path_task, shutdown_rx, host_task)
+                .await
+                .unwrap();
+        });
+        for _ in 0..50 {
+            if sock_path.exists() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+
+        let stream = UnixStream::connect(&sock_path).await.unwrap();
+        let (mut reader, mut writer) = stream.into_split();
+        write_envelope(
+            &mut writer,
+            &Envelope {
+                seq: 1,
+                correlation_id: 0,
+                payload: Some(Payload::Hello(Hello {
+                    protocol_version: PROTOCOL_VERSION.into(),
+                    peer_id: vec![0x22; 16],
+                    display_name: "reviewer".into(),
+                    capabilities: peer_proto::capability::supported_vec(),
+                    app_version: "test".into(),
+                })),
+            },
+        )
+        .await
+        .unwrap();
+        let _ = read_envelope(&mut reader).await.unwrap();
+        let _ = read_envelope(&mut reader).await.unwrap();
+        write_envelope(
+            &mut writer,
+            &Envelope {
+                seq: 2,
+                correlation_id: 0,
+                payload: Some(Payload::Auth(Auth {
+                    method: "ssh-passthrough".into(),
+                    token_id: vec![],
+                    signature: vec![],
+                })),
+            },
+        )
+        .await
+        .unwrap();
+        let _ = read_envelope(&mut reader).await.unwrap();
+
+        async fn call(
+            reader: &mut (impl tokio::io::AsyncRead + Unpin),
+            writer: &mut (impl tokio::io::AsyncWrite + Unpin),
+            seq: u64,
+            params_json: &str,
+        ) -> peer_proto::v1::TeamCallResponse {
+            write_envelope(
+                writer,
+                &Envelope {
+                    seq,
+                    correlation_id: 0,
+                    payload: Some(Payload::TeamCallRequest(
+                        peer_proto::v1::TeamCallRequest {
+                            method: "team.task.diff".into(),
+                            params_json: params_json.into(),
+                        },
+                    )),
+                },
+            )
+            .await
+            .unwrap();
+            match read_envelope(reader).await.unwrap().payload {
+                Some(Payload::TeamCallResponse(r)) => r,
+                other => panic!("expected TeamCallResponse, got {other:?}"),
+            }
+        }
+
+        let answered = call(
+            &mut reader,
+            &mut writer,
+            3,
+            &format!(r#"{{"task_id":"{}"}}"#, task.id),
+        )
+        .await;
+        assert!(answered.ok, "diff failed: {}", answered.error_message);
+
+        let value: serde_json::Value = serde_json::from_str(&answered.result_json).unwrap();
+        assert_eq!(value["head_sha"].as_str().unwrap().len(), 40);
+        assert!(value["diff_digest"]
+            .as_str()
+            .unwrap()
+            .starts_with("sha256:"));
+        assert!(value["patch"].as_str().unwrap().contains("+two"));
+        assert!(value["numstat"].as_str().unwrap().contains("a.txt"));
+        assert_eq!(value["branch"].as_str().unwrap(), "feat/thing");
+        assert_eq!(value["truncated"].as_bool().unwrap(), false);
+
+        // A task this host does not have is an error with a reason, never an
+        // empty success — the board would read that as "nothing changed",
+        // which is an approvable state.
+        let unknown = call(&mut reader, &mut writer, 4, r#"{"task_id":"tsk_nobody"}"#).await;
+        assert!(!unknown.ok);
+        assert!(unknown.result_json.is_empty());
+
+        // And a path is not a parameter, on the wire as much as anywhere.
+        let no_id = call(&mut reader, &mut writer, 5, r#"{"worktree_path":"/etc"}"#).await;
+        assert!(!no_id.ok);
+        assert_eq!(no_id.error_code, "invalid_params");
+
+        let _ = shutdown_tx.send(true);
+        server_task.abort();
+    }
+
+    /// `team.task.diff` against a real daemon on another machine.
+    ///
+    /// The test above proves the method works over a real socket in one
+    /// process. This proves it works over the link people actually use: a
+    /// reviewer on one machine reading a patch out of a worktree on another,
+    /// through an SSH-forwarded peer socket.
+    ///
+    /// `#[ignore]` because it needs a host this repository cannot start.
+    /// Point it at one and run it:
+    ///
+    /// ```sh
+    /// ssh -N -L /tmp/tm-peer-live.sock:/run/user/0/tm-peer.sock root@host &
+    /// TM_PEER_SOCK=/tmp/tm-peer-live.sock TM_TASK_ID=<id> TM_EXPECT_DIGEST=<sha256 hex> \\
+    ///   cargo test -p term-meshd --bin term-meshd a_patch_can_be_read_off_another_machine \\
+    ///   -- --ignored --nocapture
+    /// ```
+    #[tokio::test]
+    #[ignore = "needs a live peer host; see the doc comment"]
+    async fn a_patch_can_be_read_off_another_machine() {
+        let sock = std::env::var("TM_PEER_SOCK").expect("TM_PEER_SOCK");
+        let task_id = std::env::var("TM_TASK_ID").expect("TM_TASK_ID");
+
+        let stream = UnixStream::connect(&sock)
+            .await
+            .unwrap_or_else(|e| panic!("connect {sock}: {e}"));
+        let (mut reader, mut writer) = stream.into_split();
+
+        write_envelope(
+            &mut writer,
+            &Envelope {
+                seq: 1,
+                correlation_id: 0,
+                payload: Some(Payload::Hello(Hello {
+                    protocol_version: PROTOCOL_VERSION.into(),
+                    peer_id: vec![0x33; 16],
+                    display_name: "live-review".into(),
+                    capabilities: peer_proto::capability::supported_vec(),
+                    app_version: "live".into(),
+                })),
+            },
+        )
+        .await
+        .expect("hello");
+
+        // A live host pushes HostStats and layout frames on its own schedule,
+        // so nothing here may assume the next frame is the answer. The
+        // in-process test never saw this: that host has no monitor wired in.
+        async fn hello_of(
+            reader: &mut (impl tokio::io::AsyncRead + Unpin),
+        ) -> peer_proto::v1::Hello {
+            for _ in 0..20 {
+                match read_envelope(reader).await.expect("frame").payload {
+                    Some(Payload::Hello(h)) => return h,
+                    _ => continue,
+                }
+            }
+            panic!("no Hello in the first 20 frames");
+        }
+
+        let h = hello_of(&mut reader).await;
+        println!("host: {} ({})", h.display_name, h.app_version);
+        assert!(
+            h.capabilities
+                .iter()
+                .any(|c| c == peer_proto::capability::TEAM_CALL_V1),
+            "host does not advertise team.call.v1: {:?}",
+            h.capabilities
+        );
+
+        write_envelope(
+            &mut writer,
+            &Envelope {
+                seq: 2,
+                correlation_id: 0,
+                payload: Some(Payload::Auth(Auth {
+                    method: "ssh-passthrough".into(),
+                    token_id: vec![],
+                    signature: vec![],
+                })),
+            },
+        )
+        .await
+        .expect("auth");
+
+        async fn diff(
+            reader: &mut (impl tokio::io::AsyncRead + Unpin),
+            writer: &mut (impl tokio::io::AsyncWrite + Unpin),
+            seq: u64,
+            params_json: String,
+        ) -> peer_proto::v1::TeamCallResponse {
+            write_envelope(
+                writer,
+                &Envelope {
+                    seq,
+                    correlation_id: 0,
+                    payload: Some(Payload::TeamCallRequest(
+                        peer_proto::v1::TeamCallRequest {
+                            method: "team.task.diff".into(),
+                            params_json,
+                        },
+                    )),
+                },
+            )
+            .await
+            .expect("request");
+            // Skip whatever the host happened to be pushing.
+            for _ in 0..50 {
+                if let Some(Payload::TeamCallResponse(r)) =
+                    read_envelope(reader).await.expect("response").payload
+                {
+                    return r;
+                }
+            }
+            panic!("no TeamCallResponse in the next 50 frames");
+        }
+
+        let answered = diff(
+            &mut reader,
+            &mut writer,
+            3,
+            format!(r#"{{"task_id":"{task_id}"}}"#),
+        )
+        .await;
+        assert!(answered.ok, "diff failed: {}", answered.error_message);
+
+        // Printed verbatim so the app's decoder can be pinned against the bytes
+        // a real host actually sent, rather than against a hand-written fixture.
+        if let Ok(path) = std::env::var("TM_SAVE_PAYLOAD") {
+            std::fs::write(&path, &answered.result_json).expect("save payload");
+            println!("payload saved to {path}");
+        }
+        let value: serde_json::Value = serde_json::from_str(&answered.result_json).expect("json");
+        println!(
+            "head={} base={} branch={}\ndigest={} truncated={}",
+            value["head_sha"], value["base_sha"], value["branch"], value["diff_digest"],
+            value["truncated"]
+        );
+        println!("--- numstat ---\n{}", value["numstat"].as_str().unwrap_or(""));
+        println!("--- name_status ---\n{}", value["name_status"].as_str().unwrap_or(""));
+        println!("--- patch ---\n{}", value["patch"].as_str().unwrap_or(""));
+
+        assert_eq!(value["head_sha"].as_str().unwrap().len(), 40);
+        assert!(!value["patch"].as_str().unwrap().is_empty());
+        assert!(!value["numstat"].as_str().unwrap().is_empty());
+
+        // The digest is what an approval cites, so it is checked against the
+        // host's own `git diff | sha256sum` rather than merely being present.
+        if let Ok(expected) = std::env::var("TM_EXPECT_DIGEST") {
+            assert_eq!(
+                value["diff_digest"].as_str().unwrap(),
+                format!("sha256:{expected}"),
+                "the digest must be exactly SHA-256 of `git diff base..head` stdout"
+            );
+        }
+
+        // An unknown task is an error with a reason, never an empty success —
+        // the board would read that as "nothing changed", an approvable state.
+        let unknown = diff(
+            &mut reader,
+            &mut writer,
+            4,
+            r#"{"task_id":"tsk_definitely_not_there"}"#.into(),
+        )
+        .await;
+        assert!(!unknown.ok, "an unknown task must not answer ok");
+        assert!(unknown.result_json.is_empty());
+        println!("unknown task -> {} {}", unknown.error_code, unknown.error_message);
+
+        // And a path is not a parameter, across the link as much as in process.
+        let no_id = diff(&mut reader, &mut writer, 5, r#"{"worktree_path":"/etc"}"#.into()).await;
+        assert!(!no_id.ok);
+        assert_eq!(no_id.error_code, "invalid_params");
+        println!("path-only -> {} {}", no_id.error_code, no_id.error_message);
+    }
+
+    /// A team is invisible in the layout tree, so a client can only learn
+    /// where a project's leader sits by asking. This drives the real wire:
+    /// handshake, auth, then ListTeams against a host wired to a team
+    /// manager holding one team.
+    #[tokio::test]
+    async fn list_teams_reports_the_hosts_teams_over_the_wire() {
+        let tmp = TempDir::new().unwrap();
+        let sock_path = tmp.path().join("peer.sock");
+        // A real repository, so the host resolves a project root for it.
+        let repo = tmp.path().join("demo-project");
+        std::fs::create_dir_all(repo.join("src")).unwrap();
+        std::fs::create_dir(repo.join(".git")).unwrap();
+
+        let manager = cat_manager();
+        let host = Arc::new(PeerHost::new(manager));
+        let teams = Arc::new(tokio::sync::Mutex::new(
+            crate::headless::HeadlessManager::new(),
+        ));
+        teams.lock().await.insert_team_for_tests(
+            "remote-demo",
+            "uuid-remote-demo",
+            repo.join("src").to_str().unwrap(),
+            vec!["explorer".to_string()],
+        );
+        host.set_teams(teams);
+
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let sock_path_task = sock_path.clone();
+        let host_task = host.clone();
+        let server_task = tokio::spawn(async move {
+            serve_with_host(sock_path_task, shutdown_rx, host_task)
+                .await
+                .unwrap();
+        });
+        for _ in 0..50 {
+            if sock_path.exists() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+
+        let stream = UnixStream::connect(&sock_path).await.unwrap();
+        let (mut reader, mut writer) = stream.into_split();
+        write_envelope(
+            &mut writer,
+            &Envelope {
+                seq: 1,
+                correlation_id: 0,
+                payload: Some(Payload::Hello(Hello {
+                    protocol_version: PROTOCOL_VERSION.into(),
+                    peer_id: vec![0x11; 16],
+                    display_name: "integration-test".into(),
+                    capabilities: peer_proto::capability::supported_vec(),
+                    app_version: "test".into(),
+                })),
+            },
+        )
+        .await
+        .unwrap();
+        let host_hello = read_envelope(&mut reader).await.unwrap();
+        // The capability is what tells a client it may ask at all.
+        match host_hello.payload {
+            Some(Payload::Hello(h)) => assert!(
+                h.capabilities
+                    .iter()
+                    .any(|c| c == peer_proto::capability::TEAM_ROSTER_V1),
+                "host with a team manager must advertise team.roster.v1"
+            ),
+            other => panic!("expected Hello, got {other:?}"),
+        }
+        let _ = read_envelope(&mut reader).await.unwrap();
+        write_envelope(
+            &mut writer,
+            &Envelope {
+                seq: 2,
+                correlation_id: 0,
+                payload: Some(Payload::Auth(Auth {
+                    method: "ssh-passthrough".into(),
+                    token_id: vec![],
+                    signature: vec![],
+                })),
+            },
+        )
+        .await
+        .unwrap();
+        let _ = read_envelope(&mut reader).await.unwrap();
+
+        write_envelope(
+            &mut writer,
+            &Envelope {
+                seq: 3,
+                correlation_id: 0,
+                payload: Some(Payload::ListTeams(peer_proto::v1::ListTeams {})),
+            },
+        )
+        .await
+        .unwrap();
+        let reply = read_envelope(&mut reader).await.unwrap();
+        let listed = match reply.payload {
+            Some(Payload::TeamList(tl)) => tl.teams,
+            other => panic!("expected TeamList, got {other:?}"),
+        };
+
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].name, "remote-demo");
+        assert_eq!(listed[0].agent_names, vec!["explorer".to_string()]);
+        // The host resolves the repo root itself — a client staring at the
+        // working directory could not tell it from a subdirectory.
+        assert_eq!(listed[0].project_root, repo.to_string_lossy());
+
+        let _ = shutdown_tx.send(true);
+        server_task.abort();
+    }
+
     #[tokio::test]
     async fn pty_surface_round_trips_input() {
         let tmp = TempDir::new().unwrap();

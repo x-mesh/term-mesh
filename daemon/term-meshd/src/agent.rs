@@ -656,8 +656,14 @@ impl AgentSessionManager {
             let wt_params = serde_json::json!({ "repo_path": params.repo_path });
             let wt_info = worktree::create(wt_params)?;
 
-            // Watch the worktree directory
-            watcher.watch_path(&wt_info.path);
+            // File heatmap tracking is best-effort. An unavailable watcher
+            // must not fail agent creation after its worktree already exists.
+            if let Err(error) = watcher.watch_path(&wt_info.path) {
+                tracing::warn!(
+                    "agent worktree created without file watch ({}): {error}",
+                    wt_info.path
+                );
+            }
 
             let session = AgentSession {
                 id: uuid::Uuid::new_v4().to_string(),

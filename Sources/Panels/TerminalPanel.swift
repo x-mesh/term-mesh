@@ -41,6 +41,13 @@ final class TerminalPanel: Panel, ObservableObject {
     /// tab chip). nil = local pane.
     var remoteHostKey: PeerPaneHostKey? { peerPaneSession?.lease.key }
 
+    /// A relay pane renders a peer-owned terminal locally.  It must never be
+    /// re-exported by this Mac's PeerSurfaceProvider: doing so permits an
+    /// A → B → A attach loop and gives a remote UUID a misleading local
+    /// identity.  `remotePaneID` covers the brief lifecycle window after a
+    /// binding is registered while a reconnect is replacing its session.
+    var isRemoteOrigin: Bool { peerPaneSession != nil || remotePaneID != nil }
+
     /// Injected daemon service (defaults to singleton for backward compatibility).
     var daemon: any DaemonService = TermMeshDaemon.shared
 

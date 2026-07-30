@@ -101,9 +101,14 @@ struct PeerHostProfile: Codable, Identifiable, Equatable {
     /// `user@host` or an ssh-config alias. V1 profiles are SSH-only —
     /// direct-socket hosts remain ad-hoc sidebar entries.
     var sshTarget: String
-    /// Remote peer socket path. Empty = auto-detect on connect
-    /// (PeerSocketProber); the resolved path is cached back here.
+    /// User-pinned remote peer socket path. Empty = auto-detect on connect
+    /// (PeerSocketProber). Auto-detection results live in
+    /// `lastResolvedSocket`, never in this editor-facing field.
     var remoteSocket: String
+    /// Last successful auto-detection result. This is an implementation
+    /// cache, not a user choice: clearing `remoteSocket` clears this too,
+    /// forcing the next connection to probe again.
+    var lastResolvedSocket: String?
     /// Explicit SSH port (`-p`). nil = ssh default / ssh-config.
     var sshPort: Int?
     /// Identity file (`-i`). nil = default keys / ssh-config.
@@ -112,9 +117,24 @@ struct PeerHostProfile: Codable, Identifiable, Equatable {
     var colorHex: String?
     /// SF Symbol shown for this host while connected. nil = "network".
     var symbolName: String?
+    /// Where this machine keeps its projects, e.g. `/app/term-mesh-prj`.
+    ///
+    /// A project's directory over there is predictable when the machine has a
+    /// convention: the root, then the project's own folder name. That is a
+    /// guess, but it is the same guess a person makes, and it answers the
+    /// question the first time — before there is anything to remember. Empty
+    /// means this machine has no convention and the path has to come from
+    /// somewhere else.
+    var projectRootPath: String?
     /// Optional deterministic runner recipe. nil keeps this profile as a
     /// normal browse/picker-only peer host.
     var savedRunner: PeerSavedRunnerProfile?
+    /// Environment variables for everything term-mesh runs on this machine —
+    /// agent/leader launches (typed and native-ssh) and project bootstrap
+    /// scripts. Per-host because that is what they describe: one box needs a
+    /// proxy, another needs `IS_SANDBOX=1`, and neither belongs on the other.
+    /// Optional so profiles saved before the field existed still decode.
+    var environment: [String: String]?
     var lastConnectedAt: Date?
     var createdAt: Date
 
@@ -123,11 +143,14 @@ struct PeerHostProfile: Codable, Identifiable, Equatable {
         displayName: String = "",
         sshTarget: String,
         remoteSocket: String = "",
+        lastResolvedSocket: String? = nil,
         sshPort: Int? = nil,
         identityFile: String? = nil,
         colorHex: String? = nil,
         symbolName: String? = nil,
+        projectRootPath: String? = nil,
         savedRunner: PeerSavedRunnerProfile? = nil,
+        environment: [String: String]? = nil,
         lastConnectedAt: Date? = nil,
         createdAt: Date = Date()
     ) {
@@ -135,11 +158,14 @@ struct PeerHostProfile: Codable, Identifiable, Equatable {
         self.displayName = displayName
         self.sshTarget = sshTarget
         self.remoteSocket = remoteSocket
+        self.lastResolvedSocket = lastResolvedSocket
         self.sshPort = sshPort
         self.identityFile = identityFile
         self.colorHex = colorHex
         self.symbolName = symbolName
+        self.projectRootPath = projectRootPath
         self.savedRunner = savedRunner
+        self.environment = environment
         self.lastConnectedAt = lastConnectedAt
         self.createdAt = createdAt
     }
@@ -148,7 +174,60 @@ struct PeerHostProfile: Codable, Identifiable, Equatable {
         displayName.isEmpty ? sshTarget : displayName
     }
 
+    /// Socket to use for a connection without conflating explicit
+    /// configuration with an auto-detection cache.
+    var connectionSocket: String? {
+        if !remoteSocket.isEmpty { return remoteSocket }
+        guard let lastResolvedSocket, !lastResolvedSocket.isEmpty else { return nil }
+        return lastResolvedSocket
+    }
+
+    /// Where a project with this folder name would live on this machine.
+    ///
+    /// Nil when the machine has no convention set — a predicted path is worth
+    /// offering, an invented one is not.
+    func predictedProjectPath(forProjectNamed name: String) -> String? {
+        guard let root = projectRootPath?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !root.isEmpty, !name.isEmpty else { return nil }
+        return (root as NSString).appendingPathComponent(name)
+    }
+
     /// Stable key aligning this profile with live sidebar entries —
     /// must stay in sync with RemoteHostStore's stableKey convention.
     var stableKey: String { "ssh:\(sshTarget)" }
+}
+
+/// Shared shaping of a peer host's environment variables for shell use.
+/// Everything that runs on a peer goes through a shell at some point, so
+/// there is exactly one quoting/validation story, here.
+enum PeerHostEnvironment {
+    /// Keys a POSIX shell accepts as assignments. Anything else is dropped
+    /// rather than quoted into something surprising — a bad key is a typo,
+    /// and typos should not become shell words.
+    static func sanitized(_ environment: [String: String]) -> [(key: String, value: String)] {
+        environment
+            .filter { key, _ in
+                guard let first = key.first,
+                      first.isLetter || first == "_" else { return false }
+                return key.allSatisfy { $0.isLetter || $0.isNumber || $0 == "_" }
+            }
+            .sorted { $0.key < $1.key }
+            .map { (key: $0.key, value: $0.value) }
+    }
+
+    /// `K1='v1' K2='v2'` — the prefix form that scopes the variables to the
+    /// single command that follows. Empty when nothing (valid) is set.
+    static func inlineAssignments(_ environment: [String: String]) -> String {
+        sanitized(environment)
+            .map { "\($0.key)='\($0.value.replacingOccurrences(of: "'", with: "'\\''"))'" }
+            .joined(separator: " ")
+    }
+
+    /// The environment saved for a host, by the sidebar's stable key.
+    @MainActor
+    static func stored(forHostKey hostKey: String) -> [String: String] {
+        PeerHostProfileStore.shared.profiles
+            .first { $0.stableKey == hostKey }?
+            .environment ?? [:]
+    }
 }

@@ -8,6 +8,43 @@ import Foundation
 enum AutoReplyEmit {
     private static let resultTruncChars = 1500
 
+    /// Statuses a reply must never reopen.
+    static let terminalStatuses: Set<String> = [
+        "completed", "failed", "abandoned", "cancelled",
+    ]
+
+    /// Which task a reply is answering.
+    ///
+    /// When the caller knows — it wrote the capsule, so it does — the answer is
+    /// the task the capsule named and there is nothing to decide.
+    ///
+    /// When it does not, this is a guess, and the shape of the guess matters.
+    /// It used to be "first non-terminal in list order", with `blocked` counted
+    /// as non-terminal. An unrelated turn was measured walking up to a task
+    /// another turn had parked as blocked, marking it completed, and leaving
+    /// its own task untouched — losing the block reason on the way.
+    ///
+    /// So a blocked task is now only closable by a reply that names it. Parking
+    /// something is a decision; a drive-by reply is not entitled to undo one.
+    /// Among the rest the most recent wins, because a reply is far likelier to
+    /// answer the instruction just given than the oldest one still open.
+    static func selectTask(
+        from tasks: [TeamOrchestrator.TeamTask],
+        preferredTaskId: String?
+    ) -> TeamOrchestrator.TeamTask? {
+        if let preferredTaskId,
+           let named = tasks.first(where: { $0.id == preferredTaskId }) {
+            return named
+        }
+        if let running = tasks.filter({ $0.status == "in_progress" })
+            .max(by: { $0.createdAt < $1.createdAt }) {
+            return running
+        }
+        return tasks
+            .filter { !terminalStatuses.contains($0.status) && $0.status != "blocked" }
+            .max(by: { $0.createdAt < $1.createdAt })
+    }
+
     /// Normalize FULL_REPORT field: strip whitespace, treat "n/a" as nil.
     private static func normalizedFullReportPath(_ raw: String?) -> String? {
         guard let s = raw?.trimmingCharacters(in: .whitespacesAndNewlines), !s.isEmpty else { return nil }
@@ -22,16 +59,26 @@ enum AutoReplyEmit {
         teamName: String,
         agentName: String,
         event: AutoReplyEvent,
+        // The task this reply is answering, when the caller knows it.
+        //
+        // The scrollback path never can: it sees an answer appear on a screen
+        // with nothing tying it to a request. So it guesses — first
+        // `in_progress`, else the first non-terminal task — and `blocked` is
+        // not in that terminal set, so an unrelated turn can walk up and mark
+        // a blocked task completed. Observed doing exactly that.
+        //
+        // A caller that sent the instruction does know, and passing it here is
+        // the difference between closing a task and closing *this* task.
+        preferredTaskId: String? = nil,
+        agentInstanceId: String? = nil,
         store: TeamDataStore = .shared
     ) -> Bool {
         let replyText = formatReplyText(event)
         let resultPath = normalizedFullReportPath(event.fullReport)
 
-        // 1. team.report equivalent — write file + post message
-        _ = store.writeResult(teamName: teamName, agentName: agentName, content: replyText, resultPath: resultPath)
-        store.postMessage(teamName: teamName, from: agentName, content: replyText, type: "report")
-
-        // 2. Find target task for this assignee (mirror Rust CLI auto-complete)
+        // 1. Find target task for this assignee (mirror Rust CLI auto-complete).
+        // The assignment carries the pane identity captured at dispatch, so a
+        // reply from a duplicate role can never file against its sibling.
         let tasks = store.listTasks(
             teamName: teamName,
             status: nil,
@@ -41,14 +88,22 @@ enum AutoReplyEmit {
             staleOnly: false,
             dependsOn: nil
         )
-        let terminal: Set<String> = ["completed", "failed", "abandoned", "cancelled"]
-        let target = tasks.first(where: { $0.status == "in_progress" })
-            ?? tasks.first(where: { !terminal.contains($0.status) })
-        guard let task = target else {
+        guard let task = selectTask(from: tasks, preferredTaskId: preferredTaskId),
+              store.agentIdentityMatches(
+                  teamName: teamName, agentName: agentName,
+                  expectedInstanceId: task.assigneeInstanceId,
+                  reportedInstanceId: agentInstanceId)
+        else {
             return false
         }
 
-        // 3. Map STATUS to task status + drive updateTask
+        guard store.writeResult(teamName: teamName, agentName: agentName,
+                                agentInstanceId: agentInstanceId, taskId: task.id,
+                                content: replyText, resultPath: resultPath)
+        else { return false }
+        store.postMessage(teamName: teamName, from: agentName, content: replyText, type: "report")
+
+        // 2. Map STATUS to task status + drive updateTask
         let taskStatus: String
         switch event.status {
         case "BLOCKED": taskStatus = "blocked"
@@ -87,9 +142,11 @@ enum AutoReplyEmit {
                 "prev_status": prevStatus
             ] as [String: Any])
             if taskStatus == "completed" {
-                let tn = teamName, an = updated.assignee ?? agentName
+                let tn = teamName, an = updated.assignee ?? agentName, ai = updated.assigneeInstanceId
                 Task { @MainActor in
-                    TeamOrchestrator.shared.handleTaskCompletionForAutoRecycle(teamName: tn, agentName: an)
+                    TeamOrchestrator.shared.handleTaskCompletionForAutoRecycle(
+                        teamName: tn, agentName: an, agentInstanceId: ai
+                    )
                 }
             }
         }

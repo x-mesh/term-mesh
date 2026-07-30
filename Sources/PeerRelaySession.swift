@@ -879,6 +879,22 @@ final class PeerRelaySession {
         try await session.requestClosePane(paneID: surfaceID)
     }
 
+    /// Close some OTHER pane on this host, over the connection this session
+    /// already holds. Returns false when the session is gone, so a caller
+    /// sweeping several panes can move to another borrowed session.
+    ///
+    /// The host caps concurrent peer connections (`MAX_PEER_CONNECTIONS`), and
+    /// every attached pane holds one. A cleanup sweep that dials its own
+    /// connection therefore fails precisely when it is needed — a host crowded
+    /// with leftover shells is a host with no free connection slot. Borrowing
+    /// an open session asks the host for nothing new.
+    @discardableResult
+    func requestClosePane(_ paneID: Data) async throws -> Bool {
+        guard let session else { return false }
+        try await session.requestClosePane(paneID: paneID)
+        return true
+    }
+
     // ── Stale-socket sweep ──────────────────────────────────────────
     //
     // Per-session sockets land in a private per-user directory.
@@ -1680,6 +1696,24 @@ final class PeerRelaySession {
                         break pumpLoop
                     }
                     switch msg {
+                    case .teamLeaderCommandRequest(let request, let correlationID):
+                        // A tm-agent running inside the remote pane can reach
+                        // only the remote daemon. The daemon sends this scoped
+                        // request back over the already-authenticated peer
+                        // session; answer it here without app activation or a
+                        // local TERMMESH_SOCKET ever crossing machines.
+                        let response = await GhosttyPaneSurfaceProvider
+                            .handleRemoteLeaderCommand(request)
+                        do {
+                            try await currentSession.sendTeamLeaderCommandResponse(
+                                response,
+                                correlationID: correlationID
+                            )
+                        } catch {
+                            endReason = "hostToRelay-leader-response-error"
+                            break pumpLoop
+                        }
+                        continue pumpLoop
                     // Forward only this surface's output. Other-surface PtyData
                     // (never expected on a single-attach owned session, but the
                     // guard makes a shared session's stray frame a drop, not a
