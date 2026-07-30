@@ -26,10 +26,9 @@ actor ReviewBoardMergeRunner {
         let repositoryPath: String?
         /// Passed to `--to` verbatim: `parent`, `base`, or a branch name.
         let target: String
-        /// The commit the approval was recorded against, when the coordinator
-        /// still holds one. `nil` means the evidence could not be read, and the
-        /// head check below is skipped rather than the merge refused — a
-        /// coordinator hiccup must not stall a queue a person is watching.
+        /// The commit the approval was recorded against. Live merges fail
+        /// closed when this is absent; optionality remains for lightweight
+        /// runner tests that intentionally omit filesystem evidence.
         let approvedHeadSHA: String?
 
         init(
@@ -236,6 +235,11 @@ actor ReviewBoardMergeRunner {
     /// minute, and the alternative costs a review nobody did.
     private func evidenceGap(_ job: Job, at path: String) async -> String? {
         guard let git else { return nil }
+        guard let approved = job.approvedHeadSHA?
+            .trimmingCharacters(in: .whitespacesAndNewlines), !approved.isEmpty else {
+            return "The approved commit could not be read, so the worktree cannot be "
+                + "matched to the reviewed evidence. It was not merged."
+        }
         guard let status = await git(["-C", path, "status", "--porcelain"]),
               status.status == 0 else {
             return "The worktree at \(path) could not be read, so there is no way to tell "
@@ -248,10 +252,6 @@ actor ReviewBoardMergeRunner {
                 + "Commit or discard them, then approve again."
         }
 
-        guard let approved = job.approvedHeadSHA?
-            .trimmingCharacters(in: .whitespacesAndNewlines), !approved.isEmpty else {
-            return nil
-        }
         guard let head = await git(["-C", path, "rev-parse", "HEAD"]), head.status == 0 else {
             return "HEAD could not be read at \(path), so the approved commit could not be "
                 + "confirmed. It was not merged."

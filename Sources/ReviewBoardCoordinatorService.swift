@@ -1592,8 +1592,27 @@ final class ReviewBoardCoordinatorService: ObservableObject {
             // The commit the approval was recorded against, so the runner can
             // refuse a worktree that has moved on since. Read per item because
             // the merge queue row does not carry it.
-            let approvedHead = (try? await client.reviewDetail(taskID: item.taskRawID))?
-                .snapshot?.headSHA
+            let approvedHead: String
+            do {
+                guard let value = try await client.reviewDetail(taskID: item.taskRawID)
+                    .snapshot?.headSHA.trimmingCharacters(in: .whitespacesAndNewlines),
+                    !value.isEmpty else {
+                    await failQueueItem(
+                        item,
+                        "The approval evidence has no commit SHA, so the reviewed tree "
+                            + "cannot be identified. It was not merged."
+                    )
+                    continue
+                }
+                approvedHead = value
+            } catch {
+                await failQueueItem(
+                    item,
+                    "The approval evidence could not be read (\(error.localizedDescription)). "
+                        + "It was not merged."
+                )
+                continue
+            }
             guard let job = ReviewBoardMergeRunner.Job(
                 item: item,
                 tasks: tasks,
