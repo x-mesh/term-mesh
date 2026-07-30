@@ -593,10 +593,36 @@ final class TeamDataStore: ObservableObject, @unchecked Sendable {
             return (normalizedAssignee, normalizedInstanceId)
         }
         if allowNameOnlyAutoPin {
+            // Picking one of several is a guess, and a guess nobody is told
+            // about is how work lands on the wrong instance and looks fine.
+            // The caller that can act on it gets `duplicateNameWarning`; this
+            // is for whoever reads the log afterwards asking why.
+            if candidates.count > 1 {
+                Logger.team.warning(
+                    "[task.assign] \(candidates.count, privacy: .public) agents named '\(normalizedAssignee, privacy: .public)' in team '\(teamName, privacy: .public)'; pinned the first. Pass agent_instance_id to choose."
+                )
+            }
             return (normalizedAssignee, candidates.first?.instanceId)
         }
         guard candidates.count == 1 else { return nil }
         return (normalizedAssignee, candidates[0].instanceId)
+    }
+
+    /// Why a name-only assignment for this team was a choice rather than a
+    /// lookup, or nil when the name is unambiguous.
+    ///
+    /// Read separately from the assignment itself so the socket layer can put
+    /// it in its answer without `updateTask` and `reassignTask` having to
+    /// change what they return — every one of their callers would otherwise
+    /// have to learn a new shape to carry a string that only two of them show.
+    func duplicateNameWarning(teamName: String, assignee: String?) -> String? {
+        guard let name = assignee?.teamDataNilIfBlank else { return nil }
+        lock.lock()
+        defer { lock.unlock() }
+        let candidates = teamRegistry[teamName, default: []].filter { $0.name == name }
+        guard candidates.count > 1 else { return nil }
+        return "\(candidates.count) agents are named '\(name)'; the first was used."
+            + " Pass agent_instance_id to pick one."
     }
 
     @discardableResult
@@ -728,7 +754,16 @@ final class TeamDataStore: ObservableObject, @unchecked Sendable {
             guard let resolvedAssignee = resolveAssigneeUnsafe(
                 teamName: teamName,
                 assignee: assignee,
-                assigneeInstanceId: assigneeInstanceId
+                assigneeInstanceId: assigneeInstanceId,
+                // Same contract `createTask` has always had. A name the
+                // registry does not know still assigns — agents are named
+                // before they register, and refusing here turned an ordinary
+                // `tm-agent task update` into "Task not found", which reads as
+                // the task being gone rather than the name being unfamiliar.
+                // An explicit `assigneeInstanceId` is still checked above:
+                // strictness belongs where the caller asked for a specific
+                // instance, not where it named a role.
+                allowNameOnlyAutoPin: true
             ) else { return nil }
             tasks[idx].assignee = resolvedAssignee.assignee
             tasks[idx].assigneeInstanceId = resolvedAssignee.instanceId
@@ -830,7 +865,12 @@ final class TeamDataStore: ObservableObject, @unchecked Sendable {
         guard let resolvedAssignee = resolveAssigneeUnsafe(
             teamName: teamName,
             assignee: assignee,
-            assigneeInstanceId: assigneeInstanceId
+            assigneeInstanceId: assigneeInstanceId,
+            // As above. Rejecting a review sends the work back by name — that
+            // is all the Reject button has — so refusing an unregistered or
+            // duplicated name made the reassignment fail silently and left the
+            // task sitting in the review queue it had just been rejected from.
+            allowNameOnlyAutoPin: true
         ) else { return nil }
         let now = Date()
         let previousAssignee = tasks[idx].assignee

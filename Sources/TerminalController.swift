@@ -3405,7 +3405,17 @@ class TerminalController {
                 teamName: teamName, task: task, tabManager: tabManager
             )
         }
-        return v2Ok(id: id, result: ["task": store.taskDictionary(task), "dispatched": dispatched])
+        var result: [String: Any] = [
+            "task": store.taskDictionary(task), "dispatched": dispatched,
+        ]
+        // Assigning by name when several agents answer to it picks the first.
+        // The caller asked for a role and got an instance, and this is the only
+        // place that can say so before they act on the answer.
+        if assigneeInstanceId?.nilIfBlankTC == nil,
+           let warning = store.duplicateNameWarning(teamName: teamName, assignee: assignee) {
+            result["duplicate_name_warning"] = warning
+        }
+        return v2Ok(id: id, result: result)
     }
 
     private func asyncTeamTaskUnblock(params: [String: Any], id: Any?) async -> String {
@@ -3547,7 +3557,16 @@ class TerminalController {
                     id: nil
                 )
             }
-            return v2Ok(id: id, result: ["task": store.taskDictionary(task), "dispatched": dispatched])
+            var result: [String: Any] = [
+                "task": store.taskDictionary(task), "dispatched": dispatched,
+            ]
+            // `reassign_to` is a name — the Reject button has nothing else to
+            // give — so the same first-match choice applies and the same
+            // warning is owed.
+            if let warning = store.duplicateNameWarning(teamName: teamName, assignee: reassignTo) {
+                result["duplicate_name_warning"] = warning
+            }
+            return v2Ok(id: id, result: result)
         }
 
         guard let task = store.updateTask(
@@ -4471,6 +4490,18 @@ class TerminalController {
         let worktreeFinishMode = params["worktree_finish_mode"] as? String
         let worktreeRemoved = params["worktree_removed"] as? Bool
         let agentInstanceId = params["agent_instance_id"] as? String
+
+        // A caller that names an instance is asserting which one holds this
+        // task, and being told "Task not found" when the assertion fails says
+        // the wrong thing entirely — the task is there, it is somebody else's.
+        // Kept ahead of the update so the refusal has its own code even when
+        // `assignee` is absent and the store would only answer nil.
+        if let agentInstanceId = agentInstanceId?.nilIfBlankTC,
+           let task = store.getTask(teamName: teamName, taskId: taskId),
+           task.assigneeInstanceId != agentInstanceId {
+            return v2Error(id: id, code: "task_identity_mismatch",
+                           message: "Task assignment does not match agent_instance_id")
+        }
 
         // Snapshot prev status before update so events.publish can include it.
         let prevStatus = store.getTask(teamName: teamName, taskId: taskId)?.status ?? ""
