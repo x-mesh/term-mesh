@@ -1764,7 +1764,16 @@ extension TeamOrchestrator {
         // the shell could not find.
         Task { @MainActor in
             if case let .peer(hostKey) = leaderEndpoint {
-                guard let resolvedRemoteLeaderWorkingDirectory else { return }
+#if DEBUG
+                dlog("leader.attach.enter host=\(hostKey) "
+                    + "wd=\(resolvedRemoteLeaderWorkingDirectory ?? "nil")")
+#endif
+                guard let resolvedRemoteLeaderWorkingDirectory else {
+#if DEBUG
+                    dlog("leader.attach.skip reason=noRemoteWorkingDirectory host=\(hostKey)")
+#endif
+                    return
+                }
                 do {
                     // Bounded as a whole rather than step by step. This path
                     // crosses a tunnel, a relay session, an ssh command and a
@@ -1774,6 +1783,9 @@ extension TeamOrchestrator {
                     // failure handling below never ran because nothing ever
                     // threw. A ceiling turns every such stall into the
                     // reported failure it already knows how to show.
+#if DEBUG
+                    dlog("leader.attach.begin host=\(hostKey) cli=\(leaderMode)")
+#endif
                     try await Self.withLeaderAttachDeadline(hostKey: hostKey) {
                         try await self.attachRemoteLeader(
                             teamName: team.id,
@@ -1784,7 +1796,13 @@ extension TeamOrchestrator {
                             systemPrompt: remoteLeaderSystemPrompt
                         )
                     }
+#if DEBUG
+                    dlog("leader.attach.ok host=\(hostKey)")
+#endif
                 } catch {
+#if DEBUG
+                    dlog("leader.attach.threw host=\(hostKey) error=\(error)")
+#endif
                     let description = "Could not start remote leader on \(hostKey): \(error)"
                     RemoteWorkLog.info(description)
                     onRemoteAttachFailure?(description)
