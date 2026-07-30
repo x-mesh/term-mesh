@@ -6743,18 +6743,23 @@ fn main() {
             agent_instance_id,
         } => {
             let text = append_report_suffix(&text, no_report);
-            // Check if agent is headless — route to daemon socket
-            if let Some(daemon_sock) = detect_daemon_socket() {
-                if let Some(agent_id) = is_headless_agent(&daemon_sock, &team, target) {
-                    print_result(rpc_call(
-                        &daemon_sock,
-                        "headless.send",
-                        json!({
-                            "agent_id": agent_id,
-                            "text": format!("{text}\n"),
-                        }),
-                    ));
-                    return;
+            // Check if agent is headless — route to daemon socket. An
+            // explicit --panel/--agent-instance-id names a GUI pane, so it
+            // must reach the GUI resolution path below rather than being
+            // silently dropped by the headless route.
+            if panel.is_none() && agent_instance_id.is_none() {
+                if let Some(daemon_sock) = detect_daemon_socket() {
+                    if let Some(agent_id) = is_headless_agent(&daemon_sock, &team, target) {
+                        print_result(rpc_call(
+                            &daemon_sock,
+                            "headless.send",
+                            json!({
+                                "agent_id": agent_id,
+                                "text": format!("{text}\n"),
+                            }),
+                        ));
+                        return;
+                    }
                 }
             }
             let selected_instance_id = match command_agent_instance_id(
