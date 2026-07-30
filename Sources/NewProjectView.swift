@@ -89,6 +89,12 @@ struct NewProjectView: View {
     @State private var branchEdited = false
     @State private var repositoryURLSuggestions: [String] = []
     @State private var isLoadingRepositorySuggestions = false
+    /// How many of `repositoryURLSuggestions` came from disk. The rest are
+    /// from the account catalog. Kept as a count rather than a second list so
+    /// matching and selection keep working on one array.
+    @State private var localRepositoryCount = 0
+    @State private var remoteRepositoryCount = 0
+    @State private var repositoryScanTruncated = false
     @State private var showsTeamEditor = false
     @State private var showsAdvancedOptions = false
     @FocusState private var focusedField: Field?
@@ -233,15 +239,30 @@ struct NewProjectView: View {
             let directories = repositoryDirectories
             let roots = repositorySearchRoots
             isLoadingRepositorySuggestions = true
-            let suggestions = await Task.detached(priority: .utility) {
+            let local = await Task.detached(priority: .utility) {
                 RepositoryURLAutocomplete.loadOriginURLs(
                     from: directories,
                     searching: roots
                 )
             }.value
             guard !Task.isCancelled else { return }
-            repositoryURLSuggestions = suggestions
+            // Show what is on disk immediately; the account catalog needs the
+            // network and must not hold up a list that is already usable.
+            repositoryURLSuggestions = local
+            localRepositoryCount = local.count
+            remoteRepositoryCount = 0
+            repositoryScanTruncated = RepositoryURLAutocomplete.truncatedRepositoryScan
             isLoadingRepositorySuggestions = false
+
+            let remote = await GitHubRepositoryCatalog.load()
+            guard !Task.isCancelled, !remote.isEmpty else { return }
+            // Anything already cloned stays under its local entry — the same
+            // repository listed twice would be two identical rows.
+            var seen = Set(local)
+            let fresh = remote.filter { seen.insert($0).inserted }
+            guard !fresh.isEmpty else { return }
+            repositoryURLSuggestions = local + fresh
+            remoteRepositoryCount = fresh.count
         }
         .task(id: branchLookupID) {
             await loadRepositoryBranches()
@@ -1179,7 +1200,15 @@ struct NewProjectView: View {
 
     private var repositoryURLSuggestionHeader: String {
         if gitURL.isEmpty {
-            return "\(repositoryURLSuggestions.count) repositories · Type to search"
+            // Say where the entries came from. Calling them "repositories"
+            // read as the account's whole list, when what was on offer was
+            // whatever this machine had already cloned.
+            var parts = ["\(localRepositoryCount) found locally"]
+            if repositoryScanTruncated { parts[0] += " (scan limit reached)" }
+            if remoteRepositoryCount > 0 {
+                parts.append("\(remoteRepositoryCount) remote")
+            }
+            return "Recent · " + parts.joined(separator: ", ") + " · Type to search"
         }
         return "\(repositoryURLMatchCount) matching repositories"
     }
@@ -2002,11 +2031,19 @@ enum RepositoryURLAutocomplete {
         }
     }
 
+    /// The ceiling exists so a root pointed at a home directory cannot turn
+    /// opening the sheet into an unbounded walk. It was 250, which a single
+    /// ordinary work folder already exceeds — and it stopped silently, so the
+    /// list simply ended with no sign that anything had been left out.
+    /// `truncatedRepositoryScan` records when it bites.
+    static private(set) var truncatedRepositoryScan = false
+
     static func discoverRepositories(
         under roots: [String],
         maximumDepth: Int = 4,
-        maximumRepositories: Int = 250
+        maximumRepositories: Int = 2000
     ) -> [String] {
+        truncatedRepositoryScan = false
         guard maximumDepth >= 0, maximumRepositories > 0 else { return [] }
         let fileManager = FileManager.default
         var queue = roots.map {
@@ -2016,7 +2053,11 @@ enum RepositoryURLAutocomplete {
         var visited = Set<String>()
         var repositories: [String] = []
 
-        while nextIndex < queue.count, repositories.count < maximumRepositories {
+        while nextIndex < queue.count {
+            guard repositories.count < maximumRepositories else {
+                truncatedRepositoryScan = true
+                break
+            }
             let (directory, depth) = queue[nextIndex]
             nextIndex += 1
             guard !directory.isEmpty, visited.insert(directory).inserted else { continue }
@@ -2143,6 +2184,128 @@ enum RepositoryURLAutocomplete {
         components.user = nil
         components.password = nil
         return components.string ?? trimmed
+    }
+}
+
+/// Repositories the account can reach but this machine has not cloned.
+///
+/// The local scan can only offer what is already on disk, which makes the
+/// first clone of anything the one case it cannot help with. This fills that
+/// gap from the GitHub API.
+///
+/// Authentication is borrowed from `gh` rather than stored: the token is read
+/// at call time and never written anywhere, so there is no credential for this
+/// app to keep, rotate, or leak. Without `gh` the catalog is simply empty and
+/// the local list stands on its own.
+enum GitHubRepositoryCatalog {
+    /// Long enough that opening the sheet repeatedly costs one request, short
+    /// enough that a repository created this morning shows up this afternoon.
+    static let cacheLifetime: TimeInterval = 6 * 60 * 60
+
+    struct Cache: Codable {
+        var fetchedAt: Date
+        var sshURLs: [String]
+    }
+
+    private static var cacheURL: URL {
+        URL(fileURLWithPath: NSHomeDirectory())
+            .appendingPathComponent(".term-mesh", isDirectory: true)
+            .appendingPathComponent("github-repos.json")
+    }
+
+    /// Cached SSH URLs, or nil when there is no usable cache.
+    static func cached() -> [String]? {
+        guard let data = try? Data(contentsOf: cacheURL),
+              let cache = try? JSONDecoder().decode(Cache.self, from: data),
+              Date().timeIntervalSince(cache.fetchedAt) < cacheLifetime
+        else { return nil }
+        return cache.sshURLs
+    }
+
+    /// Every repository the token can see, newest first, as `git@` URLs so the
+    /// list is directly comparable with what the local scan produces.
+    ///
+    /// Returns the cache when it is fresh. A failure of any kind — no `gh`, no
+    /// network, a refused token — yields an empty list rather than an error:
+    /// this is an additional convenience over the local scan, never a
+    /// precondition for it.
+    static func load(forceRefresh: Bool = false) async -> [String] {
+        if !forceRefresh, let cached = cached() { return cached }
+        guard let token = await ghToken() else { return [] }
+        var urls: [String] = []
+        var page = 1
+        // A hard page ceiling: an account with thousands of repositories should
+        // not turn opening this sheet into a dozen round trips.
+        while page <= 10 {
+            guard let batch = await fetchPage(page, token: token), !batch.isEmpty else { break }
+            urls.append(contentsOf: batch)
+            if batch.count < 100 { break }
+            page += 1
+        }
+        guard !urls.isEmpty else { return [] }
+        persist(urls)
+        return urls
+    }
+
+    private static func persist(_ urls: [String]) {
+        let cache = Cache(fetchedAt: Date(), sshURLs: urls)
+        guard let data = try? JSONEncoder().encode(cache) else { return }
+        try? FileManager.default.createDirectory(
+            at: cacheURL.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        try? data.write(to: cacheURL, options: .atomic)
+    }
+
+    private static func fetchPage(_ page: Int, token: String) async -> [String]? {
+        var components = URLComponents(string: "https://api.github.com/user/repos")
+        components?.queryItems = [
+            URLQueryItem(name: "affiliation", value: "owner,collaborator,organization_member"),
+            URLQueryItem(name: "sort", value: "updated"),
+            URLQueryItem(name: "per_page", value: "100"),
+            URLQueryItem(name: "page", value: String(page)),
+        ]
+        guard let url = components?.url else { return nil }
+        var request = URLRequest(url: url, timeoutInterval: 15)
+        request.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
+        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        guard let (data, response) = try? await URLSession.shared.data(for: request),
+              let http = response as? HTTPURLResponse, http.statusCode == 200,
+              let rows = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]]
+        else { return nil }
+        return rows.compactMap { $0["ssh_url"] as? String }
+    }
+
+    /// `gh auth token`, or nil when gh is absent or logged out.
+    private static func ghToken() async -> String? {
+        guard let executable = ghExecutable() else { return nil }
+        return await Task.detached(priority: .utility) { () -> String? in
+            let process = Process()
+            process.executableURL = URL(fileURLWithPath: executable)
+            process.arguments = ["auth", "token"]
+            let output = Pipe()
+            process.standardOutput = output
+            process.standardError = FileHandle.nullDevice
+            guard (try? process.run()) != nil else { return nil }
+            let data = output.fileHandleForReading.readDataToEndOfFile()
+            process.waitUntilExit()
+            guard process.terminationStatus == 0 else { return nil }
+            let token = String(data: data, encoding: .utf8)?
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            return (token?.isEmpty == false) ? token : nil
+        }.value
+    }
+
+    /// A GUI app inherits a minimal PATH, so `gh` is looked for where its
+    /// installers actually put it rather than trusted to be on the path.
+    private static func ghExecutable() -> String? {
+        let candidates = [
+            "/opt/homebrew/bin/gh",
+            "/usr/local/bin/gh",
+            (NSHomeDirectory() as NSString).appendingPathComponent(".local/bin/gh"),
+            "/usr/bin/gh",
+        ]
+        return candidates.first { FileManager.default.isExecutableFile(atPath: $0) }
     }
 }
 

@@ -465,9 +465,7 @@ struct TermMeshApp: App {
                         activeTabManager.tabs.map(\.currentDirectory)
                         + TeamCreationRecentDirs.shared.current()
                     ),
-                    repositorySearchRoots: [
-                        ProjectLocationSettings.expandedLocalProjectsRoot()
-                    ]
+                    repositorySearchRoots: ProjectLocationSettings.repositorySearchRoots
                 )
             }
             .sheet(isPresented: $showWatchConfig) {

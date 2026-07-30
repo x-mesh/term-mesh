@@ -164,6 +164,8 @@ struct SettingsView: View {
     @AppStorage("teamDefaultWorkingDirectory") private var teamDefaultWorkingDirectory = ""
     @AppStorage(ProjectLocationSettings.localProjectsRootKey)
     private var localProjectsRoot = ProjectLocationSettings.defaultLocalProjectsRoot
+    @AppStorage(ProjectLocationSettings.repositorySearchRootsKey)
+    private var repositorySearchRoots = ""
     @AppStorage("agentRenderingInterval") private var agentRenderingInterval = 3
     // Phase 2 headless: idle-park threshold (0 = disabled, max 1440 min/24h)
     @AppStorage("headlessIdleParkMinutes") private var headlessIdleParkMinutes = 60
@@ -1397,6 +1399,22 @@ struct SettingsView: View {
                                 .buttonStyle(.bordered)
                                 .controlSize(.small)
                             }
+                        }
+
+                        SettingsCardDivider()
+
+                        SettingsCardRow(
+                            "Find Repositories In",
+                            subtitle: "Folders scanned for already-cloned repositories, "
+                                + "one per line. Empty uses Projects Under."
+                        ) {
+                            TextEditor(text: $repositorySearchRoots)
+                                .font(.system(.caption, design: .monospaced))
+                                .frame(width: 240, height: 54)
+                                .overlay(
+                                    RoundedRectangle(cornerRadius: 4)
+                                        .stroke(Color.secondary.opacity(0.2), lineWidth: 1)
+                                )
                         }
 
                         SettingsCardDivider()
