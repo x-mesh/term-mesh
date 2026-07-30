@@ -86,12 +86,13 @@ final class InstanceRoutingRegression169Tests: XCTestCase {
         XCTAssertEqual(unchanged.assigneeInstanceId, "instance-r")
     }
 
-    func testNameOnlyDuplicateIsRejectedButUniqueLegacyNameStillWorks() throws {
-        XCTAssertNil(store.createTask(
+    func testNameOnlyCreateAutoPinsFirstDuplicateButMutationRequiresIdentity() throws {
+        let autoPinned = try XCTUnwrap(store.createTask(
             teamName: teamName,
             title: "ambiguous create",
             assignee: "executor"
         ))
+        XCTAssertEqual(autoPinned.assigneeInstanceId, "instance-a")
 
         let task = try XCTUnwrap(store.createTask(
             teamName: teamName,
