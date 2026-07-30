@@ -254,6 +254,7 @@
 		APCT000000000000000003 /* AgentPipeCompletionTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = APCT000000000000000006 /* AgentPipeCompletionTests.swift */; };
 		RB169000000000000003 /* ReviewBoardMergeSafetyRegression169Tests.swift in Sources */ = {isa = PBXBuildFile; fileRef = RB169000000000000006 /* ReviewBoardMergeSafetyRegression169Tests.swift */; };
 		AP169000000000000003 /* AgentPaneRegression169Tests.swift in Sources */ = {isa = PBXBuildFile; fileRef = AP169000000000000006 /* AgentPaneRegression169Tests.swift */; };
+		IR169000000000000003 /* InstanceRoutingRegression169Tests.swift in Sources */ = {isa = PBXBuildFile; fileRef = IR169000000000000006 /* InstanceRoutingRegression169Tests.swift */; };
 		A5009020 /* AgentSessionTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A5009021 /* AgentSessionTests.swift */; };
 		A5009040 /* WorktreeApprovalHelperTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A5009041 /* WorktreeApprovalHelperTests.swift */; };
 				F9000010A1B2C3D4E5F60718 /* WorkspaceRetrievalDirectoryTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = F9000011A1B2C3D4E5F60718 /* WorkspaceRetrievalDirectoryTests.swift */; };
@@ -568,6 +569,7 @@
 			APCT000000000000000006 /* AgentPipeCompletionTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AgentPipeCompletionTests.swift; sourceTree = "<group>"; };
 		RB169000000000000006 /* ReviewBoardMergeSafetyRegression169Tests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ReviewBoardMergeSafetyRegression169Tests.swift; sourceTree = "<group>"; };
 		AP169000000000000006 /* AgentPaneRegression169Tests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AgentPaneRegression169Tests.swift; sourceTree = "<group>"; };
+		IR169000000000000006 /* InstanceRoutingRegression169Tests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = InstanceRoutingRegression169Tests.swift; sourceTree = "<group>"; };
 		A5009021 /* AgentSessionTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AgentSessionTests.swift; sourceTree = "<group>"; };
 		A5009041 /* WorktreeApprovalHelperTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WorktreeApprovalHelperTests.swift; sourceTree = "<group>"; };
 			F9000011A1B2C3D4E5F60718 /* WorkspaceRetrievalDirectoryTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WorkspaceRetrievalDirectoryTests.swift; sourceTree = "<group>"; };
@@ -937,6 +939,7 @@ A1740000000000000000000C /* ProcessRun.swift */,
 				APCT000000000000000006 /* AgentPipeCompletionTests.swift */,
 				RB169000000000000006 /* ReviewBoardMergeSafetyRegression169Tests.swift */,
 				AP169000000000000006 /* AgentPaneRegression169Tests.swift */,
+				IR169000000000000006 /* InstanceRoutingRegression169Tests.swift */,
 				A5009021 /* AgentSessionTests.swift */,
 				A5009041 /* WorktreeApprovalHelperTests.swift */,
 				F9000011A1B2C3D4E5F60718 /* WorkspaceRetrievalDirectoryTests.swift */,
@@ -1336,6 +1339,7 @@ A1740000000000000000000B /* ProcessRun.swift in Sources */,
 				APCT000000000000000003 /* AgentPipeCompletionTests.swift in Sources */,
 				RB169000000000000003 /* ReviewBoardMergeSafetyRegression169Tests.swift in Sources */,
 				AP169000000000000003 /* AgentPaneRegression169Tests.swift in Sources */,
+				IR169000000000000003 /* InstanceRoutingRegression169Tests.swift in Sources */,
 				A5009020 /* AgentSessionTests.swift in Sources */,
 				A5009040 /* WorktreeApprovalHelperTests.swift in Sources */,
 				F9000010A1B2C3D4E5F60718 /* WorkspaceRetrievalDirectoryTests.swift in Sources */,
