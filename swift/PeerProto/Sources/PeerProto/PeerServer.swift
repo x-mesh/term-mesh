@@ -159,6 +159,11 @@ public protocol PeerSurfaceProvider: AnyObject, Sendable {
     /// `WorkspaceLayoutChanged` push path.
     func handleWorkspaceControl(_ control: Termmesh_Peer_V1_WorkspaceControl) async
 
+    /// Create a workspace and return its host-assigned id. Returning `nil`
+    /// rejects the request. Unlike rename/delete this is a paired RPC: the
+    /// caller needs the id before it can address the new workspace.
+    func createWorkspace(title: String) async -> Data?
+
     /// Rename an existing workspace in place; the id never changes.
     /// Returns `false` (no-op) for an empty or unknown `workspaceID` —
     /// mirrors the Rust host's `PeerHost::rename_workspace` contract
@@ -223,6 +228,7 @@ public struct PeerTeamCallFailure: Error, Sendable, Equatable {
 
 public extension PeerSurfaceProvider {
     func listWorkspaces() async -> [Termmesh_Peer_V1_Workspace] { [] }
+    func createWorkspace(title: String) async -> Data? { nil }
     func renameWorkspace(id workspaceID: Data, title: String) async -> Bool { false }
     func deleteWorkspace(id workspaceID: Data) async -> Bool { false }
     func handleWorkspaceControl(_ control: Termmesh_Peer_V1_WorkspaceControl) async {}
@@ -1326,6 +1332,21 @@ actor PeerServerSession {
             // Fire-and-forget; the resulting layout update flows back
             // via the existing WorkspaceLayoutChanged push.
             await provider.handleWorkspaceControl(ctl)
+
+        case (.ready, .createWorkspaceRequest(let req)):
+            let workspaceID = await provider.createWorkspace(title: req.title)
+            try await sendEnvelopeWithCorrelation(env.seq) { inner in
+                var response = Termmesh_Peer_V1_CreateWorkspaceResponse()
+                response.accepted = workspaceID != nil
+                response.reason = workspaceID == nil
+                    ? "host could not create a workspace"
+                    : ""
+                response.workspaceID = workspaceID ?? Data()
+                inner.createWorkspaceResponse = response
+            }
+            if workspaceID != nil {
+                try await pushWorkspaceListChanged(await provider.listWorkspaces())
+            }
 
         case (.ready, .renameWorkspaceRequest(let req)):
             // Fire-and-forget like WorkspaceControl: no reply, paired

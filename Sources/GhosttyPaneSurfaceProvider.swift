@@ -564,6 +564,10 @@ final class GhosttyPaneSurfaceProvider: PeerSurfaceProvider {
         await MainActor.run { applyWorkspaceControl(control) }
     }
 
+    func createWorkspace(title: String) async -> Data? {
+        await MainActor.run { performCreateWorkspace(title: title) }
+    }
+
     func renameWorkspace(id workspaceID: Data, title: String) async -> Bool {
         await MainActor.run { performRenameWorkspace(workspaceIDBytes: workspaceID, title: title) }
     }
@@ -904,6 +908,27 @@ final class GhosttyPaneSurfaceProvider: PeerSurfaceProvider {
             }
         }
         _ = panel  // silence unused
+    }
+
+    /// Create in the window the host already considers current, but do not
+    /// select or raise it. Peer lifecycle commands mutate the roster; they do
+    /// not carry focus intent.
+    private func performCreateWorkspace(title: String) -> Data? {
+        guard let tabManager = AppDelegate.shared?
+            .preferredMainWindowContextForServiceWorkspace()?
+            .tabManager
+        else {
+            #if DEBUG
+            dlog("peer.host.createWorkspace rejected reason=no_window")
+            #endif
+            return nil
+        }
+        let workspace = tabManager.addWorkspace(select: false)
+        workspace.setCustomTitle(title)
+        #if DEBUG
+        dlog("peer.host.createWorkspace id=\(workspace.id.uuidString.prefix(8)) title=\(title)")
+        #endif
+        return withUnsafeBytes(of: workspace.id.uuid) { Data($0) }
     }
 
     /// Rename an existing workspace's display name in place; its id

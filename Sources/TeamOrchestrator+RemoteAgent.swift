@@ -128,7 +128,7 @@ extension TeamOrchestrator {
     /// failure. Generous — it covers an ssh dial, a clone-sized wait on a
     /// cold host, and a CLI's first launch — because the point is to bound a
     /// stall, not to race a slow but working host.
-    static let leaderAttachTimeout: TimeInterval = 20
+    static let leaderAttachTimeout: TimeInterval = 180
 
     /// Settles on whichever of two outcomes arrives first and ignores the
     /// other. Deliberately not a task group: a group waits for every child

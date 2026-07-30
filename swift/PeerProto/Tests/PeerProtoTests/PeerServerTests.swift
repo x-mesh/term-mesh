@@ -300,6 +300,7 @@ final class PeerServerTests: XCTestCase {
     }
 
     /// End-to-end: real `PeerServer` dispatch of
+    /// `CreateWorkspaceRequest` (paired) plus
     /// `RenameWorkspaceRequest`/`DeleteWorkspaceRequest` (fire-and-forget,
     /// per peer.proto's "Workspace lifecycle" section) reaches the
     /// provider with the exact wire arguments, and `PeerServer
@@ -332,7 +333,10 @@ final class PeerServerTests: XCTestCase {
         )
         _ = try await session.handshake()
 
-        let workspaceID = Data(repeating: 0x5A, count: 16)
+        let workspaceID = try await session.createWorkspace(title: "created-via-server")
+        XCTAssertEqual(workspaceID, RecordingWorkspaceProvider.workspaceID)
+        let createdTitle = await provider.createdTitle
+        XCTAssertEqual(createdTitle, "created-via-server")
         try await session.renameWorkspace(workspaceID: workspaceID, title: "renamed-via-server")
         try await session.deleteWorkspace(workspaceID: workspaceID)
 
@@ -819,6 +823,8 @@ private actor RecordingAttachProvider: PeerSurfaceProvider {
 /// this package) to prove `PeerServerSession.dispatch` actually invokes
 /// the provider with the wire-decoded arguments.
 private actor RecordingWorkspaceProvider: PeerSurfaceProvider {
+    static let workspaceID = Data(repeating: 0x5A, count: 16)
+    private(set) var createdTitle: String?
     private(set) var renamed: (id: Data, title: String)?
     private(set) var deleted: Data?
 
@@ -830,6 +836,11 @@ private actor RecordingWorkspaceProvider: PeerSurfaceProvider {
         clientRows: UInt32,
         resumeFromSeq: UInt64
     ) async -> PeerSurfaceAttachment? { nil }
+
+    func createWorkspace(title: String) async -> Data? {
+        createdTitle = title
+        return Self.workspaceID
+    }
 
     func renameWorkspace(id workspaceID: Data, title: String) async -> Bool {
         renamed = (workspaceID, title)
