@@ -1899,23 +1899,49 @@ class TerminalController {
         }
     }
 
+    /// Read a fixed-width hex string off the wire, refusing anything else.
+    ///
+    /// Measured in units of UTF-8 rather than `Character` on purpose, and both
+    /// the length check and the walk use the same unit. They did not: the
+    /// guard counted `value.utf8.count` while the loop advanced by
+    /// `index(_:offsetBy: 2)` over graphemes, so any non-ASCII byte made the
+    /// two disagree and the walk ran off the end. `String.index(_:offsetBy:)`
+    /// traps past `endIndex` — this returned `nil` for bad input everywhere
+    /// except the one shape that killed the process instead.
+    ///
+    /// `peer.leader.call` hands its three id parameters straight here, so the
+    /// input is whatever a socket client typed. `"0" * 62 + "é"` is 64 UTF-8
+    /// bytes and 63 characters, and every pair before the last parses as hex.
     nonisolated static func decodeFixedHex(
         _ value: String?,
         byteCount: Int
     ) -> Data? {
-        guard let value, value.utf8.count == byteCount * 2 else { return nil }
+        guard let value else { return nil }
+        // A hex string is ASCII by definition, so its UTF-8 view is also its
+        // list of digits: one unit per character, no grapheme boundary to
+        // disagree about, and no index arithmetic that can leave the buffer.
+        let digits = Array(value.utf8)
+        guard digits.count == byteCount * 2 else { return nil }
         var bytes = [UInt8]()
         bytes.reserveCapacity(byteCount)
-        var index = value.startIndex
-        for _ in 0..<byteCount {
-            let next = value.index(index, offsetBy: 2)
-            guard let byte = UInt8(value[index..<next], radix: 16) else {
-                return nil
-            }
-            bytes.append(byte)
-            index = next
+        for pair in stride(from: 0, to: digits.count, by: 2) {
+            guard let high = hexNibble(digits[pair]),
+                  let low = hexNibble(digits[pair + 1]) else { return nil }
+            bytes.append(high << 4 | low)
         }
         return Data(bytes)
+    }
+
+    /// One hex digit's value, or nil for anything that is not one. Rejects the
+    /// non-ASCII bytes `UInt8(_:radix:)` would have rejected anyway, one byte
+    /// earlier and without a `String` in between.
+    nonisolated private static func hexNibble(_ digit: UInt8) -> UInt8? {
+        switch digit {
+        case 0x30...0x39: return digit - 0x30            // 0-9
+        case 0x61...0x66: return digit - 0x61 + 10       // a-f
+        case 0x41...0x46: return digit - 0x41 + 10       // A-F
+        default: return nil
+        }
     }
 
     func v2EnsureHandleRef(kind: V2HandleKind, uuid: UUID) -> String {
