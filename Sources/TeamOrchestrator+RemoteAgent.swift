@@ -50,6 +50,7 @@ extension TeamOrchestrator {
         case unresolvedRemoteWorkingDirectory(host: String, path: String)
         case checkoutIsolationFailed(host: String, path: String, reason: String)
         case projectDeletionIncomplete(String)
+        case leaderAttachTimedOut(host: String, seconds: TimeInterval)
         case partialShellClose(closed: Int, failed: Int, reason: String)
 
         var description: String {
@@ -77,6 +78,9 @@ extension TeamOrchestrator {
                     + "refusing to reuse the requested checkout"
             case .projectDeletionIncomplete(let report):
                 return "project deletion incomplete: \(report)"
+            case .leaderAttachTimedOut(let host, let seconds):
+                return "the leader on \(host) did not finish starting within "
+                    + "\(Int(seconds))s; the host may be unreachable or the CLI may not be launching"
             case .partialShellClose(let closed, let failed, let reason):
                 return "closed \(closed) shell(s); \(failed) refused — \(reason)"
             }
@@ -118,6 +122,32 @@ extension TeamOrchestrator {
             .replacingOccurrences(of: "\r", with: " ")
             .trimmingCharacters(in: .whitespacesAndNewlines)
         return "Project · \(String(singleLine.prefix(72)))"
+    }
+
+    /// How long the whole remote-leader attach may take before it is called a
+    /// failure. Generous — it covers an ssh dial, a clone-sized wait on a
+    /// cold host, and a CLI's first launch — because the point is to bound a
+    /// stall, not to race a slow but working host.
+    static let leaderAttachTimeout: TimeInterval = 180
+
+    /// Runs `body`, failing with `.leaderAttachTimedOut` if it has not
+    /// finished within `leaderAttachTimeout`.
+    static func withLeaderAttachDeadline(
+        hostKey: String,
+        timeout: TimeInterval = leaderAttachTimeout,
+        _ body: @escaping @Sendable () async throws -> Void
+    ) async throws {
+        try await withThrowingTaskGroup(of: Void.self) { group in
+            group.addTask { try await body() }
+            group.addTask {
+                try await Task.sleep(nanoseconds: UInt64(timeout * 1_000_000_000))
+                throw RemoteAgentError.leaderAttachTimedOut(host: hostKey, seconds: timeout)
+            }
+            // Whichever finishes first decides; the other is cancelled with
+            // the group so a timed-out attach stops working in the background.
+            defer { group.cancelAll() }
+            try await group.next()
+        }
     }
 
     private func waitForRemoteRemoval(
@@ -1736,14 +1766,24 @@ extension TeamOrchestrator {
             if case let .peer(hostKey) = leaderEndpoint {
                 guard let resolvedRemoteLeaderWorkingDirectory else { return }
                 do {
-                    try await self.attachRemoteLeader(
-                        teamName: team.id,
-                        hostKey: hostKey,
-                        workingDirectory: resolvedRemoteLeaderWorkingDirectory,
-                        cli: leaderMode,
-                        model: leaderModel,
-                        systemPrompt: remoteLeaderSystemPrompt
-                    )
+                    // Bounded as a whole rather than step by step. This path
+                    // crosses a tunnel, a relay session, an ssh command and a
+                    // shell handshake, and a stall in any one of them used to
+                    // leave the pane on "Connecting remote leader…" with no
+                    // error, no retry and nothing written to the team — the
+                    // failure handling below never ran because nothing ever
+                    // threw. A ceiling turns every such stall into the
+                    // reported failure it already knows how to show.
+                    try await Self.withLeaderAttachDeadline(hostKey: hostKey) {
+                        try await self.attachRemoteLeader(
+                            teamName: team.id,
+                            hostKey: hostKey,
+                            workingDirectory: resolvedRemoteLeaderWorkingDirectory,
+                            cli: leaderMode,
+                            model: leaderModel,
+                            systemPrompt: remoteLeaderSystemPrompt
+                        )
+                    }
                 } catch {
                     let description = "Could not start remote leader on \(hostKey): \(error)"
                     RemoteWorkLog.info(description)

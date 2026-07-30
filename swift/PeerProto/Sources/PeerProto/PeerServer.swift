@@ -1155,13 +1155,18 @@ actor PeerServerSession {
             // the roster capability — otherwise the flag invites a question
             // this host cannot answer. Resolved before building the Hello,
             // since the envelope builder is synchronous.
-            let teamCapabilities = [
+            //
+            // Leader bootstrap is deliberately not in that set. Standing up a
+            // leader is what one does on a host that has no teams yet, so
+            // gating it on having one is a deadlock: no capability, so no
+            // leader; no leader, so never a team. A host that reached this
+            // point can host a leader whether or not it is hosting one now.
+            let rosterCapabilities = [
                 PeerCapability.teamRosterV1,
                 PeerCapability.teamCallV1,
-                PeerCapability.teamLeaderV1,
             ]
             let advertisedCapabilities = await provider.listTeams().isEmpty
-                ? PeerCapability.supported.filter { !teamCapabilities.contains($0) }
+                ? PeerCapability.supported.filter { !rosterCapabilities.contains($0) }
                 : PeerCapability.supported
             try await sendEnvelope { env in
                 var h = Termmesh_Peer_V1_Hello()
