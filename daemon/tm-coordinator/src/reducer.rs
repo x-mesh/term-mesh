@@ -2,7 +2,7 @@ use crate::fence::FenceRecord;
 use crate::model::{
     now_ms, Attempt, AttemptId, FencingToken, HostId, HostObservation, IntentEvent, MergeQueueId,
     MergeQueueItem, MergeQueueStatus, Placement, Project, ProjectId, ProjectState, ReviewSnapshot,
-    Task, TaskId, TaskStatus,
+    ReviewSnapshotId, Task, TaskId, TaskStatus,
 };
 use anyhow::{bail, Result};
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
@@ -890,17 +890,18 @@ impl Reducer {
         // Events written before approval evidence became part of the queue
         // model still carry the exact snapshot id at payload level. Hydrate
         // those fields before deserializing so journal replay remains valid.
+        // A snapshot the projection no longer holds degrades that one item to
+        // "no evidence" rather than failing the whole replay.
         if queue_value.get("snapshot_id").is_none() {
             let snapshot_id = required_str(&event.payload, "snapshot_id")?;
-            let snapshot = self
-                .review_snapshot(snapshot_id)?
-                .ok_or_else(|| anyhow::anyhow!("review snapshot not found"))?;
             let queue_object = queue_value
                 .as_object_mut()
                 .ok_or_else(|| anyhow::anyhow!("merge_queue_item must be an object"))?;
             queue_object.insert("snapshot_id".to_string(), snapshot_id.into());
-            queue_object.insert("head_sha".to_string(), snapshot.head_sha.into());
-            queue_object.insert("diff_digest".to_string(), snapshot.diff_digest.into());
+            if let Some(snapshot) = self.review_snapshot(snapshot_id)? {
+                queue_object.insert("head_sha".to_string(), snapshot.head_sha.into());
+                queue_object.insert("diff_digest".to_string(), snapshot.diff_digest.into());
+            }
         }
         let queue: MergeQueueItem = serde_json::from_value(queue_value)?;
         let task = self
@@ -1112,7 +1113,7 @@ impl Reducer {
                 item.project_id.as_str(),
                 item.task_id.as_str(),
                 item.attempt_id.as_str(),
-                item.snapshot_id.as_str(),
+                item.snapshot_id.as_ref().map(ReviewSnapshotId::as_str),
                 item.head_sha,
                 item.diff_digest,
                 status_string(&item.status)?,
@@ -1235,8 +1236,13 @@ fn row_to_merge_queue_item(row: &rusqlite::Row<'_>) -> rusqlite::Result<MergeQue
         project_id: ProjectId::from_str(&row.get::<_, String>(1)?).map_err(to_sql_err)?,
         task_id: TaskId::from_str(&row.get::<_, String>(2)?).map_err(to_sql_err)?,
         attempt_id: AttemptId::from_str(&row.get::<_, String>(3)?).map_err(to_sql_err)?,
-        snapshot_id: crate::model::ReviewSnapshotId::from_str(&row.get::<_, String>(4)?)
-            .map_err(to_sql_err)?,
+        // NULL survives the backfill when a row's journal event or snapshot
+        // is gone. That row must read as "no evidence"; erroring here would
+        // take every queue read down with it.
+        snapshot_id: row
+            .get::<_, Option<String>>(4)?
+            .map(|value| crate::model::ReviewSnapshotId::from_str(&value).map_err(to_sql_err))
+            .transpose()?,
         head_sha: row.get(5)?,
         diff_digest: row.get(6)?,
         status,

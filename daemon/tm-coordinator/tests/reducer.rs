@@ -697,9 +697,12 @@ fn stale_snapshot_approval_is_rejected_and_latest_evidence_is_persisted() {
     legacy_queue.remove("diff_digest");
     let replayed = Reducer::replay(&legacy_events).unwrap();
     let queue = replayed.merge_queue(None, None).unwrap();
-    assert_eq!(queue[0].snapshot_id.as_str(), second_id.as_str().unwrap());
-    assert_eq!(queue[0].head_sha, "head-2");
-    assert_eq!(queue[0].diff_digest, "sha256:second");
+    assert_eq!(
+        queue[0].snapshot_id.as_ref().map(|id| id.as_str()),
+        second_id.as_str()
+    );
+    assert_eq!(queue[0].head_sha.as_deref(), Some("head-2"));
+    assert_eq!(queue[0].diff_digest.as_deref(), Some("sha256:second"));
 }
 
 #[test]
