@@ -828,69 +828,107 @@ private struct Answer: View {
 struct MarkdownText: View {
     let text: String
     var streaming: Bool = false
+    @State private var presentation: AgentMarkdownPresentation?
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            ForEach(Array(AgentMarkdown.blocks(text).enumerated()), id: \.offset) { _, block in
-                switch block {
-                case .paragraph(let body):
-                    inline(body)
-                case .heading(let level, let title):
-                    // Weight, not size: 13/12.5/12 against a 12pt body. A
-                    // heading should be findable when you scan, not loud when
-                    // you read.
-                    inline(title)
-                        .font(.system(size: level == 1 ? 13 : (level == 2 ? 12.5 : 12),
-                                      weight: level <= 2 ? .bold : .semibold))
-                        .padding(.top, 2)
-                case .bullet(let marker, let body):
-                    HStack(alignment: .firstTextBaseline, spacing: 6) {
-                        Text(marker)
-                            .font(.system(size: 11).monospacedDigit())
-                            .foregroundStyle(.secondary)
-                        inline(body)
+        Group {
+            if streaming {
+                Text(text).font(.system(size: 12))
+            } else if let presentation, presentation.source == text {
+                VStack(alignment: .leading, spacing: 6) {
+                    ForEach(Array(presentation.blocks.enumerated()), id: \.offset) { _, block in
+                        switch block {
+                        case .paragraph(let body):
+                            Text(body).font(.system(size: 12))
+                        case .heading(let level, let title):
+                            Text(title)
+                                .font(.system(size: level == 1 ? 13 : (level == 2 ? 12.5 : 12),
+                                              weight: level <= 2 ? .bold : .semibold))
+                                .padding(.top, 2)
+                        case .bullet(let marker, let body):
+                            HStack(alignment: .firstTextBaseline, spacing: 6) {
+                                Text(marker)
+                                    .font(.system(size: 11).monospacedDigit())
+                                    .foregroundStyle(.secondary)
+                                Text(body).font(.system(size: 12))
+                            }
+                        case .quote(let body):
+                            HStack(alignment: .top, spacing: 8) {
+                                Rectangle().fill(.quaternary).frame(width: 2)
+                                Text(body).font(.system(size: 12)).foregroundStyle(.secondary)
+                            }
+                        case .code(let language, let body):
+                            PreparedCodeBlock(language: language, code: body)
+                        case .table(let headers, let rows):
+                            PreparedMarkdownTable(headers: headers, rows: rows)
+                        case .rule:
+                            Rectangle().fill(.quaternary).frame(height: 1).padding(.vertical, 2)
+                        }
                     }
-                case .quote(let body):
-                    HStack(alignment: .top, spacing: 8) {
-                        Rectangle().fill(.quaternary).frame(width: 2)
-                        inline(body).foregroundStyle(.secondary)
-                    }
-                case .code(let language, let body):
-                    CodeBlock(language: language, code: body)
-                case .table(let headers, let rows):
-                    MarkdownTable(headers: headers, rows: rows, streaming: streaming)
-                case .rule:
-                    Rectangle().fill(.quaternary).frame(height: 1).padding(.vertical, 2)
                 }
+            } else {
+                Text(text).font(.system(size: 12))
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
-    }
-
-    /// Inline emphasis resolves once the row stops streaming. Half-written
-    /// emphasis is unparseable by definition, and parsing it on each of a few
-    /// hundred deltas costs more than it returns.
-    private func inline(_ body: String) -> Text {
-        streaming ? Text(body).font(.system(size: 12))
-                  : Text(AgentMarkdown.inline(body)).font(.system(size: 12))
+        .task(id: "\(streaming):\(text)") {
+            guard !streaming else { presentation = nil; return }
+            let source = text
+            let prepared = await Task.detached(priority: .userInitiated) {
+                AgentMarkdownPresentation.prepare(source)
+            }.value
+            guard !Task.isCancelled, source == text else { return }
+            presentation = prepared
+        }
     }
 }
 
-/// A small report table, not a spreadsheet: the header has just enough weight
-/// to orient a scan, and wide tables scroll instead of squeezing words into a
-/// pile of ellipses.
-private struct MarkdownTable: View {
-    let headers: [String]
-    let rows: [[String]]
-    let streaming: Bool
+/// Immutable rendering input prepared outside SwiftUI body evaluation.
+struct AgentMarkdownPresentation: @unchecked Sendable {
+    enum Block: @unchecked Sendable {
+        case paragraph(AttributedString)
+        case heading(level: Int, text: AttributedString)
+        case bullet(marker: String, text: AttributedString)
+        case quote(AttributedString)
+        case code(language: String?, text: AttributedString)
+        case table(headers: [AttributedString], rows: [[AttributedString]])
+        case rule
+    }
+
+    let source: String
+    let blocks: [Block]
+
+    static func prepare(_ source: String) -> AgentMarkdownPresentation {
+        let blocks = AgentMarkdown.blocks(source).map { block -> Block in
+            switch block {
+            case .paragraph(let text): return .paragraph(AgentMarkdown.inline(text))
+            case .heading(let level, let text):
+                return .heading(level: level, text: AgentMarkdown.inline(text))
+            case .bullet(let marker, let text):
+                return .bullet(marker: marker, text: AgentMarkdown.inline(text))
+            case .quote(let text): return .quote(AgentMarkdown.inline(text))
+            case .code(let language, let text):
+                return .code(language: language, text: AgentMarkdown.highlighted(text, language: language))
+            case .table(let headers, let rows):
+                return .table(headers: headers.map(AgentMarkdown.inline),
+                              rows: rows.map { $0.map(AgentMarkdown.inline) })
+            case .rule: return .rule
+            }
+        }
+        return AgentMarkdownPresentation(source: source, blocks: blocks)
+    }
+}
+
+private struct PreparedMarkdownTable: View {
+    let headers: [AttributedString]
+    let rows: [[AttributedString]]
 
     var body: some View {
         ScrollView(.horizontal, showsIndicators: false) {
             Grid(alignment: .leading, horizontalSpacing: 14, verticalSpacing: 5) {
                 GridRow {
                     ForEach(Array(headers.enumerated()), id: \.offset) { _, header in
-                        cell(header)
-                            .font(.system(size: 11.5, weight: .semibold))
+                        Text(header).font(.system(size: 11.5, weight: .semibold))
                             .foregroundStyle(.secondary)
                     }
                 }
@@ -898,7 +936,8 @@ private struct MarkdownTable: View {
                 ForEach(Array(rows.enumerated()), id: \.offset) { _, row in
                     GridRow {
                         ForEach(Array(headers.indices), id: \.self) { index in
-                            cell(index < row.count ? row[index] : "")
+                            Text(index < row.count ? row[index] : AttributedString())
+                                .font(.system(size: 12))
                         }
                     }
                 }
@@ -906,35 +945,21 @@ private struct MarkdownTable: View {
             .padding(.vertical, 2)
         }
     }
-
-    private func cell(_ text: String) -> Text {
-        streaming ? Text(text).font(.system(size: 12))
-                  : Text(AgentMarkdown.inline(text)).font(.system(size: 12))
-    }
 }
 
-/// A fenced block: monospaced, scrollable, and coloured enough to scan.
-private struct CodeBlock: View {
+private struct PreparedCodeBlock: View {
     let language: String?
-    let code: String
+    let code: AttributedString
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             if let language, !language.isEmpty {
-                Text(language)
-                    .font(.system(size: 9, weight: .medium).monospaced())
-                    .foregroundStyle(.tertiary)
-                    .padding(.horizontal, 8)
-                    .padding(.top, 5)
+                Text(language).font(.system(size: 9, weight: .medium).monospaced())
+                    .foregroundStyle(.tertiary).padding(.horizontal, 8).padding(.top, 5)
             }
-            // Horizontal scrolling rather than wrapping: a wrapped command line
-            // is a line you cannot copy correctly by eye.
             ScrollView(.horizontal, showsIndicators: false) {
-                Text(AgentMarkdown.highlighted(code, language: language))
-                    .font(.system(size: 11, design: .monospaced))
-                    .textSelection(.enabled)
-                    .padding(.horizontal, 8)
-                    .padding(.vertical, 6)
+                Text(code).font(.system(size: 11, design: .monospaced))
+                    .textSelection(.enabled).padding(.horizontal, 8).padding(.vertical, 6)
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
