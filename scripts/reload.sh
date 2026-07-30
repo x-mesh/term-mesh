@@ -405,6 +405,11 @@ SCRUB_VARS=(
   GH_PAGER
   TERMINFO
   XDG_DATA_DIRS
+  # A Claude Code pane calling this script carries this marker, and `open`
+  # would otherwise hand it down to every pane shell in the launched app.
+  # Claude then treats itself as a child session and skips transcript
+  # persistence there.
+  CLAUDE_CODE_CHILD_SESSION
 )
 
 # Launch `open "$APP_PATH"` inside a subshell with the scrub applied and any
