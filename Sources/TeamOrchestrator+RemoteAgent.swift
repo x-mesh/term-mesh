@@ -128,26 +128,65 @@ extension TeamOrchestrator {
     /// failure. Generous — it covers an ssh dial, a clone-sized wait on a
     /// cold host, and a CLI's first launch — because the point is to bound a
     /// stall, not to race a slow but working host.
-    static let leaderAttachTimeout: TimeInterval = 180
+    static let leaderAttachTimeout: TimeInterval = 20
+
+    /// Settles on whichever of two outcomes arrives first and ignores the
+    /// other. Deliberately not a task group: a group waits for every child
+    /// before its scope may exit, so a child that ignores cancellation holds
+    /// the timeout inside with it — the deadline fires, and nobody hears it.
+    private actor AttachOutcome {
+        private var result: Result<Void, Error>?
+        private var waiter: CheckedContinuation<Void, Error>?
+
+        func wait() async throws {
+            if let result { return try result.get() }
+            try await withCheckedThrowingContinuation { waiter = $0 }
+        }
+
+        func settle(_ outcome: Result<Void, Error>) {
+            guard result == nil else { return }
+            result = outcome
+            guard let waiter else { return }
+            self.waiter = nil
+            waiter.resume(with: outcome)
+        }
+    }
 
     /// Runs `body`, failing with `.leaderAttachTimedOut` if it has not
     /// finished within `leaderAttachTimeout`.
+    ///
+    /// A timed-out attach is abandoned rather than awaited. Cancellation is
+    /// still requested, but this path reaches ssh and a remote shell, and
+    /// waiting for those to notice is exactly the hang being bounded.
     static func withLeaderAttachDeadline(
         hostKey: String,
         timeout: TimeInterval = leaderAttachTimeout,
         _ body: @escaping @Sendable () async throws -> Void
     ) async throws {
-        try await withThrowingTaskGroup(of: Void.self) { group in
-            group.addTask { try await body() }
-            group.addTask {
-                try await Task.sleep(nanoseconds: UInt64(timeout * 1_000_000_000))
-                throw RemoteAgentError.leaderAttachTimedOut(host: hostKey, seconds: timeout)
+        let outcome = AttachOutcome()
+        let work = Task {
+            do {
+                try await body()
+                await outcome.settle(.success(()))
+            } catch {
+                await outcome.settle(.failure(error))
             }
-            // Whichever finishes first decides; the other is cancelled with
-            // the group so a timed-out attach stops working in the background.
-            defer { group.cancelAll() }
-            try await group.next()
         }
+        let timer = Task {
+            try? await Task.sleep(nanoseconds: UInt64(timeout * 1_000_000_000))
+            guard !Task.isCancelled else { return }
+#if DEBUG
+            dlog("leader.deadline.fired host=\(hostKey)")
+#endif
+            await outcome.settle(
+                .failure(RemoteAgentError.leaderAttachTimedOut(host: hostKey, seconds: timeout))
+            )
+        }
+        defer {
+            work.cancel()
+            timer.cancel()
+        }
+        try await outcome.wait()
     }
 
     private func waitForRemoteRemoval(
