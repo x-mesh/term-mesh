@@ -67,20 +67,34 @@ final class ReviewBoardEvidenceHardeningRegression169Tests: XCTestCase {
         XCTAssertFalse(decoded.isTruncated)
     }
 
-    /// An excerpt cannot reproduce a digest taken over the whole patch, and
-    /// refusing those would refuse exactly the large reviews the excerpt was
-    /// added for. So the check is skipped, and the row still says it is an
-    /// excerpt.
-    func testATruncatedPeerPatchIsNotHeldToTheDigest() throws {
-        let json = try peerJSON(
-            patch: "diff --git a/Sources/a.swift b/Sources/a.swift\n",
-            digest: "sha256:ff",
-            truncated: true
+    /// The one exception to refusing a digest that does not match, stated as
+    /// the one thing that differs.
+    ///
+    /// An excerpt cannot reproduce a digest taken over the whole patch, so
+    /// holding it to one would refuse exactly the large reviews the excerpt was
+    /// added for. The payload here is byte-for-byte the payload
+    /// `testAPeerDigestThatDoesNotDescribeItsPatchIsRefused` sends, with
+    /// `truncated` flipped — if anything but that flag decided the outcome,
+    /// these two could not both pass.
+    func testTruncatedIsTheOnlyThingThatSkipsTheDigestCheck() throws {
+        let body = "diff --git a/Sources/a.swift b/Sources/a.swift\n+trust me\n"
+        let wrongDigest = "sha256:cafebabe"
+
+        XCTAssertNil(
+            ReviewBoardEvidence.Patch(
+                peerResponse: try peerJSON(patch: body, digest: wrongDigest, truncated: false)
+            ),
+            "the whole patch is here, so the digest has to cover it"
         )
 
-        let decoded = try XCTUnwrap(ReviewBoardEvidence.Patch(peerResponse: json))
-        XCTAssertTrue(decoded.isTruncated)
-        XCTAssertEqual(decoded.digest, "sha256:ff")
+        let decoded = try XCTUnwrap(ReviewBoardEvidence.Patch(
+            peerResponse: try peerJSON(patch: body, digest: wrongDigest, truncated: true)
+        ))
+        XCTAssertTrue(decoded.isTruncated, "a reviewer has to know this is an excerpt")
+        XCTAssertEqual(
+            decoded.digest, wrongDigest,
+            "the digest is carried through untouched — the coordinator is what re-checks it"
+        )
     }
 
     // MARK: - A team name is not a path
