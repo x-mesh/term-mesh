@@ -3668,10 +3668,45 @@ fn rpc_call(sock: &PathBuf, method: &str, params: Value) -> Result<Value, String
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
         .unwrap_or(6);
-    if remote_leader_route().is_some() && remote_leader_method_allowed(method) {
-        return remote_leader_rpc_call(sock, method, params, timeout);
+    match remote_leader_rpc_policy(remote_leader_route().is_some(), method) {
+        RemoteLeaderRpcPolicy::Proxy => {
+            return remote_leader_rpc_call(sock, method, params, timeout);
+        }
+        // A remote leader's TERMMESH_SOCKET points at the peer host's local
+        // app. Falling through for a disallowed team method therefore acts on
+        // that app, not on the GUI team that owns the leader. In particular,
+        // `tm-agent create` used to create a second same-name team after a
+        // window restore. Team methods must fail closed; non-team utilities
+        // may still use the local socket deliberately.
+        RemoteLeaderRpcPolicy::RejectTeam => {
+            return Err(format!(
+                "{method} is not allowed from a scoped remote leader; \
+                 use the owning project window to change team lifecycle"
+            ));
+        }
+        RemoteLeaderRpcPolicy::Local => {}
     }
     rpc_call_timeout(sock, method, params, timeout)
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum RemoteLeaderRpcPolicy {
+    Proxy,
+    RejectTeam,
+    Local,
+}
+
+fn remote_leader_rpc_policy(has_route: bool, method: &str) -> RemoteLeaderRpcPolicy {
+    if !has_route {
+        return RemoteLeaderRpcPolicy::Local;
+    }
+    if remote_leader_method_allowed(method) {
+        return RemoteLeaderRpcPolicy::Proxy;
+    }
+    if method.starts_with("team.") {
+        return RemoteLeaderRpcPolicy::RejectTeam;
+    }
+    RemoteLeaderRpcPolicy::Local
 }
 
 #[derive(Clone)]
@@ -3712,6 +3747,8 @@ fn remote_leader_method_allowed(method: &str) -> bool {
             | "team.read"
             | "team.collect"
             | "team.reports"
+            | "team.result.status"
+            | "team.result.collect"
             | "team.inbox"
             | "team.message.list"
             | "team.send"
@@ -3722,7 +3759,16 @@ fn remote_leader_method_allowed(method: &str) -> bool {
             | "team.task.get"
             | "team.task.create"
             | "team.task.update"
+            | "team.task.diff"
     )
+}
+
+fn scoped_team_list_from_status(mut status: Value) -> Value {
+    if let Some(result) = status.get_mut("result") {
+        let team = std::mem::take(result);
+        *result = json!([team]);
+    }
+    status
 }
 
 fn remote_leader_request_id_hex() -> String {
@@ -6433,7 +6479,20 @@ fn main() {
             }
             rpc_call(&sock, "team.destroy", json!({ "team_name": team }))
         }
-        Commands::List => rpc_call(&sock, "team.list", json!({})),
+        Commands::List => {
+            if remote_leader_route().is_some() {
+                // `team.list` is deliberately forbidden by the scoped leader
+                // protocol because it would reveal every team on the owning
+                // machine. Give the leader useful list semantics by reading
+                // its one granted team and wrapping that row as a one-item
+                // roster instead of falling through to the peer host's local
+                // app (which is what caused the split-brain incident).
+                rpc_call(&sock, "team.status", json!({ "team_name": team }))
+                    .map(scoped_team_list_from_status)
+            } else {
+                rpc_call(&sock, "team.list", json!({}))
+            }
+        }
         Commands::Read {
             agent: ref agent_name,
             agent_instance_id,
@@ -14772,15 +14831,19 @@ mod auto_watch_tests {
         for method in [
             "team.send",
             "team.delegate",
+            "team.result.status",
+            "team.result.collect",
             "team.task.create",
             "team.task.update",
             "team.task.list",
+            "team.task.diff",
         ] {
             assert!(remote_leader_method_allowed(method), "{method}");
         }
         for method in [
             "team.create",
             "team.destroy",
+            "team.list",
             "team.attach",
             "team.add_agent",
             "team.restart",
@@ -14788,6 +14851,52 @@ mod auto_watch_tests {
         ] {
             assert!(!remote_leader_method_allowed(method), "{method}");
         }
+    }
+
+    #[test]
+    fn remote_leader_list_wraps_only_its_scoped_status() {
+        let wrapped = scoped_team_list_from_status(json!({
+            "ok": true,
+            "result": {
+                "team_name": "term-mesh",
+                "team_uuid": "owned-team",
+                "agent_count": 4,
+            },
+            "remote_leader_proxy": true,
+        }));
+
+        let teams = wrapped["result"].as_array().unwrap();
+        assert_eq!(teams.len(), 1);
+        assert_eq!(teams[0]["team_uuid"], "owned-team");
+        assert_eq!(wrapped["remote_leader_proxy"], true);
+    }
+
+    #[test]
+    fn remote_leader_team_lifecycle_fails_closed_instead_of_using_peer_local_app() {
+        assert_eq!(
+            remote_leader_rpc_policy(true, "team.status"),
+            RemoteLeaderRpcPolicy::Proxy
+        );
+        for method in [
+            "team.create",
+            "team.destroy",
+            "team.preset.resolve",
+            "team.list",
+        ] {
+            assert_eq!(
+                remote_leader_rpc_policy(true, method),
+                RemoteLeaderRpcPolicy::RejectTeam,
+                "{method}"
+            );
+        }
+        assert_eq!(
+            remote_leader_rpc_policy(true, "system.info"),
+            RemoteLeaderRpcPolicy::Local
+        );
+        assert_eq!(
+            remote_leader_rpc_policy(false, "team.create"),
+            RemoteLeaderRpcPolicy::Local
+        );
     }
 
     #[test]

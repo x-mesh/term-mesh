@@ -1107,6 +1107,20 @@ final class PeerProjectBootstrapTests: XCTestCase {
     }
 
     @MainActor
+    func test_window_close_does_not_tombstone_preserved_project_workspace() {
+        let preserved = UUID()
+        let ordinaryWorkspace = UUID()
+
+        let closed = AppDelegate.workspaceIDsClosedWithWindow(
+            preserved: [preserved],
+            remaining: [ordinaryWorkspace, preserved]
+        )
+
+        XCTAssertEqual(closed, [ordinaryWorkspace])
+        XCTAssertFalse(closed.contains(preserved))
+    }
+
+    @MainActor
     func test_remote_claude_leader_launch_injects_term_mesh_prompt() {
         var grant = Termmesh_Peer_V1_TeamLeaderGrant()
         grant.grantID = Data(repeating: 0xcd, count: 32)
@@ -1178,6 +1192,10 @@ final class PeerProjectBootstrapTests: XCTestCase {
         )
 
         XCTAssertTrue(launch.hasPrefix("export PATH="), "PATH has to be set before anything runs")
+        XCTAssertEqual(
+            RemoteShellPath.binDirs.first,
+            "/Applications/term-mesh.app/Contents/Resources/bin"
+        )
         XCTAssertTrue(launch.contains("$HOME/.local/bin"))
         XCTAssertTrue(launch.contains(":$PATH\""), "the host's own PATH must survive, last")
         // Ordering matters as much as membership: a cd into the project before

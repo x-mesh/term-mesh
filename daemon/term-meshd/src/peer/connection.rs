@@ -1249,6 +1249,8 @@ pub(crate) fn team_call_allowed(method: &str) -> bool {
             | "team.read"
             | "team.collect"
             | "team.reports"
+            | "team.result.status"
+            | "team.result.collect"
             | "team.inbox"
             | "team.message.list"
             | "team.send"

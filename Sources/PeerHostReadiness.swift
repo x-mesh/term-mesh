@@ -55,9 +55,12 @@ enum PeerHostReadinessError: LocalizedError, CustomStringConvertible {
 /// The same directories are already listed in the Rust daemon's
 /// `user_bin_dirs()`; both halves of the app should look in the same places.
 enum RemoteShellPath {
-    /// Ordered most-specific first: a user's own install should win over one a
-    /// package manager put in a shared prefix.
+    /// Ordered most-specific first. A macOS peer running the app must use the
+    /// CLI shipped with that same app before a stale user install; otherwise
+    /// the Swift peer protocol and `tm-agent` routing policy can disagree
+    /// after an app-only upgrade. The path is harmless on Linux.
     static let binDirs = [
+        "/Applications/term-mesh.app/Contents/Resources/bin",
         "$HOME/.local/bin",
         "$HOME/.cargo/bin",
         "$HOME/bin",

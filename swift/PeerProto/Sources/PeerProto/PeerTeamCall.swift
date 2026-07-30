@@ -33,6 +33,8 @@ public enum PeerTeamCall {
         "team.read",
         "team.collect",
         "team.reports",
+        "team.result.status",
+        "team.result.collect",
         "team.inbox",
         "team.message.list",
         // Directing agents that already exist.
