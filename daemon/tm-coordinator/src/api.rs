@@ -787,6 +787,21 @@ impl Api {
                     &p.fencing_token,
                 )?;
                 validate_sha_digest(&p.base_sha, &p.head_sha, &p.diff_digest)?;
+                // Checked here and not only in the reducer, for the same reason
+                // every other checked mutation repeats its transition check: this
+                // closure runs before the event is appended, so a refusal leaves
+                // nothing in the log. The reducer's copy is the replay-time
+                // invariant, and reaching it live would mean the journal already
+                // holds an event that every later start refuses to fold.
+                let task = reducer
+                    .task(&p.task_id)?
+                    .ok_or_else(|| anyhow::anyhow!("task not found"))?;
+                if !task.status.can_transition_to(&TaskStatus::ReviewReady) {
+                    bail!(
+                        "invalid task transition {:?} -> review_ready",
+                        task.status
+                    );
+                }
                 let snapshot = ReviewSnapshot {
                     snapshot_id: ReviewSnapshotId::new_random(),
                     task_id: p.task_id.clone(),
@@ -1057,4 +1072,169 @@ fn validate_sha_digest(base_sha: &str, head_sha: &str, diff_digest: &str) -> Res
 /// writer that has not started yet.
 fn project_for_task(task_id: &TaskId, api: &Api) -> Result<Option<ProjectId>> {
     api.read(|reducer| Ok(reducer.task(task_id)?.map(|task| task.project_id)))
+}
+
+/// A refusal has to happen before the append, not after it.
+///
+/// `mutate_checked` writes the event to the log and only then folds it, so a
+/// check that lives solely in the reducer turns every refusal into a journal
+/// entry that each later start replays, refuses again, and reports as a
+/// degraded coordinator with all writes disabled. These pin the pre-append half
+/// for `review.snapshot`; the reducer keeps its own copy as the replay-time
+/// invariant.
+#[cfg(test)]
+mod pre_append_guard_tests {
+    use super::*;
+    use crate::model::IntentEvent;
+
+    struct CountingLog {
+        events: Mutex<Vec<IntentEvent>>,
+    }
+
+    impl EventLog for CountingLog {
+        fn append(&self, event: &IntentEvent) -> Result<()> {
+            self.events.lock().unwrap().push(event.clone());
+            Ok(())
+        }
+
+        fn read_all(&self) -> Result<Vec<IntentEvent>> {
+            Ok(self.events.lock().unwrap().clone())
+        }
+
+        fn health(&self) -> Value {
+            json!({"status": "test"})
+        }
+
+        fn is_available(&self) -> bool {
+            true
+        }
+    }
+
+    /// Drive one task all the way to `merged`, which is where the escape was.
+    fn merged_task(log: Arc<CountingLog>) -> (Arc<Api>, Value, Value, Value) {
+        let api = Api::for_tests(log).unwrap();
+        let project = api
+            .handle(
+                "project.add",
+                json!({"request_id": "p", "root_path": "/tmp/repo", "name": "repo"}),
+            )
+            .unwrap()["event"]["project_id"]
+            .clone();
+        let task = api
+            .handle(
+                "task.create",
+                json!({"request_id": "t", "project_id": project, "title": "s", "body": ""}),
+            )
+            .unwrap()["event"]["payload"]["task_id"]
+            .clone();
+        let host = api
+            .handle(
+                "host.observe",
+                json!({"request_id": "h", "host_id": "hst_guard", "os": "linux", "arch": "x86_64",
+                       "load": 0.1, "total_slots": 4, "used_slots": 0,
+                       "project_roots": ["/tmp/repo"]}),
+            )
+            .unwrap()["event"]["payload"]["host_id"]
+            .clone();
+        let placed = api
+            .handle(
+                "task.place",
+                json!({"request_id": "place", "task_id": task, "host_id": host}),
+            )
+            .unwrap();
+        let attempt = placed["event"]["payload"]["attempt_id"].clone();
+        let token = placed["event"]["payload"]["token"].clone();
+        let snapshot_id = api.handle("review.snapshot", json!({"request_id":"s1","task_id":task,"attempt_id":attempt,"fencing_token":token,"base_sha":"b","head_sha":"head","diff_digest":"sha256:aa"})).unwrap()["event"]["payload"]["snapshot_id"].clone();
+        api.handle("approve", json!({"request_id":"a1","task_id":task,"attempt_id":attempt,"fencing_token":token,"reviewer":"rev","snapshot_id":snapshot_id,"head_sha":"head","diff_digest":"sha256:aa"})).unwrap();
+        let queue_id = api.handle("merge.queue", json!({})).unwrap()["items"][0]["queue_id"].clone();
+        api.handle(
+            "merge.queue.transition",
+            json!({"request_id": "run", "queue_id": queue_id, "status": "running"}),
+        )
+        .unwrap();
+        api.handle(
+            "merge.queue.transition",
+            json!({"request_id": "merge", "queue_id": queue_id, "status": "merged"}),
+        )
+        .unwrap();
+        (api, task, attempt, token)
+    }
+
+    #[test]
+    fn a_merged_task_refuses_a_snapshot_without_appending_it() {
+        let log = Arc::new(CountingLog {
+            events: Mutex::new(Vec::new()),
+        });
+        let (api, task, attempt, token) = merged_task(log.clone());
+        let appended = log.events.lock().unwrap().len();
+
+        let refused = api.handle("review.snapshot", json!({"request_id":"s2","task_id":task,"attempt_id":attempt,"fencing_token":token,"base_sha":"b","head_sha":"head2","diff_digest":"sha256:bb"}));
+        let error = refused.unwrap_err().to_string();
+        assert!(error.contains("invalid task transition"), "{error}");
+        assert_eq!(
+            log.events.lock().unwrap().len(),
+            appended,
+            "a refused snapshot must not be written to the event log"
+        );
+        // Nothing was recorded, so the idempotency key is still usable — a
+        // corrected retry must not come back as "idempotent: true".
+        assert!(!log
+            .events
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|event| event.request_id.as_deref() == Some("s2")));
+        // And the merge queue still holds exactly the one row it merged.
+        let queue = api.handle("merge.queue", json!({})).unwrap();
+        assert_eq!(queue["items"].as_array().unwrap().len(), 1);
+    }
+
+    /// The legal path is unaffected: the first snapshot on a placed task is
+    /// still accepted and appended.
+    #[test]
+    fn a_placed_task_still_appends_its_snapshot() {
+        let log = Arc::new(CountingLog {
+            events: Mutex::new(Vec::new()),
+        });
+        let api = Api::for_tests(log.clone()).unwrap();
+        let project = api
+            .handle(
+                "project.add",
+                json!({"request_id": "p", "root_path": "/tmp/repo", "name": "repo"}),
+            )
+            .unwrap()["event"]["project_id"]
+            .clone();
+        let task = api
+            .handle(
+                "task.create",
+                json!({"request_id": "t", "project_id": project, "title": "s", "body": ""}),
+            )
+            .unwrap()["event"]["payload"]["task_id"]
+            .clone();
+        let host = api
+            .handle(
+                "host.observe",
+                json!({"request_id": "h", "host_id": "hst_legal", "os": "linux", "arch": "x86_64",
+                       "load": 0.1, "total_slots": 4, "used_slots": 0,
+                       "project_roots": ["/tmp/repo"]}),
+            )
+            .unwrap()["event"]["payload"]["host_id"]
+            .clone();
+        let placed = api
+            .handle(
+                "task.place",
+                json!({"request_id": "place", "task_id": task, "host_id": host}),
+            )
+            .unwrap();
+        let attempt = placed["event"]["payload"]["attempt_id"].clone();
+        let token = placed["event"]["payload"]["token"].clone();
+        let before = log.events.lock().unwrap().len();
+
+        api.handle("review.snapshot", json!({"request_id":"s1","task_id":task,"attempt_id":attempt,"fencing_token":token,"base_sha":"b","head_sha":"head","diff_digest":"sha256:aa"})).unwrap();
+        assert_eq!(log.events.lock().unwrap().len(), before + 1);
+        assert_eq!(
+            api.handle("task.get", json!({"task_id": task})).unwrap()["task"]["status"],
+            json!("review_ready")
+        );
+    }
 }
