@@ -8,6 +8,39 @@ from unittest.mock import patch
 from test_tm_agent_bridge import BRIDGE, CapturedEmitter
 
 
+class InputFrameHardeningTests(unittest.TestCase):
+    def test_unterminated_oversize_input_is_dropped_and_poisoned(self):
+        reader = BRIDGE.InputFrameReader(limit=32)
+
+        self.assertEqual(reader.feed(b"x" * 33), [])
+
+        self.assertTrue(reader.poisoned)
+        self.assertEqual(reader.pending, b"")
+
+    def test_poisoned_stream_never_parses_a_later_valid_line(self):
+        reader = BRIDGE.InputFrameReader(limit=32)
+        reader.feed(b"x" * 33)
+
+        frames = reader.feed(b'{"message":{"content":"safe"}}\n')
+
+        self.assertEqual(frames, [])
+        self.assertTrue(reader.poisoned)
+        self.assertEqual(reader.pending, b"")
+
+    def test_valid_frame_just_below_limit_passes_unchanged(self):
+        limit = 128
+        prefix = b'{"message":{"content":"'
+        suffix = b'"}}'
+        frame = prefix + b"x" * (limit - 1 - len(prefix) - len(suffix)) + suffix
+        self.assertEqual(len(frame), limit - 1)
+        reader = BRIDGE.InputFrameReader(limit=limit)
+
+        self.assertEqual(reader.feed(frame + b"\n"), [frame])
+
+        self.assertFalse(reader.poisoned)
+        self.assertEqual(reader.pending, b"")
+
+
 class AgyLogHardeningTests(unittest.TestCase):
     def test_log_uses_private_directory_and_mode(self):
         with tempfile.TemporaryDirectory() as root, \

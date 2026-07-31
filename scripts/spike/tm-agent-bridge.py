@@ -57,6 +57,45 @@ AGENT_ENV_LOAD_EXIT = 78
 # entire point of showing the row at all.
 TEXT_LIMIT = 4000
 DIFF_LIMIT = 65536
+# Normal tool payloads preserve at most a 64 KiB diff; 1 MiB leaves 16x
+# headroom for the surrounding turn envelope while bounding a broken writer.
+MAX_INPUT_FRAME_BYTES = 1024 * 1024
+
+
+class InputFrameReader:
+    """Split a byte stream into bounded newline-delimited frames."""
+
+    def __init__(self, limit: int = MAX_INPUT_FRAME_BYTES):
+        self.limit = limit
+        self.pending = b""
+        self.poisoned = False
+
+    def feed(self, chunk: bytes) -> list[bytes]:
+        if self.poisoned:
+            return []
+        data = self.pending + chunk
+        frames = []
+        while True:
+            newline = data.find(b"\n")
+            if newline < 0:
+                if len(data) > self.limit:
+                    self.pending = b""
+                    self.poisoned = True
+                else:
+                    self.pending = data
+                return frames
+            if newline > self.limit:
+                self.pending = b""
+                self.poisoned = True
+                return frames
+            frames.append(data[:newline])
+            data = data[newline + 1:]
+
+    def discard_incomplete(self) -> bool:
+        """Drop, rather than parse, a final unterminated frame."""
+        incomplete = bool(self.pending)
+        self.pending = b""
+        return incomplete
 
 
 def clamp(text: str, limit: int) -> str:
@@ -1267,7 +1306,7 @@ def main() -> int:
 
     def consume(fd: int) -> int:
         """Read turns and child-exit events without polling while idle."""
-        pending = b""
+        frames = InputFrameReader()
         child = getattr(bridge, "child", None)
         exit_fd = getattr(child, "exit_read_fd", None)
         watched = [fd] + ([exit_fd] if exit_fd is not None else [])
@@ -1288,17 +1327,17 @@ def main() -> int:
             except BlockingIOError:
                 continue
             if not chunk:
-                if pending.strip():
-                    reported = take(pending.decode("utf-8", errors="replace"))
-                    if not bridge.alive:
-                        if not reported:
-                            out.result(exit_failure(), stop="process_exited",
-                                       failed=True)
-                        return 1
+                if frames.discard_incomplete():
+                    log("discarded unterminated input frame at EOF")
                 return 0
-            pending += chunk
-            while b"\n" in pending:
-                raw, pending = pending.split(b"\n", 1)
+            complete = frames.feed(chunk)
+            if frames.poisoned:
+                log(
+                    "input stream poisoned: frame exceeded "
+                    f"{MAX_INPUT_FRAME_BYTES} bytes without a newline"
+                )
+                return 1
+            for raw in complete:
                 reported = take(raw.decode("utf-8", errors="replace"))
                 if not bridge.alive:
                     if not reported:
