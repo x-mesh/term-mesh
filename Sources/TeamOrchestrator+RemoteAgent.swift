@@ -16,6 +16,32 @@ import PeerProto
 // delegating, reading the reply off the scrollback, revealing it — works
 // without knowing the agent is somewhere else.
 
+/// What a reattach attempt established about the team's remote leader.
+///
+/// Three states rather than a `Bool`, because the two ways of not being
+/// attached call for opposite repairs and a `Bool` cannot tell them apart. The
+/// old code caught every transport failure and returned the same `false` an
+/// authoritative absence returned, and the recovery path read any `false` as
+/// permission to bootstrap — so a brief tunnel or list-RPC failure just after a
+/// relay EOF minted a second leader beside a remote process that was still
+/// running.
+enum RemoteLeaderReattachOutcome: Equatable {
+    /// The local viewer is on the surface the team already owns.
+    case attached
+    /// The host answered with its surface roster and the stored surface was not
+    /// in it — or none was ever recorded. Authoritative: there is no live
+    /// remote leader left for a replacement to duplicate.
+    case confirmedMissing
+    /// Nothing was established and nothing was disproved. The surface may well
+    /// still be there; whatever is stored for it must be kept.
+    case temporarilyUnavailable
+
+    /// The one state that may mint a second grant and a second surface.
+    var permitsReplacementBootstrap: Bool {
+        self == .confirmedMissing
+    }
+}
+
 extension TeamOrchestrator {
     struct PeerShellCleanupItem: Identifiable, Equatable {
         enum State: Equatable {
@@ -1148,17 +1174,49 @@ extension TeamOrchestrator {
         attempt.commit()
     }
 
+    /// How a roster read lands, or nil when the stored surface is in the list
+    /// and the attach may go ahead.
+    ///
+    /// `rosterSurfaceIDs` is nil when the host could not be asked at all — a
+    /// lease that would not open, a list RPC that threw. That is the whole
+    /// point of the separation: not knowing is not the same as knowing the
+    /// surface is gone, and only the second one may mint a replacement leader.
+    ///
+    /// Split out from the flow so the distinction can be tested without a peer:
+    /// the bug this replaces was not a missing rule but a `catch` that folded
+    /// every transport failure into the same `false` the authoritative absence
+    /// returned.
+    nonisolated static func remoteLeaderRosterVerdict(
+        rosterSurfaceIDs: [Data]?,
+        storedSurfaceID: Data
+    ) -> RemoteLeaderReattachOutcome? {
+        guard let rosterSurfaceIDs else { return .temporarilyUnavailable }
+        return rosterSurfaceIDs.contains(storedSurfaceID) ? nil : .confirmedMissing
+    }
+
+    /// How long to wait between reattach retries before giving the team back to
+    /// a person. Bounded on purpose: a peer that stays unreachable is not
+    /// something this loop can fix, and `recoverRemoteLeaderIfNeeded` is the
+    /// manual retry that stays available once these are spent.
+    static let remoteLeaderReattachBackoffSeconds: [Double] = [1, 2, 4]
+
     /// Reattach the project's local leader viewer to the exact remote surface
     /// it already owns. The remote process/surface outlives any one local pane;
     /// this path restores presentation without spawning a second leader or
     /// replaying bootstrap credentials.
+    ///
+    /// Every answer other than `.confirmedMissing` leaves the stored surface
+    /// record and its grant untouched, because the remote leader may well still
+    /// be running behind it.
     @discardableResult
-    func reattachRemoteLeaderIfNeeded(teamName: String) async -> Bool {
+    func reattachRemoteLeaderIfNeeded(teamName: String) async -> RemoteLeaderReattachOutcome {
         guard let team = teams[teamName],
               case let .peer(hostKey) = team.leaderEndpoint
-        else { return false }
-        if isLeaderPaneAttached(teamName: teamName) { return true }
-        guard !remoteLeaderReattachInFlight.contains(teamName) else { return false }
+        else { return .temporarilyUnavailable }
+        if isLeaderPaneAttached(teamName: teamName) { return .attached }
+        guard !remoteLeaderReattachInFlight.contains(teamName) else {
+            return .temporarilyUnavailable
+        }
         remoteLeaderReattachInFlight.insert(teamName)
         defer { remoteLeaderReattachInFlight.remove(teamName) }
 
@@ -1166,37 +1224,61 @@ extension TeamOrchestrator {
             hostKey: hostKey,
             teamName: teamName
         ), let surfaceID = record.surfaceID else {
+            // No surface was ever recorded, so there is none to duplicate. This
+            // is the initial-attach-failed case `recoverRemoteLeaderIfNeeded`
+            // documents, and bootstrapping is its intended repair.
             RemoteWorkLog.info("Cannot restore \(teamName) leader: its remote surface identity is missing")
-            return false
+            return .confirmedMissing
         }
         guard let host = RemoteHostStore.shared.sortedHosts.first(where: { $0.id == hostKey }),
               host.isConnected else {
             RemoteWorkLog.info("Cannot restore \(teamName) leader: \(hostKey) is disconnected")
-            return false
+            return .temporarilyUnavailable
         }
         guard let tabManager = AppDelegate.shared?.tabManagerFor(tabId: team.workspaceId),
               let workspace = tabManager.tabs.first(where: { $0.id == team.workspaceId })
-        else { return false }
+        else { return .temporarilyUnavailable }
 
         let lease: PeerPaneHostLease
         do {
             lease = try await PeerPaneHostRegistry.shared.acquire(host.paneHostSpec)
         } catch {
             RemoteWorkLog.info("Cannot restore \(teamName) leader: \(error)")
-            return false
+            return .temporarilyUnavailable
         }
 
-        let session: PeerPaneSession
+        // nil means the roster could not be read. `host.isConnected` does not
+        // promise this call succeeds — it is a cached reachability flag, and a
+        // relay EOF is exactly when the list RPC is most likely to fail.
+        var roster: [Termmesh_Peer_V1_SurfaceInfo]?
         do {
-            let surfaces = try await PeerPaneSession.listSurfaces(on: lease)
-            guard let surface = surfaces.first(where: { $0.surfaceID == surfaceID }) else {
-                PeerPaneHostRegistry.shared.release(lease)
+            roster = try await PeerPaneSession.listSurfaces(on: lease)
+        } catch {
+            RemoteWorkLog.info(
+                "Cannot confirm \(teamName) leader's surface on \(host.displayName): \(error)"
+            )
+            roster = nil
+        }
+        if let verdict = Self.remoteLeaderRosterVerdict(
+            rosterSurfaceIDs: roster?.map(\.surfaceID),
+            storedSurfaceID: surfaceID
+        ) {
+            PeerPaneHostRegistry.shared.release(lease)
+            if verdict.permitsReplacementBootstrap {
                 markRemoteLeaderFailed(
                     teamName: teamName,
                     description: "Remote leader surface no longer exists on \(host.displayName)"
                 )
-                return false
             }
+            return verdict
+        }
+        guard let surface = roster?.first(where: { $0.surfaceID == surfaceID }) else {
+            PeerPaneHostRegistry.shared.release(lease)
+            return .temporarilyUnavailable
+        }
+
+        let session: PeerPaneSession
+        do {
             session = try await PeerPaneSession.attach(
                 lease: lease,
                 surface: surface,
@@ -1204,9 +1286,10 @@ extension TeamOrchestrator {
                 spec: host.paneHostSpec
             )
         } catch {
+            // The surface is on the host's own roster; only this attach failed.
             PeerPaneHostRegistry.shared.release(lease)
             RemoteWorkLog.info("Cannot restore \(teamName) leader: \(error)")
-            return false
+            return .temporarilyUnavailable
         }
         PeerPaneHostRegistry.shared.release(lease)
 
@@ -1217,7 +1300,7 @@ extension TeamOrchestrator {
         ) else {
             session.teardown()
             RemoteWorkLog.info("Cannot restore \(teamName) leader: no local pane can host it")
-            return false
+            return .temporarilyUnavailable
         }
         workspace.setPanelCustomTitle(
             panelId: panel.id,
@@ -1235,7 +1318,7 @@ extension TeamOrchestrator {
                 + "panel=\(panel.id.uuidString.prefix(8))"
         )
 #endif
-        return true
+        return .attached
     }
 
     /// Restore a peer leader after its relay reports runtime EOF. Reattach the
@@ -1260,8 +1343,33 @@ extension TeamOrchestrator {
             description: "Remote leader disconnected; reconnecting"
         )
 
-        if await reattachRemoteLeaderIfNeeded(teamName: teamName) {
-            return true
+        // Bootstrapping mints a second grant and a second surface, so it needs
+        // the host to have *said* the old surface is gone. A reattach that
+        // merely could not reach the host is retried instead: the remote
+        // leader is most likely still running, and replacing it there leaves
+        // two on one team.
+        var outcome = await reattachRemoteLeaderIfNeeded(teamName: teamName)
+        for delay in Self.remoteLeaderReattachBackoffSeconds {
+            if case .attached = outcome { return true }
+            if outcome.permitsReplacementBootstrap { break }
+            try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
+            if Task.isCancelled { return false }
+            outcome = await reattachRemoteLeaderIfNeeded(teamName: teamName)
+        }
+        if case .attached = outcome { return true }
+        guard outcome.permitsReplacementBootstrap else {
+            // Deliberately not a bootstrap. The stored surface and grant are
+            // left as they are, so `recoverRemoteLeaderIfNeeded` can pick this
+            // up again once the host answers.
+            markRemoteLeaderFailed(
+                teamName: teamName,
+                description: "Remote leader could not be reached to confirm its surface; "
+                    + "not replaced. Retry once the host is reachable."
+            )
+#if DEBUG
+            dlog("leader.recover.unconfirmed team=\(teamName) host=\(hostKey)")
+#endif
+            return false
         }
 
         guard let team = teams[teamName],
