@@ -29,7 +29,57 @@ final class GhosttyTerminalViewComposingTests: XCTestCase {
                 superviewID: ObjectIdentifier(hostSuperview),
                 frameInWindow: hostFrame
             ),
-            anchorGeometries: [ObjectIdentifier(anchor): geometry]
+            anchorGeometries: [ObjectIdentifier(anchor): geometry],
+            liveReferences: .init([hostSuperview, window, anchor, anchorSuperview])
+        )
+    }
+
+    /// A snapshot whose views are gone cannot vouch for its own identities.
+    ///
+    /// Every id in the snapshot is the address of a view it does not retain.
+    /// Once the view is deallocated that address can be reused by the next
+    /// allocation, and pane churn rebuilds NSViews at the same size — so a
+    /// *different* anchor could match on both identity and frame and the sync
+    /// it needed would be skipped as redundant, leaving the portal stale while
+    /// the snapshot agreed. Comparison now refuses a snapshot whose recorded
+    /// views have died.
+    func testSnapshotWithADeallocatedViewIsNeverConsideredEqual() {
+        let hostSuperview = NSObject()
+        let window = NSObject()
+        let anchorSuperview = NSObject()
+
+        // The anchor is owned only by this scope, so it is genuinely
+        // deallocated on the way out — `previous` keeps its ObjectIdentifier,
+        // which then names nothing, or worse whatever lands there next.
+        let previous: TerminalPortalExternalGeometrySnapshot = {
+            let anchor = NSObject()
+            let snapshot = externalSnapshot(
+                hostSuperview: hostSuperview,
+                window: window,
+                anchor: anchor,
+                anchorSuperview: anchorSuperview
+            )
+            XCTAssertFalse(
+                terminalPortalExternalGeometryNeedsSynchronization(
+                    previous: snapshot, current: snapshot, force: false
+                ),
+                "precondition: an unchanged live snapshot still suppresses the sync"
+            )
+            return snapshot
+        }()
+
+        XCTAssertTrue(
+            terminalPortalExternalGeometryNeedsSynchronization(
+                previous: previous,
+                current: externalSnapshot(
+                    hostSuperview: hostSuperview,
+                    window: window,
+                    anchor: NSObject(),
+                    anchorSuperview: anchorSuperview
+                ),
+                force: false
+            ),
+            "a snapshot holding a dead view must not suppress a sync"
         )
     }
 

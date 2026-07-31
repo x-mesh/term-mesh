@@ -214,7 +214,15 @@ enum AgentPipeTransport {
             run += " 2>&1 | /usr/bin/env python3 \(quoted(rendererPath)) --fifo \(f)"
         }
         let chain = [
-            "rm -f \(f)",
+            // Both files, for the same reason: a hard restart reuses the agent
+            // id. `tee` without `-a` truncates in place and keeps the inode, so
+            // the events file a dead pane left behind stayed the *same file* as
+            // the one the new pane writes and the completion watch's identity
+            // check could never tell them apart. Unlinking gives the new pane a
+            // genuinely new inode. Safe here and only here: the pipeline that
+            // opens the file has not started, so unlike a delete from the app
+            // side this cannot pull the file out from under a live writer.
+            "rm -f \(f) \(quoted(fifoPath + ".events"))",
             "mkdir -p \(quoted((fifoPath as NSString).deletingLastPathComponent))",
             "mkfifo -m 600 \(f)",
             run,
@@ -315,7 +323,15 @@ enum AgentPipeTransport {
             run += " | /usr/bin/env python3 \(quoted(rendererPath)) --fifo \(f)"
         }
         let chain = [
-            "rm -f \(f)",
+            // Both files, for the same reason: a hard restart reuses the agent
+            // id. `tee` without `-a` truncates in place and keeps the inode, so
+            // the events file a dead pane left behind stayed the *same file* as
+            // the one the new pane writes and the completion watch's identity
+            // check could never tell them apart. Unlinking gives the new pane a
+            // genuinely new inode. Safe here and only here: the pipeline that
+            // opens the file has not started, so unlike a delete from the app
+            // side this cannot pull the file out from under a live writer.
+            "rm -f \(f) \(quoted(fifoPath + ".events"))",
             "mkdir -p \(quoted((fifoPath as NSString).deletingLastPathComponent))",
             "mkfifo -m 600 \(f)",
             // Hold the write end open here so the reader never blocks or ends.

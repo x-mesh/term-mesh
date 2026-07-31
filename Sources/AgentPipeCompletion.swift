@@ -197,8 +197,16 @@ final class AgentPipeCompletion {
                 // Two ways to notice. A file that shrank is a new file, which
                 // covers a truncation seen after the fact. Identity covers the
                 // rest: the offset seeded in `watch` may belong to the file the
-                // *previous* pane wrote, and if tee's replacement grows past
-                // that mark before the first tick, size alone says nothing.
+                // *previous* pane wrote, and if the replacement grows past that
+                // mark before the first tick, size alone says nothing.
+                //
+                // Identity only answers because the launch line now unlinks the
+                // events file before the pipeline opens it. `tee` without `-a`
+                // truncates in place and keeps the inode, so without that
+                // unlink both checks were blind to exactly the case this
+                // comment describes and a restarted agent read from the middle
+                // of its own file — losing its early events and splitting the
+                // line it landed in.
                 var offset = watch.offset
                 var carry = watch.carry
                 let currentID = Self.fileID(atPath: watch.path)
