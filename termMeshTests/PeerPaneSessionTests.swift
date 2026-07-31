@@ -1,5 +1,6 @@
 import XCTest
 import Darwin
+import AppKit
 import PeerProto
 
 #if canImport(term_mesh_DEV)
@@ -9,6 +10,28 @@ import PeerProto
 #endif
 
 final class PeerPaneSessionTests: XCTestCase {
+
+    func testRelayPalettePrefixPreservesSourceTerminalDefaults() {
+        let prefix = peerTerminalPalettePrefix(
+            foreground: NSColor(
+                srgbRed: CGFloat(0x12) / 255,
+                green: CGFloat(0x34) / 255,
+                blue: CGFloat(0x56) / 255,
+                alpha: 1
+            ),
+            background: NSColor(
+                srgbRed: CGFloat(0xAB) / 255,
+                green: CGFloat(0xCD) / 255,
+                blue: CGFloat(0xEF) / 255,
+                alpha: 1
+            )
+        )
+
+        XCTAssertEqual(
+            prefix,
+            Data("\u{1b}]10;rgb:1212/3434/5656\u{7}\u{1b}]11;rgb:abab/cdcd/efef\u{7}".utf8)
+        )
+    }
 
     private final class RunnerMockHost: @unchecked Sendable {
         enum Failure: Error {

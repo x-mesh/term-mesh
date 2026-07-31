@@ -199,7 +199,7 @@ final class PtyTapHub: @unchecked Sendable {
     /// seq mapping.
     func makeStream(
         fallbackSnapshot: Data?,
-        mousePrefix: Data?,
+        initialPrefix: Data?,
         resumeFromSeq: UInt64 = 0
     ) -> (
         attachID: UUID,
@@ -218,15 +218,15 @@ final class PtyTapHub: @unchecked Sendable {
         } else {
             initial = usedBufferReplay ? replay.concatenatedBytes() : (fallbackSnapshot ?? Data())
         }
-        if let mousePrefix, !mousePrefix.isEmpty {
-            initial = mousePrefix + initial
+        if let initialPrefix, !initialPrefix.isEmpty {
+            initial = initialPrefix + initial
         }
         let replayChunkCount = replay.chunkCount
         // Absolute tap seq that this attach's wire byte_seq == 0 maps to —
         // backdated `initial.count` bytes from the current tap offset.
         // Ring-replay/resume-tail bytes genuinely ARE the tap stream's last
         // `initial.count` bytes, so this is exact for them; for the
-        // viewport fallback (and the mouse-mode prefix, always synthetic)
+        // viewport fallback (and the palette/mouse prefix, always synthetic)
         // it's a deliberate fiction that still establishes a consistent
         // baseline — see `PeerServerSession.handleAttach`'s doc comment.
         // (`&-` may wrap on a fresh hub; the pump only uses chunk END
@@ -641,14 +641,18 @@ final class GhosttyPaneSurfaceProvider: PeerSurfaceProvider {
         // re-send must not overwrite an exact mode (e.g. ?1003h) with
         // this guess. Applies uniformly whether the initial bytes come
         // from the buffer replay or the plain-text fallback.
-        let mousePrefix: Data? = ghostty_surface_mouse_captured(sfcPtr)
-            ? Data("\u{1b}[?1002h\u{1b}[?1006h".utf8)
-            : nil
+        var initialPrefix = peerTerminalPalettePrefix(
+            foreground: GhosttyApp.shared.defaultForegroundColor,
+            background: GhosttyApp.shared.defaultBackgroundColor
+        )
+        if ghostty_surface_mouse_captured(sfcPtr) {
+            initialPrefix.append(Data("\u{1b}[?1002h\u{1b}[?1006h".utf8))
+        }
 
         let (attachID, stream, usedBufferReplay, initialByteCount, replayChunkCount, initialSeq) =
             hub.makeStream(
                 fallbackSnapshot: fallbackSnapshot,
-                mousePrefix: mousePrefix,
+                initialPrefix: initialPrefix,
                 resumeFromSeq: resumeFromSeq
             )
         #if DEBUG
@@ -2575,6 +2579,29 @@ private func readPaneSnapshot(_ surface: ghostty_surface_t) -> Data? {
     snapshot.append(contentsOf: [0x1b, 0x5b, 0x48])       // ESC [ H   — cursor home
     snapshot.append(body)
     return snapshot
+}
+
+/// Recreates the source pane's default terminal colors before replaying its
+/// cells into a relay viewer. Most terminal cells use the default palette,
+/// while TUIs such as Codex paint selected surfaces with an explicit color.
+/// Without this prefix a dark viewer resolves the default cells locally but
+/// preserves the host's explicit light composer color, producing a mixed
+/// light/dark screen.
+func peerTerminalPalettePrefix(foreground: NSColor, background: NSColor) -> Data {
+    func oscRGB(_ color: NSColor) -> String {
+        let rgb = color.usingColorSpace(.sRGB) ?? color
+        func component(_ value: CGFloat) -> String {
+            let byte = min(255, max(0, Int((value * 255).rounded())))
+            return String(format: "%02x%02x", byte, byte)
+        }
+
+        return "rgb:\(component(rgb.redComponent))/\(component(rgb.greenComponent))/\(component(rgb.blueComponent))"
+    }
+
+    let sequence =
+        "\u{1b}]10;\(oscRGB(foreground))\u{7}" +
+        "\u{1b}]11;\(oscRGB(background))\u{7}"
+    return Data(sequence.utf8)
 }
 
 private func surfaceIDBytes(_ id: UUID) -> Data {

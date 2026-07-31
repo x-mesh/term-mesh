@@ -166,6 +166,7 @@ class GhosttyApp {
     private(set) var app: ghostty_app_t?
     private(set) var config: ghostty_config_t?
     private(set) var defaultBackgroundColor: NSColor = .windowBackgroundColor
+    private(set) var defaultForegroundColor: NSColor = .textColor
     private(set) var defaultBackgroundOpacity: Double = 1.0
     private static func resolveBackgroundLogURL(
         environment: [String: String] = ProcessInfo.processInfo.environment
@@ -786,11 +787,29 @@ class GhosttyApp {
             )
         }
 
+        var resolvedForegroundColor = defaultForegroundColor
+        var foregroundColor = ghostty_config_color_s()
+        let foregroundKey = "foreground"
+        if ghostty_config_get(
+            config,
+            &foregroundColor,
+            foregroundKey,
+            UInt(foregroundKey.lengthOfBytes(using: .utf8))
+        ) {
+            resolvedForegroundColor = NSColor(
+                red: CGFloat(foregroundColor.r) / 255,
+                green: CGFloat(foregroundColor.g) / 255,
+                blue: CGFloat(foregroundColor.b) / 255,
+                alpha: 1.0
+            )
+        }
+
         var opacity = defaultBackgroundOpacity
         let opacityKey = "background-opacity"
         _ = ghostty_config_get(config, &opacity, opacityKey, UInt(opacityKey.lengthOfBytes(using: .utf8)))
         applyDefaultBackground(
             color: resolvedColor,
+            foregroundColor: resolvedForegroundColor,
             opacity: opacity,
             source: source,
             scope: scope
@@ -799,6 +818,7 @@ class GhosttyApp {
 
     private func applyDefaultBackground(
         color: NSColor,
+        foregroundColor: NSColor? = nil,
         opacity: Double,
         source: String,
         scope: GhosttyDefaultBackgroundUpdateScope
@@ -816,6 +836,9 @@ class GhosttyApp {
 
         defaultBackgroundUpdateScope = scope
         defaultBackgroundScopeSource = source
+        if let foregroundColor {
+            defaultForegroundColor = foregroundColor
+        }
 
         let previousHex = defaultBackgroundColor.hexString()
         let previousOpacity = defaultBackgroundOpacity
