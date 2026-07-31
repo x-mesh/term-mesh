@@ -630,6 +630,26 @@ final class TeamDataStore: ObservableObject, @unchecked Sendable {
         let created: Bool
     }
 
+    /// Record that a task's instruction reached a pane.
+    ///
+    /// First delivery wins: a re-paste after a failed one must not move the
+    /// mark forward, because what the mark answers is "has this instruction
+    /// ever landed", not "when did it last land".
+    @discardableResult
+    func markTextDelivered(
+        teamName: String,
+        taskId: String,
+        at moment: Date = Date()
+    ) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        guard let index = taskBoards[teamName]?.firstIndex(where: { $0.id == taskId })
+        else { return false }
+        guard taskBoards[teamName]![index].textDeliveredAt == nil else { return false }
+        taskBoards[teamName]![index].textDeliveredAt = moment
+        return true
+    }
+
     /// The task an idempotent request already created, if any.
     ///
     /// `createTaskWithDisposition` also dedupes on `request_id`, but delegate
