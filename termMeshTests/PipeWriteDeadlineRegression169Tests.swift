@@ -19,6 +19,24 @@ import XCTest
 /// These pin both, because a fix for either one alone is what produced the
 /// other.
 final class PipeWriteDeadlineRegression169Tests: XCTestCase {
+    private final class LockedCounter: @unchecked Sendable {
+        private let lock = NSLock()
+        private var value = 0
+
+        @discardableResult
+        func increment() -> Int {
+            lock.lock()
+            defer { lock.unlock() }
+            value += 1
+            return value
+        }
+
+        var snapshot: Int {
+            lock.lock()
+            defer { lock.unlock() }
+            return value
+        }
+    }
 
     /// The regression this file exists for.
     ///
@@ -111,6 +129,110 @@ final class PipeWriteDeadlineRegression169Tests: XCTestCase {
         )) { error in
             XCTAssertTrue("\(error)".contains("could not be terminated"), "\(error)")
         }
+    }
+
+    func testUnterminatedPartialPoisonsLaterFramesUntilChannelReset() {
+        let agentId = "poisoned-writer-\(UUID().uuidString)"
+        let firstFinished = expectation(description: "partial delivery failed")
+        let secondFinished = expectation(description: "next delivery rejected")
+        let resetFinished = expectation(description: "delivery after reset succeeded")
+        let laterWrites = LockedCounter()
+        defer { AgentPipeTransport.discard(agentId: agentId) }
+
+        AgentPipeTransport.enqueueDeliveryForTesting(
+            agentId: agentId, resultTimeout: 1,
+            operation: {
+                var clock: TimeInterval = 0
+                return try AgentPipeTransport.writeWholeLine(
+                    byteCount: 8, timeout: 1, now: { clock },
+                    pause: { clock += 1 }, terminateLine: { false },
+                    attempt: { offset, _ in offset == 0 ? .written(2) : .wouldBlock })
+            },
+            completion: { result in
+                guard case .failure(let error) = result else {
+                    return XCTFail("partial delivery unexpectedly succeeded")
+                }
+                XCTAssertTrue("\(error)".contains("could not be terminated"))
+                firstFinished.fulfill()
+            })
+
+        AgentPipeTransport.enqueueDeliveryForTesting(
+            agentId: agentId, resultTimeout: 1,
+            operation: { laterWrites.increment() },
+            completion: { result in
+                guard case .failure(let error) = result else {
+                    return XCTFail("poisoned channel accepted the next frame")
+                }
+                XCTAssertTrue("\(error)".contains("restart required"))
+                secondFinished.fulfill()
+            })
+
+        wait(for: [firstFinished, secondFinished], timeout: 1)
+        XCTAssertEqual(laterWrites.snapshot, 0, "no later frame reached the poisoned pipe")
+
+        AgentPipeTransport.discard(agentId: agentId)
+        AgentPipeTransport.enqueueDeliveryForTesting(
+            agentId: agentId, resultTimeout: 1,
+            operation: { laterWrites.increment() },
+            completion: { result in
+                guard case .success = result else {
+                    return XCTFail("reset channel did not accept a new frame: \(result)")
+                }
+                resetFinished.fulfill()
+            })
+
+        wait(for: [resetFinished], timeout: 1)
+        XCTAssertEqual(laterWrites.snapshot, 1)
+    }
+
+    func testCallerDeadlineStartsAtEnqueueAndCompletesExactlyOnce() {
+        let agentId = "queued-deadline-\(UUID().uuidString)"
+        let blockerStarted = expectation(description: "writer queue blocked")
+        let deadlineFired = expectation(description: "caller deadline fired")
+        let writerFinished = expectation(description: "background writer finished")
+        let writerQueueDrained = expectation(description: "writer queue drained")
+        let duplicateCallback = expectation(description: "completion called twice")
+        duplicateCallback.isInverted = true
+        let release = DispatchSemaphore(value: 0)
+        let callbacks = LockedCounter()
+        defer {
+            release.signal()
+            AgentPipeTransport.discard(agentId: agentId)
+        }
+
+        AgentPipeTransport.enqueueForTesting(agentId: agentId) {
+            blockerStarted.fulfill()
+            _ = release.wait(timeout: .now() + 2)
+        }
+        wait(for: [blockerStarted], timeout: 1)
+
+        AgentPipeTransport.enqueueDeliveryForTesting(
+            agentId: agentId, resultTimeout: 0.05,
+            operation: {
+                writerFinished.fulfill()
+                return 1
+            },
+            completion: { result in
+                guard callbacks.increment() == 1 else {
+                    duplicateCallback.fulfill()
+                    return
+                }
+                guard case .failure(let error) = result else {
+                    return XCTFail("queued delivery beat its caller deadline")
+                }
+                XCTAssertTrue("\(error)".contains("delivery result deadline exceeded"))
+                deadlineFired.fulfill()
+            })
+        AgentPipeTransport.enqueueForTesting(agentId: agentId) {
+            writerQueueDrained.fulfill()
+        }
+
+        wait(for: [deadlineFired], timeout: 1)
+        XCTAssertEqual(callbacks.snapshot, 1)
+        release.signal()
+        wait(for: [writerFinished, writerQueueDrained], timeout: 1)
+        wait(for: [duplicateCallback], timeout: 0.1)
+        XCTAssertEqual(callbacks.snapshot, 1, "late writer completion must not call back twice")
     }
 
     /// A signal interruption says nothing about the reader, so it must cost
