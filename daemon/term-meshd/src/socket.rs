@@ -844,6 +844,38 @@ fn truncate_utf8(s: &str, max: usize) -> &str {
     &s[..end]
 }
 
+/// Wrap a reverse leader-call answer for the CLI's proxy decoder.
+///
+/// Both dispositions are a *successful proxy*: the peer was reached and it
+/// answered. A rejection used to be collapsed into a generic JSON-RPC error
+/// string (`"{code}: {message}"`), which `decode_daemon_response` handed
+/// straight back to the caller, so `remote_leader_proxy_result` on the CLI
+/// side never saw the `{ok:false, result:{error_code, error_message}}` shape
+/// it parses — the error code, and every code-aware behaviour keyed on it
+/// (`[agent_busy]` hints, explicit unsupported-method detection), was lost
+/// before reaching the caller. Only a transport failure is an `Err` now.
+fn team_leader_proxy_envelope(
+    response: &peer_proto::v1::TeamLeaderCommandResponse,
+) -> serde_json::Value {
+    if response.ok {
+        let result = serde_json::from_str(&response.result_json)
+            .unwrap_or_else(|_| serde_json::json!({ "raw": response.result_json }));
+        return serde_json::json!({
+            "ok": true,
+            "cached": response.cached,
+            "result": result,
+        });
+    }
+    serde_json::json!({
+        "ok": false,
+        "cached": response.cached,
+        "result": {
+            "error_code": response.error_code,
+            "error_message": response.error_message,
+        },
+    })
+}
+
 /// `events.publish {kind:"xk_run", …}` — XK-EVENTS-v1 external-run telemetry
 /// (x-kit panel integration Phase 2). Validates, caps sizes, stamps `ts_ms`
 /// server-side (consistent with the task_status/reply publish path), and fans
@@ -2548,41 +2580,9 @@ async fn dispatch(req: &Request, ctx: &Context) -> Response {
                                     )
                                     .await
                                     {
-                                        Ok(response) if response.ok => {
-                                            let result = serde_json::from_str(
-                                                &response.result_json,
-                                            )
-                                            .unwrap_or_else(|_| {
-                                                serde_json::json!({
-                                                    "raw": response.result_json
-                                                })
-                                            });
-                                            Ok(serde_json::json!({
-                                                "ok": true,
-                                                "cached": response.cached,
-                                                "result": result,
-                                            }))
+                                        Ok(response) => {
+                                            Ok(team_leader_proxy_envelope(&response))
                                         }
-                                        // A peer-level rejection is a
-                                        // successful proxy of a failed
-                                        // command, not a transport failure.
-                                        // Collapsing it into a generic
-                                        // JSON-RPC error string made
-                                        // `decode_daemon_response` hand that
-                                        // text straight back, so the CLI's
-                                        // `remote_leader_proxy_result` never
-                                        // saw the structured shape it parses:
-                                        // the error code, and every
-                                        // code-aware behaviour keyed on it,
-                                        // was lost before reaching the caller.
-                                        Ok(response) => Ok(serde_json::json!({
-                                            "ok": false,
-                                            "cached": response.cached,
-                                            "result": {
-                                                "error_code": response.error_code,
-                                                "error_message": response.error_message,
-                                            },
-                                        })),
                                         Err(error) => Err(error),
                                     }
                                 }
@@ -4426,6 +4426,83 @@ async fn query_gui_team_workers(app_socket: &str, team_id: &str) -> Vec<String> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn leader_response(
+        ok: bool,
+        result_json: &str,
+        error_code: &str,
+        error_message: &str,
+    ) -> peer_proto::v1::TeamLeaderCommandResponse {
+        peer_proto::v1::TeamLeaderCommandResponse {
+            request_id: vec![0u8; 16],
+            ok,
+            cached: false,
+            result_json: result_json.to_string(),
+            error_code: error_code.to_string(),
+            error_message: error_message.to_string(),
+            ..Default::default()
+        }
+    }
+
+    /// A rejected remote-leader command must still reach the CLI as a
+    /// structured envelope.
+    ///
+    /// This is the half that was missing: the old code turned a non-ok
+    /// response into `Err("{code}: {message}")`, which became a generic
+    /// JSON-RPC error and was handed back verbatim by
+    /// `decode_daemon_response`, so the CLI's `remote_leader_proxy_result`
+    /// never saw `error_code` at all. The existing tests only exercised that
+    /// downstream helper with a hand-built value, so they kept passing while
+    /// nothing upstream produced the shape.
+    #[test]
+    fn rejected_leader_command_keeps_error_code_in_a_proxy_envelope() {
+        let envelope = team_leader_proxy_envelope(&leader_response(
+            false,
+            "",
+            "expired_grant",
+            "leader grant expired before dispatch",
+        ));
+
+        assert_eq!(envelope["ok"], serde_json::json!(false));
+        assert_eq!(envelope["result"]["error_code"], "expired_grant");
+        assert_eq!(
+            envelope["result"]["error_message"],
+            "leader grant expired before dispatch"
+        );
+    }
+
+    /// `agent_busy` is the case the code is load-bearing for: the CLI keys a
+    /// retry hint on it, and a flattened string would silently drop that.
+    #[test]
+    fn busy_agent_rejection_survives_as_a_readable_code() {
+        let envelope =
+            team_leader_proxy_envelope(&leader_response(false, "", "agent_busy", "executor busy"));
+
+        assert_eq!(envelope["result"]["error_code"], "agent_busy");
+        assert!(
+            envelope["result"]["error_message"].is_string(),
+            "message must stay a field, not be folded into the code"
+        );
+    }
+
+    #[test]
+    fn accepted_leader_command_parses_result_json() {
+        let envelope =
+            team_leader_proxy_envelope(&leader_response(true, r#"{"team_name":"demo"}"#, "", ""));
+
+        assert_eq!(envelope["ok"], serde_json::json!(true));
+        assert_eq!(envelope["result"]["team_name"], "demo");
+    }
+
+    /// A leader that answers ok with a non-JSON body must not be reported as
+    /// a failure — the raw text is carried instead.
+    #[test]
+    fn accepted_leader_command_with_unparsable_body_falls_back_to_raw() {
+        let envelope = team_leader_proxy_envelope(&leader_response(true, "not json", "", ""));
+
+        assert_eq!(envelope["ok"], serde_json::json!(true));
+        assert_eq!(envelope["result"]["raw"], "not json");
+    }
 
     /// A corrupt registry used to abort `serve` AFTER the socket was bound,
     /// leaving a listener-less socket file — the control plane looked up but

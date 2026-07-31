@@ -774,7 +774,11 @@ enum PeerProjectBootstrap {
     /// retry. `capture` drains stderr concurrently, spawns into its own
     /// process group, and escalates SIGTERM to SIGKILL across the whole group
     /// before it returns.
-    private static func runLocalScript(
+    /// Internal rather than private so the pipe-deadlock regression can drive
+    /// it with a script that actually floods stderr. Going through
+    /// `runLocal` cannot reproduce it: git writes progress only to a TTY, so
+    /// a piped clone stays far under the 64 KiB buffer that triggers the bug.
+    static func runLocalScript(
         _ script: String,
         timeoutSeconds: TimeInterval
     ) async throws {
