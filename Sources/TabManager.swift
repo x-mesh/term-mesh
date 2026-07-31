@@ -1276,7 +1276,24 @@ class TabManager: ObservableObject {
     /// `SHOW_CHILD_EXITED` action specifically so the host app can decide what to do.
     func closePanelAfterChildExited(tabId: UUID, surfaceId: UUID) {
         guard let tab = tabs.first(where: { $0.id == tabId }) else { return }
-        guard tab.panels[surfaceId] != nil else { return }
+        guard let panel = tab.panels[surfaceId] else { return }
+
+        // A remote pane's local child is only the relay helper. Its exit says
+        // the peer connection was interrupted; it does not say the pane (or
+        // its team member) was intentionally closed. PeerRelaySession has
+        // already installed a disconnect banner with Reconnect / Close
+        // actions, so keep the slot alive instead of routing this through the
+        // ordinary shell child-exit path and silently deleting the leader.
+        let isRemoteRelay = (panel as? TerminalPanel)?.peerPaneSession != nil
+        if Self.shouldPreservePanelAfterChildExit(isRemoteRelay: isRemoteRelay) {
+#if DEBUG
+            dlog(
+                "surface.close.childExited.preservedRemote tab=\(tabId.uuidString.prefix(5)) " +
+                "surface=\(surfaceId.uuidString.prefix(5))"
+            )
+#endif
+            return
+        }
 
 #if DEBUG
         dlog(
@@ -1303,6 +1320,10 @@ class TabManager: ObservableObject {
         }
 
         closeRuntimeSurface(tabId: tabId, surfaceId: surfaceId)
+    }
+
+    static func shouldPreservePanelAfterChildExit(isRemoteRelay: Bool) -> Bool {
+        isRemoteRelay
     }
 
     private func workspaceNeedsConfirmClose(_ workspace: Workspace) -> Bool {

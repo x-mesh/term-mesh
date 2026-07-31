@@ -2397,6 +2397,18 @@ final class WorkspaceReorderTests: XCTestCase {
 
 @MainActor
 final class TabManagerChildExitCloseTests: XCTestCase {
+    func testChildExitPolicyPreservesRemoteRelayPanel() {
+        XCTAssertTrue(
+            TabManager.shouldPreservePanelAfterChildExit(isRemoteRelay: true)
+        )
+    }
+
+    func testChildExitPolicyDoesNotPreserveOrdinaryTerminalPanel() {
+        XCTAssertFalse(
+            TabManager.shouldPreservePanelAfterChildExit(isRemoteRelay: false)
+        )
+    }
+
     func testChildExitOnLastPanelClosesSelectedWorkspaceAndKeepsIndexStable() {
         let manager = TabManager()
         let first = manager.tabs[0]
