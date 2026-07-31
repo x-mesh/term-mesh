@@ -263,6 +263,7 @@
 		PB169000000000000003 /* ProjectBootstrapTransactionRegression169Tests.swift in Sources */ = {isa = PBXBuildFile; fileRef = PB169000000000000006 /* ProjectBootstrapTransactionRegression169Tests.swift */; };
 		PW169000000000000003 /* PipeWriteDeadlineRegression169Tests.swift in Sources */ = {isa = PBXBuildFile; fileRef = PW169000000000000006 /* PipeWriteDeadlineRegression169Tests.swift */; };
 		PC170000000000000003 /* PipeCompletionP1Regression170Tests.swift in Sources */ = {isa = PBXBuildFile; fileRef = PC170000000000000006 /* PipeCompletionP1Regression170Tests.swift */; };
+		DG210000000000000003 /* DelegateDiagnosisP1Tests.swift in Sources */ = {isa = PBXBuildFile; fileRef = DG210000000000000006 /* DelegateDiagnosisP1Tests.swift */; };
 		DD210000000000000003 /* DelegateDedupP1Tests.swift in Sources */ = {isa = PBXBuildFile; fileRef = DD210000000000000006 /* DelegateDedupP1Tests.swift */; };
 		CS210000000000000003 /* ControlSocketFramingP1Tests.swift in Sources */ = {isa = PBXBuildFile; fileRef = CS210000000000000006 /* ControlSocketFramingP1Tests.swift */; };
 		RL170000000000000003 /* RemoteLeaderReattachTriStateTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = RL170000000000000006 /* RemoteLeaderReattachTriStateTests.swift */; };
@@ -589,6 +590,7 @@
 		PB169000000000000006 /* ProjectBootstrapTransactionRegression169Tests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ProjectBootstrapTransactionRegression169Tests.swift; sourceTree = "<group>"; };
 		PW169000000000000006 /* PipeWriteDeadlineRegression169Tests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PipeWriteDeadlineRegression169Tests.swift; sourceTree = "<group>"; };
 		PC170000000000000006 /* PipeCompletionP1Regression170Tests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PipeCompletionP1Regression170Tests.swift; sourceTree = "<group>"; };
+		DG210000000000000006 /* DelegateDiagnosisP1Tests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DelegateDiagnosisP1Tests.swift; sourceTree = "<group>"; };
 		DD210000000000000006 /* DelegateDedupP1Tests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DelegateDedupP1Tests.swift; sourceTree = "<group>"; };
 		CS210000000000000006 /* ControlSocketFramingP1Tests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ControlSocketFramingP1Tests.swift; sourceTree = "<group>"; };
 		RL170000000000000006 /* RemoteLeaderReattachTriStateTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RemoteLeaderReattachTriStateTests.swift; sourceTree = "<group>"; };
@@ -970,6 +972,7 @@ A1740000000000000000000C /* ProcessRun.swift */,
 				PB169000000000000006 /* ProjectBootstrapTransactionRegression169Tests.swift */,
 				PW169000000000000006 /* PipeWriteDeadlineRegression169Tests.swift */,
 				PC170000000000000006 /* PipeCompletionP1Regression170Tests.swift */,
+				DG210000000000000006 /* DelegateDiagnosisP1Tests.swift */,
 				DD210000000000000006 /* DelegateDedupP1Tests.swift */,
 				CS210000000000000006 /* ControlSocketFramingP1Tests.swift */,
 				RL170000000000000006 /* RemoteLeaderReattachTriStateTests.swift */,
@@ -1381,6 +1384,7 @@ A1740000000000000000000B /* ProcessRun.swift in Sources */,
 				PB169000000000000003 /* ProjectBootstrapTransactionRegression169Tests.swift in Sources */,
 				PW169000000000000003 /* PipeWriteDeadlineRegression169Tests.swift in Sources */,
 				PC170000000000000003 /* PipeCompletionP1Regression170Tests.swift in Sources */,
+				DG210000000000000003 /* DelegateDiagnosisP1Tests.swift in Sources */,
 				DD210000000000000003 /* DelegateDedupP1Tests.swift in Sources */,
 				CS210000000000000003 /* ControlSocketFramingP1Tests.swift in Sources */,
 				RL170000000000000003 /* RemoteLeaderReattachTriStateTests.swift in Sources */,
