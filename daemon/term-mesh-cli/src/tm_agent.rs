@@ -3800,9 +3800,24 @@ fn remote_leader_rpc_call(
         Ok(value) => value,
         Err(_) => rpc_call_timeout(sock, "peer.leader.call", proxy_params, timeout)?,
     };
-    let proxied = decode_daemon_response(outer)?;
+    remote_leader_proxy_result(decode_daemon_response(outer)?)
+}
+
+fn remote_leader_proxy_result(proxied: Value) -> Result<Value, String> {
     if !proxied["ok"].as_bool().unwrap_or(false) {
-        return Err("remote leader proxy returned non-ok".into());
+        let result = &proxied["result"];
+        let error_code = result["error_code"].as_str().filter(|value| !value.is_empty());
+        let error_message = result["error_message"]
+            .as_str()
+            .filter(|value| !value.is_empty());
+        return Err(match (error_code, error_message) {
+            (Some(code), Some(message)) => {
+                format!("remote leader proxy [{code}]: {message}")
+            }
+            (Some(code), None) => format!("remote leader proxy [{code}]"),
+            (None, Some(message)) => format!("remote leader proxy: {message}"),
+            (None, None) => "remote leader proxy returned non-ok".into(),
+        });
     }
     Ok(json!({
         "ok": true,
@@ -15102,6 +15117,34 @@ mod auto_watch_tests {
         assert!(!delegate_return_already_submitted(&json!({
             "result": { "return_submitted": false },
         })));
+    }
+
+    #[test]
+    fn remote_leader_proxy_preserves_nested_error_code_and_message() {
+        let error = remote_leader_proxy_result(json!({
+            "ok": false,
+            "result": {
+                "error_code": "expired_grant",
+                "error_message": "leader grant expired before dispatch",
+            },
+        }))
+        .unwrap_err();
+
+        assert_eq!(
+            error,
+            "remote leader proxy [expired_grant]: leader grant expired before dispatch"
+        );
+    }
+
+    #[test]
+    fn remote_leader_proxy_without_nested_error_details_keeps_generic_fallback() {
+        let error = remote_leader_proxy_result(json!({
+            "ok": false,
+            "result": {},
+        }))
+        .unwrap_err();
+
+        assert_eq!(error, "remote leader proxy returned non-ok");
     }
 }
 
