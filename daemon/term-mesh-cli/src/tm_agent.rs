@@ -272,6 +272,7 @@ mod project_sync_cli_tests {
             None,
             panel.as_deref(),
             Some("instance-2"),
+            "delegate-test-request",
         );
         assert_eq!(params["depends_on"], json!(["337a5e71"]));
         assert_eq!(params["panel_id"], "panel-2");
@@ -850,6 +851,9 @@ enum Commands {
     Delegate {
         agent: String,
         text: String,
+        /// Stable idempotency key. Reuse the value printed after an unknown outcome.
+        #[arg(long)]
+        request_id: Option<String>,
         #[arg(long)]
         title: Option<String>,
         #[arg(long)]
@@ -7055,6 +7059,7 @@ fn main() {
         Commands::Delegate {
             agent: ref target,
             text,
+            request_id,
             title,
             priority,
             accept,
@@ -7104,17 +7109,20 @@ fn main() {
                     &team,
                     target,
                     &text,
-                    title,
-                    priority,
-                    &accept,
-                    &deps,
-                    desc,
-                    no_report,
-                    context.as_deref(),
-                    auto_fix_budget,
-                    panel.as_deref(),
-                    worktree,
-                    from_ref.as_deref(),
+                    DelegateOptions {
+                        title,
+                        priority,
+                        accept: &accept,
+                        deps: &deps,
+                        desc,
+                        no_report,
+                        context: context.as_deref(),
+                        fix_budget: auto_fix_budget,
+                        panel_id: panel.as_deref(),
+                        worktree_policy: worktree,
+                        from_ref: from_ref.as_deref(),
+                        request_id: request_id.as_deref(),
+                    },
                 );
             }
             return;
@@ -10148,26 +10156,49 @@ fn run_add_headless(
     }
 }
 
+struct DelegateOptions<'a> {
+    title: Option<String>,
+    priority: Option<u32>,
+    accept: &'a [String],
+    deps: &'a [String],
+    desc: Option<String>,
+    no_report: bool,
+    context: Option<&'a str>,
+    fix_budget: Option<u8>,
+    panel_id: Option<&'a str>,
+    worktree_policy: WorktreePolicyArg,
+    from_ref: Option<&'a str>,
+    request_id: Option<&'a str>,
+}
+
 fn run_delegate_result(
     sock: &PathBuf,
     team: &str,
     target: &str,
     text: &str,
-    title: Option<String>,
-    priority: Option<u32>,
-    accept: &[String],
-    deps: &[String],
-    desc: Option<String>,
-    no_report: bool,
-    context: Option<&str>,
-    fix_budget: Option<u8>,
-    panel_id: Option<&str>,
-    worktree_policy: WorktreePolicyArg,
-    from_ref: Option<&str>,
+    options: DelegateOptions<'_>,
 ) -> Result<Value, String> {
+    let DelegateOptions {
+        title,
+        priority,
+        accept,
+        deps,
+        desc,
+        no_report,
+        context,
+        fix_budget,
+        panel_id,
+        worktree_policy,
+        from_ref,
+        request_id,
+    } = options;
     let resolved_title = title.unwrap_or_else(|| task_title_from_text(text));
     let resolved_priority = priority.unwrap_or(2);
     let selected_instance_id = selected_agent_instance_id(sock, team, target, panel_id);
+    let request_id = request_id
+        .filter(|value| !value.trim().is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(local_request_id);
 
     if should_acquire_worktree(
         worktree_policy,
@@ -10192,10 +10223,11 @@ fn run_delegate_result(
             panel_id,
             worktree_policy,
             from_ref,
+            &request_id,
         );
     }
 
-    // Try unified team.delegate RPC first (single round-trip).
+    // Retry an unknown transport outcome once with the exact same idempotency key.
     let delegate_params = delegate_rpc_params(
         team,
         target,
@@ -10209,9 +10241,12 @@ fn run_delegate_result(
         fix_budget,
         panel_id,
         selected_instance_id.as_deref(),
+        &request_id,
     );
-    if let Ok(v) = rpc_call(sock, "team.delegate", delegate_params) {
-        if v["ok"].as_bool().unwrap_or(false) {
+    let unified = resolve_unified_delegate(&delegate_params, &request_id, |params| {
+        rpc_call(sock, "team.delegate", params.clone())
+    })?;
+    if let UnifiedDelegateOutcome::Response(v) = unified {
             // Check if text was actually delivered to the agent's terminal
             let mut text_delivered = v["result"]["text_delivered"].as_bool().unwrap_or(true);
             if !text_delivered {
@@ -10351,7 +10386,6 @@ fn run_delegate_result(
             );
 
             return Ok(v);
-        }
     }
 
     // Fallback: 2-RPC path (server may not support team.delegate yet).
@@ -10362,8 +10396,9 @@ fn run_delegate_result(
         "team_name": team,
         "title": resolved_title,
                 "assignee": target,
-                "priority": resolved_priority,
-                "agent_instance_id": selected_instance_id,
+        "priority": resolved_priority,
+        "agent_instance_id": selected_instance_id,
+        "request_id": request_id,
     });
     if let Some(d) = desc {
         params["description"] = json!(d);
@@ -10517,6 +10552,7 @@ fn delegate_rpc_params(
     fix_budget: Option<u8>,
     panel_id: Option<&str>,
     agent_instance_id: Option<&str>,
+    request_id: &str,
 ) -> Value {
     let mut params = json!({
         "team": team,
@@ -10525,6 +10561,7 @@ fn delegate_rpc_params(
         "task_title": title,
         "priority": priority,
         "agent_instance_id": agent_instance_id,
+        "request_id": request_id,
     });
     if !accept.is_empty() {
         params["acceptance_criteria"] = json!(accept);
@@ -10545,6 +10582,93 @@ fn delegate_rpc_params(
         params["panel_id"] = json!(pid);
     }
     params
+}
+
+#[derive(Debug)]
+enum UnifiedDelegateOutcome {
+    Response(Value),
+    LegacyFallback,
+}
+
+fn delegate_response_is_explicitly_unsupported(response: &Value) -> bool {
+    if response["error"]["code"].as_i64() == Some(-32601) {
+        return true;
+    }
+    [
+        response["error"]["code"].as_str(),
+        response["error_code"].as_str(),
+        response["result"]["error_code"].as_str(),
+    ]
+    .into_iter()
+    .flatten()
+    .any(|code| {
+        matches!(
+            code.to_ascii_lowercase().as_str(),
+            "method_not_found"
+                | "method-not-found"
+                | "unknown_method"
+                | "unsupported"
+                | "unsupported_method"
+                | "not_supported"
+        )
+    })
+}
+
+fn delegate_error_is_explicitly_unsupported(error: &str) -> bool {
+    let lower = error.to_ascii_lowercase();
+    [
+        "[method_not_found]",
+        "[method-not-found]",
+        "[unknown_method]",
+        "[unsupported]",
+        "[unsupported_method]",
+        "[not_supported]",
+    ]
+    .iter()
+    .any(|code| lower.contains(code))
+}
+
+fn resolve_unified_delegate<F>(
+    params: &Value,
+    request_id: &str,
+    mut call: F,
+) -> Result<UnifiedDelegateOutcome, String>
+where
+    F: FnMut(&Value) -> Result<Value, String>,
+{
+    let first_error = match call(params) {
+        Ok(response) if response["ok"].as_bool().unwrap_or(false) => {
+            return Ok(UnifiedDelegateOutcome::Response(response));
+        }
+        Ok(response) if delegate_response_is_explicitly_unsupported(&response) => {
+            return Ok(UnifiedDelegateOutcome::LegacyFallback);
+        }
+        Ok(response) => {
+            return Err(format!(
+                "team.delegate returned non-ok (request_id={request_id}): {}",
+                pretty(&response)
+            ));
+        }
+        Err(error) if delegate_error_is_explicitly_unsupported(&error) => {
+            return Ok(UnifiedDelegateOutcome::LegacyFallback);
+        }
+        Err(error) => error,
+    };
+
+    match call(params) {
+        Ok(response) if response["ok"].as_bool().unwrap_or(false) => {
+            Ok(UnifiedDelegateOutcome::Response(response))
+        }
+        Ok(response) => Err(format!(
+            "team.delegate outcome unknown after transport retry; request_id={request_id}; \
+             retry with --request-id {request_id}; first={first_error}; retry={}",
+            pretty(&response)
+        )),
+        Err(retry_error) => Err(format!(
+            "team.delegate outcome unknown after transport retry; request_id={request_id}; \
+             retry with --request-id {request_id}; first={first_error}; retry={retry_error}"
+        )),
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -10895,6 +11019,7 @@ fn run_delegate_result_with_worktree(
     panel_id: Option<&str>,
     worktree_policy: WorktreePolicyArg,
     from_ref: Option<&str>,
+    request_id: &str,
 ) -> Result<Value, String> {
     let mut params = json!({
         "team_name": team,
@@ -10902,6 +11027,7 @@ fn run_delegate_result_with_worktree(
         "assignee": target,
         "priority": resolved_priority,
         "worktree_policy": worktree_policy_name(worktree_policy),
+        "request_id": request_id,
     });
     if let Some(d) = desc {
         params["description"] = json!(d);
@@ -10997,35 +11123,9 @@ fn run_delegate(
     team: &str,
     target: &str,
     text: &str,
-    title: Option<String>,
-    priority: Option<u32>,
-    accept: &[String],
-    deps: &[String],
-    desc: Option<String>,
-    no_report: bool,
-    context: Option<&str>,
-    fix_budget: Option<u8>,
-    panel_id: Option<&str>,
-    worktree_policy: WorktreePolicyArg,
-    from_ref: Option<&str>,
+    options: DelegateOptions<'_>,
 ) {
-    match run_delegate_result(
-        sock,
-        team,
-        target,
-        text,
-        title,
-        priority,
-        accept,
-        deps,
-        desc,
-        no_report,
-        context,
-        fix_budget,
-        panel_id,
-        worktree_policy,
-        from_ref,
-    ) {
+    match run_delegate_result(sock, team, target, text, options) {
         Ok(v) => println!("{}", pretty(&v)),
         Err(e) => {
             eprintln!("Error: {e}");
@@ -11344,17 +11444,20 @@ fn run_fan_out(
                         team,
                         target,
                         text,
-                        Some(t),
-                        priority,
-                        &[],
-                        &[],
-                        None,
-                        no_report,
-                        context,
-                        fix_budget,
-                        panel_id,
-                        worktree_policy,
-                        from_ref,
+                        DelegateOptions {
+                            title: Some(t),
+                            priority,
+                            accept: &[],
+                            deps: &[],
+                            desc: None,
+                            no_report,
+                            context,
+                            fix_budget,
+                            panel_id,
+                            worktree_policy,
+                            from_ref,
+                            request_id: None,
+                        },
                     );
                     (*target, result)
                 })
@@ -13505,17 +13608,20 @@ fn run_warmup(sock: &PathBuf, team: &str, target: Option<&str>, timeout: u32) {
             team,
             name,
             "Reply with exactly one word: pong",
-            Some("warmup-ping".to_string()),
-            Some(3),
-            &[],
-            &[],
-            None,
-            true,
-            None,
-            None,
-            None,
-            WorktreePolicyArg::Off,
-            None,
+            DelegateOptions {
+                title: Some("warmup-ping".to_string()),
+                priority: Some(3),
+                accept: &[],
+                deps: &[],
+                desc: None,
+                no_report: true,
+                context: None,
+                fix_budget: None,
+                panel_id: None,
+                worktree_policy: WorktreePolicyArg::Off,
+                from_ref: None,
+                request_id: None,
+            },
         );
         match result {
             Ok(v) => {
@@ -14152,17 +14258,20 @@ fn dispatch_and_wait(
                 &team_owned,
                 &name,
                 &prompt,
-                Some(title),
-                None,
-                &[],
-                &[],
-                None,
-                false,
-                None,
-                None,
-                None,
-                WorktreePolicyArg::Off,
-                None,
+                DelegateOptions {
+                    title: Some(title),
+                    priority: None,
+                    accept: &[],
+                    deps: &[],
+                    desc: None,
+                    no_report: false,
+                    context: None,
+                    fix_budget: None,
+                    panel_id: None,
+                    worktree_policy: WorktreePolicyArg::Off,
+                    from_ref: None,
+                    request_id: None,
+                },
             );
             (name, result)
         });
@@ -14514,17 +14623,20 @@ fn run_autonomous(
                 &team_owned,
                 &name_owned,
                 &instr,
-                Some(title),
-                None,
-                &[],
-                &[],
-                None,
-                false,
-                None,
-                None,
-                None,
-                WorktreePolicyArg::Off,
-                None,
+                DelegateOptions {
+                    title: Some(title),
+                    priority: None,
+                    accept: &[],
+                    deps: &[],
+                    desc: None,
+                    no_report: false,
+                    context: None,
+                    fix_budget: None,
+                    panel_id: None,
+                    worktree_policy: WorktreePolicyArg::Off,
+                    from_ref: None,
+                    request_id: None,
+                },
             );
             (name_owned, result)
         });
@@ -15145,6 +15257,79 @@ mod auto_watch_tests {
         .unwrap_err();
 
         assert_eq!(error, "remote leader proxy returned non-ok");
+    }
+
+    #[test]
+    fn retry_after_response_timeout_reuses_same_request_id() {
+        let params = json!({"request_id": "delegate-stable-1"});
+        let mut seen_request_ids = Vec::new();
+        let mut calls = 0;
+        let outcome = resolve_unified_delegate(&params, "delegate-stable-1", |attempt| {
+            calls += 1;
+            seen_request_ids.push(attempt["request_id"].as_str().unwrap().to_string());
+            if calls == 1 {
+                Err("read: timed out".into())
+            } else {
+                Ok(json!({"ok": true, "result": {"task": {"id": "task-1"}}}))
+            }
+        })
+        .unwrap();
+
+        assert!(matches!(outcome, UnifiedDelegateOutcome::Response(_)));
+        assert_eq!(seen_request_ids, ["delegate-stable-1", "delegate-stable-1"]);
+    }
+
+    #[test]
+    fn transport_error_does_not_enter_legacy_fallback() {
+        let params = json!({"request_id": "delegate-unknown-1"});
+        for retry in [
+            Err("read: timed out".to_string()),
+            Ok(json!({
+                "ok": false,
+                "error": {"code": -32601, "message": "method not found"},
+            })),
+        ] {
+            let mut unified_calls = 0;
+            let mut legacy_task_create_calls = 0;
+            let result = resolve_unified_delegate(&params, "delegate-unknown-1", |_| {
+                unified_calls += 1;
+                if unified_calls == 1 {
+                    Err("read: timed out".into())
+                } else {
+                    retry.clone()
+                }
+            });
+            if matches!(result, Ok(UnifiedDelegateOutcome::LegacyFallback)) {
+                legacy_task_create_calls += 1;
+            }
+
+            let error = result.unwrap_err();
+            assert_eq!(unified_calls, 2);
+            assert_eq!(legacy_task_create_calls, 0);
+            assert!(error.contains("request_id=delegate-unknown-1"));
+            assert!(error.contains("--request-id delegate-unknown-1"));
+        }
+    }
+
+    #[test]
+    fn method_not_found_still_falls_back_to_legacy() {
+        let params = json!({"request_id": "delegate-legacy-1"});
+        let mut unified_calls = 0;
+        let mut legacy_task_create_calls = 0;
+        let outcome = resolve_unified_delegate(&params, "delegate-legacy-1", |_| {
+            unified_calls += 1;
+            Ok(json!({
+                "ok": false,
+                "error": {"code": -32601, "message": "method not found"},
+            }))
+        })
+        .unwrap();
+        if matches!(outcome, UnifiedDelegateOutcome::LegacyFallback) {
+            legacy_task_create_calls += 1;
+        }
+
+        assert_eq!(unified_calls, 1);
+        assert_eq!(legacy_task_create_calls, 1);
     }
 }
 
