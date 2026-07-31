@@ -32,9 +32,25 @@ final class DelegateDiagnosisP1Tests: XCTestCase {
         super.tearDown()
     }
 
+    /// Registered with instance ids, because that is what a real team has.
+    ///
+    /// `AgentMember.agentInstanceId` is a non-optional `String`, so every agent
+    /// in a live team carries one and `delegate` passes it into `createTask`.
+    /// The convenience `registerTeam(_:agentNames:)` overload registers
+    /// `instanceId: nil`, and `resolveAssigneeUnsafe` then hands back
+    /// `candidates.first?.instanceId` — nil — so tasks created that way have no
+    /// `assigneeInstanceId`. Such a task does not block the pool either
+    /// (`hasActiveTask` matches on the instance id), so registering without one
+    /// does not reproduce the bug being pinned here.
+    @discardableResult
     private func registerTeam(agents: [String] = ["executor"]) -> String {
         let name = "delegate-diagnosis-\(UUID().uuidString)"
-        store.registerTeam(name, agentNames: agents)
+        store.registerTeam(
+            name,
+            agents: agents.map {
+                TeamDataStore.AgentRegistration(name: $0, instanceId: UUID().uuidString)
+            }
+        )
         teamNames.append(name)
         return name
     }
@@ -122,6 +138,41 @@ final class DelegateDiagnosisP1Tests: XCTestCase {
                 in: store.listTasks(teamName: team, assignee: "executor"),
                 agentInstanceIds: [UUID().uuidString]
             ).isEmpty
+        )
+    }
+
+    /// The boundary that made the first version of this file wrong.
+    ///
+    /// A task with no `assigneeInstanceId` is not reported — and must not be,
+    /// because `TeamDataStore.hasActiveTask` matches on the instance id too, so
+    /// such a task never held the pool. Naming it would send the leader to
+    /// close a task that was not the problem.
+    func testATaskWithNoInstanceIDIsNotReportedBecauseItNeverBlocked() throws {
+        let team = "delegate-diagnosis-nameonly-\(UUID().uuidString)"
+        // The name-only overload: registers instanceId: nil, exactly the setup
+        // that produced tasks these assertions used to choke on.
+        store.registerTeam(team, agentNames: ["executor"])
+        teamNames.append(team)
+
+        let task = try XCTUnwrap(store.createTask(
+            teamName: team, title: "earlier work", assignee: "executor"
+        ))
+        _ = store.updateTask(teamName: team, taskId: task.id, status: "review_ready")
+
+        XCTAssertNil(
+            task.assigneeInstanceId,
+            "a name-only registration cannot pin an instance — this is the precondition"
+        )
+        XCTAssertFalse(
+            store.hasActiveTask(teamName: team, agentInstanceId: UUID().uuidString),
+            "and so it does not hold the pool"
+        )
+        XCTAssertTrue(
+            TeamOrchestrator.delegateBlockers(
+                in: store.listTasks(teamName: team, assignee: "executor"),
+                agentInstanceIds: [UUID().uuidString]
+            ).isEmpty,
+            "the diagnosis must agree with the gate, not over-report"
         )
     }
 
