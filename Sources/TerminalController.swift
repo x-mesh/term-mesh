@@ -405,8 +405,15 @@ class TerminalController {
         var authenticated = false
 
         while isRunning {
-            let bytesRead = read(socket, &buffer, buffer.count - 1)
-            guard bytesRead > 0 else { break }
+            let bytesRead = Self.readControlSocketBytes(socket, into: &buffer)
+            if bytesRead < 0 {
+                let readErrno = errno
+                Logger.socket.warning(
+                    "handleClient: read failed errno=\(readErrno) (\(String(cString: strerror(readErrno))))"
+                )
+                break
+            }
+            if bytesRead == 0 { break }
 
             guard let frames = Self.appendControlSocketChunk(
                 Data(buffer[0..<bytesRead]),
@@ -431,26 +438,46 @@ class TerminalController {
         }
     }
 
+    /// Reads one socket chunk, retrying an interrupted syscall without losing
+    /// the caller's partial frame. Other errors are returned to the read loop
+    /// so it can log the final errno and close the connection.
+    nonisolated static func readControlSocketBytes(
+        _ socket: Int32,
+        into buffer: inout [UInt8],
+        readOperation: (Int32, UnsafeMutableRawPointer?, Int) -> Int = {
+            Darwin.read($0, $1, $2)
+        }
+    ) -> Int {
+        buffer.withUnsafeMutableBytes { bytes in
+            while true {
+                let result = readOperation(socket, bytes.baseAddress, max(0, bytes.count - 1))
+                if result < 0, errno == EINTR { continue }
+                return result
+            }
+        }
+    }
+
     /// Appends raw socket bytes and decodes only complete LF-delimited frames.
     /// Keeping the pending buffer as bytes prevents a split UTF-8 scalar from
-    /// invalidating either read chunk. A nil result means the raw pending-byte
-    /// limit was exceeded before a newline arrived.
+    /// invalidating either read chunk. Each completed frame and the remaining
+    /// unterminated suffix have independent byte limits.
     nonisolated static func appendControlSocketChunk(
         _ chunk: Data,
         to pending: inout Data,
         maxPendingBytes: Int = 1_048_576
     ) -> [String]? {
         pending.append(chunk)
-        guard pending.count <= maxPendingBytes else { return nil }
 
         var frames: [String] = []
         while let newlineIndex = pending.firstIndex(of: 0x0A) {
+            guard newlineIndex <= maxPendingBytes else { return nil }
             let frame = Data(pending[..<newlineIndex])
             pending.removeSubrange(...newlineIndex)
             if let line = String(data: frame, encoding: .utf8) {
                 frames.append(line)
             }
         }
+        guard pending.count <= maxPendingBytes else { return nil }
         return frames
     }
 

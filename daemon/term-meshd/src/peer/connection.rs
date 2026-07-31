@@ -1241,37 +1241,38 @@ pub(crate) fn reap_if_abandoned(host: &Arc<PeerHost>, surface_id: &[u8]) {
 /// Sound only because a peer is always another machine the same person owns;
 /// `team.leader.v1` scopes its caller with a registered grant because that
 /// caller is an autonomous process rather than a person.
+const TEAM_CALL_ALLOWED_METHODS: &[&str] = &[
+    "team.status",
+    "team.list",
+    "team.read",
+    "team.collect",
+    "team.reports",
+    "team.result.status",
+    "team.result.collect",
+    "team.inbox",
+    "team.message.list",
+    "team.send",
+    "team.broadcast",
+    "team.delegate",
+    "team.message.post",
+    "team.task.list",
+    "team.task.get",
+    "team.task.create",
+    "team.task.update",
+    "team.task.done",
+    "team.task.block",
+    "team.task.review",
+    "team.task.unblock",
+    "team.task.approve",
+    // Reads what a task changed. The only method here that reaches the
+    // filesystem: the host resolves the worktree from the task row the peer
+    // names — no path, ref or command comes from the caller — and runs a fixed
+    // read. See the Swift mirror for the full reasoning.
+    "team.task.diff",
+];
+
 pub(crate) fn team_call_allowed(method: &str) -> bool {
-    matches!(
-        method,
-        "team.status"
-            | "team.list"
-            | "team.read"
-            | "team.collect"
-            | "team.reports"
-            | "team.result.status"
-            | "team.result.collect"
-            | "team.inbox"
-            | "team.message.list"
-            | "team.send"
-            | "team.broadcast"
-            | "team.delegate"
-            | "team.message.post"
-            | "team.task.list"
-            | "team.task.get"
-            | "team.task.create"
-            | "team.task.update"
-            | "team.task.done"
-            | "team.task.block"
-            | "team.task.review"
-            | "team.task.unblock"
-            | "team.task.approve"
-            // Reads what a task changed. The only method here that reaches the
-            // filesystem: the host resolves the worktree from the task row the
-            // peer names — no path, ref or command comes from the caller — and
-            // runs a fixed read. See the Swift mirror for the full reasoning.
-            | "team.task.diff"
-    )
+    TEAM_CALL_ALLOWED_METHODS.contains(&method)
 }
 
 /// Run one allow-listed `team.*` method against a headless team manager.
@@ -3033,7 +3034,7 @@ mod team_leader_capability_tests {
 
 #[cfg(test)]
 mod team_call_allow_list_tests {
-    use super::team_call_allowed;
+    use super::{team_call_allowed, TEAM_CALL_ALLOWED_METHODS};
 
     /// The allow-list is the security boundary of `team.call.v1`, and it is
     /// written twice — here and in the Swift host's `PeerTeamCall`. Two copies
@@ -3072,61 +3073,13 @@ mod team_call_allow_list_tests {
             .collect();
         mirrored.sort();
         assert!(!mirrored.is_empty(), "parsed nothing out of the Swift list");
-        for method in &mirrored {
-            assert!(
-                team_call_allowed(method),
-                "{method} is allowed by the Swift host but refused here"
-            );
-        }
-        // And the other direction: a method this host allows that Swift does
-        // not would be just as much of a split.
-        for method in KNOWN_METHODS {
-            let expected = mirrored.iter().any(|m| m == method);
-            assert_eq!(
-                team_call_allowed(method),
-                expected,
-                "unexpected host parity difference for {method}"
-            );
-        }
+        let mut rust: Vec<String> = TEAM_CALL_ALLOWED_METHODS
+            .iter()
+            .map(|method| (*method).to_string())
+            .collect();
+        rust.sort();
+        assert_eq!(mirrored, rust, "Swift and Rust allow-lists diverged");
     }
-
-    /// Every method the boundary has an opinion about, so the comparison above
-    /// covers refusals too rather than only what happens to be listed.
-    const KNOWN_METHODS: &[&str] = &[
-        "team.status",
-        "team.list",
-        "team.read",
-        "team.collect",
-        "team.reports",
-        "team.result.status",
-        "team.result.collect",
-        "team.inbox",
-        "team.message.list",
-        "team.send",
-        "team.broadcast",
-        "team.delegate",
-        "team.message.post",
-        "team.task.list",
-        "team.task.get",
-        "team.task.create",
-        "team.task.update",
-        "team.task.done",
-        "team.task.block",
-        "team.task.review",
-        "team.task.unblock",
-        "team.task.approve",
-        "team.task.diff",
-        "team.task.reassign",
-        // Deliberately out: these spawn or tear down processes and take a
-        // working directory, so a peer holding one could start an arbitrary
-        // command anywhere on the host.
-        "team.create",
-        "team.destroy",
-        "team.attach",
-        "team.detach",
-        "team.add_agent",
-        "team.restart",
-    ];
 
     /// The reason `team.task.diff` was allowed at all: it names no path and no
     /// command. Guarding the refusals explicitly keeps a later "just one more
@@ -3167,10 +3120,10 @@ mod team_call_allow_list_tests {
                 Some(&line[start..end])
             })
             .collect();
-        let mut daemon_methods: Vec<&str> = KNOWN_METHODS
+        let mut daemon_methods: Vec<&str> = TEAM_CALL_ALLOWED_METHODS
             .iter()
             .copied()
-            .filter(|method| team_call_allowed(method) && *method != "team.list")
+            .filter(|method| *method != "team.list")
             .collect();
         cli_methods.sort();
         daemon_methods.sort();
