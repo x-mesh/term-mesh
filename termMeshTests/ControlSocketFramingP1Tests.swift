@@ -57,6 +57,69 @@ final class ControlSocketFramingP1Tests: XCTestCase {
         XCTAssertTrue(pending.isEmpty)
     }
 
+    func testFrameExactlyAtPendingLimitIsAcceptedWhenNewlineArrives() {
+        var pending = Data(repeating: 0x61, count: 8)
+
+        let frames = TerminalController.appendControlSocketChunk(
+            Data([0x0A]),
+            to: &pending,
+            maxPendingBytes: 8
+        )
+
+        XCTAssertEqual(frames, ["aaaaaaaa"])
+        XCTAssertTrue(pending.isEmpty)
+    }
+
+    func testFrameOneByteOverPendingLimitIsRejectedEvenWithNewline() {
+        var pending = Data(repeating: 0x61, count: 8)
+
+        let frames = TerminalController.appendControlSocketChunk(
+            Data([0x61, 0x0A]),
+            to: &pending,
+            maxPendingBytes: 8
+        )
+
+        XCTAssertNil(frames)
+    }
+
+    func testCompletedFrameIsRemovedBeforeUnterminatedSuffixLimitIsChecked() {
+        var pending = Data(repeating: 0x61, count: 8)
+
+        let frames = TerminalController.appendControlSocketChunk(
+            Data([0x0A, 0x62]),
+            to: &pending,
+            maxPendingBytes: 8
+        )
+
+        XCTAssertEqual(frames, ["aaaaaaaa"])
+        XCTAssertEqual(pending, Data([0x62]))
+    }
+
+    func testReadRetriesEINTRWithoutDiscardingTheChunk() {
+        var buffer = [UInt8](repeating: 0, count: 16)
+        var callCount = 0
+        let expected = Data("partial\n".utf8)
+
+        let bytesRead = TerminalController.readControlSocketBytes(
+            42,
+            into: &buffer
+        ) { socket, pointer, count in
+            callCount += 1
+            XCTAssertEqual(socket, 42)
+            if callCount == 1 {
+                errno = EINTR
+                return -1
+            }
+            XCTAssertGreaterThanOrEqual(count, expected.count)
+            expected.copyBytes(to: pointer!.assumingMemoryBound(to: UInt8.self), count: expected.count)
+            return expected.count
+        }
+
+        XCTAssertEqual(callCount, 2)
+        XCTAssertEqual(bytesRead, expected.count)
+        XCTAssertEqual(Data(buffer.prefix(bytesRead)), expected)
+    }
+
     func testWriteAllRetriesEINTRAndCompletesAfterShortWrite() {
         let expected = Data("{\"ok\":true}\n".utf8)
         var recorded = Data()
