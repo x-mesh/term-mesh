@@ -6,10 +6,11 @@
 #
 # Service scope is chosen automatically: a per-user service (systemctl
 # --user) when the user's systemd bus is reachable, otherwise a system
-# service (/etc/systemd/system) when running as root. Hosts with no
-# per-user bus — non-interactive ssh sessions, and older systemd such as
-# RHEL/CentOS 7's 219 — take the root/system path; a non-root run there
-# stops with instructions instead of half-installing.
+# service (/etc/systemd/system) when running as root. The system service
+# runs as the dedicated, unprivileged `term-mesh` account, never as root.
+# Hosts with no per-user bus — non-interactive ssh sessions and older
+# systemd such as RHEL/CentOS 7's 219 — take the root/system path; a
+# non-root run there stops with instructions instead of half-installing.
 #
 # Re-running this script is safe: it replaces the binary and unit file,
 # restarts the service, and leaves any existing peer.env config alone.
@@ -17,7 +18,9 @@
 # Env overrides:
 #   TERMMESH_INSTALL_TAG   Release tag to install (default: latest)
 #   TERMMESH_INSTALL_REPO  GitHub repo to fetch from (default: x-mesh/term-mesh)
-#   TERMMESH_INSTALL_PREFIX Install directory for the binary (default: ~/.local/bin)
+#   TERMMESH_INSTALL_PREFIX Install directory override (defaults: ~/.local/bin
+#                           for user scope, /usr/local/bin for system scope)
+#   TERMMESH_SERVICE_USER   Account for a system service (default: term-mesh)
 #
 # What this does NOT do: bind the peer socket to a fixed path chosen for
 # you, or pick surfaces to expose. Those are yours to set in
@@ -26,9 +29,8 @@ set -euo pipefail
 
 REPO="${TERMMESH_INSTALL_REPO:-x-mesh/term-mesh}"
 TAG="${TERMMESH_INSTALL_TAG:-latest}"
-PREFIX="${TERMMESH_INSTALL_PREFIX:-$HOME/.local/bin}"
-CONFIG_DIR="$HOME/.config/term-mesh"
-UNIT_DIR="$HOME/.config/systemd/user"
+PREFIX_OVERRIDE="${TERMMESH_INSTALL_PREFIX:-}"
+SERVICE_USER="${TERMMESH_SERVICE_USER:-term-mesh}"
 BIN_NAME="term-meshd"
 
 log() { printf '==> %s\n' "$*"; }
@@ -38,6 +40,42 @@ die() { printf 'error: %s\n' "$*" >&2; exit 1; }
 command -v systemctl >/dev/null 2>&1 || die "systemctl not found — this script requires systemd"
 command -v curl >/dev/null 2>&1 || die "curl not found"
 command -v tar >/dev/null 2>&1 || die "tar not found"
+
+# Select the scope before writing any files. The paths and ownership form a
+# security boundary: a system service must not execute a root-owned daemon
+# with root's HOME/config merely because the user bus happened to be absent.
+INSTALL_UID=$(id -u)
+if [[ "$INSTALL_UID" != 0 ]] && systemctl --user show-environment >/dev/null 2>&1; then
+  SERVICE_SCOPE=user
+  PREFIX="${PREFIX_OVERRIDE:-$HOME/.local/bin}"
+  CONFIG_DIR="$HOME/.config/term-mesh"
+  UNIT_DIR="$HOME/.config/systemd/user"
+  UNIT_PATH="${UNIT_DIR}/${BIN_NAME}.service"
+  ENV_FILE="${CONFIG_DIR}/peer.env"
+  WANTED_BY=default.target
+  PEER_SOCKET_DEFAULT="/run/user/$(id -u)/tm-peer.sock"
+  systemctl_scoped() { systemctl --user "$@"; }
+elif [[ "$INSTALL_UID" == 0 ]]; then
+  SERVICE_SCOPE=system
+  PREFIX="${PREFIX_OVERRIDE:-/usr/local/bin}"
+  CONFIG_DIR=/etc/term-mesh
+  UNIT_DIR=/etc/systemd/system
+  UNIT_PATH="${UNIT_DIR}/${BIN_NAME}.service"
+  ENV_FILE="${CONFIG_DIR}/peer.env"
+  WANTED_BY=multi-user.target
+  PEER_SOCKET_DEFAULT=/run/term-mesh/tm-peer.sock
+  systemctl_scoped() { systemctl "$@"; }
+  log "installing a system service as ${SERVICE_USER}, not root"
+else
+  die "cannot reach your user systemd bus, so 'systemctl --user' will not work here.
+This host has no per-user systemd session — common over non-interactive
+ssh, and on older systemd (e.g. RHEL/CentOS 7). Either:
+  • ask an administrator to run this installer as root; it creates an
+    unprivileged '${SERVICE_USER}' system service, or
+  • start a lingering login session first:
+        loginctl enable-linger $(whoami)
+    then reconnect and re-run, so the --user bus exists."
+fi
 
 # Normalize uname -m to the arch suffix release-linux.yml publishes assets
 # under (x86_64 / aarch64). Some distros report arm64 for the same thing.
@@ -76,16 +114,12 @@ log "extracting"
 tar -xzf "${WORK_DIR}/${ASSET}" -C "$WORK_DIR"
 [[ -f "${WORK_DIR}/${BIN_NAME}" ]] || die "archive did not contain a '${BIN_NAME}' binary"
 
-mkdir -p "$PREFIX"
-install -m 0755 "${WORK_DIR}/${BIN_NAME}" "${PREFIX}/${BIN_NAME}"
-log "installed ${PREFIX}/${BIN_NAME}"
-
 # Smoke-test the binary before wiring any service around it. `--version`
 # exits before the daemon starts (main.rs), but the dynamic linker runs
 # first — so a glibc-too-old host fails here with the exact "GLIBC_x.y
 # not found" it would fail with at service start. Catching it now means a
 # clear message instead of a service that flaps in the background.
-if ! smoke_out=$("${PREFIX}/${BIN_NAME}" --version 2>&1); then
+if ! smoke_out=$("${WORK_DIR}/${BIN_NAME}" --version 2>&1); then
   die "the installed ${BIN_NAME} cannot run on this host:
 
   ${smoke_out}
@@ -97,49 +131,85 @@ supported binary for it yet; on a supported host re-run this installer."
 fi
 log "binary runs: ${smoke_out}"
 
+# A scope switch must not leave two daemons serving different sockets. Stop,
+# disable, and remove the old unit only after the replacement has downloaded
+# and passed its smoke test. If cleanup cannot be done safely, fail closed
+# before installing or starting the new scope.
+if [[ "$SERVICE_SCOPE" == user && -e /etc/systemd/system/${BIN_NAME}.service ]]; then
+  log "removing previous system-scope service"
+  command -v sudo >/dev/null 2>&1 \
+    || die "a system ${BIN_NAME} service exists but sudo is unavailable; refusing to start a duplicate daemon. Ask an administrator to disable/remove the system unit, then re-run."
+  sudo -n systemctl disable --now "${BIN_NAME}.service" \
+    || die "could not stop/disable the previous system service non-interactively; it remains installed and no user service was created. Ask an administrator to remove it, then re-run."
+  sudo -n rm -f /etc/systemd/system/${BIN_NAME}.service
+  sudo -n systemctl daemon-reload \
+    || die "removed the old unit but could not reload the system manager; resolve that manager before re-running"
+fi
+
+if [[ "$SERVICE_SCOPE" == system ]]; then
+  [[ "$SERVICE_USER" =~ ^[a-z_][a-z0-9_-]*$ ]] \
+    || die "TERMMESH_SERVICE_USER must be a simple system account name"
+  if id -u "$SERVICE_USER" >/dev/null 2>&1; then
+    [[ "$(id -u "$SERVICE_USER")" != 0 ]] \
+      || die "TERMMESH_SERVICE_USER must not resolve to UID 0"
+  else
+    command -v useradd >/dev/null 2>&1 \
+      || die "useradd not found; create the '${SERVICE_USER}' system account first"
+  fi
+
+  # When invoked through sudo, HOME may be either root's home or the calling
+  # user's home. Resolve the account explicitly so a prior user unit cannot
+  # be missed. Commands target that user's bus without granting the daemon
+  # any of root's privileges.
+  command -v getent >/dev/null 2>&1 || die "getent not found; cannot safely locate the previous user's service"
+  PREVIOUS_USER=${SUDO_USER:-root}
+  PREVIOUS_UID=$(id -u "$PREVIOUS_USER")
+  PREVIOUS_HOME=$(getent passwd "$PREVIOUS_USER" | awk -F: '{print $6}')
+  [[ -n "$PREVIOUS_HOME" ]] || die "could not resolve home directory for ${PREVIOUS_USER}"
+  PREVIOUS_USER_UNIT="${PREVIOUS_HOME}/.config/systemd/user/${BIN_NAME}.service"
+  systemctl_previous_user() {
+    if [[ "$PREVIOUS_USER" == root ]]; then
+      systemctl --user "$@"
+    else
+      command -v runuser >/dev/null 2>&1 \
+        || die "runuser is required to remove ${PREVIOUS_USER}'s previous user service"
+      runuser -u "$PREVIOUS_USER" -- env \
+        HOME="$PREVIOUS_HOME" \
+        XDG_RUNTIME_DIR="/run/user/${PREVIOUS_UID}" \
+        DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/${PREVIOUS_UID}/bus" \
+        systemctl --user "$@"
+    fi
+  }
+  if [[ -e "$PREVIOUS_USER_UNIT" ]]; then
+    log "removing previous user-scope service for ${PREVIOUS_USER}"
+    systemctl_previous_user disable --now "${BIN_NAME}.service" \
+      || die "the previous user service exists but ${PREVIOUS_USER}'s user bus is unreachable. Start that user's bus, disable/remove the user unit, and re-run; refusing to start a duplicate daemon."
+    rm -f "$PREVIOUS_USER_UNIT"
+    systemctl_previous_user daemon-reload \
+      || die "removed the old unit but could not reload ${PREVIOUS_USER}'s user manager; resolve that manager before re-running"
+  fi
+
+  if ! id -u "$SERVICE_USER" >/dev/null 2>&1; then
+    log "creating unprivileged system account ${SERVICE_USER}"
+    useradd --system --home-dir /var/lib/term-mesh --create-home \
+      --shell /sbin/nologin "$SERVICE_USER"
+  fi
+  SERVICE_GROUP=$(id -gn "$SERVICE_USER")
+  SERVICE_HOME=$(getent passwd "$SERVICE_USER" | awk -F: '{print $6}')
+  [[ -n "$SERVICE_HOME" ]] \
+    || die "could not resolve home directory for service account ${SERVICE_USER}"
+fi
+
+mkdir -p "$PREFIX"
+install -m 0755 "${WORK_DIR}/${BIN_NAME}" "${PREFIX}/${BIN_NAME}"
+log "installed ${PREFIX}/${BIN_NAME}"
+
 case ":$PATH:" in
   *":${PREFIX}:"*) ;;
   *) log "note: ${PREFIX} is not on your PATH — add 'export PATH=\"${PREFIX}:\$PATH\"' to your shell profile if you want to run term-meshd directly" ;;
 esac
 
-# Decide the service scope BEFORE writing config, because the default
-# socket path differs between the two. `systemctl --user` needs a
-# per-user systemd instance plus a session D-Bus ($XDG_RUNTIME_DIR/bus);
-# non-interactive ssh sessions and old systemd (RHEL/CentOS 7's 219)
-# often have neither, which used to abort daemon-reload with "Failed to
-# get D-Bus connection" AFTER the binary and unit were already written.
-# `show-environment` is a read-only probe that fails the same way, so it
-# tells us up front which scope is actually usable.
-if systemctl --user show-environment >/dev/null 2>&1; then
-  SERVICE_SCOPE=user
-  UNIT_PATH="${UNIT_DIR}/${BIN_NAME}.service"
-  WANTED_BY=default.target
-  PEER_SOCKET_DEFAULT="/run/user/$(id -u)/tm-peer.sock"
-  RUNTIME_DIR_LINE=""
-  systemctl_scoped() { systemctl --user "$@"; }
-elif [[ "$(id -u)" == "0" ]]; then
-  SERVICE_SCOPE=system
-  UNIT_DIR="/etc/systemd/system"
-  UNIT_PATH="${UNIT_DIR}/${BIN_NAME}.service"
-  WANTED_BY=multi-user.target
-  # A system service has no /run/user/<uid> (that is a login-session dir),
-  # so bind under a RuntimeDirectory systemd creates and owns instead.
-  PEER_SOCKET_DEFAULT="/run/term-mesh/tm-peer.sock"
-  RUNTIME_DIR_LINE="RuntimeDirectory=term-mesh"
-  systemctl_scoped() { systemctl "$@"; }
-  log "user systemd bus unreachable — installing a system service (running as root)"
-else
-  die "cannot reach your user systemd bus, so 'systemctl --user' will not work here.
-This host has no per-user systemd session — common over non-interactive
-ssh, and on older systemd (e.g. RHEL/CentOS 7). Either:
-  • re-run this installer as root, so it installs a system-wide service, or
-  • start a lingering login session first:
-        loginctl enable-linger $(whoami)
-    then reconnect and re-run, so the --user bus exists."
-fi
-
 mkdir -p "$CONFIG_DIR"
-ENV_FILE="${CONFIG_DIR}/peer.env"
 if [[ ! -f "$ENV_FILE" ]]; then
   log "writing default config to ${ENV_FILE}"
   cat > "$ENV_FILE" <<EOF
@@ -169,9 +239,15 @@ else
     fi
   fi
 fi
+if [[ "$SERVICE_SCOPE" == system ]]; then
+  chown root:"$SERVICE_GROUP" "$CONFIG_DIR" "$ENV_FILE"
+  chmod 0750 "$CONFIG_DIR"
+  chmod 0640 "$ENV_FILE"
+fi
 
 mkdir -p "$UNIT_DIR"
-cat > "$UNIT_PATH" <<EOF
+if [[ "$SERVICE_SCOPE" == system ]]; then
+  cat > "$UNIT_PATH" <<EOF
 [Unit]
 Description=term-mesh peer host
 After=network.target
@@ -179,13 +255,38 @@ After=network.target
 [Service]
 EnvironmentFile=-${ENV_FILE}
 ExecStart=${PREFIX}/${BIN_NAME}
-${RUNTIME_DIR_LINE}
+User=${SERVICE_USER}
+Group=${SERVICE_GROUP}
+Environment=HOME=${SERVICE_HOME}
+RuntimeDirectory=term-mesh
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+CapabilityBoundingSet=
+ProtectSystem=full
+ProtectHome=true
 Restart=always
 RestartSec=2
 
 [Install]
 WantedBy=${WANTED_BY}
 EOF
+else
+  cat > "$UNIT_PATH" <<EOF
+[Unit]
+Description=term-mesh peer host
+After=network.target
+
+[Service]
+EnvironmentFile=-${ENV_FILE}
+ExecStart=${PREFIX}/${BIN_NAME}
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=${WANTED_BY}
+EOF
+fi
 log "wrote ${UNIT_PATH}"
 
 systemctl_scoped daemon-reload

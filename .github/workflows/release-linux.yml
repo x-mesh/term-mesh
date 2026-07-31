@@ -96,7 +96,15 @@ jobs:
         run: |
           set -euo pipefail
           bin="target/${{ matrix.rust_target }}/release/term-meshd"
-          maxsym=$(objdump -T "$bin" | grep -oE 'GLIBC_[0-9.]+' | sort -V | tail -n1 || true)
+          command -v objdump >/dev/null || { echo "ERROR: objdump is required for the GLIBC gate" >&2; exit 1; }
+          objdump_output=$(objdump -T "$bin")
+          # awk deliberately succeeds when there are no GLIBC imports (for
+          # example, a future static binary). With pipefail still enabled, an
+          # objdump/sort/tail failure cannot be mistaken for "no symbols".
+          maxsym=$(printf '%s\n' "$objdump_output" \
+            | awk '{ line = $0; while (match(line, /GLIBC_[0-9]+(\.[0-9]+)*/)) { print substr(line, RSTART, RLENGTH); line = substr(line, RSTART + RLENGTH) } }' \
+            | sort -V \
+            | tail -n1)
           echo "max glibc symbol required: ${maxsym:-none}"
           if [ -n "$maxsym" ]; then
             ver=${maxsym#GLIBC_}
