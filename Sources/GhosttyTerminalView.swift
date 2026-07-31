@@ -3760,6 +3760,34 @@ private extension NSScreen {
 
 // MARK: - SwiftUI Wrapper
 
+struct TerminalPortalAnchorGeometry {
+    let windowID: ObjectIdentifier?
+    let superviewID: ObjectIdentifier?
+    let frameInWindow: NSRect
+
+    func isApproximatelyEqual(
+        to other: TerminalPortalAnchorGeometry,
+        epsilon: CGFloat = 0.25
+    ) -> Bool {
+        guard windowID == other.windowID,
+              superviewID == other.superviewID else {
+            return false
+        }
+        return abs(frameInWindow.minX - other.frameInWindow.minX) <= epsilon
+            && abs(frameInWindow.minY - other.frameInWindow.minY) <= epsilon
+            && abs(frameInWindow.width - other.frameInWindow.width) <= epsilon
+            && abs(frameInWindow.height - other.frameInWindow.height) <= epsilon
+    }
+}
+
+func terminalPortalAnchorNeedsSynchronization(
+    previous: TerminalPortalAnchorGeometry?,
+    current: TerminalPortalAnchorGeometry,
+    force: Bool
+) -> Bool {
+    force || previous?.isApproximatelyEqual(to: current) != true
+}
+
 struct GhosttyTerminalView: NSViewRepresentable {
     @Environment(\.paneDropZone) var paneDropZone
 
@@ -3780,16 +3808,18 @@ struct GhosttyTerminalView: NSViewRepresentable {
         var onDidMoveToWindow: (() -> Void)?
         var onGeometryChanged: (() -> Void)?
         private var hasScheduledGeometryCallback = false
+        private var scheduledGeometryCallbackIsForced = false
+        private var lastReportedGeometry: TerminalPortalAnchorGeometry?
 
         override func viewDidMoveToWindow() {
             super.viewDidMoveToWindow()
             onDidMoveToWindow?()
-            scheduleGeometryCallback()
+            scheduleGeometryCallback(force: true)
         }
 
         override func viewDidMoveToSuperview() {
             super.viewDidMoveToSuperview()
-            scheduleGeometryCallback()
+            scheduleGeometryCallback(force: true)
         }
 
         override func layout() {
@@ -3810,14 +3840,35 @@ struct GhosttyTerminalView: NSViewRepresentable {
         /// Coalesce geometry callbacks to prevent re-entrant layout loops.
         /// Multiple layout/frame changes during a single AppKit layout pass
         /// are batched into one deferred synchronizeForAnchor call.
-        private func scheduleGeometryCallback() {
+        private func scheduleGeometryCallback(force: Bool = false) {
+            scheduledGeometryCallbackIsForced =
+                scheduledGeometryCallbackIsForced || force
             guard !hasScheduledGeometryCallback else { return }
             hasScheduledGeometryCallback = true
             DispatchQueue.main.async { [weak self] in
                 guard let self else { return }
                 self.hasScheduledGeometryCallback = false
+                let isForced = self.scheduledGeometryCallbackIsForced
+                self.scheduledGeometryCallbackIsForced = false
+                let currentGeometry = self.currentGeometry()
+                guard terminalPortalAnchorNeedsSynchronization(
+                    previous: self.lastReportedGeometry,
+                    current: currentGeometry,
+                    force: isForced
+                ) else {
+                    return
+                }
+                self.lastReportedGeometry = currentGeometry
                 self.onGeometryChanged?()
             }
+        }
+
+        private func currentGeometry() -> TerminalPortalAnchorGeometry {
+            TerminalPortalAnchorGeometry(
+                windowID: window.map(ObjectIdentifier.init),
+                superviewID: superview.map(ObjectIdentifier.init),
+                frameInWindow: convert(bounds, to: nil)
+            )
         }
     }
 
@@ -3958,7 +4009,6 @@ struct GhosttyTerminalView: NSViewRepresentable {
                     )
                     coordinator.lastBoundHostId = hostId
                 }
-                TerminalWindowPortalRegistry.synchronizeForAnchor(host)
             } else {
                 // Bind is deferred until host moves into a window. Update the
                 // existing portal entry's visibleInUI now so that any portal sync
