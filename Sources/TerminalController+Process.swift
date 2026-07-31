@@ -281,6 +281,20 @@ extension TerminalController {
     }
 
     @discardableResult
+    nonisolated static func suppressSocketSIGPIPE(_ socket: Int32) -> Bool {
+        var enabled: Int32 = 1
+        return withUnsafePointer(to: &enabled) {
+            setsockopt(
+                socket,
+                SOL_SOCKET,
+                SO_NOSIGPIPE,
+                $0,
+                socklen_t(MemoryLayout<Int32>.size)
+            ) == 0
+        }
+    }
+
+    @discardableResult
     nonisolated static func writeAllSocketBytes(
         _ bytes: Data,
         using writeBytes: (_ pointer: UnsafeRawPointer, _ count: Int) -> Int
@@ -482,6 +496,11 @@ extension TerminalController {
             }
 
             consecutiveFailures = 0
+            guard Self.suppressSocketSIGPIPE(clientSocket) else {
+                Logger.socket.error("Failed to set SO_NOSIGPIPE on accepted client")
+                close(clientSocket)
+                continue
+            }
 
             // Capture peer PID immediately — before the client can disconnect.
             // ncat --send-only closes the connection right after writing, so by

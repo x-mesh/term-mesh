@@ -82,7 +82,7 @@ final class AutoReplyDetectorTests: XCTestCase {
     }
 
     func test_noncanonical_status_values_are_rejected() {
-        for value in ["done", " DONE", "DONE ", "DON", "DONEISH", ""] {
+        for value in ["done", " DONE", "DON", "DONEISH", ""] {
             XCTAssertNil(
                 AutoReplyDetector.validatedStatus(value),
                 "validation unexpectedly accepted \(String(reflecting: value))"
@@ -92,6 +92,11 @@ final class AutoReplyDetectorTests: XCTestCase {
                 "detector unexpectedly accepted \(String(reflecting: value))"
             )
         }
+    }
+
+    func test_terminal_row_padding_after_status_is_accepted() {
+        XCTAssertEqual(AutoReplyDetector.validatedStatus("DONE   \t"), "DONE")
+        XCTAssertEqual(detect(statusValue: "NEEDS_REVIEW   ")?.status, "NEEDS_REVIEW")
     }
 
     func test_all_canonical_status_values_are_accepted() {

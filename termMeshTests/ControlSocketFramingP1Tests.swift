@@ -8,6 +8,24 @@ import XCTest
 #endif
 
 final class ControlSocketFramingP1Tests: XCTestCase {
+    func testAcceptedSocketSuppressesSIGPIPE() throws {
+        var sockets: [Int32] = [-1, -1]
+        XCTAssertEqual(socketpair(AF_UNIX, SOCK_STREAM, 0, &sockets), 0)
+        defer {
+            if sockets[0] >= 0 { close(sockets[0]) }
+            if sockets[1] >= 0 { close(sockets[1]) }
+        }
+
+        XCTAssertTrue(TerminalController.suppressSocketSIGPIPE(sockets[0]))
+        var enabled: Int32 = 0
+        var length = socklen_t(MemoryLayout<Int32>.size)
+        XCTAssertEqual(
+            getsockopt(sockets[0], SOL_SOCKET, SO_NOSIGPIPE, &enabled, &length),
+            0
+        )
+        XCTAssertEqual(enabled, 1)
+    }
+
     func testSplitUTF8ScalarAt4095ByteReadBoundaryIsHandledExactlyOnce() {
         let request = String(repeating: "a", count: 4_094) + "한"
         let wire = Data((request + "\n").utf8)

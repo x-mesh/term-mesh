@@ -68,9 +68,13 @@ final class AutoReplyDetector {
     /// trimming or case folding: placeholders, comma-separated choices, partial
     /// matches, and values with extra whitespace are not agent verdicts.
     static func validatedStatus(_ value: String) -> String? {
-        switch value {
+        // Ghostty's rectangular screen selection pads rows to the viewport
+        // width. Ignore only right-edge display padding; leading whitespace,
+        // casing and extra tokens remain invalid protocol values.
+        let normalized = value.trimmingCharactersAtEnd(in: .whitespaces)
+        switch normalized {
         case "DONE", "BLOCKED", "NEEDS_REVIEW":
-            return value
+            return normalized
         default:
             return nil
         }
@@ -94,15 +98,12 @@ final class AutoReplyDetector {
 
     private func pushLine(_ rawLine: String, at now: Date) {
         // Agent TUIs indent their output, so remove indentation and a possible
-        // bullet. Preserve trailing whitespace on STATUS specifically: the
-        // protocol value must be exact, and trimming it would turn an invalid
-        // `DONE ` into `DONE`. Other lines retain their historical normalization.
+        // bullet. Rectangular terminal snapshots pad every row on the right,
+        // so normalize that display padding for headers as well.
         let unmarked = Self.unmarked(
             Self.stripAnsi(rawLine).trimmingCharactersAtStart(in: .whitespaces)
         )
-        let line = unmarked.hasPrefix("STATUS:")
-            ? unmarked
-            : unmarked.trimmingCharactersAtEnd(in: .whitespaces)
+        let line = unmarked.trimmingCharactersAtEnd(in: .whitespaces)
         if lineBuffer.count >= Self.bufferCap {
             lineBuffer.removeFirst()
         }

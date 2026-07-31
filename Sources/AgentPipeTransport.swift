@@ -354,9 +354,8 @@ enum AgentPipeTransport {
     /// PTY buffer until something reads them.
     private static let pipeReadyTimeout: TimeInterval = 5
 
-    /// How long delivery may take before its caller gets a timeout result.
-    /// The agent writer keeps ownership of a frame that has committed bytes;
-    /// this bounds feedback, not the lifetime of that frame.
+    /// Maximum reader silence before a write is abandoned. Progress restarts
+    /// the budget, so this is a stall timeout rather than a total-duration cap.
     private static let pipeWriteTimeout: TimeInterval = 5
 
     enum WriteAttempt: Equatable {
@@ -385,78 +384,20 @@ enum AgentPipeTransport {
         }
     }
 
-    /// Makes an async delivery report exactly once. A result timeout and the
-    /// writer may race, but neither is allowed to notify the caller twice.
-    private final class DeliveryResult: @unchecked Sendable {
-        private let lock = NSLock()
-        private var finished = false
-        private let completion: (Result<Int, DeliveryError>) -> Void
-
-        init(completion: @escaping (Result<Int, DeliveryError>) -> Void) {
-            self.completion = completion
-        }
-
-        func finish(_ result: Result<Int, DeliveryError>) {
-            lock.lock()
-            guard !finished else {
-                lock.unlock()
-                return
-            }
-            finished = true
-            lock.unlock()
-            DispatchQueue.main.async { [completion] in completion(result) }
-        }
-    }
-
     private static let writers = WriterRegistry()
 
     /// One line onto the pipe, whole.
     ///
-    /// Before the FIFO accepts any byte, its deadline can reject the delivery.
-    /// Once committed, the same per-agent writer owns the frame until every byte
-    /// lands or the transport returns a hard error. In particular, a deadline
-    /// never turns committed JSON into a malformed line that can poison the next
-    /// instruction. Waiting is safe because this runs off the main actor.
+    /// A committed partial JSON frame cannot be left adjacent to the next
+    /// instruction. If the reader stops consuming, bound the writer wait and
+    /// best-effort terminate the fragment with a newline before releasing the
+    /// per-agent queue. Waiting is safe because production calls this off-main.
     static func writeWholeLine(
         byteCount: Int,
         timeout: TimeInterval = pipeWriteTimeout,
         now: () -> TimeInterval = { ProcessInfo.processInfo.systemUptime },
         pause: () -> Void = { usleep(2_000) },
-        attempt: (_ offset: Int, _ remaining: Int) -> WriteAttempt
-    ) throws -> Int {
-        var written = 0
-        let deadline = now() + timeout
-        while written < byteCount {
-            switch attempt(written, byteCount - written) {
-            case .written(let count):
-                guard count > 0 else {
-                    throw DeliveryError.writeFailed("write returned zero after \(written)B")
-                }
-                written += count
-            case .interrupted:
-                continue
-            case .wouldBlock:
-                guard written > 0 || now() < deadline else {
-                    throw DeliveryError.writeFailed(
-                        "write stalled before line commit (deadline exceeded)")
-                }
-                pause()
-            case .failed(let failure):
-                throw DeliveryError.writeFailed("errno \(failure) after \(written)B")
-            }
-        }
-        return written
-    }
-
-    /// Compatibility for the registered 0.169 deadline regressions. Production
-    /// delivery does not use this overload; committed frames use the owner-until-
-    /// complete overload above.
-    static func writeWholeLine(
-        byteCount: Int,
-        timeout: TimeInterval = pipeWriteTimeout,
-        now: () -> TimeInterval = { ProcessInfo.processInfo.systemUptime },
-        pause: () -> Void = { usleep(2_000) },
-        terminateLine: () -> Bool,
+        terminateLine: () -> Bool = { false },
         attempt: (_ offset: Int, _ remaining: Int) -> WriteAttempt
     ) throws -> Int {
         var written = 0
@@ -493,10 +434,6 @@ enum AgentPipeTransport {
     }
 
     /// Queue one user turn without making its MainActor caller poll a FIFO.
-    ///
-    /// The timeout reports that delivery has not completed; it does not cancel
-    /// a committed frame. That frame continues to own this agent writer, so a
-    /// later frame cannot overtake it or append to a partial JSON object.
     static func deliver(
         text: String,
         agentId: String,
@@ -504,19 +441,16 @@ enum AgentPipeTransport {
     ) throws {
         let path = fifoPath(agentId: agentId)
         let payload = try encode(text: text)
-        let result = DeliveryResult(completion: completion)
-        DispatchQueue.main.asyncAfter(deadline: .now() + pipeWriteTimeout) {
-            result.finish(.failure(.writeFailed(
-                "delivery result deadline exceeded; committed frame remains owned by writer")))
-        }
         writers.queue(for: agentId).async {
+            let result: Result<Int, DeliveryError>
             do {
-                result.finish(.success(try deliver(payload: payload, path: path)))
+                result = .success(try deliver(payload: payload, path: path))
             } catch let error as DeliveryError {
-                result.finish(.failure(error))
+                result = .failure(error)
             } catch {
-                result.finish(.failure(.writeFailed(error.localizedDescription)))
+                result = .failure(.writeFailed(error.localizedDescription))
             }
+            DispatchQueue.main.async { completion(result) }
         }
     }
 
@@ -540,13 +474,22 @@ enum AgentPipeTransport {
 
         return try payload.withUnsafeBytes { raw in
             guard let base = raw.baseAddress else { return 0 }
-            return try writeWholeLine(byteCount: raw.count) { offset, remaining in
-                let count = write(fd, base.advanced(by: offset), remaining)
-                if count > 0 { return .written(count) }
-                if count < 0, errno == EINTR { return .interrupted }
-                if count < 0, errno == EAGAIN { return .wouldBlock }
-                return .failed(errno)
-            }
+            return try writeWholeLine(
+                byteCount: raw.count,
+                terminateLine: {
+                    var newline: UInt8 = 0x0a
+                    return withUnsafePointer(to: &newline) {
+                        write(fd, $0, 1) == 1
+                    }
+                },
+                attempt: { offset, remaining in
+                    let count = write(fd, base.advanced(by: offset), remaining)
+                    if count > 0 { return .written(count) }
+                    if count < 0, errno == EINTR { return .interrupted }
+                    if count < 0, errno == EAGAIN { return .wouldBlock }
+                    return .failed(errno)
+                }
+            )
         }
     }
 

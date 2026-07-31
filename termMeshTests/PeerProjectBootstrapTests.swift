@@ -1343,6 +1343,40 @@ final class PeerProjectBootstrapTests: XCTestCase {
         XCTAssertLessThan(Date().timeIntervalSince(started), 3)
     }
 
+    func test_process_run_timeout_kills_descendant_after_parent_exits_on_term() async throws {
+        let pidFile = "/tmp/term-mesh-processrun-child-\(UUID().uuidString)"
+        defer { try? FileManager.default.removeItem(atPath: pidFile) }
+        let script = """
+        trap 'exit 0' TERM
+        /bin/sh -c 'trap "" TERM; exec >/dev/null 2>&1; echo $$ > \(pidFile); while :; do sleep 1; done' &
+        wait
+        """
+
+        let output = try await ProcessRun.capture(
+            executable: "/bin/sh",
+            arguments: ["-c", script],
+            timeout: 0.2
+        )
+
+        XCTAssertTrue(output.timedOut)
+        let childPID = try XCTUnwrap(
+            Int32(
+                String(contentsOfFile: pidFile, encoding: .utf8)
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+            )
+        )
+        defer { Darwin.kill(childPID, SIGKILL) }
+        let deadline = Date().addingTimeInterval(1)
+        while Darwin.kill(childPID, 0) == 0, Date() < deadline {
+            usleep(10_000)
+        }
+        XCTAssertEqual(
+            Darwin.kill(childPID, 0),
+            -1,
+            "timeout must not leave a TERM-ignoring descendant alive"
+        )
+    }
+
     func test_remote_leader_hex_route_decodes_exact_width_only() {
         XCTAssertEqual(
             TerminalController.decodeFixedHex("0011aaff", byteCount: 4),

@@ -3044,7 +3044,7 @@ mod team_call_allow_list_tests {
     /// Reading the Swift source is crude but it is the only thing that can
     /// actually fail when the two disagree.
     #[test]
-    fn swift_mirror_diff_is_limited_to_scoped_task_lifecycle_methods() {
+    fn swift_and_rust_team_call_allow_lists_match() {
         let swift = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../swift/PeerProto/Sources/PeerProto/PeerTeamCall.swift");
         let source = std::fs::read_to_string(&swift)
@@ -3072,14 +3072,6 @@ mod team_call_allow_list_tests {
             .collect();
         mirrored.sort();
         assert!(!mirrored.is_empty(), "parsed nothing out of the Swift list");
-        let rust_only_lifecycle = [
-            "team.task.done",
-            "team.task.block",
-            "team.task.review",
-            "team.task.unblock",
-            "team.task.approve",
-        ];
-
         for method in &mirrored {
             assert!(
                 team_call_allowed(method),
@@ -3089,8 +3081,7 @@ mod team_call_allow_list_tests {
         // And the other direction: a method this host allows that Swift does
         // not would be just as much of a split.
         for method in KNOWN_METHODS {
-            let expected = mirrored.iter().any(|m| m == method)
-                || rust_only_lifecycle.contains(method);
+            let expected = mirrored.iter().any(|m| m == method);
             assert_eq!(
                 team_call_allowed(method),
                 expected,

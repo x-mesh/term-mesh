@@ -197,9 +197,10 @@ enum ProcessRun {
                         stateLock.unlock()
                         return
                     }
-                    didTimeOut = true
+                    let signalled = Darwin.kill(-processGroup, SIGTERM) == 0
+                    didTimeOut = signalled
                     stateLock.unlock()
-                    Darwin.kill(-processGroup, SIGTERM)
+                    guard signalled else { return }
                     stderrQueue.asyncAfter(deadline: .now() + 1, execute: escalation)
                 }
                 stderrQueue.asyncAfter(deadline: .now() + timeout, execute: watchdog)
@@ -219,7 +220,6 @@ enum ProcessRun {
                     usleep(10_000)
                 }
                 watchdog.cancel()
-                escalation.cancel()
                 let terminatingSignal = waitStatus & 0x7f
                 let status = terminatingSignal == 0
                     ? (waitStatus >> 8) & 0xff
@@ -227,6 +227,15 @@ enum ProcessRun {
                 stateLock.lock()
                 let timedOut = didTimeOut
                 stateLock.unlock()
+                if timedOut {
+                    // The direct child can obey SIGTERM while one of its
+                    // descendants ignores it and has already closed the
+                    // captured pipes. Reaping the child is therefore not proof
+                    // that the process group is gone. Kill any remainder now
+                    // instead of cancelling the scheduled escalation.
+                    Darwin.kill(-processGroup, SIGKILL)
+                }
+                escalation.cancel()
 
                 continuation.resume(returning: Output(
                     status: status,

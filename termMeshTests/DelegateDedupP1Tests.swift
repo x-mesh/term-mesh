@@ -41,6 +41,24 @@ final class DelegateDedupP1Tests: XCTestCase {
         XCTAssertEqual(store.listTasks(teamName: team).count, 1)
     }
 
+    func testDispositionDistinguishesFirstDeliveryFromIdempotentReplay() throws {
+        let team = registerTeam()
+
+        let first = try XCTUnwrap(store.createTaskWithDisposition(
+            teamName: team, title: "delegate work", assignee: "executor",
+            requestId: "request-disposition"
+        ))
+        let retry = try XCTUnwrap(store.createTaskWithDisposition(
+            teamName: team, title: "must not be delivered", assignee: "executor",
+            requestId: "request-disposition"
+        ))
+
+        XCTAssertTrue(first.created)
+        XCTAssertFalse(retry.created)
+        XCTAssertEqual(retry.task.id, first.task.id)
+        XCTAssertEqual(store.listTasks(teamName: team).count, 1)
+    }
+
     func testNilRequestIdPreservesNonDeduplicatedCreation() throws {
         let team = registerTeam()
 

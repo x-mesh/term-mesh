@@ -3726,6 +3726,9 @@ final class TeamOrchestrator: ObservableObject {
     struct DelegateResult {
         let task: TeamTask
         let textDelivered: Bool
+        /// True when request_id resolved to an already-created task and no
+        /// second paste was attempted.
+        let requestReplayed: Bool
         /// Pre-formatted instruction text for retry (avoids re-calling private formatter).
         let instruction: String
     }
@@ -3835,7 +3838,7 @@ final class TeamOrchestrator: ObservableObject {
             )
             return .allInstancesBusy(blockers: blockers)
         }
-        guard let task = TeamDataStore.shared.createTask(
+        guard let creation = TeamDataStore.shared.createTaskWithDisposition(
             teamName: teamName,
             title: title,
             assignee: agentName,
@@ -3843,6 +3846,7 @@ final class TeamOrchestrator: ObservableObject {
             priority: priority ?? 2,
             requestId: requestId
         ) else { return .taskCreateFailed }
+        let task = creation.task
         let instruction = formatDelegateInstruction(
             teamName: teamName,
             target: target,
@@ -3850,6 +3854,22 @@ final class TeamOrchestrator: ObservableObject {
             text: text,
             context: context
         )
+        if !creation.created {
+            // Keep the same async completion ordering as the paste path. The
+            // socket caller stores DelegateOutcome immediately after this
+            // method returns; a synchronous callback could resume it first.
+            if let completion {
+                DispatchQueue.main.async { completion(true) }
+            }
+            return .delivered(
+                DelegateResult(
+                    task: task,
+                    textDelivered: true,
+                    requestReplayed: true,
+                    instruction: instruction
+                )
+            )
+        }
         // Deterministic per-pane delivery: when a valid, live, non-migrating panelId is
         // provided, bypass name round-robin (selectAgent) and paste directly into that
         // pane. The follow-up team.send_key Return carries the same panel_id (Rust side)
@@ -3870,7 +3890,12 @@ final class TeamOrchestrator: ObservableObject {
                 completion: completion
             )
             return .delivered(
-                DelegateResult(task: task, textDelivered: delivered, instruction: instruction)
+                DelegateResult(
+                    task: task,
+                    textDelivered: delivered,
+                    requestReplayed: false,
+                    instruction: instruction
+                )
             )
         }
         // CLI callers keep submit=false and send Return separately after paste ack.
@@ -3887,7 +3912,12 @@ final class TeamOrchestrator: ObservableObject {
             completion: completion
         )
         return .delivered(
-            DelegateResult(task: task, textDelivered: delivered, instruction: instruction)
+            DelegateResult(
+                task: task,
+                textDelivered: delivered,
+                requestReplayed: false,
+                instruction: instruction
+            )
         )
     }
 

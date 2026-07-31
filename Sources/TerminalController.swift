@@ -4159,7 +4159,12 @@ class TerminalController {
         }
 
         var returnSubmitted = false
-        if textDelivered, params["submit_return"] as? Bool == true {
+        if delegateResult.requestReplayed {
+            // The original idempotent operation already owned text delivery.
+            // A remote-leader retry also committed Return in that operation;
+            // submitting it again would execute an empty or duplicate turn.
+            returnSubmitted = params["submit_return"] as? Bool == true
+        } else if textDelivered, params["submit_return"] as? Bool == true {
             let keyParams: [String: Any] = [
                 "team": teamName,
                 "agent": agentName,
@@ -4188,6 +4193,7 @@ class TerminalController {
             "sent": true,
             "text_delivered": textDelivered,
             "return_submitted": returnSubmitted,
+            "request_replayed": delegateResult.requestReplayed,
             "agent_instance_id": delegateResult.task.assigneeInstanceId ?? NSNull(),
         ])
     }
