@@ -7,6 +7,7 @@ import Foundation
 @testable import term_mesh
 #endif
 
+@MainActor
 final class AgentTransportHardeningRegression169Tests: XCTestCase {
     private final class LockedOrder: @unchecked Sendable {
         private let lock = NSLock()
