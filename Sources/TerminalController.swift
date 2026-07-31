@@ -476,12 +476,12 @@ class TerminalController {
 
         var frames: [String] = []
         while let newlineIndex = pending.firstIndex(of: 0x0A) {
+            // A terminated frame past the limit is still a flood; it just
+            // arrived with its newline attached. `Data` resets `startIndex` on
+            // every mutation, so this index is the frame's length.
             guard newlineIndex <= maxPendingBytes else { return nil }
             let frame = Data(pending[..<newlineIndex])
             pending.removeSubrange(...newlineIndex)
-            // A single terminated frame past the limit is still a flood; it
-            // just arrived with its newline attached.
-            guard frame.count <= maxPendingBytes else { return nil }
             if let line = String(data: frame, encoding: .utf8) {
                 frames.append(line)
             }
