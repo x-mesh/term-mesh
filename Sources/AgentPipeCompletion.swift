@@ -48,6 +48,10 @@ final class AgentPipeCompletion {
         /// The task the last instruction carried, so its answer closes it and
         /// not whichever task happens to be first in the list.
         var pendingTaskId: String?
+        /// Identifies the delivery that installed the pending task. A failed
+        /// write may finish after another delivery replaced the expectation;
+        /// only its own token may roll its reservation back.
+        var pendingExpectationToken: UUID?
     }
 
     private var watches: [String: Watch] = [:]
@@ -119,10 +123,28 @@ final class AgentPipeCompletion {
     /// result was dropped outright and the task sat `in_progress` until a
     /// leader's `tm-agent wait` timed out. A turn with no task to answer says
     /// nothing about the turn already waiting for one.
-    func expect(agentId: String, instruction: String) {
-        guard watches[agentId] != nil else { return }
-        guard let taskId = Self.taskId(in: instruction) else { return }
+    struct ExpectationToken: Equatable {
+        fileprivate let value: UUID
+    }
+
+    @discardableResult
+    func expect(agentId: String, instruction: String) -> ExpectationToken? {
+        guard watches[agentId] != nil else { return nil }
+        guard let taskId = Self.taskId(in: instruction) else { return nil }
+        let token = ExpectationToken(value: UUID())
         watches[agentId]?.pendingTaskId = taskId
+        watches[agentId]?.pendingExpectationToken = token.value
+        return token
+    }
+
+    /// Undo a failed delivery without erasing a newer correlation that took
+    /// over while this delivery was in flight.
+    func cancelExpectation(agentId: String, token: ExpectationToken?) {
+        guard let token,
+              watches[agentId]?.pendingExpectationToken == token.value
+        else { return }
+        watches[agentId]?.pendingTaskId = nil
+        watches[agentId]?.pendingExpectationToken = nil
     }
 
     static func taskId(in text: String) -> String? {
@@ -256,6 +278,7 @@ final class AgentPipeCompletion {
             agentInstanceId: watch.agentInstanceId
         )
         watches[agentId]?.pendingTaskId = nil
+        watches[agentId]?.pendingExpectationToken = nil
     }
 
     // MARK: - The agent's verdict

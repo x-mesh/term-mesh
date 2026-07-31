@@ -3321,15 +3321,29 @@ final class TeamOrchestrator: ObservableObject {
                                    completion: completion)
         }
         if AgentPipeTransport.isDriven(agentId: agent.transportId) {
+            let expectation = AgentPipeCompletion.shared.expect(
+                agentId: agent.transportId, instruction: text)
             do {
-                AgentPipeCompletion.shared.expect(agentId: agent.transportId, instruction: text)
-                let n = try AgentPipeTransport.deliver(text: text, agentId: agent.transportId)
-                #if DEBUG
-                dlog("agent.pipe.deliver agent=\(agent.id) bytes=\(n) via=name task=\(AgentPipeCompletion.taskId(in: text) ?? "-")")
-                #endif
-                completion?(true)
+                try AgentPipeTransport.deliver(text: text, agentId: agent.transportId) { result in
+                    switch result {
+                    case .success(let n):
+                        #if DEBUG
+                        dlog("agent.pipe.deliver agent=\(agent.id) bytes=\(n) via=name task=\(AgentPipeCompletion.taskId(in: text) ?? "-")")
+                        #endif
+                        completion?(true)
+                    case .failure(let error):
+                        AgentPipeCompletion.shared.cancelExpectation(
+                            agentId: agent.transportId, token: expectation)
+                        #if DEBUG
+                        dlog("agent.pipe.deliver.FAILED agent=\(agent.id) err=\(error)")
+                        #endif
+                        completion?(false)
+                    }
+                }
                 return true
             } catch {
+                AgentPipeCompletion.shared.cancelExpectation(
+                    agentId: agent.transportId, token: expectation)
                 #if DEBUG
                 dlog("agent.pipe.deliver.FAILED agent=\(agent.id) err=\(error)")
                 #endif
@@ -3411,15 +3425,32 @@ final class TeamOrchestrator: ObservableObject {
                                    completion: completion)
         }
         if let agent = pipeDrivenAgent(teamName: teamName, panelId: panelId) {
+            let expectation = AgentPipeCompletion.shared.expect(
+                agentId: agent.transportId, instruction: text)
             do {
-                AgentPipeCompletion.shared.expect(agentId: agent.transportId, instruction: text)
-                let n = try AgentPipeTransport.deliver(text: text, agentId: agent.transportId)
-                #if DEBUG
-                dlog("agent.pipe.deliver agent=\(agent.id) bytes=\(n) task=\(AgentPipeCompletion.taskId(in: text) ?? "-")")
-                #endif
-                completion?(true)
+                try AgentPipeTransport.deliver(text: text, agentId: agent.transportId) { result in
+                    switch result {
+                    case .success(let n):
+                        #if DEBUG
+                        dlog("agent.pipe.deliver agent=\(agent.id) bytes=\(n) task=\(AgentPipeCompletion.taskId(in: text) ?? "-")")
+                        #endif
+                        completion?(true)
+                    case .failure(let error):
+                        AgentPipeCompletion.shared.cancelExpectation(
+                            agentId: agent.transportId, token: expectation)
+                        Logger.team.error(
+                            "pipe delivery failed for \(agent.id, privacy: .public): \(String(describing: error), privacy: .public)"
+                        )
+                        #if DEBUG
+                        dlog("agent.pipe.deliver.FAILED agent=\(agent.id) err=\(error)")
+                        #endif
+                        completion?(false)
+                    }
+                }
                 return true
             } catch {
+                AgentPipeCompletion.shared.cancelExpectation(
+                    agentId: agent.transportId, token: expectation)
                 // Falling back to typing would hide the failure behind a path
                 // that usually works, and the point of this option is to see
                 // whether the pipe holds.

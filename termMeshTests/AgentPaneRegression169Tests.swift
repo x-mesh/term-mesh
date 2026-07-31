@@ -273,9 +273,9 @@ final class AgentPaneRegression169Tests: XCTestCase {
         XCTAssertEqual(store.collectResults(teamName: team).count, 0)
     }
 
-    /// The file belongs to the process that writes it, so a new watch starts it
-    /// empty rather than inheriting a transcript it cannot attribute.
-    func testWatchingAgainDropsTheEventsFileTheDeadPaneLeft() throws {
+    /// The writer owns this file, so a new watch leaves it in place and starts
+    /// at EOF rather than unlinking a live tee inode or replaying stale turns.
+    func testWatchingAgainSeedsTheEventsOffsetAtEOF() throws {
         let agentId = "executor@stale-file-test"
         defer { AgentPipeCompletion.shared.forget(agentId: agentId) }
 
@@ -287,8 +287,11 @@ final class AgentPaneRegression169Tests: XCTestCase {
         AgentPipeCompletion.shared.watch(agentId: agentId, teamName: "stale-file-test",
                                          agentName: "executor")
 
-        XCTAssertFalse(FileManager.default.fileExists(atPath: path),
-                       "the previous pane's turns are not this pane's to replay")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: path),
+                      "watch must not unlink the file currently owned by tee")
+        let eof = try FileHandle(forReadingFrom: URL(fileURLWithPath: path)).seekToEnd()
+        XCTAssertEqual(AgentPipeCompletion.shared.offsetForTesting(agentId: agentId), eof,
+                       "the previous pane's turns are skipped by seeding at EOF")
     }
 
     /// `tee` truncates this file at launch and the bridge appends to whatever
