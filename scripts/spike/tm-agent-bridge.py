@@ -34,10 +34,12 @@ Usage (the pane runs this instead of the CLI):
 from __future__ import annotations
 
 import argparse
+from collections import deque
 import json
 import os
 import queue
 import re
+import select
 import shlex
 import stat
 import subprocess
@@ -218,12 +220,16 @@ def stop_process(p: subprocess.Popen, timeout: float = 5) -> None:
             except (OSError, ChildProcessError):
                 pass
     finally:
-        for stream in (p.stdin, p.stdout):
+        for stream in (p.stdin, p.stdout, p.stderr):
             if stream is not None:
                 try:
                     stream.close()
                 except (OSError, ValueError):
                     pass
+
+
+class ChildExitedError(RuntimeError):
+    """The persistent agent process can no longer accept protocol frames."""
 
 
 class Child:
@@ -237,28 +243,66 @@ class Child:
         argv, process_cwd = process_location(argv, cwd)
         self.p = subprocess.Popen(
             argv, cwd=process_cwd, env=env,
-            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             text=True, bufsize=1,
         )
         self.inbox: queue.Queue[dict] = queue.Queue()
+        self.stderr_lines: deque[str] = deque(maxlen=40)
+        self.exit_read_fd, self.exit_write_fd = os.pipe()
         threading.Thread(target=self._read, daemon=True).start()
+        self.stderr_thread = threading.Thread(target=self._read_stderr, daemon=True)
+        self.stderr_thread.start()
 
     def _read(self) -> None:
-        for line in self.p.stdout:
-            line = line.strip()
-            if not line.startswith("{"):
-                continue
+        try:
+            for line in self.p.stdout:
+                line = line.strip()
+                if not line.startswith("{"):
+                    continue
+                try:
+                    obj = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(obj, dict):
+                    self.inbox.put(obj)
+        finally:
+            self.inbox.put({"__eof__": True})
             try:
-                obj = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if isinstance(obj, dict):
-                self.inbox.put(obj)
-        self.inbox.put({"__eof__": True})
+                os.write(self.exit_write_fd, b"1")
+            except OSError:
+                pass
+
+    def _read_stderr(self) -> None:
+        for line in self.p.stderr:
+            line = line.strip()
+            if line:
+                self.stderr_lines.append(line)
+
+    def failure_message(self) -> str:
+        code = self.exit_code()
+        if code is not None:
+            self.stderr_thread.join(timeout=0.1)
+        failure = remote_launch_failure(code)
+        if failure is None:
+            if code is None:
+                failure = "agent process closed its input channel"
+            elif code < 0:
+                failure = f"agent process was killed by signal {-code}"
+            else:
+                failure = f"agent process exited with code {code}"
+        # Preserve a bounded diagnostic tail rather than discarding the only
+        # explanation a crashed CLI may have produced.
+        detail = clamp("\n".join(self.stderr_lines), 1200)
+        return f"{failure}: {detail}" if detail else failure
 
     def send(self, obj: dict) -> None:
-        self.p.stdin.write(json.dumps(obj) + "\n")
-        self.p.stdin.flush()
+        if not self.alive:
+            raise ChildExitedError(self.failure_message())
+        try:
+            self.p.stdin.write(json.dumps(obj) + "\n")
+            self.p.stdin.flush()
+        except (BrokenPipeError, OSError, ValueError) as exc:
+            raise ChildExitedError(self.failure_message()) from exc
 
     @property
     def alive(self) -> bool:
@@ -272,6 +316,14 @@ class Child:
 
     def stop(self) -> None:
         stop_process(self.p)
+        for name in ("exit_read_fd", "exit_write_fd"):
+            fd = getattr(self, name, None)
+            if fd is not None:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+                setattr(self, name, None)
 
 
 class Emitter:
@@ -385,7 +437,20 @@ class JsonRpc:
         self.on_request = on_request
 
     def _record_exit_failure(self) -> None:
-        self.failure = remote_launch_failure(self.child.exit_code())
+        code = self.child.exit_code()
+        failure = remote_launch_failure(code)
+        if failure is None and (code is not None or not self.child.alive):
+            describe = getattr(self.child, "failure_message", None)
+            failure = describe() if describe else "agent process exited"
+        self.failure = failure
+
+    def _send(self, payload: dict) -> bool:
+        try:
+            self.child.send(payload)
+            return True
+        except (ChildExitedError, BrokenPipeError, OSError, ValueError) as exc:
+            self.failure = str(exc) or "agent process exited"
+            return False
 
     def request(self, method: str, params: dict | None, timeout: float,
                 on_notify=None) -> dict | None:
@@ -394,14 +459,15 @@ class JsonRpc:
         payload = {"jsonrpc": "2.0", "id": rid, "method": method}
         if params is not None:
             payload["params"] = params
-        self.child.send(payload)
+        if not self._send(payload):
+            return None
         return self.pump(until_id=rid, timeout=timeout, on_notify=on_notify)
 
     def notify(self, method: str, params: dict | None = None) -> None:
         payload = {"jsonrpc": "2.0", "method": method}
         if params is not None:
             payload["params"] = params
-        self.child.send(payload)
+        self._send(payload)
 
     def respond(self, rid, result: dict | None = None,
                 error: dict | None = None) -> None:
@@ -410,7 +476,7 @@ class JsonRpc:
             frame["error"] = error
         else:
             frame["result"] = {} if result is None else result
-        self.child.send(frame)
+        self._send(frame)
 
     def _serve(self, obj: dict) -> None:
         """Answer a frame carrying *both* an id and a method.
@@ -780,6 +846,12 @@ class PerTurnBridge:
         self.log_path = None
         self.log_dir = None
 
+    @property
+    def alive(self) -> bool:
+        # Cursor and agy intentionally use a fresh child for every turn. The
+        # reusable bridge remains healthy while it waits for more input.
+        return True
+
 
 # ── codex: initialize → thread/start → turn/start … turn/completed ──────────
 
@@ -942,8 +1014,10 @@ class CodexBridge:
             self.out.result(detail, stop="rejected", failed=True)
             return
         if ack is None:
-            self.out.result("codex never acknowledged the turn",
-                            stop="no_ack", failed=True)
+            failure = self.rpc.failure
+            self.out.result(failure or "codex never acknowledged the turn",
+                            stop="process_exited" if failure else "no_ack",
+                            failed=True)
             return
 
         done = self.rpc.pump(until_id=None, timeout=timeout,
@@ -959,8 +1033,12 @@ class CodexBridge:
         # `turn/completed` carries `{threadId, turn}` and no usage at all, so
         # there is no cost to report here. Reading one out of a key that does
         # not exist looked like the number was simply always zero.
-        self.out.result(final, stop="end_turn" if done else "timeout",
-                        failed=done is None)
+        if done is None and self.rpc.failure:
+            self.out.result(final or self.rpc.failure, stop="process_exited",
+                            failed=True)
+        else:
+            self.out.result(final, stop="end_turn" if done else "timeout",
+                            failed=done is None)
 
     CHANGE_TOOL = {"add": "write", "update": "edit", "delete": "delete"}
 
@@ -1098,7 +1176,11 @@ class AcpBridge:
         self.out.block_done()
         final = "".join(said)
         stop = ((resp or {}).get("result") or {}).get("stopReason") or "timeout"
-        self.out.result(final, stop=stop, failed=resp is None)
+        if resp is None and self.rpc.failure:
+            self.out.result(final or self.rpc.failure, stop="process_exited",
+                            failed=True)
+        else:
+            self.out.result(final, stop=stop, failed=resp is None)
 
     @property
     def alive(self) -> bool:
@@ -1155,10 +1237,10 @@ def main() -> int:
         return 1
     log(f"{args.cli} ready — turns on {args.fifo or 'stdin'}")
 
-    def take(line: str) -> None:
+    def take(line: str) -> bool:
         line = line.strip()
         if not line:
-            return
+            return False
         # Turns arrive in claude's envelope whoever wrote them, so the caller
         # never has to know which CLI is behind this.
         try:
@@ -1170,21 +1252,73 @@ def main() -> int:
             text = line
         if text:
             bridge.turn(text, args.turn_timeout)
+            rpc = getattr(bridge, "rpc", None)
+            return bool(getattr(rpc, "failure", None))
+        return False
+
+    def exit_failure() -> str:
+        rpc = getattr(bridge, "rpc", None)
+        failure = getattr(rpc, "failure", None)
+        if failure:
+            return failure
+        child = getattr(bridge, "child", None)
+        describe = getattr(child, "failure_message", None)
+        return describe() if describe else "agent process exited"
+
+    def consume(fd: int) -> int:
+        """Read turns and child-exit events without polling while idle."""
+        pending = b""
+        child = getattr(bridge, "child", None)
+        exit_fd = getattr(child, "exit_read_fd", None)
+        watched = [fd] + ([exit_fd] if exit_fd is not None else [])
+        while True:
+            if not bridge.alive:
+                failure = exit_failure()
+                out.result(failure, stop="process_exited", failed=True)
+                log(failure)
+                return 1
+            readable, _, _ = select.select(watched, [], [])
+            if exit_fd is not None and exit_fd in readable:
+                failure = exit_failure()
+                out.result(failure, stop="process_exited", failed=True)
+                log(failure)
+                return 1
+            try:
+                chunk = os.read(fd, 65536)
+            except BlockingIOError:
+                continue
+            if not chunk:
+                if pending.strip():
+                    reported = take(pending.decode("utf-8", errors="replace"))
+                    if not bridge.alive:
+                        if not reported:
+                            out.result(exit_failure(), stop="process_exited",
+                                       failed=True)
+                        return 1
+                return 0
+            pending += chunk
+            while b"\n" in pending:
+                raw, pending = pending.split(b"\n", 1)
+                reported = take(raw.decode("utf-8", errors="replace"))
+                if not bridge.alive:
+                    if not reported:
+                        out.result(exit_failure(), stop="process_exited",
+                                   failed=True)
+                    log(exit_failure())
+                    return 1
 
     try:
         if args.fifo:
-            while True:
-                # Reopening blocks until a writer arrives, which is what keeps
-                # this idle between turns without spinning.
-                with open(args.fifo, encoding="utf-8") as fifo:
-                    for line in fifo:
-                        take(line)
-                if not bridge.alive:
-                    log("agent exited")
-                    break
+            # Holding both ends avoids EOF/readable spinning when an external
+            # writer closes. The child's exit pipe wakes the same select call,
+            # so idle agent panes add no timer-driven CPU wakeups.
+            fd = os.open(args.fifo, os.O_RDWR | os.O_NONBLOCK)
+            try:
+                return consume(fd)
+            finally:
+                os.close(fd)
         else:
-            for line in sys.stdin:
-                take(line)
+            return consume(sys.stdin.fileno())
     except KeyboardInterrupt:
         pass
     finally:
