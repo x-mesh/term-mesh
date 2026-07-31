@@ -630,6 +630,23 @@ final class TeamDataStore: ObservableObject, @unchecked Sendable {
         let created: Bool
     }
 
+    /// The task an idempotent request already created, if any.
+    ///
+    /// `createTaskWithDisposition` also dedupes on `request_id`, but delegate
+    /// picks its target *before* it reaches the store, and the pool gate
+    /// rejects any instance still holding a non-terminal task. A retry of a
+    /// request whose reply was lost was therefore refused as "all instances
+    /// busy" by the very task it was replaying. Callers resolve the request id
+    /// through this before target selection so the replay is answered instead.
+    func task(teamName: String, requestId: String) -> TeamOrchestrator.TeamTask? {
+        guard let normalized = requestId.teamDataNilIfBlank else { return nil }
+        lock.lock()
+        defer { lock.unlock() }
+        return taskBoards[teamName, default: []].first {
+            $0.request_id == normalized
+        }
+    }
+
     /// Atomically returns both the task and whether this call inserted it.
     /// Delegate needs the disposition: retrying an idempotent request must not
     /// paste the same instruction a second time.

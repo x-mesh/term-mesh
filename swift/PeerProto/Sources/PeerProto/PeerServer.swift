@@ -1133,13 +1133,24 @@ actor PeerServerSession {
         }
         let encodedBytes = (try? request.serializedData().count)
             ?? (PeerTeamLeader.maxCommandPayloadBytes + 1)
-        let registered = await teamLeaderControlPlane.registeredGrant(
+        // Fail closed on an unregistered grant. Falling back to
+        // `request.grant` made `validateGrant` compare the presented grant
+        // against itself: grantID, projectID, teamUuid, role and the
+        // `expiresAtUnixSecs` equality all matched by construction, and the
+        // only remaining test compared a wall-clock deadline (~1.7e9) against
+        // `systemUptime` (~1e5), so it could never fail. Every field arrives
+        // from caller-supplied socket parameters, so that fallback let any
+        // local process on this host invent a grant id and have the command
+        // routed over the authenticated peer session to the viewer.
+        guard let registered = await teamLeaderControlPlane.registeredGrant(
             id: request.grant.grantID
-        )
+        ) else {
+            throw PeerServerError.noMatchingLeaderSession
+        }
         guard case .success = PeerTeamLeader.validateCommand(
             request,
-            registeredGrant: registered?.value ?? request.grant,
-            registeredValidUntilUnixSeconds: registered?.validUntilLeaseSeconds,
+            registeredGrant: registered.value,
+            registeredValidUntilUnixSeconds: registered.validUntilLeaseSeconds,
             encodedBytes: encodedBytes,
             nowUnixSeconds: UInt64(ProcessInfo.processInfo.systemUptime)
         ) else {

@@ -199,6 +199,14 @@ final class TeamOrchestrator: ObservableObject {
     /// Runtime EOF can arrive more than once while Ghostty and the peer relay
     /// unwind. Only one recovery may reattach or re-bootstrap a leader.
     var remoteLeaderRecoveryInFlight: Set<String> = []
+    /// Restoring a detached project must be single-flight for the same reason
+    /// the two above are, and at the same scope. The sidebar's own
+    /// `restoringTeamNames` is per-view `@State`, so a second window has its
+    /// own copy and the debug command bypasses it entirely — two concurrent
+    /// restores then walked the same surface ids and left a duplicate viewer
+    /// per surface, with the first set of panes orphaned because
+    /// `progress.agentPanelIDs` keeps only the last writer.
+    var projectRestoreInFlight: Set<String> = []
 
     enum RemoteLeaderRecoveryPresentation: Equatable {
         case replaceAnchor
@@ -313,10 +321,48 @@ final class TeamOrchestrator: ObservableObject {
     /// Returning the original IDs lets AppDelegate still announce that these
     /// workspaces are no longer exported by that particular window.
     @discardableResult
+    /// Whether a team's workspace is a *project* presentation — the only kind
+    /// that may outlive the window showing it.
+    ///
+    /// Pure so the rule can be tested without windows or panes. A workspace
+    /// qualifies when it carries a declared project name (what lets the
+    /// Projects sidebar adopt it again later), when it hosts dedicated remote
+    /// workspaces, or when its leader lives on a peer.
+    nonisolated static func shouldPreserveProjectPresentation(
+        hasDeclaredProjectName: Bool,
+        usesDedicatedRemoteWorkspaces: Bool,
+        hasPeerLeader: Bool
+    ) -> Bool {
+        hasDeclaredProjectName || usesDedicatedRemoteWorkspaces || hasPeerLeader
+    }
+
     func preserveProjectPresentations(from tabManager: TabManager) -> [UUID] {
+        // The filter used to be "this team's workspace is in the closing
+        // window" with no project predicate at all, and
+        // `unregisterMainWindow` runs it on every main-window close including
+        // app quit. That swept up plain `tm-agent attach` teams in ordinary
+        // windows: `detachWorkspace` deliberately never calls `Panel.close`,
+        // so their local shells and native AgentSession processes kept running
+        // with no window, and because the id was then excluded from
+        // `closedWorkspaceIDs` the `.peerWorkspaceDidClose` signal that block
+        // exists to post was skipped too, leaving attached peers holding it.
+        // Only `destroyTeam` ever reclaimed such a workspace.
         let candidates = teams.values
             .filter { team in
-                tabManager.tabs.contains(where: { $0.id == team.workspaceId })
+                guard tabManager.tabs.contains(where: { $0.id == team.workspaceId })
+                else { return false }
+                let hasPeerLeader: Bool
+                if case .peer = team.leaderEndpoint {
+                    hasPeerLeader = true
+                } else {
+                    hasPeerLeader = false
+                }
+                return Self.shouldPreserveProjectPresentation(
+                    hasDeclaredProjectName: WorkspaceProjectNames.shared
+                        .projectName(for: team.workspaceId) != nil,
+                    usesDedicatedRemoteWorkspaces: team.usesDedicatedRemoteWorkspaces,
+                    hasPeerLeader: hasPeerLeader
+                )
             }
             .map { ($0.id, $0.workspaceId) }
 
@@ -3815,6 +3861,43 @@ final class TeamOrchestrator: ObservableObject {
     ) -> DelegateOutcome {
         let title = taskTitle?.nilIfBlank ?? String(text.prefix(80))
         guard let team = teams[teamName] else { return .noSuchAgent }
+        // Resolve an idempotent request BEFORE target selection. The store
+        // dedupes on request_id too, but it is only reached once a target has
+        // been picked, and the pool gate rejects any instance still holding a
+        // non-terminal task. A retry sent while the first attempt was still
+        // running was therefore answered `.allInstancesBusy` naming the very
+        // task it was replaying; the dedup branch became reachable only after
+        // that task completed, which is the case where a second paste would
+        // have been least harmful.
+        if let requestId = requestId?.nilIfBlank,
+           let existing = TeamDataStore.shared.task(
+               teamName: teamName, requestId: requestId
+           ),
+           let replayTarget = team.agents.first(where: {
+               $0.agentInstanceId == existing.assigneeInstanceId
+           }) {
+            let instruction = formatDelegateInstruction(
+                teamName: teamName,
+                target: replayTarget,
+                task: existing,
+                text: text,
+                context: context
+            )
+            // Same async completion ordering as the paste path: the socket
+            // caller stores the outcome right after this returns, and a
+            // synchronous callback could resume it first.
+            if let completion {
+                DispatchQueue.main.async { completion(true) }
+            }
+            return .delivered(
+                DelegateResult(
+                    task: existing,
+                    textDelivered: true,
+                    requestReplayed: true,
+                    instruction: instruction
+                )
+            )
+        }
         let named = team.agents.filter { $0.name == agentName }
         let target: AgentMember? = {
             if let agentInstanceId {

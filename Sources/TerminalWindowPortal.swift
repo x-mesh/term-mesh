@@ -8,17 +8,54 @@ private var termMeshWindowTerminalPortalKey: UInt8 = 0
 private var termMeshWindowTerminalPortalCloseObserverKey: UInt8 = 0
 
 struct TerminalPortalExternalGeometrySnapshot {
+    /// Keeps an `ObjectIdentifier` in this snapshot honest.
+    ///
+    /// Every id here is the address of a view the snapshot does not retain.
+    /// Once that view is deallocated the address can be handed to the next
+    /// allocation, and during pane churn SwiftUI rebuilds NSViews at the same
+    /// size — so a *different* anchor could compare equal on both identity and
+    /// frame, and the sync it needed would be skipped as redundant. That is
+    /// the failure this whole file exists to avoid: the snapshot agrees while
+    /// the pixels are stale.
+    ///
+    /// Holding the views weakly does not stop address reuse. It does something
+    /// better: it tells us the identities we recorded are no longer the ones
+    /// we meant, and a snapshot that cannot vouch for its own ids is simply
+    /// not equal to anything.
+    final class LiveReferences {
+        private let boxes: [WeakViewBox]
+
+        init(_ views: [AnyObject?]) {
+            boxes = views.compactMap { $0 }.map(WeakViewBox.init)
+        }
+
+        var allStillAlive: Bool {
+            boxes.allSatisfy { $0.view != nil }
+        }
+
+        private final class WeakViewBox {
+            weak var view: AnyObject?
+            init(_ view: AnyObject) { self.view = view }
+        }
+    }
+
     let hostSuperviewID: ObjectIdentifier?
     let hostFrame: NSRect
     let hostBounds: NSRect
     let referenceGeometry: TerminalPortalAnchorGeometry?
     let anchorGeometries: [ObjectIdentifier: TerminalPortalAnchorGeometry]
+    /// The views whose addresses the ids above came from.
+    let liveReferences: LiveReferences
 
     func isApproximatelyEqual(
         to other: TerminalPortalExternalGeometrySnapshot,
         epsilon: CGFloat = 0.25
     ) -> Bool {
-        guard hostSuperviewID == other.hostSuperviewID,
+        // Checked on both sides rather than just the stored one: neither
+        // snapshot's ids mean anything once a view behind them is gone.
+        guard liveReferences.allStillAlive,
+              other.liveReferences.allStillAlive,
+              hostSuperviewID == other.hostSuperviewID,
               Self.rectApproximatelyEqual(hostFrame, other.hostFrame, epsilon: epsilon),
               Self.rectApproximatelyEqual(hostBounds, other.hostBounds, epsilon: epsilon),
               Self.optionalGeometryApproximatelyEqual(
@@ -876,6 +913,13 @@ final class WindowTerminalPortal: NSObject {
             )
         }
         var anchors: [ObjectIdentifier: TerminalPortalAnchorGeometry] = [:]
+        // Every view an id was taken from, so the snapshot can later say
+        // whether those ids still refer to what it meant.
+        var identified: [AnyObject?] = [
+            hostView.superview,
+            installedReferenceView,
+            installedReferenceView?.superview,
+        ]
         for entry in entriesByHostedId.values {
             guard let anchor = entry.anchorView else { continue }
             anchors[ObjectIdentifier(anchor)] = TerminalPortalAnchorGeometry(
@@ -883,13 +927,16 @@ final class WindowTerminalPortal: NSObject {
                 superviewID: anchor.superview.map(ObjectIdentifier.init),
                 frameInWindow: anchor.convert(anchor.bounds, to: nil)
             )
+            identified.append(anchor)
+            identified.append(anchor.superview)
         }
         return TerminalPortalExternalGeometrySnapshot(
             hostSuperviewID: hostView.superview.map(ObjectIdentifier.init),
             hostFrame: hostView.frame,
             hostBounds: hostView.bounds,
             referenceGeometry: referenceGeometry,
-            anchorGeometries: anchors
+            anchorGeometries: anchors,
+            liveReferences: .init(identified)
         )
     }
 

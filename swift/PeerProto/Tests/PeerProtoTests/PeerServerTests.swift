@@ -829,6 +829,145 @@ final class PeerServerTests: XCTestCase {
         await transport.close()
     }
 
+    /// A grant this host never registered must not be routed.
+    ///
+    /// `callTeamLeader` used to precheck with
+    /// `registeredGrant: registered?.value ?? request.grant`, and every field
+    /// of a command request arrives from caller-supplied socket parameters.
+    /// The fallback therefore made `validateGrant` compare the presented
+    /// grant against itself — grantID, projectID, teamUuid, role and the
+    /// `expiresAtUnixSecs` equality all matched by construction — while the
+    /// one remaining check compared a wall-clock deadline (~1.7e9) against
+    /// `systemUptime` (~1e5) and so could never fail. Any local process able
+    /// to reach the socket could invent a grant id and have its command
+    /// routed over the authenticated peer session to the viewer.
+    ///
+    /// Both halves are asserted: a forged grant is refused, and a grant that
+    /// was registered and then revoked stops being routable. Asserting only
+    /// the first would still pass if the fallback were restored *and* expiry
+    /// were fixed, which is not the property that matters here.
+    func testUnregisteredLeaderGrantIsNotRoutedToViewer() async throws {
+        let sockPath = "/tmp/tm-peer-forged-grant-\(UUID().uuidString.prefix(8)).sock"
+        defer { try? FileManager.default.removeItem(atPath: sockPath) }
+        let controlPlane = PeerTeamLeaderControlPlane()
+        var surface = Termmesh_Peer_V1_SurfaceInfo()
+        surface.surfaceID = Data(repeating: 0x74, count: 16)
+        surface.title = "leader"
+        surface.cols = 80
+        surface.rows = 24
+        surface.attachable = true
+        let server = PeerServer(
+            socketPath: sockPath,
+            provider: EchoSurfaceProvider(surfaces: [surface]),
+            teamLeaderControlPlane: controlPlane
+        )
+        try await server.start()
+        defer { Task { await server.stop() } }
+
+        let viewerPeerID = Data(
+            repeating: 0x7B,
+            count: PeerIdentity.byteCount
+        )
+        let transport = try await UnixSocketTransport.connect(socketPath: sockPath)
+        let viewer = PeerSession(
+            read: { try await transport.read() },
+            write: { try await transport.write($0) }
+        )
+        var options = PeerSessionOptions()
+        options.peerID = viewerPeerID
+        _ = try await viewer.handshake(options: options)
+        _ = try await viewer.attachSurface(
+            id: surface.surfaceID,
+            cols: 80,
+            rows: 24
+        )
+
+        // Entirely caller-authored: never registered, and generously
+        // post-dated so a self-comparison would sail through every check.
+        let wallNow = UInt64(Date().timeIntervalSince1970)
+        var forged = Termmesh_Peer_V1_TeamLeaderGrant()
+        forged.grantID = Data(
+            repeating: 0xF0,
+            count: PeerTeamLeader.grantIDBytes
+        )
+        forged.projectID = "name:demo"
+        forged.teamUuid = "team-uuid"
+        forged.role = .leader
+        forged.expiresAtUnixSecs = wallNow + 3_600
+        var forgedRequest = Termmesh_Peer_V1_TeamLeaderCommandRequest()
+        forgedRequest.grant = forged
+        forgedRequest.teamUuid = forged.teamUuid
+        forgedRequest.requestID = Data(
+            repeating: 0xF1,
+            count: PeerTeamLeader.requestIDBytes
+        )
+        forgedRequest.method = "team.status"
+        forgedRequest.paramsJson = "{}"
+
+        do {
+            _ = try await server.callTeamLeader(
+                forgedRequest,
+                targetPeerID: viewerPeerID,
+                timeoutSeconds: 0.1
+            )
+            XCTFail("an unregistered grant must never be routed to the viewer")
+        } catch {
+            // The specific error matters: `noMatchingLeaderSession` is thrown
+            // by the precheck, before a frame is written. Had the request been
+            // routed, this viewer never answers it and the call would have
+            // failed as `leaderCallTimedOut` instead. Asserting the identity
+            // is therefore also the assertion that nothing reached the viewer,
+            // and it needs no second reader racing the session pump.
+            XCTAssertEqual(error as? PeerServerError, .noMatchingLeaderSession)
+        }
+
+        // Registering the same grant makes it routable, which proves the
+        // rejection above was the registry check and not an unrelated guard.
+        await controlPlane.registerGrant(forged)
+        async let routed = server.callTeamLeader(
+            forgedRequest,
+            targetPeerID: viewerPeerID,
+            timeoutSeconds: 2
+        )
+        guard case .teamLeaderCommandRequest(
+            _,
+            let correlationID
+        ) = try await viewer.receiveNextMessage() else {
+            return XCTFail("a registered grant must be routed")
+        }
+        var response = Termmesh_Peer_V1_TeamLeaderCommandResponse()
+        response.ok = true
+        response.resultJson = "{}"
+        try await viewer.sendTeamLeaderCommandResponse(
+            response,
+            correlationID: correlationID
+        )
+        let routedResult = try await routed
+        XCTAssertTrue(routedResult.ok)
+
+        // Revocation takes it away again — the registry is consulted per
+        // call, not cached from the first success.
+        await controlPlane.revokeGrant(id: forged.grantID)
+        var afterRevoke = forgedRequest
+        afterRevoke.requestID = Data(
+            repeating: 0xF2,
+            count: PeerTeamLeader.requestIDBytes
+        )
+        do {
+            _ = try await server.callTeamLeader(
+                afterRevoke,
+                targetPeerID: viewerPeerID,
+                timeoutSeconds: 0.1
+            )
+            XCTFail("a revoked grant must stop being routable")
+        } catch {
+            XCTAssertEqual(error as? PeerServerError, .noMatchingLeaderSession)
+        }
+
+        try await viewer.sendGoodbye(reason: "forged grant test done")
+        await transport.close()
+    }
+
     /// A Mac host is where a team leader usually sits, so its roster is the
     /// answer to "where does this project's leader run" — and it only exists
     /// on the wire, never in the layout tree.

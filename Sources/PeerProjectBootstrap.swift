@@ -762,46 +762,44 @@ enum PeerProjectBootstrap {
 
     /// One `/bin/sh -lc` on this Mac, bounded. Split out of `runLocal` so the
     /// rollback above runs its script the same way the setup ran its own.
-    private static func runLocalScript(
+    ///
+    /// Routed through `ProcessRun.capture` rather than a bespoke `Process`
+    /// loop. The previous implementation attached stderr to a pipe and only
+    /// read it once the process had exited: a `git clone` that emits enough
+    /// progress fills the pipe, the child blocks writing, the parent keeps
+    /// polling, and a healthy bootstrap is reported as a timeout. Its timeout
+    /// path then sent `terminate()` to `/bin/sh` alone and resumed the
+    /// continuation immediately, so a descendant `git` could still be mutating
+    /// the checkout after the caller had begun transaction rollback or a
+    /// retry. `capture` drains stderr concurrently, spawns into its own
+    /// process group, and escalates SIGTERM to SIGKILL across the whole group
+    /// before it returns.
+    /// Internal rather than private so the pipe-deadlock regression can drive
+    /// it with a script that actually floods stderr. Going through
+    /// `runLocal` cannot reproduce it: git writes progress only to a TTY, so
+    /// a piped clone stays far under the 64 KiB buffer that triggers the bug.
+    static func runLocalScript(
         _ script: String,
         timeoutSeconds: TimeInterval
     ) async throws {
-        try await withCheckedThrowingContinuation {
-            (continuation: CheckedContinuation<Void, Error>) in
-            DispatchQueue.global(qos: .userInitiated).async {
-                let process = Process()
-                process.executableURL = URL(fileURLWithPath: "/bin/sh")
-                process.arguments = ["-lc", script]
-                let errorPipe = Pipe()
-                process.standardError = errorPipe
-                do {
-                    try process.run()
-                } catch {
-                    continuation.resume(throwing: error)
-                    return
-                }
-                let deadline = Date().addingTimeInterval(timeoutSeconds)
-                while process.isRunning, Date() < deadline {
-                    Thread.sleep(forTimeInterval: 0.05)
-                }
-                if process.isRunning {
-                    process.terminate()
-                    continuation.resume(throwing: ProjectBootstrapError.timedOut)
-                    return
-                }
-                guard process.terminationStatus == 0 else {
-                    let data = (try? errorPipe.fileHandleForReading.readToEnd()) ?? Data()
-                    let message = String(data: data, encoding: .utf8)?
-                        .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-                    continuation.resume(
-                        throwing: ProjectBootstrapError.commandFailed(
-                            message.isEmpty ? "git exited with \(process.terminationStatus)" : message
-                        )
-                    )
-                    return
-                }
-                continuation.resume(returning: ())
-            }
+        let output: ProcessRun.Output
+        do {
+            output = try await ProcessRun.capture(
+                executable: "/bin/sh",
+                arguments: ["-lc", script],
+                timeout: timeoutSeconds
+            )
+        } catch ProcessRun.Failure.couldNotStart(let message) {
+            throw ProjectBootstrapError.commandFailed(message)
+        }
+        guard !output.timedOut else {
+            throw ProjectBootstrapError.timedOut
+        }
+        guard output.status == 0 else {
+            let message = output.stderrText
+            throw ProjectBootstrapError.commandFailed(
+                message.isEmpty ? "git exited with \(output.status)" : message
+            )
         }
     }
 
