@@ -73,6 +73,20 @@ enum AutoReplyEmit {
         agentInstanceId: String? = nil,
         store: TeamDataStore = .shared
     ) -> Bool {
+        // Fail closed before formatting, task lookup, result persistence, or
+        // message emission. Every producer shares the detector's exact enum
+        // validation, including turn-end paths that bypass scrollback parsing.
+        guard let status = AutoReplyDetector.validatedStatus(event.status) else {
+            return false
+        }
+        let taskStatus: String
+        switch status {
+        case "DONE": taskStatus = "completed"
+        case "BLOCKED": taskStatus = "blocked"
+        case "NEEDS_REVIEW": taskStatus = "review_ready"
+        default: return false
+        }
+
         let replyText = formatReplyText(event)
         let resultPath = normalizedFullReportPath(event.fullReport)
 
@@ -103,16 +117,10 @@ enum AutoReplyEmit {
         else { return false }
         store.postMessage(teamName: teamName, from: agentName, content: replyText, type: "report")
 
-        // 2. Map STATUS to task status + drive updateTask
-        let taskStatus: String
-        switch event.status {
-        case "BLOCKED": taskStatus = "blocked"
-        case "NEEDS_REVIEW": taskStatus = "review_ready"
-        default: taskStatus = "completed"
-        }
+        // 2. Drive the already validated STATUS transition.
         let summary = String(replyText.prefix(resultTruncChars))
-        let blockedReason = (event.status == "BLOCKED" && !event.body.isEmpty) ? event.body : nil
-        let reviewSummary = (event.status == "NEEDS_REVIEW" && !event.body.isEmpty) ? event.body : nil
+        let blockedReason = (status == "BLOCKED" && !event.body.isEmpty) ? event.body : nil
+        let reviewSummary = (status == "NEEDS_REVIEW" && !event.body.isEmpty) ? event.body : nil
 
         let prevStatus = task.status
         guard let updated = store.updateTask(

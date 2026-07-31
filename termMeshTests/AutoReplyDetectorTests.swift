@@ -13,6 +13,13 @@ final class AutoReplyDetectorTests: XCTestCase {
         d.tick(at: t.addingTimeInterval(10))
     }
     private func bytes(_ s: String) -> Data { Data(s.utf8) }
+    private func detect(statusValue: String) -> AutoReplyEvent? {
+        let detector = AutoReplyDetector()
+        let now = t0()
+        let input = "STATUS: \(statusValue)\nFILES: none\nVERIFY: n/a\nNEXT: NONE\nFULL_REPORT: n/a\n"
+        detector.pushBytes(bytes(input), at: now)
+        return detector.tick(at: now.addingTimeInterval(1))
+    }
 
     // MARK: - Fix D: sliding window
 
@@ -55,6 +62,43 @@ final class AutoReplyDetectorTests: XCTestCase {
         let t = t0()
         d.pushBytes(bytes(input), at: t)
         XCTAssertNil(drain(d, at: t), "the echoed template must not close a task")
+    }
+
+    func test_capsule_placeholder_five_lines_is_not_a_result() {
+        let input = """
+        STATUS: <DONE, BLOCKED, or NEEDS_REVIEW>
+        FILES: <changed paths or none>
+        VERIFY: <single shell command or n/a>
+        NEXT: <action or NONE>
+        FULL_REPORT: <result file path or n/a>
+
+        """
+        let detector = AutoReplyDetector()
+        let now = t0()
+        detector.pushBytes(bytes(input), at: now)
+
+        XCTAssertNil(detector.tick(at: now.addingTimeInterval(1)))
+        XCTAssertNil(detector.flush())
+    }
+
+    func test_noncanonical_status_values_are_rejected() {
+        for value in ["done", " DONE", "DONE ", "DON", "DONEISH", ""] {
+            XCTAssertNil(
+                AutoReplyDetector.validatedStatus(value),
+                "validation unexpectedly accepted \(String(reflecting: value))"
+            )
+            XCTAssertNil(
+                detect(statusValue: value),
+                "detector unexpectedly accepted \(String(reflecting: value))"
+            )
+        }
+    }
+
+    func test_all_canonical_status_values_are_accepted() {
+        for status in ["DONE", "BLOCKED", "NEEDS_REVIEW"] {
+            XCTAssertEqual(AutoReplyDetector.validatedStatus(status), status)
+            XCTAssertEqual(detect(statusValue: status)?.status, status)
+        }
     }
 
     func test_prose_keeps_its_dash() {

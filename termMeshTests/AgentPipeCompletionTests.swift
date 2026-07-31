@@ -109,6 +109,31 @@ final class AgentPipeCompletionTests: XCTestCase {
         XCTAssertEqual(event.verify, "swift build 2>&1 | grep error")
     }
 
+    func testUnknownStatusDoesNotCompleteOrWriteResult() throws {
+        let team = "unknown-status-p0-\(UUID().uuidString)"
+        let store = TeamDataStore.shared
+        store.registerTeam(team, agents: [.init(name: "executor", instanceId: nil)])
+        defer {
+            store.clearResults(teamName: team)
+            store.unregisterTeam(team)
+        }
+        let task = try XCTUnwrap(
+            store.createTask(teamName: team, title: "must stay open", assignee: "executor")
+        )
+        let event = AutoReplyEvent(
+            status: "UNKNOWN", files: "none", verify: "n/a", next: "NONE",
+            fullReport: "n/a", body: "not a verdict", raw: "STATUS: UNKNOWN"
+        )
+
+        XCTAssertFalse(AutoReplyEmit.emit(
+            teamName: team, agentName: "executor", event: event,
+            preferredTaskId: task.id, agentInstanceId: nil, store: store
+        ))
+        XCTAssertEqual(store.getTask(teamName: team, taskId: task.id)?.status, task.status)
+        XCTAssertNil(store.readResult(teamName: team, taskId: task.id, agentName: "executor"))
+        XCTAssertTrue(store.collectResults(teamName: team).isEmpty)
+    }
+
     // MARK: - Which task the answer belongs to
 
     /// The correlation the scrollback path can never make.
