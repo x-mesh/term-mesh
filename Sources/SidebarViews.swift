@@ -2098,7 +2098,7 @@ private struct SidebarProjectLocalRowView: View {
             tabManager.selectedTabId = workspace.id
             if let ledTeamName {
                 Task { @MainActor in
-                    _ = await orchestrator.reattachRemoteLeaderIfNeeded(
+                    _ = await orchestrator.recoverRemoteLeaderIfNeeded(
                         teamName: ledTeamName
                     )
                 }

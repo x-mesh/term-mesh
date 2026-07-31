@@ -20,6 +20,7 @@ import XCTest
 /// so an agent that did get going and wrote something keeps its checkout
 /// whatever this code decides. What has no test anywhere else is the location
 /// bookkeeping, and that is what makes the cleanup happen exactly once.
+@MainActor
 final class RemoteLaunchCompensationRegression169Tests: XCTestCase {
 
     private typealias Location = TeamOrchestrator.Team.RemoteProjectLocation
@@ -117,6 +118,44 @@ final class RemoteLaunchCompensationRegression169Tests: XCTestCase {
         )
 
         XCTAssertEqual(remaining, locations)
+    }
+
+    func testRuntimeCloseRecoversOnlyThePeerLeaderInItsOwningWorkspace() {
+        let leader = UUID()
+        let workspace = UUID()
+
+        XCTAssertTrue(TeamOrchestrator.shouldRecoverRemoteLeaderRuntimeClose(
+            closedPanelID: leader,
+            leaderPanelID: leader,
+            workspaceID: workspace,
+            teamWorkspaceID: workspace,
+            isPeerLeader: true
+        ))
+        XCTAssertFalse(TeamOrchestrator.shouldRecoverRemoteLeaderRuntimeClose(
+            closedPanelID: UUID(),
+            leaderPanelID: leader,
+            workspaceID: workspace,
+            teamWorkspaceID: workspace,
+            isPeerLeader: true
+        ))
+        XCTAssertFalse(TeamOrchestrator.shouldRecoverRemoteLeaderRuntimeClose(
+            closedPanelID: leader,
+            leaderPanelID: leader,
+            workspaceID: workspace,
+            teamWorkspaceID: workspace,
+            isPeerLeader: false
+        ))
+    }
+
+    func testRecoveryOpensPaneWhenTheDeadAnchorWasAlreadyRemoved() {
+        XCTAssertEqual(
+            TeamOrchestrator.remoteLeaderRecoveryPresentation(anchorExists: true),
+            .replaceAnchor
+        )
+        XCTAssertEqual(
+            TeamOrchestrator.remoteLeaderRecoveryPresentation(anchorExists: false),
+            .openPane
+        )
     }
 
 }

@@ -196,6 +196,53 @@ final class TeamOrchestrator: ObservableObject {
     /// Prevent repeated project clicks from attaching multiple local viewers
     /// to the same persistent remote leader surface.
     var remoteLeaderReattachInFlight: Set<String> = []
+    /// Runtime EOF can arrive more than once while Ghostty and the peer relay
+    /// unwind. Only one recovery may reattach or re-bootstrap a leader.
+    var remoteLeaderRecoveryInFlight: Set<String> = []
+
+    enum RemoteLeaderRecoveryPresentation: Equatable {
+        case replaceAnchor
+        case openPane
+    }
+
+    static func remoteLeaderRecoveryPresentation(
+        anchorExists: Bool
+    ) -> RemoteLeaderRecoveryPresentation {
+        anchorExists ? .replaceAnchor : .openPane
+    }
+
+    static func shouldRecoverRemoteLeaderRuntimeClose(
+        closedPanelID: UUID,
+        leaderPanelID: UUID,
+        workspaceID: UUID,
+        teamWorkspaceID: UUID,
+        isPeerLeader: Bool
+    ) -> Bool {
+        isPeerLeader
+            && closedPanelID == leaderPanelID
+            && workspaceID == teamWorkspaceID
+    }
+
+    func remoteLeaderTeamName(
+        runtimeClosedPanelID panelID: UUID,
+        workspaceID: UUID
+    ) -> String? {
+        teams.values.first { team in
+            let isPeerLeader: Bool
+            if case .peer = team.leaderEndpoint {
+                isPeerLeader = true
+            } else {
+                isPeerLeader = false
+            }
+            return Self.shouldRecoverRemoteLeaderRuntimeClose(
+                closedPanelID: panelID,
+                leaderPanelID: team.leaderPanelId,
+                workspaceID: workspaceID,
+                teamWorkspaceID: team.workspaceId,
+                isPeerLeader: isPeerLeader
+            )
+        }?.id
+    }
 
     func recordRemoteProjectLocations(
         teamName: String,
@@ -2951,6 +2998,33 @@ final class TeamOrchestrator: ObservableObject {
             teamName: teamName,
             agentList: agentList,
             runbookSection: remoteRunbooks,
+            tmAgent: "tm-agent",
+            socketPath: remoteSocketPath
+        )
+    }
+
+    /// Rebuild the same leader contract after a host restart removed the
+    /// original peer surface. At recovery time the durable team roster, not
+    /// the project-creation rows, is the source of truth.
+    static func remoteLeaderClaudeRecoverySystemPrompt(
+        teamName: String,
+        agents: [AgentMember],
+        remoteWorkingDirectory: String,
+        remoteSocketPath: String
+    ) -> String {
+        let agentList = agents.enumerated().map { index, agent in
+            let summary = oneLinerFromInstructions(agent.instructions)
+            return summary.isEmpty
+                ? "  \(index + 1). \(agent.name) (\(agent.agentType))"
+                : "  \(index + 1). \(agent.name) (\(agent.agentType)) — \(summary)"
+        }.joined(separator: "\n")
+        return buildLeaderClaudeSystemPrompt(
+            teamName: teamName,
+            agentList: agentList,
+            runbookSection: runbookLeaderSection(
+                workingDirectory: remoteWorkingDirectory,
+                roles: agents.map(\.agentType)
+            ),
             tmAgent: "tm-agent",
             socketPath: remoteSocketPath
         )

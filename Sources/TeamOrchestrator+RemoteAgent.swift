@@ -1107,11 +1107,28 @@ extension TeamOrchestrator {
         // commit: both run on MainActor, so a timeout generation cannot slip
         // between them and publish a stale attach.
         try await attempt.ensureCurrent()
-        guard let panel = workspace.replaceTerminalPaneWithRemote(
-            panelId: team.leaderPanelId,
-            session: session,
-            lifetime: .keepAlive
-        ) else {
+        let presentation = Self.remoteLeaderRecoveryPresentation(
+            anchorExists: workspace.panels[team.leaderPanelId] != nil
+        )
+        let panel: TerminalPanel?
+        switch presentation {
+        case .replaceAnchor:
+            panel = workspace.replaceTerminalPaneWithRemote(
+                panelId: team.leaderPanelId,
+                session: session,
+                lifetime: .keepAlive
+            )
+        case .openPane:
+            // A runtime EOF removes the dead panel before recovery starts.
+            // Re-bootstrap must add a new pane instead of requiring the
+            // project-creation placeholder that only exists on first launch.
+            panel = workspace.openRemotePane(
+                session: session,
+                focus: false,
+                lifetime: .keepAlive
+            )
+        }
+        guard let panel else {
             await attempt.compensate()
             throw RemoteAgentError.paneCreationFailed
         }
@@ -1221,6 +1238,108 @@ extension TeamOrchestrator {
         return true
     }
 
+    /// Restore a peer leader after its relay reports runtime EOF. Reattach the
+    /// exact surface when it survived a viewer interruption; if the peer host
+    /// restarted and the surface is gone, mint a fresh grant and bootstrap a
+    /// replacement leader into the existing team workspace.
+    @discardableResult
+    func recoverRemoteLeaderAfterRuntimeClose(
+        teamName: String,
+        closedPanelID: UUID
+    ) async -> Bool {
+        guard let original = teams[teamName],
+              original.leaderPanelId == closedPanelID,
+              case let .peer(hostKey) = original.leaderEndpoint
+        else { return false }
+        guard !remoteLeaderRecoveryInFlight.contains(teamName) else { return false }
+        remoteLeaderRecoveryInFlight.insert(teamName)
+        defer { remoteLeaderRecoveryInFlight.remove(teamName) }
+
+        markRemoteLeaderFailed(
+            teamName: teamName,
+            description: "Remote leader disconnected; reconnecting"
+        )
+
+        if await reattachRemoteLeaderIfNeeded(teamName: teamName) {
+            return true
+        }
+
+        guard let team = teams[teamName],
+              let host = RemoteHostStore.shared.sortedHosts.first(where: { $0.id == hostKey }),
+              host.isConnected
+        else {
+            markRemoteLeaderFailed(
+                teamName: teamName,
+                description: "Remote leader host is disconnected"
+            )
+            return false
+        }
+        let workingDirectory =
+            ManagedPeerSurfaceStore.shared.leaderRecord(
+                hostKey: hostKey,
+                teamName: teamName
+            )?.workingDirectory
+            ?? team.remoteProjectLocations.first(where: { $0.hostKey == hostKey })?.path
+            ?? team.workingDirectory
+        let systemPrompt: String?
+        if team.leaderMode.lowercased() == "claude" {
+            systemPrompt = Self.remoteLeaderClaudeRecoverySystemPrompt(
+                teamName: teamName,
+                agents: team.agents,
+                remoteWorkingDirectory: workingDirectory,
+                remoteSocketPath: host.remoteSockPath ?? "inherited from TERMMESH_SOCKET"
+            )
+        } else {
+            systemPrompt = LeaderParallelPolicy.renderedInstructions
+        }
+
+        do {
+            try await Self.withLeaderAttachDeadline(
+                teamName: teamName,
+                hostKey: hostKey
+            ) { attempt in
+                try await self.attachRemoteLeader(
+                    teamName: teamName,
+                    hostKey: hostKey,
+                    workingDirectory: workingDirectory,
+                    cli: team.leaderMode,
+                    model: team.leaderModel,
+                    attempt: attempt,
+                    systemPrompt: systemPrompt
+                )
+            }
+#if DEBUG
+            dlog("leader.recover.ok team=\(teamName) host=\(hostKey)")
+#endif
+            return true
+        } catch {
+            let description = "Could not recover remote leader on \(hostKey): \(error)"
+            markRemoteLeaderFailed(teamName: teamName, description: description)
+            markLeaderPolicyState(
+                teamName: teamName,
+                state: "failed",
+                failureDescription: description
+            )
+#if DEBUG
+            dlog("leader.recover.failed team=\(teamName) host=\(hostKey) error=\(error)")
+#endif
+            return false
+        }
+    }
+
+    /// User- and debug-triggered counterpart to runtime EOF recovery. This is
+    /// also safe for an initial attach that failed before a surface was
+    /// recorded: the current placeholder becomes the replacement anchor.
+    @discardableResult
+    func recoverRemoteLeaderIfNeeded(teamName: String) async -> Bool {
+        if isLeaderPaneAttached(teamName: teamName) { return true }
+        guard let panelID = teams[teamName]?.leaderPanelId else { return false }
+        return await recoverRemoteLeaderAfterRuntimeClose(
+            teamName: teamName,
+            closedPanelID: panelID
+        )
+    }
+
     /// Rebuild the local workspace for a live peer-backed project whose
     /// previous window was closed. Remote processes and surfaces are reused
     /// exactly; this never launches a second leader or agent.
@@ -1233,7 +1352,7 @@ extension TeamOrchestrator {
 
         if let existing = AppDelegate.shared?.contextContainingTabId(original.workspaceId) {
             existing.window?.makeKeyAndOrderFront(nil)
-            return await reattachRemoteLeaderIfNeeded(teamName: teamName)
+            return await recoverRemoteLeaderIfNeeded(teamName: teamName)
         }
 
         // Normal window-close recovery: adopt the exact Workspace that the

@@ -1248,6 +1248,10 @@ class TabManager: ObservableObject {
     func closeRuntimeSurface(tabId: UUID, surfaceId: UUID) {
         guard let tab = tabs.first(where: { $0.id == tabId }) else { return }
         guard tab.panels[surfaceId] != nil else { return }
+        let remoteLeaderTeam = TeamOrchestrator.shared.remoteLeaderTeamName(
+            runtimeClosedPanelID: surfaceId,
+            workspaceID: tabId
+        )
 
 #if DEBUG
         dlog(
@@ -1268,6 +1272,14 @@ class TabManager: ObservableObject {
         )
 #endif
         notifications.clearNotifications(forTabId: tab.id, surfaceId: surfaceId)
+        if closed, let remoteLeaderTeam {
+            Task { @MainActor in
+                _ = await TeamOrchestrator.shared.recoverRemoteLeaderAfterRuntimeClose(
+                    teamName: remoteLeaderTeam,
+                    closedPanelID: surfaceId
+                )
+            }
+        }
     }
 
     /// Close a panel because its child process exited (e.g. the user hit Ctrl+D).

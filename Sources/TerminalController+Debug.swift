@@ -639,6 +639,7 @@ extension TerminalController {
                         leaderMode: leaderMode,
                         leaderModel: leaderModel,
                         leaderEndpoint: leaderEndpoint,
+                        leaderWorkingDirectory: params["leader_directory"] as? String,
                         tabManager: tabManager
                     )
                     result = .ok([
@@ -739,7 +740,7 @@ extension TerminalController {
             return .err(code: "invalid_params", message: "team is required", data: nil)
         }
         Task { @MainActor in
-            let attached = await TeamOrchestrator.shared.reattachRemoteLeaderIfNeeded(
+            let attached = await TeamOrchestrator.shared.recoverRemoteLeaderIfNeeded(
                 teamName: team
             )
             dlog("debug.project.reattach_leader team=\(team) attached=\(attached)")
