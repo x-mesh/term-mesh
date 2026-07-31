@@ -14,6 +14,36 @@ import SwiftUI
 import Bonsplit
 import PeerProto
 
+enum PeerRelayWorkspaceShortcutAction: Equatable {
+    case toggleZoom
+    case split(orientation: String)
+    case closePane
+    case closeWindow
+    case newTab
+}
+
+func peerRelayWorkspaceShortcutAction(
+    characters: String,
+    keyCode: UInt16,
+    modifiers: NSEvent.ModifierFlags
+) -> PeerRelayWorkspaceShortcutAction? {
+    guard modifiers.contains(.command) else { return nil }
+    let shift = modifiers.contains(.shift)
+    if shift, keyCode == 36 /* kVK_Return */ {
+        return .toggleZoom
+    }
+    switch characters.lowercased() {
+    case "d":
+        return .split(orientation: shift ? "vertical" : "horizontal")
+    case "w":
+        return shift ? .closeWindow : .closePane
+    case "t":
+        return .newTab
+    default:
+        return nil
+    }
+}
+
 /// Marker NSWindow subclass for peer-relay workspace windows. Lets the
 /// app-level NSEvent shortcut monitor (`AppDelegate.handleCustomShortcut`)
 /// short-circuit before consuming Cmd+D / Cmd+Shift+D / Cmd+W, so those
@@ -672,6 +702,7 @@ final class PeerRelayWorkspaceWindowController: NSWindowController, NSWindowDele
         applyLayoutTask = nil
         subscriptionTask?.cancel()
         subscriptionTask = nil
+        let session = subscriptionSession
         subscriptionSession = nil
         if let monitor = keyMonitor {
             NSEvent.removeMonitor(monitor)
@@ -699,6 +730,7 @@ final class PeerRelayWorkspaceWindowController: NSWindowController, NSWindowDele
             // Finish the demux streams first so each shared pane's pump
             // loop exits, then stop the slots and close the transport.
             await demux?.finishAll()
+            await session?.stopHeartbeat()
             for slot in toStop { await slot.session.stop() }
             await transport?.close()
         }
@@ -769,6 +801,7 @@ final class PeerRelayWorkspaceWindowController: NSWindowController, NSWindowDele
         workspaceFetchTask = nil
         subscriptionTask?.cancel()
         subscriptionTask = nil
+        let session = subscriptionSession
         subscriptionSession = nil
         if let monitor = keyMonitor {
             NSEvent.removeMonitor(monitor)
@@ -784,7 +817,6 @@ final class PeerRelayWorkspaceWindowController: NSWindowController, NSWindowDele
         splitIDByObject.removeAll()
         splitWatcher = nil
         let transport = subscriptionTransport
-        let session = subscriptionSession
         subscriptionTransport = nil
         let demux = subscriptionDemux
         subscriptionDemux = nil
@@ -977,31 +1009,39 @@ final class PeerRelayWorkspaceWindowController: NSWindowController, NSWindowDele
         keyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
             guard let self,
                   let window = self.window,
-                  window.isKeyWindow,
-                  event.modifierFlags.contains(.command)
+                  window.isKeyWindow
             else { return event }
             let chars = event.charactersIgnoringModifiers ?? ""
-            let shift = event.modifierFlags.contains(.shift)
-            // Cmd+Shift+Return: zoom focused pane to fill the relay window.
-            // Matches the local Cmd+Shift+Enter "Zoom Pane" shortcut, but
-            // applies only to the relay's render — the host workspace is
-            // not informed.
-            if shift, event.keyCode == 36 /* kVK_Return */ {
+            guard let action = peerRelayWorkspaceShortcutAction(
+                characters: chars,
+                keyCode: event.keyCode,
+                modifiers: event.modifierFlags
+            ) else { return event }
+            switch action {
+            case .toggleZoom:
+                // Cmd+Shift+Return: zoom focused pane to fill the relay
+                // window. This is local-only; the host is not informed.
                 self.toggleRelayPaneZoom()
                 return nil
-            }
-            switch chars.lowercased() {
-            case "d":
-                self.dispatchSplit(orientation: shift ? "vertical" : "horizontal")
+            case .split(let orientation):
+                self.dispatchSplit(orientation: orientation)
                 return nil
-            case "w":
+            case .closePane:
                 self.dispatchClose()
                 return nil
-            case "t":
+            case .closeWindow:
+                // Cmd+Shift+W means close this viewer window everywhere
+                // else in term-mesh. Forwarding it as ClosePane killed the
+                // host PTY instead, leaving a busy-process confirmation on
+                // the host and a black relay pane. Defer the close so this
+                // event monitor can return before windowWillClose removes it.
+                DispatchQueue.main.async { [weak self] in
+                    self?.window?.performClose(nil)
+                }
+                return nil
+            case .newTab:
                 self.dispatchNewTab()
                 return nil
-            default:
-                return event
             }
         }
 
