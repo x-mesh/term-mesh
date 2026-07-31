@@ -363,6 +363,104 @@ mod project_sync_cli_tests {
         let error = instance_id_from_agents(&agents, "reviewer", Some("missing")).unwrap_err();
         assert!(error.contains("--agent-instance-id"), "{error}");
     }
+
+    #[test]
+    fn worktree_delegate_uses_panel_resolved_instance_for_task_owner() {
+        let agents = vec![
+            json!({
+                "name": "executor",
+                "panel_id": "panel-1",
+                "agent_instance_id": "instance-1",
+                "working_directory": "/repo/one",
+            }),
+            json!({
+                "name": "executor",
+                "panel_id": "panel-2",
+                "agent_instance_id": "instance-2",
+                "working_directory": "/repo/two",
+            }),
+        ];
+        let target = delegate_target_from_agents(&agents, "executor", Some("panel-2"))
+            .expect("panel-2 resolves");
+        assert!(should_acquire_worktree(
+            WorktreePolicyArg::Auto,
+            "executor",
+            "implement the fix",
+            "Fix placement routing",
+            None,
+        ));
+
+        let params = worktree_task_create_params(
+            "team-a",
+            "executor",
+            "Fix placement routing",
+            1,
+            &[],
+            &[],
+            None,
+            None,
+            target.agent_instance_id.as_deref(),
+            WorktreePolicyArg::Auto,
+            "request-1",
+        );
+        assert_eq!(params["agent_instance_id"], "instance-2");
+        assert_eq!(target.working_directory.as_deref(), Some("/repo/two"));
+    }
+
+    #[test]
+    fn explicit_panel_resolution_fails_before_task_creation() {
+        let agents = vec![json!({
+            "name": "executor",
+            "panel_id": "panel-1",
+            "agent_instance_id": "instance-1",
+        })];
+        let mut task_create_calls = 0;
+        let resolution = delegate_target_from_agents(&agents, "executor", Some("missing"));
+        if resolution.is_ok() {
+            task_create_calls += 1;
+        }
+        let error = resolution.unwrap_err();
+        assert!(error.contains("no agent named executor matches panel missing"));
+        assert_eq!(task_create_calls, 0);
+
+        let dir = tempfile::tempdir().unwrap();
+        let missing_socket = dir.path().join("missing.sock");
+        let error = selected_delegate_target(
+            &missing_socket,
+            "team-a",
+            "executor",
+            Some("panel-2"),
+        )
+        .unwrap_err();
+        assert!(error.contains("cannot resolve --panel before delegate"));
+    }
+
+    #[test]
+    fn worktree_acquire_runs_from_selected_placement() {
+        let mut seen_cwd = None;
+        let mut seen_args = Vec::new();
+        let meta = gk_wt_acquire_with(
+            "tm/team-a/task-1",
+            Some("develop"),
+            Some("/repo/selected-placement"),
+            |args, cwd| {
+                seen_args = args.to_vec();
+                seen_cwd = cwd.map(str::to_string);
+                Ok(json!({
+                    "ok": true,
+                    "result": {
+                        "path": "/repo/worktree",
+                        "branch": "tm/team-a/task-1",
+                    },
+                }))
+            },
+        )
+        .expect("acquire result");
+
+        assert_eq!(seen_cwd.as_deref(), Some("/repo/selected-placement"));
+        assert_eq!(seen_args[0..3], ["wt", "acquire", "tm/team-a/task-1"]);
+        assert_eq!(meta.path, "/repo/worktree");
+    }
 }
 
 fn worktree_policy_name(policy: WorktreePolicyArg) -> &'static str {
@@ -5390,15 +5488,54 @@ fn send_return_key_with_retry(
 /// a restart or mixed-transport failure cannot silently land on a same-name
 /// sibling.  Returning `None` preserves the legacy unique-name path, while a
 /// duplicate name without an instance is rejected by the Swift RPC.
-fn selected_agent_instance_id(
+#[derive(Debug, Default, PartialEq, Eq)]
+struct ResolvedDelegateTarget {
+    agent_instance_id: Option<String>,
+    working_directory: Option<String>,
+}
+
+fn selected_delegate_target(
     sock: &PathBuf,
     team: &str,
     target: &str,
     panel_id: Option<&str>,
-) -> Option<String> {
-    let status = rpc_call(sock, "team.status", json!({ "team_name": team })).ok()?;
-    let agents = status["result"]["agents"].as_array()?;
-    instance_id_from_agents(agents, target, panel_id).ok().flatten()
+) -> Result<ResolvedDelegateTarget, String> {
+    let status = match rpc_call(sock, "team.status", json!({ "team_name": team })) {
+        Ok(status) => status,
+        Err(error) if panel_id.is_some() => {
+            return Err(format!("cannot resolve --panel before delegate: {error}"));
+        }
+        Err(_) => return Ok(ResolvedDelegateTarget::default()),
+    };
+    let agents = match status["result"]["agents"].as_array() {
+        Some(agents) => agents,
+        None if panel_id.is_some() => {
+            return Err("team.status response has no agents array; cannot resolve --panel".into());
+        }
+        None => return Ok(ResolvedDelegateTarget::default()),
+    };
+    delegate_target_from_agents(agents, target, panel_id)
+}
+
+fn delegate_target_from_agents(
+    agents: &[Value],
+    target: &str,
+    panel_id: Option<&str>,
+) -> Result<ResolvedDelegateTarget, String> {
+    let instance = instance_id_from_agents(agents, target, panel_id)?;
+    let placement = instance.as_deref().and_then(|instance_id| {
+        agents.iter().find(|agent| {
+            agent["agent_instance_id"].as_str() == Some(instance_id)
+                && agent["name"].as_str() == Some(target)
+        })
+    });
+    Ok(ResolvedDelegateTarget {
+        agent_instance_id: instance,
+        working_directory: placement
+            .and_then(|agent| agent["working_directory"].as_str())
+            .filter(|path| !path.is_empty())
+            .map(str::to_string),
+    })
 }
 
 /// Resolve an optional panel selector to the durable instance selector used by
@@ -10199,7 +10336,10 @@ fn run_delegate_result(
     } = options;
     let resolved_title = title.unwrap_or_else(|| task_title_from_text(text));
     let resolved_priority = priority.unwrap_or(2);
-    let selected_instance_id = selected_agent_instance_id(sock, team, target, panel_id);
+    // Resolve the pane once, before either task creation path. An explicit
+    // panel must never degrade into name-only routing on status failure.
+    let selected_target = selected_delegate_target(sock, team, target, panel_id)?;
+    let selected_instance_id = selected_target.agent_instance_id.as_deref();
     let request_id = request_id
         .filter(|value| !value.trim().is_empty())
         .map(str::to_string)
@@ -10226,6 +10366,8 @@ fn run_delegate_result(
             context,
             fix_budget,
             panel_id,
+            selected_instance_id,
+            selected_target.working_directory.as_deref(),
             worktree_policy,
             from_ref,
             &request_id,
@@ -10245,7 +10387,7 @@ fn run_delegate_result(
         context,
         fix_budget,
         panel_id,
-        selected_instance_id.as_deref(),
+        selected_instance_id,
         &request_id,
     );
     let unified = resolve_unified_delegate(&delegate_params, &request_id, |params| {
@@ -10892,7 +11034,23 @@ fn acquire_task_worktree_lock(team: &str, task_id: &str) -> Result<TaskWorktreeL
     }
 }
 
-fn gk_wt_acquire(branch: &str, from_ref: Option<&str>) -> Result<GkWorktreeMeta, String> {
+fn gk_wt_acquire(
+    branch: &str,
+    from_ref: Option<&str>,
+    working_directory: Option<&str>,
+) -> Result<GkWorktreeMeta, String> {
+    gk_wt_acquire_with(branch, from_ref, working_directory, run_gk_json)
+}
+
+fn gk_wt_acquire_with<F>(
+    branch: &str,
+    from_ref: Option<&str>,
+    working_directory: Option<&str>,
+    mut run: F,
+) -> Result<GkWorktreeMeta, String>
+where
+    F: FnMut(&[String], Option<&str>) -> Result<Value, String>,
+{
     let mut args = vec![
         "wt".to_string(),
         "acquire".to_string(),
@@ -10903,7 +11061,7 @@ fn gk_wt_acquire(branch: &str, from_ref: Option<&str>) -> Result<GkWorktreeMeta,
         args.push("--from".to_string());
         args.push(base.to_string());
     }
-    let value = run_gk_json(&args, None)?;
+    let value = run(&args, working_directory)?;
     if !value["ok"].as_bool().unwrap_or(false) {
         return Err(format!("git-kit wt acquire failed: {}", pretty(&value)));
     }
@@ -11037,6 +11195,43 @@ fn run_task_finish_worktree(
     }))
 }
 
+fn worktree_task_create_params(
+    team: &str,
+    target: &str,
+    resolved_title: &str,
+    resolved_priority: u32,
+    accept: &[String],
+    deps: &[String],
+    desc: Option<&str>,
+    fix_budget: Option<u8>,
+    agent_instance_id: Option<&str>,
+    worktree_policy: WorktreePolicyArg,
+    request_id: &str,
+) -> Value {
+    let mut params = json!({
+        "team_name": team,
+        "title": resolved_title,
+        "assignee": target,
+        "priority": resolved_priority,
+        "worktree_policy": worktree_policy_name(worktree_policy),
+        "request_id": request_id,
+        "agent_instance_id": agent_instance_id,
+    });
+    if let Some(d) = desc {
+        params["description"] = json!(d);
+    }
+    if !accept.is_empty() {
+        params["acceptance_criteria"] = json!(accept);
+    }
+    if !deps.is_empty() {
+        params["depends_on"] = json!(deps);
+    }
+    if let Some(fb) = fix_budget {
+        params["fix_budget"] = json!(fb);
+    }
+    params
+}
+
 fn run_delegate_result_with_worktree(
     sock: &PathBuf,
     team: &str,
@@ -11051,30 +11246,25 @@ fn run_delegate_result_with_worktree(
     context: Option<&str>,
     fix_budget: Option<u8>,
     panel_id: Option<&str>,
+    agent_instance_id: Option<&str>,
+    working_directory: Option<&str>,
     worktree_policy: WorktreePolicyArg,
     from_ref: Option<&str>,
     request_id: &str,
 ) -> Result<Value, String> {
-    let mut params = json!({
-        "team_name": team,
-        "title": resolved_title,
-        "assignee": target,
-        "priority": resolved_priority,
-        "worktree_policy": worktree_policy_name(worktree_policy),
-        "request_id": request_id,
-    });
-    if let Some(d) = desc {
-        params["description"] = json!(d);
-    }
-    if !accept.is_empty() {
-        params["acceptance_criteria"] = json!(accept);
-    }
-    if !deps.is_empty() {
-        params["depends_on"] = json!(deps);
-    }
-    if let Some(fb) = fix_budget {
-        params["fix_budget"] = json!(fb);
-    }
+    let params = worktree_task_create_params(
+        team,
+        target,
+        &resolved_title,
+        resolved_priority,
+        accept,
+        deps,
+        desc.as_deref(),
+        fix_budget,
+        agent_instance_id,
+        worktree_policy,
+        request_id,
+    );
 
     let created = rpc_call(sock, "team.task.create", params)
         .map_err(|e| format!("task.create before worktree acquire failed: {e}"))?;
@@ -11085,7 +11275,7 @@ fn run_delegate_result_with_worktree(
         .to_string();
 
     let branch = worktree_branch_for_task(team, &task, text);
-    let meta = match gk_wt_acquire(&branch, from_ref) {
+    let meta = match gk_wt_acquire(&branch, from_ref, working_directory) {
         Ok(meta) => meta,
         Err(e) => {
             let reason = format!("worktree acquire failed: {e}");
@@ -11135,6 +11325,7 @@ fn run_delegate_result_with_worktree(
             "agent_name": target,
             "text": &send_text,
             "panel_id": panel_id,
+            "agent_instance_id": agent_instance_id,
         }),
     )
     .map_err(|e| format!("team.send: {e}"))?;
@@ -11147,8 +11338,15 @@ fn run_delegate_result_with_worktree(
         ));
     }
 
-    let _ =
-        send_return_key_with_retry(sock, team, target, true, "team.delegate.worktree", panel_id, None);
+    let _ = send_return_key_with_retry(
+        sock,
+        team,
+        target,
+        true,
+        "team.delegate.worktree",
+        panel_id,
+        agent_instance_id,
+    );
     Ok(json!({ "task": task, "send": sent, "worktree": meta.path }))
 }
 
@@ -13767,7 +13965,7 @@ fn run_claim(sock: &PathBuf, team: &str, agent: &str) {
                     && should_acquire_worktree(policy, agent, &goal, &title, details.as_deref())
                 {
                     let branch = worktree_branch_for_task(team, &task, &goal);
-                    match gk_wt_acquire(&branch, None) {
+                    match gk_wt_acquire(&branch, None, None) {
                         Ok(meta) => {
                             match update_task_with_worktree(sock, team, &task_id, &meta, policy) {
                                 Ok(updated) => {
