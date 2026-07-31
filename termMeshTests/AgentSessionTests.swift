@@ -1814,6 +1814,26 @@ final class AgentSessionTests: XCTestCase {
         XCTAssertTrue(change.lines.contains(.site(1)))
     }
 
+    /// Once the per-call budget trips, walking a diff on the rest of the
+    /// edits is what the budget forbids — but counting their raw sizes is
+    /// not, so a bailout row must still add every edit still to come rather
+    /// than stopping at the one that tripped it.
+    func testMultiEditBailoutStillCountsEveryRemainingEdit() throws {
+        let big = (0..<3000).map { "line \($0)" }.joined(separator: "\n") + "\n"
+        let bigChanged = (0..<3000).map { "changed \($0)" }.joined(separator: "\n") + "\n"
+
+        let change = try XCTUnwrap(self.change("MultiEdit", [
+            "file_path": "/repo/a.swift",
+            "edits": [["old_string": big, "new_string": bigChanged],
+                      ["old_string": "two\n", "new_string": "TWO\n"]]]))
+
+        XCTAssertEqual(change.kind, .multiEdit(sites: 2))
+        XCTAssertEqual(change.added, 3001)
+        XCTAssertEqual(change.removed, 3001)
+        XCTAssertTrue(change.lines.isEmpty)
+        XCTAssertGreaterThan(change.elided, 0)
+    }
+
     /// Applied everywhere, any single line number is a fiction — and so is the
     /// total, which is the per-site count times a number nobody reported.
     func testReplaceAllRefusesToClaimALineNumber() throws {

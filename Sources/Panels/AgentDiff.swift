@@ -363,7 +363,7 @@ enum AgentDiff {
         var sites = 0
         var anywhere = everywhere
         var walked = 0
-        for edit in edits {
+        for (index, edit) in edits.enumerated() {
             guard let old = edit["old_string"] as? String,
                   let new = edit["new_string"] as? String else { continue }
             let before = split(old), after = split(new)
@@ -371,9 +371,27 @@ enum AgentDiff {
             // hundred lines cost what one edit of five thousand does.
             walked += before.count + after.count
             if walked > maxDiffInputLines {
-                return Change(path: path, kind: .multiEdit(sites: sites + 1),
-                              added: added + after.count,
-                              removed: removed + before.count,
+                // The budget bounds the CollectionDifference walk, not plain
+                // counting: this edit and every one still to come contributes
+                // its raw before/after size to the totals (same numstat
+                // semantics `tooBigToDiff` uses) without diffing it, so a
+                // bailout row's count is never smaller than the real change.
+                sites += 1
+                added += after.count
+                removed += before.count
+                if edit["replace_all"] as? Bool == true { anywhere = true }
+                for remaining in edits[(index + 1)...] {
+                    guard let rOld = remaining["old_string"] as? String,
+                          let rNew = remaining["new_string"] as? String else { continue }
+                    let rBefore = split(rOld), rAfter = split(rNew)
+                    walked += rBefore.count + rAfter.count
+                    sites += 1
+                    added += rAfter.count
+                    removed += rBefore.count
+                    if remaining["replace_all"] as? Bool == true { anywhere = true }
+                }
+                return Change(path: path, kind: .multiEdit(sites: sites),
+                              added: added, removed: removed,
                               lines: [], elided: walked, everywhere: anywhere)
             }
             let piece = lines(old: before, new: after)
