@@ -634,33 +634,55 @@ extension TeamOrchestrator {
         for attempt in 0..<20 {
             try await leaderAttempt?.ensureCurrent()
             let probe = try await PeerRelaySession.connect(hostSockPath: hostSockPath)
+            // The probe is cancelled exactly once on every path. It used to be
+            // cancelled inside the `do`, after which the removal loop below
+            // could still throw from the same block and the `catch` cancelled
+            // it a second time.
+            let candidates: [Data]
             do {
                 let current = try await probe.session.listWorkspaces(timeoutSeconds: 2)
-                let candidates = Self.newlyCreatedWorkspaceIDs(
+                let found = Self.newlyCreatedWorkspaceIDs(
                     before: workspacesBeforeCreate,
                     after: current,
                     expectedTitle: title
                 )
-                for workspaceID in candidates where reconciledIDs.insert(workspaceID).inserted {
+                // Identity here is a generated title, and everything matched
+                // gets deleted. One match is our own timed-out creation.
+                // Several means another client created a same-titled
+                // workspace inside the reconcile window, and we cannot tell
+                // which is ours — deleting both destroys someone else's work,
+                // while leaving them costs a stray workspace the user can
+                // remove. Prefer the recoverable failure. A real fix needs a
+                // creation request id on the wire.
+                guard found.count <= 1 else {
+                    await probe.cancel()
+                    throw RemoteAgentError.projectDeletionIncomplete(
+                        "\(found.count) workspaces on \(host.displayName) match "
+                            + "'\(title)'; refusing to delete an ambiguous match"
+                    )
+                }
+                for workspaceID in found where reconciledIDs.insert(workspaceID).inserted {
                     try await probe.session.deleteWorkspace(workspaceID: workspaceID)
                 }
-                await probe.cancel()
-                if !candidates.isEmpty {
-                    for workspaceID in candidates {
-                        guard try await waitForRemoteRemoval(
-                            hostSockPath: hostSockPath,
-                            workspaceID: workspaceID
-                        ) else {
-                            throw RemoteAgentError.projectDeletionIncomplete(
-                                "timed-out workspace creation was not removed on \(host.displayName)"
-                            )
-                        }
-                    }
-                    return
-                }
+                candidates = found
             } catch {
                 await probe.cancel()
                 throw error
+            }
+            await probe.cancel()
+
+            if !candidates.isEmpty {
+                for workspaceID in candidates {
+                    guard try await waitForRemoteRemoval(
+                        hostSockPath: hostSockPath,
+                        workspaceID: workspaceID
+                    ) else {
+                        throw RemoteAgentError.projectDeletionIncomplete(
+                            "timed-out workspace creation was not removed on \(host.displayName)"
+                        )
+                    }
+                }
+                return
             }
             if attempt < 19 {
                 try await Task.sleep(nanoseconds: 250_000_000)
@@ -1457,6 +1479,13 @@ extension TeamOrchestrator {
         tabManager: TabManager
     ) async -> Bool {
         guard let original = teams[teamName] else { return false }
+        // Single-flight at orchestrator scope, not per sidebar view: two
+        // windows showing the same detached project, or one window plus the
+        // debug command, otherwise both compute `missingRestoredAgentIDs`
+        // before any await and both reattach every surface.
+        guard !projectRestoreInFlight.contains(teamName) else { return false }
+        projectRestoreInFlight.insert(teamName)
+        defer { projectRestoreInFlight.remove(teamName) }
 
         if let existing = AppDelegate.shared?.contextContainingTabId(original.workspaceId) {
             existing.window?.makeKeyAndOrderFront(nil)

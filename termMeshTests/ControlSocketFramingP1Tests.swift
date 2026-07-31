@@ -118,6 +118,37 @@ final class ControlSocketFramingP1Tests: XCTestCase {
         XCTAssertEqual(callCount, 2)
         XCTAssertEqual(bytesRead, expected.count)
         XCTAssertEqual(Data(buffer.prefix(bytesRead)), expected)
+
+    /// Several complete frames in one read may exceed the limit in total.
+    ///
+    /// The limit exists to stop a writer that never sends a newline, not to
+    /// cap how much a well-behaved client may batch into one syscall. The two
+    /// were conflated while the bound was applied to the accumulated buffer,
+    /// and valid work was dropped for arriving together.
+    func testBatchedFramesExceedingTheLimitInTotalAreStillDelivered() {
+        var pending = Data()
+        let batch = (0..<8).map { String(repeating: "\($0)", count: 32) }
+        let frames = TerminalController.appendControlSocketChunk(
+            Data((batch.joined(separator: "\n") + "\n").utf8),
+            to: &pending,
+            maxPendingBytes: 64
+        )
+
+        XCTAssertEqual(frames, batch)
+        XCTAssertTrue(pending.isEmpty)
+    }
+
+    /// The flood the limit is actually for: no newline, ever.
+    func testUnterminatedRemainderPastTheLimitPoisonsTheConnection() {
+        var pending = Data()
+        XCTAssertNil(
+            TerminalController.appendControlSocketChunk(
+                Data(String(repeating: "x", count: 65).utf8),
+                to: &pending,
+                maxPendingBytes: 64
+            )
+        )
+    }
     }
 
     func testWriteAllRetriesEINTRAndCompletesAfterShortWrite() {

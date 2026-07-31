@@ -461,6 +461,12 @@ class TerminalController {
     /// Keeping the pending buffer as bytes prevents a split UTF-8 scalar from
     /// invalidating either read chunk. Each completed frame and the remaining
     /// unterminated suffix have independent byte limits.
+    ///
+    /// Bounding the accumulated buffer instead conflated the case worth
+    /// killing a connection over — one writer flooding us without ever
+    /// sending a newline — with two legitimate shapes: a batch of complete
+    /// frames whose total happens to exceed the limit, and a frame that lands
+    /// exactly on it, pushed one byte past by its own trailing LF.
     nonisolated static func appendControlSocketChunk(
         _ chunk: Data,
         to pending: inout Data,
@@ -473,6 +479,9 @@ class TerminalController {
             guard newlineIndex <= maxPendingBytes else { return nil }
             let frame = Data(pending[..<newlineIndex])
             pending.removeSubrange(...newlineIndex)
+            // A single terminated frame past the limit is still a flood; it
+            // just arrived with its newline attached.
+            guard frame.count <= maxPendingBytes else { return nil }
             if let line = String(data: frame, encoding: .utf8) {
                 frames.append(line)
             }

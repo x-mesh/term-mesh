@@ -199,6 +199,14 @@ final class TeamOrchestrator: ObservableObject {
     /// Runtime EOF can arrive more than once while Ghostty and the peer relay
     /// unwind. Only one recovery may reattach or re-bootstrap a leader.
     var remoteLeaderRecoveryInFlight: Set<String> = []
+    /// Restoring a detached project must be single-flight for the same reason
+    /// the two above are, and at the same scope. The sidebar's own
+    /// `restoringTeamNames` is per-view `@State`, so a second window has its
+    /// own copy and the debug command bypasses it entirely — two concurrent
+    /// restores then walked the same surface ids and left a duplicate viewer
+    /// per surface, with the first set of panes orphaned because
+    /// `progress.agentPanelIDs` keeps only the last writer.
+    var projectRestoreInFlight: Set<String> = []
 
     enum RemoteLeaderRecoveryPresentation: Equatable {
         case replaceAnchor
@@ -313,10 +321,48 @@ final class TeamOrchestrator: ObservableObject {
     /// Returning the original IDs lets AppDelegate still announce that these
     /// workspaces are no longer exported by that particular window.
     @discardableResult
+    /// Whether a team's workspace is a *project* presentation — the only kind
+    /// that may outlive the window showing it.
+    ///
+    /// Pure so the rule can be tested without windows or panes. A workspace
+    /// qualifies when it carries a declared project name (what lets the
+    /// Projects sidebar adopt it again later), when it hosts dedicated remote
+    /// workspaces, or when its leader lives on a peer.
+    nonisolated static func shouldPreserveProjectPresentation(
+        hasDeclaredProjectName: Bool,
+        usesDedicatedRemoteWorkspaces: Bool,
+        hasPeerLeader: Bool
+    ) -> Bool {
+        hasDeclaredProjectName || usesDedicatedRemoteWorkspaces || hasPeerLeader
+    }
+
     func preserveProjectPresentations(from tabManager: TabManager) -> [UUID] {
+        // The filter used to be "this team's workspace is in the closing
+        // window" with no project predicate at all, and
+        // `unregisterMainWindow` runs it on every main-window close including
+        // app quit. That swept up plain `tm-agent attach` teams in ordinary
+        // windows: `detachWorkspace` deliberately never calls `Panel.close`,
+        // so their local shells and native AgentSession processes kept running
+        // with no window, and because the id was then excluded from
+        // `closedWorkspaceIDs` the `.peerWorkspaceDidClose` signal that block
+        // exists to post was skipped too, leaving attached peers holding it.
+        // Only `destroyTeam` ever reclaimed such a workspace.
         let candidates = teams.values
             .filter { team in
-                tabManager.tabs.contains(where: { $0.id == team.workspaceId })
+                guard tabManager.tabs.contains(where: { $0.id == team.workspaceId })
+                else { return false }
+                let hasPeerLeader: Bool
+                if case .peer = team.leaderEndpoint {
+                    hasPeerLeader = true
+                } else {
+                    hasPeerLeader = false
+                }
+                return Self.shouldPreserveProjectPresentation(
+                    hasDeclaredProjectName: WorkspaceProjectNames.shared
+                        .projectName(for: team.workspaceId) != nil,
+                    usesDedicatedRemoteWorkspaces: team.usesDedicatedRemoteWorkspaces,
+                    hasPeerLeader: hasPeerLeader
+                )
             }
             .map { ($0.id, $0.workspaceId) }
 

@@ -264,6 +264,7 @@
 		PW169000000000000003 /* PipeWriteDeadlineRegression169Tests.swift in Sources */ = {isa = PBXBuildFile; fileRef = PW169000000000000006 /* PipeWriteDeadlineRegression169Tests.swift */; };
 		PC170000000000000003 /* PipeCompletionP1Regression170Tests.swift in Sources */ = {isa = PBXBuildFile; fileRef = PC170000000000000006 /* PipeCompletionP1Regression170Tests.swift */; };
 		PT210000000000000003 /* PlacementTelemetryP1Tests.swift in Sources */ = {isa = PBXBuildFile; fileRef = PT210000000000000006 /* PlacementTelemetryP1Tests.swift */; };
+		PP220000000000000003 /* ProjectPresentationScopeP2Tests.swift in Sources */ = {isa = PBXBuildFile; fileRef = PP220000000000000006 /* ProjectPresentationScopeP2Tests.swift */; };
 		DG210000000000000003 /* DelegateDiagnosisP1Tests.swift in Sources */ = {isa = PBXBuildFile; fileRef = DG210000000000000006 /* DelegateDiagnosisP1Tests.swift */; };
 		DD210000000000000003 /* DelegateDedupP1Tests.swift in Sources */ = {isa = PBXBuildFile; fileRef = DD210000000000000006 /* DelegateDedupP1Tests.swift */; };
 		DD210000000000000010 /* DelegateDiagnosisP1Tests.swift in Sources */ = {isa = PBXBuildFile; fileRef = DD210000000000000011 /* DelegateDiagnosisP1Tests.swift */; };
@@ -593,6 +594,7 @@
 		PW169000000000000006 /* PipeWriteDeadlineRegression169Tests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PipeWriteDeadlineRegression169Tests.swift; sourceTree = "<group>"; };
 		PC170000000000000006 /* PipeCompletionP1Regression170Tests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PipeCompletionP1Regression170Tests.swift; sourceTree = "<group>"; };
 		PT210000000000000006 /* PlacementTelemetryP1Tests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PlacementTelemetryP1Tests.swift; sourceTree = "<group>"; };
+		PP220000000000000006 /* ProjectPresentationScopeP2Tests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ProjectPresentationScopeP2Tests.swift; sourceTree = "<group>"; };
 		DG210000000000000006 /* DelegateDiagnosisP1Tests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DelegateDiagnosisP1Tests.swift; sourceTree = "<group>"; };
 		DD210000000000000006 /* DelegateDedupP1Tests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DelegateDedupP1Tests.swift; sourceTree = "<group>"; };
 		DD210000000000000011 /* DelegateDiagnosisP1Tests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DelegateDiagnosisP1Tests.swift; sourceTree = "<group>"; };
@@ -977,6 +979,7 @@ A1740000000000000000000C /* ProcessRun.swift */,
 				PW169000000000000006 /* PipeWriteDeadlineRegression169Tests.swift */,
 				PC170000000000000006 /* PipeCompletionP1Regression170Tests.swift */,
 				PT210000000000000006 /* PlacementTelemetryP1Tests.swift */,
+				PP220000000000000006 /* ProjectPresentationScopeP2Tests.swift */,
 				DG210000000000000006 /* DelegateDiagnosisP1Tests.swift */,
 				DD210000000000000006 /* DelegateDedupP1Tests.swift */,
 				DD210000000000000011 /* DelegateDiagnosisP1Tests.swift */,
@@ -1391,6 +1394,7 @@ A1740000000000000000000B /* ProcessRun.swift in Sources */,
 				PW169000000000000003 /* PipeWriteDeadlineRegression169Tests.swift in Sources */,
 				PC170000000000000003 /* PipeCompletionP1Regression170Tests.swift in Sources */,
 				PT210000000000000003 /* PlacementTelemetryP1Tests.swift in Sources */,
+				PP220000000000000003 /* ProjectPresentationScopeP2Tests.swift in Sources */,
 				DG210000000000000003 /* DelegateDiagnosisP1Tests.swift in Sources */,
 				DD210000000000000003 /* DelegateDedupP1Tests.swift in Sources */,
 				DD210000000000000010 /* DelegateDiagnosisP1Tests.swift in Sources */,

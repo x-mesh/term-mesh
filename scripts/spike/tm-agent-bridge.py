@@ -58,6 +58,40 @@ AGENT_ENV_LOAD_EXIT = 78
 TEXT_LIMIT = 4000
 DIFF_LIMIT = 65536
 
+# Largest instruction frame this bridge will accumulate before giving up on a
+# writer. The daemon's socket reader has always bounded its lines; this raw
+# reader did not, so a writer that never sent a newline could grow `pending`
+# until the process — or the host — ran out of memory. A long-lived native
+# agent pane is exactly where that is worth nothing to an attacker and fatal
+# to the user. Real capsules are kilobytes; a megabyte is already generous.
+MAX_FRAME_BYTES = 1_048_576
+
+
+def split_input_frames(pending: bytes, chunk: bytes):
+    """Split newline-delimited frames and bound what is left over.
+
+    Returns ``(frames, remainder, oversize)``. ``oversize`` is the byte count
+    that blew the cap, or ``None`` when everything is within it.
+
+    The cap applies per frame and to the still-unterminated remainder, never
+    to the accumulated buffer: bounding the buffer would punish a legitimate
+    batch of complete frames that happened to arrive in one read, while the
+    case actually worth killing a transport over is a writer that never sends
+    a newline at all.
+    """
+    pending += chunk
+    frames = []
+    while b"\n" in pending:
+        raw, pending = pending.split(b"\n", 1)
+        if len(raw) > MAX_FRAME_BYTES:
+            # Terminated, but still a flood — it just arrived with its
+            # newline attached, which must not be a way past the cap.
+            return frames, pending, len(raw)
+        frames.append(raw.decode("utf-8", errors="replace"))
+    if len(pending) > MAX_FRAME_BYTES:
+        return frames, pending, len(pending)
+    return frames, pending, None
+
 
 def clamp(text: str, limit: int) -> str:
     """Cut long output at a line boundary, and say that it was cut.
@@ -1265,6 +1299,16 @@ def main() -> int:
         describe = getattr(child, "failure_message", None)
         return describe() if describe else "agent process exited"
 
+    def poison_oversized_frame(size: int) -> int:
+        """Refuse a writer that blew past the frame cap, and say so."""
+        message = (
+            f"input frame exceeded {MAX_FRAME_BYTES} bytes ({size}); "
+            "closing the transport"
+        )
+        out.result(message, stop="input_too_large", failed=True)
+        log(message)
+        return 1
+
     def consume(fd: int) -> int:
         """Read turns and child-exit events without polling while idle."""
         pending = b""
@@ -1296,16 +1340,17 @@ def main() -> int:
                                        failed=True)
                         return 1
                 return 0
-            pending += chunk
-            while b"\n" in pending:
-                raw, pending = pending.split(b"\n", 1)
-                reported = take(raw.decode("utf-8", errors="replace"))
+            frames, pending, oversize = split_input_frames(pending, chunk)
+            for raw in frames:
+                reported = take(raw)
                 if not bridge.alive:
                     if not reported:
                         out.result(exit_failure(), stop="process_exited",
                                    failed=True)
                     log(exit_failure())
                     return 1
+            if oversize is not None:
+                return poison_oversized_frame(oversize)
 
     try:
         if args.fifo:
