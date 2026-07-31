@@ -258,6 +258,7 @@ enum AgentPipeTransport {
     /// routed to a FIFO that no longer exists.
     static func discard(agentId: String) {
         forgetDriven(agentId: agentId)
+        writers.reset(agentId: agentId)
         try? FileManager.default.removeItem(atPath: fifoPath(agentId: agentId))
         try? FileManager.default.removeItem(atPath: fifoPath(agentId: agentId) + ".events")
     }
@@ -337,11 +338,13 @@ enum AgentPipeTransport {
     enum DeliveryError: Error, CustomStringConvertible {
         case noPipe(String)
         case writeFailed(String)
+        case unterminatedPartial(String)
 
         var description: String {
             switch self {
             case .noPipe(let path): return "no pipe at \(path)"
             case .writeFailed(let detail): return "write failed: \(detail)"
+            case .unterminatedPartial(let detail): return "write failed: \(detail)"
             }
         }
     }
@@ -368,19 +371,87 @@ enum AgentPipeTransport {
     /// One serial writer per agent. Frames for one process cannot interleave or
     /// overtake each other, while separate agents remain independent.
     private final class WriterRegistry: @unchecked Sendable {
-        private let lock = NSLock()
-        private var queues: [String: DispatchQueue] = [:]
+        struct Admission: @unchecked Sendable {
+            let agentId: String
+            let generation: UInt64
+            let queue: DispatchQueue
+        }
 
-        func queue(for agentId: String) -> DispatchQueue {
+        private struct Entry {
+            let queue: DispatchQueue
+            var generation: UInt64 = 0
+            var poisoned = false
+        }
+
+        private let lock = NSLock()
+        private var entries: [String: Entry] = [:]
+
+        func admission(for agentId: String) -> Admission {
             lock.lock()
             defer { lock.unlock() }
-            if let queue = queues[agentId] { return queue }
+            if let entry = entries[agentId] {
+                return Admission(
+                    agentId: agentId, generation: entry.generation, queue: entry.queue)
+            }
             let queue = DispatchQueue(
                 label: "com.termmesh.agent-pipe.\(agentId)",
                 qos: .userInitiated
             )
-            queues[agentId] = queue
-            return queue
+            entries[agentId] = Entry(queue: queue)
+            return Admission(agentId: agentId, generation: 0, queue: queue)
+        }
+
+        func rejection(for admission: Admission) -> DeliveryError? {
+            lock.lock()
+            defer { lock.unlock() }
+            guard let entry = entries[admission.agentId],
+                  entry.generation == admission.generation else {
+                return .writeFailed("pipe was reset before the queued delivery started")
+            }
+            return entry.poisoned
+                ? .writeFailed("pipe contains an unterminated partial frame; restart required")
+                : nil
+        }
+
+        func poison(_ admission: Admission) {
+            lock.lock()
+            defer { lock.unlock() }
+            guard var entry = entries[admission.agentId],
+                  entry.generation == admission.generation else { return }
+            entry.poisoned = true
+            entries[admission.agentId] = entry
+        }
+
+        func reset(agentId: String) {
+            lock.lock()
+            defer { lock.unlock() }
+            guard var entry = entries[agentId] else { return }
+            entry.generation &+= 1
+            entry.poisoned = false
+            entries[agentId] = entry
+        }
+    }
+
+    /// Reports an asynchronous delivery exactly once. The caller deadline and
+    /// the serialized writer may race; the writer still finishes channel cleanup.
+    private final class DeliveryResult: @unchecked Sendable {
+        private let lock = NSLock()
+        private var finished = false
+        private let completion: (Result<Int, DeliveryError>) -> Void
+
+        init(completion: @escaping (Result<Int, DeliveryError>) -> Void) {
+            self.completion = completion
+        }
+
+        func finish(_ result: Result<Int, DeliveryError>) {
+            lock.lock()
+            guard !finished else {
+                lock.unlock()
+                return
+            }
+            finished = true
+            lock.unlock()
+            DispatchQueue.main.async { [completion] in completion(result) }
         }
     }
 
@@ -418,12 +489,14 @@ enum AgentPipeTransport {
                         throw DeliveryError.writeFailed(
                             "write stalled before line commit (deadline exceeded)")
                     }
-                    let terminated = terminateLine()
+                    guard terminateLine() else {
+                        throw DeliveryError.unterminatedPartial(
+                            "write stalled after \(written)/\(byteCount)B (deadline exceeded); "
+                                + "the partial line could not be terminated")
+                    }
                     throw DeliveryError.writeFailed(
                         "write stalled after \(written)/\(byteCount)B (deadline exceeded); "
-                            + (terminated
-                                ? "the partial line was terminated for the reader"
-                                : "the partial line could not be terminated"))
+                            + "the partial line was terminated for the reader")
                 }
                 pause()
             case .failed(let failure):
@@ -441,18 +514,59 @@ enum AgentPipeTransport {
     ) throws {
         let path = fifoPath(agentId: agentId)
         let payload = try encode(text: text)
-        writers.queue(for: agentId).async {
+        enqueueDelivery(
+            agentId: agentId, resultTimeout: pipeWriteTimeout,
+            operation: { try deliver(payload: payload, path: path) },
+            completion: completion
+        )
+    }
+
+    /// Applies both transport-wide guarantees around one serialized write:
+    /// enqueue-time caller feedback is bounded, and a channel with an
+    /// unterminated committed frame rejects every later generation peer.
+    private static func enqueueDelivery(
+        agentId: String,
+        resultTimeout: TimeInterval,
+        operation: @escaping @Sendable () throws -> Int,
+        completion: @escaping (Result<Int, DeliveryError>) -> Void
+    ) {
+        let admission = writers.admission(for: agentId)
+        let resultGate = DeliveryResult(completion: completion)
+        DispatchQueue.main.asyncAfter(deadline: .now() + resultTimeout) {
+            resultGate.finish(.failure(.writeFailed("delivery result deadline exceeded")))
+        }
+        admission.queue.async {
             let result: Result<Int, DeliveryError>
-            do {
-                result = .success(try deliver(payload: payload, path: path))
-            } catch let error as DeliveryError {
-                result = .failure(error)
-            } catch {
-                result = .failure(.writeFailed(error.localizedDescription))
+            if let rejection = writers.rejection(for: admission) {
+                result = .failure(rejection)
+            } else {
+                do {
+                    result = .success(try operation())
+                } catch let error as DeliveryError {
+                    if case .unterminatedPartial = error {
+                        writers.poison(admission)
+                    }
+                    result = .failure(error)
+                } catch {
+                    result = .failure(.writeFailed(error.localizedDescription))
+                }
             }
-            DispatchQueue.main.async { completion(result) }
+            resultGate.finish(result)
         }
     }
+
+    #if DEBUG
+    static func enqueueDeliveryForTesting(
+        agentId: String,
+        resultTimeout: TimeInterval,
+        operation: @escaping @Sendable () throws -> Int,
+        completion: @escaping (Result<Int, DeliveryError>) -> Void
+    ) {
+        enqueueDelivery(
+            agentId: agentId, resultTimeout: resultTimeout,
+            operation: operation, completion: completion)
+    }
+    #endif
 
     /// Runs only on the agent serial writer. Readiness and backpressure waits
     /// therefore leave input, layout, and unrelated socket work responsive.
@@ -498,7 +612,7 @@ enum AgentPipeTransport {
         agentId: String,
         operation: @escaping @Sendable () -> Void
     ) {
-        writers.queue(for: agentId).async(execute: operation)
+        writers.admission(for: agentId).queue.async(execute: operation)
     }
     #endif
 
