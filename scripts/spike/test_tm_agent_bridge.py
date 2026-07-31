@@ -1,4 +1,5 @@
 import importlib.util
+import json
 import os
 from pathlib import Path
 import queue
@@ -200,6 +201,94 @@ class JsonRpcStartupFailureTests(unittest.TestCase):
             rpc.failure,
             "remote agent could not load ~/.config/term-mesh/agent-env",
         )
+
+
+class PersistentChildExitTests(unittest.TestCase):
+    def test_send_reports_exit_code_and_stderr_instead_of_broken_pipe(self):
+        child = BRIDGE.Child([
+            sys.executable,
+            "-c",
+            "import sys; print('intentional child crash', file=sys.stderr); "
+            "sys.exit(7)",
+        ], tempfile.gettempdir())
+        deadline = time.monotonic() + 2
+        while child.alive and time.monotonic() < deadline:
+            time.sleep(0.01)
+        while not child.stderr_lines and time.monotonic() < deadline:
+            time.sleep(0.01)
+
+        with self.assertRaises(BRIDGE.ChildExitedError) as raised:
+            child.send({"jsonrpc": "2.0", "method": "turn/start"})
+
+        self.assertIn("exited with code 7", str(raised.exception))
+        self.assertIn("intentional child crash", str(raised.exception))
+        child.stop()
+
+    def test_jsonrpc_turn_start_converts_dead_child_to_failure(self):
+        class DeadChild:
+            alive = False
+            inbox = queue.Queue()
+
+            def send(self, _obj):
+                raise BRIDGE.ChildExitedError("agent process exited with code 9")
+
+            def exit_code(self):
+                return 9
+
+        child = DeadChild()
+        rpc = BRIDGE.JsonRpc(child, emitter=None)
+
+        self.assertIsNone(rpc.request("turn/start", {}, timeout=1))
+        self.assertEqual(rpc.failure, "agent process exited with code 9")
+
+    def test_idle_bridge_observes_child_exit_without_waiting_for_another_turn(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            fake = Path(temporary) / "fake-codex"
+            fake.write_text(
+                "#!/usr/bin/env python3\n"
+                "import json, sys\n"
+                "for line in sys.stdin:\n"
+                "    frame = json.loads(line)\n"
+                "    method = frame.get('method')\n"
+                "    if method == 'initialize':\n"
+                "        print(json.dumps({'jsonrpc':'2.0','id':frame['id'],"
+                "'result':{}}), flush=True)\n"
+                "    elif method == 'thread/start':\n"
+                "        print(json.dumps({'jsonrpc':'2.0','id':frame['id'],"
+                "'result':{'thread':{'id':'thread-dead'}}}), flush=True)\n"
+                "        print('app-server crashed while idle', file=sys.stderr, flush=True)\n"
+                "        sys.exit(7)\n",
+                encoding="utf-8",
+            )
+            fake.chmod(0o700)
+            process = subprocess.Popen(
+                [sys.executable, str(BRIDGE_PATH), "--cli", "codex",
+                 "--exe", str(fake), "--cwd", temporary],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            try:
+                code = process.wait(timeout=3)
+                stdout = process.stdout.read()
+                stderr = process.stderr.read()
+            finally:
+                if process.poll() is None:
+                    process.kill()
+                    process.wait()
+                for stream in (process.stdin, process.stdout, process.stderr):
+                    if stream is not None and not stream.closed:
+                        stream.close()
+
+        self.assertEqual(code, 1)
+        results = [json.loads(line) for line in stdout.splitlines()
+                   if line.startswith("{")]
+        terminal = [event for event in results if event.get("type") == "result"][-1]
+        self.assertEqual(terminal["stop_reason"], "process_exited")
+        self.assertIn("exited with code 7", terminal["result"])
+        self.assertIn("app-server crashed while idle", terminal["result"])
+        self.assertNotIn("Traceback", stderr)
 
 
 class CapturedEmitter(BRIDGE.Emitter):
