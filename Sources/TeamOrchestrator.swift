@@ -683,6 +683,19 @@ final class TeamOrchestrator: ObservableObject {
         /// Caller-supplied idempotency key. The stored spelling intentionally
         /// matches the delegate RPC field and persisted board JSON.
         var request_id: String? = nil
+        /// When this task's instruction actually reached a pane, if it ever
+        /// did.
+        ///
+        /// The task is created before the paste is attempted, so its mere
+        /// existence says nothing about delivery — and a failed paste leaves
+        /// exactly the state a successful one does: a non-terminal task on
+        /// that instance. A retry of the same `request_id` could not tell the
+        /// two apart and answered both as "already delivered", which is right
+        /// for a lost reply and a silent drop for a paste that never landed.
+        /// Optional so boards written before this field decode unchanged; nil
+        /// there means "not known to have been delivered", which is the safe
+        /// reading for an old board.
+        var textDeliveredAt: Date? = nil
         var result: String?
         var resultPath: String? = nil
         var worktreePolicy: String? = nil
@@ -3807,6 +3820,22 @@ final class TeamOrchestrator: ObservableObject {
         case taskCreateFailed
     }
 
+    /// Whether an already-existing task may be acknowledged without pasting
+    /// its instruction again.
+    ///
+    /// Only a task whose instruction is known to have landed. The task is
+    /// created before the paste is attempted, so a paste that failed leaves
+    /// exactly what a successful one leaves — a non-terminal task on that
+    /// instance — and treating the two alike answered a retry of a delivery
+    /// that never happened with "already delivered", dropping the turn in
+    /// silence. Pure so the rule is testable without a `TabManager` or a pane.
+    nonisolated static func delegateMaySkipPaste(
+        taskAlreadyExisted: Bool,
+        textDeliveredAt: Date?
+    ) -> Bool {
+        taskAlreadyExisted && textDeliveredAt != nil
+    }
+
     /// Statuses that release an agent back to the pool.
     ///
     /// Mirrors `TeamDataStore.hasActiveTask`, which owns the real gate. The two
@@ -3869,6 +3898,13 @@ final class TeamOrchestrator: ObservableObject {
         // task it was replaying; the dedup branch became reachable only after
         // that task completed, which is the case where a second paste would
         // have been least harmful.
+        //
+        // Whether the replay may skip the paste is a separate question, and
+        // the task itself answers it: only one whose instruction is known to
+        // have landed is safe to acknowledge without pasting again. A task
+        // created for a paste that then failed looks identical otherwise, and
+        // answering that as "already delivered" drops the turn silently.
+        var replayed: TeamTask? = nil
         if let requestId = requestId?.nilIfBlank,
            let existing = TeamDataStore.shared.task(
                teamName: teamName, requestId: requestId
@@ -3876,30 +3912,41 @@ final class TeamOrchestrator: ObservableObject {
            let replayTarget = team.agents.first(where: {
                $0.agentInstanceId == existing.assigneeInstanceId
            }) {
-            let instruction = formatDelegateInstruction(
-                teamName: teamName,
-                target: replayTarget,
-                task: existing,
-                text: text,
-                context: context
-            )
-            // Same async completion ordering as the paste path: the socket
-            // caller stores the outcome right after this returns, and a
-            // synchronous callback could resume it first.
-            if let completion {
-                DispatchQueue.main.async { completion(true) }
-            }
-            return .delivered(
-                DelegateResult(
+            if Self.delegateMaySkipPaste(
+                taskAlreadyExisted: true,
+                textDeliveredAt: existing.textDeliveredAt
+            ) {
+                let instruction = formatDelegateInstruction(
+                    teamName: teamName,
+                    target: replayTarget,
                     task: existing,
-                    textDelivered: true,
-                    requestReplayed: true,
-                    instruction: instruction
+                    text: text,
+                    context: context
                 )
-            )
+                // Same async completion ordering as the paste path: the socket
+                // caller stores the outcome right after this returns, and a
+                // synchronous callback could resume it first.
+                if let completion {
+                    DispatchQueue.main.async { completion(true) }
+                }
+                return .delivered(
+                    DelegateResult(
+                        task: existing,
+                        textDelivered: true,
+                        requestReplayed: true,
+                        instruction: instruction
+                    )
+                )
+            }
+            // Undelivered: paste it, into the instance that already owns the
+            // task rather than through the pool gate this very task holds shut.
+            replayed = existing
         }
         let named = team.agents.filter { $0.name == agentName }
         let target: AgentMember? = {
+            if let replayed, let instance = replayed.assigneeInstanceId {
+                return team.agents.first { $0.agentInstanceId == instance }
+            }
             if let agentInstanceId {
                 return resolveAgentForRPC(
                     teamName: teamName, agentName: agentName, agentInstanceId: agentInstanceId
@@ -3937,7 +3984,13 @@ final class TeamOrchestrator: ObservableObject {
             text: text,
             context: context
         )
-        if !creation.created {
+        // A task that already exists may skip the paste only if that paste is
+        // known to have landed. Otherwise this is a retry of a delivery that
+        // never happened, and it has to happen now.
+        if Self.delegateMaySkipPaste(
+            taskAlreadyExisted: !creation.created,
+            textDeliveredAt: task.textDeliveredAt
+        ) {
             // Keep the same async completion ordering as the paste path. The
             // socket caller stores DelegateOutcome immediately after this
             // method returns; a synchronous callback could resume it first.
@@ -3972,6 +4025,12 @@ final class TeamOrchestrator: ObservableObject {
                 recordPendingReturnFor: target.agentInstanceId,
                 completion: completion
             )
+            // The mark is what lets a later retry of the same request_id tell
+            // a lost reply from a paste that never landed.
+            if delivered {
+                TeamDataStore.shared.markTextDelivered(
+                    teamName: teamName, taskId: task.id)
+            }
             return .delivered(
                 DelegateResult(
                     task: task,
@@ -3994,6 +4053,10 @@ final class TeamOrchestrator: ObservableObject {
             withReturn: submit,
             completion: completion
         )
+        if delivered {
+            TeamDataStore.shared.markTextDelivered(
+                teamName: teamName, taskId: task.id)
+        }
         return .delivered(
             DelegateResult(
                 task: task,
