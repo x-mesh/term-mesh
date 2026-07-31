@@ -639,11 +639,19 @@ final class TeamDataStore: ObservableObject, @unchecked Sendable {
         dependsOn: [String] = [],
         parentTaskId: String? = nil,
         createdBy: String = "leader",
-        worktreePolicy: String? = nil
+        worktreePolicy: String? = nil,
+        requestId: String? = nil
     ) -> TeamOrchestrator.TeamTask? {
         lock.lock()
         defer { lock.unlock() }
         guard teamRegistry[teamName] != nil else { return nil }
+        let normalizedRequestId = requestId?.teamDataNilIfBlank
+        if let normalizedRequestId,
+           let duplicate = taskBoards[teamName, default: []].first(where: {
+               $0.request_id == normalizedRequestId
+           }) {
+            return duplicate
+        }
         guard let resolvedAssignee = resolveAssigneeUnsafe(
             teamName: teamName,
             assignee: assignee,
@@ -652,7 +660,7 @@ final class TeamDataStore: ObservableObject, @unchecked Sendable {
         ) else { return nil }
         let now = Date()
         let normalizedCreatedBy = createdBy.teamDataNilIfBlank ?? "leader"
-        // Dedup dashboard-created tasks
+        // Preserve the dashboard's legacy debounce when it has no request_id.
         if normalizedCreatedBy.contains("dashboard"),
            let duplicate = taskBoards[teamName, default: []].last(where: {
                $0.title == title &&
@@ -699,6 +707,7 @@ final class TeamDataStore: ObservableObject, @unchecked Sendable {
             blockedReason: nil,
             reviewSummary: nil,
             createdBy: normalizedCreatedBy,
+            request_id: normalizedRequestId,
             result: nil,
             resultPath: nil,
             worktreePolicy: worktreePolicy?.teamDataNilIfBlank,
@@ -1626,6 +1635,7 @@ final class TeamDataStore: ObservableObject, @unchecked Sendable {
             "blocked_reason": task.blockedReason as Any? ?? NSNull(),
             "review_summary": task.reviewSummary as Any? ?? NSNull(),
             "created_by": task.createdBy,
+            "request_id": task.request_id as Any? ?? NSNull(),
             "result": task.result as Any? ?? NSNull(),
             "result_path": task.resultPath as Any? ?? NSNull(),
             "worktree_policy": task.worktreePolicy as Any? ?? NSNull(),

@@ -634,6 +634,9 @@ final class TeamOrchestrator: ObservableObject {
         var blockedReason: String?
         var reviewSummary: String?
         var createdBy: String
+        /// Caller-supplied idempotency key. The stored spelling intentionally
+        /// matches the delegate RPC field and persisted board JSON.
+        var request_id: String? = nil
         var result: String?
         var resultPath: String? = nil
         var worktreePolicy: String? = nil
@@ -3670,6 +3673,7 @@ final class TeamOrchestrator: ObservableObject {
         taskTitle: String? = nil,
         priority: Int? = nil,
         context: String? = nil,
+        requestId: String? = nil,
         tabManager: TabManager,
         submit: Bool = false,
         panelId: UUID? = nil,
@@ -3694,7 +3698,8 @@ final class TeamOrchestrator: ObservableObject {
             title: title,
             assignee: agentName,
             assigneeInstanceId: target.agentInstanceId,
-            priority: priority ?? 2
+            priority: priority ?? 2,
+            requestId: requestId
         ) else { return nil }
         let instruction = formatDelegateInstruction(
             teamName: teamName,
