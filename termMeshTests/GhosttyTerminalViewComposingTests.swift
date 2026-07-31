@@ -7,6 +7,94 @@ import XCTest
 #endif
 
 final class GhosttyTerminalViewComposingTests: XCTestCase {
+    private func externalSnapshot(
+        hostFrame: NSRect = NSRect(x: 0, y: 0, width: 800, height: 600),
+        anchorFrame: NSRect = NSRect(x: 10, y: 20, width: 300, height: 200),
+        hostSuperview: NSObject,
+        window: NSObject,
+        anchor: NSObject,
+        anchorSuperview: NSObject
+    ) -> TerminalPortalExternalGeometrySnapshot {
+        let geometry = TerminalPortalAnchorGeometry(
+            windowID: ObjectIdentifier(window),
+            superviewID: ObjectIdentifier(anchorSuperview),
+            frameInWindow: anchorFrame
+        )
+        return TerminalPortalExternalGeometrySnapshot(
+            hostSuperviewID: ObjectIdentifier(hostSuperview),
+            hostFrame: hostFrame,
+            hostBounds: NSRect(origin: .zero, size: hostFrame.size),
+            referenceGeometry: TerminalPortalAnchorGeometry(
+                windowID: ObjectIdentifier(window),
+                superviewID: ObjectIdentifier(hostSuperview),
+                frameInWindow: hostFrame
+            ),
+            anchorGeometries: [ObjectIdentifier(anchor): geometry]
+        )
+    }
+
+    func testExternalPortalGeometrySkipsRepeatedNotificationsAfterConvergence() {
+        let hostSuperview = NSObject()
+        let window = NSObject()
+        let anchor = NSObject()
+        let anchorSuperview = NSObject()
+        let snapshot = externalSnapshot(
+            hostSuperview: hostSuperview,
+            window: window,
+            anchor: anchor,
+            anchorSuperview: anchorSuperview
+        )
+
+        XCTAssertFalse(terminalPortalExternalGeometryNeedsSynchronization(
+            previous: snapshot,
+            current: snapshot,
+            force: false
+        ))
+        XCTAssertTrue(terminalPortalExternalGeometryNeedsSynchronization(
+            previous: snapshot,
+            current: snapshot,
+            force: true
+        ))
+    }
+
+    func testExternalPortalGeometryIgnoresNoiseButAcceptsRealResize() {
+        let hostSuperview = NSObject()
+        let window = NSObject()
+        let anchor = NSObject()
+        let anchorSuperview = NSObject()
+        let previous = externalSnapshot(
+            hostSuperview: hostSuperview,
+            window: window,
+            anchor: anchor,
+            anchorSuperview: anchorSuperview
+        )
+        let noisy = externalSnapshot(
+            anchorFrame: NSRect(x: 10.1, y: 19.9, width: 300.1, height: 199.9),
+            hostSuperview: hostSuperview,
+            window: window,
+            anchor: anchor,
+            anchorSuperview: anchorSuperview
+        )
+        let resized = externalSnapshot(
+            anchorFrame: NSRect(x: 10, y: 20, width: 301, height: 200),
+            hostSuperview: hostSuperview,
+            window: window,
+            anchor: anchor,
+            anchorSuperview: anchorSuperview
+        )
+
+        XCTAssertFalse(terminalPortalExternalGeometryNeedsSynchronization(
+            previous: previous,
+            current: noisy,
+            force: false
+        ))
+        XCTAssertTrue(terminalPortalExternalGeometryNeedsSynchronization(
+            previous: previous,
+            current: resized,
+            force: false
+        ))
+    }
+
     func testPortalAnchorGeometrySkipsUnchangedLayoutCallbacks() {
         let window = NSObject()
         let superview = NSObject()
