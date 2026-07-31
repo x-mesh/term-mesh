@@ -752,6 +752,7 @@ fn connect_and_authenticate(
                     .unwrap_or_else(|_| "tm-agent-peer".into()),
                 capabilities: capability::supported_vec(),
                 app_version: env!("CARGO_PKG_VERSION").into(),
+                cli_bin_dirs: vec![],
             })),
         },
     )?;

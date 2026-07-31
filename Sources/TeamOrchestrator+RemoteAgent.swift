@@ -1133,7 +1133,8 @@ extension TeamOrchestrator {
             workingDirectory: workingDirectory,
             grant: grantResponse.grant,
             systemPromptFile: promptFile,
-            environment: PeerHostEnvironment.stored(forHostKey: host.id)
+            environment: PeerHostEnvironment.stored(forHostKey: host.id),
+            hostBinDirs: host.hostCLIBinDirs
         )
         let launched = await sendRemoteLeaderStage(
             session: session,
@@ -1727,7 +1728,7 @@ extension TeamOrchestrator {
             throw RemoteAgentError.cliUnavailable(cli, host.displayName)
         }
         let marker = "__TERMMESH_CLI_AVAILABLE__"
-        let probe = RemoteShellPath.prologue
+        let probe = RemoteShellPath.prologue(hostBinDirs: host.hostCLIBinDirs)
             + "command -v \(shellQuoted(cli)) >/dev/null 2>&1 "
             + "&& printf %s \(shellQuoted(marker))"
         do {
@@ -1769,7 +1770,7 @@ extension TeamOrchestrator {
         }
         let marker = "__TERMMESH_LEADER_READY__"
         let missing = "__TERMMESH_LEADER_CLI_MISSING__"
-        var script = RemoteShellPath.prologue
+        var script = RemoteShellPath.prologue(hostBinDirs: host.hostCLIBinDirs)
             + "if ! command -v \(shellQuoted(cli)) >/dev/null 2>&1; "
             + "then printf %s \(shellQuoted(missing)); exit 0; fi"
         if let systemPrompt, let promptFile {
@@ -2105,6 +2106,7 @@ extension TeamOrchestrator {
             path: workingDirectory
         )
         AutoReplyPoller.shared.ensureRunning()
+        let hostCLIBinDirs = host.hostCLIBinDirs
 
         // Start the CLI once the remote shell is actually reading. The same
         // race a local pane has, for the same reason: text that arrives while
@@ -2119,7 +2121,8 @@ extension TeamOrchestrator {
                 agentName: agentName,
                 teamName: teamName,
                 workingDirectory: workingDirectory,
-                environment: PeerHostEnvironment.stored(forHostKey: hostKey)
+                environment: PeerHostEnvironment.stored(forHostKey: hostKey),
+                hostBinDirs: hostCLIBinDirs
             )
             _ = self.sendToAgentByPanel(
                 teamName: teamName,
@@ -3214,7 +3217,8 @@ extension TeamOrchestrator {
         teamName: String,
         workingDirectory: String,
         systemPromptFile: String? = nil,
-        environment: [String: String] = [:]
+        environment: [String: String] = [:],
+        hostBinDirs: [String] = []
     ) -> String {
         let quotedDir = workingDirectory.replacingOccurrences(of: "'", with: "'\\''")
         // `mkdir -p` before `cd`, because a project on another machine has
@@ -3225,7 +3229,7 @@ extension TeamOrchestrator {
         // The launch has to see the same PATH the probe did. Finding a CLI and
         // then starting a shell that cannot is the worst of both: the guard
         // passes and the pane dies with "command not found".
-        let enter = RemoteShellPath.prologue
+        let enter = RemoteShellPath.prologue(hostBinDirs: hostBinDirs)
             + "mkdir -p '\(quotedDir)' && cd '\(quotedDir)'"
         // The host profile's variables, as an assignment prefix scoped to the
         // CLI itself (`K='v' claude …`). This is where a per-machine
@@ -3267,7 +3271,8 @@ extension TeamOrchestrator {
         workingDirectory: String,
         grant: Termmesh_Peer_V1_TeamLeaderGrant,
         systemPromptFile: String? = nil,
-        environment: [String: String] = [:]
+        environment: [String: String] = [:],
+        hostBinDirs: [String] = []
     ) -> String {
         let hexGrant = grant.grantID.map { String(format: "%02x", $0) }.joined()
         let exports = [
@@ -3285,7 +3290,8 @@ extension TeamOrchestrator {
             teamName: teamName,
             workingDirectory: workingDirectory,
             systemPromptFile: systemPromptFile,
-            environment: environment
+            environment: environment,
+            hostBinDirs: hostBinDirs
         )
         // `export` applies to the final CLI, unlike a shell assignment prefix
         // before `mkdir`, which would have scoped the grant to that one setup

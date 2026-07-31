@@ -115,6 +115,9 @@ message Hello {
   repeated string capabilities = 4;
   // term-mesh marketing version; diagnostics only.
   string app_version = 5;
+  // Absolute directories containing CLIs shipped beside this host process.
+  // Consumers require host.cli-bin-dirs.v1 and successful authentication.
+  repeated string cli_bin_dirs = 6;
 }
 
 message AuthChallenge {

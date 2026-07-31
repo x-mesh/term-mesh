@@ -11,7 +11,7 @@ import Foundation
 
 enum PeerHostTestResult: Equatable {
     /// SSH tunnel + peer protocol handshake both succeeded.
-    case ok(socketPath: String)
+    case ok(socketPath: String, hostCLIBinDirs: [String])
     /// SSH reached the host but no live peer socket was found —
     /// term-meshd is likely not installed/running. Install is offered.
     case daemonMissing
@@ -356,7 +356,10 @@ enum PeerHostDoctor {
             RemoteWorkLog.debugOffMain(
                 "Relay health check passed for \(sshTarget) via \(socketPath)"
             )
-            return .ok(socketPath: socketPath)
+            return .ok(
+                socketPath: socketPath,
+                hostCLIBinDirs: connection.hostCLIBinDirs
+            )
         } catch {
             tunnel.stop()
             let message = String(describing: error)

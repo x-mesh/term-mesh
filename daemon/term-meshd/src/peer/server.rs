@@ -615,6 +615,7 @@ mod integration_tests {
                     display_name: "integration-test".into(),
                     capabilities: peer_proto::capability::supported_vec(),
                     app_version: "test".into(),
+                    cli_bin_dirs: vec![],
                 })),
             },
         )
@@ -821,6 +822,7 @@ mod integration_tests {
                     display_name: "reviewer".into(),
                     capabilities: peer_proto::capability::supported_vec(),
                     app_version: "test".into(),
+                    cli_bin_dirs: vec![],
                 })),
             },
         )
@@ -945,6 +947,7 @@ mod integration_tests {
                     display_name: "live-review".into(),
                     capabilities: peer_proto::capability::supported_vec(),
                     app_version: "live".into(),
+                    cli_bin_dirs: vec![],
                 })),
             },
         )
@@ -1136,6 +1139,7 @@ mod integration_tests {
                     display_name: "integration-test".into(),
                     capabilities: peer_proto::capability::supported_vec(),
                     app_version: "test".into(),
+                    cli_bin_dirs: vec![],
                 })),
             },
         )
@@ -1233,6 +1237,7 @@ mod integration_tests {
                     display_name: "integration-test".into(),
                     capabilities: peer_proto::capability::supported_vec(),
                     app_version: "test".into(),
+                    cli_bin_dirs: vec![],
                 })),
             },
         )
@@ -2083,6 +2088,7 @@ mod integration_tests {
                     display_name: display.into(),
                     capabilities: caps,
                     app_version: "test".into(),
+                    cli_bin_dirs: vec![],
                 })),
             },
         )
@@ -2441,6 +2447,7 @@ mod integration_tests {
                     display_name: "list-test".into(),
                     capabilities: peer_proto::capability::supported_vec(),
                     app_version: "test".into(),
+                    cli_bin_dirs: vec![],
                 })),
             },
         )
@@ -2653,6 +2660,7 @@ mod integration_tests {
                     display_name: "integration-test".into(),
                     capabilities: peer_proto::capability::supported_vec(),
                     app_version: "test".into(),
+                    cli_bin_dirs: vec![],
                 })),
             },
         )
@@ -2730,6 +2738,7 @@ mod integration_tests {
                     display_name: "adversarial-capabilities-test".into(),
                     capabilities,
                     app_version: "test".into(),
+                    cli_bin_dirs: vec![],
                 })),
             },
         )
@@ -3107,6 +3116,7 @@ mod integration_tests {
                     display_name: "wc-test".into(),
                     capabilities: peer_proto::capability::supported_vec(),
                     app_version: "test".into(),
+                    cli_bin_dirs: vec![],
                 })),
             },
         )

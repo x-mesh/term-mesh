@@ -32,13 +32,14 @@ use tokio::net::UnixStream;
 use tokio::sync::{broadcast, mpsc, Notify, OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinHandle;
 
-use crate::monitor::SystemSnapshot;
 use super::framing::{read_envelope, write_envelope};
 use super::layout::{self, PeerHost};
 use super::surface::{
     EnsureDisposition, EnsureError, EnsureOutcome, EnsureRestartPolicy, PtyChunk, PtySurface,
     SurfaceSpec,
 };
+use crate::headless::cli_builder::executable_bin_dir;
+use crate::monitor::SystemSnapshot;
 
 pub const PROTOCOL_VERSION: &str = "1.0.0";
 pub const HOST_DISPLAY_NAME_ENV: &str = "TERMMESH_PEER_DISPLAY_NAME";
@@ -1442,6 +1443,7 @@ fn host_hello(seq_counter: &AtomicU64, has_teams: bool) -> Envelope {
                 })
                 .collect(),
             app_version: env!("CARGO_PKG_VERSION").into(),
+            cli_bin_dirs: executable_bin_dir().into_iter().collect(),
         })),
     }
 }
@@ -3018,11 +3020,12 @@ mod resume_tests {
 
 #[cfg(test)]
 mod team_leader_capability_tests {
+    use std::path::Path;
     use std::sync::atomic::AtomicU64;
 
     use peer_proto::{capability, v1::envelope::Payload};
 
-    use super::host_hello;
+    use super::{executable_bin_dir, host_hello};
 
     #[test]
     fn no_team_host_still_advertises_reverse_remote_leader_route() {
@@ -3043,6 +3046,26 @@ mod team_leader_capability_tests {
             .capabilities
             .iter()
             .any(|cap| cap == capability::TEAM_CALL_V1));
+    }
+
+    #[test]
+    fn host_hello_advertises_its_authenticated_cli_bin_directory() {
+        let envelope = host_hello(&AtomicU64::new(0), false);
+        let Some(Payload::Hello(hello)) = envelope.payload else {
+            panic!("host hello must contain Hello payload");
+        };
+        assert!(hello
+            .capabilities
+            .iter()
+            .any(|cap| cap == capability::HOST_CLI_BIN_DIRS_V1));
+        assert_eq!(
+            hello.cli_bin_dirs,
+            executable_bin_dir().into_iter().collect::<Vec<_>>()
+        );
+        assert!(hello
+            .cli_bin_dirs
+            .iter()
+            .all(|path| !path.is_empty() && Path::new(path).is_absolute()));
     }
 }
 

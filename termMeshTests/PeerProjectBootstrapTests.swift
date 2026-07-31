@@ -1211,13 +1211,13 @@ final class PeerProjectBootstrapTests: XCTestCase {
         XCTAssertTrue(launch.hasPrefix("export PATH="), "PATH has to be set before anything runs")
         XCTAssertEqual(
             RemoteShellPath.binDirs.first,
-            "/Applications/term-mesh.app/Contents/Resources/bin"
+            "$HOME/.local/bin"
         )
         XCTAssertTrue(launch.contains("$HOME/.local/bin"))
-        XCTAssertTrue(launch.contains(":$PATH\""), "the host's own PATH must survive, last")
+        XCTAssertTrue(launch.contains(":\"$PATH\""), "the host's own PATH must survive, last")
         // Ordering matters as much as membership: a cd into the project before
         // PATH is set would run the CLI lookup with the old PATH.
-        let pathEnd = try? XCTUnwrap(launch.range(of: ":$PATH\";"))
+        let pathEnd = try? XCTUnwrap(launch.range(of: ":\"$PATH\";"))
         let cd = try? XCTUnwrap(launch.range(of: "cd '"))
         if let pathEnd, let cd {
             XCTAssertLessThan(pathEnd.lowerBound, cd.lowerBound)
@@ -1300,8 +1300,65 @@ final class PeerProjectBootstrapTests: XCTestCase {
             cli: "claude", model: "sonnet", agentName: "worker",
             teamName: "demo", workingDirectory: "/srv/demo"
         )
-        XCTAssertTrue(launch.hasPrefix(RemoteShellPath.prologue))
+        XCTAssertTrue(launch.hasPrefix(RemoteShellPath.prologue()))
         XCTAssertTrue(RemoteShellPath.binDirs.contains("$HOME/.local/bin"))
+    }
+
+    @MainActor
+    func test_remote_launch_prepends_authenticated_shell_quoted_host_bin_dirs() {
+        let hostBinDirs = [
+            "/Applications/Term Mesh.app/Contents/Resources/bin",
+            "/opt/it's-here/bin",
+        ]
+        let launch = TeamOrchestrator.remoteAgentCommand(
+            cli: "codex",
+            model: "gpt-5",
+            agentName: "executor",
+            teamName: "quoted-path",
+            workingDirectory: "/tmp/project",
+            hostBinDirs: hostBinDirs
+        )
+
+        XCTAssertTrue(launch.hasPrefix(RemoteShellPath.prologue(hostBinDirs: hostBinDirs)))
+        XCTAssertTrue(launch.contains("'/Applications/Term Mesh.app/Contents/Resources/bin'"))
+        XCTAssertTrue(launch.contains("'/opt/it'\\''s-here/bin'"))
+        XCTAssertTrue(launch.contains("\"$HOME/.local/bin\""))
+        XCTAssertTrue(launch.contains(":\"$PATH\"; mkdir -p"))
+    }
+
+    func test_readiness_bin_dirs_match_exact_saved_profile_identity() {
+        let wantedID = UUID()
+        let hosts = [
+            HostEntry(
+                id: "ssh:stale",
+                displayName: "stale",
+                connectionState: .connected,
+                workspaces: [],
+                activeSockPath: "/tmp/stale.sock",
+                sshTarget: "shared",
+                profileID: UUID(),
+                hostCLIBinDirs: ["/stale/bin"]
+            ),
+            HostEntry(
+                id: "ssh:saved",
+                displayName: "saved",
+                connectionState: .connected,
+                workspaces: [],
+                activeSockPath: "/tmp/saved.sock",
+                sshTarget: "shared",
+                profileID: wantedID,
+                hostCLIBinDirs: ["/exact/bin"]
+            ),
+        ]
+
+        XCTAssertEqual(
+            RemoteHostStore.hostCLIBinDirs(forProfileID: wantedID, in: hosts),
+            ["/exact/bin"]
+        )
+        XCTAssertEqual(
+            RemoteHostStore.hostCLIBinDirs(forProfileID: UUID(), in: hosts),
+            []
+        )
     }
 
     /// A directory with a quote in it stays one argument.

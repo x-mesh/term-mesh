@@ -348,6 +348,9 @@ struct HostEntry: Identifiable {
     /// CRUD menu items gate on `== true` rather than treating nil as
     /// permissive, so a stale/unknown host defaults to disabled.
     var supportsWorkspaceLifecycle: Bool?
+    /// Authenticated host CLI directories. Live-session cache only: never
+    /// written to PeerHostProfile/UserDefaults and cleared with the socket.
+    var hostCLIBinDirs: [String] = []
 
     var isConnected: Bool { connectionState == .connected }
 
@@ -371,6 +374,17 @@ struct HostEntry: Identifiable {
 @MainActor
 final class RemoteHostStore: ObservableObject {
     static let shared = RemoteHostStore()
+
+    /// Returns readiness metadata only for the exact saved profile. SSH
+    /// targets are editable and can be reused, so target-only matching can
+    /// leak a stale connection's authenticated CLI directories into another
+    /// profile's readiness probe.
+    nonisolated static func hostCLIBinDirs(
+        forProfileID profileID: UUID,
+        in hosts: [HostEntry]
+    ) -> [String] {
+        hosts.first { $0.profileID == profileID && $0.isConnected }?.hostCLIBinDirs ?? []
+    }
 
     /// Fired after a successful sidebar connect so the mounted host
     /// group force-expands (its fold state is view-local @State).
@@ -574,6 +588,7 @@ final class RemoteHostStore: ObservableObject {
                 // If it changed, refresh activeSockPath and re-fetch workspaces so
                 // WorkspaceSummary.hostSockPath never points to the dead tunnel.
                 if hosts[key]?.activeSockPath != conn.hostSockPath {
+                    hosts[key]?.hostCLIBinDirs = []
                     hosts[key]?.activeSockPath = conn.hostSockPath
                     hosts[key]?.workspaces = []
                     fetchWorkspaces(for: conn.hostSockPath, key: key)
@@ -589,6 +604,7 @@ final class RemoteHostStore: ObservableObject {
         where !activeKeys.contains(key) && sidebarLeases[key] == nil {
             if hosts[key]?.connectionState == .connected {
                 hosts[key]?.connectionState = .saved
+                hosts[key]?.hostCLIBinDirs = []
             }
         }
     }
@@ -703,6 +719,7 @@ final class RemoteHostStore: ObservableObject {
                 // cancelConnectingHost already restored the row to `.saved`.
             } catch {
                 guard self.connectAttemptIDs[key] == attemptID else { return }
+                self.hosts[key]?.hostCLIBinDirs = []
                 self.hosts[key]?.connectionState = .failed(String(describing: error))
                 #if DEBUG
                 dlog("peer.sidebar.connect fail key=\(key) error=\(error)")
@@ -730,6 +747,7 @@ final class RemoteHostStore: ObservableObject {
         hosts[key]?.workspaces = []
         hosts[key]?.activeSockPath = ""
         hosts[key]?.supportsWorkspaceLifecycle = nil
+        hosts[key]?.hostCLIBinDirs = []
         hosts[key]?.connectionState = .saved
         #if DEBUG
         dlog("peer.sidebar.connect cancelled key=\(key)")
@@ -769,6 +787,7 @@ final class RemoteHostStore: ObservableObject {
         hosts[key]?.workspaces = []
         hosts[key]?.activeSockPath = ""
         hosts[key]?.supportsWorkspaceLifecycle = nil
+        hosts[key]?.hostCLIBinDirs = []
         hosts[key]?.connectionState = .saved
         #if DEBUG
         dlog("peer.sidebar.connect retry key=\(key) cancelledPending=\(cancelledPending)")
@@ -856,6 +875,7 @@ final class RemoteHostStore: ObservableObject {
         hosts[key]?.workspaces = []
         hosts[key]?.activeSockPath = ""
         hosts[key]?.supportsWorkspaceLifecycle = nil
+        hosts[key]?.hostCLIBinDirs = []
         hosts[key]?.connectionState = .saved
         #if DEBUG
         dlog("peer.sidebar.forceDisconnect key=\(key) closed=\(ids.count)")
@@ -914,6 +934,7 @@ final class RemoteHostStore: ObservableObject {
         hosts[key]?.workspaces = []
         hosts[key]?.activeSockPath = ""
         hosts[key]?.supportsWorkspaceLifecycle = nil
+        hosts[key]?.hostCLIBinDirs = []
         if hosts[key]?.connectionState == .connected {
             hosts[key]?.connectionState = .saved
         }
@@ -951,12 +972,16 @@ final class RemoteHostStore: ObservableObject {
                 if !Task.isCancelled, self.hosts[key]?.activeSockPath == path {
                     self.hosts[key]?.supportsWorkspaceLifecycle =
                         conn.hostCapabilities.has(PeerCapability.workspaceLifecycleV1)
+                    self.hosts[key]?.hostCLIBinDirs = conn.hostCLIBinDirs
                 }
                 let workspaces: [Termmesh_Peer_V1_Workspace]
                 do {
                     workspaces = try await conn.session.listWorkspaces()
                 } catch {
                     await conn.cancel()
+                    if self.hosts[key]?.activeSockPath == path {
+                        self.hosts[key]?.hostCLIBinDirs = []
+                    }
                     return
                 }
                 // Same connection, same round trip: a team roster is only
@@ -1024,6 +1049,7 @@ final class RemoteHostStore: ObservableObject {
                     self.hosts[key]?.connectionState = .failed(Self.unreachableReason)
                     self.hosts[key]?.workspaces = []
                     self.hosts[key]?.teams = []
+                    self.hosts[key]?.hostCLIBinDirs = []
                     TeamOrchestrator.shared.markRemoteAgentsUnreachable(
                         hostKey: key,
                         reason: Self.unreachableReason
@@ -1114,6 +1140,7 @@ final class RemoteHostStore: ObservableObject {
               hosts[key]?.isConnected == true
         else { return }
         hosts[key]?.connectionState = .failed(Self.unreachableReason)
+        hosts[key]?.hostCLIBinDirs = []
         TeamOrchestrator.shared.markRemoteAgentsUnreachable(
             hostKey: key,
             reason: Self.unreachableReason
