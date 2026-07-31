@@ -2563,10 +2563,26 @@ async fn dispatch(req: &Request, ctx: &Context) -> Response {
                                                 "result": result,
                                             }))
                                         }
-                                        Ok(response) => Err(format!(
-                                            "{}: {}",
-                                            response.error_code, response.error_message
-                                        )),
+                                        // A peer-level rejection is a
+                                        // successful proxy of a failed
+                                        // command, not a transport failure.
+                                        // Collapsing it into a generic
+                                        // JSON-RPC error string made
+                                        // `decode_daemon_response` hand that
+                                        // text straight back, so the CLI's
+                                        // `remote_leader_proxy_result` never
+                                        // saw the structured shape it parses:
+                                        // the error code, and every
+                                        // code-aware behaviour keyed on it,
+                                        // was lost before reaching the caller.
+                                        Ok(response) => Ok(serde_json::json!({
+                                            "ok": false,
+                                            "cached": response.cached,
+                                            "result": {
+                                                "error_code": response.error_code,
+                                                "error_message": response.error_message,
+                                            },
+                                        })),
                                         Err(error) => Err(error),
                                     }
                                 }

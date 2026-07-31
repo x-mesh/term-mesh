@@ -3815,6 +3815,43 @@ final class TeamOrchestrator: ObservableObject {
     ) -> DelegateOutcome {
         let title = taskTitle?.nilIfBlank ?? String(text.prefix(80))
         guard let team = teams[teamName] else { return .noSuchAgent }
+        // Resolve an idempotent request BEFORE target selection. The store
+        // dedupes on request_id too, but it is only reached once a target has
+        // been picked, and the pool gate rejects any instance still holding a
+        // non-terminal task. A retry sent while the first attempt was still
+        // running was therefore answered `.allInstancesBusy` naming the very
+        // task it was replaying; the dedup branch became reachable only after
+        // that task completed, which is the case where a second paste would
+        // have been least harmful.
+        if let requestId = requestId?.nilIfBlank,
+           let existing = TeamDataStore.shared.task(
+               teamName: teamName, requestId: requestId
+           ),
+           let replayTarget = team.agents.first(where: {
+               $0.agentInstanceId == existing.assigneeInstanceId
+           }) {
+            let instruction = formatDelegateInstruction(
+                teamName: teamName,
+                target: replayTarget,
+                task: existing,
+                text: text,
+                context: context
+            )
+            // Same async completion ordering as the paste path: the socket
+            // caller stores the outcome right after this returns, and a
+            // synchronous callback could resume it first.
+            if let completion {
+                DispatchQueue.main.async { completion(true) }
+            }
+            return .delivered(
+                DelegateResult(
+                    task: existing,
+                    textDelivered: true,
+                    requestReplayed: true,
+                    instruction: instruction
+                )
+            )
+        }
         let named = team.agents.filter { $0.name == agentName }
         let target: AgentMember? = {
             if let agentInstanceId {
