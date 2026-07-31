@@ -1,4 +1,5 @@
 import AppKit
+import Darwin
 import Foundation
 import os
 
@@ -273,9 +274,34 @@ extension TerminalController {
     }
 
     func writeSocketResponse(_ response: String, to socket: Int32) {
-        let payload = response + "\n"
-        payload.withCString { ptr in
-            _ = write(socket, ptr, strlen(ptr))
+        let payload = Data((response + "\n").utf8)
+        _ = Self.writeAllSocketBytes(payload) { pointer, count in
+            Darwin.write(socket, pointer, count)
+        }
+    }
+
+    @discardableResult
+    nonisolated static func writeAllSocketBytes(
+        _ bytes: Data,
+        using writeBytes: (_ pointer: UnsafeRawPointer, _ count: Int) -> Int
+    ) -> Bool {
+        bytes.withUnsafeBytes { buffer in
+            guard let baseAddress = buffer.baseAddress else { return true }
+            var offset = 0
+            while offset < buffer.count {
+                let written = writeBytes(
+                    baseAddress.advanced(by: offset),
+                    buffer.count - offset
+                )
+                if written > 0 {
+                    offset += written
+                } else if written < 0, errno == EINTR {
+                    continue
+                } else {
+                    return false
+                }
+            }
+            return true
         }
     }
 

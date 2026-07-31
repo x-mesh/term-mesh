@@ -401,24 +401,22 @@ class TerminalController {
         }
 
         var buffer = [UInt8](repeating: 0, count: 4096)
-        var pending = ""
+        var pending = Data()
         var authenticated = false
 
         while isRunning {
             let bytesRead = read(socket, &buffer, buffer.count - 1)
             guard bytesRead > 0 else { break }
 
-            let chunk = String(bytes: buffer[0..<bytesRead], encoding: .utf8) ?? ""
-            pending.append(chunk)
-
-            if pending.utf8.count > 1_048_576 { // 1 MB — no newline arrived; drop connection
+            guard let frames = Self.appendControlSocketChunk(
+                Data(buffer[0..<bytesRead]),
+                to: &pending
+            ) else {
                 Logger.socket.warning("handleClient: pending buffer exceeded 1 MB, closing connection")
                 break
             }
 
-            while let newlineIndex = pending.firstIndex(of: "\n") {
-                let line = String(pending[..<newlineIndex])
-                pending = String(pending[pending.index(after: newlineIndex)...])
+            for line in frames {
                 let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
                 guard !trimmed.isEmpty else { continue }
 
@@ -431,6 +429,29 @@ class TerminalController {
                 writeSocketResponse(response, to: socket)
             }
         }
+    }
+
+    /// Appends raw socket bytes and decodes only complete LF-delimited frames.
+    /// Keeping the pending buffer as bytes prevents a split UTF-8 scalar from
+    /// invalidating either read chunk. A nil result means the raw pending-byte
+    /// limit was exceeded before a newline arrived.
+    nonisolated static func appendControlSocketChunk(
+        _ chunk: Data,
+        to pending: inout Data,
+        maxPendingBytes: Int = 1_048_576
+    ) -> [String]? {
+        pending.append(chunk)
+        guard pending.count <= maxPendingBytes else { return nil }
+
+        var frames: [String] = []
+        while let newlineIndex = pending.firstIndex(of: 0x0A) {
+            let frame = Data(pending[..<newlineIndex])
+            pending.removeSubrange(...newlineIndex)
+            if let line = String(data: frame, encoding: .utf8) {
+                frames.append(line)
+            }
+        }
+        return frames
     }
 
     private func processCommand(_ command: String) -> String {
