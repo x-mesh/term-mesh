@@ -1133,11 +1133,15 @@ actor PeerServerSession {
         }
         let encodedBytes = (try? request.serializedData().count)
             ?? (PeerTeamLeader.maxCommandPayloadBytes + 1)
+        let registered = await teamLeaderControlPlane.registeredGrant(
+            id: request.grant.grantID
+        )
         guard case .success = PeerTeamLeader.validateCommand(
             request,
-            registeredGrant: request.grant,
+            registeredGrant: registered?.value ?? request.grant,
+            registeredValidUntilUnixSeconds: registered?.validUntilLeaseSeconds,
             encodedBytes: encodedBytes,
-            nowUnixSeconds: UInt64(Date().timeIntervalSince1970)
+            nowUnixSeconds: UInt64(ProcessInfo.processInfo.systemUptime)
         ) else {
             throw PeerServerError.noMatchingLeaderSession
         }

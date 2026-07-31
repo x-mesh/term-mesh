@@ -433,6 +433,27 @@ final class PeerTeamLeaderTests: XCTestCase {
         )
     }
 
+    func testRegisterGrantDefaultLeaseIsEvictedAfterItsWallLifetimeElapses() async {
+        let controlPlane = PeerTeamLeaderControlPlane()
+        var grant = validGrant()
+        grant.expiresAtUnixSecs = UInt64(Date().timeIntervalSince1970) - 1
+        await controlPlane.registerGrant(grant, nowLeaseSeconds: 10)
+
+        let response = await controlPlane.execute(
+            validCommand(grant: grant, requestByte: 93),
+            encodedBytes: 128,
+            nowUnixSeconds: UInt64(Date().timeIntervalSince1970),
+            nowLeaseSeconds: 11
+        ) { _, _, _ in .success("{}") }
+
+        XCTAssertFalse(response.ok)
+        XCTAssertEqual(
+            response.errorCode,
+            PeerTeamLeader.ValidationError.unknownGrant.rawValue,
+            "an expired wall timestamp must not become an immortal uptime lease"
+        )
+    }
+
     private func validRequest() -> Termmesh_Peer_V1_TeamLeaderBootstrapRequest {
         var request = Termmesh_Peer_V1_TeamLeaderBootstrapRequest()
         request.projectID = "name:demo"

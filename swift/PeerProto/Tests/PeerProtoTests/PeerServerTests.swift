@@ -689,6 +689,7 @@ final class PeerServerTests: XCTestCase {
     func testServerRoutesReverseLeaderCommandToMatchingViewerSession() async throws {
         let sockPath = "/tmp/tm-peer-reverse-leader-\(UUID().uuidString.prefix(8)).sock"
         defer { try? FileManager.default.removeItem(atPath: sockPath) }
+        let controlPlane = PeerTeamLeaderControlPlane()
         var surface = Termmesh_Peer_V1_SurfaceInfo()
         surface.surfaceID = Data(repeating: 0x73, count: 16)
         surface.title = "leader"
@@ -697,7 +698,8 @@ final class PeerServerTests: XCTestCase {
         surface.attachable = true
         let server = PeerServer(
             socketPath: sockPath,
-            provider: EchoSurfaceProvider(surfaces: [surface])
+            provider: EchoSurfaceProvider(surfaces: [surface]),
+            teamLeaderControlPlane: controlPlane
         )
         try await server.start()
         defer { Task { await server.stop() } }
@@ -720,15 +722,25 @@ final class PeerServerTests: XCTestCase {
             rows: 24
         )
 
-        var grant = Termmesh_Peer_V1_TeamLeaderGrant()
-        grant.grantID = Data(
-            repeating: 0x91,
-            count: PeerTeamLeader.grantIDBytes
+        let wallNow = UInt64(Date().timeIntervalSince1970)
+        let leaseNow = UInt64(ProcessInfo.processInfo.systemUptime)
+        var bootstrapRequest = Termmesh_Peer_V1_TeamLeaderBootstrapRequest()
+        bootstrapRequest.projectID = "name:demo"
+        bootstrapRequest.leaderPlacement = .peer
+        bootstrapRequest.requestID = Data(
+            repeating: 0x90,
+            count: PeerTeamLeader.requestIDBytes
         )
-        grant.projectID = "name:demo"
-        grant.teamUuid = "team-uuid"
-        grant.role = .leader
-        grant.expiresAtUnixSecs = UInt64(Date().timeIntervalSince1970) + 60
+        let bootstrap = await controlPlane.bootstrap(
+            bootstrapRequest,
+            encodedBytes: 64,
+            nowUnixSeconds: wallNow - 120,
+            nowLeaseSeconds: leaseNow,
+            grantLifetimeSeconds: 60
+        ) { _ in "team-uuid" }
+        XCTAssertTrue(bootstrap.ok)
+        let grant = bootstrap.grant
+        XCTAssertLessThan(grant.expiresAtUnixSecs, wallNow)
         var request = Termmesh_Peer_V1_TeamLeaderCommandRequest()
         request.grant = grant
         request.teamUuid = grant.teamUuid
@@ -738,6 +750,13 @@ final class PeerServerTests: XCTestCase {
         )
         request.method = "team.status"
         request.paramsJson = "{}"
+        let renewal = await controlPlane.execute(
+            request,
+            encodedBytes: try request.serializedData().count,
+            nowUnixSeconds: wallNow,
+            nowLeaseSeconds: leaseNow
+        ) { _, _, _ in .success("{}") }
+        XCTAssertTrue(renewal.ok, "the live uptime lease must renew past wire expiry")
 
         let leaderRequest = request
         async let routedResponse = server.callTeamLeader(
@@ -764,6 +783,33 @@ final class PeerServerTests: XCTestCase {
         let completed = try await routedResponse
         XCTAssertTrue(completed.ok)
         XCTAssertEqual(completed.resultJson, #"{"team_name":"demo"}"#)
+
+        var elapsedGrant = grant
+        elapsedGrant.grantID = Data(
+            repeating: 0x93,
+            count: PeerTeamLeader.grantIDBytes
+        )
+        elapsedGrant.expiresAtUnixSecs = wallNow - 1
+        await controlPlane.registerGrant(
+            elapsedGrant,
+            nowLeaseSeconds: leaseNow > 0 ? leaseNow - 1 : 0
+        )
+        var elapsedRequest = request
+        elapsedRequest.grant = elapsedGrant
+        elapsedRequest.requestID = Data(
+            repeating: 0x94,
+            count: PeerTeamLeader.requestIDBytes
+        )
+        do {
+            _ = try await server.callTeamLeader(
+                elapsedRequest,
+                targetPeerID: viewerPeerID,
+                timeoutSeconds: 0.1
+            )
+            XCTFail("an elapsed registered lease must be rejected")
+        } catch {
+            XCTAssertEqual(error as? PeerServerError, .noMatchingLeaderSession)
+        }
 
         do {
             _ = try await server.callTeamLeader(

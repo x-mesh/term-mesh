@@ -565,7 +565,9 @@ public actor PeerSession {
             request,
             registeredGrant: grant,
             encodedBytes: encodedBytes,
-            nowUnixSeconds: UInt64(Date().timeIntervalSince1970)
+            // The server owns expiry because only it can see and renew the
+            // uptime-based lease. This preflight checks command shape only.
+            nowUnixSeconds: 0
         ) else {
             throw PeerSessionError.invalidTeamLeaderCommand(
                 "grant, team_uuid, request_id, method or params_json is invalid"

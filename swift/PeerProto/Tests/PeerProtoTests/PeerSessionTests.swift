@@ -342,17 +342,20 @@ actor TeamRPCMockHost {
     let transport: MockTransport
     let capabilities: [String]
     let consumeRequest: Bool
+    let replyToLeaderCommand: Bool
     private var pendingInbound = Data()
     private var seq: UInt64 = 0
 
     init(
         transport: MockTransport,
         capabilities: [String],
-        consumeRequest: Bool = false
+        consumeRequest: Bool = false,
+        replyToLeaderCommand: Bool = false
     ) {
         self.transport = transport
         self.capabilities = capabilities
         self.consumeRequest = consumeRequest
+        self.replyToLeaderCommand = replyToLeaderCommand
     }
 
     func run() async throws {
@@ -375,7 +378,20 @@ actor TeamRPCMockHost {
         result.accepted = true
         result.sessionID = Data(count: 16)
         try await sendEnvelope { $0.authResult = result }
-        if consumeRequest { _ = try await readFrame() }
+        if replyToLeaderCommand {
+            let request = try await readFrame()
+            guard case .teamLeaderCommandRequest = request.payload else {
+                throw PeerSessionError.unexpectedMessage(
+                    String(describing: request.payload)
+                )
+            }
+            var response = Termmesh_Peer_V1_TeamLeaderCommandResponse()
+            response.ok = true
+            response.resultJson = "{}"
+            try await sendEnvelope { $0.teamLeaderCommandResponse = response }
+        } else if consumeRequest {
+            _ = try await readFrame()
+        }
     }
 
     private func sendEnvelope(
@@ -615,6 +631,41 @@ final class PeerSessionTests: XCTestCase {
         }
         writtenFrameCount = await transport.writtenFrameCount()
         XCTAssertEqual(writtenFrameCount, 2)
+    }
+
+    func testLeaderClientPreflightDoesNotRejectServerRenewedWireExpiry() async throws {
+        let transport = MockTransport()
+        let host = TeamRPCMockHost(
+            transport: transport,
+            capabilities: [PeerCapability.teamLeaderV1],
+            replyToLeaderCommand: true
+        )
+        let hostTask = Task { try await host.run() }
+        let session = PeerSession(
+            read: { await transport.clientRead() },
+            write: { await transport.clientWrite($0) }
+        )
+        _ = try await session.handshake()
+
+        var grant = Termmesh_Peer_V1_TeamLeaderGrant()
+        grant.grantID = Data(repeating: 0xA1, count: PeerTeamLeader.grantIDBytes)
+        grant.projectID = "name:demo"
+        grant.teamUuid = "team-uuid"
+        grant.role = .leader
+        grant.expiresAtUnixSecs = 1
+        let response = try await session.callTeamLeader(
+            grant: grant,
+            teamUUID: grant.teamUuid,
+            requestID: Data(
+                repeating: 0xA2,
+                count: PeerTeamLeader.requestIDBytes
+            ),
+            method: "team.status",
+            paramsJSON: "{}"
+        )
+
+        XCTAssertTrue(response.ok)
+        try await hostTask.value
     }
 
     func testAdvertisedTeamRPCThatNeverRepliesTimesOut() async throws {

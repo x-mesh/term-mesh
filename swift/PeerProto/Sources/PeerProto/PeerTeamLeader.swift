@@ -211,6 +211,11 @@ public actor PeerTeamLeaderControlPlane {
         let renewalLifetimeSeconds: UInt64?
     }
 
+    struct RegisteredGrantSnapshot: Sendable {
+        let value: Termmesh_Peer_V1_TeamLeaderGrant
+        let validUntilLeaseSeconds: UInt64
+    }
+
     private let maxCacheEntries: Int
     private let maxAuditEntries: Int
     private let maxBootstrapEntries: Int
@@ -244,13 +249,28 @@ public actor PeerTeamLeaderControlPlane {
     public func registerGrant(
         _ grant: Termmesh_Peer_V1_TeamLeaderGrant,
         audiencePeerID: Data? = nil,
-        renewalLifetimeSeconds: UInt64? = nil
+        renewalLifetimeSeconds: UInt64? = nil,
+        nowLeaseSeconds: UInt64? = nil
     ) {
         guard grant.grantID.count == PeerTeamLeader.grantIDBytes else { return }
+        let leaseNow = nowLeaseSeconds ?? Self.awakeClockSeconds()
+        let wallNow = Self.wallClockSeconds()
+        let remaining = grant.expiresAtUnixSecs > wallNow
+            ? grant.expiresAtUnixSecs - wallNow
+            : 0
         storeGrant(
             grant,
             audiencePeerID: audiencePeerID,
-            renewalLifetimeSeconds: renewalLifetimeSeconds
+            renewalLifetimeSeconds: renewalLifetimeSeconds,
+            validUntilLeaseSeconds: leaseNow &+ remaining
+        )
+    }
+
+    func registeredGrant(id: Data) -> RegisteredGrantSnapshot? {
+        guard let registered = grants[id] else { return nil }
+        return RegisteredGrantSnapshot(
+            value: registered.value,
+            validUntilLeaseSeconds: registered.validUntilLeaseSeconds
         )
     }
 
@@ -437,15 +457,14 @@ public actor PeerTeamLeaderControlPlane {
         _ grant: Termmesh_Peer_V1_TeamLeaderGrant,
         audiencePeerID: Data?,
         renewalLifetimeSeconds: UInt64?,
-        validUntilLeaseSeconds: UInt64? = nil
+        validUntilLeaseSeconds: UInt64
     ) {
         grantOrder.removeAll { $0 == grant.grantID }
         grantOrder.append(grant.grantID)
         grants[grant.grantID] = RegisteredGrant(
             value: grant,
             audiencePeerID: audiencePeerID,
-            validUntilLeaseSeconds: validUntilLeaseSeconds
-                ?? grant.expiresAtUnixSecs,
+            validUntilLeaseSeconds: validUntilLeaseSeconds,
             renewalLifetimeSeconds: renewalLifetimeSeconds
         )
         while grantOrder.count > maxGrantEntries {
