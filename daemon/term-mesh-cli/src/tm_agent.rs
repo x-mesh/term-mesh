@@ -3820,7 +3820,27 @@ struct RemoteLeaderRoute {
     target_peer_id_hex: String,
 }
 
+#[cfg(test)]
+static REMOTE_LEADER_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(test)]
+thread_local! {
+    static REMOTE_LEADER_ENV_LOCK_HELD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 fn remote_leader_route() -> Option<RemoteLeaderRoute> {
+    // Tests that temporarily isolate the process-global leader route hold this
+    // lock for their duration. Other test threads must not observe the cleared
+    // environment; the owning thread is allowed to call this function while
+    // retaining the guard.
+    #[cfg(test)]
+    let _env_lock = REMOTE_LEADER_ENV_LOCK_HELD.with(|held| {
+        (!held.get()).then(|| {
+            REMOTE_LEADER_ENV_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+        })
+    });
     let grant_id_hex = env::var("TERMMESH_LEADER_GRANT_ID").ok()?;
     let project_id = env::var("TERMMESH_LEADER_PROJECT_ID").ok()?;
     let team_uuid = env::var("TERMMESH_LEADER_TEAM_UUID").ok()?;
@@ -12886,9 +12906,79 @@ fn xk_append_jsonl(path: &Path, entry: &Value) -> Result<(), String> {
 #[cfg(test)]
 mod xk_bridge_tests {
     use super::*;
+    use std::ffi::OsString;
+    use std::sync::MutexGuard;
+
+    const REMOTE_LEADER_ENV: [&str; 5] = [
+        "TERMMESH_LEADER_GRANT_ID",
+        "TERMMESH_LEADER_PROJECT_ID",
+        "TERMMESH_LEADER_TEAM_UUID",
+        "TERMMESH_LEADER_EXPIRES_AT",
+        "TERMMESH_LEADER_PEER_ID",
+    ];
+    /// Keep socket-backed bridge tests on their fake app socket even when the
+    /// caller is itself a scoped remote leader. Process environment mutation
+    /// is serialized, and every original (including non-UTF-8) value is put
+    /// back before another guarded test can run.
+    struct LocalRpcEnv {
+        saved: Vec<(&'static str, Option<OsString>)>,
+        _lock: MutexGuard<'static, ()>,
+    }
+
+    impl LocalRpcEnv {
+        fn new() -> Self {
+            let lock = REMOTE_LEADER_ENV_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            REMOTE_LEADER_ENV_LOCK_HELD.with(|held| {
+                assert!(!held.replace(true), "LocalRpcEnv cannot be nested");
+            });
+            let saved = REMOTE_LEADER_ENV
+                .iter()
+                .map(|&key| {
+                    let value = std::env::var_os(key);
+                    std::env::remove_var(key);
+                    (key, value)
+                })
+                .collect();
+            Self { saved, _lock: lock }
+        }
+    }
+
+    impl Drop for LocalRpcEnv {
+        fn drop(&mut self) {
+            for (key, value) in &self.saved {
+                match value {
+                    Some(value) => std::env::set_var(key, value),
+                    None => std::env::remove_var(key),
+                }
+            }
+            REMOTE_LEADER_ENV_LOCK_HELD.with(|held| held.set(false));
+        }
+    }
 
     fn header(lines: &[&str]) -> String {
         lines.join("\n")
+    }
+
+    #[test]
+    fn local_rpc_env_restores_prior_values() {
+        let before = {
+            let local_rpc = LocalRpcEnv::new();
+            let before = local_rpc.saved.clone();
+            assert!(REMOTE_LEADER_ENV
+                .iter()
+                .all(|key| std::env::var_os(key).is_none()));
+            before
+        };
+        let _lock = REMOTE_LEADER_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let after = REMOTE_LEADER_ENV
+            .iter()
+            .map(|&key| (key, std::env::var_os(key)))
+            .collect::<Vec<_>>();
+        assert_eq!(after, before);
     }
 
     #[test]
@@ -13101,6 +13191,7 @@ mod xk_bridge_tests {
 
     #[test]
     fn xk_run_mirrors_lifecycle_onto_board_idempotently() {
+        let _local_rpc = LocalRpcEnv::new();
         let (sock, calls) = fake_app_socket();
         let mut state = xk_state(Some(sock));
         // starting → create + in_progress
@@ -13133,6 +13224,7 @@ mod xk_bridge_tests {
 
     #[test]
     fn xk_run_failed_maps_to_blocked_with_reason() {
+        let _local_rpc = LocalRpcEnv::new();
         let (sock, calls) = fake_app_socket();
         let mut state = xk_state(Some(sock));
         handle_xk_run(&xk_run_event("starting", ""), &mut state).expect("starting");
@@ -13148,6 +13240,7 @@ mod xk_bridge_tests {
 
     #[test]
     fn xk_run_guards_skip_without_touching_the_board() {
+        let _local_rpc = LocalRpcEnv::new();
         // no app socket → no-op, no error
         let mut no_app = xk_state(None);
         handle_xk_run(&xk_run_event("starting", ""), &mut no_app).expect("no app");
