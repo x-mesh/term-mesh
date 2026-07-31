@@ -727,6 +727,7 @@ class PerTurnBridge:
     def _agy_thread(self) -> str | None:
         if not self.log_path:
             return None
+        fd = None
         try:
             flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
             fd = os.open(self.log_path, flags)
@@ -734,12 +735,16 @@ class PerTurnBridge:
             if (not stat.S_ISREG(metadata.st_mode)
                     or metadata.st_uid != os.getuid()
                     or stat.S_IMODE(metadata.st_mode) & 0o077):
-                os.close(fd)
                 return None
-            with os.fdopen(fd, encoding="utf-8", errors="replace") as fh:
+            fh = os.fdopen(fd, encoding="utf-8", errors="replace")
+            fd = None  # ownership transferred to fh
+            with fh:
                 found = self.AGY_CONVERSATION.findall(fh.read())
         except OSError:
             return None
+        finally:
+            if fd is not None:
+                os.close(fd)
         return found[-1] if found else None
 
     def _ensure_agy_log(self) -> None:

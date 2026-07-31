@@ -35,6 +35,28 @@ class AgyLogHardeningTests(unittest.TestCase):
             self.assertIsNone(bridge._agy_thread())
             bridge.stop()
 
+    def test_fstat_failure_closes_open_descriptor(self):
+        with tempfile.TemporaryDirectory() as root, \
+                patch.object(BRIDGE.tempfile, "gettempdir", return_value=root):
+            bridge = BRIDGE.PerTurnBridge("agy", "/work", None, CapturedEmitter())
+            bridge._ensure_agy_log()
+            real_open = BRIDGE.os.open
+            opened_fd = None
+
+            def capture_open(*args, **kwargs):
+                nonlocal opened_fd
+                opened_fd = real_open(*args, **kwargs)
+                return opened_fd
+
+            with patch.object(BRIDGE.os, "open", side_effect=capture_open), \
+                    patch.object(BRIDGE.os, "fstat", side_effect=OSError("injected")):
+                self.assertIsNone(bridge._agy_thread())
+
+            self.assertIsNotNone(opened_fd)
+            with self.assertRaises(OSError):
+                os.fstat(opened_fd)
+            bridge.stop()
+
 
 if __name__ == "__main__":
     unittest.main()

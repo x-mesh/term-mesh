@@ -4968,7 +4968,40 @@ fn normalize_self_referential_full_report(
     (normalized, Some(full_report.to_string()))
 }
 
+#[derive(Clone, Copy)]
+#[cfg(test)]
+enum AtomicWriteFault {
+    Write,
+    Sync,
+    Rename,
+}
+
 fn atomic_write_file(path: &Path, content: &str) -> Result<(), String> {
+    atomic_write_file_inner(path, content, false, false, false)
+}
+
+#[cfg(test)]
+fn atomic_write_file_with_fault(
+    path: &Path,
+    content: &str,
+    fault: Option<AtomicWriteFault>,
+) -> Result<(), String> {
+    atomic_write_file_inner(
+        path,
+        content,
+        matches!(fault, Some(AtomicWriteFault::Write)),
+        matches!(fault, Some(AtomicWriteFault::Sync)),
+        matches!(fault, Some(AtomicWriteFault::Rename)),
+    )
+}
+
+fn atomic_write_file_inner(
+    path: &Path,
+    content: &str,
+    fail_write: bool,
+    fail_sync: bool,
+    fail_rename: bool,
+) -> Result<(), String> {
     let dir = path
         .parent()
         .ok_or_else(|| format!("missing parent for {}", path.display()))?;
@@ -4998,16 +5031,31 @@ fn atomic_write_file(path: &Path, content: &str) -> Result<(), String> {
             Err(e) if e.kind() == ErrorKind::AlreadyExists => continue,
             Err(e) => return Err(format!("create temp {}: {e}", tmp.display())),
         };
-        if let Err(e) = file.write_all(content.as_bytes()) {
+        let write_result = if fail_write {
+            Err(std::io::Error::other("injected write failure"))
+        } else {
+            file.write_all(content.as_bytes())
+        };
+        if let Err(e) = write_result {
             let _ = fs::remove_file(&tmp);
             return Err(format!("write {}: {e}", tmp.display()));
         }
-        if let Err(e) = file.sync_all() {
+        let sync_result = if fail_sync {
+            Err(std::io::Error::other("injected sync failure"))
+        } else {
+            file.sync_all()
+        };
+        if let Err(e) = sync_result {
             let _ = fs::remove_file(&tmp);
             return Err(format!("sync {}: {e}", tmp.display()));
         }
         drop(file);
-        if let Err(e) = fs::rename(&tmp, path) {
+        let rename_result = if fail_rename {
+            Err(std::io::Error::other("injected rename failure"))
+        } else {
+            fs::rename(&tmp, path)
+        };
+        if let Err(e) = rename_result {
             let _ = fs::remove_file(&tmp);
             return Err(format!(
                 "rename {} -> {}: {e}",
@@ -5021,6 +5069,32 @@ fn atomic_write_file(path: &Path, content: &str) -> Result<(), String> {
     Err(format!(
         "failed to create unique temp file for {}",
         path.display()
+    ))
+}
+
+fn require_durable_reply(
+    alias: Result<PathBuf, String>,
+    task: Option<Result<PathBuf, String>>,
+) -> Result<(Option<PathBuf>, Option<PathBuf>, Vec<String>), String> {
+    let (alias_path, alias_error) = match alias {
+        Ok(path) => (Some(path), None),
+        Err(error) => (None, Some(error)),
+    };
+    let (task_path, task_error) = match task {
+        Some(Ok(path)) => (Some(path), None),
+        Some(Err(error)) => (None, Some(error)),
+        None => (None, None),
+    };
+    let errors = [alias_error, task_error]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+    if alias_path.is_some() || task_path.is_some() {
+        return Ok((alias_path, task_path, errors));
+    }
+    Err(format!(
+        "failed to preserve durable reply: {}",
+        errors.join("; ")
     ))
 }
 
@@ -7365,10 +7439,21 @@ fn main() {
                 );
             }
             content = normalized_content;
-            let alias_result_path = write_result_file(&team, &alias_name, &content).ok();
-            let task_result_path = reply_task_id
+            let alias_write = write_result_file(&team, &alias_name, &content);
+            let task_write = reply_task_id
                 .as_deref()
-                .and_then(|tid| write_result_file(&team, &format!("{tid}.md"), &content).ok());
+                .map(|tid| write_result_file(&team, &format!("{tid}.md"), &content));
+            let (alias_result_path, task_result_path, write_errors) =
+                match require_durable_reply(alias_write, task_write) {
+                    Ok(paths) => paths,
+                    Err(error) => {
+                        eprintln!("{error}");
+                        process::exit(1);
+                    }
+                };
+            for error in write_errors {
+                eprintln!("  Warning: one durable reply copy failed: {error}");
+            }
             let result_path = task_result_path.as_ref().or(alias_result_path.as_ref());
             let summary = truncate_summary(&content, 1500);
             let mut msg_params = json!({
@@ -7379,7 +7464,8 @@ fn main() {
                 msg_params["result_path"] = json!(path.to_string_lossy());
             }
             // team.message.post — retry once on failure, but never exit: the
-            // verdict is still recorded in the alias/task result files below and
+            // verdict was durably recorded in at least one alias/task result
+            // file and
             // the task is completed afterward, so a transient inbox-post failure
             // must not abort the reply (which would skip task completion and hang
             // the leader's wait). Mirrors the team.report handling just below.
@@ -15027,6 +15113,40 @@ mod auto_watch_tests {
 #[cfg(test)]
 mod reply_completion_regression_169_tests {
     use super::*;
+
+    #[test]
+    fn reply_requires_at_least_one_durable_copy() {
+        let full_reply = "x".repeat(1601);
+        assert_ne!(truncate_summary(&full_reply, 1500), full_reply);
+        for fault in [
+            AtomicWriteFault::Write,
+            AtomicWriteFault::Sync,
+            AtomicWriteFault::Rename,
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("reply.md");
+            let error = atomic_write_file_with_fault(&path, &full_reply, Some(fault))
+                .expect_err("injected durable write must fail");
+            assert!(!path.exists(), "a failed write must not publish a partial reply");
+            assert!(
+                require_durable_reply(Err(error.clone()), Some(Err(error))).is_err(),
+                "two failed durable writes must prevent reply completion"
+            );
+        }
+    }
+
+    #[test]
+    fn one_durable_copy_is_enough_to_continue() {
+        let durable = PathBuf::from("/tmp/task.md");
+        let (alias, task, errors) = require_durable_reply(
+            Err("alias failed".to_string()),
+            Some(Ok(durable.clone())),
+        )
+        .expect("the canonical task copy is durable");
+        assert_eq!(alias, None);
+        assert_eq!(task, Some(durable));
+        assert_eq!(errors, vec!["alias failed"]);
+    }
 
     #[test]
     fn bare_reply_closes_only_the_current_duplicate_name_instance_task() {
