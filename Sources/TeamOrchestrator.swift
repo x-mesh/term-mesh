@@ -4006,6 +4006,21 @@ final class TeamOrchestrator: ObservableObject {
                 )
             )
         }
+        // Mark from the completion, never from the synchronous return.
+        // `sendToAgentByPanel` answers `true` for a pipe-driven agent as soon
+        // as the write is queued on that agent's serial writer — the outcome
+        // arrives later, and it may be a failure. Marking on the optimistic
+        // Bool would record a delivery that never landed and let the next
+        // retry skip the paste, which is the very hole this closes. All three
+        // transports (native, pipe, terminal) report their real outcome here.
+        let taskId = task.id
+        let markOnDelivery: (Bool) -> Void = { landed in
+            if landed {
+                TeamDataStore.shared.markTextDelivered(
+                    teamName: teamName, taskId: taskId)
+            }
+            completion?(landed)
+        }
         // Deterministic per-pane delivery: when a valid, live, non-migrating panelId is
         // provided, bypass name round-robin (selectAgent) and paste directly into that
         // pane. The follow-up team.send_key Return carries the same panel_id (Rust side)
@@ -4023,14 +4038,8 @@ final class TeamOrchestrator: ObservableObject {
                 tabManager: tabManager,
                 withReturn: submit,
                 recordPendingReturnFor: target.agentInstanceId,
-                completion: completion
+                completion: markOnDelivery
             )
-            // The mark is what lets a later retry of the same request_id tell
-            // a lost reply from a paste that never landed.
-            if delivered {
-                TeamDataStore.shared.markTextDelivered(
-                    teamName: teamName, taskId: task.id)
-            }
             return .delivered(
                 DelegateResult(
                     task: task,
@@ -4051,12 +4060,8 @@ final class TeamOrchestrator: ObservableObject {
             text: instruction,
             tabManager: tabManager,
             withReturn: submit,
-            completion: completion
+            completion: markOnDelivery
         )
-        if delivered {
-            TeamDataStore.shared.markTextDelivered(
-                teamName: teamName, taskId: task.id)
-        }
         return .delivered(
             DelegateResult(
                 task: task,
