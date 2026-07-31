@@ -634,6 +634,9 @@ final class TeamOrchestrator: ObservableObject {
         var blockedReason: String?
         var reviewSummary: String?
         var createdBy: String
+        /// Caller-supplied idempotency key. The stored spelling intentionally
+        /// matches the delegate RPC field and persisted board JSON.
+        var request_id: String? = nil
         var result: String?
         var resultPath: String? = nil
         var worktreePolicy: String? = nil
@@ -3233,6 +3236,76 @@ final class TeamOrchestrator: ObservableObject {
         return nil
     }
 
+    /// The directory an agent's pane is actually sitting in.
+    ///
+    /// `parallel_telemetry.checkout` used to fall back to the workspace UUID,
+    /// which is not a path and reads like an identifier for somewhere else — a
+    /// leader collecting results took one for a remote checkout and went as far
+    /// as registering an ssh host key for a machine that was never involved.
+    ///
+    /// The real value has been on the member the whole time:
+    /// `originalAgentWorkDir` is the exact `agentWorkDir` the pane was spawned
+    /// with, and the capsule and restart paths already prefer
+    /// `worktreePath ?? originalAgentWorkDir`. This is that same order, with the
+    /// team's directory last because every member of a team without worktrees
+    /// runs there.
+    ///
+    /// Returns nil only when none of the three is known — a headless agent with
+    /// no pane. Callers publish `NSNull` rather than inventing a path.
+    nonisolated static func agentWorkingDirectory(
+        worktreePath: String?,
+        originalAgentWorkDir: String?,
+        teamWorkingDirectory: String?
+    ) -> String? {
+        for candidate in [worktreePath, originalAgentWorkDir, teamWorkingDirectory] {
+            if let value = candidate?.nilIfBlank { return value }
+        }
+        return nil
+    }
+
+    /// Whether the shell behind this pane belongs to this machine or a peer.
+    ///
+    /// Read from `hostKey` because that is what actually decides it: local pane
+    /// creation never sets one (see `addAgentPaneToWorkspace`), and a peer
+    /// attach always does. Published as its own field rather than by reshaping
+    /// `host` — `host` is the stored key verbatim and other readers depend on
+    /// that — so a leader can tell "no host recorded" from "somewhere else"
+    /// without having to know that rule.
+    nonisolated static func agentLocality(hostKey: String?) -> String {
+        (hostKey?.nilIfBlank == nil) ? "local" : "peer"
+    }
+
+    /// One same-named member, reduced to what a pane lookup needs.
+    struct PaneCandidate: Equatable {
+        let panelID: UUID?
+        let agentInstanceID: String
+    }
+
+    /// The durable instance behind a pane.
+    ///
+    /// Exact or nothing. `TeamDataStore.resolveAssigneeUnsafe` auto-pins
+    /// `candidates.first` for a name-only assignment, which for duplicate names
+    /// silently hands the work to a sibling; a caller that named a pane has
+    /// already chosen, and answering with a different one would be that same
+    /// bug wearing a more specific request.
+    ///
+    /// Pure so the no-guess property can be tested: `teams` is `private(set)`,
+    /// so a test cannot stand up a roster to look into.
+    nonisolated static func instanceID(
+        forPanel panelID: UUID,
+        among candidates: [PaneCandidate]
+    ) -> String? {
+        candidates.first { $0.panelID == panelID }?.agentInstanceID
+    }
+
+    /// `instanceID(forPanel:among:)` against the live roster for one role.
+    func agentInstanceID(teamName: String, agentName: String, panelID: UUID) -> String? {
+        let candidates = (teams[teamName]?.agents ?? [])
+            .filter { $0.name == agentName }
+            .map { PaneCandidate(panelID: $0.panelId, agentInstanceID: $0.agentInstanceId) }
+        return Self.instanceID(forPanel: panelID, among: candidates)
+    }
+
     /// Schedules a role pool by durable instance identity. Candidate order is
     /// the team's stable roster order; the cursor is scoped to team+role.
     private func selectIdleAgent(in team: Team, role: String) -> AgentMember? {
@@ -3321,15 +3394,29 @@ final class TeamOrchestrator: ObservableObject {
                                    completion: completion)
         }
         if AgentPipeTransport.isDriven(agentId: agent.transportId) {
+            let expectation = AgentPipeCompletion.shared.expect(
+                agentId: agent.transportId, instruction: text)
             do {
-                AgentPipeCompletion.shared.expect(agentId: agent.transportId, instruction: text)
-                let n = try AgentPipeTransport.deliver(text: text, agentId: agent.transportId)
-                #if DEBUG
-                dlog("agent.pipe.deliver agent=\(agent.id) bytes=\(n) via=name task=\(AgentPipeCompletion.taskId(in: text) ?? "-")")
-                #endif
-                completion?(true)
+                try AgentPipeTransport.deliver(text: text, agentId: agent.transportId) { result in
+                    switch result {
+                    case .success(let n):
+                        #if DEBUG
+                        dlog("agent.pipe.deliver agent=\(agent.id) bytes=\(n) via=name task=\(AgentPipeCompletion.taskId(in: text) ?? "-")")
+                        #endif
+                        completion?(true)
+                    case .failure(let error):
+                        AgentPipeCompletion.shared.cancelExpectation(
+                            agentId: agent.transportId, token: expectation)
+                        #if DEBUG
+                        dlog("agent.pipe.deliver.FAILED agent=\(agent.id) err=\(error)")
+                        #endif
+                        completion?(false)
+                    }
+                }
                 return true
             } catch {
+                AgentPipeCompletion.shared.cancelExpectation(
+                    agentId: agent.transportId, token: expectation)
                 #if DEBUG
                 dlog("agent.pipe.deliver.FAILED agent=\(agent.id) err=\(error)")
                 #endif
@@ -3411,15 +3498,32 @@ final class TeamOrchestrator: ObservableObject {
                                    completion: completion)
         }
         if let agent = pipeDrivenAgent(teamName: teamName, panelId: panelId) {
+            let expectation = AgentPipeCompletion.shared.expect(
+                agentId: agent.transportId, instruction: text)
             do {
-                AgentPipeCompletion.shared.expect(agentId: agent.transportId, instruction: text)
-                let n = try AgentPipeTransport.deliver(text: text, agentId: agent.transportId)
-                #if DEBUG
-                dlog("agent.pipe.deliver agent=\(agent.id) bytes=\(n) task=\(AgentPipeCompletion.taskId(in: text) ?? "-")")
-                #endif
-                completion?(true)
+                try AgentPipeTransport.deliver(text: text, agentId: agent.transportId) { result in
+                    switch result {
+                    case .success(let n):
+                        #if DEBUG
+                        dlog("agent.pipe.deliver agent=\(agent.id) bytes=\(n) task=\(AgentPipeCompletion.taskId(in: text) ?? "-")")
+                        #endif
+                        completion?(true)
+                    case .failure(let error):
+                        AgentPipeCompletion.shared.cancelExpectation(
+                            agentId: agent.transportId, token: expectation)
+                        Logger.team.error(
+                            "pipe delivery failed for \(agent.id, privacy: .public): \(String(describing: error), privacy: .public)"
+                        )
+                        #if DEBUG
+                        dlog("agent.pipe.deliver.FAILED agent=\(agent.id) err=\(error)")
+                        #endif
+                        completion?(false)
+                    }
+                }
                 return true
             } catch {
+                AgentPipeCompletion.shared.cancelExpectation(
+                    agentId: agent.transportId, token: expectation)
                 // Falling back to typing would hide the failure behind a path
                 // that usually works, and the point of this option is to see
                 // whether the pipe holds.
@@ -3622,16 +3726,80 @@ final class TeamOrchestrator: ObservableObject {
     struct DelegateResult {
         let task: TeamTask
         let textDelivered: Bool
+        /// True when request_id resolved to an already-created task and no
+        /// second paste was attempted.
+        let requestReplayed: Bool
         /// Pre-formatted instruction text for retry (avoids re-calling private formatter).
         let instruction: String
+    }
+
+    /// A task that is keeping an agent out of the delegate pool.
+    ///
+    /// Carried rather than summarised because the id is the actionable half:
+    /// the leader's next command names it.
+    struct DelegateBlocker: Equatable {
+        let taskID: String
+        let status: String
+    }
+
+    /// Why a delegate did not happen, or the result when it did.
+    ///
+    /// `delegateToAgent` returned `DelegateResult?` and collapsed two unrelated
+    /// failures into one `nil`: no such agent, and every instance already
+    /// holding a task. The RPC layer then reported both as "Task creation
+    /// failed", which is the one thing that had almost certainly NOT happened —
+    /// `TeamDataStore.createTask` only fails on an unregistered team or an
+    /// unresolvable assignee, both already established by the time it is called.
+    enum DelegateOutcome {
+        case delivered(DelegateResult)
+        /// The team has no agent by that name (or no such team).
+        case noSuchAgent
+        /// Every instance of the name is busy. Carries what is blocking each,
+        /// so the caller can say which task to close.
+        case allInstancesBusy(blockers: [DelegateBlocker])
+        /// The store genuinely refused to create the task.
+        case taskCreateFailed
+    }
+
+    /// Statuses that release an agent back to the pool.
+    ///
+    /// Mirrors `TeamDataStore.hasActiveTask`, which owns the real gate. The two
+    /// must agree: this set only decides what the *explanation* names, and an
+    /// explanation that disagreed with the gate would send the leader after the
+    /// wrong task. Deliberately does NOT include `review_ready` — that task is
+    /// waiting on a person, `taskNeedsAttention` counts it, and moving it here
+    /// would drop it out of the sidebar's review queue silently.
+    nonisolated static let delegateTerminalStatuses: Set<String> = [
+        "completed", "failed", "abandoned", "cancelled",
+    ]
+
+    /// What is keeping these instances out of the pool.
+    ///
+    /// Pure over the task list so the diagnosis can be tested without a team,
+    /// a pane or a store.
+    nonisolated static func delegateBlockers(
+        in tasks: [TeamTask],
+        agentInstanceIds: [String]
+    ) -> [DelegateBlocker] {
+        let wanted = Set(agentInstanceIds)
+        return tasks
+            .filter {
+                guard let instance = $0.assigneeInstanceId else { return false }
+                return wanted.contains(instance)
+                    && !delegateTerminalStatuses.contains($0.status)
+            }
+            .map { DelegateBlocker(taskID: $0.id, status: $0.status) }
     }
 
     /// Unified delegate: atomically create a task in TeamDataStore and dispatch the
     /// formatted instruction to the agent. Mirrors the `tm-agent delegate` two-step
     /// logic (team.task.create + team.send) in a single atomic call.
     /// Must be called on the main thread (sendToAgent requires MainActor).
-    @discardableResult
-    func delegateToAgent(
+    ///
+    /// The `DelegateResult?` spelling is kept as a wrapper below for callers
+    /// that only need "did it go out"; anything reporting to a person should
+    /// use this one and say why it did not.
+    func delegate(
         teamName: String,
         agentName: String,
         agentInstanceId: String? = nil,
@@ -3639,14 +3807,16 @@ final class TeamOrchestrator: ObservableObject {
         taskTitle: String? = nil,
         priority: Int? = nil,
         context: String? = nil,
+        requestId: String? = nil,
         tabManager: TabManager,
         submit: Bool = false,
         panelId: UUID? = nil,
         completion: ((Bool) -> Void)? = nil
-    ) -> DelegateResult? {
+    ) -> DelegateOutcome {
         let title = taskTitle?.nilIfBlank ?? String(text.prefix(80))
+        guard let team = teams[teamName] else { return .noSuchAgent }
+        let named = team.agents.filter { $0.name == agentName }
         let target: AgentMember? = {
-            guard let team = teams[teamName] else { return nil }
             if let agentInstanceId {
                 return resolveAgentForRPC(
                     teamName: teamName, agentName: agentName, agentInstanceId: agentInstanceId
@@ -3657,14 +3827,26 @@ final class TeamOrchestrator: ObservableObject {
             }
             return selectIdleAgent(in: team, role: agentName)
         }()
-        guard let target else { return nil }
-        guard let task = TeamDataStore.shared.createTask(
+        guard let target else {
+            // The name exists but nothing was selectable, so the pool gate is
+            // what refused. Name the tasks holding it rather than reporting a
+            // creation that was never attempted.
+            guard !named.isEmpty else { return .noSuchAgent }
+            let blockers = Self.delegateBlockers(
+                in: TeamDataStore.shared.listTasks(teamName: teamName, assignee: agentName),
+                agentInstanceIds: named.map(\.agentInstanceId)
+            )
+            return .allInstancesBusy(blockers: blockers)
+        }
+        guard let creation = TeamDataStore.shared.createTaskWithDisposition(
             teamName: teamName,
             title: title,
             assignee: agentName,
             assigneeInstanceId: target.agentInstanceId,
-            priority: priority ?? 2
-        ) else { return nil }
+            priority: priority ?? 2,
+            requestId: requestId
+        ) else { return .taskCreateFailed }
+        let task = creation.task
         let instruction = formatDelegateInstruction(
             teamName: teamName,
             target: target,
@@ -3672,6 +3854,22 @@ final class TeamOrchestrator: ObservableObject {
             text: text,
             context: context
         )
+        if !creation.created {
+            // Keep the same async completion ordering as the paste path. The
+            // socket caller stores DelegateOutcome immediately after this
+            // method returns; a synchronous callback could resume it first.
+            if let completion {
+                DispatchQueue.main.async { completion(true) }
+            }
+            return .delivered(
+                DelegateResult(
+                    task: task,
+                    textDelivered: true,
+                    requestReplayed: true,
+                    instruction: instruction
+                )
+            )
+        }
         // Deterministic per-pane delivery: when a valid, live, non-migrating panelId is
         // provided, bypass name round-robin (selectAgent) and paste directly into that
         // pane. The follow-up team.send_key Return carries the same panel_id (Rust side)
@@ -3691,7 +3889,14 @@ final class TeamOrchestrator: ObservableObject {
                 recordPendingReturnFor: target.agentInstanceId,
                 completion: completion
             )
-            return DelegateResult(task: task, textDelivered: delivered, instruction: instruction)
+            return .delivered(
+                DelegateResult(
+                    task: task,
+                    textDelivered: delivered,
+                    requestReplayed: false,
+                    instruction: instruction
+                )
+            )
         }
         // CLI callers keep submit=false and send Return separately after paste ack.
         // GUI callers can submit=true to use the IME paste path's inline Return.
@@ -3706,7 +3911,50 @@ final class TeamOrchestrator: ObservableObject {
             withReturn: submit,
             completion: completion
         )
-        return DelegateResult(task: task, textDelivered: delivered, instruction: instruction)
+        return .delivered(
+            DelegateResult(
+                task: task,
+                textDelivered: delivered,
+                requestReplayed: false,
+                instruction: instruction
+            )
+        )
+    }
+
+    /// `delegate` for callers that only need the result, not the reason.
+    ///
+    /// Kept so in-app callers outside this change keep compiling unchanged;
+    /// anything that reports to a person should call `delegate` and say why.
+    @discardableResult
+    func delegateToAgent(
+        teamName: String,
+        agentName: String,
+        agentInstanceId: String? = nil,
+        text: String,
+        taskTitle: String? = nil,
+        priority: Int? = nil,
+        context: String? = nil,
+        requestId: String? = nil,
+        tabManager: TabManager,
+        submit: Bool = false,
+        panelId: UUID? = nil,
+        completion: ((Bool) -> Void)? = nil
+    ) -> DelegateResult? {
+        guard case let .delivered(result) = delegate(
+            teamName: teamName,
+            agentName: agentName,
+            agentInstanceId: agentInstanceId,
+            text: text,
+            taskTitle: taskTitle,
+            priority: priority,
+            context: context,
+            requestId: requestId,
+            tabManager: tabManager,
+            submit: submit,
+            panelId: panelId,
+            completion: completion
+        ) else { return nil }
+        return result
     }
 
     private func formatDelegateInstruction(
@@ -5321,15 +5569,28 @@ final class TeamOrchestrator: ObservableObject {
                 if let branch = agent.worktreeBranch {
                     info["worktree_branch"] = branch
                 }
+                // Kept to the worktree lifecycle: present only when a task made
+                // one. `working_directory` below is where the pane actually is,
+                // which is a different question and is always answerable.
                 if let path = agent.worktreePath {
                     info["worktree_path"] = path
                 }
+                let workingDirectory = Self.agentWorkingDirectory(
+                    worktreePath: agent.worktreePath,
+                    originalAgentWorkDir: agent.originalAgentWorkDir,
+                    teamWorkingDirectory: team.workingDirectory
+                )
+                info["working_directory"] = workingDirectory as Any? ?? NSNull()
+                info["locality"] = Self.agentLocality(hostKey: agent.hostKey)
                 info["parallel_telemetry"] = [
                     "wave_id": (enrichment["active_task_id"] as? String) ?? agent.agentInstanceId,
                     "task_id": enrichment["active_task_id"] ?? NSNull(),
                     "agent_instance_id": agent.agentInstanceId,
                     "host": agent.hostKey as Any? ?? NSNull(),
-                    "checkout": agent.worktreePath ?? agent.worktreeBranch ?? agent.workspaceId.uuidString,
+                    "locality": Self.agentLocality(hostKey: agent.hostKey),
+                    // The same real path. A workspace UUID here is what sent a
+                    // leader looking for a machine that was never involved.
+                    "checkout": workingDirectory as Any? ?? NSNull(),
                     "delivery": enrichment["agent_state"] ?? "unknown",
                     "synthesis": "pending",
                 ]

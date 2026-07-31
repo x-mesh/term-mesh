@@ -64,6 +64,22 @@ final class AutoReplyDetector {
         self.config = config
     }
 
+    /// Accept only protocol verdicts, exactly as written. Deliberately does no
+    /// trimming or case folding: placeholders, comma-separated choices, partial
+    /// matches, and values with extra whitespace are not agent verdicts.
+    static func validatedStatus(_ value: String) -> String? {
+        // Ghostty's rectangular screen selection pads rows to the viewport
+        // width. Ignore only right-edge display padding; leading whitespace,
+        // casing and extra tokens remain invalid protocol values.
+        let normalized = value.trimmingCharactersAtEnd(in: .whitespaces)
+        switch normalized {
+        case "DONE", "BLOCKED", "NEEDS_REVIEW":
+            return normalized
+        default:
+            return nil
+        }
+    }
+
     /// Feed raw bytes. Returns nil always; commits via tick(at:) or flush().
     @discardableResult
     func pushBytes(_ bytes: Data, at now: Date) -> AutoReplyEvent? {
@@ -81,24 +97,19 @@ final class AutoReplyDetector {
     }
 
     private func pushLine(_ rawLine: String, at now: Date) {
-        // Leading whitespace is trimmed as well as trailing. Agent TUIs indent
-        // their output — Claude's puts the reply under a bullet — so the line
-        // arrives as `  STATUS: DONE`, and a prefix check against `STATUS:`
-        // missed every one of them. The header was reaching the detector and
-        // being dropped a character short.
-        let line = Self.unmarked(Self.stripAnsi(rawLine).trimmingCharacters(in: .whitespaces))
+        // Agent TUIs indent their output, so remove indentation and a possible
+        // bullet. Rectangular terminal snapshots pad every row on the right,
+        // so normalize that display padding for headers as well.
+        let unmarked = Self.unmarked(
+            Self.stripAnsi(rawLine).trimmingCharactersAtStart(in: .whitespaces)
+        )
+        let line = unmarked.trimmingCharactersAtEnd(in: .whitespaces)
         if lineBuffer.count >= Self.bufferCap {
             lineBuffer.removeFirst()
         }
         lineBuffer.append(line)
         lastInputAt = now
-        // A STATUS line that still lists the choices is the instruction being
-        // echoed back, not an answer — the capsule prints
-        // `STATUS: DONE|BLOCKED|NEEDS_REVIEW` and agent panes redraw it.
-        // Trimming leading space (above) made those echoes look like real
-        // headers, so the alternation is what tells them apart: a reported
-        // status is one word.
-        if line.hasPrefix("STATUS:"), !line.contains("|") {
+        if Self.validatedStatusValue(in: line) != nil {
             statusSeenAt = now
             committed = false
         }
@@ -114,7 +125,7 @@ final class AutoReplyDetector {
     /// that opens with a dash keeps its dash.
     private static func unmarked(_ line: String) -> String {
         guard let first = line.first, Self.listMarkers.contains(first) else { return line }
-        let rest = String(line.dropFirst()).trimmingCharacters(in: .whitespaces)
+        let rest = String(line.dropFirst()).trimmingCharactersAtStart(in: .whitespaces)
         guard Self.headerPrefixes.contains(where: { rest.hasPrefix($0) }) else { return line }
         return rest
     }
@@ -122,7 +133,11 @@ final class AutoReplyDetector {
     func tick(at now: Date) -> AutoReplyEvent? {
         if committed { return nil }
         guard let anchor = statusBlockStart() else { statusSeenAt = nil; return nil }
-        guard let status = scanField("STATUS", from: anchor) else { statusSeenAt = nil; return nil }
+        guard let rawStatus = scanField("STATUS", from: anchor),
+              let status = Self.validatedStatus(rawStatus) else {
+            statusSeenAt = nil
+            return nil
+        }
         guard let statusAt = statusSeenAt else { return nil }
 
         let files = scanField("FILES", from: anchor)
@@ -151,7 +166,8 @@ final class AutoReplyDetector {
     func flush() -> AutoReplyEvent? {
         if committed { return nil }
         guard let anchor = statusBlockStart() else { return nil }
-        guard let status = scanField("STATUS", from: anchor) else { return nil }
+        guard let rawStatus = scanField("STATUS", from: anchor),
+              let status = Self.validatedStatus(rawStatus) else { return nil }
         let files = scanField("FILES", from: anchor)
         let verify = scanField("VERIFY", from: anchor)
         let next = scanField("NEXT", from: anchor)
@@ -205,13 +221,21 @@ final class AutoReplyDetector {
         var latest: Int? = nil
         var prev: Int? = nil
         for (i, line) in lineBuffer.enumerated() {
-            if line.hasPrefix("STATUS:") {
+            if Self.validatedStatusValue(in: line) != nil {
                 prev = latest
                 latest = i
             }
         }
         guard latest != nil else { return nil }
         return prev != nil ? latest : 0
+    }
+
+    private static func validatedStatusValue(in line: String) -> String? {
+        let prefix = "STATUS:"
+        guard line.hasPrefix(prefix) else { return nil }
+        let rest = String(line.dropFirst(prefix.count))
+        let value = rest.hasPrefix(" ") ? String(rest.dropFirst()) : rest
+        return validatedStatus(value)
     }
 
     private func scanField(_ name: String, from fromIdx: Int = 0) -> String? {
@@ -271,6 +295,16 @@ final class AutoReplyDetector {
 }
 
 private extension String {
+    func trimmingCharactersAtStart(in set: CharacterSet) -> String {
+        var start = startIndex
+        while start < endIndex {
+            let scalars = self[start].unicodeScalars
+            if !scalars.allSatisfy({ set.contains($0) }) { break }
+            start = index(after: start)
+        }
+        return String(self[start..<endIndex])
+    }
+
     func trimmingCharactersAtEnd(in set: CharacterSet) -> String {
         var end = endIndex
         while end > startIndex {

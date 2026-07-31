@@ -203,7 +203,7 @@ actor ReviewBoardMergeRunner {
     /// Synchronous by design: deriving this key must not open an actor
     /// reentrancy window before it is inserted into `mergeLocks`.
     private func lock(for job: Job) -> MergeLock {
-        let raw = job.repositoryPath ?? job.worktreePath ?? "queue:(job.queueID)"
+        let raw = job.repositoryPath ?? job.worktreePath ?? "queue:\(job.queueID)"
         let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         let repository = trimmed.hasPrefix("/")
             ? (trimmed as NSString).standardizingPath

@@ -1,4 +1,5 @@
 import XCTest
+import Foundation
 
 #if canImport(term_mesh_DEV)
 @testable import term_mesh_DEV
@@ -6,7 +7,26 @@ import XCTest
 @testable import term_mesh
 #endif
 
+@MainActor
 final class AgentTransportHardeningRegression169Tests: XCTestCase {
+    private final class LockedOrder: @unchecked Sendable {
+        private let lock = NSLock()
+        private var values: [Int] = []
+
+        func append(_ value: Int) -> Int {
+            lock.lock()
+            defer { lock.unlock() }
+            values.append(value)
+            return values.count
+        }
+
+        var snapshot: [Int] {
+            lock.lock()
+            defer { lock.unlock() }
+            return values
+        }
+    }
+
     func testCommittedFIFOlineFinishesAfterDeadlineInsteadOfLeavingTruncatedJSON() throws {
         var attempts: [AgentPipeTransport.WriteAttempt] = [
             .written(4), .wouldBlock, .written(6),
@@ -30,6 +50,41 @@ final class AgentTransportHardeningRegression169Tests: XCTestCase {
             pause: {},
             attempt: { _, _ in .wouldBlock }
         ))
+    }
+
+    func testFailedReservationClearsOnlyItsOwnTaskId() {
+        let agentId = "expect-rollback-\(UUID().uuidString)"
+        AgentPipeCompletion.shared.watch(
+            agentId: agentId, teamName: "t", agentName: "executor")
+        defer { AgentPipeCompletion.shared.forget(agentId: agentId) }
+
+        let first = AgentPipeCompletion.shared.expect(
+            agentId: agentId, instruction: "TASK_ID: T1")
+        let second = AgentPipeCompletion.shared.expect(
+            agentId: agentId, instruction: "TASK_ID: T2")
+
+        AgentPipeCompletion.shared.cancelExpectation(agentId: agentId, token: first)
+        XCTAssertEqual(
+            AgentPipeCompletion.shared.pendingTaskIdForTesting(agentId: agentId), "T2",
+            "an older failed delivery must not clear a newer reservation")
+
+        AgentPipeCompletion.shared.cancelExpectation(agentId: agentId, token: second)
+        XCTAssertNil(AgentPipeCompletion.shared.pendingTaskIdForTesting(agentId: agentId))
+    }
+
+    func testSameAgentWriterOperationsStayFIFO() {
+        let finished = expectation(description: "serial writer drained")
+        let order = LockedOrder()
+        let agentId = "writer-order-\(UUID().uuidString)"
+
+        for value in 0..<3 {
+            AgentPipeTransport.enqueueForTesting(agentId: agentId) {
+                if order.append(value) == 3 { finished.fulfill() }
+            }
+        }
+
+        wait(for: [finished], timeout: 1)
+        XCTAssertEqual(order.snapshot, [0, 1, 2])
     }
 
     func testMarkdownPresentationPrecomputesInlineAndCodeAttributes() {

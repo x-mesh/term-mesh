@@ -625,8 +625,15 @@ final class TeamDataStore: ObservableObject, @unchecked Sendable {
             + " Pass agent_instance_id to pick one."
     }
 
-    @discardableResult
-    func createTask(
+    struct TaskCreation {
+        let task: TeamOrchestrator.TeamTask
+        let created: Bool
+    }
+
+    /// Atomically returns both the task and whether this call inserted it.
+    /// Delegate needs the disposition: retrying an idempotent request must not
+    /// paste the same instruction a second time.
+    func createTaskWithDisposition(
         teamName: String,
         title: String,
         details: String? = nil,
@@ -639,11 +646,19 @@ final class TeamDataStore: ObservableObject, @unchecked Sendable {
         dependsOn: [String] = [],
         parentTaskId: String? = nil,
         createdBy: String = "leader",
-        worktreePolicy: String? = nil
-    ) -> TeamOrchestrator.TeamTask? {
+        worktreePolicy: String? = nil,
+        requestId: String? = nil
+    ) -> TaskCreation? {
         lock.lock()
         defer { lock.unlock() }
         guard teamRegistry[teamName] != nil else { return nil }
+        let normalizedRequestId = requestId?.teamDataNilIfBlank
+        if let normalizedRequestId,
+           let duplicate = taskBoards[teamName, default: []].first(where: {
+               $0.request_id == normalizedRequestId
+           }) {
+            return TaskCreation(task: duplicate, created: false)
+        }
         guard let resolvedAssignee = resolveAssigneeUnsafe(
             teamName: teamName,
             assignee: assignee,
@@ -652,7 +667,7 @@ final class TeamDataStore: ObservableObject, @unchecked Sendable {
         ) else { return nil }
         let now = Date()
         let normalizedCreatedBy = createdBy.teamDataNilIfBlank ?? "leader"
-        // Dedup dashboard-created tasks
+        // Preserve the dashboard's legacy debounce when it has no request_id.
         if normalizedCreatedBy.contains("dashboard"),
            let duplicate = taskBoards[teamName, default: []].last(where: {
                $0.title == title &&
@@ -661,7 +676,7 @@ final class TeamDataStore: ObservableObject, @unchecked Sendable {
                $0.createdBy == normalizedCreatedBy &&
                now.timeIntervalSince($0.createdAt) < 5
            }) {
-            return duplicate
+            return TaskCreation(task: duplicate, created: false)
         }
         // Generate ID early so it can be used in dependency validation below.
         let taskId = UUID().uuidString.prefix(8).lowercased().description
@@ -699,6 +714,7 @@ final class TeamDataStore: ObservableObject, @unchecked Sendable {
             blockedReason: nil,
             reviewSummary: nil,
             createdBy: normalizedCreatedBy,
+            request_id: normalizedRequestId,
             result: nil,
             resultPath: nil,
             worktreePolicy: worktreePolicy?.teamDataNilIfBlank,
@@ -719,7 +735,42 @@ final class TeamDataStore: ObservableObject, @unchecked Sendable {
             noteTasksChanged()
         }
         notifyChanged()
-        return task
+        return TaskCreation(task: task, created: true)
+    }
+
+    @discardableResult
+    func createTask(
+        teamName: String,
+        title: String,
+        details: String? = nil,
+        assignee: String? = nil,
+        assigneeInstanceId: String? = nil,
+        acceptanceCriteria: [String] = [],
+        labels: [String] = [],
+        estimatedSize: Int? = nil,
+        priority: Int = 2,
+        dependsOn: [String] = [],
+        parentTaskId: String? = nil,
+        createdBy: String = "leader",
+        worktreePolicy: String? = nil,
+        requestId: String? = nil
+    ) -> TeamOrchestrator.TeamTask? {
+        createTaskWithDisposition(
+            teamName: teamName,
+            title: title,
+            details: details,
+            assignee: assignee,
+            assigneeInstanceId: assigneeInstanceId,
+            acceptanceCriteria: acceptanceCriteria,
+            labels: labels,
+            estimatedSize: estimatedSize,
+            priority: priority,
+            dependsOn: dependsOn,
+            parentTaskId: parentTaskId,
+            createdBy: createdBy,
+            worktreePolicy: worktreePolicy,
+            requestId: requestId
+        )?.task
     }
 
     @discardableResult
@@ -1626,6 +1677,7 @@ final class TeamDataStore: ObservableObject, @unchecked Sendable {
             "blocked_reason": task.blockedReason as Any? ?? NSNull(),
             "review_summary": task.reviewSummary as Any? ?? NSNull(),
             "created_by": task.createdBy,
+            "request_id": task.request_id as Any? ?? NSNull(),
             "result": task.result as Any? ?? NSNull(),
             "result_path": task.resultPath as Any? ?? NSNull(),
             "worktree_policy": task.worktreePolicy as Any? ?? NSNull(),

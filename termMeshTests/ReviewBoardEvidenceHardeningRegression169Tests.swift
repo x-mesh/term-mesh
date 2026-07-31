@@ -72,6 +72,7 @@ final class ReviewBoardEvidenceHardeningRegression169Tests: XCTestCase {
     func testTruncatedPeerEvidenceIsRejectedEvenWithADigest() throws {
         let body = "diff --git a/Sources/a.swift b/Sources/a.swift\n+trust me\n"
         let wrongDigest = "sha256:cafebabe"
+        let correctDigest = ReviewBoardEvidence.digest(forPatch: Data(body.utf8))
 
         XCTAssertNil(
             ReviewBoardEvidence.Patch(
@@ -82,7 +83,7 @@ final class ReviewBoardEvidenceHardeningRegression169Tests: XCTestCase {
 
         XCTAssertNil(
             ReviewBoardEvidence.Patch(
-                peerResponse: try peerJSON(patch: body, digest: wrongDigest, truncated: true)
+                peerResponse: try peerJSON(patch: body, digest: correctDigest, truncated: true)
             ),
             "an unverifiable suffix must never reach an approval"
         )

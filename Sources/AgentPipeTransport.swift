@@ -354,12 +354,8 @@ enum AgentPipeTransport {
     /// PTY buffer until something reads them.
     private static let pipeReadyTimeout: TimeInterval = 5
 
-    /// How long an EAGAIN write retry may keep polling a reader that has
-    /// stopped consuming.
-    ///
-    /// A reader that is alive but paused looks identical, from EAGAIN alone,
-    /// to one that will never resume. Without a bound this loop never
-    /// returns, and the caller — holding the FIFO fd open — never does either.
+    /// Maximum reader silence before a write is abandoned. Progress restarts
+    /// the budget, so this is a stall timeout rather than a total-duration cap.
     private static let pipeWriteTimeout: TimeInterval = 5
 
     enum WriteAttempt: Equatable {
@@ -369,31 +365,33 @@ enum AgentPipeTransport {
         case failed(Int32)
     }
 
-    /// One line onto the pipe, whole — or bounded and ended honestly.
+    /// One serial writer per agent. Frames for one process cannot interleave or
+    /// overtake each other, while separate agents remain independent.
+    private final class WriterRegistry: @unchecked Sendable {
+        private let lock = NSLock()
+        private var queues: [String: DispatchQueue] = [:]
+
+        func queue(for agentId: String) -> DispatchQueue {
+            lock.lock()
+            defer { lock.unlock() }
+            if let queue = queues[agentId] { return queue }
+            let queue = DispatchQueue(
+                label: "com.termmesh.agent-pipe.\(agentId)",
+                qos: .userInitiated
+            )
+            queues[agentId] = queue
+            return queue
+        }
+    }
+
+    private static let writers = WriterRegistry()
+
+    /// One line onto the pipe, whole.
     ///
-    /// Two properties have to hold at once, and each was once held alone.
-    ///
-    /// *No truncated NDJSON.* A line abandoned halfway leaves a fragment of a
-    /// JSON object in the pipe, and the next delivery is appended straight
-    /// onto it: two instructions destroyed rather than one.
-    ///
-    /// *No unbounded wait.* This runs on the main actor — `deliver`'s callers
-    /// are `TeamOrchestrator`, which is `@MainActor` — so a loop that only
-    /// exits when the reader resumes is the whole app waiting on a process
-    /// that may be gone. "Finish the committed line, whatever it takes" was
-    /// exactly that loop: past the first byte the deadline was never consulted
-    /// again.
-    ///
-    /// They only look contradictory while "don't truncate" is read as "must
-    /// finish". A fragment is harmless once it is *terminated*: the newline
-    /// makes it a line of its own, so the reader fails to parse that one line
-    /// and resynchronises, instead of swallowing the next instruction with it.
-    /// So the budget is bounded in every case, and a line that runs out of it
-    /// after committing bytes is closed before the error is raised.
-    ///
-    /// The clock measures a reader that has stopped, not one that is slow:
-    /// every byte accepted restarts it, and a signal interruption says nothing
-    /// about the reader and so consumes none of it.
+    /// A committed partial JSON frame cannot be left adjacent to the next
+    /// instruction. If the reader stops consuming, bound the writer wait and
+    /// best-effort terminate the fragment with a newline before releasing the
+    /// per-agent queue. Waiting is safe because production calls this off-main.
     static func writeWholeLine(
         byteCount: Int,
         timeout: TimeInterval = pipeWriteTimeout,
@@ -411,8 +409,6 @@ enum AgentPipeTransport {
                     throw DeliveryError.writeFailed("write returned zero after \(written)B")
                 }
                 written += count
-                // Progress restarts the clock: a large payload drained slowly
-                // is the reader working, not the reader stuck.
                 deadline = now() + timeout
             case .interrupted:
                 continue
@@ -437,47 +433,30 @@ enum AgentPipeTransport {
         return written
     }
 
-    /// End a line the reader never let us finish.
-    ///
-    /// Bounded on purpose, and small: this runs after a stall has already been
-    /// declared, so it must not become a second wait. A newline that cannot be
-    /// placed in 50ms is one the pipe has no room for at all, and the caller
-    /// is told which of the two happened.
-    private static func terminateLine(fd: Int32, attempts: Int = 25) -> Bool {
-        var newline: UInt8 = 0x0A
-        for _ in 0..<attempts {
-            let count = write(fd, &newline, 1)
-            if count == 1 { return true }
-            if count < 0, errno == EINTR || errno == EAGAIN {
-                usleep(2_000)
-                continue
-            }
-            return false
-        }
-        return false
-    }
-
-    /// Put one user turn on the agent's stdin.
-    ///
-    /// The text goes as-is. Nothing is flattened — a task carrying newlines
-    /// arrives with them, because there is no composer here to submit early on
-    /// one. That flattening is the clearest sign of what the terminal path
-    /// costs: an instruction is reshaped to survive its own delivery.
-    @discardableResult
-    static func deliver(text: String, agentId: String) throws -> Int {
+    /// Queue one user turn without making its MainActor caller poll a FIFO.
+    static func deliver(
+        text: String,
+        agentId: String,
+        completion: @escaping (Result<Int, DeliveryError>) -> Void
+    ) throws {
         let path = fifoPath(agentId: agentId)
         let payload = try encode(text: text)
+        writers.queue(for: agentId).async {
+            let result: Result<Int, DeliveryError>
+            do {
+                result = .success(try deliver(payload: payload, path: path))
+            } catch let error as DeliveryError {
+                result = .failure(error)
+            } catch {
+                result = .failure(.writeFailed(error.localizedDescription))
+            }
+            DispatchQueue.main.async { completion(result) }
+        }
+    }
 
-        // Non-blocking, so the caller is never hung by a pane that has gone —
-        // but a pane that has not arrived *yet* is a different thing, and the
-        // two look alike for the first second of a team's life.
-        //
-        // A team's first instruction goes out while the panes are still coming
-        // up, and readiness has two steps, not one: the pane creates the FIFO,
-        // then the process behind it opens the read end. Opening for writing in
-        // between gives ENXIO — "no reader" — which is a wait, not a failure.
-        // Waiting is what the terminal gave for free: keystrokes sit in the PTY
-        // buffer until something reads them.
+    /// Runs only on the agent serial writer. Readiness and backpressure waits
+    /// therefore leave input, layout, and unrelated socket work responsive.
+    private static func deliver(payload: Data, path: String) throws -> Int {
         let deadline = Date().addingTimeInterval(pipeReadyTimeout)
         var fd: Int32 = -1
         while true {
@@ -497,16 +476,31 @@ enum AgentPipeTransport {
             guard let base = raw.baseAddress else { return 0 }
             return try writeWholeLine(
                 byteCount: raw.count,
-                terminateLine: { terminateLine(fd: fd) }
-            ) { offset, remaining in
-                let count = write(fd, base.advanced(by: offset), remaining)
-                if count > 0 { return .written(count) }
-                if count < 0, errno == EINTR { return .interrupted }
-                if count < 0, errno == EAGAIN { return .wouldBlock }
-                return .failed(errno)
-            }
+                terminateLine: {
+                    var newline: UInt8 = 0x0a
+                    return withUnsafePointer(to: &newline) {
+                        write(fd, $0, 1) == 1
+                    }
+                },
+                attempt: { offset, remaining in
+                    let count = write(fd, base.advanced(by: offset), remaining)
+                    if count > 0 { return .written(count) }
+                    if count < 0, errno == EINTR { return .interrupted }
+                    if count < 0, errno == EAGAIN { return .wouldBlock }
+                    return .failed(errno)
+                }
+            )
         }
     }
+
+    #if DEBUG
+    static func enqueueForTesting(
+        agentId: String,
+        operation: @escaping @Sendable () -> Void
+    ) {
+        writers.queue(for: agentId).async(execute: operation)
+    }
+    #endif
 
     /// One NDJSON line in the shape claude's stream-json input expects.
     static func encode(text: String) throws -> Data {

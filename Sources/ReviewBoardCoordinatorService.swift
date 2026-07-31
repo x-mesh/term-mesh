@@ -1613,20 +1613,13 @@ final class ReviewBoardCoordinatorService: ObservableObject {
                 )
                 continue
             }
-            guard let job = ReviewBoardMergeRunner.Job(
-                item: item,
-                tasks: tasks,
-                target: target,
-                approvedHeadSHA: approvedHead
-            ) else { continue }
-
             // Against the repository, not the worktree: `finish --cleanup`
             // deletes the worktree it merged from, so an undo point recorded
             // there would name a directory that is gone by the time anyone
             // wants it.
             var repository: String?
             var before: String?
-            if let path = job.worktreePath?.trimmingCharacters(in: .whitespacesAndNewlines),
+            if let path = task.worktreePath?.trimmingCharacters(in: .whitespacesAndNewlines),
                !path.isEmpty {
                 let root = await AutoPilotUndo.repositoryRoot(containing: path) ?? path
                 repository = root
@@ -1634,6 +1627,13 @@ final class ReviewBoardCoordinatorService: ObservableObject {
                 // undo has any business putting back.
                 before = await Self.currentSHA(of: target, in: root)
             }
+            guard let job = ReviewBoardMergeRunner.Job(
+                item: item,
+                tasks: tasks,
+                repositoryPath: repository,
+                target: target,
+                approvedHeadSHA: approvedHead
+            ) else { continue }
             // Run it even with no worktree: the runner refuses that case with a
             // reason written into the queue entry, where the old `continue` left
             // the row sitting at `queued` saying nothing.

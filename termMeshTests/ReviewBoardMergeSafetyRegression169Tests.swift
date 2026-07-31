@@ -36,6 +36,29 @@ final class ReviewBoardMergeSafetyRegression169Tests: XCTestCase {
         var count: Int { all.count }
     }
 
+    private actor CommandGate {
+        private var started = false
+        private var startWaiters: [CheckedContinuation<Void, Never>] = []
+        private var releaseWaiter: CheckedContinuation<Void, Never>?
+
+        func waitUntilStarted() async {
+            guard !started else { return }
+            await withCheckedContinuation { startWaiters.append($0) }
+        }
+
+        func block() async {
+            started = true
+            startWaiters.forEach { $0.resume() }
+            startWaiters.removeAll()
+            await withCheckedContinuation { releaseWaiter = $0 }
+        }
+
+        func release() {
+            releaseWaiter?.resume()
+            releaseWaiter = nil
+        }
+    }
+
     private func output(_ text: String, status: Int32 = 0) -> ProcessRun.Output {
         ProcessRun.Output(
             status: status,
@@ -192,6 +215,56 @@ final class ReviewBoardMergeSafetyRegression169Tests: XCTestCase {
         XCTAssertEqual(ran, 1)
         let statuses = await reports.statuses
         XCTAssertEqual(statuses, ["running", "merged"])
+    }
+
+    func testSameRepositoryAndTargetAreSerializedAcrossWorktrees() async {
+        let reports = Reports()
+        let invocations = Invocations()
+        let gate = CommandGate()
+        let sha = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        let runner = ReviewBoardMergeRunner(
+            command: { arguments, _ in
+                await invocations.add(arguments)
+                await gate.block()
+                return self.envelope([
+                    "state": "ok", "ok": true,
+                    "result": ["mode": "promote", "branch": "feat/one", "to": "develop"],
+                ])
+            },
+            git: { arguments in
+                if arguments.contains("status") { return self.output("") }
+                if arguments.contains("rev-parse") { return self.output(sha) }
+                return nil
+            },
+            pathExists: { _ in true },
+            report: { queue, status, error in await reports.add(queue, status, error) }
+        )
+        let firstJob = ReviewBoardMergeRunner.Job(
+            queueID: "mrq_1",
+            taskID: "tsk_1",
+            worktreePath: "/repo/.worktrees/one",
+            repositoryPath: "/repo",
+            target: "develop",
+            approvedHeadSHA: sha
+        )
+        let secondJob = ReviewBoardMergeRunner.Job(
+            queueID: "mrq_2",
+            taskID: "tsk_2",
+            worktreePath: "/repo/.worktrees/two",
+            repositoryPath: "/repo",
+            target: "develop",
+            approvedHeadSHA: sha
+        )
+
+        let first = Task { await runner.process(firstJob) }
+        await gate.waitUntilStarted()
+        let second = await runner.process(secondJob)
+        XCTAssertEqual(second, .alreadyRunning)
+        await gate.release()
+        let firstOutcome = await first.value
+        let invocationCount = await invocations.count
+        XCTAssertEqual(firstOutcome, .merged(branch: "feat/one"))
+        XCTAssertEqual(invocationCount, 1)
     }
 
     /// Untracked files are what `--porcelain` reports with `??`, and they are

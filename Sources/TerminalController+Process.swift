@@ -1,4 +1,5 @@
 import AppKit
+import Darwin
 import Foundation
 import os
 
@@ -273,9 +274,48 @@ extension TerminalController {
     }
 
     func writeSocketResponse(_ response: String, to socket: Int32) {
-        let payload = response + "\n"
-        payload.withCString { ptr in
-            _ = write(socket, ptr, strlen(ptr))
+        let payload = Data((response + "\n").utf8)
+        _ = Self.writeAllSocketBytes(payload) { pointer, count in
+            Darwin.write(socket, pointer, count)
+        }
+    }
+
+    @discardableResult
+    nonisolated static func suppressSocketSIGPIPE(_ socket: Int32) -> Bool {
+        var enabled: Int32 = 1
+        return withUnsafePointer(to: &enabled) {
+            setsockopt(
+                socket,
+                SOL_SOCKET,
+                SO_NOSIGPIPE,
+                $0,
+                socklen_t(MemoryLayout<Int32>.size)
+            ) == 0
+        }
+    }
+
+    @discardableResult
+    nonisolated static func writeAllSocketBytes(
+        _ bytes: Data,
+        using writeBytes: (_ pointer: UnsafeRawPointer, _ count: Int) -> Int
+    ) -> Bool {
+        bytes.withUnsafeBytes { buffer in
+            guard let baseAddress = buffer.baseAddress else { return true }
+            var offset = 0
+            while offset < buffer.count {
+                let written = writeBytes(
+                    baseAddress.advanced(by: offset),
+                    buffer.count - offset
+                )
+                if written > 0 {
+                    offset += written
+                } else if written < 0, errno == EINTR {
+                    continue
+                } else {
+                    return false
+                }
+            }
+            return true
         }
     }
 
@@ -456,6 +496,11 @@ extension TerminalController {
             }
 
             consecutiveFailures = 0
+            guard Self.suppressSocketSIGPIPE(clientSocket) else {
+                Logger.socket.error("Failed to set SO_NOSIGPIPE on accepted client")
+                close(clientSocket)
+                continue
+            }
 
             // Capture peer PID immediately — before the client can disconnect.
             // ncat --send-only closes the connection right after writing, so by

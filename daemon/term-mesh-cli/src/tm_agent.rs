@@ -272,6 +272,7 @@ mod project_sync_cli_tests {
             None,
             panel.as_deref(),
             Some("instance-2"),
+            "delegate-test-request",
         );
         assert_eq!(params["depends_on"], json!(["337a5e71"]));
         assert_eq!(params["panel_id"], "panel-2");
@@ -361,6 +362,104 @@ mod project_sync_cli_tests {
         );
         let error = instance_id_from_agents(&agents, "reviewer", Some("missing")).unwrap_err();
         assert!(error.contains("--agent-instance-id"), "{error}");
+    }
+
+    #[test]
+    fn worktree_delegate_uses_panel_resolved_instance_for_task_owner() {
+        let agents = vec![
+            json!({
+                "name": "executor",
+                "panel_id": "panel-1",
+                "agent_instance_id": "instance-1",
+                "working_directory": "/repo/one",
+            }),
+            json!({
+                "name": "executor",
+                "panel_id": "panel-2",
+                "agent_instance_id": "instance-2",
+                "working_directory": "/repo/two",
+            }),
+        ];
+        let target = delegate_target_from_agents(&agents, "executor", Some("panel-2"))
+            .expect("panel-2 resolves");
+        assert!(should_acquire_worktree(
+            WorktreePolicyArg::Auto,
+            "executor",
+            "implement the fix",
+            "Fix placement routing",
+            None,
+        ));
+
+        let params = worktree_task_create_params(
+            "team-a",
+            "executor",
+            "Fix placement routing",
+            1,
+            &[],
+            &[],
+            None,
+            None,
+            target.agent_instance_id.as_deref(),
+            WorktreePolicyArg::Auto,
+            "request-1",
+        );
+        assert_eq!(params["agent_instance_id"], "instance-2");
+        assert_eq!(target.working_directory.as_deref(), Some("/repo/two"));
+    }
+
+    #[test]
+    fn explicit_panel_resolution_fails_before_task_creation() {
+        let agents = vec![json!({
+            "name": "executor",
+            "panel_id": "panel-1",
+            "agent_instance_id": "instance-1",
+        })];
+        let mut task_create_calls = 0;
+        let resolution = delegate_target_from_agents(&agents, "executor", Some("missing"));
+        if resolution.is_ok() {
+            task_create_calls += 1;
+        }
+        let error = resolution.unwrap_err();
+        assert!(error.contains("no agent named executor matches panel missing"));
+        assert_eq!(task_create_calls, 0);
+
+        let dir = tempfile::tempdir().unwrap();
+        let missing_socket = dir.path().join("missing.sock");
+        let error = selected_delegate_target(
+            &missing_socket,
+            "team-a",
+            "executor",
+            Some("panel-2"),
+        )
+        .unwrap_err();
+        assert!(error.contains("cannot resolve --panel before delegate"));
+    }
+
+    #[test]
+    fn worktree_acquire_runs_from_selected_placement() {
+        let mut seen_cwd = None;
+        let mut seen_args = Vec::new();
+        let meta = gk_wt_acquire_with(
+            "tm/team-a/task-1",
+            Some("develop"),
+            Some("/repo/selected-placement"),
+            |args, cwd| {
+                seen_args = args.to_vec();
+                seen_cwd = cwd.map(str::to_string);
+                Ok(json!({
+                    "ok": true,
+                    "result": {
+                        "path": "/repo/worktree",
+                        "branch": "tm/team-a/task-1",
+                    },
+                }))
+            },
+        )
+        .expect("acquire result");
+
+        assert_eq!(seen_cwd.as_deref(), Some("/repo/selected-placement"));
+        assert_eq!(seen_args[0..3], ["wt", "acquire", "tm/team-a/task-1"]);
+        assert_eq!(meta.path, "/repo/worktree");
     }
 }
 
@@ -850,6 +949,9 @@ enum Commands {
     Delegate {
         agent: String,
         text: String,
+        /// Stable idempotency key. Reuse the value printed after an unknown outcome.
+        #[arg(long)]
+        request_id: Option<String>,
         #[arg(long)]
         title: Option<String>,
         #[arg(long)]
@@ -3759,6 +3861,11 @@ fn remote_leader_method_allowed(method: &str) -> bool {
             | "team.task.get"
             | "team.task.create"
             | "team.task.update"
+            | "team.task.done"
+            | "team.task.block"
+            | "team.task.review"
+            | "team.task.unblock"
+            | "team.task.approve"
             | "team.task.diff"
     )
 }
@@ -3800,9 +3907,24 @@ fn remote_leader_rpc_call(
         Ok(value) => value,
         Err(_) => rpc_call_timeout(sock, "peer.leader.call", proxy_params, timeout)?,
     };
-    let proxied = decode_daemon_response(outer)?;
+    remote_leader_proxy_result(decode_daemon_response(outer)?)
+}
+
+fn remote_leader_proxy_result(proxied: Value) -> Result<Value, String> {
     if !proxied["ok"].as_bool().unwrap_or(false) {
-        return Err("remote leader proxy returned non-ok".into());
+        let result = &proxied["result"];
+        let error_code = result["error_code"].as_str().filter(|value| !value.is_empty());
+        let error_message = result["error_message"]
+            .as_str()
+            .filter(|value| !value.is_empty());
+        return Err(match (error_code, error_message) {
+            (Some(code), Some(message)) => {
+                format!("remote leader proxy [{code}]: {message}")
+            }
+            (Some(code), None) => format!("remote leader proxy [{code}]"),
+            (None, Some(message)) => format!("remote leader proxy: {message}"),
+            (None, None) => "remote leader proxy returned non-ok".into(),
+        });
     }
     Ok(json!({
         "ok": true,
@@ -4968,7 +5090,40 @@ fn normalize_self_referential_full_report(
     (normalized, Some(full_report.to_string()))
 }
 
+#[derive(Clone, Copy)]
+#[cfg(test)]
+enum AtomicWriteFault {
+    Write,
+    Sync,
+    Rename,
+}
+
 fn atomic_write_file(path: &Path, content: &str) -> Result<(), String> {
+    atomic_write_file_inner(path, content, false, false, false)
+}
+
+#[cfg(test)]
+fn atomic_write_file_with_fault(
+    path: &Path,
+    content: &str,
+    fault: Option<AtomicWriteFault>,
+) -> Result<(), String> {
+    atomic_write_file_inner(
+        path,
+        content,
+        matches!(fault, Some(AtomicWriteFault::Write)),
+        matches!(fault, Some(AtomicWriteFault::Sync)),
+        matches!(fault, Some(AtomicWriteFault::Rename)),
+    )
+}
+
+fn atomic_write_file_inner(
+    path: &Path,
+    content: &str,
+    fail_write: bool,
+    fail_sync: bool,
+    fail_rename: bool,
+) -> Result<(), String> {
     let dir = path
         .parent()
         .ok_or_else(|| format!("missing parent for {}", path.display()))?;
@@ -4998,16 +5153,31 @@ fn atomic_write_file(path: &Path, content: &str) -> Result<(), String> {
             Err(e) if e.kind() == ErrorKind::AlreadyExists => continue,
             Err(e) => return Err(format!("create temp {}: {e}", tmp.display())),
         };
-        if let Err(e) = file.write_all(content.as_bytes()) {
+        let write_result = if fail_write {
+            Err(std::io::Error::other("injected write failure"))
+        } else {
+            file.write_all(content.as_bytes())
+        };
+        if let Err(e) = write_result {
             let _ = fs::remove_file(&tmp);
             return Err(format!("write {}: {e}", tmp.display()));
         }
-        if let Err(e) = file.sync_all() {
+        let sync_result = if fail_sync {
+            Err(std::io::Error::other("injected sync failure"))
+        } else {
+            file.sync_all()
+        };
+        if let Err(e) = sync_result {
             let _ = fs::remove_file(&tmp);
             return Err(format!("sync {}: {e}", tmp.display()));
         }
         drop(file);
-        if let Err(e) = fs::rename(&tmp, path) {
+        let rename_result = if fail_rename {
+            Err(std::io::Error::other("injected rename failure"))
+        } else {
+            fs::rename(&tmp, path)
+        };
+        if let Err(e) = rename_result {
             let _ = fs::remove_file(&tmp);
             return Err(format!(
                 "rename {} -> {}: {e}",
@@ -5021,6 +5191,32 @@ fn atomic_write_file(path: &Path, content: &str) -> Result<(), String> {
     Err(format!(
         "failed to create unique temp file for {}",
         path.display()
+    ))
+}
+
+fn require_durable_reply(
+    alias: Result<PathBuf, String>,
+    task: Option<Result<PathBuf, String>>,
+) -> Result<(Option<PathBuf>, Option<PathBuf>, Vec<String>), String> {
+    let (alias_path, alias_error) = match alias {
+        Ok(path) => (Some(path), None),
+        Err(error) => (None, Some(error)),
+    };
+    let (task_path, task_error) = match task {
+        Some(Ok(path)) => (Some(path), None),
+        Some(Err(error)) => (None, Some(error)),
+        None => (None, None),
+    };
+    let errors = [alias_error, task_error]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+    if alias_path.is_some() || task_path.is_some() {
+        return Ok((alias_path, task_path, errors));
+    }
+    Err(format!(
+        "failed to preserve durable reply: {}",
+        errors.join("; ")
     ))
 }
 
@@ -5292,15 +5488,54 @@ fn send_return_key_with_retry(
 /// a restart or mixed-transport failure cannot silently land on a same-name
 /// sibling.  Returning `None` preserves the legacy unique-name path, while a
 /// duplicate name without an instance is rejected by the Swift RPC.
-fn selected_agent_instance_id(
+#[derive(Debug, Default, PartialEq, Eq)]
+struct ResolvedDelegateTarget {
+    agent_instance_id: Option<String>,
+    working_directory: Option<String>,
+}
+
+fn selected_delegate_target(
     sock: &PathBuf,
     team: &str,
     target: &str,
     panel_id: Option<&str>,
-) -> Option<String> {
-    let status = rpc_call(sock, "team.status", json!({ "team_name": team })).ok()?;
-    let agents = status["result"]["agents"].as_array()?;
-    instance_id_from_agents(agents, target, panel_id).ok().flatten()
+) -> Result<ResolvedDelegateTarget, String> {
+    let status = match rpc_call(sock, "team.status", json!({ "team_name": team })) {
+        Ok(status) => status,
+        Err(error) if panel_id.is_some() => {
+            return Err(format!("cannot resolve --panel before delegate: {error}"));
+        }
+        Err(_) => return Ok(ResolvedDelegateTarget::default()),
+    };
+    let agents = match status["result"]["agents"].as_array() {
+        Some(agents) => agents,
+        None if panel_id.is_some() => {
+            return Err("team.status response has no agents array; cannot resolve --panel".into());
+        }
+        None => return Ok(ResolvedDelegateTarget::default()),
+    };
+    delegate_target_from_agents(agents, target, panel_id)
+}
+
+fn delegate_target_from_agents(
+    agents: &[Value],
+    target: &str,
+    panel_id: Option<&str>,
+) -> Result<ResolvedDelegateTarget, String> {
+    let instance = instance_id_from_agents(agents, target, panel_id)?;
+    let placement = instance.as_deref().and_then(|instance_id| {
+        agents.iter().find(|agent| {
+            agent["agent_instance_id"].as_str() == Some(instance_id)
+                && agent["name"].as_str() == Some(target)
+        })
+    });
+    Ok(ResolvedDelegateTarget {
+        agent_instance_id: instance,
+        working_directory: placement
+            .and_then(|agent| agent["working_directory"].as_str())
+            .filter(|path| !path.is_empty())
+            .map(str::to_string),
+    })
 }
 
 /// Resolve an optional panel selector to the durable instance selector used by
@@ -6966,6 +7201,7 @@ fn main() {
         Commands::Delegate {
             agent: ref target,
             text,
+            request_id,
             title,
             priority,
             accept,
@@ -7015,17 +7251,20 @@ fn main() {
                     &team,
                     target,
                     &text,
-                    title,
-                    priority,
-                    &accept,
-                    &deps,
-                    desc,
-                    no_report,
-                    context.as_deref(),
-                    auto_fix_budget,
-                    panel.as_deref(),
-                    worktree,
-                    from_ref.as_deref(),
+                    DelegateOptions {
+                        title,
+                        priority,
+                        accept: &accept,
+                        deps: &deps,
+                        desc,
+                        no_report,
+                        context: context.as_deref(),
+                        fix_budget: auto_fix_budget,
+                        panel_id: panel.as_deref(),
+                        worktree_policy: worktree,
+                        from_ref: from_ref.as_deref(),
+                        request_id: request_id.as_deref(),
+                    },
                 );
             }
             return;
@@ -7365,10 +7604,21 @@ fn main() {
                 );
             }
             content = normalized_content;
-            let alias_result_path = write_result_file(&team, &alias_name, &content).ok();
-            let task_result_path = reply_task_id
+            let alias_write = write_result_file(&team, &alias_name, &content);
+            let task_write = reply_task_id
                 .as_deref()
-                .and_then(|tid| write_result_file(&team, &format!("{tid}.md"), &content).ok());
+                .map(|tid| write_result_file(&team, &format!("{tid}.md"), &content));
+            let (alias_result_path, task_result_path, write_errors) =
+                match require_durable_reply(alias_write, task_write) {
+                    Ok(paths) => paths,
+                    Err(error) => {
+                        eprintln!("{error}");
+                        process::exit(1);
+                    }
+                };
+            for error in write_errors {
+                eprintln!("  Warning: one durable reply copy failed: {error}");
+            }
             let result_path = task_result_path.as_ref().or(alias_result_path.as_ref());
             let summary = truncate_summary(&content, 1500);
             let mut msg_params = json!({
@@ -7379,7 +7629,8 @@ fn main() {
                 msg_params["result_path"] = json!(path.to_string_lossy());
             }
             // team.message.post — retry once on failure, but never exit: the
-            // verdict is still recorded in the alias/task result files below and
+            // verdict was durably recorded in at least one alias/task result
+            // file and
             // the task is completed afterward, so a transient inbox-post failure
             // must not abort the reply (which would skip task completion and hang
             // the leader's wait). Mirrors the team.report handling just below.
@@ -10047,26 +10298,52 @@ fn run_add_headless(
     }
 }
 
+struct DelegateOptions<'a> {
+    title: Option<String>,
+    priority: Option<u32>,
+    accept: &'a [String],
+    deps: &'a [String],
+    desc: Option<String>,
+    no_report: bool,
+    context: Option<&'a str>,
+    fix_budget: Option<u8>,
+    panel_id: Option<&'a str>,
+    worktree_policy: WorktreePolicyArg,
+    from_ref: Option<&'a str>,
+    request_id: Option<&'a str>,
+}
+
 fn run_delegate_result(
     sock: &PathBuf,
     team: &str,
     target: &str,
     text: &str,
-    title: Option<String>,
-    priority: Option<u32>,
-    accept: &[String],
-    deps: &[String],
-    desc: Option<String>,
-    no_report: bool,
-    context: Option<&str>,
-    fix_budget: Option<u8>,
-    panel_id: Option<&str>,
-    worktree_policy: WorktreePolicyArg,
-    from_ref: Option<&str>,
+    options: DelegateOptions<'_>,
 ) -> Result<Value, String> {
+    let DelegateOptions {
+        title,
+        priority,
+        accept,
+        deps,
+        desc,
+        no_report,
+        context,
+        fix_budget,
+        panel_id,
+        worktree_policy,
+        from_ref,
+        request_id,
+    } = options;
     let resolved_title = title.unwrap_or_else(|| task_title_from_text(text));
     let resolved_priority = priority.unwrap_or(2);
-    let selected_instance_id = selected_agent_instance_id(sock, team, target, panel_id);
+    // Resolve the pane once, before either task creation path. An explicit
+    // panel must never degrade into name-only routing on status failure.
+    let selected_target = selected_delegate_target(sock, team, target, panel_id)?;
+    let selected_instance_id = selected_target.agent_instance_id.as_deref();
+    let request_id = request_id
+        .filter(|value| !value.trim().is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(local_request_id);
 
     if should_acquire_worktree(
         worktree_policy,
@@ -10089,12 +10366,15 @@ fn run_delegate_result(
             context,
             fix_budget,
             panel_id,
+            selected_instance_id,
+            selected_target.working_directory.as_deref(),
             worktree_policy,
             from_ref,
+            &request_id,
         );
     }
 
-    // Try unified team.delegate RPC first (single round-trip).
+    // Retry an unknown transport outcome once with the exact same idempotency key.
     let delegate_params = delegate_rpc_params(
         team,
         target,
@@ -10107,10 +10387,13 @@ fn run_delegate_result(
         context,
         fix_budget,
         panel_id,
-        selected_instance_id.as_deref(),
+        selected_instance_id,
+        &request_id,
     );
-    if let Ok(v) = rpc_call(sock, "team.delegate", delegate_params) {
-        if v["ok"].as_bool().unwrap_or(false) {
+    let unified = resolve_unified_delegate(&delegate_params, &request_id, |params| {
+        rpc_call(sock, "team.delegate", params.clone())
+    })?;
+    if let UnifiedDelegateOutcome::Response(v) = unified {
             // Check if text was actually delivered to the agent's terminal
             let mut text_delivered = v["result"]["text_delivered"].as_bool().unwrap_or(true);
             if !text_delivered {
@@ -10250,7 +10533,6 @@ fn run_delegate_result(
             );
 
             return Ok(v);
-        }
     }
 
     // Fallback: 2-RPC path (server may not support team.delegate yet).
@@ -10261,8 +10543,9 @@ fn run_delegate_result(
         "team_name": team,
         "title": resolved_title,
                 "assignee": target,
-                "priority": resolved_priority,
-                "agent_instance_id": selected_instance_id,
+        "priority": resolved_priority,
+        "agent_instance_id": selected_instance_id,
+        "request_id": request_id,
     });
     if let Some(d) = desc {
         params["description"] = json!(d);
@@ -10416,6 +10699,7 @@ fn delegate_rpc_params(
     fix_budget: Option<u8>,
     panel_id: Option<&str>,
     agent_instance_id: Option<&str>,
+    request_id: &str,
 ) -> Value {
     let mut params = json!({
         "team": team,
@@ -10424,6 +10708,7 @@ fn delegate_rpc_params(
         "task_title": title,
         "priority": priority,
         "agent_instance_id": agent_instance_id,
+        "request_id": request_id,
     });
     if !accept.is_empty() {
         params["acceptance_criteria"] = json!(accept);
@@ -10444,6 +10729,122 @@ fn delegate_rpc_params(
         params["panel_id"] = json!(pid);
     }
     params
+}
+
+#[derive(Debug)]
+enum UnifiedDelegateOutcome {
+    Response(Value),
+    LegacyFallback,
+}
+
+fn delegate_response_is_explicitly_unsupported(response: &Value) -> bool {
+    if response["error"]["code"].as_i64() == Some(-32601) {
+        return true;
+    }
+    [
+        response["error"]["code"].as_str(),
+        response["error_code"].as_str(),
+        response["result"]["error_code"].as_str(),
+    ]
+    .into_iter()
+    .flatten()
+    .any(|code| {
+        matches!(
+            code.to_ascii_lowercase().as_str(),
+            "method_not_found"
+                | "method-not-found"
+                | "unknown_method"
+                | "unsupported"
+                | "unsupported_method"
+                | "not_supported"
+        )
+    })
+}
+
+fn delegate_error_is_explicitly_unsupported(error: &str) -> bool {
+    let lower = error.to_ascii_lowercase();
+    [
+        "[method_not_found]",
+        "[method-not-found]",
+        "[unknown_method]",
+        "[unsupported]",
+        "[unsupported_method]",
+        "[not_supported]",
+    ]
+    .iter()
+    .any(|code| lower.contains(code))
+}
+
+const DELEGATE_AGENT_BUSY_HINT: &str =
+    "\nHint: Agent has an active task — finish/block it first, or delegate to another idle agent.";
+
+fn delegate_response_error_code(response: &Value) -> Option<&str> {
+    response["error"]["code"]
+        .as_str()
+        .or_else(|| response["result"]["error_code"].as_str())
+}
+
+fn delegate_error_with_agent_busy_hint(error: String) -> String {
+    if error.contains("[agent_busy]") && !error.contains(DELEGATE_AGENT_BUSY_HINT) {
+        format!("{error}{DELEGATE_AGENT_BUSY_HINT}")
+    } else {
+        error
+    }
+}
+
+fn resolve_unified_delegate<F>(
+    params: &Value,
+    request_id: &str,
+    mut call: F,
+) -> Result<UnifiedDelegateOutcome, String>
+where
+    F: FnMut(&Value) -> Result<Value, String>,
+{
+    let first_error = match call(params) {
+        Ok(response) if response["ok"].as_bool().unwrap_or(false) => {
+            return Ok(UnifiedDelegateOutcome::Response(response));
+        }
+        Ok(response) if delegate_response_is_explicitly_unsupported(&response) => {
+            return Ok(UnifiedDelegateOutcome::LegacyFallback);
+        }
+        Ok(response) => {
+            let hint = if delegate_response_error_code(&response) == Some("agent_busy") {
+                DELEGATE_AGENT_BUSY_HINT
+            } else {
+                ""
+            };
+            return Err(format!(
+                "team.delegate returned non-ok (request_id={request_id}): {}",
+                format!("{}{hint}", pretty(&response))
+            ));
+        }
+        Err(error) if delegate_error_is_explicitly_unsupported(&error) => {
+            return Ok(UnifiedDelegateOutcome::LegacyFallback);
+        }
+        Err(error) => delegate_error_with_agent_busy_hint(error),
+    };
+
+    match call(params) {
+        Ok(response) if response["ok"].as_bool().unwrap_or(false) => {
+            Ok(UnifiedDelegateOutcome::Response(response))
+        }
+        Ok(response) => {
+            let hint = if delegate_response_error_code(&response) == Some("agent_busy") {
+                DELEGATE_AGENT_BUSY_HINT
+            } else {
+                ""
+            };
+            Err(format!(
+                "team.delegate outcome unknown after transport retry; request_id={request_id}; \
+                 retry with --request-id {request_id}; first={first_error}; retry={}{hint}",
+                pretty(&response)
+            ))
+        }
+        Err(retry_error) => Err(delegate_error_with_agent_busy_hint(format!(
+            "team.delegate outcome unknown after transport retry; request_id={request_id}; \
+             retry with --request-id {request_id}; first={first_error}; retry={retry_error}"
+        ))),
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -10633,7 +11034,23 @@ fn acquire_task_worktree_lock(team: &str, task_id: &str) -> Result<TaskWorktreeL
     }
 }
 
-fn gk_wt_acquire(branch: &str, from_ref: Option<&str>) -> Result<GkWorktreeMeta, String> {
+fn gk_wt_acquire(
+    branch: &str,
+    from_ref: Option<&str>,
+    working_directory: Option<&str>,
+) -> Result<GkWorktreeMeta, String> {
+    gk_wt_acquire_with(branch, from_ref, working_directory, run_gk_json)
+}
+
+fn gk_wt_acquire_with<F>(
+    branch: &str,
+    from_ref: Option<&str>,
+    working_directory: Option<&str>,
+    mut run: F,
+) -> Result<GkWorktreeMeta, String>
+where
+    F: FnMut(&[String], Option<&str>) -> Result<Value, String>,
+{
     let mut args = vec![
         "wt".to_string(),
         "acquire".to_string(),
@@ -10644,7 +11061,7 @@ fn gk_wt_acquire(branch: &str, from_ref: Option<&str>) -> Result<GkWorktreeMeta,
         args.push("--from".to_string());
         args.push(base.to_string());
     }
-    let value = run_gk_json(&args, None)?;
+    let value = run(&args, working_directory)?;
     if !value["ok"].as_bool().unwrap_or(false) {
         return Err(format!("git-kit wt acquire failed: {}", pretty(&value)));
     }
@@ -10778,6 +11195,43 @@ fn run_task_finish_worktree(
     }))
 }
 
+fn worktree_task_create_params(
+    team: &str,
+    target: &str,
+    resolved_title: &str,
+    resolved_priority: u32,
+    accept: &[String],
+    deps: &[String],
+    desc: Option<&str>,
+    fix_budget: Option<u8>,
+    agent_instance_id: Option<&str>,
+    worktree_policy: WorktreePolicyArg,
+    request_id: &str,
+) -> Value {
+    let mut params = json!({
+        "team_name": team,
+        "title": resolved_title,
+        "assignee": target,
+        "priority": resolved_priority,
+        "worktree_policy": worktree_policy_name(worktree_policy),
+        "request_id": request_id,
+        "agent_instance_id": agent_instance_id,
+    });
+    if let Some(d) = desc {
+        params["description"] = json!(d);
+    }
+    if !accept.is_empty() {
+        params["acceptance_criteria"] = json!(accept);
+    }
+    if !deps.is_empty() {
+        params["depends_on"] = json!(deps);
+    }
+    if let Some(fb) = fix_budget {
+        params["fix_budget"] = json!(fb);
+    }
+    params
+}
+
 fn run_delegate_result_with_worktree(
     sock: &PathBuf,
     team: &str,
@@ -10792,28 +11246,25 @@ fn run_delegate_result_with_worktree(
     context: Option<&str>,
     fix_budget: Option<u8>,
     panel_id: Option<&str>,
+    agent_instance_id: Option<&str>,
+    working_directory: Option<&str>,
     worktree_policy: WorktreePolicyArg,
     from_ref: Option<&str>,
+    request_id: &str,
 ) -> Result<Value, String> {
-    let mut params = json!({
-        "team_name": team,
-        "title": resolved_title,
-        "assignee": target,
-        "priority": resolved_priority,
-        "worktree_policy": worktree_policy_name(worktree_policy),
-    });
-    if let Some(d) = desc {
-        params["description"] = json!(d);
-    }
-    if !accept.is_empty() {
-        params["acceptance_criteria"] = json!(accept);
-    }
-    if !deps.is_empty() {
-        params["depends_on"] = json!(deps);
-    }
-    if let Some(fb) = fix_budget {
-        params["fix_budget"] = json!(fb);
-    }
+    let params = worktree_task_create_params(
+        team,
+        target,
+        &resolved_title,
+        resolved_priority,
+        accept,
+        deps,
+        desc.as_deref(),
+        fix_budget,
+        agent_instance_id,
+        worktree_policy,
+        request_id,
+    );
 
     let created = rpc_call(sock, "team.task.create", params)
         .map_err(|e| format!("task.create before worktree acquire failed: {e}"))?;
@@ -10824,7 +11275,7 @@ fn run_delegate_result_with_worktree(
         .to_string();
 
     let branch = worktree_branch_for_task(team, &task, text);
-    let meta = match gk_wt_acquire(&branch, from_ref) {
+    let meta = match gk_wt_acquire(&branch, from_ref, working_directory) {
         Ok(meta) => meta,
         Err(e) => {
             let reason = format!("worktree acquire failed: {e}");
@@ -10874,6 +11325,7 @@ fn run_delegate_result_with_worktree(
             "agent_name": target,
             "text": &send_text,
             "panel_id": panel_id,
+            "agent_instance_id": agent_instance_id,
         }),
     )
     .map_err(|e| format!("team.send: {e}"))?;
@@ -10886,8 +11338,15 @@ fn run_delegate_result_with_worktree(
         ));
     }
 
-    let _ =
-        send_return_key_with_retry(sock, team, target, true, "team.delegate.worktree", panel_id, None);
+    let _ = send_return_key_with_retry(
+        sock,
+        team,
+        target,
+        true,
+        "team.delegate.worktree",
+        panel_id,
+        agent_instance_id,
+    );
     Ok(json!({ "task": task, "send": sent, "worktree": meta.path }))
 }
 
@@ -10896,35 +11355,9 @@ fn run_delegate(
     team: &str,
     target: &str,
     text: &str,
-    title: Option<String>,
-    priority: Option<u32>,
-    accept: &[String],
-    deps: &[String],
-    desc: Option<String>,
-    no_report: bool,
-    context: Option<&str>,
-    fix_budget: Option<u8>,
-    panel_id: Option<&str>,
-    worktree_policy: WorktreePolicyArg,
-    from_ref: Option<&str>,
+    options: DelegateOptions<'_>,
 ) {
-    match run_delegate_result(
-        sock,
-        team,
-        target,
-        text,
-        title,
-        priority,
-        accept,
-        deps,
-        desc,
-        no_report,
-        context,
-        fix_budget,
-        panel_id,
-        worktree_policy,
-        from_ref,
-    ) {
+    match run_delegate_result(sock, team, target, text, options) {
         Ok(v) => println!("{}", pretty(&v)),
         Err(e) => {
             eprintln!("Error: {e}");
@@ -11243,17 +11676,20 @@ fn run_fan_out(
                         team,
                         target,
                         text,
-                        Some(t),
-                        priority,
-                        &[],
-                        &[],
-                        None,
-                        no_report,
-                        context,
-                        fix_budget,
-                        panel_id,
-                        worktree_policy,
-                        from_ref,
+                        DelegateOptions {
+                            title: Some(t),
+                            priority,
+                            accept: &[],
+                            deps: &[],
+                            desc: None,
+                            no_report,
+                            context,
+                            fix_budget,
+                            panel_id,
+                            worktree_policy,
+                            from_ref,
+                            request_id: None,
+                        },
                     );
                     (*target, result)
                 })
@@ -13404,17 +13840,20 @@ fn run_warmup(sock: &PathBuf, team: &str, target: Option<&str>, timeout: u32) {
             team,
             name,
             "Reply with exactly one word: pong",
-            Some("warmup-ping".to_string()),
-            Some(3),
-            &[],
-            &[],
-            None,
-            true,
-            None,
-            None,
-            None,
-            WorktreePolicyArg::Off,
-            None,
+            DelegateOptions {
+                title: Some("warmup-ping".to_string()),
+                priority: Some(3),
+                accept: &[],
+                deps: &[],
+                desc: None,
+                no_report: true,
+                context: None,
+                fix_budget: None,
+                panel_id: None,
+                worktree_policy: WorktreePolicyArg::Off,
+                from_ref: None,
+                request_id: None,
+            },
         );
         match result {
             Ok(v) => {
@@ -13526,7 +13965,7 @@ fn run_claim(sock: &PathBuf, team: &str, agent: &str) {
                     && should_acquire_worktree(policy, agent, &goal, &title, details.as_deref())
                 {
                     let branch = worktree_branch_for_task(team, &task, &goal);
-                    match gk_wt_acquire(&branch, None) {
+                    match gk_wt_acquire(&branch, None, None) {
                         Ok(meta) => {
                             match update_task_with_worktree(sock, team, &task_id, &meta, policy) {
                                 Ok(updated) => {
@@ -14051,17 +14490,20 @@ fn dispatch_and_wait(
                 &team_owned,
                 &name,
                 &prompt,
-                Some(title),
-                None,
-                &[],
-                &[],
-                None,
-                false,
-                None,
-                None,
-                None,
-                WorktreePolicyArg::Off,
-                None,
+                DelegateOptions {
+                    title: Some(title),
+                    priority: None,
+                    accept: &[],
+                    deps: &[],
+                    desc: None,
+                    no_report: false,
+                    context: None,
+                    fix_budget: None,
+                    panel_id: None,
+                    worktree_policy: WorktreePolicyArg::Off,
+                    from_ref: None,
+                    request_id: None,
+                },
             );
             (name, result)
         });
@@ -14413,17 +14855,20 @@ fn run_autonomous(
                 &team_owned,
                 &name_owned,
                 &instr,
-                Some(title),
-                None,
-                &[],
-                &[],
-                None,
-                false,
-                None,
-                None,
-                None,
-                WorktreePolicyArg::Off,
-                None,
+                DelegateOptions {
+                    title: Some(title),
+                    priority: None,
+                    accept: &[],
+                    deps: &[],
+                    desc: None,
+                    no_report: false,
+                    context: None,
+                    fix_budget: None,
+                    panel_id: None,
+                    worktree_policy: WorktreePolicyArg::Off,
+                    from_ref: None,
+                    request_id: None,
+                },
             );
             (name_owned, result)
         });
@@ -14896,6 +15341,11 @@ mod auto_watch_tests {
             "team.result.collect",
             "team.task.create",
             "team.task.update",
+            "team.task.done",
+            "team.task.block",
+            "team.task.review",
+            "team.task.unblock",
+            "team.task.approve",
             "team.task.list",
             "team.task.diff",
         ] {
@@ -14908,6 +15358,7 @@ mod auto_watch_tests {
             "team.attach",
             "team.add_agent",
             "team.restart",
+            "team.task.reassign",
             "surface.send_key",
         ] {
             assert!(!remote_leader_method_allowed(method), "{method}");
@@ -15017,6 +15468,128 @@ mod auto_watch_tests {
             "result": { "return_submitted": false },
         })));
     }
+
+    #[test]
+    fn remote_leader_proxy_preserves_nested_error_code_and_message() {
+        let error = remote_leader_proxy_result(json!({
+            "ok": false,
+            "result": {
+                "error_code": "expired_grant",
+                "error_message": "leader grant expired before dispatch",
+            },
+        }))
+        .unwrap_err();
+
+        assert_eq!(
+            error,
+            "remote leader proxy [expired_grant]: leader grant expired before dispatch"
+        );
+    }
+
+    #[test]
+    fn remote_leader_proxy_without_nested_error_details_keeps_generic_fallback() {
+        let error = remote_leader_proxy_result(json!({
+            "ok": false,
+            "result": {},
+        }))
+        .unwrap_err();
+
+        assert_eq!(error, "remote leader proxy returned non-ok");
+    }
+
+    #[test]
+    fn retry_after_response_timeout_reuses_same_request_id() {
+        let params = json!({"request_id": "delegate-stable-1"});
+        let mut seen_request_ids = Vec::new();
+        let mut calls = 0;
+        let outcome = resolve_unified_delegate(&params, "delegate-stable-1", |attempt| {
+            calls += 1;
+            seen_request_ids.push(attempt["request_id"].as_str().unwrap().to_string());
+            if calls == 1 {
+                Err("read: timed out".into())
+            } else {
+                Ok(json!({"ok": true, "result": {"task": {"id": "task-1"}}}))
+            }
+        })
+        .unwrap();
+
+        assert!(matches!(outcome, UnifiedDelegateOutcome::Response(_)));
+        assert_eq!(seen_request_ids, ["delegate-stable-1", "delegate-stable-1"]);
+    }
+
+    #[test]
+    fn transport_error_does_not_enter_legacy_fallback() {
+        let params = json!({"request_id": "delegate-unknown-1"});
+        for retry in [
+            Err("read: timed out".to_string()),
+            Ok(json!({
+                "ok": false,
+                "error": {"code": -32601, "message": "method not found"},
+            })),
+        ] {
+            let mut unified_calls = 0;
+            let mut legacy_task_create_calls = 0;
+            let result = resolve_unified_delegate(&params, "delegate-unknown-1", |_| {
+                unified_calls += 1;
+                if unified_calls == 1 {
+                    Err("read: timed out".into())
+                } else {
+                    retry.clone()
+                }
+            });
+            if matches!(result, Ok(UnifiedDelegateOutcome::LegacyFallback)) {
+                legacy_task_create_calls += 1;
+            }
+
+            let error = result.unwrap_err();
+            assert_eq!(unified_calls, 2);
+            assert_eq!(legacy_task_create_calls, 0);
+            assert!(error.contains("request_id=delegate-unknown-1"));
+            assert!(error.contains("--request-id delegate-unknown-1"));
+        }
+    }
+
+    #[test]
+    fn method_not_found_still_falls_back_to_legacy() {
+        let params = json!({"request_id": "delegate-legacy-1"});
+        let mut unified_calls = 0;
+        let mut legacy_task_create_calls = 0;
+        let outcome = resolve_unified_delegate(&params, "delegate-legacy-1", |_| {
+            unified_calls += 1;
+            Ok(json!({
+                "ok": false,
+                "error": {"code": -32601, "message": "method not found"},
+            }))
+        })
+        .unwrap();
+        if matches!(outcome, UnifiedDelegateOutcome::LegacyFallback) {
+            legacy_task_create_calls += 1;
+        }
+
+        assert_eq!(unified_calls, 1);
+        assert_eq!(legacy_task_create_calls, 1);
+    }
+
+    #[test]
+    fn agent_busy_delegate_error_has_actionable_hint() {
+        let response_error = resolve_unified_delegate(&json!({}), "delegate-busy-1", |_| {
+            Ok(json!({
+                "ok": false,
+                "error": {"code": "agent_busy", "message": "agent has an active task"},
+            }))
+        })
+        .unwrap_err();
+        let proxy_error = resolve_unified_delegate(&json!({}), "delegate-busy-2", |_| {
+            Err("remote leader proxy [agent_busy]: agent has an active task".into())
+        })
+        .unwrap_err();
+
+        for error in [response_error, proxy_error] {
+            assert!(error.contains("agent_busy"));
+            assert!(error.contains("finish/block it first"));
+            assert!(error.contains("another idle agent"));
+        }
+    }
 }
 
 /// The bare `tm-agent reply` contract: nothing about resolving *who* replied may
@@ -15027,6 +15600,40 @@ mod auto_watch_tests {
 #[cfg(test)]
 mod reply_completion_regression_169_tests {
     use super::*;
+
+    #[test]
+    fn reply_requires_at_least_one_durable_copy() {
+        let full_reply = "x".repeat(1601);
+        assert_ne!(truncate_summary(&full_reply, 1500), full_reply);
+        for fault in [
+            AtomicWriteFault::Write,
+            AtomicWriteFault::Sync,
+            AtomicWriteFault::Rename,
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("reply.md");
+            let error = atomic_write_file_with_fault(&path, &full_reply, Some(fault))
+                .expect_err("injected durable write must fail");
+            assert!(!path.exists(), "a failed write must not publish a partial reply");
+            assert!(
+                require_durable_reply(Err(error.clone()), Some(Err(error))).is_err(),
+                "two failed durable writes must prevent reply completion"
+            );
+        }
+    }
+
+    #[test]
+    fn one_durable_copy_is_enough_to_continue() {
+        let durable = PathBuf::from("/tmp/task.md");
+        let (alias, task, errors) = require_durable_reply(
+            Err("alias failed".to_string()),
+            Some(Ok(durable.clone())),
+        )
+        .expect("the canonical task copy is durable");
+        assert_eq!(alias, None);
+        assert_eq!(task, Some(durable));
+        assert_eq!(errors, vec!["alias failed"]);
+    }
 
     #[test]
     fn bare_reply_closes_only_the_current_duplicate_name_instance_task() {
