@@ -694,16 +694,26 @@ When a task has a fix budget (set via `--auto-fix-budget N` on delegate):
 > grant 스코프를 워커까지 확장하는 건 별건이다 — 현 grant는 `team.delegate`/`broadcast`/`send`
 > 까지 포함하는 리더 권한이라 워커에 그대로 줄 수 없다.
 
-### 피어 에이전트의 검증 한계 — 언어별로 다르다
+### 에이전트의 검증 환경 — 실행 위치를 먼저 확인한다
 
-피어 호스트(Linux)에는 **Swift 툴체인이 없다.** Rust와 Python은 피어에서 완전히 검증된다.
+`tm-agent status`의 host 필드만으로 에이전트의 실행 위치를 단정하지 않는다. 에이전트가 같은 Mac의
+`/Users/jinwoo/work/tm-projects/term-mesh-<role>-<date>-<suffix>` worktree에서 실행되는 경우가 있으므로
+먼저 `git worktree list`로 실제 경로를 확인한다. 실제 Linux 피어 호스트에는 Swift 툴체인이 없을 수
+있지만, 로컬 worktree에서 Swift 빌드가 실패하는 주된 준비 누락은 `GhosttyKit.xcframework` 링크다.
 
-| 작업 언어 | 피어에서 가능한 것 | 리더가 해야 할 것 |
-|-----------|-------------------|------------------|
-| Rust / Python | 편집 + 빌드 + 테스트 | 결과 수용 |
-| Swift | **편집만** | 로컬 머신에서 통합 후 빌드·테스트 필수 |
+| 실행 위치 | 가능한 검증 | 리더가 준비할 것 |
+|-----------|-------------|------------------|
+| 실제 Linux 피어 | Rust / Python 빌드·테스트; Swift는 편집·정적 확인 | Swift 변경은 로컬 통합 후 빌드·테스트 |
+| 같은 Mac의 별도 worktree | Swift 빌드·테스트 포함 | `GhosttyKit.xcframework` 링크 준비 |
 
-Swift 작업을 피어에 보낼 때는 태스크 캡슐에 다음을 넣는다(2026-07-29 웨이브에서 효과 확인):
+로컬 에이전트 worktree를 만든 뒤 리더 체크아웃과 같은 캐시 대상을 가리키게 한다:
+
+```bash
+TARGET=$(readlink GhosttyKit.xcframework)
+ln -s "$TARGET" <agent-worktree>/GhosttyKit.xcframework
+```
+
+실제 Linux 피어에 Swift 작업을 보낼 때는 태스크 캡슐에 다음을 넣는다(2026-07-29 웨이브에서 효과 확인):
 
 ```
 - 이 호스트에 Swift 툴체인이 없다. xcodebuild/swift build 시도 금지(시간 낭비).
@@ -711,11 +721,29 @@ Swift 작업을 피어에 보낼 때는 태스크 캡슐에 다음을 넣는다(
   그 확인 결과를 보고에 포함해라.
 ```
 
-그리고 Swift 변경은 파이프라인에 **로컬 통합 빌드 단계를 반드시 넣는다.** 피어 에이전트의
+그리고 Linux 피어의 Swift 변경은 파이프라인에 **로컬 통합 빌드 단계를 반드시 넣는다.** 피어 에이전트의
 STATUS: DONE은 "편집 완료"이지 "빌드 통과"가 아니다. v0.169 웨이브 1에서는 피어의 두
 그룹이 기존 테스트 6케이스를 깨뜨렸지만 Swift를 컴파일할 수 없어 로컬 통합 단계에서야
 발견됐다. 통합 담당자가 대신 고치지 말고, 실패한 변경은 해당 파일 소유자에게 돌려보내
 수정·재검증하게 한다.
+
+### 에이전트 결과 회수
+
+먼저 `git worktree list`로 에이전트의 실제 worktree와 브랜치를 찾는다. 에이전트가 커밋했다면
+리더 브랜치에서 그 SHA를 `git cherry-pick <sha>`한다. tracked 변경이 미커밋 상태라면 다음처럼
+패치를 만들어 적용한다. 신규 untracked 파일은 이 패치에 포함되지 않으므로 별도로 회수한다.
+
+```bash
+git -C <agent-worktree> diff > /tmp/x.patch
+git apply --3way /tmp/x.patch
+```
+
+### 위임 캡슐의 전달·검증 규칙
+
+- 캡슐이 크면 소켓 프레이밍 문제로 전달이 실패할 수 있다. 내용을 파일에 쓰고 에이전트에는
+  `cat <path>`로 읽으라는 짧은 지시만 보낸다.
+- 검증 요구에는 비교할 **직전 기준선 숫자**를 함께 쓴다. 예: `직전 기준선 1310 tests, 0 failures`.
+- 요구한 빌드·테스트가 통과하기 전에는 완료 보고하지 말라고 명시한다.
 
 ### Reply Truncation Protocol
 
