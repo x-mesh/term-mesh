@@ -3958,6 +3958,43 @@ class TerminalController {
         }
     }
 
+    /// The delegate idempotency key as it arrives on the wire.
+    ///
+    /// Static and pure so the wiring is pinned by a test: the store has deduped
+    /// on this since 5c95ab10 and the CLI has sent it since d168ad61, and the
+    /// only thing that was ever missing was somebody reading it here.
+    nonisolated static func delegateRequestID(from params: [String: Any]) -> String? {
+        guard let raw = params["request_id"] as? String else { return nil }
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
+    }
+
+    /// What is holding the pool, phrased so the next command is obvious.
+    ///
+    /// `review_ready` is the common one and the reason this exists: it is not a
+    /// terminal status, so the agent stays out of the pool until someone closes
+    /// the task — and the old message said "Task creation failed", which sent
+    /// the reader looking at the store instead.
+    ///
+    /// Pure and static so the wording is pinned by a test rather than by
+    /// reading it off a running app.
+    nonisolated static func delegateBlockerSummary(
+        _ blockers: [TeamOrchestrator.DelegateBlocker]
+    ) -> String {
+        guard !blockers.isEmpty else {
+            // Every instance was ineligible for a reason other than a task:
+            // parked, migrating, no pane, or still thinking.
+            return "every instance is parked, migrating or still working. "
+                + "Retry shortly, or pass --agent-instance-id to target one exactly."
+        }
+        let listed = blockers
+            .map { "\($0.taskID) (\($0.status))" }
+            .joined(separator: ", ")
+        return "blocked by active task(s): \(listed). "
+            + "Close one with `tm-agent task done <id>`, or pass --agent-instance-id "
+            + "to target an instance exactly."
+    }
+
     /// Unified delegate handler: atomically creates a task and dispatches the formatted
     /// instruction to the agent in a single RPC. Replaces the 2-step team.task.create +
     /// team.send pattern used by `tm-agent delegate` as fallback.
@@ -3993,6 +4030,11 @@ class TerminalController {
         let taskTitle = params["task_title"] as? String
         let priority = params["priority"] as? Int
         let context = params["context"] as? String
+        // The CLI has sent a stable id per delegate since d168ad61, and
+        // `TeamDataStore.createTask` has deduped on it since 5c95ab10 — but
+        // nothing in between read it, so a retried delegate still created a
+        // second task. This is the missing wire.
+        let requestId = TerminalController.delegateRequestID(from: params)
         let store = TeamDataStore.shared
 
         // Stagger: dynamic gap based on team size to prevent main-queue saturation
@@ -4013,7 +4055,7 @@ class TerminalController {
         // for cases where completion is never called due to a deeper bug.
         // The Rust CLI sends Return via team.send_key only after receiving this ack,
         // eliminating the race between paste flush and the previous 150ms fixed sleep.
-        var capturedDelegateResult: TeamOrchestrator.DelegateResult? = nil
+        var capturedOutcome: TeamOrchestrator.DelegateOutcome? = nil
         let textDelivered: Bool = await withCheckedContinuation { cont in
             var resumed = false
             let resume: (Bool) -> Void = { ok in
@@ -4025,7 +4067,7 @@ class TerminalController {
             Task { @MainActor in
                 let tabManager = TeamOrchestrator.shared.resolveTabManager(teamName: teamName) ?? self.tabManager
                 guard let tabManager else { resume(false); return }
-                capturedDelegateResult = TeamOrchestrator.shared.delegateToAgent(
+                let outcome = TeamOrchestrator.shared.delegate(
                     teamName: teamName,
                     agentName: agentName,
                     agentInstanceId: requestedInstanceId,
@@ -4033,15 +4075,43 @@ class TerminalController {
                     taskTitle: taskTitle,
                     priority: priority,
                     context: context,
+                    requestId: requestId,
                     tabManager: tabManager,
                     completion: { ok in resume(ok) }
                 )
-                if capturedDelegateResult == nil { resume(false) }
+                capturedOutcome = outcome
+                if case .delivered = outcome {} else { resume(false) }
             }
         }
 
-        guard let delegateResult = capturedDelegateResult else {
-            return v2Error(id: id, code: "internal_error", message: "Task creation failed for agent '\(agentName)'")
+        let delegateResult: TeamOrchestrator.DelegateResult
+        switch capturedOutcome {
+        case .delivered(let result):
+            delegateResult = result
+        case .noSuchAgent:
+            return v2Error(
+                id: id, code: "not_found",
+                message: "No agent named '\(agentName)' in team '\(teamName)'"
+            )
+        case .allInstancesBusy(let blockers):
+            // The id is the actionable half: without it the leader is told an
+            // agent is busy and has to go find out what with.
+            return v2Error(
+                id: id, code: "agent_busy",
+                message: "Agent '\(agentName)' has no idle instance — "
+                    + TerminalController.delegateBlockerSummary(blockers)
+            )
+        case .taskCreateFailed:
+            return v2Error(
+                id: id, code: "internal_error",
+                message: "Task creation failed for agent '\(agentName)'"
+            )
+        case nil:
+            // The 12s dead-man switch fired before the main-actor block ran.
+            return v2Error(
+                id: id, code: "timeout",
+                message: "Delegate to '\(agentName)' did not complete in time"
+            )
         }
 
         var returnSubmitted = false

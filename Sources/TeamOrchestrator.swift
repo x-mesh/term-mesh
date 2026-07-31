@@ -3660,12 +3660,73 @@ final class TeamOrchestrator: ObservableObject {
         let instruction: String
     }
 
+    /// A task that is keeping an agent out of the delegate pool.
+    ///
+    /// Carried rather than summarised because the id is the actionable half:
+    /// the leader's next command names it.
+    struct DelegateBlocker: Equatable {
+        let taskID: String
+        let status: String
+    }
+
+    /// Why a delegate did not happen, or the result when it did.
+    ///
+    /// `delegateToAgent` returned `DelegateResult?` and collapsed two unrelated
+    /// failures into one `nil`: no such agent, and every instance already
+    /// holding a task. The RPC layer then reported both as "Task creation
+    /// failed", which is the one thing that had almost certainly NOT happened —
+    /// `TeamDataStore.createTask` only fails on an unregistered team or an
+    /// unresolvable assignee, both already established by the time it is called.
+    enum DelegateOutcome {
+        case delivered(DelegateResult)
+        /// The team has no agent by that name (or no such team).
+        case noSuchAgent
+        /// Every instance of the name is busy. Carries what is blocking each,
+        /// so the caller can say which task to close.
+        case allInstancesBusy(blockers: [DelegateBlocker])
+        /// The store genuinely refused to create the task.
+        case taskCreateFailed
+    }
+
+    /// Statuses that release an agent back to the pool.
+    ///
+    /// Mirrors `TeamDataStore.hasActiveTask`, which owns the real gate. The two
+    /// must agree: this set only decides what the *explanation* names, and an
+    /// explanation that disagreed with the gate would send the leader after the
+    /// wrong task. Deliberately does NOT include `review_ready` — that task is
+    /// waiting on a person, `taskNeedsAttention` counts it, and moving it here
+    /// would drop it out of the sidebar's review queue silently.
+    nonisolated static let delegateTerminalStatuses: Set<String> = [
+        "completed", "failed", "abandoned", "cancelled",
+    ]
+
+    /// What is keeping these instances out of the pool.
+    ///
+    /// Pure over the task list so the diagnosis can be tested without a team,
+    /// a pane or a store.
+    nonisolated static func delegateBlockers(
+        in tasks: [TeamTask],
+        agentInstanceIds: [String]
+    ) -> [DelegateBlocker] {
+        let wanted = Set(agentInstanceIds)
+        return tasks
+            .filter {
+                guard let instance = $0.assigneeInstanceId else { return false }
+                return wanted.contains(instance)
+                    && !delegateTerminalStatuses.contains($0.status)
+            }
+            .map { DelegateBlocker(taskID: $0.id, status: $0.status) }
+    }
+
     /// Unified delegate: atomically create a task in TeamDataStore and dispatch the
     /// formatted instruction to the agent. Mirrors the `tm-agent delegate` two-step
     /// logic (team.task.create + team.send) in a single atomic call.
     /// Must be called on the main thread (sendToAgent requires MainActor).
-    @discardableResult
-    func delegateToAgent(
+    ///
+    /// The `DelegateResult?` spelling is kept as a wrapper below for callers
+    /// that only need "did it go out"; anything reporting to a person should
+    /// use this one and say why it did not.
+    func delegate(
         teamName: String,
         agentName: String,
         agentInstanceId: String? = nil,
@@ -3678,10 +3739,11 @@ final class TeamOrchestrator: ObservableObject {
         submit: Bool = false,
         panelId: UUID? = nil,
         completion: ((Bool) -> Void)? = nil
-    ) -> DelegateResult? {
+    ) -> DelegateOutcome {
         let title = taskTitle?.nilIfBlank ?? String(text.prefix(80))
+        guard let team = teams[teamName] else { return .noSuchAgent }
+        let named = team.agents.filter { $0.name == agentName }
         let target: AgentMember? = {
-            guard let team = teams[teamName] else { return nil }
             if let agentInstanceId {
                 return resolveAgentForRPC(
                     teamName: teamName, agentName: agentName, agentInstanceId: agentInstanceId
@@ -3692,7 +3754,17 @@ final class TeamOrchestrator: ObservableObject {
             }
             return selectIdleAgent(in: team, role: agentName)
         }()
-        guard let target else { return nil }
+        guard let target else {
+            // The name exists but nothing was selectable, so the pool gate is
+            // what refused. Name the tasks holding it rather than reporting a
+            // creation that was never attempted.
+            guard !named.isEmpty else { return .noSuchAgent }
+            let blockers = Self.delegateBlockers(
+                in: TeamDataStore.shared.listTasks(teamName: teamName, assignee: agentName),
+                agentInstanceIds: named.map(\.agentInstanceId)
+            )
+            return .allInstancesBusy(blockers: blockers)
+        }
         guard let task = TeamDataStore.shared.createTask(
             teamName: teamName,
             title: title,
@@ -3700,7 +3772,7 @@ final class TeamOrchestrator: ObservableObject {
             assigneeInstanceId: target.agentInstanceId,
             priority: priority ?? 2,
             requestId: requestId
-        ) else { return nil }
+        ) else { return .taskCreateFailed }
         let instruction = formatDelegateInstruction(
             teamName: teamName,
             target: target,
@@ -3727,7 +3799,9 @@ final class TeamOrchestrator: ObservableObject {
                 recordPendingReturnFor: target.agentInstanceId,
                 completion: completion
             )
-            return DelegateResult(task: task, textDelivered: delivered, instruction: instruction)
+            return .delivered(
+                DelegateResult(task: task, textDelivered: delivered, instruction: instruction)
+            )
         }
         // CLI callers keep submit=false and send Return separately after paste ack.
         // GUI callers can submit=true to use the IME paste path's inline Return.
@@ -3742,7 +3816,45 @@ final class TeamOrchestrator: ObservableObject {
             withReturn: submit,
             completion: completion
         )
-        return DelegateResult(task: task, textDelivered: delivered, instruction: instruction)
+        return .delivered(
+            DelegateResult(task: task, textDelivered: delivered, instruction: instruction)
+        )
+    }
+
+    /// `delegate` for callers that only need the result, not the reason.
+    ///
+    /// Kept so in-app callers outside this change keep compiling unchanged;
+    /// anything that reports to a person should call `delegate` and say why.
+    @discardableResult
+    func delegateToAgent(
+        teamName: String,
+        agentName: String,
+        agentInstanceId: String? = nil,
+        text: String,
+        taskTitle: String? = nil,
+        priority: Int? = nil,
+        context: String? = nil,
+        requestId: String? = nil,
+        tabManager: TabManager,
+        submit: Bool = false,
+        panelId: UUID? = nil,
+        completion: ((Bool) -> Void)? = nil
+    ) -> DelegateResult? {
+        guard case let .delivered(result) = delegate(
+            teamName: teamName,
+            agentName: agentName,
+            agentInstanceId: agentInstanceId,
+            text: text,
+            taskTitle: taskTitle,
+            priority: priority,
+            context: context,
+            requestId: requestId,
+            tabManager: tabManager,
+            submit: submit,
+            panelId: panelId,
+            completion: completion
+        ) else { return nil }
+        return result
     }
 
     private func formatDelegateInstruction(
