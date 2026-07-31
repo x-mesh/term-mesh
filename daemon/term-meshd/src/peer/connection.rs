@@ -1261,6 +1261,11 @@ pub(crate) fn team_call_allowed(method: &str) -> bool {
             | "team.task.get"
             | "team.task.create"
             | "team.task.update"
+            | "team.task.done"
+            | "team.task.block"
+            | "team.task.review"
+            | "team.task.unblock"
+            | "team.task.approve"
             // Reads what a task changed. The only method here that reaches the
             // filesystem: the host resolves the worktree from the task row the
             // peer names — no path, ref or command comes from the caller — and
@@ -3039,7 +3044,7 @@ mod team_call_allow_list_tests {
     /// Reading the Swift source is crude but it is the only thing that can
     /// actually fail when the two disagree.
     #[test]
-    fn the_swift_mirror_lists_exactly_the_same_methods() {
+    fn swift_mirror_diff_is_limited_to_scoped_task_lifecycle_methods() {
         let swift = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../swift/PeerProto/Sources/PeerProto/PeerTeamCall.swift");
         let source = std::fs::read_to_string(&swift)
@@ -3067,6 +3072,13 @@ mod team_call_allow_list_tests {
             .collect();
         mirrored.sort();
         assert!(!mirrored.is_empty(), "parsed nothing out of the Swift list");
+        let rust_only_lifecycle = [
+            "team.task.done",
+            "team.task.block",
+            "team.task.review",
+            "team.task.unblock",
+            "team.task.approve",
+        ];
 
         for method in &mirrored {
             assert!(
@@ -3077,10 +3089,12 @@ mod team_call_allow_list_tests {
         // And the other direction: a method this host allows that Swift does
         // not would be just as much of a split.
         for method in KNOWN_METHODS {
+            let expected = mirrored.iter().any(|m| m == method)
+                || rust_only_lifecycle.contains(method);
             assert_eq!(
                 team_call_allowed(method),
-                mirrored.iter().any(|m| m == method),
-                "{method} is allowed on one host and not the other"
+                expected,
+                "unexpected host parity difference for {method}"
             );
         }
     }
@@ -3093,6 +3107,8 @@ mod team_call_allow_list_tests {
         "team.read",
         "team.collect",
         "team.reports",
+        "team.result.status",
+        "team.result.collect",
         "team.inbox",
         "team.message.list",
         "team.send",
@@ -3103,7 +3119,13 @@ mod team_call_allow_list_tests {
         "team.task.get",
         "team.task.create",
         "team.task.update",
+        "team.task.done",
+        "team.task.block",
+        "team.task.review",
+        "team.task.unblock",
+        "team.task.approve",
         "team.task.diff",
+        "team.task.reassign",
         // Deliberately out: these spawn or tear down processes and take a
         // working directory, so a peer holding one could start an arbitrary
         // command anywhere on the host.
@@ -3131,6 +3153,40 @@ mod team_call_allow_list_tests {
             assert!(!team_call_allowed(method), "{method} must stay out");
         }
         assert!(team_call_allowed("team.task.diff"));
+    }
+
+    #[test]
+    fn scoped_task_methods_match_the_cli_allow_list() {
+        let cli = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../term-mesh-cli/src/tm_agent.rs");
+        let source = std::fs::read_to_string(&cli)
+            .unwrap_or_else(|e| panic!("read {}: {e}", cli.display()));
+        let body = source
+            .split_once("fn remote_leader_method_allowed(method: &str) -> bool {")
+            .expect("CLI remote-leader allow-list")
+            .1
+            .split_once("\n}")
+            .expect("CLI allow-list closing brace")
+            .0;
+        let mut cli_methods: Vec<&str> = body
+            .lines()
+            .filter_map(|line| {
+                let start = line.find('\"')? + 1;
+                let end = start + line[start..].find('\"')?;
+                Some(&line[start..end])
+            })
+            .collect();
+        let mut daemon_methods: Vec<&str> = KNOWN_METHODS
+            .iter()
+            .copied()
+            .filter(|method| team_call_allowed(method) && *method != "team.list")
+            .collect();
+        cli_methods.sort();
+        daemon_methods.sort();
+
+        assert_eq!(cli_methods, daemon_methods);
+        assert!(team_call_allowed("team.task.done"));
+        assert!(!team_call_allowed("team.task.reassign"));
     }
 }
 

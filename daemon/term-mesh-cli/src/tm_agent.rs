@@ -3763,6 +3763,11 @@ fn remote_leader_method_allowed(method: &str) -> bool {
             | "team.task.get"
             | "team.task.create"
             | "team.task.update"
+            | "team.task.done"
+            | "team.task.block"
+            | "team.task.review"
+            | "team.task.unblock"
+            | "team.task.approve"
             | "team.task.diff"
     )
 }
@@ -10628,6 +10633,23 @@ fn delegate_error_is_explicitly_unsupported(error: &str) -> bool {
     .any(|code| lower.contains(code))
 }
 
+const DELEGATE_AGENT_BUSY_HINT: &str =
+    "\nHint: Agent has an active task — finish/block it first, or delegate to another idle agent.";
+
+fn delegate_response_error_code(response: &Value) -> Option<&str> {
+    response["error"]["code"]
+        .as_str()
+        .or_else(|| response["result"]["error_code"].as_str())
+}
+
+fn delegate_error_with_agent_busy_hint(error: String) -> String {
+    if error.contains("[agent_busy]") && !error.contains(DELEGATE_AGENT_BUSY_HINT) {
+        format!("{error}{DELEGATE_AGENT_BUSY_HINT}")
+    } else {
+        error
+    }
+}
+
 fn resolve_unified_delegate<F>(
     params: &Value,
     request_id: &str,
@@ -10644,30 +10666,42 @@ where
             return Ok(UnifiedDelegateOutcome::LegacyFallback);
         }
         Ok(response) => {
+            let hint = if delegate_response_error_code(&response) == Some("agent_busy") {
+                DELEGATE_AGENT_BUSY_HINT
+            } else {
+                ""
+            };
             return Err(format!(
                 "team.delegate returned non-ok (request_id={request_id}): {}",
-                pretty(&response)
+                format!("{}{hint}", pretty(&response))
             ));
         }
         Err(error) if delegate_error_is_explicitly_unsupported(&error) => {
             return Ok(UnifiedDelegateOutcome::LegacyFallback);
         }
-        Err(error) => error,
+        Err(error) => delegate_error_with_agent_busy_hint(error),
     };
 
     match call(params) {
         Ok(response) if response["ok"].as_bool().unwrap_or(false) => {
             Ok(UnifiedDelegateOutcome::Response(response))
         }
-        Ok(response) => Err(format!(
-            "team.delegate outcome unknown after transport retry; request_id={request_id}; \
-             retry with --request-id {request_id}; first={first_error}; retry={}",
-            pretty(&response)
-        )),
-        Err(retry_error) => Err(format!(
+        Ok(response) => {
+            let hint = if delegate_response_error_code(&response) == Some("agent_busy") {
+                DELEGATE_AGENT_BUSY_HINT
+            } else {
+                ""
+            };
+            Err(format!(
+                "team.delegate outcome unknown after transport retry; request_id={request_id}; \
+                 retry with --request-id {request_id}; first={first_error}; retry={}{hint}",
+                pretty(&response)
+            ))
+        }
+        Err(retry_error) => Err(delegate_error_with_agent_busy_hint(format!(
             "team.delegate outcome unknown after transport retry; request_id={request_id}; \
              retry with --request-id {request_id}; first={first_error}; retry={retry_error}"
-        )),
+        ))),
     }
 }
 
@@ -15109,6 +15143,11 @@ mod auto_watch_tests {
             "team.result.collect",
             "team.task.create",
             "team.task.update",
+            "team.task.done",
+            "team.task.block",
+            "team.task.review",
+            "team.task.unblock",
+            "team.task.approve",
             "team.task.list",
             "team.task.diff",
         ] {
@@ -15121,6 +15160,7 @@ mod auto_watch_tests {
             "team.attach",
             "team.add_agent",
             "team.restart",
+            "team.task.reassign",
             "surface.send_key",
         ] {
             assert!(!remote_leader_method_allowed(method), "{method}");
@@ -15330,6 +15370,27 @@ mod auto_watch_tests {
 
         assert_eq!(unified_calls, 1);
         assert_eq!(legacy_task_create_calls, 1);
+    }
+
+    #[test]
+    fn agent_busy_delegate_error_has_actionable_hint() {
+        let response_error = resolve_unified_delegate(&json!({}), "delegate-busy-1", |_| {
+            Ok(json!({
+                "ok": false,
+                "error": {"code": "agent_busy", "message": "agent has an active task"},
+            }))
+        })
+        .unwrap_err();
+        let proxy_error = resolve_unified_delegate(&json!({}), "delegate-busy-2", |_| {
+            Err("remote leader proxy [agent_busy]: agent has an active task".into())
+        })
+        .unwrap_err();
+
+        for error in [response_error, proxy_error] {
+            assert!(error.contains("agent_busy"));
+            assert!(error.contains("finish/block it first"));
+            assert!(error.contains("another idle agent"));
+        }
     }
 }
 
