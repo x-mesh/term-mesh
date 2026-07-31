@@ -1,8 +1,15 @@
 #!/usr/bin/env bash
-# Install term-meshd as a systemd --user service on Linux.
+# Install term-meshd as a systemd service on Linux.
 #
 # Usage:
 #   curl -fsSL https://raw.githubusercontent.com/x-mesh/term-mesh/main/scripts/install-linux.sh | bash
+#
+# Service scope is chosen automatically: a per-user service (systemctl
+# --user) when the user's systemd bus is reachable, otherwise a system
+# service (/etc/systemd/system) when running as root. Hosts with no
+# per-user bus — non-interactive ssh sessions, and older systemd such as
+# RHEL/CentOS 7's 219 — take the root/system path; a non-root run there
+# stops with instructions instead of half-installing.
 #
 # Re-running this script is safe: it replaces the binary and unit file,
 # restarts the service, and leaves any existing peer.env config alone.
@@ -69,30 +76,78 @@ log "extracting"
 tar -xzf "${WORK_DIR}/${ASSET}" -C "$WORK_DIR"
 [[ -f "${WORK_DIR}/${BIN_NAME}" ]] || die "archive did not contain a '${BIN_NAME}' binary"
 
-RESTART_NEEDED=false
-if systemctl --user is-active --quiet "${BIN_NAME}.service" 2>/dev/null; then
-  RESTART_NEEDED=true
-fi
-
 mkdir -p "$PREFIX"
 install -m 0755 "${WORK_DIR}/${BIN_NAME}" "${PREFIX}/${BIN_NAME}"
 log "installed ${PREFIX}/${BIN_NAME}"
+
+# Smoke-test the binary before wiring any service around it. `--version`
+# exits before the daemon starts (main.rs), but the dynamic linker runs
+# first — so a glibc-too-old host fails here with the exact "GLIBC_x.y
+# not found" it would fail with at service start. Catching it now means a
+# clear message instead of a service that flaps in the background.
+if ! smoke_out=$("${PREFIX}/${BIN_NAME}" --version 2>&1); then
+  die "the installed ${BIN_NAME} cannot run on this host:
+
+  ${smoke_out}
+
+This is almost always a glibc that is too old: the release binary is
+built against a glibc 2.17 floor (RHEL/CentOS 7 and newer). Check this
+host with 'ldd --version'. If it is older than 2.17 there is no
+supported binary for it yet; on a supported host re-run this installer."
+fi
+log "binary runs: ${smoke_out}"
 
 case ":$PATH:" in
   *":${PREFIX}:"*) ;;
   *) log "note: ${PREFIX} is not on your PATH — add 'export PATH=\"${PREFIX}:\$PATH\"' to your shell profile if you want to run term-meshd directly" ;;
 esac
 
+# Decide the service scope BEFORE writing config, because the default
+# socket path differs between the two. `systemctl --user` needs a
+# per-user systemd instance plus a session D-Bus ($XDG_RUNTIME_DIR/bus);
+# non-interactive ssh sessions and old systemd (RHEL/CentOS 7's 219)
+# often have neither, which used to abort daemon-reload with "Failed to
+# get D-Bus connection" AFTER the binary and unit were already written.
+# `show-environment` is a read-only probe that fails the same way, so it
+# tells us up front which scope is actually usable.
+if systemctl --user show-environment >/dev/null 2>&1; then
+  SERVICE_SCOPE=user
+  UNIT_PATH="${UNIT_DIR}/${BIN_NAME}.service"
+  WANTED_BY=default.target
+  PEER_SOCKET_DEFAULT="/run/user/$(id -u)/tm-peer.sock"
+  RUNTIME_DIR_LINE=""
+  systemctl_scoped() { systemctl --user "$@"; }
+elif [[ "$(id -u)" == "0" ]]; then
+  SERVICE_SCOPE=system
+  UNIT_DIR="/etc/systemd/system"
+  UNIT_PATH="${UNIT_DIR}/${BIN_NAME}.service"
+  WANTED_BY=multi-user.target
+  # A system service has no /run/user/<uid> (that is a login-session dir),
+  # so bind under a RuntimeDirectory systemd creates and owns instead.
+  PEER_SOCKET_DEFAULT="/run/term-mesh/tm-peer.sock"
+  RUNTIME_DIR_LINE="RuntimeDirectory=term-mesh"
+  systemctl_scoped() { systemctl "$@"; }
+  log "user systemd bus unreachable — installing a system service (running as root)"
+else
+  die "cannot reach your user systemd bus, so 'systemctl --user' will not work here.
+This host has no per-user systemd session — common over non-interactive
+ssh, and on older systemd (e.g. RHEL/CentOS 7). Either:
+  • re-run this installer as root, so it installs a system-wide service, or
+  • start a lingering login session first:
+        loginctl enable-linger $(whoami)
+    then reconnect and re-run, so the --user bus exists."
+fi
+
 mkdir -p "$CONFIG_DIR"
 ENV_FILE="${CONFIG_DIR}/peer.env"
 if [[ ! -f "$ENV_FILE" ]]; then
   log "writing default config to ${ENV_FILE}"
   cat > "$ENV_FILE" <<EOF
-# term-meshd peer-host config, loaded by ~/.config/systemd/user/term-meshd.service.
-# Edit this file, then: systemctl --user restart term-meshd
+# term-meshd peer-host config, loaded by ${UNIT_PATH}.
+# Edit this file, then restart the service (see the install output below).
 
 # Required for the peer server to start at all (opt-in — see main.rs).
-TERMMESH_PEER_SOCKET=/run/user/$(id -u)/tm-peer.sock
+TERMMESH_PEER_SOCKET=${PEER_SOCKET_DEFAULT}
 
 # One "name=command" pair per line. Omit this entirely for a single
 # default "\$SHELL -l" surface named "shell". Example:
@@ -101,10 +156,22 @@ TERMMESH_PEER_SOCKET=/run/user/$(id -u)/tm-peer.sock
 EOF
 else
   log "keeping existing config at ${ENV_FILE}"
+  # A config left over from a different scope can point the socket somewhere
+  # this service can't bind — most often a /run/user/<uid> path inherited by
+  # a now-system service, where that dir does not exist. Warn loudly rather
+  # than silently rewriting the user's surfaces/socket choices.
+  if [[ "$SERVICE_SCOPE" == system ]]; then
+    existing_sock=$(sed -n 's/^TERMMESH_PEER_SOCKET=//p' "$ENV_FILE" | tail -n 1 | tr -d '"'"'"' ')
+    if [[ "$existing_sock" == /run/user/* ]]; then
+      log "warning: ${ENV_FILE} sets TERMMESH_PEER_SOCKET=${existing_sock}, which a"
+      log "         system service cannot create. Edit it to ${PEER_SOCKET_DEFAULT}"
+      log "         (and keep RuntimeDirectory=term-mesh in the unit), then restart."
+    fi
+  fi
 fi
 
 mkdir -p "$UNIT_DIR"
-cat > "${UNIT_DIR}/${BIN_NAME}.service" <<EOF
+cat > "$UNIT_PATH" <<EOF
 [Unit]
 Description=term-mesh peer host
 After=network.target
@@ -112,37 +179,42 @@ After=network.target
 [Service]
 EnvironmentFile=-${ENV_FILE}
 ExecStart=${PREFIX}/${BIN_NAME}
+${RUNTIME_DIR_LINE}
 Restart=always
 RestartSec=2
 
 [Install]
-WantedBy=default.target
+WantedBy=${WANTED_BY}
 EOF
-log "wrote ${UNIT_DIR}/${BIN_NAME}.service"
+log "wrote ${UNIT_PATH}"
 
-systemctl --user daemon-reload
-systemctl --user enable "${BIN_NAME}.service" >/dev/null
-if [[ "$RESTART_NEEDED" == true ]]; then
-  systemctl --user restart "${BIN_NAME}.service"
-  log "restarted ${BIN_NAME}.service (was already running)"
-else
-  systemctl --user start "${BIN_NAME}.service"
-  log "started ${BIN_NAME}.service"
-fi
+systemctl_scoped daemon-reload
+systemctl_scoped enable "${BIN_NAME}.service" >/dev/null
+# `restart` (not start) so a re-run always picks up the just-installed
+# binary; on a stopped/first-install unit it simply starts it.
+systemctl_scoped restart "${BIN_NAME}.service"
+log "started ${BIN_NAME}.service"
 
-# Lingering keeps the user's systemd instance (and this service) running
-# across logout / before any interactive login after boot. Without it,
-# the service dies the moment the installing SSH session ends. Failure
-# here is a warning, not fatal — some minimal/containerized hosts restrict
-# loginctl and the service still runs fine for the current session.
-if loginctl enable-linger "$(whoami)" 2>/dev/null; then
-  log "enabled lingering for $(whoami) (service survives logout and reboot)"
-else
-  log "warning: could not enable lingering (loginctl enable-linger $(whoami)) — the service will stop when you log out. Run that command with sudo, or as root, to fix."
+# Lingering only applies to a --user service: it keeps the user's systemd
+# instance (and this service) alive across logout / before any interactive
+# login after boot. A system service already starts at boot via
+# WantedBy=multi-user.target, so this step is skipped there.
+if [[ "$SERVICE_SCOPE" == user ]]; then
+  if loginctl enable-linger "$(whoami)" 2>/dev/null; then
+    log "enabled lingering for $(whoami) (service survives logout and reboot)"
+  else
+    log "warning: could not enable lingering (loginctl enable-linger $(whoami)) — the service will stop when you log out. Run that command with sudo, or as root, to fix."
+  fi
 fi
 
 echo
 log "done. Useful commands:"
-echo "    systemctl --user status ${BIN_NAME}"
-echo "    journalctl --user -u ${BIN_NAME} -f"
-echo "    \$EDITOR ${ENV_FILE}   # then: systemctl --user restart ${BIN_NAME}"
+if [[ "$SERVICE_SCOPE" == user ]]; then
+  echo "    systemctl --user status ${BIN_NAME}"
+  echo "    journalctl --user -u ${BIN_NAME} -f"
+  echo "    \$EDITOR ${ENV_FILE}   # then: systemctl --user restart ${BIN_NAME}"
+else
+  echo "    systemctl status ${BIN_NAME}"
+  echo "    journalctl -u ${BIN_NAME} -f"
+  echo "    \$EDITOR ${ENV_FILE}   # then: systemctl restart ${BIN_NAME}"
+fi

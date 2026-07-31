@@ -1506,13 +1506,19 @@ fn quarantine_database_set_at(directory: &File, database: &str) -> Result<(), Ap
             };
             #[cfg(target_os = "linux")]
             let result = unsafe {
-                libc::renameat2(
+                // Raw syscall, not the glibc renameat2 wrapper: the wrapper
+                // is a glibc-2.28+ versioned symbol that would raise the
+                // binary's glibc floor above old hosts (see the same note in
+                // path_sandbox::rename_exclusive_at). Semantics are identical
+                // on Linux 3.15+; ENOSYS surfaces as an error on older kernels.
+                libc::syscall(
+                    libc::SYS_renameat2,
                     directory.as_raw_fd(),
                     source.as_ptr(),
                     directory.as_raw_fd(),
                     destination.as_ptr(),
                     libc::RENAME_NOREPLACE,
-                )
+                ) as libc::c_int
             };
             if result != 0 {
                 return Err(io::Error::last_os_error().into());
