@@ -7,6 +7,69 @@ import XCTest
 #endif
 
 final class GhosttyTerminalViewComposingTests: XCTestCase {
+    func testPortalAnchorGeometrySkipsUnchangedLayoutCallbacks() {
+        let window = NSObject()
+        let superview = NSObject()
+        let previous = TerminalPortalAnchorGeometry(
+            windowID: ObjectIdentifier(window),
+            superviewID: ObjectIdentifier(superview),
+            frameInWindow: NSRect(x: 10, y: 20, width: 300, height: 200)
+        )
+
+        XCTAssertFalse(terminalPortalAnchorNeedsSynchronization(
+            previous: previous,
+            current: previous,
+            force: false
+        ))
+    }
+
+    func testPortalAnchorGeometryIgnoresSubpixelLayoutNoise() {
+        let window = NSObject()
+        let superview = NSObject()
+        let previous = TerminalPortalAnchorGeometry(
+            windowID: ObjectIdentifier(window),
+            superviewID: ObjectIdentifier(superview),
+            frameInWindow: NSRect(x: 10, y: 20, width: 300, height: 200)
+        )
+        let noisy = TerminalPortalAnchorGeometry(
+            windowID: ObjectIdentifier(window),
+            superviewID: ObjectIdentifier(superview),
+            frameInWindow: NSRect(x: 10.1, y: 19.9, width: 300.1, height: 199.9)
+        )
+
+        XCTAssertFalse(terminalPortalAnchorNeedsSynchronization(
+            previous: previous,
+            current: noisy,
+            force: false
+        ))
+    }
+
+    func testPortalAnchorGeometryReportsMeaningfulAndForcedChanges() {
+        let window = NSObject()
+        let superview = NSObject()
+        let previous = TerminalPortalAnchorGeometry(
+            windowID: ObjectIdentifier(window),
+            superviewID: ObjectIdentifier(superview),
+            frameInWindow: NSRect(x: 10, y: 20, width: 300, height: 200)
+        )
+        let resized = TerminalPortalAnchorGeometry(
+            windowID: ObjectIdentifier(window),
+            superviewID: ObjectIdentifier(superview),
+            frameInWindow: NSRect(x: 10, y: 20, width: 301, height: 200)
+        )
+
+        XCTAssertTrue(terminalPortalAnchorNeedsSynchronization(
+            previous: previous,
+            current: resized,
+            force: false
+        ))
+        XCTAssertTrue(terminalPortalAnchorNeedsSynchronization(
+            previous: previous,
+            current: previous,
+            force: true
+        ))
+    }
+
     func testEscapeNeverComposing() {
         XCTAssertFalse(
             GhosttyNSView.computeComposingFlag(
