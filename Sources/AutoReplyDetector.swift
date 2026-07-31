@@ -68,13 +68,9 @@ final class AutoReplyDetector {
     /// trimming or case folding: placeholders, comma-separated choices, partial
     /// matches, and values with extra whitespace are not agent verdicts.
     static func validatedStatus(_ value: String) -> String? {
-        // Ghostty's rectangular screen selection pads rows to the viewport
-        // width. Ignore only right-edge display padding; leading whitespace,
-        // casing and extra tokens remain invalid protocol values.
-        let normalized = value.trimmingCharactersAtEnd(in: .whitespaces)
-        switch normalized {
+        switch value {
         case "DONE", "BLOCKED", "NEEDS_REVIEW":
-            return normalized
+            return value
         default:
             return nil
         }
