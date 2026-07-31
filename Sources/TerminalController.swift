@@ -3320,7 +3320,12 @@ class TerminalController {
         }
 
         // Minimal MainActor hold: get team struct (agent names, UUIDs, team metadata) only
-        let teamInfo: (leaderSessionId: String, workspaceId: String, agents: [(name: String, id: String, instanceId: String, cli: String, model: String, agentType: String, color: String, workspaceId: String, panelId: String?, completedTaskCount: Int, worktreeBranch: String?, worktreePath: String?, hostKey: String?)], createdAt: String, policyState: String, policyFailure: String?)? = await MainActor.run {
+        // `workingDirectory` is carried because the snapshot used to drop
+        // `originalAgentWorkDir`, leaving this path with no real cwd to report
+        // and `checkout` falling back to a workspace UUID. Derived here, on the
+        // actor that owns the member, so both status implementations answer
+        // with the same value.
+        let teamInfo: (leaderSessionId: String, workspaceId: String, agents: [(name: String, id: String, instanceId: String, cli: String, model: String, agentType: String, color: String, workspaceId: String, panelId: String?, completedTaskCount: Int, worktreeBranch: String?, worktreePath: String?, hostKey: String?, workingDirectory: String?)], createdAt: String, policyState: String, policyFailure: String?)? = await MainActor.run {
             guard let team = TeamOrchestrator.shared.teamStruct(name: teamName) else { return nil }
             return (
                 leaderSessionId: team.leaderSessionId,
@@ -3329,7 +3334,12 @@ class TerminalController {
                     (name: a.name, id: a.id, instanceId: a.agentInstanceId, cli: a.cli, model: a.model, agentType: a.agentType, color: a.color,
                      workspaceId: a.workspaceId.uuidString, panelId: a.panelId?.uuidString,
                      completedTaskCount: a.completedTaskCount, worktreeBranch: a.worktreeBranch, worktreePath: a.worktreePath,
-                     hostKey: a.hostKey)
+                     hostKey: a.hostKey,
+                     workingDirectory: TeamOrchestrator.agentWorkingDirectory(
+                        worktreePath: a.worktreePath,
+                        originalAgentWorkDir: a.originalAgentWorkDir,
+                        teamWorkingDirectory: team.workingDirectory
+                     ))
                 },
                 createdAt: ISO8601DateFormatter().string(from: team.createdAt),
                 policyState: team.leaderPolicyState,
@@ -3365,13 +3375,20 @@ class TerminalController {
             // Merge data enrichment (task, heartbeat, agent_state)
             for (key, value) in enrichment { info[key] = value }
             if let branch = agent.worktreeBranch { info["worktree_branch"] = branch }
+            // Worktree lifecycle only — present when a task created one.
+            // `working_directory` is where the pane is, and is always answered.
             if let path = agent.worktreePath { info["worktree_path"] = path }
+            info["working_directory"] = agent.workingDirectory as Any? ?? NSNull()
+            info["locality"] = TeamOrchestrator.agentLocality(hostKey: agent.hostKey)
             info["parallel_telemetry"] = [
                 "wave_id": (enrichment["active_task_id"] as? String) ?? agent.instanceId,
                 "task_id": enrichment["active_task_id"] ?? NSNull(),
                 "agent_instance_id": agent.instanceId,
                 "host": agent.hostKey ?? NSNull(),
-                "checkout": agent.worktreePath ?? agent.worktreeBranch ?? agent.workspaceId,
+                "locality": TeamOrchestrator.agentLocality(hostKey: agent.hostKey),
+                // The pane's real cwd. A workspace UUID here reads like a
+                // machine identifier and was taken for one.
+                "checkout": agent.workingDirectory as Any? ?? NSNull(),
                 "delivery": (enrichment["agent_state"] as? String) ?? "unknown",
                 "synthesis": "pending",
             ]
@@ -4019,12 +4036,39 @@ class TerminalController {
         // An explicit instance stays exact. Without it, scheduling happens on
         // the main actor inside `delegateToAgent`, where idle-state check,
         // cursor advance, task assignment and delivery share one serial turn.
-        let requestedInstanceId = params["agent_instance_id"] as? String
+        var requestedInstanceId = params["agent_instance_id"] as? String
         if let requestedInstanceId, !requestedInstanceId.isEmpty {
             let selection = await resolveTeamAgentInstance(
                 params: params, teamName: teamName, agentName: agentName
             )
             if let failure = selection.failure { return v2Result(id: id, failure) }
+        } else if let rawPanelID = (params["panel_id"] as? String)?.nilIfBlankTC {
+            // A caller that named a pane has already chosen; honouring only
+            // `agent_instance_id` threw that away and fell through to the pool,
+            // where `resolveAssigneeUnsafe`'s name-only auto-pin hands the work
+            // to whichever same-named sibling happens to be first. Silent, and
+            // wrong exactly when duplicate names make it matter.
+            guard let panelID = UUID(uuidString: rawPanelID) else {
+                return v2Error(
+                    id: id, code: "invalid_params",
+                    message: "panel_id '\(rawPanelID)' is not a UUID"
+                )
+            }
+            let resolved = await MainActor.run {
+                TeamOrchestrator.shared.agentInstanceID(
+                    teamName: teamName, agentName: agentName, panelID: panelID
+                )
+            }
+            guard let resolved else {
+                // Refused rather than guessed: the caller pointed at one pane,
+                // and picking a different one is not a smaller failure.
+                return v2Error(
+                    id: id, code: "not_found",
+                    message: "No pane \(rawPanelID) belongs to agent '\(agentName)' in team "
+                        + "'\(teamName)'. Pass agent_instance_id, or omit panel_id to use the pool."
+                )
+            }
+            requestedInstanceId = resolved
         }
 
         let taskTitle = params["task_title"] as? String

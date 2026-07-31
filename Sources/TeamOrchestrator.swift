@@ -3236,6 +3236,76 @@ final class TeamOrchestrator: ObservableObject {
         return nil
     }
 
+    /// The directory an agent's pane is actually sitting in.
+    ///
+    /// `parallel_telemetry.checkout` used to fall back to the workspace UUID,
+    /// which is not a path and reads like an identifier for somewhere else — a
+    /// leader collecting results took one for a remote checkout and went as far
+    /// as registering an ssh host key for a machine that was never involved.
+    ///
+    /// The real value has been on the member the whole time:
+    /// `originalAgentWorkDir` is the exact `agentWorkDir` the pane was spawned
+    /// with, and the capsule and restart paths already prefer
+    /// `worktreePath ?? originalAgentWorkDir`. This is that same order, with the
+    /// team's directory last because every member of a team without worktrees
+    /// runs there.
+    ///
+    /// Returns nil only when none of the three is known — a headless agent with
+    /// no pane. Callers publish `NSNull` rather than inventing a path.
+    nonisolated static func agentWorkingDirectory(
+        worktreePath: String?,
+        originalAgentWorkDir: String?,
+        teamWorkingDirectory: String?
+    ) -> String? {
+        for candidate in [worktreePath, originalAgentWorkDir, teamWorkingDirectory] {
+            if let value = candidate?.nilIfBlank { return value }
+        }
+        return nil
+    }
+
+    /// Whether the shell behind this pane belongs to this machine or a peer.
+    ///
+    /// Read from `hostKey` because that is what actually decides it: local pane
+    /// creation never sets one (see `addAgentPaneToWorkspace`), and a peer
+    /// attach always does. Published as its own field rather than by reshaping
+    /// `host` — `host` is the stored key verbatim and other readers depend on
+    /// that — so a leader can tell "no host recorded" from "somewhere else"
+    /// without having to know that rule.
+    nonisolated static func agentLocality(hostKey: String?) -> String {
+        (hostKey?.nilIfBlank == nil) ? "local" : "peer"
+    }
+
+    /// One same-named member, reduced to what a pane lookup needs.
+    struct PaneCandidate: Equatable {
+        let panelID: UUID?
+        let agentInstanceID: String
+    }
+
+    /// The durable instance behind a pane.
+    ///
+    /// Exact or nothing. `TeamDataStore.resolveAssigneeUnsafe` auto-pins
+    /// `candidates.first` for a name-only assignment, which for duplicate names
+    /// silently hands the work to a sibling; a caller that named a pane has
+    /// already chosen, and answering with a different one would be that same
+    /// bug wearing a more specific request.
+    ///
+    /// Pure so the no-guess property can be tested: `teams` is `private(set)`,
+    /// so a test cannot stand up a roster to look into.
+    nonisolated static func instanceID(
+        forPanel panelID: UUID,
+        among candidates: [PaneCandidate]
+    ) -> String? {
+        candidates.first { $0.panelID == panelID }?.agentInstanceID
+    }
+
+    /// `instanceID(forPanel:among:)` against the live roster for one role.
+    func agentInstanceID(teamName: String, agentName: String, panelID: UUID) -> String? {
+        let candidates = (teams[teamName]?.agents ?? [])
+            .filter { $0.name == agentName }
+            .map { PaneCandidate(panelID: $0.panelId, agentInstanceID: $0.agentInstanceId) }
+        return Self.instanceID(forPanel: panelID, among: candidates)
+    }
+
     /// Schedules a role pool by durable instance identity. Candidate order is
     /// the team's stable roster order; the cursor is scoped to team+role.
     private func selectIdleAgent(in team: Team, role: String) -> AgentMember? {
@@ -5469,15 +5539,28 @@ final class TeamOrchestrator: ObservableObject {
                 if let branch = agent.worktreeBranch {
                     info["worktree_branch"] = branch
                 }
+                // Kept to the worktree lifecycle: present only when a task made
+                // one. `working_directory` below is where the pane actually is,
+                // which is a different question and is always answerable.
                 if let path = agent.worktreePath {
                     info["worktree_path"] = path
                 }
+                let workingDirectory = Self.agentWorkingDirectory(
+                    worktreePath: agent.worktreePath,
+                    originalAgentWorkDir: agent.originalAgentWorkDir,
+                    teamWorkingDirectory: team.workingDirectory
+                )
+                info["working_directory"] = workingDirectory as Any? ?? NSNull()
+                info["locality"] = Self.agentLocality(hostKey: agent.hostKey)
                 info["parallel_telemetry"] = [
                     "wave_id": (enrichment["active_task_id"] as? String) ?? agent.agentInstanceId,
                     "task_id": enrichment["active_task_id"] ?? NSNull(),
                     "agent_instance_id": agent.agentInstanceId,
                     "host": agent.hostKey as Any? ?? NSNull(),
-                    "checkout": agent.worktreePath ?? agent.worktreeBranch ?? agent.workspaceId.uuidString,
+                    "locality": Self.agentLocality(hostKey: agent.hostKey),
+                    // The same real path. A workspace UUID here is what sent a
+                    // leader looking for a machine that was never involved.
+                    "checkout": workingDirectory as Any? ?? NSNull(),
                     "delivery": enrichment["agent_state"] ?? "unknown",
                     "synthesis": "pending",
                 ]
