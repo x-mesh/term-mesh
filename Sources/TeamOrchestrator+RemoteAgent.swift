@@ -655,7 +655,9 @@ extension TeamOrchestrator {
                 // remove. Prefer the recoverable failure. A real fix needs a
                 // creation request id on the wire.
                 guard found.count <= 1 else {
-                    await probe.cancel()
+                    // No cancel here: this throw is caught below, and that
+                    // handler is what cancels. Doing it in both places is the
+                    // double cancel the comment above says cannot happen.
                     throw RemoteAgentError.projectDeletionIncomplete(
                         "\(found.count) workspaces on \(host.displayName) match "
                             + "'\(title)'; refusing to delete an ambiguous match"
