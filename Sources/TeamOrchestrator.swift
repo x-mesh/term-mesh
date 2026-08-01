@@ -252,11 +252,34 @@ final class TeamOrchestrator: ObservableObject {
         }?.id
     }
 
+    /// The single funnel for "this team owns these remote checkouts".
+    ///
+    /// Also writes through to disk: the in-memory list dies with the app, and
+    /// without a durable copy nothing could reclaim a peer checkout after a
+    /// restart.
     func recordRemoteProjectLocations(
         teamName: String,
         locations: [Team.RemoteProjectLocation]
     ) {
         teams[teamName]?.remoteProjectLocations = locations
+        RemoteProjectLocationStore.shared.replace(
+            teamName: teamName,
+            locations: locations.map { (hostKey: $0.hostKey, path: $0.path) }
+        )
+    }
+
+    /// Remote checkouts this team owns, including ones recorded by an earlier
+    /// run of the app.
+    ///
+    /// Reclamation must read through this rather than `Team.remoteProjectLocations`
+    /// directly — after a restart the in-memory list is empty even though the
+    /// directories are still sitting on the peer.
+    func knownRemoteProjectLocations(teamName: String) -> [Team.RemoteProjectLocation] {
+        var merged = Set(teams[teamName]?.remoteProjectLocations ?? [])
+        for stored in RemoteProjectLocationStore.shared.locations(teamName: teamName) {
+            merged.insert(Team.RemoteProjectLocation(hostKey: stored.hostKey, path: stored.path))
+        }
+        return merged.sorted { ($0.hostKey, $0.path) < ($1.hostKey, $1.path) }
     }
 
     func configureDedicatedRemoteWorkspaces(teamName: String, enabled: Bool) {
@@ -2523,6 +2546,14 @@ final class TeamOrchestrator: ObservableObject {
             releaseRemoteAgent(agent, closing: workspace, teamName: teamName)
         } else if let workspace, let pid = agent.panelId {
             _ = workspace.closePanel(pid, force: force)
+        }
+
+        // Closing the pane used to be the whole of detach, so an isolated
+        // agent's worktree outlived every agent that ever used it. Remote
+        // agents already had `reapDetachedAgentWorktree`; this is the local
+        // half. Clean-only, like team destroy.
+        if agent.hostKey == nil {
+            reapDetachedLocalWorktree(agent: agent, team: team)
         }
 
         // Remove from team.agents
@@ -5787,13 +5818,14 @@ final class TeamOrchestrator: ObservableObject {
             )
         }
         guard let workspace = tabManager.tabs.first(where: { $0.id == team.workspaceId }) else {
-            cleanupWorktrees(team: team)
+            cleanupWorktrees(team: team, name: name)
             clearResults(teamName: name)
             clearMessages(teamName: name)
             clearTasks(teamName: name)
             teams.removeValue(forKey: name)
             heartbeats.removeValue(forKey: name)
             TeamDataStore.shared.unregisterTeam(name)
+            RemoteProjectLocationStore.shared.forget(teamName: name)
             syncTeamStateToDaemon()
             return true
         }
@@ -5820,7 +5852,7 @@ final class TeamOrchestrator: ObservableObject {
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
             tabManager.closeTab(wsRef)
             // Clean up worktrees after workspace is closed
-            self.cleanupWorktrees(team: teamCopy)
+            self.cleanupWorktrees(team: teamCopy, name: name)
         }
 
         // Stop periodic render timer if no teams remain after this removal
@@ -5837,6 +5869,12 @@ final class TeamOrchestrator: ObservableObject {
 
         // Unregister from thread-safe data store (approach C: dual queue)
         TeamDataStore.shared.unregisterTeam(name)
+
+        // The team is gone, so nothing here can act on its remote checkouts
+        // any more; keeping the record would only let a later same-named team
+        // inherit paths it never created. Anything left on a peer is still
+        // reclaimable there with `tm-agent gc`.
+        RemoteProjectLocationStore.shared.forget(teamName: name)
 
         // Clean up dynamic kiro agent profiles
         Self.cleanupKiroProfiles(teamName: name)
@@ -6523,11 +6561,94 @@ final class TeamOrchestrator: ObservableObject {
         return data.hashValue
     }
 
-    /// Log detached worktrees from a destroyed team (no longer auto-deleted).
-    private func cleanupWorktrees(team: Team) {
-        for agent in team.agents {
-            guard let wtName = agent.worktreeName else { continue }
-            Logger.team.info("worktree '\(wtName, privacy: .public)' detached from agent '\(agent.name, privacy: .public)' (kept for manual cleanup)")
+    /// Reclaim one detached local agent's isolated worktree.
+    ///
+    /// Local isolated members run in a daemon-created worktree
+    /// (`term-mesh_wt_*`), not in a `PeerProjectBootstrap` checkout, so the
+    /// removal goes through the same daemon call team teardown uses. A shared
+    /// worktree, or one another agent still names, is left alone; so is a
+    /// dirty one, because `force: false` makes the daemon refuse it.
+    private func reapDetachedLocalWorktree(agent: AgentMember, team: Team) {
+        guard let name = agent.worktreeName?.nilIfBlank else { return }
+        guard name != team.sharedWorktreeName else { return }
+        let stillClaimed = team.agents.contains {
+            $0.agentInstanceId != agent.agentInstanceId && $0.worktreeName == name
+        }
+        guard !stillClaimed else { return }
+        guard let repoRoot = (team.gitRepoRoot?.nilIfBlank
+            ?? TermMeshDaemon.shared.findGitRoot(from: team.workingDirectory)) else { return }
+
+        let daemon = self.daemon
+        let agentName = agent.name
+        DispatchQueue.global(qos: .utility).async {
+            if daemon.removeWorktree(repoPath: repoRoot, name: name, force: false) {
+                Logger.team.info(
+                    "worktree '\(name, privacy: .public)' removed after detaching '\(agentName, privacy: .public)'"
+                )
+            } else {
+                Logger.team.info(
+                    "worktree '\(name, privacy: .public)' kept after detaching '\(agentName, privacy: .public)' — uncommitted changes or removal refused"
+                )
+            }
+        }
+    }
+
+    /// Reclaim the worktrees a destroyed team owned.
+    ///
+    /// This used to only log, which is why a machine that had run a few dozen
+    /// teams was carrying every worktree any of them ever created. Removal
+    /// goes through the daemon with `force: false`, so anything holding
+    /// uncommitted work is refused and survives its team — those show up in
+    /// Settings → Worktrees and in `tm-agent gc plan` for a human to judge.
+    /// Deleting a clean worktree keeps its branch and its commits.
+    private func cleanupWorktrees(team: Team, name teamName: String) {
+        guard let repoRoot = (team.gitRepoRoot?.nilIfBlank
+            ?? TermMeshDaemon.shared.findGitRoot(from: team.workingDirectory)) else {
+            for agent in team.agents where agent.worktreeName != nil {
+                Logger.team.info(
+                    "worktree '\(agent.worktreeName ?? "", privacy: .public)' left in place — no git root for team '\(teamName, privacy: .public)'"
+                )
+            }
+            return
+        }
+
+        var names = Set(team.agents.compactMap { $0.worktreeName?.nilIfBlank })
+        if let shared = team.sharedWorktreeName?.nilIfBlank {
+            names.insert(shared)
+        }
+        guard !names.isEmpty else { return }
+
+        // Shared-mode teams point several agents — and sometimes several teams
+        // — at one worktree. Anything another live team still names stays.
+        var claimedElsewhere = Set<String>()
+        for (otherName, other) in teams where otherName != teamName {
+            claimedElsewhere.formUnion(other.agents.compactMap { $0.worktreeName?.nilIfBlank })
+            if let shared = other.sharedWorktreeName?.nilIfBlank {
+                claimedElsewhere.insert(shared)
+            }
+        }
+
+        let targets = names.subtracting(claimedElsewhere).sorted()
+        for skipped in names.intersection(claimedElsewhere).sorted() {
+            Logger.team.info(
+                "worktree '\(skipped, privacy: .public)' kept — another live team still uses it"
+            )
+        }
+        guard !targets.isEmpty else { return }
+
+        let daemon = self.daemon
+        DispatchQueue.global(qos: .utility).async {
+            for name in targets {
+                if daemon.removeWorktree(repoPath: repoRoot, name: name, force: false) {
+                    Logger.team.info(
+                        "worktree '\(name, privacy: .public)' removed with team '\(teamName, privacy: .public)'"
+                    )
+                } else {
+                    Logger.team.info(
+                        "worktree '\(name, privacy: .public)' kept — uncommitted changes or removal refused"
+                    )
+                }
+            }
         }
     }
 

@@ -2275,6 +2275,9 @@ struct RemoteHostGroupView: View {
     @State private var shellCleanupSelection = Set<Data>()
     @State private var shellCleanupLoading = false
     @State private var shellCleanupError: String?
+    /// Peer capacity, so a host that is about to run out of room for agent
+    /// checkouts and build output says so before a job fails on it.
+    @ObservedObject private var hostStats = PeerHostStatsStore.shared
 
     init(host: HostEntry, store: RemoteHostStore,
          usesSeparatedPresentation: Bool,
@@ -2440,6 +2443,30 @@ struct RemoteHostGroupView: View {
         }
     }
 
+    /// Free space on the peer, shown only once it is worth acting on.
+    ///
+    /// Agent checkouts and their build output are what fill a remote host, and
+    /// the failure mode is a job that dies mid-run with no obvious cause. A
+    /// host that reports no capacity — an older build, or one that cannot
+    /// measure it — shows nothing rather than a fake reading.
+    @ViewBuilder
+    private var diskBadge: some View {
+        if host.isConnected,
+           let stats = hostStats.stats(for: host.paneHostSpec.hostKey),
+           stats.isDiskLow,
+           let text = stats.diskFreeText {
+            HStack(spacing: 2) {
+                Image(systemName: "externaldrive.badge.exclamationmark")
+                    .font(.system(size: 8, weight: .semibold))
+                Text(text)
+                    .font(.system(size: 9))
+                    .monospacedDigit()
+            }
+            .foregroundColor(.orange)
+            .help("Low disk space on \(host.displayName) — agent checkouts and builds may fail. Reclaim with `tm-agent gc plan` on that host.")
+        }
+    }
+
     private var hostHeader: some View {
         HStack(spacing: 2) {
             Button(action: handleRowTap) {
@@ -2476,6 +2503,7 @@ struct RemoteHostGroupView: View {
                                 .help("\(busy) pane\(busy == 1 ? "" : "s") running a command across this host")
                         }
                     }
+                    diskBadge
                     Spacer(minLength: 4)
                 }
                 .contentShape(Rectangle())
