@@ -166,6 +166,15 @@ pub struct GcPlan {
     pub categories: Vec<GcCategoryReport>,
     pub total_bytes: u64,
     pub reclaimable_bytes: u64,
+    /// The extra checkout roots this scan was given.
+    ///
+    /// `execute_sweep` re-scans some categories immediately before acting on
+    /// them, and a refresh that did not know about these roots would not find
+    /// the candidates the plan found under them. It reads that absence as
+    /// "changed since planning" and skips — so a sweep scoped by `--root`
+    /// planned removals it then silently declined to make.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scan_roots: Option<Vec<PathBuf>>,
 }
 
 /// Everything the daemon knows to be in use. Collected by the RPC handler from
@@ -366,6 +375,7 @@ pub fn build_plan_at(paths: &GcPaths, opts: &GcOptions, refs: &GcRefs, now: Syst
         categories,
         total_bytes,
         reclaimable_bytes,
+        scan_roots: opts.roots.clone(),
     }
 }
 
@@ -1039,7 +1049,10 @@ pub fn execute_sweep(
                     paths,
                     &GcOptions {
                         categories: Some(vec![CATEGORY_BUILD_CACHES.to_string()]),
-                        roots: None,
+                        // Same roots the plan was built with. Dropping them
+                        // here hid every candidate found under a caller's
+                        // `--root` behind "changed since planning".
+                        roots: plan.scan_roots.clone(),
                         deep: true,
                     },
                     current_refs,
@@ -1675,6 +1688,49 @@ mod tests {
         let summary = execute_sweep(&paths, &plan, true, false, &refs).unwrap();
         assert_eq!(summary.removed, 0);
         assert!(target.exists());
+    }
+
+    /// A sweep scoped by `--root` has to act on what it planned.
+    ///
+    /// `execute_sweep` re-scans build caches immediately before removing
+    /// anything, and that refresh used to be built with `roots: None`. The
+    /// candidates found under the caller's root were therefore absent from it,
+    /// which the sweep reads as "changed since planning" — so `gc sweep --deep
+    /// --apply --root <path>` reported a plan and then quietly removed nothing.
+    #[test]
+    fn a_sweep_scoped_by_root_removes_what_it_planned() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = init_repo(temp.path());
+        let paths = paths_for(temp.path());
+
+        // A checkout the scan only reaches through an explicit root.
+        let elsewhere = temp.path().join("elsewhere");
+        fs::create_dir_all(&elsewhere).unwrap();
+        let checkout = elsewhere.join("term-mesh-executor-260801-ab12");
+        add_worktree(&repo, &checkout, "agent/executor");
+        let target = checkout.join("daemon/target");
+        fs::create_dir_all(&target).unwrap();
+        fs::write(target.join("artifact"), vec![0u8; 64]).unwrap();
+
+        let opts = GcOptions {
+            categories: Some(vec![CATEGORY_BUILD_CACHES.to_string()]),
+            roots: Some(vec![elsewhere.clone()]),
+            deep: true,
+        };
+        let plan = build_plan(&paths, &opts, &GcRefs::default());
+        assert_eq!(plan.scan_roots.as_deref(), Some(&[elsewhere][..]));
+        let candidate = category(&plan, CATEGORY_BUILD_CACHES)
+            .candidates
+            .iter()
+            .find(|candidate| candidate.path == display(&target))
+            .expect("target under the caller's root is planned");
+        assert!(candidate.reclaimable());
+
+        let summary = execute_sweep(&paths, &plan, true, false, &GcRefs::default()).unwrap();
+        assert_eq!(summary.removed, 1, "the planned removal must actually happen");
+        assert!(!target.exists());
+        // Only the regenerable output goes; the checkout itself stays.
+        assert!(checkout.exists());
     }
 
     #[test]
