@@ -981,7 +981,8 @@ git commit -m "Update ghostty submodule"
 Use the `/release` command to prepare a new release. This will:
 1. Determine the new version (bumps minor by default)
 2. Gather commits since the last tag and update the changelog
-3. Update `CHANGELOG.md` and `docs-site/content/docs/changelog.mdx`
+3. Update `CHANGELOG.md` (the only changelog in this repo — there is no
+   `docs-site/`; the instruction to update one there outlived the directory)
 4. Run `./scripts/bump-version.sh` to update both versions
 5. Commit, tag, and push
 6. Upload dSYM debug symbols to Sentry (`./scripts/upload-dsym.sh --build`)
@@ -1009,7 +1010,11 @@ git push origin vX.Y.Z
 
 Notes:
 - Versioning: bump the minor version for updates unless explicitly asked otherwise.
-- Changelog: always update both `CHANGELOG.md` and the docs-site version.
+- Changelog: `CHANGELOG.md` is the only one. Write for the person running the
+  app, not the person who wrote the diff: what changed for them, and what it
+  used to do wrong. A release whose changelog covers one PR out of eighteen has
+  happened here — check `[Unreleased]` against `git log <last tag>..HEAD`
+  before cutting.
 - Sentry dSYM: required for symbolicated crash reports (EXC_BAD_ACCESS frames otherwise show `None`). `./scripts/upload-dsym.sh` without `--build` uploads the latest Release dSYM already in DerivedData.
 
 ## Lessons (x-humble)
