@@ -50,7 +50,7 @@ After making code changes, always run the reload script with a tag to launch the
 After making code changes, always run the build:
 
 ```bash
-xcodebuild -project GhosttyTabs.xcodeproj -scheme term-mesh -configuration Debug -destination 'platform=macOS' build
+xcodebuild -project GhosttyTabs.xcodeproj -scheme term-mesh -configuration Debug -destination 'platform=macOS' -clonedSourcePackagesDirPath "$HOME/Library/Caches/term-mesh/SourcePackages" build
 ```
 
 Swift unit tests belong to the `term-mesh-unit` scheme; the `term-mesh` scheme contains
@@ -278,18 +278,35 @@ tm-agent gc sweep --apply                   # actually reclaim
   `git-kit worktree cleanup -y` **reports the removals and performs none**: it
   swallows git's refusal and still returns `state: ok`. Verify with
   `git worktree list` rather than trusting its output.
-- Build caches are reported (`--deep`) but reclaimed by the scripts that own
-  them: `reload.sh` drops tag builds untouched for 7 days (override with
-  `TERMMESH_RELOAD_TAG_GC_DAYS`, disable with `TERMMESH_RELOAD_TAG_GC=0`), and
-  `setup.sh` keeps the 3 most recently used GhosttyKit SHAs
-  (`TERMMESH_GHOSTTYKIT_CACHE_KEEP`).
+- `reload.sh` records the launched PID in a tag-session manifest. The next
+  reload immediately removes ended tag sessions; failed managed builds are
+  removed on exit, with the 7-day sweep retained as a fallback (override with
+  `TERMMESH_RELOAD_TAG_GC_DAYS`, disable with `TERMMESH_RELOAD_TAG_GC=0`). It
+  caches under `~/Library/Caches/term-mesh`: SwiftPM dependency checkouts are
+  shared by every tag, while the Cargo target directory is **per tag**
+  (`cargo-target/<tag>`). Do not collapse the Cargo one into a single shared
+  directory — cargo keys its output by package name, so every tag's
+  `term-meshd` would land at the same path, and since the daemon build's
+  failure is swallowed, a tag whose build broke would ship whichever branch
+  last built successfully. `TERMMESH_CARGO_TARGET_DIR` overrides the path and
+  takes that collision on itself. reload refuses to start below 10 GiB free
+  (`TERMMESH_BUILD_MIN_FREE_GIB` overrides the threshold). At task completion,
+  `./scripts/reload.sh --tag <tag> --cleanup` stops that app and immediately
+  reclaims its managed DerivedData, sockets, log, manifest, and Cargo target.
+- `tm-agent gc sweep --category build_caches --deep` previews regenerable
+  `daemon/target` directories inside inactive worktrees. Add `--apply` to
+  remove only those targets while preserving dirty source. Active session/task
+  worktrees remain blocked. Shared Cargo/SwiftPM and GhosttyKit caches are
+  reported but remain owned by their build scripts; `setup.sh` keeps the 3 most
+  recently used GhosttyKit SHAs (`TERMMESH_GHOSTTYKIT_CACHE_KEEP`).
 - Peers report free space in `HostStats`, and the sidebar shows a warning badge
   under 5GB or 10%. Run `tm-agent gc` over ssh on that host to reclaim.
 
 VERIFY:
 
 ```bash
-cd daemon && cargo test -p term-meshd gc:: && cargo test -p term-meshd host_stats
+(cd daemon && cargo test -p term-meshd gc:: && cargo test -p term-meshd host_stats)
+bash -n scripts/reload.sh
 ```
 
 ## Pitfalls

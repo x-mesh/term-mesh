@@ -1663,6 +1663,9 @@ enum GcCommand {
         categories: Vec<String>,
         #[arg(long = "root", value_name = "PATH")]
         roots: Vec<String>,
+        /// Include regenerable build caches in the sweep plan
+        #[arg(long)]
+        deep: bool,
         #[arg(long)]
         json: bool,
     },
@@ -7889,9 +7892,10 @@ fn cmd_gc(sock: &PathBuf, command: &GcCommand) {
             force,
             categories,
             roots,
+            deep,
             json: raw,
         } => {
-            let mut params = gc_scope_params(categories, roots, false);
+            let mut params = gc_scope_params(categories, roots, *deep);
             params["apply"] = json!(*apply);
             params["force"] = json!(*force);
             gc_call(sock, "gc.sweep", params).map(|value| {
