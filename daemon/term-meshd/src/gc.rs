@@ -964,8 +964,9 @@ fn reclaim(candidate: &GcCandidate, category: &str) -> Result<String, String> {
     // parent repo holding a `prunable` registration, which clutters
     // `git worktree list` and blocks a later `worktree add` from reusing the
     // branch. git also deletes the working tree while it is at it.
-    if candidate.kind == "worktree" || candidate.kind == "checkout" {
-        prune_worktree_registration(&path);
+    let is_worktree = candidate.kind == "worktree" || candidate.kind == "checkout";
+    if is_worktree {
+        prune_worktree_registration(&path, true);
         if !path.exists() {
             return Ok("removed".to_string());
         }
@@ -977,31 +978,56 @@ fn reclaim(candidate: &GcCandidate, category: &str) -> Result<String, String> {
         return Err("refusing to remove a symlink".into());
     }
 
+    // The registration has to be read before the directory goes: `.git` is
+    // what names the owning repository.
+    let owner = if is_worktree { worktree_owner(&path) } else { None };
+
     if metadata.file_type().is_dir() {
         fs::remove_dir_all(&path).map_err(|e| e.to_string())?;
     } else {
         fs::remove_file(&path).map_err(|e| e.to_string())?;
     }
+
+    // git refuses to remove a working tree that contains submodules, and this
+    // repository has one — so for the common case the prune above did nothing
+    // and we deleted the directory ourselves. Drop the now-dangling
+    // registration, or `git worktree list` keeps reporting it as `prunable`
+    // and the branch cannot be checked out again.
+    if let Some((repo_root, name)) = owner {
+        prune_registration(&repo_root, &name, false);
+    }
     Ok("removed".to_string())
 }
 
-/// Drop the parent repository's registration for this worktree, working tree
-/// included. Best effort: an orphan whose parent repo is gone has no
-/// registration to drop, and the caller removes the directory itself.
-fn prune_worktree_registration(path: &Path) -> Option<()> {
+/// `(owning repository, worktree name)` read out of a linked worktree's
+/// `.git` pointer file, which reads `gitdir: <main>/.git/worktrees/<name>`.
+fn worktree_owner(path: &Path) -> Option<(PathBuf, String)> {
     let contents = fs::read_to_string(path.join(".git")).ok()?;
     let target = contents.trim().strip_prefix("gitdir:")?.trim();
-    // <main>/.git/worktrees/<name>
     let gitdir = Path::new(target);
-    let name = gitdir.file_name()?.to_str()?;
-    let main_root = gitdir.parent()?.parent()?.parent()?;
-    let repo = Repository::open(main_root).ok()?;
+    let name = gitdir.file_name()?.to_str()?.to_string();
+    let main_root = gitdir.parent()?.parent()?.parent()?.to_path_buf();
+    Some((main_root, name))
+}
+
+/// Drop a worktree's registration from its parent repository.
+///
+/// `with_working_tree` asks git to delete the checkout too. That fails on a
+/// worktree containing submodules, which is why the caller falls back to
+/// removing the directory itself and then pruning the record.
+fn prune_worktree_registration(path: &Path, with_working_tree: bool) -> Option<()> {
+    let (repo_root, name) = worktree_owner(path)?;
+    prune_registration(&repo_root, &name, with_working_tree)
+}
+
+fn prune_registration(repo_root: &Path, name: &str, with_working_tree: bool) -> Option<()> {
+    let repo = Repository::open(repo_root).ok()?;
     let worktree = repo.find_worktree(name).ok()?;
     worktree
         .prune(Some(
             git2::WorktreePruneOptions::new()
                 .valid(true)
-                .working_tree(true),
+                .working_tree(with_working_tree),
         ))
         .ok()?;
     Some(())
@@ -1297,6 +1323,66 @@ mod tests {
             handle.worktrees().unwrap().len(),
             0,
             "the worktree registration must be gone too"
+        );
+    }
+
+    /// git refuses to remove a working tree containing submodules, and this
+    /// repository has one (`ghostty`) — so every real term-mesh worktree hits
+    /// that path. Deleting the directory without pruning afterwards is what
+    /// leaves `git worktree list` full of `prunable` entries.
+    #[test]
+    fn a_worktree_with_a_submodule_is_still_fully_reclaimed() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = init_repo(temp.path());
+        let sub = init_repo(&temp.path().join("sub-src"));
+        git(
+            &[
+                "-c",
+                "protocol.file.allow=always",
+                "submodule",
+                "add",
+                sub.to_str().unwrap(),
+                "vendored",
+            ],
+            &repo,
+        );
+        git(&["commit", "-m", "add submodule"], &repo);
+
+        let paths = paths_for(temp.path());
+        let wt = paths
+            .daemon_worktrees
+            .join("repo")
+            .join("term-mesh_wt_5ab00001");
+        fs::create_dir_all(wt.parent().unwrap()).unwrap();
+        add_worktree(&repo, &wt, "term-mesh/5ab00001");
+        // An initialized submodule is what triggers git's refusal — and it
+        // leaves the worktree clean, so nothing else blocks the sweep.
+        git(
+            &[
+                "-c",
+                "protocol.file.allow=always",
+                "submodule",
+                "update",
+                "--init",
+            ],
+            &wt,
+        );
+
+        let plan = build_plan(&paths, &only(CATEGORY_DAEMON_WORKTREES), &GcRefs::default());
+        let candidate = &category(&plan, CATEGORY_DAEMON_WORKTREES).candidates[0];
+        assert!(
+            candidate.reclaimable(),
+            "a clean worktree must not be blocked by its submodule: {:?}",
+            candidate.blockers
+        );
+        assert_eq!(execute_sweep(&paths, &plan, true, false).unwrap().removed, 1);
+
+        assert!(!wt.exists(), "the directory must go even when git will not");
+        let handle = Repository::open(&repo).unwrap();
+        assert_eq!(
+            handle.worktrees().unwrap().len(),
+            0,
+            "and the registration must not be left behind as prunable"
         );
     }
 
