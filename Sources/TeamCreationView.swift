@@ -362,7 +362,7 @@ struct TeamCreationView: View {
 
     /// Peers that could take a member right now.
     private var connectedPeers: [HostEntry] {
-        hostStore.sortedHosts.filter(\.isConnected)
+        RemoteHostStore.selectableLaunchHosts(in: hostStore.sortedHosts)
     }
     @ObservedObject var savedTemplateManager = SavedTeamTemplateManager.shared
     @ObservedObject var teamTemplateManager = TeamTemplateManager.shared

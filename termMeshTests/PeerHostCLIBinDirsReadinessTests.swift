@@ -38,9 +38,16 @@ final class PeerHostCLIBinDirsReadinessTests: XCTestCase {
         sshPort: Int? = nil,
         identityFile: String? = nil,
         profileID: UUID? = nil,
+        configuredRemoteSocket: String? = nil,
         hostCLIBinDirs: [String] = [],
         hostCLIBinDirsResolved: Bool = false
     ) -> HostEntry {
+        let endpoint = PeerHostEndpointProvenance(
+            sshTarget: sshTarget ?? "",
+            port: sshPort,
+            identityFile: identityFile,
+            remoteSocket: configuredRemoteSocket ?? (remoteSockPath ?? "")
+        )
         var entry = HostEntry(
             id: id,
             displayName: "jw-server",
@@ -51,10 +58,17 @@ final class PeerHostCLIBinDirsReadinessTests: XCTestCase {
             remoteSockPath: remoteSockPath,
             sshPort: sshPort,
             identityFile: identityFile,
-            profileID: profileID
+            profileID: profileID,
+            configuredEndpoint: endpoint
         )
-        entry.hostCLIBinDirs = hostCLIBinDirs
-        entry.hostCLIBinDirsResolved = hostCLIBinDirsResolved
+        if hostCLIBinDirsResolved {
+            XCTAssertTrue(entry.acceptAuthenticatedHostCLIBinDirs(
+                hostCLIBinDirs,
+                provenance: endpoint
+            ))
+        } else {
+            entry.hostCLIBinDirs = hostCLIBinDirs
+        }
         return entry
     }
 
@@ -112,6 +126,102 @@ final class PeerHostCLIBinDirsReadinessTests: XCTestCase {
 
         XCTAssertFalse(entry.isConnected)
         XCTAssertFalse(entry.isLaunchable)
+    }
+
+    func testEndpointEditImmediatelyInvalidatesAuthenticatedMetadata() {
+        var entry = host(
+            sshTarget: "root@old-server",
+            remoteSockPath: "/tmp/old.sock",
+            profileID: profileID,
+            hostCLIBinDirs: ["/old/bin"],
+            hostCLIBinDirsResolved: true
+        )
+
+        entry.applyConfiguredEndpoint(PeerHostEndpointProvenance(
+            sshTarget: "root@old-server",
+            port: 2222,
+            identityFile: nil,
+            remoteSocket: "/tmp/old.sock"
+        ))
+
+        XCTAssertTrue(entry.isConnected)
+        XCTAssertFalse(entry.isLaunchable)
+        XCTAssertFalse(entry.hostCLIBinDirsResolved)
+        XCTAssertEqual(entry.hostCLIBinDirs, [])
+        XCTAssertNil(entry.hostCLIBinDirsProvenance)
+    }
+
+    /// Changing sshTarget moves a profile to a different stable dictionary
+    /// key. The old connected row can outlive that edit, but profile sync must
+    /// strip its launch authority instead of leaving stale authenticated dirs
+    /// attached to an apparently valid ad-hoc host.
+    func testSSHTargetRouteMutationDetachesOldConnectedRowMetadata() {
+        var oldRow = host(
+            sshTarget: "root@old-server",
+            remoteSockPath: "/tmp/old.sock",
+            profileID: profileID,
+            hostCLIBinDirs: ["/old/bin"],
+            hostCLIBinDirsResolved: true
+        )
+
+        oldRow.detachProfileConfiguration()
+
+        XCTAssertTrue(oldRow.isConnected)
+        XCTAssertNil(oldRow.profileID)
+        XCTAssertNil(oldRow.configuredEndpoint)
+        XCTAssertFalse(oldRow.isLaunchable)
+        XCTAssertEqual(oldRow.hostCLIBinDirs, [])
+        XCTAssertNil(oldRow.hostCLIBinDirsProvenance)
+    }
+
+    /// Models the editor's failed-doctor fallback after an in-place route
+    /// edit. Even though the profile id and live row are unchanged, applying
+    /// the new tuple invalidates the prior handshake before cache lookup.
+    func testFailedDoctorFallbackAfterRouteMutationReturnsNoStaleDirs() {
+        var entry = host(
+            sshTarget: "root@jw-server",
+            remoteSockPath: "/tmp/old.sock",
+            sshPort: 22,
+            identityFile: "/Users/x/.ssh/id_old",
+            profileID: profileID,
+            hostCLIBinDirs: ["/old/bin"],
+            hostCLIBinDirsResolved: true
+        )
+        let editedEndpoint = PeerHostEndpointProvenance(
+            sshTarget: "root@jw-server",
+            port: 2222,
+            identityFile: "/Users/x/.ssh/id_new",
+            remoteSocket: "/tmp/new.sock"
+        )
+
+        entry.applyConfiguredEndpoint(editedEndpoint)
+        let fallback = RemoteHostStore.hostCLIBinDirs(
+            forProfileID: profileID,
+            sshTarget: editedEndpoint.sshTarget,
+            port: editedEndpoint.port,
+            identityFile: editedEndpoint.identityFile,
+            remoteSocket: editedEndpoint.remoteSocket,
+            in: [entry]
+        )
+
+        XCTAssertEqual(fallback, [])
+        XCTAssertFalse(entry.isLaunchable)
+    }
+
+    func testLaunchSelectorExcludesConnectedHostWithPendingMetadata() {
+        let ready = host(
+            id: "ssh:ready",
+            hostCLIBinDirsResolved: true
+        )
+        let pending = host(
+            id: "ssh:pending",
+            hostCLIBinDirsResolved: false
+        )
+
+        XCTAssertEqual(
+            RemoteHostStore.selectableLaunchHosts(in: [pending, ready]).map(\.id),
+            ["ssh:ready"]
+        )
     }
 
     // MARK: - 2. Cached CLI metadata must match the exact endpoint tuple
@@ -251,6 +361,7 @@ final class PeerHostCLIBinDirsReadinessTests: XCTestCase {
                 sshTarget: "root@jw-server",
                 remoteSockPath: "/tmp/auto-resolved.sock",
                 profileID: profileID,
+                configuredRemoteSocket: "",
                 hostCLIBinDirs: ["/home/root/.local/bin"],
                 hostCLIBinDirsResolved: true
             ),

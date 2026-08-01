@@ -1339,7 +1339,15 @@ final class PeerProjectBootstrapTests: XCTestCase {
                 remoteSockPath: "/tmp/shared.sock",
                 profileID: UUID(),
                 hostCLIBinDirs: ["/stale/bin"],
-                hostCLIBinDirsResolved: true
+                hostCLIBinDirsResolved: true,
+                configuredEndpoint: PeerHostEndpointProvenance(
+                    sshTarget: "shared", port: nil, identityFile: nil,
+                    remoteSocket: "/tmp/shared.sock"
+                ),
+                hostCLIBinDirsProvenance: PeerHostEndpointProvenance(
+                    sshTarget: "shared", port: nil, identityFile: nil,
+                    remoteSocket: "/tmp/shared.sock"
+                )
             ),
             HostEntry(
                 id: "ssh:saved",
@@ -1353,7 +1361,17 @@ final class PeerProjectBootstrapTests: XCTestCase {
                 identityFile: "/Users/x/.ssh/id_ed25519",
                 profileID: wantedID,
                 hostCLIBinDirs: ["/exact/bin"],
-                hostCLIBinDirsResolved: true
+                hostCLIBinDirsResolved: true,
+                configuredEndpoint: PeerHostEndpointProvenance(
+                    sshTarget: "shared", port: 22,
+                    identityFile: "/Users/x/.ssh/id_ed25519",
+                    remoteSocket: "/tmp/shared.sock"
+                ),
+                hostCLIBinDirsProvenance: PeerHostEndpointProvenance(
+                    sshTarget: "shared", port: 22,
+                    identityFile: "/Users/x/.ssh/id_ed25519",
+                    remoteSocket: "/tmp/shared.sock"
+                )
             ),
         ]
 
@@ -1401,7 +1419,17 @@ final class PeerProjectBootstrapTests: XCTestCase {
             identityFile: "/Users/x/.ssh/id_old",
             profileID: wantedID,
             hostCLIBinDirs: ["/old/bin"],
-            hostCLIBinDirsResolved: true
+            hostCLIBinDirsResolved: true,
+            configuredEndpoint: PeerHostEndpointProvenance(
+                sshTarget: "old-target", port: 22,
+                identityFile: "/Users/x/.ssh/id_old",
+                remoteSocket: "/tmp/old.sock"
+            ),
+            hostCLIBinDirsProvenance: PeerHostEndpointProvenance(
+                sshTarget: "old-target", port: 22,
+                identityFile: "/Users/x/.ssh/id_old",
+                remoteSocket: "/tmp/old.sock"
+            )
         )
 
         // sshTarget changed since that connection was authenticated.
