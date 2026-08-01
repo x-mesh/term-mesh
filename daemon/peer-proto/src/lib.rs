@@ -67,6 +67,8 @@ pub mod capability {
     /// wire-gap baseline to `GridSnapshot.byte_seq` — neither is safe to
     /// infer from an untyped byte stream.
     pub const GRID_SNAPSHOT_V1: &str = "grid.snapshot.v1";
+    /// Authenticated host-reported directories containing bundled CLIs.
+    pub const HOST_CLI_BIN_DIRS_V1: &str = "host.cli-bin-dirs.v1";
 
     /// The host answers `ListTeams` with the agent teams it is running.
     /// A team is not visible in the layout tree — knowing which machine
@@ -97,6 +99,7 @@ pub mod capability {
         SURFACE_TERMINATE_V1,
         HOST_STATS_V1,
         GRID_SNAPSHOT_V1,
+        HOST_CLI_BIN_DIRS_V1,
         TEAM_ROSTER_V1,
         TEAM_CALL_V1,
         TEAM_LEADER_V1,
@@ -159,6 +162,7 @@ pub mod team_leader {
     pub fn validate_grant(
         presented: &TeamLeaderGrant,
         registered: Option<&TeamLeaderGrant>,
+        registered_valid_until_unix_seconds: Option<u64>,
         expected_project_id: &str,
         expected_team_uuid: &str,
         now_unix_seconds: u64,
@@ -184,8 +188,13 @@ pub mod team_leader {
         {
             return Err(ValidationError::InvalidRole);
         }
+        // Keep the issued wire expiry immutable for tamper detection. The
+        // authoritative server may renew a separate lease deadline without
+        // needing to mutate the long-running leader process environment.
+        let valid_until =
+            registered_valid_until_unix_seconds.unwrap_or(registered.expires_at_unix_secs);
         if presented.expires_at_unix_secs != registered.expires_at_unix_secs
-            || presented.expires_at_unix_secs <= now_unix_seconds
+            || valid_until <= now_unix_seconds
         {
             return Err(ValidationError::ExpiredGrant);
         }
@@ -197,8 +206,7 @@ pub mod team_leader {
         !bytes.is_empty()
             && bytes.len() <= max_bytes
             && bytes.iter().all(|byte| {
-                byte.is_ascii_alphanumeric()
-                    || matches!(byte, b'-' | b'.' | b':' | b'_')
+                byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b':' | b'_')
             })
     }
 
@@ -254,9 +262,7 @@ mod team_leader_tests {
         validate_bootstrap, validate_grant, ReplayGuard, ValidationError, GRANT_ID_BYTES,
         MAX_BOOTSTRAP_PAYLOAD_BYTES, REQUEST_ID_BYTES,
     };
-    use super::{
-        TeamLeaderBootstrapRequest, TeamLeaderGrant, TeamLeaderPlacement, TeamLeaderRole,
-    };
+    use super::{TeamLeaderBootstrapRequest, TeamLeaderGrant, TeamLeaderPlacement, TeamLeaderRole};
 
     fn request() -> TeamLeaderBootstrapRequest {
         TeamLeaderBootstrapRequest {
@@ -315,6 +321,7 @@ mod team_leader_tests {
             validate_grant(
                 &registered,
                 Some(&registered),
+                None,
                 "name:demo",
                 "team-uuid",
                 99
@@ -325,14 +332,28 @@ mod team_leader_tests {
         let mut forged = registered.clone();
         forged.project_id = "name:other".into();
         assert_eq!(
-            validate_grant(&forged, Some(&registered), "name:demo", "team-uuid", 99),
+            validate_grant(
+                &forged,
+                Some(&registered),
+                None,
+                "name:demo",
+                "team-uuid",
+                99
+            ),
             Err(ValidationError::ForgedProject)
         );
 
         let mut forged = registered.clone();
         forged.team_uuid = "other-team".into();
         assert_eq!(
-            validate_grant(&forged, Some(&registered), "name:demo", "team-uuid", 99),
+            validate_grant(
+                &forged,
+                Some(&registered),
+                None,
+                "name:demo",
+                "team-uuid",
+                99
+            ),
             Err(ValidationError::ForgedTeam)
         );
 
@@ -342,6 +363,7 @@ mod team_leader_tests {
             validate_grant(
                 &wrong_role,
                 Some(&registered),
+                None,
                 "name:demo",
                 "team-uuid",
                 99
@@ -352,6 +374,7 @@ mod team_leader_tests {
             validate_grant(
                 &registered,
                 Some(&registered),
+                None,
                 "name:demo",
                 "team-uuid",
                 100
@@ -359,8 +382,22 @@ mod team_leader_tests {
             Err(ValidationError::ExpiredGrant)
         );
         assert_eq!(
-            validate_grant(&registered, None, "name:demo", "team-uuid", 99),
+            validate_grant(&registered, None, None, "name:demo", "team-uuid", 99),
             Err(ValidationError::UnknownGrant)
+        );
+
+        let mut renewed = registered.clone();
+        renewed.expires_at_unix_secs = 110;
+        assert_eq!(
+            validate_grant(
+                &registered,
+                Some(&registered),
+                Some(renewed.expires_at_unix_secs),
+                "name:demo",
+                "team-uuid",
+                105
+            ),
+            Ok(())
         );
     }
 
@@ -393,6 +430,7 @@ mod tests {
                 display_name: "MacBook Pro".into(),
                 capabilities: vec!["grid-snapshot-v1".into()],
                 app_version: "0.98.2".into(),
+                cli_bin_dirs: vec![],
             })),
         };
 
@@ -478,6 +516,7 @@ mod tests {
                 display_name: "legacy-peer".into(),
                 capabilities: vec![],
                 app_version: "0.0.0".into(),
+                cli_bin_dirs: vec![],
             })),
         };
         let bytes = env.encode_to_vec();
@@ -507,6 +546,7 @@ mod tests {
                 display_name: "future-peer".into(),
                 capabilities: unknown.clone(),
                 app_version: "9.9.9".into(),
+                cli_bin_dirs: vec![],
             })),
         };
         let bytes = env.encode_to_vec();
@@ -531,6 +571,7 @@ mod tests {
                 display_name: "chatty-peer".into(),
                 capabilities: many.clone(),
                 app_version: "1.2.3".into(),
+                cli_bin_dirs: vec![],
             })),
         };
         let bytes = env.encode_to_vec();
@@ -561,6 +602,7 @@ mod tests {
                 display_name: "corrupt-test".into(),
                 capabilities: vec![placeholder.to_string()],
                 app_version: "0.0.0".into(),
+                cli_bin_dirs: vec![],
             })),
         };
         let mut bytes = env.encode_to_vec();

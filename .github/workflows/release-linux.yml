@@ -38,18 +38,22 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # Pinned to 22.04 (glibc 2.35), not ubuntu-latest (24.04, glibc
-          # 2.39): term-meshd links glibc dynamically (no musl), and a
-          # binary built against 2.39 refuses to run on 22.04 LTS hosts
-          # ("GLIBC_2.39 not found" — hit for real on okrd-mesh-jinwoo).
-          # 22.04 is the oldest glibc this workflow can target, so pin here
-          # rather than trailing ubuntu-latest's rolling default.
+          # term-meshd links glibc dynamically (no musl). glibc is only
+          # backward compatible, so a binary built against a runner's own
+          # glibc (22.04 → 2.35, 24.04 → 2.39) refuses to load on any older
+          # host ("GLIBC_2.xx not found" — hit for real on okrd-mesh-jinwoo,
+          # and on a CentOS 7 / glibc 2.17 peer). We build natively per arch
+          # but link through cargo-zigbuild against a glibc 2.17 floor, so
+          # the same binary runs on anything from RHEL/CentOS 7 upward
+          # without changing runtime semantics (still glibc, not musl).
+          # The runner OS no longer sets the floor — the `.2.17` target
+          # suffix does; the "verify glibc floor" step enforces it.
           - arch: x86_64
             runner: ubuntu-22.04
-          # GitHub-hosted arm64 runners only ship a 24.04 image (no 22.04
-          # arm option), so this leg's glibc floor is 2.39, not 2.35.
+            rust_target: x86_64-unknown-linux-gnu
           - arch: aarch64
             runner: ubuntu-24.04-arm
+            rust_target: aarch64-unknown-linux-gnu
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
@@ -58,15 +62,57 @@ jobs:
           submodules: false
 
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.rust_target }}
+
+      # zig is the cross-glibc linker cargo-zigbuild drives; pinned so the
+      # link toolchain is reproducible across runs.
+      - uses: mlugg/setup-zig@v1
+        with:
+          version: 0.13.0
+
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-zigbuild
 
       - name: cache cargo
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: daemon -> target
 
-      - name: build term-meshd (release)
+      - name: build term-meshd (release, glibc 2.17 floor)
         working-directory: daemon
-        run: cargo build --release -p term-meshd
+        # The `.2.17` suffix tells zig to link against glibc 2.17 symbol
+        # versions. rust still emits code for the host triple (no `.2.17`
+        # in the target dir), so output lands under the base triple below.
+        run: cargo zigbuild --release -p term-meshd --target ${{ matrix.rust_target }}.2.17
+
+      - name: verify glibc floor
+        working-directory: daemon
+        # Guards the whole point of the zigbuild step: assert no glibc
+        # symbol above 2.17 slipped into the binary. A regression here would
+        # ship an asset that fails to load on the very hosts this targets,
+        # and it would only surface on a user's box — so fail the release now.
+        run: |
+          set -euo pipefail
+          bin="target/${{ matrix.rust_target }}/release/term-meshd"
+          command -v objdump >/dev/null || { echo "ERROR: objdump is required for the GLIBC gate" >&2; exit 1; }
+          objdump_output=$(objdump -T "$bin")
+          # awk deliberately succeeds when there are no GLIBC imports (for
+          # example, a future static binary). With pipefail still enabled, an
+          # objdump/sort/tail failure cannot be mistaken for "no symbols".
+          maxsym=$(printf '%s\n' "$objdump_output" \
+            | awk '{ line = $0; while (match(line, /GLIBC_[0-9]+(\.[0-9]+)*/)) { print substr(line, RSTART, RLENGTH); line = substr(line, RSTART + RLENGTH) } }' \
+            | sort -V \
+            | tail -n1)
+          echo "max glibc symbol required: ${maxsym:-none}"
+          if [ -n "$maxsym" ]; then
+            ver=${maxsym#GLIBC_}
+            if [ "$(printf '%s\n2.17\n' "$ver" | sort -V | tail -n1)" != "2.17" ]; then
+              echo "ERROR: binary requires ${maxsym}, above the 2.17 floor" >&2
+              exit 1
+            fi
+          fi
 
       - name: package
         id: package
@@ -75,7 +121,7 @@ jobs:
           VERSION="${{ inputs.tag || github.ref_name }}"
           VERSION="${VERSION#v}"
           ASSET="term-meshd-linux-${{ matrix.arch }}.tar.gz"
-          tar -czf "$ASSET" -C daemon/target/release term-meshd
+          tar -czf "$ASSET" -C "daemon/target/${{ matrix.rust_target }}/release" term-meshd
           echo "asset=$ASSET" >> "$GITHUB_OUTPUT"
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           sha256sum "$ASSET" > "$ASSET.sha256"

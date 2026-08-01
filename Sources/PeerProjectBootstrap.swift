@@ -10,6 +10,7 @@ enum ProjectSourceKind: String, Codable, CaseIterable {
 enum ProjectLocationSettings {
     static let localProjectsRootKey = "termMesh.localProjectsRoot"
     static let defaultLocalProjectsRoot = "~/work/project"
+    static let repositorySearchRootsKey = "termMesh.repositorySearchRoots"
 
     static var localProjectsRoot: String {
         let saved = UserDefaults.standard.string(forKey: localProjectsRootKey)?
@@ -19,6 +20,29 @@ enum ProjectLocationSettings {
 
     static func expandedLocalProjectsRoot() -> String {
         (localProjectsRoot as NSString).expandingTildeInPath
+    }
+
+    /// Where to look for repositories this machine has already cloned.
+    ///
+    /// Kept apart from `localProjectsRoot`, which answers a different
+    /// question — where a *new* project should be put. Using one setting for
+    /// both meant that pointing new projects at a fresh directory also hid
+    /// every checkout living anywhere else, and the suggestion list quietly
+    /// shrank to whatever happened to be open.
+    ///
+    /// One path per line. Empty falls back to the project root, which is what
+    /// this did before the split.
+    static var repositorySearchRoots: [String] {
+        let saved = UserDefaults.standard.string(forKey: repositorySearchRootsKey) ?? ""
+        let entries = saved
+            .split(whereSeparator: \.isNewline)
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .filter { !$0.isEmpty }
+        let roots = entries.isEmpty ? [localProjectsRoot] : entries
+        var seen = Set<String>()
+        return roots
+            .map { ($0 as NSString).expandingTildeInPath }
+            .filter { seen.insert($0).inserted }
     }
 }
 
@@ -204,6 +228,159 @@ enum PeerProjectBootstrap {
             "0123456789abcdef".randomElement().map(String.init) ?? "0"
         }.joined()
         return "\(formatter.string(from: now))-\(random)"
+    }
+
+    // MARK: - One tag per attempt, or one per transaction
+
+    /// The tag an in-flight creation is using, keyed by what the user is
+    /// creating.
+    ///
+    /// A fresh tag per *creation* is right; a fresh tag per *attempt* is not.
+    /// `prepareCheckouts` minted one on every call, so pressing Create again
+    /// after a mid-transaction failure named a whole new set of checkouts —
+    /// `demo-executor-260730-a1b2`, then `-c3d4`, then `-e5f6` — while the
+    /// previous ones stayed on disk as worktrees and branches nothing would
+    /// ever adopt. The bootstrap script is idempotent by construction, so
+    /// reusing the tag makes a retry resume the same transaction instead of
+    /// starting a parallel one.
+    ///
+    /// Held until the creation succeeds (`finishTransaction`), not for the
+    /// process's lifetime: a later, deliberate re-creation of the same project
+    /// must not adopt this one's leftovers, which is the hazard the random tag
+    /// exists to prevent in the first place.
+    private static let transactionLock = NSLock()
+    private static var transactionTags: [String: String] = [:]
+
+    /// The key is the project as the user identified it: two projects of the
+    /// same name in different folders are two transactions.
+    static func transactionKey(name: String, sourcePath: String) -> String {
+        let path = (sourcePath.trimmingCharacters(in: .whitespacesAndNewlines) as NSString)
+            .standardizingPath
+        return "\(name.trimmingCharacters(in: .whitespacesAndNewlines))\u{1}\(path)"
+    }
+
+    /// The tag for this transaction, minted once and reused by every retry.
+    static func instanceTag(forTransaction key: String) -> String {
+        transactionLock.lock()
+        defer { transactionLock.unlock() }
+        if let existing = transactionTags[key] { return existing }
+        let tag = makeInstanceTag()
+        transactionTags[key] = tag
+        return tag
+    }
+
+    /// The creation finished — the next one is a new transaction. Also called
+    /// after a rollback that reclaimed everything, so a retry starts clean.
+    static func finishTransaction(_ key: String) {
+        transactionLock.lock()
+        transactionTags.removeValue(forKey: key)
+        transactionLock.unlock()
+    }
+
+    // MARK: - Undoing one placement
+
+    /// Whether a placement can be prepared at all without a repository to
+    /// clone from.
+    ///
+    /// An existing folder is a promise about *one* machine. Placed on any
+    /// other, `script` reduces to `test -d <path>` — it neither copies the
+    /// project nor checks that what is already there is the same project, so a
+    /// predicted path that happens to exist starts agents in an unrelated
+    /// directory that merely has the right name. There is nothing to compare
+    /// against either: the whole premise is that no Git URL was given, so the
+    /// two sides share no identity a check could match. Refusing is the only
+    /// answer that cannot be silently wrong.
+    static func requiresRepositoryURL(
+        placement: Placement,
+        sourceKind: ProjectSourceKind,
+        gitURL: String
+    ) -> Bool {
+        guard gitURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            return false
+        }
+        return sourceKind == .existingFolder && !placement.isSource
+    }
+
+    /// Take back what this transaction's checkouts added to one machine.
+    ///
+    /// Only the agent worktrees and branches carrying `instanceTag`, which no
+    /// other run can have written: the tag is minted per transaction and
+    /// appears in both the directory name and the branch. The primary checkout
+    /// is deliberately left alone — it is the one artifact that may have been
+    /// there before, `script` already rolls back its own primary when it is the
+    /// step that fails, and a leftover clone costs disk while a wrongly deleted
+    /// project folder costs the project. What accumulates across retries is
+    /// worktrees and branches, and that is exactly what this reclaims.
+    static func cleanupScript(for plan: Plan, instanceTag: String) -> String? {
+        let tag = instanceTag.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !tag.isEmpty else { return nil }
+        let owned = plan.agentCheckouts.filter {
+            $0.path != plan.primaryPath && $0.branch.contains(tag) && $0.path.contains(tag)
+        }
+        guard !owned.isEmpty else { return nil }
+        let primary = quote(plan.primaryPath)
+        var steps = owned.reversed().map { checkout -> String in
+            let path = quote(checkout.path)
+            let branch = quote(checkout.branch)
+            return "git -C \(primary) worktree remove --force \(path) >/dev/null 2>&1 "
+                + "|| rm -rf -- \(path); "
+                + "git -C \(primary) branch -D \(branch) >/dev/null 2>&1 || true"
+        }
+        steps.append("git -C \(primary) worktree prune >/dev/null 2>&1 || true")
+        // No `set -e`: a rollback that stops halfway leaves more behind than
+        // one that tries every step.
+        return steps.joined(separator: "; ")
+    }
+
+    /// Best effort, and deliberately so: the usual reason a placement failed is
+    /// that the machine after it went away, and the machine before it may have
+    /// gone with it. A rollback that cannot reach a host reports that and
+    /// leaves the transaction tag in place, so the retry adopts those same
+    /// checkouts rather than minting another set beside them.
+    @discardableResult
+    static func cleanup(
+        sshTarget: String,
+        port: Int?,
+        identityFile: String?,
+        plan: Plan,
+        instanceTag: String,
+        environment: [String: String] = [:],
+        timeoutSeconds: TimeInterval = 120
+    ) async -> Bool {
+        guard let script = cleanupScript(for: plan, instanceTag: instanceTag) else {
+            return true
+        }
+        let assignments = PeerHostEnvironment.inlineAssignments(environment)
+        let prefixed = assignments.isEmpty ? script : "export \(assignments) && \(script)"
+        do {
+            try await PeerHostReadinessChecker.runScript(
+                sshTarget: sshTarget,
+                port: port,
+                identityFile: identityFile,
+                script: prefixed,
+                timeoutSeconds: timeoutSeconds
+            )
+            return true
+        } catch {
+            return false
+        }
+    }
+
+    @discardableResult
+    static func cleanupLocal(
+        plan: Plan,
+        instanceTag: String,
+        timeoutSeconds: TimeInterval = 120
+    ) async -> Bool {
+        guard let script = cleanupScript(for: plan, instanceTag: instanceTag) else {
+            return true
+        }
+        do {
+            try await runLocalScript(script, timeoutSeconds: timeoutSeconds)
+            return true
+        } catch {
+            return false
+        }
     }
 
     /// Where everything goes, without touching the machine.
@@ -580,42 +757,49 @@ enum PeerProjectBootstrap {
             sourceKind: sourceKind,
             memMeshProjectID: memMeshProjectID
         ) else { return }
-        try await withCheckedThrowingContinuation {
-            (continuation: CheckedContinuation<Void, Error>) in
-            DispatchQueue.global(qos: .userInitiated).async {
-                let process = Process()
-                process.executableURL = URL(fileURLWithPath: "/bin/sh")
-                process.arguments = ["-lc", script]
-                let errorPipe = Pipe()
-                process.standardError = errorPipe
-                do {
-                    try process.run()
-                } catch {
-                    continuation.resume(throwing: error)
-                    return
-                }
-                let deadline = Date().addingTimeInterval(timeoutSeconds)
-                while process.isRunning, Date() < deadline {
-                    Thread.sleep(forTimeInterval: 0.05)
-                }
-                if process.isRunning {
-                    process.terminate()
-                    continuation.resume(throwing: ProjectBootstrapError.timedOut)
-                    return
-                }
-                guard process.terminationStatus == 0 else {
-                    let data = (try? errorPipe.fileHandleForReading.readToEnd()) ?? Data()
-                    let message = String(data: data, encoding: .utf8)?
-                        .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-                    continuation.resume(
-                        throwing: ProjectBootstrapError.commandFailed(
-                            message.isEmpty ? "git exited with \(process.terminationStatus)" : message
-                        )
-                    )
-                    return
-                }
-                continuation.resume(returning: ())
-            }
+        try await runLocalScript(script, timeoutSeconds: timeoutSeconds)
+    }
+
+    /// One `/bin/sh -lc` on this Mac, bounded. Split out of `runLocal` so the
+    /// rollback above runs its script the same way the setup ran its own.
+    ///
+    /// Routed through `ProcessRun.capture` rather than a bespoke `Process`
+    /// loop. The previous implementation attached stderr to a pipe and only
+    /// read it once the process had exited: a `git clone` that emits enough
+    /// progress fills the pipe, the child blocks writing, the parent keeps
+    /// polling, and a healthy bootstrap is reported as a timeout. Its timeout
+    /// path then sent `terminate()` to `/bin/sh` alone and resumed the
+    /// continuation immediately, so a descendant `git` could still be mutating
+    /// the checkout after the caller had begun transaction rollback or a
+    /// retry. `capture` drains stderr concurrently, spawns into its own
+    /// process group, and escalates SIGTERM to SIGKILL across the whole group
+    /// before it returns.
+    /// Internal rather than private so the pipe-deadlock regression can drive
+    /// it with a script that actually floods stderr. Going through
+    /// `runLocal` cannot reproduce it: git writes progress only to a TTY, so
+    /// a piped clone stays far under the 64 KiB buffer that triggers the bug.
+    static func runLocalScript(
+        _ script: String,
+        timeoutSeconds: TimeInterval
+    ) async throws {
+        let output: ProcessRun.Output
+        do {
+            output = try await ProcessRun.capture(
+                executable: "/bin/sh",
+                arguments: ["-lc", script],
+                timeout: timeoutSeconds
+            )
+        } catch ProcessRun.Failure.couldNotStart(let message) {
+            throw ProjectBootstrapError.commandFailed(message)
+        }
+        guard !output.timedOut else {
+            throw ProjectBootstrapError.timedOut
+        }
+        guard output.status == 0 else {
+            let message = output.stderrText
+            throw ProjectBootstrapError.commandFailed(
+                message.isEmpty ? "git exited with \(output.status)" : message
+            )
         }
     }
 

@@ -20,14 +20,31 @@ actor ReviewBoardMergeRunner {
         let taskID: String
         /// Where the task did its work. `nil` when the board never recorded one.
         let worktreePath: String?
+        /// Canonical root shared by worktrees that can move the same target.
+        /// Resolved by the coordinator before this actor is entered so the
+        /// merge lock can be acquired without suspending first.
+        let repositoryPath: String?
         /// Passed to `--to` verbatim: `parent`, `base`, or a branch name.
         let target: String
+        /// The commit the approval was recorded against. Live merges fail
+        /// closed when this is absent; optionality remains for lightweight
+        /// runner tests that intentionally omit filesystem evidence.
+        let approvedHeadSHA: String?
 
-        init(queueID: String, taskID: String, worktreePath: String?, target: String = "parent") {
+        init(
+            queueID: String,
+            taskID: String,
+            worktreePath: String?,
+            repositoryPath: String? = nil,
+            target: String = "parent",
+            approvedHeadSHA: String? = nil
+        ) {
             self.queueID = queueID
             self.taskID = taskID
             self.worktreePath = worktreePath
+            self.repositoryPath = repositoryPath
             self.target = target
+            self.approvedHeadSHA = approvedHeadSHA
         }
     }
 
@@ -46,7 +63,18 @@ actor ReviewBoardMergeRunner {
     typealias Command = (_ arguments: [String], _ timeout: TimeInterval) async throws
         -> ProcessRun.Output
 
+    /// Reading the worktree's own state. Separate from `command` because that
+    /// one is git-kit: what is asked here is what plain git says about the
+    /// directory, and answering it through git-kit would mean asking the tool
+    /// about to change that state to describe it.
+    typealias Git = (_ arguments: [String]) async -> ProcessRun.Output?
+
     private let command: Command
+    /// `nil` means no evidence check — the runner has no way to look at the
+    /// worktree, so it does not pretend to. Only tests that stub the
+    /// filesystem construct one that way; `live` always wires real git, and
+    /// `live` is the only constructor the app uses.
+    private let git: Git?
     private let pathExists: (String) -> Bool
     private let report: (String, String, String?) async -> Void
     private let timeout: TimeInterval
@@ -55,15 +83,25 @@ actor ReviewBoardMergeRunner {
     /// for the same item cannot get past this set while the first is awaiting
     /// the merge.
     private var inFlight: Set<String> = []
+    /// Different queue entries can still mutate the same target branch. The
+    /// repository is part of the key so unrelated repositories remain free to
+    /// progress independently.
+    private struct MergeLock: Hashable {
+        let repository: String
+        let target: String
+    }
+    private var mergeLocks: Set<MergeLock> = []
 
     init(
         timeout: TimeInterval = 300,
         command: @escaping Command,
+        git: Git? = nil,
         pathExists: @escaping (String) -> Bool = { FileManager.default.fileExists(atPath: $0) },
         report: @escaping (String, String, String?) async -> Void
     ) {
         self.timeout = timeout
         self.command = command
+        self.git = git
         self.pathExists = pathExists
         self.report = report
     }
@@ -91,6 +129,11 @@ actor ReviewBoardMergeRunner {
                     timeout: timeout
                 )
             },
+            git: { arguments in
+                try? await ProcessRun.capture(
+                    executable: "/usr/bin/git", arguments: arguments, timeout: 30
+                )
+            },
             report: { queueID, status, lastError in
                 try? await coordinator.transitionMergeQueue(
                     queueID: queueID, status: status, lastError: lastError
@@ -103,7 +146,19 @@ actor ReviewBoardMergeRunner {
 
     @discardableResult
     func process(_ job: Job) async -> Outcome {
-        guard !inFlight.contains(job.queueID) else { return .alreadyRunning }
+        // Both locks are acquired before the first await. Swift actors are
+        // reentrant at suspension points: validating evidence first allowed a
+        // second refresh to pass the guard and start an overlapping merge.
+        let mergeLock = lock(for: job)
+        guard !inFlight.contains(job.queueID), !mergeLocks.contains(mergeLock) else {
+            return .alreadyRunning
+        }
+        inFlight.insert(job.queueID)
+        mergeLocks.insert(mergeLock)
+        defer {
+            inFlight.remove(job.queueID)
+            mergeLocks.remove(mergeLock)
+        }
 
         // Everything that can be known without running anything is checked
         // first, so a hopeless merge is refused rather than half-attempted.
@@ -114,9 +169,9 @@ actor ReviewBoardMergeRunner {
         guard pathExists(path) else {
             return await fail(job, "The worktree at \(path) is gone — it was removed or never created.")
         }
-
-        inFlight.insert(job.queueID)
-        defer { inFlight.remove(job.queueID) }
+        if let reason = await evidenceGap(job, at: path) {
+            return await fail(job, reason)
+        }
 
         await report(job.queueID, "running", nil)
 
@@ -143,6 +198,75 @@ actor ReviewBoardMergeRunner {
         }
 
         return await interpret(output, for: job)
+    }
+
+    /// Synchronous by design: deriving this key must not open an actor
+    /// reentrancy window before it is inserted into `mergeLocks`.
+    private func lock(for job: Job) -> MergeLock {
+        let raw = job.repositoryPath ?? job.worktreePath ?? "queue:\(job.queueID)"
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        let repository = trimmed.hasPrefix("/")
+            ? (trimmed as NSString).standardizingPath
+            : trimmed
+        return MergeLock(
+            repository: repository,
+            target: job.target.trimmingCharacters(in: .whitespacesAndNewlines)
+        )
+    }
+
+    /// Why the tree in front of us is not the tree that was approved, or nil
+    /// when it is.
+    ///
+    /// This exists because of what `worktree finish` actually does. Without
+    /// `--push` it runs `gk promote`, and promote's first step is
+    /// `gk commit -f` — skipped only when the tree is clean. So an uncommitted
+    /// edit sitting in the worktree is *committed by the merge* and lands with
+    /// it, while the approval it rides on was recorded from
+    /// `git diff <base>..<head>`, which covers committed history and nothing
+    /// else. An agent that commits half its work and reports DONE therefore
+    /// gets the other half merged without anyone having seen it.
+    ///
+    /// The head check closes the same hole from the other side: an approval
+    /// names a commit, and a worktree that has moved on since is no longer the
+    /// thing that was approved.
+    ///
+    /// Both refuse rather than merge-and-warn. A merge is the irreversible
+    /// half of this feature; being told to commit and approve again costs a
+    /// minute, and the alternative costs a review nobody did.
+    private func evidenceGap(_ job: Job, at path: String) async -> String? {
+        guard let git else { return nil }
+        guard let approved = job.approvedHeadSHA?
+            .trimmingCharacters(in: .whitespacesAndNewlines), !approved.isEmpty else {
+            return "The approved commit could not be read, so the worktree cannot be "
+                + "matched to the reviewed evidence. It was not merged."
+        }
+        guard let status = await git(["-C", path, "status", "--porcelain"]),
+              status.status == 0 else {
+            return "The worktree at \(path) could not be read, so there is no way to tell "
+                + "whether it still holds what was approved. It was not merged."
+        }
+        let dirty = status.stdoutText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard dirty.isEmpty else {
+            return "The worktree at \(path) has uncommitted changes. Finishing it would commit "
+                + "and merge them, and the approval only covers what was already committed. "
+                + "Commit or discard them, then approve again."
+        }
+
+        guard let head = await git(["-C", path, "rev-parse", "HEAD"]), head.status == 0 else {
+            return "HEAD could not be read at \(path), so the approved commit could not be "
+                + "confirmed. It was not merged."
+        }
+        let current = head.stdoutText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard current == approved else {
+            return "This was approved at \(Self.short(approved)) but the worktree is now at "
+                + "\(Self.short(current)). It was not merged — review the newer commits and "
+                + "approve again."
+        }
+        return nil
+    }
+
+    private static func short(_ sha: String) -> String {
+        sha.isEmpty ? "an unknown commit" : String(sha.prefix(8))
     }
 
     /// Process every job, one at a time. Serial on purpose: two merges into the
@@ -228,13 +352,21 @@ extension ReviewBoardMergeRunner.Job {
     /// An entry whose task the board does not have is not merged — the
     /// worktree path lives on the task, and merging without it would mean
     /// picking a directory.
-    init?(item: ReviewBoardMergeQueueItem, tasks: [ReviewBoardTask], target: String = "parent") {
+    init?(
+        item: ReviewBoardMergeQueueItem,
+        tasks: [ReviewBoardTask],
+        repositoryPath: String? = nil,
+        target: String = "parent",
+        approvedHeadSHA: String? = nil
+    ) {
         guard let task = tasks.first(where: { $0.rawID == item.taskRawID }) else { return nil }
         self.init(
             queueID: item.id,
             taskID: item.taskRawID,
             worktreePath: task.worktreePath,
-            target: target
+            repositoryPath: repositoryPath,
+            target: target,
+            approvedHeadSHA: approvedHeadSHA
         )
     }
 }

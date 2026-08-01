@@ -115,6 +115,9 @@ message Hello {
   repeated string capabilities = 4;
   // term-mesh marketing version; diagnostics only.
   string app_version = 5;
+  // Absolute directories containing CLIs shipped beside this host process.
+  // Consumers require host.cli-bin-dirs.v1 and successful authentication.
+  repeated string cli_bin_dirs = 6;
 }
 
 message AuthChallenge {
@@ -820,6 +823,15 @@ message HostStats {
   uint64 net_tx_bytes_per_sec = 9;
   double load_5m = 10;
   double load_15m = 11;
+  // Filesystem capacity, summed across mounted disks. Unlike the rates
+  // above these are absolute: what a viewer needs to warn that a peer is
+  // about to run out of room for checkouts and build output.
+  //
+  // `disk_total_bytes == 0` means "not reported" — either the host cannot
+  // measure it or it predates these fields — and a viewer must show
+  // nothing rather than a peer that looks 100% full.
+  uint64 disk_total_bytes = 12;
+  uint64 disk_available_bytes = 13;
 }
 
 // ============================================================

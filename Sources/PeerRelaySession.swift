@@ -46,6 +46,8 @@ struct PeerRelayConnection: Sendable {
     /// trip). Callers gate optional RPCs (e.g. workspace CRUD) on this
     /// rather than assuming every host build supports them.
     let hostCapabilities: PeerCapabilities
+    /// Authenticated, validated host CLI directories for this connection.
+    let hostCLIBinDirs: [String]
     let session: PeerSession
     let transport: UnixSocketTransport
     let surfaces: [Termmesh_Peer_V1_SurfaceInfo]
@@ -895,6 +897,18 @@ final class PeerRelaySession {
         return true
     }
 
+    /// Send bytes straight to this attached remote PTY.
+    ///
+    /// Bootstrap commands must not depend on Ghostty synthesizing Return:
+    /// a relay surface can accept the local key event while the remote PTY
+    /// never receives it. Going through the authenticated peer session makes
+    /// command + CR one ordered input frame.
+    func sendRemoteKeys(_ keys: Data) async throws -> Bool {
+        guard let session else { return false }
+        try await session.sendInput(surfaceID: surfaceID, keys: keys)
+        return true
+    }
+
     // ── Stale-socket sweep ──────────────────────────────────────────
     //
     // Per-session sockets land in a private per-user directory.
@@ -971,6 +985,7 @@ final class PeerRelaySession {
             hostDisplayName: connection.hostDisplayName,
             hostAppVersion: connection.hostAppVersion,
             hostCapabilities: connection.hostCapabilities,
+            hostCLIBinDirs: connection.hostCLIBinDirs,
             session: connection.session,
             transport: connection.transport,
             surfaces: surfaces
@@ -1007,6 +1022,7 @@ final class PeerRelaySession {
             hostDisplayName: info.hostDisplayName,
             hostAppVersion: info.hostAppVersion,
             hostCapabilities: info.hostCapabilities,
+            hostCLIBinDirs: info.hostCLIBinDirs,
             session: session,
             transport: transport,
             surfaces: []

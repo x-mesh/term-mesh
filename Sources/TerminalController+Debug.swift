@@ -126,6 +126,42 @@ extension TerminalController {
         return resp == "OK" ? .ok([:]) : .err(code: "internal_error", message: resp, data: nil)
     }
 
+    /// What this process is actually running.
+    ///
+    /// Every other way of asking reports the wrong thing at least sometimes.
+    /// `--version` reads the file on disk, which a package manager may have
+    /// replaced under a process that kept the old image; the bundle's
+    /// Info.plist has the same problem; and `strings` on the binary finds
+    /// nothing useful because most of the code lives outside it. All three
+    /// misled a debugging session on 2026-07-30 — an hour went into "did that
+    /// fix get built or not".
+    ///
+    /// These values are baked in at compile time, so they describe the code
+    /// that is executing rather than whatever is on disk now.
+    func v2DebugAppBuild() -> V2CallResult {
+        let info = Bundle.main.infoDictionary
+        var payload: [String: Any] = [
+            "version": info?["CFBundleShortVersionString"] as? String ?? "unknown",
+            "build": info?["CFBundleVersion"] as? String ?? "unknown",
+            "bundle_id": Bundle.main.bundleIdentifier ?? "unknown",
+            "executable": Bundle.main.executablePath ?? "unknown",
+            "started_at": ISO8601DateFormatter().string(from: Self.processStart),
+        ]
+        if let path = Bundle.main.executablePath,
+           let attrs = try? FileManager.default.attributesOfItem(atPath: path),
+           let modified = attrs[.modificationDate] as? Date {
+            // When this is newer than `started_at`, the file was replaced
+            // underneath a still-running process: the code answering you is
+            // not the code on disk.
+            payload["executable_mtime"] = ISO8601DateFormatter().string(from: modified)
+            payload["stale_process"] = modified > Self.processStart
+        }
+        return .ok(payload)
+    }
+
+    /// When this process began, captured on first touch of the type.
+    static let processStart = Date()
+
     func v2DebugToggleCommandPalette(params: [String: Any]) -> V2CallResult {
         let requestedWindowId = v2UUID(params, "window_id")
         var result: V2CallResult = .ok([:])
@@ -603,6 +639,7 @@ extension TerminalController {
                         leaderMode: leaderMode,
                         leaderModel: leaderModel,
                         leaderEndpoint: leaderEndpoint,
+                        leaderWorkingDirectory: params["leader_directory"] as? String,
                         tabManager: tabManager
                     )
                     result = .ok([
@@ -698,6 +735,35 @@ extension TerminalController {
         return .ok(["started": true])
     }
 
+    func v2DebugProjectReattachLeader(params: [String: Any]) -> V2CallResult {
+        guard let team = params["team"] as? String, !team.isEmpty else {
+            return .err(code: "invalid_params", message: "team is required", data: nil)
+        }
+        Task { @MainActor in
+            let attached = await TeamOrchestrator.shared.recoverRemoteLeaderIfNeeded(
+                teamName: team
+            )
+            dlog("debug.project.reattach_leader team=\(team) attached=\(attached)")
+        }
+        return .ok(["started": true])
+    }
+
+    func v2DebugProjectRestorePresentation(params: [String: Any]) -> V2CallResult {
+        guard let team = params["team"] as? String, !team.isEmpty,
+              let tabManager
+        else {
+            return .err(code: "invalid_params", message: "team is required", data: nil)
+        }
+        Task { @MainActor in
+            let restored = await TeamOrchestrator.shared.restoreDetachedProjectPresentation(
+                teamName: team,
+                tabManager: tabManager
+            )
+            dlog("debug.project.restore_presentation team=\(team) restored=\(restored)")
+        }
+        return .ok(["started": true])
+    }
+
     func v2DebugPeerShellInspect(params: [String: Any]) -> V2CallResult {
         guard let handle = params["host"] as? String, !handle.isEmpty,
               let host = RemoteHostStore.shared.sortedHosts.first(where: {
@@ -723,6 +789,46 @@ extension TerminalController {
                         ] as [String: Any]
                     },
                 ]
+            } catch {
+                debugPeerShellInspection = [
+                    "ok": false,
+                    "error": String(describing: error),
+                ]
+            }
+        }
+        return .ok(["started": true])
+    }
+
+    func v2DebugPeerShellClose(params: [String: Any]) -> V2CallResult {
+        guard let handle = params["host"] as? String, !handle.isEmpty,
+              let encodedIDs = params["surface_ids"] as? [String], !encodedIDs.isEmpty,
+              let host = RemoteHostStore.shared.sortedHosts.first(where: {
+                  $0.id == handle
+                      || $0.displayName.caseInsensitiveCompare(handle) == .orderedSame
+              })
+        else {
+            return .err(
+                code: "invalid_params",
+                message: "connected host and surface_ids are required",
+                data: nil
+            )
+        }
+        let surfaceIDs = Set(encodedIDs.compactMap { Data(base64Encoded: $0) })
+        guard surfaceIDs.count == encodedIDs.count else {
+            return .err(
+                code: "invalid_params",
+                message: "surface_ids must be base64 encoded",
+                data: nil
+            )
+        }
+        debugPeerShellInspection = nil
+        Task { @MainActor in
+            do {
+                let closed = try await TeamOrchestrator.shared.closePeerShells(
+                    host: host,
+                    surfaceIDs: surfaceIDs
+                )
+                debugPeerShellInspection = ["ok": true, "closed": closed]
             } catch {
                 debugPeerShellInspection = [
                     "ok": false,

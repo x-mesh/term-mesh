@@ -8,6 +8,7 @@ mod agent;
 mod auto_reply;
 mod auto_reply_emit;
 mod codex_tokens;
+mod gc;
 mod headless;
 mod http;
 mod monitor;
@@ -203,6 +204,55 @@ async fn main() -> anyhow::Result<()> {
                     Ok(Ok(_)) => {}
                     Ok(Err(error)) => tracing::warn!("periodic paste cleanup failed: {error}"),
                     Err(error) => tracing::warn!("periodic paste cleanup task failed: {error}"),
+                }
+            }
+        });
+    }
+
+    // Disk reclamation. Deliberately narrower than what `tm-agent gc sweep`
+    // can do: the unattended pass only touches derived state (expired agent
+    // reports, stale git worktree registrations, oversized logs). Team boards
+    // require live app state and remain explicit-only. Worktrees and agent
+    // checkouts are never removed without someone asking, because only a human
+    // can judge whether
+    // an uncommitted tree still matters.
+    {
+        let mgr = Arc::clone(&agent_manager);
+        let sweep = move || {
+            let Some(paths) = gc::default_paths() else {
+                return;
+            };
+            let refs = gc::GcRefs {
+                active_session_worktrees: mgr.active_worktree_paths(),
+                active_task_worktrees: mgr.active_task_worktree_paths(),
+                repo_paths: mgr.known_repo_paths(),
+                // Team liveness comes from the Swift-synced state, which the
+                // socket layer owns; the periodic pass sticks to the age gate
+                // plus the on-disk headless snapshot check.
+                active_team_uuids: Default::default(),
+            };
+            match gc::periodic_safe_sweep(&paths, &refs) {
+                Ok(summary) if summary.removed > 0 => tracing::info!(
+                    "gc sweep: reclaimed {} item(s), {} bytes",
+                    summary.removed,
+                    summary.reclaimed_bytes
+                ),
+                Ok(_) => {}
+                Err(error) => tracing::warn!("gc sweep failed: {error}"),
+            }
+        };
+
+        let startup = sweep.clone();
+        tokio::task::spawn_blocking(startup);
+
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(6 * 3600));
+            interval.tick().await; // startup sweep above owns the first run
+            loop {
+                interval.tick().await;
+                let pass = sweep.clone();
+                if let Err(error) = tokio::task::spawn_blocking(pass).await {
+                    tracing::warn!("periodic gc sweep task failed: {error}");
                 }
             }
         });

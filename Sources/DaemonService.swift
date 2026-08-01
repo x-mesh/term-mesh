@@ -27,6 +27,7 @@ protocol DaemonService: AnyObject {
     func listBranches(repoPath: String) -> [String]
     func worktreeStatus(repoPath: String, name: String) -> TermMeshDaemon.WorktreeStatusResult
     func cleanupStaleWorktrees(repoPath: String) -> (removed: Int, skippedDirty: Int)
+    func cleanupAllStaleWorktrees() -> (removed: Int, skippedDirty: Int)
 
     // MARK: - Process Management
     func trackPID(_ pid: Int32)

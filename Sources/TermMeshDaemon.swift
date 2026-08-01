@@ -1266,6 +1266,63 @@ final class TermMeshDaemon: ObservableObject {
         }
         return (removed, skippedDirty)
     }
+
+    /// Sweep every repository that owns a worktree under the managed base
+    /// directory.
+    ///
+    /// `cleanupStaleWorktrees(repoPath:)` needs the primary repo, but at quit
+    /// all we have is the base directory. Each worktree's `.git` file names
+    /// its owner, so resolve owners first and sweep each one once.
+    func cleanupAllStaleWorktrees() -> (removed: Int, skippedDirty: Int) {
+        let fm = FileManager.default
+        let base = URL(fileURLWithPath: worktreeBaseDir)
+        guard let repoDirs = try? fm.contentsOfDirectory(
+            at: base, includingPropertiesForKeys: [.isDirectoryKey], options: [.skipsHiddenFiles]
+        ) else {
+            return (0, 0)
+        }
+
+        var owners = Set<String>()
+        for repoDir in repoDirs {
+            let worktrees = (try? fm.contentsOfDirectory(
+                at: repoDir, includingPropertiesForKeys: nil, options: [.skipsHiddenFiles]
+            )) ?? []
+            for worktree in worktrees {
+                guard let owner = Self.primaryRepoPath(ofWorktreeAt: worktree) else { continue }
+                owners.insert(owner)
+            }
+        }
+
+        var removed = 0
+        var skippedDirty = 0
+        for owner in owners.sorted() {
+            let result = cleanupStaleWorktrees(repoPath: owner)
+            removed += result.removed
+            skippedDirty += result.skippedDirty
+        }
+        return (removed, skippedDirty)
+    }
+
+    /// Resolve the repository a linked worktree belongs to.
+    ///
+    /// A linked worktree's `.git` is a file reading
+    /// `gitdir: <main>/.git/worktrees/<name>`, so the primary working
+    /// directory is three levels above that path.
+    static func primaryRepoPath(ofWorktreeAt path: URL) -> String? {
+        guard let contents = try? String(contentsOf: path.appendingPathComponent(".git"), encoding: .utf8)
+        else { return nil }
+        let trimmed = contents.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard trimmed.hasPrefix("gitdir:") else { return nil }
+        let gitdir = String(trimmed.dropFirst("gitdir:".count))
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !gitdir.isEmpty else { return nil }
+        let root = URL(fileURLWithPath: gitdir)
+            .deletingLastPathComponent()   // worktrees/<name> -> worktrees
+            .deletingLastPathComponent()   // worktrees -> .git
+            .deletingLastPathComponent()   // .git -> repo root
+        guard FileManager.default.fileExists(atPath: root.path) else { return nil }
+        return root.path
+    }
 }
 
 // MARK: - Data Models

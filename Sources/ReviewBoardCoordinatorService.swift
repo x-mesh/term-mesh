@@ -658,6 +658,19 @@ final class ReviewBoardCoordinatorClient: @unchecked Sendable {
         _ = try await request(method: "merge.queue.transition", params: params)
     }
 
+    /// The merge queue on its own, without the rest of a snapshot.
+    ///
+    /// Approving and merging happen in one pass, and the published snapshot in
+    /// hand at that point predates the approval that just landed — reading it
+    /// there meant the entry auto pilot had only just created was invisible
+    /// until the next refresh, by which time the sweep no longer recognised it
+    /// as its own. This is the read that closes that gap.
+    func fetchMergeQueue() async throws -> [ReviewBoardMergeQueueItem] {
+        let response = try await request(method: "merge.queue")
+        let rows = (response as? [String: Any])?["items"] as? [[String: Any]] ?? []
+        return rows.compactMap(ReviewBoardMergeQueueItem.init(dictionary:))
+    }
+
     /// Every mutating coordinator method answers with the same envelope.
     private func eventPayload(in result: Any) -> [String: Any]? {
         guard let object = result as? [String: Any],
@@ -927,6 +940,19 @@ final class ReviewBoardCoordinatorService: ObservableObject {
     /// is precisely the case it exists for, since two refreshes can both read
     /// the entry as `queued` before either has reported it `running`.
     private var cachedMergeRunner: ReviewBoardMergeRunner?
+    /// Tasks auto pilot approved itself, and whose merge has not been carried
+    /// out yet.
+    ///
+    /// The queue does not record who approved an entry — an automatic approval
+    /// and a person's are stamped with the same user — and the two are held to
+    /// different rules at merge time, so the distinction has to be carried.
+    /// It lives here rather than in the sweep's return value because the two
+    /// halves land in different passes: the approval is made against one
+    /// snapshot and the merge reads the next, by which point the task has left
+    /// `review_ready` and no sweep claims it again. An entry is dropped once
+    /// its merge has been attempted, so the set stays the size of the work in
+    /// flight.
+    private var autoPilotApprovedTaskIDs: Set<String> = []
     /// Hosts the coordinator remembers, live or not. Empty whenever the
     /// integration is off, so every consumer degrades to peer-roster-only.
     @Published private(set) var knownHosts: [CoordinatorKnownHost] = []
@@ -1015,6 +1041,10 @@ final class ReviewBoardCoordinatorService: ObservableObject {
         // service, so holding the runner holds a cycle. Nothing merges after a
         // stop anyway, and the next start builds a fresh one.
         cachedMergeRunner = nil
+        // The queue these named is the stopped coordinator's. Carrying them
+        // into the next start would hold a fresh person's approval to auto
+        // pilot's boundary.
+        autoPilotApprovedTaskIDs = []
         eventRefreshWorkItem?.cancel()
         eventRefreshWorkItem = nil
         hostObservationCancellable?.cancel()
@@ -1374,11 +1404,26 @@ final class ReviewBoardCoordinatorService: ObservableObject {
             // the fresh one and then ran placement and auto pilot a second time.
             if Task.isCancelled { return }
             await MainActor.run {
-                self?.snapshot = next
-                if let hosts { self?.knownHosts = hosts }
-                NotificationCenter.default.post(name: .reviewBoardSnapshotDidChange, object: nil)
+                guard let self else { return }
+                // A poll that read the same board is the common case — the
+                // work it describes takes minutes, the read repeats every two
+                // seconds. Assigning anyway would publish on every tick, and
+                // each publish costs a SwiftUI re-evaluation plus the AppKit
+                // layout pass underneath it, for a board nobody changed.
+                let snapshotChanged = self.snapshot != next
+                if snapshotChanged { self.snapshot = next }
+                if let hosts, self.knownHosts != hosts { self.knownHosts = hosts }
+                // The notification drives `ReviewBoardViewModel.refresh()`, so
+                // it carries the same cost a second time and is gated the same
+                // way. Elapsed-time labels ride the view model's own ticker,
+                // not this.
+                if snapshotChanged {
+                    NotificationCenter.default.post(
+                        name: .reviewBoardSnapshotDidChange, object: nil
+                    )
+                }
                 if !next.coordinatorOnline, attempt < Self.onlineRetryDelays.count {
-                    self?.scheduleOnlineRetry(attempt: attempt)
+                    self.scheduleOnlineRetry(attempt: attempt)
                 }
             }
             // Every refresh re-reads what is placed and carries out whatever
@@ -1422,20 +1467,26 @@ final class ReviewBoardCoordinatorService: ObservableObject {
         // different rules below, so it is carried across from the sweep that
         // made them. Empty when auto pilot is off, which is what makes every
         // queued entry a person's decision and lands it on its own parent.
-        var autoApproved: Set<String> = []
         if policy.isEnabled {
             let tasks = await MainActor.run { self.snapshot.tasks }
             if !tasks.isEmpty {
                 let outcomes = await autoPilotRunner().sweep(tasks)
-                autoApproved = Set(outcomes.filter(\.approved).map(\.taskID))
-                if !autoApproved.isEmpty {
-                    // The approvals just made are what the merge step looks at,
-                    // and the snapshot in hand predates them.
+                let approved = Set(outcomes.filter(\.approved).map(\.taskID))
+                if !approved.isEmpty {
+                    // Remembered on the service, not returned from here. The
+                    // approval and the merge routinely land in different
+                    // passes, and a set that lived only as long as this call
+                    // was empty by the time the merge step read it — which is
+                    // how auto pilot's own approvals came to be treated as a
+                    // person's and skipped the boundary re-check below.
+                    autoPilotApprovedTaskIDs.formUnion(approved)
+                    // The board should show what just happened; the merge step
+                    // no longer waits for this to come back.
                     await MainActor.run { self.refresh() }
                 }
             }
         }
-        await mergeApprovedWork(policy: policy, autoApprovedTaskIDs: autoApproved)
+        await mergeApprovedWork(policy: policy)
     }
 
     private func autoPilotRunner() -> AutoPilotRunner {
@@ -1476,22 +1527,25 @@ final class ReviewBoardCoordinatorService: ObservableObject {
     }
 
     /// Merge what the queue is holding, recording where each branch stood
-    /// first. The undo point is written before the merge because a merge that
-    /// fails halfway is exactly when it is needed, and by then the target
-    /// branch's old SHA is gone.
+    /// before and after. The old SHA is read first, because after the merge
+    /// there is no way back to it; the new one is read after, because an undo
+    /// point without it is refused — it is what proves the branch has not
+    /// advanced past the merge being undone.
     ///
     /// The queue holds every approval, not only auto pilot's — a person's click
     /// puts a row here too. Each entry therefore merges into **its own task's**
     /// recorded parent. Sending them all to `policy.ceilingBranch` is what took
     /// a task branched off `feature/x`, approved by a person, and landed it on
     /// `develop` the moment auto pilot happened to be on.
-    private func mergeApprovedWork(
-        policy: AutoPilotPolicy,
-        autoApprovedTaskIDs: Set<String>
-    ) async {
-        let (queue, tasks) = await MainActor.run {
-            (self.snapshot.mergeQueue.filter { $0.status == "queued" }, self.snapshot.tasks)
-        }
+    private func mergeApprovedWork(policy: AutoPilotPolicy) async {
+        guard let client else { return }
+        let tasks = await MainActor.run { self.snapshot.tasks }
+        // Read from the coordinator rather than from the published snapshot:
+        // an approval made moments ago in this same pass is not in that
+        // snapshot yet, and waiting a whole refresh for it is what let the
+        // entry lose its "auto pilot approved this" mark on the way.
+        let queue = ((try? await client.fetchMergeQueue()) ?? [])
+            .filter { $0.status == "queued" }
         guard !queue.isEmpty else { return }
         guard let merger = mergeRunner() else {
             RemoteWorkLog.info("Approved work cannot be merged: git-kit was not found.")
@@ -1525,43 +1579,112 @@ final class ReviewBoardCoordinatorService: ObservableObject {
             // through. A person's do not have to — they were a decision — but
             // auto pilot's must still hold at merge time, because the task row
             // can have moved between the sweep that approved it and this pass.
-            if autoApprovedTaskIDs.contains(task.rawID), target != policy.ceilingBranch {
-                await failQueueItem(
-                    item,
-                    "Auto pilot merges into \(policy.ceilingBranch); this task now targets "
-                        + "\(target). It was not merged."
-                )
+            if let refusal = Self.autoPilotBoundaryRefusal(
+                target: target,
+                policy: policy,
+                wasAutoApproved: autoPilotApprovedTaskIDs.contains(task.rawID)
+            ) {
+                autoPilotApprovedTaskIDs.remove(task.rawID)
+                await failQueueItem(item, refusal)
                 continue
             }
 
-            guard let job = ReviewBoardMergeRunner.Job(
-                item: item, tasks: tasks, target: target
-            ) else { continue }
-
-            if let path = job.worktreePath?.trimmingCharacters(in: .whitespacesAndNewlines),
+            // The commit the approval was recorded against, so the runner can
+            // refuse a worktree that has moved on since. Read per item because
+            // the merge queue row does not carry it.
+            let approvedHead: String
+            do {
+                guard let value = try await client.reviewDetail(taskID: item.taskRawID)
+                    .snapshot?.headSHA.trimmingCharacters(in: .whitespacesAndNewlines),
+                    !value.isEmpty else {
+                    await failQueueItem(
+                        item,
+                        "The approval evidence has no commit SHA, so the reviewed tree "
+                            + "cannot be identified. It was not merged."
+                    )
+                    continue
+                }
+                approvedHead = value
+            } catch {
+                await failQueueItem(
+                    item,
+                    "The approval evidence could not be read (\(error.localizedDescription)). "
+                        + "It was not merged."
+                )
+                continue
+            }
+            // Against the repository, not the worktree: `finish --cleanup`
+            // deletes the worktree it merged from, so an undo point recorded
+            // there would name a directory that is gone by the time anyone
+            // wants it.
+            var repository: String?
+            var before: String?
+            if let path = task.worktreePath?.trimmingCharacters(in: .whitespacesAndNewlines),
                !path.isEmpty {
-                // Against the repository, not the worktree: `finish --cleanup`
-                // deletes the worktree it merged from, so an undo point recorded
-                // there would name a directory that is gone by the time anyone
-                // wants it.
-                let repository = await AutoPilotUndo.repositoryRoot(containing: path) ?? path
+                let root = await AutoPilotUndo.repositoryRoot(containing: path) ?? path
+                repository = root
                 // The branch actually being moved, which is the only one an
                 // undo has any business putting back.
-                if let sha = await Self.currentSHA(of: target, in: repository) {
-                    undoLog.record(AutoPilotUndoPoint(
-                        branch: target,
-                        sha: sha,
-                        taskID: job.taskID,
-                        repositoryPath: repository,
-                        recordedAtMS: Int64(Date().timeIntervalSince1970 * 1000)
-                    ))
-                }
+                before = await Self.currentSHA(of: target, in: root)
             }
+            guard let job = ReviewBoardMergeRunner.Job(
+                item: item,
+                tasks: tasks,
+                repositoryPath: repository,
+                target: target,
+                approvedHeadSHA: approvedHead
+            ) else { continue }
             // Run it even with no worktree: the runner refuses that case with a
             // reason written into the queue entry, where the old `continue` left
             // the row sitting at `queued` saying nothing.
-            await merger.process(job)
+            let outcome = await merger.process(job)
+            // Kept while another pass is still merging this very entry: that
+            // pass has its own verdict to reach, and dropping the mark under
+            // it is how the boundary check went missing in the first place.
+            if outcome != .alreadyRunning {
+                autoPilotApprovedTaskIDs.remove(task.rawID)
+            }
+
+            // Recorded after the merge, because `AutoPilotUndo.plan` refuses
+            // any point without `mergedSHA` — it is what proves the branch has
+            // not advanced past the merge being undone, and without it every
+            // undo was refused whatever state the branch was in. Both shas are
+            // read from the same repository, so an undo puts back exactly the
+            // move this merge made.
+            guard case .merged = outcome, let repository, let before else { continue }
+            if let after = await Self.currentSHA(of: target, in: repository) {
+                undoLog.record(AutoPilotUndoPoint(
+                    branch: target,
+                    sha: before,
+                    mergedSHA: after,
+                    taskID: job.taskID,
+                    repositoryPath: repository,
+                    recordedAtMS: Int64(Date().timeIntervalSince1970 * 1000)
+                ))
+            }
         }
+    }
+
+    /// Why an automatic approval may not be merged after all, or nil when it
+    /// may.
+    ///
+    /// Auto pilot's own approvals stay inside the boundary that let them
+    /// through. A person's do not have to — theirs was a decision — but auto
+    /// pilot's must still hold at merge time, because the task row can move
+    /// between the sweep that approved it and the pass that merges it.
+    ///
+    /// Split out from the loop so the boundary can be tested on its own: the
+    /// bug this replaces was not a wrong rule but a rule that never ran,
+    /// because the "auto pilot approved this" mark had expired by the time the
+    /// merge read it.
+    nonisolated static func autoPilotBoundaryRefusal(
+        target: String,
+        policy: AutoPilotPolicy,
+        wasAutoApproved: Bool
+    ) -> String? {
+        guard wasAutoApproved, target != policy.ceilingBranch else { return nil }
+        return "Auto pilot merges into \(policy.ceilingBranch); this task now targets "
+            + "\(target). It was not merged."
     }
 
     /// Stop a queued merge with a reason a person can read off the board.

@@ -35,6 +35,31 @@ struct PeerHostStats: Equatable, Sendable {
     /// Everything on one line, for logs and tests.
     var summary: String { groups.map(\.text).joined(separator: "  ") }
 
+    /// Free space on the peer, when it reported any.
+    ///
+    /// Separate from `groups` because this is the one reading a person needs
+    /// before the machine stops being usable — agent checkouts and their build
+    /// output are what fill a peer up — so it gets its own badge rather than
+    /// competing for titlebar width.
+    let diskAvailableBytes: UInt64
+    let diskTotalBytes: UInt64
+
+    /// True when the peer is close enough to full that the next checkout or
+    /// build is at risk. A host that reports no capacity at all (an older
+    /// build, or one that cannot measure it) is never "low" — showing a
+    /// warning for a machine we know nothing about is worse than silence.
+    var isDiskLow: Bool {
+        guard diskTotalBytes > 0 else { return false }
+        if diskAvailableBytes < 5 * 1024 * 1024 * 1024 { return true }
+        return Double(diskAvailableBytes) / Double(diskTotalBytes) < 0.10
+    }
+
+    /// Free space rendered for a badge, or nil when the host did not report.
+    var diskFreeText: String? {
+        guard diskTotalBytes > 0 else { return nil }
+        return "\(Self.capacity(diskAvailableBytes)) free"
+    }
+
     init(_ wire: Termmesh_Peer_V1_HostStats, receivedAt: Date = Date()) {
         var groups: [Group] = []
         // Three figures, not one: the first says how busy the machine is,
@@ -72,10 +97,22 @@ struct PeerHostStats: Equatable, Sendable {
         }
         self.groups = groups
         self.receivedAt = receivedAt
+        self.diskTotalBytes = wire.diskTotalBytes
+        self.diskAvailableBytes = wire.diskAvailableBytes
     }
 
     private static func oneDecimal(_ value: Double) -> String {
         String(format: "%.1f", value)
+    }
+
+    /// Absolute capacity, in the units people use for disks (GB, not GiB).
+    private static func capacity(_ bytes: UInt64) -> String {
+        let value = Double(bytes)
+        switch value {
+        case 0..<1_000_000_000: return String(format: "%.0fMB", value / 1_000_000)
+        case 1_000_000_000..<1_000_000_000_000: return String(format: "%.1fGB", value / 1_000_000_000)
+        default: return String(format: "%.1fTB", value / 1_000_000_000_000)
+        }
     }
 
     /// Bytes/sec at titlebar width: two significant figures at most, and

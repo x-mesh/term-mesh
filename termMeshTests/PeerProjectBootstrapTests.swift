@@ -926,7 +926,215 @@ final class PeerProjectBootstrapTests: XCTestCase {
         XCTAssertEqual(prepare, "unset HISTFILE; stty -echo")
         XCTAssertTrue(launch.hasPrefix("export TERMMESH_LEADER_GRANT_ID="))
         XCTAssertTrue(launch.contains("; exec /bin/sh -lc "))
-        XCTAssertTrue(launch.contains("codex --model gpt-5"))
+        // The model is shell-quoted, and this whole launch is then quoted again
+        // for `sh -lc` — so the inner quotes arrive escaped. One level is
+        // consumed by that shell, leaving the CLI with `--model gpt-5`.
+        XCTAssertTrue(launch.contains(#"codex --model '\''gpt-5'\''"#))
+    }
+
+    @MainActor
+    func test_remote_leader_does_not_inject_policy_into_local_anchor_shell() {
+        XCTAssertTrue(
+            TeamOrchestrator.shouldInjectLocalLeaderPrompt(
+                launchLeaderLocally: true,
+                leaderMode: "codex"
+            )
+        )
+        XCTAssertFalse(
+            TeamOrchestrator.shouldInjectLocalLeaderPrompt(
+                launchLeaderLocally: false,
+                leaderMode: "codex"
+            )
+        )
+        XCTAssertFalse(
+            TeamOrchestrator.shouldInjectLocalLeaderPrompt(
+                launchLeaderLocally: true,
+                leaderMode: "claude"
+            )
+        )
+    }
+
+    @MainActor
+    func test_remote_leader_restore_selects_latest_exact_managed_surface() {
+        let older = ManagedPeerSurfaceStore.Record(
+            hostKey: "ssh:mac-sub",
+            surfaceIDBase64: Data([0x01]).base64EncodedString(),
+            teamName: "term-mesh",
+            role: "leader",
+            workingDirectory: "/old",
+            createdAt: Date(timeIntervalSince1970: 10)
+        )
+        let latest = ManagedPeerSurfaceStore.Record(
+            hostKey: "ssh:mac-sub",
+            surfaceIDBase64: Data([0x02]).base64EncodedString(),
+            teamName: "term-mesh",
+            role: "leader",
+            workingDirectory: "/current",
+            createdAt: Date(timeIntervalSince1970: 20)
+        )
+        let otherRole = ManagedPeerSurfaceStore.Record(
+            hostKey: "ssh:mac-sub",
+            surfaceIDBase64: Data([0x03]).base64EncodedString(),
+            teamName: "term-mesh",
+            role: "executor",
+            workingDirectory: "/agent",
+            createdAt: Date(timeIntervalSince1970: 30)
+        )
+        let otherTeam = ManagedPeerSurfaceStore.Record(
+            hostKey: "ssh:mac-sub",
+            surfaceIDBase64: Data([0x04]).base64EncodedString(),
+            teamName: "other",
+            role: "leader",
+            workingDirectory: "/other",
+            createdAt: Date(timeIntervalSince1970: 40)
+        )
+
+        let selected = ManagedPeerSurfaceStore.leaderRecord(
+            in: [older, latest, otherRole, otherTeam],
+            hostKey: "ssh:mac-sub",
+            teamName: "term-mesh"
+        )
+
+        XCTAssertEqual(selected?.surfaceID, Data([0x02]))
+        XCTAssertEqual(selected?.workingDirectory, "/current")
+    }
+
+    @MainActor
+    func test_project_presentation_move_preserves_remote_identity_and_clears_old_viewers() {
+        let oldWorkspaceID = UUID()
+        let newWorkspaceID = UUID()
+        let oldPanelID = UUID()
+        let instanceID = UUID().uuidString
+        let surfaceID = Data([0xaa, 0xbb])
+        let member = TeamOrchestrator.AgentMember(
+            id: "reviewer@term-mesh",
+            agentInstanceId: instanceID,
+            name: "reviewer",
+            teamName: "term-mesh",
+            cli: "claude",
+            launchCommand: "claude",
+            model: "opus",
+            agentType: "reviewer",
+            color: "blue",
+            instructions: "",
+            workspaceId: oldWorkspaceID,
+            panelId: oldPanelID,
+            createdAt: Date(),
+            remoteSurfaceID: surfaceID,
+            remoteSurfaceSpawned: true,
+            hostKey: "ssh:mac-sub"
+        )
+        let team = TeamOrchestrator.Team(
+            id: "term-mesh",
+            leaderSessionId: UUID().uuidString,
+            leaderMode: "claude",
+            leaderModel: "opus",
+            leaderCli: "claude",
+            leaderPanelId: UUID(),
+            leaderWorkspaceId: oldWorkspaceID,
+            leaderEndpoint: .peer(hostKey: "ssh:mac-sub"),
+            workingDirectory: "/project/term-mesh",
+            workspaceId: oldWorkspaceID,
+            agents: [member],
+            createdAt: Date(),
+            worktreeMode: "isolated"
+        )
+
+        let moved = TeamOrchestrator.projectPresentationTeam(
+            team,
+            movedTo: newWorkspaceID
+        )
+
+        XCTAssertEqual(moved.workspaceId, newWorkspaceID)
+        XCTAssertNil(moved.leaderWorkspaceId)
+        XCTAssertEqual(moved.agents[0].workspaceId, newWorkspaceID)
+        XCTAssertNil(moved.agents[0].panelId)
+        XCTAssertEqual(moved.agents[0].agentInstanceId, instanceID)
+        XCTAssertEqual(moved.agents[0].remoteSurfaceID, surfaceID)
+        XCTAssertEqual(moved.agents[0].hostKey, "ssh:mac-sub")
+    }
+
+    @MainActor
+    func test_window_close_preserves_and_re_adopts_exact_project_workspace() {
+        let orchestrator = TeamOrchestrator.shared
+        let teamName = "preserve-\(UUID().uuidString)"
+        let source = TabManager()
+        let destination = TabManager()
+        let workspace = source.addWorkspace(
+            workingDirectory: "/tmp/\(teamName)",
+            select: true
+        )
+        guard let anchorPanelID = workspace.focusedPanelId,
+              let nativeAgent = workspace.newAgentSplit(
+                  from: anchorPanelID,
+                  orientation: .horizontal,
+                  agentName: "executor",
+                  teamName: teamName,
+                  workingDirectory: "/tmp/\(teamName)"
+              )
+        else {
+            XCTFail("expected native agent panel")
+            return
+        }
+        let nativeSession = nativeAgent.session
+        defer {
+            _ = orchestrator.takePreservedProjectPresentation(teamName: teamName)
+        }
+
+        let panelIDs = Set(workspace.panels.keys)
+        let detached = source.detachWorkspace(tabId: workspace.id)
+        XCTAssertTrue(detached === workspace)
+        orchestrator.rememberPreservedProjectPresentation(
+            teamName: teamName,
+            workspace: workspace
+        )
+
+        XCTAssertFalse(source.tabs.contains(where: { $0.id == workspace.id }))
+        XCTAssertTrue(orchestrator.hasPreservedProjectPresentation(teamName: teamName))
+
+        let adopted = orchestrator.takePreservedProjectPresentation(teamName: teamName)
+        XCTAssertTrue(adopted === workspace)
+        guard let adopted else {
+            XCTFail("expected preserved workspace")
+            return
+        }
+        destination.attachWorkspace(adopted, select: true)
+
+        XCTAssertTrue(destination.tabs.contains(where: { $0 === workspace }))
+        XCTAssertEqual(Set(adopted.panels.keys), panelIDs)
+        XCTAssertTrue(adopted.agentPanel(for: nativeAgent.id) === nativeAgent)
+        XCTAssertTrue(adopted.agentPanel(for: nativeAgent.id)?.session === nativeSession)
+    }
+
+    @MainActor
+    func test_window_close_does_not_tombstone_preserved_project_workspace() {
+        let preserved = UUID()
+        let ordinaryWorkspace = UUID()
+
+        let closed = AppDelegate.workspaceIDsClosedWithWindow(
+            preserved: [preserved],
+            remaining: [ordinaryWorkspace, preserved]
+        )
+
+        XCTAssertEqual(closed, [ordinaryWorkspace])
+        XCTAssertFalse(closed.contains(preserved))
+    }
+
+    @MainActor
+    func test_window_close_notification_cleanup_uses_only_closed_workspaces() {
+        let preserved = UUID()
+        let closed = UUID()
+
+        let notificationCleanup = AppDelegate.workspaceIDsClosedWithWindow(
+            preserved: [preserved],
+            remaining: [preserved, closed]
+        )
+
+        XCTAssertEqual(notificationCleanup, [closed])
+        XCTAssertFalse(
+            notificationCleanup.contains(preserved),
+            "a preserved live project still owns notifications that can be opened later"
+        )
     }
 
     @MainActor
@@ -946,7 +1154,9 @@ final class PeerProjectBootstrapTests: XCTestCase {
             systemPromptFile: "/tmp/term-mesh-leader-prompt-team-uuid.txt"
         )
 
-        XCTAssertTrue(launch.contains("claude --model sonnet"))
+        // Escaped for the same reason as the codex leader above: quoted once
+        // for the CLI, then again by `exec /bin/sh -lc`.
+        XCTAssertTrue(launch.contains(#"claude --model '\''sonnet'\''"#))
         XCTAssertTrue(launch.contains("--system-prompt"))
         XCTAssertTrue(launch.contains("TERMMESH_LEADER_PROMPT=$(cat"))
         XCTAssertTrue(launch.contains("rm -f"))
@@ -961,9 +1171,12 @@ final class PeerProjectBootstrapTests: XCTestCase {
         XCTAssertTrue(directive.contains("digest \(LeaderParallelPolicy.digest)"))
 
         for (cli, expectedLaunch) in [
-            ("codex", "codex --model gpt-5"),
-            ("kiro", "kiro chat --model gpt-5"),
-            ("gemini", "gemini --model gpt-5"),
+            // Read straight off `remoteAgentCommand`, so the model carries the
+            // single level of quoting it is built with — no `sh -lc` wrapper
+            // here to escape it a second time.
+            ("codex", "codex --model 'gpt-5'"),
+            ("kiro", "kiro chat --model 'gpt-5'"),
+            ("gemini", "gemini --model 'gpt-5'"),
         ] {
             let launch = TeamOrchestrator.remoteAgentCommand(
                 cli: cli,
@@ -996,11 +1209,15 @@ final class PeerProjectBootstrapTests: XCTestCase {
         )
 
         XCTAssertTrue(launch.hasPrefix("export PATH="), "PATH has to be set before anything runs")
+        XCTAssertEqual(
+            RemoteShellPath.binDirs.first,
+            "$HOME/.local/bin"
+        )
         XCTAssertTrue(launch.contains("$HOME/.local/bin"))
-        XCTAssertTrue(launch.contains(":$PATH\""), "the host's own PATH must survive, last")
+        XCTAssertTrue(launch.contains(":\"$PATH\""), "the host's own PATH must survive, last")
         // Ordering matters as much as membership: a cd into the project before
         // PATH is set would run the CLI lookup with the old PATH.
-        let pathEnd = try? XCTUnwrap(launch.range(of: ":$PATH\";"))
+        let pathEnd = try? XCTUnwrap(launch.range(of: ":\"$PATH\";"))
         let cd = try? XCTUnwrap(launch.range(of: "cd '"))
         if let pathEnd, let cd {
             XCTAssertLessThan(pathEnd.lowerBound, cd.lowerBound)
@@ -1083,8 +1300,198 @@ final class PeerProjectBootstrapTests: XCTestCase {
             cli: "claude", model: "sonnet", agentName: "worker",
             teamName: "demo", workingDirectory: "/srv/demo"
         )
-        XCTAssertTrue(launch.hasPrefix(RemoteShellPath.prologue))
+        XCTAssertTrue(launch.hasPrefix(RemoteShellPath.prologue()))
         XCTAssertTrue(RemoteShellPath.binDirs.contains("$HOME/.local/bin"))
+    }
+
+    @MainActor
+    func test_remote_launch_prepends_authenticated_shell_quoted_host_bin_dirs() {
+        let hostBinDirs = [
+            "/Applications/Term Mesh.app/Contents/Resources/bin",
+            "/opt/it's-here/bin",
+        ]
+        let launch = TeamOrchestrator.remoteAgentCommand(
+            cli: "codex",
+            model: "gpt-5",
+            agentName: "executor",
+            teamName: "quoted-path",
+            workingDirectory: "/tmp/project",
+            hostBinDirs: hostBinDirs
+        )
+
+        XCTAssertTrue(launch.hasPrefix(RemoteShellPath.prologue(hostBinDirs: hostBinDirs)))
+        XCTAssertTrue(launch.contains("'/Applications/Term Mesh.app/Contents/Resources/bin'"))
+        XCTAssertTrue(launch.contains("'/opt/it'\\''s-here/bin'"))
+        XCTAssertTrue(launch.contains("\"$HOME/.local/bin\""))
+        XCTAssertTrue(launch.contains(":\"$PATH\"; mkdir -p"))
+    }
+
+    func test_readiness_bin_dirs_match_exact_saved_profile_identity() {
+        let wantedID = UUID()
+        let hosts = [
+            HostEntry(
+                id: "ssh:stale",
+                displayName: "stale",
+                connectionState: .connected,
+                workspaces: [],
+                activeSockPath: "/tmp/stale.sock",
+                sshTarget: "shared",
+                remoteSockPath: "/tmp/shared.sock",
+                profileID: UUID(),
+                hostCLIBinDirs: ["/stale/bin"],
+                hostCLIBinDirsResolved: true,
+                configuredEndpoint: PeerHostEndpointProvenance(
+                    sshTarget: "shared", port: nil, identityFile: nil,
+                    remoteSocket: "/tmp/shared.sock"
+                ),
+                hostCLIBinDirsProvenance: PeerHostEndpointProvenance(
+                    sshTarget: "shared", port: nil, identityFile: nil,
+                    remoteSocket: "/tmp/shared.sock"
+                )
+            ),
+            HostEntry(
+                id: "ssh:saved",
+                displayName: "saved",
+                connectionState: .connected,
+                workspaces: [],
+                activeSockPath: "/tmp/saved.sock",
+                sshTarget: "shared",
+                remoteSockPath: "/tmp/shared.sock",
+                sshPort: 22,
+                identityFile: "/Users/x/.ssh/id_ed25519",
+                profileID: wantedID,
+                hostCLIBinDirs: ["/exact/bin"],
+                hostCLIBinDirsResolved: true,
+                configuredEndpoint: PeerHostEndpointProvenance(
+                    sshTarget: "shared", port: 22,
+                    identityFile: "/Users/x/.ssh/id_ed25519",
+                    remoteSocket: "/tmp/shared.sock"
+                ),
+                hostCLIBinDirsProvenance: PeerHostEndpointProvenance(
+                    sshTarget: "shared", port: 22,
+                    identityFile: "/Users/x/.ssh/id_ed25519",
+                    remoteSocket: "/tmp/shared.sock"
+                )
+            ),
+        ]
+
+        XCTAssertEqual(
+            RemoteHostStore.hostCLIBinDirs(
+                forProfileID: wantedID,
+                sshTarget: "shared",
+                port: 22,
+                identityFile: "/Users/x/.ssh/id_ed25519",
+                remoteSocket: "/tmp/shared.sock",
+                in: hosts
+            ),
+            ["/exact/bin"]
+        )
+        XCTAssertEqual(
+            RemoteHostStore.hostCLIBinDirs(
+                forProfileID: UUID(),
+                sshTarget: "shared",
+                port: 22,
+                identityFile: "/Users/x/.ssh/id_ed25519",
+                remoteSocket: "/tmp/shared.sock",
+                in: hosts
+            ),
+            []
+        )
+    }
+
+    /// The stale-cache leak the exact-SHA review flagged: a profile keeps
+    /// its id across an edit to sshTarget/port/identityFile/remoteSocket,
+    /// so matching on `profileID` alone (the pre-fix behavior) would still
+    /// return a still-`.connected` host's authenticated bin dirs even
+    /// though that connection was never authenticated against the
+    /// endpoint the caller is now asking about.
+    func test_readiness_bin_dirs_reject_stale_endpoint_on_the_same_profile_id() {
+        let wantedID = UUID()
+        let connectedUnderOldEndpoint = HostEntry(
+            id: "ssh:old",
+            displayName: "old",
+            connectionState: .connected,
+            workspaces: [],
+            activeSockPath: "/tmp/old.sock",
+            sshTarget: "old-target",
+            remoteSockPath: "/tmp/old.sock",
+            sshPort: 22,
+            identityFile: "/Users/x/.ssh/id_old",
+            profileID: wantedID,
+            hostCLIBinDirs: ["/old/bin"],
+            hostCLIBinDirsResolved: true,
+            configuredEndpoint: PeerHostEndpointProvenance(
+                sshTarget: "old-target", port: 22,
+                identityFile: "/Users/x/.ssh/id_old",
+                remoteSocket: "/tmp/old.sock"
+            ),
+            hostCLIBinDirsProvenance: PeerHostEndpointProvenance(
+                sshTarget: "old-target", port: 22,
+                identityFile: "/Users/x/.ssh/id_old",
+                remoteSocket: "/tmp/old.sock"
+            )
+        )
+
+        // sshTarget changed since that connection was authenticated.
+        XCTAssertEqual(
+            RemoteHostStore.hostCLIBinDirs(
+                forProfileID: wantedID,
+                sshTarget: "new-target",
+                port: 22,
+                identityFile: "/Users/x/.ssh/id_old",
+                remoteSocket: "/tmp/old.sock",
+                in: [connectedUnderOldEndpoint]
+            ),
+            []
+        )
+        // port changed.
+        XCTAssertEqual(
+            RemoteHostStore.hostCLIBinDirs(
+                forProfileID: wantedID,
+                sshTarget: "old-target",
+                port: 2222,
+                identityFile: "/Users/x/.ssh/id_old",
+                remoteSocket: "/tmp/old.sock",
+                in: [connectedUnderOldEndpoint]
+            ),
+            []
+        )
+        // identityFile changed.
+        XCTAssertEqual(
+            RemoteHostStore.hostCLIBinDirs(
+                forProfileID: wantedID,
+                sshTarget: "old-target",
+                port: 22,
+                identityFile: "/Users/x/.ssh/id_new",
+                remoteSocket: "/tmp/old.sock",
+                in: [connectedUnderOldEndpoint]
+            ),
+            []
+        )
+        // pinned remote socket changed.
+        XCTAssertEqual(
+            RemoteHostStore.hostCLIBinDirs(
+                forProfileID: wantedID,
+                sshTarget: "old-target",
+                port: 22,
+                identityFile: "/Users/x/.ssh/id_old",
+                remoteSocket: "/tmp/new.sock",
+                in: [connectedUnderOldEndpoint]
+            ),
+            []
+        )
+        // Unchanged tuple still matches — the guard isn't overzealous.
+        XCTAssertEqual(
+            RemoteHostStore.hostCLIBinDirs(
+                forProfileID: wantedID,
+                sshTarget: "old-target",
+                port: 22,
+                identityFile: "/Users/x/.ssh/id_old",
+                remoteSocket: "/tmp/old.sock",
+                in: [connectedUnderOldEndpoint]
+            ),
+            ["/old/bin"]
+        )
     }
 
     /// A directory with a quote in it stays one argument.
@@ -1097,5 +1504,235 @@ final class PeerProjectBootstrapTests: XCTestCase {
 
         XCTAssertTrue(launch.contains("'/srv/it'\\''s here'"))
         XCTAssertFalse(launch.contains("cd '/srv/it's here'"), "an unescaped quote would end the argument early")
+    }
+
+    @MainActor
+    func test_remote_launch_shell_quotes_the_model() {
+        let launch = TeamOrchestrator.remoteAgentCommand(
+            cli: "claude",
+            model: "sonnet; touch /tmp/term-mesh-injected #",
+            agentName: "worker",
+            teamName: "demo",
+            workingDirectory: "/srv/demo"
+        )
+
+        XCTAssertTrue(launch.contains("--model 'sonnet; touch /tmp/term-mesh-injected #'"))
+        XCTAssertFalse(launch.contains("--model sonnet;"))
+    }
+
+    func test_process_run_timeout_escalates_to_sigkill() async throws {
+        let started = Date()
+        let output = try await ProcessRun.capture(
+            executable: "/bin/sh",
+            arguments: ["-c", "trap '' TERM; while :; do :; done"],
+            timeout: 0.05
+        )
+
+        XCTAssertTrue(output.timedOut)
+        XCTAssertNotEqual(output.status, 0)
+        XCTAssertLessThan(Date().timeIntervalSince(started), 3)
+    }
+
+    func test_process_run_timeout_kills_descendant_after_parent_exits_on_term() async throws {
+        let pidFile = "/tmp/term-mesh-processrun-child-\(UUID().uuidString)"
+        defer { try? FileManager.default.removeItem(atPath: pidFile) }
+        let script = """
+        trap 'exit 0' TERM
+        /bin/sh -c 'trap "" TERM; exec >/dev/null 2>&1; echo $$ > \(pidFile); while :; do sleep 1; done' &
+        wait
+        """
+
+        let output = try await ProcessRun.capture(
+            executable: "/bin/sh",
+            arguments: ["-c", script],
+            timeout: 0.2
+        )
+
+        XCTAssertTrue(output.timedOut)
+        let childPID = try XCTUnwrap(
+            Int32(
+                String(contentsOfFile: pidFile, encoding: .utf8)
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+            )
+        )
+        defer { Darwin.kill(childPID, SIGKILL) }
+        let deadline = Date().addingTimeInterval(1)
+        while Darwin.kill(childPID, 0) == 0, Date() < deadline {
+            usleep(10_000)
+        }
+        XCTAssertEqual(
+            Darwin.kill(childPID, 0),
+            -1,
+            "timeout must not leave a TERM-ignoring descendant alive"
+        )
+    }
+
+    /// A local bootstrap whose script floods stderr must finish, not time out.
+    ///
+    /// `runLocalScript` used to attach stderr to a pipe and read it only once
+    /// the process had already exited. A `git clone` that emits enough
+    /// progress fills the 64 KiB pipe buffer, the child blocks in `write`,
+    /// the parent keeps polling `isRunning`, and a perfectly healthy
+    /// bootstrap is reported as `.timedOut`. Driving `runLocal` for real is
+    /// what makes this a regression test for *that* function: a version that
+    /// reintroduces a bespoke `Process` loop fails here even though the
+    /// `ProcessRun` tests above still pass.
+    func test_local_bootstrap_survives_a_stderr_flood_from_git() async throws {
+        let root = NSTemporaryDirectory() + "tm-bootstrap-\(UUID().uuidString)"
+        let source = root + "/source"
+        try FileManager.default.createDirectory(
+            atPath: source, withIntermediateDirectories: true
+        )
+        defer { try? FileManager.default.removeItem(atPath: root) }
+
+        // A source repo with enough objects that clone/checkout chatter is
+        // real rather than a single quiet line.
+        let seed = """
+        set -e
+        cd \(source)
+        git init -q .
+        git config user.email t@example.com
+        git config user.name t
+        for i in $(seq 1 400); do
+          mkdir -p "dir$((i % 20))"
+          printf 'content %s\\n' "$i" > "dir$((i % 20))/file$i.txt"
+        done
+        git add -A
+        git commit -qm seed
+        """
+        let seeded = try await ProcessRun.capture(
+            executable: "/bin/sh", arguments: ["-lc", seed], timeout: 60
+        )
+        try XCTSkipUnless(seeded.status == 0, "git unavailable: \(seeded.stderrText)")
+
+        let plan = PeerProjectBootstrap.plan(
+            projectRoot: root,
+            projectName: "checkout",
+            agents: ["executor", "reviewer"],
+            isolateAgents: true
+        )
+        let started = Date()
+        try await PeerProjectBootstrap.runLocal(
+            plan: plan,
+            gitURL: source,
+            sourceKind: .clone,
+            memMeshProjectID: nil,
+            timeoutSeconds: 120
+        )
+        XCTAssertLessThan(
+            Date().timeIntervalSince(started), 120,
+            "a healthy bootstrap must not be reported as a timeout"
+        )
+        XCTAssertTrue(
+            FileManager.default.fileExists(atPath: plan.primaryPath),
+            "the project checkout must exist after a successful bootstrap"
+        )
+        for checkout in plan.agentCheckouts {
+            XCTAssertTrue(
+                FileManager.default.fileExists(atPath: checkout.path),
+                "agent checkout missing: \(checkout.path)"
+            )
+        }
+    }
+
+    /// The actual deadlock: a script that writes past the pipe buffer.
+    ///
+    /// The old `runLocalScript` attached stderr to a pipe and read it only
+    /// after the process exited. Once the child has written 64 KiB with
+    /// nobody draining, it blocks in `write` forever, the parent keeps
+    /// polling `isRunning`, and a script that would have finished instantly
+    /// is reported as `.timedOut`. This drives the function directly because
+    /// `runLocal` cannot reach the condition — git emits progress only to a
+    /// TTY, so a piped clone never fills the buffer.
+    func test_run_local_script_does_not_deadlock_on_large_stderr() async throws {
+        let started = Date()
+        try await PeerProjectBootstrap.runLocalScript(
+            // ~1 MiB of stderr, well past the 64 KiB pipe buffer.
+            "i=0; while [ $i -lt 8192 ]; do "
+                + "printf '%0128d\\n' $i >&2; i=$((i+1)); done; exit 0",
+            timeoutSeconds: 30
+        )
+        XCTAssertLessThan(
+            Date().timeIntervalSince(started), 30,
+            "an undrained stderr pipe must not turn a fast script into a timeout"
+        )
+    }
+
+    /// The same flood on a failing script must still surface its message
+    /// rather than a bare exit code — the drain has to survive the error path
+    /// too, and the message the user sees comes out of it.
+    func test_run_local_script_reports_stderr_from_a_failing_flood() async throws {
+        do {
+            try await PeerProjectBootstrap.runLocalScript(
+                "i=0; while [ $i -lt 8192 ]; do "
+                    + "printf '%0128d\\n' $i >&2; i=$((i+1)); done; "
+                    + "echo 'fatal: could not read Username' >&2; exit 128",
+                timeoutSeconds: 30
+            )
+            XCTFail("a non-zero exit must be reported as a failure")
+        } catch let error as PeerProjectBootstrap.ProjectBootstrapError {
+            guard case .commandFailed(let message) = error else {
+                return XCTFail("expected commandFailed, got \(error)")
+            }
+            XCTAssertTrue(
+                message.contains("could not read Username"),
+                "the real diagnostic must survive the flood, got: \(message.suffix(120))"
+            )
+        }
+    }
+
+    /// The timeout path must not leave a descendant mutating the checkout.
+    ///
+    /// The old implementation sent `terminate()` to `/bin/sh` alone and
+    /// resumed its continuation immediately, so a `git` still running under
+    /// that shell kept writing while the caller had already started
+    /// transaction rollback or a retry — two writers in one directory.
+    /// `ProcessRun.capture` kills the whole process group and waits for it.
+    func test_run_local_script_timeout_kills_a_term_ignoring_descendant() async throws {
+        let pidFile = NSTemporaryDirectory() + "tm-bootstrap-child-\(UUID().uuidString)"
+        defer { try? FileManager.default.removeItem(atPath: pidFile) }
+        let started = Date()
+        do {
+            try await PeerProjectBootstrap.runLocalScript(
+                """
+                trap 'exit 0' TERM
+                /bin/sh -c 'trap "" TERM; exec >/dev/null 2>&1; \
+                echo $$ > \(pidFile); while :; do sleep 1; done' &
+                wait
+                """,
+                timeoutSeconds: 0.3
+            )
+            XCTFail("a script that never finishes must report a timeout")
+        } catch let error as PeerProjectBootstrap.ProjectBootstrapError {
+            guard case .timedOut = error else {
+                return XCTFail("expected timedOut, got \(error)")
+            }
+        }
+        XCTAssertLessThan(Date().timeIntervalSince(started), 20)
+
+        let childPID = try XCTUnwrap(
+            Int32(
+                String(contentsOfFile: pidFile, encoding: .utf8)
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+            )
+        )
+        defer { Darwin.kill(childPID, SIGKILL) }
+        let deadline = Date().addingTimeInterval(2)
+        while Darwin.kill(childPID, 0) == 0, Date() < deadline {
+            usleep(10_000)
+        }
+        XCTAssertEqual(
+            Darwin.kill(childPID, 0), -1,
+            "rollback must not race a surviving descendant of the timed-out script"
+        )
+    }
+
+    func test_remote_leader_hex_route_decodes_exact_width_only() {
+        XCTAssertEqual(
+            TerminalController.decodeFixedHex("0011aaff", byteCount: 4),
+            Data([0x00, 0x11, 0xAA, 0xFF])
+        )
+        XCTAssertNil(TerminalController.decodeFixedHex("0011aa", byteCount: 4))
+        XCTAssertNil(TerminalController.decodeFixedHex("0011zzff", byteCount: 4))
     }
 }

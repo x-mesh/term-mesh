@@ -300,6 +300,7 @@ final class PeerServerTests: XCTestCase {
     }
 
     /// End-to-end: real `PeerServer` dispatch of
+    /// `CreateWorkspaceRequest` (paired) plus
     /// `RenameWorkspaceRequest`/`DeleteWorkspaceRequest` (fire-and-forget,
     /// per peer.proto's "Workspace lifecycle" section) reaches the
     /// provider with the exact wire arguments, and `PeerServer
@@ -332,7 +333,10 @@ final class PeerServerTests: XCTestCase {
         )
         _ = try await session.handshake()
 
-        let workspaceID = Data(repeating: 0x5A, count: 16)
+        let workspaceID = try await session.createWorkspace(title: "created-via-server")
+        XCTAssertEqual(workspaceID, RecordingWorkspaceProvider.workspaceID)
+        let createdTitle = await provider.createdTitle
+        XCTAssertEqual(createdTitle, "created-via-server")
         try await session.renameWorkspace(workspaceID: workspaceID, title: "renamed-via-server")
         try await session.deleteWorkspace(workspaceID: workspaceID)
 
@@ -682,6 +686,288 @@ final class PeerServerTests: XCTestCase {
         await server.stop()
     }
 
+    func testServerRoutesReverseLeaderCommandToMatchingViewerSession() async throws {
+        let sockPath = "/tmp/tm-peer-reverse-leader-\(UUID().uuidString.prefix(8)).sock"
+        defer { try? FileManager.default.removeItem(atPath: sockPath) }
+        let controlPlane = PeerTeamLeaderControlPlane()
+        var surface = Termmesh_Peer_V1_SurfaceInfo()
+        surface.surfaceID = Data(repeating: 0x73, count: 16)
+        surface.title = "leader"
+        surface.cols = 80
+        surface.rows = 24
+        surface.attachable = true
+        let server = PeerServer(
+            socketPath: sockPath,
+            provider: EchoSurfaceProvider(surfaces: [surface]),
+            teamLeaderControlPlane: controlPlane
+        )
+        try await server.start()
+        defer { Task { await server.stop() } }
+
+        let viewerPeerID = Data(
+            repeating: 0x7A,
+            count: PeerIdentity.byteCount
+        )
+        let transport = try await UnixSocketTransport.connect(socketPath: sockPath)
+        let viewer = PeerSession(
+            read: { try await transport.read() },
+            write: { try await transport.write($0) }
+        )
+        var options = PeerSessionOptions()
+        options.peerID = viewerPeerID
+        _ = try await viewer.handshake(options: options)
+        _ = try await viewer.attachSurface(
+            id: surface.surfaceID,
+            cols: 80,
+            rows: 24
+        )
+
+        let wallNow = UInt64(Date().timeIntervalSince1970)
+        let leaseNow = UInt64(ProcessInfo.processInfo.systemUptime)
+        var bootstrapRequest = Termmesh_Peer_V1_TeamLeaderBootstrapRequest()
+        bootstrapRequest.projectID = "name:demo"
+        bootstrapRequest.leaderPlacement = .peer
+        bootstrapRequest.requestID = Data(
+            repeating: 0x90,
+            count: PeerTeamLeader.requestIDBytes
+        )
+        let bootstrap = await controlPlane.bootstrap(
+            bootstrapRequest,
+            encodedBytes: 64,
+            nowUnixSeconds: wallNow - 120,
+            nowLeaseSeconds: leaseNow,
+            grantLifetimeSeconds: 60
+        ) { _ in "team-uuid" }
+        XCTAssertTrue(bootstrap.ok)
+        let grant = bootstrap.grant
+        XCTAssertLessThan(grant.expiresAtUnixSecs, wallNow)
+        var request = Termmesh_Peer_V1_TeamLeaderCommandRequest()
+        request.grant = grant
+        request.teamUuid = grant.teamUuid
+        request.requestID = Data(
+            repeating: 0x92,
+            count: PeerTeamLeader.requestIDBytes
+        )
+        request.method = "team.status"
+        request.paramsJson = "{}"
+        let renewal = await controlPlane.execute(
+            request,
+            encodedBytes: try request.serializedData().count,
+            nowUnixSeconds: wallNow,
+            nowLeaseSeconds: leaseNow
+        ) { _, _, _ in .success("{}") }
+        XCTAssertTrue(renewal.ok, "the live uptime lease must renew past wire expiry")
+
+        let leaderRequest = request
+        async let routedResponse = server.callTeamLeader(
+            leaderRequest,
+            targetPeerID: viewerPeerID,
+            timeoutSeconds: 2
+        )
+        guard case .teamLeaderCommandRequest(
+            let received,
+            let correlationID
+        ) = try await viewer.receiveNextMessage() else {
+            return XCTFail("expected reverse team leader request")
+        }
+        XCTAssertEqual(received.requestID, request.requestID)
+        XCTAssertEqual(received.method, "team.status")
+
+        var response = Termmesh_Peer_V1_TeamLeaderCommandResponse()
+        response.ok = true
+        response.resultJson = #"{"team_name":"demo"}"#
+        try await viewer.sendTeamLeaderCommandResponse(
+            response,
+            correlationID: correlationID
+        )
+        let completed = try await routedResponse
+        XCTAssertTrue(completed.ok)
+        XCTAssertEqual(completed.resultJson, #"{"team_name":"demo"}"#)
+
+        var elapsedGrant = grant
+        elapsedGrant.grantID = Data(
+            repeating: 0x93,
+            count: PeerTeamLeader.grantIDBytes
+        )
+        elapsedGrant.expiresAtUnixSecs = wallNow - 1
+        await controlPlane.registerGrant(
+            elapsedGrant,
+            nowLeaseSeconds: leaseNow > 0 ? leaseNow - 1 : 0
+        )
+        var elapsedRequest = request
+        elapsedRequest.grant = elapsedGrant
+        elapsedRequest.requestID = Data(
+            repeating: 0x94,
+            count: PeerTeamLeader.requestIDBytes
+        )
+        do {
+            _ = try await server.callTeamLeader(
+                elapsedRequest,
+                targetPeerID: viewerPeerID,
+                timeoutSeconds: 0.1
+            )
+            XCTFail("an elapsed registered lease must be rejected")
+        } catch {
+            XCTAssertEqual(error as? PeerServerError, .noMatchingLeaderSession)
+        }
+
+        do {
+            _ = try await server.callTeamLeader(
+                request,
+                targetPeerID: Data(
+                    repeating: 0xEE,
+                    count: PeerIdentity.byteCount
+                ),
+                timeoutSeconds: 0.1
+            )
+            XCTFail("wrong viewer identity must not receive the request")
+        } catch {
+            XCTAssertEqual(error as? PeerServerError, .noMatchingLeaderSession)
+        }
+
+        try await viewer.sendGoodbye(reason: "reverse leader test done")
+        await transport.close()
+    }
+
+    /// A grant this host never registered must not be routed.
+    ///
+    /// `callTeamLeader` used to precheck with
+    /// `registeredGrant: registered?.value ?? request.grant`, and every field
+    /// of a command request arrives from caller-supplied socket parameters.
+    /// The fallback therefore made `validateGrant` compare the presented
+    /// grant against itself — grantID, projectID, teamUuid, role and the
+    /// `expiresAtUnixSecs` equality all matched by construction — while the
+    /// one remaining check compared a wall-clock deadline (~1.7e9) against
+    /// `systemUptime` (~1e5) and so could never fail. Any local process able
+    /// to reach the socket could invent a grant id and have its command
+    /// routed over the authenticated peer session to the viewer.
+    ///
+    /// Both halves are asserted: a forged grant is refused, and a grant that
+    /// was registered and then revoked stops being routable. Asserting only
+    /// the first would still pass if the fallback were restored *and* expiry
+    /// were fixed, which is not the property that matters here.
+    func testUnregisteredLeaderGrantIsNotRoutedToViewer() async throws {
+        let sockPath = "/tmp/tm-peer-forged-grant-\(UUID().uuidString.prefix(8)).sock"
+        defer { try? FileManager.default.removeItem(atPath: sockPath) }
+        let controlPlane = PeerTeamLeaderControlPlane()
+        var surface = Termmesh_Peer_V1_SurfaceInfo()
+        surface.surfaceID = Data(repeating: 0x74, count: 16)
+        surface.title = "leader"
+        surface.cols = 80
+        surface.rows = 24
+        surface.attachable = true
+        let server = PeerServer(
+            socketPath: sockPath,
+            provider: EchoSurfaceProvider(surfaces: [surface]),
+            teamLeaderControlPlane: controlPlane
+        )
+        try await server.start()
+        defer { Task { await server.stop() } }
+
+        let viewerPeerID = Data(
+            repeating: 0x7B,
+            count: PeerIdentity.byteCount
+        )
+        let transport = try await UnixSocketTransport.connect(socketPath: sockPath)
+        let viewer = PeerSession(
+            read: { try await transport.read() },
+            write: { try await transport.write($0) }
+        )
+        var options = PeerSessionOptions()
+        options.peerID = viewerPeerID
+        _ = try await viewer.handshake(options: options)
+        _ = try await viewer.attachSurface(
+            id: surface.surfaceID,
+            cols: 80,
+            rows: 24
+        )
+
+        // Entirely caller-authored: never registered, and generously
+        // post-dated so a self-comparison would sail through every check.
+        let wallNow = UInt64(Date().timeIntervalSince1970)
+        var forged = Termmesh_Peer_V1_TeamLeaderGrant()
+        forged.grantID = Data(
+            repeating: 0xF0,
+            count: PeerTeamLeader.grantIDBytes
+        )
+        forged.projectID = "name:demo"
+        forged.teamUuid = "team-uuid"
+        forged.role = .leader
+        forged.expiresAtUnixSecs = wallNow + 3_600
+        var forgedRequest = Termmesh_Peer_V1_TeamLeaderCommandRequest()
+        forgedRequest.grant = forged
+        forgedRequest.teamUuid = forged.teamUuid
+        forgedRequest.requestID = Data(
+            repeating: 0xF1,
+            count: PeerTeamLeader.requestIDBytes
+        )
+        forgedRequest.method = "team.status"
+        forgedRequest.paramsJson = "{}"
+
+        do {
+            _ = try await server.callTeamLeader(
+                forgedRequest,
+                targetPeerID: viewerPeerID,
+                timeoutSeconds: 0.1
+            )
+            XCTFail("an unregistered grant must never be routed to the viewer")
+        } catch {
+            // The specific error matters: `noMatchingLeaderSession` is thrown
+            // by the precheck, before a frame is written. Had the request been
+            // routed, this viewer never answers it and the call would have
+            // failed as `leaderCallTimedOut` instead. Asserting the identity
+            // is therefore also the assertion that nothing reached the viewer,
+            // and it needs no second reader racing the session pump.
+            XCTAssertEqual(error as? PeerServerError, .noMatchingLeaderSession)
+        }
+
+        // Registering the same grant makes it routable, which proves the
+        // rejection above was the registry check and not an unrelated guard.
+        await controlPlane.registerGrant(forged)
+        async let routed = server.callTeamLeader(
+            forgedRequest,
+            targetPeerID: viewerPeerID,
+            timeoutSeconds: 2
+        )
+        guard case .teamLeaderCommandRequest(
+            _,
+            let correlationID
+        ) = try await viewer.receiveNextMessage() else {
+            return XCTFail("a registered grant must be routed")
+        }
+        var response = Termmesh_Peer_V1_TeamLeaderCommandResponse()
+        response.ok = true
+        response.resultJson = "{}"
+        try await viewer.sendTeamLeaderCommandResponse(
+            response,
+            correlationID: correlationID
+        )
+        let routedResult = try await routed
+        XCTAssertTrue(routedResult.ok)
+
+        // Revocation takes it away again — the registry is consulted per
+        // call, not cached from the first success.
+        await controlPlane.revokeGrant(id: forged.grantID)
+        var afterRevoke = forgedRequest
+        afterRevoke.requestID = Data(
+            repeating: 0xF2,
+            count: PeerTeamLeader.requestIDBytes
+        )
+        do {
+            _ = try await server.callTeamLeader(
+                afterRevoke,
+                targetPeerID: viewerPeerID,
+                timeoutSeconds: 0.1
+            )
+            XCTFail("a revoked grant must stop being routable")
+        } catch {
+            XCTAssertEqual(error as? PeerServerError, .noMatchingLeaderSession)
+        }
+
+        try await viewer.sendGoodbye(reason: "forged grant test done")
+        await transport.close()
+    }
+
     /// A Mac host is where a team leader usually sits, so its roster is the
     /// answer to "where does this project's leader run" — and it only exists
     /// on the wire, never in the layout tree.
@@ -717,9 +1003,13 @@ final class PeerServerTests: XCTestCase {
         XCTAssertEqual(teams[0].projectRoot, "/Users/x/work/demo")
     }
 
-    /// A host with no teams must not advertise the capability, or a client
-    /// would ask a question it cannot usefully answer.
-    func testHostWithoutTeamsDoesNotAdvertiseRoster() async throws {
+    /// Capabilities describe server support, independent of the current roster.
+    ///
+    /// Leader bootstrap is the one that made this concrete: it is only ever
+    /// used from a host that has no teams yet, so gating it on having one was
+    /// a deadlock — no capability, so no leader; no leader, so never a team.
+    /// Observed as a project that never finished creating on an empty peer.
+    func testHostWithoutTeamsAdvertisesTeamCapabilities() async throws {
         let sockPath = "/tmp/tm-peer-swift-noteams-\(UUID().uuidString.prefix(8)).sock"
         defer { try? FileManager.default.removeItem(atPath: sockPath) }
 
@@ -739,7 +1029,12 @@ final class PeerServerTests: XCTestCase {
             write: { try await transport.write($0) }
         )
         let hello = try await session.handshake()
-        XCTAssertFalse(hello.hasHostCapability(PeerCapability.teamRosterV1))
+        XCTAssertTrue(hello.hasHostCapability(PeerCapability.teamRosterV1))
+        XCTAssertTrue(hello.hasHostCapability(PeerCapability.teamCallV1))
+        XCTAssertTrue(
+            hello.hasHostCapability(PeerCapability.teamLeaderV1),
+            "an empty host must still accept a leader, or no team can ever start there"
+        )
     }
 }
 
@@ -784,6 +1079,8 @@ private actor RecordingAttachProvider: PeerSurfaceProvider {
 /// this package) to prove `PeerServerSession.dispatch` actually invokes
 /// the provider with the wire-decoded arguments.
 private actor RecordingWorkspaceProvider: PeerSurfaceProvider {
+    static let workspaceID = Data(repeating: 0x5A, count: 16)
+    private(set) var createdTitle: String?
     private(set) var renamed: (id: Data, title: String)?
     private(set) var deleted: Data?
 
@@ -795,6 +1092,11 @@ private actor RecordingWorkspaceProvider: PeerSurfaceProvider {
         clientRows: UInt32,
         resumeFromSeq: UInt64
     ) async -> PeerSurfaceAttachment? { nil }
+
+    func createWorkspace(title: String) async -> Data? {
+        createdTitle = title
+        return Self.workspaceID
+    }
 
     func renameWorkspace(id workspaceID: Data, title: String) async -> Bool {
         renamed = (workspaceID, title)

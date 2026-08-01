@@ -214,7 +214,15 @@ enum AgentPipeTransport {
             run += " 2>&1 | /usr/bin/env python3 \(quoted(rendererPath)) --fifo \(f)"
         }
         let chain = [
-            "rm -f \(f)",
+            // Both files, for the same reason: a hard restart reuses the agent
+            // id. `tee` without `-a` truncates in place and keeps the inode, so
+            // the events file a dead pane left behind stayed the *same file* as
+            // the one the new pane writes and the completion watch's identity
+            // check could never tell them apart. Unlinking gives the new pane a
+            // genuinely new inode. Safe here and only here: the pipeline that
+            // opens the file has not started, so unlike a delete from the app
+            // side this cannot pull the file out from under a live writer.
+            "rm -f \(f) \(quoted(fifoPath + ".events"))",
             "mkdir -p \(quoted((fifoPath as NSString).deletingLastPathComponent))",
             "mkfifo -m 600 \(f)",
             run,
@@ -258,6 +266,7 @@ enum AgentPipeTransport {
     /// routed to a FIFO that no longer exists.
     static func discard(agentId: String) {
         forgetDriven(agentId: agentId)
+        writers.reset(agentId: agentId)
         try? FileManager.default.removeItem(atPath: fifoPath(agentId: agentId))
         try? FileManager.default.removeItem(atPath: fifoPath(agentId: agentId) + ".events")
     }
@@ -314,7 +323,15 @@ enum AgentPipeTransport {
             run += " | /usr/bin/env python3 \(quoted(rendererPath)) --fifo \(f)"
         }
         let chain = [
-            "rm -f \(f)",
+            // Both files, for the same reason: a hard restart reuses the agent
+            // id. `tee` without `-a` truncates in place and keeps the inode, so
+            // the events file a dead pane left behind stayed the *same file* as
+            // the one the new pane writes and the completion watch's identity
+            // check could never tell them apart. Unlinking gives the new pane a
+            // genuinely new inode. Safe here and only here: the pipeline that
+            // opens the file has not started, so unlike a delete from the app
+            // side this cannot pull the file out from under a live writer.
+            "rm -f \(f) \(quoted(fifoPath + ".events"))",
             "mkdir -p \(quoted((fifoPath as NSString).deletingLastPathComponent))",
             "mkfifo -m 600 \(f)",
             // Hold the write end open here so the reader never blocks or ends.
@@ -337,11 +354,13 @@ enum AgentPipeTransport {
     enum DeliveryError: Error, CustomStringConvertible {
         case noPipe(String)
         case writeFailed(String)
+        case unterminatedPartial(String)
 
         var description: String {
             switch self {
             case .noPipe(let path): return "no pipe at \(path)"
             case .writeFailed(let detail): return "write failed: \(detail)"
+            case .unterminatedPartial(let detail): return "write failed: \(detail)"
             }
         }
     }
@@ -354,35 +373,271 @@ enum AgentPipeTransport {
     /// PTY buffer until something reads them.
     private static let pipeReadyTimeout: TimeInterval = 5
 
-    /// How long an EAGAIN write retry may keep polling a reader that has
-    /// stopped consuming.
-    ///
-    /// A reader that is alive but paused looks identical, from EAGAIN alone,
-    /// to one that will never resume. Without a bound this loop never
-    /// returns, and the caller — holding the FIFO fd open — never does either.
+    /// Maximum reader silence before a write is abandoned. Progress restarts
+    /// the budget, so this is a stall timeout rather than a total-duration cap.
     private static let pipeWriteTimeout: TimeInterval = 5
 
-    /// Put one user turn on the agent's stdin.
+    enum WriteAttempt: Equatable {
+        case written(Int)
+        case interrupted
+        case wouldBlock
+        case failed(Int32)
+    }
+
+    /// One serial writer per agent. Frames for one process cannot interleave or
+    /// overtake each other, while separate agents remain independent.
+    private final class WriterRegistry: @unchecked Sendable {
+        struct Admission: @unchecked Sendable {
+            let agentId: String
+            let generation: UInt64
+            let queue: DispatchQueue
+        }
+
+        private struct Entry {
+            let queue: DispatchQueue
+            var generation: UInt64 = 0
+            var poisoned = false
+        }
+
+        private let lock = NSLock()
+        private var entries: [String: Entry] = [:]
+
+        func admission(for agentId: String) -> Admission {
+            lock.lock()
+            defer { lock.unlock() }
+            if let entry = entries[agentId] {
+                return Admission(
+                    agentId: agentId, generation: entry.generation, queue: entry.queue)
+            }
+            let queue = DispatchQueue(
+                label: "com.termmesh.agent-pipe.\(agentId)",
+                qos: .userInitiated
+            )
+            entries[agentId] = Entry(queue: queue)
+            return Admission(agentId: agentId, generation: 0, queue: queue)
+        }
+
+        func rejection(for admission: Admission) -> DeliveryError? {
+            lock.lock()
+            defer { lock.unlock() }
+            guard let entry = entries[admission.agentId],
+                  entry.generation == admission.generation else {
+                return .writeFailed("pipe was reset before the queued delivery started")
+            }
+            return entry.poisoned
+                ? .writeFailed("pipe contains an unterminated partial frame; restart required")
+                : nil
+        }
+
+        func poison(_ admission: Admission) {
+            lock.lock()
+            defer { lock.unlock() }
+            guard var entry = entries[admission.agentId],
+                  entry.generation == admission.generation else { return }
+            entry.poisoned = true
+            entries[admission.agentId] = entry
+        }
+
+        func reset(agentId: String) {
+            lock.lock()
+            defer { lock.unlock() }
+            guard var entry = entries[agentId] else { return }
+            entry.generation &+= 1
+            entry.poisoned = false
+            entries[agentId] = entry
+        }
+    }
+
+    /// Reports an asynchronous delivery exactly once, and decides which of the
+    /// caller deadline and the serialized writer gets to be that report.
     ///
-    /// The text goes as-is. Nothing is flattened — a task carrying newlines
-    /// arrives with them, because there is no composer here to submit early on
-    /// one. That flattening is the clearest sign of what the terminal path
-    /// costs: an instruction is reshaped to survive its own delivery.
-    @discardableResult
-    static func deliver(text: String, agentId: String) throws -> Int {
+    /// Two states could not express this. "Has anyone answered yet" let the
+    /// writer check, release the lock, and only then start — so a deadline that
+    /// landed in between told the caller the turn had failed while the turn was
+    /// on its way to the agent, and the retry that failure invites delivered it
+    /// twice. `writing` is that gap made explicit: the writer claims the turn
+    /// under the same lock that tests for it, and after that the deadline has
+    /// nothing left to answer for.
+    private final class DeliveryResult: @unchecked Sendable {
+        private enum State {
+            /// Queued. The deadline may still answer for it.
+            case pending
+            /// The writer owns it. Only the writer's own outcome can report.
+            case writing
+            /// Reported.
+            case finished
+        }
+
+        private let lock = NSLock()
+        private var state: State = .pending
+        private let completion: (Result<Int, DeliveryError>) -> Void
+
+        init(completion: @escaping (Result<Int, DeliveryError>) -> Void) {
+            self.completion = completion
+        }
+
+        /// Take the turn, or learn that the deadline already answered for it.
+        ///
+        /// Test and transition share one lock, which is the whole point: a
+        /// deadline cannot arrive between them.
+        func claimForWrite() -> Bool {
+            lock.lock()
+            defer { lock.unlock() }
+            guard case .pending = state else { return false }
+            state = .writing
+            return true
+        }
+
+        /// The caller's bound on how long enqueueing can leave them without an
+        /// answer. It applies to a turn that has not started: once the writer
+        /// holds it, the caller waits for the write's own deadline instead of
+        /// being told a failure that is about to be untrue.
+        func expire(_ result: Result<Int, DeliveryError>) {
+            lock.lock()
+            guard case .pending = state else {
+                lock.unlock()
+                return
+            }
+            state = .finished
+            lock.unlock()
+            DispatchQueue.main.async { [completion] in completion(result) }
+        }
+
+        /// The writer's own outcome, which always reports once it has claimed.
+        func finish(_ result: Result<Int, DeliveryError>) {
+            lock.lock()
+            guard case .finished = state else {
+                state = .finished
+                lock.unlock()
+                DispatchQueue.main.async { [completion] in completion(result) }
+                return
+            }
+            lock.unlock()
+        }
+    }
+
+    private static let writers = WriterRegistry()
+
+    /// One line onto the pipe, whole.
+    ///
+    /// A committed partial JSON frame cannot be left adjacent to the next
+    /// instruction. If the reader stops consuming, bound the writer wait and
+    /// best-effort terminate the fragment with a newline before releasing the
+    /// per-agent queue. Waiting is safe because production calls this off-main.
+    static func writeWholeLine(
+        byteCount: Int,
+        timeout: TimeInterval = pipeWriteTimeout,
+        now: () -> TimeInterval = { ProcessInfo.processInfo.systemUptime },
+        pause: () -> Void = { usleep(2_000) },
+        terminateLine: () -> Bool = { false },
+        attempt: (_ offset: Int, _ remaining: Int) -> WriteAttempt
+    ) throws -> Int {
+        var written = 0
+        var deadline = now() + timeout
+        while written < byteCount {
+            switch attempt(written, byteCount - written) {
+            case .written(let count):
+                guard count > 0 else {
+                    throw DeliveryError.writeFailed("write returned zero after \(written)B")
+                }
+                written += count
+                deadline = now() + timeout
+            case .interrupted:
+                continue
+            case .wouldBlock:
+                guard now() < deadline else {
+                    guard written > 0 else {
+                        throw DeliveryError.writeFailed(
+                            "write stalled before line commit (deadline exceeded)")
+                    }
+                    guard terminateLine() else {
+                        throw DeliveryError.unterminatedPartial(
+                            "write stalled after \(written)/\(byteCount)B (deadline exceeded); "
+                                + "the partial line could not be terminated")
+                    }
+                    throw DeliveryError.writeFailed(
+                        "write stalled after \(written)/\(byteCount)B (deadline exceeded); "
+                            + "the partial line was terminated for the reader")
+                }
+                pause()
+            case .failed(let failure):
+                throw DeliveryError.writeFailed("errno \(failure) after \(written)B")
+            }
+        }
+        return written
+    }
+
+    /// Queue one user turn without making its MainActor caller poll a FIFO.
+    static func deliver(
+        text: String,
+        agentId: String,
+        completion: @escaping (Result<Int, DeliveryError>) -> Void
+    ) throws {
         let path = fifoPath(agentId: agentId)
         let payload = try encode(text: text)
+        enqueueDelivery(
+            agentId: agentId, resultTimeout: pipeWriteTimeout,
+            operation: { try deliver(payload: payload, path: path) },
+            completion: completion
+        )
+    }
 
-        // Non-blocking, so the caller is never hung by a pane that has gone —
-        // but a pane that has not arrived *yet* is a different thing, and the
-        // two look alike for the first second of a team's life.
-        //
-        // A team's first instruction goes out while the panes are still coming
-        // up, and readiness has two steps, not one: the pane creates the FIFO,
-        // then the process behind it opens the read end. Opening for writing in
-        // between gives ENXIO — "no reader" — which is a wait, not a failure.
-        // Waiting is what the terminal gave for free: keystrokes sit in the PTY
-        // buffer until something reads them.
+    /// Applies both transport-wide guarantees around one serialized write:
+    /// enqueue-time caller feedback is bounded, and a channel with an
+    /// unterminated committed frame rejects every later generation peer.
+    private static func enqueueDelivery(
+        agentId: String,
+        resultTimeout: TimeInterval,
+        operation: @escaping @Sendable () throws -> Int,
+        completion: @escaping (Result<Int, DeliveryError>) -> Void
+    ) {
+        let admission = writers.admission(for: agentId)
+        let resultGate = DeliveryResult(completion: completion)
+        DispatchQueue.main.asyncAfter(deadline: .now() + resultTimeout) {
+            resultGate.expire(.failure(.writeFailed("delivery result deadline exceeded")))
+        }
+        admission.queue.async {
+            // The deadline may have answered the caller while this turn was
+            // still waiting its place behind another write. Sending it now
+            // would put an instruction on the pipe that its caller was told
+            // had failed, and the retry that failure invites would deliver the
+            // same turn again. Claiming is what makes the two exclusive.
+            guard resultGate.claimForWrite() else { return }
+            let result: Result<Int, DeliveryError>
+            if let rejection = writers.rejection(for: admission) {
+                result = .failure(rejection)
+            } else {
+                do {
+                    result = .success(try operation())
+                } catch let error as DeliveryError {
+                    if case .unterminatedPartial = error {
+                        writers.poison(admission)
+                    }
+                    result = .failure(error)
+                } catch {
+                    result = .failure(.writeFailed(error.localizedDescription))
+                }
+            }
+            resultGate.finish(result)
+        }
+    }
+
+    #if DEBUG
+    static func enqueueDeliveryForTesting(
+        agentId: String,
+        resultTimeout: TimeInterval,
+        operation: @escaping @Sendable () throws -> Int,
+        completion: @escaping (Result<Int, DeliveryError>) -> Void
+    ) {
+        enqueueDelivery(
+            agentId: agentId, resultTimeout: resultTimeout,
+            operation: operation, completion: completion)
+    }
+    #endif
+
+    /// Runs only on the agent serial writer. Readiness and backpressure waits
+    /// therefore leave input, layout, and unrelated socket work responsive.
+    private static func deliver(payload: Data, path: String) throws -> Int {
         let deadline = Date().addingTimeInterval(pipeReadyTimeout)
         var fd: Int32 = -1
         while true {
@@ -398,38 +653,35 @@ enum AgentPipeTransport {
         }
         defer { close(fd) }
 
-        var written = 0
-        var writeDeadline = ProcessInfo.processInfo.systemUptime + pipeWriteTimeout
-        try payload.withUnsafeBytes { raw in
-            guard let base = raw.baseAddress else { return }
-            while written < raw.count {
-                let n = write(fd, base.advanced(by: written), raw.count - written)
-                if n > 0 {
-                    written += n
-                    // Progress restarts the clock. The deadline bounds a
-                    // reader that stopped consuming; a large payload drained
-                    // slowly is the reader working, not the reader stuck.
-                    writeDeadline = ProcessInfo.processInfo.systemUptime + pipeWriteTimeout
-                    continue
-                }
-                if n < 0, errno == EINTR {
-                    // A signal interrupt says nothing about the reader;
-                    // retry without consuming the stall budget.
-                    continue
-                }
-                if n < 0, errno == EAGAIN {
-                    guard ProcessInfo.processInfo.systemUptime < writeDeadline else {
-                        throw DeliveryError.writeFailed(
-                            "write stalled after \(written)/\(raw.count)B (deadline exceeded)")
+        return try payload.withUnsafeBytes { raw in
+            guard let base = raw.baseAddress else { return 0 }
+            return try writeWholeLine(
+                byteCount: raw.count,
+                terminateLine: {
+                    var newline: UInt8 = 0x0a
+                    return withUnsafePointer(to: &newline) {
+                        write(fd, $0, 1) == 1
                     }
-                    usleep(2_000)
-                    continue
+                },
+                attempt: { offset, remaining in
+                    let count = write(fd, base.advanced(by: offset), remaining)
+                    if count > 0 { return .written(count) }
+                    if count < 0, errno == EINTR { return .interrupted }
+                    if count < 0, errno == EAGAIN { return .wouldBlock }
+                    return .failed(errno)
                 }
-                throw DeliveryError.writeFailed("errno \(errno) after \(written)B")
-            }
+            )
         }
-        return written
     }
+
+    #if DEBUG
+    static func enqueueForTesting(
+        agentId: String,
+        operation: @escaping @Sendable () -> Void
+    ) {
+        writers.admission(for: agentId).queue.async(execute: operation)
+    }
+    #endif
 
     /// One NDJSON line in the shape claude's stream-json input expects.
     static func encode(text: String) throws -> Data {

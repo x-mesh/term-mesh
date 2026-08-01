@@ -100,6 +100,19 @@ final class PeerHostCoordinator: NSObject {
     var isRunning: Bool { server != nil }
     var currentSocketPath: String? { socketPath }
 
+    func callTeamLeader(
+        _ request: Termmesh_Peer_V1_TeamLeaderCommandRequest,
+        targetPeerID: Data,
+        timeoutSeconds: TimeInterval = 10
+    ) async throws -> Termmesh_Peer_V1_TeamLeaderCommandResponse {
+        guard let server else { throw PeerServerError.notRunning }
+        return try await server.callTeamLeader(
+            request,
+            targetPeerID: targetPeerID,
+            timeoutSeconds: timeoutSeconds
+        )
+    }
+
     @objc func startServer(_ sender: Any?) {
         switch lifecycle {
         case .running(let existing):
@@ -262,6 +275,11 @@ final class PeerHostCoordinator: NSObject {
         var config = PeerServerConfig()
         config.hostDisplayName = PeerFederationSettings.displayName
         config.hostAppVersion = "debug-server"
+        if let resourceURL = Bundle.main.resourceURL {
+            config.hostCLIBinDirs = [
+                resourceURL.appendingPathComponent("bin").standardizedFileURL.path
+            ]
+        }
 
         let server = PeerServer(socketPath: path, provider: provider, config: config)
         do {

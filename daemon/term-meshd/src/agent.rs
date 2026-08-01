@@ -1,6 +1,6 @@
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -2071,6 +2071,66 @@ impl AgentSessionManager {
                 tracing::warn!("failed to terminate session {id}: {e}");
             }
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Disk reclamation support (see `crate::gc`)
+    // -----------------------------------------------------------------------
+
+    /// Worktrees belonging to sessions that have not terminated. The GC treats
+    /// these as pinned — a live agent is still working in them.
+    pub fn active_worktree_paths(&self) -> HashSet<PathBuf> {
+        let inner = self.inner.lock().unwrap();
+        let Ok(mut stmt) = inner.db.prepare(
+            "SELECT worktree_path FROM agent_sessions WHERE status != 'terminated'",
+        ) else {
+            return HashSet::new();
+        };
+        let Ok(rows) = stmt.query_map([], |row| row.get::<_, String>(0)) else {
+            return HashSet::new();
+        };
+        rows.flatten().map(PathBuf::from).collect()
+    }
+
+    /// Worktrees held by a task that has neither finished nor been released.
+    /// `worktree_finished_at_ms IS NULL` is the "still in play" marker written
+    /// by `tm-agent task finish-worktree`.
+    pub fn active_task_worktree_paths(&self) -> HashSet<PathBuf> {
+        let inner = self.inner.lock().unwrap();
+        let Ok(mut stmt) = inner.db.prepare(
+            "SELECT worktree_path FROM tasks
+             WHERE worktree_path IS NOT NULL
+               AND worktree_path != ''
+               AND COALESCE(worktree_removed, 0) = 0
+               AND worktree_finished_at_ms IS NULL
+               AND status NOT IN ('completed', 'cancelled')",
+        ) else {
+            return HashSet::new();
+        };
+        let Ok(rows) = stmt.query_map([], |row| row.get::<_, String>(0)) else {
+            return HashSet::new();
+        };
+        rows.flatten().map(PathBuf::from).collect()
+    }
+
+    /// Every repository the daemon has ever created a session for. Used as the
+    /// starting set for stale-registration pruning and for locating agent
+    /// checkouts that sit next to a primary.
+    pub fn known_repo_paths(&self) -> Vec<PathBuf> {
+        let inner = self.inner.lock().unwrap();
+        let Ok(mut stmt) = inner
+            .db
+            .prepare("SELECT DISTINCT repo_path FROM agent_sessions WHERE repo_path != ''")
+        else {
+            return Vec::new();
+        };
+        let Ok(rows) = stmt.query_map([], |row| row.get::<_, String>(0)) else {
+            return Vec::new();
+        };
+        let mut paths: Vec<PathBuf> = rows.flatten().map(PathBuf::from).collect();
+        paths.sort();
+        paths.dedup();
+        paths
     }
 
     /// Prune old data: terminated sessions, task logs, and messages older than `max_age_ms`.

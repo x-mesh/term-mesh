@@ -9,6 +9,14 @@ import os
 final class TeamOrchestrator: ObservableObject {
     static let shared = TeamOrchestrator()
 
+    /// Live project workspaces whose last local window was closed.
+    ///
+    /// A window is only a viewer for a project. Retaining the Workspace keeps
+    /// native AgentSession processes and remote pane bindings alive until a
+    /// later window adopts the exact same presentation. Explicit team/project
+    /// teardown remains the operation that ends those processes.
+    private var detachedProjectWorkspaces: [String: Workspace] = [:]
+
     struct AgentMember: Identifiable {
         let id: String           // agent-name@team-name (legacy routing key)
         /// Team-scoped durable identity. Unlike `panelId`, this survives a
@@ -22,7 +30,7 @@ final class TeamOrchestrator: ObservableObject {
         let agentType: String    // "Explore", "executor", etc.
         let color: String        // terminal color
         let instructions: String // role description for leader routing
-        let workspaceId: UUID
+        var workspaceId: UUID
         /// nil for headless agents (no GUI pane); set for pane-mode agents.
         /// Mutable so hard restart (pane close + respawn) can rewrite the panel
         /// without rebuilding the AgentMember from scratch.
@@ -117,7 +125,7 @@ final class TeamOrchestrator: ObservableObject {
         var leaderPolicyState: String = "pending"
         var leaderPolicyFailureDescription: String? = nil
         let workingDirectory: String
-        let workspaceId: UUID     // agent workspace (may differ from leader workspace in "adopted" mode)
+        var workspaceId: UUID     // agent workspace (may differ from leader workspace in "adopted" mode)
         var agents: [AgentMember]
         let createdAt: Date
         var gitRepoRoot: String?  // for worktree cleanup
@@ -185,12 +193,93 @@ final class TeamOrchestrator: ObservableObject {
     }
 
     @Published private(set) var teams: [String: Team] = [:]
+    /// Prevent repeated project clicks from attaching multiple local viewers
+    /// to the same persistent remote leader surface.
+    var remoteLeaderReattachInFlight: Set<String> = []
+    /// Runtime EOF can arrive more than once while Ghostty and the peer relay
+    /// unwind. Only one recovery may reattach or re-bootstrap a leader.
+    var remoteLeaderRecoveryInFlight: Set<String> = []
+    /// Restoring a detached project must be single-flight for the same reason
+    /// the two above are, and at the same scope. The sidebar's own
+    /// `restoringTeamNames` is per-view `@State`, so a second window has its
+    /// own copy and the debug command bypasses it entirely — two concurrent
+    /// restores then walked the same surface ids and left a duplicate viewer
+    /// per surface, with the first set of panes orphaned because
+    /// `progress.agentPanelIDs` keeps only the last writer.
+    var projectRestoreInFlight: Set<String> = []
 
+    enum RemoteLeaderRecoveryPresentation: Equatable {
+        case replaceAnchor
+        case openPane
+    }
+
+    static func remoteLeaderRecoveryPresentation(
+        anchorExists: Bool
+    ) -> RemoteLeaderRecoveryPresentation {
+        anchorExists ? .replaceAnchor : .openPane
+    }
+
+    static func shouldRecoverRemoteLeaderRuntimeClose(
+        closedPanelID: UUID,
+        leaderPanelID: UUID,
+        workspaceID: UUID,
+        teamWorkspaceID: UUID,
+        isPeerLeader: Bool
+    ) -> Bool {
+        isPeerLeader
+            && closedPanelID == leaderPanelID
+            && workspaceID == teamWorkspaceID
+    }
+
+    func remoteLeaderTeamName(
+        runtimeClosedPanelID panelID: UUID,
+        workspaceID: UUID
+    ) -> String? {
+        teams.values.first { team in
+            let isPeerLeader: Bool
+            if case .peer = team.leaderEndpoint {
+                isPeerLeader = true
+            } else {
+                isPeerLeader = false
+            }
+            return Self.shouldRecoverRemoteLeaderRuntimeClose(
+                closedPanelID: panelID,
+                leaderPanelID: team.leaderPanelId,
+                workspaceID: workspaceID,
+                teamWorkspaceID: team.workspaceId,
+                isPeerLeader: isPeerLeader
+            )
+        }?.id
+    }
+
+    /// The single funnel for "this team owns these remote checkouts".
+    ///
+    /// Also writes through to disk: the in-memory list dies with the app, and
+    /// without a durable copy nothing could reclaim a peer checkout after a
+    /// restart.
     func recordRemoteProjectLocations(
         teamName: String,
         locations: [Team.RemoteProjectLocation]
     ) {
         teams[teamName]?.remoteProjectLocations = locations
+        RemoteProjectLocationStore.shared.replace(
+            teamName: teamName,
+            locations: locations.map { (hostKey: $0.hostKey, path: $0.path) }
+        )
+    }
+
+    /// Remote checkouts this team owns, including ones recorded by an earlier
+    /// run of the app.
+    ///
+    /// Reclamation must read through this rather than `Team.remoteProjectLocations`
+    /// directly — after a restart the in-memory list is empty even though the
+    /// directories are still sitting on the peer.
+    func knownRemoteProjectLocations(teamName: String) -> [Team.RemoteProjectLocation] {
+        var merged = Set(teams[teamName]?.remoteProjectLocations ?? [])
+        for stored in RemoteProjectLocationStore.shared.locations(teamName: teamName) {
+            merged.insert(Team.RemoteProjectLocation(hostKey: stored.hostKey, path: stored.path))
+        }
+        return merged.sorted { ($0.hostKey, $0.path) < ($1.hostKey, $1.path) }
     }
 
     func configureDedicatedRemoteWorkspaces(teamName: String, enabled: Bool) {
@@ -228,6 +317,157 @@ final class TeamOrchestrator: ObservableObject {
         team.leaderWorkspaceId = nil
         teams[teamName] = team
         syncTeamStateToDaemon()
+    }
+
+    /// Move a still-running project's presentation into a newly-created
+    /// workspace after its former window was closed. Process identity remains
+    /// with the peer surfaces; only local workspace/panel addresses change.
+    static func projectPresentationTeam(
+        _ team: Team,
+        movedTo workspaceID: UUID
+    ) -> Team {
+        var moved = team
+        moved.workspaceId = workspaceID
+        moved.leaderWorkspaceId = nil
+        for index in moved.agents.indices {
+            moved.agents[index].workspaceId = workspaceID
+            moved.agents[index].panelId = nil
+        }
+        return moved
+    }
+
+    /// Detach every live project workspace from a window that is closing and
+    /// retain it as a window-independent presentation.
+    ///
+    /// `TabManager.detachWorkspace` deliberately does not call `Panel.close`,
+    /// so native AgentSession processes and peer bindings survive unchanged.
+    /// Returning the original IDs lets AppDelegate still announce that these
+    /// workspaces are no longer exported by that particular window.
+    @discardableResult
+    /// Whether a team's workspace is a *project* presentation — the only kind
+    /// that may outlive the window showing it.
+    ///
+    /// Pure so the rule can be tested without windows or panes. A workspace
+    /// qualifies when it carries a declared project name (what lets the
+    /// Projects sidebar adopt it again later), when it hosts dedicated remote
+    /// workspaces, or when its leader lives on a peer.
+    nonisolated static func shouldPreserveProjectPresentation(
+        hasDeclaredProjectName: Bool,
+        usesDedicatedRemoteWorkspaces: Bool,
+        hasPeerLeader: Bool
+    ) -> Bool {
+        hasDeclaredProjectName || usesDedicatedRemoteWorkspaces || hasPeerLeader
+    }
+
+    func preserveProjectPresentations(from tabManager: TabManager) -> [UUID] {
+        // The filter used to be "this team's workspace is in the closing
+        // window" with no project predicate at all, and
+        // `unregisterMainWindow` runs it on every main-window close including
+        // app quit. That swept up plain `tm-agent attach` teams in ordinary
+        // windows: `detachWorkspace` deliberately never calls `Panel.close`,
+        // so their local shells and native AgentSession processes kept running
+        // with no window, and because the id was then excluded from
+        // `closedWorkspaceIDs` the `.peerWorkspaceDidClose` signal that block
+        // exists to post was skipped too, leaving attached peers holding it.
+        // Only `destroyTeam` ever reclaimed such a workspace.
+        let candidates = teams.values
+            .filter { team in
+                guard tabManager.tabs.contains(where: { $0.id == team.workspaceId })
+                else { return false }
+                let hasPeerLeader: Bool
+                if case .peer = team.leaderEndpoint {
+                    hasPeerLeader = true
+                } else {
+                    hasPeerLeader = false
+                }
+                return Self.shouldPreserveProjectPresentation(
+                    hasDeclaredProjectName: WorkspaceProjectNames.shared
+                        .projectName(for: team.workspaceId) != nil,
+                    usesDedicatedRemoteWorkspaces: team.usesDedicatedRemoteWorkspaces,
+                    hasPeerLeader: hasPeerLeader
+                )
+            }
+            .map { ($0.id, $0.workspaceId) }
+
+        var preserved: [UUID] = []
+        for (teamName, workspaceID) in candidates {
+            guard let workspace = tabManager.detachWorkspace(tabId: workspaceID) else {
+                continue
+            }
+            rememberPreservedProjectPresentation(
+                teamName: teamName,
+                workspace: workspace
+            )
+            preserved.append(workspaceID)
+#if DEBUG
+            dlog(
+                "project.presentation.preserved team=\(teamName) "
+                    + "workspace=\(workspaceID.uuidString.prefix(8)) "
+                    + "panels=\(workspace.panels.count)"
+            )
+#endif
+        }
+        return preserved
+    }
+
+    func takePreservedProjectPresentation(teamName: String) -> Workspace? {
+        let workspace = detachedProjectWorkspaces.removeValue(forKey: teamName)
+        if workspace != nil {
+            objectWillChange.send()
+        }
+        return workspace
+    }
+
+    func rememberPreservedProjectPresentation(
+        teamName: String,
+        workspace: Workspace
+    ) {
+        detachedProjectWorkspaces[teamName] = workspace
+        objectWillChange.send()
+    }
+
+    func hasPreservedProjectPresentation(teamName: String) -> Bool {
+        detachedProjectWorkspaces[teamName] != nil
+    }
+
+    func beginProjectPresentationRestore(teamName: String, workspaceID: UUID) -> Bool {
+        guard let team = teams[teamName] else { return false }
+        teams[teamName] = Self.projectPresentationTeam(
+            team,
+            movedTo: workspaceID
+        )
+        syncTeamStateToDaemon()
+        return true
+    }
+
+    /// Publish the new local viewer for one existing peer agent.
+    func replaceRemoteAgentPresentation(
+        teamName: String,
+        agentInstanceID: String,
+        workspaceID: UUID,
+        panelID: UUID
+    ) {
+        guard var team = teams[teamName],
+              let index = team.agents.firstIndex(where: {
+                  $0.agentInstanceId == agentInstanceID
+              })
+        else { return }
+        team.agents[index].workspaceId = workspaceID
+        team.agents[index].panelId = panelID
+        teams[teamName] = team
+        syncTeamStateToDaemon()
+    }
+
+    func isLeaderPaneAttached(teamName: String) -> Bool {
+        guard let team = teams[teamName] else { return false }
+        if case .peer = team.leaderEndpoint {
+            guard let located = AppDelegate.shared?.locateSurface(surfaceId: team.leaderPanelId),
+                  let workspace = located.tabManager.tabs.first(where: { $0.id == located.workspaceId }),
+                  let session = workspace.terminalPanel(for: team.leaderPanelId)?.peerPaneSession
+            else { return false }
+            return !session.isTorndown
+        }
+        return AppDelegate.shared?.locateSurface(surfaceId: team.leaderPanelId) != nil
     }
 
     func markRemoteLeaderFailed(teamName: String, description: String) {
@@ -463,6 +703,22 @@ final class TeamOrchestrator: ObservableObject {
         var blockedReason: String?
         var reviewSummary: String?
         var createdBy: String
+        /// Caller-supplied idempotency key. The stored spelling intentionally
+        /// matches the delegate RPC field and persisted board JSON.
+        var request_id: String? = nil
+        /// When this task's instruction actually reached a pane, if it ever
+        /// did.
+        ///
+        /// The task is created before the paste is attempted, so its mere
+        /// existence says nothing about delivery — and a failed paste leaves
+        /// exactly the state a successful one does: a non-terminal task on
+        /// that instance. A retry of the same `request_id` could not tell the
+        /// two apart and answered both as "already delivered", which is right
+        /// for a lost reply and a silent drop for a paste that never landed.
+        /// Optional so boards written before this field decode unchanged; nil
+        /// there means "not known to have been delivered", which is the safe
+        /// reading for an old board.
+        var textDeliveredAt: Date? = nil
         var result: String?
         var resultPath: String? = nil
         var worktreePolicy: String? = nil
@@ -1938,7 +2194,10 @@ final class TeamOrchestrator: ObservableObject {
 
         // For non-Claude CLI leaders (kiro, codex, gemini), inject team instructions.
         // Claude leaders get instructions via --system-prompt in team-leader-claude.sh.
-        if leaderMode != "repl" && leaderMode != "claude" {
+        if Self.shouldInjectLocalLeaderPrompt(
+            launchLeaderLocally: launchLeaderLocally,
+            leaderMode: leaderMode
+        ) {
             let scriptDir = Self.findScriptsDir(workingDirectory: workingDirectory)
             let prompt = buildTeamLeaderPrompt(
                 teamName: name,
@@ -2287,6 +2546,14 @@ final class TeamOrchestrator: ObservableObject {
             releaseRemoteAgent(agent, closing: workspace, teamName: teamName)
         } else if let workspace, let pid = agent.panelId {
             _ = workspace.closePanel(pid, force: force)
+        }
+
+        // Closing the pane used to be the whole of detach, so an isolated
+        // agent's worktree outlived every agent that ever used it. Remote
+        // agents already had `reapDetachedAgentWorktree`; this is the local
+        // half. Clean-only, like team destroy.
+        if agent.hostKey == nil {
+            reapDetachedLocalWorktree(agent: agent, team: team)
         }
 
         // Remove from team.agents
@@ -2829,6 +3096,33 @@ final class TeamOrchestrator: ObservableObject {
         )
     }
 
+    /// Rebuild the same leader contract after a host restart removed the
+    /// original peer surface. At recovery time the durable team roster, not
+    /// the project-creation rows, is the source of truth.
+    static func remoteLeaderClaudeRecoverySystemPrompt(
+        teamName: String,
+        agents: [AgentMember],
+        remoteWorkingDirectory: String,
+        remoteSocketPath: String
+    ) -> String {
+        let agentList = agents.enumerated().map { index, agent in
+            let summary = oneLinerFromInstructions(agent.instructions)
+            return summary.isEmpty
+                ? "  \(index + 1). \(agent.name) (\(agent.agentType))"
+                : "  \(index + 1). \(agent.name) (\(agent.agentType)) — \(summary)"
+        }.joined(separator: "\n")
+        return buildLeaderClaudeSystemPrompt(
+            teamName: teamName,
+            agentList: agentList,
+            runbookSection: runbookLeaderSection(
+                workingDirectory: remoteWorkingDirectory,
+                roles: agents.map(\.agentType)
+            ),
+            tmAgent: "tm-agent",
+            socketPath: remoteSocketPath
+        )
+    }
+
     /// Build team leader instructions for non-Claude CLI leaders (kiro, codex, gemini).
     /// These CLIs lack a --system-prompt flag, so we inject instructions as the first message.
     private func buildTeamLeaderPrompt(
@@ -3032,6 +3326,76 @@ final class TeamOrchestrator: ObservableObject {
         return nil
     }
 
+    /// The directory an agent's pane is actually sitting in.
+    ///
+    /// `parallel_telemetry.checkout` used to fall back to the workspace UUID,
+    /// which is not a path and reads like an identifier for somewhere else — a
+    /// leader collecting results took one for a remote checkout and went as far
+    /// as registering an ssh host key for a machine that was never involved.
+    ///
+    /// The real value has been on the member the whole time:
+    /// `originalAgentWorkDir` is the exact `agentWorkDir` the pane was spawned
+    /// with, and the capsule and restart paths already prefer
+    /// `worktreePath ?? originalAgentWorkDir`. This is that same order, with the
+    /// team's directory last because every member of a team without worktrees
+    /// runs there.
+    ///
+    /// Returns nil only when none of the three is known — a headless agent with
+    /// no pane. Callers publish `NSNull` rather than inventing a path.
+    nonisolated static func agentWorkingDirectory(
+        worktreePath: String?,
+        originalAgentWorkDir: String?,
+        teamWorkingDirectory: String?
+    ) -> String? {
+        for candidate in [worktreePath, originalAgentWorkDir, teamWorkingDirectory] {
+            if let value = candidate?.nilIfBlank { return value }
+        }
+        return nil
+    }
+
+    /// Whether the shell behind this pane belongs to this machine or a peer.
+    ///
+    /// Read from `hostKey` because that is what actually decides it: local pane
+    /// creation never sets one (see `addAgentPaneToWorkspace`), and a peer
+    /// attach always does. Published as its own field rather than by reshaping
+    /// `host` — `host` is the stored key verbatim and other readers depend on
+    /// that — so a leader can tell "no host recorded" from "somewhere else"
+    /// without having to know that rule.
+    nonisolated static func agentLocality(hostKey: String?) -> String {
+        (hostKey?.nilIfBlank == nil) ? "local" : "peer"
+    }
+
+    /// One same-named member, reduced to what a pane lookup needs.
+    struct PaneCandidate: Equatable {
+        let panelID: UUID?
+        let agentInstanceID: String
+    }
+
+    /// The durable instance behind a pane.
+    ///
+    /// Exact or nothing. `TeamDataStore.resolveAssigneeUnsafe` auto-pins
+    /// `candidates.first` for a name-only assignment, which for duplicate names
+    /// silently hands the work to a sibling; a caller that named a pane has
+    /// already chosen, and answering with a different one would be that same
+    /// bug wearing a more specific request.
+    ///
+    /// Pure so the no-guess property can be tested: `teams` is `private(set)`,
+    /// so a test cannot stand up a roster to look into.
+    nonisolated static func instanceID(
+        forPanel panelID: UUID,
+        among candidates: [PaneCandidate]
+    ) -> String? {
+        candidates.first { $0.panelID == panelID }?.agentInstanceID
+    }
+
+    /// `instanceID(forPanel:among:)` against the live roster for one role.
+    func agentInstanceID(teamName: String, agentName: String, panelID: UUID) -> String? {
+        let candidates = (teams[teamName]?.agents ?? [])
+            .filter { $0.name == agentName }
+            .map { PaneCandidate(panelID: $0.panelId, agentInstanceID: $0.agentInstanceId) }
+        return Self.instanceID(forPanel: panelID, among: candidates)
+    }
+
     /// Schedules a role pool by durable instance identity. Candidate order is
     /// the team's stable roster order; the cursor is scoped to team+role.
     private func selectIdleAgent(in team: Team, role: String) -> AgentMember? {
@@ -3120,15 +3484,29 @@ final class TeamOrchestrator: ObservableObject {
                                    completion: completion)
         }
         if AgentPipeTransport.isDriven(agentId: agent.transportId) {
+            let expectation = AgentPipeCompletion.shared.expect(
+                agentId: agent.transportId, instruction: text)
             do {
-                AgentPipeCompletion.shared.expect(agentId: agent.transportId, instruction: text)
-                let n = try AgentPipeTransport.deliver(text: text, agentId: agent.transportId)
-                #if DEBUG
-                dlog("agent.pipe.deliver agent=\(agent.id) bytes=\(n) via=name task=\(AgentPipeCompletion.taskId(in: text) ?? "-")")
-                #endif
-                completion?(true)
+                try AgentPipeTransport.deliver(text: text, agentId: agent.transportId) { result in
+                    switch result {
+                    case .success(let n):
+                        #if DEBUG
+                        dlog("agent.pipe.deliver agent=\(agent.id) bytes=\(n) via=name task=\(AgentPipeCompletion.taskId(in: text) ?? "-")")
+                        #endif
+                        completion?(true)
+                    case .failure(let error):
+                        AgentPipeCompletion.shared.cancelExpectation(
+                            agentId: agent.transportId, token: expectation)
+                        #if DEBUG
+                        dlog("agent.pipe.deliver.FAILED agent=\(agent.id) err=\(error)")
+                        #endif
+                        completion?(false)
+                    }
+                }
                 return true
             } catch {
+                AgentPipeCompletion.shared.cancelExpectation(
+                    agentId: agent.transportId, token: expectation)
                 #if DEBUG
                 dlog("agent.pipe.deliver.FAILED agent=\(agent.id) err=\(error)")
                 #endif
@@ -3210,15 +3588,32 @@ final class TeamOrchestrator: ObservableObject {
                                    completion: completion)
         }
         if let agent = pipeDrivenAgent(teamName: teamName, panelId: panelId) {
+            let expectation = AgentPipeCompletion.shared.expect(
+                agentId: agent.transportId, instruction: text)
             do {
-                AgentPipeCompletion.shared.expect(agentId: agent.transportId, instruction: text)
-                let n = try AgentPipeTransport.deliver(text: text, agentId: agent.transportId)
-                #if DEBUG
-                dlog("agent.pipe.deliver agent=\(agent.id) bytes=\(n) task=\(AgentPipeCompletion.taskId(in: text) ?? "-")")
-                #endif
-                completion?(true)
+                try AgentPipeTransport.deliver(text: text, agentId: agent.transportId) { result in
+                    switch result {
+                    case .success(let n):
+                        #if DEBUG
+                        dlog("agent.pipe.deliver agent=\(agent.id) bytes=\(n) task=\(AgentPipeCompletion.taskId(in: text) ?? "-")")
+                        #endif
+                        completion?(true)
+                    case .failure(let error):
+                        AgentPipeCompletion.shared.cancelExpectation(
+                            agentId: agent.transportId, token: expectation)
+                        Logger.team.error(
+                            "pipe delivery failed for \(agent.id, privacy: .public): \(String(describing: error), privacy: .public)"
+                        )
+                        #if DEBUG
+                        dlog("agent.pipe.deliver.FAILED agent=\(agent.id) err=\(error)")
+                        #endif
+                        completion?(false)
+                    }
+                }
                 return true
             } catch {
+                AgentPipeCompletion.shared.cancelExpectation(
+                    agentId: agent.transportId, token: expectation)
                 // Falling back to typing would hide the failure behind a path
                 // that usually works, and the point of this option is to see
                 // whether the pipe holds.
@@ -3421,16 +3816,118 @@ final class TeamOrchestrator: ObservableObject {
     struct DelegateResult {
         let task: TeamTask
         let textDelivered: Bool
+        /// True when request_id resolved to an already-created task and no
+        /// second paste was attempted.
+        let requestReplayed: Bool
         /// Pre-formatted instruction text for retry (avoids re-calling private formatter).
         let instruction: String
+    }
+
+    /// A task that is keeping an agent out of the delegate pool.
+    ///
+    /// Carried rather than summarised because the id is the actionable half:
+    /// the leader's next command names it.
+    struct DelegateBlocker: Equatable {
+        let taskID: String
+        let status: String
+    }
+
+    /// Why a delegate did not happen, or the result when it did.
+    ///
+    /// `delegateToAgent` returned `DelegateResult?` and collapsed two unrelated
+    /// failures into one `nil`: no such agent, and every instance already
+    /// holding a task. The RPC layer then reported both as "Task creation
+    /// failed", which is the one thing that had almost certainly NOT happened —
+    /// `TeamDataStore.createTask` only fails on an unregistered team or an
+    /// unresolvable assignee, both already established by the time it is called.
+    enum DelegateOutcome {
+        case delivered(DelegateResult)
+        /// The team has no agent by that name (or no such team).
+        case noSuchAgent
+        /// Every instance of the name is busy. Carries what is blocking each,
+        /// so the caller can say which task to close.
+        case allInstancesBusy(blockers: [DelegateBlocker])
+        /// The store genuinely refused to create the task.
+        case taskCreateFailed
+    }
+
+    /// Whether an already-existing task may be acknowledged without pasting
+    /// its instruction again.
+    ///
+    /// Only a task whose instruction is known to have landed. The task is
+    /// created before the paste is attempted, so a paste that failed leaves
+    /// exactly what a successful one leaves — a non-terminal task on that
+    /// instance — and treating the two alike answered a retry of a delivery
+    /// that never happened with "already delivered", dropping the turn in
+    /// silence. Pure so the rule is testable without a `TabManager` or a pane.
+    nonisolated static func delegateMaySkipPaste(
+        taskAlreadyExisted: Bool,
+        textDeliveredAt: Date?
+    ) -> Bool {
+        taskAlreadyExisted && textDeliveredAt != nil
+    }
+
+    /// Whether a replayed request has to move its task to the instance that is
+    /// about to be pasted into.
+    ///
+    /// A replay reuses the task it created, but the instance that task names
+    /// may be gone — target selection then picked a live one, and leaving the
+    /// board behind points ownership at a pane that is not running the work.
+    ///
+    /// Only when this call actually pastes. A task already marked delivered is
+    /// left where it is: the new pane never saw that instruction, and moving it
+    /// would be the board claiming otherwise. Pure for the same reason as
+    /// `delegateMaySkipPaste` — `delegate` needs a `TabManager` and live panes,
+    /// so the rule has to be reachable without them (#135).
+    nonisolated static func delegateMustReassignReplay(
+        taskAlreadyExisted: Bool,
+        maySkipPaste: Bool,
+        taskInstanceId: String?,
+        targetInstanceId: String?
+    ) -> Bool {
+        guard taskAlreadyExisted, !maySkipPaste else { return false }
+        return taskInstanceId != targetInstanceId
+    }
+
+    /// Statuses that release an agent back to the pool.
+    ///
+    /// Mirrors `TeamDataStore.hasActiveTask`, which owns the real gate. The two
+    /// must agree: this set only decides what the *explanation* names, and an
+    /// explanation that disagreed with the gate would send the leader after the
+    /// wrong task. Deliberately does NOT include `review_ready` — that task is
+    /// waiting on a person, `taskNeedsAttention` counts it, and moving it here
+    /// would drop it out of the sidebar's review queue silently.
+    nonisolated static let delegateTerminalStatuses: Set<String> = [
+        "completed", "failed", "abandoned", "cancelled",
+    ]
+
+    /// What is keeping these instances out of the pool.
+    ///
+    /// Pure over the task list so the diagnosis can be tested without a team,
+    /// a pane or a store.
+    nonisolated static func delegateBlockers(
+        in tasks: [TeamTask],
+        agentInstanceIds: [String]
+    ) -> [DelegateBlocker] {
+        let wanted = Set(agentInstanceIds)
+        return tasks
+            .filter {
+                guard let instance = $0.assigneeInstanceId else { return false }
+                return wanted.contains(instance)
+                    && !delegateTerminalStatuses.contains($0.status)
+            }
+            .map { DelegateBlocker(taskID: $0.id, status: $0.status) }
     }
 
     /// Unified delegate: atomically create a task in TeamDataStore and dispatch the
     /// formatted instruction to the agent. Mirrors the `tm-agent delegate` two-step
     /// logic (team.task.create + team.send) in a single atomic call.
     /// Must be called on the main thread (sendToAgent requires MainActor).
-    @discardableResult
-    func delegateToAgent(
+    ///
+    /// The `DelegateResult?` spelling is kept as a wrapper below for callers
+    /// that only need "did it go out"; anything reporting to a person should
+    /// use this one and say why it did not.
+    func delegate(
         teamName: String,
         agentName: String,
         agentInstanceId: String? = nil,
@@ -3438,14 +3935,71 @@ final class TeamOrchestrator: ObservableObject {
         taskTitle: String? = nil,
         priority: Int? = nil,
         context: String? = nil,
+        requestId: String? = nil,
         tabManager: TabManager,
         submit: Bool = false,
         panelId: UUID? = nil,
         completion: ((Bool) -> Void)? = nil
-    ) -> DelegateResult? {
+    ) -> DelegateOutcome {
         let title = taskTitle?.nilIfBlank ?? String(text.prefix(80))
+        guard let team = teams[teamName] else { return .noSuchAgent }
+        // Resolve an idempotent request BEFORE target selection. The store
+        // dedupes on request_id too, but it is only reached once a target has
+        // been picked, and the pool gate rejects any instance still holding a
+        // non-terminal task. A retry sent while the first attempt was still
+        // running was therefore answered `.allInstancesBusy` naming the very
+        // task it was replaying; the dedup branch became reachable only after
+        // that task completed, which is the case where a second paste would
+        // have been least harmful.
+        //
+        // Whether the replay may skip the paste is a separate question, and
+        // the task itself answers it: only one whose instruction is known to
+        // have landed is safe to acknowledge without pasting again. A task
+        // created for a paste that then failed looks identical otherwise, and
+        // answering that as "already delivered" drops the turn silently.
+        var replayed: TeamTask? = nil
+        if let requestId = requestId?.nilIfBlank,
+           let existing = TeamDataStore.shared.task(
+               teamName: teamName, requestId: requestId
+           ),
+           let replayTarget = team.agents.first(where: {
+               $0.agentInstanceId == existing.assigneeInstanceId
+           }) {
+            if Self.delegateMaySkipPaste(
+                taskAlreadyExisted: true,
+                textDeliveredAt: existing.textDeliveredAt
+            ) {
+                let instruction = formatDelegateInstruction(
+                    teamName: teamName,
+                    target: replayTarget,
+                    task: existing,
+                    text: text,
+                    context: context
+                )
+                // Same async completion ordering as the paste path: the socket
+                // caller stores the outcome right after this returns, and a
+                // synchronous callback could resume it first.
+                if let completion {
+                    DispatchQueue.main.async { completion(true) }
+                }
+                return .delivered(
+                    DelegateResult(
+                        task: existing,
+                        textDelivered: true,
+                        requestReplayed: true,
+                        instruction: instruction
+                    )
+                )
+            }
+            // Undelivered: paste it, into the instance that already owns the
+            // task rather than through the pool gate this very task holds shut.
+            replayed = existing
+        }
+        let named = team.agents.filter { $0.name == agentName }
         let target: AgentMember? = {
-            guard let team = teams[teamName] else { return nil }
+            if let replayed, let instance = replayed.assigneeInstanceId {
+                return team.agents.first { $0.agentInstanceId == instance }
+            }
             if let agentInstanceId {
                 return resolveAgentForRPC(
                     teamName: teamName, agentName: agentName, agentInstanceId: agentInstanceId
@@ -3456,14 +4010,55 @@ final class TeamOrchestrator: ObservableObject {
             }
             return selectIdleAgent(in: team, role: agentName)
         }()
-        guard let target else { return nil }
-        guard let task = TeamDataStore.shared.createTask(
+        guard let target else {
+            // The name exists but nothing was selectable, so the pool gate is
+            // what refused. Name the tasks holding it rather than reporting a
+            // creation that was never attempted.
+            guard !named.isEmpty else { return .noSuchAgent }
+            let blockers = Self.delegateBlockers(
+                in: TeamDataStore.shared.listTasks(teamName: teamName, assignee: agentName),
+                agentInstanceIds: named.map(\.agentInstanceId)
+            )
+            return .allInstancesBusy(blockers: blockers)
+        }
+        guard let creation = TeamDataStore.shared.createTaskWithDisposition(
             teamName: teamName,
             title: title,
             assignee: agentName,
             assigneeInstanceId: target.agentInstanceId,
-            priority: priority ?? 2
-        ) else { return nil }
+            priority: priority ?? 2,
+            requestId: requestId
+        ) else { return .taskCreateFailed }
+        // A task that already exists may skip the paste only if that paste is
+        // known to have landed. Otherwise this is a retry of a delivery that
+        // never happened, and it has to happen now.
+        let maySkipPaste = Self.delegateMaySkipPaste(
+            taskAlreadyExisted: !creation.created,
+            textDeliveredAt: creation.task.textDeliveredAt
+        )
+        var task = creation.task
+        if Self.delegateMustReassignReplay(
+            taskAlreadyExisted: !creation.created,
+            maySkipPaste: maySkipPaste,
+            taskInstanceId: task.assigneeInstanceId,
+            targetInstanceId: target.agentInstanceId
+        ) {
+            // A move that failed used to fall back to the original task and
+            // paste anyway, which delivered the work to one pane while the
+            // board kept naming another — the exact state this reassignment
+            // exists to prevent, arrived at silently. Refuse instead: an
+            // undelivered turn the caller can retry beats a delivered one
+            // nobody can trace.
+            guard let moved = TeamDataStore.shared.reassignTask(
+                teamName: teamName,
+                taskId: task.id,
+                assignee: agentName,
+                assigneeInstanceId: target.agentInstanceId
+            ) else {
+                return .taskCreateFailed
+            }
+            task = moved
+        }
         let instruction = formatDelegateInstruction(
             teamName: teamName,
             target: target,
@@ -3471,6 +4066,37 @@ final class TeamOrchestrator: ObservableObject {
             text: text,
             context: context
         )
+        if maySkipPaste {
+            // Keep the same async completion ordering as the paste path. The
+            // socket caller stores DelegateOutcome immediately after this
+            // method returns; a synchronous callback could resume it first.
+            if let completion {
+                DispatchQueue.main.async { completion(true) }
+            }
+            return .delivered(
+                DelegateResult(
+                    task: task,
+                    textDelivered: true,
+                    requestReplayed: true,
+                    instruction: instruction
+                )
+            )
+        }
+        // Mark from the completion, never from the synchronous return.
+        // `sendToAgentByPanel` answers `true` for a pipe-driven agent as soon
+        // as the write is queued on that agent's serial writer — the outcome
+        // arrives later, and it may be a failure. Marking on the optimistic
+        // Bool would record a delivery that never landed and let the next
+        // retry skip the paste, which is the very hole this closes. All three
+        // transports (native, pipe, terminal) report their real outcome here.
+        let taskId = task.id
+        let markOnDelivery: (Bool) -> Void = { landed in
+            if landed {
+                TeamDataStore.shared.markTextDelivered(
+                    teamName: teamName, taskId: taskId)
+            }
+            completion?(landed)
+        }
         // Deterministic per-pane delivery: when a valid, live, non-migrating panelId is
         // provided, bypass name round-robin (selectAgent) and paste directly into that
         // pane. The follow-up team.send_key Return carries the same panel_id (Rust side)
@@ -3488,9 +4114,16 @@ final class TeamOrchestrator: ObservableObject {
                 tabManager: tabManager,
                 withReturn: submit,
                 recordPendingReturnFor: target.agentInstanceId,
-                completion: completion
+                completion: markOnDelivery
             )
-            return DelegateResult(task: task, textDelivered: delivered, instruction: instruction)
+            return .delivered(
+                DelegateResult(
+                    task: task,
+                    textDelivered: delivered,
+                    requestReplayed: false,
+                    instruction: instruction
+                )
+            )
         }
         // CLI callers keep submit=false and send Return separately after paste ack.
         // GUI callers can submit=true to use the IME paste path's inline Return.
@@ -3503,9 +4136,52 @@ final class TeamOrchestrator: ObservableObject {
             text: instruction,
             tabManager: tabManager,
             withReturn: submit,
-            completion: completion
+            completion: markOnDelivery
         )
-        return DelegateResult(task: task, textDelivered: delivered, instruction: instruction)
+        return .delivered(
+            DelegateResult(
+                task: task,
+                textDelivered: delivered,
+                requestReplayed: false,
+                instruction: instruction
+            )
+        )
+    }
+
+    /// `delegate` for callers that only need the result, not the reason.
+    ///
+    /// Kept so in-app callers outside this change keep compiling unchanged;
+    /// anything that reports to a person should call `delegate` and say why.
+    @discardableResult
+    func delegateToAgent(
+        teamName: String,
+        agentName: String,
+        agentInstanceId: String? = nil,
+        text: String,
+        taskTitle: String? = nil,
+        priority: Int? = nil,
+        context: String? = nil,
+        requestId: String? = nil,
+        tabManager: TabManager,
+        submit: Bool = false,
+        panelId: UUID? = nil,
+        completion: ((Bool) -> Void)? = nil
+    ) -> DelegateResult? {
+        guard case let .delivered(result) = delegate(
+            teamName: teamName,
+            agentName: agentName,
+            agentInstanceId: agentInstanceId,
+            text: text,
+            taskTitle: taskTitle,
+            priority: priority,
+            context: context,
+            requestId: requestId,
+            tabManager: tabManager,
+            submit: submit,
+            panelId: panelId,
+            completion: completion
+        ) else { return nil }
+        return result
     }
 
     private func formatDelegateInstruction(
@@ -4961,6 +5637,7 @@ final class TeamOrchestrator: ObservableObject {
                 "leader_panel_id": team.leaderPanelId.uuidString,
                 "leader_endpoint": leaderEndpoint,
                 "leader_ready": team.leaderReady,
+                "leader_pane_attached": isLeaderPaneAttached(teamName: team.id),
                 "leader_failure": team.leaderFailureDescription as Any? ?? NSNull(),
                 "leader_policy_version": LeaderParallelPolicy.version,
                 "leader_policy_digest": LeaderParallelPolicy.digest,
@@ -5080,6 +5757,7 @@ final class TeamOrchestrator: ObservableObject {
             "team_name": team.id,
             "leader_session_id": team.leaderSessionId,
             "leader_ready": team.leaderReady,
+            "leader_pane_attached": isLeaderPaneAttached(teamName: team.id),
             "leader_failure": team.leaderFailureDescription as Any? ?? NSNull(),
             "leader_policy_version": LeaderParallelPolicy.version,
             "leader_policy_digest": LeaderParallelPolicy.digest,
@@ -5118,15 +5796,28 @@ final class TeamOrchestrator: ObservableObject {
                 if let branch = agent.worktreeBranch {
                     info["worktree_branch"] = branch
                 }
+                // Kept to the worktree lifecycle: present only when a task made
+                // one. `working_directory` below is where the pane actually is,
+                // which is a different question and is always answerable.
                 if let path = agent.worktreePath {
                     info["worktree_path"] = path
                 }
+                let workingDirectory = Self.agentWorkingDirectory(
+                    worktreePath: agent.worktreePath,
+                    originalAgentWorkDir: agent.originalAgentWorkDir,
+                    teamWorkingDirectory: team.workingDirectory
+                )
+                info["working_directory"] = workingDirectory as Any? ?? NSNull()
+                info["locality"] = Self.agentLocality(hostKey: agent.hostKey)
                 info["parallel_telemetry"] = [
                     "wave_id": (enrichment["active_task_id"] as? String) ?? agent.agentInstanceId,
                     "task_id": enrichment["active_task_id"] ?? NSNull(),
                     "agent_instance_id": agent.agentInstanceId,
                     "host": agent.hostKey as Any? ?? NSNull(),
-                    "checkout": agent.worktreePath ?? agent.worktreeBranch ?? agent.workspaceId.uuidString,
+                    "locality": Self.agentLocality(hostKey: agent.hostKey),
+                    // The same real path. A workspace UUID here is what sent a
+                    // leader looking for a machine that was never involved.
+                    "checkout": workingDirectory as Any? ?? NSNull(),
                     "delivery": enrichment["agent_state"] ?? "unknown",
                     "synthesis": "pending",
                 ]
@@ -5144,6 +5835,13 @@ final class TeamOrchestrator: ObservableObject {
         archive: Bool = true
     ) -> Bool {
         guard let team = teams[name] else { return false }
+        // A detached project still owns a live Workspace. Move it into the
+        // caller's manager so the normal explicit teardown below closes every
+        // panel/session instead of only deleting the team metadata.
+        if AppDelegate.shared?.tabManagerFor(tabId: team.workspaceId) == nil,
+           let preserved = detachedProjectWorkspaces.removeValue(forKey: name) {
+            tabManager.attachWorkspace(preserved, select: false)
+        }
         // Phase 2 (pane-mode resume): persist a `mode: "pane"` archive so this
         // team shows up in `Resume from previous team`. Best-effort — failures
         // don't block destroy. Headless teams are archived daemon-side by
@@ -5151,6 +5849,7 @@ final class TeamOrchestrator: ObservableObject {
         if archive {
             archivePaneTeamIfApplicable(team)
         }
+        closeRemoteLeaderSurfaceIfNeeded(teamName: name)
 
         // D3-A P2 (b): release any pending claude-sid watcher slots so
         // FSEventStream(s) for this team's workdirs tear down promptly.
@@ -5164,13 +5863,14 @@ final class TeamOrchestrator: ObservableObject {
             )
         }
         guard let workspace = tabManager.tabs.first(where: { $0.id == team.workspaceId }) else {
-            cleanupWorktrees(team: team)
+            cleanupWorktrees(team: team, name: name)
             clearResults(teamName: name)
             clearMessages(teamName: name)
             clearTasks(teamName: name)
             teams.removeValue(forKey: name)
             heartbeats.removeValue(forKey: name)
             TeamDataStore.shared.unregisterTeam(name)
+            RemoteProjectLocationStore.shared.forget(teamName: name)
             syncTeamStateToDaemon()
             return true
         }
@@ -5197,7 +5897,7 @@ final class TeamOrchestrator: ObservableObject {
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
             tabManager.closeTab(wsRef)
             // Clean up worktrees after workspace is closed
-            self.cleanupWorktrees(team: teamCopy)
+            self.cleanupWorktrees(team: teamCopy, name: name)
         }
 
         // Stop periodic render timer if no teams remain after this removal
@@ -5214,6 +5914,12 @@ final class TeamOrchestrator: ObservableObject {
 
         // Unregister from thread-safe data store (approach C: dual queue)
         TeamDataStore.shared.unregisterTeam(name)
+
+        // The team is gone, so nothing here can act on its remote checkouts
+        // any more; keeping the record would only let a later same-named team
+        // inherit paths it never created. Anything left on a peer is still
+        // reclaimable there with `tm-agent gc`.
+        RemoteProjectLocationStore.shared.forget(teamName: name)
 
         // Clean up dynamic kiro agent profiles
         Self.cleanupKiroProfiles(teamName: name)
@@ -5900,11 +6606,94 @@ final class TeamOrchestrator: ObservableObject {
         return data.hashValue
     }
 
-    /// Log detached worktrees from a destroyed team (no longer auto-deleted).
-    private func cleanupWorktrees(team: Team) {
-        for agent in team.agents {
-            guard let wtName = agent.worktreeName else { continue }
-            Logger.team.info("worktree '\(wtName, privacy: .public)' detached from agent '\(agent.name, privacy: .public)' (kept for manual cleanup)")
+    /// Reclaim one detached local agent's isolated worktree.
+    ///
+    /// Local isolated members run in a daemon-created worktree
+    /// (`term-mesh_wt_*`), not in a `PeerProjectBootstrap` checkout, so the
+    /// removal goes through the same daemon call team teardown uses. A shared
+    /// worktree, or one another agent still names, is left alone; so is a
+    /// dirty one, because `force: false` makes the daemon refuse it.
+    private func reapDetachedLocalWorktree(agent: AgentMember, team: Team) {
+        guard let name = agent.worktreeName?.nilIfBlank else { return }
+        guard name != team.sharedWorktreeName else { return }
+        let stillClaimed = team.agents.contains {
+            $0.agentInstanceId != agent.agentInstanceId && $0.worktreeName == name
+        }
+        guard !stillClaimed else { return }
+        guard let repoRoot = (team.gitRepoRoot?.nilIfBlank
+            ?? TermMeshDaemon.shared.findGitRoot(from: team.workingDirectory)) else { return }
+
+        let daemon = self.daemon
+        let agentName = agent.name
+        DispatchQueue.global(qos: .utility).async {
+            if daemon.removeWorktree(repoPath: repoRoot, name: name, force: false) {
+                Logger.team.info(
+                    "worktree '\(name, privacy: .public)' removed after detaching '\(agentName, privacy: .public)'"
+                )
+            } else {
+                Logger.team.info(
+                    "worktree '\(name, privacy: .public)' kept after detaching '\(agentName, privacy: .public)' — uncommitted changes or removal refused"
+                )
+            }
+        }
+    }
+
+    /// Reclaim the worktrees a destroyed team owned.
+    ///
+    /// This used to only log, which is why a machine that had run a few dozen
+    /// teams was carrying every worktree any of them ever created. Removal
+    /// goes through the daemon with `force: false`, so anything holding
+    /// uncommitted work is refused and survives its team — those show up in
+    /// Settings → Worktrees and in `tm-agent gc plan` for a human to judge.
+    /// Deleting a clean worktree keeps its branch and its commits.
+    private func cleanupWorktrees(team: Team, name teamName: String) {
+        guard let repoRoot = (team.gitRepoRoot?.nilIfBlank
+            ?? TermMeshDaemon.shared.findGitRoot(from: team.workingDirectory)) else {
+            for agent in team.agents where agent.worktreeName != nil {
+                Logger.team.info(
+                    "worktree '\(agent.worktreeName ?? "", privacy: .public)' left in place — no git root for team '\(teamName, privacy: .public)'"
+                )
+            }
+            return
+        }
+
+        var names = Set(team.agents.compactMap { $0.worktreeName?.nilIfBlank })
+        if let shared = team.sharedWorktreeName?.nilIfBlank {
+            names.insert(shared)
+        }
+        guard !names.isEmpty else { return }
+
+        // Shared-mode teams point several agents — and sometimes several teams
+        // — at one worktree. Anything another live team still names stays.
+        var claimedElsewhere = Set<String>()
+        for (otherName, other) in teams where otherName != teamName {
+            claimedElsewhere.formUnion(other.agents.compactMap { $0.worktreeName?.nilIfBlank })
+            if let shared = other.sharedWorktreeName?.nilIfBlank {
+                claimedElsewhere.insert(shared)
+            }
+        }
+
+        let targets = names.subtracting(claimedElsewhere).sorted()
+        for skipped in names.intersection(claimedElsewhere).sorted() {
+            Logger.team.info(
+                "worktree '\(skipped, privacy: .public)' kept — another live team still uses it"
+            )
+        }
+        guard !targets.isEmpty else { return }
+
+        let daemon = self.daemon
+        DispatchQueue.global(qos: .utility).async {
+            for name in targets {
+                if daemon.removeWorktree(repoPath: repoRoot, name: name, force: false) {
+                    Logger.team.info(
+                        "worktree '\(name, privacy: .public)' removed with team '\(teamName, privacy: .public)'"
+                    )
+                } else {
+                    Logger.team.info(
+                        "worktree '\(name, privacy: .public)' kept — uncommitted changes or removal refused"
+                    )
+                }
+            }
         }
     }
 

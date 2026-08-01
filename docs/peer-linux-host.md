@@ -14,7 +14,7 @@ this a tmux replacement rather than a remote-viewing toy.
 ```
 [ Linux server = HOST ]                       [ macOS = CLIENT ]
 term-meshd                                     term-mesh.app
-  ├ peer::serve  → /tmp/tm-peer.sock  ←ssh -L→   ├ PeerSSHTunnel (owns the ssh process)
+  ├ peer socket (see below)       ←ssh -L→       ├ PeerSSHTunnel (owns the ssh process)
   ├ forkpty: shell, logs, …                      └ term-mesh-peer-relay (pane shell, local)
   └ HTTP dashboard → 127.0.0.1:9876  ←ssh -L→   └ browser → http://127.0.0.1:19876
 ```
@@ -27,27 +27,39 @@ local shim that Ghostty spawns as the "shell" of a remote pane. Nothing but
 
 ### Quick install (recommended)
 
-One command installs the latest release, registers it as a `systemd --user`
-service, and enables lingering (so it survives logout and boots on reboot
-without an interactive login):
+One command installs the latest release. With a reachable user systemd bus it
+registers a `systemd --user` service and enables lingering (so it survives
+logout and boots without an interactive login):
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/x-mesh/term-mesh/main/scripts/install-linux.sh | bash
 ```
 
-This installs `term-meshd` to `~/.local/bin`, writes a starter config to
-`~/.config/term-mesh/peer.env` (just `TERMMESH_PEER_SOCKET`, pointing at
-`$XDG_RUNTIME_DIR`), and writes/enables
-`~/.config/systemd/user/term-meshd.service`. The peer socket is live
-immediately — no separate "declare surfaces" step is required; a single
-default `$SHELL -l` surface starts if `TERMMESH_PEER_SURFACES` is unset (see
-[Run](#run) below for the format).
+The exact paths and commands depend on the selected scope:
 
-To add surfaces or change the socket path, edit the config and restart:
+| Scope | Binary | Config | Unit | Peer socket | Service commands |
+|---|---|---|---|---|---|
+| User (default) | `~/.local/bin/term-meshd` | `~/.config/term-mesh/peer.env` | `~/.config/systemd/user/term-meshd.service` | `/run/user/<uid>/tm-peer.sock` | `systemctl --user …`; `journalctl --user …` |
+| System (root installer) | `/usr/local/bin/term-meshd` | `/etc/term-mesh/peer.env` | `/etc/systemd/system/term-meshd.service` | `/run/term-mesh/tm-peer.sock` | `systemctl …`; `journalctl …` |
+
+The system service still runs as the dedicated, non-login `term-mesh` user and
+uses systemd sandboxing; root only installs and manages it. Running the
+installer as root always selects this scope, including CentOS 7/systemd 219
+SSH sessions without a user bus. A non-root install with no user bus exits with
+instructions instead of silently creating a different service.
+
+In either scope the peer socket is live immediately. No separate "declare
+surfaces" step is required; a single default `$SHELL -l` surface starts if
+`TERMMESH_PEER_SURFACES` is unset (see [Run](#run) below for the format).
+
+To add surfaces or change the socket path, edit the matching config and restart:
 
 ```bash
 $EDITOR ~/.config/term-mesh/peer.env
 systemctl --user restart term-meshd
+# system scope instead:
+sudo $EDITOR /etc/term-mesh/peer.env
+sudo systemctl restart term-meshd
 ```
 
 Re-running the install command is safe — it updates the binary, replaces the
@@ -57,11 +69,13 @@ architecture and fetches the matching release asset. Requires systemd (most
 mainstream distros) — see [Build from source](#build-from-source) for hosts
 without it.
 
-Useful commands once installed:
+Useful commands once installed (omit `--user` for system scope):
 
 ```bash
 systemctl --user status term-meshd
 journalctl --user -u term-meshd -f
+# system scope: sudo systemctl status term-meshd
+#               sudo journalctl -u term-meshd -f
 ```
 
 ### Build from source
@@ -160,13 +174,13 @@ Peer menu → connect. Only the SSH target is required:
 | Field | Value |
 |---|---|
 | SSH target | `root@jw-server` — whatever `ssh` already accepts |
-| Remote socket | *optional* — leave empty to auto-detect (see below), or type the `TERMMESH_PEER_SOCKET` you set, e.g. `/run/user/1000/tm-peer.sock` |
+| Remote socket | `/run/term-mesh/tm-peer.sock` for the root-installed system service; non-root user services may leave this empty for auto-detection (see below) |
 
 **Auto-detect:** when the socket field is left empty, the app runs one
 short-lived ssh command against the target that checks, in order:
 
-1. `TERMMESH_PEER_SOCKET` in `~/.config/term-mesh/peer.env` (what the
-   installer writes and the systemd unit reads; last assignment wins)
+1. `TERMMESH_PEER_SOCKET` in `~/.config/term-mesh/peer.env` (the user-scope
+   installer config; last assignment wins)
 2. `$XDG_RUNTIME_DIR/tm-peer.sock`
 3. `/run/user/<uid>/tm-peer.sock` (the installer default)
 4. `/tmp/term-mesh-peer-<uid>/peer.sock` (the macOS host default)
@@ -174,6 +188,11 @@ short-lived ssh command against the target that checks, in order:
 The first live socket wins and is what gets stored in the recent-hosts
 list. Hosts with a custom socket path outside `peer.env` still need the
 path typed once — after that, recents carry it.
+
+The system-scope socket `/run/term-mesh/tm-peer.sock` and config
+`/etc/term-mesh/peer.env` are intentionally outside this per-login probe. Enter
+that socket path explicitly on the first connection; the recent-host entry
+then remembers it.
 
 The app spawns and owns the `ssh -N -T -L …` process, and reconnects with
 exponential backoff (capped at 30 s) across sleep/wake, network blips, and
@@ -296,6 +315,9 @@ Verified on Ubuntu 25.10 / x86-64 (2026-07-14):
 ### Deterministic runner verification on jw-server
 
 Verified on `root@jw-server:/app/runner` (Ubuntu x86-64, 2026-07-17).
+The commands below use the current root-installer contract: a system service,
+`/usr/local/bin/term-meshd`, and `/run/term-mesh/tm-peer.sock`. Captured
+IDs, hashes, PIDs, and protocol output remain from that verification run.
 `/app/runner` was only the child cwd. The final source build lived at
 `/tmp/term-mesh-terminate-build-20260717-095335-44485`.
 
@@ -303,15 +325,15 @@ The installed binary and both backups were measured together:
 
 ```bash
 ssh root@jw-server 'sha256sum \
-  /root/.local/bin/term-meshd \
-  /root/.local/bin/term-meshd.backup-terminate-20260717-005536 \
-  /root/.local/bin/term-meshd.backup-20260717-002500'
+  /usr/local/bin/term-meshd \
+  /usr/local/bin/term-meshd.backup-terminate-20260717-005536 \
+  /usr/local/bin/term-meshd.backup-20260717-002500'
 ```
 
 ```text
-572fe367f76484a2823150398d52c09327ae7633f34d2e309897eee1962c3a6c  /root/.local/bin/term-meshd
-f47a87c6a396211378457c71dcf9ed978071ee2d9438c730767254e4fefa2e34  /root/.local/bin/term-meshd.backup-terminate-20260717-005536
-f83f2d439702846f01ff26bacb24f9d5ab423d1e90864b02ebcd62a7920d6ff5  /root/.local/bin/term-meshd.backup-20260717-002500
+572fe367f76484a2823150398d52c09327ae7633f34d2e309897eee1962c3a6c  /usr/local/bin/term-meshd
+f47a87c6a396211378457c71dcf9ed978071ee2d9438c730767254e4fefa2e34  /usr/local/bin/term-meshd.backup-terminate-20260717-005536
+f83f2d439702846f01ff26bacb24f9d5ab423d1e90864b02ebcd62a7920d6ff5  /usr/local/bin/term-meshd.backup-20260717-002500
 ```
 
 The fixed runner command is public and reproducible:
@@ -319,7 +341,7 @@ The fixed runner command is public and reproducible:
 ```bash
 daemon/target/release/tm-agent peer ensure \
   --host root@jw-server \
-  --remote-socket /run/user/0/tm-peer.sock \
+  --remote-socket /run/term-mesh/tm-peer.sock \
   --key runner-smoke \
   --cwd /app/runner \
   --executable /bin/sh \
@@ -345,7 +367,7 @@ trap cleanup EXIT
 ssh -M -S "$CTL" -fN \
   -o ExitOnForwardFailure=yes \
   -o StreamLocalBindUnlink=yes \
-  -L "$SOCK:/run/user/0/tm-peer.sock" root@jw-server
+  -L "$SOCK:/run/term-mesh/tm-peer.sock" root@jw-server
 python3 - <<'PY'
 import os
 import sys
@@ -363,7 +385,7 @@ with PeerClient(os.environ["SOCK"], display_name="jw-runner-snapshot") as client
         )
 PY
 ssh root@jw-server '
-  main=$(systemctl --user show term-meshd.service -p MainPID --value)
+  main=$(systemctl show term-meshd.service -p MainPID --value)
   printf "daemon children (MainPID=%s):\n" "$main"
   ps -o pid=,ppid=,stat=,args= --ppid "$main"
   printf "daemon child cwd:\n"
@@ -410,7 +432,7 @@ trap cleanup EXIT
 ssh -M -S "$CTL" -fN \
   -o ExitOnForwardFailure=yes \
   -o StreamLocalBindUnlink=yes \
-  -L "$SOCK:/run/user/0/tm-peer.sock" root@jw-server
+  -L "$SOCK:/run/term-mesh/tm-peer.sock" root@jw-server
 python3 - <<'PY'
 import os
 import sys
@@ -473,7 +495,7 @@ trap cleanup EXIT
 ssh -M -S "$CTL" -fN \
   -o ExitOnForwardFailure=yes \
   -o StreamLocalBindUnlink=yes \
-  -L "$SOCK:/run/user/0/tm-peer.sock" root@jw-server
+  -L "$SOCK:/run/term-mesh/tm-peer.sock" root@jw-server
 python3 - <<'PY'
 import os
 import sys
@@ -519,7 +541,7 @@ The conflict check changed only the requested argument:
 ```bash
 daemon/target/release/tm-agent peer ensure \
   --host root@jw-server \
-  --remote-socket /run/user/0/tm-peer.sock \
+  --remote-socket /run/term-mesh/tm-peer.sock \
   --key runner-smoke --cwd /app/runner --executable /bin/sh \
   --arg=-lc --arg='exec sleep 3599' --policy on-daemon-restart
 ```
@@ -531,6 +553,7 @@ instance. Exact attach and stdin-EOF detach used:
 ```bash
 daemon/target/release/tm-agent peer attach \
   --host root@jw-server \
+  --remote-socket /run/term-mesh/tm-peer.sock \
   --surface-id 0728f1f76e3d57619135659f6b477043 </dev/null
 ```
 
@@ -561,10 +584,10 @@ The fixed ensure command created the runner before restart:
 Restart verification then used:
 
 ```bash
-ssh root@jw-server 'systemctl --user restart term-meshd.service'
+ssh root@jw-server 'systemctl restart term-meshd.service'
 daemon/target/release/tm-agent peer ensure \
   --host root@jw-server \
-  --remote-socket /run/user/0/tm-peer.sock \
+  --remote-socket /run/term-mesh/tm-peer.sock \
   --key runner-smoke \
   --cwd /app/runner \
   --executable /bin/sh \
@@ -610,7 +633,7 @@ Only that exact runner was then terminated:
 ```bash
 daemon/target/release/tm-agent peer terminate \
   --host root@jw-server \
-  --remote-socket /run/user/0/tm-peer.sock \
+  --remote-socket /run/term-mesh/tm-peer.sock \
   --surface-id 0728f1f76e3d57619135659f6b477043
 ```
 
@@ -656,7 +679,7 @@ at the end of this test.
 
 The final service was active at PID `1083594`; its installed SHA-256 remained
 `572fe367f76484a2823150398d52c09327ae7633f34d2e309897eee1962c3a6c`.
-`journalctl --user -u term-meshd.service` logged request hashes, results,
+`journalctl -u term-meshd.service` logged request hashes, results,
 surface IDs, cwd, error codes, and elapsed time without command arguments or
 environment values.
 
@@ -666,19 +689,19 @@ previous build, then compare the installed hash with the measured expected
 hash:
 
 ```bash
-install -m 755 /root/.local/bin/term-meshd.backup-terminate-20260717-005536 \
-  /root/.local/bin/.term-meshd.rollback
-mv -f /root/.local/bin/.term-meshd.rollback /root/.local/bin/term-meshd
-systemctl --user restart term-meshd.service
-systemctl --user is-active term-meshd.service
-actual=$(sha256sum /root/.local/bin/term-meshd | awk '{print $1}')
+install -m 755 /usr/local/bin/term-meshd.backup-terminate-20260717-005536 \
+  /usr/local/bin/.term-meshd.rollback
+mv -f /usr/local/bin/.term-meshd.rollback /usr/local/bin/term-meshd
+systemctl restart term-meshd.service
+systemctl is-active term-meshd.service
+actual=$(sha256sum /usr/local/bin/term-meshd | awk '{print $1}')
 expected=f47a87c6a396211378457c71dcf9ed978071ee2d9438c730767254e4fefa2e34
 test "$actual" = "$expected"
-printf '%s  %s\n' "$actual" /root/.local/bin/term-meshd
+printf '%s  %s\n' "$actual" /usr/local/bin/term-meshd
 ```
 
 To return all the way to the original build, substitute
-`/root/.local/bin/term-meshd.backup-20260717-002500`; its expected SHA-256 is
+`/usr/local/bin/term-meshd.backup-20260717-002500`; its expected SHA-256 is
 `f83f2d439702846f01ff26bacb24f9d5ab423d1e90864b02ebcd62a7920d6ff5`.
 
 Known gaps versus tmux:

@@ -77,6 +77,17 @@ enum AgentDiff {
     /// and folding it removes the only reason it was included.
     static let foldThreshold = 30
     static let foldContext = 3
+    /// The most lines this will compare before refusing to compare them.
+    ///
+    /// `maxLines` bounds what is *shown* and is applied after the walk;
+    /// `CollectionDifference` is O(N·D), so for two large sides that mostly
+    /// differ the cost is quadratic and paid before any cap is reached. It is
+    /// paid on the main actor too — `change(tool:input:)` is called from
+    /// `AgentSession.openTool`, which reads the stream there — so a full-file
+    /// `old_string`/`new_string` pair took the whole window with it. The
+    /// largest real edit measured across 88 sessions was 462 lines, so this
+    /// holds every one of them and exists for the one that is not real.
+    static let maxDiffInputLines = 4_000
 
     // MARK: - Reading a call
 
@@ -104,8 +115,13 @@ enum AgentDiff {
 
         if let old = input["old_string"] as? String,
            let new = input["new_string"] as? String {
+            let before = split(old), after = split(new)
+            if let unwalked = tooBigToDiff(path: path, kind: .edit, old: before,
+                                           new: after, everywhere: everywhere) {
+                return unwalked
+            }
             return assemble(path: path, kind: .edit,
-                            lines: lines(old: split(old), new: split(new)),
+                            lines: lines(old: before, new: after),
                             everywhere: everywhere)
         }
 
@@ -164,6 +180,20 @@ enum AgentDiff {
     /// the same point, the way every diff has done it since 1974.
     static func lines(old: [String], new: [String],
                       firstOld: Int? = nil, firstNew: Int? = nil) -> [Line] {
+        // One side empty is the whole answer already: every line of the other
+        // is an insertion or a removal. Asking Myers for it costs O(N·D) to be
+        // told what a `Write` says in its own shape, and a whole file is
+        // exactly where N is large.
+        if old.isEmpty {
+            return new.indices.map { index in
+                Line.added(new: firstNew.map { $0 + index }, text: new[index])
+            }
+        }
+        if new.isEmpty {
+            return old.indices.map { index in
+                Line.removed(old: firstOld.map { $0 + index }, text: old[index])
+            }
+        }
         var removals: [Int: String] = [:]
         var insertions: [Int: String] = [:]
         for change in new.difference(from: old) {
@@ -209,6 +239,9 @@ enum AgentDiff {
         var path = ""
         var o = 0, n = 0
         var open = false
+        /// Whether any hunk has been read yet, which `open` stops answering the
+        /// moment a damaged header closes one.
+        var began = false
 
         // A patch ends in a newline, and that final newline is a terminator
         // rather than an empty last line. Counted as one it becomes a context
@@ -224,11 +257,22 @@ enum AgentDiff {
                 if let found = headerPath(line) { path = found }
                 continue
             }
-            if let starts = hunkStarts(line) {
+            if line.hasPrefix("@@") {
+                guard let starts = hunkStarts(line) else {
+                    // A header damaged past reading says where nothing is.
+                    // Carrying the previous hunk's cursors into lines that do
+                    // not belong to it would number them wrongly, so content
+                    // stops until a header that parses — the hunk is skipped
+                    // rather than mis-placed, and earlier hunks are kept.
+                    open = false
+                    continue
+                }
                 // A second hunk means the patch skipped something without
-                // saying how much.
-                if open { out.append(.gap(0)) }
+                // saying how much — and so does a hunk after one that was
+                // dropped for being unreadable.
+                if began { out.append(.gap(0)) }
                 open = true
+                began = true
                 o = starts.old
                 n = starts.new
                 continue
@@ -299,16 +343,58 @@ enum AgentDiff {
                       lines: shown, elided: elided, everywhere: everywhere)
     }
 
+    /// A pair too large to walk, reported as its two sizes instead of diffed.
+    ///
+    /// Not `numstat` semantics, deliberately: nothing was compared, so how many
+    /// of those lines actually differ is not known here. `elided` is what tells
+    /// the row it is not showing the diff, the same way a cut one does.
+    private static func tooBigToDiff(path: String, kind: Kind, old: [String],
+                                     new: [String], everywhere: Bool) -> Change? {
+        let total = old.count + new.count
+        guard total > maxDiffInputLines else { return nil }
+        return Change(path: path, kind: kind, added: new.count, removed: old.count,
+                      lines: [], elided: total, everywhere: everywhere)
+    }
+
     private static func multiEdit(path: String, edits: [[String: Any]],
                                   everywhere: Bool) -> Change? {
         var all: [Line] = []
         var added = 0, removed = 0
         var sites = 0
         var anywhere = everywhere
-        for edit in edits {
+        var walked = 0
+        for (index, edit) in edits.enumerated() {
             guard let old = edit["old_string"] as? String,
                   let new = edit["new_string"] as? String else { continue }
-            let piece = lines(old: split(old), new: split(new))
+            let before = split(old), after = split(new)
+            // The budget is the call's, not each edit's: fifty edits of a
+            // hundred lines cost what one edit of five thousand does.
+            walked += before.count + after.count
+            if walked > maxDiffInputLines {
+                // The budget bounds the CollectionDifference walk, not plain
+                // counting: this edit and every one still to come contributes
+                // its raw before/after size to the totals (same numstat
+                // semantics `tooBigToDiff` uses) without diffing it, so a
+                // bailout row's count is never smaller than the real change.
+                sites += 1
+                added += after.count
+                removed += before.count
+                if edit["replace_all"] as? Bool == true { anywhere = true }
+                for remaining in edits[(index + 1)...] {
+                    guard let rOld = remaining["old_string"] as? String,
+                          let rNew = remaining["new_string"] as? String else { continue }
+                    let rBefore = split(rOld), rAfter = split(rNew)
+                    walked += rBefore.count + rAfter.count
+                    sites += 1
+                    added += rAfter.count
+                    removed += rBefore.count
+                    if remaining["replace_all"] as? Bool == true { anywhere = true }
+                }
+                return Change(path: path, kind: .multiEdit(sites: sites),
+                              added: added, removed: removed,
+                              lines: [], elided: walked, everywhere: anywhere)
+            }
+            let piece = lines(old: before, new: after)
             let (plus, minus) = count(piece)
             guard plus + minus > 0 else { continue }
             if sites > 0 { all.append(.site(sites)) }
@@ -414,7 +500,11 @@ enum AgentDiff {
         var new: Int?
         for part in body[..<close.lowerBound].split(separator: " ") {
             guard let mark = part.first, mark == "-" || mark == "+" else { continue }
-            let number = Int(part.dropFirst().split(separator: ",")[0])
+            // `first`, not `[0]`: a header damaged down to a bare `-` or `-,`
+            // splits to nothing at all, and indexing that was a crash — on a
+            // string a model or a bridge wrote, which is the one kind of input
+            // that must cost nothing to read.
+            let number = part.dropFirst().split(separator: ",").first.flatMap { Int($0) }
             if mark == "-", old == nil { old = number }
             if mark == "+", new == nil { new = number }
         }

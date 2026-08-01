@@ -1091,13 +1091,22 @@ fn rename_exclusive_at(
     };
     #[cfg(target_os = "linux")]
     let result = unsafe {
-        libc::renameat2(
+        // Raw renameat2 syscall rather than the glibc wrapper. The wrapper
+        // is a versioned symbol that only exists from glibc 2.28, so linking
+        // it raises the whole binary's glibc floor to 2.28 and makes it
+        // refuse to load on older hosts (RHEL/CentOS 7 ships glibc 2.17).
+        // The syscall (Linux 3.15+) is identical, so no-replace atomicity is
+        // unchanged wherever the kernel provides it; on an older kernel it
+        // returns ENOSYS, which propagates as an ordinary error below rather
+        // than aborting the process.
+        libc::syscall(
+            libc::SYS_renameat2,
             from_dir,
             from.as_ptr(),
             to_dir,
             to.as_ptr(),
             libc::RENAME_NOREPLACE,
-        )
+        ) as libc::c_int
     };
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     compile_error!("atomic no-replace rename is required for apply");

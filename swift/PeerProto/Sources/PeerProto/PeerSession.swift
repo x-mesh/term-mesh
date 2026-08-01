@@ -169,6 +169,8 @@ public struct PeerSessionInfo: Sendable, Equatable {
     /// Plumbing only for now (see P3, docs/peer-perf-proposal.md) — a hook
     /// for future wire changes (P8 and later) to query before using them.
     public let hostCapabilities: PeerCapabilities
+    /// Authenticated, validated and session-scoped host CLI directories.
+    public let hostCLIBinDirs: [String]
 
     /// Whether the host advertised `capability` in its Hello.
     public func hasHostCapability(_ capability: String) -> Bool {
@@ -206,7 +208,12 @@ public actor PeerSession {
     /// until the kernel TCP keepalive fires (default 2 hours on
     /// macOS).
     private var heartbeatTask: Task<Void, Never>?
-    private var lastPongAt: Date = Date()
+    // Use awake-time rather than wall time. `Date` advances while macOS is
+    // asleep, so the first heartbeat tick after wake used to see the whole
+    // sleep interval as host silence and tear down a healthy remote pane.
+    // `systemUptime` is backed by the suspending monotonic clock and excludes
+    // time spent asleep.
+    private var lastPongUptime: TimeInterval = ProcessInfo.processInfo.systemUptime
     /// Timestamp of the most recent inbound bytes from the host (ANY frame,
     /// not just a processed Pong). Under a heavy host→client output flood the
     /// pump loop can be blocked draining PtyData to the relay, so a Pong
@@ -215,7 +222,7 @@ public actor PeerSession {
     /// keys off this so backpressure can no longer be misread as a dead
     /// session and kill a healthy relay pane (measured pane-close root cause).
     /// See `tickHeartbeat` and `readFrame`.
-    private var lastInboundAt: Date = Date()
+    private var lastInboundUptime: TimeInterval = ProcessInfo.processInfo.systemUptime
     private var pingCounter: UInt64 = 0
     /// Set once `tickHeartbeat` observes a tick with no Pong since the
     /// previous one, and cleared as soon as a fresh Pong lands. Bounds
@@ -280,8 +287,9 @@ public actor PeerSession {
         onDead: @escaping @Sendable () -> Void
     ) {
         heartbeatTask?.cancel()
-        lastPongAt = Date()
-        lastInboundAt = Date()
+        let nowUptime = ProcessInfo.processInfo.systemUptime
+        lastPongUptime = nowUptime
+        lastInboundUptime = nowUptime
         missNotified = false
         pongSeenSinceLastTick = true
         let intervalNs = UInt64(max(intervalSeconds, 0.1) * 1_000_000_000)
@@ -327,12 +335,13 @@ public actor PeerSession {
         // Only declare the session dead when BOTH the last processed Pong AND
         // the last inbound bytes are older than the deadline. A sustained
         // host→client flood blocks the pump loop from *processing* the Pong in
-        // time, but bytes are still arriving, so `lastInboundAt` stays fresh —
+        // time, but bytes are still arriving, so `lastInboundUptime` stays fresh —
         // backpressure no longer false-positives as death (which used to send a
-        // Goodbye and close a perfectly healthy relay pane).
-        let now = Date()
-        if now.timeIntervalSince(lastPongAt) > deadAfterSeconds
-            && now.timeIntervalSince(lastInboundAt) > deadAfterSeconds {
+        // Goodbye and close a perfectly healthy relay pane). Awake-time also
+        // prevents a local Mac sleep from counting as remote host silence.
+        let nowUptime = ProcessInfo.processInfo.systemUptime
+        if nowUptime - lastPongUptime > deadAfterSeconds
+            && nowUptime - lastInboundUptime > deadAfterSeconds {
             return .dead
         }
         var result: HeartbeatTick = .alive
@@ -384,7 +393,10 @@ public actor PeerSession {
             hostAppVersion: host.appVersion,
             hostProtocolVersion: host.protocolVersion,
             sessionID: result.sessionID,
-            hostCapabilities: hostCapabilities
+            hostCapabilities: hostCapabilities,
+            hostCLIBinDirs: hostCapabilities.has(PeerCapability.hostCLIBinDirsV1)
+                ? PeerHostCLIBinDirs.validated(host.cliBinDirs)
+                : []
         )
     }
 
@@ -558,7 +570,9 @@ public actor PeerSession {
             request,
             registeredGrant: grant,
             encodedBytes: encodedBytes,
-            nowUnixSeconds: UInt64(Date().timeIntervalSince1970)
+            // The server owns expiry because only it can see and renew the
+            // uptime-based lease. This preflight checks command shape only.
+            nowUnixSeconds: 0
         ) else {
             throw PeerSessionError.invalidTeamLeaderCommand(
                 "grant, team_uuid, request_id, method or params_json is invalid"
@@ -592,7 +606,10 @@ public actor PeerSession {
     /// never on a live workspace-mirror subscription session.
     ///
     /// Returns the host-assigned workspace id on success.
-    public func createWorkspace(title: String) async throws -> Data {
+    public func createWorkspace(
+        title: String,
+        timeoutSeconds: TimeInterval = 10
+    ) async throws -> Data {
         try beginDirectResponseRPC()
         defer { directResponseRPCInFlight = false }
         try await sendEnvelope { env in
@@ -600,7 +617,10 @@ public actor PeerSession {
             req.title = title
             env.createWorkspaceRequest = req
         }
-        let reply = try await readFrame()
+        let reply = try await readFrame(
+            timeoutSeconds: timeoutSeconds,
+            operation: "createWorkspace"
+        )
         guard case .createWorkspaceResponse(let r) = reply.payload else {
             throw PeerSessionError.unexpectedMessage(
                 "expected CreateWorkspaceResponse, got \(String(describing: reply.payload))"
@@ -1044,7 +1064,7 @@ public actor PeerSession {
             // P6 first-miss/recovered edge detection (see
             // `pongSeenSinceLastTick`). Surfaced to callers as `.other`
             // since they don't need to act on it.
-            lastPongAt = Date()
+            lastPongUptime = ProcessInfo.processInfo.systemUptime
             pongSeenSinceLastTick = true
             return .other
         case .ptyData(let p):
@@ -1274,14 +1294,20 @@ public actor PeerSession {
     /// listing behind the pane picker, which made a host unreachable
     /// outright.
     ///
-    /// Only stats are dropped. An `Error` frame still surfaces, and every
-    /// other push is left alone rather than quietly discarded here, where
-    /// no caller would ever see it.
+    /// One-shot direct-response connections have no push consumer. Drop the
+    /// host's telemetry and workspace roster/layout pushes while waiting for
+    /// the requested reply; these can race a response immediately after a
+    /// split or new-tab request. An `Error` frame and reverse leader request
+    /// still surface rather than disappearing here.
     private func readFrame() async throws -> Termmesh_Peer_V1_Envelope {
         while true {
             let env = try await readAnyFrame()
-            if case .hostStats = env.payload { continue }
-            return env
+            switch env.payload {
+            case .hostStats, .workspaceUpdate, .workspaceListChanged:
+                continue
+            default:
+                return env
+            }
         }
     }
 
@@ -1339,7 +1365,7 @@ public actor PeerSession {
             // Inbound liveness: any bytes from the host prove the session is
             // alive, even when the pump loop is too backpressured to reach the
             // Pong buried behind a PtyData flood. See `tickHeartbeat`.
-            lastInboundAt = Date()
+            lastInboundUptime = ProcessInfo.processInfo.systemUptime
         }
     }
 }

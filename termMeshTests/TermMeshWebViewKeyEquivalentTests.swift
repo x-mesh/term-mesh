@@ -100,6 +100,40 @@ final class SplitShortcutTransientFocusGuardTests: XCTestCase {
     }
 }
 
+final class PeerRelayWorkspaceShortcutActionTests: XCTestCase {
+    func testCommandWClosesOnlyTheRemotePane() {
+        XCTAssertEqual(
+            peerRelayWorkspaceShortcutAction(
+                characters: "w",
+                keyCode: 13,
+                modifiers: [.command]
+            ),
+            .closePane
+        )
+    }
+
+    func testCommandShiftWClosesTheRelayWindow() {
+        XCTAssertEqual(
+            peerRelayWorkspaceShortcutAction(
+                characters: "W",
+                keyCode: 13,
+                modifiers: [.command, .shift]
+            ),
+            .closeWindow
+        )
+    }
+
+    func testCloseShortcutRequiresCommand() {
+        XCTAssertNil(
+            peerRelayWorkspaceShortcutAction(
+                characters: "w",
+                keyCode: 13,
+                modifiers: [.shift]
+            )
+        )
+    }
+}
+
 final class TermMeshWebViewKeyEquivalentTests: XCTestCase {
     private final class ActionSpy: NSObject {
         private(set) var invoked: Bool = false
@@ -2397,6 +2431,18 @@ final class WorkspaceReorderTests: XCTestCase {
 
 @MainActor
 final class TabManagerChildExitCloseTests: XCTestCase {
+    func testChildExitPolicyPreservesRemoteRelayPanel() {
+        XCTAssertTrue(
+            TabManager.shouldPreservePanelAfterChildExit(isRemoteRelay: true)
+        )
+    }
+
+    func testChildExitPolicyDoesNotPreserveOrdinaryTerminalPanel() {
+        XCTAssertFalse(
+            TabManager.shouldPreservePanelAfterChildExit(isRemoteRelay: false)
+        )
+    }
+
     func testChildExitOnLastPanelClosesSelectedWorkspaceAndKeepsIndexStable() {
         let manager = TabManager()
         let first = manager.tabs[0]

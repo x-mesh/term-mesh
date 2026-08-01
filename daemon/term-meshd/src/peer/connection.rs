@@ -32,13 +32,14 @@ use tokio::net::UnixStream;
 use tokio::sync::{broadcast, mpsc, Notify, OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinHandle;
 
-use crate::monitor::SystemSnapshot;
 use super::framing::{read_envelope, write_envelope};
 use super::layout::{self, PeerHost};
 use super::surface::{
     EnsureDisposition, EnsureError, EnsureOutcome, EnsureRestartPolicy, PtyChunk, PtySurface,
     SurfaceSpec,
 };
+use crate::headless::cli_builder::executable_bin_dir;
+use crate::monitor::SystemSnapshot;
 
 pub const PROTOCOL_VERSION: &str = "1.0.0";
 pub const HOST_DISPLAY_NAME_ENV: &str = "TERMMESH_PEER_DISPLAY_NAME";
@@ -891,6 +892,10 @@ fn host_stats_from(snapshot: &SystemSnapshot) -> HostStats {
         // narrowing a float the monitor computed by dividing a byte delta.
         net_rx_bytes_per_sec: net_rx.max(0.0) as u64,
         net_tx_bytes_per_sec: net_tx.max(0.0) as u64,
+        // Absolute capacity, so a viewer can warn before a peer runs out of
+        // room. Zero total means the host could not measure it.
+        disk_total_bytes: snapshot.disk_total_bytes,
+        disk_available_bytes: snapshot.disk_available_bytes,
     }
 }
 
@@ -1241,30 +1246,38 @@ pub(crate) fn reap_if_abandoned(host: &Arc<PeerHost>, surface_id: &[u8]) {
 /// Sound only because a peer is always another machine the same person owns;
 /// `team.leader.v1` scopes its caller with a registered grant because that
 /// caller is an autonomous process rather than a person.
+const TEAM_CALL_ALLOWED_METHODS: &[&str] = &[
+    "team.status",
+    "team.list",
+    "team.read",
+    "team.collect",
+    "team.reports",
+    "team.result.status",
+    "team.result.collect",
+    "team.inbox",
+    "team.message.list",
+    "team.send",
+    "team.broadcast",
+    "team.delegate",
+    "team.message.post",
+    "team.task.list",
+    "team.task.get",
+    "team.task.create",
+    "team.task.update",
+    "team.task.done",
+    "team.task.block",
+    "team.task.review",
+    "team.task.unblock",
+    "team.task.approve",
+    // Reads what a task changed. The only method here that reaches the
+    // filesystem: the host resolves the worktree from the task row the peer
+    // names — no path, ref or command comes from the caller — and runs a fixed
+    // read. See the Swift mirror for the full reasoning.
+    "team.task.diff",
+];
+
 pub(crate) fn team_call_allowed(method: &str) -> bool {
-    matches!(
-        method,
-        "team.status"
-            | "team.list"
-            | "team.read"
-            | "team.collect"
-            | "team.reports"
-            | "team.inbox"
-            | "team.message.list"
-            | "team.send"
-            | "team.broadcast"
-            | "team.delegate"
-            | "team.message.post"
-            | "team.task.list"
-            | "team.task.get"
-            | "team.task.create"
-            | "team.task.update"
-            // Reads what a task changed. The only method here that reaches the
-            // filesystem: the host resolves the worktree from the task row the
-            // peer names — no path, ref or command comes from the caller — and
-            // runs a fixed read. See the Swift mirror for the full reasoning.
-            | "team.task.diff"
-    )
+    TEAM_CALL_ALLOWED_METHODS.contains(&method)
 }
 
 /// Run one allow-listed `team.*` method against a headless team manager.
@@ -1430,6 +1443,7 @@ fn host_hello(seq_counter: &AtomicU64, has_teams: bool) -> Envelope {
                 })
                 .collect(),
             app_version: env!("CARGO_PKG_VERSION").into(),
+            cli_bin_dirs: executable_bin_dir().into_iter().collect(),
         })),
     }
 }
@@ -2811,8 +2825,8 @@ mod terminate_tests {
             memory_percent: 50.0,
             cpu_count: 8,
             cpu_usage_percent: 12.5,
-            disk_total_bytes: 0,
-            disk_available_bytes: 0,
+            disk_total_bytes: 500_000_000_000,
+            disk_available_bytes: 20_000_000_000,
             disk_read_bytes_per_sec: 1_024,
             disk_write_bytes_per_sec: 2_048,
             processes: Vec::new(),
@@ -2851,6 +2865,16 @@ mod terminate_tests {
 
         assert_eq!(stats.net_rx_bytes_per_sec, 1_150);
         assert_eq!(stats.net_tx_bytes_per_sec, 2_225);
+    }
+
+    /// A viewer cannot warn about a peer running out of room unless capacity
+    /// actually travels — the rate fields alone never show a full disk.
+    #[test]
+    fn host_stats_carries_disk_capacity() {
+        let stats = host_stats_from(&snapshot_with_network(vec![("eth0", 1.0, 1.0)]));
+
+        assert_eq!(stats.disk_total_bytes, 500_000_000_000);
+        assert_eq!(stats.disk_available_bytes, 20_000_000_000);
     }
 
     /// A host with no interfaces up must report zero rather than refuse to
@@ -2996,11 +3020,12 @@ mod resume_tests {
 
 #[cfg(test)]
 mod team_leader_capability_tests {
+    use std::path::Path;
     use std::sync::atomic::AtomicU64;
 
     use peer_proto::{capability, v1::envelope::Payload};
 
-    use super::host_hello;
+    use super::{executable_bin_dir, host_hello};
 
     #[test]
     fn no_team_host_still_advertises_reverse_remote_leader_route() {
@@ -3022,11 +3047,31 @@ mod team_leader_capability_tests {
             .iter()
             .any(|cap| cap == capability::TEAM_CALL_V1));
     }
+
+    #[test]
+    fn host_hello_advertises_its_authenticated_cli_bin_directory() {
+        let envelope = host_hello(&AtomicU64::new(0), false);
+        let Some(Payload::Hello(hello)) = envelope.payload else {
+            panic!("host hello must contain Hello payload");
+        };
+        assert!(hello
+            .capabilities
+            .iter()
+            .any(|cap| cap == capability::HOST_CLI_BIN_DIRS_V1));
+        assert_eq!(
+            hello.cli_bin_dirs,
+            executable_bin_dir().into_iter().collect::<Vec<_>>()
+        );
+        assert!(hello
+            .cli_bin_dirs
+            .iter()
+            .all(|path| !path.is_empty() && Path::new(path).is_absolute()));
+    }
 }
 
 #[cfg(test)]
 mod team_call_allow_list_tests {
-    use super::team_call_allowed;
+    use super::{team_call_allowed, TEAM_CALL_ALLOWED_METHODS};
 
     /// The allow-list is the security boundary of `team.call.v1`, and it is
     /// written twice — here and in the Swift host's `PeerTeamCall`. Two copies
@@ -3037,7 +3082,7 @@ mod team_call_allow_list_tests {
     /// Reading the Swift source is crude but it is the only thing that can
     /// actually fail when the two disagree.
     #[test]
-    fn the_swift_mirror_lists_exactly_the_same_methods() {
+    fn swift_and_rust_team_call_allow_lists_match() {
         let swift = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../swift/PeerProto/Sources/PeerProto/PeerTeamCall.swift");
         let source = std::fs::read_to_string(&swift)
@@ -3065,53 +3110,13 @@ mod team_call_allow_list_tests {
             .collect();
         mirrored.sort();
         assert!(!mirrored.is_empty(), "parsed nothing out of the Swift list");
-
-        for method in &mirrored {
-            assert!(
-                team_call_allowed(method),
-                "{method} is allowed by the Swift host but refused here"
-            );
-        }
-        // And the other direction: a method this host allows that Swift does
-        // not would be just as much of a split.
-        for method in KNOWN_METHODS {
-            assert_eq!(
-                team_call_allowed(method),
-                mirrored.iter().any(|m| m == method),
-                "{method} is allowed on one host and not the other"
-            );
-        }
+        let mut rust: Vec<String> = TEAM_CALL_ALLOWED_METHODS
+            .iter()
+            .map(|method| (*method).to_string())
+            .collect();
+        rust.sort();
+        assert_eq!(mirrored, rust, "Swift and Rust allow-lists diverged");
     }
-
-    /// Every method the boundary has an opinion about, so the comparison above
-    /// covers refusals too rather than only what happens to be listed.
-    const KNOWN_METHODS: &[&str] = &[
-        "team.status",
-        "team.list",
-        "team.read",
-        "team.collect",
-        "team.reports",
-        "team.inbox",
-        "team.message.list",
-        "team.send",
-        "team.broadcast",
-        "team.delegate",
-        "team.message.post",
-        "team.task.list",
-        "team.task.get",
-        "team.task.create",
-        "team.task.update",
-        "team.task.diff",
-        // Deliberately out: these spawn or tear down processes and take a
-        // working directory, so a peer holding one could start an arbitrary
-        // command anywhere on the host.
-        "team.create",
-        "team.destroy",
-        "team.attach",
-        "team.detach",
-        "team.add_agent",
-        "team.restart",
-    ];
 
     /// The reason `team.task.diff` was allowed at all: it names no path and no
     /// command. Guarding the refusals explicitly keeps a later "just one more
@@ -3129,6 +3134,40 @@ mod team_call_allow_list_tests {
             assert!(!team_call_allowed(method), "{method} must stay out");
         }
         assert!(team_call_allowed("team.task.diff"));
+    }
+
+    #[test]
+    fn scoped_task_methods_match_the_cli_allow_list() {
+        let cli = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../term-mesh-cli/src/tm_agent.rs");
+        let source = std::fs::read_to_string(&cli)
+            .unwrap_or_else(|e| panic!("read {}: {e}", cli.display()));
+        let body = source
+            .split_once("fn remote_leader_method_allowed(method: &str) -> bool {")
+            .expect("CLI remote-leader allow-list")
+            .1
+            .split_once("\n}")
+            .expect("CLI allow-list closing brace")
+            .0;
+        let mut cli_methods: Vec<&str> = body
+            .lines()
+            .filter_map(|line| {
+                let start = line.find('\"')? + 1;
+                let end = start + line[start..].find('\"')?;
+                Some(&line[start..end])
+            })
+            .collect();
+        let mut daemon_methods: Vec<&str> = TEAM_CALL_ALLOWED_METHODS
+            .iter()
+            .copied()
+            .filter(|method| *method != "team.list")
+            .collect();
+        cli_methods.sort();
+        daemon_methods.sort();
+
+        assert_eq!(cli_methods, daemon_methods);
+        assert!(team_call_allowed("team.task.done"));
+        assert!(!team_call_allowed("team.task.reassign"));
     }
 }
 

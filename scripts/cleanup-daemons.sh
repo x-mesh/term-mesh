@@ -201,13 +201,26 @@ echo "=== Tag data directories ==="
 TAG_DIRS=0
 for dir in /tmp/term-mesh-*/; do
   [ -d "$dir" ] 2>/dev/null || continue
+  [ -L "${dir%/}" ] && continue
   # Peer socket dirs are live infrastructure, not tag leftovers — the socket
-  # section above already reclaims stale sockets inside them.
-  case "$dir" in */term-mesh-peer-*) continue ;; esac
+  # section above already reclaims stale sockets inside them. The same prefix
+  # is shared by other live state (agent FIFOs, worktree locks, relay dirs),
+  # so only directories that actually hold a build are treated as tag data.
+  case "$dir" in
+    */term-mesh-peer-*) continue ;;
+    */term-mesh-agent-pipes/|*/term-mesh-worktree-locks/|*/term-mesh-paste/) continue ;;
+  esac
+  [ -d "$dir/Build" ] || continue
   AGE=$(( ( $(date +%s) - $(stat -f %m "$dir") ) / 86400 ))
   echo "  $dir (${AGE}d old)"
   TAG_DIRS=$((TAG_DIRS + 1))
   if $KILL && [ "$AGE" -gt 7 ]; then
+    # A tagged app runs its binary out of this very directory, so an old mtime
+    # does not mean nobody is using it.
+    if pgrep -f "$dir" >/dev/null 2>&1; then
+      echo "    → kept (a running process still uses it)"
+      continue
+    fi
     rm -rf "$dir"
     echo "    → removed (older than 7 days)"
   fi

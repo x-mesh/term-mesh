@@ -669,7 +669,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
     /// tidy exit is worth a second, not a quit that hangs because a peer
     /// stopped answering.
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
-        guard TeamOrchestrator.shared.releaseAllRemoteAgentsForQuit() else {
+        let sweepingWorktrees = startQuitWorktreeCleanup()
+        let releasingRemotes = TeamOrchestrator.shared.releaseAllRemoteAgentsForQuit()
+        guard sweepingWorktrees || releasingRemotes else {
             return .terminateNow
         }
 #if DEBUG
@@ -681,6 +683,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
             NSApp.reply(toApplicationShouldTerminate: true)
         }
         return .terminateLater
+    }
+
+    /// Reclaim clean, unreferenced worktrees on the way out, if the user asked
+    /// for that in Settings.
+    ///
+    /// The "Auto-Cleanup on Quit" toggle shipped with nothing reading it, so
+    /// worktrees piled up even for people who had explicitly opted in. Bounded
+    /// by the same quit grace as remote release: whatever the sweep does not
+    /// finish is picked up by the next quit, by the Worktree Manager, or by
+    /// `tm-agent gc sweep`. Only clean, unreferenced worktrees are eligible.
+    private func startQuitWorktreeCleanup() -> Bool {
+        guard daemon.worktreeAutoCleanup else { return false }
+        let daemon = self.daemon
+        DispatchQueue.global(qos: .utility).async {
+            let result = daemon.cleanupAllStaleWorktrees()
+            if result.removed > 0 || result.skippedDirty > 0 {
+                NSLog(
+                    "quit worktree cleanup: removed \(result.removed), kept \(result.skippedDirty) dirty"
+                )
+            }
+        }
+        return true
     }
 
     func applicationWillTerminate(_ notification: Notification) {
@@ -703,7 +727,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         // by the daemon's own shutdown path.
         TeamOrchestrator.shared.archiveAllLivePaneTeamsForQuit()
         TerminalController.shared.stop()
-        // Worktree auto-cleanup disabled — worktrees are managed explicitly via Worktree Manager
+        // Worktree cleanup, if enabled, was started in applicationShouldTerminate
+        // so it can run while the daemon is still up.
         daemon.stopDaemon()
         browserHistory.flushPendingSaves()
         PostHogAnalytics.shared.flush()

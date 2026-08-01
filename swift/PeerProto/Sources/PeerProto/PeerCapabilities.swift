@@ -45,6 +45,8 @@ public enum PeerCapability {
     /// which lets this client clear stale local scrollback and reset its
     /// wire-gap baseline. Mirrors `GRID_SNAPSHOT_V1` on the Rust side.
     public static let gridSnapshotV1 = "grid.snapshot.v1"
+    /// Authenticated host-reported directories containing bundled CLIs.
+    public static let hostCLIBinDirsV1 = "host.cli-bin-dirs.v1"
 
     /// The host answers `ListTeams` with the agent teams it runs. Advertised
     /// by the HOST — only a host with a team manager can answer, and a team
@@ -63,7 +65,40 @@ public enum PeerCapability {
     /// Every capability this build supports. Single source of truth for
     /// populating outgoing `Hello.capabilities` — don't hand-roll the list
     /// at each call site.
-    public static let supported: [String] = [ptyDataCoalesceV1, replayRingV1, workspaceLifecycleV1, workspaceListSubscribeV1, surfaceEnsureV1, surfaceTerminateV1, hostStatsV1, gridSnapshotV1, teamRosterV1, teamCallV1, teamLeaderV1]
+    public static let supported: [String] = [ptyDataCoalesceV1, replayRingV1, workspaceLifecycleV1, workspaceListSubscribeV1, surfaceEnsureV1, surfaceTerminateV1, hostStatsV1, gridSnapshotV1, hostCLIBinDirsV1, teamRosterV1, teamCallV1, teamLeaderV1]
+}
+
+/// Strict validation for host-controlled Hello.cli_bin_dirs. Invalid input
+/// disables this optional hint; it never aborts an otherwise valid session.
+public enum PeerHostCLIBinDirs {
+    public static let maximumCount = 2
+    public static let maximumUTF8Bytes = 4096
+
+    public static func validated(_ candidates: [String]) -> [String] {
+        guard candidates.count <= maximumCount else { return [] }
+        var seen = Set<String>()
+        var result: [String] = []
+        for candidate in candidates {
+            guard candidate.utf8.count <= maximumUTF8Bytes, isSafe(candidate) else { return [] }
+            let standardized = "/" + candidate
+                .split(separator: "/", omittingEmptySubsequences: true)
+                .joined(separator: "/")
+            guard isSafe(standardized) else { return [] }
+            if seen.insert(standardized).inserted { result.append(standardized) }
+        }
+        return result
+    }
+
+    private static func isSafe(_ path: String) -> Bool {
+        guard path.hasPrefix("/"), path != "/", !path.isEmpty else { return false }
+        guard !path.unicodeScalars.contains(where: { $0.value < 0x20 || $0.value == 0x7f }) else {
+            return false
+        }
+        let forbidden = Set<Character>(":~$*?[]{}\"")
+        guard !path.contains(where: forbidden.contains) else { return false }
+        let components = path.split(separator: "/", omittingEmptySubsequences: false)
+        return !components.contains(".") && !components.contains("..")
+    }
 }
 
 /// The other side's advertised feature flags, parsed once out of its

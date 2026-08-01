@@ -9,6 +9,7 @@ use tokio::task::JoinSet;
 use tokio::time::{timeout, Duration};
 
 use crate::agent::AgentSessionManager;
+use crate::gc;
 use crate::headless::HeadlessManager;
 use crate::monitor::{Anomaly, MonitorHandle, SystemSnapshot};
 use crate::pane_tracker::PaneTracker;
@@ -844,6 +845,38 @@ fn truncate_utf8(s: &str, max: usize) -> &str {
     &s[..end]
 }
 
+/// Wrap a reverse leader-call answer for the CLI's proxy decoder.
+///
+/// Both dispositions are a *successful proxy*: the peer was reached and it
+/// answered. A rejection used to be collapsed into a generic JSON-RPC error
+/// string (`"{code}: {message}"`), which `decode_daemon_response` handed
+/// straight back to the caller, so `remote_leader_proxy_result` on the CLI
+/// side never saw the `{ok:false, result:{error_code, error_message}}` shape
+/// it parses — the error code, and every code-aware behaviour keyed on it
+/// (`[agent_busy]` hints, explicit unsupported-method detection), was lost
+/// before reaching the caller. Only a transport failure is an `Err` now.
+fn team_leader_proxy_envelope(
+    response: &peer_proto::v1::TeamLeaderCommandResponse,
+) -> serde_json::Value {
+    if response.ok {
+        let result = serde_json::from_str(&response.result_json)
+            .unwrap_or_else(|_| serde_json::json!({ "raw": response.result_json }));
+        return serde_json::json!({
+            "ok": true,
+            "cached": response.cached,
+            "result": result,
+        });
+    }
+    serde_json::json!({
+        "ok": false,
+        "cached": response.cached,
+        "result": {
+            "error_code": response.error_code,
+            "error_message": response.error_message,
+        },
+    })
+}
+
 /// `events.publish {kind:"xk_run", …}` — XK-EVENTS-v1 external-run telemetry
 /// (x-kit panel integration Phase 2). Validates, caps sizes, stamps `ts_ms`
 /// server-side (consistent with the task_status/reply publish path), and fans
@@ -1280,6 +1313,121 @@ const ASSIGNED_TIMEOUT_OTHER_MS: u64 = 360_000;
 
 /// Walk the synced team-state JSON to build `agent_name -> cli` so the
 /// assigned-timeout watcher can pick the right threshold per assignee.
+/// Everything the daemon currently considers in use, handed to the GC so its
+/// scan stays a pure function of (filesystem, refs, clock).
+///
+/// Collected here rather than inside `crate::gc` because only the socket layer
+/// can reach the session database and the Swift-synced team state.
+async fn collect_gc_refs(ctx: &Context) -> gc::GcRefs {
+    let active_team_uuids = {
+        let state = ctx.team_state.read().unwrap();
+        state
+            .get("teams")
+            .and_then(serde_json::Value::as_array)
+            .map(|teams| {
+                teams
+                    .iter()
+                    .filter_map(|team| {
+                        team.get("id")
+                            .or_else(|| team.get("uuid"))
+                            .or_else(|| team.get("workspace_id"))
+                            .and_then(serde_json::Value::as_str)
+                            .map(str::to_string)
+                    })
+                    .collect::<HashSet<String>>()
+            })
+            .unwrap_or_default()
+    };
+
+    gc::GcRefs {
+        active_session_worktrees: ctx.agent_manager.active_worktree_paths(),
+        active_task_worktrees: ctx.agent_manager.active_task_worktree_paths(),
+        repo_paths: ctx.agent_manager.known_repo_paths(),
+        active_team_uuids,
+    }
+}
+
+/// Shared scan step for `gc.status` / `gc.plan` / `gc.sweep`.
+fn gc_scan(params: serde_json::Value, refs: gc::GcRefs) -> Result<gc::GcPlan, String> {
+    let opts: gc::GcOptions = serde_json::from_value(params)
+        .map_err(|error| format!("INVALID_PARAMS: invalid GC options: {error}"))?;
+    let paths = gc::default_paths().ok_or_else(|| "cannot resolve home directory".to_string())?;
+    Ok(gc::build_plan(&paths, &opts, &refs))
+}
+
+async fn gc_scan_off_thread(
+    ctx: &Context,
+    params: serde_json::Value,
+) -> Result<gc::GcPlan, String> {
+    let refs = collect_gc_refs(ctx).await;
+    tokio::task::spawn_blocking(move || gc_scan(params, refs))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+/// Machine-wide reclamation summary.
+///
+/// A `project_id` in the params selects the original project-scoped response
+/// shape (validated project plus the `eligible`/`retention_days` keys the
+/// pre-GC stub returned) so older CLI builds keep working unchanged.
+async fn gc_status(ctx: &Context, req: &Request) -> Result<serde_json::Value, String> {
+    let legacy_project = match project_id_param(&req.params) {
+        Ok(project_id) => {
+            load_project(ctx, project_id).await?;
+            Some(project_id.to_string())
+        }
+        Err(_) => None,
+    };
+
+    let plan = gc_scan_off_thread(ctx, req.params.clone()).await?;
+    let mut result = gc::summarize(&plan);
+    if let Some(object) = result.as_object_mut() {
+        object.insert("state".into(), serde_json::json!("idle"));
+        object.insert(
+            "last_sweep".into(),
+            serde_json::to_value(gc::last_sweep()).unwrap_or(serde_json::Value::Null),
+        );
+        if let Some(project_id) = legacy_project {
+            object.insert("project_id".into(), serde_json::json!(project_id));
+            object.insert("eligible".into(), serde_json::json!(false));
+            object.insert("retention_days".into(), serde_json::json!(90));
+        }
+    }
+    Ok(result)
+}
+
+#[derive(Debug, serde::Deserialize, Default)]
+struct GcSweepFlags {
+    #[serde(default)]
+    apply: bool,
+    #[serde(default)]
+    force: bool,
+}
+
+fn parse_gc_sweep_flags(params: serde_json::Value) -> Result<GcSweepFlags, String> {
+    serde_json::from_value(params)
+        .map_err(|error| format!("INVALID_PARAMS: invalid GC sweep flags: {error}"))
+}
+
+async fn gc_sweep(ctx: &Context, req: &Request) -> Result<serde_json::Value, String> {
+    let flags = parse_gc_sweep_flags(req.params.clone())?;
+
+    let plan = gc_scan_off_thread(ctx, req.params.clone()).await?;
+    // The scan may be expensive. Refresh live session/task references after it
+    // finishes so the apply pass cannot rely only on the snapshot from before
+    // the filesystem walk. `execute_sweep` also rechecks each worktree's git
+    // state immediately before removal.
+    let current_refs = collect_gc_refs(ctx).await;
+    tokio::task::spawn_blocking(move || {
+        let paths =
+            gc::default_paths().ok_or_else(|| "cannot resolve home directory".to_string())?;
+        gc::execute_sweep(&paths, &plan, flags.apply, flags.force, &current_refs)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+    .map(|summary| serde_json::to_value(summary).unwrap_or(serde_json::Value::Null))
+}
+
 /// Returns an empty map when no team state has been synced yet — callers fall
 /// back to the claude default.
 fn extract_assignee_cli_map(state: &serde_json::Value) -> HashMap<String, String> {
@@ -1789,19 +1937,18 @@ async fn dispatch(req: &Request, ctx: &Context) -> Response {
                 Err(error) => Err(error),
             }
         }
-        "gc.status" => match project_id_param(&req.params) {
-            Ok(project_id) => match load_project(ctx, project_id).await {
-                Ok(_) => Ok(serde_json::json!({
-                    "project_id": project_id.to_string(),
-                    "state": "idle",
-                    "eligible": false,
-                    "retention_days": 90,
-                    "reason": "gc_coordinator_not_initialized",
-                })),
-                Err(error) => Err(error),
-            },
-            Err(error) => Err(error),
-        },
+        // --- Disk reclamation (crate::gc) ---
+        // All three walk the filesystem and shell out to libgit2, so they run
+        // off the async runtime like the worktree.* handlers above.
+        //
+        // `gc.status` keeps its original project-scoped shape when a caller
+        // passes project_id, so older CLIs keep working, and answers about the
+        // machine as a whole when it does not.
+        "gc.status" => gc_status(ctx, req).await,
+        "gc.plan" => gc_scan_off_thread(ctx, req.params.clone())
+            .await
+            .map(|plan| serde_json::to_value(plan).unwrap_or(serde_json::Value::Null)),
+        "gc.sweep" => gc_sweep(ctx, req).await,
 
         "daemon.status" => {
             let uptime_secs = crate::START_TIME
@@ -2528,6 +2675,7 @@ async fn dispatch(req: &Request, ctx: &Context) -> Response {
                                 if let Err(error) = peer_proto::team_leader::validate_grant(
                                     &grant,
                                     Some(&grant),
+                                    Some(u64::MAX),
                                     &grant.project_id,
                                     &p.team_uuid,
                                     now,
@@ -2547,25 +2695,9 @@ async fn dispatch(req: &Request, ctx: &Context) -> Response {
                                     )
                                     .await
                                     {
-                                        Ok(response) if response.ok => {
-                                            let result = serde_json::from_str(
-                                                &response.result_json,
-                                            )
-                                            .unwrap_or_else(|_| {
-                                                serde_json::json!({
-                                                    "raw": response.result_json
-                                                })
-                                            });
-                                            Ok(serde_json::json!({
-                                                "ok": true,
-                                                "cached": response.cached,
-                                                "result": result,
-                                            }))
+                                        Ok(response) => {
+                                            Ok(team_leader_proxy_envelope(&response))
                                         }
-                                        Ok(response) => Err(format!(
-                                            "{}: {}",
-                                            response.error_code, response.error_message
-                                        )),
                                         Err(error) => Err(error),
                                     }
                                 }
@@ -4409,6 +4541,96 @@ async fn query_gui_team_workers(app_socket: &str, team_id: &str) -> Vec<String> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn malformed_gc_params_fail_closed_instead_of_scanning_every_category() {
+        let error = gc_scan(
+            serde_json::json!({"categories": "team_results"}),
+            gc::GcRefs::default(),
+        )
+        .unwrap_err();
+        assert!(error.starts_with("INVALID_PARAMS:"));
+
+        let error = parse_gc_sweep_flags(serde_json::json!({"apply": "yes"})).unwrap_err();
+        assert!(error.starts_with("INVALID_PARAMS:"));
+    }
+
+    fn leader_response(
+        ok: bool,
+        result_json: &str,
+        error_code: &str,
+        error_message: &str,
+    ) -> peer_proto::v1::TeamLeaderCommandResponse {
+        peer_proto::v1::TeamLeaderCommandResponse {
+            request_id: vec![0u8; 16],
+            ok,
+            cached: false,
+            result_json: result_json.to_string(),
+            error_code: error_code.to_string(),
+            error_message: error_message.to_string(),
+            ..Default::default()
+        }
+    }
+
+    /// A rejected remote-leader command must still reach the CLI as a
+    /// structured envelope.
+    ///
+    /// This is the half that was missing: the old code turned a non-ok
+    /// response into `Err("{code}: {message}")`, which became a generic
+    /// JSON-RPC error and was handed back verbatim by
+    /// `decode_daemon_response`, so the CLI's `remote_leader_proxy_result`
+    /// never saw `error_code` at all. The existing tests only exercised that
+    /// downstream helper with a hand-built value, so they kept passing while
+    /// nothing upstream produced the shape.
+    #[test]
+    fn rejected_leader_command_keeps_error_code_in_a_proxy_envelope() {
+        let envelope = team_leader_proxy_envelope(&leader_response(
+            false,
+            "",
+            "expired_grant",
+            "leader grant expired before dispatch",
+        ));
+
+        assert_eq!(envelope["ok"], serde_json::json!(false));
+        assert_eq!(envelope["result"]["error_code"], "expired_grant");
+        assert_eq!(
+            envelope["result"]["error_message"],
+            "leader grant expired before dispatch"
+        );
+    }
+
+    /// `agent_busy` is the case the code is load-bearing for: the CLI keys a
+    /// retry hint on it, and a flattened string would silently drop that.
+    #[test]
+    fn busy_agent_rejection_survives_as_a_readable_code() {
+        let envelope =
+            team_leader_proxy_envelope(&leader_response(false, "", "agent_busy", "executor busy"));
+
+        assert_eq!(envelope["result"]["error_code"], "agent_busy");
+        assert!(
+            envelope["result"]["error_message"].is_string(),
+            "message must stay a field, not be folded into the code"
+        );
+    }
+
+    #[test]
+    fn accepted_leader_command_parses_result_json() {
+        let envelope =
+            team_leader_proxy_envelope(&leader_response(true, r#"{"team_name":"demo"}"#, "", ""));
+
+        assert_eq!(envelope["ok"], serde_json::json!(true));
+        assert_eq!(envelope["result"]["team_name"], "demo");
+    }
+
+    /// A leader that answers ok with a non-JSON body must not be reported as
+    /// a failure — the raw text is carried instead.
+    #[test]
+    fn accepted_leader_command_with_unparsable_body_falls_back_to_raw() {
+        let envelope = team_leader_proxy_envelope(&leader_response(true, "not json", "", ""));
+
+        assert_eq!(envelope["ok"], serde_json::json!(true));
+        assert_eq!(envelope["result"]["raw"], "not json");
+    }
 
     /// A corrupt registry used to abort `serve` AFTER the socket was bound,
     /// leaving a listener-less socket file — the control plane looked up but

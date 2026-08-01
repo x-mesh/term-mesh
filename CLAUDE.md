@@ -50,8 +50,15 @@ After making code changes, always run the reload script with a tag to launch the
 After making code changes, always run the build:
 
 ```bash
-xcodebuild -project GhosttyTabs.xcodeproj -scheme term-mesh -configuration Debug -destination 'platform=macOS' build
+xcodebuild -project GhosttyTabs.xcodeproj -scheme term-mesh -configuration Debug -destination 'platform=macOS' -clonedSourcePackagesDirPath "$HOME/Library/Caches/term-mesh/SourcePackages" build
 ```
+
+Swift unit tests belong to the `term-mesh-unit` scheme; the `term-mesh` scheme contains
+`termMeshUITests`, not `termMeshTests`. Use `term-mesh-unit` with
+`-only-testing:termMeshTests/...`. A new test file must also be registered in
+`GhosttyTabs.xcodeproj/project.pbxproj` before it counts as complete: Xcode can silently run zero
+tests when `-only-testing` names an unregistered file, without reporting an error. Confirm both the
+project registration and the executed test count.
 
 When rebuilding GhosttyKit.xcframework, always use Release optimizations.
 Clean any xcframework-* tags first to avoid zig build crashes:
@@ -65,6 +72,11 @@ When rebuilding term-meshd (the Rust daemon):
 ```bash
 cd daemon && cargo build --release
 ```
+
+Run build and test commands so their own exit status is visible. Do not use pipelines such as
+`cargo build | tail` without `set -o pipefail`: a successful `tail` masks a missing or failed
+`cargo` as exit 0. Check tool availability (including `~/.cargo/bin`) and the build/test command's
+exit code directly before reporting success.
 
 `reload` = kill and launch the Debug app only (tag required):
 
@@ -151,7 +163,7 @@ VERIFY (stale CLI 이름·동작 불일치):
 
 ```bash
 rg -n 'agentPipeTransport|Agent Panes|Native Agent|cursor-agent|tm-agent-bridge' AGENTS.md CLAUDE.md CHANGELOG.md docs/spike/agent-pipe-render.md
-xcodebuild -project GhosttyTabs.xcodeproj -scheme term-mesh -configuration Debug -destination 'platform=macOS' -only-testing:termMeshTests/AgentSessionTests -only-testing:termMeshTests/AgentPipeCompletionTests test
+xcodebuild -project GhosttyTabs.xcodeproj -scheme term-mesh-unit -configuration Debug -destination 'platform=macOS' -only-testing:termMeshTests/AgentSessionTests -only-testing:termMeshTests/AgentPipeCompletionTests test
 ```
 
 ## Debug event log
@@ -233,6 +245,80 @@ Rules learned the hard way:
 - Driving the app calls `debug.app.activate`, which **steals focus from the
   user**. Batch the probes, and stop once verified.
 
+## Disk reclamation (`tm-agent gc`)
+
+Three subsystems create worktrees and none knows about the others — the daemon
+(`~/.term-mesh/worktrees/<repo>/term-mesh_wt_<8hex>`), git-kit via
+`tm-agent delegate --worktree` (`~/.gk/worktree/...`), and `PeerProjectBootstrap`
+agent checkouts (`<root>/<project>-<role>-<yyMMdd>-<hex4>` on an `agent/*`
+branch). Plus per-team results, task boards, logs and build caches. `gc` is the
+one place that accounts for all of it, locally or on a peer.
+
+```bash
+tm-agent gc status                          # size + candidate count per category
+tm-agent gc plan [--category X] [--deep]    # every candidate with reasons/blockers
+tm-agent gc sweep                           # dry-run — shows what would go
+tm-agent gc sweep --apply                   # actually reclaim
+```
+
+- **Dry-run is the default.** `sweep` without `--apply` deletes nothing.
+- **Blockers beat `--apply`.** Uncommitted changes, commits missing from the
+  parent repo, and worktrees an active session or task still points at are
+  never removed. `--force` relaxes exactly one blocker (`unopenable`).
+- **The daemon's own 6h sweep is narrower still**: only `team_results` (24h),
+  `worktree_meta` and `logs`. Team boards require an authoritative live-team
+  snapshot and are explicit-only. The unattended sweep never removes a
+  worktree or checkout — see `AUTO_CATEGORIES` in
+  `daemon/term-meshd/src/gc.rs`.
+- Removal goes through git, so the registration is pruned with the directory.
+  Deleting the directory alone leaves a `prunable` entry behind.
+- **`git worktree remove` refuses any worktree containing a submodule**, and
+  every term-mesh worktree has `ghostty` — so that path always fails here. `gc`
+  handles it (delete the directory, then prune the registration), but
+  `git-kit worktree cleanup -y` **reports the removals and performs none**: it
+  swallows git's refusal and still returns `state: ok`. Verify with
+  `git worktree list` rather than trusting its output.
+- `reload.sh` records the launched PID in a tag-session manifest. The next
+  reload immediately removes ended tag sessions; failed managed builds are
+  removed on exit, with the 7-day sweep retained as a fallback (override with
+  `TERMMESH_RELOAD_TAG_GC_DAYS`, disable with `TERMMESH_RELOAD_TAG_GC=0`). It
+  caches under `~/Library/Caches/term-mesh`: SwiftPM dependency checkouts are
+  shared by every tag, while the Cargo target directory is **per tag**
+  (`cargo-target/<tag>`). Do not collapse the Cargo one into a single shared
+  directory — cargo keys its output by package name, so every tag's
+  `term-meshd` would land at the same path, and since the daemon build's
+  failure is swallowed, a tag whose build broke would ship whichever branch
+  last built successfully. `TERMMESH_CARGO_TARGET_DIR` overrides the path and
+  takes that collision on itself. Only the binaries the current build produced
+  are copied into the bundle — a daemon build that fails is fatal rather than
+  falling back to `daemon/target/release`, which this script no longer writes.
+  reload refuses to start below 10 GiB free
+  (`TERMMESH_BUILD_MIN_FREE_GIB` overrides the threshold). At task completion,
+  `./scripts/reload.sh --tag <tag> --cleanup` stops that app and immediately
+  reclaims its managed DerivedData, sockets, log, manifest, and Cargo target.
+- `tm-agent gc sweep --category build_caches --deep` previews regenerable
+  `daemon/target` directories inside inactive worktrees. Add `--apply` to
+  remove only those targets while preserving dirty source. Active session/task
+  worktrees remain blocked. Shared Cargo/SwiftPM and GhosttyKit caches are
+  reported but remain owned by their build scripts; `setup.sh` keeps the 3 most
+  recently used GhosttyKit SHAs (`TERMMESH_GHOSTTYKIT_CACHE_KEEP`).
+- Peers report free space in `HostStats`, and the sidebar shows a warning badge
+  under 5GB or 10%. Run `tm-agent gc` over ssh on that host to reclaim.
+
+VERIFY:
+
+```bash
+(cd daemon && cargo test -p term-meshd gc:: && cargo test -p term-meshd host_stats)
+./scripts/test-reload-cleanup.sh
+```
+
+`bash -n` alone proves the file parses and nothing else, which is not a useful
+check on code that runs `rm -rf`. `test-reload-cleanup.sh` sources reload.sh with
+`TERMMESH_RELOAD_LIB_ONLY=1` and drives the reclaim helpers against a sandbox:
+path-guard rejections, per-tag isolation, and the two cases where reclamation
+must refuse — a tag whose app is still running behind a stale manifest PID, and a
+rebuild that failed while the previous build is live.
+
 ## Pitfalls
 
 - **Custom UTTypes** for drag-and-drop must be declared in `Resources/Info.plist` under `UTExportedTypeDeclarations` (e.g. `com.splittabbar.tabtransfer`, `com.termmesh.sidebar-tab-reorder`).
@@ -306,7 +392,7 @@ a socket exists at `/tmp/term-mesh*.sock` or `/tmp/term-mesh.sock`), ALL team op
 `TaskGet`, `TaskUpdate`, `TeamDelete`. These create a parallel, disconnected team state.
 
 **Use instead:** The project-local `/team` command (`.claude/commands/team.md`) for Claude leaders,
-or the Codex IME `/team` alias backed by `.codex/prompts/team.md` for Codex leaders. Both route
+or the Codex IME `/team` alias backed by `~/.codex/prompts/team.md` for Codex leaders. Both route
 everything through `tm-agent`.
 
 ### Command responsibility split — /team vs /tm
@@ -328,13 +414,13 @@ If OMC's keyword detector fires `[MODE: TEAM]` or `[MAGIC KEYWORD: TEAM]`:
 
 ### Codex leader prompt shims
 
-Codex does not use Claude's `.claude/commands` slash-command format, and current Codex TUI builds
-do not accept `/prompts:<name>` as an interactive slash command. Project-local Codex prompt shims
-live under `.codex/prompts/`.
+Codex does not execute Claude's `.claude/commands` slash-command format natively. Project-local
+`.codex/prompts/` is intentionally absent; distributable Codex prompt shims live under
+`Resources/CodexPrompts/` and are installed globally into `~/.codex/prompts/`.
 
 In the term-mesh IME box, Codex panes get short aliases that expand on submit into a normal Codex
-message: "read `.codex/prompts/<name>.md` and execute it with these arguments." Claude panes keep
-the original Claude slash commands.
+message: "read `~/.codex/prompts/<name>.md` and execute it with these arguments." Claude panes
+keep the original Claude slash commands.
 
 | Claude leader | Codex leader | Purpose |
 |---------------|--------------|---------|
@@ -346,13 +432,11 @@ the original Claude slash commands.
 | `/watch ...` | `/watch ...` via IME alias | Stateless drift oversight toggle/review |
 
 The IME alias map lives in `imeSlashCommandAliases()` (`Sources/GhosttySurfaceScrollView.swift`);
-each alias points at a `.codex/prompts/<name>.md` shim, read live from the repo. Both the Claude
-commands AND the Codex prompts are bundled + installed by `scripts/copy-claude-commands.sh`
-(build phase: `COMMANDS`/`SKILLS`/`CODEX_PROMPTS` arrays) and `ClaudeCommandInstaller.swift`
-(runtime: `managedCommandNames` → `~/.claude/commands/`, `managedCodexPromptNames` →
-`~/.codex/prompts/` for native Codex `/<name>`). Install is version-gated, so new prompts land on
-the next version bump. Adding a leader command means touching all of these in lockstep — see the
-6-point checklist in `scripts/copy-claude-commands.sh`.
+each alias points at the corresponding `~/.codex/prompts/<name>.md`. Both the Claude commands and
+Codex distribution prompts are bundled by `scripts/copy-claude-commands.sh` (build phase:
+`COMMANDS`/`SKILLS`/`CODEX_PROMPTS`) and installed by `ClaudeCommandInstaller.swift` into
+`~/.claude/` and `~/.codex/prompts/`. Adding a leader command means updating the paired source under
+`Resources/CodexPrompts/`, both managed-name arrays, and the IME alias map in lockstep.
 
 For Codex as the current leader, prefer:
 
@@ -682,16 +766,26 @@ When a task has a fix budget (set via `--auto-fix-budget N` on delegate):
 > grant 스코프를 워커까지 확장하는 건 별건이다 — 현 grant는 `team.delegate`/`broadcast`/`send`
 > 까지 포함하는 리더 권한이라 워커에 그대로 줄 수 없다.
 
-### 피어 에이전트의 검증 한계 — 언어별로 다르다
+### 에이전트의 검증 환경 — 실행 위치를 먼저 확인한다
 
-피어 호스트(Linux)에는 **Swift 툴체인이 없다.** Rust와 Python은 피어에서 완전히 검증된다.
+`tm-agent status`의 host 필드만으로 에이전트의 실행 위치를 단정하지 않는다. 에이전트가 같은 Mac의
+`/Users/jinwoo/work/tm-projects/term-mesh-<role>-<date>-<suffix>` worktree에서 실행되는 경우가 있으므로
+먼저 `git worktree list`로 실제 경로를 확인한다. 실제 Linux 피어 호스트에는 Swift 툴체인이 없을 수
+있지만, 로컬 worktree에서 Swift 빌드가 실패하는 주된 준비 누락은 `GhosttyKit.xcframework` 링크다.
 
-| 작업 언어 | 피어에서 가능한 것 | 리더가 해야 할 것 |
-|-----------|-------------------|------------------|
-| Rust / Python | 편집 + 빌드 + 테스트 | 결과 수용 |
-| Swift | **편집만** | 로컬 머신에서 통합 후 빌드·테스트 필수 |
+| 실행 위치 | 가능한 검증 | 리더가 준비할 것 |
+|-----------|-------------|------------------|
+| 실제 Linux 피어 | Rust / Python 빌드·테스트; Swift는 편집·정적 확인 | Swift 변경은 로컬 통합 후 빌드·테스트 |
+| 같은 Mac의 별도 worktree | Swift 빌드·테스트 포함 | `GhosttyKit.xcframework` 링크 준비 |
 
-Swift 작업을 피어에 보낼 때는 태스크 캡슐에 다음을 넣는다(2026-07-29 웨이브에서 효과 확인):
+로컬 에이전트 worktree를 만든 뒤 리더 체크아웃과 같은 캐시 대상을 가리키게 한다:
+
+```bash
+TARGET=$(readlink GhosttyKit.xcframework)
+ln -s "$TARGET" <agent-worktree>/GhosttyKit.xcframework
+```
+
+실제 Linux 피어에 Swift 작업을 보낼 때는 태스크 캡슐에 다음을 넣는다(2026-07-29 웨이브에서 효과 확인):
 
 ```
 - 이 호스트에 Swift 툴체인이 없다. xcodebuild/swift build 시도 금지(시간 낭비).
@@ -699,8 +793,29 @@ Swift 작업을 피어에 보낼 때는 태스크 캡슐에 다음을 넣는다(
   그 확인 결과를 보고에 포함해라.
 ```
 
-그리고 Swift 변경은 파이프라인에 **로컬 통합 빌드 단계를 반드시 넣는다.** 피어 에이전트의
-STATUS: DONE은 "편집 완료"이지 "빌드 통과"가 아니다.
+그리고 Linux 피어의 Swift 변경은 파이프라인에 **로컬 통합 빌드 단계를 반드시 넣는다.** 피어 에이전트의
+STATUS: DONE은 "편집 완료"이지 "빌드 통과"가 아니다. v0.169 웨이브 1에서는 피어의 두
+그룹이 기존 테스트 6케이스를 깨뜨렸지만 Swift를 컴파일할 수 없어 로컬 통합 단계에서야
+발견됐다. 통합 담당자가 대신 고치지 말고, 실패한 변경은 해당 파일 소유자에게 돌려보내
+수정·재검증하게 한다.
+
+### 에이전트 결과 회수
+
+먼저 `git worktree list`로 에이전트의 실제 worktree와 브랜치를 찾는다. 에이전트가 커밋했다면
+리더 브랜치에서 그 SHA를 `git cherry-pick <sha>`한다. tracked 변경이 미커밋 상태라면 다음처럼
+패치를 만들어 적용한다. 신규 untracked 파일은 이 패치에 포함되지 않으므로 별도로 회수한다.
+
+```bash
+git -C <agent-worktree> diff > /tmp/x.patch
+git apply --3way /tmp/x.patch
+```
+
+### 위임 캡슐의 전달·검증 규칙
+
+- 캡슐이 크면 소켓 프레이밍 문제로 전달이 실패할 수 있다. 내용을 파일에 쓰고 에이전트에는
+  `cat <path>`로 읽으라는 짧은 지시만 보낸다.
+- 검증 요구에는 비교할 **직전 기준선 숫자**를 함께 쓴다. 예: `직전 기준선 1310 tests, 0 failures`.
+- 요구한 빌드·테스트가 통과하기 전에는 완료 보고하지 말라고 명시한다.
 
 ### Reply Truncation Protocol
 
@@ -866,7 +981,8 @@ git commit -m "Update ghostty submodule"
 Use the `/release` command to prepare a new release. This will:
 1. Determine the new version (bumps minor by default)
 2. Gather commits since the last tag and update the changelog
-3. Update `CHANGELOG.md` and `docs-site/content/docs/changelog.mdx`
+3. Update `CHANGELOG.md` (the only changelog in this repo — there is no
+   `docs-site/`; the instruction to update one there outlived the directory)
 4. Run `./scripts/bump-version.sh` to update both versions
 5. Commit, tag, and push
 6. Upload dSYM debug symbols to Sentry (`./scripts/upload-dsym.sh --build`)
@@ -894,7 +1010,11 @@ git push origin vX.Y.Z
 
 Notes:
 - Versioning: bump the minor version for updates unless explicitly asked otherwise.
-- Changelog: always update both `CHANGELOG.md` and the docs-site version.
+- Changelog: `CHANGELOG.md` is the only one. Write for the person running the
+  app, not the person who wrote the diff: what changed for them, and what it
+  used to do wrong. A release whose changelog covers one PR out of eighteen has
+  happened here — check `[Unreleased]` against `git log <last tag>..HEAD`
+  before cutting.
 - Sentry dSYM: required for symbolicated crash reports (EXC_BAD_ACCESS frames otherwise show `None`). `./scripts/upload-dsym.sh` without `--build` uploads the latest Release dSYM already in DerivedData.
 
 ## Lessons (x-humble)

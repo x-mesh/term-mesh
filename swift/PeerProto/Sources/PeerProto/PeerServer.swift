@@ -159,6 +159,11 @@ public protocol PeerSurfaceProvider: AnyObject, Sendable {
     /// `WorkspaceLayoutChanged` push path.
     func handleWorkspaceControl(_ control: Termmesh_Peer_V1_WorkspaceControl) async
 
+    /// Create a workspace and return its host-assigned id. Returning `nil`
+    /// rejects the request. Unlike rename/delete this is a paired RPC: the
+    /// caller needs the id before it can address the new workspace.
+    func createWorkspace(title: String) async -> Data?
+
     /// Rename an existing workspace in place; the id never changes.
     /// Returns `false` (no-op) for an empty or unknown `workspaceID` —
     /// mirrors the Rust host's `PeerHost::rename_workspace` contract
@@ -183,8 +188,9 @@ public protocol PeerSurfaceProvider: AnyObject, Sendable {
     /// panes are arranged — so a client asking "where does this project's
     /// leader sit" has no other way to find out. Read-only: no command
     /// crosses this call. Gated behind capability "team.roster.v1"; the
-    /// default empty list is what a provider with no teams reports, and
-    /// such a host never advertises the capability.
+    /// default empty list is what a provider with no teams reports. Team
+    /// capabilities describe server support and remain advertised even when
+    /// this snapshot is empty.
     func listTeams() async -> [Termmesh_Peer_V1_Team]
 
     /// Run one allow-listed `team.*` method and return its JSON result.
@@ -223,6 +229,7 @@ public struct PeerTeamCallFailure: Error, Sendable, Equatable {
 
 public extension PeerSurfaceProvider {
     func listWorkspaces() async -> [Termmesh_Peer_V1_Workspace] { [] }
+    func createWorkspace(title: String) async -> Data? { nil }
     func renameWorkspace(id workspaceID: Data, title: String) async -> Bool { false }
     func deleteWorkspace(id workspaceID: Data) async -> Bool { false }
     func handleWorkspaceControl(_ control: Termmesh_Peer_V1_WorkspaceControl) async {}
@@ -333,21 +340,27 @@ public enum PeerServerError: Error, Equatable {
     case acceptFailed(errno: Int32)
     case alreadyRunning
     case notRunning
+    case noMatchingLeaderSession
+    case leaderCallTimedOut
+    case leaderSessionClosed
 }
 
 public struct PeerServerConfig: Sendable {
     public var hostDisplayName: String
     public var hostAppVersion: String
     public var protocolVersion: String
+    public var hostCLIBinDirs: [String]
 
     public init(
         hostDisplayName: String = "term-mesh",
         hostAppVersion: String = "0.0.0",
-        protocolVersion: String = "1.0.0"
+        protocolVersion: String = "1.0.0",
+        hostCLIBinDirs: [String] = []
     ) {
         self.hostDisplayName = hostDisplayName
         self.hostAppVersion = hostAppVersion
         self.protocolVersion = protocolVersion
+        self.hostCLIBinDirs = PeerHostCLIBinDirs.validated(hostCLIBinDirs)
     }
 }
 
@@ -525,6 +538,25 @@ public actor PeerServer {
         for session in activeSessions {
             try? await session.pushWorkspaceListChanged(workspaces)
         }
+    }
+
+    /// Route a command from a leader process running on this host back to the
+    /// viewer that owns the team. The viewer's stable peer id is part of the
+    /// grant environment, so an unrelated connected peer can never receive
+    /// the request.
+    public func callTeamLeader(
+        _ request: Termmesh_Peer_V1_TeamLeaderCommandRequest,
+        targetPeerID: Data,
+        timeoutSeconds: TimeInterval = 10
+    ) async throws -> Termmesh_Peer_V1_TeamLeaderCommandResponse {
+        for session in activeSessions
+        where await session.canRouteTeamLeaderCommand(to: targetPeerID) {
+            return try await session.callTeamLeader(
+                request,
+                timeoutSeconds: timeoutSeconds
+            )
+        }
+        throw PeerServerError.noMatchingLeaderSession
     }
 
     fileprivate func register(_ session: PeerServerSession) {
@@ -1034,6 +1066,9 @@ actor PeerServerSession {
     /// leader grants are bound to it so reconnects from the same install work
     /// while another peer cannot replay a captured grant.
     private var clientPeerID = Data()
+    private var pendingLeaderCalls: [
+        UInt64: CheckedContinuation<Termmesh_Peer_V1_TeamLeaderCommandResponse, Error>
+    ] = [:]
 
     /// Whether the connected client advertised `capability` in its Hello.
     func hasClientCapability(_ capability: String) -> Bool {
@@ -1064,13 +1099,113 @@ actor PeerServerSession {
         } catch {
             // Stream ended or protocol error — session terminates.
         }
+        failPendingLeaderCalls(with: PeerServerError.leaderSessionClosed)
         await teardownAttachments()
         await connection.close()
     }
 
     func close() async {
+        failPendingLeaderCalls(with: PeerServerError.leaderSessionClosed)
         await teardownAttachments()
         await connection.close()
+    }
+
+    func canRouteTeamLeaderCommand(to peerID: Data) -> Bool {
+        state == .ready
+            && peerID.count == PeerIdentity.byteCount
+            && clientPeerID == peerID
+            && clientCapabilities.has(PeerCapability.teamLeaderV1)
+            // Only an attached relay has a long-lived receive pump. One-shot
+            // list/bootstrap sessions also advertise the capability but stop
+            // reading after their direct response; routing to one would wait
+            // until timeout while the visible pane remained idle.
+            && !attachments.isEmpty
+    }
+
+    /// Reverse RPC over the session's existing single-reader pump. The run
+    /// loop remains the only frame reader; this method registers a
+    /// correlation waiter, writes the request, and is resumed by dispatch
+    /// when the viewer sends TeamLeaderCommandResponse.
+    func callTeamLeader(
+        _ request: Termmesh_Peer_V1_TeamLeaderCommandRequest,
+        timeoutSeconds: TimeInterval
+    ) async throws -> Termmesh_Peer_V1_TeamLeaderCommandResponse {
+        guard state == .ready,
+              clientCapabilities.has(PeerCapability.teamLeaderV1) else {
+            throw PeerServerError.noMatchingLeaderSession
+        }
+        let encodedBytes = (try? request.serializedData().count)
+            ?? (PeerTeamLeader.maxCommandPayloadBytes + 1)
+        // Fail closed on an unregistered grant. Falling back to
+        // `request.grant` made `validateGrant` compare the presented grant
+        // against itself: grantID, projectID, teamUuid, role and the
+        // `expiresAtUnixSecs` equality all matched by construction, and the
+        // only remaining test compared a wall-clock deadline (~1.7e9) against
+        // `systemUptime` (~1e5), so it could never fail. Every field arrives
+        // from caller-supplied socket parameters, so that fallback let any
+        // local process on this host invent a grant id and have the command
+        // routed over the authenticated peer session to the viewer.
+        guard let registered = await teamLeaderControlPlane.registeredGrant(
+            id: request.grant.grantID
+        ) else {
+            throw PeerServerError.noMatchingLeaderSession
+        }
+        guard case .success = PeerTeamLeader.validateCommand(
+            request,
+            registeredGrant: registered.value,
+            registeredValidUntilUnixSeconds: registered.validUntilLeaseSeconds,
+            encodedBytes: encodedBytes,
+            nowUnixSeconds: UInt64(ProcessInfo.processInfo.systemUptime)
+        ) else {
+            throw PeerServerError.noMatchingLeaderSession
+        }
+
+        let requestSeq = nextSeq()
+        var envelope = Termmesh_Peer_V1_Envelope()
+        envelope.seq = requestSeq
+        envelope.teamLeaderCommandRequest = request
+        let frame = try encodeFrame(envelope)
+        let boundedTimeout = timeoutSeconds.isFinite
+            ? min(max(timeoutSeconds, 0.05), 60)
+            : 10
+
+        return try await withCheckedThrowingContinuation { continuation in
+            pendingLeaderCalls[requestSeq] = continuation
+            Task { [weak self] in
+                guard let self else { return }
+                do {
+                    try await self.writeLeaderCallFrame(frame)
+                } catch {
+                    await self.failPendingLeaderCall(requestSeq, with: error)
+                }
+            }
+            Task { [weak self] in
+                try? await Task.sleep(
+                    nanoseconds: UInt64(boundedTimeout * 1_000_000_000)
+                )
+                await self?.failPendingLeaderCall(
+                    requestSeq,
+                    with: PeerServerError.leaderCallTimedOut
+                )
+            }
+        }
+    }
+
+    private func writeLeaderCallFrame(_ frame: Data) async throws {
+        try await connection.write(frame)
+    }
+
+    private func failPendingLeaderCall(_ correlationID: UInt64, with error: Error) {
+        pendingLeaderCalls.removeValue(forKey: correlationID)?
+            .resume(throwing: error)
+    }
+
+    private func failPendingLeaderCalls(with error: Error) {
+        let pending = pendingLeaderCalls.values
+        pendingLeaderCalls.removeAll()
+        for continuation in pending {
+            continuation.resume(throwing: error)
+        }
     }
 
     /// Server-initiated push of a workspace layout change. Sent only
@@ -1151,18 +1286,16 @@ actor PeerServerSession {
             }
             clientCapabilities = PeerCapabilities(clientHello.capabilities)
             clientPeerID = clientHello.peerID
-            // Only a provider that can actually answer ListTeams advertises
-            // the roster capability — otherwise the flag invites a question
-            // this host cannot answer. Resolved before building the Hello,
-            // since the envelope builder is synchronous.
-            let teamCapabilities = [
-                PeerCapability.teamRosterV1,
-                PeerCapability.teamCallV1,
-                PeerCapability.teamLeaderV1,
-            ]
-            let advertisedCapabilities = await provider.listTeams().isEmpty
-                ? PeerCapability.supported.filter { !teamCapabilities.contains($0) }
-                : PeerCapability.supported
+            // Capabilities describe implemented protocol support, not whether
+            // the current team roster happens to contain any rows.
+            //
+            // Gating them on a non-empty roster deadlocked the one flow they
+            // exist for: standing up a leader is what one does on a host that
+            // has no teams yet, so the client refused to bootstrap because the
+            // host advertised nothing, and the host had nothing to advertise
+            // because no leader had been bootstrapped. Observed as a project
+            // that never finished creating on a peer whose team list was empty.
+            let advertisedCapabilities = PeerCapability.supported
             try await sendEnvelope { env in
                 var h = Termmesh_Peer_V1_Hello()
                 h.protocolVersion = self.config.protocolVersion
@@ -1170,6 +1303,7 @@ actor PeerServerSession {
                 h.appVersion = self.config.hostAppVersion
                 h.peerID = randomPeerBytes(count: 16)
                 h.capabilities = advertisedCapabilities
+                h.cliBinDirs = self.config.hostCLIBinDirs
                 env.hello = h
             }
             try await sendEnvelope { env in
@@ -1317,10 +1451,38 @@ actor PeerServerSession {
                 inner.teamLeaderCommandResponse = response
             }
 
+        case (.ready, .teamLeaderCommandResponse(let response)):
+            guard env.correlationID != 0,
+                  let continuation = pendingLeaderCalls.removeValue(
+                    forKey: env.correlationID
+                  ) else {
+                try await sendError(
+                    code: 103,
+                    message: "unexpected team leader command response"
+                )
+                return
+            }
+            continuation.resume(returning: response)
+
         case (.ready, .workspaceControl(let ctl)):
             // Fire-and-forget; the resulting layout update flows back
             // via the existing WorkspaceLayoutChanged push.
             await provider.handleWorkspaceControl(ctl)
+
+        case (.ready, .createWorkspaceRequest(let req)):
+            let workspaceID = await provider.createWorkspace(title: req.title)
+            try await sendEnvelopeWithCorrelation(env.seq) { inner in
+                var response = Termmesh_Peer_V1_CreateWorkspaceResponse()
+                response.accepted = workspaceID != nil
+                response.reason = workspaceID == nil
+                    ? "host could not create a workspace"
+                    : ""
+                response.workspaceID = workspaceID ?? Data()
+                inner.createWorkspaceResponse = response
+            }
+            if workspaceID != nil {
+                try await pushWorkspaceListChanged(await provider.listWorkspaces())
+            }
 
         case (.ready, .renameWorkspaceRequest(let req)):
             // Fire-and-forget like WorkspaceControl: no reply, paired

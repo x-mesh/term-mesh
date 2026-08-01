@@ -60,7 +60,7 @@ struct IMEInputBar: View {
     var onSendKey: ((_ keycode: UInt16, _ mods: UInt32) -> Void)? = nil
     /// Terminal working directory — used to discover project-local slash commands.
     var workingDirectory: String? = nil
-    /// Slash aliases expanded just before submit, e.g. /tm -> read .codex/prompts/tm.md.
+    /// Slash aliases expanded just before submit, e.g. /tm -> read ~/.codex/prompts/tm.md.
     var slashCommandAliases: [String: String] = [:]
 
     @State private var text: String = ""

@@ -7,6 +7,207 @@ import XCTest
 #endif
 
 final class GhosttyTerminalViewComposingTests: XCTestCase {
+    private func externalSnapshot(
+        hostFrame: NSRect = NSRect(x: 0, y: 0, width: 800, height: 600),
+        anchorFrame: NSRect = NSRect(x: 10, y: 20, width: 300, height: 200),
+        hostSuperview: NSObject,
+        window: NSObject,
+        anchor: NSObject,
+        anchorSuperview: NSObject
+    ) -> TerminalPortalExternalGeometrySnapshot {
+        let geometry = TerminalPortalAnchorGeometry(
+            windowID: ObjectIdentifier(window),
+            superviewID: ObjectIdentifier(anchorSuperview),
+            frameInWindow: anchorFrame
+        )
+        return TerminalPortalExternalGeometrySnapshot(
+            hostSuperviewID: ObjectIdentifier(hostSuperview),
+            hostFrame: hostFrame,
+            hostBounds: NSRect(origin: .zero, size: hostFrame.size),
+            referenceGeometry: TerminalPortalAnchorGeometry(
+                windowID: ObjectIdentifier(window),
+                superviewID: ObjectIdentifier(hostSuperview),
+                frameInWindow: hostFrame
+            ),
+            anchorGeometries: [ObjectIdentifier(anchor): geometry],
+            liveReferences: .init([hostSuperview, window, anchor, anchorSuperview])
+        )
+    }
+
+    /// A snapshot whose views are gone cannot vouch for its own identities.
+    ///
+    /// Every id in the snapshot is the address of a view it does not retain.
+    /// Once the view is deallocated that address can be reused by the next
+    /// allocation, and pane churn rebuilds NSViews at the same size — so a
+    /// *different* anchor could match on both identity and frame and the sync
+    /// it needed would be skipped as redundant, leaving the portal stale while
+    /// the snapshot agreed. Comparison now refuses a snapshot whose recorded
+    /// views have died.
+    func testSnapshotWithADeallocatedViewIsNeverConsideredEqual() {
+        let hostSuperview = NSObject()
+        let window = NSObject()
+        let anchorSuperview = NSObject()
+
+        // The anchor is owned only by this scope, so it is genuinely
+        // deallocated on the way out — `previous` keeps its ObjectIdentifier,
+        // which then names nothing, or worse whatever lands there next.
+        let previous: TerminalPortalExternalGeometrySnapshot = {
+            let anchor = NSObject()
+            let snapshot = externalSnapshot(
+                hostSuperview: hostSuperview,
+                window: window,
+                anchor: anchor,
+                anchorSuperview: anchorSuperview
+            )
+            XCTAssertFalse(
+                terminalPortalExternalGeometryNeedsSynchronization(
+                    previous: snapshot, current: snapshot, force: false
+                ),
+                "precondition: an unchanged live snapshot still suppresses the sync"
+            )
+            return snapshot
+        }()
+
+        XCTAssertTrue(
+            terminalPortalExternalGeometryNeedsSynchronization(
+                previous: previous,
+                current: externalSnapshot(
+                    hostSuperview: hostSuperview,
+                    window: window,
+                    anchor: NSObject(),
+                    anchorSuperview: anchorSuperview
+                ),
+                force: false
+            ),
+            "a snapshot holding a dead view must not suppress a sync"
+        )
+    }
+
+    func testExternalPortalGeometrySkipsRepeatedNotificationsAfterConvergence() {
+        let hostSuperview = NSObject()
+        let window = NSObject()
+        let anchor = NSObject()
+        let anchorSuperview = NSObject()
+        let snapshot = externalSnapshot(
+            hostSuperview: hostSuperview,
+            window: window,
+            anchor: anchor,
+            anchorSuperview: anchorSuperview
+        )
+
+        XCTAssertFalse(terminalPortalExternalGeometryNeedsSynchronization(
+            previous: snapshot,
+            current: snapshot,
+            force: false
+        ))
+        XCTAssertTrue(terminalPortalExternalGeometryNeedsSynchronization(
+            previous: snapshot,
+            current: snapshot,
+            force: true
+        ))
+    }
+
+    func testExternalPortalGeometryIgnoresNoiseButAcceptsRealResize() {
+        let hostSuperview = NSObject()
+        let window = NSObject()
+        let anchor = NSObject()
+        let anchorSuperview = NSObject()
+        let previous = externalSnapshot(
+            hostSuperview: hostSuperview,
+            window: window,
+            anchor: anchor,
+            anchorSuperview: anchorSuperview
+        )
+        let noisy = externalSnapshot(
+            anchorFrame: NSRect(x: 10.1, y: 19.9, width: 300.1, height: 199.9),
+            hostSuperview: hostSuperview,
+            window: window,
+            anchor: anchor,
+            anchorSuperview: anchorSuperview
+        )
+        let resized = externalSnapshot(
+            anchorFrame: NSRect(x: 10, y: 20, width: 301, height: 200),
+            hostSuperview: hostSuperview,
+            window: window,
+            anchor: anchor,
+            anchorSuperview: anchorSuperview
+        )
+
+        XCTAssertFalse(terminalPortalExternalGeometryNeedsSynchronization(
+            previous: previous,
+            current: noisy,
+            force: false
+        ))
+        XCTAssertTrue(terminalPortalExternalGeometryNeedsSynchronization(
+            previous: previous,
+            current: resized,
+            force: false
+        ))
+    }
+
+    func testPortalAnchorGeometrySkipsUnchangedLayoutCallbacks() {
+        let window = NSObject()
+        let superview = NSObject()
+        let previous = TerminalPortalAnchorGeometry(
+            windowID: ObjectIdentifier(window),
+            superviewID: ObjectIdentifier(superview),
+            frameInWindow: NSRect(x: 10, y: 20, width: 300, height: 200)
+        )
+
+        XCTAssertFalse(terminalPortalAnchorNeedsSynchronization(
+            previous: previous,
+            current: previous,
+            force: false
+        ))
+    }
+
+    func testPortalAnchorGeometryIgnoresSubpixelLayoutNoise() {
+        let window = NSObject()
+        let superview = NSObject()
+        let previous = TerminalPortalAnchorGeometry(
+            windowID: ObjectIdentifier(window),
+            superviewID: ObjectIdentifier(superview),
+            frameInWindow: NSRect(x: 10, y: 20, width: 300, height: 200)
+        )
+        let noisy = TerminalPortalAnchorGeometry(
+            windowID: ObjectIdentifier(window),
+            superviewID: ObjectIdentifier(superview),
+            frameInWindow: NSRect(x: 10.1, y: 19.9, width: 300.1, height: 199.9)
+        )
+
+        XCTAssertFalse(terminalPortalAnchorNeedsSynchronization(
+            previous: previous,
+            current: noisy,
+            force: false
+        ))
+    }
+
+    func testPortalAnchorGeometryReportsMeaningfulAndForcedChanges() {
+        let window = NSObject()
+        let superview = NSObject()
+        let previous = TerminalPortalAnchorGeometry(
+            windowID: ObjectIdentifier(window),
+            superviewID: ObjectIdentifier(superview),
+            frameInWindow: NSRect(x: 10, y: 20, width: 300, height: 200)
+        )
+        let resized = TerminalPortalAnchorGeometry(
+            windowID: ObjectIdentifier(window),
+            superviewID: ObjectIdentifier(superview),
+            frameInWindow: NSRect(x: 10, y: 20, width: 301, height: 200)
+        )
+
+        XCTAssertTrue(terminalPortalAnchorNeedsSynchronization(
+            previous: previous,
+            current: resized,
+            force: false
+        ))
+        XCTAssertTrue(terminalPortalAnchorNeedsSynchronization(
+            previous: previous,
+            current: previous,
+            force: true
+        ))
+    }
+
     func testEscapeNeverComposing() {
         XCTAssertFalse(
             GhosttyNSView.computeComposingFlag(

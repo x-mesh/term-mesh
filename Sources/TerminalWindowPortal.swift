@@ -7,6 +7,110 @@ import Bonsplit
 private var termMeshWindowTerminalPortalKey: UInt8 = 0
 private var termMeshWindowTerminalPortalCloseObserverKey: UInt8 = 0
 
+struct TerminalPortalExternalGeometrySnapshot {
+    /// Keeps an `ObjectIdentifier` in this snapshot honest.
+    ///
+    /// Every id here is the address of a view the snapshot does not retain.
+    /// Once that view is deallocated the address can be handed to the next
+    /// allocation, and during pane churn SwiftUI rebuilds NSViews at the same
+    /// size — so a *different* anchor could compare equal on both identity and
+    /// frame, and the sync it needed would be skipped as redundant. That is
+    /// the failure this whole file exists to avoid: the snapshot agrees while
+    /// the pixels are stale.
+    ///
+    /// Holding the views weakly does not stop address reuse. It does something
+    /// better: it tells us the identities we recorded are no longer the ones
+    /// we meant, and a snapshot that cannot vouch for its own ids is simply
+    /// not equal to anything.
+    final class LiveReferences {
+        private let boxes: [WeakViewBox]
+
+        init(_ views: [AnyObject?]) {
+            boxes = views.compactMap { $0 }.map(WeakViewBox.init)
+        }
+
+        var allStillAlive: Bool {
+            boxes.allSatisfy { $0.view != nil }
+        }
+
+        private final class WeakViewBox {
+            weak var view: AnyObject?
+            init(_ view: AnyObject) { self.view = view }
+        }
+    }
+
+    let hostSuperviewID: ObjectIdentifier?
+    let hostFrame: NSRect
+    let hostBounds: NSRect
+    let referenceGeometry: TerminalPortalAnchorGeometry?
+    let anchorGeometries: [ObjectIdentifier: TerminalPortalAnchorGeometry]
+    /// The views whose addresses the ids above came from.
+    let liveReferences: LiveReferences
+
+    func isApproximatelyEqual(
+        to other: TerminalPortalExternalGeometrySnapshot,
+        epsilon: CGFloat = 0.25
+    ) -> Bool {
+        // Checked on both sides rather than just the stored one: neither
+        // snapshot's ids mean anything once a view behind them is gone.
+        guard liveReferences.allStillAlive,
+              other.liveReferences.allStillAlive,
+              hostSuperviewID == other.hostSuperviewID,
+              Self.rectApproximatelyEqual(hostFrame, other.hostFrame, epsilon: epsilon),
+              Self.rectApproximatelyEqual(hostBounds, other.hostBounds, epsilon: epsilon),
+              Self.optionalGeometryApproximatelyEqual(
+                  referenceGeometry,
+                  other.referenceGeometry,
+                  epsilon: epsilon
+              ),
+              anchorGeometries.count == other.anchorGeometries.count else {
+            return false
+        }
+
+        for (anchorID, geometry) in anchorGeometries {
+            guard let otherGeometry = other.anchorGeometries[anchorID],
+                  geometry.isApproximatelyEqual(to: otherGeometry, epsilon: epsilon) else {
+                return false
+            }
+        }
+        return true
+    }
+
+    private static func optionalGeometryApproximatelyEqual(
+        _ lhs: TerminalPortalAnchorGeometry?,
+        _ rhs: TerminalPortalAnchorGeometry?,
+        epsilon: CGFloat
+    ) -> Bool {
+        switch (lhs, rhs) {
+        case (nil, nil):
+            return true
+        case let (lhs?, rhs?):
+            return lhs.isApproximatelyEqual(to: rhs, epsilon: epsilon)
+        default:
+            return false
+        }
+    }
+
+    private static func rectApproximatelyEqual(
+        _ lhs: NSRect,
+        _ rhs: NSRect,
+        epsilon: CGFloat
+    ) -> Bool {
+        abs(lhs.origin.x - rhs.origin.x) <= epsilon
+            && abs(lhs.origin.y - rhs.origin.y) <= epsilon
+            && abs(lhs.size.width - rhs.size.width) <= epsilon
+            && abs(lhs.size.height - rhs.size.height) <= epsilon
+    }
+}
+
+func terminalPortalExternalGeometryNeedsSynchronization(
+    previous: TerminalPortalExternalGeometrySnapshot?,
+    current: TerminalPortalExternalGeometrySnapshot,
+    force: Bool
+) -> Bool {
+    force || previous?.isApproximatelyEqual(to: current) != true
+}
+
 #if DEBUG
 private func portalDebugToken(_ view: NSView?) -> String {
     guard let view else { return "nil" }
@@ -556,6 +660,8 @@ final class WindowTerminalPortal: NSObject {
     private var installConstraints: [NSLayoutConstraint] = []
     private var hasDeferredFullSyncScheduled = false
     private var hasExternalGeometrySyncScheduled = false
+    private var scheduledExternalGeometrySyncIsForced = false
+    private var lastExternalGeometrySnapshot: TerminalPortalExternalGeometrySnapshot?
     private var geometryObservers: [NSObjectProtocol] = []
 #if DEBUG
     private var lastLoggedBonsplitContainerSignature: String?
@@ -608,7 +714,7 @@ final class WindowTerminalPortal: NSObject {
             queue: .main
         ) { [weak self] _ in
             MainActor.assumeIsolated {
-                self?.scheduleExternalGeometrySynchronize()
+                self?.scheduleExternalGeometrySynchronize(force: true)
             }
         })
         geometryObservers.append(center.addObserver(
@@ -687,13 +793,20 @@ final class WindowTerminalPortal: NSObject {
         anchorObservers.removeAll()
     }
 
-    private func scheduleExternalGeometrySynchronize(after delay: TimeInterval = 0) {
+    private func scheduleExternalGeometrySynchronize(
+        after delay: TimeInterval = 0,
+        force: Bool = false
+    ) {
+        scheduledExternalGeometrySyncIsForced =
+            scheduledExternalGeometrySyncIsForced || force
         guard !hasExternalGeometrySyncScheduled else { return }
         hasExternalGeometrySyncScheduled = true
         let work = { [weak self] in
             guard let self else { return }
             self.hasExternalGeometrySyncScheduled = false
-            self.synchronizeAllEntriesFromExternalGeometryChange()
+            let isForced = self.scheduledExternalGeometrySyncIsForced
+            self.scheduledExternalGeometrySyncIsForced = false
+            self.synchronizeAllEntriesFromExternalGeometryChange(force: isForced)
         }
         if delay > 0 {
             DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: work)
@@ -741,7 +854,7 @@ final class WindowTerminalPortal: NSObject {
         return frameInContainer.width > 1 && frameInContainer.height > 1
     }
 
-    private func synchronizeAllEntriesFromExternalGeometryChange() {
+    private func synchronizeAllEntriesFromExternalGeometryChange(force: Bool) {
         // Defer geometry sync while a sheet is animating. NSSheetMoveHelper fires window
         // resize notifications during its animation frames; running layoutSubtreeIfNeeded()
         // and _setWindow: propagation concurrently with the sheet's constraint engine causes
@@ -750,21 +863,81 @@ final class WindowTerminalPortal: NSObject {
 #if DEBUG
             dlog("portal.sync.deferSheet reason=attachedSheetActive")
 #endif
-            scheduleExternalGeometrySynchronize(after: 0.25)
+            scheduleExternalGeometrySynchronize(after: 0.25, force: force)
             return
         }
-        guard ensureInstalled() else { return }
-        synchronizeLayoutHierarchy()
+        let beforeLayout = externalGeometrySnapshot()
+        guard terminalPortalExternalGeometryNeedsSynchronization(
+            previous: lastExternalGeometrySnapshot,
+            current: beforeLayout,
+            force: force
+        ) else {
+            return
+        }
+        // Record the event geometry before forcing AppKit layout. Notifications
+        // emitted by our own pass are queued for the next runloop turn; the
+        // post-layout snapshot below makes those self-induced callbacks no-ops
+        // once geometry has converged.
+        lastExternalGeometrySnapshot = beforeLayout
+        guard ensureInstalled() else {
+            // Installation can be transiently unavailable while AppKit swaps
+            // the content hierarchy. Do not let that failed attempt suppress
+            // the next notification carrying the same geometry.
+            lastExternalGeometrySnapshot = nil
+            return
+        }
         synchronizeAllHostedViews(excluding: nil)
 
         // During live resize, AppKit can deliver frame churn where host/container geometry
         // settles a tick before the terminal's own scroll/surface hierarchy. Force a final
-        // in-place geometry + surface refresh for all visible entries in this window.
-        for entry in entriesByHostedId.values {
-            guard let hostedView = entry.hostedView, !hostedView.isHidden else { continue }
-            hostedView.reconcileGeometryNow()
-            hostedView.refreshSurfaceNow()
+        // in-place geometry + surface refresh once at the explicit final pass.
+        // Ordinary anchor notifications already refresh inside synchronizeHostedView
+        // when the applied frame actually changes; forcing every notification made
+        // scrolling compete with redundant renderer wakeups.
+        if force {
+            for entry in entriesByHostedId.values {
+                guard let hostedView = entry.hostedView, !hostedView.isHidden else { continue }
+                hostedView.reconcileGeometryNow()
+                hostedView.refreshSurfaceNow()
+            }
         }
+        lastExternalGeometrySnapshot = externalGeometrySnapshot()
+    }
+
+    private func externalGeometrySnapshot() -> TerminalPortalExternalGeometrySnapshot {
+        let referenceGeometry = installedReferenceView.map { view in
+            TerminalPortalAnchorGeometry(
+                windowID: view.window.map(ObjectIdentifier.init),
+                superviewID: view.superview.map(ObjectIdentifier.init),
+                frameInWindow: view.convert(view.bounds, to: nil)
+            )
+        }
+        var anchors: [ObjectIdentifier: TerminalPortalAnchorGeometry] = [:]
+        // Every view an id was taken from, so the snapshot can later say
+        // whether those ids still refer to what it meant.
+        var identified: [AnyObject?] = [
+            hostView.superview,
+            installedReferenceView,
+            installedReferenceView?.superview,
+        ]
+        for entry in entriesByHostedId.values {
+            guard let anchor = entry.anchorView else { continue }
+            anchors[ObjectIdentifier(anchor)] = TerminalPortalAnchorGeometry(
+                windowID: anchor.window.map(ObjectIdentifier.init),
+                superviewID: anchor.superview.map(ObjectIdentifier.init),
+                frameInWindow: anchor.convert(anchor.bounds, to: nil)
+            )
+            identified.append(anchor)
+            identified.append(anchor.superview)
+        }
+        return TerminalPortalExternalGeometrySnapshot(
+            hostSuperviewID: hostView.superview.map(ObjectIdentifier.init),
+            hostFrame: hostView.frame,
+            hostBounds: hostView.bounds,
+            referenceGeometry: referenceGeometry,
+            anchorGeometries: anchors,
+            liveReferences: .init(identified)
+        )
     }
 
     private func ensureDividerOverlayOnTop() {

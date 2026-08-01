@@ -108,10 +108,25 @@ actor MockHost {
     var pendingInbound = Data()
     var seq: UInt64 = 0
     let surfaces: [Termmesh_Peer_V1_SurfaceInfo]
+    let pushWorkspaceUpdateBeforeSurfaceList: Bool
+    let protocolVersion: String
+    let capabilities: [String]
+    let cliBinDirs: [String]
 
-    init(transport: MockTransport, surfaces: [Termmesh_Peer_V1_SurfaceInfo]) {
+    init(
+        transport: MockTransport,
+        surfaces: [Termmesh_Peer_V1_SurfaceInfo],
+        pushWorkspaceUpdateBeforeSurfaceList: Bool = false,
+        protocolVersion: String = "1.0.0",
+        capabilities: [String] = [],
+        cliBinDirs: [String] = []
+    ) {
         self.transport = transport
         self.surfaces = surfaces
+        self.pushWorkspaceUpdateBeforeSurfaceList = pushWorkspaceUpdateBeforeSurfaceList
+        self.protocolVersion = protocolVersion
+        self.capabilities = capabilities
+        self.cliBinDirs = cliBinDirs
     }
 
     func run() async throws {
@@ -122,10 +137,12 @@ actor MockHost {
 
         // 2. Send host Hello
         var hostHello = Termmesh_Peer_V1_Hello()
-        hostHello.protocolVersion = "1.0.0"
+        hostHello.protocolVersion = protocolVersion
         hostHello.displayName = "mock-host"
         hostHello.peerID = Data(count: 16)
         hostHello.appVersion = "test"
+        hostHello.capabilities = capabilities
+        hostHello.cliBinDirs = cliBinDirs
         try await sendEnvelope { $0.hello = hostHello }
 
         // 3. Send AuthChallenge
@@ -148,6 +165,13 @@ actor MockHost {
         // 6. Handle ListSurfaces
         _ = try await readExpecting { env in
             if case .listSurfaces = env.payload { return true } else { return false }
+        }
+        if pushWorkspaceUpdateBeforeSurfaceList {
+            var removed = Termmesh_Peer_V1_WorkspaceRemoved()
+            removed.workspaceID = Data(repeating: 0xD1, count: 16)
+            var update = Termmesh_Peer_V1_WorkspaceUpdate()
+            update.workspaceRemoved = removed
+            try await sendEnvelope { $0.workspaceUpdate = update }
         }
         var list = Termmesh_Peer_V1_SurfaceList()
         list.surfaces = surfaces
@@ -199,6 +223,7 @@ actor LifecycleMockHost {
     let assignedWorkspaceID: Data
     let createAccepted: Bool
     let createRejectReason: String
+    let respondToCreate: Bool
 
     private(set) var receivedCreateTitle: String?
     private(set) var receivedRename: (workspaceID: Data, title: String)?
@@ -208,12 +233,14 @@ actor LifecycleMockHost {
         transport: MockTransport,
         assignedWorkspaceID: Data,
         createAccepted: Bool = true,
-        createRejectReason: String = ""
+        createRejectReason: String = "",
+        respondToCreate: Bool = true
     ) {
         self.transport = transport
         self.assignedWorkspaceID = assignedWorkspaceID
         self.createAccepted = createAccepted
         self.createRejectReason = createRejectReason
+        self.respondToCreate = respondToCreate
     }
 
     func run() async throws {
@@ -249,6 +276,7 @@ actor LifecycleMockHost {
             throw PeerSessionError.unexpectedMessage("expected CreateWorkspaceRequest")
         }
         receivedCreateTitle = createReq.title
+        guard respondToCreate else { return }
         var resp = Termmesh_Peer_V1_CreateWorkspaceResponse()
         resp.accepted = createAccepted
         if createAccepted {
@@ -325,17 +353,20 @@ actor TeamRPCMockHost {
     let transport: MockTransport
     let capabilities: [String]
     let consumeRequest: Bool
+    let replyToLeaderCommand: Bool
     private var pendingInbound = Data()
     private var seq: UInt64 = 0
 
     init(
         transport: MockTransport,
         capabilities: [String],
-        consumeRequest: Bool = false
+        consumeRequest: Bool = false,
+        replyToLeaderCommand: Bool = false
     ) {
         self.transport = transport
         self.capabilities = capabilities
         self.consumeRequest = consumeRequest
+        self.replyToLeaderCommand = replyToLeaderCommand
     }
 
     func run() async throws {
@@ -358,7 +389,20 @@ actor TeamRPCMockHost {
         result.accepted = true
         result.sessionID = Data(count: 16)
         try await sendEnvelope { $0.authResult = result }
-        if consumeRequest { _ = try await readFrame() }
+        if replyToLeaderCommand {
+            let request = try await readFrame()
+            guard case .teamLeaderCommandRequest = request.payload else {
+                throw PeerSessionError.unexpectedMessage(
+                    String(describing: request.payload)
+                )
+            }
+            var response = Termmesh_Peer_V1_TeamLeaderCommandResponse()
+            response.ok = true
+            response.resultJson = "{}"
+            try await sendEnvelope { $0.teamLeaderCommandResponse = response }
+        } else if consumeRequest {
+            _ = try await readFrame()
+        }
     }
 
     private func sendEnvelope(
@@ -382,6 +426,70 @@ actor TeamRPCMockHost {
 }
 
 final class PeerSessionTests: XCTestCase {
+    func testHostCLIBinDirValidationIsStrictAndDeterministic() {
+        XCTAssertEqual(
+            PeerHostCLIBinDirs.validated([
+                "/Applications/Term Mesh.app/Contents/Resources/bin",
+                "/opt/it's-here/bin",
+                "/Applications/Term Mesh.app/Contents/Resources/bin",
+            ]),
+            []
+        )
+        XCTAssertEqual(
+            PeerHostCLIBinDirs.validated([
+                "/Applications/Term Mesh.app/Contents/Resources/bin",
+                "/opt/it's-here/bin",
+            ]),
+            [
+                "/Applications/Term Mesh.app/Contents/Resources/bin",
+                "/opt/it's-here/bin",
+            ]
+        )
+        XCTAssertEqual(PeerHostCLIBinDirs.validated(["/safe/bin", "/safe/bin"]), ["/safe/bin"])
+
+        let unsafe = [
+            "relative/bin", "/", "/safe/../bin", "/safe/./bin",
+            "/safe:evil/bin", "/safe/$HOME/bin", "/safe\n/bin",
+        ]
+        for path in unsafe {
+            XCTAssertEqual(PeerHostCLIBinDirs.validated([path]), [], "accepted unsafe path: \(path)")
+        }
+        XCTAssertEqual(
+            PeerHostCLIBinDirs.validated(["/" + String(repeating: "a", count: PeerHostCLIBinDirs.maximumUTF8Bytes)]),
+            []
+        )
+    }
+
+    func testHandshakeExposesOnlyCapabilityGatedValidatedHostCLIBinDirs() async throws {
+        let cases: [([String], [String], [String])] = [
+            ([PeerCapability.hostCLIBinDirsV1], ["/Applications/Term Mesh.app/Contents/Resources/bin"], ["/Applications/Term Mesh.app/Contents/Resources/bin"]),
+            ([], ["/malicious/ungated/bin"], []),
+            ([PeerCapability.hostCLIBinDirsV1], ["../../malicious"], []),
+            ([], [], []),
+        ]
+
+        for (capabilities, advertised, expected) in cases {
+            let transport = MockTransport()
+            let host = MockHost(
+                transport: transport,
+                surfaces: [],
+                capabilities: capabilities,
+                cliBinDirs: advertised
+            )
+            let hostTask = Task { try await host.run() }
+            let session = PeerSession(
+                read: { await transport.clientRead() },
+                write: { await transport.clientWrite($0) }
+            )
+
+            let info = try await session.handshake()
+            XCTAssertEqual(info.hostCLIBinDirs, expected)
+            let surfaces = try await session.listSurfaces()
+            XCTAssertEqual(surfaces, [])
+            try await hostTask.value
+        }
+    }
+
     func testHandshakeAndListRoundTrip() async throws {
         let transport = MockTransport()
 
@@ -426,6 +534,30 @@ final class PeerSessionTests: XCTestCase {
         XCTAssertEqual(surfaces[1].title, "bravo")
         XCTAssertFalse(surfaces[1].attachable)
 
+        try await hostTask.value
+    }
+
+    func testListSurfacesSkipsWorkspacePushThatRacesResponse() async throws {
+        let transport = MockTransport()
+        var surface = Termmesh_Peer_V1_SurfaceInfo()
+        surface.surfaceID = Data(repeating: 0xA2, count: 16)
+        surface.title = "after-push"
+        surface.attachable = true
+
+        let host = MockHost(
+            transport: transport,
+            surfaces: [surface],
+            pushWorkspaceUpdateBeforeSurfaceList: true
+        )
+        let hostTask = Task { try await host.run() }
+        let session = PeerSession(
+            read: { await transport.clientRead() },
+            write: { await transport.clientWrite($0) }
+        )
+        _ = try await session.handshake()
+
+        let surfaces = try await session.listSurfaces()
+        XCTAssertEqual(surfaces.map(\.title), ["after-push"])
         try await hostTask.value
     }
 
@@ -498,6 +630,33 @@ final class PeerSessionTests: XCTestCase {
         try await hostTask.value
     }
 
+    func testAdvertisedWorkspaceLifecycleThatNeverRepliesTimesOut() async throws {
+        let transport = MockTransport()
+        let host = LifecycleMockHost(
+            transport: transport,
+            assignedWorkspaceID: Data(),
+            respondToCreate: false
+        )
+        let hostTask = Task { try await host.run() }
+        let session = PeerSession(
+            read: { await transport.clientRead() },
+            write: { await transport.clientWrite($0) },
+            close: { await transport.closeClientRead() }
+        )
+        _ = try await session.handshake()
+
+        do {
+            _ = try await session.createWorkspace(
+                title: "scratch",
+                timeoutSeconds: 0.05
+            )
+            XCTFail("silent host must time out")
+        } catch PeerSessionError.rpcTimedOut(let operation) {
+            XCTAssertEqual(operation, "createWorkspace")
+        }
+        try await hostTask.value
+    }
+
     func testTeamRPCsRequireNegotiatedCapabilitiesBeforeWriting() async throws {
         let transport = MockTransport()
         let host = TeamRPCMockHost(transport: transport, capabilities: [])
@@ -547,6 +706,41 @@ final class PeerSessionTests: XCTestCase {
         }
         writtenFrameCount = await transport.writtenFrameCount()
         XCTAssertEqual(writtenFrameCount, 2)
+    }
+
+    func testLeaderClientPreflightDoesNotRejectServerRenewedWireExpiry() async throws {
+        let transport = MockTransport()
+        let host = TeamRPCMockHost(
+            transport: transport,
+            capabilities: [PeerCapability.teamLeaderV1],
+            replyToLeaderCommand: true
+        )
+        let hostTask = Task { try await host.run() }
+        let session = PeerSession(
+            read: { await transport.clientRead() },
+            write: { await transport.clientWrite($0) }
+        )
+        _ = try await session.handshake()
+
+        var grant = Termmesh_Peer_V1_TeamLeaderGrant()
+        grant.grantID = Data(repeating: 0xA1, count: PeerTeamLeader.grantIDBytes)
+        grant.projectID = "name:demo"
+        grant.teamUuid = "team-uuid"
+        grant.role = .leader
+        grant.expiresAtUnixSecs = 1
+        let response = try await session.callTeamLeader(
+            grant: grant,
+            teamUUID: grant.teamUuid,
+            requestID: Data(
+                repeating: 0xA2,
+                count: PeerTeamLeader.requestIDBytes
+            ),
+            method: "team.status",
+            paramsJSON: "{}"
+        )
+
+        XCTAssertTrue(response.ok)
+        try await hostTask.value
     }
 
     func testAdvertisedTeamRPCThatNeverRepliesTimesOut() async throws {

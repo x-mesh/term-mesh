@@ -33,6 +33,8 @@ public enum PeerTeamCall {
         "team.read",
         "team.collect",
         "team.reports",
+        "team.result.status",
+        "team.result.collect",
         "team.inbox",
         "team.message.list",
         // Directing agents that already exist.
@@ -45,6 +47,11 @@ public enum PeerTeamCall {
         "team.task.get",
         "team.task.create",
         "team.task.update",
+        "team.task.done",
+        "team.task.block",
+        "team.task.review",
+        "team.task.unblock",
+        "team.task.approve",
         // Reading what a task changed, so a review can happen where the work
         // is visible rather than only where it ran.
         //

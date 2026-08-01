@@ -236,28 +236,46 @@ extension AppDelegate {
         commandPaletteSelectionByWindowId.removeValue(forKey: removed.windowId)
         commandPaletteSnapshotByWindowId.removeValue(forKey: removed.windowId)
 
+        // A main window is a viewer, not the owner of a live project. Move
+        // project workspaces out before this context is released so native
+        // AgentSession processes and remote pane bindings survive unchanged.
+        // A later window adopts the same Workspace object from the Projects
+        // sidebar. Explicit team/project teardown still owns process shutdown.
+        let projectWorkspaceIDs = TeamOrchestrator.shared
+            .preserveProjectPresentations(from: removed.tabManager)
+        let closedWorkspaceIDs = Self.workspaceIDsClosedWithWindow(
+            preserved: projectWorkspaceIDs,
+            remaining: removed.tabManager.tabs.map(\.id)
+        )
+
         // Avoid stale notifications that can no longer be opened once the owning window is gone.
         if let store = notificationStore {
-            for tab in removed.tabManager.tabs {
-                store.clearNotifications(forTabId: tab.id)
+            for workspaceID in closedWorkspaceIDs {
+                store.clearNotifications(forTabId: workspaceID)
             }
         }
 
         // Peer federation: a whole-window close (red-button close, Cmd+Shift+W,
-        // or app quit closing every window) tears down every workspace in
+        // or app quit closing every window) tears down every workspace still in
         // `removed.tabManager.tabs` WITHOUT going through
         // `TabManager.closeWorkspace` — so its `.peerWorkspaceDidClose` post
         // never fires for any of them, and attached peers keep those
         // workspace_ids in their roster forever. Post the same signal here,
-        // once per surviving workspace, so PeerHostCoordinator's existing
+        // once per actually closed workspace, so PeerHostCoordinator's existing
         // bridge broadcasts WorkspaceRemoved for each. Harmless during app
         // quit (no peer server left listening by then, or a no-op broadcast
         // to zero sessions).
-        for tab in removed.tabManager.tabs {
+        //
+        // Do NOT include `projectWorkspaceIDs`: those exact Workspace objects
+        // were detached above specifically to stay live. Broadcasting their
+        // ids as removed drops the remote leader's scoped team route; a
+        // subsequent `tm-agent list` then sees no GUI team and can create a
+        // same-name team on the peer host (split-brain).
+        for workspaceID in closedWorkspaceIDs {
             NotificationCenter.default.post(
                 name: .peerWorkspaceDidClose,
                 object: nil,
-                userInfo: ["workspaceID": tab.id]
+                userInfo: ["workspaceID": workspaceID]
             )
         }
 
@@ -284,6 +302,20 @@ extension AppDelegate {
                 TerminalController.shared.setActiveTabManager(nil)
             }
         }
+    }
+
+    /// Workspace ids that genuinely ended with a window.
+    ///
+    /// `remaining` is normally already disjoint because project workspaces
+    /// were detached first. The subtraction is intentionally defensive: it
+    /// makes the lifetime contract explicit and prevents a future refactor
+    /// from turning a preserved project into a peer tombstone.
+    static func workspaceIDsClosedWithWindow(
+        preserved: [UUID],
+        remaining: [UUID]
+    ) -> [UUID] {
+        let preservedIDs = Set(preserved)
+        return remaining.filter { !preservedIDs.contains($0) }
     }
 
     func isMainTerminalWindow(_ window: NSWindow) -> Bool {

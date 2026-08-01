@@ -109,6 +109,31 @@ final class AgentPipeCompletionTests: XCTestCase {
         XCTAssertEqual(event.verify, "swift build 2>&1 | grep error")
     }
 
+    func testUnknownStatusDoesNotCompleteOrWriteResult() throws {
+        let team = "unknown-status-p0-\(UUID().uuidString)"
+        let store = TeamDataStore.shared
+        store.registerTeam(team, agents: [.init(name: "executor", instanceId: nil)])
+        defer {
+            store.clearResults(teamName: team)
+            store.unregisterTeam(team)
+        }
+        let task = try XCTUnwrap(
+            store.createTask(teamName: team, title: "must stay open", assignee: "executor")
+        )
+        let event = AutoReplyEvent(
+            status: "UNKNOWN", files: "none", verify: "n/a", next: "NONE",
+            fullReport: "n/a", body: "not a verdict", raw: "STATUS: UNKNOWN"
+        )
+
+        XCTAssertFalse(AutoReplyEmit.emit(
+            teamName: team, agentName: "executor", event: event,
+            preferredTaskId: task.id, agentInstanceId: nil, store: store
+        ))
+        XCTAssertEqual(store.getTask(teamName: team, taskId: task.id)?.status, task.status)
+        XCTAssertNil(store.readResult(teamName: team, taskId: task.id, agentName: "executor"))
+        XCTAssertTrue(store.collectResults(teamName: team).isEmpty)
+    }
+
     // MARK: - Which task the answer belongs to
 
     /// The correlation the scrollback path can never make.
@@ -228,6 +253,59 @@ final class AgentPipeCompletionTests: XCTestCase {
         XCTAssertTrue(cmd.contains("--input-format stream-json"))
         XCTAssertTrue(cmd.contains("--replay-user-messages"),
                       "the receipt is what makes delivery verifiable")
+    }
+
+    /// The events file must be a new inode for every launch.
+    ///
+    /// A hard restart reuses the agent id, and `tee` without `-a` truncates in
+    /// place — which keeps the inode. The dead pane's events file was
+    /// therefore the *same file* as the one the new pane writes, so the
+    /// completion watch's identity check could never fire, and its only other
+    /// detector — the file shrinking — misses whenever the new process writes
+    /// past the old size inside one 250 ms tick. The watch then reads from the
+    /// middle of the new file, losing the turn's early events and splitting
+    /// the line it landed in.
+    ///
+    /// The unlink belongs in the launch chain and nowhere else: from the app
+    /// side it would race a `tee` that had already opened, leaving it writing
+    /// to an unnamed inode that no later `FileHandle(forReadingAtPath:)` can
+    /// reach — the same silent hang, permanently.
+    func testLaunchUnlinksTheEventsFileSoEachPaneGetsANewInode() {
+        let fifo = "/tmp/pipes/executor@team.stdin"
+        let claude = AgentPipeTransport.launchCommand(
+            claudePath: "/usr/local/bin/claude",
+            fifoPath: fifo,
+            model: "sonnet",
+            instructions: "",
+            extraArgs: []
+        )
+        let bridge = AgentPipeTransport.bridgeLaunchCommand(
+            cli: "codex",
+            fifoPath: fifo,
+            model: "sonnet",
+            bridgePath: "/repo/scripts/spike/tm-agent-bridge.py",
+            rendererPath: nil,
+            workingDirectory: "/repo"
+        )
+
+        for (label, cmd) in [("claude", claude), ("bridge", bridge)] {
+            guard let rm = cmd.range(of: "rm -f ") else {
+                return XCTFail("\(label): the launch chain must start by removing both files")
+            }
+            let removal = cmd[rm.lowerBound...].prefix(while: { $0 != "&" })
+            XCTAssertTrue(
+                removal.contains(".events"),
+                "\(label): the events file must be unlinked, not just truncated by tee"
+            )
+            // Ordering is the whole point: the unlink has to precede the
+            // pipeline that opens the file.
+            let events = try? XCTUnwrap(cmd.range(of: ".events"))
+            XCTAssertNotNil(events)
+            XCTAssertLessThan(
+                rm.lowerBound, cmd.range(of: "mkfifo")!.lowerBound,
+                "\(label): the removal must come before the pane starts writing"
+            )
+        }
     }
 
     /// Taking the channel took the keyboard with it.

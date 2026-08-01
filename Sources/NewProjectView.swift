@@ -89,6 +89,12 @@ struct NewProjectView: View {
     @State private var branchEdited = false
     @State private var repositoryURLSuggestions: [String] = []
     @State private var isLoadingRepositorySuggestions = false
+    /// How many of `repositoryURLSuggestions` came from disk. The rest are
+    /// from the account catalog. Kept as a count rather than a second list so
+    /// matching and selection keep working on one array.
+    @State private var localRepositoryCount = 0
+    @State private var remoteRepositoryCount = 0
+    @State private var repositoryScanTruncated = false
     @State private var showsTeamEditor = false
     @State private var showsAdvancedOptions = false
     @FocusState private var focusedField: Field?
@@ -233,15 +239,30 @@ struct NewProjectView: View {
             let directories = repositoryDirectories
             let roots = repositorySearchRoots
             isLoadingRepositorySuggestions = true
-            let suggestions = await Task.detached(priority: .utility) {
+            let local = await Task.detached(priority: .utility) {
                 RepositoryURLAutocomplete.loadOriginURLs(
                     from: directories,
                     searching: roots
                 )
             }.value
             guard !Task.isCancelled else { return }
-            repositoryURLSuggestions = suggestions
+            // Show what is on disk immediately; the account catalog needs the
+            // network and must not hold up a list that is already usable.
+            repositoryURLSuggestions = local
+            localRepositoryCount = local.count
+            remoteRepositoryCount = 0
+            repositoryScanTruncated = RepositoryURLAutocomplete.truncatedRepositoryScan
             isLoadingRepositorySuggestions = false
+
+            let remote = await GitHubRepositoryCatalog.load()
+            guard !Task.isCancelled, !remote.isEmpty else { return }
+            // Anything already cloned stays under its local entry — the same
+            // repository listed twice would be two identical rows.
+            var seen = Set(local)
+            let fresh = remote.filter { seen.insert($0).inserted }
+            guard !fresh.isEmpty else { return }
+            repositoryURLSuggestions = local + fresh
+            remoteRepositoryCount = fresh.count
         }
         .task(id: branchLookupID) {
             await loadRepositoryBranches()
@@ -1179,7 +1200,15 @@ struct NewProjectView: View {
 
     private var repositoryURLSuggestionHeader: String {
         if gitURL.isEmpty {
-            return "\(repositoryURLSuggestions.count) repositories · Type to search"
+            // Say where the entries came from. Calling them "repositories"
+            // read as the account's whole list, when what was on offer was
+            // whatever this machine had already cloned.
+            var parts = ["\(localRepositoryCount) found locally"]
+            if repositoryScanTruncated { parts[0] += " (scan limit reached)" }
+            if remoteRepositoryCount > 0 {
+                parts.append("\(remoteRepositoryCount) remote")
+            }
+            return "Recent · " + parts.joined(separator: ", ") + " · Type to search"
         }
         return "\(repositoryURLMatchCount) matching repositories"
     }
@@ -1261,15 +1290,11 @@ struct NewProjectView: View {
     /// predicted folder is a real path rather than the bare root.
     static let placeholderProjectName = "new-project"
 
-    /// Every machine that has been configured, connected or not.
-    ///
-    /// Filtering to the connected ones hid machines the person had already set
-    /// up and meant to use — the list simply had fewer entries than the
-    /// settings did, with nothing saying why. A peer that is merely idle is
-    /// still the answer to "where does this project live"; connecting is
-    /// something to do about it, not a reason to pretend it is not there.
+    /// Peers whose current connection has finished authenticating the CLI
+    /// metadata used by project and agent launch. Connected-but-pending rows
+    /// stay out of the picker instead of exposing a choice creation rejects.
     private var selectablePeers: [HostEntry] {
-        hostStore.sortedHosts.filter { !($0.sshTarget ?? "").isEmpty }
+        RemoteHostStore.selectableLaunchHosts(in: hostStore.sortedHosts)
     }
 
     private var defaultAgentHostKey: String? {
@@ -1694,7 +1719,7 @@ struct NewProjectView: View {
                 + agents.compactMap(\.hostKey)
         )
         let allConnected = remoteKeys.allSatisfy { hostKey in
-            selectablePeers.first(where: { $0.id == hostKey })?.isConnected == true
+            selectablePeers.first(where: { $0.id == hostKey })?.isLaunchable == true
         }
         return allConnected && agentsMissingHostDirectory.isEmpty
     }
@@ -1710,13 +1735,13 @@ struct NewProjectView: View {
         }
         let offline = Set([runsOnHostKey].compactMap { $0 } + agents.compactMap(\.hostKey))
             .filter { hostKey in
-                selectablePeers.first(where: { $0.id == hostKey })?.isConnected != true
+                selectablePeers.first(where: { $0.id == hostKey })?.isLaunchable != true
             }
         guard !offline.isEmpty else { return nil }
         let labels = offline.map { machineLabel($0) }.sorted().joined(separator: ", ")
         return offline.count == 1
-            ? "\(labels) is not connected."
-            : "These machines are not connected: \(labels)."
+            ? "\(labels) is not ready to launch remote tools."
+            : "These machines are not ready to launch remote tools: \(labels)."
     }
 
     /// Peer-bound agents whose project folder is still blank.
@@ -2002,11 +2027,19 @@ enum RepositoryURLAutocomplete {
         }
     }
 
+    /// The ceiling exists so a root pointed at a home directory cannot turn
+    /// opening the sheet into an unbounded walk. It was 250, which a single
+    /// ordinary work folder already exceeds — and it stopped silently, so the
+    /// list simply ended with no sign that anything had been left out.
+    /// `truncatedRepositoryScan` records when it bites.
+    static private(set) var truncatedRepositoryScan = false
+
     static func discoverRepositories(
         under roots: [String],
         maximumDepth: Int = 4,
-        maximumRepositories: Int = 250
+        maximumRepositories: Int = 2000
     ) -> [String] {
+        truncatedRepositoryScan = false
         guard maximumDepth >= 0, maximumRepositories > 0 else { return [] }
         let fileManager = FileManager.default
         var queue = roots.map {
@@ -2016,7 +2049,11 @@ enum RepositoryURLAutocomplete {
         var visited = Set<String>()
         var repositories: [String] = []
 
-        while nextIndex < queue.count, repositories.count < maximumRepositories {
+        while nextIndex < queue.count {
+            guard repositories.count < maximumRepositories else {
+                truncatedRepositoryScan = true
+                break
+            }
             let (directory, depth) = queue[nextIndex]
             nextIndex += 1
             guard !directory.isEmpty, visited.insert(directory).inserted else { continue }
@@ -2143,6 +2180,135 @@ enum RepositoryURLAutocomplete {
         components.user = nil
         components.password = nil
         return components.string ?? trimmed
+    }
+}
+
+/// Repositories the account can reach but this machine has not cloned.
+///
+/// The local scan can only offer what is already on disk, which makes the
+/// first clone of anything the one case it cannot help with. This fills that
+/// gap from the GitHub API.
+///
+/// Authentication is borrowed from `gh` rather than stored: the token is read
+/// at call time and never written anywhere, so there is no credential for this
+/// app to keep, rotate, or leak. Without `gh` the catalog is simply empty and
+/// the local list stands on its own.
+enum GitHubRepositoryCatalog {
+    /// Long enough that opening the sheet repeatedly costs one request, short
+    /// enough that a repository created this morning shows up this afternoon.
+    static let cacheLifetime: TimeInterval = 6 * 60 * 60
+
+    struct Cache: Codable {
+        var fetchedAt: Date
+        var sshURLs: [String]
+    }
+
+    private static var cacheURL: URL {
+        URL(fileURLWithPath: NSHomeDirectory())
+            .appendingPathComponent(".term-mesh", isDirectory: true)
+            .appendingPathComponent("github-repos.json")
+    }
+
+    /// Cached SSH URLs, or nil when there is no usable cache.
+    static func cached() -> [String]? {
+        guard let data = try? Data(contentsOf: cacheURL),
+              let cache = try? JSONDecoder().decode(Cache.self, from: data),
+              Date().timeIntervalSince(cache.fetchedAt) < cacheLifetime
+        else { return nil }
+        return cache.sshURLs
+    }
+
+    /// Every repository the token can see, newest first, as `git@` URLs so the
+    /// list is directly comparable with what the local scan produces.
+    ///
+    /// Returns the cache when it is fresh. A failure of any kind — no `gh`, no
+    /// network, a refused token — yields an empty list rather than an error:
+    /// this is an additional convenience over the local scan, never a
+    /// precondition for it.
+    static func load(forceRefresh: Bool = false) async -> [String] {
+        if !forceRefresh, let cached = cached() { return cached }
+        guard let token = await ghToken() else { return [] }
+        var urls: [String] = []
+        var page = 1
+        // A hard page ceiling: an account with thousands of repositories should
+        // not turn opening this sheet into a dozen round trips.
+        while page <= 10 {
+            guard let batch = await fetchPage(page, token: token), !batch.isEmpty else { break }
+            urls.append(contentsOf: batch)
+            if batch.count < 100 { break }
+            page += 1
+        }
+        guard !urls.isEmpty else { return [] }
+        persist(urls)
+        return urls
+    }
+
+    private static func persist(_ urls: [String]) {
+        let cache = Cache(fetchedAt: Date(), sshURLs: urls)
+        guard let data = try? JSONEncoder().encode(cache) else { return }
+        try? FileManager.default.createDirectory(
+            at: cacheURL.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        try? data.write(to: cacheURL, options: .atomic)
+        // Owner-only: the list names private repositories. `.atomic` replaces
+        // the file, so the mode is reapplied on every write rather than once
+        // at creation.
+        try? FileManager.default.setAttributes(
+            [.posixPermissions: 0o600],
+            ofItemAtPath: cacheURL.path
+        )
+    }
+
+    private static func fetchPage(_ page: Int, token: String) async -> [String]? {
+        var components = URLComponents(string: "https://api.github.com/user/repos")
+        components?.queryItems = [
+            URLQueryItem(name: "affiliation", value: "owner,collaborator,organization_member"),
+            URLQueryItem(name: "sort", value: "updated"),
+            URLQueryItem(name: "per_page", value: "100"),
+            URLQueryItem(name: "page", value: String(page)),
+        ]
+        guard let url = components?.url else { return nil }
+        var request = URLRequest(url: url, timeoutInterval: 15)
+        request.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
+        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        guard let (data, response) = try? await URLSession.shared.data(for: request),
+              let http = response as? HTTPURLResponse, http.statusCode == 200,
+              let rows = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]]
+        else { return nil }
+        return rows.compactMap { $0["ssh_url"] as? String }
+    }
+
+    /// `gh auth token`, or nil when gh is absent or logged out.
+    private static func ghToken() async -> String? {
+        guard let executable = ghExecutable() else { return nil }
+        return await Task.detached(priority: .utility) { () -> String? in
+            let process = Process()
+            process.executableURL = URL(fileURLWithPath: executable)
+            process.arguments = ["auth", "token"]
+            let output = Pipe()
+            process.standardOutput = output
+            process.standardError = FileHandle.nullDevice
+            guard (try? process.run()) != nil else { return nil }
+            let data = output.fileHandleForReading.readDataToEndOfFile()
+            process.waitUntilExit()
+            guard process.terminationStatus == 0 else { return nil }
+            let token = String(data: data, encoding: .utf8)?
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            return (token?.isEmpty == false) ? token : nil
+        }.value
+    }
+
+    /// A GUI app inherits a minimal PATH, so `gh` is looked for where its
+    /// installers actually put it rather than trusted to be on the path.
+    private static func ghExecutable() -> String? {
+        let candidates = [
+            "/opt/homebrew/bin/gh",
+            "/usr/local/bin/gh",
+            (NSHomeDirectory() as NSString).appendingPathComponent(".local/bin/gh"),
+            "/usr/bin/gh",
+        ]
+        return candidates.first { FileManager.default.isExecutableFile(atPath: $0) }
     }
 }
 
@@ -2412,6 +2578,10 @@ enum ProjectCreationFlow {
         case remotePathMissing
         case remoteSetupFailed(host: String, detail: String)
         case invalidRepositoryURL(String)
+        /// An existing folder cannot be put on a second machine without a
+        /// repository to reproduce it from. See
+        /// `PeerProjectBootstrap.requiresRepositoryURL`.
+        case repositoryURLRequired(host: String, sourceHost: String)
 
         var errorDescription: String? {
             switch self {
@@ -2425,6 +2595,13 @@ enum ProjectCreationFlow {
                 "Could not prepare \(host): \(detail)"
             case .invalidRepositoryURL(let problem):
                 problem
+            case .repositoryURLRequired(let host, let sourceHost):
+                """
+                \(host) has no copy of this project and there is no Repository \
+                URL to make one from. term-mesh will not start agents in a \
+                folder it cannot verify is this project. Add the repository's \
+                URL, or keep every agent on \(sourceHost).
+                """
             }
         }
     }
@@ -2526,6 +2703,85 @@ enum ProjectCreationFlow {
         ReviewBoardSettings.setVisible(true)
     }
 
+    /// A machine this transaction has already finished with, and what it would
+    /// take to undo it.
+    ///
+    /// The ssh coordinates are captured here rather than looked up again at
+    /// rollback time: the host list can change while a creation is in flight,
+    /// and an undo has to reach the machine the work was actually done on.
+    struct CompletedPlacement {
+        var hostKey: String?
+        var sshTarget: String?
+        var port: Int?
+        var identityFile: String?
+        var environment: [String: String]
+        var plan: PeerProjectBootstrap.Plan
+    }
+
+    /// Undo the placements that succeeded, newest first.
+    ///
+    /// Returns whether every one of them was reclaimed. Best effort by design:
+    /// the usual reason a placement failed is that a machine went away, and the
+    /// machines before it may have gone with it — so a rollback that cannot
+    /// reach a host says so instead of failing the failure.
+    @MainActor
+    private static func rollBack(
+        _ completed: [CompletedPlacement],
+        instanceTag: String,
+        progress: @escaping @MainActor (ProjectCreationEvent) -> Void
+    ) async -> Bool {
+        let undoable = completed.filter {
+            PeerProjectBootstrap.cleanupScript(for: $0.plan, instanceTag: instanceTag) != nil
+        }
+        guard !undoable.isEmpty else { return true }
+        let stepID = "rollback:\(instanceTag)"
+        progress(.started(ProjectBootStep(
+            id: stepID,
+            order: 9_000,
+            title: "Undo prepared checkouts",
+            detail: "\(undoable.count) machine(s)",
+            command: nil,
+            status: .running
+        )))
+        var stranded: [String] = []
+        for placement in undoable.reversed() {
+            let reclaimed: Bool
+            if let sshTarget = placement.sshTarget {
+                reclaimed = await PeerProjectBootstrap.cleanup(
+                    sshTarget: sshTarget,
+                    port: placement.port,
+                    identityFile: placement.identityFile,
+                    plan: placement.plan,
+                    instanceTag: instanceTag,
+                    environment: placement.environment
+                )
+            } else {
+                reclaimed = await PeerProjectBootstrap.cleanupLocal(
+                    plan: placement.plan,
+                    instanceTag: instanceTag
+                )
+            }
+            if !reclaimed {
+                let host = hostDisplayName(placement.hostKey)
+                stranded.append(host)
+                RemoteWorkLog.info(
+                    "Could not undo the prepared checkouts on \(host); "
+                        + "a retry will reuse them (\(instanceTag))."
+                )
+            }
+        }
+        guard stranded.isEmpty else {
+            progress(.failed(
+                id: stepID,
+                message: "Left in place on \(stranded.joined(separator: ", ")) — "
+                    + "creating this project again will reuse them."
+            ))
+            return false
+        }
+        progress(.completed(id: stepID, detail: "\(undoable.count) machine(s) reclaimed"))
+        return true
+    }
+
     /// Prepare every machine selected in the form before launching anyone.
     ///
     /// Remote members receive the concrete worktree path made for them.
@@ -2568,116 +2824,173 @@ enum ProjectCreationFlow {
         // convention — deriving the id from it would give the same project a
         // different mem-mesh identity on each machine.
         let memMeshProjectID = PeerProjectBootstrap.memMeshProjectID(for: name)
-        // One tag for the whole transaction: retrying a failed placement
-        // reuses the same paths (idempotent), while a later re-creation of
-        // the same project never adopts this run's leftovers.
-        let instanceTag = PeerProjectBootstrap.makeInstanceTag()
+        // Nothing is created until every placement is known to be preparable.
+        // A machine that cannot be given the project at all is a form mistake,
+        // and finding it after two hosts are already set up means undoing them.
+        for placement in placements where PeerProjectBootstrap.requiresRepositoryURL(
+            placement: placement, sourceKind: source.kind, gitURL: gitURL
+        ) {
+            throw CreationError.repositoryURLRequired(
+                host: hostDisplayName(placement.hostKey),
+                sourceHost: hostDisplayName(source.hostKey)
+            )
+        }
 
-        for (placementIndex, placement) in placements.enumerated() {
-            let placedRows = placement.agentIndices.map { rows[$0] }
-            let plan = PeerProjectBootstrap.plan(
-                projectRoot: (placement.projectPath as NSString).deletingLastPathComponent,
-                projectName: (placement.projectPath as NSString).lastPathComponent,
-                agents: placedRows.map(\.preset.name),
-                isolateAgents: source.isolateAgents,
-                instanceTag: instanceTag
-            )
-            let kind: ProjectSourceKind = placement.isSource
-                ? source.kind
-                : (gitURL.isEmpty ? source.kind : .clone)
-            let stepID = checkoutStepID(
-                hostKey: placement.hostKey,
-                path: plan.primaryPath
-            )
-            let checkoutStep = ProjectBootStep(
-                id: stepID,
-                order: placementIndex,
-                title: checkoutTitle(kind: kind),
-                detail: "\(hostDisplayName(placement.hostKey)) · \(plan.primaryPath)",
-                command: checkoutCommandPreview(
-                    plan: plan,
-                    gitURL: gitURL.isEmpty ? nil : gitURL,
-                    gitBranch: source.gitBranch,
-                    sourceKind: kind
-                ),
-                status: .running
-            )
-            progress(.started(checkoutStep))
+        // One tag for the whole transaction, and the same one for every retry
+        // of it: minting a fresh tag per attempt named a new set of checkouts
+        // each time while the previous set stayed on disk. Cleared once the
+        // creation succeeds, so a later re-creation of the same project never
+        // adopts this run's leftovers.
+        let transactionKey = PeerProjectBootstrap.transactionKey(
+            name: name, sourcePath: source.projectPath
+        )
+        let instanceTag = PeerProjectBootstrap.instanceTag(forTransaction: transactionKey)
 
-            if let hostKey = placement.hostKey {
-                guard let host = RemoteHostStore.shared.sortedHosts.first(where: { $0.id == hostKey }),
-                      let sshTarget = host.sshTarget, !sshTarget.isEmpty
-                else {
-                    throw CreationError.remoteHostUnavailable
-                }
-                do {
-                    try await PeerProjectBootstrap.run(
-                        sshTarget: sshTarget,
-                        port: host.sshPort,
-                        identityFile: host.identityFile,
+        // What each finished placement would take to undo, in the order it was
+        // done. A placement's own script rolls back the step that failed; this
+        // is for the ones that already succeeded when a later machine fails.
+        var completed: [CompletedPlacement] = []
+
+        do {
+            for (placementIndex, placement) in placements.enumerated() {
+                let placedRows = placement.agentIndices.map { rows[$0] }
+                let plan = PeerProjectBootstrap.plan(
+                    projectRoot: (placement.projectPath as NSString).deletingLastPathComponent,
+                    projectName: (placement.projectPath as NSString).lastPathComponent,
+                    agents: placedRows.map(\.preset.name),
+                    isolateAgents: source.isolateAgents,
+                    instanceTag: instanceTag
+                )
+                let kind: ProjectSourceKind = placement.isSource
+                    ? source.kind
+                    : (gitURL.isEmpty ? source.kind : .clone)
+                let stepID = checkoutStepID(
+                    hostKey: placement.hostKey,
+                    path: plan.primaryPath
+                )
+                let checkoutStep = ProjectBootStep(
+                    id: stepID,
+                    order: placementIndex,
+                    title: checkoutTitle(kind: kind),
+                    detail: "\(hostDisplayName(placement.hostKey)) · \(plan.primaryPath)",
+                    command: checkoutCommandPreview(
                         plan: plan,
                         gitURL: gitURL.isEmpty ? nil : gitURL,
                         gitBranch: source.gitBranch,
-                        sourceKind: kind,
-                        memMeshProjectID: memMeshProjectID,
-                        environment: PeerHostEnvironment.stored(forHostKey: hostKey)
-                    )
-                } catch {
-                    let detail = PeerProjectBootstrap.remoteFailureDescription(
-                        error,
-                        gitURL: gitURL.isEmpty ? nil : gitURL
-                    )
-                    RemoteWorkLog.info(
-                        "Could not prepare \(name) on \(host.displayName): \(detail)"
-                    )
-                    progress(.failed(id: stepID, message: detail))
-                    throw CreationError.remoteSetupFailed(
-                        host: host.displayName,
-                        detail: detail
-                    )
-                }
-                for (offset, rowIndex) in placement.agentIndices.enumerated()
-                    where offset < plan.agentCheckouts.count {
-                    prepared[rowIndex].hostKey = hostKey
-                    prepared[rowIndex].hostDirectory = plan.agentCheckouts[offset].path
-                }
-                RemoteProjectPaths.shared.remember(
-                    host: hostKey,
-                    localRoot: source.projectPath,
-                    path: plan.primaryPath
+                        sourceKind: kind
+                    ),
+                    status: .running
                 )
-            } else {
-                // Local team creation owns local member worktrees. This step
-                // prepares only their shared primary checkout.
-                let primaryOnly = PeerProjectBootstrap.Plan(
-                    primaryPath: plan.primaryPath,
-                    agentCheckouts: []
-                )
-                do {
-                    try await PeerProjectBootstrap.runLocal(
-                        plan: primaryOnly,
-                        gitURL: gitURL.isEmpty ? nil : gitURL,
-                        gitBranch: source.gitBranch,
-                        sourceKind: kind,
-                        memMeshProjectID: memMeshProjectID
+                progress(.started(checkoutStep))
+
+                if let hostKey = placement.hostKey {
+                    guard let host = RemoteHostStore.shared.sortedHosts.first(where: { $0.id == hostKey }),
+                          host.isLaunchable,
+                          let sshTarget = host.sshTarget, !sshTarget.isEmpty
+                    else {
+                        throw CreationError.remoteHostUnavailable
+                    }
+                    do {
+                        try await PeerProjectBootstrap.run(
+                            sshTarget: sshTarget,
+                            port: host.sshPort,
+                            identityFile: host.identityFile,
+                            plan: plan,
+                            gitURL: gitURL.isEmpty ? nil : gitURL,
+                            gitBranch: source.gitBranch,
+                            sourceKind: kind,
+                            memMeshProjectID: memMeshProjectID,
+                            environment: PeerHostEnvironment.stored(forHostKey: hostKey)
+                        )
+                    } catch {
+                        let detail = PeerProjectBootstrap.remoteFailureDescription(
+                            error,
+                            gitURL: gitURL.isEmpty ? nil : gitURL
+                        )
+                        RemoteWorkLog.info(
+                            "Could not prepare \(name) on \(host.displayName): \(detail)"
+                        )
+                        progress(.failed(id: stepID, message: detail))
+                        throw CreationError.remoteSetupFailed(
+                            host: host.displayName,
+                            detail: detail
+                        )
+                    }
+                    completed.append(CompletedPlacement(
+                        hostKey: hostKey,
+                        sshTarget: sshTarget,
+                        port: host.sshPort,
+                        identityFile: host.identityFile,
+                        environment: PeerHostEnvironment.stored(forHostKey: hostKey),
+                        plan: plan
+                    ))
+                    for (offset, rowIndex) in placement.agentIndices.enumerated()
+                        where offset < plan.agentCheckouts.count {
+                        prepared[rowIndex].hostKey = hostKey
+                        prepared[rowIndex].hostDirectory = plan.agentCheckouts[offset].path
+                    }
+                    RemoteProjectPaths.shared.remember(
+                        host: hostKey,
+                        localRoot: source.projectPath,
+                        path: plan.primaryPath
                     )
-                } catch {
-                    progress(.failed(id: stepID, message: error.localizedDescription))
-                    throw error
+                } else {
+                    // Local team creation owns local member worktrees. This step
+                    // prepares only their shared primary checkout.
+                    let primaryOnly = PeerProjectBootstrap.Plan(
+                        primaryPath: plan.primaryPath,
+                        agentCheckouts: []
+                    )
+                    do {
+                        try await PeerProjectBootstrap.runLocal(
+                            plan: primaryOnly,
+                            gitURL: gitURL.isEmpty ? nil : gitURL,
+                            gitBranch: source.gitBranch,
+                            sourceKind: kind,
+                            memMeshProjectID: memMeshProjectID
+                        )
+                    } catch {
+                        progress(.failed(id: stepID, message: error.localizedDescription))
+                        throw error
+                    }
+                    completed.append(CompletedPlacement(
+                        hostKey: nil,
+                        sshTarget: nil,
+                        port: nil,
+                        identityFile: nil,
+                        environment: [:],
+                        plan: plan
+                    ))
+                    localProjectPath = plan.primaryPath
                 }
-                localProjectPath = plan.primaryPath
-            }
 
-            progress(.completed(
-                id: stepID,
-                detail: "\(hostDisplayName(placement.hostKey)) · \(plan.primaryPath)"
-            ))
+                progress(.completed(
+                    id: stepID,
+                    detail: "\(hostDisplayName(placement.hostKey)) · \(plan.primaryPath)"
+                ))
 
-            if placement.includesLeader {
-                leaderProjectPath = placement.hostKey == nil ? nil : plan.primaryPath
+                if placement.includesLeader {
+                    leaderProjectPath = placement.hostKey == nil ? nil : plan.primaryPath
+                }
             }
+        } catch {
+            // Reverse order, so a machine is only undone after everything set
+            // up after it has been. Whether it succeeded decides the tag: a
+            // transaction reclaimed in full is over, and one that could not
+            // reach a host keeps its tag so the retry resumes those same
+            // checkouts instead of naming another set beside them.
+            let reclaimed = await rollBack(
+                completed,
+                instanceTag: instanceTag,
+                progress: progress
+            )
+            if reclaimed {
+                PeerProjectBootstrap.finishTransaction(transactionKey)
+            }
+            throw error
         }
 
+        PeerProjectBootstrap.finishTransaction(transactionKey)
         return PreparedCheckouts(
             rows: prepared,
             localProjectPath: localProjectPath,

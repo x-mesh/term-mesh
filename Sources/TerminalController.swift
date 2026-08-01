@@ -4,6 +4,7 @@ import Darwin
 import Foundation
 import os
 import Bonsplit
+import PeerProto
 import WebKit
 
 // The worktree-lock helpers below return `Result<_, String>`, using a String
@@ -400,24 +401,29 @@ class TerminalController {
         }
 
         var buffer = [UInt8](repeating: 0, count: 4096)
-        var pending = ""
+        var pending = Data()
         var authenticated = false
 
         while isRunning {
-            let bytesRead = read(socket, &buffer, buffer.count - 1)
-            guard bytesRead > 0 else { break }
+            let bytesRead = Self.readControlSocketBytes(socket, into: &buffer)
+            if bytesRead < 0 {
+                let readErrno = errno
+                Logger.socket.warning(
+                    "handleClient: read failed errno=\(readErrno) (\(String(cString: strerror(readErrno))))"
+                )
+                break
+            }
+            if bytesRead == 0 { break }
 
-            let chunk = String(bytes: buffer[0..<bytesRead], encoding: .utf8) ?? ""
-            pending.append(chunk)
-
-            if pending.utf8.count > 1_048_576 { // 1 MB — no newline arrived; drop connection
+            guard let frames = Self.appendControlSocketChunk(
+                Data(buffer[0..<bytesRead]),
+                to: &pending
+            ) else {
                 Logger.socket.warning("handleClient: pending buffer exceeded 1 MB, closing connection")
                 break
             }
 
-            while let newlineIndex = pending.firstIndex(of: "\n") {
-                let line = String(pending[..<newlineIndex])
-                pending = String(pending[pending.index(after: newlineIndex)...])
+            for line in frames {
                 let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
                 guard !trimmed.isEmpty else { continue }
 
@@ -430,6 +436,58 @@ class TerminalController {
                 writeSocketResponse(response, to: socket)
             }
         }
+    }
+
+    /// Reads one socket chunk, retrying an interrupted syscall without losing
+    /// the caller's partial frame. Other errors are returned to the read loop
+    /// so it can log the final errno and close the connection.
+    nonisolated static func readControlSocketBytes(
+        _ socket: Int32,
+        into buffer: inout [UInt8],
+        readOperation: (Int32, UnsafeMutableRawPointer?, Int) -> Int = {
+            Darwin.read($0, $1, $2)
+        }
+    ) -> Int {
+        buffer.withUnsafeMutableBytes { bytes in
+            while true {
+                let result = readOperation(socket, bytes.baseAddress, max(0, bytes.count - 1))
+                if result < 0, errno == EINTR { continue }
+                return result
+            }
+        }
+    }
+
+    /// Appends raw socket bytes and decodes only complete LF-delimited frames.
+    /// Keeping the pending buffer as bytes prevents a split UTF-8 scalar from
+    /// invalidating either read chunk. Each completed frame and the remaining
+    /// unterminated suffix have independent byte limits.
+    ///
+    /// Bounding the accumulated buffer instead conflated the case worth
+    /// killing a connection over — one writer flooding us without ever
+    /// sending a newline — with two legitimate shapes: a batch of complete
+    /// frames whose total happens to exceed the limit, and a frame that lands
+    /// exactly on it, pushed one byte past by its own trailing LF.
+    nonisolated static func appendControlSocketChunk(
+        _ chunk: Data,
+        to pending: inout Data,
+        maxPendingBytes: Int = 1_048_576
+    ) -> [String]? {
+        pending.append(chunk)
+
+        var frames: [String] = []
+        while let newlineIndex = pending.firstIndex(of: 0x0A) {
+            // A terminated frame past the limit is still a flood; it just
+            // arrived with its newline attached. `Data` resets `startIndex` on
+            // every mutation, so this index is the frame's length.
+            guard newlineIndex <= maxPendingBytes else { return nil }
+            let frame = Data(pending[..<newlineIndex])
+            pending.removeSubrange(...newlineIndex)
+            if let line = String(data: frame, encoding: .utf8) {
+                frames.append(line)
+            }
+        }
+        guard pending.count <= maxPendingBytes else { return nil }
+        return frames
     }
 
     private func processCommand(_ command: String) -> String {
@@ -798,6 +856,14 @@ class TerminalController {
             return v2Error(id: id, code: "invalid_request", message: "Missing method")
         }
 
+        // A remote leader process lives beside this app but its authoritative
+        // team lives on the connected viewer. Route the scoped reverse RPC
+        // before the generic team dispatcher; `peer.leader.call` is not a
+        // local team mutation.
+        if method == "peer.leader.call" {
+            return dispatchPeerLeaderCall(params: params, id: id)
+        }
+
         // ── Approach D: Async Team Dispatch ─────────────────────────────
         // ALL team commands are handled via async path. Data-only commands
         // use TeamDataStore directly (no main thread). UI commands use
@@ -829,10 +895,14 @@ class TerminalController {
             let info = Bundle.main.infoDictionary ?? [:]
             let version = info["CFBundleShortVersionString"] as? String ?? "?"
             let build = info["CFBundleVersion"] as? String ?? "?"
+            // The build phase stamps TermMeshCommit into the built plist
+            // after compilation. BuildInfo.swift is therefore a one-build
+            // fallback, not the runtime source of truth.
+            let gitSHA = info["TermMeshCommit"] as? String ?? BuildInfo.gitSHA
             return v2Ok(id: id, result: [
                 "app_version": version,
                 "build_number": build,
-                "git_sha": BuildInfo.gitSHA,
+                "git_sha": gitSHA,
             ])
         case "system.identify":
             return v2Ok(id: id, result: v2Identify(params: params))
@@ -1245,6 +1315,8 @@ class TerminalController {
             return v2Result(id: id, self.v2DebugType(params: params))
         case "debug.app.activate":
             return v2Result(id: id, self.v2DebugActivateApp())
+        case "debug.app.build":
+            return v2Result(id: id, self.v2DebugAppBuild())
         case "debug.command_palette.toggle":
             return v2Result(id: id, self.v2DebugToggleCommandPalette(params: params))
         case "debug.agent.transcript":
@@ -1296,8 +1368,14 @@ class TerminalController {
             return v2Result(id: id, self.v2DebugProjectCreate(params: params))
         case "debug.project.delete":
             return v2Result(id: id, self.v2DebugProjectDelete(params: params))
+        case "debug.project.reattach_leader":
+            return v2Result(id: id, self.v2DebugProjectReattachLeader(params: params))
+        case "debug.project.restore_presentation":
+            return v2Result(id: id, self.v2DebugProjectRestorePresentation(params: params))
         case "debug.peer.shells.inspect":
             return v2Result(id: id, self.v2DebugPeerShellInspect(params: params))
+        case "debug.peer.shells.close":
+            return v2Result(id: id, self.v2DebugPeerShellClose(params: params))
         case "debug.peer.shells.status":
             return v2Result(id: id, self.v2DebugPeerShellStatus())
         case "debug.reviewboard.delegate":
@@ -1534,6 +1612,7 @@ class TerminalController {
             "debug.shortcut.simulate",
             "debug.type",
             "debug.app.activate",
+            "debug.app.build",
             "debug.command_palette.toggle",
             "debug.agent.transcript",
             "debug.command_palette.rename_tab.open",
@@ -1777,6 +1856,149 @@ class TerminalController {
         // Ensure single-line responses for the line-oriented socket protocol.
         s = s.replacingOccurrences(of: "\n", with: "\\n")
         return s
+    }
+
+    private func dispatchPeerLeaderCall(
+        params: [String: Any],
+        id: Any?
+    ) -> String {
+        guard let grantID = Self.decodeFixedHex(
+            params["grant_id_hex"] as? String,
+            byteCount: PeerTeamLeader.grantIDBytes
+        ),
+        let targetPeerID = Self.decodeFixedHex(
+            params["target_peer_id_hex"] as? String,
+            byteCount: PeerIdentity.byteCount
+        ),
+        let requestID = Self.decodeFixedHex(
+            params["request_id_hex"] as? String,
+            byteCount: PeerTeamLeader.requestIDBytes
+        ),
+        let projectID = params["project_id"] as? String,
+        let teamUUID = params["team_uuid"] as? String,
+        let method = params["method"] as? String,
+        let paramsJSON = params["params_json"] as? String,
+        let expiresNumber = params["expires_at_unix_secs"] as? NSNumber else {
+            return v2Error(
+                id: id,
+                code: "invalid_params",
+                message: "invalid remote leader route"
+            )
+        }
+
+        var grant = Termmesh_Peer_V1_TeamLeaderGrant()
+        grant.grantID = grantID
+        grant.projectID = projectID
+        grant.teamUuid = teamUUID
+        grant.role = .leader
+        grant.expiresAtUnixSecs = expiresNumber.uint64Value
+        var request = Termmesh_Peer_V1_TeamLeaderCommandRequest()
+        request.grant = grant
+        request.teamUuid = teamUUID
+        request.requestID = requestID
+        request.method = method
+        request.paramsJson = paramsJSON
+
+        let semaphore = DispatchSemaphore(value: 0)
+        nonisolated(unsafe) var outcome:
+            Result<Termmesh_Peer_V1_TeamLeaderCommandResponse, Error>?
+        let task = Task {
+            defer { semaphore.signal() }
+            do {
+                outcome = .success(
+                    try await PeerHostCoordinator.shared.callTeamLeader(
+                        request,
+                        targetPeerID: targetPeerID,
+                        timeoutSeconds: 10
+                    )
+                )
+            } catch {
+                outcome = .failure(error)
+            }
+        }
+        if semaphore.wait(timeout: .now() + 12) == .timedOut {
+            task.cancel()
+            return v2Error(
+                id: id,
+                code: "timeout",
+                message: "remote leader proxy timed out"
+            )
+        }
+        guard let outcome else {
+            return v2Error(
+                id: id,
+                code: "internal_error",
+                message: "remote leader proxy produced no result"
+            )
+        }
+        switch outcome {
+        case .failure(let error):
+            return v2Error(
+                id: id,
+                code: "peer_leader_unavailable",
+                message: String(describing: error)
+            )
+        case .success(let response):
+            let result: Any
+            if let data = response.resultJson.data(using: .utf8),
+               let decoded = try? JSONSerialization.jsonObject(with: data) {
+                result = decoded
+            } else {
+                result = [:]
+            }
+            return v2Ok(id: id, result: [
+                "ok": response.ok,
+                "cached": response.cached,
+                "result": result,
+                "error_code": response.errorCode,
+                "error_message": response.errorMessage,
+            ])
+        }
+    }
+
+    /// Read a fixed-width hex string off the wire, refusing anything else.
+    ///
+    /// Measured in units of UTF-8 rather than `Character` on purpose, and both
+    /// the length check and the walk use the same unit. They did not: the
+    /// guard counted `value.utf8.count` while the loop advanced by
+    /// `index(_:offsetBy: 2)` over graphemes, so any non-ASCII byte made the
+    /// two disagree and the walk ran off the end. `String.index(_:offsetBy:)`
+    /// traps past `endIndex` — this returned `nil` for bad input everywhere
+    /// except the one shape that killed the process instead.
+    ///
+    /// `peer.leader.call` hands its three id parameters straight here, so the
+    /// input is whatever a socket client typed. `"0" * 62 + "é"` is 64 UTF-8
+    /// bytes and 63 characters, and every pair before the last parses as hex.
+    nonisolated static func decodeFixedHex(
+        _ value: String?,
+        byteCount: Int
+    ) -> Data? {
+        guard let value else { return nil }
+        // A hex string is ASCII by definition, so its UTF-8 view is also its
+        // list of digits: one unit per character, no grapheme boundary to
+        // disagree about, and no index arithmetic that can leave the buffer.
+        let digits = Array(value.utf8)
+        guard digits.count == byteCount * 2 else { return nil }
+        var bytes = [UInt8]()
+        bytes.reserveCapacity(byteCount)
+        for pair in stride(from: 0, to: digits.count, by: 2) {
+            guard let high = hexNibble(digits[pair]),
+                  let low = hexNibble(digits[pair + 1]) else { return nil }
+            bytes.append(high << 4 | low)
+        }
+        return Data(bytes)
+    }
+
+    /// One hex digit's value, or nil for anything that is not one. Rejects the
+    /// non-ASCII bytes `UInt8(_:radix:)` would have rejected anyway, one byte
+    /// earlier and without a `String` in between.
+    nonisolated private static func hexNibble(_ digit: UInt8) -> UInt8? {
+        switch digit {
+        case 0x30...0x39: return digit - 0x30            // 0-9
+        case 0x61...0x66: return digit - 0x61 + 10       // a-f
+        case 0x41...0x46: return digit - 0x41 + 10       // A-F
+        default: return nil
+        }
     }
 
     func v2EnsureHandleRef(kind: V2HandleKind, uuid: UUID) -> String {
@@ -2675,7 +2897,9 @@ class TerminalController {
             case noDirectory(host: String)
         }
         let resolution: Resolution = await MainActor.run {
-            let hosts = RemoteHostStore.shared.sortedHosts.filter(\.isConnected)
+            let hosts = RemoteHostStore.selectableLaunchHosts(
+                in: RemoteHostStore.shared.sortedHosts
+            )
             let candidates = hosts.map {
                 (key: $0.id, displayName: $0.displayName, sshTarget: $0.sshTarget)
             }
@@ -3134,7 +3358,12 @@ class TerminalController {
         }
 
         // Minimal MainActor hold: get team struct (agent names, UUIDs, team metadata) only
-        let teamInfo: (leaderSessionId: String, workspaceId: String, agents: [(name: String, id: String, instanceId: String, cli: String, model: String, agentType: String, color: String, workspaceId: String, panelId: String?, completedTaskCount: Int, worktreeBranch: String?, worktreePath: String?, hostKey: String?)], createdAt: String, policyState: String, policyFailure: String?)? = await MainActor.run {
+        // `workingDirectory` is carried because the snapshot used to drop
+        // `originalAgentWorkDir`, leaving this path with no real cwd to report
+        // and `checkout` falling back to a workspace UUID. Derived here, on the
+        // actor that owns the member, so both status implementations answer
+        // with the same value.
+        let teamInfo: (leaderSessionId: String, workspaceId: String, agents: [(name: String, id: String, instanceId: String, cli: String, model: String, agentType: String, color: String, workspaceId: String, panelId: String?, completedTaskCount: Int, worktreeBranch: String?, worktreePath: String?, hostKey: String?, workingDirectory: String?)], createdAt: String, policyState: String, policyFailure: String?)? = await MainActor.run {
             guard let team = TeamOrchestrator.shared.teamStruct(name: teamName) else { return nil }
             return (
                 leaderSessionId: team.leaderSessionId,
@@ -3143,7 +3372,12 @@ class TerminalController {
                     (name: a.name, id: a.id, instanceId: a.agentInstanceId, cli: a.cli, model: a.model, agentType: a.agentType, color: a.color,
                      workspaceId: a.workspaceId.uuidString, panelId: a.panelId?.uuidString,
                      completedTaskCount: a.completedTaskCount, worktreeBranch: a.worktreeBranch, worktreePath: a.worktreePath,
-                     hostKey: a.hostKey)
+                     hostKey: a.hostKey,
+                     workingDirectory: TeamOrchestrator.agentWorkingDirectory(
+                        worktreePath: a.worktreePath,
+                        originalAgentWorkDir: a.originalAgentWorkDir,
+                        teamWorkingDirectory: team.workingDirectory
+                     ))
                 },
                 createdAt: ISO8601DateFormatter().string(from: team.createdAt),
                 policyState: team.leaderPolicyState,
@@ -3179,13 +3413,20 @@ class TerminalController {
             // Merge data enrichment (task, heartbeat, agent_state)
             for (key, value) in enrichment { info[key] = value }
             if let branch = agent.worktreeBranch { info["worktree_branch"] = branch }
+            // Worktree lifecycle only — present when a task created one.
+            // `working_directory` is where the pane is, and is always answered.
             if let path = agent.worktreePath { info["worktree_path"] = path }
+            info["working_directory"] = agent.workingDirectory as Any? ?? NSNull()
+            info["locality"] = TeamOrchestrator.agentLocality(hostKey: agent.hostKey)
             info["parallel_telemetry"] = [
                 "wave_id": (enrichment["active_task_id"] as? String) ?? agent.instanceId,
                 "task_id": enrichment["active_task_id"] ?? NSNull(),
                 "agent_instance_id": agent.instanceId,
                 "host": agent.hostKey ?? NSNull(),
-                "checkout": agent.worktreePath ?? agent.worktreeBranch ?? agent.workspaceId,
+                "locality": TeamOrchestrator.agentLocality(hostKey: agent.hostKey),
+                // The pane's real cwd. A workspace UUID here reads like a
+                // machine identifier and was taken for one.
+                "checkout": agent.workingDirectory as Any? ?? NSNull(),
                 "delivery": (enrichment["agent_state"] as? String) ?? "unknown",
                 "synthesis": "pending",
             ]
@@ -3388,10 +3629,12 @@ class TerminalController {
             return v2Error(id: id, code: "invalid_params", message: "Missing task_id")
         }
         let assignee = params["assignee"] as? String
+        let assigneeInstanceId = params["agent_instance_id"] as? String
         let store = TeamDataStore.shared
 
         guard let task = store.reassignTask(
-            teamName: teamName, taskId: taskId, assignee: assignee
+            teamName: teamName, taskId: taskId, assignee: assignee,
+            assigneeInstanceId: assigneeInstanceId
         ) else {
             return v2Error(id: id, code: "not_found", message: "Task not found")
         }
@@ -3403,7 +3646,17 @@ class TerminalController {
                 teamName: teamName, task: task, tabManager: tabManager
             )
         }
-        return v2Ok(id: id, result: ["task": store.taskDictionary(task), "dispatched": dispatched])
+        var result: [String: Any] = [
+            "task": store.taskDictionary(task), "dispatched": dispatched,
+        ]
+        // Assigning by name when several agents answer to it picks the first.
+        // The caller asked for a role and got an instance, and this is the only
+        // place that can say so before they act on the answer.
+        if assigneeInstanceId?.nilIfBlankTC == nil,
+           let warning = store.duplicateNameWarning(teamName: teamName, assignee: assignee) {
+            result["duplicate_name_warning"] = warning
+        }
+        return v2Ok(id: id, result: result)
     }
 
     private func asyncTeamTaskUnblock(params: [String: Any], id: Any?) async -> String {
@@ -3545,7 +3798,16 @@ class TerminalController {
                     id: nil
                 )
             }
-            return v2Ok(id: id, result: ["task": store.taskDictionary(task), "dispatched": dispatched])
+            var result: [String: Any] = [
+                "task": store.taskDictionary(task), "dispatched": dispatched,
+            ]
+            // `reassign_to` is a name — the Reject button has nothing else to
+            // give — so the same first-match choice applies and the same
+            // warning is owed.
+            if let warning = store.duplicateNameWarning(teamName: teamName, assignee: reassignTo) {
+                result["duplicate_name_warning"] = warning
+            }
+            return v2Ok(id: id, result: result)
         }
 
         guard let task = store.updateTask(
@@ -3751,6 +4013,43 @@ class TerminalController {
         }
     }
 
+    /// The delegate idempotency key as it arrives on the wire.
+    ///
+    /// Static and pure so the wiring is pinned by a test: the store has deduped
+    /// on this since 5c95ab10 and the CLI has sent it since d168ad61, and the
+    /// only thing that was ever missing was somebody reading it here.
+    nonisolated static func delegateRequestID(from params: [String: Any]) -> String? {
+        guard let raw = params["request_id"] as? String else { return nil }
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
+    }
+
+    /// What is holding the pool, phrased so the next command is obvious.
+    ///
+    /// `review_ready` is the common one and the reason this exists: it is not a
+    /// terminal status, so the agent stays out of the pool until someone closes
+    /// the task — and the old message said "Task creation failed", which sent
+    /// the reader looking at the store instead.
+    ///
+    /// Pure and static so the wording is pinned by a test rather than by
+    /// reading it off a running app.
+    nonisolated static func delegateBlockerSummary(
+        _ blockers: [TeamOrchestrator.DelegateBlocker]
+    ) -> String {
+        guard !blockers.isEmpty else {
+            // Every instance was ineligible for a reason other than a task:
+            // parked, migrating, no pane, or still thinking.
+            return "every instance is parked, migrating or still working. "
+                + "Retry shortly, or pass --agent-instance-id to target one exactly."
+        }
+        let listed = blockers
+            .map { "\($0.taskID) (\($0.status))" }
+            .joined(separator: ", ")
+        return "blocked by active task(s): \(listed). "
+            + "Close one with `tm-agent task done <id>`, or pass --agent-instance-id "
+            + "to target an instance exactly."
+    }
+
     /// Unified delegate handler: atomically creates a task and dispatches the formatted
     /// instruction to the agent in a single RPC. Replaces the 2-step team.task.create +
     /// team.send pattern used by `tm-agent delegate` as fallback.
@@ -3775,17 +4074,49 @@ class TerminalController {
         // An explicit instance stays exact. Without it, scheduling happens on
         // the main actor inside `delegateToAgent`, where idle-state check,
         // cursor advance, task assignment and delivery share one serial turn.
-        let requestedInstanceId = params["agent_instance_id"] as? String
+        var requestedInstanceId = params["agent_instance_id"] as? String
         if let requestedInstanceId, !requestedInstanceId.isEmpty {
             let selection = await resolveTeamAgentInstance(
                 params: params, teamName: teamName, agentName: agentName
             )
             if let failure = selection.failure { return v2Result(id: id, failure) }
+        } else if let rawPanelID = (params["panel_id"] as? String)?.nilIfBlankTC {
+            // A caller that named a pane has already chosen; honouring only
+            // `agent_instance_id` threw that away and fell through to the pool,
+            // where `resolveAssigneeUnsafe`'s name-only auto-pin hands the work
+            // to whichever same-named sibling happens to be first. Silent, and
+            // wrong exactly when duplicate names make it matter.
+            guard let panelID = UUID(uuidString: rawPanelID) else {
+                return v2Error(
+                    id: id, code: "invalid_params",
+                    message: "panel_id '\(rawPanelID)' is not a UUID"
+                )
+            }
+            let resolved = await MainActor.run {
+                TeamOrchestrator.shared.agentInstanceID(
+                    teamName: teamName, agentName: agentName, panelID: panelID
+                )
+            }
+            guard let resolved else {
+                // Refused rather than guessed: the caller pointed at one pane,
+                // and picking a different one is not a smaller failure.
+                return v2Error(
+                    id: id, code: "not_found",
+                    message: "No pane \(rawPanelID) belongs to agent '\(agentName)' in team "
+                        + "'\(teamName)'. Pass agent_instance_id, or omit panel_id to use the pool."
+                )
+            }
+            requestedInstanceId = resolved
         }
 
         let taskTitle = params["task_title"] as? String
         let priority = params["priority"] as? Int
         let context = params["context"] as? String
+        // The CLI has sent a stable id per delegate since d168ad61, and
+        // `TeamDataStore.createTask` has deduped on it since 5c95ab10 — but
+        // nothing in between read it, so a retried delegate still created a
+        // second task. This is the missing wire.
+        let requestId = TerminalController.delegateRequestID(from: params)
         let store = TeamDataStore.shared
 
         // Stagger: dynamic gap based on team size to prevent main-queue saturation
@@ -3806,7 +4137,7 @@ class TerminalController {
         // for cases where completion is never called due to a deeper bug.
         // The Rust CLI sends Return via team.send_key only after receiving this ack,
         // eliminating the race between paste flush and the previous 150ms fixed sleep.
-        var capturedDelegateResult: TeamOrchestrator.DelegateResult? = nil
+        var capturedOutcome: TeamOrchestrator.DelegateOutcome? = nil
         let textDelivered: Bool = await withCheckedContinuation { cont in
             var resumed = false
             let resume: (Bool) -> Void = { ok in
@@ -3818,7 +4149,7 @@ class TerminalController {
             Task { @MainActor in
                 let tabManager = TeamOrchestrator.shared.resolveTabManager(teamName: teamName) ?? self.tabManager
                 guard let tabManager else { resume(false); return }
-                capturedDelegateResult = TeamOrchestrator.shared.delegateToAgent(
+                let outcome = TeamOrchestrator.shared.delegate(
                     teamName: teamName,
                     agentName: agentName,
                     agentInstanceId: requestedInstanceId,
@@ -3826,19 +4157,52 @@ class TerminalController {
                     taskTitle: taskTitle,
                     priority: priority,
                     context: context,
+                    requestId: requestId,
                     tabManager: tabManager,
                     completion: { ok in resume(ok) }
                 )
-                if capturedDelegateResult == nil { resume(false) }
+                capturedOutcome = outcome
+                if case .delivered = outcome {} else { resume(false) }
             }
         }
 
-        guard let delegateResult = capturedDelegateResult else {
-            return v2Error(id: id, code: "internal_error", message: "Task creation failed for agent '\(agentName)'")
+        let delegateResult: TeamOrchestrator.DelegateResult
+        switch capturedOutcome {
+        case .delivered(let result):
+            delegateResult = result
+        case .noSuchAgent:
+            return v2Error(
+                id: id, code: "not_found",
+                message: "No agent named '\(agentName)' in team '\(teamName)'"
+            )
+        case .allInstancesBusy(let blockers):
+            // The id is the actionable half: without it the leader is told an
+            // agent is busy and has to go find out what with.
+            return v2Error(
+                id: id, code: "agent_busy",
+                message: "Agent '\(agentName)' has no idle instance — "
+                    + TerminalController.delegateBlockerSummary(blockers)
+            )
+        case .taskCreateFailed:
+            return v2Error(
+                id: id, code: "internal_error",
+                message: "Task creation failed for agent '\(agentName)'"
+            )
+        case nil:
+            // The 12s dead-man switch fired before the main-actor block ran.
+            return v2Error(
+                id: id, code: "timeout",
+                message: "Delegate to '\(agentName)' did not complete in time"
+            )
         }
 
         var returnSubmitted = false
-        if textDelivered, params["submit_return"] as? Bool == true {
+        if delegateResult.requestReplayed {
+            // The original idempotent operation already owned text delivery.
+            // A remote-leader retry also committed Return in that operation;
+            // submitting it again would execute an empty or duplicate turn.
+            returnSubmitted = params["submit_return"] as? Bool == true
+        } else if textDelivered, params["submit_return"] as? Bool == true {
             let keyParams: [String: Any] = [
                 "team": teamName,
                 "agent": agentName,
@@ -3867,6 +4231,7 @@ class TerminalController {
             "sent": true,
             "text_delivered": textDelivered,
             "return_submitted": returnSubmitted,
+            "request_replayed": delegateResult.requestReplayed,
             "agent_instance_id": delegateResult.task.assigneeInstanceId ?? NSNull(),
         ])
     }
@@ -4470,7 +4835,12 @@ class TerminalController {
         let worktreeRemoved = params["worktree_removed"] as? Bool
         let agentInstanceId = params["agent_instance_id"] as? String
 
-        if let agentInstanceId,
+        // A caller that names an instance is asserting which one holds this
+        // task, and being told "Task not found" when the assertion fails says
+        // the wrong thing entirely — the task is there, it is somebody else's.
+        // Kept ahead of the update so the refusal has its own code even when
+        // `assignee` is absent and the store would only answer nil.
+        if let agentInstanceId = agentInstanceId?.nilIfBlankTC,
            let task = store.getTask(teamName: teamName, taskId: taskId),
            task.assigneeInstanceId != agentInstanceId {
             return v2Error(id: id, code: "task_identity_mismatch",
@@ -4487,6 +4857,7 @@ class TerminalController {
             result: taskResult,
             resultPath: resultPath,
             assignee: assignee,
+            assigneeInstanceId: agentInstanceId,
             blockedReason: blockedReason,
             reviewSummary: reviewSummary,
             progressNote: progressNote,
@@ -5376,14 +5747,16 @@ class TerminalController {
             return .err(code: "invalid_params", message: "Missing task_id", data: nil)
         }
         let assignee = params["assignee"] as? String
+        let assigneeInstanceId = params["agent_instance_id"] as? String
         let tabManager = v2ResolveTabManager(params: params)
 
         var result: V2CallResult = .err(code: "not_found", message: "Task not found", data: nil)
         v2MainSync {
-            guard let task = TeamOrchestrator.shared.reassignTask(
+            guard let task = TeamDataStore.shared.reassignTask(
                 teamName: teamName,
                 taskId: taskId,
-                assignee: assignee
+                assignee: assignee,
+                assigneeInstanceId: assigneeInstanceId
             ) else { return }
             let dispatched = tabManager.flatMap {
                 TeamOrchestrator.shared.dispatchTaskToAssignee(

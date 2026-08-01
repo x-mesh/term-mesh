@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 
 /// Running a command and getting all of its output back.
@@ -9,10 +10,9 @@ import Foundation
 /// draining one after the other only moves the deadlock to whichever fills
 /// while the other is being read.
 ///
-/// The deadline is enforced by terminating the process rather than by giving up
-/// on the read: a command that never writes and never exits would otherwise
-/// hold the queue forever, and terminating it is what closes the pipes and lets
-/// the read return.
+/// The deadline is enforced by terminating the spawned process group rather
+/// than by giving up on the read: descendants inherit the pipe write ends, so
+/// the entire group must exit before the reads can return.
 enum ProcessRun {
     struct Output {
         let status: Int32
@@ -49,6 +49,95 @@ enum ProcessRun {
         attributes: .concurrent
     )
 
+    private static func spawn(
+        executable: String,
+        arguments: [String],
+        environment: [String: String]?,
+        currentDirectory: String?,
+        stdout: Pipe,
+        stderr: Pipe
+    ) throws -> pid_t {
+        var actions: posix_spawn_file_actions_t?
+        var attributes: posix_spawnattr_t?
+        let actionsResult = posix_spawn_file_actions_init(&actions)
+        guard actionsResult == 0 else {
+            throw Failure.couldNotStart(String(cString: strerror(actionsResult)))
+        }
+        let attributesResult = posix_spawnattr_init(&attributes)
+        guard attributesResult == 0 else {
+            posix_spawn_file_actions_destroy(&actions)
+            throw Failure.couldNotStart(String(cString: strerror(attributesResult)))
+        }
+        defer {
+            posix_spawn_file_actions_destroy(&actions)
+            posix_spawnattr_destroy(&attributes)
+        }
+
+        let stdoutRead = stdout.fileHandleForReading.fileDescriptor
+        let stdoutWrite = stdout.fileHandleForWriting.fileDescriptor
+        let stderrRead = stderr.fileHandleForReading.fileDescriptor
+        let stderrWrite = stderr.fileHandleForWriting.fileDescriptor
+        let actionResults = [
+            posix_spawn_file_actions_adddup2(&actions, stdoutWrite, STDOUT_FILENO),
+            posix_spawn_file_actions_adddup2(&actions, stderrWrite, STDERR_FILENO),
+            posix_spawn_file_actions_addclose(&actions, stdoutRead),
+            posix_spawn_file_actions_addclose(&actions, stderrRead),
+            posix_spawn_file_actions_addclose(&actions, stdoutWrite),
+            posix_spawn_file_actions_addclose(&actions, stderrWrite),
+        ]
+        if let failure = actionResults.first(where: { $0 != 0 }) {
+            throw Failure.couldNotStart(String(cString: strerror(failure)))
+        }
+        if let currentDirectory {
+            let result = currentDirectory.withCString {
+                posix_spawn_file_actions_addchdir_np(&actions, $0)
+            }
+            guard result == 0 else {
+                throw Failure.couldNotStart(String(cString: strerror(result)))
+            }
+        }
+
+        let flagsResult = posix_spawnattr_setflags(
+            &attributes,
+            Int16(POSIX_SPAWN_SETPGROUP)
+        )
+        guard flagsResult == 0 else {
+            throw Failure.couldNotStart(String(cString: strerror(flagsResult)))
+        }
+        let groupResult = posix_spawnattr_setpgroup(&attributes, 0)
+        guard groupResult == 0 else {
+            throw Failure.couldNotStart(String(cString: strerror(groupResult)))
+        }
+
+        let argv = ([executable] + arguments).map { strdup($0) } + [nil]
+        defer { argv.compactMap { $0 }.forEach { free($0) } }
+        let inheritedEnvironment = environment ?? ProcessInfo.processInfo.environment
+        let envp = inheritedEnvironment.map { key, value in
+            strdup(key + "=" + value)
+        } + [nil]
+        defer { envp.compactMap { $0 }.forEach { free($0) } }
+
+        var pid: pid_t = 0
+        let result = executable.withCString { executablePointer in
+            argv.withUnsafeBufferPointer { argvPointer in
+                envp.withUnsafeBufferPointer { envPointer in
+                    posix_spawn(
+                        &pid,
+                        executablePointer,
+                        &actions,
+                        &attributes,
+                        UnsafeMutablePointer(mutating: argvPointer.baseAddress),
+                        UnsafeMutablePointer(mutating: envPointer.baseAddress)
+                    )
+                }
+            }
+        }
+        guard result == 0 else {
+            throw Failure.couldNotStart(String(cString: strerror(result)))
+        }
+        return pid
+    }
+
     static func capture(
         executable: String,
         arguments: [String],
@@ -58,25 +147,29 @@ enum ProcessRun {
     ) async throws -> Output {
         try await withCheckedThrowingContinuation { continuation in
             queue.async {
-                let process = Process()
                 let stdout = Pipe()
                 let stderr = Pipe()
-                process.executableURL = URL(fileURLWithPath: executable)
-                process.arguments = arguments
-                process.standardOutput = stdout
-                process.standardError = stderr
-                if let environment { process.environment = environment }
-                if let currentDirectory {
-                    process.currentDirectoryURL = URL(fileURLWithPath: currentDirectory)
-                }
+                let pid: pid_t
                 do {
-                    try process.run()
+                    pid = try spawn(
+                        executable: executable,
+                        arguments: arguments,
+                        environment: environment,
+                        currentDirectory: currentDirectory,
+                        stdout: stdout,
+                        stderr: stderr
+                    )
+                } catch let failure as Failure {
+                    continuation.resume(throwing: failure)
+                    return
                 } catch {
                     continuation.resume(
                         throwing: Failure.couldNotStart(error.localizedDescription)
                     )
                     return
                 }
+                stdout.fileHandleForWriting.closeFile()
+                stderr.fileHandleForWriting.closeFile()
 
                 var errorOutput = Data()
                 let stderrDone = DispatchGroup()
@@ -85,18 +178,67 @@ enum ProcessRun {
                     errorOutput = stderr.fileHandleForReading.readDataToEndOfFile()
                     stderrDone.leave()
                 }
-                let watchdog = DispatchWorkItem { if process.isRunning { process.terminate() } }
+                let processGroup = pid
+                let stateLock = NSLock()
+                var didTimeOut = false
+                var didFinish = false
+                let escalation = DispatchWorkItem {
+                    stateLock.lock()
+                    guard !didFinish else {
+                        stateLock.unlock()
+                        return
+                    }
+                    stateLock.unlock()
+                    Darwin.kill(-processGroup, SIGKILL)
+                }
+                let watchdog = DispatchWorkItem {
+                    stateLock.lock()
+                    guard !didFinish else {
+                        stateLock.unlock()
+                        return
+                    }
+                    let signalled = Darwin.kill(-processGroup, SIGTERM) == 0
+                    didTimeOut = signalled
+                    stateLock.unlock()
+                    guard signalled else { return }
+                    stderrQueue.asyncAfter(deadline: .now() + 1, execute: escalation)
+                }
                 stderrQueue.asyncAfter(deadline: .now() + timeout, execute: watchdog)
 
                 let output = stdout.fileHandleForReading.readDataToEndOfFile()
                 stderrDone.wait()
-                process.waitUntilExit()
-                let timedOut = !watchdog.isCancelled
-                    && process.terminationReason == .uncaughtSignal
+                var waitStatus: Int32 = 0
+                while true {
+                    stateLock.lock()
+                    let waited = waitpid(pid, &waitStatus, WNOHANG)
+                    if waited == pid || (waited == -1 && errno != EINTR) {
+                        didFinish = true
+                        stateLock.unlock()
+                        break
+                    }
+                    stateLock.unlock()
+                    usleep(10_000)
+                }
                 watchdog.cancel()
+                let terminatingSignal = waitStatus & 0x7f
+                let status = terminatingSignal == 0
+                    ? (waitStatus >> 8) & 0xff
+                    : terminatingSignal
+                stateLock.lock()
+                let timedOut = didTimeOut
+                stateLock.unlock()
+                if timedOut {
+                    // The direct child can obey SIGTERM while one of its
+                    // descendants ignores it and has already closed the
+                    // captured pipes. Reaping the child is therefore not proof
+                    // that the process group is gone. Kill any remainder now
+                    // instead of cancelling the scheduled escalation.
+                    Darwin.kill(-processGroup, SIGKILL)
+                }
+                escalation.cancel()
 
                 continuation.resume(returning: Output(
-                    status: process.terminationStatus,
+                    status: status,
                     stdout: output,
                     stderr: errorOutput,
                     timedOut: timedOut
