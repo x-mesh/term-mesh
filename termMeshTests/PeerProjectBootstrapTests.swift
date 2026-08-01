@@ -1336,8 +1336,10 @@ final class PeerProjectBootstrapTests: XCTestCase {
                 workspaces: [],
                 activeSockPath: "/tmp/stale.sock",
                 sshTarget: "shared",
+                remoteSockPath: "/tmp/shared.sock",
                 profileID: UUID(),
-                hostCLIBinDirs: ["/stale/bin"]
+                hostCLIBinDirs: ["/stale/bin"],
+                hostCLIBinDirsResolved: true
             ),
             HostEntry(
                 id: "ssh:saved",
@@ -1346,18 +1348,121 @@ final class PeerProjectBootstrapTests: XCTestCase {
                 workspaces: [],
                 activeSockPath: "/tmp/saved.sock",
                 sshTarget: "shared",
+                remoteSockPath: "/tmp/shared.sock",
+                sshPort: 22,
+                identityFile: "/Users/x/.ssh/id_ed25519",
                 profileID: wantedID,
-                hostCLIBinDirs: ["/exact/bin"]
+                hostCLIBinDirs: ["/exact/bin"],
+                hostCLIBinDirsResolved: true
             ),
         ]
 
         XCTAssertEqual(
-            RemoteHostStore.hostCLIBinDirs(forProfileID: wantedID, in: hosts),
+            RemoteHostStore.hostCLIBinDirs(
+                forProfileID: wantedID,
+                sshTarget: "shared",
+                port: 22,
+                identityFile: "/Users/x/.ssh/id_ed25519",
+                remoteSocket: "/tmp/shared.sock",
+                in: hosts
+            ),
             ["/exact/bin"]
         )
         XCTAssertEqual(
-            RemoteHostStore.hostCLIBinDirs(forProfileID: UUID(), in: hosts),
+            RemoteHostStore.hostCLIBinDirs(
+                forProfileID: UUID(),
+                sshTarget: "shared",
+                port: 22,
+                identityFile: "/Users/x/.ssh/id_ed25519",
+                remoteSocket: "/tmp/shared.sock",
+                in: hosts
+            ),
             []
+        )
+    }
+
+    /// The stale-cache leak the exact-SHA review flagged: a profile keeps
+    /// its id across an edit to sshTarget/port/identityFile/remoteSocket,
+    /// so matching on `profileID` alone (the pre-fix behavior) would still
+    /// return a still-`.connected` host's authenticated bin dirs even
+    /// though that connection was never authenticated against the
+    /// endpoint the caller is now asking about.
+    func test_readiness_bin_dirs_reject_stale_endpoint_on_the_same_profile_id() {
+        let wantedID = UUID()
+        let connectedUnderOldEndpoint = HostEntry(
+            id: "ssh:old",
+            displayName: "old",
+            connectionState: .connected,
+            workspaces: [],
+            activeSockPath: "/tmp/old.sock",
+            sshTarget: "old-target",
+            remoteSockPath: "/tmp/old.sock",
+            sshPort: 22,
+            identityFile: "/Users/x/.ssh/id_old",
+            profileID: wantedID,
+            hostCLIBinDirs: ["/old/bin"],
+            hostCLIBinDirsResolved: true
+        )
+
+        // sshTarget changed since that connection was authenticated.
+        XCTAssertEqual(
+            RemoteHostStore.hostCLIBinDirs(
+                forProfileID: wantedID,
+                sshTarget: "new-target",
+                port: 22,
+                identityFile: "/Users/x/.ssh/id_old",
+                remoteSocket: "/tmp/old.sock",
+                in: [connectedUnderOldEndpoint]
+            ),
+            []
+        )
+        // port changed.
+        XCTAssertEqual(
+            RemoteHostStore.hostCLIBinDirs(
+                forProfileID: wantedID,
+                sshTarget: "old-target",
+                port: 2222,
+                identityFile: "/Users/x/.ssh/id_old",
+                remoteSocket: "/tmp/old.sock",
+                in: [connectedUnderOldEndpoint]
+            ),
+            []
+        )
+        // identityFile changed.
+        XCTAssertEqual(
+            RemoteHostStore.hostCLIBinDirs(
+                forProfileID: wantedID,
+                sshTarget: "old-target",
+                port: 22,
+                identityFile: "/Users/x/.ssh/id_new",
+                remoteSocket: "/tmp/old.sock",
+                in: [connectedUnderOldEndpoint]
+            ),
+            []
+        )
+        // pinned remote socket changed.
+        XCTAssertEqual(
+            RemoteHostStore.hostCLIBinDirs(
+                forProfileID: wantedID,
+                sshTarget: "old-target",
+                port: 22,
+                identityFile: "/Users/x/.ssh/id_old",
+                remoteSocket: "/tmp/new.sock",
+                in: [connectedUnderOldEndpoint]
+            ),
+            []
+        )
+        // Unchanged tuple still matches — the guard isn't overzealous.
+        XCTAssertEqual(
+            RemoteHostStore.hostCLIBinDirs(
+                forProfileID: wantedID,
+                sshTarget: "old-target",
+                port: 22,
+                identityFile: "/Users/x/.ssh/id_old",
+                remoteSocket: "/tmp/old.sock",
+                in: [connectedUnderOldEndpoint]
+            ),
+            ["/old/bin"]
         )
     }
 

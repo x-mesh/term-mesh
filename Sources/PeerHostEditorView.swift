@@ -605,6 +605,10 @@ struct PeerHostEditorView: View {
             // so it safely falls through to the fixed PATH when Test failed.
             hostCLIBinDirs = RemoteHostStore.hostCLIBinDirs(
                 forProfileID: draft.id,
+                sshTarget: draft.sshTarget,
+                port: draft.sshPort,
+                identityFile: draft.identityFile,
+                remoteSocket: draft.remoteSocket,
                 in: RemoteHostStore.shared.sortedHosts
             )
         }

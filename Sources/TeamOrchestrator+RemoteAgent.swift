@@ -968,7 +968,7 @@ extension TeamOrchestrator {
         guard let host = RemoteHostStore.shared.sortedHosts.first(where: { $0.id == hostKey }) else {
             throw RemoteAgentError.hostNotFound(hostKey)
         }
-        guard host.isConnected else { throw RemoteAgentError.hostNotConnected(host.displayName) }
+        guard host.isLaunchable else { throw RemoteAgentError.hostNotConnected(host.displayName) }
         let promptFile = systemPrompt.map { _ in
             "/tmp/term-mesh-leader-prompt-\(teamUUID).txt"
         }
@@ -1859,7 +1859,7 @@ extension TeamOrchestrator {
         guard let host = RemoteHostStore.shared.sortedHosts.first(where: { $0.id == hostKey }) else {
             throw RemoteAgentError.hostNotFound(hostKey)
         }
-        guard host.isConnected else {
+        guard host.isLaunchable else {
             throw RemoteAgentError.hostNotConnected(host.displayName)
         }
         guard let tabManager = AppDelegate.shared?.tabManagerFor(tabId: team.workspaceId),

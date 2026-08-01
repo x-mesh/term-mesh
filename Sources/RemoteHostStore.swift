@@ -351,8 +351,20 @@ struct HostEntry: Identifiable {
     /// Authenticated host CLI directories. Live-session cache only: never
     /// written to PeerHostProfile/UserDefaults and cleared with the socket.
     var hostCLIBinDirs: [String] = []
+    /// True once `hostCLIBinDirs` reflects the current connection's own
+    /// handshake (set alongside it in `fetchWorkspaces`), false while a
+    /// fresh connection is still in flight. `connectionState` flips to
+    /// `.connected` synchronously (lease acquired), but the authenticated
+    /// bin dirs only land after a second async round trip — a launch that
+    /// gates on `isConnected` alone can race that gap and start a remote
+    /// CLI with an empty PATH addition. `isLaunchable` closes it.
+    var hostCLIBinDirsResolved: Bool = false
 
     var isConnected: Bool { connectionState == .connected }
+    /// Use this instead of `isConnected` before starting any remote CLI
+    /// process (leader/agent attach, CLI availability probes) — those
+    /// consume `hostCLIBinDirs` and must not race its resolution.
+    var isLaunchable: Bool { isConnected && hostCLIBinDirsResolved }
 
     /// Host spec for opening a pane/mirror from this entry. Prefers an owned
     /// `.ssh` tunnel when both SSH fields are known; otherwise falls back to
@@ -375,15 +387,34 @@ struct HostEntry: Identifiable {
 final class RemoteHostStore: ObservableObject {
     static let shared = RemoteHostStore()
 
-    /// Returns readiness metadata only for the exact saved profile. SSH
-    /// targets are editable and can be reused, so target-only matching can
-    /// leak a stale connection's authenticated CLI directories into another
-    /// profile's readiness probe.
+    /// Returns readiness metadata only when the exact endpoint tuple being
+    /// probed already backs a live, authenticated connection for this
+    /// profile. Matching on `profileID` alone is not enough: sshTarget,
+    /// port, identityFile, and the pinned remote socket are all
+    /// independently editable in the host editor sheet, so a profile can
+    /// keep its id while pointing at a different machine entirely — and
+    /// target-only matching (the previous behavior) can then leak a stale
+    /// connection's authenticated CLI directories onto an endpoint that
+    /// connection never actually reached. An empty `remoteSocket` means
+    /// "auto-detect" and is compatible with whatever socket the live
+    /// connection resolved, since that field genuinely hasn't changed.
     nonisolated static func hostCLIBinDirs(
         forProfileID profileID: UUID,
+        sshTarget: String,
+        port: Int?,
+        identityFile: String?,
+        remoteSocket: String,
         in hosts: [HostEntry]
     ) -> [String] {
-        hosts.first { $0.profileID == profileID && $0.isConnected }?.hostCLIBinDirs ?? []
+        hosts.first {
+            $0.profileID == profileID
+                && $0.isConnected
+                && $0.hostCLIBinDirsResolved
+                && $0.sshTarget == sshTarget
+                && $0.sshPort == port
+                && $0.identityFile == identityFile
+                && (remoteSocket.isEmpty || $0.remoteSockPath == remoteSocket)
+        }?.hostCLIBinDirs ?? []
     }
 
     /// Fired after a successful sidebar connect so the mounted host
@@ -589,6 +620,7 @@ final class RemoteHostStore: ObservableObject {
                 // WorkspaceSummary.hostSockPath never points to the dead tunnel.
                 if hosts[key]?.activeSockPath != conn.hostSockPath {
                     hosts[key]?.hostCLIBinDirs = []
+                    hosts[key]?.hostCLIBinDirsResolved = false
                     hosts[key]?.activeSockPath = conn.hostSockPath
                     hosts[key]?.workspaces = []
                     fetchWorkspaces(for: conn.hostSockPath, key: key)
@@ -605,6 +637,7 @@ final class RemoteHostStore: ObservableObject {
             if hosts[key]?.connectionState == .connected {
                 hosts[key]?.connectionState = .saved
                 hosts[key]?.hostCLIBinDirs = []
+                hosts[key]?.hostCLIBinDirsResolved = false
             }
         }
     }
@@ -720,6 +753,7 @@ final class RemoteHostStore: ObservableObject {
             } catch {
                 guard self.connectAttemptIDs[key] == attemptID else { return }
                 self.hosts[key]?.hostCLIBinDirs = []
+                self.hosts[key]?.hostCLIBinDirsResolved = false
                 self.hosts[key]?.connectionState = .failed(String(describing: error))
                 #if DEBUG
                 dlog("peer.sidebar.connect fail key=\(key) error=\(error)")
@@ -748,6 +782,7 @@ final class RemoteHostStore: ObservableObject {
         hosts[key]?.activeSockPath = ""
         hosts[key]?.supportsWorkspaceLifecycle = nil
         hosts[key]?.hostCLIBinDirs = []
+        hosts[key]?.hostCLIBinDirsResolved = false
         hosts[key]?.connectionState = .saved
         #if DEBUG
         dlog("peer.sidebar.connect cancelled key=\(key)")
@@ -788,6 +823,7 @@ final class RemoteHostStore: ObservableObject {
         hosts[key]?.activeSockPath = ""
         hosts[key]?.supportsWorkspaceLifecycle = nil
         hosts[key]?.hostCLIBinDirs = []
+        hosts[key]?.hostCLIBinDirsResolved = false
         hosts[key]?.connectionState = .saved
         #if DEBUG
         dlog("peer.sidebar.connect retry key=\(key) cancelledPending=\(cancelledPending)")
@@ -876,6 +912,7 @@ final class RemoteHostStore: ObservableObject {
         hosts[key]?.activeSockPath = ""
         hosts[key]?.supportsWorkspaceLifecycle = nil
         hosts[key]?.hostCLIBinDirs = []
+        hosts[key]?.hostCLIBinDirsResolved = false
         hosts[key]?.connectionState = .saved
         #if DEBUG
         dlog("peer.sidebar.forceDisconnect key=\(key) closed=\(ids.count)")
@@ -935,6 +972,7 @@ final class RemoteHostStore: ObservableObject {
         hosts[key]?.activeSockPath = ""
         hosts[key]?.supportsWorkspaceLifecycle = nil
         hosts[key]?.hostCLIBinDirs = []
+        hosts[key]?.hostCLIBinDirsResolved = false
         if hosts[key]?.connectionState == .connected {
             hosts[key]?.connectionState = .saved
         }
@@ -973,6 +1011,7 @@ final class RemoteHostStore: ObservableObject {
                     self.hosts[key]?.supportsWorkspaceLifecycle =
                         conn.hostCapabilities.has(PeerCapability.workspaceLifecycleV1)
                     self.hosts[key]?.hostCLIBinDirs = conn.hostCLIBinDirs
+                    self.hosts[key]?.hostCLIBinDirsResolved = true
                 }
                 let workspaces: [Termmesh_Peer_V1_Workspace]
                 do {
@@ -981,6 +1020,7 @@ final class RemoteHostStore: ObservableObject {
                     await conn.cancel()
                     if self.hosts[key]?.activeSockPath == path {
                         self.hosts[key]?.hostCLIBinDirs = []
+                        self.hosts[key]?.hostCLIBinDirsResolved = false
                     }
                     return
                 }
@@ -1050,6 +1090,7 @@ final class RemoteHostStore: ObservableObject {
                     self.hosts[key]?.workspaces = []
                     self.hosts[key]?.teams = []
                     self.hosts[key]?.hostCLIBinDirs = []
+                    self.hosts[key]?.hostCLIBinDirsResolved = false
                     TeamOrchestrator.shared.markRemoteAgentsUnreachable(
                         hostKey: key,
                         reason: Self.unreachableReason
@@ -1141,6 +1182,7 @@ final class RemoteHostStore: ObservableObject {
         else { return }
         hosts[key]?.connectionState = .failed(Self.unreachableReason)
         hosts[key]?.hostCLIBinDirs = []
+        hosts[key]?.hostCLIBinDirsResolved = false
         TeamOrchestrator.shared.markRemoteAgentsUnreachable(
             hostKey: key,
             reason: Self.unreachableReason
