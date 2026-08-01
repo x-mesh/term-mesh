@@ -26,6 +26,10 @@ enum ClaudeCommandInstaller {
     /// 일반 버전 게이트(installedVersionKey)로 돌아간다.
     private static let managedNameMigrationKey = "termMeshClaudeCommandsManagedNameBackupV1"
 
+    /// Deprecated Codex custom prompts를 제거한 일회성 migration 완료 표시.
+    /// 기존 term-mesh-managed 파일만 제거하며 사용자 작성 prompt는 보존한다.
+    private static let codexPromptRemovalMigrationKey = "termMeshCodexPromptRemovalV1"
+
     /// term-mesh가 소유권을 주장하는 슬래시 커맨드 파일 이름.
     /// 이 목록에 있는 파일은 사용자 버전(마커 없음)이라도 백업 후 강제 덮어쓰기 한다.
     /// 다른 이름의 파일은 절대 건드리지 않는다.
@@ -38,11 +42,8 @@ enum ClaudeCommandInstaller {
         "watch.md"
     ]
 
-    /// term-mesh가 소유권을 주장하는 Codex prompt 파일 이름 (~/.codex/prompts/).
-    /// copy-claude-commands.sh 의 CODEX_PROMPTS 배열과 동기화 유지.
-    /// Codex prompt 파일은 YAML frontmatter를 가지므로 marker가 frontmatter 직후에
-    /// 삽입되며, 감지는 isManagedSkillFile (head 30줄) 로 한다.
-    private static let managedCodexPromptNames: Set<String> = [
+    /// 과거 term-mesh가 ~/.codex/prompts/에 설치했던 deprecated custom prompt 이름.
+    private static let legacyManagedCodexPromptNames: Set<String> = [
         "team.md",
         "team-up.md",
         "tm.md",
@@ -61,11 +62,6 @@ enum ClaudeCommandInstaller {
         Bundle.main.url(forResource: "claude-skills", withExtension: nil)
     }
 
-    /// 번들 내 Codex prompt 디렉토리 (codex-prompts/)
-    private static var bundleCodexPromptsURL: URL? {
-        Bundle.main.url(forResource: "codex-prompts", withExtension: nil)
-    }
-
     /// 대상: ~/.claude/commands/
     private static var targetURL: URL {
         FileManager.default.homeDirectoryForCurrentUser
@@ -78,8 +74,8 @@ enum ClaudeCommandInstaller {
             .appendingPathComponent(".claude/skills")
     }
 
-    /// 대상: ~/.codex/prompts/
-    private static var targetCodexPromptsURL: URL {
+    /// 과거 설치본 정리 대상: ~/.codex/prompts/
+    private static var legacyCodexPromptsURL: URL {
         FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent(".codex/prompts")
     }
@@ -92,11 +88,15 @@ enum ClaudeCommandInstaller {
         ) as? String ?? "0"
         let installed = UserDefaults.standard.string(forKey: installedVersionKey) ?? ""
         let migrationDone = UserDefaults.standard.bool(forKey: managedNameMigrationKey)
+        let codexPromptRemovalDone = UserDefaults.standard.bool(
+            forKey: codexPromptRemovalMigrationKey
+        )
 
-        // 버전 게이트 OR 일회성 강제 마이그레이션 — 둘 중 하나라도 필요하면 install
+        // 버전 게이트 또는 일회성 migration 중 하나라도 필요하면 실행한다.
         let needsVersionInstall = isNewer(current, than: installed)
         let needsMigration = !migrationDone
-        guard needsVersionInstall || needsMigration else {
+        let needsCodexPromptRemoval = !codexPromptRemovalDone
+        guard needsVersionInstall || needsMigration || needsCodexPromptRemoval else {
             logger.debug("Claude commands/skills already installed for version \(current, privacy: .public)")
             return
         }
@@ -131,22 +131,13 @@ enum ClaudeCommandInstaller {
             logger.debug("claude-skills bundle resource not found (optional)")
         }
 
-        // Codex prompts → ~/.codex/prompts/ (native Codex `/<name>` support).
-        // Marker sits after YAML frontmatter, so detect ownership with the 30-line check.
-        if let srcCodex = bundleCodexPromptsURL {
+        if needsCodexPromptRemoval {
             do {
-                try installManagedMarkdown(
-                    from: srcCodex,
-                    to: targetCodexPromptsURL,
-                    managedNames: managedCodexPromptNames,
-                    isManaged: isManagedSkillFile
-                )
-                logger.info("Codex prompts installed for version \(current, privacy: .public)")
+                try removeLegacyManagedCodexPrompts()
+                UserDefaults.standard.set(true, forKey: codexPromptRemovalMigrationKey)
             } catch {
-                logger.error("Codex prompt install failed: \(error.localizedDescription, privacy: .public)")
+                logger.error("Codex prompt removal failed: \(error.localizedDescription, privacy: .public)")
             }
-        } else {
-            logger.debug("codex-prompts bundle resource not found (optional)")
         }
 
         UserDefaults.standard.set(current, forKey: installedVersionKey)
@@ -155,12 +146,10 @@ enum ClaudeCommandInstaller {
 
     // MARK: - Private
 
-    /// 번들의 `.md` 파일들을 대상 디렉토리에 마커 기반 보존 정책으로 설치한다.
-    /// Claude commands (`~/.claude/commands`) 와 Codex prompts (`~/.codex/prompts`) 가
-    /// 동일 로직을 공유한다 — managed 이름 목록과 marker 감지 함수만 다르다.
+    /// 번들의 Claude command `.md` 파일들을 대상 디렉토리에 설치한다.
     /// - managedNames: 마커 없는 사용자 파일이라도 백업 후 덮어쓸 파일 이름 (그 외엔 보존)
     /// - isManaged: 파일이 term-mesh 소유(마커 보유)인지 감지하는 함수
-    ///   (Claude commands = 5줄 검사, Codex prompts = frontmatter 뒤 marker라 30줄 검사)
+    ///   (Claude commands는 상단 5줄 안의 marker를 사용한다.)
     private static func installManagedMarkdown(
         from src: URL,
         to dst: URL,
@@ -245,6 +234,22 @@ enum ClaudeCommandInstaller {
             } catch {
                 logger.error("Backup copy failed for \(url.lastPathComponent, privacy: .public): \(error.localizedDescription, privacy: .public)")
             }
+        }
+    }
+
+    /// 이전 버전이 설치한 deprecated Codex custom prompts만 제거한다.
+    /// 같은 이름이어도 managed marker가 없으면 사용자 파일이므로 건드리지 않는다.
+    private static func removeLegacyManagedCodexPrompts() throws {
+        let fm = FileManager.default
+        guard fm.fileExists(atPath: legacyCodexPromptsURL.path) else { return }
+
+        for name in legacyManagedCodexPromptNames {
+            let url = legacyCodexPromptsURL.appendingPathComponent(name)
+            guard fm.fileExists(atPath: url.path), isManagedSkillFile(at: url) else {
+                continue
+            }
+            try fm.removeItem(at: url)
+            logger.info("Removed deprecated Codex prompt: \(name, privacy: .public)")
         }
     }
 

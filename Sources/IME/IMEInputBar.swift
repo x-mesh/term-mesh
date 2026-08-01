@@ -60,7 +60,7 @@ struct IMEInputBar: View {
     var onSendKey: ((_ keycode: UInt16, _ mods: UInt32) -> Void)? = nil
     /// Terminal working directory — used to discover project-local slash commands.
     var workingDirectory: String? = nil
-    /// Slash aliases expanded just before submit, e.g. /tm -> read .codex/prompts/tm.md.
+    /// Slash aliases expanded just before submit, e.g. /tm -> read .claude/commands/tm.md.
     var slashCommandAliases: [String: String] = [:]
 
     @State private var text: String = ""
@@ -202,7 +202,7 @@ struct IMEInputBar: View {
         var merged: [SlashCommand] = []
         for alias in slashCommandAliases.keys.sorted() {
             if seen.insert(alias).inserted {
-                merged.append(SlashCommand(name: alias, desc: "Codex prompt alias"))
+                merged.append(SlashCommand(name: alias, desc: "term-mesh command alias"))
             }
         }
         for command in slashCommands where seen.insert(command.name).inserted {
@@ -269,16 +269,16 @@ struct IMEInputBar: View {
         let separators = CharacterSet.whitespacesAndNewlines
         let tokenEnd = submitted.rangeOfCharacter(from: separators)?.lowerBound ?? submitted.endIndex
         let token = String(submitted[..<tokenEnd])
-        guard let promptFile = slashCommandAliases[token] else { return submitted }
+        guard let commandFile = slashCommandAliases[token] else { return submitted }
         let args = String(submitted[tokenEnd...])
             .trimmingCharacters(in: .whitespacesAndNewlines)
         return """
-        TERM-MESH CODEX PROMPT REQUEST
-        PROMPT_FILE: \(promptFile)
+        TERM-MESH CODEX COMMAND REQUEST
+        COMMAND_FILE: \(commandFile)
         ARGUMENTS:
         \(args)
 
-        Read PROMPT_FILE, treat ARGUMENTS as that prompt's $ARGUMENTS, and execute the prompt's workflow. This is a user-facing shortcut for \(token); do not try to run \(token) or /prompts:* as a Codex slash command.
+        Read COMMAND_FILE, treat ARGUMENTS as that command's $ARGUMENTS, and execute its workflow. You are Codex: adapt references to Claude-only interaction primitives to the equivalent available Codex interaction without changing the command semantics. This is a user-facing shortcut for \(token); do not try to run \(token) as a native Codex slash command.
         """
     }
 

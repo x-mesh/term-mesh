@@ -85,7 +85,7 @@ worker가 0인 팀에서 `/watch`가 **leader pane을 감시 대상으로 삼을
 6. `daemon/term-meshd/src/watch_controller.rs:251-278` `post_team_message` — target이 leader면 content에 `[self-watch]` prefix(D2).
 
 ### 문서
-7. `.claude/commands/watch.md` / `.codex/prompts/watch.md` — "leader 제외"를 "worker가 있으면 leader 제외; worker가 0이면 leader fallback(또는 `--target leader` 명시)"로 갱신. `--target`의 `leader` 값과 fallback 동작을 옵션 표·예시에 추가.
+7. `.claude/commands/watch.md` — "leader 제외"를 "worker가 있으면 leader 제외; worker가 0이면 leader fallback(또는 `--target leader` 명시)"로 갱신. Codex IME도 이 공통 command source를 읽는다. `--target`의 `leader` 값과 fallback 동작을 옵션 표·예시에 추가.
 
 ## 6. 엣지 케이스 / 리스크
 
