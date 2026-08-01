@@ -2897,7 +2897,9 @@ class TerminalController {
             case noDirectory(host: String)
         }
         let resolution: Resolution = await MainActor.run {
-            let hosts = RemoteHostStore.shared.sortedHosts.filter(\.isConnected)
+            let hosts = RemoteHostStore.selectableLaunchHosts(
+                in: RemoteHostStore.shared.sortedHosts
+            )
             let candidates = hosts.map {
                 (key: $0.id, displayName: $0.displayName, sshTarget: $0.sshTarget)
             }

@@ -1,5 +1,21 @@
 use std::ffi::OsString;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+
+/// Canonical parent of an executable. Shared by local PATH assembly and
+/// authenticated peer metadata so install locations are never guessed.
+pub(crate) fn canonical_executable_parent(executable: &Path) -> Option<String> {
+    let canonical = executable.canonicalize().ok()?;
+    let parent = canonical.parent()?;
+    let value = parent.to_str()?;
+    (!value.is_empty() && parent.is_absolute()).then(|| value.to_string())
+}
+
+pub(crate) fn executable_bin_dir() -> Option<String> {
+    std::env::current_exe()
+        .ok()
+        .as_deref()
+        .and_then(canonical_executable_parent)
+}
 
 /// Configuration for spawning a headless agent subprocess.
 ///
@@ -104,10 +120,7 @@ fn base_env(
     // `codex` fails with "No such file or directory". Pane mode handles this in
     // TeamOrchestrator.swift; headless mode inherits the daemon's PATH and must
     // recover the missing entries here.
-    let daemon_bin_dir = std::env::current_exe()
-        .ok()
-        .and_then(|p| p.parent().map(|d| d.to_string_lossy().to_string()))
-        .unwrap_or_default();
+    let daemon_bin_dir = executable_bin_dir().unwrap_or_default();
     let current_path = std::env::var("PATH").unwrap_or_default();
     let path = compose_agent_path(&daemon_bin_dir, &current_path);
 
@@ -454,6 +467,24 @@ pub fn daemon_socket_path() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn canonical_executable_parent_requires_an_existing_absolute_path() {
+        let current = std::env::current_exe().expect("test executable path");
+        let parent = canonical_executable_parent(&current).expect("canonical executable parent");
+        assert!(Path::new(&parent).is_absolute());
+        assert!(!parent.is_empty());
+        assert_eq!(executable_bin_dir().as_deref(), Some(parent.as_str()));
+
+        assert_eq!(
+            canonical_executable_parent(Path::new("/definitely/missing/term-meshd")),
+            None
+        );
+        assert_eq!(
+            canonical_executable_parent(Path::new("relative/missing")),
+            None
+        );
+    }
 
     #[test]
     fn compose_agent_path_prepends_daemon_bin_and_dedupes() {

@@ -46,6 +46,8 @@ struct PeerRelayConnection: Sendable {
     /// trip). Callers gate optional RPCs (e.g. workspace CRUD) on this
     /// rather than assuming every host build supports them.
     let hostCapabilities: PeerCapabilities
+    /// Authenticated, validated host CLI directories for this connection.
+    let hostCLIBinDirs: [String]
     let session: PeerSession
     let transport: UnixSocketTransport
     let surfaces: [Termmesh_Peer_V1_SurfaceInfo]
@@ -983,6 +985,7 @@ final class PeerRelaySession {
             hostDisplayName: connection.hostDisplayName,
             hostAppVersion: connection.hostAppVersion,
             hostCapabilities: connection.hostCapabilities,
+            hostCLIBinDirs: connection.hostCLIBinDirs,
             session: connection.session,
             transport: connection.transport,
             surfaces: surfaces
@@ -1019,6 +1022,7 @@ final class PeerRelaySession {
             hostDisplayName: info.hostDisplayName,
             hostAppVersion: info.hostAppVersion,
             hostCapabilities: info.hostCapabilities,
+            hostCLIBinDirs: info.hostCLIBinDirs,
             session: session,
             transport: transport,
             surfaces: []

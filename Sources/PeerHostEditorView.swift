@@ -5,6 +5,7 @@
 
 import AppKit
 import Bonsplit
+import PeerProto
 import SwiftUI
 
 /// Sheet payload: one type for both "add" and "edit" so `.sheet(item:)`
@@ -585,15 +586,39 @@ struct PeerHostEditorView: View {
     }
 
     private func checkReadiness() async {
+        guard let draft = validatedDraft() else { return }
         isCheckingReadiness = true
         readinessError = nil
         defer { isCheckingReadiness = false }
+        let hostCLIBinDirs: [String]
+        switch await PeerHostDoctor.test(
+            sshTarget: draft.sshTarget,
+            port: draft.sshPort,
+            identityFile: draft.identityFile,
+            remoteSocket: draft.remoteSocket
+        ) {
+        case .ok(_, let authenticatedBinDirs):
+            hostCLIBinDirs = authenticatedBinDirs
+        default:
+            // A connected saved profile is also sourced from a completed
+            // authenticated handshake. First-time Add Host has no such row,
+            // so it safely falls through to the fixed PATH when Test failed.
+            hostCLIBinDirs = RemoteHostStore.hostCLIBinDirs(
+                forProfileID: draft.id,
+                sshTarget: draft.sshTarget,
+                port: draft.sshPort,
+                identityFile: draft.identityFile,
+                remoteSocket: draft.remoteSocket,
+                in: RemoteHostStore.shared.sortedHosts
+            )
+        }
         do {
             readiness = try await PeerHostReadinessChecker.check(
-                sshTarget: profile.sshTarget,
-                port: profile.sshPort,
-                identityFile: profile.identityFile,
-                projectRoot: profile.projectRootPath ?? ""
+                sshTarget: draft.sshTarget,
+                port: draft.sshPort,
+                identityFile: draft.identityFile,
+                projectRoot: draft.projectRootPath ?? "",
+                hostBinDirs: hostCLIBinDirs
             )
         } catch {
             readiness = nil
@@ -695,7 +720,7 @@ struct PeerHostEditorView: View {
             // flight — discard rather than write a stale doctorState.
             guard gen == doctorGeneration else { return }
             switch result {
-            case .ok(let path):
+            case .ok(let path, _):
                 let resolved = await resolveConnectedState(socketPath: path, draft: draft)
                 guard gen == doctorGeneration else { return }
                 doctorState = resolved
@@ -779,7 +804,7 @@ struct PeerHostEditorView: View {
             )
             guard gen == doctorGeneration else { return }
             switch result {
-            case .ok(let path):
+            case .ok(let path, _):
                 let resolved = await resolveConnectedState(socketPath: path, draft: draft)
                 guard gen == doctorGeneration else { return }
                 doctorState = resolved

@@ -349,15 +349,18 @@ public struct PeerServerConfig: Sendable {
     public var hostDisplayName: String
     public var hostAppVersion: String
     public var protocolVersion: String
+    public var hostCLIBinDirs: [String]
 
     public init(
         hostDisplayName: String = "term-mesh",
         hostAppVersion: String = "0.0.0",
-        protocolVersion: String = "1.0.0"
+        protocolVersion: String = "1.0.0",
+        hostCLIBinDirs: [String] = []
     ) {
         self.hostDisplayName = hostDisplayName
         self.hostAppVersion = hostAppVersion
         self.protocolVersion = protocolVersion
+        self.hostCLIBinDirs = PeerHostCLIBinDirs.validated(hostCLIBinDirs)
     }
 }
 
@@ -1300,6 +1303,7 @@ actor PeerServerSession {
                 h.appVersion = self.config.hostAppVersion
                 h.peerID = randomPeerBytes(count: 16)
                 h.capabilities = advertisedCapabilities
+                h.cliBinDirs = self.config.hostCLIBinDirs
                 env.hello = h
             }
             try await sendEnvelope { env in

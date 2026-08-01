@@ -169,6 +169,8 @@ public struct PeerSessionInfo: Sendable, Equatable {
     /// Plumbing only for now (see P3, docs/peer-perf-proposal.md) — a hook
     /// for future wire changes (P8 and later) to query before using them.
     public let hostCapabilities: PeerCapabilities
+    /// Authenticated, validated and session-scoped host CLI directories.
+    public let hostCLIBinDirs: [String]
 
     /// Whether the host advertised `capability` in its Hello.
     public func hasHostCapability(_ capability: String) -> Bool {
@@ -391,7 +393,10 @@ public actor PeerSession {
             hostAppVersion: host.appVersion,
             hostProtocolVersion: host.protocolVersion,
             sessionID: result.sessionID,
-            hostCapabilities: hostCapabilities
+            hostCapabilities: hostCapabilities,
+            hostCLIBinDirs: hostCapabilities.has(PeerCapability.hostCLIBinDirsV1)
+                ? PeerHostCLIBinDirs.validated(host.cliBinDirs)
+                : []
         )
     }
 

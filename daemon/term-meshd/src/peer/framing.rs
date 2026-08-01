@@ -104,6 +104,7 @@ mod tests {
                 display_name: "corrupt-frame-test".into(),
                 capabilities: vec![placeholder.to_string()],
                 app_version: "test".into(),
+                cli_bin_dirs: vec![],
             })),
         };
         let mut encoded = env.encode_to_vec();

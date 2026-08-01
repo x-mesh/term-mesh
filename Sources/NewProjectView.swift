@@ -1290,15 +1290,11 @@ struct NewProjectView: View {
     /// predicted folder is a real path rather than the bare root.
     static let placeholderProjectName = "new-project"
 
-    /// Every machine that has been configured, connected or not.
-    ///
-    /// Filtering to the connected ones hid machines the person had already set
-    /// up and meant to use — the list simply had fewer entries than the
-    /// settings did, with nothing saying why. A peer that is merely idle is
-    /// still the answer to "where does this project live"; connecting is
-    /// something to do about it, not a reason to pretend it is not there.
+    /// Peers whose current connection has finished authenticating the CLI
+    /// metadata used by project and agent launch. Connected-but-pending rows
+    /// stay out of the picker instead of exposing a choice creation rejects.
     private var selectablePeers: [HostEntry] {
-        hostStore.sortedHosts.filter { !($0.sshTarget ?? "").isEmpty }
+        RemoteHostStore.selectableLaunchHosts(in: hostStore.sortedHosts)
     }
 
     private var defaultAgentHostKey: String? {
@@ -1723,7 +1719,7 @@ struct NewProjectView: View {
                 + agents.compactMap(\.hostKey)
         )
         let allConnected = remoteKeys.allSatisfy { hostKey in
-            selectablePeers.first(where: { $0.id == hostKey })?.isConnected == true
+            selectablePeers.first(where: { $0.id == hostKey })?.isLaunchable == true
         }
         return allConnected && agentsMissingHostDirectory.isEmpty
     }
@@ -1739,13 +1735,13 @@ struct NewProjectView: View {
         }
         let offline = Set([runsOnHostKey].compactMap { $0 } + agents.compactMap(\.hostKey))
             .filter { hostKey in
-                selectablePeers.first(where: { $0.id == hostKey })?.isConnected != true
+                selectablePeers.first(where: { $0.id == hostKey })?.isLaunchable != true
             }
         guard !offline.isEmpty else { return nil }
         let labels = offline.map { machineLabel($0) }.sorted().joined(separator: ", ")
         return offline.count == 1
-            ? "\(labels) is not connected."
-            : "These machines are not connected: \(labels)."
+            ? "\(labels) is not ready to launch remote tools."
+            : "These machines are not ready to launch remote tools: \(labels)."
     }
 
     /// Peer-bound agents whose project folder is still blank.
@@ -2889,6 +2885,7 @@ enum ProjectCreationFlow {
 
                 if let hostKey = placement.hostKey {
                     guard let host = RemoteHostStore.shared.sortedHosts.first(where: { $0.id == hostKey }),
+                          host.isLaunchable,
                           let sshTarget = host.sshTarget, !sshTarget.isEmpty
                     else {
                         throw CreationError.remoteHostUnavailable

@@ -909,6 +909,9 @@ public nonisolated struct Termmesh_Peer_V1_Hello: Sendable {
   /// term-mesh marketing version; diagnostics only.
   public var appVersion: String = String()
 
+  /// Absolute directories containing CLIs shipped beside this host process.
+  public var cliBinDirs: [String] = []
+
   public var unknownFields = SwiftProtobuf.UnknownStorage()
 
   public init() {}
@@ -3364,7 +3367,7 @@ nonisolated extension Termmesh_Peer_V1_Envelope: SwiftProtobuf.Message, SwiftPro
 
 nonisolated extension Termmesh_Peer_V1_Hello: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
   public static let protoMessageName: String = _protobuf_package + ".Hello"
-  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{3}protocol_version\0\u{3}peer_id\0\u{3}display_name\0\u{1}capabilities\0\u{3}app_version\0")
+  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{3}protocol_version\0\u{3}peer_id\0\u{3}display_name\0\u{1}capabilities\0\u{3}app_version\0\u{3}cli_bin_dirs\0")
 
   public mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
     while let fieldNumber = try decoder.nextFieldNumber() {
@@ -3377,6 +3380,7 @@ nonisolated extension Termmesh_Peer_V1_Hello: SwiftProtobuf.Message, SwiftProtob
       case 3: try { try decoder.decodeSingularStringField(value: &self.displayName) }()
       case 4: try { try decoder.decodeRepeatedStringField(value: &self.capabilities) }()
       case 5: try { try decoder.decodeSingularStringField(value: &self.appVersion) }()
+      case 6: try { try decoder.decodeRepeatedStringField(value: &self.cliBinDirs) }()
       default: break
       }
     }
@@ -3398,6 +3402,9 @@ nonisolated extension Termmesh_Peer_V1_Hello: SwiftProtobuf.Message, SwiftProtob
     if !self.appVersion.isEmpty {
       try visitor.visitSingularStringField(value: self.appVersion, fieldNumber: 5)
     }
+    if !self.cliBinDirs.isEmpty {
+      try visitor.visitRepeatedStringField(value: self.cliBinDirs, fieldNumber: 6)
+    }
     try unknownFields.traverse(visitor: &visitor)
   }
 
@@ -3407,6 +3414,7 @@ nonisolated extension Termmesh_Peer_V1_Hello: SwiftProtobuf.Message, SwiftProtob
     if lhs.displayName != rhs.displayName {return false}
     if lhs.capabilities != rhs.capabilities {return false}
     if lhs.appVersion != rhs.appVersion {return false}
+    if lhs.cliBinDirs != rhs.cliBinDirs {return false}
     if lhs.unknownFields != rhs.unknownFields {return false}
     return true
   }

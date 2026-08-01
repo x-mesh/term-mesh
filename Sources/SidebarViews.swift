@@ -1200,7 +1200,7 @@ struct SidebarRemoteAgentSheet: View {
     @State private var isAdding = false
 
     private var connectedHosts: [HostEntry] {
-        store.sortedHosts.filter(\.isConnected)
+        RemoteHostStore.selectableLaunchHosts(in: store.sortedHosts)
     }
 
     var body: some View {

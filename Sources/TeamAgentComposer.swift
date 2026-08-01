@@ -72,12 +72,11 @@ struct TeamAgentComposer: View {
         return host.displayName
     }
 
-    /// Every machine that has been configured, connected or not.
-    ///
-    /// A peer that is merely idle is still a place to put a member; hiding it
-    /// made the list shorter than the settings with nothing saying why.
+    /// Only peers with authenticated launch metadata are valid placements.
+    /// The shared composer is used by both project and team creation, so it
+    /// must enforce the same readiness gate as their final launch paths.
     private var selectablePeers: [HostEntry] {
-        hostStore.sortedHosts.filter { !($0.sshTarget ?? "").isEmpty }
+        RemoteHostStore.selectableLaunchHosts(in: hostStore.sortedHosts)
     }
 
     var body: some View {

@@ -1211,13 +1211,13 @@ final class PeerProjectBootstrapTests: XCTestCase {
         XCTAssertTrue(launch.hasPrefix("export PATH="), "PATH has to be set before anything runs")
         XCTAssertEqual(
             RemoteShellPath.binDirs.first,
-            "/Applications/term-mesh.app/Contents/Resources/bin"
+            "$HOME/.local/bin"
         )
         XCTAssertTrue(launch.contains("$HOME/.local/bin"))
-        XCTAssertTrue(launch.contains(":$PATH\""), "the host's own PATH must survive, last")
+        XCTAssertTrue(launch.contains(":\"$PATH\""), "the host's own PATH must survive, last")
         // Ordering matters as much as membership: a cd into the project before
         // PATH is set would run the CLI lookup with the old PATH.
-        let pathEnd = try? XCTUnwrap(launch.range(of: ":$PATH\";"))
+        let pathEnd = try? XCTUnwrap(launch.range(of: ":\"$PATH\";"))
         let cd = try? XCTUnwrap(launch.range(of: "cd '"))
         if let pathEnd, let cd {
             XCTAssertLessThan(pathEnd.lowerBound, cd.lowerBound)
@@ -1300,8 +1300,198 @@ final class PeerProjectBootstrapTests: XCTestCase {
             cli: "claude", model: "sonnet", agentName: "worker",
             teamName: "demo", workingDirectory: "/srv/demo"
         )
-        XCTAssertTrue(launch.hasPrefix(RemoteShellPath.prologue))
+        XCTAssertTrue(launch.hasPrefix(RemoteShellPath.prologue()))
         XCTAssertTrue(RemoteShellPath.binDirs.contains("$HOME/.local/bin"))
+    }
+
+    @MainActor
+    func test_remote_launch_prepends_authenticated_shell_quoted_host_bin_dirs() {
+        let hostBinDirs = [
+            "/Applications/Term Mesh.app/Contents/Resources/bin",
+            "/opt/it's-here/bin",
+        ]
+        let launch = TeamOrchestrator.remoteAgentCommand(
+            cli: "codex",
+            model: "gpt-5",
+            agentName: "executor",
+            teamName: "quoted-path",
+            workingDirectory: "/tmp/project",
+            hostBinDirs: hostBinDirs
+        )
+
+        XCTAssertTrue(launch.hasPrefix(RemoteShellPath.prologue(hostBinDirs: hostBinDirs)))
+        XCTAssertTrue(launch.contains("'/Applications/Term Mesh.app/Contents/Resources/bin'"))
+        XCTAssertTrue(launch.contains("'/opt/it'\\''s-here/bin'"))
+        XCTAssertTrue(launch.contains("\"$HOME/.local/bin\""))
+        XCTAssertTrue(launch.contains(":\"$PATH\"; mkdir -p"))
+    }
+
+    func test_readiness_bin_dirs_match_exact_saved_profile_identity() {
+        let wantedID = UUID()
+        let hosts = [
+            HostEntry(
+                id: "ssh:stale",
+                displayName: "stale",
+                connectionState: .connected,
+                workspaces: [],
+                activeSockPath: "/tmp/stale.sock",
+                sshTarget: "shared",
+                remoteSockPath: "/tmp/shared.sock",
+                profileID: UUID(),
+                hostCLIBinDirs: ["/stale/bin"],
+                hostCLIBinDirsResolved: true,
+                configuredEndpoint: PeerHostEndpointProvenance(
+                    sshTarget: "shared", port: nil, identityFile: nil,
+                    remoteSocket: "/tmp/shared.sock"
+                ),
+                hostCLIBinDirsProvenance: PeerHostEndpointProvenance(
+                    sshTarget: "shared", port: nil, identityFile: nil,
+                    remoteSocket: "/tmp/shared.sock"
+                )
+            ),
+            HostEntry(
+                id: "ssh:saved",
+                displayName: "saved",
+                connectionState: .connected,
+                workspaces: [],
+                activeSockPath: "/tmp/saved.sock",
+                sshTarget: "shared",
+                remoteSockPath: "/tmp/shared.sock",
+                sshPort: 22,
+                identityFile: "/Users/x/.ssh/id_ed25519",
+                profileID: wantedID,
+                hostCLIBinDirs: ["/exact/bin"],
+                hostCLIBinDirsResolved: true,
+                configuredEndpoint: PeerHostEndpointProvenance(
+                    sshTarget: "shared", port: 22,
+                    identityFile: "/Users/x/.ssh/id_ed25519",
+                    remoteSocket: "/tmp/shared.sock"
+                ),
+                hostCLIBinDirsProvenance: PeerHostEndpointProvenance(
+                    sshTarget: "shared", port: 22,
+                    identityFile: "/Users/x/.ssh/id_ed25519",
+                    remoteSocket: "/tmp/shared.sock"
+                )
+            ),
+        ]
+
+        XCTAssertEqual(
+            RemoteHostStore.hostCLIBinDirs(
+                forProfileID: wantedID,
+                sshTarget: "shared",
+                port: 22,
+                identityFile: "/Users/x/.ssh/id_ed25519",
+                remoteSocket: "/tmp/shared.sock",
+                in: hosts
+            ),
+            ["/exact/bin"]
+        )
+        XCTAssertEqual(
+            RemoteHostStore.hostCLIBinDirs(
+                forProfileID: UUID(),
+                sshTarget: "shared",
+                port: 22,
+                identityFile: "/Users/x/.ssh/id_ed25519",
+                remoteSocket: "/tmp/shared.sock",
+                in: hosts
+            ),
+            []
+        )
+    }
+
+    /// The stale-cache leak the exact-SHA review flagged: a profile keeps
+    /// its id across an edit to sshTarget/port/identityFile/remoteSocket,
+    /// so matching on `profileID` alone (the pre-fix behavior) would still
+    /// return a still-`.connected` host's authenticated bin dirs even
+    /// though that connection was never authenticated against the
+    /// endpoint the caller is now asking about.
+    func test_readiness_bin_dirs_reject_stale_endpoint_on_the_same_profile_id() {
+        let wantedID = UUID()
+        let connectedUnderOldEndpoint = HostEntry(
+            id: "ssh:old",
+            displayName: "old",
+            connectionState: .connected,
+            workspaces: [],
+            activeSockPath: "/tmp/old.sock",
+            sshTarget: "old-target",
+            remoteSockPath: "/tmp/old.sock",
+            sshPort: 22,
+            identityFile: "/Users/x/.ssh/id_old",
+            profileID: wantedID,
+            hostCLIBinDirs: ["/old/bin"],
+            hostCLIBinDirsResolved: true,
+            configuredEndpoint: PeerHostEndpointProvenance(
+                sshTarget: "old-target", port: 22,
+                identityFile: "/Users/x/.ssh/id_old",
+                remoteSocket: "/tmp/old.sock"
+            ),
+            hostCLIBinDirsProvenance: PeerHostEndpointProvenance(
+                sshTarget: "old-target", port: 22,
+                identityFile: "/Users/x/.ssh/id_old",
+                remoteSocket: "/tmp/old.sock"
+            )
+        )
+
+        // sshTarget changed since that connection was authenticated.
+        XCTAssertEqual(
+            RemoteHostStore.hostCLIBinDirs(
+                forProfileID: wantedID,
+                sshTarget: "new-target",
+                port: 22,
+                identityFile: "/Users/x/.ssh/id_old",
+                remoteSocket: "/tmp/old.sock",
+                in: [connectedUnderOldEndpoint]
+            ),
+            []
+        )
+        // port changed.
+        XCTAssertEqual(
+            RemoteHostStore.hostCLIBinDirs(
+                forProfileID: wantedID,
+                sshTarget: "old-target",
+                port: 2222,
+                identityFile: "/Users/x/.ssh/id_old",
+                remoteSocket: "/tmp/old.sock",
+                in: [connectedUnderOldEndpoint]
+            ),
+            []
+        )
+        // identityFile changed.
+        XCTAssertEqual(
+            RemoteHostStore.hostCLIBinDirs(
+                forProfileID: wantedID,
+                sshTarget: "old-target",
+                port: 22,
+                identityFile: "/Users/x/.ssh/id_new",
+                remoteSocket: "/tmp/old.sock",
+                in: [connectedUnderOldEndpoint]
+            ),
+            []
+        )
+        // pinned remote socket changed.
+        XCTAssertEqual(
+            RemoteHostStore.hostCLIBinDirs(
+                forProfileID: wantedID,
+                sshTarget: "old-target",
+                port: 22,
+                identityFile: "/Users/x/.ssh/id_old",
+                remoteSocket: "/tmp/new.sock",
+                in: [connectedUnderOldEndpoint]
+            ),
+            []
+        )
+        // Unchanged tuple still matches — the guard isn't overzealous.
+        XCTAssertEqual(
+            RemoteHostStore.hostCLIBinDirs(
+                forProfileID: wantedID,
+                sshTarget: "old-target",
+                port: 22,
+                identityFile: "/Users/x/.ssh/id_old",
+                remoteSocket: "/tmp/old.sock",
+                in: [connectedUnderOldEndpoint]
+            ),
+            ["/old/bin"]
+        )
     }
 
     /// A directory with a quote in it stays one argument.

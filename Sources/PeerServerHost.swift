@@ -275,6 +275,11 @@ final class PeerHostCoordinator: NSObject {
         var config = PeerServerConfig()
         config.hostDisplayName = PeerFederationSettings.displayName
         config.hostAppVersion = "debug-server"
+        if let resourceURL = Bundle.main.resourceURL {
+            config.hostCLIBinDirs = [
+                resourceURL.appendingPathComponent("bin").standardizedFileURL.path
+            ]
+        }
 
         let server = PeerServer(socketPath: path, provider: provider, config: config)
         do {

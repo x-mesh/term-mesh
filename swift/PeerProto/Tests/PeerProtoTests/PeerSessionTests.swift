@@ -109,15 +109,24 @@ actor MockHost {
     var seq: UInt64 = 0
     let surfaces: [Termmesh_Peer_V1_SurfaceInfo]
     let pushWorkspaceUpdateBeforeSurfaceList: Bool
+    let protocolVersion: String
+    let capabilities: [String]
+    let cliBinDirs: [String]
 
     init(
         transport: MockTransport,
         surfaces: [Termmesh_Peer_V1_SurfaceInfo],
-        pushWorkspaceUpdateBeforeSurfaceList: Bool = false
+        pushWorkspaceUpdateBeforeSurfaceList: Bool = false,
+        protocolVersion: String = "1.0.0",
+        capabilities: [String] = [],
+        cliBinDirs: [String] = []
     ) {
         self.transport = transport
         self.surfaces = surfaces
         self.pushWorkspaceUpdateBeforeSurfaceList = pushWorkspaceUpdateBeforeSurfaceList
+        self.protocolVersion = protocolVersion
+        self.capabilities = capabilities
+        self.cliBinDirs = cliBinDirs
     }
 
     func run() async throws {
@@ -128,10 +137,12 @@ actor MockHost {
 
         // 2. Send host Hello
         var hostHello = Termmesh_Peer_V1_Hello()
-        hostHello.protocolVersion = "1.0.0"
+        hostHello.protocolVersion = protocolVersion
         hostHello.displayName = "mock-host"
         hostHello.peerID = Data(count: 16)
         hostHello.appVersion = "test"
+        hostHello.capabilities = capabilities
+        hostHello.cliBinDirs = cliBinDirs
         try await sendEnvelope { $0.hello = hostHello }
 
         // 3. Send AuthChallenge
@@ -415,6 +426,70 @@ actor TeamRPCMockHost {
 }
 
 final class PeerSessionTests: XCTestCase {
+    func testHostCLIBinDirValidationIsStrictAndDeterministic() {
+        XCTAssertEqual(
+            PeerHostCLIBinDirs.validated([
+                "/Applications/Term Mesh.app/Contents/Resources/bin",
+                "/opt/it's-here/bin",
+                "/Applications/Term Mesh.app/Contents/Resources/bin",
+            ]),
+            []
+        )
+        XCTAssertEqual(
+            PeerHostCLIBinDirs.validated([
+                "/Applications/Term Mesh.app/Contents/Resources/bin",
+                "/opt/it's-here/bin",
+            ]),
+            [
+                "/Applications/Term Mesh.app/Contents/Resources/bin",
+                "/opt/it's-here/bin",
+            ]
+        )
+        XCTAssertEqual(PeerHostCLIBinDirs.validated(["/safe/bin", "/safe/bin"]), ["/safe/bin"])
+
+        let unsafe = [
+            "relative/bin", "/", "/safe/../bin", "/safe/./bin",
+            "/safe:evil/bin", "/safe/$HOME/bin", "/safe\n/bin",
+        ]
+        for path in unsafe {
+            XCTAssertEqual(PeerHostCLIBinDirs.validated([path]), [], "accepted unsafe path: \(path)")
+        }
+        XCTAssertEqual(
+            PeerHostCLIBinDirs.validated(["/" + String(repeating: "a", count: PeerHostCLIBinDirs.maximumUTF8Bytes)]),
+            []
+        )
+    }
+
+    func testHandshakeExposesOnlyCapabilityGatedValidatedHostCLIBinDirs() async throws {
+        let cases: [([String], [String], [String])] = [
+            ([PeerCapability.hostCLIBinDirsV1], ["/Applications/Term Mesh.app/Contents/Resources/bin"], ["/Applications/Term Mesh.app/Contents/Resources/bin"]),
+            ([], ["/malicious/ungated/bin"], []),
+            ([PeerCapability.hostCLIBinDirsV1], ["../../malicious"], []),
+            ([], [], []),
+        ]
+
+        for (capabilities, advertised, expected) in cases {
+            let transport = MockTransport()
+            let host = MockHost(
+                transport: transport,
+                surfaces: [],
+                capabilities: capabilities,
+                cliBinDirs: advertised
+            )
+            let hostTask = Task { try await host.run() }
+            let session = PeerSession(
+                read: { await transport.clientRead() },
+                write: { await transport.clientWrite($0) }
+            )
+
+            let info = try await session.handshake()
+            XCTAssertEqual(info.hostCLIBinDirs, expected)
+            let surfaces = try await session.listSurfaces()
+            XCTAssertEqual(surfaces, [])
+            try await hostTask.value
+        }
+    }
+
     func testHandshakeAndListRoundTrip() async throws {
         let transport = MockTransport()
 

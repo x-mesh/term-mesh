@@ -1,4 +1,5 @@
 import Foundation
+import PeerProto
 
 /// What a machine can actually do, asked before anyone depends on it.
 ///
@@ -60,7 +61,6 @@ enum RemoteShellPath {
     /// the Swift peer protocol and `tm-agent` routing policy can disagree
     /// after an app-only upgrade. The path is harmless on Linux.
     static let binDirs = [
-        "/Applications/term-mesh.app/Contents/Resources/bin",
         "$HOME/.local/bin",
         "$HOME/.cargo/bin",
         "$HOME/bin",
@@ -79,7 +79,22 @@ enum RemoteShellPath {
     /// Deliberately unquoted: `$HOME` has to expand on the far side. The
     /// inherited `$PATH` stays last so a host that has already arranged things
     /// keeps its own precedence.
-    static let prologue = "export PATH=\"\(binDirs.joined(separator: ":")):$PATH\"; "
+    static func prologue(hostBinDirs: [String] = []) -> String {
+        let authenticated = PeerHostCLIBinDirs.validated(hostBinDirs)
+        let reported = authenticated.map(shellQuote)
+        let fixed = binDirs.map { dir -> String in
+            if dir.hasPrefix("$HOME/") {
+                return "\"$HOME/\(dir.dropFirst(6))\""
+            }
+            return shellQuote(dir)
+        }
+        let value = (reported + fixed + ["\"$PATH\""]).joined(separator: ":")
+        return "export PATH=\(value); "
+    }
+
+    private static func shellQuote(_ value: String) -> String {
+        "'" + value.replacingOccurrences(of: "'", with: "'\\''") + "'"
+    }
 }
 
 enum PeerHostReadinessChecker {
@@ -95,6 +110,7 @@ enum PeerHostReadinessChecker {
         port: Int?,
         identityFile: String?,
         projectRoot: String,
+        hostBinDirs: [String] = [],
         timeoutSeconds: TimeInterval = 20
     ) async throws -> PeerHostReadiness {
         let root = projectRoot.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -107,7 +123,7 @@ enum PeerHostReadinessChecker {
         let probes = knownCLIs
             .map { "command -v \($0) >/dev/null 2>&1 && echo 'cli \($0)'" }
             .joined(separator: "; ")
-        let script = RemoteShellPath.prologue
+        let script = RemoteShellPath.prologue(hostBinDirs: hostBinDirs)
             + "test -d \(quotedRoot) && echo 'root yes' || echo 'root no'; \(probes)"
 
         let output = try await run(
