@@ -60,7 +60,7 @@ term-mesh는 이미 multi-agent 인프라(`tm-agent` collect/read/msg, role/runb
 - `/tm-op pair` = **one-shot** 페어 라운드 alias (한 번만 반박/보조)
 - `/watch` = **지속/토글** 오버사이트 전용 (핵심 신규)
 
-구현물: `.claude/commands/watch.md` + Codex IME용 `.codex/prompts/watch.md` shim 한 쌍.
+구현물: `.claude/commands/watch.md` + 전역 설치용 `Resources/CodexPrompts/watch.md` shim 한 쌍.
 
 ## 4. drift 발견 저장 (item 4)
 
@@ -100,7 +100,7 @@ watcher를 first-class role로 등록 + 팀 생성 시 spec 주입. 데몬 변�
 - `--stance` 3종 (런북 변형 또는 프롬프트 lens)
 - `--cli`/`--model` 선택
 - drift 이력 `board.jsonl` 기록 + `/watch status`
-- `.claude/commands/watch.md` + `.codex/prompts/watch.md`
+- `.claude/commands/watch.md` + `Resources/CodexPrompts/watch.md`
 
 ### Phase 2 — 지속 watch (자율)
 - `/watch on/off` 토글

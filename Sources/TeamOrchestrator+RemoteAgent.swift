@@ -2202,7 +2202,8 @@ extension TeamOrchestrator {
         reason: String
     ) async {
         guard let path else { return }
-        if let locations = teams[teamName]?.remoteProjectLocations {
+        let locations = knownRemoteProjectLocations(teamName: teamName)
+        if !locations.isEmpty {
             let remaining = Self.remoteProjectLocations(
                 locations, abandoning: path, onHost: hostKey
             )
@@ -2610,8 +2611,8 @@ extension TeamOrchestrator {
               let workDir = agent.originalAgentWorkDir?
                   .trimmingCharacters(in: .whitespacesAndNewlines),
               !workDir.isEmpty,
-              let team = teams[teamName],
-              team.remoteProjectLocations.contains(
+              teams[teamName] != nil,
+              knownRemoteProjectLocations(teamName: teamName).contains(
                   Team.RemoteProjectLocation(hostKey: hostKey, path: workDir)
               ),
               let host = RemoteHostStore.shared.sortedHosts.first(where: { $0.id == hostKey }),
@@ -2906,7 +2907,12 @@ extension TeamOrchestrator {
             throw RemoteAgentError.teamNotFound(teamName)
         }
 
-        let grouped = Dictionary(grouping: team.remoteProjectLocations, by: \.hostKey)
+        // Read through the durable record: after a restart the team's
+        // in-memory list is empty while its checkouts are still on the peers.
+        let grouped = Dictionary(
+            grouping: knownRemoteProjectLocations(teamName: teamName),
+            by: \.hostKey
+        )
         var deletionJobs: [(host: HostEntry, script: String)] = []
         var deleted: [String] = []
         var remaining: [String] = []

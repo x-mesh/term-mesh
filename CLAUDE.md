@@ -245,6 +245,53 @@ Rules learned the hard way:
 - Driving the app calls `debug.app.activate`, which **steals focus from the
   user**. Batch the probes, and stop once verified.
 
+## Disk reclamation (`tm-agent gc`)
+
+Three subsystems create worktrees and none knows about the others — the daemon
+(`~/.term-mesh/worktrees/<repo>/term-mesh_wt_<8hex>`), git-kit via
+`tm-agent delegate --worktree` (`~/.gk/worktree/...`), and `PeerProjectBootstrap`
+agent checkouts (`<root>/<project>-<role>-<yyMMdd>-<hex4>` on an `agent/*`
+branch). Plus per-team results, task boards, logs and build caches. `gc` is the
+one place that accounts for all of it, locally or on a peer.
+
+```bash
+tm-agent gc status                          # size + candidate count per category
+tm-agent gc plan [--category X] [--deep]    # every candidate with reasons/blockers
+tm-agent gc sweep                           # dry-run — shows what would go
+tm-agent gc sweep --apply                   # actually reclaim
+```
+
+- **Dry-run is the default.** `sweep` without `--apply` deletes nothing.
+- **Blockers beat `--apply`.** Uncommitted changes, commits missing from the
+  parent repo, and worktrees an active session or task still points at are
+  never removed. `--force` relaxes exactly one blocker (`unopenable`).
+- **The daemon's own 6h sweep is narrower still**: only `team_results` (24h),
+  `worktree_meta` and `logs`. Team boards require an authoritative live-team
+  snapshot and are explicit-only. The unattended sweep never removes a
+  worktree or checkout — see `AUTO_CATEGORIES` in
+  `daemon/term-meshd/src/gc.rs`.
+- Removal goes through git, so the registration is pruned with the directory.
+  Deleting the directory alone leaves a `prunable` entry behind.
+- **`git worktree remove` refuses any worktree containing a submodule**, and
+  every term-mesh worktree has `ghostty` — so that path always fails here. `gc`
+  handles it (delete the directory, then prune the registration), but
+  `git-kit worktree cleanup -y` **reports the removals and performs none**: it
+  swallows git's refusal and still returns `state: ok`. Verify with
+  `git worktree list` rather than trusting its output.
+- Build caches are reported (`--deep`) but reclaimed by the scripts that own
+  them: `reload.sh` drops tag builds untouched for 7 days (override with
+  `TERMMESH_RELOAD_TAG_GC_DAYS`, disable with `TERMMESH_RELOAD_TAG_GC=0`), and
+  `setup.sh` keeps the 3 most recently used GhosttyKit SHAs
+  (`TERMMESH_GHOSTTYKIT_CACHE_KEEP`).
+- Peers report free space in `HostStats`, and the sidebar shows a warning badge
+  under 5GB or 10%. Run `tm-agent gc` over ssh on that host to reclaim.
+
+VERIFY:
+
+```bash
+cd daemon && cargo test -p term-meshd gc:: && cargo test -p term-meshd host_stats
+```
+
 ## Pitfalls
 
 - **Custom UTTypes** for drag-and-drop must be declared in `Resources/Info.plist` under `UTExportedTypeDeclarations` (e.g. `com.splittabbar.tabtransfer`, `com.termmesh.sidebar-tab-reorder`).
@@ -318,7 +365,7 @@ a socket exists at `/tmp/term-mesh*.sock` or `/tmp/term-mesh.sock`), ALL team op
 `TaskGet`, `TaskUpdate`, `TeamDelete`. These create a parallel, disconnected team state.
 
 **Use instead:** The project-local `/team` command (`.claude/commands/team.md`) for Claude leaders,
-or the Codex IME `/team` alias backed by `.codex/prompts/team.md` for Codex leaders. Both route
+or the Codex IME `/team` alias backed by `~/.codex/prompts/team.md` for Codex leaders. Both route
 everything through `tm-agent`.
 
 ### Command responsibility split — /team vs /tm
@@ -340,13 +387,13 @@ If OMC's keyword detector fires `[MODE: TEAM]` or `[MAGIC KEYWORD: TEAM]`:
 
 ### Codex leader prompt shims
 
-Codex does not use Claude's `.claude/commands` slash-command format, and current Codex TUI builds
-do not accept `/prompts:<name>` as an interactive slash command. Project-local Codex prompt shims
-live under `.codex/prompts/`.
+Codex does not execute Claude's `.claude/commands` slash-command format natively. Project-local
+`.codex/prompts/` is intentionally absent; distributable Codex prompt shims live under
+`Resources/CodexPrompts/` and are installed globally into `~/.codex/prompts/`.
 
 In the term-mesh IME box, Codex panes get short aliases that expand on submit into a normal Codex
-message: "read `.codex/prompts/<name>.md` and execute it with these arguments." Claude panes keep
-the original Claude slash commands.
+message: "read `~/.codex/prompts/<name>.md` and execute it with these arguments." Claude panes
+keep the original Claude slash commands.
 
 | Claude leader | Codex leader | Purpose |
 |---------------|--------------|---------|
@@ -358,13 +405,11 @@ the original Claude slash commands.
 | `/watch ...` | `/watch ...` via IME alias | Stateless drift oversight toggle/review |
 
 The IME alias map lives in `imeSlashCommandAliases()` (`Sources/GhosttySurfaceScrollView.swift`);
-each alias points at a `.codex/prompts/<name>.md` shim, read live from the repo. Both the Claude
-commands AND the Codex prompts are bundled + installed by `scripts/copy-claude-commands.sh`
-(build phase: `COMMANDS`/`SKILLS`/`CODEX_PROMPTS` arrays) and `ClaudeCommandInstaller.swift`
-(runtime: `managedCommandNames` → `~/.claude/commands/`, `managedCodexPromptNames` →
-`~/.codex/prompts/` for native Codex `/<name>`). Install is version-gated, so new prompts land on
-the next version bump. Adding a leader command means touching all of these in lockstep — see the
-6-point checklist in `scripts/copy-claude-commands.sh`.
+each alias points at the corresponding `~/.codex/prompts/<name>.md`. Both the Claude commands and
+Codex distribution prompts are bundled by `scripts/copy-claude-commands.sh` (build phase:
+`COMMANDS`/`SKILLS`/`CODEX_PROMPTS`) and installed by `ClaudeCommandInstaller.swift` into
+`~/.claude/` and `~/.codex/prompts/`. Adding a leader command means updating the paired source under
+`Resources/CodexPrompts/`, both managed-name arrays, and the IME alias map in lockstep.
 
 For Codex as the current leader, prefer:
 

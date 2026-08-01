@@ -891,6 +891,10 @@ fn host_stats_from(snapshot: &SystemSnapshot) -> HostStats {
         // narrowing a float the monitor computed by dividing a byte delta.
         net_rx_bytes_per_sec: net_rx.max(0.0) as u64,
         net_tx_bytes_per_sec: net_tx.max(0.0) as u64,
+        // Absolute capacity, so a viewer can warn before a peer runs out of
+        // room. Zero total means the host could not measure it.
+        disk_total_bytes: snapshot.disk_total_bytes,
+        disk_available_bytes: snapshot.disk_available_bytes,
     }
 }
 
@@ -2819,8 +2823,8 @@ mod terminate_tests {
             memory_percent: 50.0,
             cpu_count: 8,
             cpu_usage_percent: 12.5,
-            disk_total_bytes: 0,
-            disk_available_bytes: 0,
+            disk_total_bytes: 500_000_000_000,
+            disk_available_bytes: 20_000_000_000,
             disk_read_bytes_per_sec: 1_024,
             disk_write_bytes_per_sec: 2_048,
             processes: Vec::new(),
@@ -2859,6 +2863,16 @@ mod terminate_tests {
 
         assert_eq!(stats.net_rx_bytes_per_sec, 1_150);
         assert_eq!(stats.net_tx_bytes_per_sec, 2_225);
+    }
+
+    /// A viewer cannot warn about a peer running out of room unless capacity
+    /// actually travels — the rate fields alone never show a full disk.
+    #[test]
+    fn host_stats_carries_disk_capacity() {
+        let stats = host_stats_from(&snapshot_with_network(vec![("eth0", 1.0, 1.0)]));
+
+        assert_eq!(stats.disk_total_bytes, 500_000_000_000);
+        assert_eq!(stats.disk_available_bytes, 20_000_000_000);
     }
 
     /// A host with no interfaces up must report zero rather than refuse to

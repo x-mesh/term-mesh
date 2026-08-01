@@ -66,6 +66,67 @@ final class RemoteProjectPaths {
     }
 }
 
+/// The checkouts a team created on other machines.
+///
+/// These directories are the team's to reclaim, and the only record of them
+/// used to live in `Team.remoteProjectLocations` — in memory. Quit the app and
+/// the list was gone, so "Delete Project" could no longer name what to remove
+/// and a detached agent's checkout had nothing to match against. The
+/// directories stayed on the peer forever, one per team composition, each with
+/// its own build output.
+///
+/// Kept next to the other peer bookkeeping and keyed by team name, which is
+/// what every caller already has.
+@MainActor
+final class RemoteProjectLocationStore {
+    struct Record: Codable, Equatable {
+        let teamName: String
+        let hostKey: String
+        let path: String
+    }
+
+    static let shared = RemoteProjectLocationStore()
+    private static let storageKey = "termmesh.remoteProjectLocations"
+    private var records: [Record]
+
+    private init() {
+        guard let data = UserDefaults.standard.data(forKey: Self.storageKey),
+              let decoded = try? JSONDecoder().decode([Record].self, from: data)
+        else {
+            records = []
+            return
+        }
+        records = decoded
+    }
+
+    /// Replace everything known for one team. Callers always hand over the
+    /// complete list, so a removed entry must not linger.
+    func replace(teamName: String, locations: [(hostKey: String, path: String)]) {
+        records.removeAll { $0.teamName == teamName }
+        records.append(contentsOf: locations.map {
+            Record(teamName: teamName, hostKey: $0.hostKey, path: $0.path)
+        })
+        persist()
+    }
+
+    func locations(teamName: String) -> [(hostKey: String, path: String)] {
+        records
+            .filter { $0.teamName == teamName }
+            .map { (hostKey: $0.hostKey, path: $0.path) }
+    }
+
+    func forget(teamName: String) {
+        let before = records.count
+        records.removeAll { $0.teamName == teamName }
+        if records.count != before { persist() }
+    }
+
+    private func persist() {
+        guard let data = try? JSONEncoder().encode(records) else { return }
+        UserDefaults.standard.set(data, forKey: Self.storageKey)
+    }
+}
+
 /// Host-side shells created for remote leaders and terminal agents.
 ///
 /// A peer surface survives a local viewer disappearing. Remembering the

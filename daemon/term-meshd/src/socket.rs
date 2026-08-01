@@ -9,6 +9,7 @@ use tokio::task::JoinSet;
 use tokio::time::{timeout, Duration};
 
 use crate::agent::AgentSessionManager;
+use crate::gc;
 use crate::headless::HeadlessManager;
 use crate::monitor::{Anomaly, MonitorHandle, SystemSnapshot};
 use crate::pane_tracker::PaneTracker;
@@ -1312,6 +1313,121 @@ const ASSIGNED_TIMEOUT_OTHER_MS: u64 = 360_000;
 
 /// Walk the synced team-state JSON to build `agent_name -> cli` so the
 /// assigned-timeout watcher can pick the right threshold per assignee.
+/// Everything the daemon currently considers in use, handed to the GC so its
+/// scan stays a pure function of (filesystem, refs, clock).
+///
+/// Collected here rather than inside `crate::gc` because only the socket layer
+/// can reach the session database and the Swift-synced team state.
+async fn collect_gc_refs(ctx: &Context) -> gc::GcRefs {
+    let active_team_uuids = {
+        let state = ctx.team_state.read().unwrap();
+        state
+            .get("teams")
+            .and_then(serde_json::Value::as_array)
+            .map(|teams| {
+                teams
+                    .iter()
+                    .filter_map(|team| {
+                        team.get("id")
+                            .or_else(|| team.get("uuid"))
+                            .or_else(|| team.get("workspace_id"))
+                            .and_then(serde_json::Value::as_str)
+                            .map(str::to_string)
+                    })
+                    .collect::<HashSet<String>>()
+            })
+            .unwrap_or_default()
+    };
+
+    gc::GcRefs {
+        active_session_worktrees: ctx.agent_manager.active_worktree_paths(),
+        active_task_worktrees: ctx.agent_manager.active_task_worktree_paths(),
+        repo_paths: ctx.agent_manager.known_repo_paths(),
+        active_team_uuids,
+    }
+}
+
+/// Shared scan step for `gc.status` / `gc.plan` / `gc.sweep`.
+fn gc_scan(params: serde_json::Value, refs: gc::GcRefs) -> Result<gc::GcPlan, String> {
+    let opts: gc::GcOptions = serde_json::from_value(params)
+        .map_err(|error| format!("INVALID_PARAMS: invalid GC options: {error}"))?;
+    let paths = gc::default_paths().ok_or_else(|| "cannot resolve home directory".to_string())?;
+    Ok(gc::build_plan(&paths, &opts, &refs))
+}
+
+async fn gc_scan_off_thread(
+    ctx: &Context,
+    params: serde_json::Value,
+) -> Result<gc::GcPlan, String> {
+    let refs = collect_gc_refs(ctx).await;
+    tokio::task::spawn_blocking(move || gc_scan(params, refs))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+/// Machine-wide reclamation summary.
+///
+/// A `project_id` in the params selects the original project-scoped response
+/// shape (validated project plus the `eligible`/`retention_days` keys the
+/// pre-GC stub returned) so older CLI builds keep working unchanged.
+async fn gc_status(ctx: &Context, req: &Request) -> Result<serde_json::Value, String> {
+    let legacy_project = match project_id_param(&req.params) {
+        Ok(project_id) => {
+            load_project(ctx, project_id).await?;
+            Some(project_id.to_string())
+        }
+        Err(_) => None,
+    };
+
+    let plan = gc_scan_off_thread(ctx, req.params.clone()).await?;
+    let mut result = gc::summarize(&plan);
+    if let Some(object) = result.as_object_mut() {
+        object.insert("state".into(), serde_json::json!("idle"));
+        object.insert(
+            "last_sweep".into(),
+            serde_json::to_value(gc::last_sweep()).unwrap_or(serde_json::Value::Null),
+        );
+        if let Some(project_id) = legacy_project {
+            object.insert("project_id".into(), serde_json::json!(project_id));
+            object.insert("eligible".into(), serde_json::json!(false));
+            object.insert("retention_days".into(), serde_json::json!(90));
+        }
+    }
+    Ok(result)
+}
+
+#[derive(Debug, serde::Deserialize, Default)]
+struct GcSweepFlags {
+    #[serde(default)]
+    apply: bool,
+    #[serde(default)]
+    force: bool,
+}
+
+fn parse_gc_sweep_flags(params: serde_json::Value) -> Result<GcSweepFlags, String> {
+    serde_json::from_value(params)
+        .map_err(|error| format!("INVALID_PARAMS: invalid GC sweep flags: {error}"))
+}
+
+async fn gc_sweep(ctx: &Context, req: &Request) -> Result<serde_json::Value, String> {
+    let flags = parse_gc_sweep_flags(req.params.clone())?;
+
+    let plan = gc_scan_off_thread(ctx, req.params.clone()).await?;
+    // The scan may be expensive. Refresh live session/task references after it
+    // finishes so the apply pass cannot rely only on the snapshot from before
+    // the filesystem walk. `execute_sweep` also rechecks each worktree's git
+    // state immediately before removal.
+    let current_refs = collect_gc_refs(ctx).await;
+    tokio::task::spawn_blocking(move || {
+        let paths =
+            gc::default_paths().ok_or_else(|| "cannot resolve home directory".to_string())?;
+        gc::execute_sweep(&paths, &plan, flags.apply, flags.force, &current_refs)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+    .map(|summary| serde_json::to_value(summary).unwrap_or(serde_json::Value::Null))
+}
+
 /// Returns an empty map when no team state has been synced yet — callers fall
 /// back to the claude default.
 fn extract_assignee_cli_map(state: &serde_json::Value) -> HashMap<String, String> {
@@ -1821,19 +1937,18 @@ async fn dispatch(req: &Request, ctx: &Context) -> Response {
                 Err(error) => Err(error),
             }
         }
-        "gc.status" => match project_id_param(&req.params) {
-            Ok(project_id) => match load_project(ctx, project_id).await {
-                Ok(_) => Ok(serde_json::json!({
-                    "project_id": project_id.to_string(),
-                    "state": "idle",
-                    "eligible": false,
-                    "retention_days": 90,
-                    "reason": "gc_coordinator_not_initialized",
-                })),
-                Err(error) => Err(error),
-            },
-            Err(error) => Err(error),
-        },
+        // --- Disk reclamation (crate::gc) ---
+        // All three walk the filesystem and shell out to libgit2, so they run
+        // off the async runtime like the worktree.* handlers above.
+        //
+        // `gc.status` keeps its original project-scoped shape when a caller
+        // passes project_id, so older CLIs keep working, and answers about the
+        // machine as a whole when it does not.
+        "gc.status" => gc_status(ctx, req).await,
+        "gc.plan" => gc_scan_off_thread(ctx, req.params.clone())
+            .await
+            .map(|plan| serde_json::to_value(plan).unwrap_or(serde_json::Value::Null)),
+        "gc.sweep" => gc_sweep(ctx, req).await,
 
         "daemon.status" => {
             let uptime_secs = crate::START_TIME
@@ -4426,6 +4541,19 @@ async fn query_gui_team_workers(app_socket: &str, team_id: &str) -> Vec<String> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn malformed_gc_params_fail_closed_instead_of_scanning_every_category() {
+        let error = gc_scan(
+            serde_json::json!({"categories": "team_results"}),
+            gc::GcRefs::default(),
+        )
+        .unwrap_err();
+        assert!(error.starts_with("INVALID_PARAMS:"));
+
+        let error = parse_gc_sweep_flags(serde_json::json!({"apply": "yes"})).unwrap_err();
+        assert!(error.starts_with("INVALID_PARAMS:"));
+    }
 
     fn leader_response(
         ok: bool,

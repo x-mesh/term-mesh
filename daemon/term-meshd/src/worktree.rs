@@ -688,10 +688,18 @@ mod tests {
     use super::*;
     use std::process::Command;
 
-    fn init_temp_repo() -> (tempfile::TempDir, String) {
+    /// Returns `(tempdir, repo_path, base_dir)`.
+    ///
+    /// `base_dir` matters: `create()` falls back to `~/.term-mesh/worktrees`
+    /// when the caller omits it, so a test that leaves it out writes worktrees
+    /// into the developer's real home directory and never cleans them up.
+    /// Every test here must pass the returned `base_dir`.
+    fn init_temp_repo() -> (tempfile::TempDir, String, String) {
         let dir = tempfile::tempdir().unwrap();
         let repo_path = dir.path().join("repo");
         std::fs::create_dir(&repo_path).unwrap();
+        let base_dir = dir.path().join("wt-base");
+        std::fs::create_dir(&base_dir).unwrap();
 
         // Initialize git repo with an initial commit
         Command::new("git")
@@ -725,15 +733,17 @@ mod tests {
             .unwrap();
 
         let path_str = repo_path.to_string_lossy().into_owned();
-        (dir, path_str)
+        let base_str = base_dir.to_string_lossy().into_owned();
+        (dir, path_str, base_str)
     }
 
     #[test]
     fn create_and_list_worktree() {
-        let (_dir, repo_path) = init_temp_repo();
+        let (_dir, repo_path, base_dir) = init_temp_repo();
 
         let params = serde_json::json!({
             "repo_path": repo_path,
+            "base_dir": base_dir,
         });
         let info = create(params).unwrap();
         assert!(info.name.starts_with("term-mesh_wt_"));
@@ -749,9 +759,12 @@ mod tests {
 
     #[test]
     fn create_and_remove_worktree() {
-        let (_dir, repo_path) = init_temp_repo();
+        let (_dir, repo_path, base_dir) = init_temp_repo();
 
-        let params = serde_json::json!({ "repo_path": repo_path });
+        let params = serde_json::json!({
+            "repo_path": repo_path,
+            "base_dir": base_dir,
+        });
         let info = create(params).unwrap();
 
         let remove_params = serde_json::json!({
@@ -768,10 +781,11 @@ mod tests {
 
     #[test]
     fn create_with_custom_branch() {
-        let (_dir, repo_path) = init_temp_repo();
+        let (_dir, repo_path, base_dir) = init_temp_repo();
 
         let params = serde_json::json!({
             "repo_path": repo_path,
+            "base_dir": base_dir,
             "branch": "custom-branch",
         });
         let info = create(params).unwrap();
@@ -790,11 +804,12 @@ mod tests {
 
     #[test]
     fn create_reuses_stale_branch() {
-        let (_dir, repo_path) = init_temp_repo();
+        let (_dir, repo_path, base_dir) = init_temp_repo();
 
         // First creation with a named branch
         let params = serde_json::json!({
             "repo_path": repo_path,
+            "base_dir": base_dir,
             "branch": "team/test-team",
         });
         let info1 = create(params).unwrap();
@@ -805,6 +820,7 @@ mod tests {
         // (stale branch+worktree get cleaned up automatically)
         let params2 = serde_json::json!({
             "repo_path": repo_path,
+            "base_dir": base_dir,
             "branch": "team/test-team",
         });
         let info2 = create(params2).unwrap();
@@ -816,7 +832,7 @@ mod tests {
 
     #[test]
     fn create_with_base_dir() {
-        let (_dir, repo_path) = init_temp_repo();
+        let (_dir, repo_path, _base_dir) = init_temp_repo();
         let base = tempfile::tempdir().unwrap();
         let params = serde_json::json!({
             "repo_path": repo_path,
@@ -848,7 +864,7 @@ mod tests {
 
     #[test]
     fn diff_summary_reports_file_stats_relative_to_base() {
-        let (_dir, repo_path) = init_temp_repo();
+        let (_dir, repo_path, base_dir) = init_temp_repo();
         let repo_path_buf = std::path::PathBuf::from(&repo_path);
 
         // Create the worktree off `main`/`master` (whatever init_temp_repo
@@ -862,7 +878,11 @@ mod tests {
             String::from_utf8_lossy(&out.stdout).trim().to_string()
         };
 
-        let info = create(serde_json::json!({ "repo_path": repo_path })).unwrap();
+        let info = create(serde_json::json!({
+            "repo_path": repo_path,
+            "base_dir": base_dir,
+        }))
+        .unwrap();
         let wt_path = std::path::PathBuf::from(&info.path);
 
         // One added file, one modified file, on the worktree branch.
@@ -900,7 +920,7 @@ mod tests {
 
     #[test]
     fn diff_summary_flags_dirty_worktree() {
-        let (_dir, repo_path) = init_temp_repo();
+        let (_dir, repo_path, base_dir) = init_temp_repo();
         let base_branch = {
             let out = Command::new("git")
                 .args(["branch", "--show-current"])
@@ -909,7 +929,11 @@ mod tests {
                 .unwrap();
             String::from_utf8_lossy(&out.stdout).trim().to_string()
         };
-        let info = create(serde_json::json!({ "repo_path": repo_path })).unwrap();
+        let info = create(serde_json::json!({
+            "repo_path": repo_path,
+            "base_dir": base_dir,
+        }))
+        .unwrap();
         let wt_path = std::path::PathBuf::from(&info.path);
 
         // Uncommitted change only — no commit.
@@ -930,8 +954,12 @@ mod tests {
 
     #[test]
     fn diff_summary_rejects_unknown_base_ref() {
-        let (_dir, repo_path) = init_temp_repo();
-        let info = create(serde_json::json!({ "repo_path": repo_path })).unwrap();
+        let (_dir, repo_path, base_dir) = init_temp_repo();
+        let info = create(serde_json::json!({
+            "repo_path": repo_path,
+            "base_dir": base_dir,
+        }))
+        .unwrap();
         let err = diff_summary(serde_json::json!({
             "path": info.path,
             "base_ref": "does-not-exist",

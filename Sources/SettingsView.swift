@@ -1604,7 +1604,10 @@ struct SettingsView: View {
 
                         SettingsCardRow("Auto-Cleanup on Quit", subtitle: "Remove stale worktrees when app closes") {
                             Toggle("", isOn: Binding(
-                                get: { daemonService?.worktreeAutoCleanup ?? true },
+                                // Matches the stored default (UserDefaults.bool
+                                // is false when unset) — reading `true` here
+                                // showed the switch on while nothing was set.
+                                get: { daemonService?.worktreeAutoCleanup ?? false },
                                 set: { daemonService?.worktreeAutoCleanup = $0 }
                             ))
                             .toggleStyle(.switch)
@@ -3788,12 +3791,22 @@ private struct WorktreeManagerSection: View {
         let name: String
         let branch: String
         let repoName: String
+        /// The repository that registered this worktree, or nil if it is gone.
+        let repoPath: String?
+    }
+
+    /// A delete the daemon refused because the worktree still holds work.
+    struct ForceDeletePrompt: Identifiable {
+        var id: String { worktree.id }
+        let worktree: FoundWorktree
+        let reason: String
     }
 
     @State private var worktrees: [FoundWorktree] = []
     @State private var isScanning = false
     @State private var hasScanResult = false
     @State private var confirmDelete: FoundWorktree? = nil
+    @State private var confirmForceDelete: ForceDeletePrompt? = nil
     @State private var errorMessage: String? = nil
 
     var body: some View {
@@ -3855,12 +3868,33 @@ private struct WorktreeManagerSection: View {
             titleVisibility: .visible
         ) {
             if let wt = confirmDelete {
-                Button("Delete \"\(wt.name)\"", role: .destructive) { forceDelete(wt) }
+                Button("Delete \"\(wt.name)\"", role: .destructive) { delete(wt) }
                 Button("Cancel", role: .cancel) {}
             }
         } message: {
             if let wt = confirmDelete {
-                Text("This will permanently remove the directory:\n\(wt.path)\n\nNote: Run `git worktree prune` in the parent repo to clean up any remaining git metadata.")
+                Text("This removes the worktree and its git registration:\n\(wt.path)\n\nA worktree with uncommitted changes is kept — you will be asked again before anything is discarded.")
+            }
+        }
+        // A refused delete is a second, explicitly destructive decision: the
+        // first dialog promised nothing would be discarded.
+        .confirmationDialog(
+            "Discard uncommitted work?",
+            isPresented: Binding(
+                get: { confirmForceDelete != nil },
+                set: { if !$0 { confirmForceDelete = nil } }
+            ),
+            titleVisibility: .visible
+        ) {
+            if let prompt = confirmForceDelete {
+                Button("Delete and discard changes", role: .destructive) {
+                    forceDelete(prompt.worktree)
+                }
+                Button("Keep it", role: .cancel) {}
+            }
+        } message: {
+            if let prompt = confirmForceDelete {
+                Text("\(prompt.worktree.path)\n\n\(prompt.reason)\n\nDeleting now throws that work away permanently.")
             }
         }
         // Re-scan when baseDir changes (e.g. user edits the base directory setting)
@@ -3880,19 +3914,64 @@ private struct WorktreeManagerSection: View {
         isScanning = false
     }
 
-    /// Delete a worktree directory off-main to avoid UI blocking on large trees.
-    /// Note: This only removes the filesystem directory. If the parent repo still
-    /// has a .git/worktrees/<name> reference, run `git worktree prune` in the
-    /// parent repo to clean up stale metadata.
-    private func forceDelete(_ wt: FoundWorktree) {
+    /// Delete through the daemon so git's own registration goes with the
+    /// directory.
+    ///
+    /// Removing the directory alone — what this used to do — left the parent
+    /// repo holding a `prunable` entry, which is why the dialog had to tell
+    /// people to run `git worktree prune` themselves. The daemon refuses a
+    /// worktree with uncommitted changes, and that refusal becomes the second
+    /// confirmation rather than a silent failure.
+    private func delete(_ wt: FoundWorktree) {
         confirmDelete = nil
+        guard let repoPath = wt.repoPath else {
+            // No repo left to ask: nothing can be registered anywhere, so the
+            // directory is all there is.
+            forceDelete(wt)
+            return
+        }
+        let name = wt.name
+        Task.detached(priority: .userInitiated) {
+            let removed = TermMeshDaemon.shared.removeWorktree(
+                repoPath: repoPath, name: name, force: false
+            )
+            let status = removed
+                ? nil
+                : TermMeshDaemon.shared.worktreeStatus(repoPath: repoPath, name: name)
+            await MainActor.run {
+                if removed {
+                    worktrees.removeAll { $0.id == wt.id }
+                    return
+                }
+                let reason = (status?.dirty ?? false)
+                    ? "It has uncommitted changes."
+                    : "The daemon refused to remove it."
+                confirmForceDelete = ForceDeletePrompt(worktree: wt, reason: reason)
+            }
+        }
+    }
+
+    /// Last resort: discard the worktree even though git objected, and fall
+    /// back to a plain directory delete when there is no repo to go through.
+    private func forceDelete(_ wt: FoundWorktree) {
+        confirmForceDelete = nil
         let path = wt.path
         let wtId = wt.id
+        let repoPath = wt.repoPath
+        let name = wt.name
         Task.detached(priority: .userInitiated) {
+            if let repoPath,
+               TermMeshDaemon.shared.removeWorktree(repoPath: repoPath, name: name, force: true) {
+                await MainActor.run { worktrees.removeAll { $0.id == wtId } }
+                return
+            }
             do {
                 try FileManager.default.removeItem(atPath: path)
                 await MainActor.run {
                     worktrees.removeAll { $0.id == wtId }
+                    if repoPath != nil {
+                        errorMessage = "Removed the directory only — run `git worktree prune` in the parent repo to clear its metadata."
+                    }
                 }
             } catch {
                 await MainActor.run {
@@ -3983,7 +4062,13 @@ private func scanWorktreeDirectory(_ baseDir: String) -> [WorktreeManagerSection
                 path: wtPath,
                 name: wtName,
                 branch: branch,
-                repoName: repoName
+                repoName: repoName,
+                // Needed to delete through git rather than behind its back.
+                // nil when the parent repo is gone, which the delete path
+                // treats as its own case.
+                repoPath: TermMeshDaemon.primaryRepoPath(
+                    ofWorktreeAt: URL(fileURLWithPath: wtPath)
+                )
             ))
         }
     }

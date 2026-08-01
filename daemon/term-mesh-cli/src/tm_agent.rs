@@ -1627,7 +1627,45 @@ struct GcCommands {
 
 #[derive(Subcommand)]
 enum GcCommand {
-    Status { project: String },
+    /// Summarize what term-mesh is holding on disk, by category
+    Status {
+        /// Optional project id — selects the legacy project-scoped response
+        project: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// List every reclaim candidate with the reasons and the blockers
+    Plan {
+        /// Limit to a category (repeatable): daemon_worktrees, gitkit_worktrees,
+        /// project_checkouts, team_results, team_boards, headless_archives,
+        /// worktree_meta, logs, build_caches
+        #[arg(long = "category", value_name = "ID")]
+        categories: Vec<String>,
+        /// Extra directory to search for agent project checkouts (repeatable)
+        #[arg(long = "root", value_name = "PATH")]
+        roots: Vec<String>,
+        /// Also size the build caches — walks Xcode derived data, so it is slow
+        #[arg(long)]
+        deep: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Reclaim what the plan marks safe. Reports only unless --apply is given.
+    Sweep {
+        /// Actually delete. Without this the command only shows what it would do.
+        #[arg(long)]
+        apply: bool,
+        /// Also reclaim worktrees git cannot open at all. Every other blocker
+        /// (uncommitted changes, unmerged commits, an active session) still holds.
+        #[arg(long)]
+        force: bool,
+        #[arg(long = "category", value_name = "ID")]
+        categories: Vec<String>,
+        #[arg(long = "root", value_name = "PATH")]
+        roots: Vec<String>,
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -4131,9 +4169,8 @@ fn run_project_sync_command(sock: &PathBuf, command: &Commands) -> Result<Value,
                 }),
             ),
         },
-        Commands::Gc(group) => match &group.command {
-            GcCommand::Status { project } => ("gc.status", json!({ "project_id": project })),
-        },
+        // `Commands::Gc` is handled by `cmd_gc`, which renders a table instead
+        // of dumping the raw envelope.
         _ => return Err("INTERNAL_ERROR: unsupported project sync command".to_string()),
     };
     daemon_result(sock, method, params)
@@ -6021,17 +6058,24 @@ fn main() {
 
     if matches!(
         cli.command,
-        Commands::Project(_)
-            | Commands::Pairing(_)
-            | Commands::Sync(_)
-            | Commands::Conflict(_)
-            | Commands::Gc(_)
+        Commands::Project(_) | Commands::Pairing(_) | Commands::Sync(_) | Commands::Conflict(_)
     ) {
         let sock = detect_watch_socket().unwrap_or_else(|| {
             eprintln!("Error: DAEMON_UNAVAILABLE: no term-meshd socket found");
             process::exit(1);
         });
         print_result(run_project_sync_command(&sock, &cli.command));
+        return;
+    }
+
+    // Disk reclamation talks to the same daemon but renders a table, so it
+    // does not go through the generic project-sync passthrough above.
+    if let Commands::Gc(group) = &cli.command {
+        let sock = detect_watch_socket().unwrap_or_else(|| {
+            eprintln!("Error: DAEMON_UNAVAILABLE: no term-meshd socket found");
+            process::exit(1);
+        });
+        cmd_gc(&sock, &group.command);
         return;
     }
 
@@ -7765,6 +7809,293 @@ fn main() {
     };
 
     print_result(result);
+}
+
+// ---------------------------------------------------------------------------
+// gc — disk reclamation
+// ---------------------------------------------------------------------------
+
+/// Scanning walks whole worktrees, so the default 6s RPC budget is far too
+/// tight for anything but `status` on a small machine.
+const GC_TIMEOUT_SECS: u64 = 120;
+
+fn gc_call(sock: &PathBuf, method: &str, params: Value) -> Result<Value, String> {
+    decode_daemon_response(rpc_call_timeout(sock, method, params, GC_TIMEOUT_SECS)?)
+}
+
+fn human_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "K", "M", "G", "T"];
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit < UNITS.len() - 1 {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes}{}", UNITS[0])
+    } else {
+        format!("{value:.1}{}", UNITS[unit])
+    }
+}
+
+fn gc_scope_params(categories: &[String], roots: &[String], deep: bool) -> Value {
+    let mut params = json!({});
+    if !categories.is_empty() {
+        params["categories"] = json!(categories);
+    }
+    if !roots.is_empty() {
+        params["roots"] = json!(roots);
+    }
+    if deep {
+        params["deep"] = json!(true);
+    }
+    params
+}
+
+fn cmd_gc(sock: &PathBuf, command: &GcCommand) {
+    let result = match command {
+        GcCommand::Status { project, json: raw } => {
+            let params = match project {
+                Some(id) => json!({ "project_id": id }),
+                None => json!({}),
+            };
+            gc_call(sock, "gc.status", params).map(|value| {
+                if *raw {
+                    println!("{}", pretty(&value));
+                } else {
+                    render_gc_status(&value);
+                }
+            })
+        }
+        GcCommand::Plan {
+            categories,
+            roots,
+            deep,
+            json: raw,
+        } => gc_call(
+            sock,
+            "gc.plan",
+            gc_scope_params(categories, roots, *deep),
+        )
+        .map(|value| {
+            if *raw {
+                println!("{}", pretty(&value));
+            } else {
+                render_gc_plan(&value);
+            }
+        }),
+        GcCommand::Sweep {
+            apply,
+            force,
+            categories,
+            roots,
+            json: raw,
+        } => {
+            let mut params = gc_scope_params(categories, roots, false);
+            params["apply"] = json!(*apply);
+            params["force"] = json!(*force);
+            gc_call(sock, "gc.sweep", params).map(|value| {
+                if *raw {
+                    println!("{}", pretty(&value));
+                } else {
+                    render_gc_sweep(&value, *apply);
+                }
+            })
+        }
+    };
+
+    if let Err(error) = result {
+        eprintln!("Error: {error}");
+        process::exit(1);
+    }
+}
+
+fn render_gc_status(value: &Value) {
+    let categories = value
+        .get("categories")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+
+    println!(
+        "{:<20} {:>7} {:>10} {:>10} {:>11}  {}",
+        "CATEGORY", "ENTRIES", "SIZE", "RECLAIM", "CANDIDATES", "SWEPT"
+    );
+    for category in &categories {
+        let name = category
+            .get("category")
+            .and_then(Value::as_str)
+            .unwrap_or("?");
+        let entries = category
+            .get("entry_count")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        let total = category
+            .get("total_bytes")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        let reclaim = category
+            .get("reclaimable_bytes")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        let candidates = category
+            .get("candidate_count")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        let auto = category
+            .get("auto")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        println!(
+            "{:<20} {:>7} {:>10} {:>10} {:>11}  {}",
+            name,
+            entries,
+            human_bytes(total),
+            human_bytes(reclaim),
+            candidates,
+            if auto { "auto" } else { "manual" }
+        );
+    }
+
+    let total = value.get("total_bytes").and_then(Value::as_u64).unwrap_or(0);
+    let reclaim = value
+        .get("reclaimable_bytes")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    println!();
+    println!(
+        "total {}  reclaimable {}",
+        human_bytes(total),
+        human_bytes(reclaim)
+    );
+
+    match value.get("last_sweep") {
+        Some(sweep) if !sweep.is_null() => {
+            println!(
+                "last sweep: {} — removed {}, reclaimed {}",
+                sweep.get("mode").and_then(Value::as_str).unwrap_or("?"),
+                sweep.get("removed").and_then(Value::as_u64).unwrap_or(0),
+                human_bytes(
+                    sweep
+                        .get("reclaimed_bytes")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(0)
+                )
+            );
+        }
+        _ => println!("last sweep: never"),
+    }
+    println!("run `tm-agent gc plan` for the candidate list");
+}
+
+fn render_gc_plan(value: &Value) {
+    let categories = value
+        .get("categories")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+
+    for category in &categories {
+        let candidates = category
+            .get("candidates")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        if candidates.is_empty() {
+            continue;
+        }
+        let name = category
+            .get("category")
+            .and_then(Value::as_str)
+            .unwrap_or("?");
+        println!("── {name}");
+        if let Some(note) = category.get("note").and_then(Value::as_str) {
+            println!("   ({note})");
+        }
+        for candidate in &candidates {
+            let path = candidate.get("path").and_then(Value::as_str).unwrap_or("?");
+            let bytes = candidate.get("bytes").and_then(Value::as_u64).unwrap_or(0);
+            let blockers = candidate
+                .get("blockers")
+                .and_then(Value::as_array)
+                .map(|list| {
+                    list.iter()
+                        .filter_map(Value::as_str)
+                        .collect::<Vec<_>>()
+                        .join(",")
+                })
+                .unwrap_or_default();
+            let marker = if blockers.is_empty() { "✓" } else { "✗" };
+            let detail = if blockers.is_empty() {
+                candidate
+                    .get("reasons")
+                    .and_then(Value::as_array)
+                    .map(|list| {
+                        list.iter()
+                            .filter_map(Value::as_str)
+                            .collect::<Vec<_>>()
+                            .join(",")
+                    })
+                    .unwrap_or_default()
+            } else {
+                format!("blocked: {blockers}")
+            };
+            println!("   {marker} {:>8}  {path}", human_bytes(bytes));
+            if !detail.is_empty() {
+                println!("              {detail}");
+            }
+        }
+        println!();
+    }
+
+    let reclaim = value
+        .get("reclaimable_bytes")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    println!("reclaimable {}", human_bytes(reclaim));
+    println!("`tm-agent gc sweep` previews the removal; add --apply to perform it");
+}
+
+fn render_gc_sweep(value: &Value, applied: bool) {
+    let outcomes = value
+        .get("outcomes")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+
+    for outcome in &outcomes {
+        let action = outcome
+            .get("action")
+            .and_then(Value::as_str)
+            .unwrap_or("?");
+        if action == "skipped" {
+            continue;
+        }
+        println!(
+            "{:<13} {:>8}  {}",
+            action,
+            human_bytes(outcome.get("bytes").and_then(Value::as_u64).unwrap_or(0)),
+            outcome.get("path").and_then(Value::as_str).unwrap_or("?")
+        );
+    }
+
+    let removed = value.get("removed").and_then(Value::as_u64).unwrap_or(0);
+    let skipped = value.get("skipped").and_then(Value::as_u64).unwrap_or(0);
+    let reclaimed = value
+        .get("reclaimed_bytes")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+
+    println!();
+    println!(
+        "{} item(s), {} — {} skipped by blockers",
+        removed,
+        human_bytes(reclaimed),
+        skipped
+    );
+    if !applied {
+        println!("(dry-run — pass --apply to delete)");
+    }
 }
 
 fn print_result(result: Result<Value, String>) {
