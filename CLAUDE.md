@@ -282,11 +282,17 @@ tm-agent gc sweep --apply                   # actually reclaim
   reload immediately removes ended tag sessions; failed managed builds are
   removed on exit, with the 7-day sweep retained as a fallback (override with
   `TERMMESH_RELOAD_TAG_GC_DAYS`, disable with `TERMMESH_RELOAD_TAG_GC=0`). It
-  shares SwiftPM checkouts and Cargo output under
-  `~/Library/Caches/term-mesh`, and refuses to start below 10 GiB free
+  caches under `~/Library/Caches/term-mesh`: SwiftPM dependency checkouts are
+  shared by every tag, while the Cargo target directory is **per tag**
+  (`cargo-target/<tag>`). Do not collapse the Cargo one into a single shared
+  directory — cargo keys its output by package name, so every tag's
+  `term-meshd` would land at the same path, and since the daemon build's
+  failure is swallowed, a tag whose build broke would ship whichever branch
+  last built successfully. `TERMMESH_CARGO_TARGET_DIR` overrides the path and
+  takes that collision on itself. reload refuses to start below 10 GiB free
   (`TERMMESH_BUILD_MIN_FREE_GIB` overrides the threshold). At task completion,
   `./scripts/reload.sh --tag <tag> --cleanup` stops that app and immediately
-  reclaims its managed DerivedData, sockets, log, and manifest.
+  reclaims its managed DerivedData, sockets, log, manifest, and Cargo target.
 - `tm-agent gc sweep --category build_caches --deep` previews regenerable
   `daemon/target` directories inside inactive worktrees. Add `--apply` to
   remove only those targets while preserving dirty source. Active session/task

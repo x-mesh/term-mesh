@@ -103,8 +103,19 @@ TAG_GC_DAYS="${TERMMESH_RELOAD_TAG_GC_DAYS:-7}"
 TAG_TMP_ROOT="${TERMMESH_RELOAD_TMP_ROOT:-/tmp}"
 TAG_SESSION_ROOT="${TAG_TMP_ROOT}/.term-mesh-reload-sessions"
 BUILD_CACHE_ROOT="${TERMMESH_BUILD_CACHE_ROOT:-$HOME/Library/Caches/term-mesh}"
+# SwiftPM's directory holds dependency *checkouts*, pinned by Package.resolved
+# and rebuilt into each DerivedData, so one copy is shared by every tag.
 SHARED_SWIFTPM_CACHE="${TERMMESH_XCODE_PACKAGE_CACHE:-${BUILD_CACHE_ROOT}/SourcePackages}"
-SHARED_CARGO_TARGET="${TERMMESH_CARGO_TARGET_DIR:-${BUILD_CACHE_ROOT}/cargo-target}"
+# Cargo's is the opposite: it holds the built binaries this script copies into
+# the app bundle, and cargo keys its output by package name only. One shared
+# directory would put every tag's `term-meshd` at the same path — and because
+# the daemon build's failure is swallowed below, a tag whose build broke would
+# ship whichever branch last built successfully. `--tag` exists to run builds
+# side by side, so the target directory is per tag and torn down with the rest
+# of that tag's artifacts. Repeat builds of the same tag still hit a warm cache,
+# which is where the time actually goes.
+CARGO_TARGET_ROOT="${BUILD_CACHE_ROOT}/cargo-target"
+SHARED_CARGO_TARGET=""
 MIN_FREE_GIB="${TERMMESH_BUILD_MIN_FREE_GIB:-10}"
 MANAGED_DERIVED=0
 BUILD_LAUNCHED=0
@@ -127,6 +138,13 @@ remove_tag_artifacts() {
   rm -f "${TAG_TMP_ROOT}/term-mesh-debug-${tag}.sock"
   rm -f "${TAG_TMP_ROOT}/term-mesh-debug-${tag}.log"
   rm -f "$HOME/Library/Application Support/term-mesh/term-meshd-dev-${tag}.sock"
+  # `safe_managed_tag_path` already proved the tag is one path component, but
+  # this root is a different one, so it is checked against this root too rather
+  # than inherited.
+  if [[ -n "${CARGO_TARGET_ROOT:-}" && "$tag" =~ ^[a-z0-9][a-z0-9-]*$ ]]; then
+    local cargo_target="${CARGO_TARGET_ROOT}/${tag}"
+    [[ -L "$cargo_target" ]] || rm -rf "$cargo_target"
+  fi
 }
 
 # A session file binds a tag build to the exact app PID launched from it. On a
@@ -421,6 +439,9 @@ if [[ -n "$TAG" ]]; then
     fi
     MANAGED_DERIVED=1
   fi
+  # An explicit TERMMESH_CARGO_TARGET_DIR is the caller taking the collision on
+  # themselves; otherwise each tag gets its own.
+  SHARED_CARGO_TARGET="${TERMMESH_CARGO_TARGET_DIR:-${CARGO_TARGET_ROOT}/${TAG_SLUG}}"
 fi
 
 if [[ "$CLEANUP_ONLY" -eq 1 ]]; then
