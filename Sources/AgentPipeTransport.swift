@@ -448,26 +448,71 @@ enum AgentPipeTransport {
         }
     }
 
-    /// Reports an asynchronous delivery exactly once. The caller deadline and
-    /// the serialized writer may race; the writer still finishes channel cleanup.
+    /// Reports an asynchronous delivery exactly once, and decides which of the
+    /// caller deadline and the serialized writer gets to be that report.
+    ///
+    /// Two states could not express this. "Has anyone answered yet" let the
+    /// writer check, release the lock, and only then start — so a deadline that
+    /// landed in between told the caller the turn had failed while the turn was
+    /// on its way to the agent, and the retry that failure invites delivered it
+    /// twice. `writing` is that gap made explicit: the writer claims the turn
+    /// under the same lock that tests for it, and after that the deadline has
+    /// nothing left to answer for.
     private final class DeliveryResult: @unchecked Sendable {
+        private enum State {
+            /// Queued. The deadline may still answer for it.
+            case pending
+            /// The writer owns it. Only the writer's own outcome can report.
+            case writing
+            /// Reported.
+            case finished
+        }
+
         private let lock = NSLock()
-        private var finished = false
+        private var state: State = .pending
         private let completion: (Result<Int, DeliveryError>) -> Void
 
         init(completion: @escaping (Result<Int, DeliveryError>) -> Void) {
             self.completion = completion
         }
 
-        func finish(_ result: Result<Int, DeliveryError>) {
+        /// Take the turn, or learn that the deadline already answered for it.
+        ///
+        /// Test and transition share one lock, which is the whole point: a
+        /// deadline cannot arrive between them.
+        func claimForWrite() -> Bool {
             lock.lock()
-            guard !finished else {
+            defer { lock.unlock() }
+            guard case .pending = state else { return false }
+            state = .writing
+            return true
+        }
+
+        /// The caller's bound on how long enqueueing can leave them without an
+        /// answer. It applies to a turn that has not started: once the writer
+        /// holds it, the caller waits for the write's own deadline instead of
+        /// being told a failure that is about to be untrue.
+        func expire(_ result: Result<Int, DeliveryError>) {
+            lock.lock()
+            guard case .pending = state else {
                 lock.unlock()
                 return
             }
-            finished = true
+            state = .finished
             lock.unlock()
             DispatchQueue.main.async { [completion] in completion(result) }
+        }
+
+        /// The writer's own outcome, which always reports once it has claimed.
+        func finish(_ result: Result<Int, DeliveryError>) {
+            lock.lock()
+            guard case .finished = state else {
+                state = .finished
+                lock.unlock()
+                DispatchQueue.main.async { [completion] in completion(result) }
+                return
+            }
+            lock.unlock()
         }
     }
 
@@ -549,9 +594,15 @@ enum AgentPipeTransport {
         let admission = writers.admission(for: agentId)
         let resultGate = DeliveryResult(completion: completion)
         DispatchQueue.main.asyncAfter(deadline: .now() + resultTimeout) {
-            resultGate.finish(.failure(.writeFailed("delivery result deadline exceeded")))
+            resultGate.expire(.failure(.writeFailed("delivery result deadline exceeded")))
         }
         admission.queue.async {
+            // The deadline may have answered the caller while this turn was
+            // still waiting its place behind another write. Sending it now
+            // would put an instruction on the pipe that its caller was told
+            // had failed, and the retry that failure invites would deliver the
+            // same turn again. Claiming is what makes the two exclusive.
+            guard resultGate.claimForWrite() else { return }
             let result: Result<Int, DeliveryError>
             if let rejection = writers.rejection(for: admission) {
                 result = .failure(rejection)

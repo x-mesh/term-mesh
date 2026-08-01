@@ -185,16 +185,25 @@ final class PipeWriteDeadlineRegression169Tests: XCTestCase {
         XCTAssertEqual(laterWrites.snapshot, 1)
     }
 
-    func testCallerDeadlineStartsAtEnqueueAndCompletesExactlyOnce() {
+    /// Two properties at once, and only the first of them held.
+    ///
+    /// The caller deadline starts when the turn is enqueued rather than when
+    /// the writer reaches it, so a queue held by an earlier write still bounds
+    /// the caller's wait, and whoever gets there first the completion runs
+    /// exactly once. What was missing is the other half: once the deadline has
+    /// answered, the abandoned turn must not reach the pipe at all. It used to,
+    /// and since a failed delivery is never marked delivered, the caller's
+    /// retry pasted the same instruction into the agent a second time.
+    func testCallerDeadlineBoundsTheCallerAndDropsTheAbandonedWrite() {
         let agentId = "queued-deadline-\(UUID().uuidString)"
         let blockerStarted = expectation(description: "writer queue blocked")
         let deadlineFired = expectation(description: "caller deadline fired")
-        let writerFinished = expectation(description: "background writer finished")
         let writerQueueDrained = expectation(description: "writer queue drained")
         let duplicateCallback = expectation(description: "completion called twice")
         duplicateCallback.isInverted = true
         let release = DispatchSemaphore(value: 0)
         let callbacks = LockedCounter()
+        let writes = LockedCounter()
         defer {
             release.signal()
             AgentPipeTransport.discard(agentId: agentId)
@@ -208,10 +217,7 @@ final class PipeWriteDeadlineRegression169Tests: XCTestCase {
 
         AgentPipeTransport.enqueueDeliveryForTesting(
             agentId: agentId, resultTimeout: 0.05,
-            operation: {
-                writerFinished.fulfill()
-                return 1
-            },
+            operation: { writes.increment() },
             completion: { result in
                 guard callbacks.increment() == 1 else {
                     duplicateCallback.fulfill()
@@ -230,9 +236,55 @@ final class PipeWriteDeadlineRegression169Tests: XCTestCase {
         wait(for: [deadlineFired], timeout: 1)
         XCTAssertEqual(callbacks.snapshot, 1)
         release.signal()
-        wait(for: [writerFinished, writerQueueDrained], timeout: 1)
+        // The queue is serial, so draining past the abandoned delivery is what
+        // makes the write count below mean "never ran" and not "not yet".
+        wait(for: [writerQueueDrained], timeout: 1)
         wait(for: [duplicateCallback], timeout: 0.1)
         XCTAssertEqual(callbacks.snapshot, 1, "late writer completion must not call back twice")
+        XCTAssertEqual(
+            writes.snapshot, 0,
+            "the turn its caller was told had failed never reached the pipe")
+    }
+
+    /// The other half of the deadline contract, and the half that was missing.
+    ///
+    /// Dropping the abandoned turn is only sound if "abandoned" is decided
+    /// atomically. The writer used to read "nobody has answered yet", release
+    /// the lock, and only then start; a deadline landing in that gap told the
+    /// caller the turn had failed while the turn was already on its way. Since
+    /// a failed delivery is never marked delivered, the retry sent the same
+    /// instruction to the agent a second time.
+    ///
+    /// Here the write starts immediately and outlives its result deadline by
+    /// far. Whoever it reports to, it must be the write's own outcome — a
+    /// failure here means the caller was told something untrue about a turn the
+    /// agent received.
+    func testAWriteAlreadyUnderWayReportsItsOwnOutcomeNotTheDeadline() {
+        let agentId = "claimed-write-\(UUID().uuidString)"
+        let reported = expectation(description: "delivery reported")
+        let callbacks = LockedCounter()
+        defer { AgentPipeTransport.discard(agentId: agentId) }
+
+        AgentPipeTransport.enqueueDeliveryForTesting(
+            agentId: agentId, resultTimeout: 0.05,
+            operation: {
+                // Six times the result deadline: the deadline certainly fires
+                // while this write holds the turn.
+                Thread.sleep(forTimeInterval: 0.3)
+                return 7
+            },
+            completion: { result in
+                XCTAssertEqual(callbacks.increment(), 1, "reported more than once")
+                guard case .success(let written) = result else {
+                    return XCTFail(
+                        "a write already under way must not be answered by the deadline: \(result)")
+                }
+                XCTAssertEqual(written, 7)
+                reported.fulfill()
+            })
+
+        wait(for: [reported], timeout: 2)
+        XCTAssertEqual(callbacks.snapshot, 1)
     }
 
     /// A signal interruption says nothing about the reader, so it must cost
