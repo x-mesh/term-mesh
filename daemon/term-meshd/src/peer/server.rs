@@ -167,14 +167,16 @@ async fn serve_with_host(
             result = listener.accept() => {
                 match result {
                     Ok((stream, _)) => {
-                        // UID gate: only same-user processes may attach
-                        // to this socket, even if a permissive parent
-                        // directory or chmod race exposed the file to
-                        // other users on the host.
-                        if !peer_uid_matches(&stream, owner_uid) {
+                        // UID gate: only the daemon's own user — or root —
+                        // may attach, even if a permissive parent directory
+                        // or chmod race exposed the socket file to other
+                        // users on the host.
+                        let peer = peer_uid(&stream);
+                        if !peer.is_some_and(|uid| peer_uid_allowed(uid, owner_uid)) {
                             tracing::warn!(
-                                "rejecting peer connection from foreign uid \
-                                 (only uid {owner_uid} may attach)"
+                                "rejecting peer connection from uid {} \
+                                 (only uid {owner_uid} or root may attach)",
+                                peer.map_or_else(|| "<unknown>".to_string(), |u| u.to_string())
                             );
                             drop(stream);
                             continue;
@@ -368,11 +370,25 @@ fn bind_with_tight_umask(path: &Path) -> std::io::Result<UnixListener> {
     UnixListener::bind(path)
 }
 
-/// Compare the connected peer's effective uid against `expected_uid`.
-/// Returns `true` only when we positively confirm the match; on any
-/// platform/syscall failure we fail closed (return `false`).
+/// Whether a peer with `peer_uid` may attach to a daemon owned by
+/// `owner_uid`.
+///
+/// The gate exists to keep *other unprivileged users* off the socket. Root
+/// is not one of them: it can already read this process's memory, its
+/// socket, and its files, so refusing it buys nothing — and it broke the
+/// installer's own root path. `install-linux.sh` running as root installs a
+/// system unit with `User=term-mesh`, so the daemon owns uid 996 while
+/// every ssh-based client arrives as uid 0 and was rejected outright.
+/// The host looked dead: the client only ever sees its handshake read
+/// return EOF, and nothing but this daemon's log said why.
+fn peer_uid_allowed(peer_uid: u32, owner_uid: u32) -> bool {
+    peer_uid == owner_uid || peer_uid == 0
+}
+
+/// The connected peer's effective uid, or `None` when it cannot be
+/// established — on any platform/syscall failure the caller fails closed.
 #[cfg(target_os = "macos")]
-fn peer_uid_matches(stream: &tokio::net::UnixStream, expected_uid: u32) -> bool {
+fn peer_uid(stream: &tokio::net::UnixStream) -> Option<u32> {
     use std::os::fd::AsRawFd;
 
     // Darwin's LOCAL_PEERCRED returns `xucred`. The first useful
@@ -400,14 +416,14 @@ fn peer_uid_matches(stream: &tokio::net::UnixStream, expected_uid: u32) -> bool 
         )
     };
     if rc != 0 {
-        return false;
+        return None;
     }
     let cred = unsafe { cred.assume_init() };
-    cred.cr_uid == expected_uid
+    Some(cred.cr_uid)
 }
 
 #[cfg(target_os = "linux")]
-fn peer_uid_matches(stream: &tokio::net::UnixStream, expected_uid: u32) -> bool {
+fn peer_uid(stream: &tokio::net::UnixStream) -> Option<u32> {
     use std::os::fd::AsRawFd;
 
     let fd = stream.as_raw_fd();
@@ -423,17 +439,17 @@ fn peer_uid_matches(stream: &tokio::net::UnixStream, expected_uid: u32) -> bool 
         )
     };
     if rc != 0 {
-        return false;
+        return None;
     }
     let cred = unsafe { cred.assume_init() };
-    cred.uid == expected_uid
+    Some(cred.uid)
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-fn peer_uid_matches(_stream: &tokio::net::UnixStream, _expected_uid: u32) -> bool {
+fn peer_uid(_stream: &tokio::net::UnixStream) -> Option<u32> {
     // Conservative default: refuse all connections on platforms where
     // we can't verify the peer's uid.
-    false
+    None
 }
 
 #[cfg(test)]
@@ -457,6 +473,29 @@ mod integration_tests {
             );
         }
     }
+    /// The uid gate must keep other unprivileged users out while letting
+    /// root in. `install-linux.sh` run as root installs a system unit with
+    /// `User=term-mesh`, so the daemon owns a service uid (996 on
+    /// jwserver69) and every ssh client arrives as uid 0; rejecting root
+    /// made that whole install path unreachable, and the client saw only
+    /// EOF.
+    #[test]
+    fn uid_gate_admits_the_owner_and_root_and_nobody_else() {
+        let owner = 996;
+        assert!(peer_uid_allowed(owner, owner), "the daemon's own user");
+        assert!(peer_uid_allowed(0, owner), "root, e.g. an ssh-forwarded client");
+        assert!(!peer_uid_allowed(1000, owner), "an unrelated local user");
+        assert!(!peer_uid_allowed(997, owner), "an adjacent service account");
+    }
+
+    /// A root-owned daemon (the plain `sudo`/container case) must not
+    /// suddenly accept everyone just because root is allowed.
+    #[test]
+    fn uid_gate_owned_by_root_still_refuses_other_users() {
+        assert!(peer_uid_allowed(0, 0));
+        assert!(!peer_uid_allowed(501, 0));
+    }
+
     /// A surface the host made on request goes away once nobody holds it, and
     /// one the operator declared does not.
     ///

@@ -34,6 +34,47 @@ final class PeerSocketProberTests: XCTestCase {
         XCTAssertTrue(cmd.contains("/tmp/term-mesh-peer-$(id -u)/peer.sock"))
     }
 
+    /// `install-linux.sh` running as root installs a SYSTEM unit whose
+    /// `RuntimeDirectory=term-mesh` puts the socket outside every
+    /// per-user candidate. Without these two, auto-detect could never
+    /// find a root-installed host — it returned the 43 sentinel while
+    /// the daemon was serving normally.
+    func test_remoteCommand_coversSystemScopeInstall() {
+        let cmd = PeerSocketProber.remoteCommand
+        XCTAssertTrue(cmd.contains("/etc/term-mesh/peer.env"),
+                      "system-scope peer.env must be consulted")
+        XCTAssertTrue(cmd.contains("/run/term-mesh/tm-peer.sock"),
+                      "system-scope RuntimeDirectory socket must be probed")
+    }
+
+    /// Order matters: a host that was once installed per-user keeps a
+    /// stale `~/.config/term-mesh/peer.env` naming a socket that no
+    /// longer exists. The `[ -S ]` test skips it, but only if the
+    /// system-scope candidates come after it in the same loop rather
+    /// than being absent.
+    func test_remoteCommand_probesUserConfigBeforeSystemConfig() {
+        let cmd = PeerSocketProber.remoteCommand
+        guard let user = cmd.range(of: ".config/term-mesh/peer.env"),
+              let system = cmd.range(of: "/etc/term-mesh/peer.env")
+        else {
+            return XCTFail("both peer.env candidates must be present")
+        }
+        XCTAssertTrue(user.lowerBound < system.lowerBound,
+                      "the user's own config must win when it points at a live socket")
+    }
+
+    func test_candidateSummary_matchesTheProbedPaths() {
+        let summary = PeerSocketProber.candidateSummary
+        XCTAssertTrue(summary.contains { $0.contains("/etc/term-mesh/peer.env") })
+        XCTAssertTrue(summary.contains { $0.contains("/run/term-mesh/tm-peer.sock") })
+        // The alert text is what a user reads after a failed probe; a
+        // candidate the script tries but the summary omits sends them
+        // looking in the wrong place.
+        for fragment in ["/run/user/<uid>/tm-peer.sock", "/tmp/term-mesh-peer-<uid>/peer.sock"] {
+            XCTAssertTrue(summary.contains { $0.contains(fragment) }, "missing \(fragment)")
+        }
+    }
+
     // MARK: - classify
 
     private func data(_ s: String) -> Data { Data(s.utf8) }

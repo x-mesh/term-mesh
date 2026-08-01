@@ -874,6 +874,26 @@ final class PeerRelaySession {
     var onError: (@MainActor (Error) -> Void)?
     var onDisconnect: (@MainActor () -> Void)?
 
+    /// How many resume-heals this pane has performed. A pane that dies
+    /// mid-flood dies *after* a run of these, and the count is the only
+    /// thing that says whether the session it lost was the original or the
+    /// Nth replacement.
+    private var resumeHealCount = 0
+
+    /// Short stable identity for a `PeerSession` instance.
+    ///
+    /// Every resume-heal swaps one session for another, so "the receive
+    /// failed" is ambiguous without saying *which* session failed: the
+    /// retiring one (expected — that IS the swap) or the just-adopted
+    /// replacement (a real fault). Object identity is the only thing that
+    /// distinguishes them.
+    /// `nonisolated`: the pump that needs it runs detached, off the main
+    /// actor, and object identity needs no isolation to read.
+    private nonisolated static func sessionTag(_ session: PeerSession) -> String {
+        let bits = UInt(bitPattern: ObjectIdentifier(session).hashValue)
+        return String(format: "%04X", UInt16(truncatingIfNeeded: bits))
+    }
+
     /// Explicit host-side termination. Ordinary local pane close must not call
     /// this; it only detaches the relay and leaves the remote PTY alive.
     func requestRemoteClose() async throws {
@@ -1665,7 +1685,7 @@ final class PeerRelaySession {
                             try await writer.enqueue(type: kTypePtyData, payload: chunk.payload)
                             self.ioStats.noteEnqueued(chunk.payload.count)
                         } catch {
-                            disconnect("hostToRelay-enqueue-failed")
+                            disconnect("hostToRelay-enqueue-failed error=\(error)")
                             return
                         }
                     }
@@ -1694,7 +1714,15 @@ final class PeerRelaySession {
                     do {
                         msg = try await currentSession.receiveNextMessage()
                     } catch {
+                        let failedTag = Self.sessionTag(currentSession)
                         if let swapped = await self.session, swapped !== currentSession {
+                            #if DEBUG
+                            // The benign case: a resume-heal retired this
+                            // session on purpose. Logged so the fatal case
+                            // below can be read as "and this time nothing
+                            // had replaced it".
+                            dlog("peer.relay.receive.swapAdopted failed=\(failedTag) adopted=\(Self.sessionTag(swapped)) error=\(error)")
+                            #endif
                             // Deliberate resume-heal swap, not a failure: adopt
                             // the resumed session and keep pumping. Its wire
                             // byte_seq restarts at 0, so the gap baseline must
@@ -1708,7 +1736,15 @@ final class PeerRelaySession {
                             continue pumpLoop
                         }
                         try? await writer.enqueue(type: kTypeGoodbye, payload: Data("host-error".utf8))
-                        endReason = "hostToRelay-receive-error"
+                        // Carry the error itself, not just the fact that one
+                        // happened: `unexpectedEof` (host dropped the socket),
+                        // `sessionClosed` (host said goodbye) and `framing`
+                        // (protocol desync) look identical in the pane and
+                        // want completely different fixes. `heal#` says
+                        // whether this was the original session or the Nth
+                        // resume replacement.
+                        let healCount = await self.resumeHealCount
+                        endReason = "hostToRelay-receive-error session=\(failedTag) heal#\(healCount) error=\(error)"
                         break pumpLoop
                     }
                     switch msg {
@@ -1793,7 +1829,7 @@ final class PeerRelaySession {
                             try await writer.enqueue(type: kTypePtyData, payload: data)
                             self.ioStats.noteEnqueued(data.count)
                         } catch {
-                            endReason = "hostToRelay-enqueue-failed"
+                            endReason = "hostToRelay-enqueue-failed error=\(error)"
                             break pumpLoop
                         }
                     case .gridSnapshot(let sid, _, _, let ansi) where sid == mySurfaceID:
@@ -1829,7 +1865,7 @@ final class PeerRelaySession {
                             try await writer.enqueue(type: kTypePtyData, payload: payload)
                             self.ioStats.noteEnqueued(payload.count)
                         } catch {
-                            endReason = "hostToRelay-enqueue-failed"
+                            endReason = "hostToRelay-enqueue-failed error=\(error)"
                             break pumpLoop
                         }
                     case .scrollbackChunk(let sid, let effOffset, let ansi, let atTop, _) where sid == mySurfaceID:
@@ -1844,7 +1880,7 @@ final class PeerRelaySession {
                         do {
                             try await writer.enqueue(type: kTypePtyData, payload: ansi)
                         } catch {
-                            endReason = "hostToRelay-enqueue-failed"
+                            endReason = "hostToRelay-enqueue-failed error=\(error)"
                             break pumpLoop
                         }
                         #if DEBUG
@@ -2085,6 +2121,8 @@ final class PeerRelaySession {
             await newConnection.cancel()
             return
         }
+        resumeHealCount += 1
+        let retiredTag = Self.sessionTag(oldSession)
         session = newConnection.session
         transport = newConnection.transport
         attachInitialSeq = outcome.initialByteSeq
@@ -2097,7 +2135,7 @@ final class PeerRelaySession {
         await oldTransport.close()
 
         #if DEBUG
-        dlog("peer.relay.gap.heal.resume.swapped newInitialSeq=\(outcome.initialByteSeq)")
+        dlog("peer.relay.gap.heal.resume.swapped heal#\(resumeHealCount) retired=\(retiredTag) adopted=\(Self.sessionTag(newConnection.session)) newInitialSeq=\(outcome.initialByteSeq)")
         #endif
     }
 
