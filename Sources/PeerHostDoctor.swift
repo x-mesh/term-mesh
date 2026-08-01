@@ -80,8 +80,16 @@ enum PeerHostDoctor {
     /// Fixed diagnosis command: service state + recent journal lines.
     /// No single quotes in the body (same constraint as the prober's
     /// remoteCommand — the sh -c wrapper must survive fish/csh).
+    ///
+    /// Reports BOTH systemd scopes. `install-linux.sh` installs a system
+    /// unit when it runs as root and a `--user` unit otherwise, so asking
+    /// only about `--user` described a root-installed host as dead while
+    /// it was serving happily — and then quoted whatever the journal
+    /// happened to end with, which is usually systemd's benign
+    /// "Consumed ... CPU time" accounting line for the previous run.
+    /// The journal tail comes from whichever scope is actually active.
     static let diagnoseCommand =
-        #"sh -c 'systemctl --user is-active term-meshd 2>&1; journalctl --user -u term-meshd --no-pager -n 6 2>&1 | tail -n 6'"#
+        #"sh -c 'u=$(systemctl --user is-active term-meshd 2>/dev/null); s=$(systemctl is-active term-meshd 2>/dev/null); echo "service: user=${u:-none} system=${s:-none}"; if [ "$s" = active ]; then journalctl -u term-meshd --no-pager -n 6 2>&1 | tail -n 6; else journalctl --user -u term-meshd --no-pager -n 6 2>&1 | tail -n 6; fi'"#
 
     /// Sentinel exit code for "no term-meshd binary found" — distinct
     /// from PeerSocketProber.noSocketExitCode (43) so the two probes'

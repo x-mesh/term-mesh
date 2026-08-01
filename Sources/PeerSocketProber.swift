@@ -12,11 +12,25 @@
 //      config written by scripts/install-linux.sh and read by the
 //      systemd --user unit (last assignment wins, matching systemd
 //      EnvironmentFile semantics).
-//   2. $XDG_RUNTIME_DIR/tm-peer.sock — distros where the runtime dir
+//   2. TERMMESH_PEER_SOCKET from /etc/term-mesh/peer.env — the same
+//      config for a SYSTEM-scope install. install-linux.sh picks that
+//      scope whenever it runs as root, and then nothing below matches:
+//      the unit sets `RuntimeDirectory=term-mesh`, so the socket lives
+//      at /run/term-mesh, not under /run/user/<uid>. Leaving this out
+//      made "leave empty to auto-detect" permanently unable to find a
+//      root-installed host (observed on jwserver69).
+//   3. $XDG_RUNTIME_DIR/tm-peer.sock — distros where the runtime dir
 //      is not /run/user/<uid>.
-//   3. /run/user/<uid>/tm-peer.sock — the Linux installer default.
-//   4. /tmp/term-mesh-peer-<uid>/peer.sock — the macOS host default
+//   4. /run/user/<uid>/tm-peer.sock — the Linux installer default.
+//   5. /run/term-mesh/tm-peer.sock — the system-scope RuntimeDirectory,
+//      probed directly so a host whose peer.env is unreadable (it is
+//      mode 0640 root:term-mesh) is still found.
+//   6. /tmp/term-mesh-peer-<uid>/peer.sock — the macOS host default
 //      (PeerFederationSettings.defaultSocketPath).
+//
+//  A path read out of a peer.env is still `[ -S ]`-tested, so a stale
+//  entry left by an earlier install of the other scope loses to the
+//  live socket further down the list instead of poisoning discovery.
 //
 //  A stale socket file (daemon dead, file left behind) still matches
 //  `[ -S ]`; discovery deliberately leaves that distinction to
@@ -59,8 +73,10 @@ enum PeerSocketProber {
     /// Human-readable candidate list, in probe order, for failure alerts.
     static let candidateSummary: [String] = [
         "TERMMESH_PEER_SOCKET in ~/.config/term-mesh/peer.env",
+        "TERMMESH_PEER_SOCKET in /etc/term-mesh/peer.env",
         "$XDG_RUNTIME_DIR/tm-peer.sock",
         "/run/user/<uid>/tm-peer.sock",
+        "/run/term-mesh/tm-peer.sock",
         "/tmp/term-mesh-peer-<uid>/peer.sock",
     ]
 
@@ -75,7 +91,7 @@ enum PeerSocketProber {
     /// through verbatim). Constraint: the body must contain NO single
     /// quotes, or the wrapping breaks — asserted by unit test.
     static let remoteCommand: String =
-        #"sh -c 'p=$(sed -n "s/^TERMMESH_PEER_SOCKET=//p" "$HOME/.config/term-mesh/peer.env" 2>/dev/null | tail -n 1 | sed "s/^[[:space:]]*//;s/[[:space:]]*$//;s/^\"//;s/\"$//"); for c in "$p" "${XDG_RUNTIME_DIR:+$XDG_RUNTIME_DIR/tm-peer.sock}" "/run/user/$(id -u)/tm-peer.sock" "/tmp/term-mesh-peer-$(id -u)/peer.sock"; do [ -n "$c" ] && [ -S "$c" ] && { printf "%s" "$c"; exit 0; }; done; exit 43'"#
+        #"sh -c 'tmsock() { sed -n "s/^TERMMESH_PEER_SOCKET=//p" "$1" 2>/dev/null | tail -n 1 | sed "s/^[[:space:]]*//;s/[[:space:]]*$//;s/^\"//;s/\"$//"; }; p=$(tmsock "$HOME/.config/term-mesh/peer.env"); q=$(tmsock /etc/term-mesh/peer.env); for c in "$p" "$q" "${XDG_RUNTIME_DIR:+$XDG_RUNTIME_DIR/tm-peer.sock}" "/run/user/$(id -u)/tm-peer.sock" "/run/term-mesh/tm-peer.sock" "/tmp/term-mesh-peer-$(id -u)/peer.sock"; do [ -n "$c" ] && [ -S "$c" ] && { printf "%s" "$c"; exit 0; }; done; exit 43'"#
 
     /// Pure classification of a finished (or killed) discovery run.
     ///
