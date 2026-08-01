@@ -238,12 +238,15 @@ pub struct GcPaths {
     pub logs: PathBuf,
     pub tmp: PathBuf,
     pub ghosttykit_cache: PathBuf,
+    pub cargo_target_cache: PathBuf,
+    pub swiftpm_cache: PathBuf,
     pub checkout_roots: Vec<PathBuf>,
 }
 
 impl GcPaths {
     pub fn from_home(home: &Path) -> Self {
         let term_mesh = home.join(".term-mesh");
+        let build_cache = home.join("Library").join("Caches").join("term-mesh");
         Self {
             daemon_worktrees: term_mesh.join("worktrees"),
             gitkit_worktrees: home.join(".gk").join("worktree"),
@@ -253,6 +256,8 @@ impl GcPaths {
             logs: term_mesh.join("logs"),
             tmp: PathBuf::from("/tmp"),
             ghosttykit_cache: home.join(".cache").join("term-mesh").join("ghosttykit"),
+            cargo_target_cache: build_cache.join("cargo-target"),
+            swiftpm_cache: build_cache.join("SourcePackages"),
             checkout_roots: Vec::new(),
         }
     }
@@ -350,7 +355,7 @@ pub fn build_plan_at(paths: &GcPaths, opts: &GcOptions, refs: &GcRefs, now: Syst
         categories.push(scan_logs(paths, now));
     }
     if opts.wants(CATEGORY_BUILD_CACHES) {
-        categories.push(scan_build_caches(paths, opts));
+        categories.push(scan_build_caches(paths, opts, refs));
     }
 
     let total_bytes = categories.iter().map(|c| c.total_bytes).sum();
@@ -657,13 +662,20 @@ fn scan_logs(paths: &GcPaths, now: SystemTime) -> GcCategoryReport {
     report
 }
 
-fn scan_build_caches(paths: &GcPaths, opts: &GcOptions) -> GcCategoryReport {
+fn scan_build_caches(paths: &GcPaths, opts: &GcOptions, refs: &GcRefs) -> GcCategoryReport {
     let mut report = GcCategoryReport::new(
         CATEGORY_BUILD_CACHES,
-        vec![display(&paths.tmp), display(&paths.ghosttykit_cache)],
+        vec![
+            display(&paths.tmp),
+            display(&paths.ghosttykit_cache),
+            display(&paths.cargo_target_cache),
+            display(&paths.swiftpm_cache),
+        ],
     );
-    report.note =
-        Some("reported only — reclaimed by scripts/reload.sh and scripts/setup.sh".into());
+    report.note = Some(
+        "tag/shared caches are reported; inactive worktree daemon/target directories are reclaimable"
+            .into(),
+    );
     if !opts.deep {
         report.note = Some("pass deep=true to size build caches".into());
         return report;
@@ -707,6 +719,79 @@ fn scan_build_caches(paths: &GcPaths, opts: &GcOptions) -> GcCategoryReport {
             branch: None,
             reasons: vec!["ghosttykit_cache".into()],
             blockers: vec!["owned_by_setup_script".into()],
+            identity: Some(file_identity(&metadata)),
+        });
+    }
+
+    for (path, reason) in [
+        (&paths.cargo_target_cache, "shared_cargo_target"),
+        (&paths.swiftpm_cache, "shared_swiftpm_packages"),
+    ] {
+        let Ok(metadata) = fs::symlink_metadata(path) else {
+            continue;
+        };
+        if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
+            continue;
+        }
+        report.push(GcCandidate {
+            path: display(path),
+            bytes: dir_size(path),
+            modified_ms: modified_ms(&metadata),
+            kind: "directory".into(),
+            branch: None,
+            reasons: vec![reason.into()],
+            blockers: vec!["shared_cache_requires_manual_cleanup".into()],
+            identity: Some(file_identity(&metadata)),
+        });
+    }
+
+    // Source changes and generated Cargo output have different lifetimes. A
+    // dirty, inactive worktree must be preserved, but its daemon/target can be
+    // removed independently and rebuilt later. Active session/task pins still
+    // block this path so GC never races an agent build.
+    let mut worktrees = Vec::new();
+    worktrees.extend(
+        scan_daemon_worktrees(paths, refs)
+            .candidates
+            .into_iter()
+            .map(|candidate| candidate.path),
+    );
+    worktrees.extend(
+        scan_gitkit_worktrees(paths, refs)
+            .candidates
+            .into_iter()
+            .map(|candidate| candidate.path),
+    );
+    worktrees.extend(
+        scan_project_checkouts(paths, opts, refs)
+            .candidates
+            .into_iter()
+            .map(|candidate| candidate.path),
+    );
+    worktrees.sort();
+    worktrees.dedup();
+
+    for worktree in worktrees {
+        let worktree = PathBuf::from(worktree);
+        let target = worktree.join("daemon").join("target");
+        let Ok(metadata) = fs::symlink_metadata(&target) else {
+            continue;
+        };
+        if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
+            continue;
+        }
+        let blockers = refs
+            .is_pinned(&worktree)
+            .map(|pin| vec![pin.to_string()])
+            .unwrap_or_default();
+        report.push(GcCandidate {
+            path: display(&target),
+            bytes: dir_size(&target),
+            modified_ms: modified_ms(&metadata),
+            kind: "directory".into(),
+            branch: None,
+            reasons: vec!["worktree_cargo_target".into(), "regenerable".into()],
+            blockers,
             identity: Some(file_identity(&metadata)),
         });
     }
@@ -950,6 +1035,15 @@ pub fn execute_sweep(
                     Some(scan_team_boards(paths, current_refs, SystemTime::now()))
                 }
                 CATEGORY_LOGS => Some(scan_logs(paths, SystemTime::now())),
+                CATEGORY_BUILD_CACHES => Some(scan_build_caches(
+                    paths,
+                    &GcOptions {
+                        categories: Some(vec![CATEGORY_BUILD_CACHES.to_string()]),
+                        roots: None,
+                        deep: true,
+                    },
+                    current_refs,
+                )),
                 _ => None,
             }
         } else {
@@ -1479,6 +1573,14 @@ mod tests {
         }
     }
 
+    fn deep(category: &str) -> GcOptions {
+        GcOptions {
+            categories: Some(vec![category.to_string()]),
+            roots: None,
+            deep: true,
+        }
+    }
+
     fn category<'a>(plan: &'a GcPlan, name: &str) -> &'a GcCategoryReport {
         plan.categories
             .iter()
@@ -1508,6 +1610,71 @@ mod tests {
             candidate.blockers
         );
         assert!(candidate.reasons.iter().any(|r| r == "clean"));
+    }
+
+    #[test]
+    fn dirty_worktree_keeps_source_but_exposes_cargo_target() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = init_repo(temp.path());
+        let paths = paths_for(temp.path());
+        let wt = paths
+            .daemon_worktrees
+            .join("repo")
+            .join("term-mesh_wt_0011aabb");
+        fs::create_dir_all(wt.parent().unwrap()).unwrap();
+        add_worktree(&repo, &wt, "term-mesh/0011aabb");
+        fs::write(wt.join("uncommitted.txt"), "keep me").unwrap();
+        let target = wt.join("daemon/target");
+        fs::create_dir_all(&target).unwrap();
+        fs::write(target.join("artifact"), vec![0u8; 32]).unwrap();
+
+        let plan = build_plan(&paths, &deep(CATEGORY_BUILD_CACHES), &GcRefs::default());
+        let candidate = category(&plan, CATEGORY_BUILD_CACHES)
+            .candidates
+            .iter()
+            .find(|candidate| candidate.path == display(&target))
+            .expect("worktree target candidate");
+        assert!(candidate.reclaimable());
+
+        let summary = execute_sweep(&paths, &plan, true, false, &GcRefs::default()).unwrap();
+        assert_eq!(summary.removed, 1);
+        assert!(!target.exists());
+        assert_eq!(
+            fs::read_to_string(wt.join("uncommitted.txt")).unwrap(),
+            "keep me"
+        );
+        assert!(wt.exists());
+    }
+
+    #[test]
+    fn active_worktree_blocks_cargo_target_reclamation() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = init_repo(temp.path());
+        let paths = paths_for(temp.path());
+        let wt = paths
+            .daemon_worktrees
+            .join("repo")
+            .join("term-mesh_wt_0011aabb");
+        fs::create_dir_all(wt.parent().unwrap()).unwrap();
+        add_worktree(&repo, &wt, "term-mesh/0011aabb");
+        let target = wt.join("daemon/target");
+        fs::create_dir_all(&target).unwrap();
+
+        let refs = GcRefs {
+            active_session_worktrees: HashSet::from([wt.clone()]),
+            ..Default::default()
+        };
+        let plan = build_plan(&paths, &deep(CATEGORY_BUILD_CACHES), &refs);
+        let candidate = category(&plan, CATEGORY_BUILD_CACHES)
+            .candidates
+            .iter()
+            .find(|candidate| candidate.path == display(&target))
+            .expect("worktree target candidate");
+        assert_eq!(candidate.blockers, ["active_session"]);
+
+        let summary = execute_sweep(&paths, &plan, true, false, &refs).unwrap();
+        assert_eq!(summary.removed, 0);
+        assert!(target.exists());
     }
 
     #[test]
