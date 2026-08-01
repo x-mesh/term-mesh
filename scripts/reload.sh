@@ -12,6 +12,7 @@ DERIVED_SET=0
 TAG=""
 TERMMESH_DEBUG_LOG=""
 ALLOW_ALL=0
+CLEANUP_ONLY=0
 USER_ENV=()
 
 usage() {
@@ -25,6 +26,7 @@ Options:
   --bundle-id <id>       Override bundle identifier.
   --derived-data <path>  Override derived data path.
   --allow-all            Set TERMMESH_SOCKET_MODE=allowAll (for external socket access).
+  --cleanup              Stop this tagged app and reclaim its managed build artifacts.
   --env KEY=VAL          Pass an environment variable to the launched app. Repeatable.
                          Prefixing this script with KEY=VAL does NOT work: the app is
                          started through `open` from a scrubbed subshell, so it inherits
@@ -99,6 +101,96 @@ wait_for_app_exit() {
 TAG_GC_DAYS="${TERMMESH_RELOAD_TAG_GC_DAYS:-7}"
 # Overridable so the sweep can be exercised against a throwaway tree.
 TAG_TMP_ROOT="${TERMMESH_RELOAD_TMP_ROOT:-/tmp}"
+TAG_SESSION_ROOT="${TAG_TMP_ROOT}/.term-mesh-reload-sessions"
+BUILD_CACHE_ROOT="${TERMMESH_BUILD_CACHE_ROOT:-$HOME/Library/Caches/term-mesh}"
+SHARED_SWIFTPM_CACHE="${TERMMESH_XCODE_PACKAGE_CACHE:-${BUILD_CACHE_ROOT}/SourcePackages}"
+SHARED_CARGO_TARGET="${TERMMESH_CARGO_TARGET_DIR:-${BUILD_CACHE_ROOT}/cargo-target}"
+MIN_FREE_GIB="${TERMMESH_BUILD_MIN_FREE_GIB:-10}"
+MANAGED_DERIVED=0
+BUILD_LAUNCHED=0
+
+safe_managed_tag_path() {
+  local path="$1"
+  case "$path" in
+    "${TAG_TMP_ROOT}"/term-mesh-[a-z0-9]*)
+      [[ "${path#"${TAG_TMP_ROOT}"/term-mesh-}" != */* && ! -L "$path" ]]
+      ;;
+    *) return 1 ;;
+  esac
+}
+
+remove_tag_artifacts() {
+  local tag="$1"
+  local path="${TAG_TMP_ROOT}/term-mesh-${tag}"
+  safe_managed_tag_path "$path" || return 1
+  rm -rf "$path"
+  rm -f "${TAG_TMP_ROOT}/term-mesh-debug-${tag}.sock"
+  rm -f "${TAG_TMP_ROOT}/term-mesh-debug-${tag}.log"
+  rm -f "$HOME/Library/Application Support/term-mesh/term-meshd-dev-${tag}.sock"
+}
+
+# A session file binds a tag build to the exact app PID launched from it. On a
+# later reload, a missing/reused PID proves that session ended and its derived
+# data can be reclaimed without waiting for the age-based fallback.
+reclaim_ended_tag_sessions() {
+  local current_slug="$1"
+  local manifest=""
+  local tag=""
+  local pid=""
+  local command=""
+  local reclaimed=0
+
+  [[ -d "$TAG_SESSION_ROOT" ]] || return 0
+  for manifest in "$TAG_SESSION_ROOT"/*.session; do
+    [[ -f "$manifest" && ! -L "$manifest" ]] || continue
+    tag="${manifest##*/}"
+    tag="${tag%.session}"
+    [[ "$tag" =~ ^[a-z0-9][a-z0-9-]*$ && "$tag" != "$current_slug" ]] || continue
+    pid="$(sed -n '1p' "$manifest" 2>/dev/null || true)"
+    command=""
+    if [[ "$pid" =~ ^[0-9]+$ ]]; then
+      command="$(ps -p "$pid" -o command= 2>/dev/null || true)"
+    fi
+    if [[ "$command" == *"${TAG_TMP_ROOT}/term-mesh-${tag}/"* \
+       || "$command" == *"/private/tmp/term-mesh-${tag}/"* ]]; then
+      continue
+    fi
+    if remove_tag_artifacts "$tag"; then
+      rm -f "$manifest"
+      echo "  reclaimed ended session ${tag}"
+      reclaimed=$((reclaimed + 1))
+    fi
+  done
+  if [[ "$reclaimed" -gt 0 ]]; then
+    echo "  ${reclaimed} ended tag session(s) reclaimed"
+  fi
+}
+
+ensure_build_space() {
+  local available_kib=""
+  local required_kib=""
+  [[ "$MIN_FREE_GIB" =~ ^[0-9]+$ ]] || {
+    echo "error: TERMMESH_BUILD_MIN_FREE_GIB must be a non-negative integer" >&2
+    return 1
+  }
+  available_kib="$(df -Pk "${TAG_TMP_ROOT}/" | awk 'NR == 2 { print $4 }')"
+  required_kib=$((MIN_FREE_GIB * 1024 * 1024))
+  if [[ ! "$available_kib" =~ ^[0-9]+$ || "$available_kib" -lt "$required_kib" ]]; then
+    echo "error: build needs at least ${MIN_FREE_GIB} GiB free under ${TAG_TMP_ROOT} (available: $(( ${available_kib:-0} / 1024 / 1024 )) GiB)" >&2
+    echo "run: tm-agent gc plan --deep" >&2
+    return 1
+  fi
+}
+
+cleanup_failed_build() {
+  local status="$?"
+  if [[ "$status" -ne 0 && "$MANAGED_DERIVED" -eq 1 && "$BUILD_LAUNCHED" -eq 0 ]]; then
+    remove_tag_artifacts "${TAG_SLUG:-}" || true
+    rm -f "${TAG_SESSION_ROOT}/${TAG_SLUG:-}.session"
+    echo "  reclaimed failed tag build ${TAG_SLUG:-unknown}" >&2
+  fi
+  return "$status"
+}
 
 # A tag directory is Xcode derived data only when it carries a Build/ subtree.
 # The same /tmp/term-mesh-* prefix is also used by live infrastructure
@@ -199,8 +291,7 @@ reclaim_stale_tag_builds() {
       continue
     fi
 
-    rm -rf "$path" "${TAG_TMP_ROOT}/term-mesh-debug-${tag}.sock"
-    rm -f "${TAG_TMP_ROOT}/term-mesh-debug-${tag}.log" "$daemon_sock"
+    remove_tag_artifacts "$tag"
     echo "  reclaimed ${tag} (${age}d)"
     reclaimed=$((reclaimed + 1))
   done < <(list_stale_tags "$current_slug")
@@ -235,17 +326,11 @@ print_tag_cleanup_reminder() {
     done
     echo "Cleanup stale tags now (they are reclaimed automatically after ${TAG_GC_DAYS}d):"
     for tag in "${stale_tags[@]}"; do
-      echo "  pkill -f \"term-mesh DEV ${tag}.app/Contents/MacOS/term-mesh DEV\""
-      echo "  rm -rf \"/tmp/term-mesh-${tag}\" \"/tmp/term-mesh-debug-${tag}.sock\""
-      echo "  rm -f \"/tmp/term-mesh-debug-${tag}.log\""
-      echo "  rm -f \"$HOME/Library/Application Support/term-mesh/term-meshd-dev-${tag}.sock\""
+      echo "  ./scripts/reload.sh --tag ${tag} --cleanup"
     done
   fi
   echo "After you verify current tag, cleanup command:"
-  echo "  pkill -f \"term-mesh DEV ${current_slug}.app/Contents/MacOS/term-mesh DEV\""
-  echo "  rm -rf \"/tmp/term-mesh-${current_slug}\" \"/tmp/term-mesh-debug-${current_slug}.sock\""
-  echo "  rm -f \"/tmp/term-mesh-debug-${current_slug}.log\""
-  echo "  rm -f \"$HOME/Library/Application Support/term-mesh/term-meshd-dev-${current_slug}.sock\""
+  echo "  ./scripts/reload.sh --tag ${current_slug} --cleanup"
 }
 
 while [[ $# -gt 0 ]]; do
@@ -297,6 +382,10 @@ while [[ $# -gt 0 ]]; do
       ALLOW_ALL=1
       shift
       ;;
+    --cleanup)
+      CLEANUP_ONLY=1
+      shift
+      ;;
     -h|--help)
       usage
       exit 0
@@ -327,14 +416,38 @@ if [[ -n "$TAG" ]]; then
   fi
   if [[ "$DERIVED_SET" -eq 0 ]]; then
     DERIVED_DATA="/tmp/term-mesh-${TAG_SLUG}"
+    if [[ "$TAG_TMP_ROOT" != "/tmp" ]]; then
+      DERIVED_DATA="${TAG_TMP_ROOT}/term-mesh-${TAG_SLUG}"
+    fi
+    MANAGED_DERIVED=1
   fi
 fi
+
+if [[ "$CLEANUP_ONLY" -eq 1 ]]; then
+  APP_PROCESS_PATTERN="${APP_NAME}.app/Contents/MacOS/${BASE_APP_NAME}"
+  /usr/bin/osascript -e "tell application id \"${BUNDLE_ID}\" to quit" >/dev/null 2>&1 || true
+  if ! wait_for_app_exit "$APP_PROCESS_PATTERN"; then
+    pkill -f "$APP_PROCESS_PATTERN" || true
+  fi
+  stop_daemon_for_socket "$HOME/Library/Application Support/term-mesh/term-meshd-dev-${TAG_SLUG}.sock"
+  remove_tag_artifacts "$TAG_SLUG"
+  rm -f "${TAG_SESSION_ROOT}/${TAG_SLUG}.session"
+  echo "reclaimed tagged build ${TAG_SLUG}"
+  exit 0
+fi
+
+mkdir -p "$TAG_TMP_ROOT" "$TAG_SESSION_ROOT" "$SHARED_SWIFTPM_CACHE" "$SHARED_CARGO_TARGET"
+reclaim_ended_tag_sessions "$TAG_SLUG"
+reclaim_stale_tag_builds "$TAG_SLUG"
+ensure_build_space
+trap cleanup_failed_build EXIT
 
 XCODEBUILD_ARGS=(
   -project GhosttyTabs.xcodeproj
   -scheme term-mesh
   -configuration Debug
   -destination 'platform=macOS'
+  -clonedSourcePackagesDirPath "$SHARED_SWIFTPM_CACHE"
 )
 if [[ -n "$DERIVED_DATA" ]]; then
   XCODEBUILD_ARGS+=(-derivedDataPath "$DERIVED_DATA")
@@ -454,12 +567,15 @@ if [[ -n "${TERMMESH_SOCKET:-}" ]]; then
 fi
 
 if [[ -d "$PWD/daemon" && -f "$PWD/daemon/Cargo.toml" ]]; then
-  (cd "$PWD/daemon" && cargo build --release 2>/dev/null) || true
+  (cd "$PWD/daemon" && CARGO_TARGET_DIR="$SHARED_CARGO_TARGET" cargo build --release 2>/dev/null) || true
 fi
 BIN_DIR="$APP_PATH/Contents/Resources/bin"
 mkdir -p "$BIN_DIR"
 for bin in term-meshd term-mesh-run tm-agent term-mesh-peer-relay; do
-  src="$PWD/daemon/target/release/$bin"
+  src="$SHARED_CARGO_TARGET/release/$bin"
+  if [[ ! -x "$src" ]]; then
+    src="$PWD/daemon/target/release/$bin"
+  fi
   if [[ -x "$src" ]]; then
     cp "$src" "$BIN_DIR/$bin"
     chmod +x "$BIN_DIR/$bin"
@@ -593,5 +709,10 @@ if [[ "${#PIDS[@]}" -gt 1 ]]; then
 fi
 
 if [[ -n "${TAG_SLUG:-}" ]]; then
+  APP_PID="$(pgrep -f "${APP_PATH}/Contents/MacOS/" | head -n 1 || true)"
+  if [[ "$APP_PID" =~ ^[0-9]+$ ]]; then
+    printf '%s\n' "$APP_PID" > "${TAG_SESSION_ROOT}/${TAG_SLUG}.session"
+    BUILD_LAUNCHED=1
+  fi
   print_tag_cleanup_reminder "$TAG_SLUG"
 fi
