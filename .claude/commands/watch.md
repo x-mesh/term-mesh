@@ -626,5 +626,5 @@ Reads `.xm/watch/board.jsonl` and summarizes this session's drift count.
 After editing this command file:
 
 ```bash
-rg -n "watch on|watch off|watch status|watch trigger|watch test|trigger_now|WatchController|next_tick|--every|daemon|autonomous" .claude/commands/watch.md
+rg -n "watch on|watch off|watch status|watch trigger|watch test|trigger_now|WatchController|next_tick|--every|daemon|autonomous" .claude/commands/watch.md Resources/CodexPrompts/watch.md
 ```

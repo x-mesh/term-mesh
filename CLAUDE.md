@@ -318,7 +318,7 @@ a socket exists at `/tmp/term-mesh*.sock` or `/tmp/term-mesh.sock`), ALL team op
 `TaskGet`, `TaskUpdate`, `TeamDelete`. These create a parallel, disconnected team state.
 
 **Use instead:** The project-local `/team` command (`.claude/commands/team.md`) for Claude leaders,
-or the Codex IME `/team` alias that reads the same command source for Codex leaders. Both route
+or the Codex IME `/team` alias backed by `~/.codex/prompts/team.md` for Codex leaders. Both route
 everything through `tm-agent`.
 
 ### Command responsibility split — /team vs /tm
@@ -338,15 +338,15 @@ If OMC's keyword detector fires `[MODE: TEAM]` or `[MAGIC KEYWORD: TEAM]`:
 1. **Do NOT invoke `/oh-my-claudecode:team`** — it uses Claude Code native teams
 2. **Instead invoke `/team`** (the project-local command) or use `tm-agent` directly
 
-### Codex leader command aliases
+### Codex leader prompt shims
 
-Codex does not execute Claude's `.claude/commands` slash-command format natively. term-mesh does
-not install deprecated Codex Custom Prompts; Claude and Codex leaders share the command files under
-`.claude/commands/` as one source of truth.
+Codex does not execute Claude's `.claude/commands` slash-command format natively. Project-local
+`.codex/prompts/` is intentionally absent; distributable Codex prompt shims live under
+`Resources/CodexPrompts/` and are installed globally into `~/.codex/prompts/`.
 
 In the term-mesh IME box, Codex panes get short aliases that expand on submit into a normal Codex
-message: "read `.claude/commands/<name>.md`, adapt Claude-only interaction primitives to Codex,
-and execute it with these arguments." Claude panes keep the original Claude slash commands.
+message: "read `~/.codex/prompts/<name>.md` and execute it with these arguments." Claude panes
+keep the original Claude slash commands.
 
 | Claude leader | Codex leader | Purpose |
 |---------------|--------------|---------|
@@ -358,10 +358,11 @@ and execute it with these arguments." Claude panes keep the original Claude slas
 | `/watch ...` | `/watch ...` via IME alias | Stateless drift oversight toggle/review |
 
 The IME alias map lives in `imeSlashCommandAliases()` (`Sources/GhosttySurfaceScrollView.swift`);
-each alias points at the corresponding `.claude/commands/<name>.md`, read live from the repo.
-`scripts/copy-claude-commands.sh` bundles commands and skills, and `ClaudeCommandInstaller.swift`
-installs their managed copies under `~/.claude/`. Adding a leader command requires updating the
-`COMMANDS` array, `managedCommandNames`, and the Codex IME alias map in lockstep.
+each alias points at the corresponding `~/.codex/prompts/<name>.md`. Both the Claude commands and
+Codex distribution prompts are bundled by `scripts/copy-claude-commands.sh` (build phase:
+`COMMANDS`/`SKILLS`/`CODEX_PROMPTS`) and installed by `ClaudeCommandInstaller.swift` into
+`~/.claude/` and `~/.codex/prompts/`. Adding a leader command means updating the paired source under
+`Resources/CodexPrompts/`, both managed-name arrays, and the IME alias map in lockstep.
 
 For Codex as the current leader, prefer:
 

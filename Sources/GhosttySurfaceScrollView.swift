@@ -1275,12 +1275,12 @@ final class GhosttySurfaceScrollView: NSView {
     private func imeSlashCommandAliases() -> [String: String] {
         guard isCodexLikePane() else { return [:] }
         return [
-            "/team": ".claude/commands/team.md",
-            "/team-up": ".claude/commands/team-up.md",
-            "/tm": ".claude/commands/tm.md",
-            "/tm-op": ".claude/commands/tm-op.md",
-            "/tm-bench": ".claude/commands/tm-bench.md",
-            "/watch": ".claude/commands/watch.md",
+            "/team": "~/.codex/prompts/team.md",
+            "/team-up": "~/.codex/prompts/team-up.md",
+            "/tm": "~/.codex/prompts/tm.md",
+            "/tm-op": "~/.codex/prompts/tm-op.md",
+            "/tm-bench": "~/.codex/prompts/tm-bench.md",
+            "/watch": "~/.codex/prompts/watch.md",
         ]
     }
 

@@ -53,7 +53,7 @@ tm-agent collect --headers
 tm-agent reports --summary
 ```
 
-For strategies already implemented by the project-local command wrapper, follow the repository's `.claude/commands/tm-op.md` workflow and keep every team operation on `tm-agent`.
+For strategies already implemented by the Codex wrapper, follow `Resources/CodexPrompts/tm-op.md` and keep every team operation on `tm-agent`.
 
 ## Verification
 
