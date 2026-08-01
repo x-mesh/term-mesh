@@ -93,41 +93,147 @@ wait_for_app_exit() {
   return 1
 }
 
-print_tag_cleanup_reminder() {
+# Tag builds are ~3.5G of derived data each, so a machine that has run a few
+# dozen tagged sessions loses tens of gigabytes to builds nobody will launch
+# again. Anything untouched for this many days is reclaimed automatically.
+TAG_GC_DAYS="${TERMMESH_RELOAD_TAG_GC_DAYS:-7}"
+# Overridable so the sweep can be exercised against a throwaway tree.
+TAG_TMP_ROOT="${TERMMESH_RELOAD_TMP_ROOT:-/tmp}"
+
+# A tag directory is Xcode derived data only when it carries a Build/ subtree.
+# The same /tmp/term-mesh-* prefix is also used by live infrastructure
+# (term-mesh-agent-pipes, term-mesh-worktree-locks, term-mesh-peer-*, relay
+# socket dirs), and those must never be swept.
+list_stale_tags() {
   local current_slug="$1"
   local path=""
   local tag=""
   local seen=" "
-  local -a stale_tags=()
 
+  # NOTE: the trailing slash is load-bearing. /tmp is a symlink to /private/tmp
+  # on macOS and find does not follow a symlinked starting point, so scanning
+  # bare `/tmp` silently matched nothing and this whole report always read
+  # "stale tags: none" while ~100G piled up.
   while IFS= read -r -d '' path; do
-    tag="${path#/tmp/term-mesh-}"
-    if [[ "$tag" == "$current_slug" ]]; then
+    tag="${path##*/term-mesh-}"
+    if [[ -z "$tag" || "$tag" == "$current_slug" ]]; then
       continue
     fi
-    # Only surface stale debug tag builds.
-    if [[ ! -d "$path/Build/Products/Debug" ]]; then
+    if [[ ! -d "$path/Build" ]]; then
       continue
     fi
     if [[ "$seen" == *" $tag "* ]]; then
       continue
     fi
     seen="${seen}${tag} "
-    stale_tags+=("$tag")
-  done < <(find /tmp -maxdepth 1 -type d -name 'term-mesh-*' -print0 2>/dev/null)
+    printf '%s\n' "$tag"
+  done < <(find "${TAG_TMP_ROOT}/" -maxdepth 1 -type d -name 'term-mesh-*' -print0 2>/dev/null)
+}
+
+# The launched binary lives inside the tag's own derived data, so any process
+# whose command line still mentions that path owns the directory.
+tag_is_running() {
+  local tag="$1"
+  if pgrep -f "${TAG_TMP_ROOT}/term-mesh-${tag}/" >/dev/null 2>&1; then
+    return 0
+  fi
+  # macOS resolves /tmp to /private/tmp in process command lines.
+  if pgrep -f "/private/tmp/term-mesh-${tag}/" >/dev/null 2>&1; then
+    return 0
+  fi
+  if pgrep -f "term-mesh DEV ${tag}.app/Contents/MacOS/" >/dev/null 2>&1; then
+    return 0
+  fi
+  return 1
+}
+
+path_in_use() {
+  local target="$1"
+  if [[ ! -e "$target" ]]; then
+    return 1
+  fi
+  if ! command -v lsof >/dev/null 2>&1; then
+    return 1
+  fi
+  lsof -- "$target" >/dev/null 2>&1
+}
+
+tag_age_days() {
+  local path="$1"
+  local mtime=""
+  mtime="$(stat -f %m "$path" 2>/dev/null || true)"
+  if [[ -z "$mtime" ]]; then
+    return 1
+  fi
+  echo $(( ( $(date +%s) - mtime ) / 86400 ))
+}
+
+reclaim_stale_tag_builds() {
+  local current_slug="$1"
+  local tag=""
+  local path=""
+  local daemon_sock=""
+  local age=""
+  local reclaimed=0
+
+  if [[ "${TERMMESH_RELOAD_TAG_GC:-1}" != "1" ]]; then
+    return 0
+  fi
+
+  while IFS= read -r tag; do
+    path="${TAG_TMP_ROOT}/term-mesh-${tag}"
+    daemon_sock="$HOME/Library/Application Support/term-mesh/term-meshd-dev-${tag}.sock"
+
+    if ! age="$(tag_age_days "$path")"; then
+      continue
+    fi
+    if [[ "$age" -le "$TAG_GC_DAYS" ]]; then
+      continue
+    fi
+    if tag_is_running "$tag"; then
+      echo "  kept ${tag} (${age}d) — still running"
+      continue
+    fi
+    if path_in_use "$daemon_sock"; then
+      echo "  kept ${tag} (${age}d) — daemon socket in use"
+      continue
+    fi
+
+    rm -rf "$path" "${TAG_TMP_ROOT}/term-mesh-debug-${tag}.sock"
+    rm -f "${TAG_TMP_ROOT}/term-mesh-debug-${tag}.log" "$daemon_sock"
+    echo "  reclaimed ${tag} (${age}d)"
+    reclaimed=$((reclaimed + 1))
+  done < <(list_stale_tags "$current_slug")
+
+  if [[ "$reclaimed" -gt 0 ]]; then
+    echo "  ${reclaimed} stale tag build(s) reclaimed"
+  fi
+}
+
+print_tag_cleanup_reminder() {
+  local current_slug="$1"
+  local tag=""
+  local -a stale_tags=()
 
   echo
   echo "Tag cleanup status:"
   echo "  current tag: ${current_slug} (keep this running until you verify)"
+
+  reclaim_stale_tag_builds "$current_slug"
+
+  while IFS= read -r tag; do
+    stale_tags+=("$tag")
+  done < <(list_stale_tags "$current_slug")
+
   if [[ "${#stale_tags[@]}" -eq 0 ]]; then
     echo "  stale tags: none"
     echo "  stale cleanup: not needed"
   else
-    echo "  stale tags:"
+    echo "  stale tags (younger than ${TAG_GC_DAYS}d, or still in use):"
     for tag in "${stale_tags[@]}"; do
       echo "    - ${tag}"
     done
-    echo "Cleanup stale tags only:"
+    echo "Cleanup stale tags now (they are reclaimed automatically after ${TAG_GC_DAYS}d):"
     for tag in "${stale_tags[@]}"; do
       echo "  pkill -f \"term-mesh DEV ${tag}.app/Contents/MacOS/term-mesh DEV\""
       echo "  rm -rf \"/tmp/term-mesh-${tag}\" \"/tmp/term-mesh-debug-${tag}.sock\""

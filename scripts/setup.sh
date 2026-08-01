@@ -70,6 +70,9 @@ trap 'rmdir "$LOCK_DIR" >/dev/null 2>&1 || true' EXIT
 
 if [ -d "$CACHE_XCFRAMEWORK" ]; then
     echo "==> Reusing cached GhosttyKit.xcframework"
+    # Mark the cache entry as used so pruning below evicts by real recency
+    # rather than by when the framework happened to be built.
+    touch "$CACHE_DIR"
 else
     # Only reuse local xcframework if its SHA stamp matches the current ghostty commit.
     # Without this check, a stale build from a previous commit could be cached under
@@ -214,6 +217,47 @@ fi
 
 echo "==> Creating symlink for GhosttyKit.xcframework..."
 ln -sfn "$CACHE_XCFRAMEWORK" GhosttyKit.xcframework
+
+# Each cached SHA is ~540M and nothing ever removed the old ones, so a repo
+# that follows ghostty for a while quietly loses gigabytes to frameworks no
+# checkout references. Keep the most recently used entries and drop the rest.
+prune_ghosttykit_cache() {
+    local keep="${TERMMESH_GHOSTTYKIT_CACHE_KEEP:-3}"
+    if ! [[ "$keep" =~ ^[0-9]+$ ]] || [ "$keep" -le 0 ]; then
+        return 0
+    fi
+
+    local linked_sha=""
+    if [ -L "$PROJECT_DIR/GhosttyKit.xcframework" ]; then
+        linked_sha="$(basename "$(dirname "$(readlink "$PROJECT_DIR/GhosttyKit.xcframework")")")"
+    fi
+
+    local kept=0
+    local entry path sha
+    while IFS= read -r entry; do
+        path="${entry#* }"
+        sha="$(basename "$path")"
+        # Only real cache entries: SHA-named directories. Lock dirs and the
+        # mktemp staging dirs share this root and must be left alone.
+        if ! [[ "$sha" =~ ^[0-9a-f]{40}$ ]]; then
+            continue
+        fi
+        # Never evict the SHA in play, the one the symlink resolves to, or one
+        # a concurrent setup.sh is still populating.
+        if [ "$sha" = "$GHOSTTY_SHA" ] || [ "$sha" = "$linked_sha" ] || [ -d "$CACHE_ROOT/$sha.lock" ]; then
+            kept=$((kept + 1))
+            continue
+        fi
+        if [ "$kept" -lt "$keep" ]; then
+            kept=$((kept + 1))
+            continue
+        fi
+        rm -rf "$path"
+        echo "==> Pruned unused GhosttyKit cache ${sha:0:12}"
+    done < <(find "$CACHE_ROOT" -mindepth 1 -maxdepth 1 -type d -exec stat -f '%m %N' {} + 2>/dev/null | sort -rn)
+}
+
+prune_ghosttykit_cache
 
 echo "==> Setup complete!"
 echo ""
