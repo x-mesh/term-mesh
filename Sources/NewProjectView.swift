@@ -711,7 +711,7 @@ struct NewProjectView: View {
                 if agentPlacementMode == .allOnOneMachine {
                     Picker("", selection: $allAgentsHostKey) {
                         Text("This Mac").tag(String?.none)
-                        ForEach(selectablePeers, id: \.id) { host in
+                        ForEach(placeableHosts, id: \.id) { host in
                             Text(host.isConnected ? host.displayName : "\(host.displayName) — offline")
                                 .tag(String?.some(host.id))
                         }
@@ -870,7 +870,7 @@ struct NewProjectView: View {
                     HStack(spacing: 8) {
                         Picker("", selection: $runsOnHostKey) {
                             Text("This Mac").tag(String?.none)
-                            ForEach(selectablePeers, id: \.id) { host in
+                            ForEach(placeableHosts, id: \.id) { host in
                                 Text(host.isConnected ? host.displayName : "\(host.displayName) — offline")
                                     .tag(String?.some(host.id))
                             }
@@ -878,7 +878,7 @@ struct NewProjectView: View {
                         .labelsHidden()
                         .frame(width: 220)
                         if let runsOnHostKey,
-                           let host = selectablePeers.first(where: { $0.id == runsOnHostKey }),
+                           let host = placeableHosts.first(where: { $0.id == runsOnHostKey }),
                            !host.isConnected {
                             Label("connecting…", systemImage: "arrow.triangle.2.circlepath")
                                 .font(.caption)
@@ -1297,6 +1297,20 @@ struct NewProjectView: View {
         RemoteHostStore.selectableLaunchHosts(in: hostStore.sortedHosts)
     }
 
+    /// Every saved machine the pickers offer — connected or not.
+    ///
+    /// Picking one starts its connection (`applyRunsOn`,
+    /// `connectHostIfNeeded`), which is what the "— offline" row labels and
+    /// the "connecting…" badge beside the leader picker are for. Feeding the
+    /// pickers `selectablePeers` instead made all of that unreachable: a host
+    /// had to be connected *already* to even appear, so placing work on an
+    /// idle machine meant leaving the sheet, connecting it in the sidebar,
+    /// and starting over. Readiness is still judged by `selectablePeers` —
+    /// this widens what you may ask for, not what may launch.
+    private var placeableHosts: [HostEntry] {
+        hostStore.sortedHosts.filter { !($0.sshTarget ?? "").isEmpty }
+    }
+
     private var defaultAgentHostKey: String? {
         switch agentPlacementMode {
         case .sameAsLeader, .perAgent:
@@ -1312,7 +1326,7 @@ struct NewProjectView: View {
 
     private func machineLabel(_ hostKey: String?) -> String {
         guard let hostKey else { return "This Mac" }
-        return selectablePeers.first(where: { $0.id == hostKey })?.displayName ?? hostKey
+        return placeableHosts.first(where: { $0.id == hostKey })?.displayName ?? hostKey
     }
 
     private var agentPlacementCompactSummary: String {
@@ -1378,7 +1392,7 @@ struct NewProjectView: View {
 
     private func connectHostIfNeeded(_ hostKey: String?) {
         guard let hostKey,
-              let host = selectablePeers.first(where: { $0.id == hostKey }),
+              let host = placeableHosts.first(where: { $0.id == hostKey }),
               !host.isConnected else { return }
         hostStore.connectSavedHost(host)
     }
@@ -1460,7 +1474,7 @@ struct NewProjectView: View {
         // Picking a machine is as good as saying "use that one", so the
         // connection is started here rather than left as a step to discover
         // at Create time when the agents fail to attach.
-        if let host = selectablePeers.first(where: { $0.id == hostKey }), !host.isConnected {
+        if let host = placeableHosts.first(where: { $0.id == hostKey }), !host.isConnected {
             hostStore.connectSavedHost(host)
         }
         // The folder is a machine's project root plus this project's name, and
@@ -1705,7 +1719,7 @@ struct NewProjectView: View {
         case .empty: action = "Create empty Git project"
         }
         let machine = runsOnHostKey.flatMap { hostKey in
-            selectablePeers.first(where: { $0.id == hostKey })?.displayName
+            placeableHosts.first(where: { $0.id == hostKey })?.displayName
         } ?? "This Mac"
         let checkout = effectiveIsolation
             ? "\(agents.count) agent worktree\(agents.count == 1 ? "" : "s")"
@@ -1739,6 +1753,15 @@ struct NewProjectView: View {
             }
         guard !offline.isEmpty else { return nil }
         let labels = offline.map { machineLabel($0) }.sorted().joined(separator: ", ")
+        // Picking a machine starts connecting it, so while that is in flight
+        // the honest answer is "wait a moment", not "this cannot launch" —
+        // the latter reads as a dead end and sends people out of the sheet.
+        let allStillConnecting = offline.allSatisfy { hostKey in
+            placeableHosts.first(where: { $0.id == hostKey })?.connectionState == .connecting
+        }
+        if allStillConnecting {
+            return "Connecting to \(labels)…"
+        }
         return offline.count == 1
             ? "\(labels) is not ready to launch remote tools."
             : "These machines are not ready to launch remote tools: \(labels)."
