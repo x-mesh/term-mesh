@@ -118,6 +118,7 @@ final class ControlSocketFramingP1Tests: XCTestCase {
         XCTAssertEqual(callCount, 2)
         XCTAssertEqual(bytesRead, expected.count)
         XCTAssertEqual(Data(buffer.prefix(bytesRead)), expected)
+    }
 
     /// Several complete frames in one read may exceed the limit in total.
     ///
@@ -148,7 +149,6 @@ final class ControlSocketFramingP1Tests: XCTestCase {
                 maxPendingBytes: 64
             )
         )
-    }
     }
 
     func testWriteAllRetriesEINTRAndCompletesAfterShortWrite() {
