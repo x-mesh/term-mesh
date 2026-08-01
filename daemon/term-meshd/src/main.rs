@@ -211,9 +211,10 @@ async fn main() -> anyhow::Result<()> {
 
     // Disk reclamation. Deliberately narrower than what `tm-agent gc sweep`
     // can do: the unattended pass only touches derived state (expired agent
-    // reports, boards of teams that no longer exist, stale git worktree
-    // registrations, oversized logs). Worktrees and agent checkouts are never
-    // removed without someone asking, because only a human can judge whether
+    // reports, stale git worktree registrations, oversized logs). Team boards
+    // require live app state and remain explicit-only. Worktrees and agent
+    // checkouts are never removed without someone asking, because only a human
+    // can judge whether
     // an uncommitted tree still matters.
     {
         let mgr = Arc::clone(&agent_manager);

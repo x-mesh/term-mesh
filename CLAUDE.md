@@ -266,8 +266,10 @@ tm-agent gc sweep --apply                   # actually reclaim
   parent repo, and worktrees an active session or task still points at are
   never removed. `--force` relaxes exactly one blocker (`unopenable`).
 - **The daemon's own 6h sweep is narrower still**: only `team_results` (24h),
-  `team_boards` (30d), `worktree_meta` and `logs`. It never removes a worktree
-  or a checkout — see `AUTO_CATEGORIES` in `daemon/term-meshd/src/gc.rs`.
+  `worktree_meta` and `logs`. Team boards require an authoritative live-team
+  snapshot and are explicit-only. The unattended sweep never removes a
+  worktree or checkout — see `AUTO_CATEGORIES` in
+  `daemon/term-meshd/src/gc.rs`.
 - Removal goes through git, so the registration is pruned with the directory.
   Deleting the directory alone leaves a `prunable` entry behind.
 - **`git worktree remove` refuses any worktree containing a submodule**, and

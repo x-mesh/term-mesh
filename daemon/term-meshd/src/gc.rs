@@ -42,14 +42,11 @@ pub const CATEGORY_LOGS: &str = "logs";
 pub const CATEGORY_BUILD_CACHES: &str = "build_caches";
 
 /// Categories the unattended sweep is allowed to act on. Everything here is
-/// derived state — reports, boards, stale git bookkeeping, logs — so the worst
-/// case of a wrong call is a lost report, never lost source.
-pub const AUTO_CATEGORIES: &[&str] = &[
-    CATEGORY_TEAM_RESULTS,
-    CATEGORY_TEAM_BOARDS,
-    CATEGORY_WORKTREE_META,
-    CATEGORY_LOGS,
-];
+/// derived state whose liveness the daemon can prove without app state. Team
+/// boards are intentionally excluded: startup runs before Swift has synced the
+/// live-team set, so age alone is not enough to delete one.
+pub const AUTO_CATEGORIES: &[&str] =
+    &[CATEGORY_TEAM_RESULTS, CATEGORY_WORKTREE_META, CATEGORY_LOGS];
 
 pub const ALL_CATEGORIES: &[&str] = &[
     CATEGORY_DAEMON_WORKTREES,
@@ -81,6 +78,18 @@ pub const LOG_ROTATE_BYTES: u64 = 10 * 1024 * 1024;
 /// multi-million-file tree.
 const SIZE_WALK_BUDGET: usize = 500_000;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FileIdentity {
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+    #[cfg(not(unix))]
+    modified_ms: u64,
+    #[cfg(not(unix))]
+    len: u64,
+}
+
 // ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
@@ -98,6 +107,9 @@ pub struct GcCandidate {
     pub reasons: Vec<String>,
     /// Why it must not be touched. Non-empty means the sweep skips it.
     pub blockers: Vec<String>,
+    /// Internal scan identity used to reject path-replacement races.
+    #[serde(skip)]
+    identity: Option<FileIdentity>,
 }
 
 impl GcCandidate {
@@ -173,10 +185,18 @@ pub struct GcRefs {
 
 impl GcRefs {
     fn is_pinned(&self, path: &Path) -> Option<&'static str> {
-        if self.active_session_worktrees.contains(path) {
+        if self
+            .active_session_worktrees
+            .iter()
+            .any(|active| same_path(active, path))
+        {
             return Some("active_session");
         }
-        if self.active_task_worktrees.contains(path) {
+        if self
+            .active_task_worktrees
+            .iter()
+            .any(|active| same_path(active, path))
+        {
             return Some("active_task");
         }
         None
@@ -302,12 +322,7 @@ pub fn build_plan(paths: &GcPaths, opts: &GcOptions, refs: &GcRefs) -> GcPlan {
     build_plan_at(paths, opts, refs, SystemTime::now())
 }
 
-pub fn build_plan_at(
-    paths: &GcPaths,
-    opts: &GcOptions,
-    refs: &GcRefs,
-    now: SystemTime,
-) -> GcPlan {
+pub fn build_plan_at(paths: &GcPaths, opts: &GcOptions, refs: &GcRefs, now: SystemTime) -> GcPlan {
     let mut categories = Vec::new();
 
     if opts.wants(CATEGORY_DAEMON_WORKTREES) {
@@ -355,8 +370,7 @@ pub fn build_plan_at(
 
 fn scan_daemon_worktrees(paths: &GcPaths, refs: &GcRefs) -> GcCategoryReport {
     let root = &paths.daemon_worktrees;
-    let mut report =
-        GcCategoryReport::new(CATEGORY_DAEMON_WORKTREES, vec![display(root)]);
+    let mut report = GcCategoryReport::new(CATEGORY_DAEMON_WORKTREES, vec![display(root)]);
 
     // Layout is <root>/<repo name>/term-mesh_wt_<8hex>.
     for repo_dir in real_subdirectories(root) {
@@ -373,8 +387,7 @@ fn scan_daemon_worktrees(paths: &GcPaths, refs: &GcRefs) -> GcCategoryReport {
 
 fn scan_gitkit_worktrees(paths: &GcPaths, refs: &GcRefs) -> GcCategoryReport {
     let root = &paths.gitkit_worktrees;
-    let mut report =
-        GcCategoryReport::new(CATEGORY_GITKIT_WORKTREES, vec![display(root)]);
+    let mut report = GcCategoryReport::new(CATEGORY_GITKIT_WORKTREES, vec![display(root)]);
 
     // git-kit nests <project>/<branch...>, and branch names contain slashes, so
     // the depth is not fixed. Recurse until a linked worktree turns up and stop
@@ -385,11 +398,7 @@ fn scan_gitkit_worktrees(paths: &GcPaths, refs: &GcRefs) -> GcCategoryReport {
     report
 }
 
-fn scan_project_checkouts(
-    paths: &GcPaths,
-    opts: &GcOptions,
-    refs: &GcRefs,
-) -> GcCategoryReport {
+fn scan_project_checkouts(paths: &GcPaths, opts: &GcOptions, refs: &GcRefs) -> GcCategoryReport {
     let mut roots: Vec<PathBuf> = paths.checkout_roots.clone();
     if let Some(extra) = &opts.roots {
         roots.extend(extra.iter().cloned());
@@ -465,6 +474,7 @@ fn scan_team_results(paths: &GcPaths, now: SystemTime) -> GcCategoryReport {
                 branch: None,
                 reasons: vec!["expired".into()],
                 blockers: Vec::new(),
+                identity: Some(file_identity(&metadata)),
             });
         }
     }
@@ -503,6 +513,7 @@ fn scan_team_boards(paths: &GcPaths, refs: &GcRefs, now: SystemTime) -> GcCatego
             branch: None,
             reasons: vec!["expired".into()],
             blockers,
+            identity: Some(file_identity(&metadata)),
         });
     }
     report
@@ -528,6 +539,7 @@ fn scan_headless_archives(paths: &GcPaths) -> GcCategoryReport {
             branch: None,
             reasons: Vec::new(),
             blockers: vec!["owned_by_headless_gc".into()],
+            identity: Some(file_identity(&metadata)),
         });
     }
     report
@@ -566,6 +578,7 @@ fn scan_worktree_meta(refs: &GcRefs) -> GcCategoryReport {
                     format!("repo={}", display(repo_path)),
                 ],
                 blockers: Vec::new(),
+                identity: None,
             });
         }
     }
@@ -600,6 +613,7 @@ fn scan_logs(paths: &GcPaths, now: SystemTime) -> GcCategoryReport {
                 branch: None,
                 reasons: vec!["oversized".into(), "rotate".into()],
                 blockers: Vec::new(),
+                identity: Some(file_identity(&metadata)),
             });
         }
     }
@@ -635,6 +649,7 @@ fn scan_logs(paths: &GcPaths, now: SystemTime) -> GcCategoryReport {
                 branch: None,
                 reasons: vec!["writer_is_gone".into()],
                 blockers: Vec::new(),
+                identity: Some(file_identity(&metadata)),
             });
         }
     }
@@ -647,9 +662,8 @@ fn scan_build_caches(paths: &GcPaths, opts: &GcOptions) -> GcCategoryReport {
         CATEGORY_BUILD_CACHES,
         vec![display(&paths.tmp), display(&paths.ghosttykit_cache)],
     );
-    report.note = Some(
-        "reported only — reclaimed by scripts/reload.sh and scripts/setup.sh".into(),
-    );
+    report.note =
+        Some("reported only — reclaimed by scripts/reload.sh and scripts/setup.sh".into());
     if !opts.deep {
         report.note = Some("pass deep=true to size build caches".into());
         return report;
@@ -676,6 +690,7 @@ fn scan_build_caches(paths: &GcPaths, opts: &GcOptions) -> GcCategoryReport {
                 branch: None,
                 reasons: vec!["tagged_debug_build".into()],
                 blockers: vec!["owned_by_reload_script".into()],
+                identity: Some(file_identity(&metadata)),
             });
         }
     }
@@ -692,6 +707,7 @@ fn scan_build_caches(paths: &GcPaths, opts: &GcOptions) -> GcCategoryReport {
             branch: None,
             reasons: vec!["ghosttykit_cache".into()],
             blockers: vec!["owned_by_setup_script".into()],
+            identity: Some(file_identity(&metadata)),
         });
     }
 
@@ -712,11 +728,34 @@ fn worktree_candidate(path: &Path, kind: &str, refs: &GcRefs) -> GcCandidate {
     let mut reasons = Vec::new();
     let mut blockers = Vec::new();
     let mut branch = None;
+    let metadata = fs::symlink_metadata(path).ok();
 
     if let Some(pin) = refs.is_pinned(path) {
         blockers.push(pin.to_string());
     } else {
         reasons.push("no_active_session".into());
+    }
+
+    // The scanners reject symlinks, but an entry can be replaced after the
+    // scan and before an apply pass reaches it. Check before Repository::open:
+    // libgit2 follows directory symlinks and could otherwise inspect (or later
+    // prune) an unrelated live worktree outside the managed tree.
+    if metadata
+        .as_ref()
+        .map(|value| value.file_type().is_symlink())
+        .unwrap_or(false)
+    {
+        blockers.push("path_is_symlink".into());
+        return GcCandidate {
+            path: display(path),
+            bytes: 0,
+            modified_ms: metadata.as_ref().map(modified_ms).unwrap_or(0),
+            kind: kind.to_string(),
+            branch,
+            reasons,
+            blockers,
+            identity: metadata.as_ref().map(file_identity),
+        };
     }
 
     match Repository::open(path) {
@@ -743,16 +782,16 @@ fn worktree_candidate(path: &Path, kind: &str, refs: &GcRefs) -> GcCandidate {
             }
         }
         Err(_) if parent_gitdir_missing(path) => {
-            // The repository this worktree belonged to is gone, so git can tell
-            // us nothing — but that also means there is nothing left to merge
-            // into and no object store holding its commits. This is the shape
-            // the leaked test worktrees take.
+            // The repository this worktree belonged to is gone, so git cannot
+            // prove that the checkout has no uncommitted files. Preserve it by
+            // default; an operator can explicitly accept that uncertainty with
+            // `--force`, which relaxes this single `unopenable` blocker.
             reasons.push("parent_repo_gone".into());
+            blockers.push("unopenable".into());
         }
         Err(_) => blockers.push("unopenable".into()),
     }
 
-    let metadata = fs::symlink_metadata(path).ok();
     GcCandidate {
         path: display(path),
         bytes: dir_size(path),
@@ -761,6 +800,7 @@ fn worktree_candidate(path: &Path, kind: &str, refs: &GcRefs) -> GcCandidate {
         branch,
         reasons,
         blockers,
+        identity: metadata.as_ref().map(file_identity),
     }
 }
 
@@ -876,7 +916,18 @@ pub fn execute_sweep(
     plan: &GcPlan,
     apply: bool,
     force: bool,
+    current_refs: &GcRefs,
 ) -> Result<SweepSummary, String> {
+    // Rust runs independent `#[test]` functions concurrently in one process.
+    // They all exercise this process-global lock, so a non-blocking acquire
+    // would make otherwise unrelated GC tests fail depending on scheduling.
+    // Production keeps the non-blocking contract: a second caller gets a
+    // deterministic `GC_BUSY` instead of waiting behind a long filesystem walk.
+    #[cfg(test)]
+    let _guard = SWEEP_LOCK
+        .lock()
+        .map_err(|_| "GC_BUSY: sweep lock is poisoned".to_string())?;
+    #[cfg(not(test))]
     let _guard = SWEEP_LOCK
         .try_lock()
         .map_err(|_| "GC_BUSY: another sweep is already running".to_string())?;
@@ -887,11 +938,26 @@ pub fn execute_sweep(
     };
 
     for category in &plan.categories {
+        // Results, boards and logs can change while a large worktree scan is
+        // running. Re-scan each managed non-worktree category once immediately
+        // before acting on it. A candidate that disappeared, became fresh,
+        // gained a liveness blocker, or moved behind a symlink is no longer in
+        // scope for this sweep.
+        let refreshed_category = if apply {
+            match category.category.as_str() {
+                CATEGORY_TEAM_RESULTS => Some(scan_team_results(paths, SystemTime::now())),
+                CATEGORY_TEAM_BOARDS => {
+                    Some(scan_team_boards(paths, current_refs, SystemTime::now()))
+                }
+                CATEGORY_LOGS => Some(scan_logs(paths, SystemTime::now())),
+                _ => None,
+            }
+        } else {
+            None
+        };
+
         for candidate in &category.candidates {
-            let overridable = force
-                && candidate.blockers.len() == 1
-                && candidate.blockers[0] == "unopenable";
-            if !candidate.reclaimable() && !overridable {
+            if !candidate_allowed(candidate, force) {
                 summary.skipped += 1;
                 summary.outcomes.push(SweepOutcome {
                     path: candidate.path.clone(),
@@ -915,6 +981,81 @@ pub fn execute_sweep(
                 summary.removed += 1;
                 continue;
             }
+
+            // A full scan can take long enough for a clean idle worktree to
+            // become dirty or active before its turn in the sweep. Never let a
+            // stale plan expand what is removable: only candidates accepted by
+            // the original plan reach here, and worktrees are then checked
+            // again against the current filesystem and current daemon refs.
+            let refreshed_worktree;
+            let candidate = if candidate.kind == "worktree" || candidate.kind == "checkout" {
+                refreshed_worktree =
+                    worktree_candidate(Path::new(&candidate.path), &candidate.kind, current_refs);
+                if candidate.identity != refreshed_worktree.identity {
+                    summary.skipped += 1;
+                    summary.outcomes.push(SweepOutcome {
+                        path: candidate.path.clone(),
+                        category: category.category.clone(),
+                        action: "skipped".into(),
+                        reason: "candidate_replaced_since_plan".into(),
+                        bytes: candidate.bytes,
+                    });
+                    continue;
+                }
+                if !candidate_allowed(&refreshed_worktree, force) {
+                    summary.skipped += 1;
+                    summary.outcomes.push(SweepOutcome {
+                        path: refreshed_worktree.path.clone(),
+                        category: category.category.clone(),
+                        action: "skipped".into(),
+                        reason: refreshed_worktree.blockers.join(","),
+                        bytes: refreshed_worktree.bytes,
+                    });
+                    continue;
+                }
+                &refreshed_worktree
+            } else if let Some(refreshed) = &refreshed_category {
+                let Some(current) = refreshed
+                    .candidates
+                    .iter()
+                    .find(|current| current.path == candidate.path)
+                else {
+                    summary.skipped += 1;
+                    summary.outcomes.push(SweepOutcome {
+                        path: candidate.path.clone(),
+                        category: category.category.clone(),
+                        action: "skipped".into(),
+                        reason: "candidate_changed_or_no_longer_eligible".into(),
+                        bytes: candidate.bytes,
+                    });
+                    continue;
+                };
+                if candidate.identity != current.identity {
+                    summary.skipped += 1;
+                    summary.outcomes.push(SweepOutcome {
+                        path: candidate.path.clone(),
+                        category: category.category.clone(),
+                        action: "skipped".into(),
+                        reason: "candidate_replaced_since_plan".into(),
+                        bytes: candidate.bytes,
+                    });
+                    continue;
+                }
+                if !candidate_allowed(current, force) {
+                    summary.skipped += 1;
+                    summary.outcomes.push(SweepOutcome {
+                        path: current.path.clone(),
+                        category: category.category.clone(),
+                        action: "skipped".into(),
+                        reason: current.blockers.join(","),
+                        bytes: current.bytes,
+                    });
+                    continue;
+                }
+                current
+            } else {
+                candidate
+            };
 
             match reclaim(candidate, &category.category) {
                 Ok(action) => {
@@ -949,6 +1090,11 @@ pub fn execute_sweep(
     Ok(summary)
 }
 
+fn candidate_allowed(candidate: &GcCandidate, force: bool) -> bool {
+    candidate.reclaimable()
+        || (force && candidate.blockers.len() == 1 && candidate.blockers[0] == "unopenable")
+}
+
 fn reclaim(candidate: &GcCandidate, category: &str) -> Result<String, String> {
     let path = PathBuf::from(&candidate.path);
 
@@ -960,27 +1106,35 @@ fn reclaim(candidate: &GcCandidate, category: &str) -> Result<String, String> {
         return rotate_log(&path).map(|_| "rotated".to_string());
     }
 
-    // Hand worktrees to git first. Removing only the directory leaves the
-    // parent repo holding a `prunable` registration, which clutters
-    // `git worktree list` and blocks a later `worktree add` from reusing the
-    // branch. git also deletes the working tree while it is at it.
     let is_worktree = candidate.kind == "worktree" || candidate.kind == "checkout";
-    if is_worktree {
-        prune_worktree_registration(&path, true);
-        if !path.exists() {
-            return Ok("removed".to_string());
-        }
-    }
 
-    // Never follow a symlink out of the managed tree.
+    // Never ask git/libgit2 to remove the working tree itself. The path may
+    // have been replaced after the candidate refresh, and libgit2 follows a
+    // directory symlink while resolving the linked checkout. Inspect the
+    // path first, read only the registration owner, then use std's
+    // symlink-safe removal and prune the now-dangling registration below.
     let metadata = fs::symlink_metadata(&path).map_err(|e| e.to_string())?;
     if metadata.file_type().is_symlink() {
         return Err("refusing to remove a symlink".into());
     }
+    if candidate.identity != Some(file_identity(&metadata)) {
+        return Err("candidate_replaced_after_refresh".into());
+    }
 
     // The registration has to be read before the directory goes: `.git` is
-    // what names the owning repository.
-    let owner = if is_worktree { worktree_owner(&path) } else { None };
+    // what names the owning repository. If that pointer now names a different
+    // live worktree, the candidate was replaced after its refresh and must not
+    // be removed. Missing parent repositories remain removable only through
+    // the existing explicit `--force` path.
+    let owner = if is_worktree {
+        let owner = verified_worktree_owner(&path)?;
+        if owner.is_none() && !candidate.reasons.iter().any(|r| r == "parent_repo_gone") {
+            return Err("refusing to remove a worktree whose registration vanished".into());
+        }
+        owner
+    } else {
+        None
+    };
 
     if metadata.file_type().is_dir() {
         fs::remove_dir_all(&path).map_err(|e| e.to_string())?;
@@ -988,11 +1142,8 @@ fn reclaim(candidate: &GcCandidate, category: &str) -> Result<String, String> {
         fs::remove_file(&path).map_err(|e| e.to_string())?;
     }
 
-    // git refuses to remove a working tree that contains submodules, and this
-    // repository has one — so for the common case the prune above did nothing
-    // and we deleted the directory ourselves. Drop the now-dangling
-    // registration, or `git worktree list` keeps reporting it as `prunable`
-    // and the branch cannot be checked out again.
+    // Drop the now-dangling registration, or `git worktree list` keeps
+    // reporting it as `prunable` and the branch cannot be checked out again.
     if let Some((repo_root, name)) = owner {
         prune_registration(&repo_root, &name, false);
     }
@@ -1010,14 +1161,30 @@ fn worktree_owner(path: &Path) -> Option<(PathBuf, String)> {
     Some((main_root, name))
 }
 
-/// Drop a worktree's registration from its parent repository.
-///
-/// `with_working_tree` asks git to delete the checkout too. That fails on a
-/// worktree containing submodules, which is why the caller falls back to
-/// removing the directory itself and then pruning the record.
-fn prune_worktree_registration(path: &Path, with_working_tree: bool) -> Option<()> {
-    let (repo_root, name) = worktree_owner(path)?;
-    prune_registration(&repo_root, &name, with_working_tree)
+fn verified_worktree_owner(path: &Path) -> Result<Option<(PathBuf, String)>, String> {
+    let Some((repo_root, name)) = worktree_owner(path) else {
+        return Ok(None);
+    };
+    let Ok(repo) = Repository::open(&repo_root) else {
+        return Ok(None);
+    };
+    let Ok(worktree) = repo.find_worktree(&name) else {
+        return Ok(None);
+    };
+
+    let registered = worktree.path();
+    let same_path = match (fs::canonicalize(path), fs::canonicalize(registered)) {
+        (Ok(candidate), Ok(registered)) => candidate == registered,
+        _ => path == registered,
+    };
+    if !same_path {
+        return Err(format!(
+            "refusing to remove a worktree whose registration points at {}",
+            registered.display()
+        ));
+    }
+
+    Ok(Some((repo_root, name)))
 }
 
 fn prune_registration(repo_root: &Path, name: &str, with_working_tree: bool) -> Option<()> {
@@ -1043,6 +1210,13 @@ fn prune_worktree_meta(candidate: &GcCandidate) -> Result<(), String> {
         .ok_or_else(|| "missing repo reference".to_string())?;
     let repo = Repository::open(repo_path).map_err(|e| e.to_string())?;
     let target = PathBuf::from(&candidate.path);
+
+    // A checkout can be recreated after the scan. Never prune its registration
+    // from a stale plan. `symlink_metadata` also treats a broken symlink as an
+    // occupant, which is the conservative answer at a deletion boundary.
+    if fs::symlink_metadata(&target).is_ok() {
+        return Err("worktree path exists again".into());
+    }
 
     let names = repo.worktrees().map_err(|e| e.to_string())?;
     for name in names.iter().flatten() {
@@ -1074,7 +1248,7 @@ pub fn periodic_safe_sweep(paths: &GcPaths, refs: &GcRefs) -> Result<SweepSummar
         deep: false,
     };
     let plan = build_plan(paths, &opts, refs);
-    let summary = execute_sweep(paths, &plan, true, false)?;
+    let summary = execute_sweep(paths, &plan, true, false, refs)?;
     record_sweep("periodic", &summary);
     Ok(summary)
 }
@@ -1110,6 +1284,34 @@ fn log_sweep(dir: &Path, mode: &str, summary: &SweepSummary) {
 
 fn display(path: &Path) -> String {
     path.to_string_lossy().into_owned()
+}
+
+#[cfg(unix)]
+fn file_identity(metadata: &fs::Metadata) -> FileIdentity {
+    use std::os::unix::fs::MetadataExt;
+
+    FileIdentity {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+    }
+}
+
+#[cfg(not(unix))]
+fn file_identity(metadata: &fs::Metadata) -> FileIdentity {
+    FileIdentity {
+        modified_ms: modified_ms(metadata),
+        len: metadata.len(),
+    }
+}
+
+fn same_path(left: &Path, right: &Path) -> bool {
+    if left == right {
+        return true;
+    }
+    match (fs::canonicalize(left), fs::canonicalize(right)) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => false,
+    }
 }
 
 fn file_name(path: &Path) -> String {
@@ -1289,7 +1491,10 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let repo = init_repo(temp.path());
         let paths = paths_for(temp.path());
-        let wt = paths.daemon_worktrees.join("repo").join("term-mesh_wt_0011aabb");
+        let wt = paths
+            .daemon_worktrees
+            .join("repo")
+            .join("term-mesh_wt_0011aabb");
         fs::create_dir_all(wt.parent().unwrap()).unwrap();
         add_worktree(&repo, &wt, "term-mesh/0011aabb");
 
@@ -1297,7 +1502,11 @@ mod tests {
         let report = category(&plan, CATEGORY_DAEMON_WORKTREES);
         assert_eq!(report.entry_count, 1);
         let candidate = &report.candidates[0];
-        assert!(candidate.reclaimable(), "blockers: {:?}", candidate.blockers);
+        assert!(
+            candidate.reclaimable(),
+            "blockers: {:?}",
+            candidate.blockers
+        );
         assert!(candidate.reasons.iter().any(|r| r == "clean"));
     }
 
@@ -1314,7 +1523,12 @@ mod tests {
         add_worktree(&repo, &wt, "term-mesh/0011aabb");
 
         let plan = build_plan(&paths, &only(CATEGORY_DAEMON_WORKTREES), &GcRefs::default());
-        assert_eq!(execute_sweep(&paths, &plan, true, false).unwrap().removed, 1);
+        assert_eq!(
+            execute_sweep(&paths, &plan, true, false, &GcRefs::default())
+                .unwrap()
+                .removed,
+            1
+        );
 
         assert!(!wt.exists());
         // A directory-only delete would leave git holding a prunable entry.
@@ -1375,7 +1589,12 @@ mod tests {
             "a clean worktree must not be blocked by its submodule: {:?}",
             candidate.blockers
         );
-        assert_eq!(execute_sweep(&paths, &plan, true, false).unwrap().removed, 1);
+        assert_eq!(
+            execute_sweep(&paths, &plan, true, false, &GcRefs::default())
+                .unwrap()
+                .removed,
+            1
+        );
 
         assert!(!wt.exists(), "the directory must go even when git will not");
         let handle = Repository::open(&repo).unwrap();
@@ -1391,7 +1610,10 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let repo = init_repo(temp.path());
         let paths = paths_for(temp.path());
-        let wt = paths.daemon_worktrees.join("repo").join("term-mesh_wt_0011aabb");
+        let wt = paths
+            .daemon_worktrees
+            .join("repo")
+            .join("term-mesh_wt_0011aabb");
         fs::create_dir_all(wt.parent().unwrap()).unwrap();
         add_worktree(&repo, &wt, "term-mesh/0011aabb");
         fs::write(wt.join("scratch.txt"), "unsaved work").unwrap();
@@ -1404,9 +1626,35 @@ mod tests {
             .any(|b| b == "uncommitted_changes"));
 
         // Even an apply pass must leave it alone.
-        let summary = execute_sweep(&paths, &plan, true, false).unwrap();
+        let summary = execute_sweep(&paths, &plan, true, false, &GcRefs::default()).unwrap();
         assert_eq!(summary.removed, 0);
         assert!(wt.exists());
+    }
+
+    #[test]
+    fn worktree_that_becomes_dirty_after_planning_is_preserved() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = init_repo(temp.path());
+        let paths = paths_for(temp.path());
+        let wt = paths
+            .daemon_worktrees
+            .join("repo")
+            .join("term-mesh_wt_0011aabb");
+        fs::create_dir_all(wt.parent().unwrap()).unwrap();
+        add_worktree(&repo, &wt, "term-mesh/0011aabb");
+
+        let plan = build_plan(&paths, &only(CATEGORY_DAEMON_WORKTREES), &GcRefs::default());
+        assert!(category(&plan, CATEGORY_DAEMON_WORKTREES).candidates[0].reclaimable());
+
+        fs::write(wt.join("scratch.txt"), "created after the scan\n").unwrap();
+        // `--force` relaxes the refreshed `unopenable` blocker, so this
+        // reaches the final registration-identity guard in `reclaim`.
+        let summary = execute_sweep(&paths, &plan, true, true, &GcRefs::default()).unwrap();
+
+        assert_eq!(summary.removed, 0);
+        assert_eq!(summary.skipped, 1);
+        assert!(summary.outcomes[0].reason.contains("uncommitted_changes"));
+        assert!(wt.join("scratch.txt").exists());
     }
 
     #[test]
@@ -1414,7 +1662,10 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let repo = init_repo(temp.path());
         let paths = paths_for(temp.path());
-        let wt = paths.daemon_worktrees.join("repo").join("term-mesh_wt_00c0ffee");
+        let wt = paths
+            .daemon_worktrees
+            .join("repo")
+            .join("term-mesh_wt_00c0ffee");
         fs::create_dir_all(wt.parent().unwrap()).unwrap();
         add_worktree(&repo, &wt, "term-mesh/00c0ffee");
         fs::write(wt.join("feature.txt"), "done\n").unwrap();
@@ -1438,7 +1689,10 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let repo = init_repo(temp.path());
         let paths = paths_for(temp.path());
-        let wt = paths.daemon_worktrees.join("repo").join("term-mesh_wt_0011aabb");
+        let wt = paths
+            .daemon_worktrees
+            .join("repo")
+            .join("term-mesh_wt_0011aabb");
         fs::create_dir_all(wt.parent().unwrap()).unwrap();
         add_worktree(&repo, &wt, "term-mesh/0011aabb");
 
@@ -1452,13 +1706,44 @@ mod tests {
     }
 
     #[test]
-    fn a_worktree_whose_repo_vanished_is_reclaimable() {
+    fn an_active_session_pins_the_same_canonical_worktree_path() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = init_repo(temp.path());
+        let paths = paths_for(temp.path());
+        let wt = paths
+            .daemon_worktrees
+            .join("repo")
+            .join("term-mesh_wt_0011aabb");
+        fs::create_dir_all(wt.parent().unwrap()).unwrap();
+        add_worktree(&repo, &wt, "term-mesh/0011aabb");
+        let aliased = wt
+            .parent()
+            .unwrap()
+            .join("..")
+            .join("repo")
+            .join("term-mesh_wt_0011aabb");
+        let refs = GcRefs {
+            active_session_worktrees: [aliased].into_iter().collect(),
+            ..Default::default()
+        };
+
+        let plan = build_plan(&paths, &only(CATEGORY_DAEMON_WORKTREES), &refs);
+        let candidate = &category(&plan, CATEGORY_DAEMON_WORKTREES).candidates[0];
+        assert!(candidate.blockers.iter().any(|b| b == "active_session"));
+    }
+
+    #[test]
+    fn a_worktree_whose_repo_vanished_requires_force() {
         // The shape the leaked unit-test worktrees take: .git points at a
         // gitdir under a deleted temp directory.
         let temp = tempfile::tempdir().unwrap();
         let paths = paths_for(temp.path());
-        let wt = paths.daemon_worktrees.join("repo").join("term-mesh_wt_deadbeef");
+        let wt = paths
+            .daemon_worktrees
+            .join("repo")
+            .join("term-mesh_wt_deadbeef");
         fs::create_dir_all(&wt).unwrap();
+        fs::write(wt.join("scratch.txt"), "possibly valuable\n").unwrap();
         fs::write(
             wt.join(".git"),
             "gitdir: /nonexistent/repo/.git/worktrees/term-mesh_wt_deadbeef\n",
@@ -1467,12 +1752,20 @@ mod tests {
 
         let plan = build_plan(&paths, &only(CATEGORY_DAEMON_WORKTREES), &GcRefs::default());
         let candidate = &category(&plan, CATEGORY_DAEMON_WORKTREES).candidates[0];
-        assert!(candidate.reclaimable(), "blockers: {:?}", candidate.blockers);
+        assert!(!candidate.reclaimable());
         assert!(candidate.reasons.iter().any(|r| r == "parent_repo_gone"));
+        assert_eq!(candidate.blockers, ["unopenable"]);
 
-        let summary = execute_sweep(&paths, &plan, true, false).unwrap();
+        let summary = execute_sweep(&paths, &plan, true, false, &GcRefs::default()).unwrap();
+        assert_eq!(summary.removed, 0);
+        assert!(
+            wt.exists(),
+            "default apply must preserve unverifiable files"
+        );
+
+        let summary = execute_sweep(&paths, &plan, true, true, &GcRefs::default()).unwrap();
         assert_eq!(summary.removed, 1);
-        assert!(!wt.exists());
+        assert!(!wt.exists(), "force explicitly accepts the unopenable risk");
     }
 
     #[test]
@@ -1506,16 +1799,134 @@ mod tests {
         assert!(precious.exists());
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn worktree_replaced_by_a_symlink_after_planning_is_preserved() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let repo = init_repo(temp.path());
+        let paths = paths_for(temp.path());
+        let wt = paths
+            .daemon_worktrees
+            .join("repo")
+            .join("term-mesh_wt_0011aabb");
+        fs::create_dir_all(wt.parent().unwrap()).unwrap();
+        add_worktree(&repo, &wt, "term-mesh/0011aabb");
+        let plan = build_plan(&paths, &only(CATEGORY_DAEMON_WORKTREES), &GcRefs::default());
+
+        fs::remove_dir_all(&wt).unwrap();
+        let precious = temp.path().join("precious");
+        fs::create_dir_all(&precious).unwrap();
+        fs::write(precious.join("keep.txt"), "keep\n").unwrap();
+        symlink(&precious, &wt).unwrap();
+
+        let summary = execute_sweep(&paths, &plan, true, false, &GcRefs::default()).unwrap();
+        assert_eq!(summary.removed, 0);
+        assert_eq!(summary.outcomes[0].reason, "candidate_replaced_since_plan");
+        assert!(precious.join("keep.txt").exists());
+    }
+
+    #[test]
+    fn worktree_replaced_by_another_registration_after_planning_is_preserved() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = init_repo(temp.path());
+        let paths = paths_for(temp.path());
+        let candidate = paths
+            .daemon_worktrees
+            .join("repo")
+            .join("term-mesh_wt_0011aabb");
+        fs::create_dir_all(candidate.parent().unwrap()).unwrap();
+        add_worktree(&repo, &candidate, "term-mesh/0011aabb");
+        let plan = build_plan(&paths, &only(CATEGORY_DAEMON_WORKTREES), &GcRefs::default());
+
+        let other = temp.path().join("other-worktree");
+        add_worktree(&repo, &other, "term-mesh/other");
+        let other_git_pointer = fs::read_to_string(other.join(".git")).unwrap();
+        fs::remove_dir_all(&candidate).unwrap();
+        fs::create_dir_all(&candidate).unwrap();
+        fs::write(candidate.join(".git"), other_git_pointer).unwrap();
+
+        let summary = execute_sweep(&paths, &plan, true, true, &GcRefs::default()).unwrap();
+        assert_eq!(summary.removed, 0);
+        assert_eq!(summary.skipped, 1);
+        assert_eq!(summary.outcomes[0].reason, "candidate_replaced_since_plan");
+        assert!(candidate.exists());
+        assert!(other.exists());
+        assert!(Repository::open(&repo)
+            .unwrap()
+            .find_worktree("other-worktree")
+            .is_ok());
+    }
+
+    #[test]
+    fn worktree_replaced_by_an_unregistered_directory_after_planning_is_preserved() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = init_repo(temp.path());
+        let paths = paths_for(temp.path());
+        let candidate = paths
+            .daemon_worktrees
+            .join("repo")
+            .join("term-mesh_wt_0011aabb");
+        fs::create_dir_all(candidate.parent().unwrap()).unwrap();
+        add_worktree(&repo, &candidate, "term-mesh/0011aabb");
+        let plan = build_plan(&paths, &only(CATEGORY_DAEMON_WORKTREES), &GcRefs::default());
+
+        fs::remove_dir_all(&candidate).unwrap();
+        fs::create_dir_all(&candidate).unwrap();
+        fs::write(candidate.join("keep.txt"), "new occupant\n").unwrap();
+
+        let summary = execute_sweep(&paths, &plan, true, true, &GcRefs::default()).unwrap();
+        assert_eq!(summary.removed, 0);
+        assert_eq!(summary.skipped, 1);
+        assert_eq!(summary.outcomes[0].reason, "candidate_replaced_since_plan");
+        assert!(candidate.join("keep.txt").exists());
+    }
+
+    #[test]
+    fn worktree_recreated_clean_at_the_same_path_after_planning_is_preserved() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = init_repo(temp.path());
+        let paths = paths_for(temp.path());
+        let candidate = paths
+            .daemon_worktrees
+            .join("repo")
+            .join("term-mesh_wt_0011aabb");
+        fs::create_dir_all(candidate.parent().unwrap()).unwrap();
+        add_worktree(&repo, &candidate, "term-mesh/original");
+        let plan = build_plan(&paths, &only(CATEGORY_DAEMON_WORKTREES), &GcRefs::default());
+
+        git(
+            &["worktree", "remove", "--force", candidate.to_str().unwrap()],
+            &repo,
+        );
+        add_worktree(&repo, &candidate, "term-mesh/recreated");
+
+        let summary = execute_sweep(&paths, &plan, true, false, &GcRefs::default()).unwrap();
+
+        assert_eq!(summary.removed, 0);
+        assert_eq!(summary.skipped, 1);
+        assert_eq!(summary.outcomes[0].reason, "candidate_replaced_since_plan");
+        assert!(candidate.exists());
+        assert!(Repository::open(&repo)
+            .unwrap()
+            .find_worktree("term-mesh_wt_0011aabb")
+            .is_ok());
+    }
+
     #[test]
     fn dry_run_removes_nothing() {
         let temp = tempfile::tempdir().unwrap();
         let paths = paths_for(temp.path());
-        let wt = paths.daemon_worktrees.join("repo").join("term-mesh_wt_deadbeef");
+        let wt = paths
+            .daemon_worktrees
+            .join("repo")
+            .join("term-mesh_wt_deadbeef");
         fs::create_dir_all(&wt).unwrap();
         fs::write(wt.join(".git"), "gitdir: /nonexistent/x\n").unwrap();
 
         let plan = build_plan(&paths, &only(CATEGORY_DAEMON_WORKTREES), &GcRefs::default());
-        let summary = execute_sweep(&paths, &plan, false, false).unwrap();
+        let summary = execute_sweep(&paths, &plan, false, true, &GcRefs::default()).unwrap();
         assert!(!summary.applied);
         assert_eq!(summary.removed, 1);
         assert_eq!(summary.outcomes[0].action, "would_remove");
@@ -1573,6 +1984,54 @@ mod tests {
     }
 
     #[test]
+    fn a_team_that_becomes_live_after_planning_keeps_its_board() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = paths_for(temp.path());
+        let board = paths.teams.join("team-uuid-1");
+        fs::create_dir_all(&board).unwrap();
+        fs::write(board.join("board.json"), "{}").unwrap();
+        let old = SystemTime::now() - BOARD_TTL - Duration::from_secs(60);
+        filetime_set(&board, old);
+        let plan = build_plan(&paths, &only(CATEGORY_TEAM_BOARDS), &GcRefs::default());
+        assert!(category(&plan, CATEGORY_TEAM_BOARDS).candidates[0].reclaimable());
+        let refs = GcRefs {
+            active_team_uuids: ["team-uuid-1".to_string()].into_iter().collect(),
+            ..Default::default()
+        };
+
+        let summary = execute_sweep(&paths, &plan, true, false, &refs).unwrap();
+
+        assert_eq!(summary.removed, 0);
+        assert_eq!(summary.skipped, 1);
+        assert_eq!(summary.outcomes[0].reason, "team_is_live");
+        assert!(board.exists());
+    }
+
+    #[test]
+    fn an_expired_result_replaced_after_planning_is_preserved() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = paths_for(temp.path());
+        let team = paths.results.join("team");
+        fs::create_dir_all(&team).unwrap();
+        let result = team.join("task.md");
+        fs::write(&result, "old").unwrap();
+        let old = SystemTime::now() - RESULTS_TTL - Duration::from_secs(60);
+        filetime_set(&result, old);
+        let plan = build_plan(&paths, &only(CATEGORY_TEAM_RESULTS), &GcRefs::default());
+        fs::write(&result, "new result").unwrap();
+
+        let summary = execute_sweep(&paths, &plan, true, false, &GcRefs::default()).unwrap();
+
+        assert_eq!(summary.removed, 0);
+        assert_eq!(summary.skipped, 1);
+        assert_eq!(
+            summary.outcomes[0].reason,
+            "candidate_changed_or_no_longer_eligible"
+        );
+        assert_eq!(fs::read_to_string(result).unwrap(), "new result");
+    }
+
+    #[test]
     fn oversized_logs_rotate_instead_of_vanishing() {
         let temp = tempfile::tempdir().unwrap();
         let paths = paths_for(temp.path());
@@ -1581,7 +2040,7 @@ mod tests {
         fs::write(&log, vec![b'x'; (LOG_ROTATE_BYTES + 1) as usize]).unwrap();
 
         let plan = build_plan(&paths, &only(CATEGORY_LOGS), &GcRefs::default());
-        let summary = execute_sweep(&paths, &plan, true, false).unwrap();
+        let summary = execute_sweep(&paths, &plan, true, false, &GcRefs::default()).unwrap();
         assert_eq!(summary.outcomes[0].action, "rotated");
         assert!(!log.exists());
         assert!(paths.logs.join("worktree.log.1").exists());
@@ -1592,7 +2051,10 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let paths = paths_for(temp.path());
         // A worktree that a full sweep would happily reclaim.
-        let wt = paths.daemon_worktrees.join("repo").join("term-mesh_wt_deadbeef");
+        let wt = paths
+            .daemon_worktrees
+            .join("repo")
+            .join("term-mesh_wt_deadbeef");
         fs::create_dir_all(&wt).unwrap();
         fs::write(wt.join(".git"), "gitdir: /nonexistent/x\n").unwrap();
         // And an expired result, which it should reclaim.
@@ -1606,6 +2068,24 @@ mod tests {
         periodic_safe_sweep(&paths, &GcRefs::default()).unwrap();
         assert!(wt.exists(), "worktrees are out of scope for the auto sweep");
         assert!(!stale.exists(), "expired results are in scope");
+    }
+
+    #[test]
+    fn the_periodic_sweep_never_deletes_team_boards_without_live_state() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = paths_for(temp.path());
+        let board = paths.teams.join("team-uuid-1");
+        fs::create_dir_all(&board).unwrap();
+        fs::write(board.join("board.json"), "{}").unwrap();
+        let old = SystemTime::now() - BOARD_TTL - Duration::from_secs(60);
+        filetime_set(&board, old);
+
+        periodic_safe_sweep(&paths, &GcRefs::default()).unwrap();
+
+        assert!(
+            board.exists(),
+            "the background daemon has no authoritative live-team snapshot"
+        );
     }
 
     #[test]
@@ -1624,9 +2104,39 @@ mod tests {
         let plan = build_plan(&paths, &only(CATEGORY_WORKTREE_META), &refs);
         assert_eq!(category(&plan, CATEGORY_WORKTREE_META).entry_count, 1);
 
-        execute_sweep(&paths, &plan, true, false).unwrap();
+        execute_sweep(&paths, &plan, true, false, &GcRefs::default()).unwrap();
         let repo_handle = Repository::open(&repo).unwrap();
         assert_eq!(repo_handle.worktrees().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn worktree_registration_that_becomes_live_after_planning_is_preserved() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = init_repo(temp.path());
+        let wt = temp.path().join("gone");
+        add_worktree(&repo, &wt, "term-mesh/gone");
+        fs::remove_dir_all(&wt).unwrap();
+
+        let refs = GcRefs {
+            repo_paths: vec![repo.clone()],
+            ..Default::default()
+        };
+        let paths = paths_for(temp.path());
+        let plan = build_plan(&paths, &only(CATEGORY_WORKTREE_META), &refs);
+        assert_eq!(category(&plan, CATEGORY_WORKTREE_META).entry_count, 1);
+
+        fs::create_dir_all(&wt).unwrap();
+        fs::write(wt.join("keep.txt"), "new occupant\n").unwrap();
+        let summary = execute_sweep(&paths, &plan, true, false, &refs).unwrap();
+
+        assert_eq!(summary.removed, 0);
+        assert_eq!(summary.skipped, 1);
+        assert_eq!(summary.outcomes[0].reason, "worktree path exists again");
+        assert!(wt.join("keep.txt").exists());
+        assert!(Repository::open(&repo)
+            .unwrap()
+            .find_worktree("gone")
+            .is_ok());
     }
 
     #[test]

@@ -1349,7 +1349,8 @@ async fn collect_gc_refs(ctx: &Context) -> gc::GcRefs {
 
 /// Shared scan step for `gc.status` / `gc.plan` / `gc.sweep`.
 fn gc_scan(params: serde_json::Value, refs: gc::GcRefs) -> Result<gc::GcPlan, String> {
-    let opts: gc::GcOptions = serde_json::from_value(params).unwrap_or_default();
+    let opts: gc::GcOptions = serde_json::from_value(params)
+        .map_err(|error| format!("INVALID_PARAMS: invalid GC options: {error}"))?;
     let paths = gc::default_paths().ok_or_else(|| "cannot resolve home directory".to_string())?;
     Ok(gc::build_plan(&paths, &opts, &refs))
 }
@@ -1395,21 +1396,32 @@ async fn gc_status(ctx: &Context, req: &Request) -> Result<serde_json::Value, St
     Ok(result)
 }
 
+#[derive(Debug, serde::Deserialize, Default)]
+struct GcSweepFlags {
+    #[serde(default)]
+    apply: bool,
+    #[serde(default)]
+    force: bool,
+}
+
+fn parse_gc_sweep_flags(params: serde_json::Value) -> Result<GcSweepFlags, String> {
+    serde_json::from_value(params)
+        .map_err(|error| format!("INVALID_PARAMS: invalid GC sweep flags: {error}"))
+}
+
 async fn gc_sweep(ctx: &Context, req: &Request) -> Result<serde_json::Value, String> {
-    #[derive(serde::Deserialize, Default)]
-    struct SweepFlags {
-        #[serde(default)]
-        apply: bool,
-        #[serde(default)]
-        force: bool,
-    }
-    let flags: SweepFlags = serde_json::from_value(req.params.clone()).unwrap_or_default();
+    let flags = parse_gc_sweep_flags(req.params.clone())?;
 
     let plan = gc_scan_off_thread(ctx, req.params.clone()).await?;
+    // The scan may be expensive. Refresh live session/task references after it
+    // finishes so the apply pass cannot rely only on the snapshot from before
+    // the filesystem walk. `execute_sweep` also rechecks each worktree's git
+    // state immediately before removal.
+    let current_refs = collect_gc_refs(ctx).await;
     tokio::task::spawn_blocking(move || {
         let paths =
             gc::default_paths().ok_or_else(|| "cannot resolve home directory".to_string())?;
-        gc::execute_sweep(&paths, &plan, flags.apply, flags.force)
+        gc::execute_sweep(&paths, &plan, flags.apply, flags.force, &current_refs)
     })
     .await
     .map_err(|e| e.to_string())?
@@ -4529,6 +4541,19 @@ async fn query_gui_team_workers(app_socket: &str, team_id: &str) -> Vec<String> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn malformed_gc_params_fail_closed_instead_of_scanning_every_category() {
+        let error = gc_scan(
+            serde_json::json!({"categories": "team_results"}),
+            gc::GcRefs::default(),
+        )
+        .unwrap_err();
+        assert!(error.starts_with("INVALID_PARAMS:"));
+
+        let error = parse_gc_sweep_flags(serde_json::json!({"apply": "yes"})).unwrap_err();
+        assert!(error.starts_with("INVALID_PARAMS:"));
+    }
 
     fn leader_response(
         ok: bool,

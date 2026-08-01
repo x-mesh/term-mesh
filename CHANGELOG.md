@@ -11,7 +11,7 @@ All notable changes to term-mesh are documented here.
 
 ### Changed
 
-- **데몬이 6시간마다 파생 데이터만 정리한다** — 만료된 에이전트 리포트(24시간), 사라진 팀의 태스크보드(30일), 작업 디렉토리가 없어진 git worktree 등록 정보, 커진 로그가 대상이다. worktree와 체크아웃은 사람이 시키지 않으면 절대 지우지 않는다.
+- **데몬이 6시간마다 안전성이 입증된 파생 데이터만 정리한다** — 만료된 에이전트 리포트(24시간), 작업 디렉토리가 없어진 git worktree 등록 정보, 커진 로그가 대상이다. 살아 있는 팀의 정본을 알 수 없는 데몬 시작 시점에는 태스크보드를 자동 삭제하지 않으며, worktree와 체크아웃도 사람이 시키지 않으면 절대 지우지 않는다.
 - **`reload.sh`가 7일 지난 태그 빌드를 실제로 지운다** — 그동안은 삭제 명령을 출력만 했다. 실행 중인 태그와 소켓을 쓰고 있는 태그는 건너뛴다. `TERMMESH_RELOAD_TAG_GC_DAYS`로 기간을 바꾸고 `TERMMESH_RELOAD_TAG_GC=0`으로 끌 수 있다.
 - **`setup.sh`가 GhosttyKit 캐시를 최근 3개 SHA만 유지한다** — SHA마다 약 540MB가 무한히 쌓이던 것을 정리한다. 현재 쓰는 SHA와 심볼릭링크가 가리키는 SHA는 항상 남긴다. `TERMMESH_GHOSTTYKIT_CACHE_KEEP`으로 개수를 바꾼다.
 
