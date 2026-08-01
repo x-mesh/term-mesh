@@ -647,6 +647,13 @@ final class TeamDataStore: ObservableObject, @unchecked Sendable {
         else { return false }
         guard taskBoards[teamName]![index].textDeliveredAt == nil else { return false }
         taskBoards[teamName]![index].textDeliveredAt = moment
+        // What a replay after a restart reads is the board snapshot on disk,
+        // not this dictionary. Without the notify the mark lived only in
+        // memory: quit the app after a delivery landed and the next retry saw
+        // an undelivered task and pasted the same instruction a second time —
+        // the very hole `textDeliveredAt` exists to close.
+        noteTasksChanged()
+        notifyChanged()
         return true
     }
 

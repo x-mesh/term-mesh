@@ -3867,6 +3867,28 @@ final class TeamOrchestrator: ObservableObject {
         taskAlreadyExisted && textDeliveredAt != nil
     }
 
+    /// Whether a replayed request has to move its task to the instance that is
+    /// about to be pasted into.
+    ///
+    /// A replay reuses the task it created, but the instance that task names
+    /// may be gone — target selection then picked a live one, and leaving the
+    /// board behind points ownership at a pane that is not running the work.
+    ///
+    /// Only when this call actually pastes. A task already marked delivered is
+    /// left where it is: the new pane never saw that instruction, and moving it
+    /// would be the board claiming otherwise. Pure for the same reason as
+    /// `delegateMaySkipPaste` — `delegate` needs a `TabManager` and live panes,
+    /// so the rule has to be reachable without them (#135).
+    nonisolated static func delegateMustReassignReplay(
+        taskAlreadyExisted: Bool,
+        maySkipPaste: Bool,
+        taskInstanceId: String?,
+        targetInstanceId: String?
+    ) -> Bool {
+        guard taskAlreadyExisted, !maySkipPaste else { return false }
+        return taskInstanceId != targetInstanceId
+    }
+
     /// Statuses that release an agent back to the pool.
     ///
     /// Mirrors `TeamDataStore.hasActiveTask`, which owns the real gate. The two
@@ -4007,7 +4029,36 @@ final class TeamOrchestrator: ObservableObject {
             priority: priority ?? 2,
             requestId: requestId
         ) else { return .taskCreateFailed }
-        let task = creation.task
+        // A task that already exists may skip the paste only if that paste is
+        // known to have landed. Otherwise this is a retry of a delivery that
+        // never happened, and it has to happen now.
+        let maySkipPaste = Self.delegateMaySkipPaste(
+            taskAlreadyExisted: !creation.created,
+            textDeliveredAt: creation.task.textDeliveredAt
+        )
+        var task = creation.task
+        if Self.delegateMustReassignReplay(
+            taskAlreadyExisted: !creation.created,
+            maySkipPaste: maySkipPaste,
+            taskInstanceId: task.assigneeInstanceId,
+            targetInstanceId: target.agentInstanceId
+        ) {
+            // A move that failed used to fall back to the original task and
+            // paste anyway, which delivered the work to one pane while the
+            // board kept naming another — the exact state this reassignment
+            // exists to prevent, arrived at silently. Refuse instead: an
+            // undelivered turn the caller can retry beats a delivered one
+            // nobody can trace.
+            guard let moved = TeamDataStore.shared.reassignTask(
+                teamName: teamName,
+                taskId: task.id,
+                assignee: agentName,
+                assigneeInstanceId: target.agentInstanceId
+            ) else {
+                return .taskCreateFailed
+            }
+            task = moved
+        }
         let instruction = formatDelegateInstruction(
             teamName: teamName,
             target: target,
@@ -4015,13 +4066,7 @@ final class TeamOrchestrator: ObservableObject {
             text: text,
             context: context
         )
-        // A task that already exists may skip the paste only if that paste is
-        // known to have landed. Otherwise this is a retry of a delivery that
-        // never happened, and it has to happen now.
-        if Self.delegateMaySkipPaste(
-            taskAlreadyExisted: !creation.created,
-            textDeliveredAt: task.textDeliveredAt
-        ) {
+        if maySkipPaste {
             // Keep the same async completion ordering as the paste path. The
             // socket caller stores DelegateOutcome immediately after this
             // method returns; a synchronous callback could resume it first.
