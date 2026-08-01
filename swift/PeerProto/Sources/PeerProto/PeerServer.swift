@@ -818,7 +818,48 @@ actor AcceptedUnixConnection {
         }
     }
 
+    /// Serializes whole frames across concurrent writers.
+    ///
+    /// This is not an optimization — it is what keeps the wire parseable.
+    /// The loop below suspends when the socket buffer is full (EAGAIN),
+    /// and `actor` isolation does NOT survive a suspension: another task
+    /// could enter `write` and interleave its bytes into the middle of a
+    /// half-written frame. The client then reads a length prefix at the
+    /// wrong offset — observed as
+    /// `frameTooLarge(size: 1685024303)`, which is the ASCII "/nod" of a
+    /// `node_modules` path from the very PTY output being relayed.
+    ///
+    /// EAGAIN needs a full socket buffer, so this only bites under a heavy
+    /// output flood — where several writers (PTY data, Pong, HostStats)
+    /// are also most likely to overlap.
+    private var writeInFlight = false
+    private var writeWaiters: [CheckedContinuation<Void, Never>] = []
+
+    private func acquireWriteSlot() async {
+        guard writeInFlight else {
+            writeInFlight = true
+            return
+        }
+        await withCheckedContinuation { continuation in
+            writeWaiters.append(continuation)
+        }
+        // Ownership was handed over by `releaseWriteSlot`; `writeInFlight`
+        // deliberately stays true across the handoff so no third writer can
+        // slip in between the resume and this frame's first byte.
+    }
+
+    private func releaseWriteSlot() {
+        if writeWaiters.isEmpty {
+            writeInFlight = false
+        } else {
+            writeWaiters.removeFirst().resume()
+        }
+    }
+
     func write(_ data: Data) async throws {
+        if holder.isClosed { return }
+        await acquireWriteSlot()
+        defer { releaseWriteSlot() }
         if holder.isClosed { return }
         let bytes = Array(data)
         var offset = 0
@@ -835,9 +876,9 @@ actor AcceptedUnixConnection {
                 continue
             }
             if n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK) {
-                // Rare for Unix sockets with small frames; a brief yield
-                // lets the kernel buffer drain. Production code would
-                // use DispatchSourceWrite; PoC keeps it simple.
+                // Suspension point. Safe only because `acquireWriteSlot`
+                // above guarantees this task owns the socket until the
+                // frame is fully written — see the note on that method.
                 try await Task.sleep(nanoseconds: 1_000_000)
                 continue
             }
