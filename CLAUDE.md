@@ -270,6 +270,12 @@ tm-agent gc sweep --apply                   # actually reclaim
   or a checkout — see `AUTO_CATEGORIES` in `daemon/term-meshd/src/gc.rs`.
 - Removal goes through git, so the registration is pruned with the directory.
   Deleting the directory alone leaves a `prunable` entry behind.
+- **`git worktree remove` refuses any worktree containing a submodule**, and
+  every term-mesh worktree has `ghostty` — so that path always fails here. `gc`
+  handles it (delete the directory, then prune the registration), but
+  `git-kit worktree cleanup -y` **reports the removals and performs none**: it
+  swallows git's refusal and still returns `state: ok`. Verify with
+  `git worktree list` rather than trusting its output.
 - Build caches are reported (`--deep`) but reclaimed by the scripts that own
   them: `reload.sh` drops tag builds untouched for 7 days (override with
   `TERMMESH_RELOAD_TAG_GC_DAYS`, disable with `TERMMESH_RELOAD_TAG_GC=0`), and
