@@ -19,7 +19,9 @@ final class PeerHostStatsTests: XCTestCase {
         rx: UInt64 = 0,
         tx: UInt64 = 0,
         diskRead: UInt64 = 0,
-        diskWrite: UInt64 = 0
+        diskWrite: UInt64 = 0,
+        diskTotal: UInt64 = 0,
+        diskAvailable: UInt64 = 0
     ) -> Termmesh_Peer_V1_HostStats {
         var stats = Termmesh_Peer_V1_HostStats()
         stats.load1M = load
@@ -30,7 +32,49 @@ final class PeerHostStatsTests: XCTestCase {
         stats.netTxBytesPerSec = tx
         stats.diskReadBytesPerSec = diskRead
         stats.diskWriteBytesPerSec = diskWrite
+        stats.diskTotalBytes = diskTotal
+        stats.diskAvailableBytes = diskAvailable
         return stats
+    }
+
+    private static let gigabyte: UInt64 = 1024 * 1024 * 1024
+
+    /// A host that never reported capacity must not look full. Older peer
+    /// builds send nothing at all, and warning about a machine we know
+    /// nothing about is worse than staying quiet.
+    func testUnreportedCapacityIsNeverLow() {
+        let stats = PeerHostStats(wire())
+
+        XCTAssertFalse(stats.isDiskLow)
+        XCTAssertNil(stats.diskFreeText)
+    }
+
+    /// The absolute floor: a big disk with only a few gigabytes left still
+    /// cannot take another checkout plus its build output.
+    func testFewGigabytesLeftIsLowEvenOnALargeDisk() {
+        let stats = PeerHostStats(wire(
+            diskTotal: 2000 * Self.gigabyte,
+            diskAvailable: 4 * Self.gigabyte
+        ))
+
+        XCTAssertTrue(stats.isDiskLow)
+        XCTAssertEqual(stats.diskFreeText, "4.3GB free")
+    }
+
+    /// The proportional floor catches a small disk that is nearly full even
+    /// though it clears the absolute one.
+    func testUnderTenPercentIsLowEvenWithRoomToSpare() {
+        let nearlyFull = PeerHostStats(wire(
+            diskTotal: 100 * Self.gigabyte,
+            diskAvailable: 9 * Self.gigabyte
+        ))
+        let comfortable = PeerHostStats(wire(
+            diskTotal: 100 * Self.gigabyte,
+            diskAvailable: 40 * Self.gigabyte
+        ))
+
+        XCTAssertTrue(nearlyFull.isDiskLow)
+        XCTAssertFalse(comfortable.isDiskLow)
     }
 
     func testSummaryLeadsWithAllThreeLoadAverages() {
