@@ -119,6 +119,10 @@ SHARED_CARGO_TARGET=""
 MIN_FREE_GIB="${TERMMESH_BUILD_MIN_FREE_GIB:-10}"
 MANAGED_DERIVED=0
 BUILD_LAUNCHED=0
+# Set before the build when this tag's derived data is already on disk, so the
+# failure trap can tell "the build I just started" from "the build that is
+# already working".
+DERIVED_PREEXISTING=0
 
 safe_managed_tag_path() {
   local path="$1"
@@ -173,6 +177,19 @@ reclaim_ended_tag_sessions() {
        || "$command" == *"/private/tmp/term-mesh-${tag}/"* ]]; then
       continue
     fi
+    # The manifest is a hint, not proof. It is written after `open` returns, so
+    # a launch whose `pgrep` came back empty leaves the previous run's PID in
+    # place; `ps` failing for any other reason is indistinguishable from that
+    # PID being gone. Either way the app can still be running, and this path
+    # deletes the directory it is running from. `reclaim_stale_tag_builds`
+    # already refuses on exactly these two checks — a PID probe must not be the
+    # weaker test.
+    if tag_is_running "$tag"; then
+      continue
+    fi
+    if path_in_use "$HOME/Library/Application Support/term-mesh/term-meshd-dev-${tag}.sock"; then
+      continue
+    fi
     if remove_tag_artifacts "$tag"; then
       rm -f "$manifest"
       echo "  reclaimed ended session ${tag}"
@@ -200,9 +217,17 @@ ensure_build_space() {
   fi
 }
 
+# Reclaim what THIS run created, and only that.
+#
+# The trap is armed before xcodebuild, but the tag's previous app is not stopped
+# until after the build succeeds — so on a failed rebuild of a tag that is
+# already running, "clean up the failed build" used to mean deleting the
+# DerivedData that live app was launched from, plus its sockets, log and cargo
+# target. A rebuild that fails must leave the working build alone.
 cleanup_failed_build() {
   local status="$?"
-  if [[ "$status" -ne 0 && "$MANAGED_DERIVED" -eq 1 && "$BUILD_LAUNCHED" -eq 0 ]]; then
+  if [[ "$status" -ne 0 && "$MANAGED_DERIVED" -eq 1 && "$BUILD_LAUNCHED" -eq 0 \
+     && "$DERIVED_PREEXISTING" -eq 0 ]] && ! tag_is_running "${TAG_SLUG:-}"; then
     remove_tag_artifacts "${TAG_SLUG:-}" || true
     rm -f "${TAG_SESSION_ROOT}/${TAG_SLUG:-}.session"
     echo "  reclaimed failed tag build ${TAG_SLUG:-unknown}" >&2
@@ -351,6 +376,14 @@ print_tag_cleanup_reminder() {
   echo "  ./scripts/reload.sh --tag ${current_slug} --cleanup"
 }
 
+# Everything above is definitions. `scripts/test-reload-cleanup.sh` sources this
+# file with TERMMESH_RELOAD_LIB_ONLY=1 to exercise the reclaim/deletion helpers
+# directly — they delete directories, and until now the only check on them was
+# `bash -n`, which proves the file parses and nothing else.
+if [[ -n "${TERMMESH_RELOAD_LIB_ONLY:-}" ]]; then
+  return 0 2>/dev/null || exit 0
+fi
+
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --tag)
@@ -461,6 +494,11 @@ mkdir -p "$TAG_TMP_ROOT" "$TAG_SESSION_ROOT" "$SHARED_SWIFTPM_CACHE" "$SHARED_CA
 reclaim_ended_tag_sessions "$TAG_SLUG"
 reclaim_stale_tag_builds "$TAG_SLUG"
 ensure_build_space
+# Recorded after the reclaim passes above, so a directory they just removed does
+# not count as pre-existing.
+if [[ "$MANAGED_DERIVED" -eq 1 && -e "$DERIVED_DATA" ]]; then
+  DERIVED_PREEXISTING=1
+fi
 trap cleanup_failed_build EXIT
 
 XCODEBUILD_ARGS=(
@@ -587,16 +625,28 @@ if [[ -n "${TERMMESH_SOCKET:-}" ]]; then
   rm -f "$TERMMESH_SOCKET"
 fi
 
+# The daemon build's failure used to be swallowed (`2>/dev/null || true`), and
+# the copy below then fell back to a target directory this script no longer
+# writes. A tag whose Rust code did not compile therefore launched with whatever
+# binary an earlier build or another branch had left there, and said nothing.
+# Distinguish the two cases that were conflated: a machine that cannot build the
+# daemon at all is a warning; a daemon build that failed is fatal.
 if [[ -d "$PWD/daemon" && -f "$PWD/daemon/Cargo.toml" ]]; then
-  (cd "$PWD/daemon" && CARGO_TARGET_DIR="$SHARED_CARGO_TARGET" cargo build --release 2>/dev/null) || true
+  if ! command -v cargo >/dev/null 2>&1; then
+    echo "warning: cargo not found — no daemon binaries will be copied into the bundle" >&2
+  elif ! (cd "$PWD/daemon" && CARGO_TARGET_DIR="$SHARED_CARGO_TARGET" cargo build --release); then
+    echo "error: daemon build failed — refusing to launch with a daemon this build did not produce" >&2
+    exit 1
+  fi
 fi
 BIN_DIR="$APP_PATH/Contents/Resources/bin"
 mkdir -p "$BIN_DIR"
 for bin in term-meshd term-mesh-run tm-agent term-mesh-peer-relay; do
+  # This tag's own build output only. The fallback to $PWD/daemon/target/release
+  # was the second half of the swallowed-failure bug above: that directory is no
+  # longer written by this script, so it holds whatever an old manual
+  # `cargo build` left there — possibly from another branch entirely.
   src="$SHARED_CARGO_TARGET/release/$bin"
-  if [[ ! -x "$src" ]]; then
-    src="$PWD/daemon/target/release/$bin"
-  fi
   if [[ -x "$src" ]]; then
     cp "$src" "$BIN_DIR/$bin"
     chmod +x "$BIN_DIR/$bin"

@@ -289,7 +289,10 @@ tm-agent gc sweep --apply                   # actually reclaim
   `term-meshd` would land at the same path, and since the daemon build's
   failure is swallowed, a tag whose build broke would ship whichever branch
   last built successfully. `TERMMESH_CARGO_TARGET_DIR` overrides the path and
-  takes that collision on itself. reload refuses to start below 10 GiB free
+  takes that collision on itself. Only the binaries the current build produced
+  are copied into the bundle — a daemon build that fails is fatal rather than
+  falling back to `daemon/target/release`, which this script no longer writes.
+  reload refuses to start below 10 GiB free
   (`TERMMESH_BUILD_MIN_FREE_GIB` overrides the threshold). At task completion,
   `./scripts/reload.sh --tag <tag> --cleanup` stops that app and immediately
   reclaims its managed DerivedData, sockets, log, manifest, and Cargo target.
@@ -306,8 +309,15 @@ VERIFY:
 
 ```bash
 (cd daemon && cargo test -p term-meshd gc:: && cargo test -p term-meshd host_stats)
-bash -n scripts/reload.sh
+./scripts/test-reload-cleanup.sh
 ```
+
+`bash -n` alone proves the file parses and nothing else, which is not a useful
+check on code that runs `rm -rf`. `test-reload-cleanup.sh` sources reload.sh with
+`TERMMESH_RELOAD_LIB_ONLY=1` and drives the reclaim helpers against a sandbox:
+path-guard rejections, per-tag isolation, and the two cases where reclamation
+must refuse — a tag whose app is still running behind a stale manifest PID, and a
+rebuild that failed while the previous build is live.
 
 ## Pitfalls
 
