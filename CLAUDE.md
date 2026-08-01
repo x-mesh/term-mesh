@@ -245,6 +245,45 @@ Rules learned the hard way:
 - Driving the app calls `debug.app.activate`, which **steals focus from the
   user**. Batch the probes, and stop once verified.
 
+## Disk reclamation (`tm-agent gc`)
+
+Three subsystems create worktrees and none knows about the others — the daemon
+(`~/.term-mesh/worktrees/<repo>/term-mesh_wt_<8hex>`), git-kit via
+`tm-agent delegate --worktree` (`~/.gk/worktree/...`), and `PeerProjectBootstrap`
+agent checkouts (`<root>/<project>-<role>-<yyMMdd>-<hex4>` on an `agent/*`
+branch). Plus per-team results, task boards, logs and build caches. `gc` is the
+one place that accounts for all of it, locally or on a peer.
+
+```bash
+tm-agent gc status                          # size + candidate count per category
+tm-agent gc plan [--category X] [--deep]    # every candidate with reasons/blockers
+tm-agent gc sweep                           # dry-run — shows what would go
+tm-agent gc sweep --apply                   # actually reclaim
+```
+
+- **Dry-run is the default.** `sweep` without `--apply` deletes nothing.
+- **Blockers beat `--apply`.** Uncommitted changes, commits missing from the
+  parent repo, and worktrees an active session or task still points at are
+  never removed. `--force` relaxes exactly one blocker (`unopenable`).
+- **The daemon's own 6h sweep is narrower still**: only `team_results` (24h),
+  `team_boards` (30d), `worktree_meta` and `logs`. It never removes a worktree
+  or a checkout — see `AUTO_CATEGORIES` in `daemon/term-meshd/src/gc.rs`.
+- Removal goes through git, so the registration is pruned with the directory.
+  Deleting the directory alone leaves a `prunable` entry behind.
+- Build caches are reported (`--deep`) but reclaimed by the scripts that own
+  them: `reload.sh` drops tag builds untouched for 7 days (override with
+  `TERMMESH_RELOAD_TAG_GC_DAYS`, disable with `TERMMESH_RELOAD_TAG_GC=0`), and
+  `setup.sh` keeps the 3 most recently used GhosttyKit SHAs
+  (`TERMMESH_GHOSTTYKIT_CACHE_KEEP`).
+- Peers report free space in `HostStats`, and the sidebar shows a warning badge
+  under 5GB or 10%. Run `tm-agent gc` over ssh on that host to reclaim.
+
+VERIFY:
+
+```bash
+cd daemon && cargo test -p term-meshd gc:: && cargo test -p term-meshd host_stats
+```
+
 ## Pitfalls
 
 - **Custom UTTypes** for drag-and-drop must be declared in `Resources/Info.plist` under `UTExportedTypeDeclarations` (e.g. `com.splittabbar.tabtransfer`, `com.termmesh.sidebar-tab-reorder`).
