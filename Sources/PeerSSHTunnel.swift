@@ -44,6 +44,91 @@ enum PeerSSHTunnelState: Sendable, Equatable {
     case failed(reason: String)
 }
 
+/// Rolling tail of a child process pipe.
+///
+/// Two jobs, both learned from tunnels that "just exited":
+///
+/// 1. **Drain.** Nothing read ssh's stderr/stdout between spawn and exit,
+///    so a chatty tunnel could fill the 64 KB pipe buffer and block ssh
+///    itself inside `write()`. A continuous reader cannot fill.
+/// 2. **Remember.** `terminationHandler` needs ssh's last words
+///    ("Timeout, server not responding.") to say *why* the tunnel died,
+///    and by then a one-shot `availableData` read is racing EOF.
+private final class SSHPipeTail: @unchecked Sendable {
+    private let limit: Int
+    private let lock = NSLock()
+    private var buffer = Data()
+    private var sawEOF = false
+
+    init(limit: Int = 4096) {
+        self.limit = limit
+    }
+
+    func attach(_ pipe: Pipe) {
+        pipe.fileHandleForReading.readabilityHandler = { [weak self] handle in
+            let chunk = handle.availableData
+            guard let self else {
+                handle.readabilityHandler = nil
+                return
+            }
+            guard !chunk.isEmpty else {
+                // Empty read == EOF. Clearing the handler is mandatory: an
+                // fd at EOF stays readable forever and would spin a core.
+                handle.readabilityHandler = nil
+                self.markEOF()
+                return
+            }
+            self.append(chunk)
+        }
+    }
+
+    /// Last bytes as text, condensed to the final `lines` non-empty lines
+    /// so one tunnel-down entry stays one log line.
+    ///
+    /// `waitForEOFUpTo` covers the exit race: ssh writes its parting
+    /// diagnostic and exits, so `terminationHandler` can easily run before
+    /// the reader queue has picked those bytes up. The child is already
+    /// gone by then, so EOF lands in milliseconds — the cap only bounds
+    /// the pathological case.
+    func snapshot(waitForEOFUpTo timeout: TimeInterval = 0, lines: Int = 2) -> String {
+        if timeout > 0 {
+            let deadline = Date().addingTimeInterval(timeout)
+            while !isEOF, Date() < deadline {
+                Thread.sleep(forTimeInterval: 0.02)
+            }
+        }
+        lock.lock()
+        let data = buffer
+        lock.unlock()
+        return String(decoding: data, as: UTF8.self)
+            .split(whereSeparator: \.isNewline)
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+            .suffix(lines)
+            .joined(separator: " | ")
+    }
+
+    private var isEOF: Bool {
+        lock.lock(); defer { lock.unlock() }
+        return sawEOF
+    }
+
+    private func markEOF() {
+        lock.lock()
+        sawEOF = true
+        lock.unlock()
+    }
+
+    private func append(_ chunk: Data) {
+        lock.lock()
+        buffer.append(chunk)
+        if buffer.count > limit {
+            buffer.removeFirst(buffer.count - limit)
+        }
+        lock.unlock()
+    }
+}
+
 final class PeerSSHTunnel: @unchecked Sendable {
     let sshTarget: String
     let remoteSockPath: String
@@ -448,7 +533,13 @@ final class PeerSSHTunnel: @unchecked Sendable {
             "-S", "none",
             "-o", "ControlMaster=no",
             "-o", "ControlPersist=no",
-            "-o", "LogLevel=ERROR",
+            // INFO, not ERROR: the one message that explains a tunnel
+            // dying mid-session — "Timeout, server not responding." after
+            // ServerAliveCountMax — is logged by OpenSSH at INFO, so
+            // ERROR threw away the exit reason we most needed. Nothing
+            // here reaches the user directly; stderr is drained into a
+            // 4 KB tail and only surfaces on the `Tunnel down` line.
+            "-o", "LogLevel=INFO",
             "-o", "ExitOnForwardFailure=yes",
             "-o", "ServerAliveInterval=15",
             "-o", "ServerAliveCountMax=3",
@@ -473,6 +564,13 @@ final class PeerSSHTunnel: @unchecked Sendable {
         proc.standardError = errPipe
         proc.standardOutput = outPipe
         proc.standardInput = nil
+        // Both pipes are drained for the life of the process. stderr's tail
+        // is the diagnostic; stdout is drained purely so the forced tty
+        // (`-tt`) writing a login banner can never wedge ssh on a full pipe.
+        let errTail = SSHPipeTail()
+        let outTail = SSHPipeTail(limit: 512)
+        errTail.attach(errPipe)
+        outTail.attach(outPipe)
 
         // ssh exited — schedule reconnect if the caller still wants
         // the tunnel up. Runs on a background thread; we hop to main
@@ -490,7 +588,13 @@ final class PeerSSHTunnel: @unchecked Sendable {
             let stillWants = self.wantsRunning
             self.lock.unlock()
             if stillWants {
-                self.scheduleReconnect()
+                // Carry ssh's own account of its death into `.down`.
+                // A bare "ssh exited" cannot distinguish a keepalive
+                // timeout under output backpressure from a network drop
+                // or a remote reboot, and those want opposite fixes.
+                self.scheduleReconnect(
+                    reason: Self.exitReason(for: terminated, stderrTail: errTail)
+                )
             }
         }
 
@@ -509,29 +613,44 @@ final class PeerSSHTunnel: @unchecked Sendable {
         while !fm.fileExists(atPath: localSockPath) {
             if Date() > deadline {
                 terminateCurrentProcess()
-                let stderrData = errPipe.fileHandleForReading.availableData
-                let detail = String(data: stderrData, encoding: .utf8) ?? "(no stderr)"
                 throw PeerSSHTunnelError.socketNeverAppeared(
-                    "ssh forward never created \(localSockPath); ssh stderr: \(detail.trimmingCharacters(in: .whitespacesAndNewlines))"
+                    "ssh forward never created \(localSockPath); ssh stderr: \(errTail.snapshot(waitForEOFUpTo: 0.2, lines: 4))"
                 )
             }
             if !proc.isRunning {
-                let stderrData = errPipe.fileHandleForReading.availableData
-                let detail = String(data: stderrData, encoding: .utf8) ?? "(no stderr)"
                 throw PeerSSHTunnelError.spawnFailed(
-                    "ssh exited with code \(proc.terminationStatus); stderr: \(detail.trimmingCharacters(in: .whitespacesAndNewlines))"
+                    Self.exitReason(for: proc, stderrTail: errTail)
                 )
             }
             try await Task.sleep(nanoseconds: 150_000_000)
         }
 
         if !proc.isRunning {
-            let stderrData = errPipe.fileHandleForReading.availableData
-            let detail = String(data: stderrData, encoding: .utf8) ?? "(no stderr)"
             throw PeerSSHTunnelError.spawnFailed(
-                "ssh exited after creating \(localSockPath); stderr: \(detail.trimmingCharacters(in: .whitespacesAndNewlines))"
+                "ssh exited after creating \(localSockPath); "
+                    + Self.exitReason(for: proc, stderrTail: errTail)
             )
         }
+    }
+
+    /// One line naming how ssh died and what it said on the way out.
+    ///
+    /// The exit code alone is nearly useless here — OpenSSH reports almost
+    /// every failure as 255 — so the stderr tail is the part that carries
+    /// information. `(no stderr)` is itself a signal: it means ssh was
+    /// killed rather than having reached its own error path.
+    private static func exitReason(for proc: Process, stderrTail: SSHPipeTail) -> String {
+        let how = proc.terminationReason == .uncaughtSignal
+            ? "ssh killed by signal \(proc.terminationStatus)"
+            : "ssh exited with code \(proc.terminationStatus)"
+        // 4 lines, not 2: an `ExitOnForwardFailure` bind rejection spans
+        // three ("bind: …", "cannot listen to port", "Could not request
+        // local forwarding.") and INFO may append a closing line after
+        // them. `looksLikeForwardBindFailure` reads this string, so a
+        // window too small to hold all three would silently disable the
+        // dashboard-forward retry.
+        let detail = stderrTail.snapshot(waitForEOFUpTo: 0.2, lines: 4)
+        return detail.isEmpty ? "\(how) (no stderr)" : "\(how): \(detail)"
     }
 
     private func terminateCurrentProcess() {
