@@ -285,6 +285,22 @@ pub fn default_socket_path() -> PathBuf {
     dir.join("term-meshd.sock")
 }
 
+/// Clear whatever occupies the socket path before binding.
+///
+/// `Path::exists` follows symlinks, so a dangling one — `/tmp/term-meshd.sock`
+/// pointing at a `/run/user/<uid>` socket from a session that has since ended —
+/// reads as absent and survives the cleanup. `bind` then sees the link entry
+/// itself and fails with `EADDRINUSE`, so the daemon exits, systemd restarts
+/// it, and it fails again on the same link. Ask about the directory entry
+/// rather than about what it points at.
+fn clear_stale_socket_entry(path: &std::path::Path) -> std::io::Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => std::fs::remove_file(path),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
 pub async fn serve(
     path: PathBuf,
     monitor_rx: watch::Receiver<Option<SystemSnapshot>>,
@@ -302,9 +318,7 @@ pub async fn serve(
     >,
     mut shutdown_rx: watch::Receiver<bool>,
 ) -> anyhow::Result<()> {
-    if path.exists() {
-        std::fs::remove_file(&path)?;
-    }
+    clear_stale_socket_entry(&path)?;
 
     let listener = bind_with_tight_umask(&path)?;
     harden_socket_permissions(&path);
@@ -5238,5 +5252,38 @@ mod tests {
         // Missing file / empty dir yields empty.
         assert!(super::board_recent_rows("/nonexistent/path", 10).is_empty());
         assert!(super::board_recent_rows(&wd_str, 0).is_empty());
+    }
+
+    /// A `/run/user/<uid>` socket disappears with the session that made it,
+    /// leaving `/tmp/term-meshd.sock` pointing at nothing. The daemon must
+    /// still be able to bind there.
+    #[test]
+    fn stale_socket_entry_is_cleared_even_when_the_symlink_dangles() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("term-meshd.sock");
+        std::os::unix::fs::symlink(dir.path().join("gone.sock"), &socket).unwrap();
+        assert!(!socket.exists(), "the target is absent, so exists() is false");
+
+        super::clear_stale_socket_entry(&socket).unwrap();
+
+        assert!(
+            std::fs::symlink_metadata(&socket).is_err(),
+            "the dangling link itself must be gone, or bind reports EADDRINUSE"
+        );
+        std::os::unix::net::UnixListener::bind(&socket).expect("the path is bindable");
+    }
+
+    #[test]
+    fn stale_socket_entry_clears_a_real_socket_and_tolerates_an_absent_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("term-meshd.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        drop(listener);
+
+        super::clear_stale_socket_entry(&socket).unwrap();
+        assert!(std::fs::symlink_metadata(&socket).is_err());
+
+        super::clear_stale_socket_entry(&dir.path().join("never-existed.sock"))
+            .expect("an absent path is not an error");
     }
 }

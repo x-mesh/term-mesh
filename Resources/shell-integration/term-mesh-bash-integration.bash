@@ -179,3 +179,95 @@ _termmesh_fix_path
 unset -f _termmesh_fix_path
 
 _termmesh_install_prompt_command
+
+# Install xterm-ghostty terminfo on a remote host, once per host.
+#
+# Same rationale as the zsh copy — see term-mesh-zsh-integration.zsh for the
+# full reasoning. In short, ghostty's own ssh wrapper cannot cache inside
+# term-mesh (no `ghostty` executable in the bundle) and re-runs the remote
+# command because it passes "$@" to the install connection.
+#
+# Note that bash panes only get this if something sources this file; unlike
+# zsh, term-mesh does not inject it automatically.
+
+# Keep only the connection part of an ssh command line (options plus
+# destination) in _termmesh_ssh_conn, dropping the remote command. Options
+# that take a value must be consumed with their value, or `ssh -p 22 host cmd`
+# would read "22" as the destination.
+_termmesh_ssh_split() {
+    _termmesh_ssh_conn=()
+    while (( $# )); do
+        case "$1" in
+            -[bcDEeFIiJLlmOopQRSWw])
+                _termmesh_ssh_conn+=("$1")
+                shift
+                (( $# )) && { _termmesh_ssh_conn+=("$1"); shift; }
+                ;;
+            -[bcDEeFIiJLlmOopQRSWw]*)
+                _termmesh_ssh_conn+=("$1")
+                shift
+                ;;
+            -*)
+                _termmesh_ssh_conn+=("$1")
+                shift
+                ;;
+            *)
+                _termmesh_ssh_conn+=("$1")
+                return 0
+                ;;
+        esac
+    done
+}
+
+ssh() {
+    local ssh_term="xterm-256color"
+    local -a ssh_opts=()
+
+    if [[ "${GHOSTTY_SHELL_FEATURES:-}" == *ssh-env* ]]; then
+        ssh_opts+=(-o "SendEnv COLORTERM TERM_PROGRAM TERM_PROGRAM_VERSION")
+    fi
+
+    if [[ "${GHOSTTY_SHELL_FEATURES:-}" == *ssh-terminfo* ]]; then
+        local ssh_user ssh_hostname ssh_port ssh_key ssh_value
+        while IFS=' ' read -r ssh_key ssh_value; do
+            case "$ssh_key" in
+                user) ssh_user="$ssh_value" ;;
+                hostname) ssh_hostname="$ssh_value" ;;
+                port) ssh_port="$ssh_value" ;;
+            esac
+        done < <(command ssh -G "$@" 2>/dev/null)
+
+        if [[ -n "$ssh_hostname" ]]; then
+            local ssh_cache_dir="${XDG_CACHE_HOME:-$HOME/.cache}/term-mesh/ssh-terminfo"
+            local ssh_cache_key="${ssh_user:-unknown}@${ssh_hostname}:${ssh_port:-22}"
+            local ssh_cache_file="$ssh_cache_dir/${ssh_cache_key//\//_}"
+
+            if [[ -f "$ssh_cache_file" ]]; then
+                ssh_term="xterm-ghostty"
+            elif command -v infocmp >/dev/null 2>&1; then
+                local ssh_terminfo
+                ssh_terminfo=$(infocmp -0 -x xterm-ghostty 2>/dev/null)
+                if [[ -n "$ssh_terminfo" ]]; then
+                    printf 'Installing xterm-ghostty terminfo on %s...\n' "$ssh_hostname" >&2
+                    _termmesh_ssh_split "$@"
+                    if printf '%s' "$ssh_terminfo" | command ssh \
+                        "${ssh_opts[@]}" "${_termmesh_ssh_conn[@]}" '
+                        infocmp xterm-ghostty >/dev/null 2>&1 && exit 0
+                        command -v tic >/dev/null 2>&1 || exit 1
+                        mkdir -p ~/.terminfo 2>/dev/null && tic -x - 2>/dev/null && exit 0
+                        exit 1
+                    ' 2>/dev/null; then
+                        ssh_term="xterm-ghostty"
+                        mkdir -p "$ssh_cache_dir" 2>/dev/null &&
+                            : > "$ssh_cache_file" 2>/dev/null
+                    else
+                        printf 'term-mesh: no xterm-ghostty terminfo on %s, using %s\n' \
+                            "$ssh_hostname" "$ssh_term" >&2
+                    fi
+                fi
+            fi
+        fi
+    fi
+
+    TERM="$ssh_term" COLORTERM=truecolor command ssh "${ssh_opts[@]}" "$@"
+}

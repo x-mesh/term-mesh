@@ -77,25 +77,22 @@ cask "term-mesh" do
     strategy :github_latest
   end
 
-  depends_on macos: ">= :ventura"
-
-  # Quit a running term-mesh before brew tries to replace the bundle.
-  # macOS technically allows replacing a running .app via rename, but
-  # brew-cask sometimes silently no-ops the move when the app holds an
-  # active LaunchServices registration — leaving the user on the old
-  # version with a "successfully installed" message. Quitting first
-  # eliminates the race for both fresh installs and upgrades.
-  preflight do
-    system_command "/usr/bin/osascript",
-                   args: ["-e", 'tell application "term-mesh" to quit'],
-                   must_succeed: false
-    sleep 2
-  end
+  depends_on macos: :ventura
 
   app "term-mesh.app"
-
   binary "#{appdir}/term-mesh.app/Contents/Resources/bin/tm-agent"
   binary "#{appdir}/term-mesh.app/Contents/Resources/bin/term-mesh-run"
+
+  # Fresh installs never run the uninstall stanza below, so a hand-installed
+  # copy could still be holding the bundle when brew moves the new one in.
+  # pkill matches on process name only, so unlike AppleScript it can never
+  # put up a GUI prompt — see the uninstall comment for why that matters.
+  preflight do
+    quit = system_command "/usr/bin/pkill",
+                          args:         ["-x", "term-mesh"],
+                          must_succeed: false
+    sleep 2 if quit.success?
+  end
 
   postflight do
     system_command "/usr/bin/xattr",
@@ -103,12 +100,30 @@ cask "term-mesh" do
                    sudo: false
   end
 
+  # Quit a running term-mesh before brew replaces the bundle. macOS
+  # technically allows replacing a running .app via rename, but brew-cask
+  # sometimes silently no-ops the move when the app holds an active
+  # LaunchServices registration — leaving the user on the old version with a
+  # "successfully installed" message.
+  #
+  # This belongs in \`uninstall quit:\`, which brew runs on upgrade while the
+  # old bundle is still in place, so the bundle id resolves and the app exits
+  # gracefully before the move.
+  #
+  # Do NOT do this from \`preflight\` with a name-based AppleScript
+  # (\`tell application "term-mesh" to quit\`): on upgrade, preflight runs
+  # *after* brew has already removed /Applications/term-mesh.app, macOS cannot
+  # resolve the name, and it puts up a blocking "choose application" chooser.
+  # The upgrade then hangs until a human dismisses it — \`must_succeed: false\`
+  # does not help, because the call never returns at all.
+  uninstall quit: "com.termmesh.app"
+
   zap trash: [
+    "~/.term-mesh",
     "~/Library/Application Support/term-mesh",
     "~/Library/Caches/com.termmesh.app",
     "~/Library/Preferences/com.termmesh.app.plist",
     "~/Library/Saved Application State/com.termmesh.app.savedState",
-    "~/.term-mesh",
   ]
 
   caveats <<~CAVEATS
