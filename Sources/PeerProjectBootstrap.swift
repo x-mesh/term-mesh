@@ -854,9 +854,42 @@ enum PeerProjectBootstrap {
     /// at least two components below `/` (`/tmp/project`, `/app/projects`, …);
     /// broad roots and relative paths never reach `rm`.
     static func deletionScript(paths: [String]) throws -> String {
-        let safePaths = try Array(Set(paths)).sorted().map(validatedDeletablePath)
+        let safePaths = try Array(Set(paths)).sorted().map(deletableShellWord)
         guard !safePaths.isEmpty else { throw DeletionError.unsafePath("") }
-        return "rm -rf -- " + safePaths.map(quote).joined(separator: " ")
+        return "rm -rf -- " + safePaths.joined(separator: " ")
+    }
+
+    /// One path, as the word the peer's shell will read.
+    ///
+    /// A project recorded as `~/work/projects/demo` names the peer's home, not
+    /// this machine's, so expanding the tilde here would delete the wrong
+    /// directory whenever the two accounts differ — and rejecting it outright
+    /// (what happened before) failed the whole batch, so the sibling checkouts
+    /// that were perfectly deletable stayed on the peer too. Leave the
+    /// expansion to the host as an unquoted `"$HOME"`, and validate the
+    /// remainder the same way an absolute path is validated. `$HOME` is itself
+    /// at least two components deep, so one component below it is specific
+    /// enough; `~` and `~/` alone are not.
+    private static func deletableShellWord(_ path: String) throws -> String {
+        let trimmed = path.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard trimmed.hasPrefix("~/") else {
+            return quote(try validatedDeletablePath(trimmed))
+        }
+        // Resolved component by component rather than through
+        // `standardizingPath`, which also rewrites `/private` prefixes — a
+        // rule about this machine's filesystem that must not reach a path
+        // being resolved against another machine's home. A `..` with nothing
+        // left to pop is dropped, so no input climbs above `$HOME`.
+        var components: [Substring] = []
+        for component in trimmed.dropFirst(2).split(separator: "/") {
+            switch component {
+            case ".": continue
+            case "..": if !components.isEmpty { components.removeLast() }
+            default: components.append(component)
+            }
+        }
+        guard !components.isEmpty else { throw DeletionError.unsafePath(path) }
+        return "\"$HOME\"" + quote("/" + components.joined(separator: "/"))
     }
 
     private static func validatedDeletablePath(_ path: String) throws -> String {

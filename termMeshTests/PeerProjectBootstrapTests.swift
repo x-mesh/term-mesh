@@ -763,6 +763,49 @@ final class PeerProjectBootstrapTests: XCTestCase {
         )
     }
 
+    /// The tilde belongs to the peer's account, so the host expands it. The
+    /// word stays one word: `"$HOME"` unquoted, the remainder quoted.
+    func test_project_deletion_leaves_home_relative_paths_for_the_host_to_expand() throws {
+        let script = try PeerProjectBootstrap.deletionScript(paths: [
+            "~/work/tm-projects/demo",
+        ])
+
+        XCTAssertEqual(script, "rm -rf -- \"$HOME\"'/work/tm-projects/demo'")
+    }
+
+    /// A project recorded with one home-relative path among its absolute ones
+    /// used to fail every path in the batch, leaving the whole project on the
+    /// peer. Each path now stands on its own.
+    func test_project_deletion_keeps_absolute_paths_when_one_is_home_relative() throws {
+        let script = try PeerProjectBootstrap.deletionScript(paths: [
+            "/Users/peer/work/tm-projects/demo",
+            "/Users/peer/work/tm-projects/demo-executor-260803-8bdf",
+            "~/work/tm-projects/demo",
+        ])
+
+        XCTAssertEqual(
+            script,
+            "rm -rf -- '/Users/peer/work/tm-projects/demo' "
+                + "'/Users/peer/work/tm-projects/demo-executor-260803-8bdf' "
+                + "\"$HOME\"'/work/tm-projects/demo'"
+        )
+    }
+
+    func test_project_deletion_confines_home_relative_paths_to_the_home_directory() throws {
+        let script = try PeerProjectBootstrap.deletionScript(paths: ["~/../demo/./work"])
+
+        XCTAssertEqual(script, "rm -rf -- \"$HOME\"'/demo/work'")
+    }
+
+    func test_project_deletion_rejects_the_home_directory_itself() {
+        for path in ["~", "~/", "~/.", "~/..", "~/../.."] {
+            XCTAssertThrowsError(
+                try PeerProjectBootstrap.deletionScript(paths: [path]),
+                "expected \(path) to be refused"
+            )
+        }
+    }
+
     func test_remote_git_ssh_auth_failure_has_an_actionable_message() {
         let error = PeerHostReadinessError.sshFailed(
             """

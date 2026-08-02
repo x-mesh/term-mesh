@@ -60,7 +60,12 @@ extension TeamOrchestrator {
         var idLabel: String { id.prefix(4).map { String(format: "%02x", $0) }.joined() }
     }
 
-    enum RemoteAgentError: Error, CustomStringConvertible {
+    /// `LocalizedError` is what puts `description` in front of the user. An
+    /// alert reads `localizedDescription`, and a plain `Error` answers that
+    /// with "(term_mesh.TeamOrchestrator.RemoteAgentError error 12.)" — so a
+    /// deletion report naming every path that survived was being discarded at
+    /// the one moment it mattered.
+    enum RemoteAgentError: LocalizedError, CustomStringConvertible {
         case teamNotFound(String)
         case hostNotFound(String)
         case hostNotConnected(String)
@@ -111,6 +116,8 @@ extension TeamOrchestrator {
                 return "closed \(closed) shell(s); \(failed) refused — \(reason)"
             }
         }
+
+        var errorDescription: String? { description }
     }
 
     nonisolated static func requiredRemoteWorkingDirectory(
@@ -3085,6 +3092,11 @@ extension TeamOrchestrator {
             let report = "deleted=[\(deleted.joined(separator: ", "))]; "
                 + "remaining=[\(remaining.joined(separator: ", "))]; "
                 + "failures=[\(failures.joined(separator: "; "))]"
+            // The alert is dismissed and the report goes with it. Remote Work
+            // is where the user is already looking for what a peer did, and a
+            // partial deletion is exactly the thing to compare against the
+            // next attempt.
+            RemoteWorkLog.info("Could not delete \(teamName): \(report)")
             throw RemoteAgentError.projectDeletionIncomplete(report)
         }
         _ = destroyTeam(name: teamName, tabManager: tabManager, archive: false)
