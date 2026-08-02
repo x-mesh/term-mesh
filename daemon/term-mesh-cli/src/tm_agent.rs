@@ -8107,9 +8107,67 @@ fn print_result(result: Result<Value, String>) {
         Ok(resp) => println!("{}", pretty(&resp)),
         Err(e) => {
             eprintln!("Error: {e}");
+            eprint_version_skew();
             process::exit(1);
         }
     }
+}
+
+/// Say so when this binary and the app it just failed to talk to are from
+/// different builds.
+///
+/// A stale CLI fails in whatever way its own generation failed: a 0.167.0
+/// `tm-agent` driving a 0.170.x app answered every leader-scoped command with
+/// `noMatchingLeaderSession` — a name that exists nowhere in the current tree,
+/// so the message pointed at nothing and the team simply never received an
+/// instruction. Nothing in that failure suggested the binary was the problem,
+/// and the binary was the whole problem.
+///
+/// This runs only on the failure path, so the check costs nothing when things
+/// work, and it stays quiet unless the two builds actually disagree — a
+/// version line printed under every unrelated error would train people to
+/// scroll past it.
+fn eprint_version_skew() {
+    let Some(sock) = detect_socket() else { return };
+    let Ok(info) = rpc_call(&sock, "system.info", json!({})) else {
+        return;
+    };
+    if let Some(note) = version_skew_note(
+        GIT_SHA,
+        info["result"]["git_sha"].as_str().unwrap_or_default(),
+        env!("CARGO_PKG_VERSION"),
+        info["result"]["app_version"].as_str().unwrap_or("unknown"),
+    ) {
+        eprintln!("{note}");
+    }
+}
+
+/// The note for a CLI and an app built from different commits, or `None` when
+/// they agree — or when the app did not say, which is not evidence of skew and
+/// must not be reported as one.
+fn version_skew_note(
+    cli_sha: &str,
+    app_sha: &str,
+    cli_version: &str,
+    app_version: &str,
+) -> Option<String> {
+    if app_sha.is_empty() || app_sha == cli_sha {
+        return None;
+    }
+    Some(format!(
+        "\nThis tm-agent is {} ({}), the term-mesh app is {} ({}).\n\
+         Different builds: the command above may have failed for that reason \
+         alone. Check which binary is running with `command -v tm-agent` — an \
+         older copy earlier in PATH shadows a current one.",
+        cli_version,
+        short_sha(cli_sha),
+        app_version,
+        short_sha(app_sha),
+    ))
+}
+
+fn short_sha(sha: &str) -> &str {
+    if sha.len() > 9 { &sha[..9] } else { sha }
 }
 
 /// Parse a `tm-agent daemon replay-capacity --set` value: a plain byte
@@ -16273,5 +16331,40 @@ mod reply_completion_regression_169_tests {
             .filter_map(|path| path.file_name().and_then(|name| name.to_str().map(str::to_owned)))
             .collect::<Vec<_>>();
         assert_eq!(names, vec!["task-a.md", "executor-reply.md"]);
+    }
+}
+
+#[cfg(test)]
+mod version_skew_tests {
+    use super::version_skew_note;
+
+    /// The case that cost an afternoon: a 0.167.0 CLI driving a 0.170.x app
+    /// answered every leader command with `noMatchingLeaderSession`, a name
+    /// that exists nowhere in the current tree. The note has to name both
+    /// builds, or it explains nothing.
+    #[test]
+    fn different_builds_name_both_versions() {
+        let note = version_skew_note("abc123456", "def987654", "0.167.0", "0.170.1")
+            .expect("mismatched builds must produce a note");
+        assert!(note.contains("0.167.0"), "{note}");
+        assert!(note.contains("0.170.1"), "{note}");
+        assert!(note.contains("abc123456") && note.contains("def987654"), "{note}");
+        // The actionable half: which binary is actually running.
+        assert!(note.contains("command -v tm-agent"), "{note}");
+    }
+
+    #[test]
+    fn matching_builds_say_nothing() {
+        assert_eq!(
+            version_skew_note("abc123456", "abc123456", "0.170.1", "0.170.1"),
+            None
+        );
+    }
+
+    /// An app that reports no SHA is unknown, not skewed. Printing a version
+    /// warning under every unrelated failure would train people to ignore it.
+    #[test]
+    fn an_unknown_app_build_is_not_a_mismatch() {
+        assert_eq!(version_skew_note("abc123456", "", "0.170.1", "unknown"), None);
     }
 }
