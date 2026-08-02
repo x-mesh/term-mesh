@@ -80,12 +80,22 @@ jobs:
         with:
           workspaces: daemon -> target
 
-      - name: build term-meshd (release, glibc 2.17 floor)
+      - name: build term-meshd + tm-agent (release, glibc 2.17 floor)
         working-directory: daemon
         # The `.2.17` suffix tells zig to link against glibc 2.17 symbol
         # versions. rust still emits code for the host triple (no `.2.17`
         # in the target dir), so output lands under the base triple below.
-        run: cargo zigbuild --release -p term-meshd --target ${{ matrix.rust_target }}.2.17
+        #
+        # tm-agent ships alongside the daemon because a Linux peer needs both
+        # and only ever got one: the asset carried term-meshd, `install-linux.sh`
+        # installed term-meshd, and nothing on the machine could ever update the
+        # CLI. Every Linux host in the fleet sat three versions behind on
+        # tm-agent while its daemon tracked releases, and a leader driving a
+        # team through the stale CLI failed with an error naming a symbol that
+        # no longer existed in the tree.
+        run: |
+          cargo zigbuild --release -p term-meshd --target ${{ matrix.rust_target }}.2.17
+          cargo zigbuild --release -p term-mesh-cli --bin tm-agent --target ${{ matrix.rust_target }}.2.17
 
       - name: verify glibc floor
         working-directory: daemon
@@ -95,24 +105,28 @@ jobs:
         # and it would only surface on a user's box — so fail the release now.
         run: |
           set -euo pipefail
-          bin="target/${{ matrix.rust_target }}/release/term-meshd"
           command -v objdump >/dev/null || { echo "ERROR: objdump is required for the GLIBC gate" >&2; exit 1; }
-          objdump_output=$(objdump -T "$bin")
-          # awk deliberately succeeds when there are no GLIBC imports (for
-          # example, a future static binary). With pipefail still enabled, an
-          # objdump/sort/tail failure cannot be mistaken for "no symbols".
-          maxsym=$(printf '%s\n' "$objdump_output" \
-            | awk '{ line = $0; while (match(line, /GLIBC_[0-9]+(\.[0-9]+)*/)) { print substr(line, RSTART, RLENGTH); line = substr(line, RSTART + RLENGTH) } }' \
-            | sort -V \
-            | tail -n1)
-          echo "max glibc symbol required: ${maxsym:-none}"
-          if [ -n "$maxsym" ]; then
-            ver=${maxsym#GLIBC_}
-            if [ "$(printf '%s\n2.17\n' "$ver" | sort -V | tail -n1)" != "2.17" ]; then
-              echo "ERROR: binary requires ${maxsym}, above the 2.17 floor" >&2
-              exit 1
+          # Both shipped binaries, not just the daemon: an asset that loads on
+          # an old host is only half the promise if the CLI beside it does not.
+          for name in term-meshd tm-agent; do
+            bin="target/${{ matrix.rust_target }}/release/$name"
+            objdump_output=$(objdump -T "$bin")
+            # awk deliberately succeeds when there are no GLIBC imports (for
+            # example, a future static binary). With pipefail still enabled, an
+            # objdump/sort/tail failure cannot be mistaken for "no symbols".
+            maxsym=$(printf '%s\n' "$objdump_output" \
+              | awk '{ line = $0; while (match(line, /GLIBC_[0-9]+(\.[0-9]+)*/)) { print substr(line, RSTART, RLENGTH); line = substr(line, RSTART + RLENGTH) } }' \
+              | sort -V \
+              | tail -n1)
+            echo "$name: max glibc symbol required: ${maxsym:-none}"
+            if [ -n "$maxsym" ]; then
+              ver=${maxsym#GLIBC_}
+              if [ "$(printf '%s\n2.17\n' "$ver" | sort -V | tail -n1)" != "2.17" ]; then
+                echo "ERROR: $name requires ${maxsym}, above the 2.17 floor" >&2
+                exit 1
+              fi
             fi
-          fi
+          done
 
       - name: package
         id: package
@@ -121,7 +135,11 @@ jobs:
           VERSION="${{ inputs.tag || github.ref_name }}"
           VERSION="${VERSION#v}"
           ASSET="term-meshd-linux-${{ matrix.arch }}.tar.gz"
-          tar -czf "$ASSET" -C "daemon/target/${{ matrix.rust_target }}/release" term-meshd
+          # The asset name stays as it is — installers in the wild fetch it by
+          # this exact name — but it now carries the CLI too. `install-linux.sh`
+          # treats tm-agent as optional so it can still install an older tag
+          # whose archive holds only the daemon.
+          tar -czf "$ASSET" -C "daemon/target/${{ matrix.rust_target }}/release" term-meshd tm-agent
           echo "asset=$ASSET" >> "$GITHUB_OUTPUT"
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           sha256sum "$ASSET" > "$ASSET.sha256"

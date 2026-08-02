@@ -131,6 +131,25 @@ supported binary for it yet; on a supported host re-run this installer."
 fi
 log "binary runs: ${smoke_out}"
 
+# The CLI ships in the same archive as of 0.170.2. Optional on purpose: an
+# older tag's archive holds only the daemon, and installing one of those must
+# still work rather than dying on a file that release never built.
+CLI_NAME="tm-agent"
+CLI_PRESENT=0
+if [[ -f "${WORK_DIR}/${CLI_NAME}" ]]; then
+  if ! cli_smoke_out=$("${WORK_DIR}/${CLI_NAME}" --version 2>&1); then
+    die "the bundled ${CLI_NAME} cannot run on this host:
+
+  ${cli_smoke_out}
+
+Same cause as the daemon check above — see 'ldd --version'."
+  fi
+  CLI_PRESENT=1
+  log "cli runs: ${cli_smoke_out}"
+else
+  log "warning: this release's archive carries no ${CLI_NAME}; leaving any existing one in place"
+fi
+
 # A scope switch must not leave two daemons serving different sockets. Stop,
 # disable, and remove the old unit only after the replacement has downloaded
 # and passed its smoke test. If cleanup cannot be done safely, fail closed
@@ -203,6 +222,21 @@ fi
 mkdir -p "$PREFIX"
 install -m 0755 "${WORK_DIR}/${BIN_NAME}" "${PREFIX}/${BIN_NAME}"
 log "installed ${PREFIX}/${BIN_NAME}"
+
+if [[ "$CLI_PRESENT" == 1 ]]; then
+  install -m 0755 "${WORK_DIR}/${CLI_NAME}" "${PREFIX}/${CLI_NAME}"
+  log "installed ${PREFIX}/${CLI_NAME}"
+  # A copy of the CLI somewhere else on PATH does not go away just because a
+  # newer one landed here, and term-mesh searches $HOME/.local/bin before
+  # /usr/local/bin — so a leftover from an earlier install silently wins and
+  # the whole fleet drifts. Name it; deleting someone else's binary is not
+  # this script's call.
+  while read -r other; do
+    [[ -z "$other" || "$other" == "${PREFIX}/${CLI_NAME}" ]] && continue
+    log "warning: another ${CLI_NAME} is on PATH at ${other} ($("$other" --version 2>&1 | head -1))"
+    log "         term-mesh resolves \$HOME/.local/bin before /usr/local/bin — remove the stale copy or it keeps winning"
+  done < <(type -aP "$CLI_NAME" 2>/dev/null || true)
+fi
 
 case ":$PATH:" in
   *":${PREFIX}:"*) ;;
