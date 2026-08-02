@@ -295,3 +295,128 @@ autoload -Uz add-zsh-hook
 add-zsh-hook preexec _termmesh_preexec
 add-zsh-hook precmd _termmesh_precmd
 add-zsh-hook precmd _termmesh_fix_path
+
+# Install xterm-ghostty terminfo on a remote host, once per host.
+#
+# Ghostty's own integration already wraps ssh for this, and .zshrc sources it
+# before us, so the definition below deliberately replaces it. Two things break
+# ghostty's version inside term-mesh:
+#
+#   1. It remembers installed hosts via `$GHOSTTY_BIN_DIR/ghostty +ssh-cache`,
+#      but term-mesh ships no `ghostty` executable — the bundle holds only
+#      `term-mesh`. Every lookup fails, so the install runs on every connection.
+#   2. It hands "$@" to the install connection verbatim. With
+#      `ssh host 'command'` the command therefore runs twice: once on the
+#      install connection, once on the real one.
+#
+# So: keep the cache in a plain file, and give the install connection the
+# connection arguments only.
+
+# Split ssh arguments into the connection part (options plus destination) and
+# the remote command, keeping only the former in _termmesh_ssh_conn.
+#
+# ssh's grammar is `ssh [options] destination [command ...]`. An option that
+# takes a value has to be consumed together with that value, otherwise the
+# value gets mistaken for the destination — `ssh -p 22 host cmd` would treat
+# "22" as the host and send "host cmd" as the command.
+typeset -ga _termmesh_ssh_conn
+_termmesh_ssh_split() {
+    _termmesh_ssh_conn=()
+    while (( $# )); do
+        case "$1" in
+            # Value in the next argument.
+            -[bcDEeFIiJLlmOopQRSWw])
+                _termmesh_ssh_conn+=("$1")
+                shift
+                (( $# )) && { _termmesh_ssh_conn+=("$1"); shift }
+                ;;
+            # Value attached to the flag, e.g. -p22.
+            -[bcDEeFIiJLlmOopQRSWw]*)
+                _termmesh_ssh_conn+=("$1")
+                shift
+                ;;
+            # Plain flag.
+            -*)
+                _termmesh_ssh_conn+=("$1")
+                shift
+                ;;
+            # First non-option argument is the destination; everything after
+            # it is the remote command, which we drop.
+            *)
+                _termmesh_ssh_conn+=("$1")
+                return 0
+                ;;
+        esac
+    done
+}
+
+# Defining ssh while this file is sourced is not enough: something later in the
+# rc chain defines it again on top of us. Observed directly — after startup,
+# _termmesh_ssh_split was ours while ssh was still ghostty's. So install the
+# wrapper from the first precmd instead, once every init file has run. The PATH
+# fix above exists for exactly the same reason.
+_termmesh_install_ssh_wrapper() {
+    add-zsh-hook -d precmd _termmesh_install_ssh_wrapper
+
+    function ssh() {
+    emulate -L zsh
+    setopt local_options no_glob_subst
+
+    local ssh_term="xterm-256color"
+    local -a ssh_opts=()
+
+    if [[ "${GHOSTTY_SHELL_FEATURES:-}" == *ssh-env* ]]; then
+        ssh_opts+=(-o "SendEnv COLORTERM TERM_PROGRAM TERM_PROGRAM_VERSION")
+    fi
+
+    if [[ "${GHOSTTY_SHELL_FEATURES:-}" == *ssh-terminfo* ]]; then
+        local ssh_user ssh_hostname ssh_port ssh_key ssh_value
+        while IFS=' ' read -r ssh_key ssh_value; do
+            case "$ssh_key" in
+                user) ssh_user="$ssh_value" ;;
+                hostname) ssh_hostname="$ssh_value" ;;
+                port) ssh_port="$ssh_value" ;;
+            esac
+        done < <(command ssh -G "$@" 2>/dev/null)
+
+        if [[ -n "$ssh_hostname" ]]; then
+            # Key on what actually identifies the account, not on the alias the
+            # user typed: two aliases can resolve to the same host, and the same
+            # alias can be repointed.
+            local ssh_cache_dir="${XDG_CACHE_HOME:-$HOME/.cache}/term-mesh/ssh-terminfo"
+            local ssh_cache_key="${ssh_user:-unknown}@${ssh_hostname}:${ssh_port:-22}"
+            local ssh_cache_file="$ssh_cache_dir/${ssh_cache_key//\//_}"
+
+            if [[ -f "$ssh_cache_file" ]]; then
+                ssh_term="xterm-ghostty"
+            elif (( $+commands[infocmp] )); then
+                local ssh_terminfo
+                ssh_terminfo=$(infocmp -0 -x xterm-ghostty 2>/dev/null)
+                if [[ -n "$ssh_terminfo" ]]; then
+                    print "Installing xterm-ghostty terminfo on ${ssh_hostname}..." >&2
+                    _termmesh_ssh_split "$@"
+                    if builtin print -r -- "$ssh_terminfo" | command ssh \
+                        "${ssh_opts[@]}" "${_termmesh_ssh_conn[@]}" '
+                        infocmp xterm-ghostty >/dev/null 2>&1 && exit 0
+                        command -v tic >/dev/null 2>&1 || exit 1
+                        mkdir -p ~/.terminfo 2>/dev/null && tic -x - 2>/dev/null && exit 0
+                        exit 1
+                    ' 2>/dev/null; then
+                        ssh_term="xterm-ghostty"
+                        mkdir -p "$ssh_cache_dir" 2>/dev/null &&
+                            : >| "$ssh_cache_file" 2>/dev/null
+                    else
+                        # Falling back is not a failure: xterm-256color is
+                        # understood everywhere, which is the whole point of
+                        # not sending xterm-ghostty to a host that lacks it.
+                        print "term-mesh: no xterm-ghostty terminfo on ${ssh_hostname}, using ${ssh_term}" >&2
+                    fi
+                fi
+            fi
+        fi
+    fi
+
+    TERM="$ssh_term" COLORTERM=truecolor command ssh "${ssh_opts[@]}" "$@"
+    }
+}
+add-zsh-hook precmd _termmesh_install_ssh_wrapper
