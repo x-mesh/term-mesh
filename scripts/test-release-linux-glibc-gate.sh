@@ -7,7 +7,10 @@ ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 WORK=$(mktemp -d)
 trap 'rm -rf "$WORK"' EXIT
 mkdir -p "$WORK/daemon/target/x86_64-unknown-linux-gnu/release" "$WORK/bin"
-touch "$WORK/daemon/target/x86_64-unknown-linux-gnu/release/term-meshd"
+# Both binaries the release ships — the gate walks them, and a fixture with
+# only the daemon would let a regression that skips the CLI pass.
+touch "$WORK/daemon/target/x86_64-unknown-linux-gnu/release/term-meshd" \
+  "$WORK/daemon/target/x86_64-unknown-linux-gnu/release/tm-agent"
 
 # shellcheck disable=SC2016 # Keep the GitHub expression literal for Ruby.
 ruby -ryaml -e '

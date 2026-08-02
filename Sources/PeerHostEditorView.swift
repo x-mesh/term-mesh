@@ -70,6 +70,10 @@ struct PeerHostEditorView: View {
     /// failure isn't the "still outdated after a real update" case this
     /// exists to suppress — the user should be able to just retry.
     @State private var updateAttempted = false
+    /// Version drift this host would launch with, from the last Test.
+    /// Empty on a consistent host — a warning shown on healthy hosts is
+    /// one people stop reading.
+    @State private var binaryWarnings: [String] = []
     /// Version reported by a binary found on the host while term-meshd
     /// itself isn't running (`.daemonMissing`). Kept out of that case's
     /// associated value since its signature must not change.
@@ -266,6 +270,7 @@ struct PeerHostEditorView: View {
             doctorStatusLine
 
             agentStackStatusLine
+            binaryWarningLines
 
             HStack {
                 Button("Test Relay", action: runTest)
@@ -439,6 +444,21 @@ struct PeerHostEditorView: View {
         case .diagnosed(let reason):
             Label("Installed but the daemon won't run: \(reason)",
                   systemImage: "exclamationmark.triangle.fill")
+                .font(.caption).foregroundColor(.orange)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+    }
+
+    /// Version drift, one line each. Silent on a consistent host.
+    ///
+    /// Worth surfacing here rather than only in the log: this is the screen
+    /// someone is already on when they ask "why is this host behaving
+    /// strangely", and the answer — it launches a different binary than the
+    /// one you installed — is invisible everywhere else.
+    @ViewBuilder
+    private var binaryWarningLines: some View {
+        ForEach(binaryWarnings, id: \.self) { warning in
+            Label(warning, systemImage: "exclamationmark.arrow.triangle.2.circlepath")
                 .font(.caption).foregroundColor(.orange)
                 .fixedSize(horizontal: false, vertical: true)
         }
@@ -683,6 +703,7 @@ struct PeerHostEditorView: View {
         doctorState = .idle
         testedDraft = nil
         daemonMissingVersion = nil
+        binaryWarnings = []
         daemonMissingHostKind = nil
         testedHostKind = nil
         updateAttempted = false
@@ -704,6 +725,7 @@ struct PeerHostEditorView: View {
         let gen = doctorGeneration
         doctorState = .testing
         daemonMissingVersion = nil
+        binaryWarnings = []
         daemonMissingHostKind = nil
         // Snapshot NOW — this is the exact target Install/Update must use
         // later, even if the form fields change before the user acts on
@@ -725,6 +747,7 @@ struct PeerHostEditorView: View {
                 guard gen == doctorGeneration else { return }
                 doctorState = resolved
                 await refreshAgentStack(draft: draft, gen: gen)
+                await refreshBinaryInventory(draft: draft, gen: gen)
             case .daemonMissing:
                 // Binary may still be present with the service just not
                 // running — surface that without touching the frozen
@@ -750,6 +773,7 @@ struct PeerHostEditorView: View {
                 // answering — a host can carry the scripts and hooks
                 // before its daemon is ever installed.
                 await refreshAgentStack(draft: draft, gen: gen)
+                await refreshBinaryInventory(draft: draft, gen: gen)
             case .relayFailed(let socket, let message):
                 doctorState = .relayFailed(socket: socket, message: message)
             case .sshFailed(let msg): doctorState = .sshFailed(msg)
@@ -771,6 +795,7 @@ struct PeerHostEditorView: View {
         let gen = doctorGeneration
         doctorState = .installing
         daemonMissingVersion = nil
+        binaryWarnings = []
         installInFlight = true
         Task {
             do {
@@ -829,6 +854,29 @@ struct PeerHostEditorView: View {
     /// the lane at `.idle` rather than inventing a red state: the daemon
     /// line already reports connectivity problems, and this lane only
     /// speaks when it actually measured something.
+    /// Ask the host which term-mesh binaries it would actually run.
+    ///
+    /// Separate from the version probe next to it because the two ask
+    /// different questions: that one asks the login shell, this one searches
+    /// the PATH the app launches agents with. A host can answer "current" to
+    /// the first while every agent on it runs a copy years old out of
+    /// `$HOME/.local/bin`, which is searched first — and nothing said so
+    /// until a leader failed with an error naming a symbol that no longer
+    /// exists.
+    private func refreshBinaryInventory(draft: PeerHostProfile, gen: Int) async {
+        guard gen == doctorGeneration else { return }
+        let inventory = await PeerHostDoctor.binaryInventory(
+            sshTarget: draft.sshTarget, port: draft.sshPort,
+            identityFile: draft.identityFile
+        )
+        guard gen == doctorGeneration else { return }
+        let warnings = inventory.map(PeerHostDoctor.inventoryWarnings) ?? []
+        binaryWarnings = warnings
+        for warning in warnings {
+            RemoteWorkLog.info("\(draft.sshTarget): \(warning)")
+        }
+    }
+
     private func refreshAgentStack(draft: PeerHostProfile, gen: Int) async {
         guard gen == doctorGeneration else { return }
         agentStackState = .checking
@@ -868,6 +916,7 @@ struct PeerHostEditorView: View {
             Task {
                 let gen = doctorGeneration
                 await refreshAgentStack(draft: draft, gen: gen)
+                await refreshBinaryInventory(draft: draft, gen: gen)
                 guard gen == doctorGeneration,
                       case .status = agentStackState else { return }
                 runAgentStackInstall()
@@ -892,6 +941,7 @@ struct PeerHostEditorView: View {
                 // state (green complete, or orange with what's still
                 // missing) instead of a static "set up" that might not be.
                 await refreshAgentStack(draft: draft, gen: gen)
+                await refreshBinaryInventory(draft: draft, gen: gen)
             } catch {
                 guard gen == doctorGeneration else { return }
                 agentStackState = .installFailed(String(describing: error))

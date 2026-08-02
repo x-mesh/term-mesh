@@ -35,7 +35,18 @@ cat > "$stage/term-meshd" <<'BIN'
 echo 'term-meshd test'
 BIN
 chmod +x "$stage/term-meshd"
-tar -czf "$out" -C "$stage" term-meshd
+members=term-meshd
+# MOCK_ARCHIVE_HAS_CLI=0 reproduces a pre-0.170.2 asset, which carried only
+# the daemon. The installer has to keep working against those.
+if [[ "${MOCK_ARCHIVE_HAS_CLI:-1}" == 1 ]]; then
+  cat > "$stage/tm-agent" <<'BIN'
+#!/usr/bin/env bash
+echo 'tm-agent test'
+BIN
+  chmod +x "$stage/tm-agent"
+  members="term-meshd tm-agent"
+fi
+tar -czf "$out" -C "$stage" $members
 rm -rf "$stage"
 EOF
 cat > "$MOCK_BIN/loginctl" <<'EOF'
@@ -108,5 +119,36 @@ if TERMMESH_SERVICE_USER=root TERMMESH_INSTALL_PREFIX=/opt/term-mesh-root \
   exit 1
 fi
 [[ ! -e /opt/term-mesh-root/term-meshd ]]
+
+# The CLI is why the fleet drifted: the asset carried only the daemon, so
+# nothing on a Linux host could ever update tm-agent and every peer sat
+# versions behind while its daemon tracked releases.
+echo '==> the CLI ships and installs beside the daemon'
+TERMMESH_INSTALL_PREFIX=/opt/term-mesh-cli bash "$INSTALLER" > /tmp/cli-install.log 2>&1
+[[ -x /opt/term-mesh-cli/tm-agent ]] || { echo 'tm-agent was not installed' >&2; exit 1; }
+[[ "$(/opt/term-mesh-cli/tm-agent --version)" == 'tm-agent test' ]]
+grep -q 'installed /opt/term-mesh-cli/tm-agent' /tmp/cli-install.log
+
+echo '==> a stale CLI earlier on PATH is named, not silently overridden'
+mkdir -p /tmp/shadow-bin
+cat > /tmp/shadow-bin/tm-agent <<'SH'
+#!/usr/bin/env bash
+echo 'tm-agent 0.0.1-stale'
+SH
+chmod +x /tmp/shadow-bin/tm-agent
+PATH="/tmp/shadow-bin:$PATH" TERMMESH_INSTALL_PREFIX=/opt/term-mesh-cli \
+  bash "$INSTALLER" > /tmp/shadow-install.log 2>&1
+grep -q '/tmp/shadow-bin/tm-agent' /tmp/shadow-install.log \
+  || { echo 'the shadowing copy was not reported' >&2; exit 1; }
+grep -q '0.0.1-stale' /tmp/shadow-install.log
+rm -rf /tmp/shadow-bin
+
+# An older tag's archive holds no tm-agent. Installing one must still work.
+echo '==> an archive without the CLI still installs the daemon'
+MOCK_ARCHIVE_HAS_CLI=0 TERMMESH_INSTALL_PREFIX=/opt/term-mesh-nocli \
+  bash "$INSTALLER" > /tmp/nocli-install.log 2>&1
+[[ -x /opt/term-mesh-nocli/term-meshd ]]
+[[ ! -e /opt/term-mesh-nocli/tm-agent ]]
+grep -q 'carries no tm-agent' /tmp/nocli-install.log
 
 echo '==> installer scope simulations passed'
