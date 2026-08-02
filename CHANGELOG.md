@@ -2,7 +2,7 @@
 
 All notable changes to term-mesh are documented here.
 
-## [Unreleased]
+## [0.171.0] - 2026-08-03
 
 ### Fixed
 
@@ -19,6 +19,10 @@ All notable changes to term-mesh are documented here.
 ### Changed
 
 - **Homebrew 업그레이드가 앱 선택 창을 띄우고 멈추던 문제** — 업그레이드 도중 실행 중인 term-mesh를 종료시키는 단계가 있는데, brew는 그 시점에 이미 앱을 지운 뒤였다. macOS가 이름으로 앱을 찾지 못해 "응용 프로그램을 선택하세요" 창을 띄웠고, 업그레이드는 사람이 그 창을 닫을 때까지 멈춰 있었다. 이제 앱이 아직 제자리에 있을 때 종료시킨다.
+
+### Thanks to 1 contributor!
+
+- [@JINWOO-J](https://github.com/JINWOO-J)
 
 ## [0.170.2] - 2026-08-02
 
