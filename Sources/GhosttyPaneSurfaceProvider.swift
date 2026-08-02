@@ -704,7 +704,12 @@ final class GhosttyPaneSurfaceProvider: PeerSurfaceProvider {
 
         let input: @Sendable (Data) async -> Void = { [weakTS] bytes in
             await MainActor.run {
-                guard let ptr = weakTS.value?.surface else { return }
+                guard let terminalSurface = weakTS.value,
+                      let ptr = terminalSurface.surface else { return }
+                // Somebody is typing in the viewer, so the viewer's size wins
+                // the arbitration from here — see `resolvePixelSize`. Without
+                // this the viewer can never grow past the host pane's width.
+                terminalSurface.noteRemoteInput()
                 // Track a weak surface ref so a deferred lone-Escape tail can be
                 // flushed later without capturing the raw (non-Sendable) pointer.
                 peerSurfaceRefForKey[UInt(bitPattern: ptr)] = weakTS

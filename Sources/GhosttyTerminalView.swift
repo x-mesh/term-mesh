@@ -279,6 +279,11 @@ final class TerminalSurface: Identifiable, ObservableObject {
     private var localPixelSize: (w: UInt32, h: UInt32)?
     /// What an attached remote viewer asked for, nil when nobody is attached.
     private var remoteViewerPixelSize: (w: UInt32, h: UInt32)?
+    /// Which side typed most recently, nil until either does. The min rule
+    /// alone locks the PTY at the smaller party's size with nothing the party
+    /// actually working in it can do — enlarging just re-loses the min. Whoever
+    /// is typing is the one reading, so they get the grid.
+    private var remoteViewerTypedLast: Bool?
     private var lastXScale: CGFloat = 0
     private var lastYScale: CGFloat = 0
     private var pendingTextQueue: [Data] = []
@@ -1040,10 +1045,34 @@ final class TerminalSurface: Identifiable, ObservableObject {
         return true
     }
 
+    /// Record that this pane's own keyboard produced input, and re-arbitrate.
+    ///
+    /// Called from the local key path rather than from every write to the PTY:
+    /// a `tm-agent send` or a socket-driven paste is not somebody sitting in
+    /// front of this pane, and treating it as one would hand the grid to a
+    /// window nobody is reading.
+    func noteLocalInput() { noteTypist(remote: false) }
+
+    /// Record that an attached remote viewer produced input, and re-arbitrate.
+    func noteRemoteInput() { noteTypist(remote: true) }
+
+    private func noteTypist(remote: Bool) {
+        // Called per keystroke, so it costs a comparison on all but the first
+        // press after the other side was typing.
+        guard remoteViewerTypedLast != remote else { return }
+        remoteViewerTypedLast = remote
+        guard let surface else { return }
+        let resolved = resolvedPixelSize()
+        guard resolved.w != lastPixelWidth || resolved.h != lastPixelHeight else { return }
+        applyResolvedSize(resolved, to: surface)
+    }
+
     /// The viewer is gone; the local pane gets its own size back.
     func clearRemoteViewerPixelSize() {
         guard remoteViewerPixelSize != nil else { return }
         remoteViewerPixelSize = nil
+        // The arbitration this recorded is over with the viewer that caused it.
+        remoteViewerTypedLast = nil
         guard let surface = surface else { return }
         let resolved = resolvedPixelSize()
         guard resolved.w != lastPixelWidth || resolved.h != lastPixelHeight else { return }
@@ -1069,11 +1098,19 @@ final class TerminalSurface: Identifiable, ObservableObject {
     /// and margin is the one failure mode here that loses nothing. When the
     /// local pane is not on screen there is nobody to shortchange, and the
     /// viewer gets exactly what it asked for.
+    ///
+    /// Except that min alone has no way out: the party that wants more room
+    /// cannot get it by asking, because asking is what re-loses the min. A
+    /// remote viewer maximized to full screen stayed pinned to the host pane's
+    /// width forever. So once either side types, that side is the one being
+    /// read and it takes the grid — the same rule the Rust peer host reaches
+    /// through `SizeArbiter::note_input`. Until anyone types, min still holds.
     private func resolvedPixelSize() -> (w: UInt32, h: UInt32) {
         Self.resolvePixelSize(
             local: localPixelSize,
             remote: remoteViewerPixelSize,
             localOnScreen: isLocallyOnScreen,
+            remoteTypedLast: remoteViewerTypedLast,
             fallback: (lastPixelWidth, lastPixelHeight)
         )
     }
@@ -1084,11 +1121,16 @@ final class TerminalSurface: Identifiable, ObservableObject {
         local: (w: UInt32, h: UInt32)?,
         remote: (w: UInt32, h: UInt32)?,
         localOnScreen: Bool,
+        remoteTypedLast: Bool?,
         fallback: (w: UInt32, h: UInt32)
     ) -> (w: UInt32, h: UInt32) {
         guard let remote else { return local ?? fallback }
         guard let local, localOnScreen else { return remote }
-        return (min(local.w, remote.w), min(local.h, remote.h))
+        switch remoteTypedLast {
+        case .some(true): return remote
+        case .some(false): return local
+        case .none: return (min(local.w, remote.w), min(local.h, remote.h))
+        }
     }
 
     /// Whether a person could actually be looking at the local pane. A pane
@@ -2877,6 +2919,10 @@ func pushTargetSurfaceSize(_ size: CGSize) {
     }
 
     override func keyDown(with event: NSEvent) {
+        // Somebody is sitting in front of this pane, so it — not a remote
+        // viewer that typed earlier — owns the PTY's grid from here on. Placed
+        // before the IME redirect so composing counts as typing too.
+        terminalSurface?.noteLocalInput()
         // When the IME input bar is active, redirect all key events to its text view
         // so the user can keep typing without manually clicking the IME bar.
         if let imeTextView = enclosingSurfaceScrollView?.findIMETextView() {

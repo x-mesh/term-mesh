@@ -867,6 +867,7 @@ final class RemoteViewerSizeArbitrationTests: XCTestCase {
             local: (w: 1200, h: 800),
             remote: (w: 900, h: 1000),
             localOnScreen: true,
+            remoteTypedLast: nil,
             fallback: (w: 0, h: 0)
         )
         XCTAssertEqual(size.w, 900, "the narrower width wins")
@@ -880,6 +881,7 @@ final class RemoteViewerSizeArbitrationTests: XCTestCase {
             local: (w: 400, h: 300),
             remote: (w: 1600, h: 1200),
             localOnScreen: false,
+            remoteTypedLast: nil,
             fallback: (w: 0, h: 0)
         )
         XCTAssertEqual(size.w, 1600)
@@ -893,6 +895,7 @@ final class RemoteViewerSizeArbitrationTests: XCTestCase {
             local: (w: 1200, h: 800),
             remote: nil,
             localOnScreen: true,
+            remoteTypedLast: nil,
             fallback: (w: 10, h: 10)
         )
         XCTAssertEqual(size.w, 1200)
@@ -906,9 +909,67 @@ final class RemoteViewerSizeArbitrationTests: XCTestCase {
             local: nil,
             remote: (w: 640, h: 480),
             localOnScreen: true,
+            remoteTypedLast: nil,
             fallback: (w: 10, h: 10)
         )
         XCTAssertEqual(size.w, 640)
         XCTAssertEqual(size.h, 480)
+    }
+
+    /// The bug this rule exists for: a viewer maximized to full screen stayed
+    /// pinned to the host pane's width, because asking for more room is what
+    /// re-loses the min. Typing in the viewer is what breaks the deadlock.
+    func test_a_typing_viewer_takes_the_grid_from_a_smaller_host_pane() {
+        let size = TerminalSurface.resolvePixelSize(
+            local: (w: 600, h: 400),
+            remote: (w: 2400, h: 1400),
+            localOnScreen: true,
+            remoteTypedLast: true,
+            fallback: (w: 0, h: 0)
+        )
+        XCTAssertEqual(size.w, 2400, "the viewer being typed into is the one being read")
+        XCTAssertEqual(size.h, 1400)
+    }
+
+    /// And the same in reverse, so a viewer left open on another machine
+    /// cannot hold the pane somebody is actually working in at its size.
+    func test_a_typing_local_pane_takes_the_grid_back_from_the_viewer() {
+        let size = TerminalSurface.resolvePixelSize(
+            local: (w: 2400, h: 1400),
+            remote: (w: 600, h: 400),
+            localOnScreen: true,
+            remoteTypedLast: false,
+            fallback: (w: 0, h: 0)
+        )
+        XCTAssertEqual(size.w, 2400)
+        XCTAssertEqual(size.h, 1400)
+    }
+
+    /// A hidden local pane already yields entirely; who typed last must not
+    /// resurrect it as a constraint.
+    func test_a_hidden_local_pane_yields_even_when_it_typed_last() {
+        let size = TerminalSurface.resolvePixelSize(
+            local: (w: 400, h: 300),
+            remote: (w: 1600, h: 1200),
+            localOnScreen: false,
+            remoteTypedLast: false,
+            fallback: (w: 0, h: 0)
+        )
+        XCTAssertEqual(size.w, 1600)
+        XCTAssertEqual(size.h, 1200)
+    }
+
+    /// With no viewer attached there is nothing to arbitrate, whatever the
+    /// last keystroke was.
+    func test_without_a_viewer_the_local_size_stands_regardless_of_the_typist() {
+        let size = TerminalSurface.resolvePixelSize(
+            local: (w: 1200, h: 800),
+            remote: nil,
+            localOnScreen: true,
+            remoteTypedLast: true,
+            fallback: (w: 10, h: 10)
+        )
+        XCTAssertEqual(size.w, 1200)
+        XCTAssertEqual(size.h, 800)
     }
 }
