@@ -129,19 +129,29 @@ TERMMESH_INSTALL_PREFIX=/opt/term-mesh-cli bash "$INSTALLER" > /tmp/cli-install.
 [[ "$(/opt/term-mesh-cli/tm-agent --version)" == 'tm-agent test' ]]
 grep -q 'installed /opt/term-mesh-cli/tm-agent' /tmp/cli-install.log
 
-echo '==> a stale CLI earlier on PATH is named, not silently overridden'
-mkdir -p /tmp/shadow-bin
-cat > /tmp/shadow-bin/tm-agent <<'SH'
+# The copy that wins lives in a directory term-mesh searches, which is NOT
+# the same as a directory on this script's PATH. Installing 0.170.2 onto two
+# peers left both running the 0.170.1 copies in ~/.local/bin precisely
+# because the first version of this check only consulted $PATH — and root's
+# PATH has no ~/.local/bin, so it saw nothing. $PATH stays deliberately
+# clean here: the warning has to fire anyway.
+echo '==> a stale CLI in a term-mesh search dir is named even when it is off $PATH'
+mkdir -p "$HOME/.local/bin"
+cat > "$HOME/.local/bin/tm-agent" <<'SH'
 #!/usr/bin/env bash
 echo 'tm-agent 0.0.1-stale'
 SH
-chmod +x /tmp/shadow-bin/tm-agent
-PATH="/tmp/shadow-bin:$PATH" TERMMESH_INSTALL_PREFIX=/opt/term-mesh-cli \
-  bash "$INSTALLER" > /tmp/shadow-install.log 2>&1
-grep -q '/tmp/shadow-bin/tm-agent' /tmp/shadow-install.log \
+chmod +x "$HOME/.local/bin/tm-agent"
+case ":$PATH:" in
+  *":$HOME/.local/bin:"*) echo 'fixture invalid: ~/.local/bin must not be on PATH' >&2; exit 1 ;;
+esac
+TERMMESH_INSTALL_PREFIX=/opt/term-mesh-cli bash "$INSTALLER" > /tmp/shadow-install.log 2>&1
+grep -q "$HOME/.local/bin/tm-agent" /tmp/shadow-install.log \
   || { echo 'the shadowing copy was not reported' >&2; exit 1; }
 grep -q '0.0.1-stale' /tmp/shadow-install.log
-rm -rf /tmp/shadow-bin
+grep -q 'term-mesh will run' /tmp/shadow-install.log \
+  || { echo 'the warning must say which binary actually runs' >&2; exit 1; }
+rm -f "$HOME/.local/bin/tm-agent"
 
 # An older tag's archive holds no tm-agent. Installing one must still work.
 echo '==> an archive without the CLI still installs the daemon'
