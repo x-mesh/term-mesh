@@ -113,6 +113,53 @@ enum PeerHostDoctor {
     static let versionProbeCommand =
         #"sh -c 'if [ "$(uname -s)" = Darwin ]; then v=$(/usr/bin/defaults read /Applications/term-mesh.app/Contents/Info.plist CFBundleShortVersionString 2>/dev/null) && [ -n "$v" ] && echo "term-mesh-app $v" || exit 44; else b=$(command -v term-meshd 2>/dev/null); [ -x "$b" ] || b="$HOME/.local/bin/term-meshd"; [ -x "$b" ] && "$b" --version || exit 44; fi'"#
 
+    /// One term-mesh binary a host would run, and which copy it is.
+    struct BinaryEntry: Equatable {
+        var path: String
+        var version: String
+    }
+
+    /// What a host would actually execute, and what else is lying around.
+    struct BinaryInventory: Equatable {
+        var appVersion: String?
+        /// The `tm-agent` an agent launched here would get.
+        var cli: BinaryEntry?
+        /// Other `tm-agent` copies on the same PATH, in search order after
+        /// the winner. A different version here is the drift.
+        var cliShadowed: [BinaryEntry] = []
+        var daemon: BinaryEntry?
+        var daemonShadowed: [BinaryEntry] = []
+    }
+
+    /// Fixed inventory probe: which term-mesh binaries this host would run,
+    /// and every other copy of them on the same PATH.
+    ///
+    /// Searches the app's own launch PATH — `RemoteShellPath.binDirs` — not
+    /// the login shell's. That distinction is the entire point.
+    /// `versionProbeCommand` asks the login shell, and a host can answer
+    /// 0.170.1 there while every agent launched on it runs a 0.167.0 copy out
+    /// of `$HOME/.local/bin`, because that directory is searched first. A
+    /// whole fleet drifted that way with nothing pointing at it: the failure
+    /// surfaced as a leader whose every command died with an error naming a
+    /// symbol the current tree no longer contains.
+    ///
+    /// Emits `key=path|version` lines and always exits 0 — absence is data,
+    /// not an error. No single quotes in the body (sh -c '…' wrapper
+    /// constraint, same as remoteCommand/diagnoseCommand).
+    static var binaryInventoryCommand: String {
+        // Built from binDirs rather than repeated here: a probe that searches
+        // a different PATH than the launcher answers a different question.
+        let path = RemoteShellPath.binDirs
+            .map { dir in
+                dir.hasPrefix("$HOME/") ? "\"$HOME/\(dir.dropFirst(6))\"" : dir
+            }
+            .joined(separator: ":")
+        let body = "export PATH=\(path):\"$PATH\"; "
+            + #"if [ "$(uname -s)" = Darwin ]; then v=$(/usr/bin/defaults read /Applications/term-mesh.app/Contents/Info.plist CFBundleShortVersionString 2>/dev/null); [ -n "$v" ] && echo "app=$v"; fi; "#
+            + #"for b in tm-agent term-meshd; do first=1; seen=""; for d in $(echo "$PATH" | tr : " "); do p="$d/$b"; case " $seen " in *" $p "*) continue ;; esac; if [ -x "$p" ]; then seen="$seen $p"; v=$("$p" --version 2>/dev/null | head -1); if [ "$first" = 1 ]; then echo "$b=$p|$v"; first=0; else echo "$b.shadowed=$p|$v"; fi; fi; done; done; exit 0"#
+        return "sh -c '\(body)'"
+    }
+
     /// Fixed probe for the agent-notification stack: script locations
     /// (installer default first, then the manual /usr/local/bin), hook
     /// wiring (a grep-level check — the wiring itself is idempotent, so
@@ -390,6 +437,88 @@ enum PeerHostDoctor {
             sshTarget: sshTarget, port: port, identityFile: identityFile,
             command: installCommand, timeoutSeconds: 180
         )
+    }
+
+    /// Pure parse of `binaryInventoryCommand` output. Unknown lines are
+    /// ignored rather than failing the probe: this is diagnostics, and a
+    /// future key must not turn the whole report into an error.
+    static func parseBinaryInventory(_ stdout: String) -> BinaryInventory {
+        var inventory = BinaryInventory()
+        for line in stdout.split(whereSeparator: \.isNewline) {
+            let trimmed = line.trimmingCharacters(in: .whitespaces)
+            guard let separator = trimmed.firstIndex(of: "=") else { continue }
+            let key = String(trimmed[trimmed.startIndex..<separator])
+            let value = String(trimmed[trimmed.index(after: separator)...])
+            if key == "app" {
+                inventory.appVersion = value.isEmpty ? nil : value
+                continue
+            }
+            // `path|version`. A binary that ran but printed nothing still
+            // gets an entry — where it is matters even when it won't say
+            // what it is.
+            let parts = value.split(separator: "|", maxSplits: 1, omittingEmptySubsequences: false)
+            guard let path = parts.first, !path.isEmpty else { continue }
+            let entry = BinaryEntry(
+                path: String(path),
+                version: parts.count > 1 ? String(parts[1]) : ""
+            )
+            switch key {
+            case "tm-agent": inventory.cli = entry
+            case "tm-agent.shadowed": inventory.cliShadowed.append(entry)
+            case "term-meshd": inventory.daemon = entry
+            case "term-meshd.shadowed": inventory.daemonShadowed.append(entry)
+            default: continue
+            }
+        }
+        return inventory
+    }
+
+    /// What is worth saying out loud about an inventory, or nothing.
+    ///
+    /// Deliberately quiet: a host whose binaries agree produces no lines. A
+    /// warning that appears on healthy hosts is one people stop reading, and
+    /// this one has to survive being read months from now, once.
+    static func inventoryWarnings(_ inventory: BinaryInventory) -> [String] {
+        var warnings: [String] = []
+        // A copy earlier in PATH beats a newer one later, so the version that
+        // matters is the one that wins — and the loser is what makes it look
+        // like the host is up to date when it is not.
+        for (name, winner, shadowed) in [
+            ("tm-agent", inventory.cli, inventory.cliShadowed),
+            ("term-meshd", inventory.daemon, inventory.daemonShadowed),
+        ] {
+            guard let winner else { continue }
+            for other in shadowed where other.version != winner.version {
+                warnings.append(
+                    "\(name): this host runs \(winner.path) (\(winner.version)) — "
+                        + "\(other.path) (\(other.version)) is shadowed by it."
+                )
+            }
+        }
+        if let appVersion = inventory.appVersion,
+           let cli = inventory.cli,
+           !cli.version.isEmpty,
+           !cli.version.contains(appVersion) {
+            warnings.append(
+                "tm-agent here is \(cli.version) but the app is \(appVersion) — "
+                    + "a leader on this host drives its team through the older one."
+            )
+        }
+        return warnings
+    }
+
+    /// Ask a host what it would actually run. Never throws; an unreachable
+    /// host simply has nothing to report.
+    static func binaryInventory(
+        sshTarget: String,
+        port: Int?,
+        identityFile: String?
+    ) async -> BinaryInventory? {
+        guard let output = try? await runRemote(
+            sshTarget: sshTarget, port: port, identityFile: identityFile,
+            command: binaryInventoryCommand, timeoutSeconds: 20
+        ) else { return nil }
+        return parseBinaryInventory(output)
     }
 
     /// Post-install health check: service state + journal tail. Used
