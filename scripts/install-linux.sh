@@ -226,17 +226,35 @@ log "installed ${PREFIX}/${BIN_NAME}"
 if [[ "$CLI_PRESENT" == 1 ]]; then
   install -m 0755 "${WORK_DIR}/${CLI_NAME}" "${PREFIX}/${CLI_NAME}"
   log "installed ${PREFIX}/${CLI_NAME}"
-  # A copy of the CLI somewhere else on PATH does not go away just because a
-  # newer one landed here, and term-mesh searches $HOME/.local/bin before
-  # /usr/local/bin — so a leftover from an earlier install silently wins and
-  # the whole fleet drifts. Name it; deleting someone else's binary is not
-  # this script's call.
-  while read -r other; do
-    [[ -z "$other" || "$other" == "${PREFIX}/${CLI_NAME}" ]] && continue
-    log "warning: another ${CLI_NAME} is on PATH at ${other} ($("$other" --version 2>&1 | head -1))"
-    log "         term-mesh resolves \$HOME/.local/bin before /usr/local/bin — remove the stale copy or it keeps winning"
-  done < <(type -aP "$CLI_NAME" 2>/dev/null || true)
 fi
+
+# term-mesh launches agents through a FIXED PATH, and it is not this script's
+# PATH: `$HOME/.local/bin` comes first and `/usr/local/bin` last (see
+# `PeerHostReadiness.binDirs`). A copy left in an earlier directory keeps
+# winning no matter what lands here, so the host runs one version and reports
+# another. Checking `$PATH` alone misses it completely — root's PATH usually
+# has no `~/.local/bin`, so the copy that actually wins is invisible from
+# here. That is not hypothetical: installing 0.170.2 onto two peers left both
+# running the 0.170.1 copies in `~/.local/bin`, and nothing said so.
+#
+# Naming it is the whole job. Deleting someone else's binary is not this
+# script's call.
+TERMMESH_SEARCH_DIRS=(
+  "$HOME/.local/bin" "$HOME/.cargo/bin" "$HOME/bin" "$HOME/go/bin"
+  "$HOME/.bun/bin" "$HOME/.npm-global/bin" "$HOME/.npm-packages/bin"
+  /opt/homebrew/bin /usr/local/bin
+)
+for name in "$BIN_NAME" "$CLI_NAME"; do
+  [[ "$name" == "$CLI_NAME" && "$CLI_PRESENT" != 1 ]] && continue
+  winner=
+  for dir in "${TERMMESH_SEARCH_DIRS[@]}"; do
+    if [[ -x "$dir/$name" ]]; then winner="$dir/$name"; break; fi
+  done
+  [[ -z "$winner" || "$winner" == "${PREFIX}/${name}" ]] && continue
+  log "warning: term-mesh will run ${winner} ($("$winner" --version 2>&1 | head -1)),"
+  log "         not the ${name} just installed at ${PREFIX}/${name}"
+  log "         it searches \$HOME/.local/bin before ${PREFIX} — remove or replace the older copy"
+done
 
 case ":$PATH:" in
   *":${PREFIX}:"*) ;;
