@@ -558,142 +558,46 @@ struct TabItemView: View, Equatable {
         }
         .contextMenu {
             let targetIds = contextTargetIds()
-            let tabColorPalette = WorkspaceTabColorSettings.palette()
-            let shouldPin = !tab.isPinned
-            let pinLabel = targetIds.count > 1
-                ? (shouldPin ? "Pin Workspaces" : "Unpin Workspaces")
-                : (shouldPin ? "Pin Workspace" : "Unpin Workspace")
-            let closeLabel = targetIds.count > 1 ? "Close Workspaces" : "Close Workspace"
-            let markReadLabel = targetIds.count > 1 ? "Mark Workspaces as Read" : "Mark Workspace as Read"
-            let markUnreadLabel = targetIds.count > 1 ? "Mark Workspaces as Unread" : "Mark Workspace as Unread"
-            let renameWorkspaceShortcut = KeyboardShortcutSettings.shortcut(for: .renameWorkspace)
-            let closeWorkspaceShortcut = KeyboardShortcutSettings.shortcut(for: .closeWorkspace)
-            Button(pinLabel) {
-                for id in targetIds {
-                    if let tab = tabManager.tabs.first(where: { $0.id == id }) {
-                        tabManager.setPinned(tab, pinned: shouldPin)
-                    }
-                }
-                syncSelectionAfterMutation()
-            }
-
-            if let key = renameWorkspaceShortcut.keyEquivalent {
-                Button("Rename Workspace…") {
-                    promptRename()
-                }
-                .keyboardShortcut(key, modifiers: renameWorkspaceShortcut.eventModifiers)
-            } else {
-                Button("Rename Workspace…") {
-                    promptRename()
-                }
-            }
-
-            if tab.hasCustomTitle {
-                Button("Remove Custom Workspace Name") {
-                    tabManager.clearCustomTitle(tabId: tab.id)
-                }
-            }
-
-            Menu("Tab Color") {
-                if tab.customColor != nil {
-                    Button {
-                        applyTabColor(nil, targetIds: targetIds)
-                    } label: {
-                        Label("Clear Color", systemImage: "xmark.circle")
-                    }
-                }
-
-                Button {
-                    promptCustomColor(targetIds: targetIds)
-                } label: {
-                    Label("Choose Custom Color…", systemImage: "paintpalette")
-                }
-
-                if !tabColorPalette.isEmpty {
-                    Divider()
-                }
-
-                ForEach(tabColorPalette, id: \.id) { entry in
-                    Button {
-                        applyTabColor(entry.hex, targetIds: targetIds)
-                    } label: {
-                        Label {
-                            Text(entry.name)
-                        } icon: {
-                            Image(nsImage: coloredCircleImage(color: tabColorSwatchColor(for: entry.hex)))
+            SidebarTabContextMenu(
+                targetIds: targetIds,
+                visibleIndex: visibleIndex,
+                visibleWorkspaceCount: visibleTabIds.count,
+                isPinned: tab.isPinned,
+                hasCustomTitle: tab.hasCustomTitle,
+                customColor: tab.customColor,
+                hasTag: tab.tag != nil,
+                palette: WorkspaceTabColorSettings.palette(),
+                renameShortcut: KeyboardShortcutSettings.shortcut(for: .renameWorkspace),
+                closeShortcut: KeyboardShortcutSettings.shortcut(for: .closeWorkspace),
+                colorScheme: colorScheme,
+                activeIndicatorStyle: activeTabIndicatorStyle,
+                onSetPinned: { shouldPin in
+                    for id in targetIds {
+                        if let target = tabManager.tabs.first(where: { $0.id == id }) {
+                            tabManager.setPinned(target, pinned: shouldPin)
                         }
                     }
-                }
-            }
-
-            if tab.tag != nil {
-                Button("Clear Tag") {
-                    tab.tag = nil
-                }
-            }
-            Button("Set Tag…") {
-                ContentView.showWorkspaceTagPrompt(for: tab)
-            }
-
-            Divider()
-
-            Button("Move Up") {
-                moveBy(-1)
-            }
-            .disabled(visibleIndex == 0)
-
-            Button("Move Down") {
-                moveBy(1)
-            }
-            .disabled(visibleIndex.map { $0 >= visibleTabIds.count - 1 } ?? true)
-
-            Button("Move to Top") {
-                tabManager.moveTabsToTop(Set(targetIds))
-                syncSelectionAfterMutation()
-            }
-            .disabled(targetIds.isEmpty)
-
-            Divider()
-
-            if let key = closeWorkspaceShortcut.keyEquivalent {
-                Button(closeLabel) {
-                    closeTabs(targetIds, allowPinned: true)
-                }
-                .keyboardShortcut(key, modifiers: closeWorkspaceShortcut.eventModifiers)
-                .disabled(targetIds.isEmpty)
-            } else {
-                Button(closeLabel) {
-                    closeTabs(targetIds, allowPinned: true)
-                }
-                .disabled(targetIds.isEmpty)
-            }
-
-            Button("Close Other Workspaces") {
-                closeOtherTabs(targetIds)
-            }
-            .disabled(visibleTabIds.count <= 1 || targetIds.count == visibleTabIds.count)
-
-            Button("Close Workspaces Below") {
-                closeTabsBelow(tabId: tab.id)
-            }
-            .disabled(visibleIndex.map { $0 >= visibleTabIds.count - 1 } ?? true)
-
-            Button("Close Workspaces Above") {
-                closeTabsAbove(tabId: tab.id)
-            }
-            .disabled(visibleIndex == 0)
-
-            Divider()
-
-            Button(markReadLabel) {
-                markTabsRead(targetIds)
-            }
-            .disabled(!hasUnreadNotifications(in: targetIds))
-
-            Button(markUnreadLabel) {
-                markTabsUnread(targetIds)
-            }
-            .disabled(!hasReadNotifications(in: targetIds))
+                    syncSelectionAfterMutation()
+                },
+                onRename: { promptRename() },
+                onClearCustomTitle: { tabManager.clearCustomTitle(tabId: tab.id) },
+                onApplyColor: { applyTabColor($0, targetIds: targetIds) },
+                onChooseCustomColor: { promptCustomColor(targetIds: targetIds) },
+                onClearTag: { tab.tag = nil },
+                onSetTag: { ContentView.showWorkspaceTagPrompt(for: tab) },
+                onMove: { moveBy($0) },
+                onMoveToTop: {
+                    tabManager.moveTabsToTop(Set(targetIds))
+                    syncSelectionAfterMutation()
+                },
+                onClose: { closeTabs(targetIds, allowPinned: true) },
+                onCloseOthers: { closeOtherTabs(targetIds) },
+                onCloseBelow: { closeTabsBelow(tabId: tab.id) },
+                onCloseAbove: { closeTabsAbove(tabId: tab.id) },
+                onMarkRead: { markTabsRead(targetIds) },
+                onMarkUnread: { markTabsUnread(targetIds) }
+            )
+            .equatable()
         }
         .onAppear { updateCachedSlotWidth() }
         .onChange(of: workspaceShortcutLabel) { _ in updateCachedSlotWidth() }
@@ -1247,6 +1151,139 @@ struct TabItemView: View, Equatable {
             guard response == .alertFirstButtonReturn else { return }
             self.tabManager.setCustomTitle(tabId: self.tab.id, title: input.stringValue)
         }
+    }
+}
+
+private struct SidebarTabContextMenu: View, Equatable {
+    @EnvironmentObject private var notificationStore: TerminalNotificationStore
+
+    let targetIds: [UUID]
+    let visibleIndex: Int?
+    let visibleWorkspaceCount: Int
+    let isPinned: Bool
+    let hasCustomTitle: Bool
+    let customColor: String?
+    let hasTag: Bool
+    let palette: [WorkspaceTabColorEntry]
+    let renameShortcut: StoredShortcut
+    let closeShortcut: StoredShortcut
+    let colorScheme: ColorScheme
+    let activeIndicatorStyle: SidebarActiveTabIndicatorStyle
+    let onSetPinned: (Bool) -> Void
+    let onRename: () -> Void
+    let onClearCustomTitle: () -> Void
+    let onApplyColor: (String?) -> Void
+    let onChooseCustomColor: () -> Void
+    let onClearTag: () -> Void
+    let onSetTag: () -> Void
+    let onMove: (Int) -> Void
+    let onMoveToTop: () -> Void
+    let onClose: () -> Void
+    let onCloseOthers: () -> Void
+    let onCloseBelow: () -> Void
+    let onCloseAbove: () -> Void
+    let onMarkRead: () -> Void
+    let onMarkUnread: () -> Void
+
+    static func == (lhs: Self, rhs: Self) -> Bool {
+        lhs.targetIds == rhs.targetIds &&
+            lhs.visibleIndex == rhs.visibleIndex &&
+            lhs.visibleWorkspaceCount == rhs.visibleWorkspaceCount &&
+            lhs.isPinned == rhs.isPinned &&
+            lhs.hasCustomTitle == rhs.hasCustomTitle &&
+            lhs.customColor == rhs.customColor &&
+            lhs.hasTag == rhs.hasTag &&
+            lhs.palette == rhs.palette &&
+            lhs.renameShortcut == rhs.renameShortcut &&
+            lhs.closeShortcut == rhs.closeShortcut &&
+            lhs.colorScheme == rhs.colorScheme &&
+            lhs.activeIndicatorStyle == rhs.activeIndicatorStyle
+    }
+
+    @ViewBuilder
+    var body: some View {
+        let shouldPin = !isPinned
+        let plural = targetIds.count > 1
+
+        Button(plural ? (shouldPin ? "Pin Workspaces" : "Unpin Workspaces") : (shouldPin ? "Pin Workspace" : "Unpin Workspace")) {
+            onSetPinned(shouldPin)
+        }
+
+        shortcutButton("Rename Workspace…", shortcut: renameShortcut, action: onRename)
+
+        if hasCustomTitle {
+            Button("Remove Custom Workspace Name", action: onClearCustomTitle)
+        }
+
+        Menu("Tab Color") {
+            if customColor != nil {
+                Button { onApplyColor(nil) } label: {
+                    Label("Clear Color", systemImage: "xmark.circle")
+                }
+            }
+            Button(action: onChooseCustomColor) {
+                Label("Choose Custom Color…", systemImage: "paintpalette")
+            }
+            if !palette.isEmpty { Divider() }
+            ForEach(palette) { entry in
+                Button { onApplyColor(entry.hex) } label: {
+                    Label { Text(entry.name) } icon: {
+                        Image(nsImage: coloredCircleImage(color: swatchColor(for: entry.hex)))
+                    }
+                }
+            }
+        }
+
+        if hasTag { Button("Clear Tag", action: onClearTag) }
+        Button("Set Tag…", action: onSetTag)
+        Divider()
+
+        Button("Move Up") { onMove(-1) }.disabled(visibleIndex == 0)
+        Button("Move Down") { onMove(1) }
+            .disabled(visibleIndex.map { $0 >= visibleWorkspaceCount - 1 } ?? true)
+        Button("Move to Top", action: onMoveToTop).disabled(targetIds.isEmpty)
+        Divider()
+
+        shortcutButton(plural ? "Close Workspaces" : "Close Workspace", shortcut: closeShortcut, action: onClose)
+            .disabled(targetIds.isEmpty)
+        Button("Close Other Workspaces", action: onCloseOthers)
+            .disabled(visibleWorkspaceCount <= 1 || targetIds.count == visibleWorkspaceCount)
+        Button("Close Workspaces Below", action: onCloseBelow)
+            .disabled(visibleIndex.map { $0 >= visibleWorkspaceCount - 1 } ?? true)
+        Button("Close Workspaces Above", action: onCloseAbove).disabled(visibleIndex == 0)
+        Divider()
+
+        Button(plural ? "Mark Workspaces as Read" : "Mark Workspace as Read", action: onMarkRead)
+            .disabled(!hasUnreadNotifications)
+        Button(plural ? "Mark Workspaces as Unread" : "Mark Workspace as Unread", action: onMarkUnread)
+            .disabled(!hasReadNotifications)
+    }
+
+    @ViewBuilder
+    private func shortcutButton(_ title: String, shortcut: StoredShortcut, action: @escaping () -> Void) -> some View {
+        if let key = shortcut.keyEquivalent {
+            Button(title, action: action).keyboardShortcut(key, modifiers: shortcut.eventModifiers)
+        } else {
+            Button(title, action: action)
+        }
+    }
+
+    private var hasUnreadNotifications: Bool {
+        let targetSet = Set(targetIds)
+        return notificationStore.notifications.contains { targetSet.contains($0.tabId) && !$0.isRead }
+    }
+
+    private var hasReadNotifications: Bool {
+        let targetSet = Set(targetIds)
+        return notificationStore.notifications.contains { targetSet.contains($0.tabId) && $0.isRead }
+    }
+
+    private func swatchColor(for hex: String) -> NSColor {
+        WorkspaceTabColorSettings.displayNSColor(
+            hex: hex,
+            colorScheme: colorScheme,
+            forceBright: activeIndicatorStyle == .leftRail
+        ) ?? NSColor(hex: hex) ?? .gray
     }
 }
 

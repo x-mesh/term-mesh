@@ -3157,6 +3157,54 @@ final class WorkspacePanelGitBranchTests: XCTestCase {
 @MainActor
 final class SidebarBranchOrderingTests: XCTestCase {
 
+    func testWorkspaceCachesDominantRemoteHostKeyUntilPanelsOrFocusChange() {
+        let workspace = Workspace()
+        guard let firstPanelId = workspace.focusedPanelId,
+              let paneId = workspace.paneId(forPanelId: firstPanelId),
+              let secondPanel = workspace.newTerminalSurface(inPane: paneId, focus: false) else {
+            XCTFail("Expected two local terminal panels")
+            return
+        }
+
+        guard let initiallyFocusedPanelId = workspace.focusedPanelId else {
+            XCTFail("Expected one of the terminal panels to be focused")
+            return
+        }
+        let targetPanelId = initiallyFocusedPanelId == firstPanelId ? secondPanel.id : firstPanelId
+        guard let targetTabId = workspace.surfaceIdFromPanelId(targetPanelId) else {
+            XCTFail("Expected a Bonsplit tab for the focus target")
+            return
+        }
+
+        XCTAssertNil(workspace.dominantRemoteHostKey)
+        XCTAssertEqual(workspace.dominantRemoteHostKeyComputationCount, 1)
+
+        XCTAssertNil(workspace.dominantRemoteHostKey)
+        XCTAssertEqual(
+            workspace.dominantRemoteHostKeyComputationCount,
+            1,
+            "Selection-only sidebar renders must reuse the host-key snapshot"
+        )
+
+        workspace.applyTabSelection(tabId: targetTabId, inPane: paneId)
+        XCTAssertEqual(workspace.focusedPanelId, targetPanelId)
+        XCTAssertNil(workspace.dominantRemoteHostKey)
+        XCTAssertEqual(
+            workspace.dominantRemoteHostKeyComputationCount,
+            2,
+            "Changing the focused panel must recompute the focus-preferred host"
+        )
+
+        let panelToRemove = targetPanelId == firstPanelId ? secondPanel.id : firstPanelId
+        workspace.panels.removeValue(forKey: panelToRemove)
+        XCTAssertNil(workspace.dominantRemoteHostKey)
+        XCTAssertEqual(
+            workspace.dominantRemoteHostKeyComputationCount,
+            3,
+            "Changing panel membership must invalidate the fallback-host scan"
+        )
+    }
+
     func testWorkspaceCachesBranchDirectoryEntriesUntilAnInputChanges() {
         let workspace = Workspace()
         guard let panelId = workspace.focusedPanelId else {
