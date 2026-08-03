@@ -1349,7 +1349,8 @@ final class WindowTerminalPortal: NSObject {
         // before the hosted view enters a window.
         hostedView.reconcileGeometryNow()
 
-        if hostedView.superview !== hostView {
+        let requiredHostedViewAttachment = hostedView.superview !== hostView
+        if requiredHostedViewAttachment {
 #if DEBUG
             dlog(
                 "portal.reparent hosted=\(portalDebugToken(hostedView)) " +
@@ -1374,7 +1375,21 @@ final class WindowTerminalPortal: NSObject {
         ensureDividerOverlayOnTop()
 
         synchronizeHostedView(withId: hostedId, installationPrepared: true)
-        scheduleDeferredFullSynchronizeAll()
+
+        // A warm workspace switch rebinds the same hosted view to the same
+        // anchor only to flip visibility. The targeted synchronization above
+        // already applies that state. Walking every portal entry again on the
+        // next run-loop turn adds a full AppKit layout pass to every switch
+        // without repairing any geometry. Keep the deferred failsafe for real
+        // topology changes, where another anchor can legitimately have missed
+        // a geometry callback during SwiftUI/AppKit churn.
+        let needsFullReconciliation =
+            previousEntry == nil ||
+            didChangeAnchor ||
+            requiredHostedViewAttachment
+        if needsFullReconciliation {
+            scheduleDeferredFullSynchronizeAll()
+        }
         pruneDeadEntries()
     }
 
