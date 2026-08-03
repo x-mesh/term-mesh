@@ -74,12 +74,18 @@ struct SidebarEmptyArea: View {
     }
 }
 
-struct TabItemView: View {
-    @EnvironmentObject var tabManager: TabManager
+struct TabItemView: View, Equatable {
     @EnvironmentObject var notificationStore: TerminalNotificationStore
     @Environment(\.colorScheme) private var colorScheme
+    /// Action target only. The row deliberately does not subscribe to the
+    /// manager's broad publisher; explicit render snapshots below define its
+    /// invalidation boundary.
+    let tabManager: TabManager
     @ObservedObject var tab: Tab
     let index: Int
+    let isActive: Bool
+    let isMultiSelected: Bool
+    let workspaceCount: Int
     /// Tabs that are actually rendered in this section, in presentation
     /// order. Experimental mode excludes peer-mirror backing workspaces.
     let visibleTabIds: [UUID]
@@ -129,14 +135,6 @@ struct TabItemView: View {
     @AppStorage("sidebarShowStatusPills") private var sidebarShowStatusPills = true
     @AppStorage(SidebarActiveTabIndicatorSettings.styleKey)
     private var activeTabIndicatorStyleRaw = SidebarActiveTabIndicatorSettings.defaultStyle.rawValue
-
-    var isActive: Bool {
-        tabManager.selectedTabId == tab.id
-    }
-
-    var isMultiSelected: Bool {
-        selectedTabIds.contains(tab.id)
-    }
 
     private var isBeingDragged: Bool {
         draggedTabId == tab.id
@@ -202,11 +200,11 @@ struct TabItemView: View {
     }
 
     private var workspaceShortcutDigit: Int? {
-        WorkspaceShortcutMapper.commandDigitForWorkspace(at: index, workspaceCount: tabManager.tabs.count)
+        WorkspaceShortcutMapper.commandDigitForWorkspace(at: index, workspaceCount: workspaceCount)
     }
 
     private var showCloseButton: Bool {
-        isHovering && tabManager.tabs.count > 1 && !(showsCommandShortcutHints || alwaysShowShortcutHints)
+        isHovering && workspaceCount > 1 && !(showsCommandShortcutHints || alwaysShowShortcutHints)
     }
 
     private var workspaceShortcutLabel: String? {
@@ -235,6 +233,19 @@ struct TabItemView: View {
         let font = NSFont.systemFont(ofSize: 10, weight: .semibold)
         let textWidth = (label as NSString).size(withAttributes: [.font: font]).width
         return ceil(textWidth) + 12
+    }
+
+    static func == (lhs: TabItemView, rhs: TabItemView) -> Bool {
+        lhs.tab === rhs.tab &&
+            lhs.index == rhs.index &&
+            lhs.isActive == rhs.isActive &&
+            lhs.isMultiSelected == rhs.isMultiSelected &&
+            lhs.workspaceCount == rhs.workspaceCount &&
+            lhs.visibleTabIds == rhs.visibleTabIds &&
+            lhs.rowSpacing == rhs.rowSpacing &&
+            lhs.showsCommandShortcutHints == rhs.showsCommandShortcutHints &&
+            lhs.draggedTabId == rhs.draggedTabId &&
+            lhs.dropIndicator == rhs.dropIndicator
     }
 
     var body: some View {
@@ -1893,12 +1904,12 @@ struct SidebarStatusPillsRow: View {
     }
 }
 
-enum SidebarDropEdge {
+enum SidebarDropEdge: Equatable {
     case top
     case bottom
 }
 
-struct SidebarDropIndicator {
+struct SidebarDropIndicator: Equatable {
     let tabId: UUID?
     let edge: SidebarDropEdge
 }

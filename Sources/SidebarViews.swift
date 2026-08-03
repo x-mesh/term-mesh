@@ -90,8 +90,12 @@ struct VerticalTabsSidebar: View {
                                             separatedSectionsEnabled: sidebarSeparatedSectionsEnabled
                                         ) {
                                             TabItemView(
+                                                tabManager: tabManager,
                                                 tab: tab,
                                                 index: index,
+                                                isActive: tabManager.selectedTabId == tab.id,
+                                                isMultiSelected: selectedTabIds.contains(tab.id),
+                                                workspaceCount: tabManager.tabs.count,
                                                 visibleTabIds: visibleLocalWorkspaceIds,
                                                 rowSpacing: tabRowSpacing,
                                                 selection: $selection,
@@ -102,6 +106,7 @@ struct VerticalTabsSidebar: View {
                                                 draggedTabId: $draggedTabId,
                                                 dropIndicator: $dropIndicator
                                             )
+                                            .equatable()
                                         }
                                     }
                                 }
