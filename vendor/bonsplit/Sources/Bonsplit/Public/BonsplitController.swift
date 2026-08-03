@@ -59,7 +59,10 @@ public final class BonsplitController {
     /// so their views (kept alive in a ZStack for state preservation) don't intercept drags
     /// meant for the active workspace.
     @ObservationIgnored public var isInteractive: Bool = true {
-        didSet { internalController.isInteractive = isInteractive }
+        didSet {
+            guard oldValue != isInteractive else { return }
+            internalController.isInteractive = isInteractive
+        }
     }
 
     /// Handler for file/URL drops from external apps (e.g., Finder).
