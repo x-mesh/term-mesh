@@ -107,11 +107,18 @@ final class DashboardController: NSObject, WKNavigationDelegate {
     private var webView: WKWebView?
     private var uiTimer: Timer?
     private var trackingTimer: Timer?
+    private var trackingSyncInFlight = false
     private var trackedPIDs: Set<Int32> = []
     private var messageHandler: DashboardMessageHandler?
 
     /// Project roots currently being watched — keyed by tab ID to avoid duplicates.
     private var watchedProjects: [UUID: String] = [:]
+    private struct ProjectRootCacheEntry {
+        let root: String
+        let resolvedAt: Date
+    }
+    private var projectRootCache: [String: ProjectRootCacheEntry] = [:]
+    private let projectRootCacheTTL: TimeInterval = 60
 
     /// PIDs that we've already sent a notification for (avoid spamming).
     private var notifiedAlertPIDs: Set<Int32> = []
@@ -160,6 +167,8 @@ final class DashboardController: NSObject, WKNavigationDelegate {
     func stopTracking() {
         trackingTimer?.invalidate()
         trackingTimer = nil
+        trackingSyncInFlight = false
+        projectRootCache.removeAll()
         notifiedAlertPIDs.removeAll()
         let daemon = self.daemon
         let paths = Set(watchedProjects.values)
@@ -267,24 +276,30 @@ final class DashboardController: NSObject, WKNavigationDelegate {
     // MARK: - Tracking (always-on)
 
     private func syncTrackingState() {
+        guard !trackingSyncInFlight else { return }
+        trackingSyncInFlight = true
+
         DispatchQueue.global(qos: .utility).async { [weak self] in
             let descendants = Self.discoverDescendantPIDs()
             DispatchQueue.main.async {
+                guard let self else { return }
+                self.trackingSyncInFlight = false
                 if let descendants {
-                    self?.reconcileTrackedPIDs(descendants)
+                    self.reconcileTrackedPIDs(descendants)
                 }
-                self?.watchTabProjects()
-                self?.syncSessionsToDaemon()
-                self?.syncTeamsToDaemon()
-                self?.pollAlerts()
-                self?.deliverPendingInputs()
+                let projectRoots = self.resolveProjectRoots()
+                self.watchTabProjects(projectRoots: projectRoots)
+                self.syncSessionsToDaemon(projectRoots: projectRoots)
+                self.syncTeamsToDaemon()
+                self.pollAlerts()
+                self.deliverPendingInputs()
             }
         }
     }
 
     /// Push current session list to daemon so HTTP dashboard can show the session picker.
     /// All tabs are synced regardless of watch safety — this is metadata for the session picker.
-    private func syncSessionsToDaemon() {
+    private func syncSessionsToDaemon(projectRoots: [UUID: String]) {
         guard let tabManager else { return }
 
         let notificationStore = self.notifications
@@ -293,7 +308,7 @@ final class DashboardController: NSObject, WKNavigationDelegate {
             let cwd = workspace.currentDirectory
             guard !cwd.isEmpty else { continue }
 
-            let projectRoot = findProjectRoot(from: cwd) ?? cwd
+            let projectRoot = projectRoots[workspace.id] ?? cwd
 
             var session: [String: Any] = [
                 "id": workspace.id.uuidString,
@@ -566,24 +581,16 @@ final class DashboardController: NSObject, WKNavigationDelegate {
 
     /// Watch the **project root** of each terminal tab's working directory.
     /// Each tab = one watched project. If a tab's directory changes, the watch updates.
-    private func watchTabProjects() {
-        guard let tabManager else { return }
-
+    private func watchTabProjects(projectRoots: [UUID: String]) {
         var currentTabProjects: [UUID: String] = [:]
 
-        for workspace in tabManager.tabs {
-            let cwd = workspace.currentDirectory
-            guard !cwd.isEmpty else { continue }
-
-            // Find the project root from the tab's current directory
-            let projectRoot = findProjectRoot(from: cwd) ?? cwd
-
+        for (tabID, projectRoot) in projectRoots {
             // Normalize and skip dangerous/broad paths. TermMeshDaemon repeats
             // this validation at the client boundary and term-meshd enforces it
             // again at the socket boundary.
             guard let safeProjectRoot = TermMeshDaemon.safeWatchPath(projectRoot) else { continue }
 
-            currentTabProjects[workspace.id] = safeProjectRoot
+            currentTabProjects[tabID] = safeProjectRoot
         }
 
         let daemon = self.daemon
@@ -622,6 +629,37 @@ final class DashboardController: NSObject, WKNavigationDelegate {
                 }
             }
         }
+    }
+
+    /// Resolve each tab's project root once per tracking cycle. Results are cached
+    /// briefly so stable tabs do not repeatedly traverse the same directory tree.
+    private func resolveProjectRoots(now: Date = Date()) -> [UUID: String] {
+        guard let tabManager else {
+            projectRootCache.removeAll()
+            return [:]
+        }
+
+        var roots: [UUID: String] = [:]
+        var activeDirectories: Set<String> = []
+
+        for workspace in tabManager.tabs {
+            let cwd = workspace.currentDirectory
+            guard !cwd.isEmpty else { continue }
+            activeDirectories.insert(cwd)
+
+            if let cached = projectRootCache[cwd],
+               now.timeIntervalSince(cached.resolvedAt) < projectRootCacheTTL {
+                roots[workspace.id] = cached.root
+                continue
+            }
+
+            let root = findProjectRoot(from: cwd) ?? cwd
+            projectRootCache[cwd] = ProjectRootCacheEntry(root: root, resolvedAt: now)
+            roots[workspace.id] = root
+        }
+
+        projectRootCache = projectRootCache.filter { activeDirectories.contains($0.key) }
+        return roots
     }
 
     /// Walk up from `directory` looking for project markers (.git, Cargo.toml, etc.)
