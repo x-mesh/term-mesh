@@ -447,7 +447,6 @@ struct ContentView: View {
                     }
                     .opacity(isVisible ? 1 : 0)
                     .allowsHitTesting(isSelectedWorkspace)
-                    .zIndex(isSelectedWorkspace ? 2 : (isRetiringWorkspace ? 1 : 0))
                 }
             }
             .opacity(sidebarSelectionState.selection == .tabs ? 1 : 0)
