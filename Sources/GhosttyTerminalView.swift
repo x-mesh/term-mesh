@@ -510,6 +510,11 @@ final class TerminalSurface: Identifiable, ObservableObject {
                 requestBackgroundSurfaceStartIfNeeded(reason: "attachToWindow")
                 return
             }
+            guard !surfaceCreationInProgress else { return }
+            guard ProcessInfo.processInfo.systemUptime >= surfaceCreationRetryNotBefore else {
+                requestBackgroundSurfaceStartIfNeeded(reason: "attachBackoff")
+                return
+            }
             #if DEBUG
             dlog("surface.attach.create surface=\(id.uuidString.prefix(5))")
             #endif
