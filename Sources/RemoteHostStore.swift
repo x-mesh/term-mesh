@@ -328,7 +328,7 @@ struct PeerHostEndpointProvenance: Equatable, Sendable {
     let remoteSocket: String
 }
 
-struct HostEntry: Identifiable {
+struct HostEntry: Identifiable, Equatable {
     let id: String         // stable dedup key (stableKey)
     var displayName: String
     var connectionState: HostConnectionState

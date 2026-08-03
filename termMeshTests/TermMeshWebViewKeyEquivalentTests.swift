@@ -6503,6 +6503,58 @@ final class TerminalControllerSidebarDedupeTests: XCTestCase {
     }
 }
 
+@MainActor
+final class SidebarNotificationSummaryTests: XCTestCase {
+    func testSummariesCountUnreadAndPreferLatestUnreadText() {
+        let workspace = UUID()
+        let notifications = [
+            notification(workspace: workspace, title: "Newest read", body: "", isRead: true),
+            notification(workspace: workspace, title: "Unread title", body: "  Unread body  ", isRead: false),
+            notification(workspace: workspace, title: "Older unread", body: "", isRead: false),
+        ]
+
+        let summary = TerminalNotificationStore.makeSidebarSummaries(from: notifications)[workspace]
+
+        XCTAssertEqual(summary?.unreadCount, 2)
+        XCTAssertEqual(summary?.displayText, "Unread body")
+    }
+
+    func testSummariesUseLatestReadTextAndIgnoreWhitespaceOnlyText() {
+        let workspace = UUID()
+        let emptyWorkspace = UUID()
+        let notifications = [
+            notification(workspace: workspace, title: "Latest title", body: "", isRead: true),
+            notification(workspace: workspace, title: "Older title", body: "Older body", isRead: true),
+            notification(workspace: emptyWorkspace, title: "  ", body: "  ", isRead: false),
+        ]
+
+        let summaries = TerminalNotificationStore.makeSidebarSummaries(from: notifications)
+
+        XCTAssertEqual(summaries[workspace]?.unreadCount, 0)
+        XCTAssertEqual(summaries[workspace]?.displayText, "Latest title")
+        XCTAssertEqual(summaries[emptyWorkspace]?.unreadCount, 1)
+        XCTAssertNil(summaries[emptyWorkspace]?.displayText)
+    }
+
+    private func notification(
+        workspace: UUID,
+        title: String,
+        body: String,
+        isRead: Bool
+    ) -> TerminalNotification {
+        TerminalNotification(
+            id: UUID(),
+            tabId: workspace,
+            surfaceId: nil,
+            title: title,
+            subtitle: "",
+            body: body,
+            createdAt: Date(),
+            isRead: isRead
+        )
+    }
+}
+
 final class TerminalControllerRemoteAgentAddTests: XCTestCase {
     private let hosts = [
         (key: "ssh:root@jw-server", displayName: "Build Server", sshTarget: Optional("root@jw-server"))

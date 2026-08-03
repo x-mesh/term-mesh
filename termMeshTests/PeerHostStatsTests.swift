@@ -59,6 +59,7 @@ final class PeerHostStatsTests: XCTestCase {
 
         XCTAssertTrue(stats.isDiskLow)
         XCTAssertEqual(stats.diskFreeText, "4.3GB free")
+        XCTAssertEqual(stats.diskWarningText, "4.3GB free")
     }
 
     /// The proportional floor catches a small disk that is nearly full even
@@ -75,6 +76,7 @@ final class PeerHostStatsTests: XCTestCase {
 
         XCTAssertTrue(nearlyFull.isDiskLow)
         XCTAssertFalse(comfortable.isDiskLow)
+        XCTAssertNil(comfortable.diskWarningText)
     }
 
     func testSummaryLeadsWithAllThreeLoadAverages() {

@@ -75,7 +75,6 @@ struct SidebarEmptyArea: View {
 }
 
 struct TabItemView: View, Equatable {
-    @EnvironmentObject var notificationStore: TerminalNotificationStore
     @Environment(\.colorScheme) private var colorScheme
     /// Action target only. The row deliberately does not subscribe to the
     /// manager's broad publisher; explicit render snapshots below define its
@@ -89,6 +88,9 @@ struct TabItemView: View, Equatable {
     /// Parent-computed snapshot. Avoids a linear scan of every team from
     /// every row body and makes team membership part of the Equatable edge.
     let activeTeamName: String?
+    /// Parent-computed notification state. This prevents a notification for
+    /// one workspace from directly invalidating every sidebar row.
+    let notificationSummary: SidebarNotificationSummary
     /// Tabs that are actually rendered in this section, in presentation
     /// order. Experimental mode excludes peer-mirror backing workspaces.
     let visibleTabIds: [UUID]
@@ -245,6 +247,7 @@ struct TabItemView: View, Equatable {
             lhs.isMultiSelected == rhs.isMultiSelected &&
             lhs.workspaceCount == rhs.workspaceCount &&
             lhs.activeTeamName == rhs.activeTeamName &&
+            lhs.notificationSummary == rhs.notificationSummary &&
             lhs.visibleTabIds == rhs.visibleTabIds &&
             lhs.rowSpacing == rhs.rowSpacing &&
             lhs.showsCommandShortcutHints == rhs.showsCommandShortcutHints &&
@@ -263,7 +266,7 @@ struct TabItemView: View, Equatable {
 
         VStack(alignment: .leading, spacing: 4) {
             HStack(spacing: 8) {
-                let unreadCount = notificationStore.unreadCount(forTabId: tab.id)
+                let unreadCount = notificationSummary.unreadCount
                 if unreadCount > 0 {
                     ZStack {
                         Circle()
@@ -561,45 +564,17 @@ struct TabItemView: View, Equatable {
             moveBy(1)
         }
         .contextMenu {
-            let targetIds = contextTargetIds()
             SidebarTabContextMenu(
-                targetIds: targetIds,
+                clickedID: tab.id,
+                selectedTabIds: selectedTabIds,
+                visibleTabIds: visibleTabIds,
                 visibleIndex: visibleIndex,
                 visibleWorkspaceCount: visibleTabIds.count,
                 isPinned: tab.isPinned,
                 hasCustomTitle: tab.hasCustomTitle,
                 customColor: tab.customColor,
                 hasTag: tab.tag != nil,
-                palette: WorkspaceTabColorSettings.palette(),
-                renameShortcut: KeyboardShortcutSettings.shortcut(for: .renameWorkspace),
-                closeShortcut: KeyboardShortcutSettings.shortcut(for: .closeWorkspace),
-                colorScheme: colorScheme,
-                activeIndicatorStyle: activeTabIndicatorStyle,
-                onSetPinned: { shouldPin in
-                    for id in targetIds {
-                        if let target = tabManager.tabs.first(where: { $0.id == id }) {
-                            tabManager.setPinned(target, pinned: shouldPin)
-                        }
-                    }
-                    syncSelectionAfterMutation()
-                },
-                onRename: { promptRename() },
-                onClearCustomTitle: { tabManager.clearCustomTitle(tabId: tab.id) },
-                onApplyColor: { applyTabColor($0, targetIds: targetIds) },
-                onChooseCustomColor: { promptCustomColor(targetIds: targetIds) },
-                onClearTag: { tab.tag = nil },
-                onSetTag: { ContentView.showWorkspaceTagPrompt(for: tab) },
-                onMove: { moveBy($0) },
-                onMoveToTop: {
-                    tabManager.moveTabsToTop(Set(targetIds))
-                    syncSelectionAfterMutation()
-                },
-                onClose: { closeTabs(targetIds, allowPinned: true) },
-                onCloseOthers: { closeOtherTabs(targetIds) },
-                onCloseBelow: { closeTabsBelow(tabId: tab.id) },
-                onCloseAbove: { closeTabsAbove(tabId: tab.id) },
-                onMarkRead: { markTabsRead(targetIds) },
-                onMarkUnread: { markTabsUnread(targetIds) }
+                onAction: handleContextMenuAction
             )
             .equatable()
         }
@@ -785,6 +760,47 @@ struct TabItemView: View, Equatable {
         )
     }
 
+    private func handleContextMenuAction(_ action: SidebarTabMenuAction) {
+        switch action {
+        case .setPinned(let shouldPin, let targetIds):
+            for id in targetIds {
+                if let target = tabManager.tabs.first(where: { $0.id == id }) {
+                    tabManager.setPinned(target, pinned: shouldPin)
+                }
+            }
+            syncSelectionAfterMutation()
+        case .rename:
+            promptRename()
+        case .clearCustomTitle:
+            tabManager.clearCustomTitle(tabId: tab.id)
+        case .applyColor(let color, let targetIds):
+            applyTabColor(color, targetIds: targetIds)
+        case .chooseCustomColor(let targetIds):
+            promptCustomColor(targetIds: targetIds)
+        case .clearTag:
+            tab.tag = nil
+        case .setTag:
+            ContentView.showWorkspaceTagPrompt(for: tab)
+        case .move(let offset):
+            moveBy(offset)
+        case .moveToTop(let targetIds):
+            tabManager.moveTabsToTop(Set(targetIds))
+            syncSelectionAfterMutation()
+        case .close(let targetIds):
+            closeTabs(targetIds, allowPinned: true)
+        case .closeOthers(let targetIds):
+            closeOtherTabs(targetIds)
+        case .closeBelow:
+            closeTabsBelow(tabId: tab.id)
+        case .closeAbove:
+            closeTabsAbove(tabId: tab.id)
+        case .markRead(let targetIds):
+            markTabsRead(targetIds)
+        case .markUnread(let targetIds):
+            markTabsUnread(targetIds)
+        }
+    }
+
     private func closeTabs(_ targetIds: [UUID], allowPinned: Bool) {
         let idsToClose = targetIds.filter { id in
             guard let tab = tabManager.tabs.first(where: { $0.id == id }) else { return false }
@@ -819,24 +835,14 @@ struct TabItemView: View, Equatable {
 
     private func markTabsRead(_ targetIds: [UUID]) {
         for id in targetIds {
-            notificationStore.markRead(forTabId: id)
+            TerminalNotificationStore.shared.markRead(forTabId: id)
         }
     }
 
     private func markTabsUnread(_ targetIds: [UUID]) {
         for id in targetIds {
-            notificationStore.markUnread(forTabId: id)
+            TerminalNotificationStore.shared.markUnread(forTabId: id)
         }
-    }
-
-    private func hasUnreadNotifications(in targetIds: [UUID]) -> Bool {
-        let targetSet = Set(targetIds)
-        return notificationStore.notifications.contains { targetSet.contains($0.tabId) && !$0.isRead }
-    }
-
-    private func hasReadNotifications(in targetIds: [UUID]) -> Bool {
-        let targetSet = Set(targetIds)
-        return notificationStore.notifications.contains { targetSet.contains($0.tabId) && $0.isRead }
     }
 
     private func syncSelectionAfterMutation() {
@@ -857,10 +863,7 @@ struct TabItemView: View, Equatable {
     }
 
     private var latestNotificationText: String? {
-        guard let notification = notificationStore.latestNotification(forTabId: tab.id) else { return nil }
-        let text = notification.body.isEmpty ? notification.title : notification.body
-        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        return trimmed.isEmpty ? nil : trimmed
+        notificationSummary.displayText
     }
 
     private var activeTeam: TeamOrchestrator.Team? {
@@ -1154,79 +1157,88 @@ struct TabItemView: View, Equatable {
     }
 }
 
+private enum SidebarTabMenuAction {
+    case setPinned(Bool, [UUID])
+    case rename
+    case clearCustomTitle
+    case applyColor(String?, [UUID])
+    case chooseCustomColor([UUID])
+    case clearTag
+    case setTag
+    case move(Int)
+    case moveToTop([UUID])
+    case close([UUID])
+    case closeOthers([UUID])
+    case closeBelow
+    case closeAbove
+    case markRead([UUID])
+    case markUnread([UUID])
+}
+
 private struct SidebarTabContextMenu: View, Equatable {
     @EnvironmentObject private var notificationStore: TerminalNotificationStore
+    @Environment(\.colorScheme) private var colorScheme
+    @AppStorage(SidebarActiveTabIndicatorSettings.styleKey)
+    private var activeIndicatorStyleRaw = SidebarActiveTabIndicatorSettings.defaultStyle.rawValue
 
-    let targetIds: [UUID]
+    let clickedID: UUID
+    let selectedTabIds: Set<UUID>
+    let visibleTabIds: [UUID]
     let visibleIndex: Int?
     let visibleWorkspaceCount: Int
     let isPinned: Bool
     let hasCustomTitle: Bool
     let customColor: String?
     let hasTag: Bool
-    let palette: [WorkspaceTabColorEntry]
-    let renameShortcut: StoredShortcut
-    let closeShortcut: StoredShortcut
-    let colorScheme: ColorScheme
-    let activeIndicatorStyle: SidebarActiveTabIndicatorStyle
-    let onSetPinned: (Bool) -> Void
-    let onRename: () -> Void
-    let onClearCustomTitle: () -> Void
-    let onApplyColor: (String?) -> Void
-    let onChooseCustomColor: () -> Void
-    let onClearTag: () -> Void
-    let onSetTag: () -> Void
-    let onMove: (Int) -> Void
-    let onMoveToTop: () -> Void
-    let onClose: () -> Void
-    let onCloseOthers: () -> Void
-    let onCloseBelow: () -> Void
-    let onCloseAbove: () -> Void
-    let onMarkRead: () -> Void
-    let onMarkUnread: () -> Void
+    let onAction: (SidebarTabMenuAction) -> Void
 
     static func == (lhs: Self, rhs: Self) -> Bool {
-        lhs.targetIds == rhs.targetIds &&
+        lhs.clickedID == rhs.clickedID &&
+            lhs.selectedTabIds == rhs.selectedTabIds &&
+            lhs.visibleTabIds == rhs.visibleTabIds &&
             lhs.visibleIndex == rhs.visibleIndex &&
             lhs.visibleWorkspaceCount == rhs.visibleWorkspaceCount &&
             lhs.isPinned == rhs.isPinned &&
             lhs.hasCustomTitle == rhs.hasCustomTitle &&
             lhs.customColor == rhs.customColor &&
-            lhs.hasTag == rhs.hasTag &&
-            lhs.palette == rhs.palette &&
-            lhs.renameShortcut == rhs.renameShortcut &&
-            lhs.closeShortcut == rhs.closeShortcut &&
-            lhs.colorScheme == rhs.colorScheme &&
-            lhs.activeIndicatorStyle == rhs.activeIndicatorStyle
+            lhs.hasTag == rhs.hasTag
     }
 
     @ViewBuilder
     var body: some View {
+        let targetIds = SidebarPresentationSettings.contextTargetIDs(
+            clickedID: clickedID,
+            selectedIDs: selectedTabIds,
+            visibleWorkspaceIDs: visibleTabIds
+        )
+        let palette = WorkspaceTabColorSettings.palette()
+        let renameShortcut = KeyboardShortcutSettings.shortcut(for: .renameWorkspace)
+        let closeShortcut = KeyboardShortcutSettings.shortcut(for: .closeWorkspace)
         let shouldPin = !isPinned
         let plural = targetIds.count > 1
 
         Button(plural ? (shouldPin ? "Pin Workspaces" : "Unpin Workspaces") : (shouldPin ? "Pin Workspace" : "Unpin Workspace")) {
-            onSetPinned(shouldPin)
+            onAction(.setPinned(shouldPin, targetIds))
         }
 
-        shortcutButton("Rename Workspace…", shortcut: renameShortcut, action: onRename)
+        shortcutButton("Rename Workspace…", shortcut: renameShortcut) { onAction(.rename) }
 
         if hasCustomTitle {
-            Button("Remove Custom Workspace Name", action: onClearCustomTitle)
+            Button("Remove Custom Workspace Name") { onAction(.clearCustomTitle) }
         }
 
         Menu("Tab Color") {
             if customColor != nil {
-                Button { onApplyColor(nil) } label: {
+                Button { onAction(.applyColor(nil, targetIds)) } label: {
                     Label("Clear Color", systemImage: "xmark.circle")
                 }
             }
-            Button(action: onChooseCustomColor) {
+            Button { onAction(.chooseCustomColor(targetIds)) } label: {
                 Label("Choose Custom Color…", systemImage: "paintpalette")
             }
             if !palette.isEmpty { Divider() }
             ForEach(palette) { entry in
-                Button { onApplyColor(entry.hex) } label: {
+                Button { onAction(.applyColor(entry.hex, targetIds)) } label: {
                     Label { Text(entry.name) } icon: {
                         Image(nsImage: coloredCircleImage(color: swatchColor(for: entry.hex)))
                     }
@@ -1234,29 +1246,35 @@ private struct SidebarTabContextMenu: View, Equatable {
             }
         }
 
-        if hasTag { Button("Clear Tag", action: onClearTag) }
-        Button("Set Tag…", action: onSetTag)
+        if hasTag { Button("Clear Tag") { onAction(.clearTag) } }
+        Button("Set Tag…") { onAction(.setTag) }
         Divider()
 
-        Button("Move Up") { onMove(-1) }.disabled(visibleIndex == 0)
-        Button("Move Down") { onMove(1) }
+        Button("Move Up") { onAction(.move(-1)) }.disabled(visibleIndex == 0)
+        Button("Move Down") { onAction(.move(1)) }
             .disabled(visibleIndex.map { $0 >= visibleWorkspaceCount - 1 } ?? true)
-        Button("Move to Top", action: onMoveToTop).disabled(targetIds.isEmpty)
+        Button("Move to Top") { onAction(.moveToTop(targetIds)) }.disabled(targetIds.isEmpty)
         Divider()
 
-        shortcutButton(plural ? "Close Workspaces" : "Close Workspace", shortcut: closeShortcut, action: onClose)
+        shortcutButton(plural ? "Close Workspaces" : "Close Workspace", shortcut: closeShortcut) {
+            onAction(.close(targetIds))
+        }
             .disabled(targetIds.isEmpty)
-        Button("Close Other Workspaces", action: onCloseOthers)
+        Button("Close Other Workspaces") { onAction(.closeOthers(targetIds)) }
             .disabled(visibleWorkspaceCount <= 1 || targetIds.count == visibleWorkspaceCount)
-        Button("Close Workspaces Below", action: onCloseBelow)
+        Button("Close Workspaces Below") { onAction(.closeBelow) }
             .disabled(visibleIndex.map { $0 >= visibleWorkspaceCount - 1 } ?? true)
-        Button("Close Workspaces Above", action: onCloseAbove).disabled(visibleIndex == 0)
+        Button("Close Workspaces Above") { onAction(.closeAbove) }.disabled(visibleIndex == 0)
         Divider()
 
-        Button(plural ? "Mark Workspaces as Read" : "Mark Workspace as Read", action: onMarkRead)
-            .disabled(!hasUnreadNotifications)
-        Button(plural ? "Mark Workspaces as Unread" : "Mark Workspace as Unread", action: onMarkUnread)
-            .disabled(!hasReadNotifications)
+        Button(plural ? "Mark Workspaces as Read" : "Mark Workspace as Read") {
+            onAction(.markRead(targetIds))
+        }
+            .disabled(!hasUnreadNotifications(in: targetIds))
+        Button(plural ? "Mark Workspaces as Unread" : "Mark Workspace as Unread") {
+            onAction(.markUnread(targetIds))
+        }
+            .disabled(!hasReadNotifications(in: targetIds))
     }
 
     @ViewBuilder
@@ -1268,18 +1286,21 @@ private struct SidebarTabContextMenu: View, Equatable {
         }
     }
 
-    private var hasUnreadNotifications: Bool {
+    private func hasUnreadNotifications(in targetIds: [UUID]) -> Bool {
         let targetSet = Set(targetIds)
         return notificationStore.notifications.contains { targetSet.contains($0.tabId) && !$0.isRead }
     }
 
-    private var hasReadNotifications: Bool {
+    private func hasReadNotifications(in targetIds: [UUID]) -> Bool {
         let targetSet = Set(targetIds)
         return notificationStore.notifications.contains { targetSet.contains($0.tabId) && $0.isRead }
     }
 
     private func swatchColor(for hex: String) -> NSColor {
-        WorkspaceTabColorSettings.displayNSColor(
+        let activeIndicatorStyle = SidebarActiveTabIndicatorSettings.resolvedStyle(
+            rawValue: activeIndicatorStyleRaw
+        )
+        return WorkspaceTabColorSettings.displayNSColor(
             hex: hex,
             colorScheme: colorScheme,
             forceBright: activeIndicatorStyle == .leftRail

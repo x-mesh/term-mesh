@@ -77,6 +77,14 @@ struct TerminalNotification: Identifiable, Hashable {
     var isRead: Bool
 }
 
+struct SidebarNotificationSummary: Equatable {
+    var unreadCount = 0
+    var latestUnreadText: String?
+    var latestText: String?
+
+    var displayText: String? { latestUnreadText ?? latestText }
+}
+
 @MainActor
 final class TerminalNotificationStore: ObservableObject {
     static let shared = TerminalNotificationStore()
@@ -86,9 +94,11 @@ final class TerminalNotificationStore: ObservableObject {
 
     @Published private(set) var notifications: [TerminalNotification] = [] {
         didSet {
+            sidebarSummaryCache = Self.makeSidebarSummaries(from: notifications)
             refreshDockBadge()
         }
     }
+    private(set) var sidebarSummaryCache: [UUID: SidebarNotificationSummary] = [:]
 
     private let center = UNUserNotificationCenter.current()
     private var hasRequestedAuthorization = false
@@ -148,6 +158,34 @@ final class TerminalNotificationStore: ObservableObject {
             return unread
         }
         return notifications.first(where: { $0.tabId == tabId })
+    }
+
+    /// One pass for the whole sidebar. Rows receive the resulting value
+    /// snapshot instead of each subscribing to this store and rescanning the
+    /// complete notification list during workspace selection changes.
+    static func makeSidebarSummaries(
+        from notifications: [TerminalNotification]
+    ) -> [UUID: SidebarNotificationSummary] {
+        notifications.reduce(into: [:]) { result, notification in
+            var summary = result[notification.tabId] ?? SidebarNotificationSummary()
+            let text = Self.sidebarDisplayText(for: notification)
+            if summary.latestText == nil {
+                summary.latestText = text
+            }
+            if !notification.isRead {
+                summary.unreadCount += 1
+                if summary.latestUnreadText == nil {
+                    summary.latestUnreadText = text
+                }
+            }
+            result[notification.tabId] = summary
+        }
+    }
+
+    private static func sidebarDisplayText(for notification: TerminalNotification) -> String? {
+        let text = notification.body.isEmpty ? notification.title : notification.body
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
     }
 
     func addNotification(tabId: UUID, surfaceId: UUID?, title: String, subtitle: String, body: String) {

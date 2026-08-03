@@ -60,6 +60,14 @@ struct PeerHostStats: Equatable, Sendable {
         return "\(Self.capacity(diskAvailableBytes)) free"
     }
 
+    /// Sidebar badge content, precomputed before constructing a host row so
+    /// unrelated view transactions do not make every row query the shared
+    /// stats store again.
+    var diskWarningText: String? {
+        guard isDiskLow else { return nil }
+        return diskFreeText
+    }
+
     init(_ wire: Termmesh_Peer_V1_HostStats, receivedAt: Date = Date()) {
         var groups: [Group] = []
         // Three figures, not one: the first says how busy the machine is,
