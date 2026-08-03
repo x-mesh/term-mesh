@@ -7,6 +7,17 @@ import XCTest
 #endif
 
 final class GhosttyTerminalViewComposingTests: XCTestCase {
+    func testSurfaceCreationRetryDelayUsesBoundedBackoff() {
+        XCTAssertEqual(terminalSurfaceCreationRetryDelay(afterFailureCount: 0), 0.25)
+        XCTAssertEqual(terminalSurfaceCreationRetryDelay(afterFailureCount: 1), 0.25)
+        XCTAssertEqual(terminalSurfaceCreationRetryDelay(afterFailureCount: 2), 1)
+        XCTAssertEqual(terminalSurfaceCreationRetryDelay(afterFailureCount: 3), 2)
+        XCTAssertEqual(terminalSurfaceCreationRetryDelay(afterFailureCount: 4), 5)
+        XCTAssertEqual(terminalSurfaceCreationRetryDelay(afterFailureCount: 5), 10)
+        XCTAssertEqual(terminalSurfaceCreationRetryDelay(afterFailureCount: 6), 30)
+        XCTAssertEqual(terminalSurfaceCreationRetryDelay(afterFailureCount: 100), 30)
+    }
+
     private func externalSnapshot(
         hostFrame: NSRect = NSRect(x: 0, y: 0, width: 800, height: 600),
         anchorFrame: NSRect = NSRect(x: 10, y: 20, width: 300, height: 200),

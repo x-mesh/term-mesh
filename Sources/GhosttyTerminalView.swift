@@ -60,6 +60,12 @@ func termMeshScalarHex(_ value: String?) -> String {
 }
 #endif
 
+func terminalSurfaceCreationRetryDelay(afterFailureCount failureCount: Int) -> TimeInterval {
+    let delays: [TimeInterval] = [0.25, 1, 2, 5, 10, 30]
+    let index = min(max(failureCount - 1, 0), delays.count - 1)
+    return delays[index]
+}
+
 enum GhosttyPasteboardHelper {
     private static let selectionPasteboard = NSPasteboard(
         name: NSPasteboard.Name("com.mitchellh.ghostty.selection")
@@ -290,6 +296,10 @@ final class TerminalSurface: Identifiable, ObservableObject {
     private var pendingTextBytes: Int = 0
     private let maxPendingTextBytes = 1_048_576
     private var backgroundSurfaceStartQueued = false
+    private var backgroundSurfaceStartToken: UUID?
+    private var surfaceCreationInProgress = false
+    private var surfaceCreationFailureCount = 0
+    private var surfaceCreationRetryNotBefore: TimeInterval = 0
     private var surfaceCallbackContext: Unmanaged<GhosttySurfaceCallbackContext>?
     /// Coordinates deferred ghostty_surface_free with active read leases.
     /// Created once per TerminalSurface; outlives the object when leases are held.
@@ -496,21 +506,21 @@ final class TerminalSurface: Identifiable, ObservableObject {
                 ])
                 return
             }
-#if DEBUG
+            if deferCreation {
+                requestBackgroundSurfaceStartIfNeeded(reason: "attachToWindow")
+                return
+            }
+            #if DEBUG
             dlog("surface.attach.create surface=\(id.uuidString.prefix(5))")
-#endif
+            #endif
             sentryBreadcrumb("surface.attach.create", category: "terminal", data: [
                 "surface": id.uuidString,
                 "workspace": tabId.uuidString,
                 "width": Double(view.bounds.width),
                 "height": Double(view.bounds.height),
                 "windowCount": NSApp.windows.count,
-                "deferred": deferCreation
+                "deferred": false
             ])
-            if deferCreation {
-                requestBackgroundSurfaceStartIfNeeded(reason: "attachToWindow")
-                return
-            }
             createSurface(for: view)
 #if DEBUG
             dlog("surface.attach.create.done surface=\(id.uuidString.prefix(5)) hasSurface=\(surface != nil ? 1 : 0)")
@@ -550,6 +560,32 @@ final class TerminalSurface: Identifiable, ObservableObject {
     }
 
     private func createSurface(for view: GhosttyNSView) {
+        guard !surfaceCreationInProgress else { return }
+
+        let now = ProcessInfo.processInfo.systemUptime
+        guard now >= surfaceCreationRetryNotBefore else {
+            requestBackgroundSurfaceStartIfNeeded(reason: "creationBackoff")
+            return
+        }
+
+        backgroundSurfaceStartToken = nil
+        backgroundSurfaceStartQueued = false
+        surfaceCreationInProgress = true
+        defer {
+            surfaceCreationInProgress = false
+            if surface != nil {
+                surfaceCreationFailureCount = 0
+                surfaceCreationRetryNotBefore = 0
+            } else {
+                surfaceCreationFailureCount += 1
+                surfaceCreationRetryNotBefore = ProcessInfo.processInfo.systemUptime
+                    + terminalSurfaceCreationRetryDelay(afterFailureCount: surfaceCreationFailureCount)
+                if view.window != nil {
+                    requestBackgroundSurfaceStartIfNeeded(reason: "creationRetry")
+                }
+            }
+        }
+
         let createSurfaceStartedAt = CACurrentMediaTime()
         #if DEBUG
         let resourcesDir = getenv("GHOSTTY_RESOURCES_DIR").flatMap { String(cString: $0) } ?? "(unset)"
@@ -1932,13 +1968,20 @@ final class TerminalSurface: Identifiable, ObservableObject {
         }
 
         guard surface == nil, attachedView != nil else { return }
+        guard !surfaceCreationInProgress else { return }
         guard !backgroundSurfaceStartQueued else { return }
         backgroundSurfaceStartQueued = true
 
-        DispatchQueue.main.async { [weak self] in
+        let now = ProcessInfo.processInfo.systemUptime
+        let delay = max(0, surfaceCreationRetryNotBefore - now)
+        let token = UUID()
+        backgroundSurfaceStartToken = token
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
             guard let self else { return }
+            guard self.backgroundSurfaceStartToken == token else { return }
+            self.backgroundSurfaceStartToken = nil
             self.backgroundSurfaceStartQueued = false
-            guard self.surface == nil, let view = self.attachedView else { return }
+            guard self.surface == nil, let view = self.attachedView, view.window != nil else { return }
             sentryBreadcrumb("surface.create.deferredStart", category: "terminal", data: [
                 "surface": self.id.uuidString,
                 "workspace": self.tabId.uuidString,
