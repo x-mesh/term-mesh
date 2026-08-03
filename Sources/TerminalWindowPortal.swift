@@ -1410,7 +1410,12 @@ final class WindowTerminalPortal: NSObject {
         installationPrepared: Bool = false
     ) {
         if !installationPrepared {
-            guard ensureInstalled() else { return }
+            // A deferred reconciliation only needs to verify that the portal is
+            // still installed. Re-entering AppKit layout here repeats the full
+            // host-subtree pass that bind/geometry handling already performed.
+            // ensureInstalled still forces layout when installation or z-order
+            // actually changes, preserving cold attach and hierarchy repair.
+            guard ensureInstalled(forceLayout: false) else { return }
         }
         pruneDeadEntries()
         let hostedIds = Array(entriesByHostedId.keys)
