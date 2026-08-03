@@ -2429,10 +2429,11 @@ static func focusLog(_ message: String) {
             ghostty_surface_set_display_id(surface, displayID)
         }
 
-        // Recompute from current bounds after layout. Pending size is only a fallback
-        // when we don't have usable bounds (e.g. detached/off-window transitions).
-        superview?.layoutSubtreeIfNeeded()
-        layoutSubtreeIfNeeded()
+        // Use the bounds AppKit has already assigned for this move. Forcing the
+        // hosting hierarchy to lay out from viewDidMoveToWindow can re-enter an
+        // active SwiftUI layout pass during workspace switches. The normal
+        // layout() callback applies the settled size afterward. Pending size is
+        // only a fallback for detached/off-window transitions.
         updateSurfaceSize()
         applySurfaceBackground()
         applySurfaceColorScheme(force: true)

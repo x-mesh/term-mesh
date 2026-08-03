@@ -1044,7 +1044,6 @@ final class WindowTerminalPortal: NSObject {
         }
 
         synchronizeLayoutHierarchy()
-        _ = synchronizeHostFrameToReference()
         ensureDividerOverlayOnTop()
 
         return true
@@ -1358,25 +1357,24 @@ final class WindowTerminalPortal: NSObject {
 
         ensureDividerOverlayOnTop()
 
-        synchronizeHostedView(withId: hostedId)
+        synchronizeHostedView(withId: hostedId, installationPrepared: true)
         scheduleDeferredFullSynchronizeAll()
         pruneDeadEntries()
     }
 
     func synchronizeHostedViewForAnchor(_ anchorView: NSView) {
         guard ensureInstalled() else { return }
-        synchronizeLayoutHierarchy()
         pruneDeadEntries()
         let anchorId = ObjectIdentifier(anchorView)
         let primaryHostedId = hostedByAnchorId[anchorId]
         if let primaryHostedId {
-            synchronizeHostedView(withId: primaryHostedId)
+            synchronizeHostedView(withId: primaryHostedId, installationPrepared: true)
         }
 
         // Failsafe: during aggressive divider drags/structural churn, one anchor can miss a
         // geometry callback while another fires. Reconcile all mapped hosted views so no stale
         // frame remains "stuck" onscreen until the next interaction.
-        synchronizeAllHostedViews(excluding: primaryHostedId)
+        synchronizeAllHostedViews(excluding: primaryHostedId, installationPrepared: true)
         scheduleDeferredFullSynchronizeAll()
     }
 
@@ -1390,20 +1388,29 @@ final class WindowTerminalPortal: NSObject {
         }
     }
 
-    private func synchronizeAllHostedViews(excluding hostedIdToSkip: ObjectIdentifier?) {
-        guard ensureInstalled() else { return }
-        synchronizeLayoutHierarchy()
+    private func synchronizeAllHostedViews(
+        excluding hostedIdToSkip: ObjectIdentifier?,
+        installationPrepared: Bool = false
+    ) {
+        if !installationPrepared {
+            guard ensureInstalled() else { return }
+        }
         pruneDeadEntries()
         let hostedIds = Array(entriesByHostedId.keys)
         for hostedId in hostedIds {
             if hostedId == hostedIdToSkip { continue }
-            synchronizeHostedView(withId: hostedId)
+            synchronizeHostedView(withId: hostedId, installationPrepared: true)
         }
         updateHostViewVisibility()
     }
 
-    private func synchronizeHostedView(withId hostedId: ObjectIdentifier) {
-        guard ensureInstalled() else { return }
+    private func synchronizeHostedView(
+        withId hostedId: ObjectIdentifier,
+        installationPrepared: Bool = false
+    ) {
+        if !installationPrepared {
+            guard ensureInstalled() else { return }
+        }
         guard let entry = entriesByHostedId[hostedId] else { return }
         guard let hostedView = entry.hostedView else {
             entriesByHostedId.removeValue(forKey: hostedId)
