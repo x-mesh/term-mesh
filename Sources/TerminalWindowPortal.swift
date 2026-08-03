@@ -119,6 +119,14 @@ func terminalPortalBindNeedsFullReconciliation(
     !hasPreviousEntry || didChangeAnchor || requiredHostedViewAttachment
 }
 
+func terminalPortalBindNeedsGeometrySeed(
+    hasPreviousEntry: Bool,
+    didChangeAnchor: Bool,
+    requiredHostedViewAttachment: Bool
+) -> Bool {
+    !hasPreviousEntry || didChangeAnchor || requiredHostedViewAttachment
+}
+
 #if DEBUG
 private func portalDebugToken(_ view: NSView?) -> String {
     guard let view else { return "nil" }
@@ -1332,32 +1340,42 @@ final class WindowTerminalPortal: NSObject {
 
         observeAnchorGeometry(anchorView, id: anchorId)
         _ = synchronizeHostFrameToReference()
+        let requiredHostedViewAttachment = hostedView.superview !== hostView
+        let needsGeometrySeed = terminalPortalBindNeedsGeometrySeed(
+            hasPreviousEntry: previousEntry != nil,
+            didChangeAnchor: didChangeAnchor,
+            requiredHostedViewAttachment: requiredHostedViewAttachment
+        )
 
         // Seed frame/bounds before entering the window so a freshly reparented
         // surface doesn't do a transient 800x600 size update on viewDidMoveToWindow.
-        if let seededFrame = seededFrameInHost(for: anchorView),
-           seededFrame.width > 0,
-           seededFrame.height > 0 {
-            CATransaction.begin()
-            CATransaction.setDisableActions(true)
-            hostedView.frame = seededFrame
-            hostedView.bounds = NSRect(origin: .zero, size: seededFrame.size)
-            CATransaction.commit()
-        } else {
-            // If anchor geometry is still unsettled, keep this hidden/zero-sized until
-            // synchronizeHostedView resolves a valid target frame on the next layout tick.
-            CATransaction.begin()
-            CATransaction.setDisableActions(true)
-            hostedView.frame = .zero
-            hostedView.bounds = .zero
-            CATransaction.commit()
-            hostedView.isHidden = true
+        // Visibility-only warm rebinds are already attached and the targeted
+        // synchronization below handles any real frame change, so avoid rewriting
+        // identical geometry and reconciling the inner surface on every switch.
+        if needsGeometrySeed {
+            if let seededFrame = seededFrameInHost(for: anchorView),
+               seededFrame.width > 0,
+               seededFrame.height > 0 {
+                CATransaction.begin()
+                CATransaction.setDisableActions(true)
+                hostedView.frame = seededFrame
+                hostedView.bounds = NSRect(origin: .zero, size: seededFrame.size)
+                CATransaction.commit()
+            } else {
+                // If anchor geometry is still unsettled, keep this hidden/zero-sized until
+                // synchronizeHostedView resolves a valid target frame on the next layout tick.
+                CATransaction.begin()
+                CATransaction.setDisableActions(true)
+                hostedView.frame = .zero
+                hostedView.bounds = .zero
+                CATransaction.commit()
+                hostedView.isHidden = true
+            }
+            // Keep inner scroll/surface geometry in sync with the seeded outer frame
+            // before the hosted view enters a window.
+            hostedView.reconcileGeometryNow()
         }
-        // Keep inner scroll/surface geometry in sync with the seeded outer frame
-        // before the hosted view enters a window.
-        hostedView.reconcileGeometryNow()
 
-        let requiredHostedViewAttachment = hostedView.superview !== hostView
         if requiredHostedViewAttachment {
 #if DEBUG
             dlog(
