@@ -56,6 +56,11 @@ enum SidebarResizeInteraction {
 }
 
 enum WorkspaceMountPolicy {
+    // Keep inactive warm workspaces in SwiftUI's native-view display list. An exact zero
+    // opacity lets SwiftUI prune and later re-add AppKit platform views on every switch.
+    // This value is below an 8-bit alpha step, so it remains visually transparent while
+    // preserving the already-mounted native hierarchy. Hit testing is disabled separately.
+    static let inactiveWorkspaceOpacity = 0.0001
     // Keep the selected workspace and one recently used workspace mounted. The
     // inactive entry is hidden and input-disabled by ContentView, but retaining
     // its SwiftUI/Ghostty tree avoids rebuilding every surface on a quick return.

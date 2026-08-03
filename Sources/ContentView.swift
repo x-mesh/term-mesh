@@ -512,8 +512,9 @@ struct ContentView: View {
                             }
                         )
                     }
-                    .opacity(isVisible ? 1 : 0)
+                    .opacity(isVisible ? 1 : WorkspaceMountPolicy.inactiveWorkspaceOpacity)
                     .allowsHitTesting(isSelectedWorkspace)
+                    .accessibilityHidden(!isVisible)
                     .zIndex(Double(visualPriority))
                 }
             }
