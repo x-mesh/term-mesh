@@ -1403,7 +1403,9 @@ final class WindowTerminalPortal: NSObject {
     }
 
     func synchronizeHostedViewForAnchor(_ anchorView: NSView) {
-        guard ensureInstalled() else { return }
+        // HostContainerView schedules this callback after its AppKit layout pass.
+        // Installation/topology changes still force layout inside ensureInstalled.
+        guard ensureInstalled(forceLayout: false) else { return }
         pruneDeadEntries()
         let anchorId = ObjectIdentifier(anchorView)
         let primaryHostedId = hostedByAnchorId[anchorId]
