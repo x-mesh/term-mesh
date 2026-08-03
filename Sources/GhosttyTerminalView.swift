@@ -639,8 +639,10 @@ final class TerminalSurface: Identifiable, ObservableObject {
 
         var surfaceConfig = configTemplate ?? ghostty_surface_config_new()
         surfaceConfig.platform_tag = GHOSTTY_PLATFORM_MACOS
+        let displayID = (view.window?.screen ?? NSScreen.main)?.displayID ?? 0
         surfaceConfig.platform = ghostty_platform_u(macos: ghostty_platform_macos_s(
-            nsview: Unmanaged.passUnretained(view).toOpaque()
+            nsview: Unmanaged.passUnretained(view).toOpaque(),
+            display_id: displayID
         ))
         let callbackContext = Unmanaged.passRetained(GhosttySurfaceCallbackContext(surfaceView: view, terminalSurface: self))
         surfaceConfig.userdata = callbackContext.toOpaque()
