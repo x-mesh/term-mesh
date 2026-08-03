@@ -25,6 +25,7 @@ struct VerticalTabsSidebar: View {
     @StateObject private var dragAutoScrollController = SidebarDragAutoScrollController()
     @StateObject private var dragFailsafeMonitor = SidebarDragFailsafeMonitor()
     @ObservedObject private var remoteHostStore = RemoteHostStore.shared
+    @ObservedObject private var teamOrchestrator = TeamOrchestrator.shared
     @State private var draggedTabId: UUID?
     @State private var dropIndicator: SidebarDropIndicator?
     @AppStorage(SidebarLayoutSettings.localTabsCollapsedKey)
@@ -55,6 +56,13 @@ struct VerticalTabsSidebar: View {
     }
 
     var body: some View {
+        let teamNameByWorkspaceId = teamOrchestrator.teams.values.reduce(into: [UUID: String]()) { result, team in
+            // Preserve the old `first(where:)` behavior for the unlikely case
+            // where stale team records temporarily share a workspace.
+            if result[team.workspaceId] == nil {
+                result[team.workspaceId] = team.id
+            }
+        }
         VStack(spacing: 0) {
             GeometryReader { proxy in
                 ScrollView {
@@ -96,6 +104,7 @@ struct VerticalTabsSidebar: View {
                                                 isActive: tabManager.selectedTabId == tab.id,
                                                 isMultiSelected: selectedTabIds.contains(tab.id),
                                                 workspaceCount: tabManager.tabs.count,
+                                                activeTeamName: teamNameByWorkspaceId[tab.id],
                                                 visibleTabIds: visibleLocalWorkspaceIds,
                                                 rowSpacing: tabRowSpacing,
                                                 selection: $selection,

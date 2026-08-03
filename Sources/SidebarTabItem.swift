@@ -86,6 +86,9 @@ struct TabItemView: View, Equatable {
     let isActive: Bool
     let isMultiSelected: Bool
     let workspaceCount: Int
+    /// Parent-computed snapshot. Avoids a linear scan of every team from
+    /// every row body and makes team membership part of the Equatable edge.
+    let activeTeamName: String?
     /// Tabs that are actually rendered in this section, in presentation
     /// order. Experimental mode excludes peer-mirror backing workspaces.
     let visibleTabIds: [UUID]
@@ -241,6 +244,7 @@ struct TabItemView: View, Equatable {
             lhs.isActive == rhs.isActive &&
             lhs.isMultiSelected == rhs.isMultiSelected &&
             lhs.workspaceCount == rhs.workspaceCount &&
+            lhs.activeTeamName == rhs.activeTeamName &&
             lhs.visibleTabIds == rhs.visibleTabIds &&
             lhs.rowSpacing == rhs.rowSpacing &&
             lhs.showsCommandShortcutHints == rhs.showsCommandShortcutHints &&
@@ -859,12 +863,8 @@ struct TabItemView: View, Equatable {
         return trimmed.isEmpty ? nil : trimmed
     }
 
-    private var activeTeamName: String? {
-        TeamOrchestrator.shared.teams.values.first(where: { $0.workspaceId == tab.id })?.id
-    }
-
     private var activeTeam: TeamOrchestrator.Team? {
-        TeamOrchestrator.shared.teams.values.first(where: { $0.workspaceId == tab.id })
+        activeTeamName.flatMap { TeamOrchestrator.shared.teams[$0] }
     }
 
     private func teamAttentionCount(teamName: String) -> Int {
