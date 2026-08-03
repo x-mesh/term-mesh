@@ -34,7 +34,7 @@ final class WorkspaceAppearanceConfigCache: @unchecked Sendable {
 /// but their panes and live layout remain host-authoritative. Keeping the
 /// branch here provides a stable remote-renderer bridge point and makes it
 /// impossible for a remote selection to fall back to a separate `NSWindow`.
-struct SelectedWorkspaceContentView: View, Equatable {
+struct SelectedWorkspaceContentView: View {
     @ObservedObject var workspace: Workspace
     let isWorkspaceVisible: Bool
     let isWorkspaceInputActive: Bool
@@ -45,13 +45,6 @@ struct SelectedWorkspaceContentView: View, Equatable {
         _ backgroundSource: String?,
         _ notificationPayloadHex: String?
     ) -> Void)?
-
-    static func == (lhs: Self, rhs: Self) -> Bool {
-        lhs.workspace === rhs.workspace &&
-            lhs.isWorkspaceVisible == rhs.isWorkspaceVisible &&
-            lhs.isWorkspaceInputActive == rhs.isWorkspaceInputActive &&
-            lhs.workspacePortalPriority == rhs.workspacePortalPriority
-    }
 
     @ViewBuilder
     var body: some View {

@@ -304,14 +304,18 @@ struct SplitContainerView<Content: View, EmptyContent: View>: NSViewRepresentabl
         // drag sessions to views belonging to background workspaces. SwiftUI's
         // .allowsHitTesting(false) only affects gesture recognizers, not AppKit's
         // view-hierarchy-based NSDraggingDestination routing.
-        splitView.isHidden = !controller.isInteractive
-        splitView.wantsLayer = true
-        splitView.layer?.backgroundColor = NSColor.clear.cgColor
-        splitView.layer?.isOpaque = false
+        let shouldHide = !controller.isInteractive
+        if splitView.isHidden != shouldHide {
+            splitView.isHidden = shouldHide
+        }
+        configureTransparentLayer(for: splitView)
         (splitView as? ThemedSplitView)?.customDividerColor = TabBarColors.nsColorSeparator(for: appearance)
 
         // Update orientation if changed
-        splitView.isVertical = splitState.orientation == .horizontal
+        let isVertical = splitState.orientation == .horizontal
+        if splitView.isVertical != isVertical {
+            splitView.isVertical = isVertical
+        }
 
         // Update children. When a child's node type changes (split→pane or pane→split),
         // replace the hosted content (not the arranged subview) to ensure native NSViews
@@ -324,12 +328,8 @@ struct SplitContainerView<Content: View, EmptyContent: View>: NSViewRepresentabl
 
             let firstContainer = arranged[0]
             let secondContainer = arranged[1]
-            firstContainer.wantsLayer = true
-            firstContainer.layer?.backgroundColor = NSColor.clear.cgColor
-            firstContainer.layer?.isOpaque = false
-            secondContainer.wantsLayer = true
-            secondContainer.layer?.backgroundColor = NSColor.clear.cgColor
-            secondContainer.layer?.isOpaque = false
+            configureTransparentLayer(for: firstContainer)
+            configureTransparentLayer(for: secondContainer)
 
             updateHostedContent(
                 in: firstContainer,
@@ -355,6 +355,20 @@ struct SplitContainerView<Content: View, EmptyContent: View>: NSViewRepresentabl
     }
 
     // MARK: - Helpers
+
+    private func configureTransparentLayer(for view: NSView) {
+        if !view.wantsLayer {
+            view.wantsLayer = true
+        }
+        guard let layer = view.layer else { return }
+        let clear = NSColor.clear.cgColor
+        if layer.backgroundColor != clear {
+            layer.backgroundColor = clear
+        }
+        if layer.isOpaque {
+            layer.isOpaque = false
+        }
+    }
 
     private func makeHostingController(for node: SplitNode) -> NSHostingController<AnyView> {
         let hostingController = NSHostingController(rootView: AnyView(makeView(for: node)))
