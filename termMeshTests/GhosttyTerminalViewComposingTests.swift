@@ -7,6 +7,35 @@ import XCTest
 #endif
 
 final class GhosttyTerminalViewComposingTests: XCTestCase {
+    @MainActor
+    func testRepeatedHiddenVisibilityDoesNotRestartRendererUnrealizeDebounce() {
+        let surface = TerminalSurface(
+            tabId: UUID(),
+            context: GHOSTTY_SURFACE_CONTEXT_SPLIT,
+            configTemplate: nil
+        )
+
+        surface.hostedView.setVisibleInUI(false)
+        var state = surface.debugRendererVisibilityState()
+        XCTAssertFalse(state.requested)
+        XCTAssertTrue(state.unrealizePending)
+        XCTAssertEqual(state.unrealizeScheduleCount, 1)
+
+        surface.hostedView.setVisibleInUI(false)
+        state = surface.debugRendererVisibilityState()
+        XCTAssertTrue(state.unrealizePending)
+        XCTAssertEqual(
+            state.unrealizeScheduleCount,
+            1,
+            "Repeated SwiftUI updates must preserve the original five-second deadline"
+        )
+
+        surface.hostedView.setVisibleInUI(true)
+        state = surface.debugRendererVisibilityState()
+        XCTAssertTrue(state.requested)
+        XCTAssertFalse(state.unrealizePending)
+    }
+
     func testSurfaceCreationRetryDelayUsesBoundedBackoff() {
         XCTAssertEqual(terminalSurfaceCreationRetryDelay(afterFailureCount: 0), 0.25)
         XCTAssertEqual(terminalSurfaceCreationRetryDelay(afterFailureCount: 1), 0.25)

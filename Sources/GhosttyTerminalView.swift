@@ -258,6 +258,12 @@ final class TerminalSurface: Identifiable, ObservableObject {
     /// Debounced unrealize work item, so transient reparent/workspace flaps don't
     /// thrash the swap chain (recreate cost) when a surface briefly goes invisible.
     private var rendererUnrealizeWork: DispatchWorkItem?
+    /// Last requested renderer visibility. SwiftUI may re-apply the same workspace state
+    /// many times; preserving this state prevents every update from restarting the debounce.
+    private var rendererVisibilityRequested = true
+    #if DEBUG
+    private var rendererUnrealizeScheduleCount = 0
+    #endif
     /// How long a surface must stay invisible before its GPU resources are released.
     private static let rendererUnrealizeDebounce: TimeInterval = 5.0
     /// Whether the terminal surface view is currently attached to a window.
@@ -946,6 +952,17 @@ final class TerminalSurface: Identifiable, ObservableObject {
             return
         }
         guard let createdSurface = surface else { return }
+        // A newly-created Ghostty surface always starts with a realized renderer. If the
+        // owning workspace was hidden while creation/retry completed, apply that state now;
+        // the visibility setter will arrange the delayed GPU release without extending it
+        // on later identical SwiftUI updates.
+        rendererRealized = true
+        let visibleInUI = surfaceView.isVisibleInUI
+        ghostty_surface_set_occlusion(createdSurface, visibleInUI)
+        DispatchQueue.main.async { [weak self] in
+            guard let self, self.surface == createdSurface else { return }
+            self.setSurfaceVisibleForRenderer(visibleInUI)
+        }
 
         // For vsync-driven rendering, Ghostty needs to know which display we're on so it can
         // start a CVDisplayLink with the right refresh rate. If we don't set this early, the
@@ -1265,23 +1282,42 @@ final class TerminalSurface: Identifiable, ObservableObject {
     /// unrealizes only after `rendererUnrealizeDebounce` of sustained invisibility, so brief
     /// reparent/workspace flaps don't churn the swap chain.
     @MainActor func setSurfaceVisibleForRenderer(_ visible: Bool) {
-        rendererUnrealizeWork?.cancel()
-        rendererUnrealizeWork = nil
+        rendererVisibilityRequested = visible
         if visible {
+            rendererUnrealizeWork?.cancel()
+            rendererUnrealizeWork = nil
             setRendererRealized(true)
         } else {
+            // Do not restart the five-second countdown for repeated hidden-state updates.
+            // A nil-surface timer may have elapsed before a delayed creation, so schedule
+            // again whenever the renderer is realized and no pending release remains.
+            guard rendererRealized, rendererUnrealizeWork == nil else { return }
             let work = DispatchWorkItem { [weak self] in
                 guard let self else { return }
                 self.rendererUnrealizeWork = nil
+                guard !self.rendererVisibilityRequested else { return }
                 self.setRendererRealized(false)
             }
             rendererUnrealizeWork = work
+            #if DEBUG
+            rendererUnrealizeScheduleCount += 1
+            #endif
             DispatchQueue.main.asyncAfter(
                 deadline: .now() + Self.rendererUnrealizeDebounce,
                 execute: work
             )
         }
     }
+
+    #if DEBUG
+    @MainActor func debugRendererVisibilityState() -> (
+        requested: Bool,
+        unrealizePending: Bool,
+        unrealizeScheduleCount: Int
+    ) {
+        (rendererVisibilityRequested, rendererUnrealizeWork != nil, rendererUnrealizeScheduleCount)
+    }
+    #endif
 
     func needsConfirmClose() -> Bool {
         guard let surface = surface else { return false }
