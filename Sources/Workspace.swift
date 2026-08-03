@@ -2919,9 +2919,6 @@ final class Workspace: Identifiable, ObservableObject {
         }
 
         targetPanel.focus()
-        if let terminalPanel = targetPanel as? TerminalPanel {
-            terminalPanel.hostedView.ensureFocus(for: id, surfaceId: targetPanelId)
-        }
         if let dir = panelDirectories[targetPanelId] {
             currentDirectory = dir
         }
