@@ -177,6 +177,30 @@ final class GhosttyTerminalViewComposingTests: XCTestCase {
         ))
     }
 
+    func testPortalBindFullReconciliationOnlyForTopologyChanges() {
+        XCTAssertFalse(terminalPortalBindNeedsFullReconciliation(
+            hasPreviousEntry: true,
+            didChangeAnchor: false,
+            requiredHostedViewAttachment: false
+        ), "Visibility-only warm rebinds are already handled by targeted synchronization")
+
+        XCTAssertTrue(terminalPortalBindNeedsFullReconciliation(
+            hasPreviousEntry: false,
+            didChangeAnchor: false,
+            requiredHostedViewAttachment: false
+        ))
+        XCTAssertTrue(terminalPortalBindNeedsFullReconciliation(
+            hasPreviousEntry: true,
+            didChangeAnchor: true,
+            requiredHostedViewAttachment: false
+        ))
+        XCTAssertTrue(terminalPortalBindNeedsFullReconciliation(
+            hasPreviousEntry: true,
+            didChangeAnchor: false,
+            requiredHostedViewAttachment: true
+        ))
+    }
+
     func testExternalPortalGeometryIgnoresNoiseButAcceptsRealResize() {
         let hostSuperview = NSObject()
         let window = NSObject()

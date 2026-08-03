@@ -111,6 +111,14 @@ func terminalPortalExternalGeometryNeedsSynchronization(
     force || previous?.isApproximatelyEqual(to: current) != true
 }
 
+func terminalPortalBindNeedsFullReconciliation(
+    hasPreviousEntry: Bool,
+    didChangeAnchor: Bool,
+    requiredHostedViewAttachment: Bool
+) -> Bool {
+    !hasPreviousEntry || didChangeAnchor || requiredHostedViewAttachment
+}
+
 #if DEBUG
 private func portalDebugToken(_ view: NSView?) -> String {
     guard let view else { return "nil" }
@@ -1383,10 +1391,11 @@ final class WindowTerminalPortal: NSObject {
         // without repairing any geometry. Keep the deferred failsafe for real
         // topology changes, where another anchor can legitimately have missed
         // a geometry callback during SwiftUI/AppKit churn.
-        let needsFullReconciliation =
-            previousEntry == nil ||
-            didChangeAnchor ||
-            requiredHostedViewAttachment
+        let needsFullReconciliation = terminalPortalBindNeedsFullReconciliation(
+            hasPreviousEntry: previousEntry != nil,
+            didChangeAnchor: didChangeAnchor,
+            requiredHostedViewAttachment: requiredHostedViewAttachment
+        )
         if needsFullReconciliation {
             scheduleDeferredFullSynchronizeAll()
         }
