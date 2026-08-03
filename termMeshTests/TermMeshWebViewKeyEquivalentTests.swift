@@ -4577,7 +4577,7 @@ final class MenuBarIconRendererTests: XCTestCase {
 }
 
 final class WorkspaceMountPolicyTests: XCTestCase {
-    func testDefaultPolicyMountsOnlySelectedWorkspace() {
+    func testDefaultPolicyKeepsSelectedAndRecentWorkspace() {
         let a = UUID()
         let b = UUID()
         let orderedTabIds: [UUID] = [a, b]
@@ -4591,7 +4591,7 @@ final class WorkspaceMountPolicyTests: XCTestCase {
             maxMounted: WorkspaceMountPolicy.maxMountedWorkspaces
         )
 
-        XCTAssertEqual(next, [b])
+        XCTAssertEqual(next, [b, a])
     }
 
     func testSelectedWorkspaceMovesToFrontAndMountCountIsBounded() {
@@ -4662,7 +4662,7 @@ final class WorkspaceMountPolicyTests: XCTestCase {
         XCTAssertEqual(next, [a])
     }
 
-    func testCycleHotModeKeepsOnlySelectedWhenNoPinnedHandoff() {
+    func testCycleHotModeKeepsSelectedAndRecentWhenNoPinnedHandoff() {
         let a = UUID()
         let b = UUID()
         let c = UUID()
@@ -4678,7 +4678,7 @@ final class WorkspaceMountPolicyTests: XCTestCase {
             maxMounted: WorkspaceMountPolicy.maxMountedWorkspacesDuringCycle
         )
 
-        XCTAssertEqual(next, [c])
+        XCTAssertEqual(next, [c, a])
     }
 
     func testCycleHotModeRespectsMaxMountedLimit() {
@@ -4696,7 +4696,7 @@ final class WorkspaceMountPolicyTests: XCTestCase {
             maxMounted: 2
         )
 
-        XCTAssertEqual(next, [b])
+        XCTAssertEqual(next, [b, a])
     }
 
     func testPinnedIdsAreRetainedAcrossReconcile() {

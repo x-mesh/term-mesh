@@ -56,9 +56,11 @@ enum SidebarResizeInteraction {
 }
 
 enum WorkspaceMountPolicy {
-    // Keep only the selected workspace mounted to minimize layer-tree traversal.
-    static let maxMountedWorkspaces = 1
-    // During workspace cycling, keep only a minimal handoff pair (selected + retiring).
+    // Keep the selected workspace and one recently used workspace mounted. The
+    // inactive entry is hidden and input-disabled by ContentView, but retaining
+    // its SwiftUI/Ghostty tree avoids rebuilding every surface on a quick return.
+    static let maxMountedWorkspaces = 2
+    // Workspace cycling uses the same bounded selected + recent pair.
     static let maxMountedWorkspacesDuringCycle = 2
 
     static func nextMountedWorkspaceIds(
@@ -84,12 +86,6 @@ enum WorkspaceMountPolicy {
                 ordered.removeAll { $0 == id }
                 ordered.insert(id, at: 0)
             }
-        }
-
-        if isCycleHot,
-           pinnedIds.isEmpty,
-           let selected {
-            ordered.removeAll { $0 != selected }
         }
 
         // Ensure pinned ids (retiring handoff workspaces) are always retained at highest priority.
