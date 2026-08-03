@@ -302,6 +302,54 @@ final class GhosttyTerminalViewComposingTests: XCTestCase {
         ))
     }
 
+    func testPortalAnchorFullReconciliationOnlyForTopologyChanges() {
+        let firstWindow = NSObject()
+        let secondWindow = NSObject()
+        let firstSuperview = NSObject()
+        let secondSuperview = NSObject()
+        let previous = TerminalPortalAnchorGeometry(
+            windowID: ObjectIdentifier(firstWindow),
+            superviewID: ObjectIdentifier(firstSuperview),
+            frameInWindow: NSRect(x: 10, y: 20, width: 300, height: 200)
+        )
+        let frameOnlyChange = TerminalPortalAnchorGeometry(
+            windowID: ObjectIdentifier(firstWindow),
+            superviewID: ObjectIdentifier(firstSuperview),
+            frameInWindow: NSRect(x: 40, y: 20, width: 280, height: 200)
+        )
+        let windowChange = TerminalPortalAnchorGeometry(
+            windowID: ObjectIdentifier(secondWindow),
+            superviewID: ObjectIdentifier(firstSuperview),
+            frameInWindow: previous.frameInWindow
+        )
+        let superviewChange = TerminalPortalAnchorGeometry(
+            windowID: ObjectIdentifier(firstWindow),
+            superviewID: ObjectIdentifier(secondSuperview),
+            frameInWindow: previous.frameInWindow
+        )
+
+        XCTAssertTrue(terminalPortalAnchorNeedsFullReconciliation(
+            previous: nil,
+            current: previous
+        ), "The first geometry report must reconcile every portal entry")
+        XCTAssertFalse(terminalPortalAnchorNeedsFullReconciliation(
+            previous: previous,
+            current: frameOnlyChange
+        ), "Frame-only changes are handled by targeted and external geometry synchronization")
+        XCTAssertFalse(terminalPortalAnchorNeedsFullReconciliation(
+            previous: previous,
+            current: previous
+        ), "A forced callback on unchanged topology must remain targeted")
+        XCTAssertTrue(terminalPortalAnchorNeedsFullReconciliation(
+            previous: previous,
+            current: windowChange
+        ))
+        XCTAssertTrue(terminalPortalAnchorNeedsFullReconciliation(
+            previous: previous,
+            current: superviewChange
+        ))
+    }
+
     func testEscapeNeverComposing() {
         XCTAssertFalse(
             GhosttyNSView.computeComposingFlag(

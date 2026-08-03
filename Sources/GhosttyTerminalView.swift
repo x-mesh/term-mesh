@@ -3936,6 +3936,15 @@ func terminalPortalAnchorNeedsSynchronization(
     force || previous?.isApproximatelyEqual(to: current) != true
 }
 
+func terminalPortalAnchorNeedsFullReconciliation(
+    previous: TerminalPortalAnchorGeometry?,
+    current: TerminalPortalAnchorGeometry
+) -> Bool {
+    guard let previous else { return true }
+    return previous.windowID != current.windowID
+        || previous.superviewID != current.superviewID
+}
+
 struct GhosttyTerminalView: NSViewRepresentable {
     @Environment(\.paneDropZone) var paneDropZone
 
@@ -3954,7 +3963,7 @@ struct GhosttyTerminalView: NSViewRepresentable {
 
     private final class HostContainerView: NSView {
         var onDidMoveToWindow: (() -> Void)?
-        var onGeometryChanged: (() -> Void)?
+        var onGeometryChanged: ((_ needsFullReconciliation: Bool) -> Void)?
         private var hasScheduledGeometryCallback = false
         private var scheduledGeometryCallbackIsForced = false
         private var lastReportedGeometry: TerminalPortalAnchorGeometry?
@@ -3999,15 +4008,21 @@ struct GhosttyTerminalView: NSViewRepresentable {
                 let isForced = self.scheduledGeometryCallbackIsForced
                 self.scheduledGeometryCallbackIsForced = false
                 let currentGeometry = self.currentGeometry()
+                let previousGeometry = self.lastReportedGeometry
                 guard terminalPortalAnchorNeedsSynchronization(
-                    previous: self.lastReportedGeometry,
+                    previous: previousGeometry,
                     current: currentGeometry,
                     force: isForced
                 ) else {
                     return
                 }
                 self.lastReportedGeometry = currentGeometry
-                self.onGeometryChanged?()
+                self.onGeometryChanged?(
+                    terminalPortalAnchorNeedsFullReconciliation(
+                        previous: previousGeometry,
+                        current: currentGeometry
+                    )
+                )
             }
         }
 
@@ -4133,11 +4148,14 @@ struct GhosttyTerminalView: NSViewRepresentable {
                 hostedView.setActive(coordinator.desiredIsActive)
                 hostedView.setNotificationRing(visible: coordinator.desiredShowsUnreadNotificationRing)
             }
-            host.onGeometryChanged = { [weak host, weak coordinator] in
+            host.onGeometryChanged = { [weak host, weak coordinator] needsFullReconciliation in
                 guard let host, let coordinator else { return }
                 guard coordinator.attachGeneration == generation else { return }
                 guard coordinator.lastBoundHostId == ObjectIdentifier(host) else { return }
-                TerminalWindowPortalRegistry.synchronizeForAnchor(host)
+                TerminalWindowPortalRegistry.synchronizeForAnchor(
+                    host,
+                    needsFullReconciliation: needsFullReconciliation
+                )
             }
 
             if host.window != nil {

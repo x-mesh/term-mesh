@@ -1402,7 +1402,10 @@ final class WindowTerminalPortal: NSObject {
         pruneDeadEntries()
     }
 
-    func synchronizeHostedViewForAnchor(_ anchorView: NSView) {
+    func synchronizeHostedViewForAnchor(
+        _ anchorView: NSView,
+        needsFullReconciliation: Bool = true
+    ) {
         // HostContainerView schedules this callback after its AppKit layout pass.
         // Installation/topology changes still force layout inside ensureInstalled.
         guard ensureInstalled(forceLayout: false) else { return }
@@ -1413,12 +1416,14 @@ final class WindowTerminalPortal: NSObject {
             synchronizeHostedView(withId: primaryHostedId, installationPrepared: true)
         }
 
-        // Failsafe: during aggressive divider drags/structural churn, one anchor can miss a
-        // geometry callback while another fires. Reconcile all mapped hosted views once on the
-        // next runloop turn. Do not also synchronize the remaining entries synchronously here:
-        // every anchor callback would otherwise walk the whole portal twice, and workspace
-        // switches commonly deliver one callback per terminal in the same turn.
-        scheduleDeferredFullSynchronizeAll()
+        // Structural churn can make another anchor miss its callback, so retain the deferred
+        // all-entry failsafe when this anchor enters a new window or superview. Frame-only
+        // changes are already covered by the targeted sync above and by the portal's external
+        // window/split/anchor observers; scheduling another full pass here makes every warm
+        // workspace switch force AppKit layout across all hosted terminals.
+        if needsFullReconciliation {
+            scheduleDeferredFullSynchronizeAll()
+        }
     }
 
     private func scheduleDeferredFullSynchronizeAll() {
@@ -1837,10 +1842,16 @@ enum TerminalWindowPortalRegistry {
         pruneHostedMappings(for: windowId, validHostedIds: nextPortal.hostedIds())
     }
 
-    static func synchronizeForAnchor(_ anchorView: NSView) {
+    static func synchronizeForAnchor(
+        _ anchorView: NSView,
+        needsFullReconciliation: Bool = true
+    ) {
         guard let window = anchorView.window else { return }
         let portal = portal(for: window)
-        portal.synchronizeHostedViewForAnchor(anchorView)
+        portal.synchronizeHostedViewForAnchor(
+            anchorView,
+            needsFullReconciliation: needsFullReconciliation
+        )
     }
 
     static func hideHostedView(_ hostedView: GhosttySurfaceScrollView) {
