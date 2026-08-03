@@ -588,6 +588,7 @@ struct ContentView: View {
                                 )
                             }
                         )
+                        .equatable()
                     }
                     .opacity(isVisible ? 1 : WorkspaceMountPolicy.inactiveWorkspaceOpacity)
                     .allowsHitTesting(isSelectedWorkspace)
