@@ -2323,6 +2323,19 @@ final class SidebarPresentationSettingsTests: XCTestCase {
     }
 }
 
+final class SidebarAxisPickerTests: XCTestCase {
+    func testEqualityDependsOnlyOnRenderedSelection() {
+        let host = SidebarAxisPicker(selection: SidebarAxis.host.rawValue) { _ in }
+        let sameHostWithDifferentAction = SidebarAxisPicker(selection: SidebarAxis.host.rawValue) { _ in
+            XCTFail("Action identity must not affect rendering equality")
+        }
+        let project = SidebarAxisPicker(selection: SidebarAxis.project.rawValue) { _ in }
+
+        XCTAssertEqual(host, sameHostWithDifferentAction)
+        XCTAssertNotEqual(host, project)
+    }
+}
+
 final class SidebarActiveTabIndicatorSettingsTests: XCTestCase {
     func testDefaultStyleWhenUnset() {
         let suiteName = "SidebarActiveTabIndicatorSettingsTests.Default.\(UUID().uuidString)"

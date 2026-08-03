@@ -74,7 +74,11 @@ struct VerticalTabsSidebar: View {
                             .frame(height: trafficLightPadding)
 
                         if isAxisControlEnabled {
-                            SidebarAxisPicker(selection: $selectedAxisRaw)
+                            SidebarAxisPicker(
+                                selection: selectedAxisRaw,
+                                onSelectionChange: { selectedAxisRaw = $0 }
+                            )
+                                .equatable()
                                 .padding(.top, 2)
                                 .padding(.bottom, 2)
                         }
@@ -918,11 +922,22 @@ private enum PeerSidebarPalette {
 /// The sidebar's top-level switch. It sits above every section on purpose:
 /// as a control tucked inside the Peer Hosts header it looked like it governed
 /// the sidebar but only regrouped one section of it.
-struct SidebarAxisPicker: View {
-    @Binding var selection: String
+struct SidebarAxisPicker: View, Equatable {
+    let selection: String
+    let onSelectionChange: (String) -> Void
+
+    static func == (lhs: Self, rhs: Self) -> Bool {
+        lhs.selection == rhs.selection
+    }
 
     var body: some View {
-        Picker("", selection: $selection) {
+        Picker(
+            "",
+            selection: Binding(
+                get: { selection },
+                set: onSelectionChange
+            )
+        ) {
             ForEach(SidebarAxis.allCases) { axis in
                 Text(axis.title)
                     .accessibilityLabel(axis.accessibilityDescription)
