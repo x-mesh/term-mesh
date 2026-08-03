@@ -104,6 +104,7 @@ extension Workspace: BonsplitDelegate {
               let panel = panels[panelId] else {
             return
         }
+        refreshDominantRemoteHostKeyCache(focusedPanelId: panelId)
 
         if shouldTreatCurrentEventAsExplicitFocusIntent() {
             markExplicitFocusIntent(on: panelId)

@@ -3177,12 +3177,12 @@ final class SidebarBranchOrderingTests: XCTestCase {
         }
 
         XCTAssertNil(workspace.dominantRemoteHostKey)
-        XCTAssertEqual(workspace.dominantRemoteHostKeyComputationCount, 1)
+        let initialComputationCount = workspace.dominantRemoteHostKeyComputationCount
 
         XCTAssertNil(workspace.dominantRemoteHostKey)
         XCTAssertEqual(
             workspace.dominantRemoteHostKeyComputationCount,
-            1,
+            initialComputationCount,
             "Selection-only sidebar renders must reuse the host-key snapshot"
         )
 
@@ -3191,7 +3191,7 @@ final class SidebarBranchOrderingTests: XCTestCase {
         XCTAssertNil(workspace.dominantRemoteHostKey)
         XCTAssertEqual(
             workspace.dominantRemoteHostKeyComputationCount,
-            2,
+            initialComputationCount + 1,
             "Changing the focused panel must recompute the focus-preferred host"
         )
 
@@ -3200,7 +3200,7 @@ final class SidebarBranchOrderingTests: XCTestCase {
         XCTAssertNil(workspace.dominantRemoteHostKey)
         XCTAssertEqual(
             workspace.dominantRemoteHostKeyComputationCount,
-            3,
+            initialComputationCount + 2,
             "Changing panel membership must invalidate the fallback-host scan"
         )
     }

@@ -158,7 +158,10 @@ final class Workspace: Identifiable, ObservableObject {
     private var sidebarBranchDirectoryDisplayLinesCache: [Bool: [SidebarBranchOrdering.BranchDirectoryDisplayLine]] = [:]
     private(set) var sidebarBranchDirectoryEntriesComputationCount = 0
     private(set) var sidebarBranchDirectoryDisplayLinesComputationCount = 0
-    private var dominantRemoteHostKeyCache: (focusedPanelId: UUID?, hostKey: PeerPaneHostKey?)?
+    /// Outer optional tracks whether a value has been computed; the inner
+    /// optional caches the common local-workspace result (`nil`) as well.
+    private var dominantRemoteHostKeyCache: PeerPaneHostKey??
+    private var dominantRemoteHostKeyCachedFocusedPanelId: UUID?
     private(set) var dominantRemoteHostKeyComputationCount = 0
     @Published var surfaceListeningPorts: [UUID: [Int]] = [:]
     @Published var listeningPorts: [Int] = []
@@ -2273,28 +2276,43 @@ final class Workspace: Identifiable, ObservableObject {
     /// remote pane normally stays on the same host). nil for purely
     /// local workspaces.
     var dominantRemoteHostKey: PeerPaneHostKey? {
-        let currentFocusedPanelId = focusedPanelId
-        if let cache = dominantRemoteHostKeyCache,
-           cache.focusedPanelId == currentFocusedPanelId {
-            return cache.hostKey
+        if let cached = dominantRemoteHostKeyCache {
+            return cached
         }
-
-        dominantRemoteHostKeyComputationCount += 1
-        let hostKey: PeerPaneHostKey?
-        if let currentFocusedPanelId,
-           let focusedHostKey = (panels[currentFocusedPanelId] as? TerminalPanel)?.remoteHostKey {
-            hostKey = focusedHostKey
-        } else {
-            hostKey = panels.values.lazy.compactMap {
-                ($0 as? TerminalPanel)?.remoteHostKey
-            }.first
-        }
-        dominantRemoteHostKeyCache = (currentFocusedPanelId, hostKey)
+        let hostKey = computeDominantRemoteHostKey(focusedPanelId: focusedPanelId)
+        dominantRemoteHostKeyCachedFocusedPanelId = focusedPanelId
+        dominantRemoteHostKeyCache = .some(hostKey)
         return hostKey
     }
 
     private func invalidateDominantRemoteHostKeyCache() {
         dominantRemoteHostKeyCache = nil
+        dominantRemoteHostKeyCachedFocusedPanelId = nil
+    }
+
+    /// Selection callbacks already know the focused panel. Refresh from that
+    /// ID so subsequent sidebar renders do not have to enter Bonsplit's
+    /// observation graph merely to validate a cache hit.
+    func refreshDominantRemoteHostKeyCache(focusedPanelId: UUID?) {
+        if dominantRemoteHostKeyCache != nil,
+           dominantRemoteHostKeyCachedFocusedPanelId == focusedPanelId {
+            return
+        }
+        dominantRemoteHostKeyCachedFocusedPanelId = focusedPanelId
+        dominantRemoteHostKeyCache = .some(
+            computeDominantRemoteHostKey(focusedPanelId: focusedPanelId)
+        )
+    }
+
+    private func computeDominantRemoteHostKey(focusedPanelId: UUID?) -> PeerPaneHostKey? {
+        dominantRemoteHostKeyComputationCount += 1
+        if let focusedPanelId,
+           let focusedHostKey = (panels[focusedPanelId] as? TerminalPanel)?.remoteHostKey {
+            return focusedHostKey
+        }
+        return panels.values.lazy.compactMap {
+            ($0 as? TerminalPanel)?.remoteHostKey
+        }.first
     }
 
     /// Host a remote peer surface as a NORMAL Bonsplit pane: split from
