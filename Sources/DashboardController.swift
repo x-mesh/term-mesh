@@ -1,7 +1,67 @@
 import AppKit
+import Darwin
 import UserNotifications
 import WebKit
 import os
+
+// MARK: - Process Tree Snapshot
+
+/// Reads the Darwin process table without spawning an external process.
+enum ProcessTreeSnapshot {
+    typealias ParentPair = (pid: Int32, parentPID: Int32)
+
+    nonisolated static func descendantPIDs(
+        of rootPID: Int32,
+        in processes: [ParentPair]
+    ) -> Set<Int32> {
+        var children: [Int32: [Int32]] = [:]
+        for process in processes where process.pid > 0 && process.pid != rootPID {
+            children[process.parentPID, default: []].append(process.pid)
+        }
+
+        var pending = children[rootPID] ?? []
+        var nextIndex = 0
+        var descendants: Set<Int32> = []
+        while nextIndex < pending.count {
+            let pid = pending[nextIndex]
+            nextIndex += 1
+            guard descendants.insert(pid).inserted else { continue }
+            pending.append(contentsOf: children[pid] ?? [])
+        }
+        return descendants
+    }
+
+    /// Returns nil if the kernel snapshot cannot be obtained. Callers retain
+    /// their last known PID set instead of treating a failure as an empty tree.
+    nonisolated static func currentParentPairs(maxAttempts: Int = 3) -> [ParentPair]? {
+        var mib: [Int32] = [CTL_KERN, KERN_PROC, KERN_PROC_ALL, 0]
+
+        for _ in 0..<maxAttempts {
+            var requiredBytes = 0
+            guard sysctl(&mib, u_int(mib.count), nil, &requiredBytes, nil, 0) == 0 else {
+                return nil
+            }
+
+            // Processes can appear between the size query and the read. Leave
+            // headroom and retry if the process table still outgrows it.
+            let stride = MemoryLayout<kinfo_proc>.stride
+            let capacity = max(1, requiredBytes / stride + 32)
+            var entries = Array(repeating: kinfo_proc(), count: capacity)
+            var actualBytes = entries.count * stride
+            let result = entries.withUnsafeMutableBytes { buffer in
+                sysctl(&mib, u_int(mib.count), buffer.baseAddress, &actualBytes, nil, 0)
+            }
+            if result == 0 {
+                let count = min(entries.count, actualBytes / stride)
+                return entries.prefix(count).map {
+                    (pid: $0.kp_proc.p_pid, parentPID: $0.kp_eproc.e_ppid)
+                }
+            }
+            guard errno == ENOMEM else { return nil }
+        }
+        return nil
+    }
+}
 
 // MARK: - Dashboard Preset
 
@@ -210,7 +270,9 @@ final class DashboardController: NSObject, WKNavigationDelegate {
         DispatchQueue.global(qos: .utility).async { [weak self] in
             let descendants = Self.discoverDescendantPIDs()
             DispatchQueue.main.async {
-                self?.reconcileTrackedPIDs(descendants)
+                if let descendants {
+                    self?.reconcileTrackedPIDs(descendants)
+                }
                 self?.watchTabProjects()
                 self?.syncSessionsToDaemon()
                 self?.syncTeamsToDaemon()
@@ -473,42 +535,10 @@ final class DashboardController: NSObject, WKNavigationDelegate {
     // MARK: - Process Discovery
 
     /// Discover all descendant PIDs of this app. Safe to call from any thread (no shared state).
-    private static func discoverDescendantPIDs() -> Set<Int32> {
+    private nonisolated static func discoverDescendantPIDs() -> Set<Int32>? {
         let appPID = ProcessInfo.processInfo.processIdentifier
-
-        let pipe = Pipe()
-        let proc = Process()
-        proc.executableURL = URL(fileURLWithPath: "/bin/ps")
-        proc.arguments = ["-eo", "pid,ppid"]
-        proc.standardOutput = pipe
-        proc.standardError = FileHandle.nullDevice
-        try? proc.run()
-        proc.waitUntilExit()
-
-        let data = pipe.fileHandleForReading.readDataToEndOfFile()
-        guard let output = String(data: data, encoding: .utf8) else { return [] }
-
-        var children: [Int32: [Int32]] = [:]
-        for line in output.split(separator: "\n").dropFirst() {
-            let parts = line.split(separator: " ", omittingEmptySubsequences: true)
-            guard parts.count >= 2,
-                  let pid = Int32(parts[0]),
-                  let ppid = Int32(parts[1]) else { continue }
-            children[ppid, default: []].append(pid)
-        }
-
-        var queue: [Int32] = children[appPID] ?? []
-        var allDescendants: Set<Int32> = []
-        while !queue.isEmpty {
-            let pid = queue.removeFirst()
-            guard !allDescendants.contains(pid) else { continue }
-            allDescendants.insert(pid)
-            if let grandchildren = children[pid] {
-                queue.append(contentsOf: grandchildren)
-            }
-        }
-
-        return allDescendants
+        guard let processes = ProcessTreeSnapshot.currentParentPairs() else { return nil }
+        return ProcessTreeSnapshot.descendantPIDs(of: appPID, in: processes)
     }
 
     /// Reconcile tracked PIDs with discovered descendants. Must be called on @MainActor.
