@@ -1959,6 +1959,21 @@ final class WorkspacePlacementSettingsTests: XCTestCase {
 }
 
 final class WorkspaceTabColorSettingsTests: XCTestCase {
+    func testStandardPaletteIsComputedOnceUntilInvalidated() {
+        WorkspaceTabColorSettings.invalidateStandardPaletteCache()
+        let initialCount = WorkspaceTabColorSettings.standardPaletteComputationCount
+
+        let first = WorkspaceTabColorSettings.palette()
+        let second = WorkspaceTabColorSettings.palette()
+
+        XCTAssertEqual(first, second)
+        XCTAssertEqual(WorkspaceTabColorSettings.standardPaletteComputationCount, initialCount + 1)
+
+        WorkspaceTabColorSettings.invalidateStandardPaletteCache()
+        _ = WorkspaceTabColorSettings.palette()
+        XCTAssertEqual(WorkspaceTabColorSettings.standardPaletteComputationCount, initialCount + 2)
+    }
+
     func testNormalizedHexAcceptsAndNormalizesValidInput() {
         XCTAssertEqual(WorkspaceTabColorSettings.normalizedHex("#abc123"), "#ABC123")
         XCTAssertEqual(WorkspaceTabColorSettings.normalizedHex("  aBcDeF "), "#ABCDEF")

@@ -280,6 +280,8 @@ enum WorkspaceTabColorSettings {
     static let defaultOverridesKey = "workspaceTabColor.defaultOverrides"
     static let customColorsKey = "workspaceTabColor.customColors"
     static let maxCustomColors = 24
+    private static var standardPaletteCache: [WorkspaceTabColorEntry]?
+    private(set) static var standardPaletteComputationCount = 0
 
     private static let originalPRPalette: [WorkspaceTabColorEntry] = [
         WorkspaceTabColorEntry(name: "Red", hex: "#C0392B"),
@@ -305,7 +307,16 @@ enum WorkspaceTabColorSettings {
     }
 
     static func palette(defaults: UserDefaults = .standard) -> [WorkspaceTabColorEntry] {
-        defaultPaletteWithOverrides(defaults: defaults) + customColorEntries(defaults: defaults)
+        if defaults === UserDefaults.standard, let standardPaletteCache {
+            return standardPaletteCache
+        }
+
+        let palette = defaultPaletteWithOverrides(defaults: defaults) + customColorEntries(defaults: defaults)
+        if defaults === UserDefaults.standard {
+            standardPaletteCache = palette
+            standardPaletteComputationCount += 1
+        }
+        return palette
     }
 
     static func defaultPaletteWithOverrides(defaults: UserDefaults = .standard) -> [WorkspaceTabColorEntry] {
@@ -387,11 +398,13 @@ enum WorkspaceTabColorSettings {
         } else {
             defaults.set(normalizedColors, forKey: customColorsKey)
         }
+        invalidatePaletteCacheIfNeeded(defaults: defaults)
     }
 
     static func reset(defaults: UserDefaults = .standard) {
         defaults.removeObject(forKey: defaultOverridesKey)
         defaults.removeObject(forKey: customColorsKey)
+        invalidatePaletteCacheIfNeeded(defaults: defaults)
     }
 
     static func normalizedHex(_ raw: String) -> String? {
@@ -448,6 +461,16 @@ enum WorkspaceTabColorSettings {
         } else {
             defaults.set(map, forKey: defaultOverridesKey)
         }
+        invalidatePaletteCacheIfNeeded(defaults: defaults)
+    }
+
+    static func invalidateStandardPaletteCache() {
+        standardPaletteCache = nil
+    }
+
+    private static func invalidatePaletteCacheIfNeeded(defaults: UserDefaults) {
+        guard defaults === UserDefaults.standard else { return }
+        invalidateStandardPaletteCache()
     }
 
     private static func brightenedForDarkAppearance(_ color: NSColor) -> NSColor {
