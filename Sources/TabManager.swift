@@ -1594,8 +1594,18 @@ class TabManager: ObservableObject {
 
     private func updateWindowTitle(for tab: Workspace?) {
         let title = windowTitle(for: tab)
-        let targetWindow = NSApp.keyWindow ?? NSApp.mainWindow ?? NSApp.windows.first
-        targetWindow?.title = title
+        let targetWindow = AppDelegate.shared?.mainWindow(for: self)
+            ?? NSApp.keyWindow
+            ?? NSApp.mainWindow
+            ?? NSApp.windows.first
+        Self.applyWindowTitleIfChanged(title, to: targetWindow)
+    }
+
+    @discardableResult
+    static func applyWindowTitleIfChanged(_ title: String, to window: NSWindow?) -> Bool {
+        guard let window, window.title != title else { return false }
+        window.title = title
+        return true
     }
 
     private func windowTitle(for tab: Workspace?) -> String {

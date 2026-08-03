@@ -448,6 +448,81 @@ final class TitlebarGitSnapshotCacheTests: XCTestCase {
     }
 }
 
+final class TitlebarWorktreeCountCacheTests: XCTestCase {
+    func testRecentCountIsReusedUntilTTLExpires() {
+        let cache = TitlebarWorktreeCountCache(ttl: 2)
+        var loadCount = 0
+        var results: [Int] = []
+
+        cache.resolve(directory: "/tmp/repo", now: 10, load: {
+            loadCount += 1
+            return 3
+        }, completion: { results.append($0) })
+        cache.resolve(directory: "/tmp/repo/.", now: 11, load: {
+            loadCount += 1
+            return 4
+        }, completion: { results.append($0) })
+        cache.resolve(directory: "/tmp/repo", now: 12.1, load: {
+            loadCount += 1
+            return 4
+        }, completion: { results.append($0) })
+
+        XCTAssertEqual(loadCount, 2)
+        XCTAssertEqual(results, [3, 3, 4])
+    }
+
+    func testConcurrentRequestsForSameDirectoryJoinInFlightLoad() {
+        let cache = TitlebarWorktreeCountCache(ttl: 2)
+        let firstLoadStarted = expectation(description: "first load started")
+        let bothCompleted = expectation(description: "both requests completed")
+        bothCompleted.expectedFulfillmentCount = 2
+        let allowFirstLoadToFinish = DispatchSemaphore(value: 0)
+        let lock = NSLock()
+        var loadCount = 0
+        var results: [Int] = []
+
+        DispatchQueue.global().async {
+            cache.resolve(directory: "/tmp/repo", now: 10, load: {
+                lock.lock()
+                loadCount += 1
+                lock.unlock()
+                firstLoadStarted.fulfill()
+                allowFirstLoadToFinish.wait()
+                return 5
+            }, completion: { count in
+                lock.lock()
+                results.append(count)
+                lock.unlock()
+                bothCompleted.fulfill()
+            })
+        }
+
+        wait(for: [firstLoadStarted], timeout: 1)
+        DispatchQueue.global().async {
+            cache.resolve(directory: "/tmp/repo/.", now: 10.1, load: {
+                lock.lock()
+                loadCount += 1
+                lock.unlock()
+                return 6
+            }, completion: { count in
+                lock.lock()
+                results.append(count)
+                lock.unlock()
+                bothCompleted.fulfill()
+            })
+        }
+        allowFirstLoadToFinish.signal()
+
+        wait(for: [bothCompleted], timeout: 1)
+        lock.lock()
+        let finalLoadCount = loadCount
+        let finalResults = results
+        lock.unlock()
+        XCTAssertEqual(finalLoadCount, 1)
+        XCTAssertEqual(finalResults.sorted(), [5, 5])
+    }
+}
+
 final class NotificationBurstCoalescerTests: XCTestCase {
     func testSignalsInSameBurstFlushOnce() {
         let coalescer = NotificationBurstCoalescer(delay: 0.01)
