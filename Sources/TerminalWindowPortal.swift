@@ -1403,7 +1403,12 @@ final class WindowTerminalPortal: NSObject {
     }
 
     func synchronizeHostedViewForAnchor(_ anchorView: NSView) {
-        guard ensureInstalled() else { return }
+        // HostContainerView defers this callback until the AppKit layout pass
+        // that changed the anchor has completed. Re-entering the portal host's
+        // layout here walks the hierarchy again on every warm workspace
+        // switch. A real installation/reference/z-order mutation still forces
+        // layout inside ensureInstalled even with forceLayout disabled.
+        guard ensureInstalled(forceLayout: false) else { return }
         pruneDeadEntries()
         let anchorId = ObjectIdentifier(anchorView)
         let primaryHostedId = hostedByAnchorId[anchorId]
