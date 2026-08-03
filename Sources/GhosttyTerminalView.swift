@@ -66,6 +66,15 @@ func terminalSurfaceCreationRetryDelay(afterFailureCount failureCount: Int) -> T
     return delays[index]
 }
 
+func terminalSurfaceShouldStartSynchronously(
+    creationInProgress: Bool,
+    backgroundStartQueued: Bool,
+    now: TimeInterval,
+    retryNotBefore: TimeInterval
+) -> Bool {
+    !creationInProgress && !backgroundStartQueued && now >= retryNotBefore
+}
+
 enum GhosttyPasteboardHelper {
     private static let selectionPasteboard = NSPasteboard(
         name: NSPasteboard.Name("com.mitchellh.ghostty.selection")
@@ -510,8 +519,13 @@ final class TerminalSurface: Identifiable, ObservableObject {
                 requestBackgroundSurfaceStartIfNeeded(reason: "attachToWindow")
                 return
             }
-            guard !surfaceCreationInProgress else { return }
-            guard ProcessInfo.processInfo.systemUptime >= surfaceCreationRetryNotBefore else {
+            let now = ProcessInfo.processInfo.systemUptime
+            guard terminalSurfaceShouldStartSynchronously(
+                creationInProgress: surfaceCreationInProgress,
+                backgroundStartQueued: backgroundSurfaceStartQueued,
+                now: now,
+                retryNotBefore: surfaceCreationRetryNotBefore
+            ) else {
                 requestBackgroundSurfaceStartIfNeeded(reason: "attachBackoff")
                 return
             }

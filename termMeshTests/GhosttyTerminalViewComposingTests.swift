@@ -18,6 +18,36 @@ final class GhosttyTerminalViewComposingTests: XCTestCase {
         XCTAssertEqual(terminalSurfaceCreationRetryDelay(afterFailureCount: 100), 30)
     }
 
+    func testSurfaceCreationWaitsForQueuedBackgroundRetry() {
+        XCTAssertFalse(terminalSurfaceShouldStartSynchronously(
+            creationInProgress: false,
+            backgroundStartQueued: true,
+            now: 20,
+            retryNotBefore: 10
+        ))
+    }
+
+    func testSurfaceCreationStartsSynchronouslyOnlyWhenEligible() {
+        XCTAssertTrue(terminalSurfaceShouldStartSynchronously(
+            creationInProgress: false,
+            backgroundStartQueued: false,
+            now: 20,
+            retryNotBefore: 10
+        ))
+        XCTAssertFalse(terminalSurfaceShouldStartSynchronously(
+            creationInProgress: true,
+            backgroundStartQueued: false,
+            now: 20,
+            retryNotBefore: 10
+        ))
+        XCTAssertFalse(terminalSurfaceShouldStartSynchronously(
+            creationInProgress: false,
+            backgroundStartQueued: false,
+            now: 9,
+            retryNotBefore: 10
+        ))
+    }
+
     private func externalSnapshot(
         hostFrame: NSRect = NSRect(x: 0, y: 0, width: 800, height: 600),
         anchorFrame: NSRect = NSRect(x: 10, y: 20, width: 300, height: 200),
