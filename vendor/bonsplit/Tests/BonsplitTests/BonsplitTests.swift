@@ -4,6 +4,40 @@ import AppKit
 import SwiftUI
 
 final class BonsplitTests: XCTestCase {
+    func testInactiveContainerAlphaPreservesHierarchyWithoutVisiblePixels() {
+        XCTAssertEqual(BonsplitContainerVisibilityPolicy.alpha(isInteractive: true), 1)
+        XCTAssertGreaterThan(BonsplitContainerVisibilityPolicy.inactiveAlpha, 0)
+        XCTAssertLessThan(BonsplitContainerVisibilityPolicy.inactiveAlpha, 0.5 / 255.0)
+        XCTAssertEqual(
+            BonsplitContainerVisibilityPolicy.alpha(isInteractive: false),
+            BonsplitContainerVisibilityPolicy.inactiveAlpha
+        )
+    }
+
+    @MainActor
+    func testInactivePaneContainerRejectsHitTestingWithoutBeingHidden() {
+        let container = PaneDragContainerView(frame: NSRect(x: 0, y: 0, width: 100, height: 100))
+        let child = NSView(frame: container.bounds)
+        container.addSubview(child)
+
+        container.isInteractionEnabled = false
+
+        XCTAssertFalse(container.isHidden)
+        XCTAssertNil(container.hitTest(NSPoint(x: 50, y: 50)))
+    }
+
+    @MainActor
+    func testInactiveSplitContainerRejectsHitTestingWithoutBeingHidden() {
+        let splitView = ThemedSplitView(frame: NSRect(x: 0, y: 0, width: 100, height: 100))
+        let child = NSView(frame: splitView.bounds)
+        splitView.addSubview(child)
+
+        splitView.isInteractionEnabled = false
+
+        XCTAssertFalse(splitView.isHidden)
+        XCTAssertNil(splitView.hitTest(NSPoint(x: 50, y: 50)))
+    }
+
 #if DEBUG
     func testDebugEventLogReopensAClosedFileHandleInsteadOfCrashing() throws {
         let directory = FileManager.default.temporaryDirectory

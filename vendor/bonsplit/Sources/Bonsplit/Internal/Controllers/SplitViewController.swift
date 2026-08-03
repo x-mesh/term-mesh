@@ -31,9 +31,9 @@ final class SplitViewController {
     @ObservationIgnored var activeDragTab: TabItem?
     @ObservationIgnored var activeDragSourcePaneId: PaneID?
 
-    /// When false, drop delegates reject all drags and NSViews are hidden.
-    /// Mirrors BonsplitController.isInteractive. Must be observable so
-    /// updateNSView is called to toggle isHidden on the AppKit containers.
+    /// When false, drop delegates and AppKit hit testing reject interaction.
+    /// Mirrors BonsplitController.isInteractive. Must be observable so the
+    /// representable containers update their interaction and visibility state.
     var isInteractive: Bool = true
 
     /// Handler for file/URL drops from external apps (e.g. Finder).

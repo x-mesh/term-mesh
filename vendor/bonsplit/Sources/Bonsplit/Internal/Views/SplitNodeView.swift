@@ -46,7 +46,24 @@ struct SplitNodeView<Content: View, EmptyContent: View>: View {
 
 /// Container NSView for a pane inside SinglePaneWrapper.
 class PaneDragContainerView: NSView {
+    var isInteractionEnabled = true
+
     override var isOpaque: Bool { false }
+
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        guard isInteractionEnabled else { return nil }
+        return super.hitTest(point)
+    }
+}
+
+enum BonsplitContainerVisibilityPolicy {
+    /// Keeps AppKit-backed SwiftUI platform views installed while remaining below
+    /// half of one 8-bit alpha step, so inactive containers contribute no pixel.
+    static let inactiveAlpha: CGFloat = 0.0001
+
+    static func alpha(isInteractive: Bool) -> CGFloat {
+        isInteractive ? 1 : inactiveAlpha
+    }
 }
 
 /// Wrapper that uses NSHostingController for proper AppKit layout constraints
@@ -92,9 +109,13 @@ struct SinglePaneWrapper<Content: View, EmptyContent: View>: NSViewRepresentable
     }
 
     func updateNSView(_ nsView: NSView, context: Context) {
-        // Hide the container when inactive so AppKit's drag routing doesn't deliver
-        // drag sessions to views belonging to background workspaces.
-        nsView.isHidden = !controller.isInteractive
+        // Exact `isHidden` changes make SwiftUI remove and later reinstall the
+        // NSHostingView's platform subviews. Keep the hierarchy mounted instead;
+        // hit testing and the drop delegates still reject inactive workspaces.
+        let isInteractive = controller.isInteractive
+        nsView.isHidden = false
+        nsView.alphaValue = BonsplitContainerVisibilityPolicy.alpha(isInteractive: isInteractive)
+        (nsView as? PaneDragContainerView)?.isInteractionEnabled = isInteractive
         nsView.wantsLayer = true
         nsView.layer?.backgroundColor = NSColor.clear.cgColor
         nsView.layer?.isOpaque = false

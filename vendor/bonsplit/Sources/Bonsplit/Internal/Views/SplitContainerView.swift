@@ -3,14 +3,20 @@ import AppKit
 
 private var splitContainerProgrammaticSyncDepth = 0
 
-private class ThemedSplitView: NSSplitView {
+class ThemedSplitView: NSSplitView {
     var customDividerColor: NSColor?
+    var isInteractionEnabled = true
 
     override var dividerColor: NSColor {
         customDividerColor ?? super.dividerColor
     }
 
     override var isOpaque: Bool { false }
+
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        guard isInteractionEnabled else { return nil }
+        return super.hitTest(point)
+    }
 }
 
 #if DEBUG
@@ -300,11 +306,13 @@ struct SplitContainerView<Content: View, EmptyContent: View>: NSViewRepresentabl
             onGeometryChange: onGeometryChange
         )
 
-        // Hide the NSSplitView when inactive so AppKit's drag routing doesn't deliver
-        // drag sessions to views belonging to background workspaces. SwiftUI's
-        // .allowsHitTesting(false) only affects gesture recognizers, not AppKit's
-        // view-hierarchy-based NSDraggingDestination routing.
-        splitView.isHidden = !controller.isInteractive
+        // Preserve the native hierarchy across workspace switches. Exact `isHidden`
+        // toggles cause the hosted platform views to be removed and re-added.
+        // Hit testing and every SwiftUI drop delegate remain disabled while inactive.
+        let isInteractive = controller.isInteractive
+        splitView.isHidden = false
+        splitView.alphaValue = BonsplitContainerVisibilityPolicy.alpha(isInteractive: isInteractive)
+        (splitView as? ThemedSplitView)?.isInteractionEnabled = isInteractive
         splitView.wantsLayer = true
         splitView.layer?.backgroundColor = NSColor.clear.cgColor
         splitView.layer?.isOpaque = false

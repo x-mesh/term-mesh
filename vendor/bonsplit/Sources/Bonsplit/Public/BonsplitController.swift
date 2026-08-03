@@ -55,9 +55,9 @@ public final class BonsplitController {
     /// Configuration for behavior and appearance
     public var configuration: BonsplitConfiguration
 
-    /// When false, drop delegates reject all drags. Set to false for inactive workspaces
-    /// so their views (kept alive in a ZStack for state preservation) don't intercept drags
-    /// meant for the active workspace.
+    /// When false, drop delegates and AppKit container hit testing reject interaction.
+    /// Set to false for inactive workspaces so their mounted views don't intercept
+    /// input or drags meant for the active workspace.
     @ObservationIgnored public var isInteractive: Bool = true {
         didSet { internalController.isInteractive = isInteractive }
     }
