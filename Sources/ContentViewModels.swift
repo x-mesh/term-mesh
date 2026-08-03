@@ -146,4 +146,18 @@ enum WorkspaceHandoffPolicy {
         guard !oldIsPeerMirror, !newIsPeerMirror else { return false }
         return true
     }
+
+    /// Reorder workspace layers only while two workspaces intentionally overlap.
+    /// A warm immediate switch has exactly one visible workspace, so changing the
+    /// selected layer's priority only makes SwiftUI reparent AppKit platform views.
+    static func visualPriority(
+        isSelected: Bool,
+        isRetiring: Bool,
+        hasOverlap: Bool
+    ) -> Int {
+        guard hasOverlap else { return 0 }
+        if isSelected { return 2 }
+        if isRetiring { return 1 }
+        return 0
+    }
 }

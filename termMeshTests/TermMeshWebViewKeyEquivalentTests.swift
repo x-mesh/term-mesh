@@ -4810,6 +4810,37 @@ final class WorkspaceHandoffPolicyTests: XCTestCase {
             newIsPeerMirror: false
         ))
     }
+
+    func testWarmImmediateSwitchKeepsStableVisualPriority() {
+        XCTAssertEqual(WorkspaceHandoffPolicy.visualPriority(
+            isSelected: true,
+            isRetiring: false,
+            hasOverlap: false
+        ), 0)
+        XCTAssertEqual(WorkspaceHandoffPolicy.visualPriority(
+            isSelected: false,
+            isRetiring: false,
+            hasOverlap: false
+        ), 0)
+    }
+
+    func testOverlapHandoffPrioritizesSelectedAboveRetiring() {
+        XCTAssertEqual(WorkspaceHandoffPolicy.visualPriority(
+            isSelected: true,
+            isRetiring: false,
+            hasOverlap: true
+        ), 2)
+        XCTAssertEqual(WorkspaceHandoffPolicy.visualPriority(
+            isSelected: false,
+            isRetiring: true,
+            hasOverlap: true
+        ), 1)
+        XCTAssertEqual(WorkspaceHandoffPolicy.visualPriority(
+            isSelected: false,
+            isRetiring: false,
+            hasOverlap: true
+        ), 0)
+    }
 }
 
 @MainActor
@@ -5564,7 +5595,7 @@ final class TerminalWindowPortalLifecycleTests: XCTestCase {
         )
     }
 
-    func testVisibilityTransitionBringsHostedViewToFront() {
+    func testVisibilityTransitionAtSamePriorityPreservesHostedViewOrder() {
         let window = NSWindow(
             contentRect: NSRect(x: 0, y: 0, width: 500, height: 300),
             styleMask: [.titled, .closable],
@@ -5600,8 +5631,8 @@ final class TerminalWindowPortalLifecycleTests: XCTestCase {
         portal.bind(hostedView: hosted1, to: anchor1, visibleInUI: false)
         portal.bind(hostedView: hosted1, to: anchor1, visibleInUI: true)
         XCTAssertTrue(
-            portal.terminalViewAtWindowPoint(overlapInWindow) === terminal1,
-            "Becoming visible should refresh z-order for already-hosted view"
+            portal.terminalViewAtWindowPoint(overlapInWindow) === terminal2,
+            "Visibility-only updates should preserve the established portal z-order"
         )
     }
 

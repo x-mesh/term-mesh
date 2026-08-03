@@ -1357,10 +1357,10 @@ final class WindowTerminalPortal: NSObject {
             )
 #endif
             hostView.addSubview(hostedView, positioned: .above, relativeTo: nil)
-        } else if (becameVisible || priorityIncreased), hostView.subviews.last !== hostedView {
-            // Refresh z-order only when a view becomes visible or gets a higher priority.
-            // Anchor-only churn is common during split tree updates; forcing remove/add there
-            // causes transient inWindow=0 -> 1 bounces that can flash black.
+        } else if priorityIncreased, hostView.subviews.last !== hostedView {
+            // Refresh z-order only for an explicit priority promotion. Warm workspace
+            // switches toggle visibility at the same priority, so raising there needlessly
+            // reparents the terminal and causes AppKit layout/in-window churn.
 #if DEBUG
             dlog(
                 "portal.reparent hosted=\(portalDebugToken(hostedView)) reason=raise " +

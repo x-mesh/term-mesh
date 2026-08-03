@@ -415,6 +415,7 @@ struct ContentView: View {
         let mountedWorkspaces = tabManager.tabs.filter { mountedWorkspaceIdSet.contains($0.id) }
         let selectedWorkspaceId = tabManager.selectedTabId
         let retiringWorkspaceId = self.retiringWorkspaceId
+        let hasOverlappingWorkspaceHandoff = retiringWorkspaceId != nil
 
         return ZStack {
             ZStack {
@@ -427,13 +428,17 @@ struct ContentView: View {
                     // delay handoff completion and make browser returns feel laggy.
                     let isInputActive = isSelectedWorkspace
                     let isVisible = isSelectedWorkspace || isRetiringWorkspace
-                    let portalPriority = isSelectedWorkspace ? 2 : (isRetiringWorkspace ? 1 : 0)
+                    let visualPriority = WorkspaceHandoffPolicy.visualPriority(
+                        isSelected: isSelectedWorkspace,
+                        isRetiring: isRetiringWorkspace,
+                        hasOverlap: hasOverlappingWorkspaceHandoff
+                    )
                     WorkspaceRetrievalChrome(workspace: tab) {
                         SelectedWorkspaceContentView(
                             workspace: tab,
                             isWorkspaceVisible: isVisible,
                             isWorkspaceInputActive: isInputActive,
-                            workspacePortalPriority: portalPriority,
+                            workspacePortalPriority: visualPriority,
                             onThemeRefreshRequest: { reason, eventId, source, payloadHex in
                                 scheduleTitlebarThemeRefreshFromWorkspace(
                                     workspaceId: tab.id,
@@ -447,7 +452,7 @@ struct ContentView: View {
                     }
                     .opacity(isVisible ? 1 : 0)
                     .allowsHitTesting(isSelectedWorkspace)
-                    .zIndex(isSelectedWorkspace ? 2 : (isRetiringWorkspace ? 1 : 0))
+                    .zIndex(Double(visualPriority))
                 }
             }
             .opacity(sidebarSelectionState.selection == .tabs ? 1 : 0)
