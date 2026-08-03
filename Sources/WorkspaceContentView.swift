@@ -3,6 +3,31 @@ import Foundation
 import AppKit
 import Bonsplit
 
+/// Latest appearance snapshot for SwiftUI state initialization. SwiftUI evaluates
+/// a `@State` initializer every time it recreates the surrounding View value even
+/// when the existing state storage wins. Keeping that initializer in memory avoids
+/// rereading Ghostty's config files on every warm workspace selection. Explicit
+/// config/theme refresh paths still load from disk and replace this snapshot.
+final class WorkspaceAppearanceConfigCache: @unchecked Sendable {
+    private let lock = NSLock()
+    private var cached: GhosttyConfig?
+
+    func snapshot(load: () -> GhosttyConfig) -> GhosttyConfig {
+        lock.lock()
+        defer { lock.unlock() }
+        if let cached { return cached }
+        let loaded = load()
+        cached = loaded
+        return loaded
+    }
+
+    func store(_ config: GhosttyConfig) {
+        lock.lock()
+        cached = config
+        lock.unlock()
+    }
+}
+
 /// Resolves the selected main-content target explicitly.
 ///
 /// Peer mirrors use the same Bonsplit portal contract as local workspaces,
@@ -74,6 +99,8 @@ private struct PeerMirrorMainContentView: View {
 
 /// View that renders a Workspace's content using BonsplitView
 struct WorkspaceContentView: View {
+    private static let appearanceConfigCache = WorkspaceAppearanceConfigCache()
+
     @ObservedObject var workspace: Workspace
     let isWorkspaceVisible: Bool
     let isWorkspaceInputActive: Bool
@@ -84,7 +111,7 @@ struct WorkspaceContentView: View {
         _ backgroundSource: String?,
         _ notificationPayloadHex: String?
     ) -> Void)?
-    @State private var config = WorkspaceContentView.resolveGhosttyAppearanceConfig(reason: "stateInit")
+    @State private var config = WorkspaceContentView.initialGhosttyAppearanceConfig()
     @Environment(\.colorScheme) private var colorScheme
     @EnvironmentObject var notificationStore: TerminalNotificationStore
     @Environment(\.configProvider) private var configProvider
@@ -258,6 +285,12 @@ struct WorkspaceContentView: View {
         return next
     }
 
+    private static func initialGhosttyAppearanceConfig() -> GhosttyConfig {
+        appearanceConfigCache.snapshot {
+            resolveGhosttyAppearanceConfig(reason: "stateInit")
+        }
+    }
+
     private func refreshGhosttyAppearanceConfig(
         reason: String,
         backgroundOverride: NSColor? = nil,
@@ -270,6 +303,7 @@ struct WorkspaceContentView: View {
             reason: reason,
             backgroundOverride: backgroundOverride
         )
+        Self.appearanceConfigCache.store(next)
         let eventLabel = backgroundEventId.map(String.init) ?? "nil"
         let sourceLabel = backgroundSource ?? "nil"
         let payloadLabel = notificationPayloadHex ?? "nil"

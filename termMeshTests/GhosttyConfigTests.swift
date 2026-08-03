@@ -266,6 +266,34 @@ final class WorkspaceChromeThemeTests: XCTestCase {
 }
 
 final class WorkspaceAppearanceConfigResolutionTests: XCTestCase {
+    func testAppearanceConfigCacheLoadsOnceAndUsesStoredRefresh() {
+        let cache = WorkspaceAppearanceConfigCache()
+        var loadCount = 0
+        var initial = GhosttyConfig()
+        initial.fontSize = 13
+
+        XCTAssertEqual(cache.snapshot {
+            loadCount += 1
+            return initial
+        }.fontSize, 13)
+        XCTAssertEqual(cache.snapshot {
+            loadCount += 1
+            var unexpected = GhosttyConfig()
+            unexpected.fontSize = 99
+            return unexpected
+        }.fontSize, 13)
+        XCTAssertEqual(loadCount, 1)
+
+        var refreshed = GhosttyConfig()
+        refreshed.fontSize = 17
+        cache.store(refreshed)
+
+        XCTAssertEqual(cache.snapshot {
+            XCTFail("Stored refresh should satisfy future state initializers")
+            return GhosttyConfig()
+        }.fontSize, 17)
+    }
+
     func testResolvedAppearanceConfigPrefersGhosttyRuntimeBackgroundOverLoadedConfig() {
         guard let loadedBackground = NSColor(hex: "#112233"),
               let runtimeBackground = NSColor(hex: "#FDF6E3"),
