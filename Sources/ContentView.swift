@@ -1680,7 +1680,7 @@ struct ContentView: View {
                 selectedTabIds = [newValue]
                 lastSidebarSelectionIndex = tabManager.tabs.firstIndex { $0.id == newValue }
             }
-            updateTitlebarText()
+            scheduleTitlebarTextRefresh()
         })
 
         view = AnyView(view.onChange(of: tabManager.isWorkspaceCycleHot) { _ in
