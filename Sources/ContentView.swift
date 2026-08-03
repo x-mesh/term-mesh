@@ -20,6 +20,66 @@ extension NSHostingView: HostingViewSizingControl {
     func disableSizingOptions() { sizingOptions = [] }
 }
 
+struct TitlebarGitSnapshot: Equatable {
+    let branch: String
+    let isDirty: Bool
+    let dirtyCount: Int
+    let isWorktree: Bool
+}
+
+/// Process-wide cache for the titlebar's fallback git probe. Workspace cycling
+/// can ask for the same directory several times before the first three-process
+/// git query finishes, so callers both reuse recent results and join in-flight
+/// work instead of spawning another query.
+final class TitlebarGitSnapshotCache: @unchecked Sendable {
+    private struct Entry {
+        let snapshot: TitlebarGitSnapshot
+        let completedAt: TimeInterval
+    }
+
+    private let lock = NSLock()
+    private let ttl: TimeInterval
+    private let negativeTTL: TimeInterval
+    private var entries: [String: Entry] = [:]
+    private var waiters: [String: [(TitlebarGitSnapshot) -> Void]] = [:]
+
+    init(ttl: TimeInterval = 2.0, negativeTTL: TimeInterval = 10.0) {
+        self.ttl = ttl
+        self.negativeTTL = negativeTTL
+    }
+
+    func resolve(
+        directory: String,
+        now: TimeInterval = ProcessInfo.processInfo.systemUptime,
+        load: () -> TitlebarGitSnapshot,
+        completion: @escaping (TitlebarGitSnapshot) -> Void
+    ) {
+        let key = (directory as NSString).standardizingPath
+        lock.lock()
+        if let entry = entries[key],
+           now - entry.completedAt < (entry.snapshot.branch.isEmpty ? negativeTTL : ttl) {
+            lock.unlock()
+            completion(entry.snapshot)
+            return
+        }
+        if waiters[key] != nil {
+            waiters[key, default: []].append(completion)
+            lock.unlock()
+            return
+        }
+        waiters[key] = [completion]
+        lock.unlock()
+
+        let snapshot = load()
+
+        lock.lock()
+        entries[key] = Entry(snapshot: snapshot, completedAt: now)
+        let completions = waiters.removeValue(forKey: key) ?? []
+        lock.unlock()
+        completions.forEach { $0(snapshot) }
+    }
+}
+
 /// Installs a FileDropOverlayView on the window's theme frame for Finder file drag support.
 
 struct ContentView: View {
@@ -76,6 +136,7 @@ struct ContentView: View {
     @State private var titlebarTag: String? = nil
     @State private var titlebarDashboardPort: Int? = nil
     @State private var titlebarWorktreeCount: Int = 0
+    @State private var titlebarGitFallbackGeneration: UInt64 = 0
     @State private var isFullScreen: Bool = false
     @State private var observedWindow: NSWindow?
     @StateObject private var fullscreenControlsViewModel = TitlebarControlsViewModel()
@@ -112,6 +173,7 @@ struct ContentView: View {
         hotSpot: NSCursor.resizeLeftRight.hotSpot
     )
     private static let commandPaletteUsageDefaultsKey = "commandPalette.commandUsage.v1"
+    private static let titlebarGitSnapshotCache = TitlebarGitSnapshotCache()
     private static let commandPaletteCommandsPrefix = ">"
     /// Peer-workspace scope prefix. Same mechanism as `>` for commands: the
     /// scope is derived from the query, so ⌘⇧O is just a shortcut that seeds
@@ -1159,6 +1221,7 @@ struct ContentView: View {
         let updateStart = CFAbsoluteTimeGetCurrent()
         guard let selectedId = tabManager.selectedTabId,
               let tab = tabManager.tabs.first(where: { $0.id == selectedId }) else {
+            titlebarGitFallbackGeneration &+= 1
             if !titlebarText.isEmpty { titlebarText = "" }
             if !titlebarGitBranch.isEmpty { titlebarGitBranch = "" }
             if !titlebarWorktreeName.isEmpty { titlebarWorktreeName = "" }
@@ -1200,9 +1263,12 @@ struct ContentView: View {
         let focusedTTY: String? = focusedPanelId.flatMap { snapTTYNames[$0] }
         let hasPanelDir = focusedPanelId != nil && snapPanelDirs[focusedPanelId!] != nil
         #if DEBUG
-        dlog("titlebar.update focusedPanel=\(focusedPanelId?.uuidString.prefix(8) ?? "nil") gitBranch=\(branchState?.branch ?? "nil") panelBranches=\(snapPanelBranches.mapValues { $0.branch }) currentDir=\(snapCurrentDir) focusedDir=\(focusedDir) tty=\(focusedTTY ?? "nil") hasPanelDir=\(hasPanelDir) worktreeName=\(snapWorktreeName ?? "nil") hostKey=\(snapHostKey?.description ?? "nil")")
+        if !hasPanelDir || (branchState?.branch ?? "") != titlebarGitBranch {
+            dlog("titlebar.update focusedPanel=\(focusedPanelId?.uuidString.prefix(8) ?? "nil") gitBranch=\(branchState?.branch ?? "nil") panelBranches=\(snapPanelBranches.mapValues { $0.branch }) currentDir=\(snapCurrentDir) focusedDir=\(focusedDir) tty=\(focusedTTY ?? "nil") hasPanelDir=\(hasPanelDir) worktreeName=\(snapWorktreeName ?? "nil") hostKey=\(snapHostKey?.description ?? "nil")")
+        }
         #endif
         if let bs = branchState {
+            titlebarGitFallbackGeneration &+= 1
             let branch = bs.branch
             if titlebarGitBranch != branch { titlebarGitBranch = branch }
             let dirty = bs.isDirty
@@ -1212,6 +1278,8 @@ struct ContentView: View {
             if titlebarIsWorktree { titlebarIsWorktree = false }
         } else {
             // Fallback: resolve CWD from TTY if panelDirectories has no entry, then run git
+            titlebarGitFallbackGeneration &+= 1
+            let fallbackGeneration = titlebarGitFallbackGeneration
             let resolveDir = focusedDir
             let needsTTYResolve = !hasPanelDir && focusedTTY != nil
             let ttyForResolve = focusedTTY
@@ -1224,15 +1292,26 @@ struct ContentView: View {
                     dir = resolveDir
                 }
                 guard !dir.isEmpty else { return }
-                let (branch, dirty, count, isWt) = Self.queryGitBranch(in: dir)
-                #if DEBUG
-                dlog("titlebar.gitFallback dir=\(dir) branch=\(branch) dirty=\(dirty) count=\(count) isWorktree=\(isWt) viaTTY=\(needsTTYResolve)")
-                #endif
-                DispatchQueue.main.async {
-                    if self.titlebarGitBranch != branch { self.titlebarGitBranch = branch }
-                    if self.titlebarGitDirty != dirty { self.titlebarGitDirty = dirty }
-                    if self.titlebarGitDirtyCount != count { self.titlebarGitDirtyCount = count }
-                    if self.titlebarIsWorktree != isWt { self.titlebarIsWorktree = isWt }
+                Self.titlebarGitSnapshotCache.resolve(directory: dir, load: {
+                    let snapshot = Self.queryGitBranch(in: dir)
+                    #if DEBUG
+                    dlog("titlebar.gitFallback dir=\(dir) branch=\(snapshot.branch) dirty=\(snapshot.isDirty) count=\(snapshot.dirtyCount) isWorktree=\(snapshot.isWorktree) viaTTY=\(needsTTYResolve)")
+                    #endif
+                    return snapshot
+                }) { snapshot in
+                    DispatchQueue.main.async {
+                        guard self.titlebarGitFallbackGeneration == fallbackGeneration,
+                              self.tabManager.selectedTabId == selectedId,
+                              let selectedTab = self.tabManager.tabs.first(where: { $0.id == selectedId }),
+                              selectedTab.focusedPanelId == focusedPanelId,
+                              (focusedPanelId.flatMap { selectedTab.panelDirectories[$0] } ?? selectedTab.currentDirectory) == focusedDir else {
+                            return
+                        }
+                        if self.titlebarGitBranch != snapshot.branch { self.titlebarGitBranch = snapshot.branch }
+                        if self.titlebarGitDirty != snapshot.isDirty { self.titlebarGitDirty = snapshot.isDirty }
+                        if self.titlebarGitDirtyCount != snapshot.dirtyCount { self.titlebarGitDirtyCount = snapshot.dirtyCount }
+                        if self.titlebarIsWorktree != snapshot.isWorktree { self.titlebarIsWorktree = snapshot.isWorktree }
+                    }
                 }
             }
         }
@@ -1317,7 +1396,7 @@ struct ContentView: View {
         }
     }
 
-    private static func queryGitBranch(in directory: String) -> (branch: String, dirty: Bool, dirtyCount: Int, isWorktree: Bool) {
+    private static func queryGitBranch(in directory: String) -> TitlebarGitSnapshot {
         let branchProcess = Process()
         branchProcess.executableURL = URL(fileURLWithPath: "/usr/bin/git")
         branchProcess.arguments = ["branch", "--show-current"]
@@ -1328,11 +1407,15 @@ struct ContentView: View {
         do {
             try branchProcess.run()
             branchProcess.waitUntilExit()
-        } catch { return ("", false, 0, false) }
-        guard branchProcess.terminationStatus == 0 else { return ("", false, 0, false) }
+        } catch { return TitlebarGitSnapshot(branch: "", isDirty: false, dirtyCount: 0, isWorktree: false) }
+        guard branchProcess.terminationStatus == 0 else {
+            return TitlebarGitSnapshot(branch: "", isDirty: false, dirtyCount: 0, isWorktree: false)
+        }
         let branchData = branchPipe.fileHandleForReading.readDataToEndOfFile()
         let branch = String(data: branchData, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        guard !branch.isEmpty else { return ("", false, 0, false) }
+        guard !branch.isEmpty else {
+            return TitlebarGitSnapshot(branch: "", isDirty: false, dirtyCount: 0, isWorktree: false)
+        }
 
         let statusProcess = Process()
         statusProcess.executableURL = URL(fileURLWithPath: "/usr/bin/git")
@@ -1344,7 +1427,9 @@ struct ContentView: View {
         do {
             try statusProcess.run()
             statusProcess.waitUntilExit()
-        } catch { return (branch, false, 0, false) }
+        } catch {
+            return TitlebarGitSnapshot(branch: branch, isDirty: false, dirtyCount: 0, isWorktree: false)
+        }
         let statusData = statusPipe.fileHandleForReading.readDataToEndOfFile()
         let statusOutput = String(data: statusData, encoding: .utf8) ?? ""
         let changedFiles = statusOutput.components(separatedBy: "\n").filter { !$0.isEmpty }
@@ -1372,7 +1457,12 @@ struct ContentView: View {
             }
         } catch {}
 
-        return (branch, !changedFiles.isEmpty, changedFiles.count, isWorktree)
+        return TitlebarGitSnapshot(
+            branch: branch,
+            isDirty: !changedFiles.isEmpty,
+            dirtyCount: changedFiles.count,
+            isWorktree: isWorktree
+        )
     }
 
     /// Resolve the CWD of the foreground process on a given TTY.

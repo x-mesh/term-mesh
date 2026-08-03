@@ -338,6 +338,116 @@ final class WorkspaceAppearanceConfigResolutionTests: XCTestCase {
     }
 }
 
+final class TitlebarGitSnapshotCacheTests: XCTestCase {
+    private var cleanMain: TitlebarGitSnapshot {
+        TitlebarGitSnapshot(branch: "main", isDirty: false, dirtyCount: 0, isWorktree: false)
+    }
+
+    func testRecentSnapshotIsReusedUntilTTLExpires() {
+        let cache = TitlebarGitSnapshotCache(ttl: 2, negativeTTL: 10)
+        var loadCount = 0
+        var results: [TitlebarGitSnapshot] = []
+
+        cache.resolve(directory: "/tmp/repo", now: 10, load: {
+            loadCount += 1
+            return cleanMain
+        }, completion: { results.append($0) })
+        cache.resolve(directory: "/tmp/repo/", now: 11.9, load: {
+            loadCount += 1
+            return TitlebarGitSnapshot(branch: "unexpected", isDirty: true, dirtyCount: 1, isWorktree: false)
+        }, completion: { results.append($0) })
+
+        XCTAssertEqual(loadCount, 1)
+        XCTAssertEqual(results, [cleanMain, cleanMain])
+
+        let refreshed = TitlebarGitSnapshot(branch: "develop", isDirty: true, dirtyCount: 2, isWorktree: false)
+        cache.resolve(directory: "/tmp/repo", now: 12.1, load: {
+            loadCount += 1
+            return refreshed
+        }, completion: { results.append($0) })
+
+        XCTAssertEqual(loadCount, 2)
+        XCTAssertEqual(results.last, refreshed)
+    }
+
+    func testNegativeSnapshotUsesLongerTTL() {
+        let cache = TitlebarGitSnapshotCache(ttl: 2, negativeTTL: 10)
+        let missing = TitlebarGitSnapshot(branch: "", isDirty: false, dirtyCount: 0, isWorktree: false)
+        var loadCount = 0
+        var results: [TitlebarGitSnapshot] = []
+
+        cache.resolve(directory: "/tmp/not-a-repo", now: 10, load: {
+            loadCount += 1
+            return missing
+        }, completion: { results.append($0) })
+        cache.resolve(directory: "/tmp/not-a-repo", now: 19.9, load: {
+            loadCount += 1
+            return cleanMain
+        }, completion: { results.append($0) })
+
+        XCTAssertEqual(loadCount, 1)
+        XCTAssertEqual(results, [missing, missing])
+
+        cache.resolve(directory: "/tmp/not-a-repo", now: 20.1, load: {
+            loadCount += 1
+            return cleanMain
+        }, completion: { results.append($0) })
+
+        XCTAssertEqual(loadCount, 2)
+        XCTAssertEqual(results.last, cleanMain)
+    }
+
+    func testConcurrentRequestsForSameDirectoryJoinInFlightLoad() {
+        let cache = TitlebarGitSnapshotCache(ttl: 2, negativeTTL: 10)
+        let firstLoadStarted = expectation(description: "first load started")
+        let bothCompleted = expectation(description: "both requests completed")
+        bothCompleted.expectedFulfillmentCount = 2
+        let allowFirstLoadToFinish = DispatchSemaphore(value: 0)
+        let lock = NSLock()
+        let expected = cleanMain
+        var loadCount = 0
+        var results: [TitlebarGitSnapshot] = []
+
+        DispatchQueue.global().async {
+            cache.resolve(directory: "/tmp/repo", now: 10, load: {
+                lock.lock()
+                loadCount += 1
+                lock.unlock()
+                firstLoadStarted.fulfill()
+                allowFirstLoadToFinish.wait()
+                return expected
+            }, completion: {
+                lock.lock()
+                results.append($0)
+                lock.unlock()
+                bothCompleted.fulfill()
+            })
+        }
+        wait(for: [firstLoadStarted], timeout: 1)
+
+        DispatchQueue.global().async {
+            cache.resolve(directory: "/tmp/repo/", now: 10.1, load: {
+                XCTFail("Joined request must not start a second load")
+                return expected
+            }, completion: {
+                lock.lock()
+                results.append($0)
+                lock.unlock()
+                bothCompleted.fulfill()
+            })
+        }
+        allowFirstLoadToFinish.signal()
+        wait(for: [bothCompleted], timeout: 1)
+
+        lock.lock()
+        let finalLoadCount = loadCount
+        let finalResults = results
+        lock.unlock()
+        XCTAssertEqual(finalLoadCount, 1)
+        XCTAssertEqual(finalResults, [expected, expected])
+    }
+}
+
 final class NotificationBurstCoalescerTests: XCTestCase {
     func testSignalsInSameBurstFlushOnce() {
         let coalescer = NotificationBurstCoalescer(delay: 0.01)
