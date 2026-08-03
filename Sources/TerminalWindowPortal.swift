@@ -1372,9 +1372,10 @@ final class WindowTerminalPortal: NSObject {
         }
 
         // Failsafe: during aggressive divider drags/structural churn, one anchor can miss a
-        // geometry callback while another fires. Reconcile all mapped hosted views so no stale
-        // frame remains "stuck" onscreen until the next interaction.
-        synchronizeAllHostedViews(excluding: primaryHostedId, installationPrepared: true)
+        // geometry callback while another fires. Reconcile all mapped hosted views once on the
+        // next runloop turn. Do not also synchronize the remaining entries synchronously here:
+        // every anchor callback would otherwise walk the whole portal twice, and workspace
+        // switches commonly deliver one callback per terminal in the same turn.
         scheduleDeferredFullSynchronizeAll()
     }
 
@@ -1497,6 +1498,7 @@ final class WindowTerminalPortal: NSObject {
         let shouldDeferReveal = !shouldHide && hostedView.isHidden && !revealReadyForDisplay
 
         let oldFrame = hostedView.frame
+        let wasHidden = hostedView.isHidden
 #if DEBUG
         let frameWasClamped = hasFiniteFrame && !Self.rectApproximatelyEqual(frameInHost, targetFrame)
         if frameWasClamped {
@@ -1582,15 +1584,17 @@ final class WindowTerminalPortal: NSObject {
         }
 
 #if DEBUG
-        dlog(
-            "portal.sync.result hosted=\(portalDebugToken(hostedView)) " +
-            "anchor=\(portalDebugToken(anchorView)) host=\(portalDebugToken(hostView)) " +
-            "hostWin=\(hostView.window?.windowNumber ?? -1) " +
-            "old=\(portalDebugFrame(oldFrame)) raw=\(portalDebugFrame(frameInHost)) " +
-            "target=\(portalDebugFrame(targetFrame)) hide=\(shouldHide ? 1 : 0) " +
-            "entryVisible=\(entry.visibleInUI ? 1 : 0) hostedHidden=\(hostedView.isHidden ? 1 : 0) " +
-            "hostBounds=\(portalDebugFrame(hostBounds))"
-        )
+        if !Self.rectApproximatelyEqual(oldFrame, hostedView.frame) || wasHidden != hostedView.isHidden {
+            dlog(
+                "portal.sync.result hosted=\(portalDebugToken(hostedView)) " +
+                "anchor=\(portalDebugToken(anchorView)) host=\(portalDebugToken(hostView)) " +
+                "hostWin=\(hostView.window?.windowNumber ?? -1) " +
+                "old=\(portalDebugFrame(oldFrame)) raw=\(portalDebugFrame(frameInHost)) " +
+                "target=\(portalDebugFrame(targetFrame)) hide=\(shouldHide ? 1 : 0) " +
+                "entryVisible=\(entry.visibleInUI ? 1 : 0) hostedHidden=\(hostedView.isHidden ? 1 : 0) " +
+                "hostBounds=\(portalDebugFrame(hostBounds))"
+            )
+        }
 #endif
 
         ensureDividerOverlayOnTop()
