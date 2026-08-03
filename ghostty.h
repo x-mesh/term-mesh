@@ -448,6 +448,7 @@ typedef struct {
 
 typedef struct {
   void* nsview;
+  uint32_t display_id;
 } ghostty_platform_macos_s;
 
 typedef struct {
