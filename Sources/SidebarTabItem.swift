@@ -238,6 +238,14 @@ struct TabItemView: View {
     }
 
     var body: some View {
+        // Selection changes invalidate every sidebar row. Build the relatively
+        // expensive branch/directory presentation once per body evaluation;
+        // referring to the computed property from the emptiness check, branch
+        // icon gate, and ForEach used to repeat path normalization three times.
+        let verticalLines = sidebarBranchVerticalLayout
+            ? makeVerticalBranchDirectoryLines()
+            : []
+
         VStack(alignment: .leading, spacing: 4) {
             HStack(spacing: 8) {
                 let unreadCount = notificationStore.unreadCount(forTabId: tab.id)
@@ -390,15 +398,17 @@ struct TabItemView: View {
 
             // Branch + directory row
             if sidebarBranchVerticalLayout {
-                if !verticalBranchDirectoryLines.isEmpty {
+                if !verticalLines.isEmpty {
                     HStack(alignment: .top, spacing: 3) {
-                        if sidebarShowGitBranchIcon, sidebarShowGitBranch, verticalRowsContainBranch {
+                        if sidebarShowGitBranchIcon,
+                           sidebarShowGitBranch,
+                           verticalLines.contains(where: { $0.branch != nil }) {
                             Image(systemName: "arrow.triangle.branch")
                                 .font(.system(size: 9))
                                 .foregroundColor(activeSecondaryColor(0.6))
                         }
                         VStack(alignment: .leading, spacing: 1) {
-                            ForEach(Array(verticalBranchDirectoryLines.enumerated()), id: \.offset) { _, line in
+                            ForEach(Array(verticalLines.enumerated()), id: \.offset) { _, line in
                                 HStack(spacing: 3) {
                                     if let branch = line.branch {
                                         Text(branch)
@@ -1099,22 +1109,14 @@ struct TabItemView: View {
         }
     }
 
-    private var verticalBranchDirectoryEntries: [SidebarBranchOrdering.BranchDirectoryEntry] {
-        tab.sidebarBranchDirectoryEntriesInDisplayOrder()
-    }
-
-    private var verticalRowsContainBranch: Bool {
-        sidebarShowGitBranch && verticalBranchDirectoryLines.contains { $0.branch != nil }
-    }
-
     private struct VerticalBranchDirectoryLine {
         let branch: String?
         let directory: String?
     }
 
-    private var verticalBranchDirectoryLines: [VerticalBranchDirectoryLine] {
+    private func makeVerticalBranchDirectoryLines() -> [VerticalBranchDirectoryLine] {
         let home = FileManager.default.homeDirectoryForCurrentUser.path
-        return verticalBranchDirectoryEntries.compactMap { entry in
+        return tab.sidebarBranchDirectoryEntriesInDisplayOrder().compactMap { entry in
             let branchText: String? = {
                 guard sidebarShowGitBranch, let branch = entry.branch else { return nil }
                 return "\(branch)\(entry.isDirty ? "*" : "")"
