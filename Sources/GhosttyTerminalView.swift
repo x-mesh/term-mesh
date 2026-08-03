@@ -2425,6 +2425,11 @@ static func focusLog(_ message: String) {
     }
 
     func attachSurface(_ surface: TerminalSurface) {
+        // SwiftUI can call updateNSView repeatedly for visibility/focus changes.
+        // The existing surface is already attached to this view; window moves
+        // and geometry changes have their own callbacks, so re-running the full
+        // attach/size/background/color pipeline here only adds switch-time work.
+        guard terminalSurface !== surface else { return }
         appliedColorScheme = nil
         terminalSurface = surface
         tabId = surface.tabId

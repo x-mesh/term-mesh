@@ -95,16 +95,112 @@ struct TabItemView: View, Equatable {
     /// order. Experimental mode excludes peer-mirror backing workspaces.
     let visibleTabIds: [UUID]
     let rowSpacing: CGFloat
-    @Binding var selection: SidebarSelection
-    @Binding var selectedTabIds: Set<UUID>
-    @Binding var lastSidebarSelectionIndex: Int?
+    /// Action-only bindings are stored as closures so selection changes do not
+    /// directly invalidate every row. Explicit render snapshots below still
+    /// carry the drag state that affects pixels.
+    private let getSelection: () -> SidebarSelection
+    private let setSelection: (SidebarSelection) -> Void
+    private let getSelectedTabIds: () -> Set<UUID>
+    private let setSelectedTabIds: (Set<UUID>) -> Void
+    private let getLastSidebarSelectionIndex: () -> Int?
+    private let setLastSidebarSelectionIndex: (Int?) -> Void
     let showsCommandShortcutHints: Bool
     let dragAutoScrollController: SidebarDragAutoScrollController
-    @Binding var draggedTabId: UUID?
-    @Binding var dropIndicator: SidebarDropIndicator?
+    private let getDraggedTabId: () -> UUID?
+    private let setDraggedTabId: (UUID?) -> Void
+    private let getDropIndicator: () -> SidebarDropIndicator?
+    private let setDropIndicator: (SidebarDropIndicator?) -> Void
+    private let draggedTabIdSnapshot: UUID?
+    private let dropIndicatorSnapshot: SidebarDropIndicator?
     @State private var isHovering = false
     @State private var rowHeight: CGFloat = 1
     @State private var cachedSlotWidth: CGFloat = 28
+
+    init(
+        tabManager: TabManager,
+        tab: Tab,
+        index: Int,
+        isActive: Bool,
+        isMultiSelected: Bool,
+        workspaceCount: Int,
+        activeTeamName: String?,
+        notificationSummary: SidebarNotificationSummary,
+        visibleTabIds: [UUID],
+        rowSpacing: CGFloat,
+        selection: Binding<SidebarSelection>,
+        selectedTabIds: Binding<Set<UUID>>,
+        lastSidebarSelectionIndex: Binding<Int?>,
+        showsCommandShortcutHints: Bool,
+        dragAutoScrollController: SidebarDragAutoScrollController,
+        draggedTabId: Binding<UUID?>,
+        dropIndicator: Binding<SidebarDropIndicator?>
+    ) {
+        self.tabManager = tabManager
+        self.tab = tab
+        self.index = index
+        self.isActive = isActive
+        self.isMultiSelected = isMultiSelected
+        self.workspaceCount = workspaceCount
+        self.activeTeamName = activeTeamName
+        self.notificationSummary = notificationSummary
+        self.visibleTabIds = visibleTabIds
+        self.rowSpacing = rowSpacing
+        self.getSelection = { selection.wrappedValue }
+        self.setSelection = { selection.wrappedValue = $0 }
+        self.getSelectedTabIds = { selectedTabIds.wrappedValue }
+        self.setSelectedTabIds = { selectedTabIds.wrappedValue = $0 }
+        self.getLastSidebarSelectionIndex = { lastSidebarSelectionIndex.wrappedValue }
+        self.setLastSidebarSelectionIndex = { lastSidebarSelectionIndex.wrappedValue = $0 }
+        self.showsCommandShortcutHints = showsCommandShortcutHints
+        self.dragAutoScrollController = dragAutoScrollController
+        self.getDraggedTabId = { draggedTabId.wrappedValue }
+        self.setDraggedTabId = { draggedTabId.wrappedValue = $0 }
+        self.getDropIndicator = { dropIndicator.wrappedValue }
+        self.setDropIndicator = { dropIndicator.wrappedValue = $0 }
+        self.draggedTabIdSnapshot = draggedTabId.wrappedValue
+        self.dropIndicatorSnapshot = dropIndicator.wrappedValue
+    }
+
+    private var selection: SidebarSelection {
+        get { getSelection() }
+        nonmutating set { setSelection(newValue) }
+    }
+
+    private var selectedTabIds: Set<UUID> {
+        get { getSelectedTabIds() }
+        nonmutating set { setSelectedTabIds(newValue) }
+    }
+
+    private var lastSidebarSelectionIndex: Int? {
+        get { getLastSidebarSelectionIndex() }
+        nonmutating set { setLastSidebarSelectionIndex(newValue) }
+    }
+
+    private var draggedTabId: UUID? {
+        get { getDraggedTabId() }
+        nonmutating set { setDraggedTabId(newValue) }
+    }
+
+    private var dropIndicator: SidebarDropIndicator? {
+        get { getDropIndicator() }
+        nonmutating set { setDropIndicator(newValue) }
+    }
+
+    private var selectedTabIdsBinding: Binding<Set<UUID>> {
+        Binding(get: getSelectedTabIds, set: setSelectedTabIds)
+    }
+
+    private var lastSidebarSelectionIndexBinding: Binding<Int?> {
+        Binding(get: getLastSidebarSelectionIndex, set: setLastSidebarSelectionIndex)
+    }
+
+    private var draggedTabIdBinding: Binding<UUID?> {
+        Binding(get: getDraggedTabId, set: setDraggedTabId)
+    }
+
+    private var dropIndicatorBinding: Binding<SidebarDropIndicator?> {
+        Binding(get: getDropIndicator, set: setDropIndicator)
+    }
 
     /// Host chip for a relay/remote workspace row. Extracted from `body`
     /// to keep the row's VStack within the Swift type-checker's budget.
@@ -251,8 +347,8 @@ struct TabItemView: View, Equatable {
             lhs.visibleTabIds == rhs.visibleTabIds &&
             lhs.rowSpacing == rhs.rowSpacing &&
             lhs.showsCommandShortcutHints == rhs.showsCommandShortcutHints &&
-            lhs.draggedTabId == rhs.draggedTabId &&
-            lhs.dropIndicator == rhs.dropIndicator
+            lhs.draggedTabIdSnapshot == rhs.draggedTabIdSnapshot &&
+            lhs.dropIndicatorSnapshot == rhs.dropIndicatorSnapshot
     }
 
     var body: some View {
@@ -541,12 +637,12 @@ struct TabItemView: View, Equatable {
         .onDrop(of: [SidebarTabDragPayload.typeIdentifier], delegate: SidebarTabDropDelegate(
             targetTabId: tab.id,
             tabManager: tabManager,
-            draggedTabId: $draggedTabId,
-            selectedTabIds: $selectedTabIds,
-            lastSidebarSelectionIndex: $lastSidebarSelectionIndex,
+            draggedTabId: draggedTabIdBinding,
+            selectedTabIds: selectedTabIdsBinding,
+            lastSidebarSelectionIndex: lastSidebarSelectionIndexBinding,
             targetRowHeight: rowHeight,
             dragAutoScrollController: dragAutoScrollController,
-            dropIndicator: $dropIndicator
+            dropIndicator: dropIndicatorBinding
         ))
         .onTapGesture {
             updateSelection()

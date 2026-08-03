@@ -1562,45 +1562,47 @@ struct ContentView: View {
         return dir.isEmpty ? nil : dir
     }
 
-    private var contentAndSidebarLayout: AnyView {
-        let layout: AnyView
+    @ViewBuilder
+    private var contentAndSidebarLayout: some View {
         if sidebarBlendMode == SidebarBlendModeOption.withinWindow.rawValue {
             // Overlay mode: terminal extends full width, sidebar on top
             // This allows withinWindow blur to see the terminal content
-            layout = AnyView(
-                ZStack(alignment: .leading) {
-                    terminalContentWithReviewBoard
-                        .padding(.leading, sidebarState.isVisible ? sidebarWidth : 0)
-                    if sidebarState.isVisible {
-                        sidebarView
-                    }
+            ZStack(alignment: .leading) {
+                terminalContentWithReviewBoard
+                    .padding(.leading, sidebarState.isVisible ? sidebarWidth : 0)
+                if sidebarState.isVisible {
+                    sidebarView
                 }
-            )
+            }
+            .overlay(alignment: .leading) {
+                if sidebarState.isVisible {
+                    sidebarResizerOverlay
+                        .zIndex(1000)
+                }
+            }
+            .onPreferenceChange(SidebarOverlayWidthPreferenceKey.self) { width in
+                guard width > 0 else { return }
+                clampSidebarWidthIfNeeded(availableWidth: width)
+            }
         } else {
             // Standard HStack mode for behindWindow blur
-            layout = AnyView(
-                HStack(spacing: 0) {
-                    if sidebarState.isVisible {
-                        sidebarView
-                    }
-                    terminalContentWithReviewBoard
+            HStack(spacing: 0) {
+                if sidebarState.isVisible {
+                    sidebarView
                 }
-            )
+                terminalContentWithReviewBoard
+            }
+            .overlay(alignment: .leading) {
+                if sidebarState.isVisible {
+                    sidebarResizerOverlay
+                        .zIndex(1000)
+                }
+            }
+            .onPreferenceChange(SidebarOverlayWidthPreferenceKey.self) { width in
+                guard width > 0 else { return }
+                clampSidebarWidthIfNeeded(availableWidth: width)
+            }
         }
-
-        return AnyView(
-            layout
-                .overlay(alignment: .leading) {
-                    if sidebarState.isVisible {
-                        sidebarResizerOverlay
-                            .zIndex(1000)
-                    }
-                }
-                .onPreferenceChange(SidebarOverlayWidthPreferenceKey.self) { width in
-                    guard width > 0 else { return }
-                    clampSidebarWidthIfNeeded(availableWidth: width)
-                }
-        )
     }
 
     var body: some View {

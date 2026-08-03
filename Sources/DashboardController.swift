@@ -6,7 +6,8 @@ import os
 
 // MARK: - Process Tree Snapshot
 
-/// Reads the Darwin process table without spawning an external process.
+/// Discovers process descendants through targeted libproc child queries, with
+/// a Darwin process-table snapshot retained as a coverage-preserving fallback.
 enum ProcessTreeSnapshot {
     typealias ParentPair = (pid: Int32, parentPID: Int32)
 

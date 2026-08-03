@@ -130,6 +130,7 @@ struct VerticalTabsSidebar: View {
                                 store: remoteHostStore,
                                 usesSeparatedPresentation: sidebarSeparatedSectionsEnabled
                             )
+                            .equatable()
                         case .project:
                             SidebarProjectsSection(
                                 store: remoteHostStore,
@@ -1021,7 +1022,7 @@ struct SidebarProjectsSection: View {
 }
 
 
-struct SidebarRemoteHostsSection: View {
+struct SidebarRemoteHostsSection: View, Equatable {
     @ObservedObject var store: RemoteHostStore
     @ObservedObject private var hostStats = PeerHostStatsStore.shared
     let usesSeparatedPresentation: Bool
@@ -1034,6 +1035,11 @@ struct SidebarRemoteHostsSection: View {
         isExpanded: false,
         generation: 0
     )
+
+    static func == (lhs: Self, rhs: Self) -> Bool {
+        lhs.store === rhs.store
+            && lhs.usesSeparatedPresentation == rhs.usesSeparatedPresentation
+    }
 
     private var hasPeerPaneDetails: Bool {
         store.sortedHosts.contains { host in
