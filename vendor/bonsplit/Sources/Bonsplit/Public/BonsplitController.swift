@@ -328,6 +328,7 @@ public final class BonsplitController {
             sourcePane.moveTab(from: sourceIndex, to: destinationIndex)
             sourcePane.selectTab(tabItem.id)
             internalController.focusPane(sourcePane.id)
+            delegate?.splitTabBar(self, didReorderTab: movedTab, inPane: sourcePane.id)
             delegate?.splitTabBar(self, didSelectTab: movedTab, inPane: sourcePane.id)
             notifyGeometryChange()
             return true
@@ -353,6 +354,7 @@ public final class BonsplitController {
         internalController.focusPane(pane.id)
         if let tabIndex = pane.tabs.firstIndex(where: { $0.id == tabId.id }) {
             let tab = Tab(from: pane.tabs[tabIndex])
+            delegate?.splitTabBar(self, didReorderTab: tab, inPane: pane.id)
             delegate?.splitTabBar(self, didSelectTab: tab, inPane: pane.id)
         }
         notifyGeometryChange()

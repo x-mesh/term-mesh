@@ -3198,6 +3198,71 @@ final class SidebarBranchOrderingTests: XCTestCase {
         XCTAssertEqual(workspace.sidebarBranchDirectoryEntriesComputationCount, 3)
     }
 
+    func testWorkspaceCachesFormattedBranchDirectoryLines() {
+        let workspace = Workspace()
+        guard let panelId = workspace.focusedPanelId else {
+            XCTFail("Expected initial panel")
+            return
+        }
+
+        workspace.updatePanelDirectory(panelId: panelId, directory: "/repo/one")
+        workspace.updatePanelGitBranch(panelId: panelId, branch: "main", isDirty: true)
+
+        let expected = [
+            SidebarBranchOrdering.BranchDirectoryDisplayLine(
+                branch: "main*",
+                directory: "/repo/one"
+            )
+        ]
+        XCTAssertEqual(workspace.sidebarBranchDirectoryDisplayLines(showGitBranch: true), expected)
+        XCTAssertEqual(workspace.sidebarBranchDirectoryDisplayLinesComputationCount, 1)
+
+        XCTAssertEqual(workspace.sidebarBranchDirectoryDisplayLines(showGitBranch: true), expected)
+        XCTAssertEqual(
+            workspace.sidebarBranchDirectoryDisplayLinesComputationCount,
+            1,
+            "Repeated row renders must reuse formatted branch/directory lines"
+        )
+
+        XCTAssertEqual(
+            workspace.sidebarBranchDirectoryDisplayLines(showGitBranch: false),
+            [SidebarBranchOrdering.BranchDirectoryDisplayLine(branch: nil, directory: "/repo/one")]
+        )
+        XCTAssertEqual(workspace.sidebarBranchDirectoryDisplayLinesComputationCount, 2)
+    }
+
+    func testReorderingTabsInvalidatesBranchDirectoryDisplayOrder() {
+        let workspace = Workspace()
+        guard let firstPanelId = workspace.focusedPanelId,
+              let paneId = workspace.paneId(forPanelId: firstPanelId),
+              let secondPanel = workspace.newTerminalSurface(inPane: paneId, focus: false) else {
+            XCTFail("Expected two panels in one pane")
+            return
+        }
+
+        workspace.updatePanelDirectory(panelId: firstPanelId, directory: "/repo/one")
+        workspace.updatePanelDirectory(panelId: secondPanel.id, directory: "/repo/two")
+        workspace.updatePanelGitBranch(panelId: firstPanelId, branch: "first", isDirty: false)
+        workspace.updatePanelGitBranch(panelId: secondPanel.id, branch: "second", isDirty: false)
+
+        XCTAssertEqual(
+            workspace.sidebarBranchDirectoryDisplayLines(showGitBranch: true).map(\.branch),
+            ["first", "second"]
+        )
+        XCTAssertEqual(workspace.sidebarBranchDirectoryEntriesComputationCount, 1)
+
+        XCTAssertTrue(workspace.reorderSurface(panelId: secondPanel.id, toIndex: 0))
+        XCTAssertEqual(
+            workspace.sidebarBranchDirectoryDisplayLines(showGitBranch: true).map(\.branch),
+            ["second", "first"]
+        )
+        XCTAssertEqual(
+            workspace.sidebarBranchDirectoryEntriesComputationCount,
+            2,
+            "A same-pane reorder must invalidate the display-order snapshot"
+        )
+    }
+
     func testOrderedUniqueBranchesDedupesByNameAndMergesDirtyState() {
         let first = UUID()
         let second = UUID()

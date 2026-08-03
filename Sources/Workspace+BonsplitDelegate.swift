@@ -483,6 +483,10 @@ extension Workspace: BonsplitDelegate {
         scheduleFocusReconcile()
     }
 
+    func splitTabBar(_ controller: BonsplitController, didReorderTab tab: Bonsplit.Tab, inPane pane: PaneID) {
+        invalidateSidebarBranchDirectoryEntriesCache()
+    }
+
     func splitTabBar(_ controller: BonsplitController, didFocusPane pane: PaneID) {
         // When a pane is focused, focus its selected tab's panel
         guard let tab = controller.selectedTab(inPane: pane) else { return }

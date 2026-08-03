@@ -152,7 +152,9 @@ final class Workspace: Identifiable, ObservableObject {
         didSet { invalidateSidebarBranchDirectoryEntriesCache() }
     }
     private var sidebarBranchDirectoryEntriesCache: [SidebarBranchOrdering.BranchDirectoryEntry]?
+    private var sidebarBranchDirectoryDisplayLinesCache: [Bool: [SidebarBranchOrdering.BranchDirectoryDisplayLine]] = [:]
     private(set) var sidebarBranchDirectoryEntriesComputationCount = 0
+    private(set) var sidebarBranchDirectoryDisplayLinesComputationCount = 0
     @Published var surfaceListeningPorts: [UUID: [Int]] = [:]
     @Published var listeningPorts: [Int] = []
     var surfaceTTYNames: [UUID: String] = [:]
@@ -893,9 +895,29 @@ final class Workspace: Identifiable, ObservableObject {
         return entries
     }
 
+    func sidebarBranchDirectoryDisplayLines(
+        showGitBranch: Bool
+    ) -> [SidebarBranchOrdering.BranchDirectoryDisplayLine] {
+        if let cached = sidebarBranchDirectoryDisplayLinesCache[showGitBranch] {
+            return cached
+        }
+
+        let lines = SidebarBranchOrdering.branchDirectoryDisplayLines(
+            entries: sidebarBranchDirectoryEntriesInDisplayOrder(),
+            showGitBranch: showGitBranch,
+            homeDirectory: Self.sidebarHomeDirectory
+        )
+        sidebarBranchDirectoryDisplayLinesCache[showGitBranch] = lines
+        sidebarBranchDirectoryDisplayLinesComputationCount += 1
+        return lines
+    }
+
     func invalidateSidebarBranchDirectoryEntriesCache() {
         sidebarBranchDirectoryEntriesCache = nil
+        sidebarBranchDirectoryDisplayLinesCache.removeAll(keepingCapacity: true)
     }
+
+    private static let sidebarHomeDirectory = FileManager.default.homeDirectoryForCurrentUser.path
 
     // MARK: - Panel Operations
 

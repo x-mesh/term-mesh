@@ -164,6 +164,11 @@ enum SidebarBranchOrdering {
         let directory: String?
     }
 
+    struct BranchDirectoryDisplayLine: Equatable {
+        let branch: String?
+        let directory: String?
+    }
+
     static func orderedPaneIds(tree: ExternalTreeNode) -> [String] {
         switch tree {
         case .pane(let pane):
@@ -337,6 +342,36 @@ enum SidebarBranchOrdering {
                 directory: entry.directory
             )
         }
+    }
+
+    static func branchDirectoryDisplayLines(
+        entries: [BranchDirectoryEntry],
+        showGitBranch: Bool,
+        homeDirectory: String
+    ) -> [BranchDirectoryDisplayLine] {
+        entries.compactMap { entry in
+            let branch: String? = {
+                guard showGitBranch, let branch = entry.branch else { return nil }
+                return "\(branch)\(entry.isDirty ? "*" : "")"
+            }()
+            let directory = shortenedSidebarPath(entry.directory, homeDirectory: homeDirectory)
+
+            guard branch != nil || directory != nil else { return nil }
+            return BranchDirectoryDisplayLine(branch: branch, directory: directory)
+        }
+    }
+
+    static func shortenedSidebarPath(_ path: String?, homeDirectory: String) -> String? {
+        guard let path else { return nil }
+        let trimmed = path.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+        if trimmed == homeDirectory {
+            return "~"
+        }
+        if trimmed.hasPrefix(homeDirectory + "/") {
+            return "~" + trimmed.dropFirst(homeDirectory.count)
+        }
+        return trimmed
     }
 }
 

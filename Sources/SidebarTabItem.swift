@@ -254,7 +254,7 @@ struct TabItemView: View, Equatable {
         // referring to the computed property from the emptiness check, branch
         // icon gate, and ForEach used to repeat path normalization three times.
         let verticalLines = sidebarBranchVerticalLayout
-            ? makeVerticalBranchDirectoryLines()
+            ? tab.sidebarBranchDirectoryDisplayLines(showGitBranch: sidebarShowGitBranch)
             : []
 
         VStack(alignment: .leading, spacing: 4) {
@@ -1117,38 +1117,6 @@ struct TabItemView: View, Equatable {
                 }
             }
             return text
-        }
-    }
-
-    private struct VerticalBranchDirectoryLine {
-        let branch: String?
-        let directory: String?
-    }
-
-    private func makeVerticalBranchDirectoryLines() -> [VerticalBranchDirectoryLine] {
-        let home = FileManager.default.homeDirectoryForCurrentUser.path
-        return tab.sidebarBranchDirectoryEntriesInDisplayOrder().compactMap { entry in
-            let branchText: String? = {
-                guard sidebarShowGitBranch, let branch = entry.branch else { return nil }
-                return "\(branch)\(entry.isDirty ? "*" : "")"
-            }()
-
-            let directoryText: String? = {
-                guard let directory = entry.directory else { return nil }
-                let shortened = shortenPath(directory, home: home)
-                return shortened.isEmpty ? nil : shortened
-            }()
-
-            switch (branchText, directoryText) {
-            case let (branch?, directory?):
-                return VerticalBranchDirectoryLine(branch: branch, directory: directory)
-            case let (branch?, nil):
-                return VerticalBranchDirectoryLine(branch: branch, directory: nil)
-            case let (nil, directory?):
-                return VerticalBranchDirectoryLine(branch: nil, directory: directory)
-            default:
-                return nil
-            }
         }
     }
 
