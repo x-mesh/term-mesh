@@ -10,6 +10,65 @@ import os
 enum ProcessTreeSnapshot {
     typealias ParentPair = (pid: Int32, parentPID: Int32)
 
+    /// Walk descendants from a targeted child lookup. Unlike a process-table
+    /// snapshot, this scales with this app's own tree rather than every process
+    /// on the machine. A child can disappear between the parent and child
+    /// lookups; that is a normal exit, so only a root lookup failure invalidates
+    /// the traversal.
+    nonisolated static func descendantPIDs(
+        of rootPID: Int32,
+        childrenOf: (Int32) -> [Int32]?
+    ) -> Set<Int32>? {
+        var pending = [rootPID]
+        var nextIndex = 0
+        var visited = Set([rootPID])
+        var descendants: Set<Int32> = []
+
+        while nextIndex < pending.count {
+            let parentPID = pending[nextIndex]
+            nextIndex += 1
+            guard let children = childrenOf(parentPID) else {
+                if parentPID == rootPID { return nil }
+                continue
+            }
+            for pid in children where pid > 0 && visited.insert(pid).inserted {
+                descendants.insert(pid)
+                pending.append(pid)
+            }
+        }
+        return descendants
+    }
+
+    /// Query only one process's direct children through libproc. The function
+    /// returns a PID count (not a byte count). Retry when the buffer fills so a
+    /// burst of new children cannot silently truncate monitoring coverage.
+    nonisolated static func childPIDs(
+        of parentPID: Int32,
+        initialCapacity: Int = 16,
+        maximumCapacity: Int = 4_096
+    ) -> [Int32]? {
+        var capacity = max(1, min(initialCapacity, maximumCapacity))
+        while capacity <= maximumCapacity {
+            var buffer = [pid_t](repeating: 0, count: capacity)
+            let result = buffer.withUnsafeMutableBytes { bytes in
+                proc_listchildpids(parentPID, bytes.baseAddress, Int32(bytes.count))
+            }
+            guard result >= 0 else { return nil }
+            let count = Int(result)
+            guard count <= buffer.count else { return nil }
+            if count < buffer.count {
+                return Array(buffer[..<count]).filter { $0 > 0 }
+            }
+            guard capacity < maximumCapacity else { return nil }
+            capacity = min(capacity * 2, maximumCapacity)
+        }
+        return nil
+    }
+
+    nonisolated static func currentDescendantPIDs(of rootPID: Int32) -> Set<Int32>? {
+        descendantPIDs(of: rootPID) { childPIDs(of: $0) }
+    }
+
     nonisolated static func descendantPIDs(
         of rootPID: Int32,
         in processes: [ParentPair]
@@ -632,6 +691,11 @@ final class DashboardController: NSObject, WKNavigationDelegate {
     /// Discover all descendant PIDs of this app. Safe to call from any thread (no shared state).
     private nonisolated static func discoverDescendantPIDs() -> Set<Int32>? {
         let appPID = ProcessInfo.processInfo.processIdentifier
+        if let descendants = ProcessTreeSnapshot.currentDescendantPIDs(of: appPID) {
+            return descendants
+        }
+        // libproc lookup failure is rare, but retaining the former full-table
+        // implementation as a fallback avoids losing Budget Guard coverage.
         guard let processes = ProcessTreeSnapshot.currentParentPairs() else { return nil }
         return ProcessTreeSnapshot.descendantPIDs(of: appPID, in: processes)
     }

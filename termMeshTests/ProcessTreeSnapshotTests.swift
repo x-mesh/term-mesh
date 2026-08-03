@@ -7,6 +7,31 @@ import XCTest
 #endif
 
 final class ProcessTreeSnapshotTests: XCTestCase {
+    func testTargetedTraversalFindsEveryGenerationAndStopsOnCycles() {
+        let children: [Int32: [Int32]] = [
+            10: [11, 13],
+            11: [12],
+            12: [10],
+        ]
+
+        XCTAssertEqual(
+            ProcessTreeSnapshot.descendantPIDs(of: 10) { children[$0] ?? [] },
+            Set([11, 12, 13])
+        )
+    }
+
+    func testTargetedTraversalRejectsRootLookupFailureButToleratesExitedChild() {
+        XCTAssertNil(ProcessTreeSnapshot.descendantPIDs(of: 10) { _ in nil })
+
+        XCTAssertEqual(
+            ProcessTreeSnapshot.descendantPIDs(of: 10) { pid in
+                if pid == 10 { return [11] }
+                return nil
+            },
+            Set([11])
+        )
+    }
+
     func testFindsEveryGenerationButNotUnrelatedProcesses() {
         let snapshot: [ProcessTreeSnapshot.ParentPair] = [
             (pid: 10, parentPID: 1),
@@ -39,5 +64,19 @@ final class ProcessTreeSnapshotTests: XCTestCase {
     func testLiveSnapshotContainsLaunchd() throws {
         let snapshot = try XCTUnwrap(ProcessTreeSnapshot.currentParentPairs())
         XCTAssertTrue(snapshot.contains { $0.pid == 1 })
+    }
+
+    func testLiveTargetedLookupFindsSpawnedDirectChild() throws {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/bin/sleep")
+        process.arguments = ["5"]
+        try process.run()
+        defer {
+            if process.isRunning { process.terminate() }
+            process.waitUntilExit()
+        }
+
+        let children = try XCTUnwrap(ProcessTreeSnapshot.childPIDs(of: getpid()))
+        XCTAssertTrue(children.contains(process.processIdentifier))
     }
 }
