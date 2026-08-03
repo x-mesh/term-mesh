@@ -1632,7 +1632,8 @@ struct ContentView: View {
                 }
         )
 
-        view = AnyView(view.onAppear {
+        view = AnyView(
+            view.onAppear {
             tabManager.applyWindowBackgroundForSelectedTab()
             reconcileMountedWorkspaceIds()
             previousSelectedWorkspaceId = tabManager.selectedTabId
@@ -1658,9 +1659,9 @@ struct ContentView: View {
                 reject: { try await coordinator.reject($0, reviewer: reviewer, reason: $1) }
             ))
             reviewBoardViewModel.refresh()
-        })
+            }
 
-        view = AnyView(view.onChange(of: tabManager.selectedTabId) { newValue in
+            .onChange(of: tabManager.selectedTabId) { newValue in
 #if DEBUG
             if let snapshot = tabManager.debugCurrentWorkspaceSwitchSnapshot() {
                 let dtMs = (CACurrentMediaTime() - snapshot.startedAt) * 1000
@@ -1680,9 +1681,9 @@ struct ContentView: View {
                 lastSidebarSelectionIndex = tabManager.tabs.firstIndex { $0.id == newValue }
             }
             updateTitlebarText()
-        })
+            }
 
-        view = AnyView(view.onChange(of: tabManager.isWorkspaceCycleHot) { _ in
+            .onChange(of: tabManager.isWorkspaceCycleHot) { _ in
 #if DEBUG
             if let snapshot = tabManager.debugCurrentWorkspaceSwitchSnapshot() {
                 let dtMs = (CACurrentMediaTime() - snapshot.startedAt) * 1000
@@ -1694,29 +1695,29 @@ struct ContentView: View {
             }
 #endif
             reconcileMountedWorkspaceIds()
-        })
+            }
 
-        view = AnyView(view.onChange(of: retiringWorkspaceId) { _ in
+            .onChange(of: retiringWorkspaceId) { _ in
             reconcileMountedWorkspaceIds()
-        })
+            }
 
-        view = AnyView(view.onReceive(NotificationCenter.default.publisher(for: .ghosttyDidSetTitle)) { notification in
+            .onReceive(NotificationCenter.default.publisher(for: .ghosttyDidSetTitle)) { notification in
             guard let tabId = notification.userInfo?[GhosttyNotificationKey.tabId] as? UUID,
                   tabId == tabManager.selectedTabId else { return }
             scheduleTitlebarTextRefresh()
-        })
+            }
 
-        view = AnyView(view.onReceive(NotificationCenter.default.publisher(for: .ghosttyDidFocusTab)) { _ in
+            .onReceive(NotificationCenter.default.publisher(for: .ghosttyDidFocusTab)) { _ in
             sidebarSelectionState.selection = .tabs
             scheduleTitlebarTextRefresh()
-        })
+            }
 
-        view = AnyView(view.onReceive(NotificationCenter.default.publisher(for: .ghosttyDidFocusSurface)) { notification in
+            .onReceive(NotificationCenter.default.publisher(for: .ghosttyDidFocusSurface)) { notification in
             guard let tabId = notification.userInfo?[GhosttyNotificationKey.tabId] as? UUID,
                   tabId == tabManager.selectedTabId else { return }
             completeWorkspaceHandoffIfNeeded(focusedTabId: tabId, reason: "focus")
             scheduleTitlebarTextRefresh()
-        })
+            }
 
         // Periodically refresh titlebar git branch + directory (3s interval).
         //
@@ -1731,7 +1732,7 @@ struct ContentView: View {
         // threshold. Routing through `scheduleTitlebarTextRefresh()`
         // also coalesces with focus / selectTab / ghosttyDidSetTitle
         // pushes so the periodic tick is a no-op when nothing changed.
-        view = AnyView(view.onReceive(Timer.publish(every: 3, on: .main, in: .common).autoconnect()) { _ in
+            .onReceive(Timer.publish(every: 3, on: .main, in: .common).autoconnect()) { _ in
             guard NSApp?.isActive == true else {
                 sentryBreadcrumb("titlebar.update.skip",
                                  category: "ui",
@@ -1739,21 +1740,21 @@ struct ContentView: View {
                 return
             }
             scheduleTitlebarTextRefresh()
-        })
+            }
 
-        view = AnyView(view.onChange(of: titlebarThemeGeneration) { [configProvider] oldValue, newValue in
+            .onChange(of: titlebarThemeGeneration) { [configProvider] oldValue, newValue in
             configProvider?.logBackgroundIfEnabled(
                 "titlebar theme refresh applied oldGeneration=\(oldValue) generation=\(newValue) appBg=\(configProvider?.defaultBackgroundColor.hexString() ?? "nil") appOpacity=\(String(format: "%.3f", configProvider?.defaultBackgroundOpacity ?? 0))"
             )
-        })
+            }
 
-        view = AnyView(view.onReceive(NotificationCenter.default.publisher(for: .ghosttyDidBecomeFirstResponderSurface)) { notification in
+            .onReceive(NotificationCenter.default.publisher(for: .ghosttyDidBecomeFirstResponderSurface)) { notification in
             guard let tabId = notification.userInfo?[GhosttyNotificationKey.tabId] as? UUID,
                   tabId == tabManager.selectedTabId else { return }
             completeWorkspaceHandoffIfNeeded(focusedTabId: tabId, reason: "first_responder")
-        })
+            }
 
-        view = AnyView(view.onReceive(NotificationCenter.default.publisher(for: .browserDidBecomeFirstResponderWebView)) { notification in
+            .onReceive(NotificationCenter.default.publisher(for: .browserDidBecomeFirstResponderWebView)) { notification in
             guard let webView = notification.object as? WKWebView,
                   let selectedTabId = tabManager.selectedTabId,
                   let selectedWorkspace = tabManager.selectedWorkspace,
@@ -1761,18 +1762,20 @@ struct ContentView: View {
                   let focusedBrowser = selectedWorkspace.browserPanel(for: focusedPanelId),
                   focusedBrowser.webView === webView else { return }
             completeWorkspaceHandoffIfNeeded(focusedTabId: selectedTabId, reason: "browser_first_responder")
-        })
+            }
 
-        view = AnyView(view.onReceive(NotificationCenter.default.publisher(for: .browserDidFocusAddressBar)) { notification in
+            .onReceive(NotificationCenter.default.publisher(for: .browserDidFocusAddressBar)) { notification in
             guard let panelId = notification.object as? UUID,
                   let selectedTabId = tabManager.selectedTabId,
                   let selectedWorkspace = tabManager.selectedWorkspace,
                   selectedWorkspace.focusedPanelId == panelId,
                   selectedWorkspace.browserPanel(for: panelId) != nil else { return }
             completeWorkspaceHandoffIfNeeded(focusedTabId: selectedTabId, reason: "browser_address_bar")
-        })
+            }
+        )
 
-        view = AnyView(view.onReceive(tabManager.$tabs) { tabs in
+        view = AnyView(
+            view.onReceive(tabManager.$tabs) { tabs in
             let existingIds = Set(tabs.map { $0.id })
             if let retiringWorkspaceId, !existingIds.contains(retiringWorkspaceId) {
                 self.retiringWorkspaceId = nil
@@ -1794,9 +1797,9 @@ struct ContentView: View {
                     lastSidebarSelectionIndex = nil
                 }
             }
-        })
+            }
 
-        view = AnyView(view.onReceive(NotificationCenter.default.publisher(for: SidebarDragLifecycleNotification.stateDidChange)) { notification in
+            .onReceive(NotificationCenter.default.publisher(for: SidebarDragLifecycleNotification.stateDidChange)) { notification in
             let tabId = SidebarDragLifecycleNotification.tabId(from: notification)
             sidebarDraggedTabId = tabId
 #if DEBUG
@@ -1805,9 +1808,9 @@ struct ContentView: View {
                 "reason=\(SidebarDragLifecycleNotification.reason(from: notification))"
             )
 #endif
-        })
+            }
 
-        view = AnyView(view.onReceive(NotificationCenter.default.publisher(for: .commandPaletteToggleRequested)) { notification in
+            .onReceive(NotificationCenter.default.publisher(for: .commandPaletteToggleRequested)) { notification in
             let requestedWindow = notification.object as? NSWindow
             guard Self.shouldHandleCommandPaletteRequest(
                 observedWindow: observedWindow,
@@ -1816,9 +1819,9 @@ struct ContentView: View {
                 mainWindow: NSApp.mainWindow
             ) else { return }
             toggleCommandPalette()
-        })
+            }
 
-        view = AnyView(view.onReceive(NotificationCenter.default.publisher(for: .commandPaletteRequested)) { notification in
+            .onReceive(NotificationCenter.default.publisher(for: .commandPaletteRequested)) { notification in
             let requestedWindow = notification.object as? NSWindow
             guard Self.shouldHandleCommandPaletteRequest(
                 observedWindow: observedWindow,
@@ -1827,9 +1830,9 @@ struct ContentView: View {
                 mainWindow: NSApp.mainWindow
             ) else { return }
             openCommandPaletteCommands()
-        })
+            }
 
-        view = AnyView(view.onReceive(NotificationCenter.default.publisher(for: .commandPaletteSwitcherRequested)) { notification in
+            .onReceive(NotificationCenter.default.publisher(for: .commandPaletteSwitcherRequested)) { notification in
             let requestedWindow = notification.object as? NSWindow
             guard Self.shouldHandleCommandPaletteRequest(
                 observedWindow: observedWindow,
@@ -1838,9 +1841,9 @@ struct ContentView: View {
                 mainWindow: NSApp.mainWindow
             ) else { return }
             openCommandPaletteSwitcher()
-        })
+            }
 
-        view = AnyView(view.onReceive(NotificationCenter.default.publisher(for: .commandPalettePeersRequested)) { notification in
+            .onReceive(NotificationCenter.default.publisher(for: .commandPalettePeersRequested)) { notification in
             let requestedWindow = notification.object as? NSWindow
             guard Self.shouldHandleCommandPaletteRequest(
                 observedWindow: observedWindow,
@@ -1849,7 +1852,7 @@ struct ContentView: View {
                 mainWindow: NSApp.mainWindow
             ) else { return }
             openCommandPalettePeers()
-        })
+            }
 
         // Republish the palette when peer state moves under it.
         //
@@ -1861,11 +1864,13 @@ struct ContentView: View {
         // counter increment is cheap, and peer state moves rarely (connect,
         // disconnect, roster arrival), so the unconditional version costs
         // little and cannot deadlock itself.
-        view = AnyView(view.onReceive(RemoteHostStore.shared.objectWillChange) { _ in
+            .onReceive(RemoteHostStore.shared.objectWillChange) { _ in
             peerStoreRevision &+= 1
-        })
+            }
+        )
 
-        view = AnyView(view.onReceive(NotificationCenter.default.publisher(for: .reviewBoardTaskSelected)) { notification in
+        view = AnyView(
+            view.onReceive(NotificationCenter.default.publisher(for: .reviewBoardTaskSelected)) { notification in
             reviewBoardViewModel.refresh()
             if let taskID = notification.userInfo?["task_id"] as? String {
                 reviewBoardViewModel.selectTask(id: ReviewBoardText.safeIdentifier(taskID))
@@ -1873,18 +1878,18 @@ struct ContentView: View {
             if isReviewBoardEnabled {
                 isReviewBoardClosed = false
             }
-        })
+            }
 
-        view = AnyView(view.onReceive(NotificationCenter.default.publisher(for: .reviewBoardSnapshotDidChange)) { _ in
+            .onReceive(NotificationCenter.default.publisher(for: .reviewBoardSnapshotDidChange)) { _ in
             reviewBoardViewModel.refresh()
-        })
+            }
 
-        view = AnyView(view.onChange(of: isReviewBoardEnabled) { _ in
+            .onChange(of: isReviewBoardEnabled) { _ in
             (reviewBoardCoordinator ?? ReviewBoardCoordinatorService.shared).startIfNeeded()
             reviewBoardViewModel.refresh()
-        })
+            }
 
-        view = AnyView(view.onReceive(NotificationCenter.default.publisher(for: .worktreeWorkspaceRequested)) { notification in
+            .onReceive(NotificationCenter.default.publisher(for: .worktreeWorkspaceRequested)) { notification in
             let requestedWindow = notification.object as? NSWindow
             guard Self.shouldHandleCommandPaletteRequest(
                 observedWindow: observedWindow,
@@ -1893,9 +1898,9 @@ struct ContentView: View {
                 mainWindow: NSApp.mainWindow
             ) else { return }
             createWorktreeWorkspace()
-        })
+            }
 
-        view = AnyView(view.onReceive(NotificationCenter.default.publisher(for: .commandPaletteRenameTabRequested)) { notification in
+            .onReceive(NotificationCenter.default.publisher(for: .commandPaletteRenameTabRequested)) { notification in
             let requestedWindow = notification.object as? NSWindow
             guard Self.shouldHandleCommandPaletteRequest(
                 observedWindow: observedWindow,
@@ -1904,9 +1909,9 @@ struct ContentView: View {
                 mainWindow: NSApp.mainWindow
             ) else { return }
             openCommandPaletteRenameTabInput()
-        })
+            }
 
-        view = AnyView(view.onReceive(NotificationCenter.default.publisher(for: .commandPaletteMoveSelection)) { notification in
+            .onReceive(NotificationCenter.default.publisher(for: .commandPaletteMoveSelection)) { notification in
             guard isCommandPalettePresented else { return }
             guard case .commands = commandPaletteMode else { return }
             let requestedWindow = notification.object as? NSWindow
@@ -1918,9 +1923,9 @@ struct ContentView: View {
             ) else { return }
             guard let delta = notification.userInfo?["delta"] as? Int, delta != 0 else { return }
             moveCommandPaletteSelection(by: delta)
-        })
+            }
 
-        view = AnyView(view.onReceive(NotificationCenter.default.publisher(for: .commandPaletteRenameInputInteractionRequested)) { notification in
+            .onReceive(NotificationCenter.default.publisher(for: .commandPaletteRenameInputInteractionRequested)) { notification in
             guard isCommandPalettePresented else { return }
             guard case .renameInput = commandPaletteMode else { return }
             let requestedWindow = notification.object as? NSWindow
@@ -1931,9 +1936,9 @@ struct ContentView: View {
                 mainWindow: NSApp.mainWindow
             ) else { return }
             handleCommandPaletteRenameInputInteraction()
-        })
+            }
 
-        view = AnyView(view.onReceive(NotificationCenter.default.publisher(for: .commandPaletteRenameInputDeleteBackwardRequested)) { notification in
+            .onReceive(NotificationCenter.default.publisher(for: .commandPaletteRenameInputDeleteBackwardRequested)) { notification in
             guard isCommandPalettePresented else { return }
             guard case .renameInput = commandPaletteMode else { return }
             let requestedWindow = notification.object as? NSWindow
@@ -1944,62 +1949,64 @@ struct ContentView: View {
                 mainWindow: NSApp.mainWindow
             ) else { return }
             _ = handleCommandPaletteRenameDeleteBackward(modifiers: [])
-        })
+            }
+        )
 
-        view = AnyView(view.background(WindowAccessor(dedupeByWindow: false) { window in
+        view = AnyView(
+            view.background(WindowAccessor(dedupeByWindow: false) { window in
             MainActor.assumeIsolated {
                 let overlayController = commandPaletteWindowOverlayController(for: window)
                 _ = peerStoreRevision  // read so this closure re-runs when peer state moves
                 overlayController.update(rootView: AnyView(commandPaletteOverlay), isVisible: isCommandPalettePresented)
             }
-        }))
+            })
 
-        view = AnyView(view.onChange(of: bgGlassTintHex) { _ in
+            .onChange(of: bgGlassTintHex) { _ in
             updateWindowGlassTint()
-        })
+            }
 
-        view = AnyView(view.onChange(of: bgGlassTintOpacity) { _ in
+            .onChange(of: bgGlassTintOpacity) { _ in
             updateWindowGlassTint()
-        })
+            }
 
-        view = AnyView(view.onReceive(NotificationCenter.default.publisher(for: NSWindow.didEnterFullScreenNotification)) { notification in
+            .onReceive(NotificationCenter.default.publisher(for: NSWindow.didEnterFullScreenNotification)) { notification in
             guard let window = notification.object as? NSWindow,
                   window === observedWindow else { return }
             isFullScreen = true
             setTitlebarControlsHidden(true, in: window)
             AppDelegate.shared?.fullscreenControlsViewModel = fullscreenControlsViewModel
-        })
+            }
 
-        view = AnyView(view.onReceive(NotificationCenter.default.publisher(for: NSWindow.didExitFullScreenNotification)) { notification in
+            .onReceive(NotificationCenter.default.publisher(for: NSWindow.didExitFullScreenNotification)) { notification in
             guard let window = notification.object as? NSWindow,
                   window === observedWindow else { return }
             isFullScreen = false
             setTitlebarControlsHidden(false, in: window)
             AppDelegate.shared?.fullscreenControlsViewModel = nil
-        })
+            }
 
-        view = AnyView(view.onReceive(NotificationCenter.default.publisher(for: NSWindow.didResizeNotification)) { notification in
+            .onReceive(NotificationCenter.default.publisher(for: NSWindow.didResizeNotification)) { notification in
             guard let window = notification.object as? NSWindow,
                   window === observedWindow else { return }
             clampSidebarWidthIfNeeded(availableWidth: window.contentView?.bounds.width ?? window.contentLayoutRect.width)
             updateSidebarResizerBandState()
-        })
+            }
 
-        view = AnyView(view.onChange(of: sidebarWidth) { _ in
+            .onChange(of: sidebarWidth) { _ in
             updateSidebarResizerBandState()
-        })
+            }
 
-        view = AnyView(view.onChange(of: sidebarState.isVisible) { _ in
+            .onChange(of: sidebarState.isVisible) { _ in
             updateSidebarResizerBandState()
-        })
+            }
+        )
 
-        view = AnyView(view.ignoresSafeArea())
-
-        view = AnyView(view.onDisappear {
-            removeSidebarResizerPointerMonitor()
-        })
-
-        view = AnyView(view.background(WindowAccessor { [sidebarBlendMode, bgGlassEnabled, bgGlassTintHex, bgGlassTintOpacity] window in
+        view = AnyView(
+            view.ignoresSafeArea()
+                .onDisappear {
+                    removeSidebarResizerPointerMonitor()
+                }
+                .background(WindowAccessor { [sidebarBlendMode, bgGlassEnabled, bgGlassTintHex, bgGlassTintOpacity] window in
             window.identifier = NSUserInterfaceItemIdentifier(windowIdentifier)
             window.titlebarAppearsTransparent = true
             // Do not make the entire background draggable; it interferes with drag gestures
@@ -2078,7 +2085,8 @@ struct ContentView: View {
                 sidebarSelectionState: sidebarSelectionState
             )
             installFileDropOverlay(on: window, tabManager: tabManager)
-        }))
+                })
+        )
 
         return view
     }
