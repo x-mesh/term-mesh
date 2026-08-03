@@ -1433,11 +1433,6 @@ class TabManager: ObservableObject {
         }
 
         panel.focus()
-
-        // For terminal panels, ensure proper focus handling
-        if let terminalPanel = panel as? TerminalPanel {
-            terminalPanel.hostedView.ensureFocus(for: selectedTabId, surfaceId: panelId)
-        }
     }
 
     func completePendingWorkspaceUnfocus(reason: String) {
