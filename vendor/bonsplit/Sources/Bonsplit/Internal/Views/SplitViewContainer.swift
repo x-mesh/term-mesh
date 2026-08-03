@@ -14,30 +14,25 @@ struct SplitViewContainer<Content: View, EmptyContent: View>: View {
     var animationDuration: Double = 0.15
 
     var body: some View {
-        splitNodeContent
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
-            .background(TabBarColors.paneBackground(for: appearance))
-            .focusable()
-            .focusEffectDisabled()
-            .background {
-                // Observe the container without making GeometryReader the sizing parent of
-                // the entire split/AppKit subtree. As a background it receives the resolved
-                // size, so terminal hosting views no longer get remeasured through an extra
-                // GeometryReader layout on every workspace visibility change.
-                GeometryReader { geometry in
-                    Color.clear
-                        .onChange(of: geometry.size) { _, _ in
-                            updateContainerFrame(geometry: geometry)
-                        }
-                        .onAppear {
-                            updateContainerFrame(geometry: geometry)
-                        }
+        GeometryReader { geometry in
+            splitNodeContent
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .background(TabBarColors.paneBackground(for: appearance))
+                .focusable()
+                .focusEffectDisabled()
+                .onChange(of: geometry.size) { _, newSize in
+                    updateContainerFrame(geometry: geometry)
                 }
-            }
+                .onAppear {
+                    updateContainerFrame(geometry: geometry)
+                }
+        }
     }
 
     private func updateContainerFrame(geometry: GeometryProxy) {
-        controller.containerFrame = geometry.frame(in: .global)
+        // Get frame in global coordinate space
+        let frame = geometry.frame(in: .global)
+        controller.containerFrame = frame
         onGeometryChange?(false)  // Container resize is not a drag
     }
 
