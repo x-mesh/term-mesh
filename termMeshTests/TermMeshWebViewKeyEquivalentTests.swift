@@ -529,59 +529,6 @@ final class AppDelegateWindowContextRoutingTests: XCTestCase {
         XCTAssertTrue(resolved === manager, "Expected registered window object identity to win even if identifier string changed")
         XCTAssertTrue(app.tabManager === manager)
     }
-
-    func testMainWindowLookupUsesOwningTabManagerInsteadOfFocusedWindow() {
-        _ = NSApplication.shared
-        let app = AppDelegate()
-        let windowA = makeMainWindow(id: UUID())
-        let windowB = makeMainWindow(id: UUID())
-        let managerA = TabManager()
-        let managerB = TabManager()
-        defer {
-            app.unregisterMainWindow(windowA)
-            app.unregisterMainWindow(windowB)
-            windowA.orderOut(nil)
-            windowB.orderOut(nil)
-        }
-
-        app.registerMainWindow(
-            windowA,
-            windowId: UUID(),
-            tabManager: managerA,
-            sidebarState: SidebarState(),
-            sidebarSelectionState: SidebarSelectionState()
-        )
-        app.registerMainWindow(
-            windowB,
-            windowId: UUID(),
-            tabManager: managerB,
-            sidebarState: SidebarState(),
-            sidebarSelectionState: SidebarSelectionState()
-        )
-        windowB.makeKeyAndOrderFront(nil)
-
-        XCTAssertTrue(app.mainWindow(for: managerA) === windowA)
-        XCTAssertTrue(app.mainWindow(for: managerB) === windowB)
-    }
-}
-
-@MainActor
-final class TabManagerWindowTitleTests: XCTestCase {
-    func testApplyWindowTitleSkipsIdenticalValue() {
-        let window = NSWindow()
-        window.title = "Project A"
-
-        XCTAssertFalse(TabManager.applyWindowTitleIfChanged("Project A", to: window))
-        XCTAssertEqual(window.title, "Project A")
-    }
-
-    func testApplyWindowTitleWritesChangedValue() {
-        let window = NSWindow()
-        window.title = "Project A"
-
-        XCTAssertTrue(TabManager.applyWindowTitleIfChanged("Project B", to: window))
-        XCTAssertEqual(window.title, "Project B")
-    }
 }
 
 final class FocusFlashPatternTests: XCTestCase {

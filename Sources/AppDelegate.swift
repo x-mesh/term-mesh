@@ -853,13 +853,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         windowForMainWindowId(windowId)
     }
 
-    func mainWindow(for tabManager: TabManager) -> NSWindow? {
-        guard let context = mainWindowContexts.values.first(where: { $0.tabManager === tabManager }) else {
-            return nil
-        }
-        return context.window ?? windowForMainWindowId(context.windowId)
-    }
-
     func setCommandPaletteVisible(_ visible: Bool, for window: NSWindow) {
         guard let windowId = mainWindowId(for: window) else { return }
         commandPaletteVisibilityByWindowId[windowId] = visible
