@@ -826,6 +826,12 @@ final class GhosttySurfaceScrollView: NSView {
 
     func setBackgroundColor(_ color: NSColor) {
         guard let layer = backgroundView.layer else { return }
+        guard terminalBackgroundLayerNeedsUpdate(
+            currentColor: layer.backgroundColor,
+            currentOpaque: layer.isOpaque,
+            targetColor: color.cgColor,
+            targetOpaque: layer.isOpaque
+        ) else { return }
         CATransaction.begin()
         CATransaction.setDisableActions(true)
         layer.backgroundColor = color.cgColor

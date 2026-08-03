@@ -1,4 +1,5 @@
 import XCTest
+import AppKit
 
 #if canImport(term_mesh_DEV)
 @testable import term_mesh_DEV
@@ -7,6 +8,53 @@ import XCTest
 #endif
 
 final class GhosttyTerminalViewComposingTests: XCTestCase {
+    func testBackgroundLayerUpdatePolicySkipsEquivalentState() {
+        let color = NSColor(calibratedRed: 0.1, green: 0.2, blue: 0.3, alpha: 0.8)
+
+        XCTAssertFalse(terminalBackgroundLayerNeedsUpdate(
+            currentColor: color.cgColor,
+            currentOpaque: false,
+            targetColor: color.cgColor,
+            targetOpaque: false
+        ))
+        XCTAssertTrue(terminalBackgroundLayerNeedsUpdate(
+            currentColor: color.cgColor,
+            currentOpaque: false,
+            targetColor: color.cgColor,
+            targetOpaque: true
+        ))
+        XCTAssertTrue(terminalBackgroundLayerNeedsUpdate(
+            currentColor: nil,
+            currentOpaque: false,
+            targetColor: color.cgColor,
+            targetOpaque: false
+        ))
+    }
+
+    func testWindowBackgroundUpdatePolicyTracksColorAndOpacity() {
+        let current = NSColor(calibratedWhite: 0.15, alpha: 1)
+        let changed = NSColor(calibratedWhite: 0.2, alpha: 1)
+
+        XCTAssertFalse(terminalWindowBackgroundNeedsUpdate(
+            currentColor: current,
+            currentOpaque: true,
+            targetColor: current,
+            targetOpaque: true
+        ))
+        XCTAssertTrue(terminalWindowBackgroundNeedsUpdate(
+            currentColor: current,
+            currentOpaque: true,
+            targetColor: changed,
+            targetOpaque: true
+        ))
+        XCTAssertTrue(terminalWindowBackgroundNeedsUpdate(
+            currentColor: current,
+            currentOpaque: true,
+            targetColor: current,
+            targetOpaque: false
+        ))
+    }
+
     @MainActor
     func testRepeatedHiddenVisibilityDoesNotRestartRendererUnrealizeDebounce() {
         let surface = TerminalSurface(

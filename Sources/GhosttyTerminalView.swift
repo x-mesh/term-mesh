@@ -17,6 +17,25 @@ func termMeshShouldUseTransparentBackgroundWindow() -> Bool {
     let bgGlassEnabled = defaults.object(forKey: "bgGlassEnabled") as? Bool ?? true
     return sidebarBlendMode == "behindWindow" && bgGlassEnabled && !WindowGlassEffect.isAvailable
 }
+
+func terminalBackgroundLayerNeedsUpdate(
+    currentColor: CGColor?,
+    currentOpaque: Bool,
+    targetColor: CGColor,
+    targetOpaque: Bool
+) -> Bool {
+    guard let currentColor else { return true }
+    return currentColor != targetColor || currentOpaque != targetOpaque
+}
+
+func terminalWindowBackgroundNeedsUpdate(
+    currentColor: NSColor,
+    currentOpaque: Bool,
+    targetColor: NSColor,
+    targetOpaque: Bool
+) -> Bool {
+    !currentColor.isEqual(targetColor) || currentOpaque != targetOpaque
+}
 #endif
 
 #if DEBUG
@@ -2352,11 +2371,18 @@ static func focusLog(_ message: String) {
 
     func applySurfaceBackground() {
         let color = effectiveBackgroundColor()
-        if let layer {
+        let targetOpaque = color.alphaComponent >= 1.0
+        if let layer,
+           terminalBackgroundLayerNeedsUpdate(
+               currentColor: layer.backgroundColor,
+               currentOpaque: layer.isOpaque,
+               targetColor: color.cgColor,
+               targetOpaque: targetOpaque
+           ) {
             CATransaction.begin()
             CATransaction.setDisableActions(true)
             layer.backgroundColor = color.cgColor
-            layer.isOpaque = color.alphaComponent >= 1.0
+            layer.isOpaque = targetOpaque
             CATransaction.commit()
         }
         terminalSurface?.hostedView.setBackgroundColor(color)
@@ -2378,19 +2404,24 @@ static func focusLog(_ message: String) {
         }
         applySurfaceBackground()
         let color = effectiveBackgroundColor()
-        if termMeshShouldUseTransparentBackgroundWindow() {
-            window.backgroundColor = .clear
-            window.isOpaque = false
-        } else {
-            window.backgroundColor = color
-            window.isOpaque = color.alphaComponent >= 1.0
+        let usesTransparentWindow = termMeshShouldUseTransparentBackgroundWindow()
+        let targetColor = usesTransparentWindow ? NSColor.clear : color
+        let targetOpaque = !usesTransparentWindow && color.alphaComponent >= 1.0
+        if terminalWindowBackgroundNeedsUpdate(
+            currentColor: window.backgroundColor,
+            currentOpaque: window.isOpaque,
+            targetColor: targetColor,
+            targetOpaque: targetOpaque
+        ) {
+            window.backgroundColor = targetColor
+            window.isOpaque = targetOpaque
         }
         if configProvider.backgroundLogEnabled {
-            let signature = "\(termMeshShouldUseTransparentBackgroundWindow() ? "transparent" : color.hexString()):\(String(format: "%.3f", color.alphaComponent))"
+            let signature = "\(usesTransparentWindow ? "transparent" : color.hexString()):\(String(format: "%.3f", color.alphaComponent))"
             if signature != lastLoggedWindowBackgroundSignature {
                 lastLoggedWindowBackgroundSignature = signature
                 configProvider.logBackground(
-                    "window background applied tab=\(tabId?.uuidString ?? "unknown") surface=\(terminalSurface?.id.uuidString ?? "unknown") transparent=\(termMeshShouldUseTransparentBackgroundWindow()) color=\(color.hexString()) opacity=\(String(format: "%.3f", color.alphaComponent))"
+                    "window background applied tab=\(tabId?.uuidString ?? "unknown") surface=\(terminalSurface?.id.uuidString ?? "unknown") transparent=\(usesTransparentWindow) color=\(color.hexString()) opacity=\(String(format: "%.3f", color.alphaComponent))"
                 )
             }
         }

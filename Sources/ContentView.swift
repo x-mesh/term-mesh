@@ -80,6 +80,55 @@ final class TitlebarGitSnapshotCache: @unchecked Sendable {
     }
 }
 
+/// Short-lived cache for the titlebar worktree badge. Project switching can
+/// revisit the same directory faster than the daemon round trip completes, so
+/// reuse recent counts and let concurrent requests join the same load.
+final class TitlebarWorktreeCountCache: @unchecked Sendable {
+    private struct Entry {
+        let count: Int
+        let completedAt: TimeInterval
+    }
+
+    private let lock = NSLock()
+    private let ttl: TimeInterval
+    private var entries: [String: Entry] = [:]
+    private var waiters: [String: [(Int) -> Void]] = [:]
+
+    init(ttl: TimeInterval = 2.0) {
+        self.ttl = ttl
+    }
+
+    func resolve(
+        directory: String,
+        now: TimeInterval = ProcessInfo.processInfo.systemUptime,
+        load: () -> Int,
+        completion: @escaping (Int) -> Void
+    ) {
+        let key = (directory as NSString).standardizingPath
+        lock.lock()
+        if let entry = entries[key], now - entry.completedAt < ttl {
+            lock.unlock()
+            completion(entry.count)
+            return
+        }
+        if waiters[key] != nil {
+            waiters[key, default: []].append(completion)
+            lock.unlock()
+            return
+        }
+        waiters[key] = [completion]
+        lock.unlock()
+
+        let count = load()
+
+        lock.lock()
+        entries[key] = Entry(count: count, completedAt: now)
+        let completions = waiters.removeValue(forKey: key) ?? []
+        lock.unlock()
+        completions.forEach { $0(count) }
+    }
+}
+
 /// Installs a FileDropOverlayView on the window's theme frame for Finder file drag support.
 
 struct ContentView: View {
@@ -174,6 +223,7 @@ struct ContentView: View {
     )
     private static let commandPaletteUsageDefaultsKey = "commandPalette.commandUsage.v1"
     private static let titlebarGitSnapshotCache = TitlebarGitSnapshotCache()
+    private static let titlebarWorktreeCountCache = TitlebarWorktreeCountCache()
     private static let commandPaletteCommandsPrefix = ">"
     /// Peer-workspace scope prefix. Same mechanism as `>` for commands: the
     /// scope is derived from the query, so ⌘⇧O is just a shortcut that seeds
@@ -1370,9 +1420,17 @@ struct ContentView: View {
         let daemon = self.daemonService
         let cwdForWorktree = snapCurrentDir
         DispatchQueue.global(qos: .utility).async {
-            if let repoPath = daemon?.findGitRoot(from: cwdForWorktree), !repoPath.isEmpty {
-                let count = daemon?.listWorktrees(repoPath: repoPath).count ?? 0
+            Self.titlebarWorktreeCountCache.resolve(directory: cwdForWorktree, load: {
+                guard let repoPath = daemon?.findGitRoot(from: cwdForWorktree), !repoPath.isEmpty else {
+                    return 0
+                }
+                return daemon?.listWorktrees(repoPath: repoPath).count ?? 0
+            }) { count in
                 DispatchQueue.main.async {
+                    guard self.tabManager.selectedTabId == selectedId,
+                          self.tabManager.selectedWorkspace?.currentDirectory == cwdForWorktree else {
+                        return
+                    }
                     if self.titlebarWorktreeCount != count { self.titlebarWorktreeCount = count }
                 }
             }
@@ -1680,7 +1738,7 @@ struct ContentView: View {
                 selectedTabIds = [newValue]
                 lastSidebarSelectionIndex = tabManager.tabs.firstIndex { $0.id == newValue }
             }
-            scheduleTitlebarTextRefresh()
+            updateTitlebarText()
         })
 
         view = AnyView(view.onChange(of: tabManager.isWorkspaceCycleHot) { _ in
