@@ -4762,6 +4762,11 @@ final class MenuBarIconRendererTests: XCTestCase {
 }
 
 final class WorkspaceMountPolicyTests: XCTestCase {
+    func testInactiveWorkspaceOpacityKeepsNativeHierarchyWithoutVisiblePixelContribution() {
+        XCTAssertGreaterThan(WorkspaceMountPolicy.inactiveWorkspaceOpacity, 0)
+        XCTAssertLessThan(WorkspaceMountPolicy.inactiveWorkspaceOpacity, 0.5 / 255.0)
+    }
+
     func testDefaultPolicyKeepsSelectedAndRecentWorkspace() {
         let a = UUID()
         let b = UUID()
