@@ -19,7 +19,9 @@ final class Workspace: Identifiable, ObservableObject {
     /// Injected config provider (defaults to singleton for backward compatibility).
     var configProvider: any GhosttyConfigProvider = GhosttyApp.shared
 
-    @Published var currentDirectory: String
+    @Published var currentDirectory: String {
+        didSet { invalidateSidebarBranchDirectoryEntriesCache() }
+    }
 
     /// Timestamp when this workspace was created (for session duration display)
     let createdAt: Date = Date()
@@ -40,7 +42,9 @@ final class Workspace: Identifiable, ObservableObject {
     let bonsplitController: BonsplitController
 
     /// Mapping from bonsplit TabID to our Panel instances
-    @Published var panels: [UUID: any Panel] = [:]
+    @Published var panels: [UUID: any Panel] = [:] {
+        didSet { invalidateSidebarBranchDirectoryEntriesCache() }
+    }
 
     /// Subscriptions for panel updates (e.g., browser title changes)
     var panelSubscriptions: [UUID: AnyCancellable] = [:]
@@ -128,7 +132,9 @@ final class Workspace: Identifiable, ObservableObject {
     }
 
     /// Published directory for each panel
-    @Published var panelDirectories: [UUID: String] = [:]
+    @Published var panelDirectories: [UUID: String] = [:] {
+        didSet { invalidateSidebarBranchDirectoryEntriesCache() }
+    }
     @Published var panelTitles: [UUID: String] = [:]
     @Published var panelCustomTitles: [UUID: String] = [:]
     @Published var pinnedPanelIds: Set<UUID> = []
@@ -139,8 +145,14 @@ final class Workspace: Identifiable, ObservableObject {
     @Published var statusEntries: [String: SidebarStatusEntry] = [:]
     @Published var logEntries: [SidebarLogEntry] = []
     @Published var progress: SidebarProgressState?
-    @Published var gitBranch: SidebarGitBranchState?
-    @Published var panelGitBranches: [UUID: SidebarGitBranchState] = [:]
+    @Published var gitBranch: SidebarGitBranchState? {
+        didSet { invalidateSidebarBranchDirectoryEntriesCache() }
+    }
+    @Published var panelGitBranches: [UUID: SidebarGitBranchState] = [:] {
+        didSet { invalidateSidebarBranchDirectoryEntriesCache() }
+    }
+    private var sidebarBranchDirectoryEntriesCache: [SidebarBranchOrdering.BranchDirectoryEntry]?
+    private(set) var sidebarBranchDirectoryEntriesComputationCount = 0
     @Published var surfaceListeningPorts: [UUID: [Int]] = [:]
     @Published var listeningPorts: [Int] = []
     var surfaceTTYNames: [UUID: String] = [:]
@@ -865,13 +877,24 @@ final class Workspace: Identifiable, ObservableObject {
     }
 
     func sidebarBranchDirectoryEntriesInDisplayOrder() -> [SidebarBranchOrdering.BranchDirectoryEntry] {
-        SidebarBranchOrdering.orderedUniqueBranchDirectoryEntries(
+        if let sidebarBranchDirectoryEntriesCache {
+            return sidebarBranchDirectoryEntriesCache
+        }
+
+        let entries = SidebarBranchOrdering.orderedUniqueBranchDirectoryEntries(
             orderedPanelIds: sidebarOrderedPanelIds(),
             panelBranches: panelGitBranches,
             panelDirectories: panelDirectories,
             defaultDirectory: currentDirectory,
             fallbackBranch: gitBranch
         )
+        sidebarBranchDirectoryEntriesCache = entries
+        sidebarBranchDirectoryEntriesComputationCount += 1
+        return entries
+    }
+
+    func invalidateSidebarBranchDirectoryEntriesCache() {
+        sidebarBranchDirectoryEntriesCache = nil
     }
 
     // MARK: - Panel Operations

@@ -3139,7 +3139,64 @@ final class WorkspacePanelGitBranchTests: XCTestCase {
     }
 }
 
+@MainActor
 final class SidebarBranchOrderingTests: XCTestCase {
+
+    func testWorkspaceCachesBranchDirectoryEntriesUntilAnInputChanges() {
+        let workspace = Workspace()
+        guard let panelId = workspace.focusedPanelId else {
+            XCTFail("Expected initial panel")
+            return
+        }
+
+        workspace.updatePanelDirectory(panelId: panelId, directory: "/repo/one")
+        workspace.updatePanelGitBranch(panelId: panelId, branch: "main", isDirty: false)
+
+        XCTAssertEqual(
+            workspace.sidebarBranchDirectoryEntriesInDisplayOrder(),
+            [
+                SidebarBranchOrdering.BranchDirectoryEntry(
+                    branch: "main",
+                    isDirty: false,
+                    directory: "/repo/one"
+                )
+            ]
+        )
+        XCTAssertEqual(workspace.sidebarBranchDirectoryEntriesComputationCount, 1)
+
+        _ = workspace.sidebarBranchDirectoryEntriesInDisplayOrder()
+        XCTAssertEqual(
+            workspace.sidebarBranchDirectoryEntriesComputationCount,
+            1,
+            "Selection-only row reevaluations must reuse the workspace snapshot"
+        )
+
+        workspace.updatePanelDirectory(panelId: panelId, directory: "/repo/two")
+        XCTAssertEqual(
+            workspace.sidebarBranchDirectoryEntriesInDisplayOrder(),
+            [
+                SidebarBranchOrdering.BranchDirectoryEntry(
+                    branch: "main",
+                    isDirty: false,
+                    directory: "/repo/two"
+                )
+            ]
+        )
+        XCTAssertEqual(workspace.sidebarBranchDirectoryEntriesComputationCount, 2)
+
+        workspace.updatePanelGitBranch(panelId: panelId, branch: "feature", isDirty: true)
+        XCTAssertEqual(
+            workspace.sidebarBranchDirectoryEntriesInDisplayOrder(),
+            [
+                SidebarBranchOrdering.BranchDirectoryEntry(
+                    branch: "feature",
+                    isDirty: true,
+                    directory: "/repo/two"
+                )
+            ]
+        )
+        XCTAssertEqual(workspace.sidebarBranchDirectoryEntriesComputationCount, 3)
+    }
 
     func testOrderedUniqueBranchesDedupesByNameAndMergesDirtyState() {
         let first = UUID()

@@ -326,6 +326,7 @@ extension Workspace: BonsplitDelegate {
     }
 
     func splitTabBar(_ controller: BonsplitController, didCloseTab tabId: TabID, fromPane pane: PaneID) {
+        invalidateSidebarBranchDirectoryEntriesCache()
         // Live mirror self-heal: a close that reached the tree outside
         // the reconciler (force-close paths bypass the shouldCloseTab
         // veto) diverged from the host — snap back on the next tick.
@@ -459,6 +460,7 @@ extension Workspace: BonsplitDelegate {
     }
 
     func splitTabBar(_ controller: BonsplitController, didMoveTab tab: Bonsplit.Tab, fromPane source: PaneID, toPane destination: PaneID) {
+        invalidateSidebarBranchDirectoryEntriesCache()
         // Live mirror self-heal: moveTab has NO veto hook, so a user tab
         // drag can mutate the mirrored tree directly. Snap back to the
         // last authoritative layout. Reconciler-driven moves run under
@@ -502,6 +504,7 @@ extension Workspace: BonsplitDelegate {
     }
 
     func splitTabBar(_ controller: BonsplitController, didClosePane paneId: PaneID) {
+        invalidateSidebarBranchDirectoryEntriesCache()
         let closedPanelIds = pendingPaneClosePanelIds.removeValue(forKey: paneId.id) ?? []
 
         if !closedPanelIds.isEmpty {
@@ -607,6 +610,7 @@ extension Workspace: BonsplitDelegate {
     }
 
     func splitTabBar(_ controller: BonsplitController, didSplitPane originalPane: PaneID, newPane: PaneID, orientation: SplitOrientation) {
+        invalidateSidebarBranchDirectoryEntriesCache()
 #if DEBUG
         let panelKindForTab: (TabID) -> String = { tabId in
             guard let panelId = self.panelIdFromSurfaceId(tabId),
