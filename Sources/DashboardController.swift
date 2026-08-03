@@ -90,6 +90,63 @@ struct AgentPerformance {
     var tokensUsed: Int64
 }
 
+/// Panel event logs are append-only and usually unchanged between dashboard ticks.
+/// Keep disk I/O and JSON parsing off the main actor, and reuse the parsed tail
+/// until either the file size or modification time changes.
+private final class PanelEventLogCache: @unchecked Sendable {
+    static let shared = PanelEventLogCache()
+
+    private struct Entry {
+        let size: UInt64
+        let modifiedAt: Date
+        let events: [[String: Any]]
+    }
+
+    private let lock = NSLock()
+    private var entries: [String: Entry] = [:]
+
+    func events(path: String, limit: Int) -> [[String: Any]] {
+        guard let attributes = try? FileManager.default.attributesOfItem(atPath: path),
+              let size = (attributes[.size] as? NSNumber)?.uint64Value,
+              let modifiedAt = attributes[.modificationDate] as? Date else { return [] }
+
+        lock.lock()
+        if let cached = entries[path], cached.size == size, cached.modifiedAt == modifiedAt {
+            lock.unlock()
+            return cached.events
+        }
+        lock.unlock()
+
+        guard let data = FileManager.default.contents(atPath: path),
+              let text = String(data: data, encoding: .utf8) else { return [] }
+        let lines = text.split(separator: "\n", omittingEmptySubsequences: true).suffix(limit)
+        var events: [[String: Any]] = []
+        for line in lines {
+            guard let data = line.data(using: .utf8),
+                  let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { continue }
+            var event: [String: Any] = ["type": object["type"] as? String ?? "event"]
+            if let seq = object["seq"] as? NSNumber { event["seq"] = seq.intValue }
+            if let at = object["at"] as? String { event["at"] = at }
+            if let model = object["model"] as? String { event["model"] = model }
+            if let phase = object["phase"] as? String { event["phase"] = phase }
+            if let text = object["text"] as? String { event["text"] = String(text.prefix(2000)) }
+            if let bytes = object["bytes"] as? NSNumber { event["bytes"] = bytes.intValue }
+            if let code = object["code"] as? NSNumber { event["code"] = code.intValue }
+            if let ok = object["ok"] as? Bool { event["ok"] = ok }
+            if let error = object["error"] as? String { event["error"] = String(error.prefix(200)) }
+            events.append(event)
+        }
+
+        lock.lock()
+        if entries.count >= 64, entries[path] == nil {
+            entries.removeValue(forKey: entries.keys.first ?? path)
+        }
+        entries[path] = Entry(size: size, modifiedAt: modifiedAt, events: events)
+        lock.unlock()
+        return events
+    }
+}
+
 /// Manages the term-mesh monitoring dashboard in a separate window.
 ///
 /// Watch criteria: each terminal tab's **project root** (detected by .git, Cargo.toml, etc.)
@@ -106,6 +163,8 @@ final class DashboardController: NSObject, WKNavigationDelegate {
     private var window: NSWindow?
     private var webView: WKWebView?
     private var uiTimer: Timer?
+    private var uiFetchInFlight = false
+    private var uiFetchGeneration = 0
     private var trackingTimer: Timer?
     private var trackingSyncInFlight = false
     private var trackedPIDs: Set<Int32> = []
@@ -119,6 +178,12 @@ final class DashboardController: NSObject, WKNavigationDelegate {
     }
     private var projectRootCache: [String: ProjectRootCacheEntry] = [:]
     private let projectRootCacheTTL: TimeInterval = 60
+    private struct FleetPayloadCacheEntry {
+        let payload: [String: Any]
+        let createdAt: Date
+    }
+    private var fleetPayloadCache: FleetPayloadCacheEntry?
+    private let fleetPayloadCacheTTL: TimeInterval = 3
 
     /// PIDs that we've already sent a notification for (avoid spamming).
     private var notifiedAlertPIDs: Set<Int32> = []
@@ -169,6 +234,7 @@ final class DashboardController: NSObject, WKNavigationDelegate {
         trackingTimer = nil
         trackingSyncInFlight = false
         projectRootCache.removeAll()
+        fleetPayloadCache = nil
         notifiedAlertPIDs.removeAll()
         let daemon = self.daemon
         let paths = Set(watchedProjects.values)
@@ -260,8 +326,12 @@ final class DashboardController: NSObject, WKNavigationDelegate {
 
     private func startUIPolling() {
         stopUIPolling()
+        let generation = uiFetchGeneration
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
-            self?.fetchAndPush()
+            guard let self,
+                  generation == self.uiFetchGeneration,
+                  self.window?.isVisible == true else { return }
+            self.fetchAndPush()
         }
         uiTimer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { [weak self] _ in
             self?.fetchAndPush()
@@ -271,6 +341,8 @@ final class DashboardController: NSObject, WKNavigationDelegate {
     private func stopUIPolling() {
         uiTimer?.invalidate()
         uiTimer = nil
+        uiFetchGeneration &+= 1
+        uiFetchInFlight = false
     }
 
     // MARK: - Tracking (always-on)
@@ -291,7 +363,12 @@ final class DashboardController: NSObject, WKNavigationDelegate {
                 self.watchTabProjects(projectRoots: projectRoots)
                 self.syncSessionsToDaemon(projectRoots: projectRoots)
                 self.syncTeamsToDaemon()
-                self.pollAlerts()
+                // The open dashboard already obtains monitor.snapshot every two
+                // seconds. Reuse that response for alerts instead of issuing a
+                // second snapshot RPC from the three-second tracking cycle.
+                if self.uiTimer == nil {
+                    self.pollAlerts()
+                }
                 self.deliverPendingInputs()
             }
         }
@@ -336,7 +413,10 @@ final class DashboardController: NSObject, WKNavigationDelegate {
     }
 
     private func syncTeamsToDaemon() {
-        let payload = currentTeamPayload()
+        // Keep the daemon sync authoritative. UI refreshes between these
+        // three-second ticks reuse this payload instead of rebuilding it.
+        let fleet = currentFleetPayload(forceRefresh: true)
+        let payload = teamPayload(from: fleet)
         recordAgentTimeline(from: payload)
         computeAgentPerformance(from: payload)
         DispatchQueue.global(qos: .utility).async {
@@ -685,16 +765,34 @@ final class DashboardController: NSObject, WKNavigationDelegate {
     // MARK: - Data Push (WKWebView only)
 
     private func fetchAndPush() {
-        guard let webView else { return }
+        guard let webView, !uiFetchInFlight else { return }
+        uiFetchInFlight = true
+        let generation = uiFetchGeneration
+        let fleetSnapshot = currentFleetPayload()
 
         DispatchQueue.global(qos: .utility).async {
             let daemon = self.daemon
             let monitorData = daemon.rpcCallRaw(method: "monitor.snapshot", params: [:])
+            let monitorAlerts: [[String: Any]]? = monitorData.flatMap { raw in
+                guard let data = raw.data(using: .utf8),
+                      let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+                else { return nil }
+                return json["alerts"] as? [[String: Any]]
+            }
             let watcherData = daemon.rpcCallRaw(method: "watcher.snapshot", params: [:])
             let sessionData = daemon.rpcCallRaw(method: "session.list", params: [:])
             let usageData = daemon.rpcCallRaw(method: "usage.snapshot", params: [:])
             let agentsData = daemon.rpcCallRaw(method: "agent.list", params: ["include_terminated": false])
             let tasksData = daemon.rpcCallRaw(method: "task.list", params: [:] as [String: Any])
+            var fleet = fleetSnapshot
+            if var runs = fleet["panel_runs"] as? [[String: Any]] {
+                for index in runs.indices {
+                    if let path = runs[index]["log_path"] as? String, !path.isEmpty {
+                        runs[index]["events"] = PanelEventLogCache.shared.events(path: path, limit: 40)
+                    }
+                }
+                fleet["panel_runs"] = runs
+            }
 
             // Mission Control: drift-watch status + recent board rows per
             // watched team ({team_id: {enabled, healthy, …, recent[]}}).
@@ -722,7 +820,13 @@ final class DashboardController: NSObject, WKNavigationDelegate {
             }
 
             DispatchQueue.main.async {
-                let teamPayload = self.currentTeamPayload()
+                guard generation == self.uiFetchGeneration, webView === self.webView else { return }
+                self.uiFetchInFlight = false
+                if let monitorAlerts {
+                    self.requestNotificationPermission()
+                    self.processAlerts(monitorAlerts)
+                }
+                let teamPayload = self.teamPayload(from: fleet)
                 let teamData = teamPayload["teams"] as? [[String: Any]] ?? []
                 let teamTasks = teamPayload["tasks"] as? [[String: Any]] ?? []
                 let teamAttention = teamPayload["attention"] as? [[String: Any]] ?? []
@@ -811,20 +915,7 @@ final class DashboardController: NSObject, WKNavigationDelegate {
 
                 // Mission Control: fleet aggregate (teams × agents × tasks ×
                 // attention × approvals + panel_runs) + daemon watch enrichment.
-                var fleet = TeamOrchestrator.shared.fleetState()
                 fleet["watch"] = watchMap
-                // Enrich each x-kit panel run with its durable event log (events.jsonl) so the
-                // card shows every model's real stdout/stderr, not just a status chip. The socket
-                // only advertises the file PATH (log_path); the bytes are read here off disk — the
-                // same local-file pattern the web dashboard uses. Best-effort per run.
-                if var runs = fleet["panel_runs"] as? [[String: Any]] {
-                    for i in runs.indices {
-                        if let lp = runs[i]["log_path"] as? String, !lp.isEmpty {
-                            runs[i]["events"] = Self.readPanelEventLog(path: lp, limit: 40)
-                        }
-                    }
-                    fleet["panel_runs"] = runs
-                }
                 if let fleetJson = Self.dashboardJSONString(fleet) {
                     webView.evaluateJavaScript("if(window.updateFleet)updateFleet(\(fleetJson));") { _, _ in }
                 }
@@ -856,38 +947,9 @@ final class DashboardController: NSObject, WKNavigationDelegate {
         return string
     }
 
-    /// Read the last `limit` records from an x-panel run's events.jsonl — the durable,
-    /// milestone-only log written by x-panel-cli's writeEvent (spawn/stdout/stderr/exit/…).
-    /// Best-effort: a missing/unreadable file yields []. Only the fields the log pane renders
-    /// are kept, and each `text` is capped, so a huge stdout record can't bloat the WKWebView
-    /// payload. Control-char sanitization is unnecessary here — the JS side escapeHTML's every
-    /// field into an HTML pane (no terminal to hijack).
-    private static func readPanelEventLog(path: String, limit: Int = 40) -> [[String: Any]] {
-        guard let data = FileManager.default.contents(atPath: path),
-              let text = String(data: data, encoding: .utf8) else { return [] }
-        let lines = text.split(separator: "\n", omittingEmptySubsequences: true).suffix(limit)
-        var out: [[String: Any]] = []
-        for line in lines {
-            guard let d = line.data(using: .utf8),
-                  let obj = try? JSONSerialization.jsonObject(with: d) as? [String: Any] else { continue }
-            var rec: [String: Any] = ["type": obj["type"] as? String ?? "event"]
-            if let seq = obj["seq"] as? NSNumber { rec["seq"] = seq.intValue }
-            if let at = obj["at"] as? String { rec["at"] = at }
-            if let model = obj["model"] as? String { rec["model"] = model }
-            if let phase = obj["phase"] as? String { rec["phase"] = phase }
-            if let t = obj["text"] as? String { rec["text"] = String(t.prefix(2000)) }
-            if let bytes = obj["bytes"] as? NSNumber { rec["bytes"] = bytes.intValue }
-            if let code = obj["code"] as? NSNumber { rec["code"] = code.intValue }
-            if let ok = obj["ok"] as? Bool { rec["ok"] = ok }
-            if let err = obj["error"] as? String { rec["error"] = String(err.prefix(200)) }
-            out.append(rec)
-        }
-        return out
-    }
-
     private func pushInstanceStatus() {
         guard let webView else { return }
-        let instanceMeta = currentTeamPayload()["instance"] as? [String: Any] ?? [:]
+        let instanceMeta = currentFleetPayload()["instance"] as? [String: Any] ?? [:]
         guard let instanceJson = Self.dashboardJSONString(instanceMeta) else { return }
         webView.evaluateJavaScript("if(window.updateInstanceStatus)updateInstanceStatus(\(instanceJson));") { _, _ in }
     }
@@ -899,38 +961,37 @@ final class DashboardController: NSObject, WKNavigationDelegate {
     /// directly as a JS object literal — same technique `fetchAndPush`
     /// already uses for daemon RPC results.
     fileprivate func pushApprovalResult(_ raw: String) {
+        invalidateTeamPayloadCache()
         guard let webView else { return }
         webView.evaluateJavaScript("if(window.onFleetApprovalResult)onFleetApprovalResult(\(raw));") { _, error in
             if let error { Logger.app.error("dashboard approval result push error: \(error, privacy: .public)") }
         }
+        fetchAndPush()
     }
 
-    private func currentTeamPayload() -> [String: Any] {
-        let teamData = TeamOrchestrator.shared.listTeams()
-        let teamTasks = teamData.flatMap { team -> [[String: Any]] in
-            guard let teamName = team["team_name"] as? String else { return [] }
-            return TeamOrchestrator.shared.listTasks(teamName: teamName).map { task in
-                var dict = TeamOrchestrator.shared.taskDictionary(task)
-                dict["team_name"] = teamName
-                return dict
-            }
+    private func currentFleetPayload(forceRefresh: Bool = false) -> [String: Any] {
+        let now = Date()
+        if !forceRefresh,
+           let cached = fleetPayloadCache,
+           now.timeIntervalSince(cached.createdAt) < fleetPayloadCacheTTL {
+            return cached.payload
         }
-        let teamAttention = teamData.flatMap { team -> [[String: Any]] in
-            guard let teamName = team["team_name"] as? String else { return [] }
-            return TeamOrchestrator.shared.inboxItems(teamName: teamName)
-        }
-        let instanceMeta: [String: Any] = [
-            "app_name": Bundle.main.object(forInfoDictionaryKey: "CFBundleName") as? String
-                ?? ProcessInfo.processInfo.processName,
-            "socket_path": SocketControlSettings.socketPath(),
-            "team_count": teamData.count
+        let payload = TeamOrchestrator.shared.fleetState()
+        fleetPayloadCache = FleetPayloadCacheEntry(payload: payload, createdAt: now)
+        return payload
+    }
+
+    private func teamPayload(from fleet: [String: Any]) -> [String: Any] {
+        [
+            "teams": fleet["teams"] ?? [],
+            "tasks": fleet["tasks"] ?? [],
+            "attention": fleet["attention"] ?? [],
+            "instance": fleet["instance"] ?? [:],
         ]
-        return [
-            "teams": teamData,
-            "tasks": teamTasks,
-            "attention": teamAttention,
-            "instance": instanceMeta,
-        ]
+    }
+
+    private func invalidateTeamPayloadCache() {
+        fleetPayloadCache = nil
     }
 
     fileprivate func handleTeamTaskAction(teamName: String, taskId: String, action: String, note: String?) {
@@ -997,6 +1058,7 @@ final class DashboardController: NSObject, WKNavigationDelegate {
         default:
             return
         }
+        invalidateTeamPayloadCache()
         fetchAndPush()
     }
 
@@ -1010,6 +1072,7 @@ final class DashboardController: NSObject, WKNavigationDelegate {
             priority: 2,
             createdBy: "dashboard"
         )
+        invalidateTeamPayloadCache()
         fetchAndPush()
     }
 }

@@ -661,6 +661,8 @@ final class WindowTerminalPortal: NSObject {
     private var hasDeferredFullSyncScheduled = false
     private var hasExternalGeometrySyncScheduled = false
     private var scheduledExternalGeometrySyncIsForced = false
+    private var geometrySyncDeferredForSheet = false
+    private var deferredSheetGeometrySyncIsForced = false
     private var lastExternalGeometrySnapshot: TerminalPortalExternalGeometrySnapshot?
     private var geometryObservers: [NSObjectProtocol] = []
 #if DEBUG
@@ -715,6 +717,19 @@ final class WindowTerminalPortal: NSObject {
         ) { [weak self] _ in
             MainActor.assumeIsolated {
                 self?.scheduleExternalGeometrySynchronize(force: true)
+            }
+        })
+        geometryObservers.append(center.addObserver(
+            forName: NSWindow.didEndSheetNotification,
+            object: window,
+            queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated {
+                guard let self, self.geometrySyncDeferredForSheet else { return }
+                let force = self.deferredSheetGeometrySyncIsForced
+                self.geometrySyncDeferredForSheet = false
+                self.deferredSheetGeometrySyncIsForced = false
+                self.scheduleExternalGeometrySynchronize(force: force)
             }
         })
         geometryObservers.append(center.addObserver(
@@ -860,10 +875,14 @@ final class WindowTerminalPortal: NSObject {
         // and _setWindow: propagation concurrently with the sheet's constraint engine causes
         // 2 s+ main-thread hangs (TERM-MESH-2, getMethodNoSuper_nolock pattern).
         if let window = self.window, window.attachedSheet != nil {
+            let wasAlreadyDeferred = geometrySyncDeferredForSheet
+            geometrySyncDeferredForSheet = true
+            deferredSheetGeometrySyncIsForced = deferredSheetGeometrySyncIsForced || force
 #if DEBUG
-            dlog("portal.sync.deferSheet reason=attachedSheetActive")
+            if !wasAlreadyDeferred {
+                dlog("portal.sync.deferSheet reason=attachedSheetActive")
+            }
 #endif
-            scheduleExternalGeometrySynchronize(after: 0.25, force: force)
             return
         }
         let beforeLayout = externalGeometrySnapshot()

@@ -347,6 +347,7 @@ final class WindowBrowserPortal: NSObject {
     private weak var installedReferenceView: NSView?
     private var hasDeferredFullSyncScheduled = false
     private var hasExternalGeometrySyncScheduled = false
+    private var geometrySyncDeferredForSheet = false
     private var geometryObservers: [NSObjectProtocol] = []
 
     private struct Entry {
@@ -392,6 +393,17 @@ final class WindowBrowserPortal: NSObject {
         ) { [weak self] _ in
             MainActor.assumeIsolated {
                 self?.scheduleExternalGeometrySynchronize()
+            }
+        })
+        geometryObservers.append(center.addObserver(
+            forName: NSWindow.didEndSheetNotification,
+            object: window,
+            queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated {
+                guard let self, self.geometrySyncDeferredForSheet else { return }
+                self.geometrySyncDeferredForSheet = false
+                self.scheduleExternalGeometrySynchronize()
             }
         })
         geometryObservers.append(center.addObserver(
@@ -456,10 +468,13 @@ final class WindowBrowserPortal: NSObject {
         // resize notifications during its animation frames; running layoutSubtreeIfNeeded()
         // concurrently with the sheet's constraint engine causes 2 s+ hangs (TERM-MESH-2).
         if let window = self.window, window.attachedSheet != nil {
+            let wasAlreadyDeferred = geometrySyncDeferredForSheet
+            geometrySyncDeferredForSheet = true
 #if DEBUG
-            dlog("browser.portal.sync.deferSheet reason=attachedSheetActive")
+            if !wasAlreadyDeferred {
+                dlog("browser.portal.sync.deferSheet reason=attachedSheetActive")
+            }
 #endif
-            scheduleExternalGeometrySynchronize(after: 0.25)
             return
         }
         guard ensureInstalled() else { return }
