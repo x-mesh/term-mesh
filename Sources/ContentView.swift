@@ -27,6 +27,33 @@ struct TitlebarGitSnapshot: Equatable {
     let isWorktree: Bool
 }
 
+struct TitlebarGitStatusSnapshot: Equatable {
+    let branch: String
+    let dirtyCount: Int
+}
+
+func parseTitlebarGitStatusPorcelainV2(_ output: String) -> TitlebarGitStatusSnapshot? {
+    var branch = ""
+    var dirtyCount = 0
+
+    for line in output.split(separator: "\n", omittingEmptySubsequences: true) {
+        if line.hasPrefix("# branch.head ") {
+            let head = line.dropFirst("# branch.head ".count)
+            if head != "(detached)" {
+                branch = String(head)
+            }
+        } else if line.hasPrefix("1 ") ||
+                    line.hasPrefix("2 ") ||
+                    line.hasPrefix("u ") ||
+                    line.hasPrefix("? ") {
+            dirtyCount += 1
+        }
+    }
+
+    guard !branch.isEmpty else { return nil }
+    return TitlebarGitStatusSnapshot(branch: branch, dirtyCount: dirtyCount)
+}
+
 /// Process-wide cache for the titlebar's fallback git probe. Workspace cycling
 /// can ask for the same directory several times before the first three-process
 /// git query finishes, so callers both reuse recent results and join in-flight
@@ -1456,42 +1483,22 @@ struct ContentView: View {
     }
 
     private static func queryGitBranch(in directory: String) -> TitlebarGitSnapshot {
-        let branchProcess = Process()
-        branchProcess.executableURL = URL(fileURLWithPath: "/usr/bin/git")
-        branchProcess.arguments = ["branch", "--show-current"]
-        branchProcess.currentDirectoryURL = URL(fileURLWithPath: directory)
-        let branchPipe = Pipe()
-        branchProcess.standardOutput = branchPipe
-        branchProcess.standardError = Pipe()
-        do {
-            try branchProcess.run()
-            branchProcess.waitUntilExit()
-        } catch { return TitlebarGitSnapshot(branch: "", isDirty: false, dirtyCount: 0, isWorktree: false) }
-        guard branchProcess.terminationStatus == 0 else {
-            return TitlebarGitSnapshot(branch: "", isDirty: false, dirtyCount: 0, isWorktree: false)
-        }
-        let branchData = branchPipe.fileHandleForReading.readDataToEndOfFile()
-        let branch = String(data: branchData, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        guard !branch.isEmpty else {
-            return TitlebarGitSnapshot(branch: "", isDirty: false, dirtyCount: 0, isWorktree: false)
-        }
-
         let statusProcess = Process()
         statusProcess.executableURL = URL(fileURLWithPath: "/usr/bin/git")
-        statusProcess.arguments = ["status", "--porcelain", "--short"]
+        statusProcess.arguments = ["status", "--porcelain=v2", "--branch"]
         statusProcess.currentDirectoryURL = URL(fileURLWithPath: directory)
         let statusPipe = Pipe()
         statusProcess.standardOutput = statusPipe
-        statusProcess.standardError = Pipe()
+        statusProcess.standardError = FileHandle.nullDevice
         do {
             try statusProcess.run()
-            statusProcess.waitUntilExit()
-        } catch {
-            return TitlebarGitSnapshot(branch: branch, isDirty: false, dirtyCount: 0, isWorktree: false)
-        }
+        } catch { return TitlebarGitSnapshot(branch: "", isDirty: false, dirtyCount: 0, isWorktree: false) }
         let statusData = statusPipe.fileHandleForReading.readDataToEndOfFile()
-        let statusOutput = String(data: statusData, encoding: .utf8) ?? ""
-        let changedFiles = statusOutput.components(separatedBy: "\n").filter { !$0.isEmpty }
+        statusProcess.waitUntilExit()
+        guard statusProcess.terminationStatus == 0,
+              let status = parseTitlebarGitStatusPorcelainV2(String(data: statusData, encoding: .utf8) ?? "") else {
+            return TitlebarGitSnapshot(branch: "", isDirty: false, dirtyCount: 0, isWorktree: false)
+        }
 
         // Detect worktree: git-dir != git-common-dir means we're in a worktree
         var isWorktree = false
@@ -1517,9 +1524,9 @@ struct ContentView: View {
         } catch {}
 
         return TitlebarGitSnapshot(
-            branch: branch,
-            isDirty: !changedFiles.isEmpty,
-            dirtyCount: changedFiles.count,
+            branch: status.branch,
+            isDirty: status.dirtyCount > 0,
+            dirtyCount: status.dirtyCount,
             isWorktree: isWorktree
         )
     }

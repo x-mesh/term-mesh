@@ -448,6 +448,35 @@ final class TitlebarGitSnapshotCacheTests: XCTestCase {
     }
 }
 
+final class TitlebarGitStatusParserTests: XCTestCase {
+    func testParsesBranchAndCountsTrackedUnmergedAndUntrackedRecords() {
+        let output = """
+        # branch.oid abcdef
+        # branch.head feature/parser
+        1 .M N... 100644 100644 100644 abcdef abcdef Sources/A.swift
+        2 R. N... 100644 100644 100644 abcdef abcdef R100 Sources/B.swift\tSources/C.swift
+        u UU N... 100644 100644 100644 100644 abcdef abcdef abcdef Sources/D.swift
+        ? Sources/New.swift
+        """
+
+        XCTAssertEqual(
+            parseTitlebarGitStatusPorcelainV2(output),
+            TitlebarGitStatusSnapshot(branch: "feature/parser", dirtyCount: 4)
+        )
+    }
+
+    func testIgnoresHeadersAndReturnsNilForDetachedHead() {
+        let output = """
+        # branch.oid abcdef
+        # branch.head (detached)
+        # branch.upstream origin/main
+        # branch.ab +1 -2
+        """
+
+        XCTAssertNil(parseTitlebarGitStatusPorcelainV2(output))
+    }
+}
+
 final class TitlebarWorktreeCountCacheTests: XCTestCase {
     func testRecentCountIsReusedUntilTTLExpires() {
         let cache = TitlebarWorktreeCountCache(ttl: 2)
