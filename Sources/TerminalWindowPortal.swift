@@ -974,9 +974,10 @@ final class WindowTerminalPortal: NSObject {
     }
 
     @discardableResult
-    private func ensureInstalled() -> Bool {
+    private func ensureInstalled(forceLayout: Bool = true) -> Bool {
         guard let window else { return false }
         guard let (container, reference) = installationTarget(for: window) else { return false }
+        var installationChanged = false
 
         if hostView.superview !== container || installedContainerView !== container {
             // Container changed (or host view is not yet installed): full re-insertion.
@@ -996,6 +997,7 @@ final class WindowTerminalPortal: NSObject {
             NSLayoutConstraint.activate(installConstraints)
             installedContainerView = container
             installedReferenceView = reference
+            installationChanged = true
         } else if installedReferenceView !== reference {
             // Container is unchanged but reference view changed (e.g. NSGlassEffectView
             // child swap on theme change). Update constraints without removing the host view
@@ -1009,8 +1011,10 @@ final class WindowTerminalPortal: NSObject {
             ]
             NSLayoutConstraint.activate(installConstraints)
             installedReferenceView = reference
+            installationChanged = true
         } else if !Self.isView(hostView, above: reference, in: container) {
             container.addSubview(hostView, positioned: .above, relativeTo: reference)
+            installationChanged = true
         }
 
         // Z-order contract: terminal portal must render below browser portal.
@@ -1018,6 +1022,7 @@ final class WindowTerminalPortal: NSObject {
         if let browserHost = container.subviews.first(where: { $0 is WindowBrowserHostView }),
            Self.isView(hostView, above: browserHost, in: container) {
             container.addSubview(hostView, positioned: .below, relativeTo: browserHost)
+            installationChanged = true
         }
 
         // The command palette installs into this same container with `.above`,
@@ -1028,6 +1033,7 @@ final class WindowTerminalPortal: NSObject {
         if let palette = container.subviews.first(where: { $0 is CommandPaletteOverlayContainerView }),
            !Self.isView(palette, above: hostView, in: container) {
             container.addSubview(palette, positioned: .above, relativeTo: hostView)
+            installationChanged = true
         }
 
         // Keep the drag/mouse forwarding overlay above portal-hosted terminal views.
@@ -1035,6 +1041,7 @@ final class WindowTerminalPortal: NSObject {
            overlay.superview === container,
            !Self.isView(overlay, above: hostView, in: container) {
             container.addSubview(overlay, positioned: .above, relativeTo: hostView)
+            installationChanged = true
         }
         // Ensure file drop overlay renders above both portal hosts at compositor level.
         if let overlay = objc_getAssociatedObject(window, &fileDropOverlayKey) as? NSView,
@@ -1043,7 +1050,16 @@ final class WindowTerminalPortal: NSObject {
             overlay.layer?.zPosition = 300
         }
 
-        synchronizeLayoutHierarchy()
+        // A steady-state SwiftUI representable update already runs inside AppKit's
+        // layout pass. Re-entering layoutSubtreeIfNeeded() from every bind walks the
+        // whole hosting hierarchy again during workspace switches. Installation and
+        // z-order mutations still need an immediate pass; geometry-driven callers keep
+        // the default forceLayout=true so resize/sidebar changes retain their contract.
+        if forceLayout || installationChanged {
+            synchronizeLayoutHierarchy()
+        } else {
+            _ = synchronizeHostFrameToReference()
+        }
         ensureDividerOverlayOnTop()
 
         return true
@@ -1246,7 +1262,7 @@ final class WindowTerminalPortal: NSObject {
     }
 
     func bind(hostedView: GhosttySurfaceScrollView, to anchorView: NSView, visibleInUI: Bool, zPriority: Int = 0) {
-        guard ensureInstalled() else { return }
+        guard ensureInstalled(forceLayout: false) else { return }
 
         // Unhide host view before adding content so the first frame renders correctly.
         if hostView.isHidden {

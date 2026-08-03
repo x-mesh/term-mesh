@@ -4735,6 +4735,83 @@ final class WorkspaceMountPolicyTests: XCTestCase {
     }
 }
 
+final class WorkspaceHandoffPolicyTests: XCTestCase {
+    func testWarmLocalBrowserFreePairTransitionsImmediately() {
+        let old = UUID()
+        let new = UUID()
+
+        XCTAssertTrue(WorkspaceHandoffPolicy.canTransitionImmediately(
+            oldSelectedId: old,
+            newSelectedId: new,
+            mountedIds: [old, new],
+            oldIsTerminalOnly: true,
+            newIsTerminalOnly: true,
+            newRendererReady: true,
+            oldIsPeerMirror: false,
+            newIsPeerMirror: false
+        ))
+    }
+
+    func testColdTargetRetainsOverlapHandoff() {
+        let old = UUID()
+        let new = UUID()
+
+        XCTAssertFalse(WorkspaceHandoffPolicy.canTransitionImmediately(
+            oldSelectedId: old,
+            newSelectedId: new,
+            mountedIds: [old],
+            oldIsTerminalOnly: true,
+            newIsTerminalOnly: true,
+            newRendererReady: true,
+            oldIsPeerMirror: false,
+            newIsPeerMirror: false
+        ))
+    }
+
+    func testBrowserAndPeerWorkspacesRetainOverlapHandoff() {
+        let old = UUID()
+        let new = UUID()
+        let mounted: Set<UUID> = [old, new]
+
+        XCTAssertFalse(WorkspaceHandoffPolicy.canTransitionImmediately(
+            oldSelectedId: old,
+            newSelectedId: new,
+            mountedIds: mounted,
+            oldIsTerminalOnly: false,
+            newIsTerminalOnly: true,
+            newRendererReady: true,
+            oldIsPeerMirror: false,
+            newIsPeerMirror: false
+        ))
+        XCTAssertFalse(WorkspaceHandoffPolicy.canTransitionImmediately(
+            oldSelectedId: old,
+            newSelectedId: new,
+            mountedIds: mounted,
+            oldIsTerminalOnly: true,
+            newIsTerminalOnly: true,
+            newRendererReady: true,
+            oldIsPeerMirror: false,
+            newIsPeerMirror: true
+        ))
+    }
+
+    func testUnrealizedWarmTargetRetainsOverlapHandoff() {
+        let old = UUID()
+        let new = UUID()
+
+        XCTAssertFalse(WorkspaceHandoffPolicy.canTransitionImmediately(
+            oldSelectedId: old,
+            newSelectedId: new,
+            mountedIds: [old, new],
+            oldIsTerminalOnly: true,
+            newIsTerminalOnly: true,
+            newRendererReady: false,
+            oldIsPeerMirror: false,
+            newIsPeerMirror: false
+        ))
+    }
+}
+
 @MainActor
 final class WindowTerminalHostViewTests: XCTestCase {
     private final class CapturingView: NSView {

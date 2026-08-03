@@ -447,6 +447,7 @@ struct ContentView: View {
                     }
                     .opacity(isVisible ? 1 : 0)
                     .allowsHitTesting(isSelectedWorkspace)
+                    .zIndex(isSelectedWorkspace ? 2 : (isRetiringWorkspace ? 1 : 0))
                 }
             }
             .opacity(sidebarSelectionState.selection == .tabs ? 1 : 0)
@@ -2059,6 +2060,40 @@ struct ContentView: View {
             retiringWorkspaceId = nil
             workspaceHandoffFallbackTask?.cancel()
             workspaceHandoffFallbackTask = nil
+            return
+        }
+
+        if let oldWorkspace = tabManager.tabs.first(where: { $0.id == oldSelectedId }),
+           let newWorkspace = tabManager.tabs.first(where: { $0.id == newSelectedId }),
+           WorkspaceHandoffPolicy.canTransitionImmediately(
+               oldSelectedId: oldSelectedId,
+               newSelectedId: newSelectedId,
+               mountedIds: Set(mountedWorkspaceIds),
+               oldIsTerminalOnly: !oldWorkspace.panels.isEmpty &&
+                   oldWorkspace.panels.values.allSatisfy { $0 is TerminalPanel },
+               newIsTerminalOnly: !newWorkspace.panels.isEmpty &&
+                   newWorkspace.panels.values.allSatisfy { $0 is TerminalPanel },
+               newRendererReady: newWorkspace.panels.values.allSatisfy { panel in
+                   (panel as? TerminalPanel)?.surface.isRendererReadyForImmediateVisibility == true
+               },
+               oldIsPeerMirror: oldWorkspace.isPeerMirror,
+               newIsPeerMirror: newWorkspace.isPeerMirror
+           ) {
+            workspaceHandoffGeneration &+= 1
+            workspaceHandoffFallbackTask?.cancel()
+            workspaceHandoffFallbackTask = nil
+            // Portal terminals live outside the SwiftUI subtree. Hide the old workspace
+            // synchronously so the already-mounted target can become the sole visible tree
+            // in this update without waiting for a second handoff-completion render.
+            oldWorkspace.hideAllTerminalPortalViews()
+            retiringWorkspaceId = nil
+            tabManager.completePendingWorkspaceUnfocus(reason: "warm_immediate")
+#if DEBUG
+            dlog(
+                "ws.handoff.immediate old=\(debugShortWorkspaceId(oldSelectedId)) " +
+                "new=\(debugShortWorkspaceId(newSelectedId))"
+            )
+#endif
             return
         }
 

@@ -123,3 +123,27 @@ enum WorkspaceMountPolicy {
         return [selected]
     }
 }
+
+enum WorkspaceHandoffPolicy {
+    /// A warm pair of local, browser-free workspaces can switch in one visibility update.
+    /// Browser and peer workspaces retain the overlap handoff because their AppKit/WebKit
+    /// responders may not be ready when selection changes.
+    static func canTransitionImmediately(
+        oldSelectedId: UUID,
+        newSelectedId: UUID,
+        mountedIds: Set<UUID>,
+        oldIsTerminalOnly: Bool,
+        newIsTerminalOnly: Bool,
+        newRendererReady: Bool,
+        oldIsPeerMirror: Bool,
+        newIsPeerMirror: Bool
+    ) -> Bool {
+        guard oldSelectedId != newSelectedId else { return false }
+        guard mountedIds.contains(oldSelectedId), mountedIds.contains(newSelectedId) else {
+            return false
+        }
+        guard oldIsTerminalOnly, newIsTerminalOnly, newRendererReady else { return false }
+        guard !oldIsPeerMirror, !newIsPeerMirror else { return false }
+        return true
+    }
+}

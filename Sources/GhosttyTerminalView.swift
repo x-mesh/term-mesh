@@ -255,6 +255,7 @@ final class TerminalSurface: Identifiable, ObservableObject {
     /// surfaces that have been invisible (e.g. background workspace) for a while.
     /// Starts true: a freshly created surface is realized.
     private var rendererRealized = true
+    @MainActor var isRendererReadyForImmediateVisibility: Bool { rendererRealized }
     /// Debounced unrealize work item, so transient reparent/workspace flaps don't
     /// thrash the swap chain (recreate cost) when a surface briefly goes invisible.
     private var rendererUnrealizeWork: DispatchWorkItem?
