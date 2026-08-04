@@ -2178,6 +2178,7 @@ private struct PeerShellCleanupSheet: View {
     let onRefresh: () -> Void
     let onClose: () -> Void
     @Environment(\.dismiss) private var dismiss
+    @State private var showCloseConfirm = false
 
     private var closeableCount: Int {
         items.filter { $0.state != .inUse && !$0.isBusy }.count
@@ -2209,6 +2210,16 @@ private struct PeerShellCleanupSheet: View {
                         .controlSize(.small)
                 }
             }
+
+            // Unlike Disconnect, this reaches across the link and ends
+            // processes on the host. Say so before the list, not after —
+            // the sheet title alone reads like local housekeeping.
+            HStack(alignment: .firstTextBaseline, spacing: 6) {
+                Image(systemName: "exclamationmark.triangle.fill")
+                    .foregroundColor(.orange)
+                Text("These shells run on \(hostName). Closing them ends the processes inside — anything unsaved there is lost.")
+            }
+            .font(.caption)
 
             Text("Orphans and panes whose folder was deleted are selected automatically. Panes in use or running a command are always protected.")
                 .font(.caption)
@@ -2289,12 +2300,26 @@ private struct PeerShellCleanupSheet: View {
                 Button("Refresh", action: onRefresh)
                     .disabled(isLoading)
                 Button("Cancel") { dismiss() }
-                Button("Close \(selection.count) Panes", role: .destructive, action: onClose)
-                    .disabled(selection.isEmpty || isLoading)
+                Button("Close \(selection.count) Panes", role: .destructive) {
+                    showCloseConfirm = true
+                }
+                .disabled(selection.isEmpty || isLoading)
             }
         }
         .padding(18)
         .frame(minWidth: 680, minHeight: 430)
+        // Select All puts every closeable shell one click from termination,
+        // so the irreversible step gets its own confirmation. This is the one
+        // place in the host menu that earns a prompt.
+        .confirmationDialog(
+            "Close \(selection.count) panes on \"\(hostName)\"?",
+            isPresented: $showCloseConfirm
+        ) {
+            Button("Close \(selection.count) Panes", role: .destructive, action: onClose)
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("The processes inside end immediately. This cannot be undone.")
+        }
     }
 
     private func stateLabel(_ state: TeamOrchestrator.PeerShellCleanupItem.State) -> String {
@@ -2329,7 +2354,6 @@ struct RemoteHostGroupView: View, Equatable {
     @State private var showDeleteConfirm = false
     @State private var showNewWorkspaceAlert = false
     @State private var newWorkspaceTitle = ""
-    @State private var showForceDisconnectConfirm = false
     @State private var showShellCleanup = false
     @State private var shellCleanupItems: [TeamOrchestrator.PeerShellCleanupItem] = []
     @State private var shellCleanupSelection = Set<Data>()
@@ -2643,15 +2667,12 @@ struct RemoteHostGroupView: View, Equatable {
                     Button("Retry Connection") { store.retryConnectingHost(host) }
                 }
             case .connected:
+                // Grouped by what the action touches, because the two
+                // destructive-looking entries are not equally destructive:
+                // Disconnect only drops this Mac's end of the link, while
+                // Clean Up Panes ends processes on the host itself.
                 Button("Open Surface as Pane…") {
                     store.openSurfaceAsPane(host)
-                }
-                Button("Clean Up Panes…") {
-                    Task { @MainActor in
-                        try? await Task.sleep(nanoseconds: 50_000_000)
-                        showShellCleanup = true
-                        await loadShellCleanup()
-                    }
                 }
                 Button("New Workspace…") {
                     Task { @MainActor in
@@ -2661,13 +2682,19 @@ struct RemoteHostGroupView: View, Equatable {
                     }
                 }
                 .disabled(host.supportsWorkspaceLifecycle != true)
-                if store.hasSidebarLease(for: host.id) {
-                    Button("Disconnect") { store.disconnectSavedHost(host) }
-                }
-                Button("Force Disconnect (Close All Panes)…") {
+
+                Divider()
+                // No confirmation: the host keeps running, so reconnecting
+                // picks the work back up. Guarding a reversible action wears
+                // out the habit that has to still work for Clean Up Panes.
+                Button("Disconnect") { store.forceDisconnectSavedHost(host) }
+
+                Divider()
+                Button("Clean Up Panes…", role: .destructive) {
                     Task { @MainActor in
                         try? await Task.sleep(nanoseconds: 50_000_000)
-                        showForceDisconnectConfirm = true
+                        showShellCleanup = true
+                        await loadShellCleanup()
                     }
                 }
             case .connecting:
@@ -2770,17 +2797,6 @@ struct RemoteHostGroupView: View, Equatable {
         } message: {
             Text("The saved host profile is removed. Open panes and mirrors stay connected.")
         }
-        .confirmationDialog(
-            "Force disconnect \"\(host.displayName)\"?",
-            isPresented: $showForceDisconnectConfirm
-        ) {
-            Button("Force Disconnect", role: .destructive) {
-                store.forceDisconnectSavedHost(host)
-            }
-            Button("Cancel", role: .cancel) {}
-        } message: {
-            Text("Closes every pane, mirror and relay window opened from this host. Remote processes keep running on the host.")
-        }
         .alert("New Workspace", isPresented: $showNewWorkspaceAlert) {
             TextField("Workspace name", text: $newWorkspaceTitle)
             Button("Create") {
@@ -2867,6 +2883,11 @@ struct RemoteWorkspaceRowView: View {
         case connected
         case working
         case viewing
+        /// Open, but living in a different window of this app. The row still
+        /// reads "open" everywhere (one app holds one view of a host
+        /// workspace), so without this the only feedback for a click is focus
+        /// jumping to a window the person may not even be looking at.
+        case elsewhere
     }
 
     @Environment(\.colorScheme) private var colorScheme
@@ -2911,8 +2932,34 @@ struct RemoteWorkspaceRowView: View {
         mirroredWorkspace?.id == tabManager.selectedTabId
     }
 
+    /// The window that actually holds this mirror, which is not necessarily
+    /// the window drawing this row — `RemoteHostStore` is a singleton, so
+    /// every window's sidebar renders the same host list.
+    private var mirrorHomeContext: AppDelegate.MainWindowContext? {
+        guard let id = mirroredWorkspace?.id else { return nil }
+        return AppDelegate.shared?.contextContainingTabId(id)
+    }
+
+    private var isMirrorInAnotherWindow: Bool {
+        guard let home = mirrorHomeContext?.tabManager else { return false }
+        return home !== tabManager
+    }
+
+    /// Names the other window by what it is showing rather than by index —
+    /// "Window 2" has to be counted, a workspace title is recognized.
+    private var mirrorHomeWindowLabel: String? {
+        guard isMirrorInAnotherWindow, let home = mirrorHomeContext else { return nil }
+        if let title = home.window?.title, !title.isEmpty { return title }
+        guard let selected = home.tabManager.selectedTabId,
+              let tab = home.tabManager.tabs.first(where: { $0.id == selected }),
+              !tab.title.isEmpty
+        else { return nil }
+        return tab.title
+    }
+
     private var mirrorVisualState: MirrorVisualState {
         if isMirrorSelected { return .viewing }
+        if isMirrorInAnotherWindow { return .elsewhere }
         if isMirrorOpen, workspace.busyCount > 0 { return .working }
         if isMirrorOpen { return .connected }
         return .closed
@@ -2924,6 +2971,9 @@ struct RemoteWorkspaceRowView: View {
         case .connected: return "연결됨"
         case .working: return "작업 중"
         case .viewing: return "보고 있음"
+        case .elsewhere:
+            guard let label = mirrorHomeWindowLabel else { return "다른 창" }
+            return "다른 창 · \(label)"
         }
     }
 
@@ -2933,6 +2983,7 @@ struct RemoteWorkspaceRowView: View {
         case .connected: return "link"
         case .working: return "bolt.fill"
         case .viewing: return "eye.fill"
+        case .elsewhere: return "macwindow.on.rectangle"
         }
     }
 
@@ -2963,7 +3014,7 @@ struct RemoteWorkspaceRowView: View {
     private var usesInvertedMirrorForeground: Bool {
         switch mirrorVisualState {
         case .working, .viewing: return true
-        case .closed, .connected: return false
+        case .closed, .connected, .elsewhere: return false
         }
     }
 
@@ -2976,6 +3027,7 @@ struct RemoteWorkspaceRowView: View {
         case .working, .viewing: return .white.opacity(opacity)
         case .connected: return .primary.opacity(opacity)
         case .closed: return .secondary.opacity(opacity)
+        case .elsewhere: return .secondary.opacity(opacity * 0.8)
         }
     }
 
@@ -2985,6 +3037,9 @@ struct RemoteWorkspaceRowView: View {
         case .connected: return AnyShapeStyle(peerTintGradient(role: .workspaceConnected))
         case .working: return AnyShapeStyle(peerTintGradient(role: .workspaceWorking))
         case .viewing: return AnyShapeStyle(originalPeerGradient)
+        // Deliberately the plain row fill, not a tint: the host accent means
+        // "live here", and this window is not where it lives.
+        case .elsewhere: return AnyShapeStyle(rowBackgroundFill)
         }
     }
 

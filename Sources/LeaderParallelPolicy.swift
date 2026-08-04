@@ -5,7 +5,7 @@ import Foundation
 /// renderer consumes `renderedInstructions`; no renderer owns a fork of these
 /// scheduling rules.
 enum LeaderParallelPolicy {
-    static let version = "3"
+    static let version = "4"
     static let activation = "runtime-enforced"
 
     /// Ordered rules are both the canonical policy and the digest input.  Do
@@ -43,6 +43,10 @@ enum LeaderParallelPolicy {
         (
             "timebox-convergence",
             "Each parallel wave has configurable soft and hard deadlines. At the soft deadline report partial evidence and missing tasks. At the hard deadline converge only on completed evidence and explicitly cancel, split, or continue unfinished tasks; a timeout is never success."
+        ),
+        (
+            "external-event-wait",
+            "Events outside the team bus (CI runs, deploys, remote builds) cannot be awaited with team wait primitives. Before watching one, verify that the watched resource exists; absence after its explicit discovery window is a terminal finding to report, not a retry loop. Never start an unbounded watch or end a turn silently waiting on an external event. Either poll with an explicit attempt cap and report state plus the next action at the cap, or delegate a bounded watch to a worker whose deadline is shorter than the leader's tm-agent wait timeout and whose reply covers success, failure, absence, and timeout. If the leader wait expires first, report partial state; do not claim that the ended turn will resume automatically."
         ),
     ]
 

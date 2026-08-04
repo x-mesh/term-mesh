@@ -13,16 +13,60 @@ Prepare a new release for term-mesh. This command updates the changelog, bumps t
      `git fetch origin main`
    - Detect the current branch: `BRANCH=$(git rev-parse --abbrev-ref HEAD)`
    - **If on `main`:** fast-forward to `origin/main` (`git merge --ff-only origin/main`), then cut the release branch from it.
-   - **If on `develop`: do NOT release from here.** `develop` is this repo's integration branch — it mirrors `main` between releases (see the merge-PR history: #106, #108, #112). Releasing from it squashes every accumulated commit into the single `Bump version` commit, so main loses the individual history AND the same changes end up under two different SHAs — after which `develop` and `main` have permanently diverged and every later release fights conflicts. Instead:
-     1. Open a `develop → main` PR and merge it **with a merge commit, not squash** (`gh pr merge <N> --merge`). The commits are preserved.
-     2. `git checkout main && git merge --ff-only origin/main`
-     3. Re-run `/release` from `main`. The release PR then carries only the version bump, which is safe to squash.
+   - **If on `develop`: do NOT cut the release branch here.** Run **step 2a** first — it lands `develop` on `main` — then continue this step from `main`.
    - **If NOT on `main` or `develop`** (e.g. a feature branch like `fix/memory-leak`): the current branch's work is **folded into the release PR** and squash-merged to main together with the version bump. Before cutting the branch, run these guards:
      - **Clean tree:** `git status --porcelain` must be empty. Uncommitted changes are NOT included — commit or stash first.
      - **Not behind main:** `git rev-list --count HEAD..origin/main` must be `0`. If non-zero, rebase or merge `origin/main` into the branch and resolve conflicts before continuing — otherwise the release PR will conflict.
      - **Confirm the fold-in set with the user:** `git log --oneline origin/main..HEAD` — every one of these commits gets **squashed into the single `Bump version to X.Y.Z` commit** on main (history is flattened by the squash-merge in step 9). If the user wants the feature commits preserved as a distinct change, stop and merge the feature branch to main on its own PR first, then re-run `/release` from main.
    - Cut the release branch from the current HEAD: `git checkout -b release/vX.Y.Z`
    - The PR → squash-merge → tag-on-main steps below then carry the folded work into `main`.
+
+2a. **Land `develop` on `main`** *(only when step 2 started on `develop`)*
+
+   `develop` is this repo's integration branch: PRs merge into it, so between releases it is
+   normally **ahead** of `main`. It is not a mirror of `main`. Two consequences, and both are
+   release work — do not hand them back to the user as a prerequisite:
+
+   - Releasing straight from `develop` would squash every accumulated commit into the single
+     `Bump version` commit. `main` loses the individual history AND the same changes land
+     under a second set of SHAs, after which `develop` and `main` have permanently diverged
+     and every later release fights conflicts.
+   - Whatever is still unpushed, or still labelled `WIP`, on `develop` is part of this
+     release's source. Tidy and push it here — after the tag exists it is too late.
+
+   Run these in order. Stop at the first failure and report it.
+
+   1. **Clean tree:** `git status --porcelain` must be empty. Uncommitted changes are not
+      released — commit or stash first.
+   2. **Tidy WIP commits.** List what would otherwise ship with a WIP subject:
+      ```bash
+      git log --oneline origin/main..HEAD --no-merges | grep -Ei ' (wip[(:]|wip )' || echo "no WIP commits"
+      ```
+      If any exist, show them and ask the user whether to squash — this rewrites history, so
+      it is never automatic. On approval run `/squash --by-topic` (preview with `--dry-run`
+      first) and confirm `git diff origin/main..HEAD --stat` is unchanged before and after.
+      If the user declines, continue; the WIP subjects then land on `main` verbatim.
+   3. **Push `develop`:** `git-kit push`, then verify nothing is left behind:
+      `git rev-list --count @{u}..HEAD` must be `0`. The PR below is built from the *remote*
+      branch, so an unpushed commit silently drops out of the release.
+   4. **Open or reuse the `develop → main` PR** (`gh pr create` prints the URL; it has no
+      `--json`, so take the number off the end):
+      ```bash
+      PR=$(gh pr list --repo x-mesh/term-mesh --head develop --base main --state open \
+        --json number --jq '.[0].number')
+      if [ -z "$PR" ]; then
+        PR_URL=$(gh pr create --repo x-mesh/term-mesh --base main --head develop \
+          --title "Merge develop into main for vX.Y.Z" --body "<commit summary>")
+        PR=${PR_URL##*/}
+      fi
+      ```
+   5. **Merge it with a merge commit, never a squash:**
+      `gh pr merge "$PR" --repo x-mesh/term-mesh --merge`
+      Squashing here is exactly what causes the divergence described above. Do not pass
+      `--delete-branch` — `develop` is a permanent branch.
+   6. **Move to `main`:** `git checkout main && git fetch origin main && git merge --ff-only origin/main`
+   7. Resume step 2 on `main` and cut `release/vX.Y.Z` from it. The release PR then carries
+      only the version bump, which is safe to squash.
 
 3. **Gather changes and contributors since the last release**
    - **API budget preflight** — before any `gh` call, check the GraphQL pool:
@@ -72,22 +116,25 @@ Prepare a new release for term-mesh. This command updates the changelog, bumps t
    - Create PR: `gh pr create --title "Release vX.Y.Z" --body "...changelog summary..."`
    - Include the changelog entries in the PR body
 
-8. **Monitor CI**
-   - **Do NOT use `gh pr checks --watch`** — it polls the GraphQL pool continuously and a
-     long CI run can drain thousands of GraphQL calls in a single release.
-   - Instead, poll with a bounded loop on the underlying workflow run (uses the REST/core
-     pool, and `gh run watch` streams without per-tick GraphQL):
+8. **Check for branch CI without waiting for a run that cannot exist**
+   - Ground truth for this repository: no workflow runs for `release/*` branches or release
+     PRs. `ghostty-prebuild` runs only on pushes to `main` / `feat/**`, and `release-linux`
+     runs on `v*` tag pushes. An empty branch run is therefore expected, not something to
+     retry.
+   - **Do NOT use `gh pr checks --watch` or `gh run watch`**. Both can hold the leader on an
+     external event with no hard deadline.
+   - Resolve the run id exactly once:
      ```bash
-     # Resolve the run id once, then stream it (REST-backed):
      RUN_ID=$(gh run list --repo x-mesh/term-mesh --branch release/vX.Y.Z \
        --limit 1 --json databaseId --jq '.[0].databaseId')
-     gh run watch "$RUN_ID" --repo x-mesh/term-mesh --exit-status
      ```
-   - If `gh run watch` is unavailable, fall back to a capped manual poll: `gh run view
-     "$RUN_ID" --json status,conclusion` every ~30s, max ~40 iterations (~20 min), then
-     stop and report rather than polling forever.
-   - If CI fails, fix the issues and push again
-   - Wait for all checks to pass before proceeding
+   - If `RUN_ID` is empty, report `No branch CI configured (expected)` and proceed directly
+     to step 9. Do not sleep, retry, or wait for a run to appear.
+   - If a run does exist (for example, after a future workflow change), poll it through
+     `gh run view "$RUN_ID" --json status,conclusion` every 30 seconds, at most 40 times
+     (~20 minutes). Proceed only on conclusion `success`. On failure, cancellation, or the
+     attempt cap, stop the release and report the current state plus the next action;
+     timeout is not success.
 
 9. **Merge the PR into main**
    - Target branch is `main` (see CLAUDE.md — main is the released-version branch).
@@ -100,6 +147,21 @@ Prepare a new release for term-mesh. This command updates the changelog, bumps t
     - `git fetch origin main` (do NOT fast-forward local main — it may carry local-only commits that diverge from the squash-merge result; the tag only needs the remote SHA).
     - `git tag vX.Y.Z <squash-merge-sha>` — tag the exact commit that got merged to main, not whatever local HEAD happens to be.
     - `git push origin vX.Y.Z`
+    - The tag push triggers `release-linux.yml`; its Linux assets upload asynchronously.
+      Discover only this release's run by filtering on both workflow and merge commit SHA,
+      trying every 5 seconds for at most 60 seconds:
+      ```bash
+      RUN_URL=""
+      for attempt in {1..12}; do
+        RUN_URL=$(gh run list --repo x-mesh/term-mesh --workflow release-linux.yml \
+          --commit <squash-merge-sha> --event push --limit 1 --json url --jq '.[0].url')
+        [ -n "$RUN_URL" ] && break
+        sleep 5
+      done
+      ```
+      Include `RUN_URL` in the final report when found, but do not wait for completion. If
+      it is still empty, report `release-linux run not yet observed` with the workflow page
+      URL and continue; this asynchronous discovery timeout does not invalidate the release.
 
 11. **Checkout the tag before building dSYM** *(critical — skipping this uploads the previous version's debug symbols)*
     - `git checkout vX.Y.Z` (detached HEAD on the exact released code)
@@ -124,8 +186,16 @@ Prepare a new release for term-mesh. This command updates the changelog, bumps t
       - Set `DRY_RUN=1` to stage the change locally without pushing.
     - Verify: `brew update && brew info --cask x-mesh/tap/term-mesh` should report the new version.
 
-15. **Return to the working branch**
-    - `git checkout main` (or `develop`) so subsequent commands don't run on detached HEAD.
+15. **Return to the working branch, and re-sync `develop`**
+    - `git checkout main && git fetch origin main && git merge --ff-only origin/main` so subsequent commands don't run on detached HEAD.
+    - **If the release went through step 2a**, `develop` is now behind `main` by the
+      version-bump commit. Left behind, the next release's PR carries a stale `CHANGELOG.md`
+      and pbxproj version. Fast-forward and push it:
+      ```bash
+      git checkout develop && git merge --ff-only origin/main && git push origin develop
+      ```
+      `--ff-only` is deliberate: if it refuses, `develop` gained commits during the release —
+      report that to the user rather than forcing a merge.
     - If local `main` diverged from `origin/main` during the release, flag it to the user — don't silently `reset --hard`.
 
 16. **Notify**

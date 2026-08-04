@@ -44,9 +44,20 @@ End-to-end release via PR flow: bump version, update changelog, create PR, merge
    - Commit message: `Bump version to X.Y.Z`
    - Push: `git push -u origin release/vX.Y.Z`
 
-7. **Create PR and wait for CI**
+7. **Create PR and check for branch CI**
    - `gh pr create --title "Release vX.Y.Z" --body "...changelog..."`
-   - `gh pr checks --watch`
+   - This repository has no workflow for `release/*` branches or release PRs:
+     `ghostty-prebuild` runs only on pushes to `main` / `feat/**`, and `release-linux`
+     runs only after a `v*` tag push. Do not use `gh pr checks --watch` or `gh run watch`.
+   - Resolve the branch run once:
+     ```bash
+     RUN_ID=$(gh run list --repo x-mesh/term-mesh --branch release/vX.Y.Z \
+       --limit 1 --json databaseId --jq '.[0].databaseId')
+     ```
+   - Empty `RUN_ID` is expected: report `No branch CI configured (expected)` and proceed to
+     step 8 without retrying. If a run exists after a future workflow change, poll with
+     `gh run view` every 30 seconds for at most 40 attempts. Proceed only on `success`; stop
+     and report failure, cancellation, or timeout.
 
 8. **Merge PR**
    - `gh pr merge --squash --delete-branch`

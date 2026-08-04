@@ -511,6 +511,8 @@ RELOAD_SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 RELOAD_PROJECT_DIR="$(dirname "$RELOAD_SCRIPT_DIR")"
 # shellcheck source=lib/ghostty-abi.sh
 . "$RELOAD_SCRIPT_DIR/lib/ghostty-abi.sh"
+# shellcheck source=lib/cargo.sh
+. "$RELOAD_SCRIPT_DIR/lib/cargo.sh"
 if ! ghostty_abi_is_consistent "$RELOAD_PROJECT_DIR"; then
   echo "==> ghostty ABI mismatch detected before build:"
   ghostty_abi_report "$RELOAD_PROJECT_DIR"
@@ -655,9 +657,9 @@ fi
 # Distinguish the two cases that were conflated: a machine that cannot build the
 # daemon at all is a warning; a daemon build that failed is fatal.
 if [[ -d "$PWD/daemon" && -f "$PWD/daemon/Cargo.toml" ]]; then
-  if ! command -v cargo >/dev/null 2>&1; then
+  if ! resolve_cargo; then
     echo "warning: cargo not found — no daemon binaries will be copied into the bundle" >&2
-  elif ! (cd "$PWD/daemon" && CARGO_TARGET_DIR="$SHARED_CARGO_TARGET" cargo build --release); then
+  elif ! (cd "$PWD/daemon" && CARGO_TARGET_DIR="$SHARED_CARGO_TARGET" "$CARGO_BIN" build --release); then
     echo "error: daemon build failed — refusing to launch with a daemon this build did not produce" >&2
     exit 1
   fi

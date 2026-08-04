@@ -9,6 +9,11 @@ NAME_SET=0
 BUNDLE_SET=0
 DERIVED_SET=0
 TAG=""
+CLEANUP_ONLY=0
+STAGING_TMP_ROOT="${TERMMESH_RELOAD_TMP_ROOT:-/tmp}"
+RELOADS_SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=lib/cargo.sh
+. "$RELOADS_SCRIPT_DIR/lib/cargo.sh"
 
 usage() {
   cat <<'EOF'
@@ -23,6 +28,8 @@ Options:
   --name <app name>      Override app display/bundle name.
   --bundle-id <id>       Override bundle identifier.
   --derived-data <path>  Override derived data path.
+  --cleanup              Stop this tagged app and reclaim its managed build artifacts.
+                         Requires --tag.
   -h, --help             Show this help.
 EOF
 }
@@ -84,6 +91,10 @@ while [[ $# -gt 0 ]]; do
       DERIVED_SET=1
       shift 2
       ;;
+    --cleanup)
+      CLEANUP_ONLY=1
+      shift
+      ;;
     -h|--help)
       usage
       exit 0
@@ -106,8 +117,94 @@ if [[ -n "$TAG" ]]; then
     BUNDLE_ID="com.termmesh.app.staging.${TAG_ID}"
   fi
   if [[ "$DERIVED_SET" -eq 0 ]]; then
-    DERIVED_DATA="/tmp/term-mesh-staging-${TAG_SLUG}"
+    DERIVED_DATA="${STAGING_TMP_ROOT}/term-mesh-staging-${TAG_SLUG}"
   fi
+fi
+
+# The app derives its socket path from its bundle id and deliberately ignores
+# TERMMESH_SOCKET_PATH for tagged bundles, so that a stale env var cannot
+# redirect a tagged build onto the production socket — see
+# SocketControlSettings.shouldHonorSocketPathOverride. Follow that convention
+# instead of fighting it: computing a different path here means the value
+# written to term-mesh-last-socket-path names a file the app never creates, and
+# the stale-socket cleanup below scrubs the wrong one, leaving the real socket
+# behind on every run.
+staging_socket_path() {
+  local bid="$1"
+  local tag=""
+  case "$bid" in
+    com.termmesh.app.staging.*)
+      # Mirrors SocketControlSettings.sanitizeTag: '.' becomes '-', anything
+      # outside [A-Za-z0-9_-] is dropped.
+      tag="$(printf '%s' "${bid#com.termmesh.app.staging.}" | sed -E 's/\./-/g; s/[^A-Za-z0-9_-]//g')"
+      ;;
+  esac
+  if [[ -n "$tag" ]]; then
+    echo "${STAGING_TMP_ROOT}/term-mesh-staging-${tag}.sock"
+  else
+    echo "${STAGING_TMP_ROOT}/term-mesh-staging.sock"
+  fi
+}
+
+STAGING_SLUG="${TAG_SLUG:-staging}"
+APP_SUPPORT_DIR="$HOME/Library/Application Support/term-mesh"
+TERMMESH_DAEMON_SOCKET="${APP_SUPPORT_DIR}/term-meshd-${STAGING_SLUG}.sock"
+TERMMESH_SOCKET="$(staging_socket_path "$BUNDLE_ID")"
+
+# Guards the one rm -rf below: only a path this script chose is reclaimable, and
+# only when it is a single component under the staging root and not a symlink.
+safe_managed_staging_path() {
+  local path="$1"
+  case "$path" in
+    "${STAGING_TMP_ROOT}"/term-mesh-staging-[a-z0-9]*)
+      [[ "${path#"${STAGING_TMP_ROOT}"/term-mesh-staging-}" != */* && ! -L "$path" ]]
+      ;;
+    *) return 1 ;;
+  esac
+}
+
+stop_staging_daemon() {
+  local socket_path="$1"
+  [[ -S "$socket_path" ]] || return 0
+  for PID in $(lsof -t "$socket_path" 2>/dev/null); do
+    kill "$PID" 2>/dev/null || true
+  done
+  rm -f "$socket_path"
+}
+
+wait_for_app_exit() {
+  local pattern="$1"
+  local attempt=0
+  for attempt in {1..40}; do
+    pgrep -f "$pattern" >/dev/null 2>&1 || return 0
+    sleep 0.1
+  done
+  return 1
+}
+
+if [[ "$CLEANUP_ONLY" -eq 1 ]]; then
+  if [[ -z "$TAG" ]]; then
+    echo "error: --cleanup requires --tag" >&2
+    exit 1
+  fi
+  APP_PROCESS_PATTERN="${APP_NAME}.app/Contents/MacOS/${BASE_APP_NAME}"
+  # A staging app that never finished launching ignores the quit event, so the
+  # pkill is the one that actually has to land.
+  /usr/bin/osascript -e "tell application id \"${BUNDLE_ID}\" to quit" >/dev/null 2>&1 || true
+  if ! wait_for_app_exit "$APP_PROCESS_PATTERN"; then
+    pkill -f "$APP_PROCESS_PATTERN" || true
+  fi
+  stop_staging_daemon "$TERMMESH_DAEMON_SOCKET"
+  rm -f "$TERMMESH_SOCKET"
+  if [[ "$DERIVED_SET" -eq 1 ]]; then
+    echo "note: --derived-data is caller-owned; left in place: ${DERIVED_DATA}"
+  elif safe_managed_staging_path "$DERIVED_DATA"; then
+    rm -rf "$DERIVED_DATA"
+  else
+    echo "note: not a managed staging path; left in place: ${DERIVED_DATA}" >&2
+  fi
+  echo "reclaimed staging build ${TAG_SLUG}"
+  exit 0
 fi
 
 XCODEBUILD_ARGS=(
@@ -187,11 +284,9 @@ if [[ -f "$INFO_PLIST" ]]; then
 
   # Inject staging socket paths via LSEnvironment so the Release binary
   # (which defaults to /tmp/term-mesh.sock) uses isolated sockets instead.
-  STAGING_SLUG="${TAG_SLUG:-staging}"
-  APP_SUPPORT_DIR="$HOME/Library/Application Support/term-mesh"
-  TERMMESH_DAEMON_SOCKET="${APP_SUPPORT_DIR}/term-meshd-${STAGING_SLUG}.sock"
-  TERMMESH_SOCKET="/tmp/term-mesh-${STAGING_SLUG}.sock"
-  echo "$TERMMESH_SOCKET" > /tmp/term-mesh-last-socket-path || true
+  # The paths themselves are resolved before the build, so --cleanup can find
+  # them without rebuilding.
+  echo "$TERMMESH_SOCKET" > "${STAGING_TMP_ROOT}/term-mesh-last-socket-path" || true
   /usr/libexec/PlistBuddy -c "Add :LSEnvironment dict" "$INFO_PLIST" 2>/dev/null || true
   /usr/libexec/PlistBuddy -c "Set :LSEnvironment:TERMMESH_DAEMON_UNIX_PATH \"${TERMMESH_DAEMON_SOCKET}\"" "$INFO_PLIST" 2>/dev/null \
     || /usr/libexec/PlistBuddy -c "Add :LSEnvironment:TERMMESH_DAEMON_UNIX_PATH string \"${TERMMESH_DAEMON_SOCKET}\"" "$INFO_PLIST"
@@ -220,12 +315,29 @@ sleep 0.3
 # and copy from target/release, matching reloadp.sh / reload.sh. The previous
 # `zig build` + `zig-out/bin/term-meshd` path silently failed ("no build.zig
 # file found"), so term-meshd was never copied and STAGING ran a stale daemon.
-if [[ -d "$PWD/daemon" ]]; then
-  (cd "$PWD/daemon" && cargo build --release) || echo "warn: cargo build failed; using existing target/release binaries"
+# Having no cargo at all is a warning; a daemon build that failed is fatal.
+# Falling back to whatever daemon/target/release already holds means launching a
+# binary this run did not produce, possibly from another branch — the failure
+# then looks like a successful build.
+DAEMON_BUILT=0
+if [[ -d "$PWD/daemon" && -f "$PWD/daemon/Cargo.toml" ]]; then
+  if ! resolve_cargo; then
+    echo "warning: cargo not found — no daemon binaries will be copied into the bundle" >&2
+  elif ! (cd "$PWD/daemon" && "$CARGO_BIN" build --release); then
+    echo "error: daemon build failed — refusing to launch with a daemon this build did not produce" >&2
+    exit 1
+  else
+    DAEMON_BUILT=1
+  fi
 fi
 BIN_DIR="$APP_PATH/Contents/Resources/bin"
 mkdir -p "$BIN_DIR"
+# Only what this run built. daemon/target/release survives between runs and
+# holds whatever was last built there, from whatever branch — on one machine it
+# was two days and several branches old, and got shipped into the bundle twice
+# because cargo was missing and the failure was only a warning.
 for bin in term-meshd term-mesh-run tm-agent term-mesh-peer-relay; do
+  [[ "$DAEMON_BUILT" -eq 1 ]] || continue
   src="$PWD/daemon/target/release/$bin"
   if [[ -x "$src" ]]; then
     cp "$src" "$BIN_DIR/$bin"
@@ -272,6 +384,13 @@ OPEN_CLEAN_ENV=(
 # (e.g. `tm-agent` run from a non-term-mesh shell) to drive it over the socket.
 "${OPEN_CLEAN_ENV[@]}" TERMMESH_SOCKET_PATH="$TERMMESH_SOCKET" TERMMESH_DAEMON_UNIX_PATH="$TERMMESH_DAEMON_SOCKET" open "$APP_PATH" --env TERMMESH_SOCKET_MODE=allowAll
 osascript -e "tell application id \"${BUNDLE_ID}\" to activate" || true
+
+echo "socket: ${TERMMESH_SOCKET}"
+if [[ -n "$TAG" ]]; then
+  # Release derived data is several GB per tag and nothing sweeps it, so say how
+  # to get it back.
+  echo "cleanup: ./scripts/reloads.sh --tag ${TAG} --cleanup"
+fi
 
 # Safety: ensure only one instance is running.
 sleep 0.2

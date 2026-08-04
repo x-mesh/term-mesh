@@ -618,6 +618,9 @@ tm-agent brief <agent>
 # Machine-readable status/task/collect/reports retain duplicate rows and expose body-free routing
 # telemetry (wave/task/agent_instance/host/checkout/delivery/synthesis). A hard timebox converges
 # on completed evidence and blocks/cancels/splits remaining work — timeout is never success.
+# External events (CI, deploys, remote builds) require an existence check and bounded watch. Either
+# report at the cap or delegate a shorter bounded watch to a worker and wait for its reply; an ended
+# leader turn does not resume by itself.
 #
 # Broadcast reaches ALL panels including duplicate-named agents:
 #   tm-agent broadcast 'msg'
@@ -999,6 +1002,10 @@ Use the `/release` command to prepare a new release. This will:
 4. Run `./scripts/bump-version.sh` to update both versions
 5. Commit, tag, and push
 6. Upload dSYM debug symbols to Sentry (`./scripts/upload-dsym.sh --build`)
+
+There is no PR or branch CI for `release/*`: `ghostty-prebuild` runs only on
+pushes to `main` / `feat/**`, while `release-linux` runs only on a `v*` tag
+push. Do not wait for branch checks during a release.
 
 Running from a non-`main` branch: `/release` cuts the release branch from the current HEAD, so the branch's commits are **folded into the release PR** and squash-merged to `main` together with the version bump (one squash commit). The command first guards a clean tree and that the branch isn't behind `origin/main`. To keep the feature commits as a distinct change, merge the branch to `main` on its own PR first, then run `/release` from `main`.
 
