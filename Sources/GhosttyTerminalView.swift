@@ -274,7 +274,9 @@ final class TerminalSurface: Identifiable, ObservableObject {
     /// surfaces that have been invisible (e.g. background workspace) for a while.
     /// Starts true: a freshly created surface is realized.
     private var rendererRealized = true
-    @MainActor var isRendererReadyForImmediateVisibility: Bool { rendererRealized }
+    @MainActor var isRendererReadyForImmediateVisibility: Bool {
+        surface != nil && rendererRealized
+    }
     /// Debounced unrealize work item, so transient reparent/workspace flaps don't
     /// thrash the swap chain (recreate cost) when a surface briefly goes invisible.
     private var rendererUnrealizeWork: DispatchWorkItem?
@@ -981,7 +983,7 @@ final class TerminalSurface: Identifiable, ObservableObject {
         ghostty_surface_set_occlusion(createdSurface, visibleInUI)
         DispatchQueue.main.async { [weak self] in
             guard let self, self.surface == createdSurface else { return }
-            self.setSurfaceVisibleForRenderer(visibleInUI)
+            self.setSurfaceVisibleForRenderer(self.surfaceView.isVisibleInUI)
         }
 
         // For vsync-driven rendering, Ghostty needs to know which display we're on so it can

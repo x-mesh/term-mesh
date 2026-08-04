@@ -9,6 +9,17 @@ import os
 final class TeamOrchestrator: ObservableObject {
     static let shared = TeamOrchestrator()
 
+    private init() {
+        // Native turn state lives in the thread-safe data store rather than in
+        // teams. Forward its coalesced change signal so sidebar runtime
+        // snapshots are recomputed when an agent starts or finishes a turn.
+        TeamDataStore.shared.onDataChanged = { [weak self] in
+            Task { @MainActor in
+                self?.objectWillChange.send()
+            }
+        }
+    }
+
     /// Live project workspaces whose last local window was closed.
     ///
     /// A window is only a viewer for a project. Retaining the Workspace keeps
@@ -7201,6 +7212,7 @@ final class TeamOrchestrator: ObservableObject {
         if let count = messages[teamName]?.count, count > maxMessagesPerTeam {
             messages[teamName]?.removeFirst(count - maxMessagesPerTeam)
         }
+        objectWillChange.send()
         syncTeamStateToDaemon()
         return msg
     }
@@ -7220,6 +7232,7 @@ final class TeamOrchestrator: ObservableObject {
     /// Clear messages for a team.
     func clearMessages(teamName: String) {
         messages.removeValue(forKey: teamName)
+        objectWillChange.send()
         syncTeamStateToDaemon()
     }
 
@@ -7292,6 +7305,7 @@ final class TeamOrchestrator: ObservableObject {
             tasks[parentIdx].updatedAt = now
             taskBoards[teamName] = tasks
         }
+        objectWillChange.send()
         syncTeamStateToDaemon()
         return task
     }
@@ -7388,6 +7402,7 @@ final class TeamOrchestrator: ObservableObject {
         }
         tasks[idx].updatedAt = now
         taskBoards[teamName] = tasks
+        objectWillChange.send()
         syncTeamStateToDaemon()
         return tasks[idx]
     }
@@ -7416,6 +7431,7 @@ final class TeamOrchestrator: ObservableObject {
             tasks[idx].reassignmentCount += 1
         }
         taskBoards[teamName] = tasks
+        objectWillChange.send()
         syncTeamStateToDaemon()
         return tasks[idx]
     }
@@ -7436,6 +7452,7 @@ final class TeamOrchestrator: ObservableObject {
         tasks[idx].updatedAt = now
         tasks[idx].lastProgressAt = now
         taskBoards[teamName] = tasks
+        objectWillChange.send()
         syncTeamStateToDaemon()
         return tasks[idx]
     }
@@ -7507,6 +7524,7 @@ final class TeamOrchestrator: ObservableObject {
             tasks[idx].lastProgressAt = now
             taskBoards[teamName] = tasks
         }
+        objectWillChange.send()
         syncTeamStateToDaemon()
     }
 
@@ -7603,6 +7621,7 @@ final class TeamOrchestrator: ObservableObject {
     /// Clear the task board for a team.
     func clearTasks(teamName: String) {
         taskBoards.removeValue(forKey: teamName)
+        objectWillChange.send()
         syncTeamStateToDaemon()
     }
 

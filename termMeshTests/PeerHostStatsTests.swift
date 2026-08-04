@@ -93,7 +93,7 @@ final class PeerHostStatsTests: XCTestCase {
 
         // Read/write, not arrows — those already mean "over the wire" in
         // the network group and would read as more traffic here.
-        XCTAssertTrue(summary.contains("io 1.2M/340K"), "got \(summary)")
+        XCTAssertTrue(summary.contains("agent io 1.2M/340K"), "got \(summary)")
     }
 
     func testIdleHostShowsOnlyWhatIsHappening() {
@@ -111,7 +111,7 @@ final class PeerHostStatsTests: XCTestCase {
             wire(load: 1, load5: 1, load15: 1, rx: 10, tx: 10, diskRead: 10, diskWrite: 10)
         ).groups
 
-        XCTAssertEqual(groups.map { $0.text.prefix(3) }.map(String.init), ["loa", "mem", "net", "io "])
+        XCTAssertEqual(groups.map { $0.text.prefix(3) }.map(String.init), ["loa", "mem", "net", "age"])
         XCTAssertEqual(groups.map(\.dropPriority), [0, -1, -2, -3])
     }
 

@@ -74,6 +74,21 @@ struct SidebarEmptyArea: View {
     }
 }
 
+struct SidebarTeamRuntimeSnapshot: Equatable {
+    struct AgentState: Equatable {
+        let agentInstanceId: String
+        let state: String
+    }
+
+    let teamName: String
+    let attentionCount: Int
+    let agentStates: [AgentState]
+
+    func state(for agentInstanceId: String) -> String {
+        agentStates.first(where: { $0.agentInstanceId == agentInstanceId })?.state ?? "idle"
+    }
+}
+
 struct TabItemView: View, Equatable {
     @Environment(\.colorScheme) private var colorScheme
     /// Action target only. The row deliberately does not subscribe to the
@@ -85,9 +100,12 @@ struct TabItemView: View, Equatable {
     let isActive: Bool
     let isMultiSelected: Bool
     let workspaceCount: Int
-    /// Parent-computed snapshot. Avoids a linear scan of every team from
-    /// every row body and makes team membership part of the Equatable edge.
-    let activeTeamName: String?
+    /// Parent-computed live snapshot. Keeping roster/state/attention values in
+    /// the Equatable edge updates the affected row without invalidating all rows.
+    let teamRuntimeSnapshot: SidebarTeamRuntimeSnapshot?
+    /// Profile changes publish through RemoteHostStore; carrying the rendered
+    /// label makes a rename cross this row's Equatable edge.
+    let remoteHostLabel: String?
     /// Parent-computed notification state. This prevents a notification for
     /// one workspace from directly invalidating every sidebar row.
     let notificationSummary: SidebarNotificationSummary
@@ -123,7 +141,8 @@ struct TabItemView: View, Equatable {
         isActive: Bool,
         isMultiSelected: Bool,
         workspaceCount: Int,
-        activeTeamName: String?,
+        teamRuntimeSnapshot: SidebarTeamRuntimeSnapshot?,
+        remoteHostLabel: String?,
         notificationSummary: SidebarNotificationSummary,
         visibleTabIds: [UUID],
         rowSpacing: CGFloat,
@@ -141,7 +160,8 @@ struct TabItemView: View, Equatable {
         self.isActive = isActive
         self.isMultiSelected = isMultiSelected
         self.workspaceCount = workspaceCount
-        self.activeTeamName = activeTeamName
+        self.teamRuntimeSnapshot = teamRuntimeSnapshot
+        self.remoteHostLabel = remoteHostLabel
         self.notificationSummary = notificationSummary
         self.visibleTabIds = visibleTabIds
         self.rowSpacing = rowSpacing
@@ -206,7 +226,7 @@ struct TabItemView: View, Equatable {
     /// to keep the row's VStack within the Swift type-checker's budget.
     @ViewBuilder
     private var hostChip: some View {
-        if let hostKey = tab.dominantRemoteHostKey {
+        if let hostKey = tab.dominantRemoteHostKey, let remoteHostLabel {
             let chipColor = Color(nsColor: PeerHostAccent.primaryColor(for: hostKey))
             // Dot always carries the host hue. Text switches to white on a
             // selected row (bright gradient background) where the host hue
@@ -216,7 +236,7 @@ struct TabItemView: View, Equatable {
                 Circle()
                     .fill(chipColor)
                     .frame(width: 5, height: 5)
-                Text(PeerHostProfileStore.shared.displayLabel(for: hostKey))
+                Text(remoteHostLabel)
                     .font(.system(size: 10, weight: usesInvertedActiveForeground ? .medium : .regular, design: .monospaced))
                     .foregroundColor(textColor)
                     .lineLimit(1)
@@ -342,7 +362,8 @@ struct TabItemView: View, Equatable {
             lhs.isActive == rhs.isActive &&
             lhs.isMultiSelected == rhs.isMultiSelected &&
             lhs.workspaceCount == rhs.workspaceCount &&
-            lhs.activeTeamName == rhs.activeTeamName &&
+            lhs.teamRuntimeSnapshot == rhs.teamRuntimeSnapshot &&
+            lhs.remoteHostLabel == rhs.remoteHostLabel &&
             lhs.notificationSummary == rhs.notificationSummary &&
             lhs.visibleTabIds == rhs.visibleTabIds &&
             lhs.rowSpacing == rhs.rowSpacing &&
@@ -467,7 +488,7 @@ struct TabItemView: View, Equatable {
             }
 
             // Active team indicator with inbox badge and expandable overview
-            if let teamName = activeTeamName {
+            if let teamName = teamRuntimeSnapshot?.teamName {
                 teamIndicatorView(teamName: teamName)
             }
 
@@ -963,11 +984,7 @@ struct TabItemView: View, Equatable {
     }
 
     private var activeTeam: TeamOrchestrator.Team? {
-        activeTeamName.flatMap { TeamOrchestrator.shared.teams[$0] }
-    }
-
-    private func teamAttentionCount(teamName: String) -> Int {
-        TeamOrchestrator.shared.inboxItems(teamName: teamName).count
+        teamRuntimeSnapshot.flatMap { TeamOrchestrator.shared.teams[$0.teamName] }
     }
 
     @ViewBuilder
@@ -978,7 +995,7 @@ struct TabItemView: View, Equatable {
         TeamIndicatorBlock(
             teamName: teamName,
             activeTeam: activeTeam,
-            attentionCount: teamAttentionCount(teamName: teamName),
+            attentionCount: teamRuntimeSnapshot?.attentionCount ?? 0,
             badgeForegroundColor: activeSecondaryColor(0.9),
             teamContextMenuBuilder: { AnyView(self.teamRowContextMenu(teamName: teamName)) },
             agentDotBuilder: { agent in AnyView(self.agentDot(teamName: teamName, agent: agent)) }
@@ -987,7 +1004,7 @@ struct TabItemView: View, Equatable {
 
     @ViewBuilder
     private func agentDot(teamName: String, agent: TeamOrchestrator.AgentMember) -> some View {
-        let state = TeamOrchestrator.shared.agentState(teamName: teamName, agentName: agent.name)
+        let state = teamRuntimeSnapshot?.state(for: agent.agentInstanceId) ?? "idle"
         let color: Color = switch state {
         case "running":      .green
         case "blocked":      .red

@@ -58,11 +58,22 @@ struct VerticalTabsSidebar: View {
 
     var body: some View {
         let notificationSummaryByWorkspaceId = notificationStore.sidebarSummaryCache
-        let teamNameByWorkspaceId = teamOrchestrator.teams.values.reduce(into: [UUID: String]()) { result, team in
+        let teamSnapshotByWorkspaceId = teamOrchestrator.teams.values.reduce(
+            into: [UUID: SidebarTeamRuntimeSnapshot]()
+        ) { result, team in
             // Preserve the old `first(where:)` behavior for the unlikely case
             // where stale team records temporarily share a workspace.
             if result[team.workspaceId] == nil {
-                result[team.workspaceId] = team.id
+                result[team.workspaceId] = SidebarTeamRuntimeSnapshot(
+                    teamName: team.id,
+                    attentionCount: teamOrchestrator.inboxItems(teamName: team.id).count,
+                    agentStates: team.agents.map { agent in
+                        SidebarTeamRuntimeSnapshot.AgentState(
+                            agentInstanceId: agent.agentInstanceId,
+                            state: teamOrchestrator.agentState(teamName: team.id, agentName: agent.name)
+                        )
+                    }
+                )
             }
         }
         VStack(spacing: 0) {
@@ -110,7 +121,10 @@ struct VerticalTabsSidebar: View {
                                                 isActive: tabManager.selectedTabId == tab.id,
                                                 isMultiSelected: selectedTabIds.contains(tab.id),
                                                 workspaceCount: tabManager.tabs.count,
-                                                activeTeamName: teamNameByWorkspaceId[tab.id],
+                                                teamRuntimeSnapshot: teamSnapshotByWorkspaceId[tab.id],
+                                                remoteHostLabel: tab.dominantRemoteHostKey.map {
+                                                    PeerHostProfileStore.shared.displayLabel(for: $0)
+                                                },
                                                 notificationSummary: notificationSummaryByWorkspaceId[tab.id] ?? SidebarNotificationSummary(),
                                                 visibleTabIds: visibleLocalWorkspaceIds,
                                                 rowSpacing: tabRowSpacing,

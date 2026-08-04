@@ -20,15 +20,14 @@ final class ProcessTreeSnapshotTests: XCTestCase {
         )
     }
 
-    func testTargetedTraversalRejectsRootLookupFailureButToleratesExitedChild() {
+    func testTargetedTraversalRejectsAnyLookupFailureSoCallerCanFallback() {
         XCTAssertNil(ProcessTreeSnapshot.descendantPIDs(of: 10) { _ in nil })
 
-        XCTAssertEqual(
+        XCTAssertNil(
             ProcessTreeSnapshot.descendantPIDs(of: 10) { pid in
                 if pid == 10 { return [11] }
                 return nil
-            },
-            Set([11])
+            }
         )
     }
 

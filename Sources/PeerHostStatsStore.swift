@@ -98,7 +98,7 @@ struct PeerHostStats: Equatable, Sendable {
         if wire.diskReadBytesPerSec > 0 || wire.diskWriteBytesPerSec > 0 {
             groups.append(
                 Group(
-                    text: "io \(Self.rate(wire.diskReadBytesPerSec))/\(Self.rate(wire.diskWriteBytesPerSec))",
+                    text: "agent io \(Self.rate(wire.diskReadBytesPerSec))/\(Self.rate(wire.diskWriteBytesPerSec))",
                     dropPriority: -3
                 )
             )

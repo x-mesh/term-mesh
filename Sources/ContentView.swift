@@ -63,16 +63,27 @@ final class TitlebarGitSnapshotCache: @unchecked Sendable {
         let snapshot: TitlebarGitSnapshot
         let completedAt: TimeInterval
     }
+    private struct InFlight {
+        let id: UUID
+        let claimedAt: TimeInterval
+        var completions: [(TitlebarGitSnapshot) -> Void]
+    }
 
     private let lock = NSLock()
     private let ttl: TimeInterval
     private let negativeTTL: TimeInterval
+    private let inFlightTimeout: TimeInterval
     private var entries: [String: Entry] = [:]
-    private var waiters: [String: [(TitlebarGitSnapshot) -> Void]] = [:]
+    private var inFlight: [String: InFlight] = [:]
 
-    init(ttl: TimeInterval = 2.0, negativeTTL: TimeInterval = 10.0) {
+    init(
+        ttl: TimeInterval = 2.0,
+        negativeTTL: TimeInterval = 10.0,
+        inFlightTimeout: TimeInterval = 5.0
+    ) {
         self.ttl = ttl
         self.negativeTTL = negativeTTL
+        self.inFlightTimeout = inFlightTimeout
     }
 
     func resolve(
@@ -89,19 +100,30 @@ final class TitlebarGitSnapshotCache: @unchecked Sendable {
             completion(entry.snapshot)
             return
         }
-        if waiters[key] != nil {
-            waiters[key, default: []].append(completion)
+        if var claim = inFlight[key], now - claim.claimedAt < inFlightTimeout {
+            claim.completions.append(completion)
+            inFlight[key] = claim
             lock.unlock()
             return
         }
-        waiters[key] = [completion]
+        let claimID = UUID()
+        let inheritedCompletions = inFlight[key]?.completions ?? []
+        inFlight[key] = InFlight(
+            id: claimID,
+            claimedAt: now,
+            completions: inheritedCompletions + [completion]
+        )
         lock.unlock()
 
         let snapshot = load()
 
         lock.lock()
+        guard inFlight[key]?.id == claimID else {
+            lock.unlock()
+            return
+        }
         entries[key] = Entry(snapshot: snapshot, completedAt: now)
-        let completions = waiters.removeValue(forKey: key) ?? []
+        let completions = inFlight.removeValue(forKey: key)?.completions ?? []
         lock.unlock()
         completions.forEach { $0(snapshot) }
     }

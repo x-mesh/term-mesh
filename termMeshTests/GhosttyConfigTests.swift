@@ -446,6 +446,55 @@ final class TitlebarGitSnapshotCacheTests: XCTestCase {
         XCTAssertEqual(finalLoadCount, 1)
         XCTAssertEqual(finalResults, [expected, expected])
     }
+
+    func testExpiredInFlightClaimIsReplacedAndLateResultIsDiscarded() {
+        let cache = TitlebarGitSnapshotCache(ttl: 2, negativeTTL: 10, inFlightTimeout: 5)
+        let firstLoadStarted = expectation(description: "first load started")
+        let firstLoadFinished = expectation(description: "first load finished")
+        let bothCompleted = expectation(description: "both callers completed from replacement")
+        bothCompleted.expectedFulfillmentCount = 2
+        let releaseFirstLoad = DispatchSemaphore(value: 0)
+        let replacement = TitlebarGitSnapshot(
+            branch: "replacement", isDirty: true, dirtyCount: 1, isWorktree: false
+        )
+        let stale = TitlebarGitSnapshot(
+            branch: "stale", isDirty: false, dirtyCount: 0, isWorktree: false
+        )
+        let lock = NSLock()
+        var results: [TitlebarGitSnapshot] = []
+
+        DispatchQueue.global().async {
+            cache.resolve(directory: "/tmp/repo", now: 10, load: {
+                firstLoadStarted.fulfill()
+                releaseFirstLoad.wait()
+                firstLoadFinished.fulfill()
+                return stale
+            }, completion: { snapshot in
+                lock.lock()
+                results.append(snapshot)
+                lock.unlock()
+                bothCompleted.fulfill()
+            })
+        }
+
+        wait(for: [firstLoadStarted], timeout: 1)
+        DispatchQueue.global().async {
+            cache.resolve(directory: "/tmp/repo", now: 16, load: { replacement }) { snapshot in
+                lock.lock()
+                results.append(snapshot)
+                lock.unlock()
+                bothCompleted.fulfill()
+            }
+        }
+
+        wait(for: [bothCompleted], timeout: 1)
+        releaseFirstLoad.signal()
+        wait(for: [firstLoadFinished], timeout: 1)
+        lock.lock()
+        let finalResults = results
+        lock.unlock()
+        XCTAssertEqual(finalResults, [replacement, replacement])
+    }
 }
 
 final class TitlebarGitStatusParserTests: XCTestCase {

@@ -493,8 +493,16 @@ impl MonitorHandle {
     }
 
     pub fn untrack_pid(&self, pid: u32) {
-        let mut pids = self.tracked_pids.lock().unwrap();
-        pids.retain(|&p| p != pid);
+        {
+            let mut pids = self.tracked_pids.lock().unwrap();
+            pids.retain(|&p| p != pid);
+        }
+        // A stopped process can outlive its tracking relationship. Resume it
+        // before forgetting the PID and always clear membership so PID reuse
+        // cannot make a new process look already stopped.
+        if self.stopped_pids.lock().unwrap().remove(&pid) {
+            let _ = send_signal(pid, libc::SIGCONT);
+        }
         tracing::info!("untracked PID {pid}");
     }
 
@@ -617,6 +625,22 @@ mod tests {
 
         handle.untrack_pid(5678);
         assert!(handle.tracked_pids().is_empty());
+    }
+
+    #[test]
+    fn untrack_clears_stopped_membership_for_pid_reuse() {
+        let handle = MonitorHandle {
+            tracked_pids: std::sync::Arc::new(std::sync::Mutex::new(vec![99999])),
+            stopped_pids: std::sync::Arc::new(std::sync::Mutex::new(HashSet::from([99999]))),
+            auto_stop: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            cpu_threshold: 90.0,
+            memory_threshold: 4 * 1024 * 1024 * 1024,
+        };
+
+        handle.untrack_pid(99999);
+
+        assert!(handle.tracked_pids().is_empty());
+        assert!(handle.stopped_pids.lock().unwrap().is_empty());
     }
 
     #[test]

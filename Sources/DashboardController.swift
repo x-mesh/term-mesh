@@ -14,8 +14,9 @@ enum ProcessTreeSnapshot {
     /// Walk descendants from a targeted child lookup. Unlike a process-table
     /// snapshot, this scales with this app's own tree rather than every process
     /// on the machine. A child can disappear between the parent and child
-    /// lookups; that is a normal exit, so only a root lookup failure invalidates
-    /// the traversal.
+    /// lookups. Because libproc cannot distinguish that exit from a query error,
+    /// any failed lookup invalidates the targeted snapshot so callers can use
+    /// the coverage-preserving full-table fallback.
     nonisolated static func descendantPIDs(
         of rootPID: Int32,
         childrenOf: (Int32) -> [Int32]?
@@ -28,10 +29,7 @@ enum ProcessTreeSnapshot {
         while nextIndex < pending.count {
             let parentPID = pending[nextIndex]
             nextIndex += 1
-            guard let children = childrenOf(parentPID) else {
-                if parentPID == rootPID { return nil }
-                continue
-            }
+            guard let children = childrenOf(parentPID) else { return nil }
             for pid in children where pid > 0 && visited.insert(pid).inserted {
                 descendants.insert(pid)
                 pending.append(pid)
@@ -227,6 +225,7 @@ final class DashboardController: NSObject, WKNavigationDelegate {
     private var uiFetchGeneration = 0
     private var trackingTimer: Timer?
     private var trackingSyncInFlight = false
+    private var alertPollInFlight = false
     private var trackedPIDs: Set<Int32> = []
     private var messageHandler: DashboardMessageHandler?
 
@@ -235,9 +234,11 @@ final class DashboardController: NSObject, WKNavigationDelegate {
     private struct ProjectRootCacheEntry {
         let root: String
         let resolvedAt: Date
+        let foundProjectMarker: Bool
     }
     private var projectRootCache: [String: ProjectRootCacheEntry] = [:]
     private let projectRootCacheTTL: TimeInterval = 60
+    private let negativeProjectRootCacheTTL: TimeInterval = 3
     private struct FleetPayloadCacheEntry {
         let payload: [String: Any]
         let createdAt: Date
@@ -423,12 +424,9 @@ final class DashboardController: NSObject, WKNavigationDelegate {
                 self.watchTabProjects(projectRoots: projectRoots)
                 self.syncSessionsToDaemon(projectRoots: projectRoots)
                 self.syncTeamsToDaemon()
-                // The open dashboard already obtains monitor.snapshot every two
-                // seconds. Reuse that response for alerts instead of issuing a
-                // second snapshot RPC from the three-second tracking cycle.
-                if self.uiTimer == nil {
-                    self.pollAlerts()
-                }
+                // Budget Guard notifications are safety-critical and cannot wait
+                // behind the dashboard's long, serial multi-RPC refresh.
+                self.pollAlerts()
                 self.deliverPendingInputs()
             }
         }
@@ -588,16 +586,22 @@ final class DashboardController: NSObject, WKNavigationDelegate {
 
     /// Poll monitor snapshot for alerts and send native notifications for new SIGSTOP events.
     private func pollAlerts() {
+        guard !alertPollInFlight else { return }
+        alertPollInFlight = true
         requestNotificationPermission()
 
         DispatchQueue.global(qos: .utility).async { [weak self, daemon = self.daemon] in
-            guard let response = daemon.rpcCallRaw(method: "monitor.snapshot", params: [:]),
-                  let data = response.data(using: .utf8),
-                  let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-                  let alerts = json["alerts"] as? [[String: Any]] else { return }
+            let alerts: [[String: Any]]? = daemon.rpcCallRaw(method: "monitor.snapshot", params: [:])
+                .flatMap { $0.data(using: .utf8) }
+                .flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] }
+                .flatMap { $0["alerts"] as? [[String: Any]] }
 
             DispatchQueue.main.async {
-                self?.processAlerts(alerts)
+                guard let self else { return }
+                self.alertPollInFlight = false
+                if let alerts {
+                    self.processAlerts(alerts)
+                }
             }
         }
     }
@@ -793,13 +797,20 @@ final class DashboardController: NSObject, WKNavigationDelegate {
             activeDirectories.insert(cwd)
 
             if let cached = projectRootCache[cwd],
-               now.timeIntervalSince(cached.resolvedAt) < projectRootCacheTTL {
+               now.timeIntervalSince(cached.resolvedAt) < (
+                   cached.foundProjectMarker ? projectRootCacheTTL : negativeProjectRootCacheTTL
+               ) {
                 roots[workspace.id] = cached.root
                 continue
             }
 
-            let root = findProjectRoot(from: cwd) ?? cwd
-            projectRootCache[cwd] = ProjectRootCacheEntry(root: root, resolvedAt: now)
+            let detectedRoot = findProjectRoot(from: cwd)
+            let root = detectedRoot ?? cwd
+            projectRootCache[cwd] = ProjectRootCacheEntry(
+                root: root,
+                resolvedAt: now,
+                foundProjectMarker: detectedRoot != nil
+            )
             roots[workspace.id] = root
         }
 
