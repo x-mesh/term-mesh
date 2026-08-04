@@ -16,6 +16,20 @@ git config core.hooksPath .githooks
 echo "==> Initializing submodules..."
 git submodule update --init --recursive
 
+# `git submodule update` above aligns a drifted worktree on its own, and fails
+# loudly on a dirty one. It stays silent in one case: a submodule carrying
+# local commits. Verify the worktree really landed on the pin, because every
+# ABI decision below keys off it.
+PINNED_GHOSTTY_SHA="$(git rev-parse HEAD:ghostty 2>/dev/null || true)"
+GHOSTTY_SHA="$(git -C ghostty rev-parse HEAD)"
+if [ -n "$PINNED_GHOSTTY_SHA" ] && [ "$PINNED_GHOSTTY_SHA" != "$GHOSTTY_SHA" ]; then
+    echo "ERROR: ghostty submodule is not on the commit this repo pins." >&2
+    echo "  pinned by parent  : $PINNED_GHOSTTY_SHA" >&2
+    echo "  submodule worktree: $GHOSTTY_SHA" >&2
+    echo "  Fix with ./scripts/sync-submodules.sh, then re-run this script." >&2
+    exit 1
+fi
+
 # Keep the committed root ghostty.h in sync with the ghostty submodule header.
 # Swift compiles the ghostty C API *declarations* from this root copy (imported
 # via term-mesh-Bridging-Header.h); the xcframework only supplies libghostty.a
@@ -43,7 +57,7 @@ fi
 echo "==> Cleaning problematic xcframework-* tags in ghostty submodule..."
 git -C ghostty tag -l 'xcframework-*' | while read -r t; do git -C ghostty tag -d "$t"; done 2>/dev/null || true
 
-GHOSTTY_SHA="$(git -C ghostty rev-parse HEAD)"
+# GHOSTTY_SHA was resolved and verified against the parent's pin above.
 CACHE_ROOT="${TERMMESH_GHOSTTYKIT_CACHE_DIR:-$HOME/.cache/term-mesh/ghosttykit}"
 CACHE_DIR="$CACHE_ROOT/$GHOSTTY_SHA"
 CACHE_XCFRAMEWORK="$CACHE_DIR/GhosttyKit.xcframework"
@@ -217,6 +231,17 @@ fi
 
 echo "==> Creating symlink for GhosttyKit.xcframework..."
 ln -sfn "$CACHE_XCFRAMEWORK" GhosttyKit.xcframework
+
+# Final ABI assert: the declarations Swift compiles must match the archive it
+# links. True by construction above, so a failure here means a future edit
+# broke the invariant — catch it now instead of in a runtime segfault.
+# shellcheck source=lib/ghostty-abi.sh
+. "$SCRIPT_DIR/lib/ghostty-abi.sh"
+if ! ghostty_abi_is_consistent "$PROJECT_DIR"; then
+    echo "ERROR: ghostty ABI check failed after setup." >&2
+    ghostty_abi_report "$PROJECT_DIR"
+    exit 1
+fi
 
 # Each cached SHA is ~540M and nothing ever removed the old ones, so a repo
 # that follows ghostty for a while quietly loses gigabytes to frameworks no
