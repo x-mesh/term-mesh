@@ -72,22 +72,25 @@ Prepare a new release for term-mesh. This command updates the changelog, bumps t
    - Create PR: `gh pr create --title "Release vX.Y.Z" --body "...changelog summary..."`
    - Include the changelog entries in the PR body
 
-8. **Monitor CI**
-   - **Do NOT use `gh pr checks --watch`** — it polls the GraphQL pool continuously and a
-     long CI run can drain thousands of GraphQL calls in a single release.
-   - Instead, poll with a bounded loop on the underlying workflow run (uses the REST/core
-     pool, and `gh run watch` streams without per-tick GraphQL):
+8. **Check for branch CI without waiting for a run that cannot exist**
+   - Ground truth for this repository: no workflow runs for `release/*` branches or release
+     PRs. `ghostty-prebuild` runs only on pushes to `main` / `feat/**`, and `release-linux`
+     runs on `v*` tag pushes. An empty branch run is therefore expected, not something to
+     retry.
+   - **Do NOT use `gh pr checks --watch` or `gh run watch`**. Both can hold the leader on an
+     external event with no hard deadline.
+   - Resolve the run id exactly once:
      ```bash
-     # Resolve the run id once, then stream it (REST-backed):
      RUN_ID=$(gh run list --repo x-mesh/term-mesh --branch release/vX.Y.Z \
        --limit 1 --json databaseId --jq '.[0].databaseId')
-     gh run watch "$RUN_ID" --repo x-mesh/term-mesh --exit-status
      ```
-   - If `gh run watch` is unavailable, fall back to a capped manual poll: `gh run view
-     "$RUN_ID" --json status,conclusion` every ~30s, max ~40 iterations (~20 min), then
-     stop and report rather than polling forever.
-   - If CI fails, fix the issues and push again
-   - Wait for all checks to pass before proceeding
+   - If `RUN_ID` is empty, report `No branch CI configured (expected)` and proceed directly
+     to step 9. Do not sleep, retry, or wait for a run to appear.
+   - If a run does exist (for example, after a future workflow change), poll it through
+     `gh run view "$RUN_ID" --json status,conclusion` every 30 seconds, at most 40 times
+     (~20 minutes). Proceed only on conclusion `success`. On failure, cancellation, or the
+     attempt cap, stop the release and report the current state plus the next action;
+     timeout is not success.
 
 9. **Merge the PR into main**
    - Target branch is `main` (see CLAUDE.md — main is the released-version branch).
@@ -100,6 +103,21 @@ Prepare a new release for term-mesh. This command updates the changelog, bumps t
     - `git fetch origin main` (do NOT fast-forward local main — it may carry local-only commits that diverge from the squash-merge result; the tag only needs the remote SHA).
     - `git tag vX.Y.Z <squash-merge-sha>` — tag the exact commit that got merged to main, not whatever local HEAD happens to be.
     - `git push origin vX.Y.Z`
+    - The tag push triggers `release-linux.yml`; its Linux assets upload asynchronously.
+      Discover only this release's run by filtering on both workflow and merge commit SHA,
+      trying every 5 seconds for at most 60 seconds:
+      ```bash
+      RUN_URL=""
+      for attempt in {1..12}; do
+        RUN_URL=$(gh run list --repo x-mesh/term-mesh --workflow release-linux.yml \
+          --commit <squash-merge-sha> --event push --limit 1 --json url --jq '.[0].url')
+        [ -n "$RUN_URL" ] && break
+        sleep 5
+      done
+      ```
+      Include `RUN_URL` in the final report when found, but do not wait for completion. If
+      it is still empty, report `release-linux run not yet observed` with the workflow page
+      URL and continue; this asynchronous discovery timeout does not invalidate the release.
 
 11. **Checkout the tag before building dSYM** *(critical — skipping this uploads the previous version's debug symbols)*
     - `git checkout vX.Y.Z` (detached HEAD on the exact released code)
