@@ -19,12 +19,12 @@ final class AgentSessionTests: XCTestCase {
         let first = LeaderParallelPolicy.renderedInstructions
         let second = LeaderParallelPolicy.renderedInstructions
 
-        XCTAssertEqual(LeaderParallelPolicy.version, "3")
+        XCTAssertEqual(LeaderParallelPolicy.version, "4")
         XCTAssertEqual(LeaderParallelPolicy.activation, "runtime-enforced")
         XCTAssertEqual(first, second)
         XCTAssertEqual(LeaderParallelPolicy.digest.count, 64)
         XCTAssertTrue(LeaderParallelPolicy.digest.allSatisfy { $0.isHexDigit })
-        XCTAssertTrue(first.contains("policy_version: 3"))
+        XCTAssertTrue(first.contains("policy_version: 4"))
         XCTAssertTrue(first.contains("policy_digest: \(LeaderParallelPolicy.digest)"))
         XCTAssertTrue(first.contains("policy_activation: runtime-enforced"))
     }
@@ -41,6 +41,7 @@ final class AgentSessionTests: XCTestCase {
             "isolated-checkout-ref-contract",
             "policy-parity",
             "timebox-convergence",
+            "external-event-wait",
         ].forEach { XCTAssertTrue(policy.contains("[\($0)]"), "missing \($0)") }
         XCTAssertTrue(policy.contains("This policy is active."))
     }

@@ -618,6 +618,9 @@ tm-agent brief <agent>
 # Machine-readable status/task/collect/reports retain duplicate rows and expose body-free routing
 # telemetry (wave/task/agent_instance/host/checkout/delivery/synthesis). A hard timebox converges
 # on completed evidence and blocks/cancels/splits remaining work — timeout is never success.
+# External events (CI, deploys, remote builds) require an existence check and bounded watch. Either
+# report at the cap or delegate a shorter bounded watch to a worker and wait for its reply; an ended
+# leader turn does not resume by itself.
 #
 # Broadcast reaches ALL panels including duplicate-named agents:
 #   tm-agent broadcast 'msg'

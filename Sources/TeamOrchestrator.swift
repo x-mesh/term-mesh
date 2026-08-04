@@ -2204,7 +2204,7 @@ final class TeamOrchestrator: ObservableObject {
         Logger.team.info("created team '\(name, privacy: .public)' with \(members.count, privacy: .public) agent(s) + leader console")
 
         // For non-Claude CLI leaders (kiro, codex, gemini), inject team instructions.
-        // Claude leaders get instructions via --system-prompt in team-leader-claude.sh.
+        // Claude leaders receive them through the direct --system-prompt launch above.
         if Self.shouldInjectLocalLeaderPrompt(
             launchLeaderLocally: launchLeaderLocally,
             leaderMode: leaderMode
