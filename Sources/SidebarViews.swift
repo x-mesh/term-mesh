@@ -2883,6 +2883,11 @@ struct RemoteWorkspaceRowView: View {
         case connected
         case working
         case viewing
+        /// Open, but living in a different window of this app. The row still
+        /// reads "open" everywhere (one app holds one view of a host
+        /// workspace), so without this the only feedback for a click is focus
+        /// jumping to a window the person may not even be looking at.
+        case elsewhere
     }
 
     @Environment(\.colorScheme) private var colorScheme
@@ -2927,8 +2932,34 @@ struct RemoteWorkspaceRowView: View {
         mirroredWorkspace?.id == tabManager.selectedTabId
     }
 
+    /// The window that actually holds this mirror, which is not necessarily
+    /// the window drawing this row — `RemoteHostStore` is a singleton, so
+    /// every window's sidebar renders the same host list.
+    private var mirrorHomeContext: AppDelegate.MainWindowContext? {
+        guard let id = mirroredWorkspace?.id else { return nil }
+        return AppDelegate.shared?.contextContainingTabId(id)
+    }
+
+    private var isMirrorInAnotherWindow: Bool {
+        guard let home = mirrorHomeContext?.tabManager else { return false }
+        return home !== tabManager
+    }
+
+    /// Names the other window by what it is showing rather than by index —
+    /// "Window 2" has to be counted, a workspace title is recognized.
+    private var mirrorHomeWindowLabel: String? {
+        guard isMirrorInAnotherWindow, let home = mirrorHomeContext else { return nil }
+        if let title = home.window?.title, !title.isEmpty { return title }
+        guard let selected = home.tabManager.selectedTabId,
+              let tab = home.tabManager.tabs.first(where: { $0.id == selected }),
+              !tab.title.isEmpty
+        else { return nil }
+        return tab.title
+    }
+
     private var mirrorVisualState: MirrorVisualState {
         if isMirrorSelected { return .viewing }
+        if isMirrorInAnotherWindow { return .elsewhere }
         if isMirrorOpen, workspace.busyCount > 0 { return .working }
         if isMirrorOpen { return .connected }
         return .closed
@@ -2940,6 +2971,9 @@ struct RemoteWorkspaceRowView: View {
         case .connected: return "연결됨"
         case .working: return "작업 중"
         case .viewing: return "보고 있음"
+        case .elsewhere:
+            guard let label = mirrorHomeWindowLabel else { return "다른 창" }
+            return "다른 창 · \(label)"
         }
     }
 
@@ -2949,6 +2983,7 @@ struct RemoteWorkspaceRowView: View {
         case .connected: return "link"
         case .working: return "bolt.fill"
         case .viewing: return "eye.fill"
+        case .elsewhere: return "macwindow.on.rectangle"
         }
     }
 
@@ -2979,7 +3014,7 @@ struct RemoteWorkspaceRowView: View {
     private var usesInvertedMirrorForeground: Bool {
         switch mirrorVisualState {
         case .working, .viewing: return true
-        case .closed, .connected: return false
+        case .closed, .connected, .elsewhere: return false
         }
     }
 
@@ -2992,6 +3027,7 @@ struct RemoteWorkspaceRowView: View {
         case .working, .viewing: return .white.opacity(opacity)
         case .connected: return .primary.opacity(opacity)
         case .closed: return .secondary.opacity(opacity)
+        case .elsewhere: return .secondary.opacity(opacity * 0.8)
         }
     }
 
@@ -3001,6 +3037,9 @@ struct RemoteWorkspaceRowView: View {
         case .connected: return AnyShapeStyle(peerTintGradient(role: .workspaceConnected))
         case .working: return AnyShapeStyle(peerTintGradient(role: .workspaceWorking))
         case .viewing: return AnyShapeStyle(originalPeerGradient)
+        // Deliberately the plain row fill, not a tint: the host accent means
+        // "live here", and this window is not where it lives.
+        case .elsewhere: return AnyShapeStyle(rowBackgroundFill)
         }
     }
 
