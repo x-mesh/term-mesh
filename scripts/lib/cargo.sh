@@ -26,13 +26,24 @@ resolve_cargo() {
     return 0
   fi
 
+  # Search order. TERMMESH_CARGO_CANDIDATES (colon-separated) replaces it — the
+  # "no cargo anywhere" branch is otherwise untestable on any machine that has
+  # cargo installed, and a test that quietly changes meaning per machine is
+  # worse than no test.
+  local candidates=()
+  if [[ -n "${TERMMESH_CARGO_CANDIDATES:-}" ]]; then
+    IFS=':' read -r -a candidates <<< "$TERMMESH_CARGO_CANDIDATES"
+  else
+    candidates=(
+      "${CARGO_HOME:-$HOME/.cargo}/bin/cargo"
+      "$HOME/.cargo/bin/cargo"
+      /opt/homebrew/bin/cargo
+      /usr/local/bin/cargo
+    )
+  fi
+
   local candidate
-  for candidate in \
-    "${CARGO_HOME:-$HOME/.cargo}/bin/cargo" \
-    "$HOME/.cargo/bin/cargo" \
-    /opt/homebrew/bin/cargo \
-    /usr/local/bin/cargo
-  do
+  for candidate in "${candidates[@]}"; do
     if [[ -x "$candidate" ]]; then
       CARGO_BIN="$candidate"
       PATH="$(dirname "$candidate"):$PATH"

@@ -29,9 +29,9 @@ make_cargo() {  # make_cargo <dir> <exit code>
 # environment `ssh host 'cmd'` hands you.
 BARE_PATH="/usr/bin:/bin"
 
-resolve() {  # resolve <HOME> <CARGO_HOME|-> <PATH>  -> "<rc>|<CARGO_BIN>|<found on PATH?>"
-  local home="$1" cargo_home="$2" path="$3"
-  env -i HOME="$home" PATH="$path" /bin/bash -c '
+resolve() {  # resolve <HOME> <CARGO_HOME|-> <PATH> [candidates] -> "<rc>|<CARGO_BIN>|<on PATH?>"
+  local home="$1" cargo_home="$2" path="$3" candidates="${4:-}"
+  env -i HOME="$home" PATH="$path" TERMMESH_CARGO_CANDIDATES="$candidates" /bin/bash -c '
     set -uo pipefail
     if [ -n "${2:-}" ] && [ "$2" != "-" ]; then export CARGO_HOME="$2"; fi
     . "$1/lib/cargo.sh"
@@ -67,8 +67,11 @@ R="$(resolve "$H" "$SANDBOX/custom-cargo" "$BARE_PATH")"
 check "resolves via CARGO_HOME" "$(echo "$R" | cut -d'|' -f2)" "$SANDBOX/custom-cargo/bin/cargo"
 
 echo "== reports absence instead of guessing =="
+# Pin the search list at paths that cannot exist. Without this the assertion
+# silently inverts on any machine that happens to have Homebrew's cargo — which
+# is exactly how this test passed on one Mac and failed on another.
 H="$SANDBOX/h4"; mkdir -p "$H"
-R="$(resolve "$H" - "$BARE_PATH")"
+R="$(resolve "$H" - "$BARE_PATH" "$SANDBOX/nope/cargo:$SANDBOX/also-nope/cargo")"
 check "returns 1"       "${R%%|*}"                      "1"
 check "CARGO_BIN empty" "$(echo "$R" | cut -d'|' -f2)"  ""
 
