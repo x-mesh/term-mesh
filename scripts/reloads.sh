@@ -11,6 +11,9 @@ DERIVED_SET=0
 TAG=""
 CLEANUP_ONLY=0
 STAGING_TMP_ROOT="${TERMMESH_RELOAD_TMP_ROOT:-/tmp}"
+RELOADS_SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=lib/cargo.sh
+. "$RELOADS_SCRIPT_DIR/lib/cargo.sh"
 
 usage() {
   cat <<'EOF'
@@ -312,12 +315,29 @@ sleep 0.3
 # and copy from target/release, matching reloadp.sh / reload.sh. The previous
 # `zig build` + `zig-out/bin/term-meshd` path silently failed ("no build.zig
 # file found"), so term-meshd was never copied and STAGING ran a stale daemon.
-if [[ -d "$PWD/daemon" ]]; then
-  (cd "$PWD/daemon" && cargo build --release) || echo "warn: cargo build failed; using existing target/release binaries"
+# Having no cargo at all is a warning; a daemon build that failed is fatal.
+# Falling back to whatever daemon/target/release already holds means launching a
+# binary this run did not produce, possibly from another branch — the failure
+# then looks like a successful build.
+DAEMON_BUILT=0
+if [[ -d "$PWD/daemon" && -f "$PWD/daemon/Cargo.toml" ]]; then
+  if ! resolve_cargo; then
+    echo "warning: cargo not found — no daemon binaries will be copied into the bundle" >&2
+  elif ! (cd "$PWD/daemon" && "$CARGO_BIN" build --release); then
+    echo "error: daemon build failed — refusing to launch with a daemon this build did not produce" >&2
+    exit 1
+  else
+    DAEMON_BUILT=1
+  fi
 fi
 BIN_DIR="$APP_PATH/Contents/Resources/bin"
 mkdir -p "$BIN_DIR"
+# Only what this run built. daemon/target/release survives between runs and
+# holds whatever was last built there, from whatever branch — on one machine it
+# was two days and several branches old, and got shipped into the bundle twice
+# because cargo was missing and the failure was only a warning.
 for bin in term-meshd term-mesh-run tm-agent term-mesh-peer-relay; do
+  [[ "$DAEMON_BUILT" -eq 1 ]] || continue
   src="$PWD/daemon/target/release/$bin"
   if [[ -x "$src" ]]; then
     cp "$src" "$BIN_DIR/$bin"
