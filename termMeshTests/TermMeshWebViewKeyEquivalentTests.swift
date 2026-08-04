@@ -54,6 +54,70 @@ private func installTermMeshUnitTestInspectorOverride() {
     termMeshUnitTestInspectorOverrideInstalled = true
 }
 
+final class SidebarTeamRuntimeSnapshotTests: XCTestCase {
+    private let baseline = SidebarTeamRuntimeSnapshot(
+        teamName: "term-mesh",
+        attentionCount: 0,
+        agentStates: [
+            .init(agentInstanceId: "leader-1", state: "idle"),
+            .init(agentInstanceId: "reviewer-1", state: "running")
+        ]
+    )
+
+    func testIdenticalSnapshotRemainsEqual() {
+        XCTAssertEqual(
+            baseline,
+            SidebarTeamRuntimeSnapshot(
+                teamName: "term-mesh",
+                attentionCount: 0,
+                agentStates: [
+                    .init(agentInstanceId: "leader-1", state: "idle"),
+                    .init(agentInstanceId: "reviewer-1", state: "running")
+                ]
+            )
+        )
+    }
+
+    func testEveryRenderedTeamDimensionInvalidatesEquality() {
+        let changes = [
+            SidebarTeamRuntimeSnapshot(
+                teamName: "renamed-team",
+                attentionCount: baseline.attentionCount,
+                agentStates: baseline.agentStates
+            ),
+            SidebarTeamRuntimeSnapshot(
+                teamName: baseline.teamName,
+                attentionCount: 1,
+                agentStates: baseline.agentStates
+            ),
+            SidebarTeamRuntimeSnapshot(
+                teamName: baseline.teamName,
+                attentionCount: baseline.attentionCount,
+                agentStates: [
+                    .init(agentInstanceId: "leader-1", state: "blocked"),
+                    .init(agentInstanceId: "reviewer-1", state: "running")
+                ]
+            ),
+            SidebarTeamRuntimeSnapshot(
+                teamName: baseline.teamName,
+                attentionCount: baseline.attentionCount,
+                agentStates: baseline.agentStates + [
+                    .init(agentInstanceId: "executor-1", state: "idle")
+                ]
+            )
+        ]
+
+        for changed in changes {
+            XCTAssertNotEqual(baseline, changed)
+        }
+    }
+
+    func testStateLookupUsesInstanceIdentityAndDefaultsToIdle() {
+        XCTAssertEqual(baseline.state(for: "reviewer-1"), "running")
+        XCTAssertEqual(baseline.state(for: "missing-instance"), "idle")
+    }
+}
+
 final class SplitShortcutTransientFocusGuardTests: XCTestCase {
     func testSuppressesWhenFirstResponderFallsBackAndHostedViewIsTiny() {
         XCTAssertTrue(
