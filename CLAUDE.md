@@ -236,6 +236,19 @@ Rules learned the hard way:
   IS the bug in SwiftUI-hosted surfaces, and only a screenshot shows it.
 - **`debug.type` inserts text literally.** A `\u0008` in the payload lands
   as a control character, not a delete. To reset a field, close and reopen the surface.
+- **`debug.shortcut.simulate` needs the app frontmost, every time.** When the
+  app is not active the combo never reaches the shortcut handler — it arrives
+  through the IME as text, so `cmd+]` types `ㄴ` into the focused terminal. That
+  reads exactly like "the shortcut did nothing", and the probe silently measures
+  the wrong thing. Call `debug.app.activate` before *each* simulate (not once
+  before a loop — focus is lost in between) and allow ~1s before reading state.
+- **`screencapture -R` takes physical pixels.** On Retina, coordinates read off a
+  downscaled screenshot are wrong by the backing scale factor and capture the
+  wrong region. Prefer a full-screen capture.
+- **Identify panes by planting markers, not by reading the layout.**
+  `surface.send_text` a unique string into each surface first, then screenshot:
+  that maps surface ids to on-screen positions, so a later `debug.type` can be
+  attributed to a specific surface instead of eyeballed.
 - **`debug.command_palette.results`' `query` is the prefix-stripped matching
   string**, not the raw field. Read `mode` to know the real scope.
 - **Instrumentation can kill the instrument.** `dlog` from a computed
