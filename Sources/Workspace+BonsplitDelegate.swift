@@ -104,6 +104,7 @@ extension Workspace: BonsplitDelegate {
               let panel = panels[panelId] else {
             return
         }
+        refreshDominantRemoteHostKeyCache(focusedPanelId: panelId)
 
         if shouldTreatCurrentEventAsExplicitFocusIntent() {
             markExplicitFocusIntent(on: panelId)
@@ -138,18 +139,6 @@ extension Workspace: BonsplitDelegate {
                     self?.clearManualUnread(panelId: panelId)
                 }
             }
-        }
-
-        // Converge AppKit first responder with bonsplit's selected tab in the focused pane.
-        // Without this, keyboard input can remain on a different terminal than the blue tab indicator.
-        // Skip when an IME is mid-composition in any pane — the makeFirstResponder swizzle
-        // would block the change anyway, but skipping here avoids unnecessary retry loops.
-        let imeComposingElsewhere: Bool = {
-            guard let window = (panel as? TerminalPanel)?.hostedView.window else { return false }
-            return (window.firstResponder as? IMETextView)?.hasMarkedText() == true
-        }()
-        if let terminalPanel = panel as? TerminalPanel, !imeComposingElsewhere {
-            terminalPanel.hostedView.ensureFocus(for: id, surfaceId: panelId)
         }
 
         // Update current directory if this is a terminal
@@ -326,6 +315,7 @@ extension Workspace: BonsplitDelegate {
     }
 
     func splitTabBar(_ controller: BonsplitController, didCloseTab tabId: TabID, fromPane pane: PaneID) {
+        invalidateSidebarBranchDirectoryEntriesCache()
         // Live mirror self-heal: a close that reached the tree outside
         // the reconciler (force-close paths bypass the shouldCloseTab
         // veto) diverged from the host — snap back on the next tick.
@@ -459,6 +449,7 @@ extension Workspace: BonsplitDelegate {
     }
 
     func splitTabBar(_ controller: BonsplitController, didMoveTab tab: Bonsplit.Tab, fromPane source: PaneID, toPane destination: PaneID) {
+        invalidateSidebarBranchDirectoryEntriesCache()
         // Live mirror self-heal: moveTab has NO veto hook, so a user tab
         // drag can mutate the mirrored tree directly. Snap back to the
         // last authoritative layout. Reconciler-driven moves run under
@@ -479,6 +470,10 @@ extension Workspace: BonsplitDelegate {
         normalizePinnedTabs(in: destination)
         scheduleTerminalGeometryReconcile()
         scheduleFocusReconcile()
+    }
+
+    func splitTabBar(_ controller: BonsplitController, didReorderTab tab: Bonsplit.Tab, inPane pane: PaneID) {
+        invalidateSidebarBranchDirectoryEntriesCache()
     }
 
     func splitTabBar(_ controller: BonsplitController, didFocusPane pane: PaneID) {
@@ -502,6 +497,7 @@ extension Workspace: BonsplitDelegate {
     }
 
     func splitTabBar(_ controller: BonsplitController, didClosePane paneId: PaneID) {
+        invalidateSidebarBranchDirectoryEntriesCache()
         let closedPanelIds = pendingPaneClosePanelIds.removeValue(forKey: paneId.id) ?? []
 
         if !closedPanelIds.isEmpty {
@@ -607,6 +603,7 @@ extension Workspace: BonsplitDelegate {
     }
 
     func splitTabBar(_ controller: BonsplitController, didSplitPane originalPane: PaneID, newPane: PaneID, orientation: SplitOrientation) {
+        invalidateSidebarBranchDirectoryEntriesCache()
 #if DEBUG
         let panelKindForTab: (TabID) -> String = { tabId in
             guard let panelId = self.panelIdFromSurfaceId(tabId),

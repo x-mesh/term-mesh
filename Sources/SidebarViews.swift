@@ -18,6 +18,7 @@ struct SidebarResizerAccessibilityModifier: ViewModifier {
 struct VerticalTabsSidebar: View {
     @ObservedObject var updateViewModel: UpdateViewModel
     @EnvironmentObject var tabManager: TabManager
+    @EnvironmentObject private var notificationStore: TerminalNotificationStore
     @Binding var selection: SidebarSelection
     @Binding var selectedTabIds: Set<UUID>
     @Binding var lastSidebarSelectionIndex: Int?
@@ -25,6 +26,7 @@ struct VerticalTabsSidebar: View {
     @StateObject private var dragAutoScrollController = SidebarDragAutoScrollController()
     @StateObject private var dragFailsafeMonitor = SidebarDragFailsafeMonitor()
     @ObservedObject private var remoteHostStore = RemoteHostStore.shared
+    @ObservedObject private var teamOrchestrator = TeamOrchestrator.shared
     @State private var draggedTabId: UUID?
     @State private var dropIndicator: SidebarDropIndicator?
     @AppStorage(SidebarLayoutSettings.localTabsCollapsedKey)
@@ -55,6 +57,25 @@ struct VerticalTabsSidebar: View {
     }
 
     var body: some View {
+        let notificationSummaryByWorkspaceId = notificationStore.sidebarSummaryCache
+        let teamSnapshotByWorkspaceId = teamOrchestrator.teams.values.reduce(
+            into: [UUID: SidebarTeamRuntimeSnapshot]()
+        ) { result, team in
+            // Preserve the old `first(where:)` behavior for the unlikely case
+            // where stale team records temporarily share a workspace.
+            if result[team.workspaceId] == nil {
+                result[team.workspaceId] = SidebarTeamRuntimeSnapshot(
+                    teamName: team.id,
+                    attentionCount: teamOrchestrator.inboxItems(teamName: team.id).count,
+                    agentStates: team.agents.map { agent in
+                        SidebarTeamRuntimeSnapshot.AgentState(
+                            agentInstanceId: agent.agentInstanceId,
+                            state: teamOrchestrator.agentState(teamName: team.id, agentName: agent.name)
+                        )
+                    }
+                )
+            }
+        }
         VStack(spacing: 0) {
             GeometryReader { proxy in
                 ScrollView {
@@ -64,7 +85,11 @@ struct VerticalTabsSidebar: View {
                             .frame(height: trafficLightPadding)
 
                         if isAxisControlEnabled {
-                            SidebarAxisPicker(selection: $selectedAxisRaw)
+                            SidebarAxisPicker(
+                                selection: selectedAxisRaw,
+                                onSelectionChange: { selectedAxisRaw = $0 }
+                            )
+                                .equatable()
                                 .padding(.top, 2)
                                 .padding(.bottom, 2)
                         }
@@ -90,8 +115,17 @@ struct VerticalTabsSidebar: View {
                                             separatedSectionsEnabled: sidebarSeparatedSectionsEnabled
                                         ) {
                                             TabItemView(
+                                                tabManager: tabManager,
                                                 tab: tab,
                                                 index: index,
+                                                isActive: tabManager.selectedTabId == tab.id,
+                                                isMultiSelected: selectedTabIds.contains(tab.id),
+                                                workspaceCount: tabManager.tabs.count,
+                                                teamRuntimeSnapshot: teamSnapshotByWorkspaceId[tab.id],
+                                                remoteHostLabel: tab.dominantRemoteHostKey.map {
+                                                    PeerHostProfileStore.shared.displayLabel(for: $0)
+                                                },
+                                                notificationSummary: notificationSummaryByWorkspaceId[tab.id] ?? SidebarNotificationSummary(),
                                                 visibleTabIds: visibleLocalWorkspaceIds,
                                                 rowSpacing: tabRowSpacing,
                                                 selection: $selection,
@@ -102,6 +136,7 @@ struct VerticalTabsSidebar: View {
                                                 draggedTabId: $draggedTabId,
                                                 dropIndicator: $dropIndicator
                                             )
+                                            .equatable()
                                         }
                                     }
                                 }
@@ -113,6 +148,7 @@ struct VerticalTabsSidebar: View {
                                 store: remoteHostStore,
                                 usesSeparatedPresentation: sidebarSeparatedSectionsEnabled
                             )
+                            .equatable()
                         case .project:
                             SidebarProjectsSection(
                                 store: remoteHostStore,
@@ -900,11 +936,22 @@ private enum PeerSidebarPalette {
 /// The sidebar's top-level switch. It sits above every section on purpose:
 /// as a control tucked inside the Peer Hosts header it looked like it governed
 /// the sidebar but only regrouped one section of it.
-struct SidebarAxisPicker: View {
-    @Binding var selection: String
+struct SidebarAxisPicker: View, Equatable {
+    let selection: String
+    let onSelectionChange: (String) -> Void
+
+    static func == (lhs: Self, rhs: Self) -> Bool {
+        lhs.selection == rhs.selection
+    }
 
     var body: some View {
-        Picker("", selection: $selection) {
+        Picker(
+            "",
+            selection: Binding(
+                get: { selection },
+                set: onSelectionChange
+            )
+        ) {
             ForEach(SidebarAxis.allCases) { axis in
                 Text(axis.title)
                     .accessibilityLabel(axis.accessibilityDescription)
@@ -1004,8 +1051,9 @@ struct SidebarProjectsSection: View {
 }
 
 
-struct SidebarRemoteHostsSection: View {
+struct SidebarRemoteHostsSection: View, Equatable {
     @ObservedObject var store: RemoteHostStore
+    @ObservedObject private var hostStats = PeerHostStatsStore.shared
     let usesSeparatedPresentation: Bool
     @AppStorage(SidebarLayoutSettings.remoteHostsCollapsedKey)
     private var isCollapsed = false
@@ -1016,6 +1064,11 @@ struct SidebarRemoteHostsSection: View {
         isExpanded: false,
         generation: 0
     )
+
+    static func == (lhs: Self, rhs: Self) -> Bool {
+        lhs.store === rhs.store
+            && lhs.usesSeparatedPresentation == rhs.usesSeparatedPresentation
+    }
 
     private var hasPeerPaneDetails: Bool {
         store.sortedHosts.contains { host in
@@ -1118,10 +1171,15 @@ struct SidebarRemoteHostsSection: View {
                                 host: host,
                                 store: store,
                                 usesSeparatedPresentation: usesSeparatedPresentation,
-                                paneExpansionCommand: paneExpansionCommand
+                                paneExpansionCommand: paneExpansionCommand,
+                                expandSignal: store.expandSignal,
+                                diskWarningText: host.isConnected
+                                    ? hostStats.stats(for: host.paneHostSpec.hostKey)?.diskWarningText
+                                    : nil
                             ) { context in
                                 editorContext = context
                             }
+                            .equatable()
                         }
                     }
                 }
@@ -2257,12 +2315,14 @@ private struct PeerShellCleanupSheet: View {
     }
 }
 
-struct RemoteHostGroupView: View {
+struct RemoteHostGroupView: View, Equatable {
     @Environment(\.colorScheme) private var colorScheme
     let host: HostEntry
     let store: RemoteHostStore
     let usesSeparatedPresentation: Bool
     let paneExpansionCommand: PeerPaneExpansionCommand
+    let expandSignal: RemoteHostStore.ExpandSignal
+    let diskWarningText: String?
     /// Opens the shared add/edit sheet (owned by the section view).
     let onEdit: (PeerHostEditorContext) -> Void
     @State private var isExpanded: Bool
@@ -2275,21 +2335,29 @@ struct RemoteHostGroupView: View {
     @State private var shellCleanupSelection = Set<Data>()
     @State private var shellCleanupLoading = false
     @State private var shellCleanupError: String?
-    /// Peer capacity, so a host that is about to run out of room for agent
-    /// checkouts and build output says so before a job fails on it.
-    @ObservedObject private var hostStats = PeerHostStatsStore.shared
-
     init(host: HostEntry, store: RemoteHostStore,
          usesSeparatedPresentation: Bool,
          paneExpansionCommand: PeerPaneExpansionCommand,
+         expandSignal: RemoteHostStore.ExpandSignal,
+         diskWarningText: String?,
          onEdit: @escaping (PeerHostEditorContext) -> Void) {
         self.host = host
         self.store = store
         self.usesSeparatedPresentation = usesSeparatedPresentation
         self.paneExpansionCommand = paneExpansionCommand
+        self.expandSignal = expandSignal
+        self.diskWarningText = diskWarningText
         self.onEdit = onEdit
         // Fold state persists per stable host key; default is expanded.
         _isExpanded = State(initialValue: !SidebarLayoutSettings.isHostCollapsed(host.id))
+    }
+
+    static func == (lhs: Self, rhs: Self) -> Bool {
+        lhs.host == rhs.host
+            && lhs.usesSeparatedPresentation == rhs.usesSeparatedPresentation
+            && lhs.paneExpansionCommand == rhs.paneExpansionCommand
+            && lhs.expandSignal == rhs.expandSignal
+            && lhs.diskWarningText == rhs.diskWarningText
     }
 
     /// Profile-management items shared by every connection state.
@@ -2452,9 +2520,7 @@ struct RemoteHostGroupView: View {
     @ViewBuilder
     private var diskBadge: some View {
         if host.isConnected,
-           let stats = hostStats.stats(for: host.paneHostSpec.hostKey),
-           stats.isDiskLow,
-           let text = stats.diskFreeText {
+           let text = diskWarningText {
             HStack(spacing: 2) {
                 Image(systemName: "externaldrive.badge.exclamationmark")
                     .font(.system(size: 8, weight: .semibold))
@@ -2745,7 +2811,7 @@ struct RemoteHostGroupView: View {
         .onChange(of: isExpanded) { newValue in
             SidebarLayoutSettings.setHostCollapsed(host.id, !newValue)
         }
-        .onChange(of: store.expandSignal) { signal in
+        .onChange(of: expandSignal) { signal in
             if signal.key == host.id { isExpanded = true }
         }
     }

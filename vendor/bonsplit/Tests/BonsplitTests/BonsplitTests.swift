@@ -98,6 +98,20 @@ final class BonsplitTests: XCTestCase {
     }
 
     @MainActor
+    func testInteractiveStateSkipsRedundantInternalWrite() {
+        let controller = BonsplitController()
+        controller.internalController.isInteractive = false
+
+        controller.isInteractive = true
+
+        XCTAssertFalse(controller.internalController.isInteractive)
+
+        controller.isInteractive = false
+
+        XCTAssertFalse(controller.internalController.isInteractive)
+    }
+
+    @MainActor
     func testTabCreation() {
         let controller = BonsplitController()
         let tabId = controller.createTab(title: "Test Tab", icon: "doc")

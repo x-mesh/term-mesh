@@ -56,9 +56,16 @@ enum SidebarResizeInteraction {
 }
 
 enum WorkspaceMountPolicy {
-    // Keep only the selected workspace mounted to minimize layer-tree traversal.
-    static let maxMountedWorkspaces = 1
-    // During workspace cycling, keep only a minimal handoff pair (selected + retiring).
+    // Keep inactive warm workspaces in SwiftUI's native-view display list. An exact zero
+    // opacity lets SwiftUI prune and later re-add AppKit platform views on every switch.
+    // This value is below an 8-bit alpha step, so it remains visually transparent while
+    // preserving the already-mounted native hierarchy. Hit testing is disabled separately.
+    static let inactiveWorkspaceOpacity = 0.0001
+    // Keep the selected workspace and one recently used workspace mounted. The
+    // inactive entry is hidden and input-disabled by ContentView, but retaining
+    // its SwiftUI/Ghostty tree avoids rebuilding every surface on a quick return.
+    static let maxMountedWorkspaces = 2
+    // Workspace cycling uses the same bounded selected + recent pair.
     static let maxMountedWorkspacesDuringCycle = 2
 
     static func nextMountedWorkspaceIds(
@@ -84,12 +91,6 @@ enum WorkspaceMountPolicy {
                 ordered.removeAll { $0 == id }
                 ordered.insert(id, at: 0)
             }
-        }
-
-        if isCycleHot,
-           pinnedIds.isEmpty,
-           let selected {
-            ordered.removeAll { $0 != selected }
         }
 
         // Ensure pinned ids (retiring handoff workspaces) are always retained at highest priority.
@@ -125,5 +126,43 @@ enum WorkspaceMountPolicy {
         // Keep warming focused to the selected workspace. Retiring/target workspaces are
         // pinned by handoff logic, so warming adjacent neighbors here just adds layout work.
         return [selected]
+    }
+}
+
+enum WorkspaceHandoffPolicy {
+    /// A warm pair of local, browser-free workspaces can switch in one visibility update.
+    /// Browser and peer workspaces retain the overlap handoff because their AppKit/WebKit
+    /// responders may not be ready when selection changes.
+    static func canTransitionImmediately(
+        oldSelectedId: UUID,
+        newSelectedId: UUID,
+        mountedIds: Set<UUID>,
+        oldIsTerminalOnly: Bool,
+        newIsTerminalOnly: Bool,
+        newRendererReady: Bool,
+        oldIsPeerMirror: Bool,
+        newIsPeerMirror: Bool
+    ) -> Bool {
+        guard oldSelectedId != newSelectedId else { return false }
+        guard mountedIds.contains(oldSelectedId), mountedIds.contains(newSelectedId) else {
+            return false
+        }
+        guard oldIsTerminalOnly, newIsTerminalOnly, newRendererReady else { return false }
+        guard !oldIsPeerMirror, !newIsPeerMirror else { return false }
+        return true
+    }
+
+    /// Reorder workspace layers only while two workspaces intentionally overlap.
+    /// A warm immediate switch has exactly one visible workspace, so changing the
+    /// selected layer's priority only makes SwiftUI reparent AppKit platform views.
+    static func visualPriority(
+        isSelected: Bool,
+        isRetiring: Bool,
+        hasOverlap: Bool
+    ) -> Int {
+        guard hasOverlap else { return 0 }
+        if isSelected { return 2 }
+        if isRetiring { return 1 }
+        return 0
     }
 }

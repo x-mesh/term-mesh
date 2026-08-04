@@ -19,7 +19,9 @@ final class Workspace: Identifiable, ObservableObject {
     /// Injected config provider (defaults to singleton for backward compatibility).
     var configProvider: any GhosttyConfigProvider = GhosttyApp.shared
 
-    @Published var currentDirectory: String
+    @Published var currentDirectory: String {
+        didSet { invalidateSidebarBranchDirectoryEntriesCache() }
+    }
 
     /// Timestamp when this workspace was created (for session duration display)
     let createdAt: Date = Date()
@@ -40,7 +42,12 @@ final class Workspace: Identifiable, ObservableObject {
     let bonsplitController: BonsplitController
 
     /// Mapping from bonsplit TabID to our Panel instances
-    @Published var panels: [UUID: any Panel] = [:]
+    @Published var panels: [UUID: any Panel] = [:] {
+        didSet {
+            invalidateSidebarBranchDirectoryEntriesCache()
+            invalidateDominantRemoteHostKeyCache()
+        }
+    }
 
     /// Subscriptions for panel updates (e.g., browser title changes)
     var panelSubscriptions: [UUID: AnyCancellable] = [:]
@@ -128,7 +135,9 @@ final class Workspace: Identifiable, ObservableObject {
     }
 
     /// Published directory for each panel
-    @Published var panelDirectories: [UUID: String] = [:]
+    @Published var panelDirectories: [UUID: String] = [:] {
+        didSet { invalidateSidebarBranchDirectoryEntriesCache() }
+    }
     @Published var panelTitles: [UUID: String] = [:]
     @Published var panelCustomTitles: [UUID: String] = [:]
     @Published var pinnedPanelIds: Set<UUID> = []
@@ -139,8 +148,21 @@ final class Workspace: Identifiable, ObservableObject {
     @Published var statusEntries: [String: SidebarStatusEntry] = [:]
     @Published var logEntries: [SidebarLogEntry] = []
     @Published var progress: SidebarProgressState?
-    @Published var gitBranch: SidebarGitBranchState?
-    @Published var panelGitBranches: [UUID: SidebarGitBranchState] = [:]
+    @Published var gitBranch: SidebarGitBranchState? {
+        didSet { invalidateSidebarBranchDirectoryEntriesCache() }
+    }
+    @Published var panelGitBranches: [UUID: SidebarGitBranchState] = [:] {
+        didSet { invalidateSidebarBranchDirectoryEntriesCache() }
+    }
+    private var sidebarBranchDirectoryEntriesCache: [SidebarBranchOrdering.BranchDirectoryEntry]?
+    private var sidebarBranchDirectoryDisplayLinesCache: [Bool: [SidebarBranchOrdering.BranchDirectoryDisplayLine]] = [:]
+    private(set) var sidebarBranchDirectoryEntriesComputationCount = 0
+    private(set) var sidebarBranchDirectoryDisplayLinesComputationCount = 0
+    /// Outer optional tracks whether a value has been computed; the inner
+    /// optional caches the common local-workspace result (`nil`) as well.
+    private var dominantRemoteHostKeyCache: PeerPaneHostKey??
+    private var dominantRemoteHostKeyCachedFocusedPanelId: UUID?
+    private(set) var dominantRemoteHostKeyComputationCount = 0
     @Published var surfaceListeningPorts: [UUID: [Int]] = [:]
     @Published var listeningPorts: [Int] = []
     var surfaceTTYNames: [UUID: String] = [:]
@@ -865,14 +887,45 @@ final class Workspace: Identifiable, ObservableObject {
     }
 
     func sidebarBranchDirectoryEntriesInDisplayOrder() -> [SidebarBranchOrdering.BranchDirectoryEntry] {
-        SidebarBranchOrdering.orderedUniqueBranchDirectoryEntries(
+        if let sidebarBranchDirectoryEntriesCache {
+            return sidebarBranchDirectoryEntriesCache
+        }
+
+        let entries = SidebarBranchOrdering.orderedUniqueBranchDirectoryEntries(
             orderedPanelIds: sidebarOrderedPanelIds(),
             panelBranches: panelGitBranches,
             panelDirectories: panelDirectories,
             defaultDirectory: currentDirectory,
             fallbackBranch: gitBranch
         )
+        sidebarBranchDirectoryEntriesCache = entries
+        sidebarBranchDirectoryEntriesComputationCount += 1
+        return entries
     }
+
+    func sidebarBranchDirectoryDisplayLines(
+        showGitBranch: Bool
+    ) -> [SidebarBranchOrdering.BranchDirectoryDisplayLine] {
+        if let cached = sidebarBranchDirectoryDisplayLinesCache[showGitBranch] {
+            return cached
+        }
+
+        let lines = SidebarBranchOrdering.branchDirectoryDisplayLines(
+            entries: sidebarBranchDirectoryEntriesInDisplayOrder(),
+            showGitBranch: showGitBranch,
+            homeDirectory: Self.sidebarHomeDirectory
+        )
+        sidebarBranchDirectoryDisplayLinesCache[showGitBranch] = lines
+        sidebarBranchDirectoryDisplayLinesComputationCount += 1
+        return lines
+    }
+
+    func invalidateSidebarBranchDirectoryEntriesCache() {
+        sidebarBranchDirectoryEntriesCache = nil
+        sidebarBranchDirectoryDisplayLinesCache.removeAll(keepingCapacity: true)
+    }
+
+    private static let sidebarHomeDirectory = FileManager.default.homeDirectoryForCurrentUser.path
 
     // MARK: - Panel Operations
 
@@ -2223,15 +2276,43 @@ final class Workspace: Identifiable, ObservableObject {
     /// remote pane normally stays on the same host). nil for purely
     /// local workspaces.
     var dominantRemoteHostKey: PeerPaneHostKey? {
-        if let focusedPanelId, let hostKey = (panels[focusedPanelId] as? TerminalPanel)?.remoteHostKey {
-            return hostKey
+        if let cached = dominantRemoteHostKeyCache {
+            return cached
         }
-        for panel in panels.values {
-            if let hostKey = (panel as? TerminalPanel)?.remoteHostKey {
-                return hostKey
-            }
+        let hostKey = computeDominantRemoteHostKey(focusedPanelId: focusedPanelId)
+        dominantRemoteHostKeyCachedFocusedPanelId = focusedPanelId
+        dominantRemoteHostKeyCache = .some(hostKey)
+        return hostKey
+    }
+
+    private func invalidateDominantRemoteHostKeyCache() {
+        dominantRemoteHostKeyCache = nil
+        dominantRemoteHostKeyCachedFocusedPanelId = nil
+    }
+
+    /// Selection callbacks already know the focused panel. Refresh from that
+    /// ID so subsequent sidebar renders do not have to enter Bonsplit's
+    /// observation graph merely to validate a cache hit.
+    func refreshDominantRemoteHostKeyCache(focusedPanelId: UUID?) {
+        if dominantRemoteHostKeyCache != nil,
+           dominantRemoteHostKeyCachedFocusedPanelId == focusedPanelId {
+            return
         }
-        return nil
+        dominantRemoteHostKeyCachedFocusedPanelId = focusedPanelId
+        dominantRemoteHostKeyCache = .some(
+            computeDominantRemoteHostKey(focusedPanelId: focusedPanelId)
+        )
+    }
+
+    private func computeDominantRemoteHostKey(focusedPanelId: UUID?) -> PeerPaneHostKey? {
+        dominantRemoteHostKeyComputationCount += 1
+        if let focusedPanelId,
+           let focusedHostKey = (panels[focusedPanelId] as? TerminalPanel)?.remoteHostKey {
+            return focusedHostKey
+        }
+        return panels.values.lazy.compactMap {
+            ($0 as? TerminalPanel)?.remoteHostKey
+        }.first
     }
 
     /// Host a remote peer surface as a NORMAL Bonsplit pane: split from
@@ -2364,6 +2445,7 @@ final class Workspace: Identifiable, ObservableObject {
         bindingRole: PaneBindingRole = .owned
     ) {
         panel.peerPaneSession = session
+        invalidateDominantRemoteHostKeyCache()
         let remotePaneID = Self.remotePaneID(from: session.originSurface.surfaceID)
         panel.remotePaneID = remotePaneID
         panel.remotePaneLifetime = lifetime
@@ -2837,9 +2919,6 @@ final class Workspace: Identifiable, ObservableObject {
         }
 
         targetPanel.focus()
-        if let terminalPanel = targetPanel as? TerminalPanel {
-            terminalPanel.hostedView.ensureFocus(for: id, surfaceId: targetPanelId)
-        }
         if let dir = panelDirectories[targetPanelId] {
             currentDirectory = dir
         }

@@ -274,6 +274,7 @@
 		A5009040 /* WorktreeApprovalHelperTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A5009041 /* WorktreeApprovalHelperTests.swift */; };
 				F9000010A1B2C3D4E5F60718 /* WorkspaceRetrievalDirectoryTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = F9000011A1B2C3D4E5F60718 /* WorkspaceRetrievalDirectoryTests.swift */; };
 				F9000014A1B2C3D4E5F60718 /* PeerHostStatsTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = F9000015A1B2C3D4E5F60718 /* PeerHostStatsTests.swift */; };
+				D5000101A1B2C3D4E5F60718 /* ProcessTreeSnapshotTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = D5000102A1B2C3D4E5F60718 /* ProcessTreeSnapshotTests.swift */; };
 				FA000000A1B2C3D4E5F60718 /* PeerSocketProberTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = FA000001A1B2C3D4E5F60718 /* PeerSocketProberTests.swift */; };
 				FA000000A1B2C3D4E5F60719 /* PeerHostBinaryInventoryTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = FA000001A1B2C3D4E5F60719 /* PeerHostBinaryInventoryTests.swift */; };
 			FE000004A1B2C3D4E5F60718 /* PasteQueueTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = FE000005A1B2C3D4E5F60718 /* PasteQueueTests.swift */; };
@@ -606,6 +607,7 @@
 		A5009041 /* WorktreeApprovalHelperTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WorktreeApprovalHelperTests.swift; sourceTree = "<group>"; };
 			F9000011A1B2C3D4E5F60718 /* WorkspaceRetrievalDirectoryTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WorkspaceRetrievalDirectoryTests.swift; sourceTree = "<group>"; };
 			F9000015A1B2C3D4E5F60718 /* PeerHostStatsTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PeerHostStatsTests.swift; sourceTree = "<group>"; };
+			D5000102A1B2C3D4E5F60718 /* ProcessTreeSnapshotTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ProcessTreeSnapshotTests.swift; sourceTree = "<group>"; };
 			FA000001A1B2C3D4E5F60718 /* PeerSocketProberTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PeerSocketProberTests.swift; sourceTree = "<group>"; };
 			FA000001A1B2C3D4E5F60719 /* PeerHostBinaryInventoryTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PeerHostBinaryInventoryTests.swift; sourceTree = "<group>"; };
 			FE000005A1B2C3D4E5F60718 /* PasteQueueTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PasteQueueTests.swift; sourceTree = "<group>"; };
@@ -993,6 +995,7 @@ A1740000000000000000000C /* ProcessRun.swift */,
 				A5009041 /* WorktreeApprovalHelperTests.swift */,
 				F9000011A1B2C3D4E5F60718 /* WorkspaceRetrievalDirectoryTests.swift */,
 				F9000015A1B2C3D4E5F60718 /* PeerHostStatsTests.swift */,
+				D5000102A1B2C3D4E5F60718 /* ProcessTreeSnapshotTests.swift */,
 				FA000001A1B2C3D4E5F60718 /* PeerSocketProberTests.swift */,
 				FA000001A1B2C3D4E5F60719 /* PeerHostBinaryInventoryTests.swift */,
 				FE000005A1B2C3D4E5F60718 /* PasteQueueTests.swift */,
@@ -1410,6 +1413,7 @@ A1740000000000000000000B /* ProcessRun.swift in Sources */,
 				A5009040 /* WorktreeApprovalHelperTests.swift in Sources */,
 				F9000010A1B2C3D4E5F60718 /* WorkspaceRetrievalDirectoryTests.swift in Sources */,
 				F9000014A1B2C3D4E5F60718 /* PeerHostStatsTests.swift in Sources */,
+				D5000101A1B2C3D4E5F60718 /* ProcessTreeSnapshotTests.swift in Sources */,
 				FA000000A1B2C3D4E5F60718 /* PeerSocketProberTests.swift in Sources */,
 				FA000000A1B2C3D4E5F60719 /* PeerHostBinaryInventoryTests.swift in Sources */,
 				FE000004A1B2C3D4E5F60718 /* PasteQueueTests.swift in Sources */,

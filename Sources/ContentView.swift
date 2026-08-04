@@ -20,6 +20,164 @@ extension NSHostingView: HostingViewSizingControl {
     func disableSizingOptions() { sizingOptions = [] }
 }
 
+struct TitlebarGitSnapshot: Equatable {
+    let branch: String
+    let isDirty: Bool
+    let dirtyCount: Int
+    let isWorktree: Bool
+}
+
+struct TitlebarGitStatusSnapshot: Equatable {
+    let branch: String
+    let dirtyCount: Int
+}
+
+func parseTitlebarGitStatusPorcelainV2(_ output: String) -> TitlebarGitStatusSnapshot? {
+    var branch = ""
+    var dirtyCount = 0
+
+    for line in output.split(separator: "\n", omittingEmptySubsequences: true) {
+        if line.hasPrefix("# branch.head ") {
+            let head = line.dropFirst("# branch.head ".count)
+            if head != "(detached)" {
+                branch = String(head)
+            }
+        } else if line.hasPrefix("1 ") ||
+                    line.hasPrefix("2 ") ||
+                    line.hasPrefix("u ") ||
+                    line.hasPrefix("? ") {
+            dirtyCount += 1
+        }
+    }
+
+    guard !branch.isEmpty else { return nil }
+    return TitlebarGitStatusSnapshot(branch: branch, dirtyCount: dirtyCount)
+}
+
+/// Process-wide cache for the titlebar's fallback git probe. Workspace cycling
+/// can ask for the same directory several times before the first three-process
+/// git query finishes, so callers both reuse recent results and join in-flight
+/// work instead of spawning another query.
+final class TitlebarGitSnapshotCache: @unchecked Sendable {
+    private struct Entry {
+        let snapshot: TitlebarGitSnapshot
+        let completedAt: TimeInterval
+    }
+    private struct InFlight {
+        let id: UUID
+        let claimedAt: TimeInterval
+        var completions: [(TitlebarGitSnapshot) -> Void]
+    }
+
+    private let lock = NSLock()
+    private let ttl: TimeInterval
+    private let negativeTTL: TimeInterval
+    private let inFlightTimeout: TimeInterval
+    private var entries: [String: Entry] = [:]
+    private var inFlight: [String: InFlight] = [:]
+
+    init(
+        ttl: TimeInterval = 2.0,
+        negativeTTL: TimeInterval = 10.0,
+        inFlightTimeout: TimeInterval = 5.0
+    ) {
+        self.ttl = ttl
+        self.negativeTTL = negativeTTL
+        self.inFlightTimeout = inFlightTimeout
+    }
+
+    func resolve(
+        directory: String,
+        now: TimeInterval = ProcessInfo.processInfo.systemUptime,
+        load: () -> TitlebarGitSnapshot,
+        completion: @escaping (TitlebarGitSnapshot) -> Void
+    ) {
+        let key = (directory as NSString).standardizingPath
+        lock.lock()
+        if let entry = entries[key],
+           now - entry.completedAt < (entry.snapshot.branch.isEmpty ? negativeTTL : ttl) {
+            lock.unlock()
+            completion(entry.snapshot)
+            return
+        }
+        if var claim = inFlight[key], now - claim.claimedAt < inFlightTimeout {
+            claim.completions.append(completion)
+            inFlight[key] = claim
+            lock.unlock()
+            return
+        }
+        let claimID = UUID()
+        let inheritedCompletions = inFlight[key]?.completions ?? []
+        inFlight[key] = InFlight(
+            id: claimID,
+            claimedAt: now,
+            completions: inheritedCompletions + [completion]
+        )
+        lock.unlock()
+
+        let snapshot = load()
+
+        lock.lock()
+        guard inFlight[key]?.id == claimID else {
+            lock.unlock()
+            return
+        }
+        entries[key] = Entry(snapshot: snapshot, completedAt: now)
+        let completions = inFlight.removeValue(forKey: key)?.completions ?? []
+        lock.unlock()
+        completions.forEach { $0(snapshot) }
+    }
+}
+
+/// Short-lived cache for the titlebar worktree badge. Project switching can
+/// revisit the same directory faster than the daemon round trip completes, so
+/// reuse recent counts and let concurrent requests join the same load.
+final class TitlebarWorktreeCountCache: @unchecked Sendable {
+    private struct Entry {
+        let count: Int
+        let completedAt: TimeInterval
+    }
+
+    private let lock = NSLock()
+    private let ttl: TimeInterval
+    private var entries: [String: Entry] = [:]
+    private var waiters: [String: [(Int) -> Void]] = [:]
+
+    init(ttl: TimeInterval = 2.0) {
+        self.ttl = ttl
+    }
+
+    func resolve(
+        directory: String,
+        now: TimeInterval = ProcessInfo.processInfo.systemUptime,
+        load: () -> Int,
+        completion: @escaping (Int) -> Void
+    ) {
+        let key = (directory as NSString).standardizingPath
+        lock.lock()
+        if let entry = entries[key], now - entry.completedAt < ttl {
+            lock.unlock()
+            completion(entry.count)
+            return
+        }
+        if waiters[key] != nil {
+            waiters[key, default: []].append(completion)
+            lock.unlock()
+            return
+        }
+        waiters[key] = [completion]
+        lock.unlock()
+
+        let count = load()
+
+        lock.lock()
+        entries[key] = Entry(count: count, completedAt: now)
+        let completions = waiters.removeValue(forKey: key) ?? []
+        lock.unlock()
+        completions.forEach { $0(count) }
+    }
+}
+
 /// Installs a FileDropOverlayView on the window's theme frame for Finder file drag support.
 
 struct ContentView: View {
@@ -76,6 +234,7 @@ struct ContentView: View {
     @State private var titlebarTag: String? = nil
     @State private var titlebarDashboardPort: Int? = nil
     @State private var titlebarWorktreeCount: Int = 0
+    @State private var titlebarGitFallbackGeneration: UInt64 = 0
     @State private var isFullScreen: Bool = false
     @State private var observedWindow: NSWindow?
     @StateObject private var fullscreenControlsViewModel = TitlebarControlsViewModel()
@@ -112,6 +271,8 @@ struct ContentView: View {
         hotSpot: NSCursor.resizeLeftRight.hotSpot
     )
     private static let commandPaletteUsageDefaultsKey = "commandPalette.commandUsage.v1"
+    private static let titlebarGitSnapshotCache = TitlebarGitSnapshotCache()
+    private static let titlebarWorktreeCountCache = TitlebarWorktreeCountCache()
     private static let commandPaletteCommandsPrefix = ">"
     /// Peer-workspace scope prefix. Same mechanism as `>` for commands: the
     /// scope is derived from the query, so ⌘⇧O is just a shortcut that seeds
@@ -415,6 +576,7 @@ struct ContentView: View {
         let mountedWorkspaces = tabManager.tabs.filter { mountedWorkspaceIdSet.contains($0.id) }
         let selectedWorkspaceId = tabManager.selectedTabId
         let retiringWorkspaceId = self.retiringWorkspaceId
+        let hasOverlappingWorkspaceHandoff = retiringWorkspaceId != nil
 
         return ZStack {
             ZStack {
@@ -427,13 +589,17 @@ struct ContentView: View {
                     // delay handoff completion and make browser returns feel laggy.
                     let isInputActive = isSelectedWorkspace
                     let isVisible = isSelectedWorkspace || isRetiringWorkspace
-                    let portalPriority = isSelectedWorkspace ? 2 : (isRetiringWorkspace ? 1 : 0)
+                    let visualPriority = WorkspaceHandoffPolicy.visualPriority(
+                        isSelected: isSelectedWorkspace,
+                        isRetiring: isRetiringWorkspace,
+                        hasOverlap: hasOverlappingWorkspaceHandoff
+                    )
                     WorkspaceRetrievalChrome(workspace: tab) {
                         SelectedWorkspaceContentView(
                             workspace: tab,
                             isWorkspaceVisible: isVisible,
                             isWorkspaceInputActive: isInputActive,
-                            workspacePortalPriority: portalPriority,
+                            workspacePortalPriority: visualPriority,
                             onThemeRefreshRequest: { reason, eventId, source, payloadHex in
                                 scheduleTitlebarThemeRefreshFromWorkspace(
                                     workspaceId: tab.id,
@@ -445,9 +611,10 @@ struct ContentView: View {
                             }
                         )
                     }
-                    .opacity(isVisible ? 1 : 0)
+                    .opacity(isVisible ? 1 : WorkspaceMountPolicy.inactiveWorkspaceOpacity)
                     .allowsHitTesting(isSelectedWorkspace)
-                    .zIndex(isSelectedWorkspace ? 2 : (isRetiringWorkspace ? 1 : 0))
+                    .accessibilityHidden(!isVisible)
+                    .zIndex(Double(visualPriority))
                 }
             }
             .opacity(sidebarSelectionState.selection == .tabs ? 1 : 0)
@@ -1154,6 +1321,7 @@ struct ContentView: View {
         let updateStart = CFAbsoluteTimeGetCurrent()
         guard let selectedId = tabManager.selectedTabId,
               let tab = tabManager.tabs.first(where: { $0.id == selectedId }) else {
+            titlebarGitFallbackGeneration &+= 1
             if !titlebarText.isEmpty { titlebarText = "" }
             if !titlebarGitBranch.isEmpty { titlebarGitBranch = "" }
             if !titlebarWorktreeName.isEmpty { titlebarWorktreeName = "" }
@@ -1195,9 +1363,12 @@ struct ContentView: View {
         let focusedTTY: String? = focusedPanelId.flatMap { snapTTYNames[$0] }
         let hasPanelDir = focusedPanelId != nil && snapPanelDirs[focusedPanelId!] != nil
         #if DEBUG
-        dlog("titlebar.update focusedPanel=\(focusedPanelId?.uuidString.prefix(8) ?? "nil") gitBranch=\(branchState?.branch ?? "nil") panelBranches=\(snapPanelBranches.mapValues { $0.branch }) currentDir=\(snapCurrentDir) focusedDir=\(focusedDir) tty=\(focusedTTY ?? "nil") hasPanelDir=\(hasPanelDir) worktreeName=\(snapWorktreeName ?? "nil") hostKey=\(snapHostKey?.description ?? "nil")")
+        if !hasPanelDir || (branchState?.branch ?? "") != titlebarGitBranch {
+            dlog("titlebar.update focusedPanel=\(focusedPanelId?.uuidString.prefix(8) ?? "nil") gitBranch=\(branchState?.branch ?? "nil") panelBranches=\(snapPanelBranches.mapValues { $0.branch }) currentDir=\(snapCurrentDir) focusedDir=\(focusedDir) tty=\(focusedTTY ?? "nil") hasPanelDir=\(hasPanelDir) worktreeName=\(snapWorktreeName ?? "nil") hostKey=\(snapHostKey?.description ?? "nil")")
+        }
         #endif
         if let bs = branchState {
+            titlebarGitFallbackGeneration &+= 1
             let branch = bs.branch
             if titlebarGitBranch != branch { titlebarGitBranch = branch }
             let dirty = bs.isDirty
@@ -1207,6 +1378,8 @@ struct ContentView: View {
             if titlebarIsWorktree { titlebarIsWorktree = false }
         } else {
             // Fallback: resolve CWD from TTY if panelDirectories has no entry, then run git
+            titlebarGitFallbackGeneration &+= 1
+            let fallbackGeneration = titlebarGitFallbackGeneration
             let resolveDir = focusedDir
             let needsTTYResolve = !hasPanelDir && focusedTTY != nil
             let ttyForResolve = focusedTTY
@@ -1219,15 +1392,26 @@ struct ContentView: View {
                     dir = resolveDir
                 }
                 guard !dir.isEmpty else { return }
-                let (branch, dirty, count, isWt) = Self.queryGitBranch(in: dir)
-                #if DEBUG
-                dlog("titlebar.gitFallback dir=\(dir) branch=\(branch) dirty=\(dirty) count=\(count) isWorktree=\(isWt) viaTTY=\(needsTTYResolve)")
-                #endif
-                DispatchQueue.main.async {
-                    if self.titlebarGitBranch != branch { self.titlebarGitBranch = branch }
-                    if self.titlebarGitDirty != dirty { self.titlebarGitDirty = dirty }
-                    if self.titlebarGitDirtyCount != count { self.titlebarGitDirtyCount = count }
-                    if self.titlebarIsWorktree != isWt { self.titlebarIsWorktree = isWt }
+                Self.titlebarGitSnapshotCache.resolve(directory: dir, load: {
+                    let snapshot = Self.queryGitBranch(in: dir)
+                    #if DEBUG
+                    dlog("titlebar.gitFallback dir=\(dir) branch=\(snapshot.branch) dirty=\(snapshot.isDirty) count=\(snapshot.dirtyCount) isWorktree=\(snapshot.isWorktree) viaTTY=\(needsTTYResolve)")
+                    #endif
+                    return snapshot
+                }) { snapshot in
+                    DispatchQueue.main.async {
+                        guard self.titlebarGitFallbackGeneration == fallbackGeneration,
+                              self.tabManager.selectedTabId == selectedId,
+                              let selectedTab = self.tabManager.tabs.first(where: { $0.id == selectedId }),
+                              selectedTab.focusedPanelId == focusedPanelId,
+                              (focusedPanelId.flatMap { selectedTab.panelDirectories[$0] } ?? selectedTab.currentDirectory) == focusedDir else {
+                            return
+                        }
+                        if self.titlebarGitBranch != snapshot.branch { self.titlebarGitBranch = snapshot.branch }
+                        if self.titlebarGitDirty != snapshot.isDirty { self.titlebarGitDirty = snapshot.isDirty }
+                        if self.titlebarGitDirtyCount != snapshot.dirtyCount { self.titlebarGitDirtyCount = snapshot.dirtyCount }
+                        if self.titlebarIsWorktree != snapshot.isWorktree { self.titlebarIsWorktree = snapshot.isWorktree }
+                    }
                 }
             }
         }
@@ -1285,9 +1469,17 @@ struct ContentView: View {
         let daemon = self.daemonService
         let cwdForWorktree = snapCurrentDir
         DispatchQueue.global(qos: .utility).async {
-            if let repoPath = daemon?.findGitRoot(from: cwdForWorktree), !repoPath.isEmpty {
-                let count = daemon?.listWorktrees(repoPath: repoPath).count ?? 0
+            Self.titlebarWorktreeCountCache.resolve(directory: cwdForWorktree, load: {
+                guard let repoPath = daemon?.findGitRoot(from: cwdForWorktree), !repoPath.isEmpty else {
+                    return 0
+                }
+                return daemon?.listWorktrees(repoPath: repoPath).count ?? 0
+            }) { count in
                 DispatchQueue.main.async {
+                    guard self.tabManager.selectedTabId == selectedId,
+                          self.tabManager.selectedWorkspace?.currentDirectory == cwdForWorktree else {
+                        return
+                    }
                     if self.titlebarWorktreeCount != count { self.titlebarWorktreeCount = count }
                 }
             }
@@ -1312,37 +1504,23 @@ struct ContentView: View {
         }
     }
 
-    private static func queryGitBranch(in directory: String) -> (branch: String, dirty: Bool, dirtyCount: Int, isWorktree: Bool) {
-        let branchProcess = Process()
-        branchProcess.executableURL = URL(fileURLWithPath: "/usr/bin/git")
-        branchProcess.arguments = ["branch", "--show-current"]
-        branchProcess.currentDirectoryURL = URL(fileURLWithPath: directory)
-        let branchPipe = Pipe()
-        branchProcess.standardOutput = branchPipe
-        branchProcess.standardError = Pipe()
-        do {
-            try branchProcess.run()
-            branchProcess.waitUntilExit()
-        } catch { return ("", false, 0, false) }
-        guard branchProcess.terminationStatus == 0 else { return ("", false, 0, false) }
-        let branchData = branchPipe.fileHandleForReading.readDataToEndOfFile()
-        let branch = String(data: branchData, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        guard !branch.isEmpty else { return ("", false, 0, false) }
-
+    private static func queryGitBranch(in directory: String) -> TitlebarGitSnapshot {
         let statusProcess = Process()
         statusProcess.executableURL = URL(fileURLWithPath: "/usr/bin/git")
-        statusProcess.arguments = ["status", "--porcelain", "--short"]
+        statusProcess.arguments = ["status", "--porcelain=v2", "--branch"]
         statusProcess.currentDirectoryURL = URL(fileURLWithPath: directory)
         let statusPipe = Pipe()
         statusProcess.standardOutput = statusPipe
-        statusProcess.standardError = Pipe()
+        statusProcess.standardError = FileHandle.nullDevice
         do {
             try statusProcess.run()
-            statusProcess.waitUntilExit()
-        } catch { return (branch, false, 0, false) }
+        } catch { return TitlebarGitSnapshot(branch: "", isDirty: false, dirtyCount: 0, isWorktree: false) }
         let statusData = statusPipe.fileHandleForReading.readDataToEndOfFile()
-        let statusOutput = String(data: statusData, encoding: .utf8) ?? ""
-        let changedFiles = statusOutput.components(separatedBy: "\n").filter { !$0.isEmpty }
+        statusProcess.waitUntilExit()
+        guard statusProcess.terminationStatus == 0,
+              let status = parseTitlebarGitStatusPorcelainV2(String(data: statusData, encoding: .utf8) ?? "") else {
+            return TitlebarGitSnapshot(branch: "", isDirty: false, dirtyCount: 0, isWorktree: false)
+        }
 
         // Detect worktree: git-dir != git-common-dir means we're in a worktree
         var isWorktree = false
@@ -1367,7 +1545,12 @@ struct ContentView: View {
             }
         } catch {}
 
-        return (branch, !changedFiles.isEmpty, changedFiles.count, isWorktree)
+        return TitlebarGitSnapshot(
+            branch: status.branch,
+            isDirty: status.dirtyCount > 0,
+            dirtyCount: status.dirtyCount,
+            isWorktree: isWorktree
+        )
     }
 
     /// Resolve the CWD of the foreground process on a given TTY.
@@ -1467,45 +1650,47 @@ struct ContentView: View {
         return dir.isEmpty ? nil : dir
     }
 
-    private var contentAndSidebarLayout: AnyView {
-        let layout: AnyView
+    @ViewBuilder
+    private var contentAndSidebarLayout: some View {
         if sidebarBlendMode == SidebarBlendModeOption.withinWindow.rawValue {
             // Overlay mode: terminal extends full width, sidebar on top
             // This allows withinWindow blur to see the terminal content
-            layout = AnyView(
-                ZStack(alignment: .leading) {
-                    terminalContentWithReviewBoard
-                        .padding(.leading, sidebarState.isVisible ? sidebarWidth : 0)
-                    if sidebarState.isVisible {
-                        sidebarView
-                    }
+            ZStack(alignment: .leading) {
+                terminalContentWithReviewBoard
+                    .padding(.leading, sidebarState.isVisible ? sidebarWidth : 0)
+                if sidebarState.isVisible {
+                    sidebarView
                 }
-            )
+            }
+            .overlay(alignment: .leading) {
+                if sidebarState.isVisible {
+                    sidebarResizerOverlay
+                        .zIndex(1000)
+                }
+            }
+            .onPreferenceChange(SidebarOverlayWidthPreferenceKey.self) { width in
+                guard width > 0 else { return }
+                clampSidebarWidthIfNeeded(availableWidth: width)
+            }
         } else {
             // Standard HStack mode for behindWindow blur
-            layout = AnyView(
-                HStack(spacing: 0) {
-                    if sidebarState.isVisible {
-                        sidebarView
-                    }
-                    terminalContentWithReviewBoard
+            HStack(spacing: 0) {
+                if sidebarState.isVisible {
+                    sidebarView
                 }
-            )
+                terminalContentWithReviewBoard
+            }
+            .overlay(alignment: .leading) {
+                if sidebarState.isVisible {
+                    sidebarResizerOverlay
+                        .zIndex(1000)
+                }
+            }
+            .onPreferenceChange(SidebarOverlayWidthPreferenceKey.self) { width in
+                guard width > 0 else { return }
+                clampSidebarWidthIfNeeded(availableWidth: width)
+            }
         }
-
-        return AnyView(
-            layout
-                .overlay(alignment: .leading) {
-                    if sidebarState.isVisible {
-                        sidebarResizerOverlay
-                            .zIndex(1000)
-                    }
-                }
-                .onPreferenceChange(SidebarOverlayWidthPreferenceKey.self) { width in
-                    guard width > 0 else { return }
-                    clampSidebarWidthIfNeeded(availableWidth: width)
-                }
-        )
     }
 
     var body: some View {
@@ -2060,6 +2245,40 @@ struct ContentView: View {
             retiringWorkspaceId = nil
             workspaceHandoffFallbackTask?.cancel()
             workspaceHandoffFallbackTask = nil
+            return
+        }
+
+        if let oldWorkspace = tabManager.tabs.first(where: { $0.id == oldSelectedId }),
+           let newWorkspace = tabManager.tabs.first(where: { $0.id == newSelectedId }),
+           WorkspaceHandoffPolicy.canTransitionImmediately(
+               oldSelectedId: oldSelectedId,
+               newSelectedId: newSelectedId,
+               mountedIds: Set(mountedWorkspaceIds),
+               oldIsTerminalOnly: !oldWorkspace.panels.isEmpty &&
+                   oldWorkspace.panels.values.allSatisfy { $0 is TerminalPanel },
+               newIsTerminalOnly: !newWorkspace.panels.isEmpty &&
+                   newWorkspace.panels.values.allSatisfy { $0 is TerminalPanel },
+               newRendererReady: newWorkspace.panels.values.allSatisfy { panel in
+                   (panel as? TerminalPanel)?.surface.isRendererReadyForImmediateVisibility == true
+               },
+               oldIsPeerMirror: oldWorkspace.isPeerMirror,
+               newIsPeerMirror: newWorkspace.isPeerMirror
+           ) {
+            workspaceHandoffGeneration &+= 1
+            workspaceHandoffFallbackTask?.cancel()
+            workspaceHandoffFallbackTask = nil
+            // Portal terminals live outside the SwiftUI subtree. Hide the old workspace
+            // synchronously so the already-mounted target can become the sole visible tree
+            // in this update without waiting for a second handoff-completion render.
+            oldWorkspace.hideAllTerminalPortalViews()
+            retiringWorkspaceId = nil
+            tabManager.completePendingWorkspaceUnfocus(reason: "warm_immediate")
+#if DEBUG
+            dlog(
+                "ws.handoff.immediate old=\(debugShortWorkspaceId(oldSelectedId)) " +
+                "new=\(debugShortWorkspaceId(newSelectedId))"
+            )
+#endif
             return
         }
 

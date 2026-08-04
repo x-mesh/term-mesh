@@ -1,4 +1,5 @@
 import XCTest
+import AppKit
 
 #if canImport(term_mesh_DEV)
 @testable import term_mesh_DEV
@@ -7,6 +8,123 @@ import XCTest
 #endif
 
 final class GhosttyTerminalViewComposingTests: XCTestCase {
+    func testBackgroundLayerUpdatePolicySkipsEquivalentState() {
+        let color = NSColor(calibratedRed: 0.1, green: 0.2, blue: 0.3, alpha: 0.8)
+
+        XCTAssertFalse(terminalBackgroundLayerNeedsUpdate(
+            currentColor: color.cgColor,
+            currentOpaque: false,
+            targetColor: color.cgColor,
+            targetOpaque: false
+        ))
+        XCTAssertTrue(terminalBackgroundLayerNeedsUpdate(
+            currentColor: color.cgColor,
+            currentOpaque: false,
+            targetColor: color.cgColor,
+            targetOpaque: true
+        ))
+        XCTAssertTrue(terminalBackgroundLayerNeedsUpdate(
+            currentColor: nil,
+            currentOpaque: false,
+            targetColor: color.cgColor,
+            targetOpaque: false
+        ))
+    }
+
+    func testWindowBackgroundUpdatePolicyTracksColorAndOpacity() {
+        let current = NSColor(calibratedWhite: 0.15, alpha: 1)
+        let changed = NSColor(calibratedWhite: 0.2, alpha: 1)
+
+        XCTAssertFalse(terminalWindowBackgroundNeedsUpdate(
+            currentColor: current,
+            currentOpaque: true,
+            targetColor: current,
+            targetOpaque: true
+        ))
+        XCTAssertTrue(terminalWindowBackgroundNeedsUpdate(
+            currentColor: current,
+            currentOpaque: true,
+            targetColor: changed,
+            targetOpaque: true
+        ))
+        XCTAssertTrue(terminalWindowBackgroundNeedsUpdate(
+            currentColor: current,
+            currentOpaque: true,
+            targetColor: current,
+            targetOpaque: false
+        ))
+    }
+
+    @MainActor
+    func testRepeatedHiddenVisibilityDoesNotRestartRendererUnrealizeDebounce() {
+        let surface = TerminalSurface(
+            tabId: UUID(),
+            context: GHOSTTY_SURFACE_CONTEXT_SPLIT,
+            configTemplate: nil
+        )
+
+        surface.hostedView.setVisibleInUI(false)
+        var state = surface.debugRendererVisibilityState()
+        XCTAssertFalse(state.requested)
+        XCTAssertTrue(state.unrealizePending)
+        XCTAssertEqual(state.unrealizeScheduleCount, 1)
+
+        surface.hostedView.setVisibleInUI(false)
+        state = surface.debugRendererVisibilityState()
+        XCTAssertTrue(state.unrealizePending)
+        XCTAssertEqual(
+            state.unrealizeScheduleCount,
+            1,
+            "Repeated SwiftUI updates must preserve the original five-second deadline"
+        )
+
+        surface.hostedView.setVisibleInUI(true)
+        state = surface.debugRendererVisibilityState()
+        XCTAssertTrue(state.requested)
+        XCTAssertFalse(state.unrealizePending)
+    }
+
+    func testSurfaceCreationRetryDelayUsesBoundedBackoff() {
+        XCTAssertEqual(terminalSurfaceCreationRetryDelay(afterFailureCount: 0), 0.25)
+        XCTAssertEqual(terminalSurfaceCreationRetryDelay(afterFailureCount: 1), 0.25)
+        XCTAssertEqual(terminalSurfaceCreationRetryDelay(afterFailureCount: 2), 1)
+        XCTAssertEqual(terminalSurfaceCreationRetryDelay(afterFailureCount: 3), 2)
+        XCTAssertEqual(terminalSurfaceCreationRetryDelay(afterFailureCount: 4), 5)
+        XCTAssertEqual(terminalSurfaceCreationRetryDelay(afterFailureCount: 5), 10)
+        XCTAssertEqual(terminalSurfaceCreationRetryDelay(afterFailureCount: 6), 30)
+        XCTAssertEqual(terminalSurfaceCreationRetryDelay(afterFailureCount: 100), 30)
+    }
+
+    func testSurfaceCreationWaitsForQueuedBackgroundRetry() {
+        XCTAssertFalse(terminalSurfaceShouldStartSynchronously(
+            creationInProgress: false,
+            backgroundStartQueued: true,
+            now: 20,
+            retryNotBefore: 10
+        ))
+    }
+
+    func testSurfaceCreationStartsSynchronouslyOnlyWhenEligible() {
+        XCTAssertTrue(terminalSurfaceShouldStartSynchronously(
+            creationInProgress: false,
+            backgroundStartQueued: false,
+            now: 20,
+            retryNotBefore: 10
+        ))
+        XCTAssertFalse(terminalSurfaceShouldStartSynchronously(
+            creationInProgress: true,
+            backgroundStartQueued: false,
+            now: 20,
+            retryNotBefore: 10
+        ))
+        XCTAssertFalse(terminalSurfaceShouldStartSynchronously(
+            creationInProgress: false,
+            backgroundStartQueued: false,
+            now: 9,
+            retryNotBefore: 10
+        ))
+    }
+
     private func externalSnapshot(
         hostFrame: NSRect = NSRect(x: 0, y: 0, width: 800, height: 600),
         anchorFrame: NSRect = NSRect(x: 10, y: 20, width: 300, height: 200),
@@ -104,6 +222,54 @@ final class GhosttyTerminalViewComposingTests: XCTestCase {
             previous: snapshot,
             current: snapshot,
             force: true
+        ))
+    }
+
+    func testPortalBindFullReconciliationOnlyForTopologyChanges() {
+        XCTAssertFalse(terminalPortalBindNeedsFullReconciliation(
+            hasPreviousEntry: true,
+            didChangeAnchor: false,
+            requiredHostedViewAttachment: false
+        ), "Visibility-only warm rebinds are already handled by targeted synchronization")
+
+        XCTAssertTrue(terminalPortalBindNeedsFullReconciliation(
+            hasPreviousEntry: false,
+            didChangeAnchor: false,
+            requiredHostedViewAttachment: false
+        ))
+        XCTAssertTrue(terminalPortalBindNeedsFullReconciliation(
+            hasPreviousEntry: true,
+            didChangeAnchor: true,
+            requiredHostedViewAttachment: false
+        ))
+        XCTAssertTrue(terminalPortalBindNeedsFullReconciliation(
+            hasPreviousEntry: true,
+            didChangeAnchor: false,
+            requiredHostedViewAttachment: true
+        ))
+    }
+
+    func testPortalBindSeedsGeometryOnlyForTopologyChanges() {
+        XCTAssertFalse(terminalPortalBindNeedsGeometrySeed(
+            hasPreviousEntry: true,
+            didChangeAnchor: false,
+            requiredHostedViewAttachment: false
+        ), "Visibility-only warm rebinds keep their settled geometry")
+
+        XCTAssertTrue(terminalPortalBindNeedsGeometrySeed(
+            hasPreviousEntry: false,
+            didChangeAnchor: false,
+            requiredHostedViewAttachment: false
+        ))
+        XCTAssertTrue(terminalPortalBindNeedsGeometrySeed(
+            hasPreviousEntry: true,
+            didChangeAnchor: true,
+            requiredHostedViewAttachment: false
+        ))
+        XCTAssertTrue(terminalPortalBindNeedsGeometrySeed(
+            hasPreviousEntry: true,
+            didChangeAnchor: false,
+            requiredHostedViewAttachment: true
         ))
     }
 
@@ -205,6 +371,54 @@ final class GhosttyTerminalViewComposingTests: XCTestCase {
             previous: previous,
             current: previous,
             force: true
+        ))
+    }
+
+    func testPortalAnchorFullReconciliationOnlyForTopologyChanges() {
+        let firstWindow = NSObject()
+        let secondWindow = NSObject()
+        let firstSuperview = NSObject()
+        let secondSuperview = NSObject()
+        let previous = TerminalPortalAnchorGeometry(
+            windowID: ObjectIdentifier(firstWindow),
+            superviewID: ObjectIdentifier(firstSuperview),
+            frameInWindow: NSRect(x: 10, y: 20, width: 300, height: 200)
+        )
+        let frameOnlyChange = TerminalPortalAnchorGeometry(
+            windowID: ObjectIdentifier(firstWindow),
+            superviewID: ObjectIdentifier(firstSuperview),
+            frameInWindow: NSRect(x: 40, y: 20, width: 280, height: 200)
+        )
+        let windowChange = TerminalPortalAnchorGeometry(
+            windowID: ObjectIdentifier(secondWindow),
+            superviewID: ObjectIdentifier(firstSuperview),
+            frameInWindow: previous.frameInWindow
+        )
+        let superviewChange = TerminalPortalAnchorGeometry(
+            windowID: ObjectIdentifier(firstWindow),
+            superviewID: ObjectIdentifier(secondSuperview),
+            frameInWindow: previous.frameInWindow
+        )
+
+        XCTAssertTrue(terminalPortalAnchorNeedsFullReconciliation(
+            previous: nil,
+            current: previous
+        ), "The first geometry report must reconcile every portal entry")
+        XCTAssertFalse(terminalPortalAnchorNeedsFullReconciliation(
+            previous: previous,
+            current: frameOnlyChange
+        ), "Frame-only changes are handled by targeted and external geometry synchronization")
+        XCTAssertFalse(terminalPortalAnchorNeedsFullReconciliation(
+            previous: previous,
+            current: previous
+        ), "A forced callback on unchanged topology must remain targeted")
+        XCTAssertTrue(terminalPortalAnchorNeedsFullReconciliation(
+            previous: previous,
+            current: windowChange
+        ))
+        XCTAssertTrue(terminalPortalAnchorNeedsFullReconciliation(
+            previous: previous,
+            current: superviewChange
         ))
     }
 

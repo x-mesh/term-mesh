@@ -501,6 +501,29 @@ if [[ "$MANAGED_DERIVED" -eq 1 && -e "$DERIVED_DATA" ]]; then
 fi
 trap cleanup_failed_build EXIT
 
+# Gate the build on ghostty ABI consistency. reload.sh never runs setup.sh, so
+# nothing else re-links GhosttyKit.xcframework after a submodule move: the
+# symlink can still point at an older build while the root ghostty.h Swift
+# compiles against has already advanced. That combination builds cleanly and
+# crashes in ghostty_surface_new seconds after launch (2026-08-04), so check it
+# here and repair via setup.sh rather than shipping a poisoned binary.
+RELOAD_SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+RELOAD_PROJECT_DIR="$(dirname "$RELOAD_SCRIPT_DIR")"
+# shellcheck source=lib/ghostty-abi.sh
+. "$RELOAD_SCRIPT_DIR/lib/ghostty-abi.sh"
+if ! ghostty_abi_is_consistent "$RELOAD_PROJECT_DIR"; then
+  echo "==> ghostty ABI mismatch detected before build:"
+  ghostty_abi_report "$RELOAD_PROJECT_DIR"
+  echo "==> Repairing via ./scripts/setup.sh ..."
+  "$RELOAD_SCRIPT_DIR/setup.sh"
+  if ! ghostty_abi_is_consistent "$RELOAD_PROJECT_DIR"; then
+    echo "error: ghostty ABI still inconsistent after setup.sh; refusing to build" >&2
+    ghostty_abi_report "$RELOAD_PROJECT_DIR"
+    exit 1
+  fi
+  echo "==> ghostty ABI repaired; continuing build"
+fi
+
 XCODEBUILD_ARGS=(
   -project GhosttyTabs.xcodeproj
   -scheme term-mesh

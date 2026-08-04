@@ -826,6 +826,12 @@ final class GhosttySurfaceScrollView: NSView {
 
     func setBackgroundColor(_ color: NSColor) {
         guard let layer = backgroundView.layer else { return }
+        guard terminalBackgroundLayerNeedsUpdate(
+            currentColor: layer.backgroundColor,
+            currentOpaque: layer.isOpaque,
+            targetColor: color.cgColor,
+            targetOpaque: layer.isOpaque
+        ) else { return }
         CATransaction.begin()
         CATransaction.setDisableActions(true)
         layer.backgroundColor = color.cgColor
@@ -1786,11 +1792,19 @@ final class GhosttySurfaceScrollView: NSView {
     func setVisibleInUI(_ visible: Bool) {
         let wasVisible = surfaceView.isVisibleInUI
         surfaceView.setVisibleInUI(visible)
-        // Reclaim renderer GPU resources (~40MB swap chain/IOSurface) for surfaces that
-        // stay invisible; recreate them before a surface is shown again. Driven here so it
-        // tracks workspace selection exactly. Realize runs before `isHidden = false` below
-        // so the swap chain is rebuilding by the time the view is shown.
-        surfaceView.terminalSurface?.setSurfaceVisibleForRenderer(visible)
+        if wasVisible != visible, let terminalSurface = surfaceView.terminalSurface {
+            // Occlusion is the lightweight, immediate pause: Ghostty stops the surface's
+            // CVDisplayLink and ignores wakeup-driven draws while a workspace is hidden.
+            // GPU unrealize remains debounced below so quick workspace switches do not
+            // churn the swap chain. Keep focus ownership in the existing active-pane path.
+            if visible {
+                terminalSurface.setSurfaceVisibleForRenderer(true)
+                terminalSurface.setOcclusion(true)
+            } else {
+                terminalSurface.setOcclusion(false)
+                terminalSurface.setSurfaceVisibleForRenderer(false)
+            }
+        }
         isHidden = !visible
 #if DEBUG
         if wasVisible != visible {

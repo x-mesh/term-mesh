@@ -139,6 +139,14 @@ fn send_signal(pid: u32, signal: i32) -> bool {
     unsafe { libc::kill(pid as i32, signal) == 0 }
 }
 
+/// Refresh only the processes explicitly registered by the app.
+fn refresh_tracked_processes(system: &mut System, tracked: &[u32]) {
+    let pids: Vec<Pid> = tracked.iter().copied().map(Pid::from_u32).collect();
+    if !pids.is_empty() {
+        system.refresh_processes(ProcessesToUpdate::Some(&pids), true);
+    }
+}
+
 fn iso8601_now() -> String {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -166,7 +174,7 @@ fn iso8601_now() -> String {
     )
 }
 
-/// Start background resource monitor with auto-process-discovery.
+/// Start the background resource monitor for app-registered processes.
 /// Watch paths are managed separately by the Swift app (per terminal tab).
 pub fn start_monitor(
     config: BudgetConfig,
@@ -183,7 +191,12 @@ pub fn start_monitor(
     let stopped = handle.stopped_pids.clone();
     let auto_stop = handle.auto_stop.clone();
     tokio::spawn(async move {
-        let mut sys = System::new_all();
+        // Process discovery belongs to the Swift app, which registers exactly
+        // the PIDs this monitor needs. `System::new_all()` eagerly enumerates
+        // every process at startup, and refreshing `ProcessesToUpdate::All` on
+        // each tick made the daemon spike every two seconds even when no agent
+        // was running. Start empty and populate only registered PIDs below.
+        let mut sys = System::new();
         let mut disks = Disks::new_with_refreshed_list();
         let mut networks = Networks::new_with_refreshed_list();
         let mut tick = interval(Duration::from_secs(2));
@@ -198,8 +211,6 @@ pub fn start_monitor(
             tick_count += 1;
             sys.refresh_memory();
             sys.refresh_cpu_usage();
-            // Refresh all processes every tick for system-wide disk I/O
-            sys.refresh_processes(ProcessesToUpdate::All, true);
             // Refresh disk space every 15 ticks (30s)
             if tick_count % 15 == 1 {
                 disks.refresh(false);
@@ -207,13 +218,11 @@ pub fn start_monitor(
             // Refresh network stats every tick
             networks.refresh(false);
 
-            // Only refresh tracked PIDs (registered by Swift app via monitor.track RPC)
+            // Only refresh tracked PIDs (registered by Swift app via monitor.track RPC).
+            // `remove_dead_processes` remains true so a registered process that
+            // exits disappears from both sysinfo and the tracked list below.
             let tracked_snapshot: Vec<u32> = pids.lock().unwrap().clone();
-            let pids_to_refresh: Vec<Pid> =
-                tracked_snapshot.iter().map(|&p| Pid::from_u32(p)).collect();
-            if !pids_to_refresh.is_empty() {
-                sys.refresh_processes(ProcessesToUpdate::Some(&pids_to_refresh), true);
-            }
+            refresh_tracked_processes(&mut sys, &tracked_snapshot);
 
             // Remove dead PIDs from tracked list
             {
@@ -237,6 +246,8 @@ pub fn start_monitor(
             let mut alerts = Vec::new();
             let mut anomalies: Vec<Anomaly> = Vec::new();
 
+            let mut io_read = 0u64;
+            let mut io_write = 0u64;
             for &pid in &tracked {
                 if let Some(proc) = sys.process(Pid::from_u32(pid)) {
                     let cpu = proc.cpu_usage();
@@ -244,6 +255,9 @@ pub fn start_monitor(
                     let is_stopped = stopped_set.contains(&pid);
                     let name = proc.name().to_string_lossy().into_owned();
                     let ppid = proc.parent().map(|p| p.as_u32()).unwrap_or(0);
+                    let disk_usage = proc.disk_usage();
+                    io_read = io_read.saturating_add(disk_usage.read_bytes);
+                    io_write = io_write.saturating_add(disk_usage.written_bytes);
 
                     // cmdline: join argv, truncate to 200 chars
                     let cmdline: Option<String> = {
@@ -383,13 +397,8 @@ pub fn start_monitor(
                 })
                 .collect();
 
-            // System-wide disk I/O: aggregate across ALL processes
-            // disk_usage().read_bytes is bytes since last refresh (already a delta)
-            let (io_read, io_write) =
-                sys.processes().values().fold((0u64, 0u64), |(r, w), proc| {
-                    let du = proc.disk_usage();
-                    (r + du.read_bytes, w + du.written_bytes)
-                });
+            // Aggregate only registered processes. disk_usage().read_bytes and
+            // written_bytes are deltas since the preceding refresh.
             let read_per_sec = io_read / 2; // 2s interval
             let write_per_sec = io_write / 2;
 
@@ -484,8 +493,16 @@ impl MonitorHandle {
     }
 
     pub fn untrack_pid(&self, pid: u32) {
-        let mut pids = self.tracked_pids.lock().unwrap();
-        pids.retain(|&p| p != pid);
+        {
+            let mut pids = self.tracked_pids.lock().unwrap();
+            pids.retain(|&p| p != pid);
+        }
+        // A stopped process can outlive its tracking relationship. Resume it
+        // before forgetting the PID and always clear membership so PID reuse
+        // cannot make a new process look already stopped.
+        if self.stopped_pids.lock().unwrap().remove(&pid) {
+            let _ = send_signal(pid, libc::SIGCONT);
+        }
         tracing::info!("untracked PID {pid}");
     }
 
@@ -558,6 +575,17 @@ impl MonitorHandle {
 mod tests {
     use super::*;
 
+    #[test]
+    fn tracked_refresh_does_not_enumerate_unregistered_processes() {
+        let mut system = System::new();
+        let current = std::process::id();
+
+        refresh_tracked_processes(&mut system, &[current]);
+
+        assert!(system.process(Pid::from_u32(current)).is_some());
+        assert_eq!(system.processes().len(), 1);
+    }
+
     // ── BudgetConfig defaults ──
 
     #[test]
@@ -597,6 +625,22 @@ mod tests {
 
         handle.untrack_pid(5678);
         assert!(handle.tracked_pids().is_empty());
+    }
+
+    #[test]
+    fn untrack_clears_stopped_membership_for_pid_reuse() {
+        let handle = MonitorHandle {
+            tracked_pids: std::sync::Arc::new(std::sync::Mutex::new(vec![99999])),
+            stopped_pids: std::sync::Arc::new(std::sync::Mutex::new(HashSet::from([99999]))),
+            auto_stop: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            cpu_threshold: 90.0,
+            memory_threshold: 4 * 1024 * 1024 * 1024,
+        };
+
+        handle.untrack_pid(99999);
+
+        assert!(handle.tracked_pids().is_empty());
+        assert!(handle.stopped_pids.lock().unwrap().is_empty());
     }
 
     #[test]

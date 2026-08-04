@@ -54,6 +54,70 @@ private func installTermMeshUnitTestInspectorOverride() {
     termMeshUnitTestInspectorOverrideInstalled = true
 }
 
+final class SidebarTeamRuntimeSnapshotTests: XCTestCase {
+    private let baseline = SidebarTeamRuntimeSnapshot(
+        teamName: "term-mesh",
+        attentionCount: 0,
+        agentStates: [
+            .init(agentInstanceId: "leader-1", state: "idle"),
+            .init(agentInstanceId: "reviewer-1", state: "running")
+        ]
+    )
+
+    func testIdenticalSnapshotRemainsEqual() {
+        XCTAssertEqual(
+            baseline,
+            SidebarTeamRuntimeSnapshot(
+                teamName: "term-mesh",
+                attentionCount: 0,
+                agentStates: [
+                    .init(agentInstanceId: "leader-1", state: "idle"),
+                    .init(agentInstanceId: "reviewer-1", state: "running")
+                ]
+            )
+        )
+    }
+
+    func testEveryRenderedTeamDimensionInvalidatesEquality() {
+        let changes = [
+            SidebarTeamRuntimeSnapshot(
+                teamName: "renamed-team",
+                attentionCount: baseline.attentionCount,
+                agentStates: baseline.agentStates
+            ),
+            SidebarTeamRuntimeSnapshot(
+                teamName: baseline.teamName,
+                attentionCount: 1,
+                agentStates: baseline.agentStates
+            ),
+            SidebarTeamRuntimeSnapshot(
+                teamName: baseline.teamName,
+                attentionCount: baseline.attentionCount,
+                agentStates: [
+                    .init(agentInstanceId: "leader-1", state: "blocked"),
+                    .init(agentInstanceId: "reviewer-1", state: "running")
+                ]
+            ),
+            SidebarTeamRuntimeSnapshot(
+                teamName: baseline.teamName,
+                attentionCount: baseline.attentionCount,
+                agentStates: baseline.agentStates + [
+                    .init(agentInstanceId: "executor-1", state: "idle")
+                ]
+            )
+        ]
+
+        for changed in changes {
+            XCTAssertNotEqual(baseline, changed)
+        }
+    }
+
+    func testStateLookupUsesInstanceIdentityAndDefaultsToIdle() {
+        XCTAssertEqual(baseline.state(for: "reviewer-1"), "running")
+        XCTAssertEqual(baseline.state(for: "missing-instance"), "idle")
+    }
+}
+
 final class SplitShortcutTransientFocusGuardTests: XCTestCase {
     func testSuppressesWhenFirstResponderFallsBackAndHostedViewIsTiny() {
         XCTAssertTrue(
@@ -1959,6 +2023,21 @@ final class WorkspacePlacementSettingsTests: XCTestCase {
 }
 
 final class WorkspaceTabColorSettingsTests: XCTestCase {
+    func testStandardPaletteIsComputedOnceUntilInvalidated() {
+        WorkspaceTabColorSettings.invalidateStandardPaletteCache()
+        let initialCount = WorkspaceTabColorSettings.standardPaletteComputationCount
+
+        let first = WorkspaceTabColorSettings.palette()
+        let second = WorkspaceTabColorSettings.palette()
+
+        XCTAssertEqual(first, second)
+        XCTAssertEqual(WorkspaceTabColorSettings.standardPaletteComputationCount, initialCount + 1)
+
+        WorkspaceTabColorSettings.invalidateStandardPaletteCache()
+        _ = WorkspaceTabColorSettings.palette()
+        XCTAssertEqual(WorkspaceTabColorSettings.standardPaletteComputationCount, initialCount + 2)
+    }
+
     func testNormalizedHexAcceptsAndNormalizesValidInput() {
         XCTAssertEqual(WorkspaceTabColorSettings.normalizedHex("#abc123"), "#ABC123")
         XCTAssertEqual(WorkspaceTabColorSettings.normalizedHex("  aBcDeF "), "#ABCDEF")
@@ -2305,6 +2384,19 @@ final class SidebarPresentationSettingsTests: XCTestCase {
             ),
             [localA, peerMirror, localB]
         )
+    }
+}
+
+final class SidebarAxisPickerTests: XCTestCase {
+    func testEqualityDependsOnlyOnRenderedSelection() {
+        let host = SidebarAxisPicker(selection: SidebarAxis.host.rawValue) { _ in }
+        let sameHostWithDifferentAction = SidebarAxisPicker(selection: SidebarAxis.host.rawValue) { _ in
+            XCTFail("Action identity must not affect rendering equality")
+        }
+        let project = SidebarAxisPicker(selection: SidebarAxis.project.rawValue) { _ in }
+
+        XCTAssertEqual(host, sameHostWithDifferentAction)
+        XCTAssertNotEqual(host, project)
     }
 }
 
@@ -3139,7 +3231,177 @@ final class WorkspacePanelGitBranchTests: XCTestCase {
     }
 }
 
+@MainActor
 final class SidebarBranchOrderingTests: XCTestCase {
+
+    func testWorkspaceCachesDominantRemoteHostKeyUntilPanelsOrFocusChange() {
+        let workspace = Workspace()
+        guard let firstPanelId = workspace.focusedPanelId,
+              let paneId = workspace.paneId(forPanelId: firstPanelId),
+              let secondPanel = workspace.newTerminalSurface(inPane: paneId, focus: false) else {
+            XCTFail("Expected two local terminal panels")
+            return
+        }
+
+        guard let initiallyFocusedPanelId = workspace.focusedPanelId else {
+            XCTFail("Expected one of the terminal panels to be focused")
+            return
+        }
+        let targetPanelId = initiallyFocusedPanelId == firstPanelId ? secondPanel.id : firstPanelId
+        guard let targetTabId = workspace.surfaceIdFromPanelId(targetPanelId) else {
+            XCTFail("Expected a Bonsplit tab for the focus target")
+            return
+        }
+
+        XCTAssertNil(workspace.dominantRemoteHostKey)
+        let initialComputationCount = workspace.dominantRemoteHostKeyComputationCount
+
+        XCTAssertNil(workspace.dominantRemoteHostKey)
+        XCTAssertEqual(
+            workspace.dominantRemoteHostKeyComputationCount,
+            initialComputationCount,
+            "Selection-only sidebar renders must reuse the host-key snapshot"
+        )
+
+        workspace.applyTabSelection(tabId: targetTabId, inPane: paneId)
+        XCTAssertEqual(workspace.focusedPanelId, targetPanelId)
+        XCTAssertNil(workspace.dominantRemoteHostKey)
+        XCTAssertEqual(
+            workspace.dominantRemoteHostKeyComputationCount,
+            initialComputationCount + 1,
+            "Changing the focused panel must recompute the focus-preferred host"
+        )
+
+        let panelToRemove = targetPanelId == firstPanelId ? secondPanel.id : firstPanelId
+        workspace.panels.removeValue(forKey: panelToRemove)
+        XCTAssertNil(workspace.dominantRemoteHostKey)
+        XCTAssertEqual(
+            workspace.dominantRemoteHostKeyComputationCount,
+            initialComputationCount + 2,
+            "Changing panel membership must invalidate the fallback-host scan"
+        )
+    }
+
+    func testWorkspaceCachesBranchDirectoryEntriesUntilAnInputChanges() {
+        let workspace = Workspace()
+        guard let panelId = workspace.focusedPanelId else {
+            XCTFail("Expected initial panel")
+            return
+        }
+
+        workspace.updatePanelDirectory(panelId: panelId, directory: "/repo/one")
+        workspace.updatePanelGitBranch(panelId: panelId, branch: "main", isDirty: false)
+
+        XCTAssertEqual(
+            workspace.sidebarBranchDirectoryEntriesInDisplayOrder(),
+            [
+                SidebarBranchOrdering.BranchDirectoryEntry(
+                    branch: "main",
+                    isDirty: false,
+                    directory: "/repo/one"
+                )
+            ]
+        )
+        XCTAssertEqual(workspace.sidebarBranchDirectoryEntriesComputationCount, 1)
+
+        _ = workspace.sidebarBranchDirectoryEntriesInDisplayOrder()
+        XCTAssertEqual(
+            workspace.sidebarBranchDirectoryEntriesComputationCount,
+            1,
+            "Selection-only row reevaluations must reuse the workspace snapshot"
+        )
+
+        workspace.updatePanelDirectory(panelId: panelId, directory: "/repo/two")
+        XCTAssertEqual(
+            workspace.sidebarBranchDirectoryEntriesInDisplayOrder(),
+            [
+                SidebarBranchOrdering.BranchDirectoryEntry(
+                    branch: "main",
+                    isDirty: false,
+                    directory: "/repo/two"
+                )
+            ]
+        )
+        XCTAssertEqual(workspace.sidebarBranchDirectoryEntriesComputationCount, 2)
+
+        workspace.updatePanelGitBranch(panelId: panelId, branch: "feature", isDirty: true)
+        XCTAssertEqual(
+            workspace.sidebarBranchDirectoryEntriesInDisplayOrder(),
+            [
+                SidebarBranchOrdering.BranchDirectoryEntry(
+                    branch: "feature",
+                    isDirty: true,
+                    directory: "/repo/two"
+                )
+            ]
+        )
+        XCTAssertEqual(workspace.sidebarBranchDirectoryEntriesComputationCount, 3)
+    }
+
+    func testWorkspaceCachesFormattedBranchDirectoryLines() {
+        let workspace = Workspace()
+        guard let panelId = workspace.focusedPanelId else {
+            XCTFail("Expected initial panel")
+            return
+        }
+
+        workspace.updatePanelDirectory(panelId: panelId, directory: "/repo/one")
+        workspace.updatePanelGitBranch(panelId: panelId, branch: "main", isDirty: true)
+
+        let expected = [
+            SidebarBranchOrdering.BranchDirectoryDisplayLine(
+                branch: "main*",
+                directory: "/repo/one"
+            )
+        ]
+        XCTAssertEqual(workspace.sidebarBranchDirectoryDisplayLines(showGitBranch: true), expected)
+        XCTAssertEqual(workspace.sidebarBranchDirectoryDisplayLinesComputationCount, 1)
+
+        XCTAssertEqual(workspace.sidebarBranchDirectoryDisplayLines(showGitBranch: true), expected)
+        XCTAssertEqual(
+            workspace.sidebarBranchDirectoryDisplayLinesComputationCount,
+            1,
+            "Repeated row renders must reuse formatted branch/directory lines"
+        )
+
+        XCTAssertEqual(
+            workspace.sidebarBranchDirectoryDisplayLines(showGitBranch: false),
+            [SidebarBranchOrdering.BranchDirectoryDisplayLine(branch: nil, directory: "/repo/one")]
+        )
+        XCTAssertEqual(workspace.sidebarBranchDirectoryDisplayLinesComputationCount, 2)
+    }
+
+    func testReorderingTabsInvalidatesBranchDirectoryDisplayOrder() {
+        let workspace = Workspace()
+        guard let firstPanelId = workspace.focusedPanelId,
+              let paneId = workspace.paneId(forPanelId: firstPanelId),
+              let secondPanel = workspace.newTerminalSurface(inPane: paneId, focus: false) else {
+            XCTFail("Expected two panels in one pane")
+            return
+        }
+
+        workspace.updatePanelDirectory(panelId: firstPanelId, directory: "/repo/one")
+        workspace.updatePanelDirectory(panelId: secondPanel.id, directory: "/repo/two")
+        workspace.updatePanelGitBranch(panelId: firstPanelId, branch: "first", isDirty: false)
+        workspace.updatePanelGitBranch(panelId: secondPanel.id, branch: "second", isDirty: false)
+
+        XCTAssertEqual(
+            workspace.sidebarBranchDirectoryDisplayLines(showGitBranch: true).map(\.branch),
+            ["first", "second"]
+        )
+        XCTAssertEqual(workspace.sidebarBranchDirectoryEntriesComputationCount, 1)
+
+        XCTAssertTrue(workspace.reorderSurface(panelId: secondPanel.id, toIndex: 0))
+        XCTAssertEqual(
+            workspace.sidebarBranchDirectoryDisplayLines(showGitBranch: true).map(\.branch),
+            ["second", "first"]
+        )
+        XCTAssertEqual(
+            workspace.sidebarBranchDirectoryEntriesComputationCount,
+            2,
+            "A same-pane reorder must invalidate the display-order snapshot"
+        )
+    }
 
     func testOrderedUniqueBranchesDedupesByNameAndMergesDirtyState() {
         let first = UUID()
@@ -4577,7 +4839,12 @@ final class MenuBarIconRendererTests: XCTestCase {
 }
 
 final class WorkspaceMountPolicyTests: XCTestCase {
-    func testDefaultPolicyMountsOnlySelectedWorkspace() {
+    func testInactiveWorkspaceOpacityKeepsNativeHierarchyWithoutVisiblePixelContribution() {
+        XCTAssertGreaterThan(WorkspaceMountPolicy.inactiveWorkspaceOpacity, 0)
+        XCTAssertLessThan(WorkspaceMountPolicy.inactiveWorkspaceOpacity, 0.5 / 255.0)
+    }
+
+    func testDefaultPolicyKeepsSelectedAndRecentWorkspace() {
         let a = UUID()
         let b = UUID()
         let orderedTabIds: [UUID] = [a, b]
@@ -4591,7 +4858,7 @@ final class WorkspaceMountPolicyTests: XCTestCase {
             maxMounted: WorkspaceMountPolicy.maxMountedWorkspaces
         )
 
-        XCTAssertEqual(next, [b])
+        XCTAssertEqual(next, [b, a])
     }
 
     func testSelectedWorkspaceMovesToFrontAndMountCountIsBounded() {
@@ -4662,7 +4929,7 @@ final class WorkspaceMountPolicyTests: XCTestCase {
         XCTAssertEqual(next, [a])
     }
 
-    func testCycleHotModeKeepsOnlySelectedWhenNoPinnedHandoff() {
+    func testCycleHotModeKeepsSelectedAndRecentWhenNoPinnedHandoff() {
         let a = UUID()
         let b = UUID()
         let c = UUID()
@@ -4678,7 +4945,7 @@ final class WorkspaceMountPolicyTests: XCTestCase {
             maxMounted: WorkspaceMountPolicy.maxMountedWorkspacesDuringCycle
         )
 
-        XCTAssertEqual(next, [c])
+        XCTAssertEqual(next, [c, a])
     }
 
     func testCycleHotModeRespectsMaxMountedLimit() {
@@ -4696,7 +4963,7 @@ final class WorkspaceMountPolicyTests: XCTestCase {
             maxMounted: 2
         )
 
-        XCTAssertEqual(next, [b])
+        XCTAssertEqual(next, [b, a])
     }
 
     func testPinnedIdsAreRetainedAcrossReconcile() {
@@ -4732,6 +4999,114 @@ final class WorkspaceMountPolicyTests: XCTestCase {
         )
 
         XCTAssertEqual(next, [b, a])
+    }
+}
+
+final class WorkspaceHandoffPolicyTests: XCTestCase {
+    func testWarmLocalBrowserFreePairTransitionsImmediately() {
+        let old = UUID()
+        let new = UUID()
+
+        XCTAssertTrue(WorkspaceHandoffPolicy.canTransitionImmediately(
+            oldSelectedId: old,
+            newSelectedId: new,
+            mountedIds: [old, new],
+            oldIsTerminalOnly: true,
+            newIsTerminalOnly: true,
+            newRendererReady: true,
+            oldIsPeerMirror: false,
+            newIsPeerMirror: false
+        ))
+    }
+
+    func testColdTargetRetainsOverlapHandoff() {
+        let old = UUID()
+        let new = UUID()
+
+        XCTAssertFalse(WorkspaceHandoffPolicy.canTransitionImmediately(
+            oldSelectedId: old,
+            newSelectedId: new,
+            mountedIds: [old],
+            oldIsTerminalOnly: true,
+            newIsTerminalOnly: true,
+            newRendererReady: true,
+            oldIsPeerMirror: false,
+            newIsPeerMirror: false
+        ))
+    }
+
+    func testBrowserAndPeerWorkspacesRetainOverlapHandoff() {
+        let old = UUID()
+        let new = UUID()
+        let mounted: Set<UUID> = [old, new]
+
+        XCTAssertFalse(WorkspaceHandoffPolicy.canTransitionImmediately(
+            oldSelectedId: old,
+            newSelectedId: new,
+            mountedIds: mounted,
+            oldIsTerminalOnly: false,
+            newIsTerminalOnly: true,
+            newRendererReady: true,
+            oldIsPeerMirror: false,
+            newIsPeerMirror: false
+        ))
+        XCTAssertFalse(WorkspaceHandoffPolicy.canTransitionImmediately(
+            oldSelectedId: old,
+            newSelectedId: new,
+            mountedIds: mounted,
+            oldIsTerminalOnly: true,
+            newIsTerminalOnly: true,
+            newRendererReady: true,
+            oldIsPeerMirror: false,
+            newIsPeerMirror: true
+        ))
+    }
+
+    func testUnrealizedWarmTargetRetainsOverlapHandoff() {
+        let old = UUID()
+        let new = UUID()
+
+        XCTAssertFalse(WorkspaceHandoffPolicy.canTransitionImmediately(
+            oldSelectedId: old,
+            newSelectedId: new,
+            mountedIds: [old, new],
+            oldIsTerminalOnly: true,
+            newIsTerminalOnly: true,
+            newRendererReady: false,
+            oldIsPeerMirror: false,
+            newIsPeerMirror: false
+        ))
+    }
+
+    func testWarmImmediateSwitchKeepsStableVisualPriority() {
+        XCTAssertEqual(WorkspaceHandoffPolicy.visualPriority(
+            isSelected: true,
+            isRetiring: false,
+            hasOverlap: false
+        ), 0)
+        XCTAssertEqual(WorkspaceHandoffPolicy.visualPriority(
+            isSelected: false,
+            isRetiring: false,
+            hasOverlap: false
+        ), 0)
+    }
+
+    func testOverlapHandoffPrioritizesSelectedAboveRetiring() {
+        XCTAssertEqual(WorkspaceHandoffPolicy.visualPriority(
+            isSelected: true,
+            isRetiring: false,
+            hasOverlap: true
+        ), 2)
+        XCTAssertEqual(WorkspaceHandoffPolicy.visualPriority(
+            isSelected: false,
+            isRetiring: true,
+            hasOverlap: true
+        ), 1)
+        XCTAssertEqual(WorkspaceHandoffPolicy.visualPriority(
+            isSelected: false,
+            isRetiring: false,
+            hasOverlap: true
+        ), 0)
     }
 }
 
@@ -5487,7 +5862,7 @@ final class TerminalWindowPortalLifecycleTests: XCTestCase {
         )
     }
 
-    func testVisibilityTransitionBringsHostedViewToFront() {
+    func testVisibilityTransitionAtSamePriorityPreservesHostedViewOrder() {
         let window = NSWindow(
             contentRect: NSRect(x: 0, y: 0, width: 500, height: 300),
             styleMask: [.titled, .closable],
@@ -5523,8 +5898,8 @@ final class TerminalWindowPortalLifecycleTests: XCTestCase {
         portal.bind(hostedView: hosted1, to: anchor1, visibleInUI: false)
         portal.bind(hostedView: hosted1, to: anchor1, visibleInUI: true)
         XCTAssertTrue(
-            portal.terminalViewAtWindowPoint(overlapInWindow) === terminal1,
-            "Becoming visible should refresh z-order for already-hosted view"
+            portal.terminalViewAtWindowPoint(overlapInWindow) === terminal2,
+            "Visibility-only updates should preserve the established portal z-order"
         )
     }
 
@@ -6206,6 +6581,58 @@ final class TerminalControllerSidebarDedupeTests: XCTestCase {
         XCTAssertEqual(
             TerminalController.normalizeReportedDirectory("  file://bad host  "),
             "file://bad host"
+        )
+    }
+}
+
+@MainActor
+final class SidebarNotificationSummaryTests: XCTestCase {
+    func testSummariesCountUnreadAndPreferLatestUnreadText() {
+        let workspace = UUID()
+        let notifications = [
+            notification(workspace: workspace, title: "Newest read", body: "", isRead: true),
+            notification(workspace: workspace, title: "Unread title", body: "  Unread body  ", isRead: false),
+            notification(workspace: workspace, title: "Older unread", body: "", isRead: false),
+        ]
+
+        let summary = TerminalNotificationStore.makeSidebarSummaries(from: notifications)[workspace]
+
+        XCTAssertEqual(summary?.unreadCount, 2)
+        XCTAssertEqual(summary?.displayText, "Unread body")
+    }
+
+    func testSummariesUseLatestReadTextAndIgnoreWhitespaceOnlyText() {
+        let workspace = UUID()
+        let emptyWorkspace = UUID()
+        let notifications = [
+            notification(workspace: workspace, title: "Latest title", body: "", isRead: true),
+            notification(workspace: workspace, title: "Older title", body: "Older body", isRead: true),
+            notification(workspace: emptyWorkspace, title: "  ", body: "  ", isRead: false),
+        ]
+
+        let summaries = TerminalNotificationStore.makeSidebarSummaries(from: notifications)
+
+        XCTAssertEqual(summaries[workspace]?.unreadCount, 0)
+        XCTAssertEqual(summaries[workspace]?.displayText, "Latest title")
+        XCTAssertEqual(summaries[emptyWorkspace]?.unreadCount, 1)
+        XCTAssertNil(summaries[emptyWorkspace]?.displayText)
+    }
+
+    private func notification(
+        workspace: UUID,
+        title: String,
+        body: String,
+        isRead: Bool
+    ) -> TerminalNotification {
+        TerminalNotification(
+            id: UUID(),
+            tabId: workspace,
+            surfaceId: nil,
+            title: title,
+            subtitle: "",
+            body: body,
+            createdAt: Date(),
+            isRead: isRead
         )
     }
 }

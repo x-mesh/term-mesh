@@ -266,6 +266,34 @@ final class WorkspaceChromeThemeTests: XCTestCase {
 }
 
 final class WorkspaceAppearanceConfigResolutionTests: XCTestCase {
+    func testAppearanceConfigCacheLoadsOnceAndUsesStoredRefresh() {
+        let cache = WorkspaceAppearanceConfigCache()
+        var loadCount = 0
+        var initial = GhosttyConfig()
+        initial.fontSize = 13
+
+        XCTAssertEqual(cache.snapshot {
+            loadCount += 1
+            return initial
+        }.fontSize, 13)
+        XCTAssertEqual(cache.snapshot {
+            loadCount += 1
+            var unexpected = GhosttyConfig()
+            unexpected.fontSize = 99
+            return unexpected
+        }.fontSize, 13)
+        XCTAssertEqual(loadCount, 1)
+
+        var refreshed = GhosttyConfig()
+        refreshed.fontSize = 17
+        cache.store(refreshed)
+
+        XCTAssertEqual(cache.snapshot {
+            XCTFail("Stored refresh should satisfy future state initializers")
+            return GhosttyConfig()
+        }.fontSize, 17)
+    }
+
     func testResolvedAppearanceConfigPrefersGhosttyRuntimeBackgroundOverLoadedConfig() {
         guard let loadedBackground = NSColor(hex: "#112233"),
               let runtimeBackground = NSColor(hex: "#FDF6E3"),
@@ -307,6 +335,269 @@ final class WorkspaceAppearanceConfigResolutionTests: XCTestCase {
         )
 
         XCTAssertEqual(resolved.backgroundColor.hexString(), "#272822")
+    }
+}
+
+final class TitlebarGitSnapshotCacheTests: XCTestCase {
+    private var cleanMain: TitlebarGitSnapshot {
+        TitlebarGitSnapshot(branch: "main", isDirty: false, dirtyCount: 0, isWorktree: false)
+    }
+
+    func testRecentSnapshotIsReusedUntilTTLExpires() {
+        let cache = TitlebarGitSnapshotCache(ttl: 2, negativeTTL: 10)
+        var loadCount = 0
+        var results: [TitlebarGitSnapshot] = []
+
+        cache.resolve(directory: "/tmp/repo", now: 10, load: {
+            loadCount += 1
+            return cleanMain
+        }, completion: { results.append($0) })
+        cache.resolve(directory: "/tmp/repo/", now: 11.9, load: {
+            loadCount += 1
+            return TitlebarGitSnapshot(branch: "unexpected", isDirty: true, dirtyCount: 1, isWorktree: false)
+        }, completion: { results.append($0) })
+
+        XCTAssertEqual(loadCount, 1)
+        XCTAssertEqual(results, [cleanMain, cleanMain])
+
+        let refreshed = TitlebarGitSnapshot(branch: "develop", isDirty: true, dirtyCount: 2, isWorktree: false)
+        cache.resolve(directory: "/tmp/repo", now: 12.1, load: {
+            loadCount += 1
+            return refreshed
+        }, completion: { results.append($0) })
+
+        XCTAssertEqual(loadCount, 2)
+        XCTAssertEqual(results.last, refreshed)
+    }
+
+    func testNegativeSnapshotUsesLongerTTL() {
+        let cache = TitlebarGitSnapshotCache(ttl: 2, negativeTTL: 10)
+        let missing = TitlebarGitSnapshot(branch: "", isDirty: false, dirtyCount: 0, isWorktree: false)
+        var loadCount = 0
+        var results: [TitlebarGitSnapshot] = []
+
+        cache.resolve(directory: "/tmp/not-a-repo", now: 10, load: {
+            loadCount += 1
+            return missing
+        }, completion: { results.append($0) })
+        cache.resolve(directory: "/tmp/not-a-repo", now: 19.9, load: {
+            loadCount += 1
+            return cleanMain
+        }, completion: { results.append($0) })
+
+        XCTAssertEqual(loadCount, 1)
+        XCTAssertEqual(results, [missing, missing])
+
+        cache.resolve(directory: "/tmp/not-a-repo", now: 20.1, load: {
+            loadCount += 1
+            return cleanMain
+        }, completion: { results.append($0) })
+
+        XCTAssertEqual(loadCount, 2)
+        XCTAssertEqual(results.last, cleanMain)
+    }
+
+    func testConcurrentRequestsForSameDirectoryJoinInFlightLoad() {
+        let cache = TitlebarGitSnapshotCache(ttl: 2, negativeTTL: 10)
+        let firstLoadStarted = expectation(description: "first load started")
+        let bothCompleted = expectation(description: "both requests completed")
+        bothCompleted.expectedFulfillmentCount = 2
+        let allowFirstLoadToFinish = DispatchSemaphore(value: 0)
+        let lock = NSLock()
+        let expected = cleanMain
+        var loadCount = 0
+        var results: [TitlebarGitSnapshot] = []
+
+        DispatchQueue.global().async {
+            cache.resolve(directory: "/tmp/repo", now: 10, load: {
+                lock.lock()
+                loadCount += 1
+                lock.unlock()
+                firstLoadStarted.fulfill()
+                allowFirstLoadToFinish.wait()
+                return expected
+            }, completion: {
+                lock.lock()
+                results.append($0)
+                lock.unlock()
+                bothCompleted.fulfill()
+            })
+        }
+        wait(for: [firstLoadStarted], timeout: 1)
+
+        DispatchQueue.global().async {
+            cache.resolve(directory: "/tmp/repo/", now: 10.1, load: {
+                XCTFail("Joined request must not start a second load")
+                return expected
+            }, completion: {
+                lock.lock()
+                results.append($0)
+                lock.unlock()
+                bothCompleted.fulfill()
+            })
+        }
+        allowFirstLoadToFinish.signal()
+        wait(for: [bothCompleted], timeout: 1)
+
+        lock.lock()
+        let finalLoadCount = loadCount
+        let finalResults = results
+        lock.unlock()
+        XCTAssertEqual(finalLoadCount, 1)
+        XCTAssertEqual(finalResults, [expected, expected])
+    }
+
+    func testExpiredInFlightClaimIsReplacedAndLateResultIsDiscarded() {
+        let cache = TitlebarGitSnapshotCache(ttl: 2, negativeTTL: 10, inFlightTimeout: 5)
+        let firstLoadStarted = expectation(description: "first load started")
+        let firstLoadFinished = expectation(description: "first load finished")
+        let bothCompleted = expectation(description: "both callers completed from replacement")
+        bothCompleted.expectedFulfillmentCount = 2
+        let releaseFirstLoad = DispatchSemaphore(value: 0)
+        let replacement = TitlebarGitSnapshot(
+            branch: "replacement", isDirty: true, dirtyCount: 1, isWorktree: false
+        )
+        let stale = TitlebarGitSnapshot(
+            branch: "stale", isDirty: false, dirtyCount: 0, isWorktree: false
+        )
+        let lock = NSLock()
+        var results: [TitlebarGitSnapshot] = []
+
+        DispatchQueue.global().async {
+            cache.resolve(directory: "/tmp/repo", now: 10, load: {
+                firstLoadStarted.fulfill()
+                releaseFirstLoad.wait()
+                firstLoadFinished.fulfill()
+                return stale
+            }, completion: { snapshot in
+                lock.lock()
+                results.append(snapshot)
+                lock.unlock()
+                bothCompleted.fulfill()
+            })
+        }
+
+        wait(for: [firstLoadStarted], timeout: 1)
+        DispatchQueue.global().async {
+            cache.resolve(directory: "/tmp/repo", now: 16, load: { replacement }) { snapshot in
+                lock.lock()
+                results.append(snapshot)
+                lock.unlock()
+                bothCompleted.fulfill()
+            }
+        }
+
+        wait(for: [bothCompleted], timeout: 1)
+        releaseFirstLoad.signal()
+        wait(for: [firstLoadFinished], timeout: 1)
+        lock.lock()
+        let finalResults = results
+        lock.unlock()
+        XCTAssertEqual(finalResults, [replacement, replacement])
+    }
+}
+
+final class TitlebarGitStatusParserTests: XCTestCase {
+    func testParsesBranchAndCountsTrackedUnmergedAndUntrackedRecords() {
+        let output = """
+        # branch.oid abcdef
+        # branch.head feature/parser
+        1 .M N... 100644 100644 100644 abcdef abcdef Sources/A.swift
+        2 R. N... 100644 100644 100644 abcdef abcdef R100 Sources/B.swift\tSources/C.swift
+        u UU N... 100644 100644 100644 100644 abcdef abcdef abcdef Sources/D.swift
+        ? Sources/New.swift
+        """
+
+        XCTAssertEqual(
+            parseTitlebarGitStatusPorcelainV2(output),
+            TitlebarGitStatusSnapshot(branch: "feature/parser", dirtyCount: 4)
+        )
+    }
+
+    func testIgnoresHeadersAndReturnsNilForDetachedHead() {
+        let output = """
+        # branch.oid abcdef
+        # branch.head (detached)
+        # branch.upstream origin/main
+        # branch.ab +1 -2
+        """
+
+        XCTAssertNil(parseTitlebarGitStatusPorcelainV2(output))
+    }
+}
+
+final class TitlebarWorktreeCountCacheTests: XCTestCase {
+    func testRecentCountIsReusedUntilTTLExpires() {
+        let cache = TitlebarWorktreeCountCache(ttl: 2)
+        var loadCount = 0
+        var results: [Int] = []
+
+        cache.resolve(directory: "/tmp/repo", now: 10, load: {
+            loadCount += 1
+            return 3
+        }, completion: { results.append($0) })
+        cache.resolve(directory: "/tmp/repo/.", now: 11, load: {
+            loadCount += 1
+            return 4
+        }, completion: { results.append($0) })
+        cache.resolve(directory: "/tmp/repo", now: 12.1, load: {
+            loadCount += 1
+            return 4
+        }, completion: { results.append($0) })
+
+        XCTAssertEqual(loadCount, 2)
+        XCTAssertEqual(results, [3, 3, 4])
+    }
+
+    func testConcurrentRequestsForSameDirectoryJoinInFlightLoad() {
+        let cache = TitlebarWorktreeCountCache(ttl: 2)
+        let firstLoadStarted = expectation(description: "first load started")
+        let bothCompleted = expectation(description: "both requests completed")
+        bothCompleted.expectedFulfillmentCount = 2
+        let allowFirstLoadToFinish = DispatchSemaphore(value: 0)
+        let lock = NSLock()
+        var loadCount = 0
+        var results: [Int] = []
+
+        DispatchQueue.global().async {
+            cache.resolve(directory: "/tmp/repo", now: 10, load: {
+                lock.lock()
+                loadCount += 1
+                lock.unlock()
+                firstLoadStarted.fulfill()
+                allowFirstLoadToFinish.wait()
+                return 5
+            }, completion: { count in
+                lock.lock()
+                results.append(count)
+                lock.unlock()
+                bothCompleted.fulfill()
+            })
+        }
+
+        wait(for: [firstLoadStarted], timeout: 1)
+        DispatchQueue.global().async {
+            cache.resolve(directory: "/tmp/repo/.", now: 10.1, load: {
+                lock.lock()
+                loadCount += 1
+                lock.unlock()
+                return 6
+            }, completion: { count in
+                lock.lock()
+                results.append(count)
+                lock.unlock()
+                bothCompleted.fulfill()
+            })
+        }
+        allowFirstLoadToFinish.signal()
+
+        wait(for: [bothCompleted], timeout: 1)
+        lock.lock()
+        let finalLoadCount = loadCount
+        let finalResults = results
+        lock.unlock()
+        XCTAssertEqual(finalLoadCount, 1)
+        XCTAssertEqual(finalResults.sorted(), [5, 5])
     }
 }
 

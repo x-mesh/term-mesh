@@ -59,7 +59,10 @@ public final class BonsplitController {
     /// so their views (kept alive in a ZStack for state preservation) don't intercept drags
     /// meant for the active workspace.
     @ObservationIgnored public var isInteractive: Bool = true {
-        didSet { internalController.isInteractive = isInteractive }
+        didSet {
+            guard oldValue != isInteractive else { return }
+            internalController.isInteractive = isInteractive
+        }
     }
 
     /// Handler for file/URL drops from external apps (e.g., Finder).
@@ -328,6 +331,7 @@ public final class BonsplitController {
             sourcePane.moveTab(from: sourceIndex, to: destinationIndex)
             sourcePane.selectTab(tabItem.id)
             internalController.focusPane(sourcePane.id)
+            delegate?.splitTabBar(self, didReorderTab: movedTab, inPane: sourcePane.id)
             delegate?.splitTabBar(self, didSelectTab: movedTab, inPane: sourcePane.id)
             notifyGeometryChange()
             return true
@@ -353,6 +357,7 @@ public final class BonsplitController {
         internalController.focusPane(pane.id)
         if let tabIndex = pane.tabs.firstIndex(where: { $0.id == tabId.id }) {
             let tab = Tab(from: pane.tabs[tabIndex])
+            delegate?.splitTabBar(self, didReorderTab: tab, inPane: pane.id)
             delegate?.splitTabBar(self, didSelectTab: tab, inPane: pane.id)
         }
         notifyGeometryChange()

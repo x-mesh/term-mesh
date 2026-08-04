@@ -17,6 +17,25 @@ func termMeshShouldUseTransparentBackgroundWindow() -> Bool {
     let bgGlassEnabled = defaults.object(forKey: "bgGlassEnabled") as? Bool ?? true
     return sidebarBlendMode == "behindWindow" && bgGlassEnabled && !WindowGlassEffect.isAvailable
 }
+
+func terminalBackgroundLayerNeedsUpdate(
+    currentColor: CGColor?,
+    currentOpaque: Bool,
+    targetColor: CGColor,
+    targetOpaque: Bool
+) -> Bool {
+    guard let currentColor else { return true }
+    return currentColor != targetColor || currentOpaque != targetOpaque
+}
+
+func terminalWindowBackgroundNeedsUpdate(
+    currentColor: NSColor,
+    currentOpaque: Bool,
+    targetColor: NSColor,
+    targetOpaque: Bool
+) -> Bool {
+    !currentColor.isEqual(targetColor) || currentOpaque != targetOpaque
+}
 #endif
 
 #if DEBUG
@@ -59,6 +78,21 @@ func termMeshScalarHex(_ value: String?) -> String {
         .joined(separator: ",")
 }
 #endif
+
+func terminalSurfaceCreationRetryDelay(afterFailureCount failureCount: Int) -> TimeInterval {
+    let delays: [TimeInterval] = [0.25, 1, 2, 5, 10, 30]
+    let index = min(max(failureCount - 1, 0), delays.count - 1)
+    return delays[index]
+}
+
+func terminalSurfaceShouldStartSynchronously(
+    creationInProgress: Bool,
+    backgroundStartQueued: Bool,
+    now: TimeInterval,
+    retryNotBefore: TimeInterval
+) -> Bool {
+    !creationInProgress && !backgroundStartQueued && now >= retryNotBefore
+}
 
 enum GhosttyPasteboardHelper {
     private static let selectionPasteboard = NSPasteboard(
@@ -240,9 +274,18 @@ final class TerminalSurface: Identifiable, ObservableObject {
     /// surfaces that have been invisible (e.g. background workspace) for a while.
     /// Starts true: a freshly created surface is realized.
     private var rendererRealized = true
+    @MainActor var isRendererReadyForImmediateVisibility: Bool {
+        surface != nil && rendererRealized
+    }
     /// Debounced unrealize work item, so transient reparent/workspace flaps don't
     /// thrash the swap chain (recreate cost) when a surface briefly goes invisible.
     private var rendererUnrealizeWork: DispatchWorkItem?
+    /// Last requested renderer visibility. SwiftUI may re-apply the same workspace state
+    /// many times; preserving this state prevents every update from restarting the debounce.
+    private var rendererVisibilityRequested = true
+    #if DEBUG
+    private var rendererUnrealizeScheduleCount = 0
+    #endif
     /// How long a surface must stay invisible before its GPU resources are released.
     private static let rendererUnrealizeDebounce: TimeInterval = 5.0
     /// Whether the terminal surface view is currently attached to a window.
@@ -290,6 +333,10 @@ final class TerminalSurface: Identifiable, ObservableObject {
     private var pendingTextBytes: Int = 0
     private let maxPendingTextBytes = 1_048_576
     private var backgroundSurfaceStartQueued = false
+    private var backgroundSurfaceStartToken: UUID?
+    private var surfaceCreationInProgress = false
+    private var surfaceCreationFailureCount = 0
+    private var surfaceCreationRetryNotBefore: TimeInterval = 0
     private var surfaceCallbackContext: Unmanaged<GhosttySurfaceCallbackContext>?
     /// Coordinates deferred ghostty_surface_free with active read leases.
     /// Created once per TerminalSurface; outlives the object when leases are held.
@@ -496,21 +543,31 @@ final class TerminalSurface: Identifiable, ObservableObject {
                 ])
                 return
             }
-#if DEBUG
+            if deferCreation {
+                requestBackgroundSurfaceStartIfNeeded(reason: "attachToWindow")
+                return
+            }
+            let now = ProcessInfo.processInfo.systemUptime
+            guard terminalSurfaceShouldStartSynchronously(
+                creationInProgress: surfaceCreationInProgress,
+                backgroundStartQueued: backgroundSurfaceStartQueued,
+                now: now,
+                retryNotBefore: surfaceCreationRetryNotBefore
+            ) else {
+                requestBackgroundSurfaceStartIfNeeded(reason: "attachBackoff")
+                return
+            }
+            #if DEBUG
             dlog("surface.attach.create surface=\(id.uuidString.prefix(5))")
-#endif
+            #endif
             sentryBreadcrumb("surface.attach.create", category: "terminal", data: [
                 "surface": id.uuidString,
                 "workspace": tabId.uuidString,
                 "width": Double(view.bounds.width),
                 "height": Double(view.bounds.height),
                 "windowCount": NSApp.windows.count,
-                "deferred": deferCreation
+                "deferred": false
             ])
-            if deferCreation {
-                requestBackgroundSurfaceStartIfNeeded(reason: "attachToWindow")
-                return
-            }
             createSurface(for: view)
 #if DEBUG
             dlog("surface.attach.create.done surface=\(id.uuidString.prefix(5)) hasSurface=\(surface != nil ? 1 : 0)")
@@ -550,6 +607,32 @@ final class TerminalSurface: Identifiable, ObservableObject {
     }
 
     private func createSurface(for view: GhosttyNSView) {
+        guard !surfaceCreationInProgress else { return }
+
+        let now = ProcessInfo.processInfo.systemUptime
+        guard now >= surfaceCreationRetryNotBefore else {
+            requestBackgroundSurfaceStartIfNeeded(reason: "creationBackoff")
+            return
+        }
+
+        backgroundSurfaceStartToken = nil
+        backgroundSurfaceStartQueued = false
+        surfaceCreationInProgress = true
+        defer {
+            surfaceCreationInProgress = false
+            if surface != nil {
+                surfaceCreationFailureCount = 0
+                surfaceCreationRetryNotBefore = 0
+            } else {
+                surfaceCreationFailureCount += 1
+                surfaceCreationRetryNotBefore = ProcessInfo.processInfo.systemUptime
+                    + terminalSurfaceCreationRetryDelay(afterFailureCount: surfaceCreationFailureCount)
+                if view.window != nil {
+                    requestBackgroundSurfaceStartIfNeeded(reason: "creationRetry")
+                }
+            }
+        }
+
         let createSurfaceStartedAt = CACurrentMediaTime()
         #if DEBUG
         let resourcesDir = getenv("GHOSTTY_RESOURCES_DIR").flatMap { String(cString: $0) } ?? "(unset)"
@@ -584,8 +667,10 @@ final class TerminalSurface: Identifiable, ObservableObject {
 
         var surfaceConfig = configTemplate ?? ghostty_surface_config_new()
         surfaceConfig.platform_tag = GHOSTTY_PLATFORM_MACOS
+        let displayID = (view.window?.screen ?? NSScreen.main)?.displayID ?? 0
         surfaceConfig.platform = ghostty_platform_u(macos: ghostty_platform_macos_s(
-            nsview: Unmanaged.passUnretained(view).toOpaque()
+            nsview: Unmanaged.passUnretained(view).toOpaque(),
+            display_id: displayID
         ))
         let callbackContext = Unmanaged.passRetained(GhosttySurfaceCallbackContext(surfaceView: view, terminalSurface: self))
         surfaceConfig.userdata = callbackContext.toOpaque()
@@ -889,6 +974,17 @@ final class TerminalSurface: Identifiable, ObservableObject {
             return
         }
         guard let createdSurface = surface else { return }
+        // A newly-created Ghostty surface always starts with a realized renderer. If the
+        // owning workspace was hidden while creation/retry completed, apply that state now;
+        // the visibility setter will arrange the delayed GPU release without extending it
+        // on later identical SwiftUI updates.
+        rendererRealized = true
+        let visibleInUI = surfaceView.isVisibleInUI
+        ghostty_surface_set_occlusion(createdSurface, visibleInUI)
+        DispatchQueue.main.async { [weak self] in
+            guard let self, self.surface == createdSurface else { return }
+            self.setSurfaceVisibleForRenderer(self.surfaceView.isVisibleInUI)
+        }
 
         // For vsync-driven rendering, Ghostty needs to know which display we're on so it can
         // start a CVDisplayLink with the right refresh rate. If we don't set this early, the
@@ -1208,23 +1304,42 @@ final class TerminalSurface: Identifiable, ObservableObject {
     /// unrealizes only after `rendererUnrealizeDebounce` of sustained invisibility, so brief
     /// reparent/workspace flaps don't churn the swap chain.
     @MainActor func setSurfaceVisibleForRenderer(_ visible: Bool) {
-        rendererUnrealizeWork?.cancel()
-        rendererUnrealizeWork = nil
+        rendererVisibilityRequested = visible
         if visible {
+            rendererUnrealizeWork?.cancel()
+            rendererUnrealizeWork = nil
             setRendererRealized(true)
         } else {
+            // Do not restart the five-second countdown for repeated hidden-state updates.
+            // A nil-surface timer may have elapsed before a delayed creation, so schedule
+            // again whenever the renderer is realized and no pending release remains.
+            guard rendererRealized, rendererUnrealizeWork == nil else { return }
             let work = DispatchWorkItem { [weak self] in
                 guard let self else { return }
                 self.rendererUnrealizeWork = nil
+                guard !self.rendererVisibilityRequested else { return }
                 self.setRendererRealized(false)
             }
             rendererUnrealizeWork = work
+            #if DEBUG
+            rendererUnrealizeScheduleCount += 1
+            #endif
             DispatchQueue.main.asyncAfter(
                 deadline: .now() + Self.rendererUnrealizeDebounce,
                 execute: work
             )
         }
     }
+
+    #if DEBUG
+    @MainActor func debugRendererVisibilityState() -> (
+        requested: Bool,
+        unrealizePending: Bool,
+        unrealizeScheduleCount: Int
+    ) {
+        (rendererVisibilityRequested, rendererUnrealizeWork != nil, rendererUnrealizeScheduleCount)
+    }
+    #endif
 
     func needsConfirmClose() -> Bool {
         guard let surface = surface else { return false }
@@ -1932,13 +2047,20 @@ final class TerminalSurface: Identifiable, ObservableObject {
         }
 
         guard surface == nil, attachedView != nil else { return }
+        guard !surfaceCreationInProgress else { return }
         guard !backgroundSurfaceStartQueued else { return }
         backgroundSurfaceStartQueued = true
 
-        DispatchQueue.main.async { [weak self] in
+        let now = ProcessInfo.processInfo.systemUptime
+        let delay = max(0, surfaceCreationRetryNotBefore - now)
+        let token = UUID()
+        backgroundSurfaceStartToken = token
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
             guard let self else { return }
+            guard self.backgroundSurfaceStartToken == token else { return }
+            self.backgroundSurfaceStartToken = nil
             self.backgroundSurfaceStartQueued = false
-            guard self.surface == nil, let view = self.attachedView else { return }
+            guard self.surface == nil, let view = self.attachedView, view.window != nil else { return }
             sentryBreadcrumb("surface.create.deferredStart", category: "terminal", data: [
                 "surface": self.id.uuidString,
                 "workspace": self.tabId.uuidString,
@@ -2251,11 +2373,18 @@ static func focusLog(_ message: String) {
 
     func applySurfaceBackground() {
         let color = effectiveBackgroundColor()
-        if let layer {
+        let targetOpaque = color.alphaComponent >= 1.0
+        if let layer,
+           terminalBackgroundLayerNeedsUpdate(
+               currentColor: layer.backgroundColor,
+               currentOpaque: layer.isOpaque,
+               targetColor: color.cgColor,
+               targetOpaque: targetOpaque
+           ) {
             CATransaction.begin()
             CATransaction.setDisableActions(true)
             layer.backgroundColor = color.cgColor
-            layer.isOpaque = color.alphaComponent >= 1.0
+            layer.isOpaque = targetOpaque
             CATransaction.commit()
         }
         terminalSurface?.hostedView.setBackgroundColor(color)
@@ -2277,19 +2406,24 @@ static func focusLog(_ message: String) {
         }
         applySurfaceBackground()
         let color = effectiveBackgroundColor()
-        if termMeshShouldUseTransparentBackgroundWindow() {
-            window.backgroundColor = .clear
-            window.isOpaque = false
-        } else {
-            window.backgroundColor = color
-            window.isOpaque = color.alphaComponent >= 1.0
+        let usesTransparentWindow = termMeshShouldUseTransparentBackgroundWindow()
+        let targetColor = usesTransparentWindow ? NSColor.clear : color
+        let targetOpaque = !usesTransparentWindow && color.alphaComponent >= 1.0
+        if terminalWindowBackgroundNeedsUpdate(
+            currentColor: window.backgroundColor,
+            currentOpaque: window.isOpaque,
+            targetColor: targetColor,
+            targetOpaque: targetOpaque
+        ) {
+            window.backgroundColor = targetColor
+            window.isOpaque = targetOpaque
         }
         if configProvider.backgroundLogEnabled {
-            let signature = "\(termMeshShouldUseTransparentBackgroundWindow() ? "transparent" : color.hexString()):\(String(format: "%.3f", color.alphaComponent))"
+            let signature = "\(usesTransparentWindow ? "transparent" : color.hexString()):\(String(format: "%.3f", color.alphaComponent))"
             if signature != lastLoggedWindowBackgroundSignature {
                 lastLoggedWindowBackgroundSignature = signature
                 configProvider.logBackground(
-                    "window background applied tab=\(tabId?.uuidString ?? "unknown") surface=\(terminalSurface?.id.uuidString ?? "unknown") transparent=\(termMeshShouldUseTransparentBackgroundWindow()) color=\(color.hexString()) opacity=\(String(format: "%.3f", color.alphaComponent))"
+                    "window background applied tab=\(tabId?.uuidString ?? "unknown") surface=\(terminalSurface?.id.uuidString ?? "unknown") transparent=\(usesTransparentWindow) color=\(color.hexString()) opacity=\(String(format: "%.3f", color.alphaComponent))"
                 )
             }
         }
@@ -2324,6 +2458,11 @@ static func focusLog(_ message: String) {
     }
 
     func attachSurface(_ surface: TerminalSurface) {
+        // SwiftUI can call updateNSView repeatedly for visibility/focus changes.
+        // The existing surface is already attached to this view; window moves
+        // and geometry changes have their own callbacks, so re-running the full
+        // attach/size/background/color pipeline here only adds switch-time work.
+        guard terminalSurface !== surface else { return }
         appliedColorScheme = nil
         terminalSurface = surface
         tabId = surface.tabId
@@ -2365,10 +2504,11 @@ static func focusLog(_ message: String) {
             ghostty_surface_set_display_id(surface, displayID)
         }
 
-        // Recompute from current bounds after layout. Pending size is only a fallback
-        // when we don't have usable bounds (e.g. detached/off-window transitions).
-        superview?.layoutSubtreeIfNeeded()
-        layoutSubtreeIfNeeded()
+        // Use the bounds AppKit has already assigned for this move. Forcing the
+        // hosting hierarchy to lay out from viewDidMoveToWindow can re-enter an
+        // active SwiftUI layout pass during workspace switches. The normal
+        // layout() callback applies the settled size afterward. Pending size is
+        // only a fallback for detached/off-window transitions.
         updateSurfaceSize()
         applySurfaceBackground()
         applySurfaceColorScheme(force: true)
@@ -3834,6 +3974,15 @@ func terminalPortalAnchorNeedsSynchronization(
     force || previous?.isApproximatelyEqual(to: current) != true
 }
 
+func terminalPortalAnchorNeedsFullReconciliation(
+    previous: TerminalPortalAnchorGeometry?,
+    current: TerminalPortalAnchorGeometry
+) -> Bool {
+    guard let previous else { return true }
+    return previous.windowID != current.windowID
+        || previous.superviewID != current.superviewID
+}
+
 struct GhosttyTerminalView: NSViewRepresentable {
     @Environment(\.paneDropZone) var paneDropZone
 
@@ -3852,7 +4001,7 @@ struct GhosttyTerminalView: NSViewRepresentable {
 
     private final class HostContainerView: NSView {
         var onDidMoveToWindow: (() -> Void)?
-        var onGeometryChanged: (() -> Void)?
+        var onGeometryChanged: ((_ needsFullReconciliation: Bool) -> Void)?
         private var hasScheduledGeometryCallback = false
         private var scheduledGeometryCallbackIsForced = false
         private var lastReportedGeometry: TerminalPortalAnchorGeometry?
@@ -3897,15 +4046,21 @@ struct GhosttyTerminalView: NSViewRepresentable {
                 let isForced = self.scheduledGeometryCallbackIsForced
                 self.scheduledGeometryCallbackIsForced = false
                 let currentGeometry = self.currentGeometry()
+                let previousGeometry = self.lastReportedGeometry
                 guard terminalPortalAnchorNeedsSynchronization(
-                    previous: self.lastReportedGeometry,
+                    previous: previousGeometry,
                     current: currentGeometry,
                     force: isForced
                 ) else {
                     return
                 }
                 self.lastReportedGeometry = currentGeometry
-                self.onGeometryChanged?()
+                self.onGeometryChanged?(
+                    terminalPortalAnchorNeedsFullReconciliation(
+                        previous: previousGeometry,
+                        current: currentGeometry
+                    )
+                )
             }
         }
 
@@ -4031,11 +4186,14 @@ struct GhosttyTerminalView: NSViewRepresentable {
                 hostedView.setActive(coordinator.desiredIsActive)
                 hostedView.setNotificationRing(visible: coordinator.desiredShowsUnreadNotificationRing)
             }
-            host.onGeometryChanged = { [weak host, weak coordinator] in
+            host.onGeometryChanged = { [weak host, weak coordinator] needsFullReconciliation in
                 guard let host, let coordinator else { return }
                 guard coordinator.attachGeneration == generation else { return }
                 guard coordinator.lastBoundHostId == ObjectIdentifier(host) else { return }
-                TerminalWindowPortalRegistry.synchronizeForAnchor(host)
+                TerminalWindowPortalRegistry.synchronizeForAnchor(
+                    host,
+                    needsFullReconciliation: needsFullReconciliation
+                )
             }
 
             if host.window != nil {

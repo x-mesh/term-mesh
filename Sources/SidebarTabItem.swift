@@ -74,32 +74,159 @@ struct SidebarEmptyArea: View {
     }
 }
 
-struct TabItemView: View {
-    @EnvironmentObject var tabManager: TabManager
-    @EnvironmentObject var notificationStore: TerminalNotificationStore
+struct SidebarTeamRuntimeSnapshot: Equatable {
+    struct AgentState: Equatable {
+        let agentInstanceId: String
+        let state: String
+    }
+
+    let teamName: String
+    let attentionCount: Int
+    let agentStates: [AgentState]
+
+    func state(for agentInstanceId: String) -> String {
+        agentStates.first(where: { $0.agentInstanceId == agentInstanceId })?.state ?? "idle"
+    }
+}
+
+struct TabItemView: View, Equatable {
     @Environment(\.colorScheme) private var colorScheme
+    /// Action target only. The row deliberately does not subscribe to the
+    /// manager's broad publisher; explicit render snapshots below define its
+    /// invalidation boundary.
+    let tabManager: TabManager
     @ObservedObject var tab: Tab
     let index: Int
+    let isActive: Bool
+    let isMultiSelected: Bool
+    let workspaceCount: Int
+    /// Parent-computed live snapshot. Keeping roster/state/attention values in
+    /// the Equatable edge updates the affected row without invalidating all rows.
+    let teamRuntimeSnapshot: SidebarTeamRuntimeSnapshot?
+    /// Profile changes publish through RemoteHostStore; carrying the rendered
+    /// label makes a rename cross this row's Equatable edge.
+    let remoteHostLabel: String?
+    /// Parent-computed notification state. This prevents a notification for
+    /// one workspace from directly invalidating every sidebar row.
+    let notificationSummary: SidebarNotificationSummary
     /// Tabs that are actually rendered in this section, in presentation
     /// order. Experimental mode excludes peer-mirror backing workspaces.
     let visibleTabIds: [UUID]
     let rowSpacing: CGFloat
-    @Binding var selection: SidebarSelection
-    @Binding var selectedTabIds: Set<UUID>
-    @Binding var lastSidebarSelectionIndex: Int?
+    /// Action-only bindings are stored as closures so selection changes do not
+    /// directly invalidate every row. Explicit render snapshots below still
+    /// carry the drag state that affects pixels.
+    private let getSelection: () -> SidebarSelection
+    private let setSelection: (SidebarSelection) -> Void
+    private let getSelectedTabIds: () -> Set<UUID>
+    private let setSelectedTabIds: (Set<UUID>) -> Void
+    private let getLastSidebarSelectionIndex: () -> Int?
+    private let setLastSidebarSelectionIndex: (Int?) -> Void
     let showsCommandShortcutHints: Bool
     let dragAutoScrollController: SidebarDragAutoScrollController
-    @Binding var draggedTabId: UUID?
-    @Binding var dropIndicator: SidebarDropIndicator?
+    private let getDraggedTabId: () -> UUID?
+    private let setDraggedTabId: (UUID?) -> Void
+    private let getDropIndicator: () -> SidebarDropIndicator?
+    private let setDropIndicator: (SidebarDropIndicator?) -> Void
+    private let draggedTabIdSnapshot: UUID?
+    private let dropIndicatorSnapshot: SidebarDropIndicator?
     @State private var isHovering = false
     @State private var rowHeight: CGFloat = 1
     @State private var cachedSlotWidth: CGFloat = 28
+
+    init(
+        tabManager: TabManager,
+        tab: Tab,
+        index: Int,
+        isActive: Bool,
+        isMultiSelected: Bool,
+        workspaceCount: Int,
+        teamRuntimeSnapshot: SidebarTeamRuntimeSnapshot?,
+        remoteHostLabel: String?,
+        notificationSummary: SidebarNotificationSummary,
+        visibleTabIds: [UUID],
+        rowSpacing: CGFloat,
+        selection: Binding<SidebarSelection>,
+        selectedTabIds: Binding<Set<UUID>>,
+        lastSidebarSelectionIndex: Binding<Int?>,
+        showsCommandShortcutHints: Bool,
+        dragAutoScrollController: SidebarDragAutoScrollController,
+        draggedTabId: Binding<UUID?>,
+        dropIndicator: Binding<SidebarDropIndicator?>
+    ) {
+        self.tabManager = tabManager
+        self.tab = tab
+        self.index = index
+        self.isActive = isActive
+        self.isMultiSelected = isMultiSelected
+        self.workspaceCount = workspaceCount
+        self.teamRuntimeSnapshot = teamRuntimeSnapshot
+        self.remoteHostLabel = remoteHostLabel
+        self.notificationSummary = notificationSummary
+        self.visibleTabIds = visibleTabIds
+        self.rowSpacing = rowSpacing
+        self.getSelection = { selection.wrappedValue }
+        self.setSelection = { selection.wrappedValue = $0 }
+        self.getSelectedTabIds = { selectedTabIds.wrappedValue }
+        self.setSelectedTabIds = { selectedTabIds.wrappedValue = $0 }
+        self.getLastSidebarSelectionIndex = { lastSidebarSelectionIndex.wrappedValue }
+        self.setLastSidebarSelectionIndex = { lastSidebarSelectionIndex.wrappedValue = $0 }
+        self.showsCommandShortcutHints = showsCommandShortcutHints
+        self.dragAutoScrollController = dragAutoScrollController
+        self.getDraggedTabId = { draggedTabId.wrappedValue }
+        self.setDraggedTabId = { draggedTabId.wrappedValue = $0 }
+        self.getDropIndicator = { dropIndicator.wrappedValue }
+        self.setDropIndicator = { dropIndicator.wrappedValue = $0 }
+        self.draggedTabIdSnapshot = draggedTabId.wrappedValue
+        self.dropIndicatorSnapshot = dropIndicator.wrappedValue
+    }
+
+    private var selection: SidebarSelection {
+        get { getSelection() }
+        nonmutating set { setSelection(newValue) }
+    }
+
+    private var selectedTabIds: Set<UUID> {
+        get { getSelectedTabIds() }
+        nonmutating set { setSelectedTabIds(newValue) }
+    }
+
+    private var lastSidebarSelectionIndex: Int? {
+        get { getLastSidebarSelectionIndex() }
+        nonmutating set { setLastSidebarSelectionIndex(newValue) }
+    }
+
+    private var draggedTabId: UUID? {
+        get { getDraggedTabId() }
+        nonmutating set { setDraggedTabId(newValue) }
+    }
+
+    private var dropIndicator: SidebarDropIndicator? {
+        get { getDropIndicator() }
+        nonmutating set { setDropIndicator(newValue) }
+    }
+
+    private var selectedTabIdsBinding: Binding<Set<UUID>> {
+        Binding(get: getSelectedTabIds, set: setSelectedTabIds)
+    }
+
+    private var lastSidebarSelectionIndexBinding: Binding<Int?> {
+        Binding(get: getLastSidebarSelectionIndex, set: setLastSidebarSelectionIndex)
+    }
+
+    private var draggedTabIdBinding: Binding<UUID?> {
+        Binding(get: getDraggedTabId, set: setDraggedTabId)
+    }
+
+    private var dropIndicatorBinding: Binding<SidebarDropIndicator?> {
+        Binding(get: getDropIndicator, set: setDropIndicator)
+    }
 
     /// Host chip for a relay/remote workspace row. Extracted from `body`
     /// to keep the row's VStack within the Swift type-checker's budget.
     @ViewBuilder
     private var hostChip: some View {
-        if let hostKey = tab.dominantRemoteHostKey {
+        if let hostKey = tab.dominantRemoteHostKey, let remoteHostLabel {
             let chipColor = Color(nsColor: PeerHostAccent.primaryColor(for: hostKey))
             // Dot always carries the host hue. Text switches to white on a
             // selected row (bright gradient background) where the host hue
@@ -109,7 +236,7 @@ struct TabItemView: View {
                 Circle()
                     .fill(chipColor)
                     .frame(width: 5, height: 5)
-                Text(PeerHostProfileStore.shared.displayLabel(for: hostKey))
+                Text(remoteHostLabel)
                     .font(.system(size: 10, weight: usesInvertedActiveForeground ? .medium : .regular, design: .monospaced))
                     .foregroundColor(textColor)
                     .lineLimit(1)
@@ -129,14 +256,6 @@ struct TabItemView: View {
     @AppStorage("sidebarShowStatusPills") private var sidebarShowStatusPills = true
     @AppStorage(SidebarActiveTabIndicatorSettings.styleKey)
     private var activeTabIndicatorStyleRaw = SidebarActiveTabIndicatorSettings.defaultStyle.rawValue
-
-    var isActive: Bool {
-        tabManager.selectedTabId == tab.id
-    }
-
-    var isMultiSelected: Bool {
-        selectedTabIds.contains(tab.id)
-    }
 
     private var isBeingDragged: Bool {
         draggedTabId == tab.id
@@ -202,11 +321,11 @@ struct TabItemView: View {
     }
 
     private var workspaceShortcutDigit: Int? {
-        WorkspaceShortcutMapper.commandDigitForWorkspace(at: index, workspaceCount: tabManager.tabs.count)
+        WorkspaceShortcutMapper.commandDigitForWorkspace(at: index, workspaceCount: workspaceCount)
     }
 
     private var showCloseButton: Bool {
-        isHovering && tabManager.tabs.count > 1 && !(showsCommandShortcutHints || alwaysShowShortcutHints)
+        isHovering && workspaceCount > 1 && !(showsCommandShortcutHints || alwaysShowShortcutHints)
     }
 
     private var workspaceShortcutLabel: String? {
@@ -237,10 +356,34 @@ struct TabItemView: View {
         return ceil(textWidth) + 12
     }
 
+    static func == (lhs: TabItemView, rhs: TabItemView) -> Bool {
+        lhs.tab === rhs.tab &&
+            lhs.index == rhs.index &&
+            lhs.isActive == rhs.isActive &&
+            lhs.isMultiSelected == rhs.isMultiSelected &&
+            lhs.workspaceCount == rhs.workspaceCount &&
+            lhs.teamRuntimeSnapshot == rhs.teamRuntimeSnapshot &&
+            lhs.remoteHostLabel == rhs.remoteHostLabel &&
+            lhs.notificationSummary == rhs.notificationSummary &&
+            lhs.visibleTabIds == rhs.visibleTabIds &&
+            lhs.rowSpacing == rhs.rowSpacing &&
+            lhs.showsCommandShortcutHints == rhs.showsCommandShortcutHints &&
+            lhs.draggedTabIdSnapshot == rhs.draggedTabIdSnapshot &&
+            lhs.dropIndicatorSnapshot == rhs.dropIndicatorSnapshot
+    }
+
     var body: some View {
+        // Selection changes invalidate every sidebar row. Build the relatively
+        // expensive branch/directory presentation once per body evaluation;
+        // referring to the computed property from the emptiness check, branch
+        // icon gate, and ForEach used to repeat path normalization three times.
+        let verticalLines = sidebarBranchVerticalLayout
+            ? tab.sidebarBranchDirectoryDisplayLines(showGitBranch: sidebarShowGitBranch)
+            : []
+
         VStack(alignment: .leading, spacing: 4) {
             HStack(spacing: 8) {
-                let unreadCount = notificationStore.unreadCount(forTabId: tab.id)
+                let unreadCount = notificationSummary.unreadCount
                 if unreadCount > 0 {
                     ZStack {
                         Circle()
@@ -345,7 +488,7 @@ struct TabItemView: View {
             }
 
             // Active team indicator with inbox badge and expandable overview
-            if let teamName = activeTeamName {
+            if let teamName = teamRuntimeSnapshot?.teamName {
                 teamIndicatorView(teamName: teamName)
             }
 
@@ -390,15 +533,17 @@ struct TabItemView: View {
 
             // Branch + directory row
             if sidebarBranchVerticalLayout {
-                if !verticalBranchDirectoryLines.isEmpty {
+                if !verticalLines.isEmpty {
                     HStack(alignment: .top, spacing: 3) {
-                        if sidebarShowGitBranchIcon, sidebarShowGitBranch, verticalRowsContainBranch {
+                        if sidebarShowGitBranchIcon,
+                           sidebarShowGitBranch,
+                           verticalLines.contains(where: { $0.branch != nil }) {
                             Image(systemName: "arrow.triangle.branch")
                                 .font(.system(size: 9))
                                 .foregroundColor(activeSecondaryColor(0.6))
                         }
                         VStack(alignment: .leading, spacing: 1) {
-                            ForEach(Array(verticalBranchDirectoryLines.enumerated()), id: \.offset) { _, line in
+                            ForEach(Array(verticalLines.enumerated()), id: \.offset) { _, line in
                                 HStack(spacing: 3) {
                                     if let branch = line.branch {
                                         Text(branch)
@@ -513,12 +658,12 @@ struct TabItemView: View {
         .onDrop(of: [SidebarTabDragPayload.typeIdentifier], delegate: SidebarTabDropDelegate(
             targetTabId: tab.id,
             tabManager: tabManager,
-            draggedTabId: $draggedTabId,
-            selectedTabIds: $selectedTabIds,
-            lastSidebarSelectionIndex: $lastSidebarSelectionIndex,
+            draggedTabId: draggedTabIdBinding,
+            selectedTabIds: selectedTabIdsBinding,
+            lastSidebarSelectionIndex: lastSidebarSelectionIndexBinding,
             targetRowHeight: rowHeight,
             dragAutoScrollController: dragAutoScrollController,
-            dropIndicator: $dropIndicator
+            dropIndicator: dropIndicatorBinding
         ))
         .onTapGesture {
             updateSelection()
@@ -536,143 +681,19 @@ struct TabItemView: View {
             moveBy(1)
         }
         .contextMenu {
-            let targetIds = contextTargetIds()
-            let tabColorPalette = WorkspaceTabColorSettings.palette()
-            let shouldPin = !tab.isPinned
-            let pinLabel = targetIds.count > 1
-                ? (shouldPin ? "Pin Workspaces" : "Unpin Workspaces")
-                : (shouldPin ? "Pin Workspace" : "Unpin Workspace")
-            let closeLabel = targetIds.count > 1 ? "Close Workspaces" : "Close Workspace"
-            let markReadLabel = targetIds.count > 1 ? "Mark Workspaces as Read" : "Mark Workspace as Read"
-            let markUnreadLabel = targetIds.count > 1 ? "Mark Workspaces as Unread" : "Mark Workspace as Unread"
-            let renameWorkspaceShortcut = KeyboardShortcutSettings.shortcut(for: .renameWorkspace)
-            let closeWorkspaceShortcut = KeyboardShortcutSettings.shortcut(for: .closeWorkspace)
-            Button(pinLabel) {
-                for id in targetIds {
-                    if let tab = tabManager.tabs.first(where: { $0.id == id }) {
-                        tabManager.setPinned(tab, pinned: shouldPin)
-                    }
-                }
-                syncSelectionAfterMutation()
-            }
-
-            if let key = renameWorkspaceShortcut.keyEquivalent {
-                Button("Rename Workspace…") {
-                    promptRename()
-                }
-                .keyboardShortcut(key, modifiers: renameWorkspaceShortcut.eventModifiers)
-            } else {
-                Button("Rename Workspace…") {
-                    promptRename()
-                }
-            }
-
-            if tab.hasCustomTitle {
-                Button("Remove Custom Workspace Name") {
-                    tabManager.clearCustomTitle(tabId: tab.id)
-                }
-            }
-
-            Menu("Tab Color") {
-                if tab.customColor != nil {
-                    Button {
-                        applyTabColor(nil, targetIds: targetIds)
-                    } label: {
-                        Label("Clear Color", systemImage: "xmark.circle")
-                    }
-                }
-
-                Button {
-                    promptCustomColor(targetIds: targetIds)
-                } label: {
-                    Label("Choose Custom Color…", systemImage: "paintpalette")
-                }
-
-                if !tabColorPalette.isEmpty {
-                    Divider()
-                }
-
-                ForEach(tabColorPalette, id: \.id) { entry in
-                    Button {
-                        applyTabColor(entry.hex, targetIds: targetIds)
-                    } label: {
-                        Label {
-                            Text(entry.name)
-                        } icon: {
-                            Image(nsImage: coloredCircleImage(color: tabColorSwatchColor(for: entry.hex)))
-                        }
-                    }
-                }
-            }
-
-            if tab.tag != nil {
-                Button("Clear Tag") {
-                    tab.tag = nil
-                }
-            }
-            Button("Set Tag…") {
-                ContentView.showWorkspaceTagPrompt(for: tab)
-            }
-
-            Divider()
-
-            Button("Move Up") {
-                moveBy(-1)
-            }
-            .disabled(visibleIndex == 0)
-
-            Button("Move Down") {
-                moveBy(1)
-            }
-            .disabled(visibleIndex.map { $0 >= visibleTabIds.count - 1 } ?? true)
-
-            Button("Move to Top") {
-                tabManager.moveTabsToTop(Set(targetIds))
-                syncSelectionAfterMutation()
-            }
-            .disabled(targetIds.isEmpty)
-
-            Divider()
-
-            if let key = closeWorkspaceShortcut.keyEquivalent {
-                Button(closeLabel) {
-                    closeTabs(targetIds, allowPinned: true)
-                }
-                .keyboardShortcut(key, modifiers: closeWorkspaceShortcut.eventModifiers)
-                .disabled(targetIds.isEmpty)
-            } else {
-                Button(closeLabel) {
-                    closeTabs(targetIds, allowPinned: true)
-                }
-                .disabled(targetIds.isEmpty)
-            }
-
-            Button("Close Other Workspaces") {
-                closeOtherTabs(targetIds)
-            }
-            .disabled(visibleTabIds.count <= 1 || targetIds.count == visibleTabIds.count)
-
-            Button("Close Workspaces Below") {
-                closeTabsBelow(tabId: tab.id)
-            }
-            .disabled(visibleIndex.map { $0 >= visibleTabIds.count - 1 } ?? true)
-
-            Button("Close Workspaces Above") {
-                closeTabsAbove(tabId: tab.id)
-            }
-            .disabled(visibleIndex == 0)
-
-            Divider()
-
-            Button(markReadLabel) {
-                markTabsRead(targetIds)
-            }
-            .disabled(!hasUnreadNotifications(in: targetIds))
-
-            Button(markUnreadLabel) {
-                markTabsUnread(targetIds)
-            }
-            .disabled(!hasReadNotifications(in: targetIds))
+            SidebarTabContextMenu(
+                clickedID: tab.id,
+                selectedTabIds: selectedTabIds,
+                visibleTabIds: visibleTabIds,
+                visibleIndex: visibleIndex,
+                visibleWorkspaceCount: visibleTabIds.count,
+                isPinned: tab.isPinned,
+                hasCustomTitle: tab.hasCustomTitle,
+                customColor: tab.customColor,
+                hasTag: tab.tag != nil,
+                onAction: handleContextMenuAction
+            )
+            .equatable()
         }
         .onAppear { updateCachedSlotWidth() }
         .onChange(of: workspaceShortcutLabel) { _ in updateCachedSlotWidth() }
@@ -856,6 +877,47 @@ struct TabItemView: View {
         )
     }
 
+    private func handleContextMenuAction(_ action: SidebarTabMenuAction) {
+        switch action {
+        case .setPinned(let shouldPin, let targetIds):
+            for id in targetIds {
+                if let target = tabManager.tabs.first(where: { $0.id == id }) {
+                    tabManager.setPinned(target, pinned: shouldPin)
+                }
+            }
+            syncSelectionAfterMutation()
+        case .rename:
+            promptRename()
+        case .clearCustomTitle:
+            tabManager.clearCustomTitle(tabId: tab.id)
+        case .applyColor(let color, let targetIds):
+            applyTabColor(color, targetIds: targetIds)
+        case .chooseCustomColor(let targetIds):
+            promptCustomColor(targetIds: targetIds)
+        case .clearTag:
+            tab.tag = nil
+        case .setTag:
+            ContentView.showWorkspaceTagPrompt(for: tab)
+        case .move(let offset):
+            moveBy(offset)
+        case .moveToTop(let targetIds):
+            tabManager.moveTabsToTop(Set(targetIds))
+            syncSelectionAfterMutation()
+        case .close(let targetIds):
+            closeTabs(targetIds, allowPinned: true)
+        case .closeOthers(let targetIds):
+            closeOtherTabs(targetIds)
+        case .closeBelow:
+            closeTabsBelow(tabId: tab.id)
+        case .closeAbove:
+            closeTabsAbove(tabId: tab.id)
+        case .markRead(let targetIds):
+            markTabsRead(targetIds)
+        case .markUnread(let targetIds):
+            markTabsUnread(targetIds)
+        }
+    }
+
     private func closeTabs(_ targetIds: [UUID], allowPinned: Bool) {
         let idsToClose = targetIds.filter { id in
             guard let tab = tabManager.tabs.first(where: { $0.id == id }) else { return false }
@@ -890,24 +952,14 @@ struct TabItemView: View {
 
     private func markTabsRead(_ targetIds: [UUID]) {
         for id in targetIds {
-            notificationStore.markRead(forTabId: id)
+            TerminalNotificationStore.shared.markRead(forTabId: id)
         }
     }
 
     private func markTabsUnread(_ targetIds: [UUID]) {
         for id in targetIds {
-            notificationStore.markUnread(forTabId: id)
+            TerminalNotificationStore.shared.markUnread(forTabId: id)
         }
-    }
-
-    private func hasUnreadNotifications(in targetIds: [UUID]) -> Bool {
-        let targetSet = Set(targetIds)
-        return notificationStore.notifications.contains { targetSet.contains($0.tabId) && !$0.isRead }
-    }
-
-    private func hasReadNotifications(in targetIds: [UUID]) -> Bool {
-        let targetSet = Set(targetIds)
-        return notificationStore.notifications.contains { targetSet.contains($0.tabId) && $0.isRead }
     }
 
     private func syncSelectionAfterMutation() {
@@ -928,22 +980,11 @@ struct TabItemView: View {
     }
 
     private var latestNotificationText: String? {
-        guard let notification = notificationStore.latestNotification(forTabId: tab.id) else { return nil }
-        let text = notification.body.isEmpty ? notification.title : notification.body
-        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        return trimmed.isEmpty ? nil : trimmed
-    }
-
-    private var activeTeamName: String? {
-        TeamOrchestrator.shared.teams.values.first(where: { $0.workspaceId == tab.id })?.id
+        notificationSummary.displayText
     }
 
     private var activeTeam: TeamOrchestrator.Team? {
-        TeamOrchestrator.shared.teams.values.first(where: { $0.workspaceId == tab.id })
-    }
-
-    private func teamAttentionCount(teamName: String) -> Int {
-        TeamOrchestrator.shared.inboxItems(teamName: teamName).count
+        teamRuntimeSnapshot.flatMap { TeamOrchestrator.shared.teams[$0.teamName] }
     }
 
     @ViewBuilder
@@ -954,7 +995,7 @@ struct TabItemView: View {
         TeamIndicatorBlock(
             teamName: teamName,
             activeTeam: activeTeam,
-            attentionCount: teamAttentionCount(teamName: teamName),
+            attentionCount: teamRuntimeSnapshot?.attentionCount ?? 0,
             badgeForegroundColor: activeSecondaryColor(0.9),
             teamContextMenuBuilder: { AnyView(self.teamRowContextMenu(teamName: teamName)) },
             agentDotBuilder: { agent in AnyView(self.agentDot(teamName: teamName, agent: agent)) }
@@ -963,7 +1004,7 @@ struct TabItemView: View {
 
     @ViewBuilder
     private func agentDot(teamName: String, agent: TeamOrchestrator.AgentMember) -> some View {
-        let state = TeamOrchestrator.shared.agentState(teamName: teamName, agentName: agent.name)
+        let state = teamRuntimeSnapshot?.state(for: agent.agentInstanceId) ?? "idle"
         let color: Color = switch state {
         case "running":      .green
         case "blocked":      .red
@@ -1099,46 +1140,6 @@ struct TabItemView: View {
         }
     }
 
-    private var verticalBranchDirectoryEntries: [SidebarBranchOrdering.BranchDirectoryEntry] {
-        tab.sidebarBranchDirectoryEntriesInDisplayOrder()
-    }
-
-    private var verticalRowsContainBranch: Bool {
-        sidebarShowGitBranch && verticalBranchDirectoryLines.contains { $0.branch != nil }
-    }
-
-    private struct VerticalBranchDirectoryLine {
-        let branch: String?
-        let directory: String?
-    }
-
-    private var verticalBranchDirectoryLines: [VerticalBranchDirectoryLine] {
-        let home = FileManager.default.homeDirectoryForCurrentUser.path
-        return verticalBranchDirectoryEntries.compactMap { entry in
-            let branchText: String? = {
-                guard sidebarShowGitBranch, let branch = entry.branch else { return nil }
-                return "\(branch)\(entry.isDirty ? "*" : "")"
-            }()
-
-            let directoryText: String? = {
-                guard let directory = entry.directory else { return nil }
-                let shortened = shortenPath(directory, home: home)
-                return shortened.isEmpty ? nil : shortened
-            }()
-
-            switch (branchText, directoryText) {
-            case let (branch?, directory?):
-                return VerticalBranchDirectoryLine(branch: branch, directory: directory)
-            case let (branch?, nil):
-                return VerticalBranchDirectoryLine(branch: branch, directory: nil)
-            case let (nil, directory?):
-                return VerticalBranchDirectoryLine(branch: nil, directory: directory)
-            default:
-                return nil
-            }
-        }
-    }
-
     private var directorySummaryText: String? {
         guard !tab.panels.isEmpty else { return nil }
         let home = FileManager.default.homeDirectoryForCurrentUser.path
@@ -1266,6 +1267,157 @@ struct TabItemView: View {
             guard response == .alertFirstButtonReturn else { return }
             self.tabManager.setCustomTitle(tabId: self.tab.id, title: input.stringValue)
         }
+    }
+}
+
+private enum SidebarTabMenuAction {
+    case setPinned(Bool, [UUID])
+    case rename
+    case clearCustomTitle
+    case applyColor(String?, [UUID])
+    case chooseCustomColor([UUID])
+    case clearTag
+    case setTag
+    case move(Int)
+    case moveToTop([UUID])
+    case close([UUID])
+    case closeOthers([UUID])
+    case closeBelow
+    case closeAbove
+    case markRead([UUID])
+    case markUnread([UUID])
+}
+
+private struct SidebarTabContextMenu: View, Equatable {
+    @EnvironmentObject private var notificationStore: TerminalNotificationStore
+    @Environment(\.colorScheme) private var colorScheme
+    @AppStorage(SidebarActiveTabIndicatorSettings.styleKey)
+    private var activeIndicatorStyleRaw = SidebarActiveTabIndicatorSettings.defaultStyle.rawValue
+
+    let clickedID: UUID
+    let selectedTabIds: Set<UUID>
+    let visibleTabIds: [UUID]
+    let visibleIndex: Int?
+    let visibleWorkspaceCount: Int
+    let isPinned: Bool
+    let hasCustomTitle: Bool
+    let customColor: String?
+    let hasTag: Bool
+    let onAction: (SidebarTabMenuAction) -> Void
+
+    static func == (lhs: Self, rhs: Self) -> Bool {
+        lhs.clickedID == rhs.clickedID &&
+            lhs.selectedTabIds == rhs.selectedTabIds &&
+            lhs.visibleTabIds == rhs.visibleTabIds &&
+            lhs.visibleIndex == rhs.visibleIndex &&
+            lhs.visibleWorkspaceCount == rhs.visibleWorkspaceCount &&
+            lhs.isPinned == rhs.isPinned &&
+            lhs.hasCustomTitle == rhs.hasCustomTitle &&
+            lhs.customColor == rhs.customColor &&
+            lhs.hasTag == rhs.hasTag
+    }
+
+    @ViewBuilder
+    var body: some View {
+        let targetIds = SidebarPresentationSettings.contextTargetIDs(
+            clickedID: clickedID,
+            selectedIDs: selectedTabIds,
+            visibleWorkspaceIDs: visibleTabIds
+        )
+        let palette = WorkspaceTabColorSettings.palette()
+        let renameShortcut = KeyboardShortcutSettings.shortcut(for: .renameWorkspace)
+        let closeShortcut = KeyboardShortcutSettings.shortcut(for: .closeWorkspace)
+        let shouldPin = !isPinned
+        let plural = targetIds.count > 1
+
+        Button(plural ? (shouldPin ? "Pin Workspaces" : "Unpin Workspaces") : (shouldPin ? "Pin Workspace" : "Unpin Workspace")) {
+            onAction(.setPinned(shouldPin, targetIds))
+        }
+
+        shortcutButton("Rename Workspace…", shortcut: renameShortcut) { onAction(.rename) }
+
+        if hasCustomTitle {
+            Button("Remove Custom Workspace Name") { onAction(.clearCustomTitle) }
+        }
+
+        Menu("Tab Color") {
+            if customColor != nil {
+                Button { onAction(.applyColor(nil, targetIds)) } label: {
+                    Label("Clear Color", systemImage: "xmark.circle")
+                }
+            }
+            Button { onAction(.chooseCustomColor(targetIds)) } label: {
+                Label("Choose Custom Color…", systemImage: "paintpalette")
+            }
+            if !palette.isEmpty { Divider() }
+            ForEach(palette) { entry in
+                Button { onAction(.applyColor(entry.hex, targetIds)) } label: {
+                    Label { Text(entry.name) } icon: {
+                        Image(nsImage: coloredCircleImage(color: swatchColor(for: entry.hex)))
+                    }
+                }
+            }
+        }
+
+        if hasTag { Button("Clear Tag") { onAction(.clearTag) } }
+        Button("Set Tag…") { onAction(.setTag) }
+        Divider()
+
+        Button("Move Up") { onAction(.move(-1)) }.disabled(visibleIndex == 0)
+        Button("Move Down") { onAction(.move(1)) }
+            .disabled(visibleIndex.map { $0 >= visibleWorkspaceCount - 1 } ?? true)
+        Button("Move to Top") { onAction(.moveToTop(targetIds)) }.disabled(targetIds.isEmpty)
+        Divider()
+
+        shortcutButton(plural ? "Close Workspaces" : "Close Workspace", shortcut: closeShortcut) {
+            onAction(.close(targetIds))
+        }
+            .disabled(targetIds.isEmpty)
+        Button("Close Other Workspaces") { onAction(.closeOthers(targetIds)) }
+            .disabled(visibleWorkspaceCount <= 1 || targetIds.count == visibleWorkspaceCount)
+        Button("Close Workspaces Below") { onAction(.closeBelow) }
+            .disabled(visibleIndex.map { $0 >= visibleWorkspaceCount - 1 } ?? true)
+        Button("Close Workspaces Above") { onAction(.closeAbove) }.disabled(visibleIndex == 0)
+        Divider()
+
+        Button(plural ? "Mark Workspaces as Read" : "Mark Workspace as Read") {
+            onAction(.markRead(targetIds))
+        }
+            .disabled(!hasUnreadNotifications(in: targetIds))
+        Button(plural ? "Mark Workspaces as Unread" : "Mark Workspace as Unread") {
+            onAction(.markUnread(targetIds))
+        }
+            .disabled(!hasReadNotifications(in: targetIds))
+    }
+
+    @ViewBuilder
+    private func shortcutButton(_ title: String, shortcut: StoredShortcut, action: @escaping () -> Void) -> some View {
+        if let key = shortcut.keyEquivalent {
+            Button(title, action: action).keyboardShortcut(key, modifiers: shortcut.eventModifiers)
+        } else {
+            Button(title, action: action)
+        }
+    }
+
+    private func hasUnreadNotifications(in targetIds: [UUID]) -> Bool {
+        let targetSet = Set(targetIds)
+        return notificationStore.notifications.contains { targetSet.contains($0.tabId) && !$0.isRead }
+    }
+
+    private func hasReadNotifications(in targetIds: [UUID]) -> Bool {
+        let targetSet = Set(targetIds)
+        return notificationStore.notifications.contains { targetSet.contains($0.tabId) && $0.isRead }
+    }
+
+    private func swatchColor(for hex: String) -> NSColor {
+        let activeIndicatorStyle = SidebarActiveTabIndicatorSettings.resolvedStyle(
+            rawValue: activeIndicatorStyleRaw
+        )
+        return WorkspaceTabColorSettings.displayNSColor(
+            hex: hex,
+            colorScheme: colorScheme,
+            forceBright: activeIndicatorStyle == .leftRail
+        ) ?? NSColor(hex: hex) ?? .gray
     }
 }
 
@@ -1891,12 +2043,12 @@ struct SidebarStatusPillsRow: View {
     }
 }
 
-enum SidebarDropEdge {
+enum SidebarDropEdge: Equatable {
     case top
     case bottom
 }
 
-struct SidebarDropIndicator {
+struct SidebarDropIndicator: Equatable {
     let tabId: UUID?
     let edge: SidebarDropEdge
 }
