@@ -13,6 +13,10 @@
 //! global to compensate; passing them in keeps the assembly a pure function,
 //! which is the part worth testing.
 
+// Consumed once a bridge launches a child; until then the compiler is right
+// that nothing calls any of it.
+#![allow(dead_code)]
+
 use std::collections::BTreeMap;
 use std::env;
 

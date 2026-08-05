@@ -25,7 +25,9 @@
 //! The CLI surface is deliberately identical to the Python bridge's: the two
 //! are meant to be swappable behind one launch line while the port is proven.
 
+mod emitter;
 mod location;
+mod text;
 
 use clap::Parser;
 
