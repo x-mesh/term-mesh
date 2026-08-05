@@ -523,7 +523,7 @@ final class AgentSession: ObservableObject {
         // chose rather than whichever one PATH happens to find.
         if !cliPath.isEmpty { args += ["--exe", cliPath] }
         return Launch(executable: "/usr/bin/env",
-                      arguments: ["python3"] + args,
+                      arguments: AgentPipeTransport.bridgeInterpreter(for: bridgePath) + args,
                       workingDirectory: workingDirectory,
                       environment: environment)
     }
@@ -606,7 +606,7 @@ final class AgentSession: ObservableObject {
         if !model.isEmpty { args += ["--model", model] }
         return Launch(
             executable: "/usr/bin/env",
-            arguments: ["python3"] + args,
+            arguments: AgentPipeTransport.bridgeInterpreter(for: bridgePath) + args,
             workingDirectory: FileManager.default.temporaryDirectory.path,
             environment: env
         )

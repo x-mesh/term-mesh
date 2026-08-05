@@ -7,6 +7,7 @@ members = [
     "term-mesh-peer-relay",
     "sync-protocol",
     "tm-coordinator",
+    "tm-agent-bridge",
 ]
 
 # Force static linking of zlib so term-meshd doesn't depend on Homebrew's libz.

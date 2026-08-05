@@ -336,7 +336,7 @@ mkdir -p "$BIN_DIR"
 # holds whatever was last built there, from whatever branch — on one machine it
 # was two days and several branches old, and got shipped into the bundle twice
 # because cargo was missing and the failure was only a warning.
-for bin in term-meshd term-mesh-run tm-agent term-mesh-peer-relay; do
+for bin in term-meshd term-mesh-run tm-agent term-mesh-peer-relay tm-agent-bridge; do
   [[ "$DAEMON_BUILT" -eq 1 ]] || continue
   src="$PWD/daemon/target/release/$bin"
   if [[ -x "$src" ]]; then
