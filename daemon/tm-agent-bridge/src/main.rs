@@ -26,6 +26,7 @@ mod codex;
 mod emitter;
 mod jsonrpc;
 mod location;
+mod per_turn;
 mod text;
 mod transport;
 
@@ -39,6 +40,7 @@ use serde_json::Value;
 use acp::AcpBridge;
 use codex::CodexBridge;
 use emitter::Emitter;
+use per_turn::{PerTurnBridge, PerTurnCli};
 use text::{split_input_frames, MAX_FRAME_BYTES};
 use transport::{ProcessChild, Transport};
 
@@ -140,6 +142,26 @@ impl<T: Transport> Bridge for CodexBridge<T> {
     }
 }
 
+impl Bridge for PerTurnBridge {
+    fn start(&mut self) -> bool {
+        PerTurnBridge::start(self)
+    }
+    fn turn(&mut self, text: &str, timeout: Duration) {
+        PerTurnBridge::turn(self, text, timeout)
+    }
+    fn alive(&self) -> bool {
+        // Cursor and agy use a fresh child for every turn, so the bridge that
+        // waits between them is never the thing that died.
+        PerTurnBridge::alive(self)
+    }
+    fn failure(&self) -> Option<String> {
+        None
+    }
+    fn child_failure_message(&self) -> String {
+        "agent process exited".to_string()
+    }
+}
+
 impl<T: Transport> Bridge for AcpBridge<T> {
     fn start(&mut self) -> bool {
         AcpBridge::start(self)
@@ -205,48 +227,61 @@ fn main() -> std::process::ExitCode {
         }
     };
 
-    let argv: Vec<String> = match args.cli {
-        Cli::Codex => vec![
+    // A persistent CLI is spawned once and spoken to; a per-turn CLI has
+    // nothing running between turns, so there is no child here to watch.
+    let persistent_argv: Option<Vec<String>> = match args.cli {
+        Cli::Codex => Some(vec![
             args.exe.clone().unwrap_or_else(|| "codex".into()),
             "app-server".into(),
-        ],
+        ]),
         // `kiro-cli acp`, NOT `kiro-cli chat acp`: both parse and only the
         // first is a server. The second starts the interactive chat agent,
         // which reads the handshake as a user message and answers it in prose.
-        Cli::Kiro => vec![
+        Cli::Kiro => Some(vec![
             args.exe.clone().unwrap_or_else(|| "kiro-cli".into()),
             "acp".into(),
             "--trust-all-tools".into(),
-        ],
-        Cli::Gemini => vec![
+        ]),
+        Cli::Gemini => Some(vec![
             args.exe.clone().unwrap_or_else(|| "gemini".into()),
             "--acp".into(),
             "--yolo".into(),
-        ],
-        Cli::Cursor | Cli::Agy => {
-            // A turn-per-process CLI needs the other bridge shape, which has
-            // not been ported yet. Refusing loudly beats a pane that looks
-            // started and never answers.
-            eprintln!(
-                "tm-agent-bridge: {} is not implemented in the Rust bridge yet; \
-                 the app still runs scripts/spike/tm-agent-bridge.py",
-                args.cli.as_str()
-            );
-            return std::process::ExitCode::FAILURE;
-        }
+        ]),
+        Cli::Cursor | Cli::Agy => None,
     };
 
-    let (child, exit_rx) = match ProcessChild::spawn(&argv, &cwd) {
-        Ok(pair) => pair,
-        Err(e) => {
-            out.result(&format!("{e}"), "startup_failed", None, true);
-            return std::process::ExitCode::FAILURE;
+    let (mut bridge, exit_rx): (Box<dyn Bridge>, Option<Receiver<()>>) = match persistent_argv {
+        Some(argv) => {
+            let (child, exit_rx) = match ProcessChild::spawn(&argv, &cwd) {
+                Ok(pair) => pair,
+                Err(e) => {
+                    out.result(&format!("{e}"), "startup_failed", None, true);
+                    return std::process::ExitCode::FAILURE;
+                }
+            };
+            let bridge: Box<dyn Bridge> = match args.cli {
+                Cli::Codex => Box::new(CodexBridge::new(child, out, &cwd, args.model.clone())),
+                _ => Box::new(AcpBridge::new(child, out, &cwd, args.model.clone())),
+            };
+            (bridge, Some(exit_rx))
         }
-    };
-
-    let mut bridge: Box<dyn Bridge> = match args.cli {
-        Cli::Codex => Box::new(CodexBridge::new(child, out, &cwd, args.model.clone())),
-        _ => Box::new(AcpBridge::new(child, out, &cwd, args.model.clone())),
+        None => {
+            let cli = if args.cli == Cli::Cursor {
+                PerTurnCli::Cursor
+            } else {
+                PerTurnCli::Agy
+            };
+            (
+                Box::new(PerTurnBridge::new(
+                    cli,
+                    &cwd,
+                    args.model.clone(),
+                    out,
+                    args.exe.clone(),
+                )),
+                None,
+            )
+        }
     };
 
     if !bridge.start() {
@@ -272,7 +307,12 @@ fn main() -> std::process::ExitCode {
 
     let (wake_tx, wake_rx) = mpsc::channel();
     spawn_input_reader(args.fifo.clone(), wake_tx.clone());
-    spawn_exit_watcher(exit_rx, wake_tx);
+    match exit_rx {
+        Some(exit_rx) => spawn_exit_watcher(exit_rx, wake_tx),
+        // Nothing runs between turns, so nothing can be waited on for its
+        // exit. Dropping the sender keeps the loop's recv honest.
+        None => drop(wake_tx),
+    }
 
     let code = consume(
         &mut *bridge,

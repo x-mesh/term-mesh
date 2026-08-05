@@ -2596,6 +2596,7 @@ name = "tm-agent-bridge"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "libc",
  "serde",
  "serde_json",
  "tempfile",
