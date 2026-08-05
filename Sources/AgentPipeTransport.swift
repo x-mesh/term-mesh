@@ -78,12 +78,18 @@ enum AgentPipeTransport {
 
     /// The bridge, found next to the app or in the repo it was built from.
     ///
-    /// `TERMMESH_BRIDGE_IMPL=rust` selects the ported binary instead. The two
-    /// take the same arguments and emit the same events, so this is the only
-    /// place that has to know which one is running — and while both ship, a
-    /// pane can be moved back by unsetting one variable.
+    /// The compiled bridge by default; `TERMMESH_BRIDGE_IMPL=python` goes back
+    /// to the script. The two take the same arguments and emit the same
+    /// events, so this is the only place that has to know which one is
+    /// running, and while both ship a pane can be moved back with one
+    /// variable.
+    ///
+    /// Falling through to the script when no binary is found is deliberate: a
+    /// bundle built before the port, or a checkout whose cargo output is not
+    /// there yet, still gets a working bridge rather than a pane that cannot
+    /// start.
     static func bridgePath(workingDirectory: String) -> String? {
-        if ProcessInfo.processInfo.environment[bridgeImplKey] == "rust",
+        if prefersRustBridge(),
            let binary = rustBridgePath(workingDirectory: workingDirectory) {
             return binary
         }
@@ -92,6 +98,14 @@ enum AgentPipeTransport {
     }
 
     static let bridgeImplKey = "TERMMESH_BRIDGE_IMPL"
+
+    /// Whether to run the port. Split out so the choice is testable without a
+    /// filesystem the answer would otherwise depend on.
+    static func prefersRustBridge(
+        environment: [String: String] = ProcessInfo.processInfo.environment
+    ) -> Bool {
+        environment[bridgeImplKey] != "python"
+    }
 
     /// The compiled bridge: beside the other daemon binaries in the bundle, or
     /// in the cargo output of the repo this was built from.

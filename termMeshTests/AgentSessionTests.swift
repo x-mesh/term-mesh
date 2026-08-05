@@ -954,6 +954,18 @@ final class AgentSessionTests: XCTestCase {
     /// the same events, so a pane can be moved between them. What differs is
     /// only how each is started: a script is an argument to its interpreter, a
     /// compiled binary is the command itself.
+    func testTheCompiledBridgeIsTheDefaultAndPythonIsTheWayBack() {
+        XCTAssertTrue(AgentPipeTransport.prefersRustBridge(environment: [:]))
+        XCTAssertTrue(AgentPipeTransport.prefersRustBridge(
+            environment: ["TERMMESH_BRIDGE_IMPL": "rust"]))
+        XCTAssertFalse(AgentPipeTransport.prefersRustBridge(
+            environment: ["TERMMESH_BRIDGE_IMPL": "python"]))
+        // Only the one word turns it back. A typo must not silently pick the
+        // implementation nobody asked for.
+        XCTAssertTrue(AgentPipeTransport.prefersRustBridge(
+            environment: ["TERMMESH_BRIDGE_IMPL": "pyhton"]))
+    }
+
     func testAScriptBridgeIsRunByItsInterpreterAndABinaryIsNot() {
         XCTAssertEqual(
             AgentPipeTransport.bridgeInterpreter(for: "/repo/scripts/spike/tm-agent-bridge.py"),
