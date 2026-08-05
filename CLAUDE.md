@@ -339,8 +339,12 @@ rebuild that failed while the previous build is live.
   name that was not already there — ghostty then reads freed memory. Overwriting an
   existing name is fine (libc replaces that entry in place); adding is not. All such
   writes belong in `GhosttyEnvironment` (`Sources/GhosttyApp.swift`), which runs
-  before `ghostty_init`; route new ones through `GhosttyEnvironment.setValue(_:forName:)`
-  so a DEBUG build logs `ghostty.env.added_after_init` instead of failing silently.
+  before `ghostty_init`; route new ones through `GhosttyEnvironment.setValue(_:forName:)`.
+  A late addition there is repaired — it calls the fork's `ghostty_sync_environ()`,
+  which hands ghostty the new address — and a DEBUG build logs
+  `ghostty.env.added_after_init` naming the value. **The repair is a safety net, not
+  a licence:** fix the ordering, because anything that reads the environment between
+  the write and the sync still reads the stale block.
 
   This shipped as v0.174.0 and was fixed in v0.174.1. It cost XDG path resolution:
   "Ghostty Settings…" returned an empty path and did nothing, Reload Configuration
