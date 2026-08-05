@@ -1331,6 +1331,8 @@ class TerminalController {
             return v2Result(id: id, self.v2DebugCommandPaletteSelection(params: params))
         case "debug.command_palette.results":
             return v2Result(id: id, self.v2DebugCommandPaletteResults(params: params))
+        case "debug.command_palette.set_query":
+            return v2Result(id: id, self.v2DebugCommandPaletteSetQuery(params: params))
         case "debug.command_palette.rename_input.interact":
             return v2Result(id: id, self.v2DebugCommandPaletteRenameInputInteraction(params: params))
         case "debug.command_palette.rename_input.delete_backward":
@@ -1622,6 +1624,7 @@ class TerminalController {
             "debug.command_palette.visible",
             "debug.command_palette.selection",
             "debug.command_palette.results",
+            "debug.command_palette.set_query",
             "debug.command_palette.rename_input.interact",
             "debug.command_palette.rename_input.delete_backward",
             "debug.command_palette.rename_input.selection",

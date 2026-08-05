@@ -1917,6 +1917,23 @@ struct ContentView: View {
             openCommandPaletteCommands()
         })
 
+        // Debug/e2e probe: set the palette query programmatically. Synthetic
+        // debug.type cannot reach the palette's SwiftUI field (it inserts into
+        // the window's AppKit first responder, which stays on the terminal),
+        // so socket-driven tests exercise the real filter pipeline through the
+        // same binding the user's typing feeds.
+        view = AnyView(view.onReceive(NotificationCenter.default.publisher(for: .commandPaletteSetQueryRequested)) { notification in
+            let requestedWindow = notification.object as? NSWindow
+            guard Self.shouldHandleCommandPaletteRequest(
+                observedWindow: observedWindow,
+                requestedWindow: requestedWindow,
+                keyWindow: NSApp.keyWindow,
+                mainWindow: NSApp.mainWindow
+            ) else { return }
+            guard isCommandPalettePresented else { return }
+            commandPaletteQuery = (notification.userInfo?["query"] as? String) ?? ""
+        })
+
         view = AnyView(view.onReceive(NotificationCenter.default.publisher(for: .commandPaletteSwitcherRequested)) { notification in
             let requestedWindow = notification.object as? NSWindow
             guard Self.shouldHandleCommandPaletteRequest(

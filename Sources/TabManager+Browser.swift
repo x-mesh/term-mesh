@@ -1279,6 +1279,7 @@ extension Notification.Name {
     static let commandPaletteRenameTabRequested = Notification.Name("term-mesh.commandPaletteRenameTabRequested")
     static let commandPaletteMoveSelection = Notification.Name("term-mesh.commandPaletteMoveSelection")
     static let commandPaletteRenameInputInteractionRequested = Notification.Name("term-mesh.commandPaletteRenameInputInteractionRequested")
+    static let commandPaletteSetQueryRequested = Notification.Name("term-mesh.commandPaletteSetQueryRequested")
     static let commandPaletteRenameInputDeleteBackwardRequested = Notification.Name("term-mesh.commandPaletteRenameInputDeleteBackwardRequested")
     static let ghosttyDidUpdateGitBranch = Notification.Name("ghosttyDidUpdateGitBranch")
     static let ghosttyDidSetTitle = Notification.Name("ghosttyDidSetTitle")

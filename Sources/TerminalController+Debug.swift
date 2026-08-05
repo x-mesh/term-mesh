@@ -185,6 +185,40 @@ extension TerminalController {
         return result
     }
 
+    /// Set the open command palette's raw query (mode prefixes like ">" / "@"
+    /// included). Exists because debug.type inserts into the AppKit first
+    /// responder, which the palette's SwiftUI field never becomes under
+    /// synthetic activation — this drives the same binding user typing feeds.
+    func v2DebugCommandPaletteSetQuery(params: [String: Any]) -> V2CallResult {
+        guard let query = params["query"] as? String else {
+            return .err(code: "invalid_params", message: "Missing query", data: nil)
+        }
+        let requestedWindowId = v2UUID(params, "window_id")
+        var result: V2CallResult = .ok([:])
+        _ = v2MainExec(timeout: 5) {
+            let targetWindow: NSWindow?
+            if let requestedWindowId {
+                guard let window = AppDelegate.shared?.mainWindow(for: requestedWindowId) else {
+                    result = .err(
+                        code: "not_found",
+                        message: "Window not found",
+                        data: ["window_id": requestedWindowId.uuidString, "window_ref": self.v2Ref(kind: .window, uuid: requestedWindowId)]
+                    )
+                    return
+                }
+                targetWindow = window
+            } else {
+                targetWindow = NSApp.keyWindow ?? NSApp.mainWindow
+            }
+            NotificationCenter.default.post(
+                name: .commandPaletteSetQueryRequested,
+                object: targetWindow,
+                userInfo: ["query": query]
+            )
+        }
+        return result
+    }
+
     func v2DebugOpenCommandPaletteRenameTabInput(params: [String: Any]) -> V2CallResult {
         let requestedWindowId = v2UUID(params, "window_id")
         var result: V2CallResult = .ok([:])
