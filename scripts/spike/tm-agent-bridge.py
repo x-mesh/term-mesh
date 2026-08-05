@@ -999,6 +999,21 @@ class CodexBridge:
         return (((turn.get("error") or {}).get("message") or "").strip()
                 or "codex ended the turn as failed without saying why")
 
+    @classmethod
+    def _failure_reason(cls, errors: list[tuple[bool, str]],
+                        done: dict | None) -> str | None:
+        """The one sentence for why a turn ended, in order of finality.
+
+        A terminal `error` first: it is the only one that can carry detail the
+        turn object drops. Then the completed turn itself. A retry line ranks
+        last and is used only when nothing else accounts for the failure —
+        reporting one as the outcome describes an attempt, not an ending.
+        """
+        for retrying, detail in errors:
+            if not retrying:
+                return detail
+        return cls._turn_failure(done) or (errors[-1][1] if errors else None)
+
     def turn(self, text: str, timeout: float) -> None:
         self.out.sent(text)
         self.out.turn_begins()
@@ -1015,9 +1030,15 @@ class CodexBridge:
                 # the empty item list as the only evidence, which reads as
                 # "the model had nothing to say" — the one thing it does not
                 # mean.
+                #
+                # `willRetry` separates an attempt that failed from the reason
+                # the turn ends, and the two are not interchangeable: an
+                # unusable model reports `Reconnecting... 1/5` first, so taking
+                # the earliest error names a symptom and drops the account that
+                # arrives once the retries run out.
                 detail = ((p.get("error") or {}).get("message") or "").strip()
                 if detail:
-                    failed_because.append(detail)
+                    failed_because.append((bool(p.get("willRetry")), detail))
                 return
             if m == "item/agentMessage/delta":
                 chunk = p.get("delta") or ""
@@ -1090,8 +1111,7 @@ class CodexBridge:
         # reported "the turn ended without an answer", which sent the search
         # everywhere except the cause. Say the reason, and keep whatever was
         # streamed ahead of it.
-        reason = (failed_because[0] if failed_because
-                  else self._turn_failure(done))
+        reason = self._failure_reason(failed_because, done)
         if reason:
             self.out.result(
                 "\n\n".join(part for part in (final.strip(), reason) if part),

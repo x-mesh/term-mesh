@@ -527,6 +527,63 @@ class CodexTurnFailureTests(unittest.TestCase):
         self.assertIn("got this far", result["result"])
         self.assertIn("provider went away", result["result"])
 
+    def test_a_retry_line_loses_to_the_reason_the_turn_actually_ended(self):
+        """`Reconnecting... 1/5` is an attempt failing, not the turn ending.
+
+        Measured with an unusable `--model`: codex emits the retry line first
+        and the real account only once the retries are spent. Taking the
+        earliest error reported the symptom.
+        """
+        bridge, _, out = codex_bridge([
+            {"jsonrpc": "2.0", "id": 1, "result": {}},
+            {"jsonrpc": "2.0", "method": "error",
+             "params": {"error": {"message": "Reconnecting... 1/5"},
+                        "willRetry": True}},
+            {"jsonrpc": "2.0", "method": "turn/completed",
+             "params": {"threadId": "thread-1",
+                        "turn": {"status": "failed",
+                                 "error": {"message": "model not found"}}}},
+        ])
+
+        bridge.turn("do work", timeout=2)
+
+        result = self.last_result(out)
+        self.assertEqual(result["result"], "model not found")
+
+    def test_a_terminal_error_outranks_an_earlier_retry(self):
+        bridge, _, out = codex_bridge([
+            {"jsonrpc": "2.0", "id": 1, "result": {}},
+            {"jsonrpc": "2.0", "method": "error",
+             "params": {"error": {"message": "Reconnecting... 1/5"},
+                        "willRetry": True}},
+            {"jsonrpc": "2.0", "method": "error",
+             "params": {"error": {"message": self.KEY_ERROR},
+                        "willRetry": False}},
+            {"jsonrpc": "2.0", "method": "turn/completed",
+             "params": {"threadId": "thread-1", "turn": {"status": "failed"}}},
+        ])
+
+        bridge.turn("do work", timeout=2)
+
+        self.assertEqual(self.last_result(out)["result"], self.KEY_ERROR)
+
+    def test_a_retry_line_is_still_better_than_nothing(self):
+        """No terminal error, no failed turn — the retry is all there is."""
+        bridge, _, out = codex_bridge([
+            {"jsonrpc": "2.0", "id": 1, "result": {}},
+            {"jsonrpc": "2.0", "method": "error",
+             "params": {"error": {"message": "Reconnecting... 5/5"},
+                        "willRetry": True}},
+            {"jsonrpc": "2.0", "method": "turn/completed",
+             "params": {"threadId": "thread-1", "turn": {}}},
+        ])
+
+        bridge.turn("do work", timeout=2)
+
+        result = self.last_result(out)
+        self.assertEqual(result["result"], "Reconnecting... 5/5")
+        self.assertTrue(result["is_error"])
+
     def test_an_empty_turn_that_did_not_fail_still_reads_as_empty(self):
         """Nothing failed; there was simply nothing said. Unchanged."""
         bridge, _, out = codex_bridge([
