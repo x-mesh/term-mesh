@@ -987,6 +987,8 @@ class TerminalController {
             return v2Result(id: id, self.v2SurfaceDragToSplit(params: params))
         case "surface.refresh":
             return v2Result(id: id, self.v2SurfaceRefresh(params: params))
+        case "surface.rebuild_renderer":
+            return v2Result(id: id, self.v2SurfaceRebuildRenderer(params: params))
         case "surface.health":
             return v2Result(id: id, self.v2SurfaceHealth(params: params))
         case "surface.send_text":
@@ -1329,6 +1331,10 @@ class TerminalController {
             return v2Result(id: id, self.v2DebugCommandPaletteSelection(params: params))
         case "debug.command_palette.results":
             return v2Result(id: id, self.v2DebugCommandPaletteResults(params: params))
+        case "debug.command_palette.set_query":
+            return v2Result(id: id, self.v2DebugCommandPaletteSetQuery(params: params))
+        case "debug.blank_recovery.state":
+            return v2Result(id: id, self.v2DebugBlankRecoveryState(params: params))
         case "debug.command_palette.rename_input.interact":
             return v2Result(id: id, self.v2DebugCommandPaletteRenameInputInteraction(params: params))
         case "debug.command_palette.rename_input.delete_backward":
@@ -1489,6 +1495,7 @@ class TerminalController {
             "surface.action",
             "tab.action",
             "surface.refresh",
+            "surface.rebuild_renderer",
             "surface.health",
             "surface.send_text",
             "surface.send_key",
@@ -1619,6 +1626,8 @@ class TerminalController {
             "debug.command_palette.visible",
             "debug.command_palette.selection",
             "debug.command_palette.results",
+            "debug.command_palette.set_query",
+            "debug.blank_recovery.state",
             "debug.command_palette.rename_input.interact",
             "debug.command_palette.rename_input.delete_backward",
             "debug.command_palette.rename_input.selection",

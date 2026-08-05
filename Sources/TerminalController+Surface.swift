@@ -614,6 +614,43 @@ extension TerminalController {
         return result
     }
 
+    /// Hard blank-pane recovery: forces one unrealize/realize transaction on the target
+    /// terminal's renderer (swap chain + IOSurface rebuild; PTY/terminal state/scrollback
+    /// untouched). Targets `surface_id` when given, else the workspace's focused panel.
+    /// Runs on main: it is a low-frequency surface-manipulation command, not telemetry.
+    func v2SurfaceRebuildRenderer(params: [String: Any]) -> V2CallResult {
+        guard let tabManager = v2ResolveTabManager(params: params) else {
+            return .err(code: "unavailable", message: "TabManager not available", data: nil)
+        }
+        var result: V2CallResult = .err(code: "internal_error", message: "Failed to rebuild renderer", data: nil)
+        let completed = v2MainExec(timeout: 2) {
+            guard let ws = self.v2ResolveWorkspace(params: params, tabManager: tabManager) else {
+                result = .err(code: "not_found", message: "Workspace not found", data: nil)
+                return
+            }
+            let surfaceId = self.v2UUID(params, "surface_id") ?? ws.focusedPanelId
+            guard let surfaceId else {
+                result = .err(code: "not_found", message: "No focused surface", data: nil)
+                return
+            }
+            guard let terminalPanel = ws.terminalPanel(for: surfaceId) else {
+                result = .err(code: "invalid_params", message: "Surface is not a terminal", data: ["surface_id": surfaceId.uuidString])
+                return
+            }
+            let accepted = terminalPanel.surface.rebuildRenderer()
+            if accepted { terminalPanel.surface.forceRefresh() }
+            result = .ok([
+                "surface_id": surfaceId.uuidString,
+                "surface_ref": self.v2Ref(kind: .surface, uuid: surfaceId),
+                "workspace_id": ws.id.uuidString,
+                "workspace_ref": self.v2Ref(kind: .workspace, uuid: ws.id),
+                "rebuilt": accepted
+            ])
+        }
+        if !completed { return .err(code: "timeout", message: "Main thread busy", data: nil) }
+        return result
+    }
+
     func v2SurfaceHealth(params: [String: Any]) -> V2CallResult {
         guard let tabManager = v2ResolveTabManager(params: params) else {
             return .err(code: "unavailable", message: "TabManager not available", data: nil)

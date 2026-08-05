@@ -54,6 +54,38 @@ private func installTermMeshUnitTestInspectorOverride() {
     termMeshUnitTestInspectorOverrideInstalled = true
 }
 
+final class AppLaunchEnvironmentTests: XCTestCase {
+    func testDetectsEverySupportedXCTestSignal() {
+        let signals: [[String: String]] = [
+            ["XCTestConfigurationFilePath": "/tmp/config.xctestconfiguration"],
+            ["XCTestBundlePath": "/tmp/termMeshTests.xctest"],
+            ["XCTestSessionIdentifier": "session"],
+            ["XCInjectBundle": "/tmp/termMeshTests.xctest"],
+            ["XCInjectBundleInto": "/tmp/term-mesh DEV.app"],
+            ["DYLD_INSERT_LIBRARIES": "/tmp/libXCTestBundleInject.dylib"],
+            ["TERMMESH_UI_TEST_ENABLED": "1"],
+            ["CMUX_UI_TEST_ENABLED": "1"],
+        ]
+
+        for environment in signals {
+            XCTAssertTrue(
+                AppLaunchEnvironment.isRunningUnderXCTest(environment),
+                "expected XCTest detection for \(environment.keys.sorted())"
+            )
+        }
+    }
+
+    func testNormalApplicationEnvironmentDoesNotDisableSessionRestore() {
+        XCTAssertFalse(
+            AppLaunchEnvironment.isRunningUnderXCTest([
+                "HOME": "/Users/example",
+                "TERM_PROGRAM": "ghostty",
+                "DYLD_INSERT_LIBRARIES": "/tmp/libSomethingElse.dylib",
+            ])
+        )
+    }
+}
+
 final class SidebarTeamRuntimeSnapshotTests: XCTestCase {
     private let baseline = SidebarTeamRuntimeSnapshot(
         teamName: "term-mesh",
@@ -3734,6 +3766,38 @@ final class SidebarDropPlannerTests: XCTestCase {
                 targetHeight: 40
             )
         )
+    }
+}
+
+@MainActor
+final class SidebarActiveDragLifecycleTests: XCTestCase {
+    func testAppResignClearsTheAppWideDragIdentity() async throws {
+        let state = SidebarActiveDrag()
+        let tabId = UUID()
+        state.begin(tabId: tabId)
+        XCTAssertEqual(state.tabId, tabId)
+
+        NotificationCenter.default.post(
+            name: NSApplication.didResignActiveNotification,
+            object: nil
+        )
+        try await Task.sleep(nanoseconds: 300_000_000)
+
+        XCTAssertNil(state.tabId)
+    }
+
+    func testExplicitEndClearsIdentityAndAllowsANewDrag() {
+        let state = SidebarActiveDrag()
+        let first = UUID()
+        let second = UUID()
+
+        state.begin(tabId: first)
+        state.end(reason: "test_cancel")
+        XCTAssertNil(state.tabId)
+
+        state.begin(tabId: second)
+        XCTAssertEqual(state.tabId, second)
+        state.end(reason: "test_cleanup")
     }
 }
 

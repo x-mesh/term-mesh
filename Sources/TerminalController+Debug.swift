@@ -185,6 +185,88 @@ extension TerminalController {
         return result
     }
 
+    /// Inspect (and with `simulate: true`, force) a terminal's automatic
+    /// blank-pane recovery. Targets `surface_id` or the focused panel.
+    func v2DebugBlankRecoveryState(params: [String: Any]) -> V2CallResult {
+        guard let tabManager = v2ResolveTabManager(params: params) else {
+            return .err(code: "unavailable", message: "TabManager not available", data: nil)
+        }
+        let simulate = params["simulate"] as? Bool ?? false
+        var result: V2CallResult = .err(code: "internal_error", message: "Failed to read recovery state", data: nil)
+        let completed = v2MainExec(timeout: 5) {
+            guard let ws = self.v2ResolveWorkspace(params: params, tabManager: tabManager) else {
+                result = .err(code: "not_found", message: "Workspace not found", data: nil)
+                return
+            }
+            let surfaceId = self.v2UUID(params, "surface_id") ?? ws.focusedPanelId
+            guard let surfaceId, let terminalPanel = ws.terminalPanel(for: surfaceId) else {
+                result = .err(code: "not_found", message: "No terminal surface", data: nil)
+                return
+            }
+            var simulatedAccepted: Bool?
+            if simulate {
+                simulatedAccepted = terminalPanel.surface.performAutoBlankRebuild(
+                    problem: "simulated",
+                    trigger: "debug"
+                )
+            }
+            var injected: Bool?
+            #if DEBUG
+            if params["inject"] as? Bool ?? false {
+                injected = terminalPanel.surface.debugInjectRendererUnrealize()
+            }
+            #endif
+            let st = terminalPanel.surface.autoBlankRecoveryState()
+            result = .ok([
+                "surface_id": surfaceId.uuidString,
+                "surface_ref": self.v2Ref(kind: .surface, uuid: surfaceId),
+                "checks": st.checks,
+                "rebuilds": st.rebuilds,
+                "last_reason": self.v2OrNull(st.lastReason),
+                "pending": st.pending,
+                "current_problem": self.v2OrNull(st.currentProblem),
+                "simulated_accepted": self.v2OrNull(simulatedAccepted),
+                "injected": self.v2OrNull(injected)
+            ])
+        }
+        if !completed { return .err(code: "timeout", message: "Main thread busy", data: nil) }
+        return result
+    }
+
+    /// Set the open command palette's raw query (mode prefixes like ">" / "@"
+    /// included). Exists because debug.type inserts into the AppKit first
+    /// responder, which the palette's SwiftUI field never becomes under
+    /// synthetic activation — this drives the same binding user typing feeds.
+    func v2DebugCommandPaletteSetQuery(params: [String: Any]) -> V2CallResult {
+        guard let query = params["query"] as? String else {
+            return .err(code: "invalid_params", message: "Missing query", data: nil)
+        }
+        let requestedWindowId = v2UUID(params, "window_id")
+        var result: V2CallResult = .ok([:])
+        _ = v2MainExec(timeout: 5) {
+            let targetWindow: NSWindow?
+            if let requestedWindowId {
+                guard let window = AppDelegate.shared?.mainWindow(for: requestedWindowId) else {
+                    result = .err(
+                        code: "not_found",
+                        message: "Window not found",
+                        data: ["window_id": requestedWindowId.uuidString, "window_ref": self.v2Ref(kind: .window, uuid: requestedWindowId)]
+                    )
+                    return
+                }
+                targetWindow = window
+            } else {
+                targetWindow = NSApp.keyWindow ?? NSApp.mainWindow
+            }
+            NotificationCenter.default.post(
+                name: .commandPaletteSetQueryRequested,
+                object: targetWindow,
+                userInfo: ["query": query]
+            )
+        }
+        return result
+    }
+
     func v2DebugOpenCommandPaletteRenameTabInput(params: [String: Any]) -> V2CallResult {
         let requestedWindowId = v2UUID(params, "window_id")
         var result: V2CallResult = .ok([:])

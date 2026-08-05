@@ -94,6 +94,7 @@ class TabManager: ObservableObject {
     private var workspaceCycleGeneration: UInt64 = 0
     private var workspaceCycleCooldownTask: Task<Void, Never>?
     private var pendingWorkspaceUnfocusTarget: (tabId: UUID, panelId: UUID)?
+    private let persistsSessionState: Bool
 #if DEBUG
     private var debugWorkspaceSwitchCounter: UInt64 = 0
     private var debugWorkspaceSwitchId: UInt64 = 0
@@ -111,9 +112,11 @@ class TabManager: ObservableObject {
     init(
         initialWorkingDirectory: String? = nil,
         restoreSavedSession: Bool = false,
+        persistsSessionState: Bool = true,
         daemon: (any DaemonService)? = nil,
         notifications: (any NotificationService)? = nil
     ) {
+        self.persistsSessionState = persistsSessionState
         self.daemon = daemon ?? TermMeshDaemon.shared
         self.notifications = notifications ?? TerminalNotificationStore.shared
         // Session restore: only the primary window (created by TermMeshApp at launch)
@@ -181,8 +184,11 @@ class TabManager: ObservableObject {
         setupChildExitKeyboardUITestIfNeeded()
 #endif
 
-        // Periodic session save for crash-safety (every 30s).
-        startPeriodicSessionSave()
+        // Periodic session save for crash-safety (every 30s). XCTest app hosts
+        // opt out so their blank workspace cannot replace the user's session.
+        if persistsSessionState {
+            startPeriodicSessionSave()
+        }
     }
 
     deinit {
@@ -241,6 +247,17 @@ class TabManager: ObservableObject {
 
     var canUseSelectionForFind: Bool {
         selectedTerminalPanel?.hasSelection() == true
+    }
+
+    /// Hard recovery for a blank/stuck focused terminal: rebuild its renderer's swap
+    /// chain + IOSurface in place (PTY, terminal state, and scrollback untouched), then
+    /// poke a refresh so the rebuilt target presents a frame without a focus change.
+    @discardableResult
+    func rebuildFocusedTerminalRenderer() -> Bool {
+        guard let panel = selectedTerminalPanel else { return false }
+        let accepted = panel.surface.rebuildRenderer()
+        if accepted { panel.surface.forceRefresh() }
+        return accepted
     }
 
     func startSearch() {
@@ -389,6 +406,7 @@ class TabManager: ObservableObject {
     )
 
     func saveSessionState() {
+        guard persistsSessionState else { return }
         // Main-thread snapshot (Workspace is @MainActor-isolated).
         let teamWorkspaceIds = Set(
             TeamOrchestrator.shared.teams.values.map { $0.workspaceId }
@@ -447,8 +465,14 @@ class TabManager: ObservableObject {
     /// Debounced session save — coalesces rapid tab open/close/directory changes
     /// into a single disk write. Safe to call frequently.
     private var sessionSaveWorkItem: DispatchWorkItem?
+#if DEBUG
+    private(set) var debugSessionSaveRequestCount = 0
+#endif
 
     private func scheduleSessionSave() {
+#if DEBUG
+        debugSessionSaveRequestCount += 1
+#endif
         sessionSaveWorkItem?.cancel()
         let work = DispatchWorkItem { [weak self] in
             self?.saveSessionState()
@@ -1042,6 +1066,12 @@ class TabManager: ObservableObject {
     /// Attach an existing workspace to this window.
     func attachWorkspace(_ workspace: Workspace, at index: Int? = nil, select: Bool = true) {
         wireClosedBrowserTracking(for: workspace)
+        // detachWorkspace drops the directory observer along with the row, so
+        // the manager taking the workspace has to subscribe again. Without it
+        // a `cd` after the move schedules no session save, and a crash before
+        // the next periodic one restores the directory the workspace had
+        // before it was moved.
+        observeDirectoryChanges(for: workspace)
         let insertIndex: Int = {
             guard let index else { return tabs.count }
             return max(0, min(index, tabs.count))

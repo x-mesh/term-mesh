@@ -1917,6 +1917,23 @@ struct ContentView: View {
             openCommandPaletteCommands()
         })
 
+        // Debug/e2e probe: set the palette query programmatically. Synthetic
+        // debug.type cannot reach the palette's SwiftUI field (it inserts into
+        // the window's AppKit first responder, which stays on the terminal),
+        // so socket-driven tests exercise the real filter pipeline through the
+        // same binding the user's typing feeds.
+        view = AnyView(view.onReceive(NotificationCenter.default.publisher(for: .commandPaletteSetQueryRequested)) { notification in
+            let requestedWindow = notification.object as? NSWindow
+            guard Self.shouldHandleCommandPaletteRequest(
+                observedWindow: observedWindow,
+                requestedWindow: requestedWindow,
+                keyWindow: NSApp.keyWindow,
+                mainWindow: NSApp.mainWindow
+            ) else { return }
+            guard isCommandPalettePresented else { return }
+            commandPaletteQuery = (notification.userInfo?["query"] as? String) ?? ""
+        })
+
         view = AnyView(view.onReceive(NotificationCenter.default.publisher(for: .commandPaletteSwitcherRequested)) { notification in
             let requestedWindow = notification.object as? NSWindow
             guard Self.shouldHandleCommandPaletteRequest(
@@ -3921,6 +3938,16 @@ struct ContentView: View {
         )
         contributions.append(
             CommandPaletteCommandContribution(
+                commandId: "palette.terminalRebuildRenderer",
+                title: constant("Rebuild Terminal Renderer"),
+                subtitle: terminalPanelSubtitle,
+                shortcutHint: nil,
+                keywords: ["terminal", "rebuild", "renderer", "blank", "stuck", "frozen", "redraw", "repair"],
+                when: { $0.bool(CommandPaletteContextKeys.panelIsTerminal) }
+            )
+        )
+        contributions.append(
+            CommandPaletteCommandContribution(
                 commandId: "palette.terminalUseSelectionForFind",
                 title: constant("Use Selection for Find"),
                 subtitle: terminalPanelSubtitle,
@@ -4318,6 +4345,11 @@ struct ContentView: View {
         }
         registry.register(commandId: "palette.terminalHideFind") {
             tabManager.hideFind()
+        }
+        registry.register(commandId: "palette.terminalRebuildRenderer") {
+            if !tabManager.rebuildFocusedTerminalRenderer() {
+                NSSound.beep()
+            }
         }
         registry.register(commandId: "palette.terminalUseSelectionForFind") {
             tabManager.searchSelection()

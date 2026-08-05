@@ -10,6 +10,45 @@ import PeerProto
 
 final class PeerWorkspaceMirrorTests: XCTestCase {
 
+    func test_workspaceMirrorPrunePolicy_keepsOwnedWorkspace() {
+        let workspaceID = UUID()
+        XCTAssertFalse(
+            PeerClientCoordinator.WorkspaceMirrorPrunePolicy.shouldPrune(
+                isTornDown: false,
+                workspaceID: workspaceID,
+                contextContainsWorkspace: { $0 == workspaceID }
+            )
+        )
+    }
+
+    func test_workspaceMirrorPrunePolicy_prunesMissingWorkspaceAndOrphan() {
+        XCTAssertTrue(
+            PeerClientCoordinator.WorkspaceMirrorPrunePolicy.shouldPrune(
+                isTornDown: false,
+                workspaceID: nil,
+                contextContainsWorkspace: { _ in false }
+            )
+        )
+
+        XCTAssertTrue(
+            PeerClientCoordinator.WorkspaceMirrorPrunePolicy.shouldPrune(
+                isTornDown: false,
+                workspaceID: UUID(),
+                contextContainsWorkspace: { _ in false }
+            )
+        )
+    }
+
+    func test_workspaceMirrorPrunePolicy_ignoresAlreadyTornDownMirror() {
+        XCTAssertFalse(
+            PeerClientCoordinator.WorkspaceMirrorPrunePolicy.shouldPrune(
+                isTornDown: true,
+                workspaceID: nil,
+                contextContainsWorkspace: { _ in false }
+            )
+        )
+    }
+
     // MARK: - Layout builders
 
     private func leaf(_ id: UInt8, title: String = "") -> Termmesh_Peer_V1_WorkspaceLayout {

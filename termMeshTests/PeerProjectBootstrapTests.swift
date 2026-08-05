@@ -1150,6 +1150,61 @@ final class PeerProjectBootstrapTests: XCTestCase {
     }
 
     @MainActor
+    func test_sidebar_window_mover_relocates_exact_workspace_and_reobserves_directory() {
+        let source = TabManager()
+        let destination = TabManager()
+        let workspace = source.addWorkspace(
+            workingDirectory: "/tmp/window-move-source",
+            select: true
+        )
+        let sourceCount = source.tabs.count
+        let destinationCount = destination.tabs.count
+
+        XCTAssertTrue(
+            SidebarWorkspaceWindowMover.move(
+                tabId: workspace.id,
+                from: source,
+                to: destination
+            )
+        )
+        XCTAssertFalse(source.tabs.contains(where: { $0 === workspace }))
+        XCTAssertTrue(destination.tabs.contains(where: { $0 === workspace }))
+        XCTAssertEqual(source.tabs.count, sourceCount - 1)
+        XCTAssertEqual(destination.tabs.count, destinationCount + 1)
+        XCTAssertEqual(destination.selectedTabId, workspace.id)
+
+        let saveRequestsBeforeDirectoryChange = destination.debugSessionSaveRequestCount
+        workspace.currentDirectory = "/tmp/window-move-destination"
+        XCTAssertEqual(
+            destination.debugSessionSaveRequestCount,
+            saveRequestsBeforeDirectoryChange + 1,
+            "attachWorkspace must reinstall the directory observer removed by detachWorkspace"
+        )
+    }
+
+    @MainActor
+    func test_sidebar_window_mover_rejectsSameWindowAndUnknownWorkspace() {
+        let source = TabManager()
+        let workspace = source.tabs[0]
+
+        XCTAssertFalse(
+            SidebarWorkspaceWindowMover.move(
+                tabId: workspace.id,
+                from: source,
+                to: source
+            )
+        )
+        XCTAssertFalse(
+            SidebarWorkspaceWindowMover.move(
+                tabId: UUID(),
+                from: source,
+                to: TabManager()
+            )
+        )
+        XCTAssertTrue(source.tabs.contains(where: { $0 === workspace }))
+    }
+
+    @MainActor
     func test_window_close_does_not_tombstone_preserved_project_workspace() {
         let preserved = UUID()
         let ordinaryWorkspace = UUID()

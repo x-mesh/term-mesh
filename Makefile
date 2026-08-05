@@ -35,7 +35,7 @@ XCFW          := GhosttyKit.xcframework
 # that needs to ship with the app? Append it here — every install/dmg
 # target picks it up automatically. `verify-daemon-binaries` enforces
 # that each one was actually built before any packaging step runs.
-DAEMON_BINS   := term-meshd term-mesh-run tm-agent term-mesh-peer-relay
+DAEMON_BINS   := term-meshd term-mesh-run tm-agent term-mesh-peer-relay tm-agent-bridge
 
 .PHONY: init doctor sync setup build prod deploy deploy-prod dmg run stop clean daemon test install-commands sentry-upload-dsym verify-daemon-binaries
 
@@ -78,14 +78,14 @@ doctor:
 	else \
 		echo "  [warn] GhosttyKit.xcframework stale/missing   -> make setup"; \
 	fi; \
-	zig15=""; \
-	for z in "$${ZIG:-}" /opt/homebrew/opt/zig@0.15/bin/zig /usr/local/opt/zig@0.15/bin/zig $$HOME/.local/zig-0.15*/zig $$HOME/zig/zig-*-0.15*/zig "$$(command -v zig 2>/dev/null)"; do \
-		[ -n "$$z" ] && [ -x "$$z" ] && "$$z" version 2>/dev/null | grep -q '^0\.15\.' && { zig15="$$z"; break; }; \
+	zig16=""; \
+	for z in "$${ZIG:-}" "$$(command -v zig 2>/dev/null)" /opt/homebrew/opt/zig/bin/zig /usr/local/opt/zig/bin/zig /opt/homebrew/opt/zig@0.16/bin/zig /usr/local/opt/zig@0.16/bin/zig $$HOME/.local/zig-0.16*/zig $$HOME/zig/zig-*-0.16*/zig; do \
+		[ -n "$$z" ] && [ -x "$$z" ] && "$$z" version 2>/dev/null | grep -q '^0\.16\.' && { zig16="$$z"; break; }; \
 	done; \
-	if [ -n "$$zig15" ]; then \
-		echo "  [ok]   zig 0.15.x available ($$zig15)"; \
+	if [ -n "$$zig16" ]; then \
+		echo "  [ok]   zig 0.16.x available ($$zig16)"; \
 	else \
-		echo "  [warn] zig 0.15.x missing/resolves to 0.16    -> brew install zig@0.15 (or set ZIG=...)"; \
+		echo "  [warn] zig 0.16.x missing                     -> brew install zig (or set ZIG=...)"; \
 	fi; \
 	if [ -x /opt/homebrew/opt/llvm/bin/llvm-libtool-darwin ] || [ -x /usr/local/opt/llvm/bin/llvm-libtool-darwin ] || command -v llvm-libtool-darwin >/dev/null 2>&1; then \
 		echo "  [ok]   llvm-libtool-darwin available"; \

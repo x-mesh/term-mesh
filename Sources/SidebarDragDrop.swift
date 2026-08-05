@@ -703,24 +703,77 @@ final class SidebarDragAutoScrollController: ObservableObject {
     }
 }
 
+/// The workspace being dragged, app-wide, and the end of that drag.
+///
+/// Each window owns its own `draggedTabId` @State, so a drop delegate in
+/// another window sees nil and rejects the drop — which is why a sidebar row
+/// could only ever be reordered within its own window. The payload already
+/// carries the workspace id, but `performDrop` must answer synchronously and
+/// `loadDataRepresentation` is async, so the source is recorded here at drag
+/// start instead. Same process, so this is simply the fact both windows need.
+///
+/// It owns the failsafe rather than leaving that to a window, because a drag
+/// can end without any drop — escape, app deactivation, mouse-up over
+/// something that takes no drop. The window that started it clears its own
+/// @State on those, but nothing was clearing this; the next drop in any window
+/// would then read a stale id here and move whatever had been dragged last.
+/// A window's `draggedTabId` also cannot gate the watch: rows outside the
+/// Local Workspaces list (peer mirrors) never set it.
+@MainActor
+final class SidebarActiveDrag: ObservableObject {
+    static let shared = SidebarActiveDrag()
+
+    /// Published so a row can dim itself while it is the one in flight. Rows
+    /// outside this window observe it too, which is the point: the row and the
+    /// drag no longer have to live in the same window.
+    @Published private(set) var tabId: UUID?
+    private let failsafe = SidebarDragFailsafeMonitor()
+
+    func begin(tabId: UUID) {
+        self.tabId = tabId
+        failsafe.start { [weak self] reason in
+            self?.end(reason: reason)
+        }
+    }
+
+    func end(reason: String) {
+        guard tabId != nil else { return }
+#if DEBUG
+        dlog("sidebar.activeDrag.end tab=\(tabId.map { String($0.uuidString.prefix(5)) } ?? "nil") reason=\(reason)")
+#endif
+        tabId = nil
+        failsafe.stop()
+    }
+}
+
+/// The state-changing part of a cross-window drop, kept independent of
+/// SwiftUI's DropInfo so the exact detach/attach lifecycle is regression
+/// testable without synthesizing an AppKit drag session.
+@MainActor
+enum SidebarWorkspaceWindowMover {
+    static func move(
+        tabId: UUID,
+        from source: TabManager,
+        to destination: TabManager,
+        at index: Int? = nil
+    ) -> Bool {
+        guard source !== destination,
+              !destination.tabs.contains(where: { $0.id == tabId }),
+              let workspace = source.detachWorkspace(tabId: tabId)
+        else { return false }
+
+        destination.attachWorkspace(workspace, at: index, select: true)
+        return true
+    }
+}
+
 enum SidebarTabDragPayload {
     static let typeIdentifier = "com.termmesh.sidebar-tab-reorder"
     private static let prefix = "term-mesh.sidebar-tab."
 
-    /// The workspace currently being dragged, app-wide.
-    ///
-    /// Each window owns its own `draggedTabId` @State, so a drop delegate in
-    /// another window sees nil and rejects the drop — which is why a sidebar
-    /// row could only ever be reordered within its own window. The payload
-    /// already carries the workspace id, but `performDrop` must answer
-    /// synchronously and `loadDataRepresentation` is async, so the source is
-    /// recorded here at drag start instead. Same process, so this is simply
-    /// the fact both windows need.
-    @MainActor static var activeDragTabId: UUID?
-
     @MainActor
     static func provider(for tabId: UUID) -> NSItemProvider {
-        activeDragTabId = tabId
+        SidebarActiveDrag.shared.begin(tabId: tabId)
         let provider = NSItemProvider()
         let payload = "\(prefix)\(tabId.uuidString)"
         provider.registerDataRepresentation(forTypeIdentifier: typeIdentifier, visibility: .ownProcess) { completion in
@@ -746,7 +799,7 @@ struct SidebarTabDropDelegate: DropDelegate {
     /// Without the fallback a drag can never leave the window it began in.
     @MainActor
     private var sourceTabId: UUID? {
-        draggedTabId ?? SidebarTabDragPayload.activeDragTabId
+        draggedTabId ?? SidebarActiveDrag.shared.tabId
     }
 
     func validateDrop(info: DropInfo) -> Bool {
@@ -790,7 +843,7 @@ struct SidebarTabDropDelegate: DropDelegate {
     func performDrop(info: DropInfo) -> Bool {
         defer {
             draggedTabId = nil
-            SidebarTabDragPayload.activeDragTabId = nil
+            SidebarActiveDrag.shared.end(reason: "drop")
             dropIndicator = nil
             dragAutoScrollController.stop()
         }
@@ -805,10 +858,11 @@ struct SidebarTabDropDelegate: DropDelegate {
         }
         guard let fromIndex = tabManager.tabs.firstIndex(where: { $0.id == draggedTabId }) else {
             // Not one of this window's rows — the drag came from another
-            // window, so this is a move rather than a reorder. Verified on a
-            // live peer mirror: detach/attach keeps the subscription alive,
-            // because the mirror resolves its TabManager per call instead of
-            // caching the one it was opened in.
+            // window, so this is a move rather than a reorder. A peer mirror
+            // survives the move: its registration is keyed by lease and host
+            // workspace id and holds no TabManager reference
+            // (PeerClientCoordinator.mirroredWorkspace), while detach/attach
+            // only rewrites the tabs array.
             return moveWorkspaceFromAnotherWindow(draggedTabId)
         }
         let tabIds = tabManager.tabs.map(\.id)
@@ -876,13 +930,17 @@ struct SidebarTabDropDelegate: DropDelegate {
             return dropIndicator?.edge == .bottom ? idx + 1 : idx
         }()
 
-        guard let workspace = source.detachWorkspace(tabId: tabId) else {
+        guard SidebarWorkspaceWindowMover.move(
+            tabId: tabId,
+            from: source,
+            to: tabManager,
+            at: insertIndex
+        ) else {
 #if DEBUG
             dlog("sidebar.drop.abort reason=detachFailed tab=\(tabId.uuidString.prefix(5))")
 #endif
             return false
         }
-        tabManager.attachWorkspace(workspace, at: insertIndex, select: true)
 #if DEBUG
         dlog("sidebar.drop.moveWindow tab=\(tabId.uuidString.prefix(5)) to=\(insertIndex)")
 #endif
@@ -915,5 +973,76 @@ struct SidebarTabDropDelegate: DropDelegate {
         guard let indicator else { return "nil" }
         let tabText = indicator.tabId.map { String($0.uuidString.prefix(5)) } ?? "end"
         return "\(tabText):\(indicator.edge == .top ? "top" : "bottom")"
+    }
+}
+
+/// Catches a workspace dropped anywhere on the sidebar that no row claimed,
+/// and moves it into this window.
+///
+/// The row and empty-area delegates only cover the Local Workspaces list; the
+/// Projects axis and the Remote Hosts section take no drop at all, and the
+/// empty area collapses to nothing once the list is full — which is exactly
+/// the window a person is most likely to be dragging work into.
+///
+/// It deliberately does not place the row. Position is only stored for the
+/// Local Workspaces list, which is `tabManager.tabs` itself; the Projects axis
+/// sorts by project label and the Remote Hosts section follows the order the
+/// host gave, both recomputed every render. Dropping "between" rows there has
+/// nowhere to be remembered, so this appends and lets the receiving window
+/// present it under its own rules.
+struct SidebarWindowMoveDropDelegate: DropDelegate {
+    let tabManager: TabManager
+    @Binding var selectedTabIds: Set<UUID>
+    @Binding var lastSidebarSelectionIndex: Int?
+
+    /// Only a drag that started in another window. A drag from this window is
+    /// left to the row delegates, which can also reorder.
+    @MainActor
+    private var incomingTabId: UUID? {
+        guard let id = SidebarActiveDrag.shared.tabId else { return nil }
+        guard !tabManager.tabs.contains(where: { $0.id == id }) else { return nil }
+        return id
+    }
+
+    func validateDrop(info: DropInfo) -> Bool {
+        let hasType = info.hasItemsConforming(to: [SidebarTabDragPayload.typeIdentifier])
+        let incoming = MainActor.assumeIsolated { incomingTabId != nil }
+#if DEBUG
+        dlog("sidebar.windowMove.validate hasType=\(hasType) incoming=\(incoming)")
+#endif
+        return hasType && incoming
+    }
+
+    func dropUpdated(info: DropInfo) -> DropProposal? {
+        DropProposal(operation: .move)
+    }
+
+    func performDrop(info: DropInfo) -> Bool {
+        defer { SidebarActiveDrag.shared.end(reason: "window_move_drop") }
+        guard let tabId = incomingTabId else { return false }
+        guard let source = AppDelegate.shared?.tabManagerFor(tabId: tabId),
+              source !== tabManager
+        else {
+#if DEBUG
+            dlog("sidebar.windowMove.abort reason=sourceMissing tab=\(tabId.uuidString.prefix(5))")
+#endif
+            return false
+        }
+        guard SidebarWorkspaceWindowMover.move(
+            tabId: tabId,
+            from: source,
+            to: tabManager
+        ) else {
+#if DEBUG
+            dlog("sidebar.windowMove.abort reason=detachFailed tab=\(tabId.uuidString.prefix(5))")
+#endif
+            return false
+        }
+#if DEBUG
+        dlog("sidebar.drop.moveWindow tab=\(tabId.uuidString.prefix(5)) to=end source=fallback")
+#endif
+        selectedTabIds = [tabId]
+        lastSidebarSelectionIndex = tabManager.tabs.firstIndex { $0.id == tabId }
+        return true
     }
 }
