@@ -26,6 +26,7 @@ REQUIRED_BINS=(
   term-mesh-run
   tm-agent
   term-mesh-peer-relay
+  tm-agent-bridge
 )
 
 BIN_DIR="$APP/Contents/Resources/bin"

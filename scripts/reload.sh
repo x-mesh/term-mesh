@@ -666,7 +666,7 @@ if [[ -d "$PWD/daemon" && -f "$PWD/daemon/Cargo.toml" ]]; then
 fi
 BIN_DIR="$APP_PATH/Contents/Resources/bin"
 mkdir -p "$BIN_DIR"
-for bin in term-meshd term-mesh-run tm-agent term-mesh-peer-relay; do
+for bin in term-meshd term-mesh-run tm-agent term-mesh-peer-relay tm-agent-bridge; do
   # This tag's own build output only. The fallback to $PWD/daemon/target/release
   # was the second half of the swallowed-failure bug above: that directory is no
   # longer written by this script, so it holds whatever an old manual
