@@ -3921,6 +3921,16 @@ struct ContentView: View {
         )
         contributions.append(
             CommandPaletteCommandContribution(
+                commandId: "palette.terminalRebuildRenderer",
+                title: constant("Rebuild Terminal Renderer"),
+                subtitle: terminalPanelSubtitle,
+                shortcutHint: nil,
+                keywords: ["terminal", "rebuild", "renderer", "blank", "stuck", "frozen", "redraw", "repair"],
+                when: { $0.bool(CommandPaletteContextKeys.panelIsTerminal) }
+            )
+        )
+        contributions.append(
+            CommandPaletteCommandContribution(
                 commandId: "palette.terminalUseSelectionForFind",
                 title: constant("Use Selection for Find"),
                 subtitle: terminalPanelSubtitle,
@@ -4318,6 +4328,11 @@ struct ContentView: View {
         }
         registry.register(commandId: "palette.terminalHideFind") {
             tabManager.hideFind()
+        }
+        registry.register(commandId: "palette.terminalRebuildRenderer") {
+            if !tabManager.rebuildFocusedTerminalRenderer() {
+                NSSound.beep()
+            }
         }
         registry.register(commandId: "palette.terminalUseSelectionForFind") {
             tabManager.searchSelection()

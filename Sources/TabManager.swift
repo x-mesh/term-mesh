@@ -243,6 +243,17 @@ class TabManager: ObservableObject {
         selectedTerminalPanel?.hasSelection() == true
     }
 
+    /// Hard recovery for a blank/stuck focused terminal: rebuild its renderer's swap
+    /// chain + IOSurface in place (PTY, terminal state, and scrollback untouched), then
+    /// poke a refresh so the rebuilt target presents a frame without a focus change.
+    @discardableResult
+    func rebuildFocusedTerminalRenderer() -> Bool {
+        guard let panel = selectedTerminalPanel else { return false }
+        let accepted = panel.surface.rebuildRenderer()
+        if accepted { panel.surface.forceRefresh() }
+        return accepted
+    }
+
     func startSearch() {
         guard let panel = selectedTerminalPanel else { return }
         if panel.searchState == nil {

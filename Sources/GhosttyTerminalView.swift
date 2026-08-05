@@ -1299,6 +1299,24 @@ final class TerminalSurface: Identifiable, ObservableObject {
         #endif
     }
 
+    /// Hard recovery for a blank/stuck pane: force one unrealize/realize transaction on
+    /// the renderer thread, rebuilding the Metal swap chain / IOSurface without freeing
+    /// the surface, PTY, terminal state, or scrollback. Unlike `forceRefresh()` (a size
+    /// recalc + redraw poke) this replaces the render target itself, so it also recovers
+    /// panes whose backing IOSurface went stale after display/reparent churn. Skipped
+    /// while the renderer is intentionally unrealized (hidden workspace) — rebuilding
+    /// would realize GPU resources the visibility controller has released.
+    @discardableResult
+    @MainActor func rebuildRenderer() -> Bool {
+        guard let surface = surface else { return false }
+        guard rendererRealized else { return false }
+        let accepted = ghostty_surface_rebuild_renderer(surface)
+        #if DEBUG
+        dlog("surface.renderer.rebuild accepted=\(accepted) surface=\(id.uuidString.prefix(8))")
+        #endif
+        return accepted
+    }
+
     /// Drive renderer GPU realization from UI visibility (workspace selection). A surface
     /// that becomes visible realizes immediately so it can draw; one that becomes invisible
     /// unrealizes only after `rendererUnrealizeDebounce` of sustained invisibility, so brief

@@ -987,6 +987,8 @@ class TerminalController {
             return v2Result(id: id, self.v2SurfaceDragToSplit(params: params))
         case "surface.refresh":
             return v2Result(id: id, self.v2SurfaceRefresh(params: params))
+        case "surface.rebuild_renderer":
+            return v2Result(id: id, self.v2SurfaceRebuildRenderer(params: params))
         case "surface.health":
             return v2Result(id: id, self.v2SurfaceHealth(params: params))
         case "surface.send_text":
@@ -1489,6 +1491,7 @@ class TerminalController {
             "surface.action",
             "tab.action",
             "surface.refresh",
+            "surface.rebuild_renderer",
             "surface.health",
             "surface.send_text",
             "surface.send_key",
