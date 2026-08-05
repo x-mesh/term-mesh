@@ -3737,6 +3737,38 @@ final class SidebarDropPlannerTests: XCTestCase {
     }
 }
 
+@MainActor
+final class SidebarActiveDragLifecycleTests: XCTestCase {
+    func testAppResignClearsTheAppWideDragIdentity() async throws {
+        let state = SidebarActiveDrag()
+        let tabId = UUID()
+        state.begin(tabId: tabId)
+        XCTAssertEqual(state.tabId, tabId)
+
+        NotificationCenter.default.post(
+            name: NSApplication.didResignActiveNotification,
+            object: nil
+        )
+        try await Task.sleep(nanoseconds: 300_000_000)
+
+        XCTAssertNil(state.tabId)
+    }
+
+    func testExplicitEndClearsIdentityAndAllowsANewDrag() {
+        let state = SidebarActiveDrag()
+        let first = UUID()
+        let second = UUID()
+
+        state.begin(tabId: first)
+        state.end(reason: "test_cancel")
+        XCTAssertNil(state.tabId)
+
+        state.begin(tabId: second)
+        XCTAssertEqual(state.tabId, second)
+        state.end(reason: "test_cleanup")
+    }
+}
+
 final class SidebarDragAutoScrollPlannerTests: XCTestCase {
     func testAutoScrollPlanTriggersNearTopAndBottomOnly() {
         let topPlan = SidebarDragAutoScrollPlanner.plan(distanceToTop: 4, distanceToBottom: 96, edgeInset: 44, minStep: 2, maxStep: 12)

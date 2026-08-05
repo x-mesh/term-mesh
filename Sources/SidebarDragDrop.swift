@@ -746,6 +746,27 @@ final class SidebarActiveDrag: ObservableObject {
     }
 }
 
+/// The state-changing part of a cross-window drop, kept independent of
+/// SwiftUI's DropInfo so the exact detach/attach lifecycle is regression
+/// testable without synthesizing an AppKit drag session.
+@MainActor
+enum SidebarWorkspaceWindowMover {
+    static func move(
+        tabId: UUID,
+        from source: TabManager,
+        to destination: TabManager,
+        at index: Int? = nil
+    ) -> Bool {
+        guard source !== destination,
+              !destination.tabs.contains(where: { $0.id == tabId }),
+              let workspace = source.detachWorkspace(tabId: tabId)
+        else { return false }
+
+        destination.attachWorkspace(workspace, at: index, select: true)
+        return true
+    }
+}
+
 enum SidebarTabDragPayload {
     static let typeIdentifier = "com.termmesh.sidebar-tab-reorder"
     private static let prefix = "term-mesh.sidebar-tab."
@@ -909,13 +930,17 @@ struct SidebarTabDropDelegate: DropDelegate {
             return dropIndicator?.edge == .bottom ? idx + 1 : idx
         }()
 
-        guard let workspace = source.detachWorkspace(tabId: tabId) else {
+        guard SidebarWorkspaceWindowMover.move(
+            tabId: tabId,
+            from: source,
+            to: tabManager,
+            at: insertIndex
+        ) else {
 #if DEBUG
             dlog("sidebar.drop.abort reason=detachFailed tab=\(tabId.uuidString.prefix(5))")
 #endif
             return false
         }
-        tabManager.attachWorkspace(workspace, at: insertIndex, select: true)
 #if DEBUG
         dlog("sidebar.drop.moveWindow tab=\(tabId.uuidString.prefix(5)) to=\(insertIndex)")
 #endif
@@ -1003,13 +1028,16 @@ struct SidebarWindowMoveDropDelegate: DropDelegate {
 #endif
             return false
         }
-        guard let workspace = source.detachWorkspace(tabId: tabId) else {
+        guard SidebarWorkspaceWindowMover.move(
+            tabId: tabId,
+            from: source,
+            to: tabManager
+        ) else {
 #if DEBUG
             dlog("sidebar.windowMove.abort reason=detachFailed tab=\(tabId.uuidString.prefix(5))")
 #endif
             return false
         }
-        tabManager.attachWorkspace(workspace, select: true)
 #if DEBUG
         dlog("sidebar.drop.moveWindow tab=\(tabId.uuidString.prefix(5)) to=end source=fallback")
 #endif

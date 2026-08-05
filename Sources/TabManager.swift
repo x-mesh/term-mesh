@@ -458,8 +458,14 @@ class TabManager: ObservableObject {
     /// Debounced session save — coalesces rapid tab open/close/directory changes
     /// into a single disk write. Safe to call frequently.
     private var sessionSaveWorkItem: DispatchWorkItem?
+#if DEBUG
+    private(set) var debugSessionSaveRequestCount = 0
+#endif
 
     private func scheduleSessionSave() {
+#if DEBUG
+        debugSessionSaveRequestCount += 1
+#endif
         sessionSaveWorkItem?.cancel()
         let work = DispatchWorkItem { [weak self] in
             self?.saveSessionState()

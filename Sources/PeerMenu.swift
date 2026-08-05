@@ -213,6 +213,18 @@ final class PeerClientCoordinator: NSObject, NSMenuDelegate {
         openWorkspaceMirrors.first { $0.workspace?.id == id }
     }
 
+    enum WorkspaceMirrorPrunePolicy {
+        static func shouldPrune(
+            isTornDown: Bool,
+            workspaceID: UUID?,
+            contextContainsWorkspace: (UUID) -> Bool
+        ) -> Bool {
+            guard !isTornDown else { return false }
+            guard let workspaceID else { return true }
+            return !contextContainsWorkspace(workspaceID)
+        }
+    }
+
     /// Resolve an open live mirror by its host-owned identity, wherever in
     /// this app it lives. Sidebar presentation uses this to show remote state
     /// without treating the backing Workspace as a local card.
@@ -252,9 +264,13 @@ final class PeerClientCoordinator: NSObject, NSMenuDelegate {
     @discardableResult
     func pruneOrphanedWorkspaceMirrors() -> Int {
         let orphans = openWorkspaceMirrors.filter { mirror in
-            guard !mirror.isTornDown else { return false }
-            guard let workspace = mirror.workspace else { return true }
-            return AppDelegate.shared?.contextContainingTabId(workspace.id) == nil
+            WorkspaceMirrorPrunePolicy.shouldPrune(
+                isTornDown: mirror.isTornDown,
+                workspaceID: mirror.workspace?.id,
+                contextContainsWorkspace: { workspaceID in
+                    AppDelegate.shared?.contextContainingTabId(workspaceID) != nil
+                }
+            )
         }
         guard !orphans.isEmpty else { return 0 }
         for mirror in orphans {
