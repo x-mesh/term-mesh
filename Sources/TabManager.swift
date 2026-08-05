@@ -1053,6 +1053,12 @@ class TabManager: ObservableObject {
     /// Attach an existing workspace to this window.
     func attachWorkspace(_ workspace: Workspace, at index: Int? = nil, select: Bool = true) {
         wireClosedBrowserTracking(for: workspace)
+        // detachWorkspace drops the directory observer along with the row, so
+        // the manager taking the workspace has to subscribe again. Without it
+        // a `cd` after the move schedules no session save, and a crash before
+        // the next periodic one restores the directory the workspace had
+        // before it was moved.
+        observeDirectoryChanges(for: workspace)
         let insertIndex: Int = {
             guard let index else { return tabs.count }
             return max(0, min(index, tabs.count))
