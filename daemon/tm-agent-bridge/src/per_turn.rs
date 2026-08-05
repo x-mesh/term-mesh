@@ -173,7 +173,20 @@ impl PerTurnBridge {
 
         let (program, rest) = match located.argv.split_first() {
             Some(pair) => pair,
-            None => return,
+            // `argv` always puts the CLI in first, and the remote form adds
+            // ssh ahead of that, so there is no way to arrive here today. It
+            // says so anyway: every other way out of this function reports
+            // something, and a silent return is how a pane ends up waiting on
+            // a turn that already gave up.
+            None => {
+                self.out.result(
+                    &format!("could not start {}: no command to run", self.cli.as_str()),
+                    "spawn_failed",
+                    None,
+                    true,
+                );
+                return;
+            }
         };
         let mut command = Command::new(program);
         command
