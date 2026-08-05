@@ -985,15 +985,40 @@ class CodexBridge:
         # Nested: {"result":{"thread":{"id":…}}} — not `result.threadId`.
         return (res.get("thread") or {}).get("id") or res.get("threadId")
 
+    @staticmethod
+    def _turn_failure(done: dict | None) -> str | None:
+        """Why `turn/completed` says the turn did not succeed, if it did not.
+
+        The completed turn carries its own `status` and `error`, so a failure
+        stays legible even when the `error` notification preceding it was
+        missed.
+        """
+        turn = ((done or {}).get("params") or {}).get("turn") or {}
+        if turn.get("status") != "failed":
+            return None
+        return (((turn.get("error") or {}).get("message") or "").strip()
+                or "codex ended the turn as failed without saying why")
+
     def turn(self, text: str, timeout: float) -> None:
         self.out.sent(text)
         self.out.turn_begins()
         said: list[str] = []
         streamed = [False]
+        failed_because: list[str] = []
 
         def notify(o: dict) -> None:
             m = o.get("method", "")
             p = o.get("params") or {}
+            if m == "error":
+                # codex says why a turn died here, and says it *before* the
+                # `turn/completed` that carries no items. Dropping this left
+                # the empty item list as the only evidence, which reads as
+                # "the model had nothing to say" — the one thing it does not
+                # mean.
+                detail = ((p.get("error") or {}).get("message") or "").strip()
+                if detail:
+                    failed_because.append(detail)
+                return
             if m == "item/agentMessage/delta":
                 chunk = p.get("delta") or ""
                 if chunk:
@@ -1058,6 +1083,20 @@ class CodexBridge:
                              on_notify=notify, until_method="turn/completed")
         self.out.block_done()
         final = ("" if streamed[0] else "\n").join(said)
+        # A failed turn already said why — twice, as the `error` notification
+        # and again in the completed turn. Measured against a peer whose login
+        # shell never exported the provider's API key: codex reported
+        # `Missing environment variable: AI_MESH_API_KEY` in 75ms, and this
+        # reported "the turn ended without an answer", which sent the search
+        # everywhere except the cause. Say the reason, and keep whatever was
+        # streamed ahead of it.
+        reason = (failed_because[0] if failed_because
+                  else self._turn_failure(done))
+        if reason:
+            self.out.result(
+                "\n\n".join(part for part in (final.strip(), reason) if part),
+                stop="failed", failed=True)
+            return
         if done and not final.strip():
             # Ended without saying anything. Reporting that as a success is how
             # an empty answer becomes a completed task.

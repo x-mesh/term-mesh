@@ -447,6 +447,101 @@ class FileChangeTests(unittest.TestCase):
         self.assertEqual(len(out.blocks("tool_use")), 2)
 
 
+class CodexTurnFailureTests(unittest.TestCase):
+    """A turn that failed has to say why it failed.
+
+    Measured against a real peer: its non-interactive login shell never
+    reached the `export` in `~/.bashrc`, so codex failed every turn in 75ms
+    with `Missing environment variable: AI_MESH_API_KEY`. The bridge replaced
+    that sentence with "the turn ended without an answer" — true about the
+    text, useless about the cause — and the search went to the CLI binary,
+    the model name, and the panes before it got anywhere near the shell.
+    """
+
+    KEY_ERROR = "Missing environment variable: `AI_MESH_API_KEY`."
+
+    def last_result(self, out) -> dict:
+        return [e for e in out.events if e.get("type") == "result"][-1]
+
+    def test_an_error_notification_survives_into_the_result(self):
+        bridge, _, out = codex_bridge([
+            {"jsonrpc": "2.0", "id": 1, "result": {}},
+            {"jsonrpc": "2.0", "method": "error",
+             "params": {"error": {"message": self.KEY_ERROR},
+                        "willRetry": False}},
+            {"jsonrpc": "2.0", "method": "turn/completed",
+             "params": {"threadId": "thread-1", "turn": {"status": "failed"}}},
+        ])
+
+        bridge.turn("do work", timeout=2)
+
+        result = self.last_result(out)
+        self.assertTrue(result["is_error"])
+        self.assertEqual(result["stop_reason"], "failed")
+        self.assertIn("AI_MESH_API_KEY", result["result"])
+
+    def test_a_failed_turn_object_alone_is_enough(self):
+        """The reason is read from the turn even with no `error` notification."""
+        bridge, _, out = codex_bridge([
+            {"jsonrpc": "2.0", "id": 1, "result": {}},
+            {"jsonrpc": "2.0", "method": "turn/completed",
+             "params": {"threadId": "thread-1",
+                        "turn": {"status": "failed",
+                                 "error": {"message": self.KEY_ERROR}}}},
+        ])
+
+        bridge.turn("do work", timeout=2)
+
+        result = self.last_result(out)
+        self.assertTrue(result["is_error"])
+        self.assertIn("AI_MESH_API_KEY", result["result"])
+
+    def test_a_failure_without_a_message_still_reads_as_a_failure(self):
+        bridge, _, out = codex_bridge([
+            {"jsonrpc": "2.0", "id": 1, "result": {}},
+            {"jsonrpc": "2.0", "method": "turn/completed",
+             "params": {"threadId": "thread-1", "turn": {"status": "failed"}}},
+        ])
+
+        bridge.turn("do work", timeout=2)
+
+        result = self.last_result(out)
+        self.assertTrue(result["is_error"])
+        self.assertEqual(result["stop_reason"], "failed")
+        self.assertNotEqual(result["result"], "the turn ended without an answer")
+
+    def test_text_streamed_before_the_failure_is_kept(self):
+        bridge, _, out = codex_bridge([
+            {"jsonrpc": "2.0", "id": 1, "result": {}},
+            {"jsonrpc": "2.0", "method": "item/agentMessage/delta",
+             "params": {"delta": "got this far"}},
+            {"jsonrpc": "2.0", "method": "error",
+             "params": {"error": {"message": "provider went away"}}},
+            {"jsonrpc": "2.0", "method": "turn/completed",
+             "params": {"threadId": "thread-1", "turn": {"status": "failed"}}},
+        ])
+
+        bridge.turn("do work", timeout=2)
+
+        result = self.last_result(out)
+        self.assertIn("got this far", result["result"])
+        self.assertIn("provider went away", result["result"])
+
+    def test_an_empty_turn_that_did_not_fail_still_reads_as_empty(self):
+        """Nothing failed; there was simply nothing said. Unchanged."""
+        bridge, _, out = codex_bridge([
+            {"jsonrpc": "2.0", "id": 1, "result": {}},
+            {"jsonrpc": "2.0", "method": "turn/completed",
+             "params": {"threadId": "thread-1", "turn": {"status": "completed"}}},
+        ])
+
+        bridge.turn("do work", timeout=2)
+
+        result = self.last_result(out)
+        self.assertEqual(result["stop_reason"], "empty")
+        self.assertEqual(result["result"], "the turn ended without an answer")
+
+
 class ApprovalTests(unittest.TestCase):
     def pump_one(self, frame: dict, environment: dict | None = None):
         bridge, child, _ = codex_bridge([frame])
