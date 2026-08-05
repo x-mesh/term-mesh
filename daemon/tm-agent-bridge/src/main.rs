@@ -25,6 +25,7 @@
 //! The CLI surface is deliberately identical to the Python bridge's: the two
 //! are meant to be swappable behind one launch line while the port is proven.
 
+mod codex;
 mod emitter;
 mod jsonrpc;
 mod location;

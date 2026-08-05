@@ -12,7 +12,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::process::{Child as OsChild, Command, Stdio};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::Value;
 
@@ -22,6 +22,8 @@ use crate::text::clamp;
 /// How much of a crashed CLI's stderr is kept as an explanation.
 const STDERR_LINES: usize = 40;
 const STDERR_DETAIL_LIMIT: usize = 1200;
+/// How long `exit_code` waits for a child that is on its way out.
+const REAP_GRACE: Duration = Duration::from_millis(100);
 
 /// The persistent agent process can no longer accept protocol frames.
 #[derive(Debug, Clone)]
@@ -181,7 +183,21 @@ impl Transport for ProcessChild {
     }
 
     fn exit_code(&self) -> Option<i32> {
-        self.poll_exit()
+        if let Some(code) = self.poll_exit() {
+            return Some(code);
+        }
+        // Give it a moment, matching Python's `wait(timeout=0.1)`. A child
+        // whose stdout just closed is on its way out but not yet reaped, and
+        // answering "still running" in that window turns a crash into a
+        // timeout — the caller reports the wrong ending for the right event.
+        let deadline = Instant::now() + REAP_GRACE;
+        while Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+            if let Some(code) = self.poll_exit() {
+                return Some(code);
+            }
+        }
+        None
     }
 
     fn failure_message(&self) -> String {
