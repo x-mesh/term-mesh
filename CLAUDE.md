@@ -334,6 +334,26 @@ rebuild that failed while the previous build is live.
 
 ## Pitfalls
 
+- **Never add an environment variable after `ghostty_init`.** It records the address
+  of the process environment block, and libc moves that block when `setenv` adds a
+  name that was not already there — ghostty then reads freed memory. Overwriting an
+  existing name is fine (libc replaces that entry in place); adding is not. All such
+  writes belong in `GhosttyEnvironment` (`Sources/GhosttyApp.swift`), which runs
+  before `ghostty_init`; route new ones through `GhosttyEnvironment.setValue(_:forName:)`
+  so a DEBUG build logs `ghostty.env.added_after_init` instead of failing silently.
+
+  This shipped as v0.174.0 and was fixed in v0.174.1. It cost XDG path resolution:
+  "Ghostty Settings…" returned an empty path and did nothing, Reload Configuration
+  rebuilt the config without the user's file, and surface creation crashed in
+  `ghostty_surface_new` with a faulting address of `0x415441445f474458` — that is
+  `XDG_DATA` in little-endian bytes, a fragment of the environment read as a pointer.
+
+  **It only reproduces from Dock/Finder/`brew`.** A shell launch already has `TERM`
+  and `TERM_PROGRAM`, so those writes overwrite rather than add and nothing moves.
+  Reproduce with `env -i HOME="$HOME" PATH=/usr/bin:/bin USER="$USER" open -n <app>`;
+  a Debug build launched by `reload.sh` inherits the shell environment and will look
+  fine. Measure with the terminal grid (`stty size`), which moves when font-size is
+  lost, not by eye.
 - **Custom UTTypes** for drag-and-drop must be declared in `Resources/Info.plist` under `UTExportedTypeDeclarations` (e.g. `com.splittabbar.tabtransfer`, `com.termmesh.sidebar-tab-reorder`).
 - Do not add an app-level display link or manual `ghostty_surface_draw` loop; rely on Ghostty wakeups/renderer to avoid typing lag.
 - **Terminal find layering contract:** `SurfaceSearchOverlay` must be mounted from `GhosttySurfaceScrollView` in `Sources/GhosttyTerminalView.swift` (AppKit portal layer), not from SwiftUI panel containers such as `Sources/Panels/TerminalPanelView.swift`. Portal-hosted terminal views can sit above SwiftUI during split/workspace churn.
