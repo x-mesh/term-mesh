@@ -25,6 +25,8 @@
 //! The CLI surface is deliberately identical to the Python bridge's: the two
 //! are meant to be swappable behind one launch line while the port is proven.
 
+mod location;
+
 use clap::Parser;
 
 /// The CLIs a bridge can drive. `gemini` is accepted for parity with the
