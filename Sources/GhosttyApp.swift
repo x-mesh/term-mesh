@@ -150,6 +150,111 @@ final class GhosttySurfaceCallbackContext {
 // Minimal Ghostty wrapper for terminal rendering
 // This uses libghostty (GhosttyKit.xcframework) for actual terminal emulation
 
+// MARK: - Ghostty Environment
+
+/// The environment the embedded ghostty library reads.
+///
+/// This has to finish before `ghostty_init`, and it is not merely tidier that
+/// way. `ghostty_init` records the address of the process environment block,
+/// and libc moves that block when `setenv` adds a name that was not already
+/// there. Every addition after `ghostty_init` therefore leaves ghostty reading
+/// an address that no longer holds the environment.
+///
+/// A Finder, Dock or `brew` launch supplies neither `TERM` nor `TERM_PROGRAM`,
+/// so the five values below are all additions and the block does move. Launch
+/// the same build from a shell and they already exist, `setenv` overwrites in
+/// place, and nothing moves — which is why this only ever showed up for people
+/// who start the app the ordinary way.
+///
+/// What it broke was every ghostty call that resolves an XDG path, which since
+/// the zig 0.16 sync reads the recorded block rather than the live environment.
+/// The startup config load survived because it runs before this ran at all;
+/// what did not were the two things that resolve a path later. "Ghostty
+/// Settings…" received an empty path and did nothing, and Reload Configuration
+/// built a config with the user's file missing from it — measured as a grid of
+/// 48x84 becoming 43x84, the `font-size = 12` in that file having been lost.
+enum GhosttyEnvironment {
+    private static var configured = false
+
+    /// Safe to call more than once; only the first call touches the
+    /// environment. Both entry points into ghostty call it, because either can
+    /// be the one that runs first.
+    static func configureOnce() {
+        guard !configured else { return }
+        configured = true
+        configure()
+    }
+
+    private static func configure() {
+        let fileManager = FileManager.default
+        let ghosttyAppResources = "/Applications/Ghostty.app/Contents/Resources/ghostty"
+        let bundledGhosttyURL = Bundle.main.resourceURL?.appendingPathComponent("ghostty")
+        var resolvedResourcesDir: String?
+
+        if getenv("GHOSTTY_RESOURCES_DIR") == nil {
+            if let bundledGhosttyURL,
+               fileManager.fileExists(atPath: bundledGhosttyURL.path),
+               fileManager.fileExists(atPath: bundledGhosttyURL.appendingPathComponent("themes").path) {
+                resolvedResourcesDir = bundledGhosttyURL.path
+            } else if fileManager.fileExists(atPath: ghosttyAppResources) {
+                resolvedResourcesDir = ghosttyAppResources
+            } else if let bundledGhosttyURL, fileManager.fileExists(atPath: bundledGhosttyURL.path) {
+                resolvedResourcesDir = bundledGhosttyURL.path
+            }
+
+            if let resolvedResourcesDir {
+                setenv("GHOSTTY_RESOURCES_DIR", resolvedResourcesDir, 1)
+            }
+        }
+
+        if getenv("TERM") == nil {
+            setenv("TERM", "xterm-ghostty", 1)
+        }
+
+        // A terminal that launched term-mesh leaves its own name here, and the
+        // daemon and every headless agent inherit it. Ghostty is what a pane
+        // actually is, so the name is set outright rather than only when the
+        // slot is empty.
+        setenv("TERM_PROGRAM", "ghostty", 1)
+
+        // Warp leaves more than a name: a client version and a protocol
+        // version, and a CLI agent finding both will speak Warp's own
+        // notification protocol instead of raising a plain one. A pane's
+        // environment is a copy of this process's and Ghostty's env_vars can
+        // only add to that copy, so the variables have to go from here.
+        for key in ProcessInfo.processInfo.environment.keys where key.hasPrefix("WARP_") {
+            unsetenv(key)
+        }
+
+        if let resourcesDir = getenv("GHOSTTY_RESOURCES_DIR").flatMap({ String(cString: $0) }) {
+            let resourcesURL = URL(fileURLWithPath: resourcesDir)
+            let resourcesParent = resourcesURL.deletingLastPathComponent()
+            let dataDir = resourcesParent.path
+            let manDir = resourcesParent.appendingPathComponent("man").path
+
+            appendEnvPathIfMissing(
+                "XDG_DATA_DIRS",
+                path: dataDir,
+                defaultValue: "/usr/local/share:/usr/share"
+            )
+            appendEnvPathIfMissing("MANPATH", path: manDir)
+        }
+    }
+
+    private static func appendEnvPathIfMissing(_ key: String, path: String, defaultValue: String? = nil) {
+        if path.isEmpty { return }
+        var current = getenv(key).flatMap { String(cString: $0) } ?? ""
+        if current.isEmpty, let defaultValue {
+            current = defaultValue
+        }
+        if current.split(separator: ":").contains(Substring(path)) {
+            return
+        }
+        let updated = current.isEmpty ? path : "\(current):\(path)"
+        setenv(key, updated, 1)
+    }
+}
+
 // MARK: - Ghostty App Singleton
 
 class GhosttyApp {
@@ -312,6 +417,10 @@ class GhosttyApp {
     #endif
 
     private func initializeGhostty() {
+        // Every environment change has to land before ghostty_init, which
+        // records where the environment block lives. See GhosttyEnvironment.
+        GhosttyEnvironment.configureOnce()
+
         // Ensure TUI apps can use colors even if NO_COLOR is set in the launcher env.
         if getenv("NO_COLOR") != nil {
             unsetenv("NO_COLOR")

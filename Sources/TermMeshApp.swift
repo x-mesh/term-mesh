@@ -90,7 +90,10 @@ struct TermMeshApp: App {
     @State private var ghosttyTheme = GhosttyTheme.current
 
     init() {
-        Self.configureGhosttyEnvironment()
+        // Idempotent, and already done if a `GhosttyApp.shared` touch got here
+        // first. It must run before ghostty_init either way — see
+        // GhosttyEnvironment.
+        GhosttyEnvironment.configureOnce()
 
         let startupAppearance = AppearanceSettings.resolvedMode()
         Self.applyAppearance(startupAppearance)
@@ -133,75 +136,6 @@ struct TermMeshApp: App {
         // UI tests depend on AppDelegate wiring happening even if SwiftUI view appearance
         // callbacks (e.g. `.onAppear`) are delayed or skipped.
         appDelegate.configure(tabManager: tabManager, notificationStore: notificationStore, sidebarState: sidebarState)
-    }
-
-    private static func configureGhosttyEnvironment() {
-        let fileManager = FileManager.default
-        let ghosttyAppResources = "/Applications/Ghostty.app/Contents/Resources/ghostty"
-        let bundledGhosttyURL = Bundle.main.resourceURL?.appendingPathComponent("ghostty")
-        var resolvedResourcesDir: String?
-
-        if getenv("GHOSTTY_RESOURCES_DIR") == nil {
-            if let bundledGhosttyURL,
-               fileManager.fileExists(atPath: bundledGhosttyURL.path),
-               fileManager.fileExists(atPath: bundledGhosttyURL.appendingPathComponent("themes").path) {
-                resolvedResourcesDir = bundledGhosttyURL.path
-            } else if fileManager.fileExists(atPath: ghosttyAppResources) {
-                resolvedResourcesDir = ghosttyAppResources
-            } else if let bundledGhosttyURL, fileManager.fileExists(atPath: bundledGhosttyURL.path) {
-                resolvedResourcesDir = bundledGhosttyURL.path
-            }
-
-            if let resolvedResourcesDir {
-                setenv("GHOSTTY_RESOURCES_DIR", resolvedResourcesDir, 1)
-            }
-        }
-
-        if getenv("TERM") == nil {
-            setenv("TERM", "xterm-ghostty", 1)
-        }
-
-        // A terminal that launched term-mesh leaves its own name here, and the
-        // daemon and every headless agent inherit it. Ghostty is what a pane
-        // actually is, so the name is set outright rather than only when the
-        // slot is empty.
-        setenv("TERM_PROGRAM", "ghostty", 1)
-
-        // Warp leaves more than a name: a client version and a protocol
-        // version, and a CLI agent finding both will speak Warp's own
-        // notification protocol instead of raising a plain one. A pane's
-        // environment is a copy of this process's and Ghostty's env_vars can
-        // only add to that copy, so the variables have to go from here.
-        for key in ProcessInfo.processInfo.environment.keys where key.hasPrefix("WARP_") {
-            unsetenv(key)
-        }
-
-        if let resourcesDir = getenv("GHOSTTY_RESOURCES_DIR").flatMap({ String(cString: $0) }) {
-            let resourcesURL = URL(fileURLWithPath: resourcesDir)
-            let resourcesParent = resourcesURL.deletingLastPathComponent()
-            let dataDir = resourcesParent.path
-            let manDir = resourcesParent.appendingPathComponent("man").path
-
-            appendEnvPathIfMissing(
-                "XDG_DATA_DIRS",
-                path: dataDir,
-                defaultValue: "/usr/local/share:/usr/share"
-            )
-            appendEnvPathIfMissing("MANPATH", path: manDir)
-        }
-    }
-
-    private static func appendEnvPathIfMissing(_ key: String, path: String, defaultValue: String? = nil) {
-        if path.isEmpty { return }
-        var current = getenv(key).flatMap { String(cString: $0) } ?? ""
-        if current.isEmpty, let defaultValue {
-            current = defaultValue
-        }
-        if current.split(separator: ":").contains(Substring(path)) {
-            return
-        }
-        let updated = current.isEmpty ? path : "\(current):\(path)"
-        setenv(key, updated, 1)
     }
 
     private func migrateSidebarAppearanceDefaultsIfNeeded(defaults: UserDefaults) {
