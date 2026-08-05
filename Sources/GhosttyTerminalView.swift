@@ -1442,9 +1442,24 @@ final class TerminalSurface: Identifiable, ObservableObject {
         return accepted
     }
 
-    @MainActor func autoBlankRecoveryState() -> (checks: Int, rebuilds: Int, lastReason: String?, pending: Bool) {
-        (autoBlankChecksRan, autoBlankRebuilds, lastAutoBlankReason, autoBlankCheckWork != nil)
+    @MainActor func autoBlankRecoveryState() -> (checks: Int, rebuilds: Int, lastReason: String?, pending: Bool, currentProblem: String?) {
+        (autoBlankChecksRan, autoBlankRebuilds, lastAutoBlankReason, autoBlankCheckWork != nil,
+         renderBackingProblem()?.rawValue)
     }
+
+    #if DEBUG
+    /// Fault injection for e2e: unrealize the renderer through the REAL C-API
+    /// teardown path while deliberately leaving the `rendererRealized` mirror
+    /// at true — reproducing the "renderer released its GPU resources but the
+    /// UI believes the pane is live" blank-pane failure mode that automatic
+    /// recovery exists to fix. Debug builds only; never call outside tests.
+    @MainActor func debugInjectRendererUnrealize() -> Bool {
+        guard let surface = surface, rendererRealized else { return false }
+        _ = ghostty_surface_set_renderer_realized(surface, false)
+        dlog("surface.renderer.debugInjectUnrealize surface=\(id.uuidString.prefix(8))")
+        return true
+    }
+    #endif
 
     /// Drive renderer GPU realization from UI visibility (workspace selection). A surface
     /// that becomes visible realizes immediately so it can draw; one that becomes invisible

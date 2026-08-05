@@ -210,6 +210,12 @@ extension TerminalController {
                     trigger: "debug"
                 )
             }
+            var injected: Bool?
+            #if DEBUG
+            if params["inject"] as? Bool ?? false {
+                injected = terminalPanel.surface.debugInjectRendererUnrealize()
+            }
+            #endif
             let st = terminalPanel.surface.autoBlankRecoveryState()
             result = .ok([
                 "surface_id": surfaceId.uuidString,
@@ -218,7 +224,9 @@ extension TerminalController {
                 "rebuilds": st.rebuilds,
                 "last_reason": self.v2OrNull(st.lastReason),
                 "pending": st.pending,
-                "simulated_accepted": self.v2OrNull(simulatedAccepted.map { $0 ? "true" : "false" })
+                "current_problem": self.v2OrNull(st.currentProblem),
+                "simulated_accepted": self.v2OrNull(simulatedAccepted.map { $0 ? "true" : "false" }),
+                "injected": self.v2OrNull(injected.map { $0 ? "true" : "false" })
             ])
         }
         if !completed { return .err(code: "timeout", message: "Main thread busy", data: nil) }
