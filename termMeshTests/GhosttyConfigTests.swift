@@ -1054,4 +1054,52 @@ final class PostHogAnalyticsPropertiesTests: XCTestCase {
         XCTAssertNil(dailyProperties["app_version"])
         XCTAssertNil(dailyProperties["app_build"])
     }
+
+}
+
+/// The environment must be settled before `ghostty_init` records where it
+/// lives. See `GhosttyEnvironment`.
+final class GhosttyEnvironmentOrderingTests: XCTestCase {
+    /// The one combination that cost a release: adding a name after
+    /// `ghostty_init` recorded the environment block. libc grows the array and
+    /// moves it, and ghostty keeps reading the old address — which in 0.174.0
+    /// left "Ghostty Settings…" doing nothing and made Reload Configuration
+    /// drop the user's config file.
+    func testAddingAnEnvironmentNameAfterGhosttyInitIsUnsafe() {
+        XCTAssertFalse(
+            GhosttyEnvironment.writeIsSafe(
+                isAddition: true,
+                ghosttyRecordedEnvironment: true
+            )
+        )
+    }
+
+    /// Overwriting is safe whenever: libc replaces that entry in place, so the
+    /// block never moves. This is why launching from a shell — where TERM and
+    /// TERM_PROGRAM already exist — hid the bug entirely.
+    func testOverwritingAnExistingNameIsSafeEvenAfterGhosttyInit() {
+        XCTAssertTrue(
+            GhosttyEnvironment.writeIsSafe(
+                isAddition: false,
+                ghosttyRecordedEnvironment: true
+            )
+        )
+    }
+
+    /// Before ghostty has recorded anything, either kind of write is fine —
+    /// which is the whole point of running the environment setup first.
+    func testAnyWriteBeforeGhosttyInitIsSafe() {
+        XCTAssertTrue(
+            GhosttyEnvironment.writeIsSafe(
+                isAddition: true,
+                ghosttyRecordedEnvironment: false
+            )
+        )
+        XCTAssertTrue(
+            GhosttyEnvironment.writeIsSafe(
+                isAddition: false,
+                ghosttyRecordedEnvironment: false
+            )
+        )
+    }
 }

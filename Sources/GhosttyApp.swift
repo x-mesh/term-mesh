@@ -176,6 +176,10 @@ final class GhosttySurfaceCallbackContext {
 enum GhosttyEnvironment {
     private static var configured = false
 
+    /// True once `ghostty_init` has recorded where the environment block lives.
+    /// From here on an addition moves the block out from under it.
+    private(set) static var ghosttyRecordedEnvironment = false
+
     /// Safe to call more than once; only the first call touches the
     /// environment. Both entry points into ghostty call it, because either can
     /// be the one that runs first.
@@ -183,6 +187,36 @@ enum GhosttyEnvironment {
         guard !configured else { return }
         configured = true
         configure()
+    }
+
+    /// Call immediately after `ghostty_init` returns. Arms the check below.
+    static func noteGhosttyInitialized() {
+        ghosttyRecordedEnvironment = true
+    }
+
+    /// Whether writing a name is safe at a given point.
+    ///
+    /// Overwriting a name that is already there is always safe — libc replaces
+    /// that one entry and the block stays put. Adding one is safe only before
+    /// `ghostty_init`, because the array has to grow and libc moves it.
+    static func writeIsSafe(isAddition: Bool, ghosttyRecordedEnvironment: Bool) -> Bool {
+        !isAddition || !ghosttyRecordedEnvironment
+    }
+
+    /// Every environment write meant for ghostty goes through here, so an
+    /// unsafe one leaves a trace instead of silently costing the user their
+    /// config. The write still happens: refusing it would trade a broken
+    /// setting for a missing one, and the log says exactly what to move.
+    static func setValue(_ value: String, forName name: String) {
+        #if DEBUG
+        if !writeIsSafe(
+            isAddition: getenv(name) == nil,
+            ghosttyRecordedEnvironment: ghosttyRecordedEnvironment
+        ) {
+            dlog("ghostty.env.added_after_init name=\(name) — ghostty is now reading a stale environment block; this write belongs before ghostty_init")
+        }
+        #endif
+        setenv(name, value, 1)
     }
 
     private static func configure() {
@@ -203,19 +237,19 @@ enum GhosttyEnvironment {
             }
 
             if let resolvedResourcesDir {
-                setenv("GHOSTTY_RESOURCES_DIR", resolvedResourcesDir, 1)
+                setValue(resolvedResourcesDir, forName: "GHOSTTY_RESOURCES_DIR")
             }
         }
 
         if getenv("TERM") == nil {
-            setenv("TERM", "xterm-ghostty", 1)
+            setValue("xterm-ghostty", forName: "TERM")
         }
 
         // A terminal that launched term-mesh leaves its own name here, and the
         // daemon and every headless agent inherit it. Ghostty is what a pane
         // actually is, so the name is set outright rather than only when the
         // slot is empty.
-        setenv("TERM_PROGRAM", "ghostty", 1)
+        setValue("ghostty", forName: "TERM_PROGRAM")
 
         // Warp leaves more than a name: a client version and a protocol
         // version, and a CLI agent finding both will speak Warp's own
@@ -251,7 +285,7 @@ enum GhosttyEnvironment {
             return
         }
         let updated = current.isEmpty ? path : "\(current):\(path)"
-        setenv(key, updated, 1)
+        setValue(updated, forName: key)
     }
 }
 
@@ -434,6 +468,9 @@ class GhosttyApp {
 
         // Initialize Ghostty library first
         let result = ghostty_init(UInt(CommandLine.argc), CommandLine.unsafeArgv)
+        // From here the environment block ghostty recorded must not move, so
+        // any later addition is a bug worth hearing about.
+        GhosttyEnvironment.noteGhosttyInitialized()
         if result != GHOSTTY_SUCCESS {
             Logger.ui.error("Failed to initialize ghostty: \(result, privacy: .public)")
             return
