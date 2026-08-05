@@ -134,33 +134,32 @@ else
     fi
 
     if [ -z "$SEEDED_FROM" ]; then
-        # A local build needs zig 0.15.x — ghostty's build.zig rejects 0.16 —
-        # and llvm-libtool-darwin. macOS /usr/bin/libtool silently skips
+        # A local build needs zig 0.16.x — ghostty's build.zig.zon pins
+        # minimum_zig_version 0.16.0 since the 2026-08 upstream sync — and
+        # llvm-libtool-darwin. macOS /usr/bin/libtool silently skips
         # 8-byte-misaligned archive members (warning only), which drops
         # libghostty_zcu.o and erases every ghostty_surface_* symbol from the
         # combined xcframework. llvm-libtool-darwin keeps misaligned members.
         #
-        # Verify each zig candidate's *actual* version, not just the path: a
-        # `brew upgrade zig` to 0.16 can leave /opt/homebrew/opt/zig@0.15 as a
-        # stale symlink pointing at the 0.16 keg, and a broken brew keg can
+        # Verify each zig candidate's *actual* version, not just the path:
+        # versioned brew kegs can be stale symlinks and a broken keg can
         # resolve to an unusable binary — both pass a path-only check and then
-        # fail the build. Override with ZIG=/path/to/zig-0.15.x/zig; standalone
+        # fail the build. Override with ZIG=/path/to/zig-0.16.x/zig; standalone
         # tarball extracts under ~/.local and ~/zig are searched too.
-        _zig_is_0_15() { [ -x "$1" ] && "$1" version 2>/dev/null | grep -q '^0\.15\.'; }
+        _zig_is_0_16() { [ -x "$1" ] && "$1" version 2>/dev/null | grep -q '^0\.16\.'; }
         ZIG_BIN=""
         for cand in \
             "${ZIG:-}" \
-            /opt/homebrew/opt/zig@0.15/bin/zig /usr/local/opt/zig@0.15/bin/zig \
-            "$HOME"/.local/zig-0.15*/zig "$HOME"/zig/zig-*-0.15*/zig \
-            "$(command -v zig 2>/dev/null)"; do
+            "$(command -v zig 2>/dev/null)" \
+            /opt/homebrew/opt/zig/bin/zig /usr/local/opt/zig/bin/zig \
+            /opt/homebrew/opt/zig@0.16/bin/zig /usr/local/opt/zig@0.16/bin/zig \
+            "$HOME"/.local/zig-0.16*/zig "$HOME"/zig/zig-*-0.16*/zig; do
             [ -n "$cand" ] || continue
-            if _zig_is_0_15 "$cand"; then ZIG_BIN="$cand"; break; fi
+            if _zig_is_0_16 "$cand"; then ZIG_BIN="$cand"; break; fi
         done
         if [ -z "$ZIG_BIN" ]; then
-            echo "Error: zig 0.15.x is required to build GhosttyKit (ghostty rejects 0.16)."
-            echo "Install via: brew install zig@0.15, or set ZIG=/path/to/zig-0.15.x/zig"
-            echo "If zig@0.15 is installed but resolves to 0.16 (stale keg symlink):"
-            echo "  brew unlink zig 2>/dev/null; brew link --overwrite --force zig@0.15"
+            echo "Error: zig 0.16.x is required to build GhosttyKit (ghostty pins minimum_zig_version 0.16.0)."
+            echo "Install via: brew install zig, or set ZIG=/path/to/zig-0.16.x/zig"
             exit 1
         fi
 
