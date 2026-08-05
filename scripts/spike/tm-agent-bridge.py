@@ -1328,7 +1328,11 @@ def main() -> int:
         )
         bridge.stop()
         return 1
-    log(f"{args.cli} ready — turns on {args.fifo or 'stdin'}")
+    # Which implementation is speaking. Two bridges ship while the port is
+    # proven, they take the same arguments and emit the same events, and this
+    # line was identical in both — so a pane gave no way to tell which one had
+    # just answered, or which one to blame.
+    log(f"{args.cli} ready via python — turns on {args.fifo or 'stdin'}")
 
     def take(line: str) -> bool:
         line = line.strip()

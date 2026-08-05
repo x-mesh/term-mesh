@@ -299,9 +299,14 @@ fn main() -> std::process::ExitCode {
         out.result(&failure.unwrap_or_default(), stop, None, true);
         return std::process::ExitCode::FAILURE;
     }
+    // Which implementation is speaking, and which build of it. Two bridges
+    // ship while the port is proven, they take the same arguments and emit the
+    // same events, and this line used to be identical in both — so a pane gave
+    // no way to tell which one had just answered, or which one to blame.
     log(&format!(
-        "{} ready — turns on {}",
+        "{} ready via rust {} — turns on {}",
         args.cli.as_str(),
+        env!("CARGO_PKG_VERSION"),
         args.fifo.as_deref().unwrap_or("stdin")
     ));
 
