@@ -948,6 +948,54 @@ final class AgentSessionTests: XCTestCase {
         XCTAssertFalse(bridged.interruptible)
     }
 
+    // MARK: - Which bridge runs
+
+    /// The Python bridge and the Rust port take the same arguments and emit
+    /// the same events, so a pane can be moved between them. What differs is
+    /// only how each is started: a script is an argument to its interpreter, a
+    /// compiled binary is the command itself.
+    func testAScriptBridgeIsRunByItsInterpreterAndABinaryIsNot() {
+        XCTAssertEqual(
+            AgentPipeTransport.bridgeInterpreter(for: "/repo/scripts/spike/tm-agent-bridge.py"),
+            ["python3"])
+        XCTAssertEqual(
+            AgentPipeTransport.bridgeInterpreter(for: "/app/Contents/Resources/bin/tm-agent-bridge"),
+            [])
+    }
+
+    func testTheNativeLaunchDropsPython3ForTheCompiledBridge() {
+        let script = AgentSession.bridgeLaunch(
+            cli: "codex", bridgePath: "/repo/bridge.py", model: "",
+            workingDirectory: "/tmp")
+        XCTAssertEqual(script.arguments.first, "python3")
+        XCTAssertEqual(script.arguments.dropFirst().first, "/repo/bridge.py")
+
+        let binary = AgentSession.bridgeLaunch(
+            cli: "codex", bridgePath: "/bundle/bin/tm-agent-bridge", model: "",
+            workingDirectory: "/tmp")
+        XCTAssertEqual(binary.arguments.first, "/bundle/bin/tm-agent-bridge")
+        XCTAssertFalse(binary.arguments.contains("python3"))
+    }
+
+    func testTheTerminalLaunchLineDropsPython3ForTheCompiledBridge() {
+        // The whole chain is quoted again for the shell, so this reads the
+        // line for what it runs rather than for how it came out escaped.
+        let script = AgentPipeTransport.bridgeLaunchCommand(
+            cli: "codex", fifoPath: "/tmp/f", model: "",
+            bridgePath: "/repo/bridge.py", rendererPath: nil,
+            workingDirectory: "/tmp")
+        XCTAssertTrue(script.contains("python3"))
+        XCTAssertTrue(script.contains("/repo/bridge.py"))
+
+        let binary = AgentPipeTransport.bridgeLaunchCommand(
+            cli: "codex", fifoPath: "/tmp/f", model: "",
+            bridgePath: "/bundle/bin/tm-agent-bridge", rendererPath: nil,
+            workingDirectory: "/tmp")
+        XCTAssertTrue(binary.contains("/bundle/bin/tm-agent-bridge"))
+        // No renderer either, so nothing else could have put it there.
+        XCTAssertFalse(binary.contains("python3"))
+    }
+
     /// A turn stopped on purpose is not a failure, and should not be labelled
     /// with claude's own word for it, `error_during_execution`.
     func testAStoppedTurnReadsAsStoppedRatherThanFailed() {

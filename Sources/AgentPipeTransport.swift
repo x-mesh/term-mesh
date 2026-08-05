@@ -77,9 +77,41 @@ enum AgentPipeTransport {
     }
 
     /// The bridge, found next to the app or in the repo it was built from.
+    ///
+    /// `TERMMESH_BRIDGE_IMPL=rust` selects the ported binary instead. The two
+    /// take the same arguments and emit the same events, so this is the only
+    /// place that has to know which one is running — and while both ship, a
+    /// pane can be moved back by unsetting one variable.
     static func bridgePath(workingDirectory: String) -> String? {
-        script(named: "scripts/spike/tm-agent-bridge.py",
-               workingDirectory: workingDirectory)
+        if ProcessInfo.processInfo.environment[bridgeImplKey] == "rust",
+           let binary = rustBridgePath(workingDirectory: workingDirectory) {
+            return binary
+        }
+        return script(named: "scripts/spike/tm-agent-bridge.py",
+                      workingDirectory: workingDirectory)
+    }
+
+    static let bridgeImplKey = "TERMMESH_BRIDGE_IMPL"
+
+    /// The compiled bridge: beside the other daemon binaries in the bundle, or
+    /// in the cargo output of the repo this was built from.
+    private static func rustBridgePath(workingDirectory: String) -> String? {
+        var candidates: [String] = []
+        if let res = Bundle.main.resourcePath {
+            candidates.append((res as NSString).appendingPathComponent("bin/tm-agent-bridge"))
+        }
+        candidates.append((workingDirectory as NSString)
+            .appendingPathComponent("daemon/target/release/tm-agent-bridge"))
+        return candidates.first { FileManager.default.isExecutableFile(atPath: $0) }
+    }
+
+    /// What has to run the bridge at this path.
+    ///
+    /// A script is an argument to its interpreter; a compiled binary is the
+    /// command itself. Reading it off the path keeps every call site the same
+    /// shape whichever implementation is selected.
+    static func bridgeInterpreter(for path: String) -> [String] {
+        path.hasSuffix(".py") ? ["python3"] : []
     }
 
     static func canDrive(cli: String) -> Bool {
@@ -200,7 +232,10 @@ enum AgentPipeTransport {
         rendererPath: String?,
         workingDirectory: String
     ) -> String {
-        var run = "/usr/bin/env python3 \(quoted(bridgePath))"
+        let interpreter = bridgeInterpreter(for: bridgePath)
+            .map { "\($0) " }
+            .joined()
+        var run = "/usr/bin/env \(interpreter)\(quoted(bridgePath))"
             + " --cli \(quoted(cli))"
             + " --fifo \(quoted(fifoPath))"
             + " --events \(quoted(fifoPath + ".events"))"
