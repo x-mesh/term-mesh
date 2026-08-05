@@ -203,20 +203,32 @@ enum GhosttyEnvironment {
         !isAddition || !ghosttyRecordedEnvironment
     }
 
-    /// Every environment write meant for ghostty goes through here, so an
-    /// unsafe one leaves a trace instead of silently costing the user their
-    /// config. The write still happens: refusing it would trade a broken
-    /// setting for a missing one, and the log says exactly what to move.
+    /// Every environment write meant for ghostty goes through here.
+    ///
+    /// An addition after `ghostty_init` moves the block ghostty recorded, so
+    /// this repairs it — `ghostty_sync_environ` hands ghostty the new address.
+    /// The repair is not a licence to write late: the ordering is still the
+    /// thing to fix, and a DEBUG build says which value to move. But a user
+    /// running a release build gets their config either way.
+    ///
+    /// Both steps are deliberate. Refusing the write would trade a broken
+    /// setting for a missing one, and syncing on every write would cost a walk
+    /// of the environment for the overwrites that never needed it.
     static func setValue(_ value: String, forName name: String) {
-        #if DEBUG
-        if !writeIsSafe(
-            isAddition: getenv(name) == nil,
+        let isAddition = getenv(name) == nil
+        let needsRepair = !writeIsSafe(
+            isAddition: isAddition,
             ghosttyRecordedEnvironment: ghosttyRecordedEnvironment
-        ) {
-            dlog("ghostty.env.added_after_init name=\(name) — ghostty is now reading a stale environment block; this write belongs before ghostty_init")
+        )
+        #if DEBUG
+        if needsRepair {
+            dlog("ghostty.env.added_after_init name=\(name) — ghostty's recorded environment block has moved; re-syncing, but this write belongs before ghostty_init")
         }
         #endif
         setenv(name, value, 1)
+        if needsRepair {
+            ghostty_sync_environ()
+        }
     }
 
     private static func configure() {

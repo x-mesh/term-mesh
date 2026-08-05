@@ -1288,6 +1288,13 @@ typedef enum {
 // Published API
 
 GHOSTTY_API int ghostty_init(uintptr_t, char**);
+// Re-read the process environment. ghostty_init records where the environment
+// block lives and libc moves it when setenv adds a name that was not already
+// there, so an embedder that writes to the environment afterwards must call
+// this or every later XDG path lookup reads a stale address. Call after
+// ghostty_init, from the thread that made the change, with no other ghostty
+// call in flight.
+GHOSTTY_API void ghostty_sync_environ(void);
 GHOSTTY_API void ghostty_cli_try_action(void);
 GHOSTTY_API ghostty_info_s ghostty_info(void);
 GHOSTTY_API const char* ghostty_translate(const char*);
