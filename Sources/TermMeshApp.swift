@@ -96,8 +96,14 @@ struct TermMeshApp: App {
         Self.applyAppearance(startupAppearance)
         // Ensure terminal theme override exists at startup (covers fresh install)
         TerminalThemeOverride.write(for: startupAppearance.rawValue)
+        // Unit-test bundles run inside the real app host. Do not restore the
+        // user's terminal session before XCTest establishes its connection.
+        let isRunningUnderXCTest = AppLaunchEnvironment.isRunningUnderXCTest(
+            ProcessInfo.processInfo.environment
+        )
         _tabManager = StateObject(wrappedValue: TabManager(
-            restoreSavedSession: true,
+            restoreSavedSession: !isRunningUnderXCTest,
+            persistsSessionState: !isRunningUnderXCTest,
             daemon: TermMeshDaemon.shared,
             notifications: TerminalNotificationStore.shared
         ))

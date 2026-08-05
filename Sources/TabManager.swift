@@ -94,6 +94,7 @@ class TabManager: ObservableObject {
     private var workspaceCycleGeneration: UInt64 = 0
     private var workspaceCycleCooldownTask: Task<Void, Never>?
     private var pendingWorkspaceUnfocusTarget: (tabId: UUID, panelId: UUID)?
+    private let persistsSessionState: Bool
 #if DEBUG
     private var debugWorkspaceSwitchCounter: UInt64 = 0
     private var debugWorkspaceSwitchId: UInt64 = 0
@@ -111,9 +112,11 @@ class TabManager: ObservableObject {
     init(
         initialWorkingDirectory: String? = nil,
         restoreSavedSession: Bool = false,
+        persistsSessionState: Bool = true,
         daemon: (any DaemonService)? = nil,
         notifications: (any NotificationService)? = nil
     ) {
+        self.persistsSessionState = persistsSessionState
         self.daemon = daemon ?? TermMeshDaemon.shared
         self.notifications = notifications ?? TerminalNotificationStore.shared
         // Session restore: only the primary window (created by TermMeshApp at launch)
@@ -181,8 +184,11 @@ class TabManager: ObservableObject {
         setupChildExitKeyboardUITestIfNeeded()
 #endif
 
-        // Periodic session save for crash-safety (every 30s).
-        startPeriodicSessionSave()
+        // Periodic session save for crash-safety (every 30s). XCTest app hosts
+        // opt out so their blank workspace cannot replace the user's session.
+        if persistsSessionState {
+            startPeriodicSessionSave()
+        }
     }
 
     deinit {
@@ -400,6 +406,7 @@ class TabManager: ObservableObject {
     )
 
     func saveSessionState() {
+        guard persistsSessionState else { return }
         // Main-thread snapshot (Workspace is @MainActor-isolated).
         let teamWorkspaceIds = Set(
             TeamOrchestrator.shared.teams.values.map { $0.workspaceId }

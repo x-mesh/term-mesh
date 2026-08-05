@@ -26,11 +26,8 @@ private struct TermMeshWindowRoot<Content: View>: View {
     }
 }
 
-@MainActor
-final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDelegate, NSMenuItemValidation {
-    static var shared: AppDelegate?
-
-    func isRunningUnderXCTest(_ env: [String: String]) -> Bool {
+enum AppLaunchEnvironment {
+    static func isRunningUnderXCTest(_ env: [String: String]) -> Bool {
         // On some macOS/Xcode setups, the app-under-test process doesn't get
         // `XCTestConfigurationFilePath`. Use a broader set of signals so UI tests
         // can reliably skip heavyweight startup work and bring up a window.
@@ -42,6 +39,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         if env["DYLD_INSERT_LIBRARIES"]?.contains("libXCTest") == true { return true }
         if env.keys.contains(where: { $0.hasPrefix("TERMMESH_UI_TEST_") || $0.hasPrefix("CMUX_UI_TEST_") }) { return true }
         return false
+    }
+}
+
+@MainActor
+final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDelegate, NSMenuItemValidation {
+    static var shared: AppDelegate?
+
+    func isRunningUnderXCTest(_ env: [String: String]) -> Bool {
+        AppLaunchEnvironment.isRunningUnderXCTest(env)
     }
 
     final class MainWindowContext {

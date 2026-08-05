@@ -54,6 +54,38 @@ private func installTermMeshUnitTestInspectorOverride() {
     termMeshUnitTestInspectorOverrideInstalled = true
 }
 
+final class AppLaunchEnvironmentTests: XCTestCase {
+    func testDetectsEverySupportedXCTestSignal() {
+        let signals: [[String: String]] = [
+            ["XCTestConfigurationFilePath": "/tmp/config.xctestconfiguration"],
+            ["XCTestBundlePath": "/tmp/termMeshTests.xctest"],
+            ["XCTestSessionIdentifier": "session"],
+            ["XCInjectBundle": "/tmp/termMeshTests.xctest"],
+            ["XCInjectBundleInto": "/tmp/term-mesh DEV.app"],
+            ["DYLD_INSERT_LIBRARIES": "/tmp/libXCTestBundleInject.dylib"],
+            ["TERMMESH_UI_TEST_ENABLED": "1"],
+            ["CMUX_UI_TEST_ENABLED": "1"],
+        ]
+
+        for environment in signals {
+            XCTAssertTrue(
+                AppLaunchEnvironment.isRunningUnderXCTest(environment),
+                "expected XCTest detection for \(environment.keys.sorted())"
+            )
+        }
+    }
+
+    func testNormalApplicationEnvironmentDoesNotDisableSessionRestore() {
+        XCTAssertFalse(
+            AppLaunchEnvironment.isRunningUnderXCTest([
+                "HOME": "/Users/example",
+                "TERM_PROGRAM": "ghostty",
+                "DYLD_INSERT_LIBRARIES": "/tmp/libSomethingElse.dylib",
+            ])
+        )
+    }
+}
+
 final class SidebarTeamRuntimeSnapshotTests: XCTestCase {
     private let baseline = SidebarTeamRuntimeSnapshot(
         teamName: "term-mesh",
