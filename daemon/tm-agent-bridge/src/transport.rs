@@ -70,7 +70,13 @@ pub struct ProcessChild {
 }
 
 impl ProcessChild {
-    pub fn spawn(argv: &[String], cwd: &str) -> std::io::Result<Self> {
+    /// Also returns a channel that fires once when the child's output ends.
+    ///
+    /// The main loop waits on turns and on the child going away at the same
+    /// time. Python selects over a pipe the reader writes to; here the reader
+    /// thread already knows, so it says so on a channel and an idle pane
+    /// needs no timer to notice.
+    pub fn spawn(argv: &[String], cwd: &str) -> std::io::Result<(Self, Receiver<()>)> {
         let located = process_location(&RemoteEnv::from_process(), argv, cwd)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
         let (program, rest) = located
@@ -97,6 +103,7 @@ impl ProcessChild {
         let stderr = process.stderr.take().expect("stderr is piped");
 
         let (tx, inbox) = mpsc::channel();
+        let (exit_tx, exit_rx) = mpsc::channel();
         std::thread::spawn(move || {
             for line in BufReader::new(stdout).lines() {
                 let Ok(line) = line else { break };
@@ -108,11 +115,13 @@ impl ProcessChild {
                 }
                 if let Ok(Value::Object(map)) = serde_json::from_str::<Value>(line) {
                     if tx.send(Inbound::Frame(Value::Object(map))).is_err() {
-                        return;
+                        break;
                     }
                 }
             }
             let _ = tx.send(Inbound::Eof);
+            // Whoever is idle at the time hears about it too.
+            let _ = exit_tx.send(());
         });
 
         let stderr_lines = Arc::new(Mutex::new(VecDeque::with_capacity(STDERR_LINES)));
@@ -132,13 +141,16 @@ impl ProcessChild {
             }
         });
 
-        Ok(Self {
-            process: Mutex::new(process),
-            exit: Mutex::new(None),
-            stdin,
-            inbox,
-            stderr_lines,
-        })
+        Ok((
+            Self {
+                process: Mutex::new(process),
+                exit: Mutex::new(None),
+                stdin,
+                inbox,
+                stderr_lines,
+            },
+            exit_rx,
+        ))
     }
 
     /// Collect the child's status if it has one, and remember it.
@@ -346,7 +358,7 @@ mod tests {
             .iter()
             .map(|s| s.to_string())
             .collect();
-        let mut child = ProcessChild::spawn(&argv, "/tmp").expect("spawns");
+        let (mut child, _exit) = ProcessChild::spawn(&argv, "/tmp").expect("spawns");
 
         wait_until(Duration::from_secs(2), || !child.alive());
         wait_until(Duration::from_secs(2), || {
@@ -369,7 +381,7 @@ mod tests {
             .iter()
             .map(|s| s.to_string())
             .collect();
-        let child = ProcessChild::spawn(&argv, "/tmp").expect("spawns");
+        let (child, _exit) = ProcessChild::spawn(&argv, "/tmp").expect("spawns");
 
         let first = child.recv_timeout(Duration::from_secs(2)).expect("a frame");
         let second = child.recv_timeout(Duration::from_secs(2)).expect("an end");
@@ -388,7 +400,7 @@ mod tests {
         .iter()
         .map(|s| s.to_string())
         .collect();
-        let child = ProcessChild::spawn(&argv, "/tmp").expect("spawns");
+        let (child, _exit) = ProcessChild::spawn(&argv, "/tmp").expect("spawns");
 
         let first = child.recv_timeout(Duration::from_secs(2)).expect("a frame");
 
@@ -404,7 +416,7 @@ mod tests {
             .iter()
             .map(|s| s.to_string())
             .collect();
-        let child = ProcessChild::spawn(&argv, "/tmp").expect("spawns");
+        let (child, _exit) = ProcessChild::spawn(&argv, "/tmp").expect("spawns");
 
         wait_until(Duration::from_secs(2), || !child.alive());
 

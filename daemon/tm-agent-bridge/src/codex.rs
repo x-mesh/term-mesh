@@ -244,7 +244,7 @@ impl<T: Transport> CodexBridge<T> {
         match init.as_ref() {
             Some(reply) if reply.get("error").is_none() => {}
             _ => {
-                log(&format!(
+                crate::log(&format!(
                     "codex initialize failed: {}",
                     describe(init.as_ref())
                 ));
@@ -274,7 +274,7 @@ impl<T: Transport> CodexBridge<T> {
             // *value* it does not know outright. So if these names are ever
             // retired the thread never starts at all — and a pane that has to
             // ask permission beats no pane.
-            log("codex would not start with an approval policy; retrying plain");
+            crate::log("codex would not start with an approval policy; retrying plain");
             let plain = self.rpc.request(
                 "thread/start",
                 Some(json!({"cwd": self.cwd})),
@@ -283,7 +283,7 @@ impl<T: Transport> CodexBridge<T> {
             );
             self.thread_id = thread_id(plain.as_ref());
             if self.thread_id.is_none() {
-                log(&format!(
+                crate::log(&format!(
                     "codex thread/start gave no id: {}",
                     describe(plain.as_ref())
                 ));
@@ -436,7 +436,7 @@ impl<T: Transport> CodexBridge<T> {
             Some(reply) if reply.get("error").is_some() => {
                 let detail = serde_json::to_string(&reply["error"]).unwrap_or_default();
                 let detail = clamp(&detail, 300);
-                log(&format!("codex refused the turn: {detail}"));
+                crate::log(&format!("codex refused the turn: {detail}"));
                 out.result(&detail, "rejected", None, true);
                 return;
             }
@@ -519,18 +519,6 @@ fn describe(reply: Option<&Value>) -> String {
     match reply {
         Some(v) => clamp(&serde_json::to_string(v).unwrap_or_default(), 160),
         None => "no reply".to_string(),
-    }
-}
-
-/// Colour only for a terminal. When the app hosts this there is nothing to
-/// interpret the escapes, and they would arrive as literal garbage in a view
-/// that draws text rather than cells.
-fn log(message: &str) {
-    use std::io::IsTerminal;
-    if std::io::stdout().is_terminal() {
-        println!("\x1b[38;5;244m[bridge] {message}\x1b[0m");
-    } else {
-        println!("[bridge] {message}");
     }
 }
 
