@@ -225,8 +225,8 @@ extension TerminalController {
                 "last_reason": self.v2OrNull(st.lastReason),
                 "pending": st.pending,
                 "current_problem": self.v2OrNull(st.currentProblem),
-                "simulated_accepted": self.v2OrNull(simulatedAccepted.map { $0 ? "true" : "false" }),
-                "injected": self.v2OrNull(injected.map { $0 ? "true" : "false" })
+                "simulated_accepted": self.v2OrNull(simulatedAccepted),
+                "injected": self.v2OrNull(injected)
             ])
         }
         if !completed { return .err(code: "timeout", message: "Main thread busy", data: nil) }

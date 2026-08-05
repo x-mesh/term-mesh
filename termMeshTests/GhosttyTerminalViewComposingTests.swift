@@ -8,6 +8,67 @@ import AppKit
 #endif
 
 final class GhosttyTerminalViewComposingTests: XCTestCase {
+    func testAutoBlankRecoveryPolicyCoversHealthyConfirmationCooldownAndRebuild() {
+        XCTAssertEqual(
+            terminalAutoBlankRecoveryDecision(
+                hasProblem: false,
+                confirmed: false,
+                elapsedSinceLastRebuild: nil
+            ),
+            .healthy
+        )
+        XCTAssertEqual(
+            terminalAutoBlankRecoveryDecision(
+                hasProblem: true,
+                confirmed: false,
+                elapsedSinceLastRebuild: nil
+            ),
+            .confirm
+        )
+        XCTAssertEqual(
+            terminalAutoBlankRecoveryDecision(
+                hasProblem: true,
+                confirmed: true,
+                elapsedSinceLastRebuild: 29.999
+            ),
+            .cooldown
+        )
+        XCTAssertEqual(
+            terminalAutoBlankRecoveryDecision(
+                hasProblem: true,
+                confirmed: true,
+                elapsedSinceLastRebuild: 30.0
+            ),
+            .rebuild
+        )
+        XCTAssertEqual(
+            terminalAutoBlankRecoveryDecision(
+                hasProblem: true,
+                confirmed: true,
+                elapsedSinceLastRebuild: nil
+            ),
+            .rebuild
+        )
+    }
+
+    @MainActor
+    func testHidingSurfaceCancelsPendingAutoBlankRecoveryCheck() {
+        let surface = TerminalSurface(
+            tabId: UUID(),
+            context: GHOSTTY_SURFACE_CONTEXT_SPLIT,
+            configTemplate: nil
+        )
+
+        surface.scheduleAutoBlankRecovery(reason: "test")
+        XCTAssertTrue(surface.autoBlankRecoveryState().pending)
+
+        surface.setSurfaceVisibleForRenderer(false)
+        XCTAssertFalse(surface.autoBlankRecoveryState().pending)
+
+        // Cancel the renderer-unrealize debounce created by the hide transition.
+        surface.setSurfaceVisibleForRenderer(true)
+    }
+
     func testBackgroundLayerUpdatePolicySkipsEquivalentState() {
         let color = NSColor(calibratedRed: 0.1, green: 0.2, blue: 0.3, alpha: 0.8)
 

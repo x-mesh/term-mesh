@@ -1,7 +1,6 @@
 import Foundation
 import SwiftUI
 import AppKit
-import IOSurface
 import Metal
 import QuartzCore
 import Combine
@@ -10,6 +9,30 @@ import Sentry
 import Bonsplit
 import IOSurface
 import os
+
+enum TerminalAutoBlankRecoveryDecision: Equatable {
+    case healthy
+    case confirm
+    case cooldown
+    case rebuild
+}
+
+/// Pure policy for the timing-sensitive blank-pane recovery state machine.
+/// Keeping the decision separate from AppKit/renderer side effects lets tests
+/// pin the healthy, confirmation, cooldown, and rebuild paths deterministically.
+func terminalAutoBlankRecoveryDecision(
+    hasProblem: Bool,
+    confirmed: Bool,
+    elapsedSinceLastRebuild: TimeInterval?,
+    cooldown: TimeInterval = 30.0
+) -> TerminalAutoBlankRecoveryDecision {
+    guard hasProblem else { return .healthy }
+    guard confirmed else { return .confirm }
+    if let elapsedSinceLastRebuild, elapsedSinceLastRebuild < cooldown {
+        return .cooldown
+    }
+    return .rebuild
+}
 
 #if os(macOS)
 func termMeshShouldUseTransparentBackgroundWindow() -> Bool {
@@ -1405,8 +1428,17 @@ final class TerminalSurface: Identifiable, ObservableObject {
         guard surface != nil, rendererRealized, rendererVisibilityRequested,
               !renderingPaused else { return }
         if !confirmed { autoBlankChecksRan += 1 }
-        guard let problem = renderBackingProblem() else { return }
-        guard confirmed else {
+        let problem = renderBackingProblem()
+        let elapsedSinceLastRebuild = lastAutoBlankRebuildAt.map { Date().timeIntervalSince($0) }
+        switch terminalAutoBlankRecoveryDecision(
+            hasProblem: problem != nil,
+            confirmed: confirmed,
+            elapsedSinceLastRebuild: elapsedSinceLastRebuild,
+            cooldown: Self.autoBlankCooldown
+        ) {
+        case .healthy:
+            return
+        case .confirm:
             // Double-confirm: transient states (first frame not yet presented,
             // live resize trailing) must not trigger a GPU rebuild.
             let work = DispatchWorkItem { [weak self] in
@@ -1417,15 +1449,15 @@ final class TerminalSurface: Identifiable, ObservableObject {
             autoBlankCheckWork = work
             DispatchQueue.main.asyncAfter(deadline: .now() + Self.autoBlankConfirmDelay, execute: work)
             return
-        }
-        if let last = lastAutoBlankRebuildAt,
-           Date().timeIntervalSince(last) < Self.autoBlankCooldown {
+        case .cooldown:
             #if DEBUG
-            dlog("surface.renderer.autoRebuild.skip cooldown problem=\(problem.rawValue) surface=\(id.uuidString.prefix(8))")
+            dlog("surface.renderer.autoRebuild.skip cooldown problem=\(problem?.rawValue ?? "unknown") surface=\(id.uuidString.prefix(8))")
             #endif
             return
+        case .rebuild:
+            guard let problem else { return }
+            performAutoBlankRebuild(problem: problem.rawValue, trigger: trigger)
         }
-        performAutoBlankRebuild(problem: problem.rawValue, trigger: trigger)
     }
 
     /// Act path shared by the detector and the debug simulate probe.
