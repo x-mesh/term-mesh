@@ -27,6 +27,7 @@ struct VerticalTabsSidebar: View {
     @StateObject private var dragFailsafeMonitor = SidebarDragFailsafeMonitor()
     @ObservedObject private var remoteHostStore = RemoteHostStore.shared
     @ObservedObject private var teamOrchestrator = TeamOrchestrator.shared
+    @ObservedObject private var activeDrag = SidebarActiveDrag.shared
     @State private var draggedTabId: UUID?
     @State private var dropIndicator: SidebarDropIndicator?
     @AppStorage(SidebarLayoutSettings.localTabsCollapsedKey)
@@ -54,6 +55,14 @@ struct VerticalTabsSidebar: View {
             from: tabManager.tabs.map { (id: $0.id, isPeerMirror: $0.isPeerMirror) },
             separatedSectionsEnabled: sidebarSeparatedSectionsEnabled
         )
+    }
+
+    /// A workspace from another window is in flight, so this sidebar is a
+    /// place to put it. Says so with a border, because outside the Local
+    /// Workspaces list there are no row indicators to imply it.
+    private var isAcceptingWindowMoveDrop: Bool {
+        guard let id = activeDrag.tabId else { return false }
+        return !tabManager.tabs.contains { $0.id == id }
     }
 
     var body: some View {
@@ -191,6 +200,26 @@ struct VerticalTabsSidebar: View {
                 }
                 .background(Color.clear)
                 .modifier(ClearScrollBackground())
+                // Last in line: the row and empty-area delegates above take
+                // their drops first, and whatever they leave — the Projects
+                // axis, the Remote Hosts section, a list too full to leave any
+                // empty area — lands here as a move into this window.
+                .onDrop(
+                    of: [SidebarTabDragPayload.typeIdentifier],
+                    delegate: SidebarWindowMoveDropDelegate(
+                        tabManager: tabManager,
+                        selectedTabIds: $selectedTabIds,
+                        lastSidebarSelectionIndex: $lastSidebarSelectionIndex
+                    )
+                )
+                .overlay {
+                    if isAcceptingWindowMoveDrop {
+                        RoundedRectangle(cornerRadius: 6)
+                            .strokeBorder(Color.accentColor.opacity(0.6), lineWidth: 2)
+                            .padding(4)
+                            .allowsHitTesting(false)
+                    }
+                }
             }
             SidebarWorktreeSandboxToggle()
                 .frame(maxWidth: .infinity, alignment: .leading)
@@ -262,8 +291,13 @@ struct VerticalTabsSidebar: View {
             dropIndicator = nil
         }
         .onReceive(NotificationCenter.default.publisher(for: SidebarDragLifecycleNotification.requestClear)) { notification in
-            guard draggedTabId != nil else { return }
             let reason = SidebarDragLifecycleNotification.reason(from: notification)
+            // The app-wide source is cleared even when this window never held
+            // the drag: a peer row drags without setting `draggedTabId`, and a
+            // stale id there would move that workspace on the next drop
+            // anywhere.
+            SidebarActiveDrag.shared.end(reason: reason)
+            guard draggedTabId != nil else { return }
 #if DEBUG
             dlog("sidebar.dragClear tab=\(debugShortSidebarTabId(draggedTabId)) reason=\(reason)")
 #endif
@@ -2892,6 +2926,7 @@ struct RemoteWorkspaceRowView: View {
 
     @Environment(\.colorScheme) private var colorScheme
     @EnvironmentObject private var tabManager: TabManager
+    @ObservedObject private var activeDrag = SidebarActiveDrag.shared
     let workspace: WorkspaceSummary
     /// The host group this row is rendered under. Passed explicitly so the
     /// mirror open uses THIS host's spec (SSH vs direct) — a workspace.id can
@@ -2927,6 +2962,11 @@ struct RemoteWorkspaceRowView: View {
     }
 
     private var isMirrorOpen: Bool { mirroredWorkspace != nil }
+
+    private var isBeingDragged: Bool {
+        guard let id = mirroredWorkspace?.id else { return false }
+        return activeDrag.tabId == id
+    }
 
     private var isMirrorSelected: Bool {
         mirroredWorkspace?.id == tabManager.selectedTabId
@@ -3319,6 +3359,25 @@ struct RemoteWorkspaceRowView: View {
                 rowChrome(legacyRow)
                     .onTapGesture { handleTap() }
             }
+        }
+        // Dragging this row moves the open mirror to another window. What
+        // travels is the local Workspace backing it, so the drop side needs no
+        // peer-specific handling — the same payload the Local Workspaces rows
+        // use. A row with nothing open is not draggable: there is no view to
+        // move, and opening one belongs to the menu above, where the person
+        // can say which window.
+        .opacity(isBeingDragged ? 0.6 : 1)
+        .onDrag {
+            guard let mirror = mirroredWorkspace else {
+#if DEBUG
+                dlog("sidebar.onDrag.peer.skip reason=noMirror host=\(host.displayName)")
+#endif
+                return NSItemProvider()
+            }
+#if DEBUG
+            dlog("sidebar.onDrag.peer tab=\(mirror.id.uuidString.prefix(5)) host=\(host.displayName)")
+#endif
+            return SidebarTabDragPayload.provider(for: mirror.id)
         }
         .contextMenu {
             // Live mirror (Phase 2B): host-authoritative layout sync —
