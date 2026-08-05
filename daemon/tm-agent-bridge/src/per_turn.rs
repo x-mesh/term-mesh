@@ -27,7 +27,7 @@ use std::time::Duration;
 use serde_json::{json, Value};
 
 use crate::emitter::Emitter;
-use crate::location::{process_location, RemoteEnv};
+use crate::location::{process_location, remote_launch_failure, RemoteEnv};
 use crate::text::{clamp, TEXT_LIMIT};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -204,11 +204,24 @@ impl PerTurnBridge {
         // A watchdog rather than a reader thread: the answer is drawn as it
         // arrives, and drawing needs the emitter, which cannot be in two
         // places. Killing on the deadline turns the read into an EOF.
+        //
+        // It waits on a channel rather than sleeping, so a turn that finishes
+        // early ends the thread with it. A plain sleep left one alive for the
+        // rest of the timeout — ten minutes by default — accumulating one per
+        // turn, each holding a pid it no longer owns. `kill(pid, 0)` succeeds
+        // for whoever inherited that number, so a late sleeper could signal an
+        // unrelated process.
         let killed = Arc::new(AtomicBool::new(false));
         let pid = child.id();
         let flag = Arc::clone(&killed);
+        let (finished, wait_for_finish) = std::sync::mpsc::channel::<()>();
         let watchdog = std::thread::spawn(move || {
-            std::thread::sleep(timeout);
+            // Disconnected means the turn ended and the sender was dropped.
+            if wait_for_finish.recv_timeout(timeout)
+                != Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+            {
+                return;
+            }
             // SAFETY: signal 0 first — a pid that has been reaped and reused
             // must not be signalled by mistake.
             unsafe {
@@ -227,7 +240,8 @@ impl PerTurnBridge {
             PerTurnCli::Agy => self.read_agy(stdout),
         };
         let status = child.wait();
-        drop(watchdog);
+        drop(finished);
+        let _ = watchdog.join();
 
         if killed.load(Ordering::SeqCst) {
             self.out.result(
@@ -240,6 +254,18 @@ impl PerTurnBridge {
                 None,
                 true,
             );
+            return;
+        }
+
+        let code = status.ok().and_then(|s| s.code()).unwrap_or(-1);
+
+        // Before the cursor branch, because the wrapper fails the same way for
+        // both and neither writes a result of its own when it does. A remote
+        // turn whose `.profile` or `agent-env` would not load exits 77/78 with
+        // nothing on stdout, so returning here without saying so leaves the
+        // pane waiting for a completion that is never coming.
+        if let Some(failure) = remote_launch_failure(Some(code)) {
+            self.out.result(failure, "environment_failed", None, true);
             return;
         }
 
@@ -259,7 +285,6 @@ impl PerTurnBridge {
         // as one is how an empty answer becomes a completed task. And a turn
         // with no result at all never ends, because whoever is watching for
         // completion is still waiting for this line.
-        let code = status.ok().and_then(|s| s.code()).unwrap_or(-1);
         if code != 0 {
             let body = if said.is_empty() {
                 format!("{} exited {code}", self.cli.as_str())
@@ -471,6 +496,17 @@ impl PerTurnBridge {
     }
 }
 
+/// The agy log is kept past the tempdir guard on purpose — the id is read back
+/// out of it between turns — so something has to remove it at the end. Doing it
+/// here rather than asking the exit path to remember: a bridge can end by
+/// closed input, by a killed process, or by main simply returning, and only one
+/// of those is a place to put a call.
+impl Drop for PerTurnBridge {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
 /// Read a file only if it is a plain file this user owns and nobody else can
 /// touch, following no symlink to get there.
 ///
@@ -661,5 +697,78 @@ Created conversation 22222222-2222-4222-8222-222222222222\n";
     fn a_per_turn_bridge_is_always_alive_between_turns() {
         let (b, _) = bridge(PerTurnCli::Cursor);
         assert!(b.alive());
+    }
+
+    /// A stand-in for the CLI: it ignores every argument and exits how the
+    /// test says.
+    fn fake_cli(dir: &std::path::Path, body: &str) -> String {
+        let path = dir.join("fake-cli");
+        std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        path.display().to_string()
+    }
+
+    fn bridge_with(cli: PerTurnCli, exe: String) -> (PerTurnBridge, Arc<Mutex<Vec<Value>>>) {
+        let (out, sink) = captured();
+        (
+            PerTurnBridge::new(cli, "/tmp", None, out, Some(exe)),
+            sink,
+        )
+    }
+
+    #[test]
+    fn a_turn_that_finishes_early_does_not_leave_its_watchdog_behind() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut b, _) = bridge_with(PerTurnCli::Agy, fake_cli(dir.path(), "echo done"));
+
+        // A generous deadline the turn will not need. Before the watchdog
+        // could be cancelled it slept the whole of this, one thread per turn,
+        // each still holding a pid it no longer owned.
+        let started = std::time::Instant::now();
+        b.turn("hi", Duration::from_secs(30));
+
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "the watchdog has to end with the turn, not outlive it"
+        );
+    }
+
+    #[test]
+    fn a_remote_wrapper_failure_is_reported_for_both_clis() {
+        // 77 and 78 mean the remote shell could not load ~/.profile or
+        // agent-env. Neither CLI writes anything on stdout when that happens,
+        // so a bridge that stays quiet leaves the pane waiting forever.
+        for (cli, code, expected) in [
+            (PerTurnCli::Cursor, 77, "~/.profile"),
+            (PerTurnCli::Agy, 78, "agent-env"),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let (mut b, sink) = bridge_with(cli, fake_cli(dir.path(), &format!("exit {code}")));
+
+            b.turn("hi", Duration::from_secs(10));
+
+            let result = last_result(&sink);
+            assert_eq!(result["stop_reason"], "environment_failed", "{cli:?}");
+            assert!(
+                result["result"].as_str().unwrap().contains(expected),
+                "{cli:?}: {}",
+                result["result"]
+            );
+        }
+    }
+
+    #[test]
+    fn the_agy_log_is_removed_when_the_bridge_goes_away() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut b, _) = bridge_with(PerTurnCli::Agy, fake_cli(dir.path(), "echo hi"));
+        b.turn("hi", Duration::from_secs(10));
+
+        let log = b.log_path.clone().expect("agy was given a log to write");
+        assert!(log.exists());
+
+        // The tempdir guard is deliberately released so the id survives
+        // between turns, which makes dropping the bridge the only cleanup.
+        drop(b);
+        assert!(!log.exists(), "every agy session would otherwise leave one behind");
     }
 }
