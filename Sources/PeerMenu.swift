@@ -228,10 +228,44 @@ final class PeerClientCoordinator: NSObject, NSMenuDelegate {
         openWorkspaceMirrors.first { mirror in
             guard !mirror.isTornDown,
                   mirror.lease.key == hostKey,
-                  mirror.matchesHostWorkspaceID(hostWorkspaceID)
+                  mirror.matchesHostWorkspaceID(hostWorkspaceID),
+                  let workspace = mirror.workspace
             else { return false }
-            return mirror.workspace != nil
+            // A Workspace no window holds is not somewhere to go. Its window
+            // went away without the mirror being torn down, and calling that
+            // "already open" made the host workspace impossible to reopen at
+            // all: the dedupe in openWorkspaceAsMirror refused to make a
+            // second mirror, while revealLocalWorkspace had no window to
+            // raise and returned in silence. Every click did nothing.
+            return AppDelegate.shared?.contextContainingTabId(workspace.id) != nil
         }?.workspace
+    }
+
+    /// Tear down mirrors whose Workspace no longer belongs to any window.
+    ///
+    /// Registration outlives the window in that case — nothing on the window's
+    /// way out tells the coordinator — so the entry would otherwise sit there
+    /// forever, holding a lease and answering questions about a view that no
+    /// longer exists. Called when a mirror is about to be opened, which is
+    /// both the moment a stale entry starts mattering and a user action rather
+    /// than a render pass.
+    @discardableResult
+    func pruneOrphanedWorkspaceMirrors() -> Int {
+        let orphans = openWorkspaceMirrors.filter { mirror in
+            guard !mirror.isTornDown else { return false }
+            guard let workspace = mirror.workspace else { return true }
+            return AppDelegate.shared?.contextContainingTabId(workspace.id) == nil
+        }
+        guard !orphans.isEmpty else { return 0 }
+        for mirror in orphans {
+#if DEBUG
+            dlog("peer.mirror.prune host=\(mirror.lease.key) workspace=\(mirror.workspace?.id.uuidString.prefix(5) ?? "nil")")
+#endif
+            mirror.teardown()
+            openWorkspaceMirrors.removeAll { $0 === mirror }
+        }
+        postRelaysChanged()
+        return orphans.count
     }
 
     func workspaceMirrorIdentityDidChange() {
@@ -997,6 +1031,10 @@ final class PeerClientCoordinator: NSObject, NSMenuDelegate {
         // shell, not a clone. Mirrors are for crossing a machine boundary;
         // within one app the answer to "show me that workspace" is to go to
         // where it already is.
+        // Drop registrations whose window is gone before asking whether this
+        // workspace is already mirrored, so a stale one cannot answer yes.
+        pruneOrphanedWorkspaceMirrors()
+
         if live, let workspaceID,
            let mirrorWorkspace = mirroredWorkspace(
                forHostKey: spec.hostKey,
