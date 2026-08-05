@@ -26,8 +26,10 @@
 //! are meant to be swappable behind one launch line while the port is proven.
 
 mod emitter;
+mod jsonrpc;
 mod location;
 mod text;
+mod transport;
 
 use clap::Parser;
 
