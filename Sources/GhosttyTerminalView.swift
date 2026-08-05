@@ -1,6 +1,7 @@
 import Foundation
 import SwiftUI
 import AppKit
+import IOSurface
 import Metal
 import QuartzCore
 import Combine
@@ -1277,6 +1278,9 @@ final class TerminalSurface: Identifiable, ObservableObject {
                displayID != 0 {
                 ghostty_surface_set_display_id(surface, displayID)
             }
+            Task { @MainActor [weak self] in
+                self?.scheduleAutoBlankRecovery(reason: "focus")
+            }
         }
     }
 
@@ -1317,6 +1321,131 @@ final class TerminalSurface: Identifiable, ObservableObject {
         return accepted
     }
 
+    // MARK: - Automatic blank-pane recovery
+
+    /// Structural render-backing problems that may trigger an automatic renderer
+    /// rebuild. Pixel content is deliberately ignored: a cleared terminal is
+    /// legitimately uniform, so only a broken render target qualifies.
+    enum RenderBackingProblem: String {
+        /// Visible, realized surface whose layer has no contents at all.
+        case noContents = "no_contents"
+        /// Layer contents is an IOSurface whose pixel size is far from the
+        /// layer's expected backing size (stale target after display churn).
+        case staleSize = "stale_size"
+    }
+
+    private static let autoBlankCheckDelay: TimeInterval = 1.5
+    private static let autoBlankConfirmDelay: TimeInterval = 0.6
+    private static let autoBlankCooldown: TimeInterval = 30.0
+    /// Divergence allowed between the IOSurface and the layer's expected pixel
+    /// size before it counts as stale — generous so a trailing live-resize
+    /// frame never qualifies.
+    private static let autoBlankSizeTolerancePx = 64
+
+    private var autoBlankCheckWork: DispatchWorkItem?
+    private var lastAutoBlankRebuildAt: Date?
+    private(set) var autoBlankChecksRan = 0
+    private(set) var autoBlankRebuilds = 0
+    private(set) var lastAutoBlankReason: String?
+
+    /// Escape hatch: `defaults write <bundle> disableAutoBlankRecovery -bool YES`.
+    private var autoBlankRecoveryDisabled: Bool {
+        UserDefaults.standard.bool(forKey: "disableAutoBlankRecovery")
+    }
+
+    /// Inspect the attached view's layer for a structurally broken render
+    /// target. Returns nil when healthy or indeterminate (detached, zero-size,
+    /// snapshot-mitigation contents) — indeterminate must never trigger.
+    @MainActor private func renderBackingProblem() -> RenderBackingProblem? {
+        guard let view = attachedView,
+              view.window != nil,
+              view.bounds.width > 0,
+              view.bounds.height > 0,
+              let layer = view.layer else { return nil }
+        guard let contents = layer.contents else { return .noContents }
+        let cf = contents as CFTypeRef
+        // During blank-flash mitigation contents can be a CGImage snapshot —
+        // that machinery owns the layer then; treat as healthy.
+        guard CFGetTypeID(cf) == IOSurfaceGetTypeID() else { return nil }
+        let ioSurface = contents as! IOSurfaceRef
+        let width = Int(IOSurfaceGetWidth(ioSurface))
+        let height = Int(IOSurfaceGetHeight(ioSurface))
+        if width <= 0 || height <= 0 { return .noContents }
+        let scale = max(1.0, layer.contentsScale)
+        let expectedWidth = Int((view.bounds.width * scale).rounded())
+        let expectedHeight = Int((view.bounds.height * scale).rounded())
+        if abs(width - expectedWidth) > Self.autoBlankSizeTolerancePx ||
+            abs(height - expectedHeight) > Self.autoBlankSizeTolerancePx {
+            return .staleSize
+        }
+        return nil
+    }
+
+    /// Schedule a structural blank check shortly after the surface (re)becomes
+    /// visible or focused — the windows where stuck render targets historically
+    /// appear. A detection is double-confirmed and rate-limited before acting.
+    @MainActor func scheduleAutoBlankRecovery(reason: String) {
+        guard !autoBlankRecoveryDisabled else { return }
+        autoBlankCheckWork?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            self.autoBlankCheckWork = nil
+            self.runAutoBlankCheck(trigger: reason, confirmed: false)
+        }
+        autoBlankCheckWork = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.autoBlankCheckDelay, execute: work)
+    }
+
+    @MainActor func cancelAutoBlankRecovery() {
+        autoBlankCheckWork?.cancel()
+        autoBlankCheckWork = nil
+    }
+
+    @MainActor private func runAutoBlankCheck(trigger: String, confirmed: Bool) {
+        guard surface != nil, rendererRealized, rendererVisibilityRequested,
+              !renderingPaused else { return }
+        if !confirmed { autoBlankChecksRan += 1 }
+        guard let problem = renderBackingProblem() else { return }
+        guard confirmed else {
+            // Double-confirm: transient states (first frame not yet presented,
+            // live resize trailing) must not trigger a GPU rebuild.
+            let work = DispatchWorkItem { [weak self] in
+                guard let self else { return }
+                self.autoBlankCheckWork = nil
+                self.runAutoBlankCheck(trigger: trigger, confirmed: true)
+            }
+            autoBlankCheckWork = work
+            DispatchQueue.main.asyncAfter(deadline: .now() + Self.autoBlankConfirmDelay, execute: work)
+            return
+        }
+        if let last = lastAutoBlankRebuildAt,
+           Date().timeIntervalSince(last) < Self.autoBlankCooldown {
+            #if DEBUG
+            dlog("surface.renderer.autoRebuild.skip cooldown problem=\(problem.rawValue) surface=\(id.uuidString.prefix(8))")
+            #endif
+            return
+        }
+        performAutoBlankRebuild(problem: problem.rawValue, trigger: trigger)
+    }
+
+    /// Act path shared by the detector and the debug simulate probe.
+    @MainActor @discardableResult
+    func performAutoBlankRebuild(problem: String, trigger: String) -> Bool {
+        lastAutoBlankRebuildAt = Date()
+        autoBlankRebuilds += 1
+        lastAutoBlankReason = "\(problem)/\(trigger)"
+        #if DEBUG
+        dlog("surface.renderer.autoRebuild problem=\(problem) trigger=\(trigger) surface=\(id.uuidString.prefix(8))")
+        #endif
+        let accepted = rebuildRenderer()
+        if accepted { forceRefresh() }
+        return accepted
+    }
+
+    @MainActor func autoBlankRecoveryState() -> (checks: Int, rebuilds: Int, lastReason: String?, pending: Bool) {
+        (autoBlankChecksRan, autoBlankRebuilds, lastAutoBlankReason, autoBlankCheckWork != nil)
+    }
+
     /// Drive renderer GPU realization from UI visibility (workspace selection). A surface
     /// that becomes visible realizes immediately so it can draw; one that becomes invisible
     /// unrealizes only after `rendererUnrealizeDebounce` of sustained invisibility, so brief
@@ -1327,7 +1456,9 @@ final class TerminalSurface: Identifiable, ObservableObject {
             rendererUnrealizeWork?.cancel()
             rendererUnrealizeWork = nil
             setRendererRealized(true)
+            scheduleAutoBlankRecovery(reason: "visible")
         } else {
+            cancelAutoBlankRecovery()
             // Do not restart the five-second countdown for repeated hidden-state updates.
             // A nil-surface timer may have elapsed before a delayed creation, so schedule
             // again whenever the renderer is realized and no pending release remains.

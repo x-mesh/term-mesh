@@ -185,6 +185,46 @@ extension TerminalController {
         return result
     }
 
+    /// Inspect (and with `simulate: true`, force) a terminal's automatic
+    /// blank-pane recovery. Targets `surface_id` or the focused panel.
+    func v2DebugBlankRecoveryState(params: [String: Any]) -> V2CallResult {
+        guard let tabManager = v2ResolveTabManager(params: params) else {
+            return .err(code: "unavailable", message: "TabManager not available", data: nil)
+        }
+        let simulate = params["simulate"] as? Bool ?? false
+        var result: V2CallResult = .err(code: "internal_error", message: "Failed to read recovery state", data: nil)
+        let completed = v2MainExec(timeout: 5) {
+            guard let ws = self.v2ResolveWorkspace(params: params, tabManager: tabManager) else {
+                result = .err(code: "not_found", message: "Workspace not found", data: nil)
+                return
+            }
+            let surfaceId = self.v2UUID(params, "surface_id") ?? ws.focusedPanelId
+            guard let surfaceId, let terminalPanel = ws.terminalPanel(for: surfaceId) else {
+                result = .err(code: "not_found", message: "No terminal surface", data: nil)
+                return
+            }
+            var simulatedAccepted: Bool?
+            if simulate {
+                simulatedAccepted = terminalPanel.surface.performAutoBlankRebuild(
+                    problem: "simulated",
+                    trigger: "debug"
+                )
+            }
+            let st = terminalPanel.surface.autoBlankRecoveryState()
+            result = .ok([
+                "surface_id": surfaceId.uuidString,
+                "surface_ref": self.v2Ref(kind: .surface, uuid: surfaceId),
+                "checks": st.checks,
+                "rebuilds": st.rebuilds,
+                "last_reason": self.v2OrNull(st.lastReason),
+                "pending": st.pending,
+                "simulated_accepted": self.v2OrNull(simulatedAccepted.map { $0 ? "true" : "false" })
+            ])
+        }
+        if !completed { return .err(code: "timeout", message: "Main thread busy", data: nil) }
+        return result
+    }
+
     /// Set the open command palette's raw query (mode prefixes like ">" / "@"
     /// included). Exists because debug.type inserts into the AppKit first
     /// responder, which the palette's SwiftUI field never becomes under
