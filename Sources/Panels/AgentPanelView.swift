@@ -252,9 +252,29 @@ struct AgentPanelView: View {
                         }
                         if session.rows.isEmpty { emptyState }
                         ForEach(session.rows) { item in
-                            row(item.entry)
-                                .padding(.top, item.topGap)
-                                .id(item.id)
+                            TranscriptRow(
+                                item: item,
+                                streaming: session.streamingIds.contains(item.id),
+                                open: openTools.contains(item.id),
+                                root: panel.workingDirectory,
+                                setOpen: { open in
+                                    // Opening a row grows the transcript exactly
+                                    // as an append does, and the bottom anchor
+                                    // cannot tell the two apart. Without touching
+                                    // `grewAt` the anchor reads its own
+                                    // disappearance as the user scrolling away,
+                                    // and the "Latest" pill appears because
+                                    // somebody expanded a diff.
+                                    grewAt = Date()
+                                    if open {
+                                        openTools.insert(item.id)
+                                    } else {
+                                        openTools.remove(item.id)
+                                    }
+                                }
+                            )
+                            .equatable()
+                            .id(item.id)
                         }
                         // A normal VStack mounts this marker even while it is
                         // off screen, so visibility is measured in the scroll
@@ -345,79 +365,6 @@ struct AgentPanelView: View {
         .frame(maxWidth: .infinity, alignment: .leading)
     }
 
-    @ViewBuilder
-    private func row(_ entry: AgentSession.Entry) -> some View {
-        switch entry {
-        case .said(_, let speaker, let text):
-            said(speaker, text)
-        case .answered(let id, let text):
-            // Selectable, because the reason to read an agent's answer is
-            // usually to take something out of it. The caret says the row is
-            // still being written — a terminal can only show characters
-            // arriving and leave "did it stop there?" to be guessed.
-            Answer(text: text, streaming: session.streamingIds.contains(id))
-        case .thought(let id, let body):
-            label("✻", (body?.isEmpty == false ? body! : "thinking"),
-                  muted: true, streaming: session.streamingIds.contains(id))
-        case .tool(let id, let call):
-            if let change = call.change {
-                ChangeRow(call: call, change: change,
-                          root: panel.workingDirectory, open: openBinding(id))
-            } else {
-                ToolRow(call: call, open: openBinding(id))
-            }
-        case .turnEnded(_, let end):
-            turnEnd(end)
-        case .notice(_, let text):
-            label("!", text, muted: false)
-        }
-    }
-
-    private func said(_ speaker: AgentSession.Speaker, _ text: String) -> some View {
-        Instruction(speaker: speaker, read: AgentSession.read(instruction: text))
-    }
-
-    /// Opening a row grows the transcript exactly as an append does, and the
-    /// bottom anchor cannot tell the two apart. Without touching `grewAt` the
-    /// anchor reads its own disappearance as the user scrolling away, and the
-    /// "Latest" pill appears because somebody expanded a diff.
-    private func openBinding(_ id: UUID) -> Binding<Bool> {
-        Binding(get: { openTools.contains(id) },
-                set: { open in
-                    grewAt = Date()
-                    if open { openTools.insert(id) } else { openTools.remove(id) }
-                })
-    }
-
-    private func label(_ glyph: String, _ text: String, muted: Bool,
-                       streaming: Bool = false) -> some View {
-        HStack(alignment: .top, spacing: 6) {
-            Text(glyph).font(.system(size: 11))
-            // Thinking streams too, and it is the part that runs longest with
-            // nothing else to show. Pinned to the tail so a long reasoning
-            // block does not push the pane around while it is written.
-            Text(streaming ? String(text.suffix(120)) : text)
-                .font(.system(size: 11))
-                .lineLimit(muted ? 2 : nil)
-            if streaming { Caret() }
-        }
-        .foregroundStyle(muted ? AnyShapeStyle(.secondary) : AnyShapeStyle(Color.orange))
-    }
-
-    private func turnEnd(_ end: AgentSession.TurnEnd) -> some View {
-        TurnFooter(end: end, facts: facts(end))
-    }
-
-    private func facts(_ end: AgentSession.TurnEnd) -> String {
-        var parts = [end.stop]
-        if let d = end.duration { parts.append(String(format: "%.1fs", d)) }
-        if let c = end.cost { parts.append(String(format: "$%.4f", c)) }
-        if end.tokensIn != nil || end.tokensOut != nil {
-            parts.append("\(end.tokensIn ?? 0)→\(end.tokensOut ?? 0) tok")
-        }
-        return parts.joined(separator: " · ")
-    }
-
     // MARK: - Composer
 
     /// The person's way in.
@@ -502,6 +449,96 @@ private struct TranscriptBottomPreferenceKey: PreferenceKey {
 /// Measured on a real transcript: sixteen lines, nine of them scaffold, the
 /// intent one line inside `[GOAL]`. The bubble was showing the envelope and
 /// burying the letter. The envelope is still there for anyone who needs it.
+/// One transcript row, isolated behind `Equatable`.
+///
+/// The transcript mounts its whole window in a non-lazy stack — `LazyVStack`
+/// spun forever inside `LazyStack.place(subviews:)` while streamed rows changed
+/// height — and `ScrollView` has to size that entire stack to know its scroll
+/// range. So a streamed delta re-ran the layout for every mounted row to settle
+/// a change that usually touches only the last one: with five agents streaming,
+/// `sample` put 1088 of 5157 main-thread samples inside
+/// `GeometryReaderLayout.placeSubviews` → `ScrollViewLayoutComputer.sizeThatFits`.
+///
+/// Equality lets SwiftUI skip the body *and* the re-measure for rows that did
+/// not move, which is all of them but one during a stream.
+private struct TranscriptRow: View, Equatable {
+    let item: AgentSession.Row
+    let streaming: Bool
+    let open: Bool
+    let root: String
+    let setOpen: (Bool) -> Void
+
+    /// `setOpen` is deliberately not compared: the parent rebuilds that closure
+    /// on every body pass, so comparing it would defeat the shell entirely, and
+    /// nothing it captures changes what this row draws.
+    static func == (lhs: TranscriptRow, rhs: TranscriptRow) -> Bool {
+        lhs.item == rhs.item
+            && lhs.streaming == rhs.streaming
+            && lhs.open == rhs.open
+            && lhs.root == rhs.root
+    }
+
+    var body: some View {
+        content.padding(.top, item.topGap)
+    }
+
+    @ViewBuilder
+    private var content: some View {
+        switch item.entry {
+        case .said(_, let speaker, let text):
+            Instruction(speaker: speaker, read: AgentSession.read(instruction: text))
+        case .answered(_, let text):
+            // Selectable, because the reason to read an agent's answer is
+            // usually to take something out of it. The caret says the row is
+            // still being written — a terminal can only show characters
+            // arriving and leave "did it stop there?" to be guessed.
+            Answer(text: text, streaming: streaming)
+        case .thought(_, let body):
+            label("✻", (body?.isEmpty == false ? body! : "thinking"),
+                  muted: true, streaming: streaming)
+        case .tool(_, let call):
+            if let change = call.change {
+                ChangeRow(call: call, change: change, root: root, open: openBinding)
+            } else {
+                ToolRow(call: call, open: openBinding)
+            }
+        case .turnEnded(_, let end):
+            TurnFooter(end: end, facts: Self.facts(end))
+        case .notice(_, let text):
+            label("!", text, muted: false)
+        }
+    }
+
+    private var openBinding: Binding<Bool> {
+        Binding(get: { open }, set: { setOpen($0) })
+    }
+
+    private func label(_ glyph: String, _ text: String, muted: Bool,
+                       streaming: Bool = false) -> some View {
+        HStack(alignment: .top, spacing: 6) {
+            Text(glyph).font(.system(size: 11))
+            // Thinking streams too, and it is the part that runs longest with
+            // nothing else to show. Pinned to the tail so a long reasoning
+            // block does not push the pane around while it is written.
+            Text(streaming ? String(text.suffix(120)) : text)
+                .font(.system(size: 11))
+                .lineLimit(muted ? 2 : nil)
+            if streaming { Caret() }
+        }
+        .foregroundStyle(muted ? AnyShapeStyle(.secondary) : AnyShapeStyle(Color.orange))
+    }
+
+    private static func facts(_ end: AgentSession.TurnEnd) -> String {
+        var parts = [end.stop]
+        if let d = end.duration { parts.append(String(format: "%.1fs", d)) }
+        if let c = end.cost { parts.append(String(format: "$%.4f", c)) }
+        if end.tokensIn != nil || end.tokensOut != nil {
+            parts.append("\(end.tokensIn ?? 0)→\(end.tokensOut ?? 0) tok")
+        }
+        return parts.joined(separator: " · ")
+    }
+}
+
 private struct Instruction: View {
     let speaker: AgentSession.Speaker
     let read: AgentSession.Instruction
