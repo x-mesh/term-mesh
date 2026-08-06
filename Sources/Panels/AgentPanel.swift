@@ -31,7 +31,6 @@ final class AgentPanel: ObservableObject, Panel {
 
     let session = AgentSession()
 
-    private var cancellables = Set<AnyCancellable>()
     private var focusRequest: (() -> Void)?
 
     init(id: UUID = UUID(), agentName: String, teamName: String,
@@ -44,11 +43,12 @@ final class AgentPanel: ObservableObject, Panel {
         self.cli = cli
         self.color = color
         self.title = title ?? agentName
-        // A panel is an ObservableObject wrapping another one, so its own
-        // changes have to be forwarded or the pane never redraws.
-        session.objectWillChange
-            .sink { [weak self] in self?.objectWillChange.send() }
-            .store(in: &cancellables)
+        // No session forwarding here on purpose. This used to republish every
+        // one of the session's announcements as the panel's own, which meant a
+        // streamed character invalidated the *panel* — and so every view
+        // watching it, whether or not it drew the transcript. The session is
+        // `@Observable` now: a view that reads `panel.session.rows` depends on
+        // that property alone. What this object still announces is `title`.
     }
 
     func start(claudePath: String, model: String, instructions: String,
@@ -96,7 +96,6 @@ final class AgentPanel: ObservableObject, Panel {
 
     func close() {
         session.stop()
-        cancellables.removeAll()
     }
 
     func focus() { focusRequest?() }
