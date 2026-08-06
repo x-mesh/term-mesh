@@ -88,6 +88,9 @@ enum AgentDiff {
     /// largest real edit measured across 88 sessions was 462 lines, so this
     /// holds every one of them and exists for the one that is not real.
     static let maxDiffInputLines = 4_000
+    /// A single minified line can evade the line budget while still making a
+    /// large temporary `String` and horizontal layout. Count bytes first.
+    static let maxDiffInputBytes = 1 * 1024 * 1024
 
     // MARK: - Reading a call
 
@@ -115,6 +118,11 @@ enum AgentDiff {
 
         if let old = input["old_string"] as? String,
            let new = input["new_string"] as? String {
+            if let unwalked = tooBigToRead(path: path, kind: .edit,
+                                           old: old, new: new,
+                                           everywhere: everywhere) {
+                return unwalked
+            }
             let before = split(old), after = split(new)
             if let unwalked = tooBigToDiff(path: path, kind: .edit, old: before,
                                            new: after, everywhere: everywhere) {
@@ -354,6 +362,20 @@ enum AgentDiff {
         guard total > maxDiffInputLines else { return nil }
         return Change(path: path, kind: kind, added: new.count, removed: old.count,
                       lines: [], elided: total, everywhere: everywhere)
+    }
+
+    private static func tooBigToRead(path: String, kind: Kind, old: String,
+                                     new: String, everywhere: Bool) -> Change? {
+        let bytes = old.utf8.count + new.utf8.count
+        guard bytes > maxDiffInputBytes else { return nil }
+        let removed = old.isEmpty ? 0 : old.utf8.reduce(into: 1) { count, byte in
+            if byte == 0x0A { count += 1 }
+        }
+        let added = new.isEmpty ? 0 : new.utf8.reduce(into: 1) { count, byte in
+            if byte == 0x0A { count += 1 }
+        }
+        return Change(path: path, kind: kind, added: added, removed: removed,
+                      lines: [], elided: added + removed, everywhere: everywhere)
     }
 
     private static func multiEdit(path: String, edits: [[String: Any]],

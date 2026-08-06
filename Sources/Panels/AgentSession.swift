@@ -1,6 +1,159 @@
 import Foundation
 import Combine
 
+/// Splits an NDJSON byte stream without copying the unread tail once per line.
+/// Owned by the stream's serial queue; it is intentionally not thread-safe.
+final class AgentStreamDecoder {
+    static let defaultMaxLineBytes = 8 * 1024 * 1024
+    static let maxPendingBatchBytes = 1 * 1024 * 1024
+    static let batchInterval: TimeInterval = 1.0 / 30.0
+    enum Output: Equatable {
+        case line(String)
+        case oversized(Int)
+    }
+
+    private var bytes: [UInt8] = []
+    private var scanOffset = 0
+    private let maxLineBytes: Int
+
+    init(maxLineBytes: Int) {
+        self.maxLineBytes = maxLineBytes
+    }
+
+    func consume(_ data: Data) -> [Output] {
+        bytes.append(contentsOf: data)
+        var output: [Output] = []
+        var lineStart = 0
+        var index = scanOffset
+
+        while index < bytes.count {
+            guard bytes[index] == 0x0A else {
+                index += 1
+                continue
+            }
+            var end = index
+            if end > lineStart, bytes[end - 1] == 0x0D { end -= 1 }
+            if end > lineStart {
+                let lineBytes = bytes[lineStart..<end]
+                if lineBytes.count > maxLineBytes {
+                    output.append(.oversized(lineBytes.count))
+                } else if let line = String(bytes: lineBytes, encoding: .utf8), !line.isEmpty {
+                    output.append(.line(line))
+                }
+            }
+            lineStart = index + 1
+            index += 1
+        }
+
+        if lineStart > 0 {
+            bytes.removeFirst(lineStart)
+            index -= lineStart
+        }
+        scanOffset = index
+
+        if bytes.count > maxLineBytes {
+            output.append(.oversized(bytes.count))
+            bytes.removeAll(keepingCapacity: true)
+            scanOffset = 0
+        }
+        return output
+    }
+}
+
+/// JSON objects are created and then consumed on two serial queues. Foundation
+/// exposes them as `Any`, so Swift cannot prove that they are immutable; this
+/// wrapper owns the transfer and no caller mutates the object after parsing.
+private struct AgentParsedLine: @unchecked Sendable {
+    let raw: String
+    let object: [String: Any]?
+    let preparedChanges: [String: AgentDiff.Change]
+    let preparedToolIDs: Set<String>
+    let sourceLineCount: Int
+    let sourceBytes: Int
+
+    init(_ raw: String) {
+        self.raw = raw
+        sourceLineCount = 1
+        sourceBytes = raw.utf8.count
+        if let data = raw.data(using: .utf8) {
+            object = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+        } else {
+            object = nil
+        }
+        var changes: [String: AgentDiff.Change] = [:]
+        var toolIDs: Set<String> = []
+        if object?["type"] as? String == "assistant",
+           let message = object?["message"] as? [String: Any] {
+            for block in message["content"] as? [[String: Any]] ?? []
+            where block["type"] as? String == "tool_use" {
+                guard let id = block["id"] as? String else { continue }
+                toolIDs.insert(id)
+                let name = block["name"] as? String ?? "tool"
+                let input = block["input"] as? [String: Any] ?? [:]
+                changes[id] = AgentDiff.change(tool: name, input: input)
+            }
+        }
+        preparedChanges = changes
+        preparedToolIDs = toolIDs
+    }
+
+    private init(object: [String: Any], sourceLineCount: Int, sourceBytes: Int) {
+        raw = ""
+        self.object = object
+        preparedChanges = [:]
+        preparedToolIDs = []
+        self.sourceLineCount = sourceLineCount
+        self.sourceBytes = sourceBytes
+    }
+
+    private var deltaParts: (index: Int, field: String, text: String)? {
+        guard object?["type"] as? String == "stream_event",
+              let event = object?["event"] as? [String: Any],
+              event["type"] as? String == "content_block_delta",
+              let index = event["index"] as? Int,
+              let delta = event["delta"] as? [String: Any],
+              let type = delta["type"] as? String else { return nil }
+        if type == "text_delta", let text = delta["text"] as? String {
+            return (index, "text", text)
+        }
+        if type == "thinking_delta", let text = delta["thinking"] as? String {
+            return (index, "thinking", text)
+        }
+        return nil
+    }
+
+    /// Adjacent deltas for the same content block are semantically one append.
+    /// Merging them here avoids repeatedly copying the growing Swift `String`
+    /// when a CLI emits one JSON frame per token.
+    func merging(_ next: AgentParsedLine) -> AgentParsedLine? {
+        guard let lhs = deltaParts, let rhs = next.deltaParts,
+              lhs.index == rhs.index, lhs.field == rhs.field,
+              var outer = object,
+              var event = outer["event"] as? [String: Any],
+              var delta = event["delta"] as? [String: Any]
+        else { return nil }
+        delta[lhs.field] = lhs.text + rhs.text
+        event["delta"] = delta
+        outer["event"] = event
+        return AgentParsedLine(
+            object: outer,
+            sourceLineCount: sourceLineCount + next.sourceLineCount,
+            sourceBytes: sourceBytes + next.sourceBytes
+        )
+    }
+
+    var isBarrier: Bool {
+        guard let type = object?["type"] as? String else { return true }
+        if type == "result" || type == "system" || type == "user" || type == "assistant" {
+            return true
+        }
+        guard type == "stream_event",
+              let event = object?["event"] as? [String: Any],
+              let eventType = event["type"] as? String else { return false }
+        return eventType != "content_block_delta"
+    }
+}
+
 /// A running agent, held directly rather than through a terminal.
 ///
 /// Everything terminal-shaped in the pipe transport is there because the host
@@ -37,7 +190,7 @@ final class AgentSession: ObservableObject {
         case person
     }
 
-    enum Entry: Identifiable {
+    enum Entry: Identifiable, Equatable {
         case said(id: UUID, Speaker, String)
         case answered(id: UUID, String)
         case thought(id: UUID, String?)
@@ -213,14 +366,65 @@ final class AgentSession: ObservableObject {
     /// transcript rebuilt itself twice for each character that arrived.
     private(set) var entries: [Entry] = [] {
         didSet {
-            // Before `revision`, never after: the announcement is what makes a
-            // body re-run, and it must not find rows that describe the previous
-            // entries.
+            if oldValue.count != entries.count ||
+                !zip(oldValue, entries).allSatisfy({ $0.0.id == $0.1.id }) {
+                rowsStructureDirty = true
+            } else {
+                for (old, new) in zip(oldValue, entries) where old != new {
+                    dirtyEntryIDs.insert(new.id)
+                }
+            }
+            entriesDirty = true
+            if mutationDepth == 0 { publishEntries() }
+        }
+    }
+
+    /// A pipe read can contain hundreds of character deltas. Apply the whole
+    /// read as one model transaction so row projection and SwiftUI invalidation
+    /// happen once, not once per character.
+    private var mutationDepth = 0
+    private var entriesDirty = false
+    private var rowsStructureDirty = true
+    private var dirtyEntryIDs: Set<UUID> = []
+
+    private func withEntryTransaction(_ body: () -> Void) {
+        mutationDepth += 1
+        body()
+        mutationDepth -= 1
+        if mutationDepth == 0, entriesDirty { publishEntries() }
+    }
+
+    private func publishEntries() {
+        guard entriesDirty else { return }
+        entriesDirty = false
+        if rowsStructureDirty {
             let display = Self.displayRows(for: entries)
             rows = display.rows
             omittedEntryCount = display.omitted
-            revision &+= 1
+        } else if !dirtyEntryIDs.isEmpty {
+            let displayStart = max(0, entries.count - Self.maxRenderedEntries)
+            var relativeIndexes = Set<Int>()
+            for id in dirtyEntryIDs {
+                guard let absolute = entries.firstIndex(where: { $0.id == id }),
+                      absolute >= displayStart else { continue }
+                let relative = absolute - displayStart
+                relativeIndexes.insert(relative)
+                if relative + 1 < rows.count { relativeIndexes.insert(relative + 1) }
+            }
+            for relative in relativeIndexes.sorted() where relative < rows.count {
+                let absolute = displayStart + relative
+                let entry = entries[absolute]
+                let previous = absolute > displayStart ? entries[absolute - 1] : nil
+                rows[relative] = Row(
+                    id: entry.id,
+                    topGap: Self.topGap(before: entry, after: previous),
+                    entry: entry
+                )
+            }
         }
+        rowsStructureDirty = false
+        dirtyEntryIDs.removeAll(keepingCapacity: true)
+        revision &+= 1
     }
 
     /// One transcript row, with its identity and its spacing already decided.
@@ -298,6 +502,14 @@ final class AgentSession: ObservableObject {
     /// answer grows an entry that is already there, so the count sits still
     /// while the text runs off the bottom of the pane.
     @Published private(set) var revision = 0
+    #if DEBUG
+    private var debugAppliedBatches = 0
+    private var debugAppliedLines = 0
+    private var debugAppliedBytes = 0
+    private var debugAutoScrolls = 0
+    private var debugApplyTotalMs = 0.0
+    private var debugApplyMaxMs = 0.0
+    #endif
     @Published private(set) var isThinking = false {
         didSet {
             guard oldValue != isThinking else { return }
@@ -343,6 +555,10 @@ final class AgentSession: ObservableObject {
         var stdoutEOF = false
         var terminationStatus: Int32?
         var finishScheduled = false
+        let decoder = AgentStreamDecoder(maxLineBytes: AgentStreamDecoder.defaultMaxLineBytes)
+        var pending: [AgentParsedLine] = []
+        var pendingBytes = 0
+        var flushScheduled = false
 
         /// Protects FileHandle read/notification/close operations only.
         private let ioLock = NSLock()
@@ -398,6 +614,40 @@ final class AgentSession: ObservableObject {
             finishScheduled = true
             return terminationStatus
         }
+
+        /// Called only on `queue`. At most one timer is outstanding.
+        func enqueue(_ parsed: [AgentParsedLine], flush: @escaping @Sendable ([AgentParsedLine]) -> Void) {
+            guard !parsed.isEmpty else { return }
+            for item in parsed {
+                if let last = pending.last, let merged = last.merging(item) {
+                    pending[pending.count - 1] = merged
+                } else {
+                    pending.append(item)
+                }
+                pendingBytes += item.sourceBytes
+                if pendingBytes >= AgentStreamDecoder.maxPendingBatchBytes {
+                    flushPending(flush)
+                }
+            }
+            if parsed.contains(where: \.isBarrier) {
+                flushPending(flush)
+                return
+            }
+            guard !flushScheduled else { return }
+            flushScheduled = true
+            queue.asyncAfter(deadline: .now() + AgentStreamDecoder.batchInterval) { [weak self] in
+                self?.flushPending(flush)
+            }
+        }
+
+        func flushPending(_ flush: @escaping @Sendable ([AgentParsedLine]) -> Void) {
+            flushScheduled = false
+            guard !pending.isEmpty else { return }
+            let batch = pending
+            pending.removeAll(keepingCapacity: true)
+            pendingBytes = 0
+            flush(batch)
+        }
     }
 
     private var process: Process?
@@ -411,11 +661,11 @@ final class AgentSession: ObservableObject {
     /// answer that is most of a line, and if the line it lands in is `result`
     /// the turn never ends at all. Split on newlines in the bytes; decode only
     /// what is whole.
-    private var carry = Data()
+    private var directDecoder = AgentStreamDecoder(maxLineBytes: AgentSession.maxLineBytes)
 
     /// A line that never arrives must not grow forever. Far above any real
     /// event: a long tool result is tens of kilobytes.
-    private static let maxLineBytes = 8 * 1024 * 1024
+    private static let maxLineBytes = AgentStreamDecoder.defaultMaxLineBytes
 
     /// How long stdout may stay open after the agent itself has gone.
     ///
@@ -691,9 +941,21 @@ final class AgentSession: ObservableObject {
                 streams.queue.async {
                     guard !streams.closed else { return }
                     if !data.isEmpty {
-                        DispatchQueue.main.async { [weak self, weak p] in
-                            guard let self, let p, self.process === p else { return }
-                            self.consume(data)
+                        let parsed = streams.decoder.consume(data).map { output -> AgentParsedLine in
+                            switch output {
+                            case .line(let line):
+                                return AgentParsedLine(line)
+                            case .oversized(let count):
+                                return AgentParsedLine(
+                                    "dropped an unterminated line of \(count) bytes"
+                                )
+                            }
+                        }
+                        streams.enqueue(parsed) { [weak self, weak p] batch in
+                            DispatchQueue.main.async { [weak self, weak p] in
+                                guard let self, let p, self.process === p else { return }
+                                self.apply(batch)
+                            }
                         }
                         return
                     }
@@ -702,6 +964,12 @@ final class AgentSession: ObservableObject {
                     // stdout events were enqueued under ioLock before this event.
                     streams.stopOutputNotifications()
                     streams.stdoutEOF = true
+                    streams.flushPending { [weak self, weak p] batch in
+                        DispatchQueue.main.async { [weak self, weak p] in
+                            guard let self, let p, self.process === p else { return }
+                            self.apply(batch)
+                        }
+                    }
                     guard let code = streams.takeFinishCodeIfReady() else { return }
                     DispatchQueue.main.async { [weak self, weak p] in
                         guard let self, let p, self.process === p else { return }
@@ -835,7 +1103,7 @@ final class AgentSession: ObservableObject {
         stdin = nil
         streamResources = nil
         process = nil
-        carry.removeAll()
+        directDecoder = AgentStreamDecoder(maxLineBytes: Self.maxLineBytes)
         isRunning = false
         canInterrupt = false
 
@@ -1011,36 +1279,62 @@ final class AgentSession: ObservableObject {
     // MARK: - Reading the stream
 
     private func consume(_ data: Data) {
-        carry.append(data)
-        while let newline = carry.firstIndex(of: 0x0A) {
-            let line = Data(carry[carry.startIndex..<newline])
-            carry = Data(carry[carry.index(after: newline)...])
-            guard !line.isEmpty, let text = String(data: line, encoding: .utf8),
-                  !text.isEmpty
-            else { continue }
-            handle(text)
-        }
-        if carry.count > Self.maxLineBytes {
-            append(.notice(id: UUID(), "dropped an unterminated line of \(carry.count) bytes"))
-            carry.removeAll()
+        withEntryTransaction {
+            for output in directDecoder.consume(data) {
+                switch output {
+                case .line(let line):
+                    handle(AgentParsedLine(line))
+                case .oversized(let count):
+                    append(.notice(
+                        id: UUID(),
+                        "dropped an unterminated line of \(count) bytes"
+                    ))
+                }
+            }
         }
     }
 
-    private func handle(_ line: String) {
-        guard let data = line.data(using: .utf8),
-              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
-        else {
-            // Not every line is ours — a CLI may write a warning to stdout.
-            // Showing it beats swallowing it.
-            // A CLI colours its warnings whether or not anything can interpret
-            // the escapes. Nothing here can — this draws text, not cells.
-            append(.notice(id: UUID(), Self.withoutAnsi(line)))
+    /// Production input is parsed off-main and arrives in coalesced batches.
+    /// Tests still feed individual strings through `handle(_:)`, which keeps
+    /// their synchronous contract while exercising the same event handlers.
+    private func apply(_ batch: [AgentParsedLine]) {
+        #if DEBUG
+        let applyStarted = CFAbsoluteTimeGetCurrent()
+        defer {
+            let elapsed = (CFAbsoluteTimeGetCurrent() - applyStarted) * 1_000
+            debugApplyTotalMs += elapsed
+            debugApplyMaxMs = max(debugApplyMaxMs, elapsed)
+        }
+        debugAppliedBatches += 1
+        debugAppliedLines += batch.reduce(0) { $0 + $1.sourceLineCount }
+        debugAppliedBytes += batch.reduce(0) { $0 + $1.sourceBytes }
+        #endif
+        withEntryTransaction {
+            for parsed in batch { handle(parsed) }
+        }
+    }
+
+    private func handle(_ parsed: AgentParsedLine) {
+        guard let object = parsed.object else {
+            append(.notice(id: UUID(), Self.withoutAnsi(parsed.raw)))
             return
         }
+        handle(object, preparedChanges: parsed.preparedChanges,
+               preparedToolIDs: parsed.preparedToolIDs)
+    }
+
+    private func handle(_ line: String) {
+        withEntryTransaction { handle(AgentParsedLine(line)) }
+    }
+
+    private func handle(_ obj: [String: Any],
+                        preparedChanges: [String: AgentDiff.Change] = [:],
+                        preparedToolIDs: Set<String> = []) {
         switch obj["type"] as? String {
         case "system":  system(obj)
         case "user":    user(obj)
-        case "assistant": assistant(obj)
+        case "assistant": assistant(obj, preparedChanges: preparedChanges,
+                                      preparedToolIDs: preparedToolIDs)
         case "stream_event": streamEvent(obj["event"] as? [String: Any] ?? [:])
         case "result":  result(obj)
         default:        break
@@ -1074,7 +1368,9 @@ final class AgentSession: ObservableObject {
         }
     }
 
-    private func assistant(_ o: [String: Any]) {
+    private func assistant(_ o: [String: Any],
+                           preparedChanges: [String: AgentDiff.Change],
+                           preparedToolIDs: Set<String>) {
         let message = o["message"] as? [String: Any] ?? [:]
         for block in message["content"] as? [[String: Any]] ?? [] {
             switch block["type"] as? String {
@@ -1096,7 +1392,10 @@ final class AgentSession: ObservableObject {
                     .trimmingCharacters(in: .whitespacesAndNewlines)
                 append(.thought(id: UUID(), body.isEmpty ? nil : body))
             case "tool_use":
-                openTool(block)
+                let toolId = block["id"] as? String
+                openTool(block,
+                         preparedChange: toolId.flatMap { preparedChanges[$0] },
+                         changeWasPrepared: toolId.map(preparedToolIDs.contains) ?? false)
             default:
                 break
             }
@@ -1169,7 +1468,8 @@ final class AgentSession: ObservableObject {
         }
     }
 
-    private func openTool(_ block: [String: Any]) {
+    private func openTool(_ block: [String: Any], preparedChange: AgentDiff.Change?,
+                          changeWasPrepared: Bool) {
         let name = block["name"] as? String ?? "tool"
         let args = block["input"] as? [String: Any] ?? [:]
         // The one field that says what a call will do, per tool. A generic dump
@@ -1179,7 +1479,9 @@ final class AgentSession: ObservableObject {
         // The input already carries everything a diff needs; this was pulling
         // one string out of it and dropping the rest on the floor. Worked out
         // here, once, because a view's body is the one place it must never be.
-        let change = AgentDiff.change(tool: name, input: args)
+        let change = changeWasPrepared
+            ? preparedChange
+            : AgentDiff.change(tool: name, input: args)
         append(.tool(id: UUID(),
                      ToolCall(name: name, headline: headline, change: change)))
         if let id = block["id"] as? String { openTools[id] = entries.count - 1 }
@@ -1320,6 +1622,28 @@ final class AgentSession: ObservableObject {
     // MARK: - Testing
 
     #if DEBUG
+    struct RenderMetrics {
+        let batches: Int
+        let lines: Int
+        let bytes: Int
+        let revisions: Int
+        let autoScrolls: Int
+        let entries: Int
+        let renderedRows: Int
+        let applyTotalMs: Double
+        let applyMaxMs: Double
+    }
+
+    func noteAutoScrollForDebug() { debugAutoScrolls += 1 }
+
+    func renderMetricsForDebug() -> RenderMetrics {
+        RenderMetrics(batches: debugAppliedBatches, lines: debugAppliedLines,
+                      bytes: debugAppliedBytes, revisions: revision,
+                      autoScrolls: debugAutoScrolls, entries: entries.count,
+                      renderedRows: rows.count, applyTotalMs: debugApplyTotalMs,
+                      applyMaxMs: debugApplyMaxMs)
+    }
+
     /// Feed one line of the stream, as the reader would.
     func ingestForTesting(_ line: String) { handle(line) }
 
@@ -1347,6 +1671,11 @@ final class AgentSession: ObservableObject {
 
     /// Bytes as the reader would hand them over, boundaries and all.
     func consumeForTesting(_ data: Data) { consume(data) }
+
+    /// A production-style parsed batch without a Process or pipe.
+    func applyBatchForTesting(_ lines: [String]) {
+        apply(lines.map(AgentParsedLine.init))
+    }
 
     /// The process going away.
     func finishForTesting(code: Int32) { finishAfterDrain(code: code) }

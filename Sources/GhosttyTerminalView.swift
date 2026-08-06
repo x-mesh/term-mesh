@@ -1530,10 +1530,12 @@ final class TerminalSurface: Identifiable, ObservableObject {
     #if DEBUG
     @MainActor func debugRendererVisibilityState() -> (
         requested: Bool,
+        realized: Bool,
         unrealizePending: Bool,
         unrealizeScheduleCount: Int
     ) {
-        (rendererVisibilityRequested, rendererUnrealizeWork != nil, rendererUnrealizeScheduleCount)
+        (rendererVisibilityRequested, rendererRealized,
+         rendererUnrealizeWork != nil, rendererUnrealizeScheduleCount)
     }
     #endif
 
