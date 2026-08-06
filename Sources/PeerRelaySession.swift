@@ -356,8 +356,12 @@ actor RelayResizeCoalescer {
     private var session: PeerSession
     private let surfaceID: Data
     private let delayNs: UInt64
-    private var pending: (cols: UInt32, rows: UInt32)?
+    private var pending: (cols: UInt32, rows: UInt32, claimAuthority: Bool)?
     private var flushTask: Task<Void, Never>?
+    private var authorityEligible: Bool
+    /// The helper's first resize only reconciles Ghostty's initial geometry.
+    /// It is not a divider/window interaction and must not steal authority.
+    private var hasObservedInitialResize = false
     /// The heal action itself. Owned by `PeerRelaySession`, not this actor:
     /// R3 replaced the old in-place resize nudge with a resume re-attach,
     /// which needs `PeerRelaySession`'s session/transport/seq-tracking state
@@ -391,6 +395,7 @@ actor RelayResizeCoalescer {
         surfaceID: Data,
         initialCols: UInt32,
         initialRows: UInt32,
+        authorityEligible: Bool = false,
         delayMs: UInt64 = 24,
         healDebounceMs: UInt64 = 400,
         healMaxWaitSeconds: TimeInterval = 2.0,
@@ -399,6 +404,7 @@ actor RelayResizeCoalescer {
         self.session = session
         self.surfaceID = surfaceID
         self.delayNs = delayMs * 1_000_000
+        self.authorityEligible = authorityEligible
         self.healDebounceSeconds = TimeInterval(healDebounceMs) / 1000.0
         self.healMaxWait = healMaxWaitSeconds
         self.onHeal = onHeal
@@ -424,8 +430,14 @@ actor RelayResizeCoalescer {
         lastSize
     }
 
+    func setAuthorityEligible(_ eligible: Bool) {
+        authorityEligible = eligible
+    }
+
     func submit(cols: UInt32, rows: UInt32) {
-        pending = (cols, rows)
+        let claimAuthority = authorityEligible && hasObservedInitialResize
+        hasObservedInitialResize = true
+        pending = (cols, rows, claimAuthority)
         lastSize = (cols, rows)
         guard flushTask == nil else { return }
         let delayNs = self.delayNs
@@ -458,7 +470,43 @@ actor RelayResizeCoalescer {
         }
         pending = nil
         flushTask = nil
-        try? await session.sendResize(surfaceID: surfaceID, cols: size.cols, rows: size.rows)
+        do {
+            try await session.sendResize(
+                surfaceID: surfaceID,
+                cols: size.cols,
+                rows: size.rows,
+                claimAuthority: size.claimAuthority
+            )
+        } catch {
+            NSLog("[peer-relay] resize send failed; retrying latest size once: %@", String(describing: error))
+            // Preserve a newer resize that arrived while the failed write was
+            // suspended. Otherwise retry this size once after a short backoff.
+            if pending == nil { pending = size }
+            guard flushTask == nil else { return }
+            flushTask = Task { [weak self] in
+                try? await Task.sleep(nanoseconds: 50_000_000)
+                await self?.flushPendingWithoutRetry()
+            }
+        }
+    }
+
+    private func flushPendingWithoutRetry() async {
+        guard let size = pending else {
+            flushTask = nil
+            return
+        }
+        pending = nil
+        flushTask = nil
+        do {
+            try await session.sendResize(
+                surfaceID: surfaceID,
+                cols: size.cols,
+                rows: size.rows,
+                claimAuthority: size.claimAuthority
+            )
+        } catch {
+            NSLog("[peer-relay] resize retry failed: %@", String(describing: error))
+        }
     }
 
     // ── P9.2 gap heal ────────────────────────────────────────────────
@@ -826,6 +874,12 @@ final class PeerRelaySession {
     // Stored (not just local to `startPumping`) so `performResumeHeal` can
     // read the live remote size and re-target its session after a swap.
     private var resizeCoalescer: RelayResizeCoalescer?
+    private var resizeAuthorityEligible = false
+
+    func setResizeAuthorityEligible(_ eligible: Bool) {
+        resizeAuthorityEligible = eligible
+        Task { await resizeCoalescer?.setAuthorityEligible(eligible) }
+    }
 
     // ── R3 resume heal (peer-relay-bulk-loss) ─────────────────────────
     //
@@ -1607,6 +1661,7 @@ final class PeerRelaySession {
             surfaceID: surfaceID,
             initialCols: remoteCols,
             initialRows: remoteRows,
+            authorityEligible: resizeAuthorityEligible,
             onHeal: { [weak self] reason in
                 await self?.performResumeHeal(reason: reason)
             }

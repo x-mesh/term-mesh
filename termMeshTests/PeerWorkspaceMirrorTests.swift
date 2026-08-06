@@ -491,17 +491,45 @@ final class RelayResizeCoalescerHealTests: XCTestCase {
     private actor ResizeColsCollector {
         private var pending = Data()
         private var collected: [UInt32] = []
+        private var authorityClaims: [Bool] = []
 
         func add(_ data: Data) {
             pending.append(data)
             while let env = try? decodeFrame(from: &pending) {
                 if case .resize(let r)? = env.payload {
                     collected.append(r.cols)
+                    authorityClaims.append(r.claimAuthority)
                 }
             }
         }
 
         func cols() -> [UInt32] { collected }
+        func claims() -> [Bool] { authorityClaims }
+    }
+
+    func testInitialResizeIsPassiveThenFocusedResizeClaimsAuthority() async throws {
+        let collector = ResizeColsCollector()
+        let session = makeSession(collector)
+        let coalescer = RelayResizeCoalescer(
+            session: session,
+            surfaceID: Data(repeating: 0xC4, count: 16),
+            initialCols: 80,
+            initialRows: 24,
+            authorityEligible: true,
+            delayMs: 1,
+            onHeal: { _ in }
+        )
+
+        await coalescer.submit(cols: 80, rows: 24)
+        await coalescer.flushNow()
+        await coalescer.submit(cols: 120, rows: 36)
+        await coalescer.flushNow()
+
+        let cols = await collector.cols()
+        let claims = await collector.claims()
+        XCTAssertEqual(cols, [80, 120])
+        XCTAssertEqual(claims, [false, true])
+        await coalescer.cancel()
     }
 
     /// Records every `onHeal(reason)` invocation.

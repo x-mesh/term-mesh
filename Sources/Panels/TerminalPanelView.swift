@@ -35,6 +35,12 @@ struct TerminalPanelView: View {
         // This prevents transient teardown/recreate that can momentarily detach the hosted terminal view.
         .id(panel.id)
         .background(Color.clear)
+        .onAppear {
+            panel.peerPaneSession?.relaySession.setResizeAuthorityEligible(isFocused)
+        }
+        .onChange(of: isFocused) { focused in
+            panel.peerPaneSession?.relaySession.setResizeAuthorityEligible(focused)
+        }
     }
 }
 

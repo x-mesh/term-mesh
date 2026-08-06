@@ -1692,6 +1692,9 @@ pub fn attach_cmd(
                             rows,
                             pixel_width: 0,
                             pixel_height: 0,
+                            // This CLI is the foreground interactive viewer;
+                            // SIGWINCH is an explicit resize of its terminal.
+                            claim_authority: true,
                         })),
                     };
                     if tx.send(env).is_err() {

@@ -142,6 +142,7 @@ final class PeerRelayWindowController: NSWindowController, NSWindowDelegate {
     // ── Show ─────────────────────────────────────────────────────────
 
     func show() {
+        relaySession.setResizeAuthorityEligible(true)
         window?.installPeerTitlebarGradientAccent()
         window?.makeKeyAndOrderFront(nil)
         // Accept the relay connection and begin pumping after the
@@ -224,6 +225,7 @@ final class PeerRelayWindowController: NSWindowController, NSWindowDelegate {
     func windowWillClose(_ notification: Notification) {
         guard !isClosing else { return }
         isClosing = true
+        relaySession.setResizeAuthorityEligible(false)
         if let occlusionObserver {
             NotificationCenter.default.removeObserver(occlusionObserver)
             self.occlusionObserver = nil
@@ -233,5 +235,13 @@ final class PeerRelayWindowController: NSWindowController, NSWindowDelegate {
         let s = relaySession
         Task { await s.stop() }
         onClose?()
+    }
+
+    func windowDidBecomeKey(_ notification: Notification) {
+        relaySession.setResizeAuthorityEligible(true)
+    }
+
+    func windowDidResignKey(_ notification: Notification) {
+        relaySession.setResizeAuthorityEligible(false)
     }
 }
