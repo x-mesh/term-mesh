@@ -20,7 +20,7 @@ final class SplitViewController {
 
     /// Monotonic counter incremented on each drag start. Used to invalidate stale
     /// timeout timers that would otherwise cancel a new drag of the same tab.
-    var dragGeneration: Int = 0
+    @ObservationIgnored var dragGeneration: Int = 0
 
     /// Source pane of the dragging tab
     var dragSourcePaneId: PaneID?
@@ -46,16 +46,16 @@ final class SplitViewController {
     var dragHiddenSourcePaneId: PaneID?
 
     /// Current frame of the entire split view container
-    var containerFrame: CGRect = .zero
+    @ObservationIgnored var containerFrame: CGRect = .zero
 
     /// Flag to prevent notification loops during external updates
-    var isExternalUpdateInProgress: Bool = false
+    @ObservationIgnored var isExternalUpdateInProgress: Bool = false
 
     /// Timestamp of last geometry notification for debouncing
-    var lastGeometryNotificationTime: TimeInterval = 0
+    @ObservationIgnored var lastGeometryNotificationTime: TimeInterval = 0
 
     /// Callback for geometry changes
-    var onGeometryChange: (() -> Void)?
+    @ObservationIgnored var onGeometryChange: (() -> Void)?
 
     init(rootNode: SplitNode? = nil) {
         if let rootNode {
@@ -74,6 +74,7 @@ final class SplitViewController {
     /// Set focus to a specific pane
     func focusPane(_ paneId: PaneID) {
         guard rootNode.findPane(paneId) != nil else { return }
+        guard focusedPaneId != paneId else { return }
 #if DEBUG
         dlog("focus.bonsplit pane=\(paneId.id.uuidString.prefix(5))")
 #endif
