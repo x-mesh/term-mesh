@@ -339,8 +339,12 @@ final class Workspace: Identifiable, ObservableObject {
             guard let self,
                   let selectedTabId,
                   let panelId = self.panelIdFromSurfaceId(selectedTabId),
-                  self.panels[panelId] is TerminalPanel,
-                  let agent = TeamOrchestrator.shared.agentIdentity(forPanelId: panelId) else {
+                  let panel = self.panels[panelId],
+                  let agent = TeamOrchestrator.shared.agentIdentity(forPanelId: panelId),
+                  let presentation = Self.agentRestartPresentation(
+                      panelType: panel.panelType,
+                      agentName: agent.agentName
+                  ) else {
                 return []
             }
 
@@ -356,16 +360,17 @@ final class Workspace: Identifiable, ObservableObject {
                 BonsplitController.PaneHeaderAction(
                     id: "agent-restart-\(panelId.uuidString)",
                     systemImage: "arrow.clockwise",
-                    help: "Restart \(agent.agentName) CLI — close + respawn (⌥-click: soft restart, just type the launch command)",
-                    accessibilityLabel: "Restart \(agent.agentName) CLI",
+                    help: presentation.help,
+                    accessibilityLabel: presentation.accessibilityLabel,
                     action: {
                         let optionHeld =
                             NSApp.currentEvent?.modifierFlags.contains(.option)
                             ?? NSEvent.modifierFlags.contains(.option)
+                        let useSoftRestart = optionHeld && presentation.allowsSoftRestart
                         #if DEBUG
-                        dlog("[team.restart] header.click team=\(agent.teamName) agent=\(agent.agentName) optionHeld=\(optionHeld) mode=\(optionHeld ? "soft" : "hard")")
+                        dlog("[team.restart] header.click team=\(agent.teamName) agent=\(agent.agentName) panelType=\(panel.panelType.rawValue) optionHeld=\(optionHeld) mode=\(useSoftRestart ? "soft" : "hard")")
                         #endif
-                        if optionHeld {
+                        if useSoftRestart {
                             TeamOrchestrator.shared.restartAgentPane(panelId: panelId)
                         } else {
                             // panelId-keyed so duplicate-named agents (e.g. two
@@ -380,6 +385,37 @@ final class Workspace: Identifiable, ObservableObject {
                     }
                 )
             ]
+        }
+    }
+
+    struct AgentRestartPresentation: Equatable {
+        let help: String
+        let accessibilityLabel: String
+        let allowsSoftRestart: Bool
+    }
+
+    /// Keep the pane-local context reset available when an agent moves from a
+    /// terminal-backed panel to the native renderer. Browser panes can never be
+    /// agents, while terminal panes retain their Option-click recovery shortcut.
+    static func agentRestartPresentation(
+        panelType: PanelType,
+        agentName: String
+    ) -> AgentRestartPresentation? {
+        switch panelType {
+        case .terminal:
+            return AgentRestartPresentation(
+                help: "Restart \(agentName) agent — clears conversation context (⌥-click: soft restart)",
+                accessibilityLabel: "Restart \(agentName) agent and clear conversation context",
+                allowsSoftRestart: true
+            )
+        case .agent:
+            return AgentRestartPresentation(
+                help: "Restart \(agentName) agent — clears conversation context",
+                accessibilityLabel: "Restart \(agentName) agent and clear conversation context",
+                allowsSoftRestart: false
+            )
+        case .browser:
+            return nil
         }
     }
 
