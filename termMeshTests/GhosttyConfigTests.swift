@@ -837,6 +837,70 @@ final class TabManagerNotificationOrderingSourceTests: XCTestCase {
     }
 }
 
+@MainActor
+final class TabManagerInactiveTitlePublicationTests: XCTestCase {
+    override func tearDown() {
+        AppFocusState.overrideIsFocused = nil
+        super.tearDown()
+    }
+
+    func testInactiveTitleBurstPublishesOnlyLatestValueOnActivation() async throws {
+        let manager = TabManager(
+            initialWorkingDirectory: "/tmp",
+            persistsSessionState: false
+        )
+        let workspace = try XCTUnwrap(manager.selectedWorkspace)
+        let panelId = try XCTUnwrap(workspace.focusedPanelId)
+        let originalTitle = workspace.panelTitles[panelId]
+
+        AppFocusState.overrideIsFocused = false
+        postTitle("background-1", workspaceId: workspace.id, panelId: panelId)
+        postTitle("background-2", workspaceId: workspace.id, panelId: panelId)
+        try await Task.sleep(nanoseconds: 100_000_000)
+
+        XCTAssertEqual(workspace.panelTitles[panelId], originalTitle)
+
+        AppFocusState.overrideIsFocused = true
+        NotificationCenter.default.post(name: NSApplication.didBecomeActiveNotification, object: nil)
+
+        XCTAssertEqual(workspace.panelTitles[panelId], "background-2")
+    }
+
+    func testScheduledActiveFlushDoesNotPublishAfterAppBecomesInactive() async throws {
+        let manager = TabManager(
+            initialWorkingDirectory: "/tmp",
+            persistsSessionState: false
+        )
+        let workspace = try XCTUnwrap(manager.selectedWorkspace)
+        let panelId = try XCTUnwrap(workspace.focusedPanelId)
+        let originalTitle = workspace.panelTitles[panelId]
+
+        AppFocusState.overrideIsFocused = true
+        postTitle("queued-while-active", workspaceId: workspace.id, panelId: panelId)
+        AppFocusState.overrideIsFocused = false
+        try await Task.sleep(nanoseconds: 100_000_000)
+
+        XCTAssertEqual(workspace.panelTitles[panelId], originalTitle)
+
+        AppFocusState.overrideIsFocused = true
+        NotificationCenter.default.post(name: NSApplication.didBecomeActiveNotification, object: nil)
+
+        XCTAssertEqual(workspace.panelTitles[panelId], "queued-while-active")
+    }
+
+    private func postTitle(_ title: String, workspaceId: UUID, panelId: UUID) {
+        NotificationCenter.default.post(
+            name: .ghosttyDidSetTitle,
+            object: nil,
+            userInfo: [
+                GhosttyNotificationKey.tabId: workspaceId,
+                GhosttyNotificationKey.surfaceId: panelId,
+                GhosttyNotificationKey.title: title,
+            ]
+        )
+    }
+}
+
 final class SocketControlSettingsTests: XCTestCase {
     func testMigrateModeSupportsExpandedSocketModes() {
         XCTAssertEqual(SocketControlSettings.migrateMode("off"), .off)

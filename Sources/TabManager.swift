@@ -145,6 +145,15 @@ class TabManager: ObservableObject {
             }
         })
         observers.append(NotificationCenter.default.addObserver(
+            forName: NSApplication.didBecomeActiveNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated { [weak self] in
+                self?.flushPendingPanelTitleUpdates()
+            }
+        })
+        observers.append(NotificationCenter.default.addObserver(
             forName: .termMeshBroadcastIMEText,
             object: nil,
             queue: .main
@@ -1578,12 +1587,21 @@ class TabManager: ObservableObject {
         guard !trimmed.isEmpty else { return }
         let key = PanelTitleUpdateKey(tabId: tabId, panelId: panelId)
         pendingPanelTitleUpdates[key] = trimmed
+        // Terminal programs may update their title continuously while the app is
+        // inactive. Publishing those strings through Workspace/@Published wakes
+        // every sidebar subscriber and can keep hidden NSHostingView graphs in a
+        // layout loop. Preserve only the newest value per surface; the activation
+        // observer above publishes the accumulated snapshot once it is visible.
+        guard AppFocusState.isAppActive() else { return }
         panelTitleUpdateCoalescer.signal { [weak self] in
             self?.flushPendingPanelTitleUpdates()
         }
     }
 
     private func flushPendingPanelTitleUpdates() {
+        // A flush scheduled while active can run after the app resigns active.
+        // Keep the snapshot queued rather than publishing into an inactive graph.
+        guard AppFocusState.isAppActive() else { return }
         guard !pendingPanelTitleUpdates.isEmpty else { return }
         let updates = pendingPanelTitleUpdates
         pendingPanelTitleUpdates.removeAll(keepingCapacity: true)
