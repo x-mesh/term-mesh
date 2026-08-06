@@ -374,20 +374,68 @@ struct AgentPanelView: View {
     /// pipeline. Here it is just a text field, and it can do what neither could:
     /// hold a multi-line draft without submitting on the first newline.
     private var composer: some View {
+        AgentComposer(
+            draft: $draft,
+            focused: $composerFocused,
+            agentName: panel.agentName,
+            accent: accent,
+            isThinking: session.isThinking,
+            canStop: canStop,
+            canSend: canSend,
+            isFocused: isFocused,
+            onSend: send,
+            onStop: { session.interrupt() }
+        )
+        .equatable()
+    }
+}
+
+/// The composer, isolated behind `Equatable`.
+///
+/// It is a text field and a button, but it sat in the panel's own body, so it
+/// was re-evaluated on every streamed delta along with the transcript — one
+/// more subtree for AttributeGraph to walk per token. Nothing it draws depends
+/// on the transcript, so it should not move when the transcript does.
+private struct AgentComposer: View, Equatable {
+    @Binding var draft: String
+    var focused: FocusState<Bool>.Binding
+    let agentName: String
+    let accent: Color
+    let isThinking: Bool
+    let canStop: Bool
+    let canSend: Bool
+    let isFocused: Bool
+    let onSend: () -> Void
+    let onStop: () -> Void
+
+    /// `draft` is compared, and has to be: the field is the one thing here that
+    /// the person is changing, and skipping its body would drop keystrokes.
+    /// The two closures are not — the panel rebuilds them on every pass.
+    static func == (lhs: AgentComposer, rhs: AgentComposer) -> Bool {
+        lhs.draft == rhs.draft
+            && lhs.agentName == rhs.agentName
+            && lhs.accent == rhs.accent
+            && lhs.isThinking == rhs.isThinking
+            && lhs.canStop == rhs.canStop
+            && lhs.canSend == rhs.canSend
+            && lhs.isFocused == rhs.isFocused
+    }
+
+    var body: some View {
         HStack(alignment: .bottom, spacing: 8) {
-            TextField("Message \(panel.agentName)…", text: $draft, axis: .vertical)
+            TextField("Message \(agentName)…", text: $draft, axis: .vertical)
                 .textFieldStyle(.plain)
                 .font(.system(size: 12))
                 .lineLimit(1...8)
-                .focused($composerFocused)
-                .onSubmit(send)
+                .focused(focused)
+                .onSubmit(onSend)
             // Which of six panes is working is a question you answer by
             // glancing, not by reading. So the state has a shape — and it
             // lives here rather than over the transcript, where it landed on
             // the banner card and read as the banner's decoration. This row
             // never scrolls, is the same place in every pane, and puts "it is
             // working" next to "stop it".
-            if session.isThinking {
+            if isThinking {
                 WorkingMark(accent: accent)
                     .transition(.opacity)
                     .allowsHitTesting(false)
@@ -398,7 +446,7 @@ struct AgentPanelView: View {
             // the far end of the header for the three seconds a haiku turn
             // lasts is not a control anyone can find. Send and stop are also
             // never both available, so they are never two buttons.
-            Button(action: canStop ? session.interrupt : send) {
+            Button(action: canStop ? onStop : onSend) {
                 Image(systemName: canStop ? "stop.circle.fill" : "arrow.up.circle.fill")
                     .font(.system(size: 16))
                     .foregroundStyle(canStop ? AnyShapeStyle(Color.red) : AnyShapeStyle(.tint))
@@ -410,9 +458,11 @@ struct AgentPanelView: View {
         .padding(.horizontal, 10)
         .padding(.vertical, 8)
         .background(Color.primary.opacity(isFocused ? 0.04 : 0.02))
-        .animation(.easeOut(duration: 0.2), value: session.isThinking)
+        .animation(.easeOut(duration: 0.2), value: isThinking)
     }
+}
 
+extension AgentPanelView {
     private var canSend: Bool {
         session.isRunning && !draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }

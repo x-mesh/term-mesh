@@ -209,7 +209,11 @@ private struct ReviewBoardTaskRow: View, Equatable {
     /// The closures are rebuilt by the parent on every pass and capture nothing
     /// that changes what this card draws, so comparing them would defeat the
     /// shell entirely.
-    static func == (lhs: ReviewBoardTaskRow, rhs: ReviewBoardTaskRow) -> Bool {
+    /// `nonisolated` because the panel is `@MainActor` and this type inherits
+    /// that, while `Equatable` is not actor-isolated. Everything compared here
+    /// is `Sendable`, so reading it off the main actor is safe — without this
+    /// the conformance is a warning today and an error under Swift 6.
+    nonisolated static func == (lhs: ReviewBoardTaskRow, rhs: ReviewBoardTaskRow) -> Bool {
         lhs.task == rhs.task
             && lhs.isSelected == rhs.isSelected
             && lhs.isWorking == rhs.isWorking
