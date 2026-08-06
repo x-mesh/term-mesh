@@ -397,6 +397,50 @@ final class PeerTeamLeaderTests: XCTestCase {
         )
     }
 
+    func testOwnerKeepaliveExtendsIdleGrantWithoutResurrectingExpiredBearer() async {
+        let controlPlane = PeerTeamLeaderControlPlane()
+        let bootstrap = await controlPlane.bootstrap(
+            validRequest(),
+            encodedBytes: 64,
+            nowUnixSeconds: 1_000,
+            nowLeaseSeconds: 10,
+            grantLifetimeSeconds: 10
+        ) { _ in "team-uuid" }
+        XCTAssertTrue(bootstrap.ok)
+
+        let renewed = await controlPlane.keepAliveGrant(
+            id: bootstrap.grant.grantID,
+            nowUnixSeconds: 1_009,
+            nowLeaseSeconds: 19
+        )
+        XCTAssertTrue(renewed)
+        let afterIdle = await controlPlane.execute(
+            validCommand(grant: bootstrap.grant, requestByte: 85),
+            encodedBytes: 128,
+            nowUnixSeconds: 1_018,
+            nowLeaseSeconds: 28
+        ) { _, _, _ in .success("{}") }
+        XCTAssertTrue(afterIdle.ok)
+
+        let resurrected = await controlPlane.keepAliveGrant(
+            id: bootstrap.grant.grantID,
+            nowUnixSeconds: 1_040,
+            nowLeaseSeconds: 50
+        )
+        XCTAssertFalse(resurrected)
+        let expired = await controlPlane.execute(
+            validCommand(grant: bootstrap.grant, requestByte: 86),
+            encodedBytes: 128,
+            nowUnixSeconds: 1_040,
+            nowLeaseSeconds: 50
+        ) { _, _, _ in .success("{}") }
+        XCTAssertFalse(expired.ok)
+        XCTAssertEqual(
+            expired.errorCode,
+            PeerTeamLeader.ValidationError.unknownGrant.rawValue
+        )
+    }
+
     func testSystemSleepDoesNotConsumeTheServerLease() async {
         let controlPlane = PeerTeamLeaderControlPlane()
         let bootstrap = await controlPlane.bootstrap(

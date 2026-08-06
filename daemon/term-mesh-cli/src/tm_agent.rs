@@ -3974,18 +3974,26 @@ fn remote_leader_rpc_call(
 fn remote_leader_proxy_result(proxied: Value) -> Result<Value, String> {
     if !proxied["ok"].as_bool().unwrap_or(false) {
         let result = &proxied["result"];
-        let error_code = result["error_code"].as_str().filter(|value| !value.is_empty());
+        let error_code = result["error_code"]
+            .as_str()
+            .filter(|value| !value.is_empty());
         let error_message = result["error_message"]
             .as_str()
             .filter(|value| !value.is_empty());
-        return Err(match (error_code, error_message) {
+        let mut message = match (error_code, error_message) {
             (Some(code), Some(message)) => {
                 format!("remote leader proxy [{code}]: {message}")
             }
             (Some(code), None) => format!("remote leader proxy [{code}]"),
             (None, Some(message)) => format!("remote leader proxy: {message}"),
             (None, None) => "remote leader proxy returned non-ok".into(),
-        });
+        };
+        if matches!(error_code, Some("expired_grant" | "unknown_grant")) {
+            message.push_str(
+                "; reconnect or restart the remote leader pane from its owning project window",
+            );
+        }
+        return Err(message);
     }
     Ok(json!({
         "ok": true,
@@ -16072,7 +16080,26 @@ mod auto_watch_tests {
 
         assert_eq!(
             error,
-            "remote leader proxy [expired_grant]: leader grant expired before dispatch"
+            "remote leader proxy [expired_grant]: leader grant expired before dispatch; \
+             reconnect or restart the remote leader pane from its owning project window"
+        );
+    }
+
+    #[test]
+    fn unknown_remote_leader_grant_has_an_actionable_recovery_hint() {
+        let error = remote_leader_proxy_result(json!({
+            "ok": false,
+            "result": {
+                "error_code": "unknown_grant",
+                "error_message": "remote leader command rejected",
+            },
+        }))
+        .unwrap_err();
+
+        assert!(error.contains("[unknown_grant]"), "{error}");
+        assert!(
+            error.contains("reconnect or restart the remote leader pane"),
+            "{error}"
         );
     }
 
