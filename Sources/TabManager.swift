@@ -492,15 +492,19 @@ class TabManager: ObservableObject {
 
     /// Observe currentDirectory changes on a workspace so session state is
     /// persisted when the user cd's into a different directory.
-    private var directoryObservers: [UUID: AnyCancellable] = [:]
-
+    ///
+    /// `Workspace` is `@Observable`, which has no `$currentDirectory`
+    /// publisher, so the workspace calls back instead. Its `didSet` carries
+    /// what the operators used to: nothing fires for the initial value, and
+    /// nothing fires when the path is reassigned unchanged.
     private func observeDirectoryChanges(for workspace: Workspace) {
-        directoryObservers[workspace.id] = workspace.$currentDirectory
-            .dropFirst()  // skip initial value
-            .removeDuplicates()
-            .sink { [weak self] _ in
-                self?.scheduleSessionSave()
-            }
+        workspace.onCurrentDirectoryChange = { [weak self] in
+            self?.scheduleSessionSave()
+        }
+    }
+
+    private func stopObservingDirectoryChanges(for workspace: Workspace) {
+        workspace.onCurrentDirectoryChange = nil
     }
 
     static func loadSavedSession() -> SavedSessionState? {
@@ -989,7 +993,7 @@ class TabManager: ObservableObject {
 
         notifications.clearNotifications(forTabId: workspace.id)
         unwireClosedBrowserTracking(for: workspace)
-        directoryObservers.removeValue(forKey: workspace.id)
+        stopObservingDirectoryChanges(for: workspace)
 
         guard let index = tabs.firstIndex(where: { $0.id == workspace.id }) else {
             scheduleSessionSave()
@@ -1055,7 +1059,7 @@ class TabManager: ObservableObject {
 
         let removed = tabs.remove(at: index)
         unwireClosedBrowserTracking(for: removed)
-        directoryObservers.removeValue(forKey: removed.id)
+        stopObservingDirectoryChanges(for: removed)
         lastFocusedPanelByTab.removeValue(forKey: removed.id)
 
         if tabs.isEmpty {

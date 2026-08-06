@@ -870,8 +870,7 @@ extension TabManager {
                         cont.resume(returning: value)
                     }
 
-                    cancellable = tab.$panels
-                        .map { $0.count }
+                    cancellable = tab.panelsCountSubject
                         .removeDuplicates()
                         .sink { count in
                             if count == 1 {
@@ -1106,8 +1105,7 @@ extension TabManager {
                 self.uiTestCancellables.removeAll()
             }
 
-            tab.$panels
-                .map { $0.count }
+            tab.panelsCountSubject
                 .removeDuplicates()
                 .sink { [weak self, weak tab] count in
                     Task { @MainActor in

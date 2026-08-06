@@ -2113,7 +2113,7 @@ private struct SidebarPeerProjectsView: View {
 private struct SidebarProjectLocalRowView: View {
     @EnvironmentObject private var tabManager: TabManager
     @ObservedObject private var orchestrator = TeamOrchestrator.shared
-    @ObservedObject var workspace: Workspace
+    let workspace: Workspace
     let usesSeparatedPresentation: Bool
     @State private var isHovering = false
 
