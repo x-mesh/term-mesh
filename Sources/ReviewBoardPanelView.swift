@@ -170,20 +170,54 @@ struct ReviewBoardPanelView: View {
     }
 
     private var taskList: some View {
-        VStack(alignment: .leading, spacing: 7) {
+        // Read once, not once per row. `selectedTask` searches the task list,
+        // so asking each row whether it is the selected one made drawing the
+        // list O(N²) — and every row also asked `isWorking`, which walked every
+        // team's agents. Both are settled here and handed down as values.
+        let selectedID = viewModel.selectedTask?.id
+        let working = viewModel.workingAssignees
+        return VStack(alignment: .leading, spacing: 7) {
             sectionTitle("Tasks")
             ForEach(viewModel.tasks) { task in
-                taskRow(task)
+                ReviewBoardTaskRow(
+                    task: task,
+                    isSelected: selectedID == task.id,
+                    isWorking: task.assignee.map(working.contains) ?? false,
+                    onSelect: { viewModel.selectTask(id: task.id) },
+                    onReveal: { viewModel.revealPane(for: task) }
+                )
+                .equatable()
             }
         }
     }
 
-    private func taskRow(_ task: ReviewBoardTask) -> some View {
-        let isSelected = viewModel.selectedTask?.id == task.id
+/// One task card, isolated behind `Equatable`.
+///
+/// The board republishes on every roster tick and on every task-board
+/// revision, and with ten agents working that is often. Without this shell the
+/// whole list re-evaluated each time — and each row's own body then re-read
+/// `selectedTask` (a search) and `isWorking` (a walk of every team's agents),
+/// so redrawing an N-task board cost O(N²) work for a change that usually
+/// moved one row's status string.
+private struct ReviewBoardTaskRow: View, Equatable {
+    let task: ReviewBoardTask
+    let isSelected: Bool
+    let isWorking: Bool
+    let onSelect: () -> Void
+    let onReveal: () -> Void
+
+    /// The closures are rebuilt by the parent on every pass and capture nothing
+    /// that changes what this card draws, so comparing them would defeat the
+    /// shell entirely.
+    static func == (lhs: ReviewBoardTaskRow, rhs: ReviewBoardTaskRow) -> Bool {
+        lhs.task == rhs.task
+            && lhs.isSelected == rhs.isSelected
+            && lhs.isWorking == rhs.isWorking
+    }
+
+    var body: some View {
         let parts = ReviewBoardText.splitDirective(task.title)
-        return Button {
-            viewModel.selectTask(id: task.id)
-        } label: {
+        return Button(action: onSelect) {
             VStack(alignment: .leading, spacing: 5) {
                 HStack(spacing: 6) {
                     if let directive = parts.directive {
@@ -204,7 +238,7 @@ struct ReviewBoardPanelView: View {
                     // "working" beats the board's own word when the agent's
                     // pane is printing: `assigned` is true but says nothing
                     // about whether anything is happening.
-                    if viewModel.isWorking(task) {
+                    if isWorking {
                         HStack(spacing: 3) {
                             Circle()
                                 .fill(Color.green)
@@ -251,13 +285,14 @@ struct ReviewBoardPanelView: View {
         .buttonStyle(.plain)
         // One click picks the task, two go to it — the same pair of meanings
         // a file list has, so nothing has to be explained.
-        .simultaneousGesture(TapGesture(count: 2).onEnded {
-            viewModel.revealPane(for: task)
-        })
+        .simultaneousGesture(TapGesture(count: 2).onEnded(onReveal))
         .accessibilityLabel("\(task.title), \(task.status), priority \(task.priority)")
         .accessibilityIdentifier("reviewBoard.task.\(task.id)")
     }
+}
+}
 
+extension ReviewBoardPanelView {
     private func taskDetails(_ task: ReviewBoardTask) -> some View {
         let digest = viewModel.digest(for: task)
         return VStack(alignment: .leading, spacing: 12) {

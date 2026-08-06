@@ -89,6 +89,10 @@ final class ReviewBoardViewModel: ObservableObject {
         if initialSnapshot == .empty {
             refresh()
         } else {
+            // `refresh()` derives these off a snapshot *change*, and this path
+            // has none to react to — the snapshot arrived with the caller.
+            rebuildDerivedSnapshotState()
+            workingAssignees = Self.runningAgentNames()
             keepSelectionValid()
         }
         observeTeams()
@@ -136,33 +140,28 @@ final class ReviewBoardViewModel: ObservableObject {
     /// Agent names that are printing right now, by the task they hold. The
     /// board's own status comes from the task board, which cannot tell work in
     /// progress from work not yet begun; this is what closes that gap.
-    var workingAssignees: Set<String> {
-        var working: Set<String> = []
-        for team in TeamOrchestrator.shared.listTeams() {
-            for agent in team["agents"] as? [[String: Any]] ?? [] {
-                guard (agent["agent_state"] as? String) == "running",
-                      let name = agent["name"] as? String else { continue }
-                working.insert(name)
-            }
-        }
-        return working
-    }
+    /// Derived, not computed.
+    ///
+    /// These three used to be computed properties, and the panel read them from
+    /// inside its body — `tasks` five times per pass plus twice per row (through
+    /// `selectedTask`), and `isWorking` once per row. Each read re-sorted the
+    /// board, re-filtered the queue, or walked every team's agent dictionaries
+    /// through `TeamOrchestrator.listTeams()`. With ten agents on a board of N
+    /// tasks that is O(N) subsystem walks and ~2N sorts to draw one frame, all
+    /// of it repeated on every streamed delta that dirtied the graph.
+    ///
+    /// They change only when the snapshot or the team roster does, so they are
+    /// settled there instead — once per refresh, not once per read.
+    @Published private(set) var tasks: [ReviewBoardTask] = []
+    @Published private(set) var pendingMergeQueue: [ReviewBoardMergeQueueItem] = []
+    @Published private(set) var workingAssignees: Set<String> = []
 
     func isWorking(_ task: ReviewBoardTask) -> Bool {
         guard let assignee = task.assignee else { return false }
         return workingAssignees.contains(assignee)
     }
 
-    var tasks: [ReviewBoardTask] {
-        snapshot.tasks.sorted { lhs, rhs in
-            let lhsRank = statusRank(lhs.status)
-            let rhsRank = statusRank(rhs.status)
-            if lhsRank != rhsRank { return lhsRank < rhsRank }
-            if lhs.priority != rhs.priority { return lhs.priority < rhs.priority }
-            return (lhs.updatedAt ?? "") > (rhs.updatedAt ?? "")
-        }
-    }
-
+    /// Cheap: a lookup in the already-sorted list, no sort of its own.
     var selectedTask: ReviewBoardTask? {
         if let selectedTaskID,
            let task = tasks.first(where: { $0.id == selectedTaskID }) {
@@ -178,8 +177,45 @@ final class ReviewBoardViewModel: ObservableObject {
         // still revalidated — it can go stale for reasons other than a new
         // snapshot, such as the selected task leaving the list.
         let next = snapshotProvider()
-        if snapshot != next { snapshot = next }
+        if snapshot != next {
+            snapshot = next
+            rebuildDerivedSnapshotState()
+        }
+        // The roster moves on its own beat — an agent starts printing without
+        // the board changing — so this is refreshed every tick regardless, and
+        // gated on inequality so an unchanged roster publishes nothing.
+        let working = Self.runningAgentNames()
+        if workingAssignees != working { workingAssignees = working }
         keepSelectionValid()
+    }
+
+    /// Re-derive everything that is a pure function of `snapshot`.
+    private func rebuildDerivedSnapshotState() {
+        tasks = snapshot.tasks.sorted { lhs, rhs in
+            let lhsRank = statusRank(lhs.status)
+            let rhsRank = statusRank(rhs.status)
+            if lhsRank != rhsRank { return lhsRank < rhsRank }
+            if lhs.priority != rhs.priority { return lhs.priority < rhs.priority }
+            return (lhs.updatedAt ?? "") > (rhs.updatedAt ?? "")
+        }
+        pendingMergeQueue = snapshot.mergeQueue
+            .filter { $0.isPending || $0.isFailed }
+            .sorted { ($0.approvedAt ?? "") > ($1.approvedAt ?? "") }
+    }
+
+    /// Agent names that are printing right now. The board's own status comes
+    /// from the task board, which cannot tell work in progress from work not
+    /// yet begun; this is what closes that gap.
+    private static func runningAgentNames() -> Set<String> {
+        var working: Set<String> = []
+        for team in TeamOrchestrator.shared.listTeams() {
+            for agent in team["agents"] as? [[String: Any]] ?? [] {
+                guard (agent["agent_state"] as? String) == "running",
+                      let name = agent["name"] as? String else { continue }
+                working.insert(name)
+            }
+        }
+        return working
     }
 
     func setSnapshotProvider(_ provider: @escaping @MainActor () -> ReviewBoardSnapshot) {
@@ -397,11 +433,6 @@ final class ReviewBoardViewModel: ObservableObject {
     /// Entries still waiting on the queue, newest approval first. Finished
     /// ones are dropped: a merged entry is history, and the panel is for what
     /// still needs attention — except failures, which need it most of all.
-    var pendingMergeQueue: [ReviewBoardMergeQueueItem] {
-        snapshot.mergeQueue
-            .filter { $0.isPending || $0.isFailed }
-            .sorted { ($0.approvedAt ?? "") > ($1.approvedAt ?? "") }
-    }
 
     /// A queue entry names a task by id, which is not a thing to show a
     /// person. Falls back to the shortened id when the task is not in the
