@@ -295,6 +295,9 @@ struct AgentPanelView: View {
                     guard following else { return }
                     // Unanimated on purpose. A 250-delta answer animating each
                     // step is not a smooth scroll, it is a stutter.
+                    #if DEBUG
+                    session.noteAutoScrollForDebug()
+                    #endif
                     proxy.scrollTo(Self.bottom, anchor: .bottom)
                 }
                 .overlay(alignment: .bottomTrailing) {

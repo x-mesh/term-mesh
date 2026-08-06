@@ -1143,6 +1143,37 @@ final class AgentSessionTests: XCTestCase {
         XCTAssertGreaterThan(s.revision, afterDelta)
     }
 
+    func testAParsedDeltaBatchPublishesOneTranscriptRevision() {
+        let s = AgentSession()
+        s.ingestForTesting(blockStart(0, "text"))
+        let before = s.revision
+
+        s.applyBatchForTesting([
+            delta(0, "one "),
+            delta(0, "two "),
+            delta(0, "three"),
+        ])
+
+        XCTAssertEqual(s.revision, before + 1)
+        guard case .answered(_, let text) = s.entries.last else {
+            return XCTFail("missing streamed answer")
+        }
+        XCTAssertEqual(text, "one two three")
+    }
+
+    func testStreamDecoderKeepsSplitUTF8AndSeveralLines() {
+        let decoder = AgentStreamDecoder(maxLineBytes: 1024)
+        let text = "첫째\n둘째\n"
+        let bytes = Array(text.utf8)
+        let split = bytes.firstIndex { $0 >= 0x80 }! + 1
+
+        XCTAssertTrue(decoder.consume(Data(bytes[..<split])).isEmpty)
+        XCTAssertEqual(
+            decoder.consume(Data(bytes[split...])),
+            [.line("첫째"), .line("둘째")]
+        )
+    }
+
     /// A tool result closes a row without adding one, and that changes what is
     /// on screen too.
     func testAToolResultMovesTheRevision() {

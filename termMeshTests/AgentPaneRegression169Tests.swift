@@ -93,6 +93,19 @@ final class AgentPaneRegression169Tests: XCTestCase {
         XCTAssertEqual(change.elided, 8_000, "the row still says how much it is not showing")
     }
 
+    func testAOneLineMegabyteEditIsReportedWithoutWalkingIt() throws {
+        let old = String(repeating: "a", count: AgentDiff.maxDiffInputBytes)
+        let new = String(repeating: "b", count: AgentDiff.maxDiffInputBytes)
+
+        let change = try XCTUnwrap(AgentDiff.change(tool: "Edit", input: [
+            "file_path": "/repo/minified.js", "old_string": old, "new_string": new]))
+
+        XCTAssertTrue(change.lines.isEmpty)
+        XCTAssertEqual(change.added, 1)
+        XCTAssertEqual(change.removed, 1)
+        XCTAssertEqual(change.elided, 2)
+    }
+
     /// The budget belongs to the call: fifty edits of a hundred lines cost what
     /// one edit of five thousand does.
     func testAnOversizedMultiEditIsReportedWithoutWalkingIt() throws {

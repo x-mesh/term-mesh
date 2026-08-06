@@ -3,6 +3,61 @@ import Foundation
 #if DEBUG
 extension TerminalController {
 
+    func v2DebugAgentRenderStats(params: [String: Any]) -> V2CallResult {
+        let wanted = (params["agent"] ?? params["agent_name"]) as? String
+        var agents: [[String: Any]] = []
+        for context in AppDelegate.shared?.mainWindowContexts.values ?? [:].values {
+            for workspace in context.tabManager.tabs {
+                for panel in workspace.panels.values.compactMap({ $0 as? AgentPanel }) {
+                    guard wanted == nil || panel.agentName == wanted else { continue }
+                    let metrics = panel.session.renderMetricsForDebug()
+                    agents.append([
+                        "agent": panel.agentName,
+                        "team": panel.teamName,
+                        "panel_id": panel.id.uuidString,
+                        "batches": metrics.batches,
+                        "lines": metrics.lines,
+                        "bytes": metrics.bytes,
+                        "revisions": metrics.revisions,
+                        "auto_scrolls": metrics.autoScrolls,
+                        "entries": metrics.entries,
+                        "rendered_rows": metrics.renderedRows,
+                        "apply_total_ms": metrics.applyTotalMs,
+                        "apply_max_ms": metrics.applyMaxMs,
+                    ])
+                }
+            }
+        }
+        return .ok(["agents": agents, "count": agents.count])
+    }
+
+    func v2DebugTerminalRendererStates() -> V2CallResult {
+        var surfaces: [[String: Any]] = []
+        for context in AppDelegate.shared?.mainWindowContexts.values ?? [:].values {
+            for workspace in context.tabManager.tabs {
+                for panel in workspace.panels.values.compactMap({ $0 as? TerminalPanel }) {
+                    let state = panel.surface.debugRendererVisibilityState()
+                    surfaces.append([
+                        "workspace_id": workspace.id.uuidString,
+                        "panel_id": panel.id.uuidString,
+                        "requested": state.requested,
+                        "realized": state.realized,
+                        "unrealize_pending": state.unrealizePending,
+                        "unrealize_schedule_count": state.unrealizeScheduleCount,
+                        "in_window": panel.hostedView.window != nil,
+                        "hidden": panel.hostedView.isHidden,
+                    ])
+                }
+            }
+        }
+        return .ok([
+            "surfaces": surfaces,
+            "count": surfaces.count,
+            "realized_count": surfaces.lazy.filter { $0["realized"] as? Bool == true }.count,
+            "requested_count": surfaces.lazy.filter { $0["requested"] as? Bool == true }.count,
+        ])
+    }
+
     /// Read a natively-held agent's transcript as data.
     ///
     /// The pane path can only be checked by reading its pixels — strip the
