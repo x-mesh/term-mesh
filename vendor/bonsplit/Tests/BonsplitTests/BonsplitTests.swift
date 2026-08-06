@@ -112,6 +112,49 @@ final class BonsplitTests: XCTestCase {
     }
 
     @MainActor
+    func testFocusPaneSkipsRedundantObservableWrite() async {
+        let controller = BonsplitController()
+        let paneId = try! XCTUnwrap(controller.internalController.focusedPaneId)
+        let invalidated = expectation(description: "focusedPaneId invalidated")
+        invalidated.isInverted = true
+
+        withObservationTracking {
+            _ = controller.internalController.focusedPaneId
+        } onChange: {
+            invalidated.fulfill()
+        }
+
+        controller.internalController.focusPane(paneId)
+        await fulfillment(of: [invalidated], timeout: 0.05)
+        XCTAssertEqual(controller.internalController.focusedPaneId, paneId)
+    }
+
+    @MainActor
+    func testGeometryBookkeepingIsExcludedFromObservation() async {
+        let controller = BonsplitController().internalController
+        let invalidated = expectation(description: "bookkeeping state invalidated")
+        invalidated.isInverted = true
+
+        withObservationTracking {
+            _ = controller.containerFrame
+            _ = controller.isExternalUpdateInProgress
+            _ = controller.lastGeometryNotificationTime
+            _ = controller.dragGeneration
+            _ = controller.onGeometryChange
+        } onChange: {
+            invalidated.fulfill()
+        }
+
+        controller.containerFrame = CGRect(x: 10, y: 20, width: 800, height: 600)
+        controller.isExternalUpdateInProgress = true
+        controller.lastGeometryNotificationTime = 123
+        controller.dragGeneration += 1
+        controller.onGeometryChange = {}
+
+        await fulfillment(of: [invalidated], timeout: 0.05)
+    }
+
+    @MainActor
     func testTabCreation() {
         let controller = BonsplitController()
         let tabId = controller.createTab(title: "Test Tab", icon: "doc")
