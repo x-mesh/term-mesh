@@ -549,7 +549,7 @@ async fn reader_loop(
                 // winsize arbitration (min across attachers, tmux-style) —
                 // see `PtySurface::request_size`.
                 if let Some((cols, rows)) = clamp_pty_size(req.client_cols, req.client_rows) {
-                    if let Err(e) = surface.request_size(size_requester, cols, rows) {
+                    if let Err(e) = surface.request_size(size_requester, cols, rows, false) {
                         tracing::warn!("resize on attach failed: {e}");
                     }
                 }
@@ -821,7 +821,11 @@ async fn reader_loop(
                     continue;
                 };
                 if let Some((cols, rows)) = clamp_pty_size(r.cols, r.rows) {
-                    if let Err(e) = entry.surface.request_size(size_requester, cols, rows) {
+                    if let Err(e) =
+                        entry
+                            .surface
+                            .request_size(size_requester, cols, rows, r.claim_authority)
+                    {
                         tracing::warn!("resize failed: {e}");
                     }
                 }

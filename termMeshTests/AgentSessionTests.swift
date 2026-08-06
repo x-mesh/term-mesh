@@ -15,6 +15,37 @@ import XCTest
 @MainActor
 final class AgentSessionTests: XCTestCase {
 
+    func testNativeAgentPaneExposesContextClearingRestart() throws {
+        let presentation = try XCTUnwrap(Workspace.agentRestartPresentation(
+            panelType: .agent,
+            agentName: "reviewer"
+        ))
+
+        XCTAssertEqual(presentation.help,
+                       "Restart reviewer agent — clears conversation context")
+        XCTAssertEqual(presentation.accessibilityLabel,
+                       "Restart reviewer agent and clear conversation context")
+        XCTAssertFalse(presentation.allowsSoftRestart)
+    }
+
+    func testTerminalAgentPaneRetainsOptionClickSoftRestart() throws {
+        let presentation = try XCTUnwrap(Workspace.agentRestartPresentation(
+            panelType: .terminal,
+            agentName: "executor"
+        ))
+
+        XCTAssertTrue(presentation.help.contains("clears conversation context"))
+        XCTAssertTrue(presentation.help.contains("⌥-click: soft restart"))
+        XCTAssertTrue(presentation.allowsSoftRestart)
+    }
+
+    func testBrowserPaneDoesNotExposeAgentRestart() {
+        XCTAssertNil(Workspace.agentRestartPresentation(
+            panelType: .browser,
+            agentName: "not-an-agent"
+        ))
+    }
+
     func testLeaderParallelPolicyRendersStableVersionAndDigest() {
         let first = LeaderParallelPolicy.renderedInstructions
         let second = LeaderParallelPolicy.renderedInstructions

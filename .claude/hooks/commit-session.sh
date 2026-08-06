@@ -14,6 +14,23 @@ set -euo pipefail
 REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null) || REPO_ROOT="$CLAUDE_PROJECT_DIR"
 cd "$REPO_ROOT" || exit 0
 
+# Never mutate the index while Git is replaying or reconciling history. In
+# particular, `git add -u` marks conflict-marker files as resolved during a
+# rebase and lets this hook manufacture commits inside the paused operation.
+GIT_DIR=$(git rev-parse --git-dir 2>/dev/null) || exit 0
+case "$GIT_DIR" in
+  /*) ;;
+  *) GIT_DIR="$REPO_ROOT/$GIT_DIR" ;;
+esac
+if [[ -d "$GIT_DIR/rebase-merge" || -d "$GIT_DIR/rebase-apply" \
+   || -f "$GIT_DIR/MERGE_HEAD" || -f "$GIT_DIR/CHERRY_PICK_HEAD" \
+   || -f "$GIT_DIR/REVERT_HEAD" ]]; then
+  exit 0
+fi
+if [[ -n "$(git diff --name-only --diff-filter=U 2>/dev/null)" ]]; then
+  exit 0
+fi
+
 # Stage tracked files only (new files require manual git add).
 git add -u 2>/dev/null || true
 # Alternative: stage all + exclude sensitive patterns
@@ -40,7 +57,7 @@ unset CMUX_SURFACE_ID TERMMESH_TAB_ID CMUX_TAB_ID TERMMESH_PANEL_ID CMUX_PANEL_I
 # Generate commit message via Claude headless mode
 COMMIT_MSG=""
 if command -v claude &>/dev/null; then
-  COMMIT_MSG=$(echo "$DIFF" | claude -p \
+  COMMIT_MSG=$(echo "$DIFF" | CLAUDE_CODE_SAFE_MODE=1 claude -p \
     "You are a commit message generator. Based on the following git diff, write a single commit message.
 Rules:
 - First line MUST start with 'WIP(scope): short summary' (max 72 chars)
@@ -65,10 +82,14 @@ fi
 # Commit using -F - to safely handle special characters.
 # Hooks stay ENABLED: .githooks/commit-msg is the fence-stripping backstop,
 # and --no-verify here is what let ``` markers into history in the first place.
-if echo "$COMMIT_MSG" | git commit -F - 2>/dev/null; then
+# The hook protocol owns stdout, including output inherited from child
+# processes. Suppress git's commit summary as well as its diagnostics.
+if echo "$COMMIT_MSG" | git commit -F - >/dev/null 2>&1; then
   FIRST_LINE=$(echo "$COMMIT_MSG" | head -1)
   SHORT_SHA=$(git rev-parse --short HEAD 2>/dev/null)
-  echo "Auto-committed: ${SHORT_SHA} ${FIRST_LINE} (${FILE_COUNT} files)"
+  # Hook stdout is a machine-readable protocol channel. Codex parses any
+  # non-empty output as JSON, so diagnostics belong on stderr.
+  echo "Auto-committed: ${SHORT_SHA} ${FIRST_LINE} (${FILE_COUNT} files)" >&2
 fi
 
 # Update CHANGELOG if it exists
@@ -85,6 +106,6 @@ if [ -f "$CHANGELOG" ]; then
 
   git add "$CHANGELOG" 2>/dev/null || true
   if ! git diff-index --quiet HEAD 2>/dev/null; then
-    git commit -m "docs: auto-update changelog" --no-verify 2>/dev/null || true
+    git commit -m "docs: auto-update changelog" --no-verify >/dev/null 2>&1 || true
   fi
 fi

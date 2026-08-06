@@ -1874,6 +1874,12 @@ public nonisolated struct Termmesh_Peer_V1_Resize: Sendable {
 
   public var pixelHeight: UInt32 = 0
 
+  /// Explicit user activity (focused divider/window/zoom resize) may claim
+  /// winsize authority just like keyboard input. Automatic/background layout
+  /// updates leave this false so passive mirrors cannot steal the PTY grid.
+  /// Missing on older clients decodes false and preserves the old policy.
+  public var claimAuthority: Bool = false
+
   public var unknownFields = SwiftProtobuf.UnknownStorage()
 
   public init() {}
@@ -5256,7 +5262,7 @@ nonisolated extension Termmesh_Peer_V1_Paste: SwiftProtobuf.Message, SwiftProtob
 
 nonisolated extension Termmesh_Peer_V1_Resize: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
   public static let protoMessageName: String = _protobuf_package + ".Resize"
-  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{3}surface_id\0\u{1}cols\0\u{1}rows\0\u{3}pixel_width\0\u{3}pixel_height\0")
+  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{3}surface_id\0\u{1}cols\0\u{1}rows\0\u{3}pixel_width\0\u{3}pixel_height\0\u{3}claim_authority\0")
 
   public mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
     while let fieldNumber = try decoder.nextFieldNumber() {
@@ -5269,6 +5275,7 @@ nonisolated extension Termmesh_Peer_V1_Resize: SwiftProtobuf.Message, SwiftProto
       case 3: try { try decoder.decodeSingularUInt32Field(value: &self.rows) }()
       case 4: try { try decoder.decodeSingularUInt32Field(value: &self.pixelWidth) }()
       case 5: try { try decoder.decodeSingularUInt32Field(value: &self.pixelHeight) }()
+      case 6: try { try decoder.decodeSingularBoolField(value: &self.claimAuthority) }()
       default: break
       }
     }
@@ -5290,6 +5297,9 @@ nonisolated extension Termmesh_Peer_V1_Resize: SwiftProtobuf.Message, SwiftProto
     if self.pixelHeight != 0 {
       try visitor.visitSingularUInt32Field(value: self.pixelHeight, fieldNumber: 5)
     }
+    if self.claimAuthority {
+      try visitor.visitSingularBoolField(value: self.claimAuthority, fieldNumber: 6)
+    }
     try unknownFields.traverse(visitor: &visitor)
   }
 
@@ -5299,6 +5309,7 @@ nonisolated extension Termmesh_Peer_V1_Resize: SwiftProtobuf.Message, SwiftProto
     if lhs.rows != rhs.rows {return false}
     if lhs.pixelWidth != rhs.pixelWidth {return false}
     if lhs.pixelHeight != rhs.pixelHeight {return false}
+    if lhs.claimAuthority != rhs.claimAuthority {return false}
     if lhs.unknownFields != rhs.unknownFields {return false}
     return true
   }

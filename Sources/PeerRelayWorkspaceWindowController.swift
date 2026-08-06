@@ -1158,6 +1158,9 @@ final class PeerRelayWorkspaceWindowController: NSWindowController, NSWindowDele
     @MainActor
     private func updatePaneFocusDecorations() {
         for (sid, slot) in panesBySurfaceID {
+            slot.session.setResizeAuthorityEligible(
+                sid == lastClickedSurfaceID && window?.isKeyWindow == true
+            )
             slot.view.wantsLayer = true
             if sid == lastClickedSurfaceID {
                 slot.view.layer?.borderWidth = 2
@@ -1166,6 +1169,16 @@ final class PeerRelayWorkspaceWindowController: NSWindowController, NSWindowDele
                 slot.view.layer?.borderWidth = 0
                 slot.view.layer?.borderColor = NSColor.clear.cgColor
             }
+        }
+    }
+
+    func windowDidBecomeKey(_ notification: Notification) {
+        updatePaneFocusDecorations()
+    }
+
+    func windowDidResignKey(_ notification: Notification) {
+        for slot in panesBySurfaceID.values {
+            slot.session.setResizeAuthorityEligible(false)
         }
     }
 

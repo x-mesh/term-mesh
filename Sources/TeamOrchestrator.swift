@@ -210,6 +210,11 @@ final class TeamOrchestrator: ObservableObject {
     /// Runtime EOF can arrive more than once while Ghostty and the peer relay
     /// unwind. Only one recovery may reattach or re-bootstrap a leader.
     var remoteLeaderRecoveryInFlight: Set<String> = []
+    /// Owner-side keepalives for scoped remote-leader grants. The bearer in
+    /// the remote process cannot renew itself after going idle; only this app,
+    /// which minted the grant and owns the project, may extend its server lease.
+    var remoteLeaderGrantKeepalives: [String: Task<Void, Never>] = [:]
+    var remoteLeaderGrantIDs: [String: Data] = [:]
     /// Restoring a detached project must be single-flight for the same reason
     /// the two above are, and at the same scope. The sidebar's own
     /// `restoringTeamNames` is per-view `@State`, so a second window has its
@@ -1522,6 +1527,7 @@ final class TeamOrchestrator: ObservableObject {
                 return nil
             }
             Logger.team.info("cleaning up stale team '\(name, privacy: .public)' (workspace closed)")
+            stopRemoteLeaderGrantKeepalive(teamName: name, revoke: true)
             teams.removeValue(forKey: name)
         }
 
@@ -2590,6 +2596,7 @@ final class TeamOrchestrator: ObservableObject {
             }
             // Last agent — remove the team entry. The adopted leader pane is
             // the caller's own pane (external ownership) and must not be closed.
+            stopRemoteLeaderGrantKeepalive(teamName: teamName, revoke: true)
             teams.removeValue(forKey: teamName)
             TeamDataStore.shared.unregisterTeam(teamName)
             syncTeamStateToDaemon()

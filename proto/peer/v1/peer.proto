@@ -643,6 +643,11 @@ message Resize {
   uint32 rows = 3;
   uint32 pixel_width = 4;
   uint32 pixel_height = 5;
+  // Explicit user activity (focused divider/window/zoom resize) may claim
+  // winsize authority just like keyboard input. Automatic/background layout
+  // updates leave this false so passive mirrors cannot steal the PTY grid.
+  // Missing on older clients decodes false and preserves the old policy.
+  bool claim_authority = 6;
 }
 
 // Visible-screen keyframe for a fresh attach (capability

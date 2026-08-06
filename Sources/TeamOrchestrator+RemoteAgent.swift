@@ -1204,6 +1204,49 @@ extension TeamOrchestrator {
             endpoint: .peer(hostKey: hostKey)
         )
         attempt.commit()
+        startRemoteLeaderGrantKeepalive(
+            teamName: teamName,
+            grantID: grantResponse.grant.grantID
+        )
+    }
+
+    /// Keep a live remote leader's scoped grant renewable while its owning
+    /// project exists. Thirty minutes leaves a full interval of scheduler
+    /// tolerance inside the one-hour lease. No bearer is sent over a new
+    /// channel and an already-expired grant is never resurrected.
+    func startRemoteLeaderGrantKeepalive(teamName: String, grantID: Data) {
+        stopRemoteLeaderGrantKeepalive(teamName: teamName, revoke: true)
+        remoteLeaderGrantIDs[teamName] = grantID
+        remoteLeaderGrantKeepalives[teamName] = Task { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: 30 * 60 * 1_000_000_000)
+                guard !Task.isCancelled,
+                      let self,
+                      self.teams[teamName] != nil,
+                      self.remoteLeaderGrantIDs[teamName] == grantID else { return }
+                let renewed = await PeerTeamLeaderControlPlane.shared.keepAliveGrant(id: grantID)
+                // Reconnect can replace this grant while the control-plane
+                // actor call is suspended. A superseded task must never mark
+                // the new leader failed or erase its keepalive registration.
+                guard !Task.isCancelled,
+                      self.remoteLeaderGrantIDs[teamName] == grantID else { return }
+                guard renewed else {
+                    self.markRemoteLeaderFailed(
+                        teamName: teamName,
+                        description: "Remote leader grant expired; reconnect the leader pane"
+                    )
+                    self.remoteLeaderGrantKeepalives.removeValue(forKey: teamName)
+                    self.remoteLeaderGrantIDs.removeValue(forKey: teamName)
+                    return
+                }
+            }
+        }
+    }
+
+    func stopRemoteLeaderGrantKeepalive(teamName: String, revoke: Bool) {
+        remoteLeaderGrantKeepalives.removeValue(forKey: teamName)?.cancel()
+        guard let grantID = remoteLeaderGrantIDs.removeValue(forKey: teamName), revoke else { return }
+        Task { await PeerTeamLeaderControlPlane.shared.revokeGrant(id: grantID) }
     }
 
     /// How a roster read lands, or nil when the stored surface is in the list
@@ -1693,6 +1736,7 @@ extension TeamOrchestrator {
     /// its local viewer. Tear down the project-owned remote surface even when
     /// that viewer was detached earlier.
     func closeRemoteLeaderSurfaceIfNeeded(teamName: String) {
+        stopRemoteLeaderGrantKeepalive(teamName: teamName, revoke: true)
         guard let team = teams[teamName],
               case let .peer(hostKey) = team.leaderEndpoint,
               let record = ManagedPeerSurfaceStore.shared.leaderRecord(

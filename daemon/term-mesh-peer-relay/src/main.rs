@@ -699,6 +699,12 @@ fn main() {
     // Restored automatically on drop at the end of main().
     let _raw_guard = RawStdinGuard::enable();
 
+    // Install SIGWINCH before sampling the initial size. Ghostty may resize
+    // the PTY immediately after spawn; sampling first left a window where
+    // that one transition was lost forever. The self-pipe safely retains an
+    // event until the reader thread starts below.
+    let sigwinch_rx_fd = install_sigwinch_pipe().ok();
+
     // Send initial Resize so the host knows our terminal size.
     let initial_resize = current_winsize();
     if let Some((cols, rows)) = initial_resize {
@@ -708,9 +714,6 @@ fn main() {
 
     let (tx, rx) = mpsc::channel::<Vec<u8>>();
     let tx_stop = tx.clone();
-
-    // SIGWINCH pipe
-    let sigwinch_rx_fd = install_sigwinch_pipe().ok();
 
     // Writer thread: receives frames from channel, writes to socket.
     //

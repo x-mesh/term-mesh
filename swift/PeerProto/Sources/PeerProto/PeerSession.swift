@@ -182,11 +182,40 @@ public typealias PeerReadFn = @Sendable () async throws -> Data
 public typealias PeerWriteFn = @Sendable (Data) async throws -> Void
 public typealias PeerCloseFn = @Sendable () async -> Void
 
+/// The single serialization point for every client -> host envelope.
+///
+/// Keeping this separate from `PeerSession` is what lets latency-sensitive
+/// input bypass the actor that is decoding a host output flood, while still
+/// preserving one monotonically increasing sequence and one ordered transport
+/// write stream. Sending input directly through the transport would be faster
+/// but unsafe: it could interleave framed bytes or reorder envelope sequence
+/// numbers relative to resize, heartbeat and RPC traffic.
+private actor PeerSessionOutboundWriter {
+    private let write: PeerWriteFn
+    private var seq: UInt64 = 0
+
+    init(write: @escaping PeerWriteFn) {
+        self.write = write
+    }
+
+    func send(_ unsequenced: Termmesh_Peer_V1_Envelope) async throws {
+        var envelope = unsequenced
+        seq &+= 1
+        envelope.seq = seq
+        let frame: Data
+        do {
+            frame = try encodeFrame(envelope)
+        } catch let error as PeerFramingError {
+            throw PeerSessionError.framing(error)
+        }
+        try await write(frame)
+    }
+}
+
 public actor PeerSession {
     private let read: PeerReadFn
-    private let write: PeerWriteFn
+    private nonisolated let outbound: PeerSessionOutboundWriter
     private let closeTransport: PeerCloseFn?
-    private var seq: UInt64 = 0
     private var pendingInbound = Data()
     private let demux = PeerSessionDemux()
     private var activeEnsureRequestIDs: Set<Data> = []
@@ -247,7 +276,7 @@ public actor PeerSession {
         close: PeerCloseFn? = nil
     ) {
         self.read = read
-        self.write = write
+        self.outbound = PeerSessionOutboundWriter(write: write)
         self.closeTransport = close
     }
 
@@ -256,7 +285,7 @@ public actor PeerSession {
     /// lets the session's single inbound pump release its actor promptly.
     public init(transport: UnixSocketTransport) {
         self.read = { try await transport.read() }
-        self.write = { try await transport.write($0) }
+        self.outbound = PeerSessionOutboundWriter { try await transport.write($0) }
         self.closeTransport = { await transport.close() }
     }
 
@@ -1137,13 +1166,13 @@ public actor PeerSession {
         }
     }
 
-    public func sendInput(surfaceID: Data, keys: Data) async throws {
-        try await sendEnvelope { env in
-            var input = Termmesh_Peer_V1_Input()
-            input.surfaceID = surfaceID
-            input.kind = .keys(keys)
-            env.input = input
-        }
+    public nonisolated func sendInput(surfaceID: Data, keys: Data) async throws {
+        var input = Termmesh_Peer_V1_Input()
+        input.surfaceID = surfaceID
+        input.kind = .keys(keys)
+        var envelope = Termmesh_Peer_V1_Envelope()
+        envelope.input = input
+        try await outbound.send(envelope)
     }
 
     /// Answer a reverse scoped-leader request on the same authenticated peer
@@ -1153,16 +1182,9 @@ public actor PeerSession {
         correlationID: UInt64
     ) async throws {
         var env = Termmesh_Peer_V1_Envelope()
-        env.seq = nextSeq()
         env.correlationID = correlationID
         env.teamLeaderCommandResponse = response
-        let frame: Data
-        do {
-            frame = try encodeFrame(env)
-        } catch let err as PeerFramingError {
-            throw PeerSessionError.framing(err)
-        }
-        try await write(frame)
+        try await outbound.send(env)
     }
 
     /// Paste a block of text as a single Input frame.
@@ -1177,12 +1199,18 @@ public actor PeerSession {
         }
     }
 
-    public func sendResize(surfaceID: Data, cols: UInt32, rows: UInt32) async throws {
+    public func sendResize(
+        surfaceID: Data,
+        cols: UInt32,
+        rows: UInt32,
+        claimAuthority: Bool = false
+    ) async throws {
         try await sendEnvelope { env in
             var r = Termmesh_Peer_V1_Resize()
             r.surfaceID = surfaceID
             r.cols = cols
             r.rows = rows
+            r.claimAuthority = claimAuthority
             env.resize = r
         }
     }
@@ -1207,11 +1235,6 @@ public actor PeerSession {
 
     // MARK: - Private: envelope plumbing
 
-    private func nextSeq() -> UInt64 {
-        seq += 1
-        return seq
-    }
-
     private func beginDirectResponseRPC() throws {
         if let inboundTerminalError { throw inboundTerminalError }
         guard !directResponseRPCInFlight,
@@ -1225,15 +1248,8 @@ public actor PeerSession {
 
     private func sendEnvelope(configure: (inout Termmesh_Peer_V1_Envelope) -> Void) async throws {
         var env = Termmesh_Peer_V1_Envelope()
-        env.seq = nextSeq()
         configure(&env)
-        let frame: Data
-        do {
-            frame = try encodeFrame(env)
-        } catch let err as PeerFramingError {
-            throw PeerSessionError.framing(err)
-        }
-        try await write(frame)
+        try await outbound.send(env)
     }
 
     private func sendHello(options: PeerSessionOptions) async throws {
