@@ -6,7 +6,22 @@ import Combine
 final class AgentStreamDecoder {
     static let defaultMaxLineBytes = 8 * 1024 * 1024
     static let maxPendingBatchBytes = 1 * 1024 * 1024
-    static let batchInterval: TimeInterval = 1.0 / 30.0
+    /// 30Hz is the shipped rate. The override exists so the rate itself can be
+    /// measured: every session schedules its own flush, so N streaming sessions
+    /// put up to N×rate batches per second on the main thread, and SwiftUI
+    /// answers each one with a graph walk (the updStack cost) even when no
+    /// body re-runs — today's row-cap experiment showed the walk's width does
+    /// not depend on transcript length, which leaves its *frequency*:
+    ///
+    ///   defaults write <bundle id> agentStreamBatchHz -int 10
+    ///
+    /// Read at each schedule, so a change applies from the next batch. Safe to
+    /// vary live, unlike the row cap: nothing is sized by this value — barriers
+    /// and the 1MB pending cap still flush immediately at any rate.
+    static var batchInterval: TimeInterval {
+        let hz = UserDefaults.standard.double(forKey: "agentStreamBatchHz")
+        return hz > 0 ? 1.0 / hz : 1.0 / 30.0
+    }
     enum Output: Equatable {
         case line(String)
         case oversized(Int)
@@ -403,6 +418,37 @@ final class AgentSession {
     @ObservationIgnored private var entriesDirty = false
     @ObservationIgnored private var rowsStructureDirty = true
     @ObservationIgnored private var dirtyEntryIDs: Set<UUID> = []
+    /// The bound `rows` was last built with. Only differs from
+    /// `maxRenderedEntries` when the override moved between two publishes.
+    @ObservationIgnored private var renderedBound = 0
+
+    /// Whether this transcript is on screen — the pane's tab is selected, its
+    /// workspace is showing, and no sibling pane is zoomed over it.
+    ///
+    /// SwiftUI coalesces mutations per frame and then walks every subgraph that
+    /// was dirtied, so ten streaming agents behind one visible pane are paid for
+    /// ten times over. Two experiments ruled out the alternatives: a 30x smaller
+    /// row window changed nothing, and dropping the flush rate from 30Hz to 10Hz
+    /// changed nothing. What is left is the count of dirty sessions per frame,
+    /// which is what this removes — a hidden transcript stops announcing until
+    /// someone looks at it again.
+    ///
+    /// Only the transcript is deferred. `isThinking` carries a `didSet` that
+    /// pushes `onBusyChanged` to the off-main status RPC, so gating it would
+    /// make a busy agent report idle to `tm-agent status` — a headless reader
+    /// with no pane at all. `isRunning`, `summary` and `streamingIds` are read
+    /// only by this pane's own view, so deferring them would be safe; they
+    /// change per turn and per content block rather than per delta, which is
+    /// three orders of magnitude below the traffic this is aimed at.
+    ///
+    /// Defaults to `true`: a view that forgets to set this degrades to today's
+    /// behaviour, never to a pane that silently stops updating.
+    @ObservationIgnored var isVisible = true {
+        didSet {
+            guard isVisible, isVisible != oldValue, entriesDirty else { return }
+            publishEntries()
+        }
+    }
 
     private func withEntryTransaction(_ body: () -> Void) {
         mutationDepth += 1
@@ -413,13 +459,24 @@ final class AgentSession {
 
     private func publishEntries() {
         guard entriesDirty else { return }
+        // Leave `entriesDirty` standing so the work resumes on the way back in;
+        // `rowsStructureDirty` and `dirtyEntryIDs` keep accumulating with it.
+        guard isVisible else { return }
         entriesDirty = false
-        if rowsStructureDirty {
+        // The incremental branch below maps `rows[relative]` onto
+        // `entries[displayStart + relative]` and uses `rows.count` as the width
+        // of the window. That substitution holds only while the bound is the
+        // one `rows` was built with, so a change of bound has to rebuild in
+        // full — otherwise `displayStart` moves under an array that did not,
+        // and the branch reads past the end of `entries`.
+        let bound = Self.maxRenderedEntries
+        if rowsStructureDirty || renderedBound != bound {
             let display = Self.displayRows(for: entries)
             rows = display.rows
             omittedEntryCount = display.omitted
+            renderedBound = bound
         } else if !dirtyEntryIDs.isEmpty {
-            let displayStart = max(0, entries.count - Self.maxRenderedEntries)
+            let displayStart = max(0, entries.count - bound)
             var relativeIndexes = Set<Int>()
             for id in dirtyEntryIDs {
                 guard let absolute = entries.firstIndex(where: { $0.id == id }),
@@ -514,7 +571,23 @@ final class AgentSession {
         return (omitted, rows(for: Array(entries.suffix(maxRenderedEntries))))
     }
 
-    static let maxRenderedEntries = 300
+    /// 300 is the shipped bound. The override exists so the bound itself can be
+    /// measured: the transcript stack is not lazy, so `ScrollView` sizes every
+    /// mounted row on each streamed delta, and that cost scales with this number
+    /// even for rows `TranscriptRow`'s `Equatable` already spared a body pass.
+    /// Whether that sizing is a large share of the streaming cost or a rounding
+    /// error is unmeasured — and two builds cannot answer it, because the
+    /// workload cannot be reproduced across them. Reading it live lets one app
+    /// carry one workload through both settings:
+    ///
+    ///   defaults write <bundle id> agentMaxRenderedEntries -int 50
+    ///
+    /// `publishEntries` must rebuild in full when this changes; see the note
+    /// there. Delete the key to return to 300.
+    static var maxRenderedEntries: Int {
+        let override = UserDefaults.standard.integer(forKey: "agentMaxRenderedEntries")
+        return override > 0 ? override : 300
+    }
 
     /// Changes on every mutation, not just every append.
     ///

@@ -13,6 +13,10 @@ import SwiftUI
 struct AgentPanelView: View {
     @ObservedObject var panel: AgentPanel
     let isFocused: Bool
+    /// Selected in its pane, in a showing workspace, not covered by a zoom.
+    /// Forwarded to the session, which stops publishing its transcript while
+    /// this is false — see `AgentSession.isVisible`.
+    let isVisibleInUI: Bool
     let appearance: PanelAppearance
     let onFocus: () -> Void
 
@@ -90,6 +94,13 @@ struct AgentPanelView: View {
         // running. Taking focus has to be reported, not just accepted.
         .onChange(of: composerFocused) { _, focused in
             if focused { onFocus() }
+        }
+        // `initial: true` because a pane that is built already hidden — a
+        // background workspace being restored, a tab that is not the selected
+        // one — never gets a change to react to, and would otherwise publish
+        // every delta of a transcript nobody has looked at yet.
+        .onChange(of: isVisibleInUI, initial: true) { _, visible in
+            session.isVisible = visible
         }
         .onAppear {
             panel.onFocusRequested { composerFocused = true }
