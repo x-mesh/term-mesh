@@ -941,6 +941,21 @@ final class AgentSessionTests: XCTestCase {
                        AgentSession.topGap(before: entries[17], after: nil))
     }
 
+    /// The batch-rate override maps Hz to the flush interval and falls back to
+    /// the shipped 30Hz when absent or nonsense. Unlike the row cap, nothing
+    /// downstream is sized by this value, so the mapping is the whole contract.
+    func testStreamBatchRateOverrideMapsToTheFlushInterval() {
+        let key = "agentStreamBatchHz"
+        UserDefaults.standard.removeObject(forKey: key)
+        defer { UserDefaults.standard.removeObject(forKey: key) }
+
+        XCTAssertEqual(AgentStreamDecoder.batchInterval, 1.0 / 30.0)
+        UserDefaults.standard.set(10, forKey: key)
+        XCTAssertEqual(AgentStreamDecoder.batchInterval, 1.0 / 10.0)
+        UserDefaults.standard.set(-5, forKey: key)
+        XCTAssertEqual(AgentStreamDecoder.batchInterval, 1.0 / 30.0)
+    }
+
     /// Lowering the bound mid-stream must not read past the transcript.
     ///
     /// `publishEntries`'s incremental branch maps `rows[relative]` onto

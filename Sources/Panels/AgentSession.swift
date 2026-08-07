@@ -6,7 +6,22 @@ import Combine
 final class AgentStreamDecoder {
     static let defaultMaxLineBytes = 8 * 1024 * 1024
     static let maxPendingBatchBytes = 1 * 1024 * 1024
-    static let batchInterval: TimeInterval = 1.0 / 30.0
+    /// 30Hz is the shipped rate. The override exists so the rate itself can be
+    /// measured: every session schedules its own flush, so N streaming sessions
+    /// put up to N×rate batches per second on the main thread, and SwiftUI
+    /// answers each one with a graph walk (the updStack cost) even when no
+    /// body re-runs — today's row-cap experiment showed the walk's width does
+    /// not depend on transcript length, which leaves its *frequency*:
+    ///
+    ///   defaults write <bundle id> agentStreamBatchHz -int 10
+    ///
+    /// Read at each schedule, so a change applies from the next batch. Safe to
+    /// vary live, unlike the row cap: nothing is sized by this value — barriers
+    /// and the 1MB pending cap still flush immediately at any rate.
+    static var batchInterval: TimeInterval {
+        let hz = UserDefaults.standard.double(forKey: "agentStreamBatchHz")
+        return hz > 0 ? 1.0 / hz : 1.0 / 30.0
+    }
     enum Output: Equatable {
         case line(String)
         case oversized(Int)
