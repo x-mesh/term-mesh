@@ -19,7 +19,7 @@ private enum RetrievalChromePalette {
 struct WorkspaceRetrievalSidebarSection: View {
     let workspace: Workspace
     @ObservedObject private var store: WorkspaceRetrievalStore
-    @EnvironmentObject private var tabManager: TabManager
+    @Environment(TabManager.self) private var tabManager
 
     init(workspace: Workspace) {
         self.workspace = workspace
