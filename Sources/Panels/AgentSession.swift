@@ -442,7 +442,10 @@ final class AgentSession: ObservableObject {
     /// Deciding both here costs one pass per mutation instead of one per layout,
     /// and leaves `id` a stored property that nothing has to unwrap an enum to
     /// read.
-    struct Row: Identifiable {
+    /// `Equatable` so the view layer can tell an unchanged row from a changed
+    /// one: the transcript mounts this whole window in a non-lazy stack, and a
+    /// streamed delta usually rewrites exactly one row.
+    struct Row: Identifiable, Equatable {
         let id: UUID
         /// Presentation, in the model on purpose: it is a function of which
         /// *kinds* of entry sit next to each other, so it can only be settled
