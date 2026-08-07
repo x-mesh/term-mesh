@@ -86,7 +86,7 @@ final class WorkspaceObservationTests: XCTestCase {
             _ = ws.dominantRemoteHostKey
         } onChange: { redrew.fulfill() }
 
-        ws.panels[UUID()] = TerminalPanel(workingDirectory: "/tmp")
+        ws.panels[UUID()] = AgentPanel(agentName: "probe", teamName: "t", workingDirectory: "/tmp")
 
         wait(for: [redrew], timeout: 1)
     }
@@ -125,7 +125,7 @@ final class WorkspaceObservationTests: XCTestCase {
     /// that, `PassthroughSubject` would hang until a second change.
     func testPanelCountSubjectReplaysTheCurrentValueOnSubscribe() {
         let ws = workspace()
-        ws.panels[UUID()] = TerminalPanel(workingDirectory: "/tmp")
+        ws.panels[UUID()] = AgentPanel(agentName: "probe", teamName: "t", workingDirectory: "/tmp")
 
         var seen: [Int] = []
         let token = ws.panelsCountSubject.sink { seen.append($0) }
@@ -133,7 +133,7 @@ final class WorkspaceObservationTests: XCTestCase {
 
         XCTAssertEqual(seen, [1], "a late subscriber still learns the current count")
 
-        ws.panels[UUID()] = TerminalPanel(workingDirectory: "/tmp")
+        ws.panels[UUID()] = AgentPanel(agentName: "probe", teamName: "t", workingDirectory: "/tmp")
         XCTAssertEqual(seen, [1, 2], "and subsequent changes arrive")
     }
 }
