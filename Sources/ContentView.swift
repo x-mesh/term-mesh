@@ -1865,7 +1865,13 @@ struct ContentView: View {
         // `$tabs` publisher, which fired in `willSet` and left `tabManager.tabs`
         // holding the old array, `onChange` runs after the mutation, so the
         // reconcile no longer has to be handed the new array explicitly.
-        view = AnyView(view.onChange(of: tabManager.tabs.map(\.id)) { _, tabIds in
+        //
+        // `initial: true` reproduces the value the `@Published` publisher emitted
+        // to every new subscriber. `onAppear` covers the reconcile and the empty
+        // seed, but not the two cleanups below it — filtering ids of workspaces
+        // that went away, and clamping a now out-of-range sidebar index — so on a
+        // re-appear those would otherwise stay stale until the next tabs change.
+        view = AnyView(view.onChange(of: tabManager.tabs.map(\.id), initial: true) { _, tabIds in
             let existingIds = Set(tabIds)
             if let retiringWorkspaceId, !existingIds.contains(retiringWorkspaceId) {
                 self.retiringWorkspaceId = nil

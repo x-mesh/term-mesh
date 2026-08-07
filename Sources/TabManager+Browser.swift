@@ -1145,7 +1145,13 @@ extension TabManager {
                         ])
                         return
                     }
-                    try? await Task.sleep(nanoseconds: 50_000_000)
+                    // `try?` here would swallow cancellation and spin this loop
+                    // at full speed until the timeout fires.
+                    do {
+                        try await Task.sleep(nanoseconds: 50_000_000)
+                    } catch {
+                        return
+                    }
                 }
             }
 
