@@ -411,7 +411,14 @@ private struct AgentComposer: View, Equatable {
     /// `draft` is compared, and has to be: the field is the one thing here that
     /// the person is changing, and skipping its body would drop keystrokes.
     /// The two closures are not — the panel rebuilds them on every pass.
-    static func == (lhs: AgentComposer, rhs: AgentComposer) -> Bool {
+    /// Neither is `focused`: it is a binding the field attaches to, not
+    /// something this view draws, and `FocusState.Binding` is not `Equatable`.
+    ///
+    /// `nonisolated` for the same reason `ReviewBoardTaskRow.==` carries it:
+    /// `Equatable` is not actor-isolated, and the moment the enclosing view
+    /// becomes `@MainActor` this conformance would cross that boundary — a
+    /// warning today, an error under Swift 6. Everything compared is `Sendable`.
+    nonisolated static func == (lhs: AgentComposer, rhs: AgentComposer) -> Bool {
         lhs.draft == rhs.draft
             && lhs.agentName == rhs.agentName
             && lhs.accent == rhs.accent
@@ -521,7 +528,11 @@ private struct TranscriptRow: View, Equatable {
     /// `setOpen` is deliberately not compared: the parent rebuilds that closure
     /// on every body pass, so comparing it would defeat the shell entirely, and
     /// nothing it captures changes what this row draws.
-    static func == (lhs: TranscriptRow, rhs: TranscriptRow) -> Bool {
+    ///
+    /// `nonisolated` matches `ReviewBoardTaskRow.==` — `Equatable` is not
+    /// actor-isolated, so this conformance would cross the boundary as soon as
+    /// the enclosing view is `@MainActor`. Everything compared is `Sendable`.
+    nonisolated static func == (lhs: TranscriptRow, rhs: TranscriptRow) -> Bool {
         lhs.item == rhs.item
             && lhs.streaming == rhs.streaming
             && lhs.open == rhs.open
