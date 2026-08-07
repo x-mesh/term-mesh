@@ -125,15 +125,18 @@ final class WorkspaceObservationTests: XCTestCase {
     /// that, `PassthroughSubject` would hang until a second change.
     func testPanelCountSubjectReplaysTheCurrentValueOnSubscribe() {
         let ws = workspace()
+        // A workspace opens with a pane already in it, so count from what is
+        // there rather than from zero.
+        let base = ws.panels.count
         ws.panels[UUID()] = AgentPanel(agentName: "probe", teamName: "t", workingDirectory: "/tmp")
 
         var seen: [Int] = []
         let token = ws.panelsCountSubject.sink { seen.append($0) }
         defer { token.cancel() }
 
-        XCTAssertEqual(seen, [1], "a late subscriber still learns the current count")
+        XCTAssertEqual(seen, [base + 1], "a late subscriber still learns the current count")
 
         ws.panels[UUID()] = AgentPanel(agentName: "probe", teamName: "t", workingDirectory: "/tmp")
-        XCTAssertEqual(seen, [1, 2], "and subsequent changes arrive")
+        XCTAssertEqual(seen, [base + 1, base + 2], "and subsequent changes arrive")
     }
 }
