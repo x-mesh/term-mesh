@@ -356,7 +356,11 @@ actor RelayResizeCoalescer {
     private var session: PeerSession
     private let surfaceID: Data
     private let delayNs: UInt64
-    private var pending: (cols: UInt32, rows: UInt32, claimAuthority: Bool)?
+    /// The coalesced resize waiting to go out. The third field is *not* the
+    /// authority claim — it records only that this resize came after the
+    /// helper's initial geometry reconcile. The claim itself is read at flush,
+    /// because focus can move during the coalescing delay.
+    private var pending: (cols: UInt32, rows: UInt32, pastInitialResize: Bool)?
     private var flushTask: Task<Void, Never>?
     private var authorityEligible: Bool
     /// The helper's first resize only reconciles Ghostty's initial geometry.
@@ -434,10 +438,27 @@ actor RelayResizeCoalescer {
         authorityEligible = eligible
     }
 
+    /// Whether the resize about to be written may claim size authority.
+    ///
+    /// Read here rather than captured in `submit`, and that difference is the
+    /// point. A resize is held for `delayNs` before it goes out; focus can
+    /// leave the pane in that window (`windowDidResignKey`, a sibling pane
+    /// taking focus), and a claim decided beforehand would still be sent. The
+    /// host arbitrates PTY size by most recent activity, so that late claim
+    /// lands *after* the newly focused pane's own resize and takes the size
+    /// back — the remote TUI ends up sized for the pane the person just left.
+    /// This actor serialises its state, so the value read at flush is the
+    /// eligibility as of the moment the write actually happens.
+    private func claimAuthorityNow(_ size: (cols: UInt32, rows: UInt32, pastInitialResize: Bool)) -> Bool {
+        authorityEligible && size.pastInitialResize
+    }
+
     func submit(cols: UInt32, rows: UInt32) {
-        let claimAuthority = authorityEligible && hasObservedInitialResize
+        // Only "is this past the initial resize" is decided here. Whether the
+        // pane may claim authority is decided at flush — see `claimAuthorityNow`.
+        let pastInitialResize = hasObservedInitialResize
         hasObservedInitialResize = true
-        pending = (cols, rows, claimAuthority)
+        pending = (cols, rows, pastInitialResize)
         lastSize = (cols, rows)
         guard flushTask == nil else { return }
         let delayNs = self.delayNs
@@ -475,7 +496,7 @@ actor RelayResizeCoalescer {
                 surfaceID: surfaceID,
                 cols: size.cols,
                 rows: size.rows,
-                claimAuthority: size.claimAuthority
+                claimAuthority: claimAuthorityNow(size)
             )
         } catch {
             NSLog("[peer-relay] resize send failed; retrying latest size once: %@", String(describing: error))
@@ -502,7 +523,7 @@ actor RelayResizeCoalescer {
                 surfaceID: surfaceID,
                 cols: size.cols,
                 rows: size.rows,
-                claimAuthority: size.claimAuthority
+                claimAuthority: claimAuthorityNow(size)
             )
         } catch {
             NSLog("[peer-relay] resize retry failed: %@", String(describing: error))

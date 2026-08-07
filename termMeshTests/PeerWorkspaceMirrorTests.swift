@@ -532,6 +532,76 @@ final class RelayResizeCoalescerHealTests: XCTestCase {
         await coalescer.cancel()
     }
 
+    /// A resize held for the coalescing delay must not claim authority if
+    /// focus left the pane before it went out.
+    ///
+    /// The claim used to be decided in `submit` and carried in `pending`, so a
+    /// resize that started while focused still asserted authority ~24ms later
+    /// even though `setAuthorityEligible(false)` had run in between. The host
+    /// arbitrates PTY size by most recent activity, so that late claim landed
+    /// after the newly focused pane's own resize and took the size back — the
+    /// remote TUI ended up sized for the pane the person had just left.
+    func testAResizeDoesNotClaimAuthorityAfterFocusLeavesDuringTheDelay() async throws {
+        let collector = ResizeColsCollector()
+        let session = makeSession(collector)
+        let coalescer = RelayResizeCoalescer(
+            session: session,
+            surfaceID: Data(repeating: 0xC5, count: 16),
+            initialCols: 80,
+            initialRows: 24,
+            authorityEligible: true,
+            delayMs: 1,
+            onHeal: { _ in }
+        )
+
+        // Get past the initial geometry reconcile, which is passive by design.
+        await coalescer.submit(cols: 80, rows: 24)
+        await coalescer.flushNow()
+
+        // A focused resize starts…
+        await coalescer.submit(cols: 120, rows: 36)
+        // …focus moves away before it is written…
+        await coalescer.setAuthorityEligible(false)
+        // …and only then does it go out.
+        await coalescer.flushNow()
+
+        let claims = await collector.claims()
+        XCTAssertEqual(claims, [false, false],
+                       "a resize flushed after focus left must not claim authority")
+        let cols = await collector.cols()
+        XCTAssertEqual(cols, [80, 120], "the size itself is still sent")
+        await coalescer.cancel()
+    }
+
+    /// The mirror of the above: focus arriving during the delay should let the
+    /// resize claim authority. Deciding at flush has to work both ways, or the
+    /// fix would simply have moved the bug.
+    func testAResizeClaimsAuthorityWhenFocusArrivesDuringTheDelay() async throws {
+        let collector = ResizeColsCollector()
+        let session = makeSession(collector)
+        let coalescer = RelayResizeCoalescer(
+            session: session,
+            surfaceID: Data(repeating: 0xC6, count: 16),
+            initialCols: 80,
+            initialRows: 24,
+            authorityEligible: false,
+            delayMs: 1,
+            onHeal: { _ in }
+        )
+
+        await coalescer.submit(cols: 80, rows: 24)
+        await coalescer.flushNow()
+
+        await coalescer.submit(cols: 120, rows: 36)
+        await coalescer.setAuthorityEligible(true)
+        await coalescer.flushNow()
+
+        let claims = await collector.claims()
+        XCTAssertEqual(claims, [false, true],
+                       "a resize flushed after focus arrived may claim authority")
+        await coalescer.cancel()
+    }
+
     /// Records every `onHeal(reason)` invocation.
     private actor HealRecorder {
         private var reasons: [String] = []
