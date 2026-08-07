@@ -433,10 +433,13 @@ final class AgentSession {
     /// which is what this removes — a hidden transcript stops announcing until
     /// someone looks at it again.
     ///
-    /// Only the transcript is deferred. `isRunning`, `isThinking`, `summary` and
-    /// `streamingIds` keep publishing, because the sidebar and the pane's own
-    /// tab draw a busy agent from those and a hidden agent must not look
-    /// finished.
+    /// Only the transcript is deferred. `isThinking` carries a `didSet` that
+    /// pushes `onBusyChanged` to the off-main status RPC, so gating it would
+    /// make a busy agent report idle to `tm-agent status` — a headless reader
+    /// with no pane at all. `isRunning`, `summary` and `streamingIds` are read
+    /// only by this pane's own view, so deferring them would be safe; they
+    /// change per turn and per content block rather than per delta, which is
+    /// three orders of magnitude below the traffic this is aimed at.
     ///
     /// Defaults to `true`: a view that forgets to set this degrades to today's
     /// behaviour, never to a pane that silently stops updating.

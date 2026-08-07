@@ -985,9 +985,10 @@ final class AgentSessionTests: XCTestCase {
         XCTAssertEqual(s.rows.map(\.id), s.entries.map(\.id))
     }
 
-    /// Status is not the transcript. The sidebar and the pane's tab draw a busy
-    /// agent from `streamingIds`, so gating that with visibility would leave a
-    /// hidden agent looking finished. Only the transcript is deferred.
+    /// Status is not the transcript. `isThinking` feeds `onBusyChanged` and so
+    /// the off-main status RPC, which serves `tm-agent status` for readers that
+    /// have no pane at all — gating status behind a pane's visibility would let
+    /// a busy agent report idle to them. Only the transcript is deferred.
     func testAHiddenSessionStillReportsThatItIsStreaming() throws {
         let s = session([blockStart(0, "text"), delta(0, "half a sen")])
         s.isVisible = false
