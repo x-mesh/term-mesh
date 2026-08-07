@@ -38,9 +38,10 @@
 #   DECAYING   Agents finished during the sampling window. Across one set of
 #              three runs idle went 45→57→65% and updStack 751→619→452, which
 #              makes whichever condition you measured *second* look better.
-#   DRIFTED    The app changed under the measurement — workspaces 3→5, relays
-#              16→22, RSS 350→504MB between two sets. Those two sets are not
-#              the same app and cannot be compared.
+#   DRIFTED    The app changed under the measurement — workspaces 3→5 and
+#              relays 16→22 between two sets that were then compared as one
+#              app. Only that topology is compared; RSS is printed beside it
+#              but drifts a couple of MB on its own even while idle.
 #
 # Exit codes: 0 usable · 1 error · 2 every run IDLE · 3 conditions not stable.
 # A non-zero exit means "no data", never "a bad result".
@@ -161,26 +162,35 @@ PY
 
 # Conditions are what make two measurements comparable, so they are captured
 # before AND after: an app that grew a window mid-set was never one condition.
-snapshot_conditions() {
+#
+# Only the topology is compared. RSS is reported next to it because it says a
+# lot about which app you are looking at, but it moves on its own — a 2MB drift
+# across eight idle seconds is normal, and comparing it made DRIFTED fire on
+# every set. A guard that cries wolf is one nobody reads.
+snapshot_topology() {
   if [[ -n "$REPLAY" ]]; then
     printf 'replayed from %s' "$REPLAY"
     return
   fi
-  local scope relays rss
+  local scope relays
   scope="$(printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"window.list"}' \
     | nc -U "$SOCKET" 2>/dev/null \
     | python3 -c "$SCOPE_PY" 2>/dev/null || echo "scope unknown")"
   relays="$(pgrep -f term-mesh-peer-relay | wc -l | tr -d ' ')"
-  rss="$(ps -p "$PID" -o rss= 2>/dev/null | awk '{printf "%.0fMB", $1/1024}')"
-  printf '%s · %s relays · %s' "$scope" "$relays" "$rss"
+  printf '%s · %s relays' "$scope" "$relays"
 }
 
-BEFORE="$(snapshot_conditions)"
+current_rss() {
+  [[ -n "$REPLAY" ]] && return
+  ps -p "$PID" -o rss= 2>/dev/null | awk '{printf " · %.0fMB", $1/1024}'
+}
+
+BEFORE="$(snapshot_topology)"
 if [[ -n "$REPLAY" ]]; then
   echo "replay · $RUNS run(s) · $BEFORE${LABEL:+ · label $LABEL}"
 else
   UPTIME="$(ps -p "$PID" -o etime= 2>/dev/null | tr -d ' ')"
-  echo "pid $PID · up $UPTIME · $BEFORE${LABEL:+ · label $LABEL}"
+  echo "pid $PID · up $UPTIME · $BEFORE$(current_rss)${LABEL:+ · label $LABEL}"
 fi
 echo
 
@@ -251,7 +261,7 @@ for ((i = 1; i <= RUNS; i++)); do
     "$i" "$state" "$pct" "$evtpct_n" "${cycle:-0}" "${upd:-0}" "${dirty:-0}" "$bodies"
 done
 
-AFTER="$(snapshot_conditions)"
+AFTER="$(snapshot_topology)"
 echo
 
 median() {
