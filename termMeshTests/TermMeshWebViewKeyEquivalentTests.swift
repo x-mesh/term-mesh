@@ -6779,3 +6779,62 @@ final class TerminalControllerSocketTextChunkTests: XCTestCase {
         )
     }
 }
+
+/// Which named theme ghostty is handed, and who decides between light and dark.
+///
+/// A `light:…,dark:…` pair lets ghostty choose, and it chooses by the *system*
+/// appearance. So on a Mac set to Light with term-mesh set to Dark — the exact
+/// case the Light/Dark setting exists for — the chrome went dark and the
+/// terminal stayed light. `TerminalThemeOverride` deletes itself whenever a
+/// named theme exists, so nothing was left to force the choice.
+final class TerminalThemeLineTests: XCTestCase {
+
+    func testAnExplicitDarkModePinsTheDarkThemeRatherThanHandingOverThePair() {
+        XCTAssertEqual(
+            TerminalSettingsOverride.themeLine(light: "Light Owl", dark: "Mathias", mode: .dark),
+            "theme = Mathias"
+        )
+    }
+
+    func testAnExplicitLightModePinsTheLightTheme() {
+        XCTAssertEqual(
+            TerminalSettingsOverride.themeLine(light: "Light Owl", dark: "Mathias", mode: .light),
+            "theme = Light Owl"
+        )
+    }
+
+    /// System mode is the one case where deferring to the system is the ask.
+    func testSystemModeStillHandsOverBothHalves() {
+        XCTAssertEqual(
+            TerminalSettingsOverride.themeLine(light: "Light Owl", dark: "Mathias", mode: .system),
+            "theme = light:Light Owl,dark:Mathias"
+        )
+        XCTAssertEqual(
+            TerminalSettingsOverride.themeLine(light: "Light Owl", dark: "Mathias", mode: .auto),
+            "theme = light:Light Owl,dark:Mathias"
+        )
+    }
+
+    /// Setting only one half means that theme in every mode, not a half-empty pair.
+    func testOneHalfSetIsUsedForBothModes() {
+        XCTAssertEqual(
+            TerminalSettingsOverride.themeLine(light: "", dark: "Mathias", mode: .light),
+            "theme = Mathias"
+        )
+        XCTAssertEqual(
+            TerminalSettingsOverride.themeLine(light: "Light Owl", dark: "", mode: .dark),
+            "theme = Light Owl"
+        )
+        XCTAssertEqual(
+            TerminalSettingsOverride.themeLine(light: "", dark: "Mathias", mode: .system),
+            "theme = light:Mathias,dark:Mathias"
+        )
+    }
+
+    /// No named theme means no line at all — the hardcoded palettes in
+    /// `TerminalThemeOverride` take over, which is what its deletion branch assumes.
+    func testNoNamedThemeWritesNoThemeLine() {
+        XCTAssertNil(TerminalSettingsOverride.themeLine(light: "", dark: "", mode: .dark))
+        XCTAssertNil(TerminalSettingsOverride.themeLine(light: "", dark: "", mode: .system))
+    }
+}

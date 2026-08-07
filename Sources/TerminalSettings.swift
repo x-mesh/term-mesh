@@ -52,10 +52,9 @@ enum TerminalSettingsOverride {
         if fontSize > 0 {
             lines.append("font-size = \(Int(fontSize))")
         }
-        if !themeLight.isEmpty || !themeDark.isEmpty {
-            let light = themeLight.isEmpty ? themeDark : themeLight
-            let dark = themeDark.isEmpty ? themeLight : themeDark
-            lines.append("theme = light:\(light),dark:\(dark)")
+        if let theme = themeLine(light: themeLight, dark: themeDark,
+                                 mode: AppearanceSettings.resolvedMode(defaults: defaults)) {
+            lines.append(theme)
         }
         // background-opacity: requires CAMetalLayer.isOpaque=false in ghostty — not supported yet
         if !cursorColor.isEmpty {
@@ -82,6 +81,34 @@ enum TerminalSettingsOverride {
 
         try? fm.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
         try? lines.joined(separator: "\n").appending("\n").write(to: url, atomically: true, encoding: .utf8)
+    }
+
+    /// The `theme` line for a pair of named themes under an appearance mode.
+    ///
+    /// A `light:…,dark:…` pair hands ghostty both halves and lets it choose,
+    /// and it chooses by the *system* appearance — not by the app's. So while
+    /// the two disagree, which is the whole point of the Light/Dark setting,
+    /// the terminal drew the wrong half: chrome dark, terminal light, on a Mac
+    /// set to Light. `TerminalThemeOverride`, the one thing that could have
+    /// forced it, deletes itself whenever a named theme exists, on the premise
+    /// that the named theme "already provides colors" — true of the colors,
+    /// false of the choice between them.
+    ///
+    /// So an explicit mode pins a single theme and leaves ghostty nothing to
+    /// decide. Only `system` still hands over the pair, which is exactly when
+    /// following the system appearance is what was asked for.
+    static func themeLine(light: String, dark: String, mode: AppearanceMode) -> String? {
+        guard !light.isEmpty || !dark.isEmpty else { return nil }
+        let resolvedLight = light.isEmpty ? dark : light
+        let resolvedDark = dark.isEmpty ? light : dark
+        switch mode {
+        case .light:
+            return "theme = \(resolvedLight)"
+        case .dark:
+            return "theme = \(resolvedDark)"
+        case .system, .auto:
+            return "theme = light:\(resolvedLight),dark:\(resolvedDark)"
+        }
     }
 
     /// Remove the override file entirely (reset to config defaults).

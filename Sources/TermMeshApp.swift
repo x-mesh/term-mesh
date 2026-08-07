@@ -97,7 +97,11 @@ struct TermMeshApp: App {
 
         let startupAppearance = AppearanceSettings.resolvedMode()
         Self.applyAppearance(startupAppearance)
-        // Ensure terminal theme override exists at startup (covers fresh install)
+        // Ensure terminal theme override exists at startup (covers fresh install).
+        // The settings file goes first: its `theme` line depends on the appearance
+        // mode, and a build that shipped before that was true leaves a stale pair
+        // behind — which is what made a fresh install come up light on a Light Mac.
+        TerminalSettingsOverride.write()
         TerminalThemeOverride.write(for: startupAppearance.rawValue)
         // Unit-test bundles run inside the real app host. Do not restore the
         // user's terminal session before XCTest establishes its connection.
@@ -326,6 +330,10 @@ struct TermMeshApp: App {
         }
         .onChange(of: appearanceMode) { _ in
             applyAppearance()
+            // The settings file's `theme` line pins light or dark by this mode,
+            // so it has to be rewritten here too — otherwise a named theme keeps
+            // whichever half the system appearance picked when it was last saved.
+            TerminalSettingsOverride.write()
             // Write terminal color override and reload Ghostty config
             TerminalThemeOverride.write(for: appearanceMode)
             configProvider.reloadConfiguration(source: "appearance.toggle")
