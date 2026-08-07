@@ -941,6 +941,73 @@ final class AgentSessionTests: XCTestCase {
                        AgentSession.topGap(before: entries[17], after: nil))
     }
 
+    // MARK: - Visibility gating
+    //
+    // Two experiments said the streaming cost is neither the transcript's width
+    // (a 30x smaller row window moved nothing) nor the flush rate (30Hz to 10Hz
+    // moved nothing). What is left is how many sessions are dirty in a frame —
+    // SwiftUI coalesces mutations per frame and then walks every dirty subgraph.
+    // Ten agents streaming behind one visible pane pay for ten.
+
+    /// A hidden transcript does not publish. `entries` is the model and keeps
+    /// filling; `rows` and `revision` are the projection nobody is reading.
+    func testAHiddenSessionStopsPublishingItsTranscript() {
+        let s = session([blockStart(0, "text"), delta(0, "one"), blockStop(0)])
+        XCTAssertEqual(s.rows.count, 1)
+        let revisionWhenHidden = s.revision
+
+        s.isVisible = false
+        s.ingestForTesting(blockStart(0, "text"))
+        s.ingestForTesting(delta(0, "two"))
+        s.ingestForTesting(blockStop(0))
+
+        XCTAssertEqual(s.rows.count, 1, "the transcript must not move while nobody is looking")
+        XCTAssertEqual(s.revision, revisionWhenHidden, "and must not announce")
+        XCTAssertEqual(s.entries.count, 2, "but the model must still be there")
+    }
+
+    /// Coming back catches up in one announcement, not one per missed delta —
+    /// the whole point is that the hidden pane cost nothing on the way.
+    func testBecomingVisibleAgainPublishesEverythingThatArrivedWhileHidden() {
+        let s = session([blockStart(0, "text"), delta(0, "one"), blockStop(0)])
+        s.isVisible = false
+        for index in 2...5 {
+            s.ingestForTesting(blockStart(0, "text"))
+            s.ingestForTesting(delta(0, "answer \(index)"))
+            s.ingestForTesting(blockStop(0))
+        }
+        let revisionWhileHidden = s.revision
+
+        s.isVisible = true
+
+        XCTAssertEqual(s.rows.count, 5, "the transcript catches up")
+        XCTAssertEqual(s.revision, revisionWhileHidden + 1, "in exactly one announcement")
+        XCTAssertEqual(s.rows.map(\.id), s.entries.map(\.id))
+    }
+
+    /// Status is not the transcript. The sidebar and the pane's tab draw a busy
+    /// agent from `streamingIds`, so gating that with visibility would leave a
+    /// hidden agent looking finished. Only the transcript is deferred.
+    func testAHiddenSessionStillReportsThatItIsStreaming() throws {
+        let s = session([blockStart(0, "text"), delta(0, "half a sen")])
+        s.isVisible = false
+        s.ingestForTesting(blockStart(1, "text"))
+        s.ingestForTesting(delta(1, "still writing"))
+
+        XCTAssertFalse(s.streamingIds.isEmpty, "a hidden agent must still look busy")
+        XCTAssertEqual(s.entries.count, 2)
+    }
+
+    /// Nothing is gated by default, so a wiring mistake in the view degrades to
+    /// today's behaviour rather than to a pane that silently stops updating.
+    func testASessionPublishesUntilSomeoneSaysItIsHidden() {
+        let s = AgentSession()
+        XCTAssertTrue(s.isVisible)
+        s.ingestForTesting(blockStart(0, "text"))
+        s.ingestForTesting(delta(0, "visible by default"))
+        XCTAssertEqual(s.rows.count, 1)
+    }
+
     /// The batch-rate override maps Hz to the flush interval and falls back to
     /// the shipped 30Hz when absent or nonsense. Unlike the row cap, nothing
     /// downstream is sized by this value, so the mapping is the whole contract.

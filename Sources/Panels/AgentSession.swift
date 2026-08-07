@@ -422,6 +422,31 @@ final class AgentSession {
     /// `maxRenderedEntries` when the override moved between two publishes.
     @ObservationIgnored private var renderedBound = 0
 
+    /// Whether this transcript is on screen — the pane's tab is selected, its
+    /// workspace is showing, and no sibling pane is zoomed over it.
+    ///
+    /// SwiftUI coalesces mutations per frame and then walks every subgraph that
+    /// was dirtied, so ten streaming agents behind one visible pane are paid for
+    /// ten times over. Two experiments ruled out the alternatives: a 30x smaller
+    /// row window changed nothing, and dropping the flush rate from 30Hz to 10Hz
+    /// changed nothing. What is left is the count of dirty sessions per frame,
+    /// which is what this removes — a hidden transcript stops announcing until
+    /// someone looks at it again.
+    ///
+    /// Only the transcript is deferred. `isRunning`, `isThinking`, `summary` and
+    /// `streamingIds` keep publishing, because the sidebar and the pane's own
+    /// tab draw a busy agent from those and a hidden agent must not look
+    /// finished.
+    ///
+    /// Defaults to `true`: a view that forgets to set this degrades to today's
+    /// behaviour, never to a pane that silently stops updating.
+    @ObservationIgnored var isVisible = true {
+        didSet {
+            guard isVisible, isVisible != oldValue, entriesDirty else { return }
+            publishEntries()
+        }
+    }
+
     private func withEntryTransaction(_ body: () -> Void) {
         mutationDepth += 1
         body()
@@ -431,6 +456,9 @@ final class AgentSession {
 
     private func publishEntries() {
         guard entriesDirty else { return }
+        // Leave `entriesDirty` standing so the work resumes on the way back in;
+        // `rowsStructureDirty` and `dirtyEntryIDs` keep accumulating with it.
+        guard isVisible else { return }
         entriesDirty = false
         // The incremental branch below maps `rows[relative]` onto
         // `entries[displayStart + relative]` and uses `rows.count` as the width
