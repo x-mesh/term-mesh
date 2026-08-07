@@ -5,7 +5,7 @@ import Bonsplit
 
 @main
 struct TermMeshApp: App {
-    @StateObject private var tabManager: TabManager
+    @State private var tabManager: TabManager
     @StateObject private var notificationStore = TerminalNotificationStore.shared
     @StateObject private var sidebarState = SidebarState()
     @StateObject private var sidebarSelectionState = SidebarSelectionState()
@@ -104,7 +104,7 @@ struct TermMeshApp: App {
         let isRunningUnderXCTest = AppLaunchEnvironment.isRunningUnderXCTest(
             ProcessInfo.processInfo.environment
         )
-        _tabManager = StateObject(wrappedValue: TabManager(
+        _tabManager = State(wrappedValue: TabManager(
             restoreSavedSession: !isRunningUnderXCTest,
             persistsSessionState: !isRunningUnderXCTest,
             daemon: TermMeshDaemon.shared,
@@ -259,7 +259,7 @@ struct TermMeshApp: App {
     @ViewBuilder
     private var primaryWindowBaseContent: some View {
     ContentView(updateViewModel: appDelegate.updateViewModel, windowId: primaryWindowId)
-        .environmentObject(tabManager)
+        .environment(tabManager)
         .environmentObject(notificationStore)
         .environmentObject(sidebarState)
         .environmentObject(sidebarSelectionState)

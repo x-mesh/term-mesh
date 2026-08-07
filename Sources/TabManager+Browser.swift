@@ -1133,21 +1133,27 @@ extension TabManager {
                 }
                 .store(in: &uiTestCancellables)
 
-            $tabs
-                .map { $0.contains(where: { $0.id == tab.id }) }
-                .removeDuplicates()
-                .sink { alive in
-                    Task { @MainActor in
-                        if !alive {
-                            finish([
-                                "workspaceCountAfter": "0",
-                                "panelCountAfter": "0",
-                                "closedWorkspace": "1",
-                            ])
-                        }
+            // `tabs` lost its Combine publisher when TabManager moved to
+            // `@Observable`; this poll matches how the rest of this fixture waits.
+            Task { @MainActor in
+                while !finished {
+                    if !self.tabs.contains(where: { $0.id == tab.id }) {
+                        finish([
+                            "workspaceCountAfter": "0",
+                            "panelCountAfter": "0",
+                            "closedWorkspace": "1",
+                        ])
+                        return
+                    }
+                    // `try?` here would swallow cancellation and spin this loop
+                    // at full speed until the timeout fires.
+                    do {
+                        try await Task.sleep(nanoseconds: 50_000_000)
+                    } catch {
+                        return
                     }
                 }
-                .store(in: &uiTestCancellables)
+            }
 
             let work = DispatchWorkItem {
                 finish([

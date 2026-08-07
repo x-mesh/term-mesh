@@ -36,6 +36,7 @@ struct PanelContentView: View {
                 AgentPanelView(
                     panel: agentPanel,
                     isFocused: isFocused,
+                    isVisibleInUI: isVisibleInUI,
                     appearance: appearance,
                     onFocus: onFocus
                 )

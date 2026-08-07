@@ -196,7 +196,7 @@ struct ContentView: View {
     /// with the spinner row it had a second earlier.
     @State private var peerStoreRevision = 0
     let windowId: UUID
-    @EnvironmentObject var tabManager: TabManager
+    @Environment(TabManager.self) var tabManager
     @EnvironmentObject var notificationStore: TerminalNotificationStore
     @EnvironmentObject var sidebarState: SidebarState
     @EnvironmentObject var sidebarSelectionState: SidebarSelectionState
@@ -1860,8 +1860,19 @@ struct ContentView: View {
             completeWorkspaceHandoffIfNeeded(focusedTabId: selectedTabId, reason: "browser_address_bar")
         })
 
-        view = AnyView(view.onReceive(tabManager.$tabs) { tabs in
-            let existingIds = Set(tabs.map { $0.id })
+        // Keyed on the id list because `Workspace` is not Equatable — and because
+        // membership plus order is all this closure reacts to. Unlike the former
+        // `$tabs` publisher, which fired in `willSet` and left `tabManager.tabs`
+        // holding the old array, `onChange` runs after the mutation, so the
+        // reconcile no longer has to be handed the new array explicitly.
+        //
+        // `initial: true` reproduces the value the `@Published` publisher emitted
+        // to every new subscriber. `onAppear` covers the reconcile and the empty
+        // seed, but not the two cleanups below it — filtering ids of workspaces
+        // that went away, and clamping a now out-of-range sidebar index — so on a
+        // re-appear those would otherwise stay stale until the next tabs change.
+        view = AnyView(view.onChange(of: tabManager.tabs.map(\.id), initial: true) { _, tabIds in
+            let existingIds = Set(tabIds)
             if let retiringWorkspaceId, !existingIds.contains(retiringWorkspaceId) {
                 self.retiringWorkspaceId = nil
                 workspaceHandoffFallbackTask?.cancel()
@@ -1870,14 +1881,14 @@ struct ContentView: View {
             if let previousSelectedWorkspaceId, !existingIds.contains(previousSelectedWorkspaceId) {
                 self.previousSelectedWorkspaceId = tabManager.selectedTabId
             }
-            reconcileMountedWorkspaceIds(tabs: tabs)
+            reconcileMountedWorkspaceIds()
             selectedTabIds = selectedTabIds.filter { existingIds.contains($0) }
             if selectedTabIds.isEmpty, let selectedId = tabManager.selectedTabId {
                 selectedTabIds = [selectedId]
             }
-            if let lastIndex = lastSidebarSelectionIndex, lastIndex >= tabs.count {
+            if let lastIndex = lastSidebarSelectionIndex, lastIndex >= tabIds.count {
                 if let selectedId = tabManager.selectedTabId {
-                    lastSidebarSelectionIndex = tabs.firstIndex { $0.id == selectedId }
+                    lastSidebarSelectionIndex = tabIds.firstIndex(of: selectedId)
                 } else {
                     lastSidebarSelectionIndex = nil
                 }

@@ -1,5 +1,6 @@
 import XCTest
 import AppKit
+import Observation
 
 #if canImport(term_mesh_DEV)
 @testable import term_mesh_DEV
@@ -1165,5 +1166,102 @@ final class GhosttyEnvironmentOrderingTests: XCTestCase {
                 ghosttyRecordedEnvironment: false
             )
         )
+    }
+}
+
+/// What `TabManager` announces after the move to `@Observable`, and the one
+/// assumption `ContentView`'s `onChange` rests on.
+///
+/// Under `@Observable` every stored property becomes an invalidation source
+/// unless it is annotated otherwise, so the interesting cases are the two the
+/// diff cannot show: churn that must stay silent, and the key expression that
+/// decides whether the workspace-list closure runs at all.
+@MainActor
+final class TabManagerObservationTests: XCTestCase {
+    override func tearDown() {
+        AppFocusState.overrideIsFocused = nil
+        super.tearDown()
+    }
+
+    private func makeManager() -> TabManager {
+        TabManager(initialWorkingDirectory: "/tmp", persistsSessionState: false)
+    }
+
+    private func postTitle(_ title: String, workspaceId: UUID, panelId: UUID) {
+        NotificationCenter.default.post(
+            name: .ghosttyDidSetTitle,
+            object: nil,
+            userInfo: [
+                GhosttyNotificationKey.tabId: workspaceId,
+                GhosttyNotificationKey.surfaceId: panelId,
+                GhosttyNotificationKey.title: title,
+            ]
+        )
+    }
+
+    // MARK: - Silence
+
+    /// Terminal titles arrive on every prompt and are coalesced at 30Hz. The
+    /// coalescer's buffer is `@ObservationIgnored` precisely so that stream
+    /// never reaches a reader of the workspace list. Drop the annotation and
+    /// this fails.
+    func testTitleChurnDoesNotWakeWorkspaceListReaders() async throws {
+        let manager = makeManager()
+        let workspace = try XCTUnwrap(manager.selectedWorkspace)
+        let panelId = try XCTUnwrap(workspace.focusedPanelId)
+
+        let woke = expectation(description: "workspace-list readers must stay asleep")
+        woke.isInverted = true
+        withObservationTracking {
+            _ = manager.tabs
+            _ = manager.selectedTabId
+        } onChange: { woke.fulfill() }
+
+        AppFocusState.overrideIsFocused = true
+        for i in 0..<20 {
+            postTitle("title-\(i)", workspaceId: workspace.id, panelId: panelId)
+        }
+        try await Task.sleep(nanoseconds: 200_000_000)
+
+        await fulfillment(of: [woke], timeout: 0.2)
+    }
+
+    // MARK: - Wake-ups that must survive
+
+    func testOpeningAWorkspaceWakesListReaders() {
+        let manager = makeManager()
+        let woke = expectation(description: "workspace list must be invalidated")
+        withObservationTracking {
+            _ = manager.tabs
+        } onChange: { woke.fulfill() }
+
+        _ = manager.addWorkspace(workingDirectory: "/tmp", select: false)
+
+        wait(for: [woke], timeout: 1.0)
+    }
+
+    // MARK: - The key `ContentView.onChange` rests on
+
+    /// `ContentView` keys its workspace-list `onChange` on `tabs.map(\.id)`
+    /// rather than on `tabs`, because `Workspace` is not `Equatable`. That is
+    /// only sound if the id list moves for exactly the mutations the closure
+    /// has to answer — membership and order — and stays put for the one it
+    /// never answered even under the old `$tabs` publisher: renaming a
+    /// workspace mutates the object, not the array.
+    func testIdListTracksMembershipAndOrderButNotRename() throws {
+        let manager = makeManager()
+        let first = try XCTUnwrap(manager.tabs.first)
+
+        let beforeOpen = manager.tabs.map(\.id)
+        let second = manager.addWorkspace(workingDirectory: "/tmp", select: false)
+        XCTAssertNotEqual(beforeOpen, manager.tabs.map(\.id), "opening a workspace must move the key")
+
+        let beforeMove = manager.tabs.map(\.id)
+        manager.moveTabToTop(second.id)
+        XCTAssertNotEqual(beforeMove, manager.tabs.map(\.id), "reordering must move the key")
+
+        let beforeRename = manager.tabs.map(\.id)
+        manager.setCustomTitle(tabId: first.id, title: "renamed")
+        XCTAssertEqual(beforeRename, manager.tabs.map(\.id), "a rename must not move the key")
     }
 }

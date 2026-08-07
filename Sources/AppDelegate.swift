@@ -1355,7 +1355,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
 
         let root = TermMeshWindowRoot {
             ContentView(updateViewModel: self.updateViewModel, windowId: windowId)
-                .environmentObject(tabManager)
+                .environment(tabManager)
                 .environmentObject(notificationStore)
                 .environmentObject(sidebarState)
                 .environmentObject(sidebarSelectionState)

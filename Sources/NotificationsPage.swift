@@ -2,7 +2,7 @@ import SwiftUI
 
 struct NotificationsPage: View {
     @EnvironmentObject var notificationStore: TerminalNotificationStore
-    @EnvironmentObject var tabManager: TabManager
+    @Environment(TabManager.self) var tabManager
     @Binding var selection: SidebarSelection
     @FocusState private var focusedNotificationId: UUID?
     @AppStorage(KeyboardShortcutSettings.Action.jumpToUnread.defaultsKey) private var jumpToUnreadShortcutData = Data()
