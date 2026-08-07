@@ -1,4 +1,5 @@
 import XCTest
+import Observation
 
 #if canImport(term_mesh_DEV)
 @testable import term_mesh_DEV
@@ -940,22 +941,47 @@ final class AgentSessionTests: XCTestCase {
                        AgentSession.topGap(before: entries[17], after: nil))
     }
 
-    /// A streamed delta must announce itself once. `AgentPanel` forwards every
-    /// `objectWillChange` the session sends, so publishing both `entries` and
-    /// `revision` for one mutation rebuilt the whole transcript twice per
-    /// character that arrived.
+    /// A streamed delta must announce itself once. The session used to publish
+    /// both `entries` and `revision` for one mutation, and `AgentPanel`
+    /// forwarded every announcement, so the transcript rebuilt itself twice per
+    /// character that arrived. Under `@Observable` the guarantee is stated as a
+    /// count: one transaction advances `revision` exactly once, and `entries`
+    /// is outside observation entirely.
     func testAStreamedDeltaAnnouncesItselfOnce() {
         let s = session([blockStart(0, "text")])
-        var announcements = 0
-        let token = s.objectWillChange.sink { _ in announcements += 1 }
-        defer { token.cancel() }
+        let revisionBefore = s.revision
+        let rowsInvalidated = expectation(description: "rows invalidated once")
+        withObservationTracking { _ = s.rows } onChange: { rowsInvalidated.fulfill() }
 
         s.ingestForTesting(delta(0, "half a sen"))
 
-        XCTAssertEqual(announcements, 1, "one mutation, one announcement")
+        wait(for: [rowsInvalidated], timeout: 1)
+        XCTAssertEqual(s.revision, revisionBefore + 1, "one mutation, one announcement")
         // And the rows the view reads are already the new ones — they are
         // rebuilt before the announcement, not after it.
         XCTAssertEqual(s.rows.map(\.id), s.entries.map(\.id))
+    }
+
+    /// A delta must not wake the turn-state properties.
+    ///
+    /// `@Observable` invalidates on assignment, not on change, so the turn
+    /// boundaries that assign `isThinking`/`isRunning`/`canInterrupt`
+    /// unconditionally would wake every view reading them on every event. The
+    /// guarded setters exist to stop that; this fails if one is bypassed.
+    func testAStreamedDeltaLeavesTurnStateSilent() {
+        let s = session([blockStart(0, "text")])
+        let turnStateWoke = expectation(description: "turn state must stay silent")
+        turnStateWoke.isInverted = true
+        withObservationTracking {
+            _ = s.isThinking
+            _ = s.isRunning
+            _ = s.canInterrupt
+            _ = s.summary
+        } onChange: { turnStateWoke.fulfill() }
+
+        s.ingestForTesting(delta(0, "half a sen"))
+
+        wait(for: [turnStateWoke], timeout: 0.2)
     }
 
     // MARK: - Stopping a turn

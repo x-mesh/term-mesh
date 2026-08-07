@@ -176,8 +176,22 @@ private struct AgentParsedLine: @unchecked Sendable {
 /// a diff as a diff, keep the answer selectable, and let a person search it —
 /// none of which is available to something that has already been flattened to
 /// a grid of cells.
-@MainActor
-final class AgentSession: ObservableObject {
+/// **Observation.** `@Observable` rather than `ObservableObject`, because
+/// invalidation here is per-delta and multiplied by however many agents are
+/// running. `ObservableObject` announces the *object*: every view watching the
+/// session — and, through `AgentPanel`'s forwarding, every view watching the
+/// panel — was dirtied by a change to any one property. With ten agents
+/// streaming, `sample` put 1017 main-thread samples inside
+/// `AG::Graph::UpdateStack::update` with no app symbols beneath it: not bodies
+/// running, but the graph being walked. `@Observable` tracks the properties a
+/// view actually read, so a delta wakes what draws the transcript and nothing
+/// else.
+///
+/// The rule for what stays observable: **a stored property is observed only if
+/// a view body reads it.** Bookkeeping, callbacks, process handles and the raw
+/// `entries` are `@ObservationIgnored` — the same split vendor/bonsplit made.
+@Observable @MainActor
+final class AgentSession {
 
     // MARK: - What a session is made of
 
@@ -360,11 +374,14 @@ final class AgentSession: ObservableObject {
 
     // MARK: - State
 
-    /// Deliberately not `@Published`: `revision` below is the one announcement
-    /// a mutation makes. Publishing both sent two `objectWillChange` per
-    /// streamed delta — `AgentPanel` forwards every one of them — so the
-    /// transcript rebuilt itself twice for each character that arrived.
-    private(set) var entries: [Entry] = [] {
+    /// The model's own history, deliberately outside observation.
+    ///
+    /// No view reads this — the panel draws `rows`, the bounded projection
+    /// below. Observing it would mean every streamed character invalidated the
+    /// transcript twice: once here and once when the projection it feeds is
+    /// rebuilt. `withEntryTransaction` still collapses a whole pipe read into
+    /// one `publishEntries()`, so N deltas remain one announcement.
+    @ObservationIgnored private(set) var entries: [Entry] = [] {
         didSet {
             if oldValue.count != entries.count ||
                 !zip(oldValue, entries).allSatisfy({ $0.0.id == $0.1.id }) {
@@ -382,10 +399,10 @@ final class AgentSession: ObservableObject {
     /// A pipe read can contain hundreds of character deltas. Apply the whole
     /// read as one model transaction so row projection and SwiftUI invalidation
     /// happen once, not once per character.
-    private var mutationDepth = 0
-    private var entriesDirty = false
-    private var rowsStructureDirty = true
-    private var dirtyEntryIDs: Set<UUID> = []
+    @ObservationIgnored private var mutationDepth = 0
+    @ObservationIgnored private var entriesDirty = false
+    @ObservationIgnored private var rowsStructureDirty = true
+    @ObservationIgnored private var dirtyEntryIDs: Set<UUID> = []
 
     private func withEntryTransaction(_ body: () -> Void) {
         mutationDepth += 1
@@ -503,17 +520,19 @@ final class AgentSession: ObservableObject {
     ///
     /// A view following the bottom cannot key on `entries.count`: a streamed
     /// answer grows an entry that is already there, so the count sits still
-    /// while the text runs off the bottom of the pane.
-    @Published private(set) var revision = 0
+    /// while the text runs off the bottom of the pane. Observed, because
+    /// `AgentPanelView` keys its auto-scroll on it; also a monotonic mutation
+    /// counter, which is what the transaction tests assert on.
+    private(set) var revision = 0
     #if DEBUG
-    private var debugAppliedBatches = 0
-    private var debugAppliedLines = 0
-    private var debugAppliedBytes = 0
-    private var debugAutoScrolls = 0
-    private var debugApplyTotalMs = 0.0
-    private var debugApplyMaxMs = 0.0
+    @ObservationIgnored private var debugAppliedBatches = 0
+    @ObservationIgnored private var debugAppliedLines = 0
+    @ObservationIgnored private var debugAppliedBytes = 0
+    @ObservationIgnored private var debugAutoScrolls = 0
+    @ObservationIgnored private var debugApplyTotalMs = 0.0
+    @ObservationIgnored private var debugApplyMaxMs = 0.0
     #endif
-    @Published private(set) var isThinking = false {
+    private(set) var isThinking = false {
         didSet {
             guard oldValue != isThinking else { return }
             onBusyChanged?(isThinking)
@@ -525,13 +544,13 @@ final class AgentSession: ObservableObject {
     /// `isThinking` is the truth and it lives on the main actor, while the
     /// status RPC is served off it — so the fact has to be pushed somewhere an
     /// off-main reader can see, rather than pulled.
-    var onBusyChanged: ((Bool) -> Void)?
-    @Published private(set) var isRunning = false
+    @ObservationIgnored var onBusyChanged: ((Bool) -> Void)?
+    private(set) var isRunning = false
     /// What the CLI announced about itself, shown once rather than per turn.
-    @Published private(set) var summary: String?
+    private(set) var summary: String?
 
     /// Whether this agent's turn can be stopped. See `Launch.interruptible`.
-    @Published private(set) var canInterrupt = false
+    private(set) var canInterrupt = false
 
     /// Rows still being written, so the view can show a caret on them.
     ///
@@ -539,11 +558,41 @@ final class AgentSession: ObservableObject {
     /// leaves "is it still coming, or did it stop there?" to be inferred from
     /// whether more shows up — which is the same inference the completion
     /// detector had to make, one layer down.
-    @Published private(set) var streamingIds: Set<UUID> = []
+    private(set) var streamingIds: Set<UUID> = []
 
     /// Called when a turn ends, with the agent's final text. The task-board
     /// side reads its own header out of this; the session does not interpret it.
-    var onTurnEnd: ((String, TurnEnd, String?) -> Void)?
+    @ObservationIgnored var onTurnEnd: ((String, TurnEnd, String?) -> Void)?
+
+    // MARK: - Turn-state writes
+    //
+    // `@Observable` invalidates on *assignment*, not on change. The turn
+    // boundaries below assign unconditionally — `isThinking = false` runs on
+    // every result event whether or not a turn was in flight — and each of
+    // those woke every view reading the property for no visible difference.
+    // `isThinking`'s `didSet` already guarded the *callback*; these guard the
+    // write itself, which is what observation keys on. Same shape as
+    // bonsplit's `focusPane` redundant-write guard.
+
+    private func setThinking(_ value: Bool) {
+        guard isThinking != value else { return }
+        isThinking = value
+    }
+
+    private func setRunning(_ value: Bool) {
+        guard isRunning != value else { return }
+        isRunning = value
+    }
+
+    private func setCanInterrupt(_ value: Bool) {
+        guard canInterrupt != value else { return }
+        canInterrupt = value
+    }
+
+    private func clearStreamingIds() {
+        guard !streamingIds.isEmpty else { return }
+        streamingIds.removeAll()
+    }
 
     /// Lifecycle state is confined to `queue`. `ioLock` protects FileHandle reads
     /// against asynchronous close; MainActor never waits on either synchronization
@@ -653,9 +702,9 @@ final class AgentSession: ObservableObject {
         }
     }
 
-    private var process: Process?
-    private var stdin: FileHandle?
-    private var streamResources: StreamResources?
+    @ObservationIgnored private var process: Process?
+    @ObservationIgnored private var stdin: FileHandle?
+    @ObservationIgnored private var streamResources: StreamResources?
     /// Bytes, not a string.
     ///
     /// A pipe read ends wherever the kernel handed the buffer over, which can
@@ -664,7 +713,7 @@ final class AgentSession: ObservableObject {
     /// answer that is most of a line, and if the line it lands in is `result`
     /// the turn never ends at all. Split on newlines in the bytes; decode only
     /// what is whole.
-    private var directDecoder = AgentStreamDecoder(maxLineBytes: AgentSession.maxLineBytes)
+    @ObservationIgnored private var directDecoder = AgentStreamDecoder(maxLineBytes: AgentSession.maxLineBytes)
 
     /// A line that never arrives must not grow forever. Far above any real
     /// event: a long tool result is tens of kilobytes.
@@ -683,10 +732,10 @@ final class AgentSession: ObservableObject {
     static let drainGrace: TimeInterval = 2
 
     /// Tool calls waiting for their result, keyed by the id the events use.
-    private var openTools: [String: Int] = [:]
+    @ObservationIgnored private var openTools: [String: Int] = [:]
     /// Assistant text for the turn in flight, so `result` can be trusted to
     /// carry the final answer without the model having to be reassembled.
-    private var saidThisTurn: [String] = []
+    @ObservationIgnored private var saidThisTurn: [String] = []
 
     /// Content blocks being streamed, keyed by the index the events use, held
     /// as positions in `entries` so a delta lands on the row it belongs to.
@@ -695,8 +744,8 @@ final class AgentSession: ObservableObject {
     /// deltas, then again whole. Both would draw it, so the second is skipped
     /// for whatever the first already built — but only for that, since tool
     /// calls only ever arrive complete.
-    private var streamOpen: [Int: Int] = [:]
-    private var streamedThisMessage = false
+    @ObservationIgnored private var streamOpen: [Int: Int] = [:]
+    @ObservationIgnored private var streamedThisMessage = false
 
     // MARK: - Running
 
@@ -1046,8 +1095,8 @@ final class AgentSession: ObservableObject {
             append(.notice(id: UUID(), "could not start the agent: \(error.localizedDescription)"))
             return
         }
-        isRunning = true
-        canInterrupt = launch.interruptible
+        setRunning(true)
+        setCanInterrupt(launch.interruptible)
     }
 
     func stop() {
@@ -1076,7 +1125,7 @@ final class AgentSession: ObservableObject {
         guard process === expected else { return }
         // A result frame normally starts the next queued turn. This process has
         // exited, so keep that queue intact for finishAfterDrain to report.
-        isRunning = false
+        setRunning(false)
         guard teardown(process: expected, terminate: false) else { return }
         if !drainedFully {
             append(.notice(id: UUID(),
@@ -1107,8 +1156,8 @@ final class AgentSession: ObservableObject {
         streamResources = nil
         process = nil
         directDecoder = AgentStreamDecoder(maxLineBytes: Self.maxLineBytes)
-        isRunning = false
-        canInterrupt = false
+        setRunning(false)
+        setCanInterrupt(false)
 
         // Closing our stdin descriptor is a local close, not a drain or wait.
         try? input?.close()
@@ -1124,9 +1173,9 @@ final class AgentSession: ObservableObject {
     }
 
     private func finishAfterDrain(code: Int32, stopped: Bool = false) {
-        isThinking = false
+        setThinking(false)
         streamOpen.removeAll()
-        streamingIds.removeAll()
+        clearStreamingIds()
         if code != 0 {
             append(.notice(id: UUID(), "the agent exited (\(code))"))
         }
@@ -1194,7 +1243,7 @@ final class AgentSession: ObservableObject {
     /// written straight into the same stdin, taking `currentTaskId` with it.
     /// The person's `result` would then close the leader's task, or the CLI
     /// would merge the two and one completion would simply never arrive.
-    private var turnInFlight = false
+    @ObservationIgnored private var turnInFlight = false
 
     @discardableResult
     private func write(_ text: String, from speaker: Speaker, taskId: String?) throws -> Int {
@@ -1207,7 +1256,7 @@ final class AgentSession: ObservableObject {
         // Any write opens a turn. Only a leader's carries a task.
         turnInFlight = true
         if speaker == .leader { currentTaskId = taskId }
-        isThinking = true
+        setThinking(true)
         return payload.count
     }
 
@@ -1217,7 +1266,7 @@ final class AgentSession: ObservableObject {
     /// screen has nothing tying it to a request — so it guessed, and a reply
     /// was measured closing an unrelated blocked task. Here the instruction
     /// says which task it is, and this side is the one that wrote it.
-    private(set) var currentTaskId: String?
+    @ObservationIgnored private(set) var currentTaskId: String?
 
     static func taskId(in text: String) -> String? {
         for raw in text.components(separatedBy: "\n") {
@@ -1230,7 +1279,7 @@ final class AgentSession: ObservableObject {
         return nil
     }
 
-    private var pendingSpeaker: Speaker = .leader
+    @ObservationIgnored private var pendingSpeaker: Speaker = .leader
 
     /// Leader turns waiting for the one in flight to finish.
     ///
@@ -1245,7 +1294,7 @@ final class AgentSession: ObservableObject {
     /// So leader turns are serialised — one instruction, one turn, one result —
     /// and a person's message still goes straight in, joining the turn already
     /// running, which is what makes interrupting useful.
-    private var queued: [(text: String, taskId: String?)] = []
+    @ObservationIgnored private var queued: [(text: String, taskId: String?)] = []
 
     static func encode(text: String) throws -> Data {
         var data = try JSONSerialization.data(withJSONObject: [
@@ -1277,7 +1326,7 @@ final class AgentSession: ObservableObject {
     /// Set when the stop came from here, so the turn that ends a moment later
     /// can say "stopped" rather than `error_during_execution` — which is what
     /// claude calls it, and which reads like something went wrong.
-    private var stopRequested = false
+    @ObservationIgnored private var stopRequested = false
 
     // MARK: - Reading the stream
 
@@ -1529,7 +1578,7 @@ final class AgentSession: ObservableObject {
         // A turn can end with blocks still open — an error, a stop, a killed
         // process. Leaving their carets on would say "still writing" forever.
         streamOpen.removeAll()
-        streamingIds.removeAll()
+        clearStreamingIds()
         // Same for a tool whose result never came. Measured on kiro: five rows
         // left spinning because the bridge dropped the id its results carried,
         // and a row with no id can never be closed by one. The id is carried
@@ -1543,7 +1592,7 @@ final class AgentSession: ObservableObject {
         }
         openTools.removeAll()
         append(.turnEnded(id: UUID(), end))
-        isThinking = false
+        setThinking(false)
         turnInFlight = false
         stopRequested = false
         // `result` carries the final answer as a clean string — the boundary is
@@ -1663,7 +1712,7 @@ final class AgentSession: ObservableObject {
     func openTurnForTesting(from speaker: Speaker, taskId: String? = nil) {
         pendingSpeaker = speaker
         turnInFlight = true
-        isThinking = true
+        setThinking(true)
         if speaker == .leader { currentTaskId = taskId }
     }
 

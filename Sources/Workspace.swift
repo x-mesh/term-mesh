@@ -8,64 +8,111 @@ import CoreText
 
 /// Workspace represents a sidebar tab.
 /// Each workspace contains one BonsplitController that manages split panes and nested surfaces.
-@MainActor
-final class Workspace: Identifiable, ObservableObject {
+///
+/// **Observation.** `@Observable`, not `ObservableObject`. Every workspace stays
+/// mounted — inactive ones are kept in a ZStack so their terminals survive a tab
+/// switch — so with ten workspaces open, an `objectWillChange` from any one of
+/// twenty-two `@Published` properties dirtied every view watching it, in every
+/// workspace, whether or not it drew the thing that changed.
+///
+/// The rule is the same one `AgentSession` follows: **a stored property is
+/// observed only if a view body reads it.** Bookkeeping, caches, callbacks and
+/// close-path state are `@ObservationIgnored`. Two of those exclusions are
+/// load-bearing rather than tidy:
+///
+/// - The lazily-filled caches below must stay out of observation because they
+///   are written *during* body evaluation. A view that mutates observed state
+///   while being evaluated is the AttributeGraph hazard this whole change
+///   exists to avoid. Their freshness is carried by version counters instead.
+/// - `processTitle` / `surfaceTTYNames` / `manualUnreadMarkedAt` were
+///   deliberately never `@Published`: terminal titles change continuously, and
+///   publishing them woke every sidebar subscriber. Making them observed now
+///   would undo that.
+@Observable @MainActor
+final class Workspace: Identifiable {
     let id: UUID
-    lazy var retrievalStore = WorkspaceRetrievalStore(workspaceID: id)
-    @Published var title: String
-    @Published var customTitle: String?
-    @Published var isPinned: Bool = false
-    @Published var customColor: String?  // hex string, e.g. "#C0392B"
+    @ObservationIgnored lazy var retrievalStore = WorkspaceRetrievalStore(workspaceID: id)
+    var title: String
+    var customTitle: String?
+    var isPinned: Bool = false
+    var customColor: String?  // hex string, e.g. "#C0392B"
     /// Injected config provider (defaults to singleton for backward compatibility).
-    var configProvider: any GhosttyConfigProvider = GhosttyApp.shared
+    @ObservationIgnored var configProvider: any GhosttyConfigProvider = GhosttyApp.shared
 
-    @Published var currentDirectory: String {
-        didSet { invalidateSidebarBranchDirectoryEntriesCache() }
+    var currentDirectory: String {
+        didSet {
+            invalidateSidebarBranchDirectoryEntriesCache()
+            // `TabManager` used to reach this through
+            // `$currentDirectory.dropFirst().removeDuplicates()`, which
+            // `@Observable` has no equivalent for. The two operators it relied
+            // on are reproduced here: `didSet` never runs for the value set in
+            // `init`, and the comparison stands in for `removeDuplicates`.
+            if oldValue != currentDirectory { onCurrentDirectoryChange?() }
+        }
     }
+
+    /// Called after `currentDirectory` actually changes. One subscriber
+    /// (`TabManager`, to schedule a session save), so a callback rather than a
+    /// publisher — the same shape `AgentSession.onBusyChanged` uses.
+    @ObservationIgnored var onCurrentDirectoryChange: (() -> Void)?
 
     /// Timestamp when this workspace was created (for session duration display)
     let createdAt: Date = Date()
 
     /// User-assigned tag/bookmark displayed in the titlebar
-    @Published var tag: String?
+    var tag: String?
 
     /// Ordinal for TERMMESH_PORT range assignment (monotonically increasing per app session)
-    var portOrdinal: Int = 0
+    @ObservationIgnored var portOrdinal: Int = 0
 
     /// term-mesh: Worktree metadata for auto-cleanup on tab close.
-    @Published var worktreeName: String?
-    var worktreeRepoPath: String?
+    var worktreeName: String?
+    @ObservationIgnored var worktreeRepoPath: String?
     /// Detected at runtime: true if currentDirectory is inside a git worktree (`.git` is a file, not a directory).
-    @Published var isInsideWorktree: Bool = false
+    var isInsideWorktree: Bool = false
 
     /// The bonsplit controller managing the split panes for this workspace
     let bonsplitController: BonsplitController
 
     /// Mapping from bonsplit TabID to our Panel instances
-    @Published var panels: [UUID: any Panel] = [:] {
+    var panels: [UUID: any Panel] = [:] {
         didSet {
             invalidateSidebarBranchDirectoryEntriesCache()
             invalidateDominantRemoteHostKeyCache()
+            if oldValue.count != panels.count {
+                panelsCountSubject.send(panels.count)
+            }
         }
     }
 
+    /// Panel-count changes for the UI-test harnesses, which wait on a pane
+    /// closing from outside SwiftUI.
+    ///
+    /// `CurrentValueSubject`, not `PassthroughSubject`, and that is the whole
+    /// point: the `$panels` publisher this replaces delivered the current value
+    /// on subscribe, so a harness that attached *after* the close it was
+    /// waiting for still resolved immediately. With a passthrough it would wait
+    /// for a second change that never comes and fail on its 8-second timeout.
+    @ObservationIgnored private(set) lazy var panelsCountSubject =
+        CurrentValueSubject<Int, Never>(panels.count)
+
     /// Subscriptions for panel updates (e.g., browser title changes)
-    var panelSubscriptions: [UUID: AnyCancellable] = [:]
+    @ObservationIgnored var panelSubscriptions: [UUID: AnyCancellable] = [:]
 
     /// When true, suppresses auto-creation in didSplitPane (programmatic splits handle their own panels)
-    var isProgrammaticSplit = false
+    @ObservationIgnored var isProgrammaticSplit = false
 
     /// Last terminal panel used as an inheritance source (typically last focused terminal).
-    var lastTerminalConfigInheritancePanelId: UUID?
+    @ObservationIgnored var lastTerminalConfigInheritancePanelId: UUID?
     /// Last known terminal font points from inheritance sources. Used as fallback when
     /// no live terminal surface is currently available.
-    var lastTerminalConfigInheritanceFontPoints: Float?
+    @ObservationIgnored var lastTerminalConfigInheritanceFontPoints: Float?
     /// Per-panel inherited zoom lineage. Descendants reuse this root value unless
     /// a panel is explicitly re-zoomed by the user.
-    var terminalInheritanceFontPointsByPanelId: [UUID: Float] = [:]
+    @ObservationIgnored var terminalInheritanceFontPointsByPanelId: [UUID: Float] = [:]
 
     /// Callback used by TabManager to capture recently closed browser panels for Cmd+Shift+T restore.
-    var onClosedBrowserPanel: ((ClosedBrowserPanelRestoreSnapshot) -> Void)?
+    @ObservationIgnored var onClosedBrowserPanel: ((ClosedBrowserPanelRestoreSnapshot) -> Void)?
 
     // MARK: - Pane Zoom
 
@@ -109,7 +156,13 @@ final class Workspace: Identifiable, ObservableObject {
         // dropped anchor-geometry callback can't leave a stale-size surface.
         scheduleTerminalGeometryReconcile()
 
-        objectWillChange.send()
+        // No manual announcement here any more. Zoom state lives in
+        // `bonsplitController.zoomedPaneId`, which is itself `@Observable`, and
+        // the two views that show it — the titlebar indicator and the pane
+        // chrome — reach it through `isPaneZoomed`. Under `ObservableObject`
+        // that read was invisible to this object, so the toggle had to announce
+        // itself by hand; observation now follows the property across the
+        // boundary.
     }
 
 
@@ -135,38 +188,49 @@ final class Workspace: Identifiable, ObservableObject {
     }
 
     /// Published directory for each panel
-    @Published var panelDirectories: [UUID: String] = [:] {
+    var panelDirectories: [UUID: String] = [:] {
         didSet { invalidateSidebarBranchDirectoryEntriesCache() }
     }
-    @Published var panelTitles: [UUID: String] = [:]
-    @Published var panelCustomTitles: [UUID: String] = [:]
-    @Published var pinnedPanelIds: Set<UUID> = []
-    @Published var manualUnreadPanelIds: Set<UUID> = []
-    var manualUnreadMarkedAt: [UUID: Date] = [:]
+    var panelTitles: [UUID: String] = [:]
+    var panelCustomTitles: [UUID: String] = [:]
+    var pinnedPanelIds: Set<UUID> = []
+    var manualUnreadPanelIds: Set<UUID> = []
+    @ObservationIgnored var manualUnreadMarkedAt: [UUID: Date] = [:]
     nonisolated static let manualUnreadFocusGraceInterval: TimeInterval = 0.2
     nonisolated static let manualUnreadClearDelayAfterFocusFlash: TimeInterval = 0.2
-    @Published var statusEntries: [String: SidebarStatusEntry] = [:]
-    @Published var logEntries: [SidebarLogEntry] = []
-    @Published var progress: SidebarProgressState?
-    @Published var gitBranch: SidebarGitBranchState? {
+    var statusEntries: [String: SidebarStatusEntry] = [:]
+    var logEntries: [SidebarLogEntry] = []
+    var progress: SidebarProgressState?
+    var gitBranch: SidebarGitBranchState? {
         didSet { invalidateSidebarBranchDirectoryEntriesCache() }
     }
-    @Published var panelGitBranches: [UUID: SidebarGitBranchState] = [:] {
+    var panelGitBranches: [UUID: SidebarGitBranchState] = [:] {
         didSet { invalidateSidebarBranchDirectoryEntriesCache() }
     }
-    private var sidebarBranchDirectoryEntriesCache: [SidebarBranchOrdering.BranchDirectoryEntry]?
-    private var sidebarBranchDirectoryDisplayLinesCache: [Bool: [SidebarBranchOrdering.BranchDirectoryDisplayLine]] = [:]
-    private(set) var sidebarBranchDirectoryEntriesComputationCount = 0
-    private(set) var sidebarBranchDirectoryDisplayLinesComputationCount = 0
+    @ObservationIgnored private var sidebarBranchDirectoryEntriesCache: [SidebarBranchOrdering.BranchDirectoryEntry]?
+    @ObservationIgnored private var sidebarBranchDirectoryDisplayLinesCache: [Bool: [SidebarBranchOrdering.BranchDirectoryDisplayLine]] = [:]
+    @ObservationIgnored private(set) var sidebarBranchDirectoryEntriesComputationCount = 0
+    @ObservationIgnored private(set) var sidebarBranchDirectoryDisplayLinesComputationCount = 0
     /// Outer optional tracks whether a value has been computed; the inner
     /// optional caches the common local-workspace result (`nil`) as well.
-    private var dominantRemoteHostKeyCache: PeerPaneHostKey??
-    private var dominantRemoteHostKeyCachedFocusedPanelId: UUID?
-    private(set) var dominantRemoteHostKeyComputationCount = 0
-    @Published var surfaceListeningPorts: [UUID: [Int]] = [:]
-    @Published var listeningPorts: [Int] = []
-    var surfaceTTYNames: [UUID: String] = [:]
-    @Published var shellIntegrationHealth: [UUID: ShellIntegrationHealth] = [:]
+    /// Freshness tokens for the two lazily-filled caches above.
+    ///
+    /// The caches are `@ObservationIgnored` because they are written during
+    /// body evaluation, which means a cache *hit* reads nothing observed and
+    /// leaves the view with no dependency to invalidate. These counters are the
+    /// dependency: each accessor reads one before consulting its cache, and
+    /// each `invalidate…` advances it. Bumped only from `didSet` — the model
+    /// path — never from the fill path.
+    private(set) var sidebarBranchDataVersion = 0
+    private(set) var dominantRemoteHostDataVersion = 0
+
+    @ObservationIgnored private var dominantRemoteHostKeyCache: PeerPaneHostKey??
+    @ObservationIgnored private var dominantRemoteHostKeyCachedFocusedPanelId: UUID?
+    @ObservationIgnored private(set) var dominantRemoteHostKeyComputationCount = 0
+    var surfaceListeningPorts: [UUID: [Int]] = [:]
+    var listeningPorts: [Int] = []
+    @ObservationIgnored var surfaceTTYNames: [UUID: String] = [:]
+    var shellIntegrationHealth: [UUID: ShellIntegrationHealth] = [:]
 
     var focusedSurfaceId: UUID? { focusedPanelId }
     var surfaceDirectories: [UUID: String] {
@@ -174,7 +238,10 @@ final class Workspace: Identifiable, ObservableObject {
         set { panelDirectories = newValue }
     }
 
-    var processTitle: String
+    /// Deliberately unobserved. A terminal rewrites its title on every prompt
+    /// and every command; publishing that stream woke every sidebar subscriber
+    /// for a string most of them do not draw.
+    @ObservationIgnored var processTitle: String
 
     enum SurfaceKind {
         static let terminal = "terminal"
@@ -430,32 +497,32 @@ final class Workspace: Identifiable, ObservableObject {
     // MARK: - Surface ID to Panel ID Mapping
 
     /// Mapping from bonsplit TabID (surface ID) to panel UUID
-    var surfaceIdToPanelId: [TabID: UUID] = [:]
+    @ObservationIgnored var surfaceIdToPanelId: [TabID: UUID] = [:]
 
     /// Tab IDs that are allowed to close even if they would normally require confirmation.
     /// This is used by app-level confirmation prompts (e.g., Cmd+W "Close Tab?") so the
     /// Bonsplit delegate doesn't block the close after the user already confirmed.
-    var forceCloseTabIds: Set<TabID> = []
+    @ObservationIgnored var forceCloseTabIds: Set<TabID> = []
 
     /// Tab IDs that are currently showing (or about to show) a close confirmation prompt.
     /// Prevents repeated close gestures (e.g., middle-click spam) from stacking dialogs.
-    var pendingCloseConfirmTabIds: Set<TabID> = []
+    @ObservationIgnored var pendingCloseConfirmTabIds: Set<TabID> = []
 
     /// Deterministic tab selection to apply after a tab closes.
     /// Keyed by the closing tab ID, value is the tab ID we want to select next.
-    var postCloseSelectTabId: [TabID: TabID] = [:]
+    @ObservationIgnored var postCloseSelectTabId: [TabID: TabID] = [:]
     /// Panel IDs that were in a pane when a pane-close operation was approved.
     /// Bonsplit pane-close does not emit per-tab didClose callbacks.
-    var pendingPaneClosePanelIds: [UUID: [UUID]] = [:]
-    var pendingClosedBrowserRestoreSnapshots: [TabID: ClosedBrowserPanelRestoreSnapshot] = [:]
-    var isApplyingTabSelection = false
-    var pendingTabSelection: (tabId: TabID, pane: PaneID)?
-    var isReconcilingFocusState = false
-    var focusReconcileScheduled = false
-    var geometryReconcileScheduled = false
-    var isNormalizingPinnedTabOrder = false
-    var pendingNonFocusSplitFocusReassert: PendingNonFocusSplitFocusReassert?
-    var nonFocusSplitFocusReassertGeneration: UInt64 = 0
+    @ObservationIgnored var pendingPaneClosePanelIds: [UUID: [UUID]] = [:]
+    @ObservationIgnored var pendingClosedBrowserRestoreSnapshots: [TabID: ClosedBrowserPanelRestoreSnapshot] = [:]
+    @ObservationIgnored var isApplyingTabSelection = false
+    @ObservationIgnored var pendingTabSelection: (tabId: TabID, pane: PaneID)?
+    @ObservationIgnored var isReconcilingFocusState = false
+    @ObservationIgnored var focusReconcileScheduled = false
+    @ObservationIgnored var geometryReconcileScheduled = false
+    @ObservationIgnored var isNormalizingPinnedTabOrder = false
+    @ObservationIgnored var pendingNonFocusSplitFocusReassert: PendingNonFocusSplitFocusReassert?
+    @ObservationIgnored var nonFocusSplitFocusReassertGeneration: UInt64 = 0
 
     struct PendingNonFocusSplitFocusReassert {
         let generation: UInt64
@@ -478,8 +545,8 @@ final class Workspace: Identifiable, ObservableObject {
         let manuallyUnread: Bool
     }
 
-    var detachingTabIds: Set<TabID> = []
-    var pendingDetachedSurfaces: [TabID: DetachedSurfaceTransfer] = [:]
+    @ObservationIgnored var detachingTabIds: Set<TabID> = []
+    @ObservationIgnored var pendingDetachedSurfaces: [TabID: DetachedSurfaceTransfer] = [:]
 
     func panelIdFromSurfaceId(_ surfaceId: TabID) -> UUID? {
         surfaceIdToPanelId[surfaceId]
@@ -923,6 +990,15 @@ final class Workspace: Identifiable, ObservableObject {
     }
 
     func sidebarBranchDirectoryEntriesInDisplayOrder() -> [SidebarBranchOrdering.BranchDirectoryEntry] {
+        // Register the dependency before the cache can short-circuit it.
+        //
+        // The cache itself is `@ObservationIgnored` — it has to be, because it
+        // is filled during body evaluation. But that means a *hit* reads no
+        // observed property at all, so a row drawn from a warm cache would
+        // record no dependency and never redraw again: change the branch, the
+        // `didSet` empties the cache, and nothing asks for it a second time.
+        // This read is the dependency, and `invalidate…` below advances it.
+        _ = sidebarBranchDataVersion
         if let sidebarBranchDirectoryEntriesCache {
             return sidebarBranchDirectoryEntriesCache
         }
@@ -942,6 +1018,8 @@ final class Workspace: Identifiable, ObservableObject {
     func sidebarBranchDirectoryDisplayLines(
         showGitBranch: Bool
     ) -> [SidebarBranchOrdering.BranchDirectoryDisplayLine] {
+        // Same reason as above: a cache hit must still leave a dependency.
+        _ = sidebarBranchDataVersion
         if let cached = sidebarBranchDirectoryDisplayLinesCache[showGitBranch] {
             return cached
         }
@@ -959,6 +1037,11 @@ final class Workspace: Identifiable, ObservableObject {
     func invalidateSidebarBranchDirectoryEntriesCache() {
         sidebarBranchDirectoryEntriesCache = nil
         sidebarBranchDirectoryDisplayLinesCache.removeAll(keepingCapacity: true)
+        // The observed half of the invalidation. Callers all reach here from a
+        // `didSet` — the model path — which is the only place it is safe to
+        // write an observed property. Never bump this while filling a cache:
+        // that path runs inside body evaluation.
+        sidebarBranchDataVersion &+= 1
     }
 
     private static let sidebarHomeDirectory = FileManager.default.homeDirectoryForCurrentUser.path
@@ -2288,7 +2371,7 @@ final class Workspace: Identifiable, ObservableObject {
     /// gates below and the delegate vetoes in
     /// Workspace+BonsplitDelegate). The controller's reconciler is the
     /// only writer, marked by `isApplyingRemoteLayout`.
-    weak var peerMirror: PeerWorkspaceMirrorController?
+    @ObservationIgnored weak var peerMirror: PeerWorkspaceMirrorController?
     var isPeerMirror: Bool { peerMirror != nil }
 
     /// True when a local structural action must forward to the mirror
@@ -2312,6 +2395,12 @@ final class Workspace: Identifiable, ObservableObject {
     /// remote pane normally stays on the same host). nil for purely
     /// local workspaces.
     var dominantRemoteHostKey: PeerPaneHostKey? {
+        // See `sidebarBranchDirectoryEntriesInDisplayOrder`: the cache is
+        // unobserved by necessity, so the version counter carries the
+        // dependency a cache hit would otherwise skip. Reading an `Int` of our
+        // own also keeps the note below true — validating a hit still does not
+        // enter Bonsplit's observation graph.
+        _ = dominantRemoteHostDataVersion
         if let cached = dominantRemoteHostKeyCache {
             return cached
         }
@@ -2324,6 +2413,7 @@ final class Workspace: Identifiable, ObservableObject {
     private func invalidateDominantRemoteHostKeyCache() {
         dominantRemoteHostKeyCache = nil
         dominantRemoteHostKeyCachedFocusedPanelId = nil
+        dominantRemoteHostDataVersion &+= 1
     }
 
     /// Selection callbacks already know the focused panel. Refresh from that

@@ -95,7 +95,7 @@ struct TabItemView: View, Equatable {
     /// manager's broad publisher; explicit render snapshots below define its
     /// invalidation boundary.
     let tabManager: TabManager
-    @ObservedObject var tab: Tab
+    let tab: Tab
     let index: Int
     let isActive: Bool
     let isMultiSelected: Bool

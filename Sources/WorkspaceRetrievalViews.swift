@@ -17,7 +17,7 @@ private enum RetrievalChromePalette {
 }
 
 struct WorkspaceRetrievalSidebarSection: View {
-    @ObservedObject var workspace: Workspace
+    let workspace: Workspace
     @ObservedObject private var store: WorkspaceRetrievalStore
     @EnvironmentObject private var tabManager: TabManager
 
@@ -123,7 +123,7 @@ struct WorkspaceRetrievalSidebarSection: View {
 }
 
 struct WorkspaceRetrievalChrome<Content: View>: View {
-    @ObservedObject var workspace: Workspace
+    let workspace: Workspace
     @ObservedObject private var store: WorkspaceRetrievalStore
     private let content: Content
 
@@ -247,7 +247,7 @@ private struct RetrievalPresentationBar: View {
 }
 
 private struct RetrievalActivityDrawer: View {
-    @ObservedObject var workspace: Workspace
+    let workspace: Workspace
     @ObservedObject private var store: WorkspaceRetrievalStore
     @State private var selectedTab: RetrievalDrawerTab = .activity
     @State private var isEditingProject = false
@@ -551,7 +551,7 @@ private struct RetrievalActivityDrawer: View {
 }
 
 private struct RetrievalChangesInspector: View {
-    @ObservedObject var workspace: Workspace
+    let workspace: Workspace
     @ObservedObject private var store: WorkspaceRetrievalStore
     @State private var showsUnverifiedApproval = false
 
@@ -681,7 +681,7 @@ private struct RetrievalChangesInspector: View {
 }
 
 private struct RetrievalCloseGate: View {
-    @ObservedObject var workspace: Workspace
+    let workspace: Workspace
     let pane: WorkspaceRemotePaneRecord
 
     var body: some View {
