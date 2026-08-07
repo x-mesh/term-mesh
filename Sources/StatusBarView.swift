@@ -1,7 +1,7 @@
 import SwiftUI
 
 struct StatusBarView: View {
-    @EnvironmentObject var tabManager: TabManager
+    @Environment(TabManager.self) var tabManager
     @ObservedObject private var teamOrchestrator = TeamOrchestrator.shared
 
     private var selectedWorkspace: Workspace? {

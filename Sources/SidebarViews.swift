@@ -17,7 +17,7 @@ struct SidebarResizerAccessibilityModifier: ViewModifier {
 
 struct VerticalTabsSidebar: View {
     @ObservedObject var updateViewModel: UpdateViewModel
-    @EnvironmentObject var tabManager: TabManager
+    @Environment(TabManager.self) var tabManager
     @EnvironmentObject private var notificationStore: TerminalNotificationStore
     @Binding var selection: SidebarSelection
     @Binding var selectedTabIds: Set<UUID>
@@ -1560,7 +1560,7 @@ private struct SidebarPeerProjectGroup: Identifiable {
 /// and listing it here just reproduced the Host view one toggle away. Host
 /// lifecycle (connect, retry, edit, delete) lives in the Host view alone.
 private struct SidebarPeerProjectsView: View {
-    @EnvironmentObject private var tabManager: TabManager
+    @Environment(TabManager.self) private var tabManager
     @ObservedObject private var coordinator = ReviewBoardCoordinatorService.shared
     @ObservedObject private var orchestrator = TeamOrchestrator.shared
     let hosts: [HostEntry]
@@ -2111,7 +2111,7 @@ private struct SidebarPeerProjectsView: View {
 /// does the two things that do make sense here — show where it is working,
 /// and select it.
 private struct SidebarProjectLocalRowView: View {
-    @EnvironmentObject private var tabManager: TabManager
+    @Environment(TabManager.self) private var tabManager
     @ObservedObject private var orchestrator = TeamOrchestrator.shared
     let workspace: Workspace
     let usesSeparatedPresentation: Bool
@@ -2925,7 +2925,7 @@ struct RemoteWorkspaceRowView: View {
     }
 
     @Environment(\.colorScheme) private var colorScheme
-    @EnvironmentObject private var tabManager: TabManager
+    @Environment(TabManager.self) private var tabManager
     @ObservedObject private var activeDrag = SidebarActiveDrag.shared
     let workspace: WorkspaceSummary
     /// The host group this row is rendered under. Passed explicitly so the

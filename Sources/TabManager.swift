@@ -7,22 +7,23 @@ import Combine
 import os
 
 @MainActor
-class TabManager: ObservableObject {
+@Observable
+class TabManager {
     /// Injected daemon service.
     let daemon: any DaemonService
     /// Injected notification service.
     let notifications: any NotificationService
 
-    @Published var tabs: [Workspace] = []
-    @Published private(set) var isWorkspaceCycleHot: Bool = false
+    var tabs: [Workspace] = []
+    private(set) var isWorkspaceCycleHot: Bool = false
 
     /// Titlebar progress bar state. Set to non-nil to show, nil to hide.
-    @Published var titlebarProgress: TitlebarProgress?
+    var titlebarProgress: TitlebarProgress?
 
     /// Global monotonically increasing counter for TERMMESH_PORT ordinal assignment.
     /// Static so port ranges don't overlap across multiple windows (each window has its own TabManager).
     private static var nextPortOrdinal: Int = 0
-    @Published var selectedTabId: UUID? {
+    var selectedTabId: UUID? {
         didSet {
             guard selectedTabId != oldValue else { return }
             sentryBreadcrumb("workspace.switch", data: [
@@ -73,40 +74,43 @@ class TabManager: ObservableObject {
             DispatchQueue.main.async(execute: workItem)
         }
     }
-    private var observers: [NSObjectProtocol] = []
-    private var suppressFocusFlash = false
-    private var lastFocusedPanelByTab: [UUID: UUID] = [:]
+    // Everything below is bookkeeping no view body reads. Under `@Observable`
+    // every stored property would otherwise become an invalidation source, and
+    // `pendingPanelTitleUpdates` alone is written at the coalescer's 30Hz.
+    @ObservationIgnored private var observers: [NSObjectProtocol] = []
+    @ObservationIgnored private var suppressFocusFlash = false
+    @ObservationIgnored private var lastFocusedPanelByTab: [UUID: UUID] = [:]
     private struct PanelTitleUpdateKey: Hashable {
         let tabId: UUID
         let panelId: UUID
     }
-    private var pendingPanelTitleUpdates: [PanelTitleUpdateKey: String] = [:]
-    private let panelTitleUpdateCoalescer = NotificationBurstCoalescer(delay: 1.0 / 30.0)
+    @ObservationIgnored private var pendingPanelTitleUpdates: [PanelTitleUpdateKey: String] = [:]
+    @ObservationIgnored private let panelTitleUpdateCoalescer = NotificationBurstCoalescer(delay: 1.0 / 30.0)
     var recentlyClosedBrowsers = RecentlyClosedBrowserStack(capacity: 20)
 
     // Recent tab history for back/forward navigation (like browser history)
-    private var tabHistory: [UUID] = []
-    private var historyIndex: Int = -1
-    private var isNavigatingHistory = false
-    private let maxHistorySize = 50
-    private var selectionSideEffectsGeneration: UInt64 = 0
-    private var selectionSideEffectWorkItem: DispatchWorkItem?
-    private var workspaceCycleGeneration: UInt64 = 0
-    private var workspaceCycleCooldownTask: Task<Void, Never>?
-    private var pendingWorkspaceUnfocusTarget: (tabId: UUID, panelId: UUID)?
-    private let persistsSessionState: Bool
+    @ObservationIgnored private var tabHistory: [UUID] = []
+    @ObservationIgnored private var historyIndex: Int = -1
+    @ObservationIgnored private var isNavigatingHistory = false
+    @ObservationIgnored private let maxHistorySize = 50
+    @ObservationIgnored private var selectionSideEffectsGeneration: UInt64 = 0
+    @ObservationIgnored private var selectionSideEffectWorkItem: DispatchWorkItem?
+    @ObservationIgnored private var workspaceCycleGeneration: UInt64 = 0
+    @ObservationIgnored private var workspaceCycleCooldownTask: Task<Void, Never>?
+    @ObservationIgnored private var pendingWorkspaceUnfocusTarget: (tabId: UUID, panelId: UUID)?
+    @ObservationIgnored private let persistsSessionState: Bool
 #if DEBUG
-    private var debugWorkspaceSwitchCounter: UInt64 = 0
-    private var debugWorkspaceSwitchId: UInt64 = 0
-    private var debugWorkspaceSwitchStartTime: CFTimeInterval = 0
+    @ObservationIgnored private var debugWorkspaceSwitchCounter: UInt64 = 0
+    @ObservationIgnored private var debugWorkspaceSwitchId: UInt64 = 0
+    @ObservationIgnored private var debugWorkspaceSwitchStartTime: CFTimeInterval = 0
 #endif
 
 #if DEBUG
-    var didSetupSplitCloseRightUITest = false
-    var didSetupUITestFocusShortcuts = false
-    var didSetupChildExitSplitUITest = false
-    var didSetupChildExitKeyboardUITest = false
-    var uiTestCancellables = Set<AnyCancellable>()
+    @ObservationIgnored var didSetupSplitCloseRightUITest = false
+    @ObservationIgnored var didSetupUITestFocusShortcuts = false
+    @ObservationIgnored var didSetupChildExitSplitUITest = false
+    @ObservationIgnored var didSetupChildExitKeyboardUITest = false
+    @ObservationIgnored var uiTestCancellables = Set<AnyCancellable>()
 #endif
 
     init(
@@ -207,7 +211,7 @@ class TabManager: ObservableObject {
         observers.forEach { NotificationCenter.default.removeObserver($0) }
     }
 
-    private var periodicSessionSaveTimer: DispatchSourceTimer?
+    @ObservationIgnored private var periodicSessionSaveTimer: DispatchSourceTimer?
 
     private func startPeriodicSessionSave() {
         periodicSessionSaveTimer?.cancel()
@@ -473,9 +477,9 @@ class TabManager: ObservableObject {
 
     /// Debounced session save — coalesces rapid tab open/close/directory changes
     /// into a single disk write. Safe to call frequently.
-    private var sessionSaveWorkItem: DispatchWorkItem?
+    @ObservationIgnored private var sessionSaveWorkItem: DispatchWorkItem?
 #if DEBUG
-    private(set) var debugSessionSaveRequestCount = 0
+    @ObservationIgnored private(set) var debugSessionSaveRequestCount = 0
 #endif
 
     private func scheduleSessionSave() {
