@@ -258,6 +258,59 @@ Rules learned the hard way:
 - Driving the app calls `debug.app.activate`, which **steals focus from the
   user**. Batch the probes, and stop once verified.
 
+## Measuring "the app feels slow" (`scripts/perf-sample.sh`)
+
+"Slow" here has almost always meant *the main thread is busy in SwiftUI*, not
+that a log is large or a daemon is looping. Sample it rather than reasoning
+about it:
+
+```bash
+./scripts/perf-sample.sh                 # 3 runs of 8s against /Applications
+./scripts/perf-sample.sh --tag observable    # a reloads.sh --tag staging app
+./scripts/perf-sample.sh -n 1 -d 5 --keep    # one run, keep the raw samples
+```
+
+It reports per run: streaming state, main-thread idle %, the SwiftUI update
+cycle, `AG::Graph::UpdateStack::update`, `propagate_dirty`, and how many
+term-mesh view bodies ran inside the cycle.
+
+| symbol | what a high number means |
+|---|---|
+| `UpdateStack::update` | AttributeGraph is *walking* a large graph |
+| `propagate_dirty` | one change is invalidating far too much |
+| term-mesh bodies in cycle | app views are re-evaluating — **0 is the goal** |
+
+Reference points (ten agents streaming, two windows, Review Board open):
+
+| | v0.175.1 | after PR #180 + #182 |
+|---|---|---|
+| `UpdateStack::update` | 1017 | ~400 |
+| SwiftUI update cycle | 1242 | ~470 |
+| main-thread idle | 46% | 74% |
+| `propagate_dirty` | 40 | 6–13 |
+| app view bodies in cycle | many | 0–2 |
+
+**Three ways this measurement lies, all of them hit during the work above:**
+
+- **An idle app reports beautiful numbers.** Without agents streaming you get
+  ~86% idle and a small cycle no matter what the code does. Four separate
+  measurements were discarded for this. The script prints `IDLE` per run —
+  that is *no data*, not a good result. Its exit code is 2 when every run was
+  idle.
+- **`grep -c` is the wrong statistic.** A line count reflects recursion depth,
+  not cost: `StackLayout.placeChildren` appeared 167 times while costing 11
+  samples. Read the sample count on the branch (the script does).
+- **Conditions decide the answer.** `GeometryReader` + `ScrollView` appears in
+  three places (`SidebarViews`, `AgentPanelView`, bonsplit `TabBarView`), so a
+  different window count moves the numbers on its own. Compare like with like,
+  or compare nothing. The script prints window/workspace/relay counts first for
+  exactly this reason.
+
+For a before/after on the same machine, prefer `reloads.sh --tag <name>`: it
+builds Release into an isolated app so production keeps its workspaces and
+peers, and both can be sampled in the same 8-second window. `reload.sh --tag`
+is Debug (`-Onone`) and will understate any optimisation that adds a comparison.
+
 ## Disk reclamation (`tm-agent gc`)
 
 Three subsystems create worktrees and none knows about the others — the daemon
