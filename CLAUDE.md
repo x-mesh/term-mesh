@@ -268,6 +268,8 @@ about it:
 ./scripts/perf-sample.sh                 # 3 runs of 8s against /Applications
 ./scripts/perf-sample.sh --tag observable    # a reloads.sh --tag staging app
 ./scripts/perf-sample.sh -n 1 -d 5 --keep    # one run, keep the raw samples
+./scripts/perf-sample.sh --label A --json    # name a condition, emit a summary
+./scripts/perf-sample.sh --replay DIR        # re-judge a kept set, sample nothing
 ```
 
 It reports per run: streaming state, main-thread idle %, the SwiftUI update
@@ -290,26 +292,50 @@ Reference points (ten agents streaming, two windows, Review Board open):
 | `propagate_dirty` | 40 | 6–13 |
 | app view bodies in cycle | many | 0–2 |
 
-**Three ways this measurement lies, all of them hit during the work above:**
+**Every number here is a ratio against a workload the script does not control**,
+so a run can look perfectly usable and mean nothing. Four ways that happened,
+each now a per-run verdict rather than something you have to remember:
 
-- **An idle app reports beautiful numbers.** Without agents streaming you get
-  ~86% idle and a small cycle no matter what the code does. Four separate
-  measurements were discarded for this. The script prints `IDLE` per run —
-  that is *no data*, not a good result. Its exit code is 2 when every run was
-  idle.
+| verdict | what actually happened | exit |
+|---|---|---|
+| `IDLE` | nothing was streaming; ~86% idle regardless of the code. Four measurements were discarded for this | 2 |
+| `DIRTY` | the pointer crossed the window. One pass near a split divider put `termMesh_sendEvent` at 31% of the main thread and dragged in 51 view bodies. That run is excluded from the median | — |
+| `DECAYING` | agents finished mid-set: 751 → 619 → 452 across three runs. Whatever you measure *next* wins for that reason alone | 3 |
+| `DRIFTED` | the app changed underneath — workspaces 3→5, relays 16→22 between sets. Those are not the same app | 3 |
+
+**A non-zero exit means "no data", never "a bad result".** Two rules the script
+cannot enforce for you:
+
 - **`grep -c` is the wrong statistic.** A line count reflects recursion depth,
   not cost: `StackLayout.placeChildren` appeared 167 times while costing 11
   samples. Read the sample count on the branch (the script does).
-- **Conditions decide the answer.** `GeometryReader` + `ScrollView` appears in
-  three places (`SidebarViews`, `AgentPanelView`, bonsplit `TabBarView`), so a
-  different window count moves the numbers on its own. Compare like with like,
-  or compare nothing. The script prints window/workspace/relay counts first for
-  exactly this reason.
+- **Keep your hands off the machine while it samples.** That is what `DIRTY`
+  catches after the fact, and it costs you the run.
+
+To compare two conditions, **interleave — never A then B.** Decay alone will
+hand you a result:
+
+```bash
+./scripts/perf-sample.sh --tag t --label A-expanded
+# change the condition
+./scripts/perf-sample.sh --tag t --label B-collapsed
+# change it back
+./scripts/perf-sample.sh --tag t --label A2-expanded
+```
+
+B is real only if it sits below the line from A to A2.
 
 For a before/after on the same machine, prefer `reloads.sh --tag <name>`: it
 builds Release into an isolated app so production keeps its workspaces and
 peers, and both can be sampled in the same 8-second window. `reload.sh --tag`
 is Debug (`-Onone`) and will understate any optimisation that adds a comparison.
+
+VERIFY: the verdicts fire only under conditions nobody can reproduce on demand,
+so they are tested against synthetic sample sets carrying the numbers above.
+
+```bash
+./scripts/test-perf-sample.sh
+```
 
 ## Disk reclamation (`tm-agent gc`)
 
