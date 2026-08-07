@@ -1,4 +1,5 @@
 import XCTest
+import Observation
 
 #if canImport(term_mesh_DEV)
 @testable import term_mesh_DEV
@@ -14,6 +15,37 @@ import XCTest
 /// parsing: turning the stream into things a view can draw as what they are.
 @MainActor
 final class AgentSessionTests: XCTestCase {
+
+    func testNativeAgentPaneExposesContextClearingRestart() throws {
+        let presentation = try XCTUnwrap(Workspace.agentRestartPresentation(
+            panelType: .agent,
+            agentName: "reviewer"
+        ))
+
+        XCTAssertEqual(presentation.help,
+                       "Restart reviewer agent — clears conversation context")
+        XCTAssertEqual(presentation.accessibilityLabel,
+                       "Restart reviewer agent and clear conversation context")
+        XCTAssertFalse(presentation.allowsSoftRestart)
+    }
+
+    func testTerminalAgentPaneRetainsOptionClickSoftRestart() throws {
+        let presentation = try XCTUnwrap(Workspace.agentRestartPresentation(
+            panelType: .terminal,
+            agentName: "executor"
+        ))
+
+        XCTAssertTrue(presentation.help.contains("clears conversation context"))
+        XCTAssertTrue(presentation.help.contains("⌥-click: soft restart"))
+        XCTAssertTrue(presentation.allowsSoftRestart)
+    }
+
+    func testBrowserPaneDoesNotExposeAgentRestart() {
+        XCTAssertNil(Workspace.agentRestartPresentation(
+            panelType: .browser,
+            agentName: "not-an-agent"
+        ))
+    }
 
     func testLeaderParallelPolicyRendersStableVersionAndDigest() {
         let first = LeaderParallelPolicy.renderedInstructions
@@ -909,22 +941,47 @@ final class AgentSessionTests: XCTestCase {
                        AgentSession.topGap(before: entries[17], after: nil))
     }
 
-    /// A streamed delta must announce itself once. `AgentPanel` forwards every
-    /// `objectWillChange` the session sends, so publishing both `entries` and
-    /// `revision` for one mutation rebuilt the whole transcript twice per
-    /// character that arrived.
+    /// A streamed delta must announce itself once. The session used to publish
+    /// both `entries` and `revision` for one mutation, and `AgentPanel`
+    /// forwarded every announcement, so the transcript rebuilt itself twice per
+    /// character that arrived. Under `@Observable` the guarantee is stated as a
+    /// count: one transaction advances `revision` exactly once, and `entries`
+    /// is outside observation entirely.
     func testAStreamedDeltaAnnouncesItselfOnce() {
         let s = session([blockStart(0, "text")])
-        var announcements = 0
-        let token = s.objectWillChange.sink { _ in announcements += 1 }
-        defer { token.cancel() }
+        let revisionBefore = s.revision
+        let rowsInvalidated = expectation(description: "rows invalidated once")
+        withObservationTracking { _ = s.rows } onChange: { rowsInvalidated.fulfill() }
 
         s.ingestForTesting(delta(0, "half a sen"))
 
-        XCTAssertEqual(announcements, 1, "one mutation, one announcement")
+        wait(for: [rowsInvalidated], timeout: 1)
+        XCTAssertEqual(s.revision, revisionBefore + 1, "one mutation, one announcement")
         // And the rows the view reads are already the new ones — they are
         // rebuilt before the announcement, not after it.
         XCTAssertEqual(s.rows.map(\.id), s.entries.map(\.id))
+    }
+
+    /// A delta must not wake the turn-state properties.
+    ///
+    /// `@Observable` invalidates on assignment, not on change, so the turn
+    /// boundaries that assign `isThinking`/`isRunning`/`canInterrupt`
+    /// unconditionally would wake every view reading them on every event. The
+    /// guarded setters exist to stop that; this fails if one is bypassed.
+    func testAStreamedDeltaLeavesTurnStateSilent() {
+        let s = session([blockStart(0, "text")])
+        let turnStateWoke = expectation(description: "turn state must stay silent")
+        turnStateWoke.isInverted = true
+        withObservationTracking {
+            _ = s.isThinking
+            _ = s.isRunning
+            _ = s.canInterrupt
+            _ = s.summary
+        } onChange: { turnStateWoke.fulfill() }
+
+        s.ingestForTesting(delta(0, "half a sen"))
+
+        wait(for: [turnStateWoke], timeout: 0.2)
     }
 
     // MARK: - Stopping a turn
@@ -1141,6 +1198,37 @@ final class AgentSessionTests: XCTestCase {
 
         s.ingestForTesting(delta(0, "tence"))
         XCTAssertGreaterThan(s.revision, afterDelta)
+    }
+
+    func testAParsedDeltaBatchPublishesOneTranscriptRevision() {
+        let s = AgentSession()
+        s.ingestForTesting(blockStart(0, "text"))
+        let before = s.revision
+
+        s.applyBatchForTesting([
+            delta(0, "one "),
+            delta(0, "two "),
+            delta(0, "three"),
+        ])
+
+        XCTAssertEqual(s.revision, before + 1)
+        guard case .answered(_, let text) = s.entries.last else {
+            return XCTFail("missing streamed answer")
+        }
+        XCTAssertEqual(text, "one two three")
+    }
+
+    func testStreamDecoderKeepsSplitUTF8AndSeveralLines() {
+        let decoder = AgentStreamDecoder(maxLineBytes: 1024)
+        let text = "첫째\n둘째\n"
+        let bytes = Array(text.utf8)
+        let split = bytes.firstIndex { $0 >= 0x80 }! + 1
+
+        XCTAssertTrue(decoder.consume(Data(bytes[..<split])).isEmpty)
+        XCTAssertEqual(
+            decoder.consume(Data(bytes[split...])),
+            [.line("첫째"), .line("둘째")]
+        )
     }
 
     /// A tool result closes a row without adding one, and that changes what is

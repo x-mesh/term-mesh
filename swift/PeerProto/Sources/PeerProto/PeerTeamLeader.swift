@@ -278,6 +278,31 @@ public actor PeerTeamLeaderControlPlane {
         grants.removeValue(forKey: id)
     }
 
+    /// Extend a live grant on behalf of the app that minted and owns it.
+    ///
+    /// This is deliberately not a wire command: possession of an old bearer
+    /// must not be enough to resurrect it. The owning app uses this while the
+    /// remote leader project still exists, so an otherwise-idle pane does not
+    /// lose its team route after the one-hour bootstrap lease.
+    @discardableResult
+    public func keepAliveGrant(
+        id: Data,
+        nowUnixSeconds: UInt64? = nil,
+        nowLeaseSeconds: UInt64? = nil
+    ) -> Bool {
+        let wallNow = nowUnixSeconds ?? Self.wallClockSeconds()
+        let leaseNow = nowLeaseSeconds
+            ?? nowUnixSeconds
+            ?? Self.awakeClockSeconds()
+        purgeExpired(
+            nowUnixSeconds: wallNow,
+            nowLeaseSeconds: leaseNow
+        )
+        guard grants[id] != nil else { return false }
+        touchGrant(id, nowLeaseSeconds: leaseNow)
+        return true
+    }
+
     public func auditRecords() -> [PeerTeamLeaderAuditRecord] {
         auditLog
     }

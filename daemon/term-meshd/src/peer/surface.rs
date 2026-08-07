@@ -459,17 +459,18 @@ struct ChildLifecycle {
 struct SizeArbiter {
     /// Requested winsize per live attacher.
     requests: HashMap<u64, (u16, u16)>,
-    /// When each attacher last typed, as a per-surface monotonic stamp.
+    /// When each attacher last expressed explicit user activity (typing or a
+    /// focused resize), as a per-surface monotonic stamp.
     /// Entries leave with their attacher (`drop_size_request`), so a
     /// departed typist cannot rule from the grave.
-    input_stamps: HashMap<u64, u64>,
+    activity_stamps: HashMap<u64, u64>,
     next_stamp: u64,
 }
 
 impl SizeArbiter {
     fn effective(&self) -> Option<(u16, u16)> {
         let latest_typist = self
-            .input_stamps
+            .activity_stamps
             .iter()
             .filter(|(id, _)| self.requests.contains_key(*id))
             .max_by_key(|&(_, stamp)| *stamp)
@@ -997,10 +998,21 @@ impl PtySurface {
     /// (see [`SizeArbiter::effective`]). Callers pair this with
     /// [`drop_size_request`] on detach; a raw [`resize`] bypasses
     /// arbitration and is reserved for single-writer paths (spawn).
-    pub fn request_size(&self, requester: u64, cols: u16, rows: u16) -> std::io::Result<()> {
+    pub fn request_size(
+        &self,
+        requester: u64,
+        cols: u16,
+        rows: u16,
+        claim_authority: bool,
+    ) -> std::io::Result<()> {
         let effective = {
             let mut arbiter = self.size_requests.lock().unwrap();
             arbiter.requests.insert(requester, (cols, rows));
+            if claim_authority {
+                arbiter.next_stamp += 1;
+                let stamp = arbiter.next_stamp;
+                arbiter.activity_stamps.insert(requester, stamp);
+            }
             arbiter.effective()
         };
         self.apply_arbitrated(effective)
@@ -1017,7 +1029,7 @@ impl PtySurface {
             let mut arbiter = self.size_requests.lock().unwrap();
             arbiter.next_stamp += 1;
             let stamp = arbiter.next_stamp;
-            arbiter.input_stamps.insert(requester, stamp);
+            arbiter.activity_stamps.insert(requester, stamp);
             arbiter.effective()
         };
         if let Err(e) = self.apply_arbitrated(effective) {
@@ -1032,7 +1044,7 @@ impl PtySurface {
     pub fn drop_size_request(&self, requester: u64) {
         let effective = {
             let mut arbiter = self.size_requests.lock().unwrap();
-            arbiter.input_stamps.remove(&requester);
+            arbiter.activity_stamps.remove(&requester);
             if arbiter.requests.remove(&requester).is_none() {
                 return;
             }
@@ -2391,10 +2403,14 @@ mod tests {
             )
         };
 
-        surface.request_size(1, 120, 30).expect("first request");
+        surface
+            .request_size(1, 120, 30, false)
+            .expect("first request");
         assert_eq!(size(&surface), (120, 30), "sole attacher gets its size");
 
-        surface.request_size(2, 80, 40).expect("second request");
+        surface
+            .request_size(2, 80, 40, false)
+            .expect("second request");
         assert_eq!(size(&surface), (80, 30), "per-axis min of both requests");
 
         // The smaller-column attacher leaves → survivor gets its grid back.
@@ -2422,8 +2438,12 @@ mod tests {
             )
         };
 
-        surface.request_size(1, 120, 30).expect("first request");
-        surface.request_size(2, 80, 40).expect("second request");
+        surface
+            .request_size(1, 120, 30, false)
+            .expect("first request");
+        surface
+            .request_size(2, 80, 40, false)
+            .expect("second request");
         assert_eq!(size(&surface), (80, 30), "nobody typed yet → min");
 
         surface.note_input(1);
@@ -2433,7 +2453,9 @@ mod tests {
         assert_eq!(size(&surface), (80, 40), "latest typist takes over");
 
         // A silent third viewer attaching smaller cannot steal the grid…
-        surface.request_size(3, 60, 20).expect("third request");
+        surface
+            .request_size(3, 60, 20, false)
+            .expect("third request");
         assert_eq!(size(&surface), (80, 40), "watcher can't shrink the typist");
 
         // …and the ruling typist leaving falls back to the previous one,
@@ -2442,12 +2464,49 @@ mod tests {
         assert_eq!(size(&surface), (120, 30), "earlier typist inherits rule");
 
         // A typist updating its request keeps ruling at the new size.
-        surface.request_size(1, 100, 50).expect("typist resize");
+        surface
+            .request_size(1, 100, 50, false)
+            .expect("typist resize");
         assert_eq!(size(&surface), (100, 50), "ruling typist may resize freely");
 
         // Every typist gone → min across the survivors again.
         surface.drop_size_request(1);
         assert_eq!(size(&surface), (60, 20), "no typist left → back to min");
+    }
+
+    #[tokio::test]
+    async fn focused_resize_claims_authority_without_background_stealing_it() {
+        let surface = cat_surface();
+        let size = |s: &PtySurface| {
+            (
+                s.cols.load(Ordering::Relaxed) as u16,
+                s.rows.load(Ordering::Relaxed) as u16,
+            )
+        };
+
+        surface
+            .request_size(1, 120, 30, false)
+            .expect("first request");
+        surface
+            .request_size(2, 80, 24, false)
+            .expect("second request");
+        surface.note_input(1);
+        assert_eq!(size(&surface), (120, 30), "typist initially owns the grid");
+
+        surface
+            .request_size(2, 100, 40, false)
+            .expect("background resize");
+        assert_eq!(size(&surface), (120, 30), "background resize cannot steal");
+
+        surface
+            .request_size(2, 100, 40, true)
+            .expect("focused resize");
+        assert_eq!(size(&surface), (100, 40), "focused resize takes authority");
+
+        surface
+            .request_size(1, 140, 50, false)
+            .expect("old owner background resize");
+        assert_eq!(size(&surface), (100, 40), "new owner remains authoritative");
     }
 
     #[tokio::test]

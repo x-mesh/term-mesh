@@ -4,7 +4,10 @@ import PackageDescription
 let package = Package(
     name: "term-mesh",
     platforms: [
-        .macOS(.v13)
+        // Matches MACOSX_DEPLOYMENT_TARGET in the Xcode project, which is what
+        // actually builds this app. The sources use `@Observable`, so a lower
+        // floor here only misleads tooling that reads this manifest.
+        .macOS(.v14)
     ],
     products: [
         .executable(name: "term-mesh", targets: ["term-mesh"])

@@ -46,9 +46,11 @@ actor MockTransport {
     private var clientToServerWaiter: CheckedContinuation<Data, Never>?
     private var serverToClientWaiter: CheckedContinuation<Data, Never>?
     private var clientWriteCount = 0
+    private var clientWrittenFrames: [Data] = []
 
     func clientWrite(_ data: Data) {
         clientWriteCount += 1
+        clientWrittenFrames.append(data)
         if let waiter = serverToClientWaiter {
             // unused path
             _ = waiter
@@ -98,6 +100,7 @@ actor MockTransport {
     }
 
     func writtenFrameCount() -> Int { clientWriteCount }
+    func writtenFrames() -> [Data] { clientWrittenFrames }
 }
 
 /// Minimal server-side role for tests. Drives the opposite half of the
@@ -426,6 +429,84 @@ actor TeamRPCMockHost {
 }
 
 final class PeerSessionTests: XCTestCase {
+    func testResizeSerializesAuthorityClaimAndDefaultsToFalse() async throws {
+        let transport = MockTransport()
+        let session = PeerSession(
+            read: { await transport.clientRead() },
+            write: { await transport.clientWrite($0) }
+        )
+        let surfaceID = Data(repeating: 0xA6, count: 16)
+
+        try await session.sendResize(
+            surfaceID: surfaceID,
+            cols: 132,
+            rows: 44,
+            claimAuthority: true
+        )
+        try await session.sendResize(surfaceID: surfaceID, cols: 80, rows: 24)
+
+        var firstBytes = await transport.serverRead()
+        let first = try XCTUnwrap(decodeFrame(from: &firstBytes))
+        guard case .resize(let claimed)? = first.payload else {
+            return XCTFail("expected claimed Resize")
+        }
+        XCTAssertEqual(claimed.surfaceID, surfaceID)
+        XCTAssertEqual(claimed.cols, 132)
+        XCTAssertEqual(claimed.rows, 44)
+        XCTAssertTrue(claimed.claimAuthority)
+
+        var secondBytes = await transport.serverRead()
+        let second = try XCTUnwrap(decodeFrame(from: &secondBytes))
+        guard case .resize(let passive)? = second.payload else {
+            return XCTFail("expected passive Resize")
+        }
+        XCTAssertFalse(passive.claimAuthority)
+    }
+
+    func testConcurrentInputFastPathKeepsFramesIntactAndSequenceMonotonic() async throws {
+        let transport = MockTransport()
+        let session = PeerSession(
+            read: { await transport.clientRead() },
+            write: { await transport.clientWrite($0) }
+        )
+        let surfaceID = Data(repeating: 0xA7, count: 16)
+        let count = 128
+
+        try await withThrowingTaskGroup(of: Void.self) { group in
+            for value in 0..<count {
+                group.addTask {
+                    try await session.sendInput(
+                        surfaceID: surfaceID,
+                        keys: Data([UInt8(value)])
+                    )
+                }
+            }
+            try await group.waitForAll()
+        }
+
+        let frames = await transport.writtenFrames()
+        XCTAssertEqual(frames.count, count)
+        var sequences: [UInt64] = []
+        var keys: [UInt8] = []
+        for frame in frames {
+            var pending = frame
+            let envelope = try XCTUnwrap(try decodeFrame(from: &pending))
+            XCTAssertTrue(pending.isEmpty, "one write must contain exactly one frame")
+            sequences.append(envelope.seq)
+            guard case .input(let input) = envelope.payload,
+                  input.surfaceID == surfaceID,
+                  case .keys(let payload)? = input.kind,
+                  payload.count == 1 else {
+                XCTFail("expected one intact key-input frame")
+                continue
+            }
+            keys.append(payload[0])
+        }
+
+        XCTAssertEqual(sequences, (1...UInt64(count)).map { $0 })
+        XCTAssertEqual(keys.sorted(), (0..<count).map(UInt8.init))
+    }
+
     func testHostCLIBinDirValidationIsStrictAndDeterministic() {
         XCTAssertEqual(
             PeerHostCLIBinDirs.validated([

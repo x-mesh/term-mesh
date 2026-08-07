@@ -271,6 +271,7 @@
 		CS210000000000000003 /* ControlSocketFramingP1Tests.swift in Sources */ = {isa = PBXBuildFile; fileRef = CS210000000000000006 /* ControlSocketFramingP1Tests.swift */; };
 		RL170000000000000003 /* RemoteLeaderReattachTriStateTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = RL170000000000000006 /* RemoteLeaderReattachTriStateTests.swift */; };
 		A5009020 /* AgentSessionTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A5009021 /* AgentSessionTests.swift */; };
+		A5009120 /* WorkspaceObservationTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A5009121 /* WorkspaceObservationTests.swift */; };
 		A5009040 /* WorktreeApprovalHelperTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A5009041 /* WorktreeApprovalHelperTests.swift */; };
 				F9000010A1B2C3D4E5F60718 /* WorkspaceRetrievalDirectoryTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = F9000011A1B2C3D4E5F60718 /* WorkspaceRetrievalDirectoryTests.swift */; };
 				F9000014A1B2C3D4E5F60718 /* PeerHostStatsTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = F9000015A1B2C3D4E5F60718 /* PeerHostStatsTests.swift */; };
@@ -604,6 +605,7 @@
 		CS210000000000000006 /* ControlSocketFramingP1Tests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ControlSocketFramingP1Tests.swift; sourceTree = "<group>"; };
 		RL170000000000000006 /* RemoteLeaderReattachTriStateTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RemoteLeaderReattachTriStateTests.swift; sourceTree = "<group>"; };
 		A5009021 /* AgentSessionTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AgentSessionTests.swift; sourceTree = "<group>"; };
+		A5009121 /* WorkspaceObservationTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WorkspaceObservationTests.swift; sourceTree = "<group>"; };
 		A5009041 /* WorktreeApprovalHelperTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WorktreeApprovalHelperTests.swift; sourceTree = "<group>"; };
 			F9000011A1B2C3D4E5F60718 /* WorkspaceRetrievalDirectoryTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WorkspaceRetrievalDirectoryTests.swift; sourceTree = "<group>"; };
 			F9000015A1B2C3D4E5F60718 /* PeerHostStatsTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PeerHostStatsTests.swift; sourceTree = "<group>"; };
@@ -992,6 +994,7 @@ A1740000000000000000000C /* ProcessRun.swift */,
 				CS210000000000000006 /* ControlSocketFramingP1Tests.swift */,
 				RL170000000000000006 /* RemoteLeaderReattachTriStateTests.swift */,
 				A5009021 /* AgentSessionTests.swift */,
+				A5009121 /* WorkspaceObservationTests.swift */,
 				A5009041 /* WorktreeApprovalHelperTests.swift */,
 				F9000011A1B2C3D4E5F60718 /* WorkspaceRetrievalDirectoryTests.swift */,
 				F9000015A1B2C3D4E5F60718 /* PeerHostStatsTests.swift */,
@@ -1410,6 +1413,7 @@ A1740000000000000000000B /* ProcessRun.swift in Sources */,
 				CS210000000000000003 /* ControlSocketFramingP1Tests.swift in Sources */,
 				RL170000000000000003 /* RemoteLeaderReattachTriStateTests.swift in Sources */,
 				A5009020 /* AgentSessionTests.swift in Sources */,
+				A5009120 /* WorkspaceObservationTests.swift in Sources */,
 				A5009040 /* WorktreeApprovalHelperTests.swift in Sources */,
 				F9000010A1B2C3D4E5F60718 /* WorkspaceRetrievalDirectoryTests.swift in Sources */,
 				F9000014A1B2C3D4E5F60718 /* PeerHostStatsTests.swift in Sources */,

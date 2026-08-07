@@ -35,7 +35,7 @@ final class WorkspaceAppearanceConfigCache: @unchecked Sendable {
 /// branch here provides a stable remote-renderer bridge point and makes it
 /// impossible for a remote selection to fall back to a separate `NSWindow`.
 struct SelectedWorkspaceContentView: View {
-    @ObservedObject var workspace: Workspace
+    let workspace: Workspace
     let isWorkspaceVisible: Bool
     let isWorkspaceInputActive: Bool
     let workspacePortalPriority: Int
@@ -75,7 +75,7 @@ struct SelectedWorkspaceContentView: View {
 /// click, preserving the socket focus policy for background roster/layout
 /// updates.
 private struct PeerMirrorMainContentView: View {
-    @ObservedObject var workspace: Workspace
+    let workspace: Workspace
     let isWorkspaceVisible: Bool
     let isWorkspaceInputActive: Bool
     let workspacePortalPriority: Int
@@ -101,7 +101,7 @@ private struct PeerMirrorMainContentView: View {
 struct WorkspaceContentView: View {
     private static let appearanceConfigCache = WorkspaceAppearanceConfigCache()
 
-    @ObservedObject var workspace: Workspace
+    let workspace: Workspace
     let isWorkspaceVisible: Bool
     let isWorkspaceInputActive: Bool
     let workspacePortalPriority: Int
@@ -381,7 +381,7 @@ extension WorkspaceContentView {
 
 /// View shown for empty panes
 struct EmptyPanelView: View {
-    @ObservedObject var workspace: Workspace
+    let workspace: Workspace
     let paneId: PaneID
     @AppStorage(KeyboardShortcutSettings.Action.newSurface.defaultsKey) private var newSurfaceShortcutData = Data()
     @AppStorage(KeyboardShortcutSettings.Action.openBrowser.defaultsKey) private var openBrowserShortcutData = Data()

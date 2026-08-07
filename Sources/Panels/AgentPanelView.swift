@@ -252,9 +252,29 @@ struct AgentPanelView: View {
                         }
                         if session.rows.isEmpty { emptyState }
                         ForEach(session.rows) { item in
-                            row(item.entry)
-                                .padding(.top, item.topGap)
-                                .id(item.id)
+                            TranscriptRow(
+                                item: item,
+                                streaming: session.streamingIds.contains(item.id),
+                                open: openTools.contains(item.id),
+                                root: panel.workingDirectory,
+                                setOpen: { open in
+                                    // Opening a row grows the transcript exactly
+                                    // as an append does, and the bottom anchor
+                                    // cannot tell the two apart. Without touching
+                                    // `grewAt` the anchor reads its own
+                                    // disappearance as the user scrolling away,
+                                    // and the "Latest" pill appears because
+                                    // somebody expanded a diff.
+                                    grewAt = Date()
+                                    if open {
+                                        openTools.insert(item.id)
+                                    } else {
+                                        openTools.remove(item.id)
+                                    }
+                                }
+                            )
+                            .equatable()
+                            .id(item.id)
                         }
                         // A normal VStack mounts this marker even while it is
                         // off screen, so visibility is measured in the scroll
@@ -295,6 +315,9 @@ struct AgentPanelView: View {
                     guard following else { return }
                     // Unanimated on purpose. A 250-delta answer animating each
                     // step is not a smooth scroll, it is a stutter.
+                    #if DEBUG
+                    session.noteAutoScrollForDebug()
+                    #endif
                     proxy.scrollTo(Self.bottom, anchor: .bottom)
                 }
                 .overlay(alignment: .bottomTrailing) {
@@ -342,79 +365,6 @@ struct AgentPanelView: View {
         .frame(maxWidth: .infinity, alignment: .leading)
     }
 
-    @ViewBuilder
-    private func row(_ entry: AgentSession.Entry) -> some View {
-        switch entry {
-        case .said(_, let speaker, let text):
-            said(speaker, text)
-        case .answered(let id, let text):
-            // Selectable, because the reason to read an agent's answer is
-            // usually to take something out of it. The caret says the row is
-            // still being written — a terminal can only show characters
-            // arriving and leave "did it stop there?" to be guessed.
-            Answer(text: text, streaming: session.streamingIds.contains(id))
-        case .thought(let id, let body):
-            label("✻", (body?.isEmpty == false ? body! : "thinking"),
-                  muted: true, streaming: session.streamingIds.contains(id))
-        case .tool(let id, let call):
-            if let change = call.change {
-                ChangeRow(call: call, change: change,
-                          root: panel.workingDirectory, open: openBinding(id))
-            } else {
-                ToolRow(call: call, open: openBinding(id))
-            }
-        case .turnEnded(_, let end):
-            turnEnd(end)
-        case .notice(_, let text):
-            label("!", text, muted: false)
-        }
-    }
-
-    private func said(_ speaker: AgentSession.Speaker, _ text: String) -> some View {
-        Instruction(speaker: speaker, read: AgentSession.read(instruction: text))
-    }
-
-    /// Opening a row grows the transcript exactly as an append does, and the
-    /// bottom anchor cannot tell the two apart. Without touching `grewAt` the
-    /// anchor reads its own disappearance as the user scrolling away, and the
-    /// "Latest" pill appears because somebody expanded a diff.
-    private func openBinding(_ id: UUID) -> Binding<Bool> {
-        Binding(get: { openTools.contains(id) },
-                set: { open in
-                    grewAt = Date()
-                    if open { openTools.insert(id) } else { openTools.remove(id) }
-                })
-    }
-
-    private func label(_ glyph: String, _ text: String, muted: Bool,
-                       streaming: Bool = false) -> some View {
-        HStack(alignment: .top, spacing: 6) {
-            Text(glyph).font(.system(size: 11))
-            // Thinking streams too, and it is the part that runs longest with
-            // nothing else to show. Pinned to the tail so a long reasoning
-            // block does not push the pane around while it is written.
-            Text(streaming ? String(text.suffix(120)) : text)
-                .font(.system(size: 11))
-                .lineLimit(muted ? 2 : nil)
-            if streaming { Caret() }
-        }
-        .foregroundStyle(muted ? AnyShapeStyle(.secondary) : AnyShapeStyle(Color.orange))
-    }
-
-    private func turnEnd(_ end: AgentSession.TurnEnd) -> some View {
-        TurnFooter(end: end, facts: facts(end))
-    }
-
-    private func facts(_ end: AgentSession.TurnEnd) -> String {
-        var parts = [end.stop]
-        if let d = end.duration { parts.append(String(format: "%.1fs", d)) }
-        if let c = end.cost { parts.append(String(format: "$%.4f", c)) }
-        if end.tokensIn != nil || end.tokensOut != nil {
-            parts.append("\(end.tokensIn ?? 0)→\(end.tokensOut ?? 0) tok")
-        }
-        return parts.joined(separator: " · ")
-    }
-
     // MARK: - Composer
 
     /// The person's way in.
@@ -424,20 +374,75 @@ struct AgentPanelView: View {
     /// pipeline. Here it is just a text field, and it can do what neither could:
     /// hold a multi-line draft without submitting on the first newline.
     private var composer: some View {
+        AgentComposer(
+            draft: $draft,
+            focused: $composerFocused,
+            agentName: panel.agentName,
+            accent: accent,
+            isThinking: session.isThinking,
+            canStop: canStop,
+            canSend: canSend,
+            isFocused: isFocused,
+            onSend: send,
+            onStop: { session.interrupt() }
+        )
+        .equatable()
+    }
+}
+
+/// The composer, isolated behind `Equatable`.
+///
+/// It is a text field and a button, but it sat in the panel's own body, so it
+/// was re-evaluated on every streamed delta along with the transcript — one
+/// more subtree for AttributeGraph to walk per token. Nothing it draws depends
+/// on the transcript, so it should not move when the transcript does.
+private struct AgentComposer: View, Equatable {
+    @Binding var draft: String
+    var focused: FocusState<Bool>.Binding
+    let agentName: String
+    let accent: Color
+    let isThinking: Bool
+    let canStop: Bool
+    let canSend: Bool
+    let isFocused: Bool
+    let onSend: () -> Void
+    let onStop: () -> Void
+
+    /// `draft` is compared, and has to be: the field is the one thing here that
+    /// the person is changing, and skipping its body would drop keystrokes.
+    /// The two closures are not — the panel rebuilds them on every pass.
+    /// Neither is `focused`: it is a binding the field attaches to, not
+    /// something this view draws, and `FocusState.Binding` is not `Equatable`.
+    ///
+    /// `nonisolated` for the same reason `ReviewBoardTaskRow.==` carries it:
+    /// `Equatable` is not actor-isolated, and the moment the enclosing view
+    /// becomes `@MainActor` this conformance would cross that boundary — a
+    /// warning today, an error under Swift 6. Everything compared is `Sendable`.
+    nonisolated static func == (lhs: AgentComposer, rhs: AgentComposer) -> Bool {
+        lhs.draft == rhs.draft
+            && lhs.agentName == rhs.agentName
+            && lhs.accent == rhs.accent
+            && lhs.isThinking == rhs.isThinking
+            && lhs.canStop == rhs.canStop
+            && lhs.canSend == rhs.canSend
+            && lhs.isFocused == rhs.isFocused
+    }
+
+    var body: some View {
         HStack(alignment: .bottom, spacing: 8) {
-            TextField("Message \(panel.agentName)…", text: $draft, axis: .vertical)
+            TextField("Message \(agentName)…", text: $draft, axis: .vertical)
                 .textFieldStyle(.plain)
                 .font(.system(size: 12))
                 .lineLimit(1...8)
-                .focused($composerFocused)
-                .onSubmit(send)
+                .focused(focused)
+                .onSubmit(onSend)
             // Which of six panes is working is a question you answer by
             // glancing, not by reading. So the state has a shape — and it
             // lives here rather than over the transcript, where it landed on
             // the banner card and read as the banner's decoration. This row
             // never scrolls, is the same place in every pane, and puts "it is
             // working" next to "stop it".
-            if session.isThinking {
+            if isThinking {
                 WorkingMark(accent: accent)
                     .transition(.opacity)
                     .allowsHitTesting(false)
@@ -448,7 +453,7 @@ struct AgentPanelView: View {
             // the far end of the header for the three seconds a haiku turn
             // lasts is not a control anyone can find. Send and stop are also
             // never both available, so they are never two buttons.
-            Button(action: canStop ? session.interrupt : send) {
+            Button(action: canStop ? onStop : onSend) {
                 Image(systemName: canStop ? "stop.circle.fill" : "arrow.up.circle.fill")
                     .font(.system(size: 16))
                     .foregroundStyle(canStop ? AnyShapeStyle(Color.red) : AnyShapeStyle(.tint))
@@ -460,9 +465,11 @@ struct AgentPanelView: View {
         .padding(.horizontal, 10)
         .padding(.vertical, 8)
         .background(Color.primary.opacity(isFocused ? 0.04 : 0.02))
-        .animation(.easeOut(duration: 0.2), value: session.isThinking)
+        .animation(.easeOut(duration: 0.2), value: isThinking)
     }
+}
 
+extension AgentPanelView {
     private var canSend: Bool {
         session.isRunning && !draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
@@ -499,6 +506,100 @@ private struct TranscriptBottomPreferenceKey: PreferenceKey {
 /// Measured on a real transcript: sixteen lines, nine of them scaffold, the
 /// intent one line inside `[GOAL]`. The bubble was showing the envelope and
 /// burying the letter. The envelope is still there for anyone who needs it.
+/// One transcript row, isolated behind `Equatable`.
+///
+/// The transcript mounts its whole window in a non-lazy stack — `LazyVStack`
+/// spun forever inside `LazyStack.place(subviews:)` while streamed rows changed
+/// height — and `ScrollView` has to size that entire stack to know its scroll
+/// range. So a streamed delta re-ran the layout for every mounted row to settle
+/// a change that usually touches only the last one: with five agents streaming,
+/// `sample` put 1088 of 5157 main-thread samples inside
+/// `GeometryReaderLayout.placeSubviews` → `ScrollViewLayoutComputer.sizeThatFits`.
+///
+/// Equality lets SwiftUI skip the body *and* the re-measure for rows that did
+/// not move, which is all of them but one during a stream.
+private struct TranscriptRow: View, Equatable {
+    let item: AgentSession.Row
+    let streaming: Bool
+    let open: Bool
+    let root: String
+    let setOpen: (Bool) -> Void
+
+    /// `setOpen` is deliberately not compared: the parent rebuilds that closure
+    /// on every body pass, so comparing it would defeat the shell entirely, and
+    /// nothing it captures changes what this row draws.
+    ///
+    /// `nonisolated` matches `ReviewBoardTaskRow.==` — `Equatable` is not
+    /// actor-isolated, so this conformance would cross the boundary as soon as
+    /// the enclosing view is `@MainActor`. Everything compared is `Sendable`.
+    nonisolated static func == (lhs: TranscriptRow, rhs: TranscriptRow) -> Bool {
+        lhs.item == rhs.item
+            && lhs.streaming == rhs.streaming
+            && lhs.open == rhs.open
+            && lhs.root == rhs.root
+    }
+
+    var body: some View {
+        content.padding(.top, item.topGap)
+    }
+
+    @ViewBuilder
+    private var content: some View {
+        switch item.entry {
+        case .said(_, let speaker, let text):
+            Instruction(speaker: speaker, read: AgentSession.read(instruction: text))
+        case .answered(_, let text):
+            // Selectable, because the reason to read an agent's answer is
+            // usually to take something out of it. The caret says the row is
+            // still being written — a terminal can only show characters
+            // arriving and leave "did it stop there?" to be guessed.
+            Answer(text: text, streaming: streaming)
+        case .thought(_, let body):
+            label("✻", (body?.isEmpty == false ? body! : "thinking"),
+                  muted: true, streaming: streaming)
+        case .tool(_, let call):
+            if let change = call.change {
+                ChangeRow(call: call, change: change, root: root, open: openBinding)
+            } else {
+                ToolRow(call: call, open: openBinding)
+            }
+        case .turnEnded(_, let end):
+            TurnFooter(end: end, facts: Self.facts(end))
+        case .notice(_, let text):
+            label("!", text, muted: false)
+        }
+    }
+
+    private var openBinding: Binding<Bool> {
+        Binding(get: { open }, set: { setOpen($0) })
+    }
+
+    private func label(_ glyph: String, _ text: String, muted: Bool,
+                       streaming: Bool = false) -> some View {
+        HStack(alignment: .top, spacing: 6) {
+            Text(glyph).font(.system(size: 11))
+            // Thinking streams too, and it is the part that runs longest with
+            // nothing else to show. Pinned to the tail so a long reasoning
+            // block does not push the pane around while it is written.
+            Text(streaming ? String(text.suffix(120)) : text)
+                .font(.system(size: 11))
+                .lineLimit(muted ? 2 : nil)
+            if streaming { Caret() }
+        }
+        .foregroundStyle(muted ? AnyShapeStyle(.secondary) : AnyShapeStyle(Color.orange))
+    }
+
+    private static func facts(_ end: AgentSession.TurnEnd) -> String {
+        var parts = [end.stop]
+        if let d = end.duration { parts.append(String(format: "%.1fs", d)) }
+        if let c = end.cost { parts.append(String(format: "$%.4f", c)) }
+        if end.tokensIn != nil || end.tokensOut != nil {
+            parts.append("\(end.tokensIn ?? 0)→\(end.tokensOut ?? 0) tok")
+        }
+        return parts.joined(separator: " · ")
+    }
+}
+
 private struct Instruction: View {
     let speaker: AgentSession.Speaker
     let read: AgentSession.Instruction
