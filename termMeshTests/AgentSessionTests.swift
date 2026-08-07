@@ -941,6 +941,39 @@ final class AgentSessionTests: XCTestCase {
                        AgentSession.topGap(before: entries[17], after: nil))
     }
 
+    /// Lowering the bound mid-stream must not read past the transcript.
+    ///
+    /// `publishEntries`'s incremental branch maps `rows[relative]` onto
+    /// `entries[displayStart + relative]` and uses `rows.count` as the width of
+    /// the window. That substitution only holds while the bound is fixed. Drop
+    /// it from 300 to 10 with `rows` still 300 long and `displayStart` jumps to
+    /// `entries.count - 10`, so the branch walks off the end of `entries` — a
+    /// STAGING build with ten agents streaming died exactly here.
+    func testLoweringTheRenderedBoundMidStreamStaysInsideTheTranscript() {
+        let key = "agentMaxRenderedEntries"
+        UserDefaults.standard.removeObject(forKey: key)
+        defer { UserDefaults.standard.removeObject(forKey: key) }
+
+        // A transcript past the shipped bound, then one answer left open so the
+        // next delta grows a row that is already there instead of adding one.
+        var lines: [String] = []
+        for index in 0..<(AgentSession.maxRenderedEntries + 20) {
+            lines += [blockStart(0, "text"), delta(0, "answer \(index)"), blockStop(0)]
+        }
+        lines += [blockStart(0, "text"), delta(0, "the open one")]
+        let s = session(lines)
+        XCTAssertEqual(s.rows.count, 300, "the window starts at the shipped bound")
+
+        UserDefaults.standard.set(10, forKey: key)
+
+        // Growing the open answer takes the incremental branch, not a rebuild.
+        s.ingestForTesting(delta(0, " and more of it"))
+
+        XCTAssertEqual(s.rows.count, 10, "the window must follow the new bound")
+        XCTAssertEqual(s.rows.map(\.id), Array(s.entries.suffix(10)).map(\.id),
+                       "and must still be the tail of the transcript")
+    }
+
     /// A streamed delta must announce itself once. The session used to publish
     /// both `entries` and `revision` for one mutation, and `AgentPanel`
     /// forwarded every announcement, so the transcript rebuilt itself twice per

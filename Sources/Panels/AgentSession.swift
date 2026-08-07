@@ -403,6 +403,9 @@ final class AgentSession {
     @ObservationIgnored private var entriesDirty = false
     @ObservationIgnored private var rowsStructureDirty = true
     @ObservationIgnored private var dirtyEntryIDs: Set<UUID> = []
+    /// The bound `rows` was last built with. Only differs from
+    /// `maxRenderedEntries` when the override moved between two publishes.
+    @ObservationIgnored private var renderedBound = 0
 
     private func withEntryTransaction(_ body: () -> Void) {
         mutationDepth += 1
@@ -414,12 +417,20 @@ final class AgentSession {
     private func publishEntries() {
         guard entriesDirty else { return }
         entriesDirty = false
-        if rowsStructureDirty {
+        // The incremental branch below maps `rows[relative]` onto
+        // `entries[displayStart + relative]` and uses `rows.count` as the width
+        // of the window. That substitution holds only while the bound is the
+        // one `rows` was built with, so a change of bound has to rebuild in
+        // full — otherwise `displayStart` moves under an array that did not,
+        // and the branch reads past the end of `entries`.
+        let bound = Self.maxRenderedEntries
+        if rowsStructureDirty || renderedBound != bound {
             let display = Self.displayRows(for: entries)
             rows = display.rows
             omittedEntryCount = display.omitted
+            renderedBound = bound
         } else if !dirtyEntryIDs.isEmpty {
-            let displayStart = max(0, entries.count - Self.maxRenderedEntries)
+            let displayStart = max(0, entries.count - bound)
             var relativeIndexes = Set<Int>()
             for id in dirtyEntryIDs {
                 guard let absolute = entries.firstIndex(where: { $0.id == id }),
@@ -514,7 +525,23 @@ final class AgentSession {
         return (omitted, rows(for: Array(entries.suffix(maxRenderedEntries))))
     }
 
-    static let maxRenderedEntries = 300
+    /// 300 is the shipped bound. The override exists so the bound itself can be
+    /// measured: the transcript stack is not lazy, so `ScrollView` sizes every
+    /// mounted row on each streamed delta, and that cost scales with this number
+    /// even for rows `TranscriptRow`'s `Equatable` already spared a body pass.
+    /// Whether that sizing is a large share of the streaming cost or a rounding
+    /// error is unmeasured — and two builds cannot answer it, because the
+    /// workload cannot be reproduced across them. Reading it live lets one app
+    /// carry one workload through both settings:
+    ///
+    ///   defaults write <bundle id> agentMaxRenderedEntries -int 50
+    ///
+    /// `publishEntries` must rebuild in full when this changes; see the note
+    /// there. Delete the key to return to 300.
+    static var maxRenderedEntries: Int {
+        let override = UserDefaults.standard.integer(forKey: "agentMaxRenderedEntries")
+        return override > 0 ? override : 300
+    }
 
     /// Changes on every mutation, not just every append.
     ///
