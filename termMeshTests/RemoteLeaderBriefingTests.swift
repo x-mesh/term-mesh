@@ -161,3 +161,83 @@ final class RemoteLeaderBriefingTests: XCTestCase {
         XCTAssertTrue(prompt.contains("tm-agent delegate"))
     }
 }
+
+/// A peer leader's whole job is `tm-agent`, and `tm-agent` reaches the app
+/// over a Unix socket. Codex's default sandbox denies that connect with
+/// EPERM, so `detect_socket` finds nothing and every team command answers
+/// "no socket found": the leader can name its teammates and cannot reach one.
+///
+/// Verified on a live peer before the fix — the leader reported
+/// `PermissionError: [Errno 1] Operation not permitted` connecting to
+/// `/tmp/term-mesh.sock`, while the same flags on the local launch path had
+/// carried a comment naming this exact failure since it was written.
+@MainActor
+final class RemoteLeaderAutonomyFlagsTests: XCTestCase {
+
+    private func command(cli: String, isLeader: Bool = true) -> String {
+        TeamOrchestrator.remoteAgentCommand(
+            cli: cli,
+            model: "gpt-5.6-sol",
+            agentName: isLeader ? "leader" : "executor",
+            teamName: "selftest",
+            workingDirectory: "/Users/jinwoo/work/tm-projects/selftest",
+            systemPromptFile: "/tmp/term-mesh-leader-prompt-TEST.txt",
+            needsSocketAccess: isLeader
+        )
+    }
+
+    /// The two that matter, and why: without the sandbox flag the socket is
+    /// unreachable; without the approval flag the first tool call waits for a
+    /// keypress in a pane nobody is watching.
+    func test_aCodexLeaderMayReachTheSocketAndActUnattended() {
+        let cmd = command(cli: "codex")
+        XCTAssertTrue(
+            cmd.contains("--sandbox danger-full-access"),
+            "codex's sandbox denies the tm-agent socket connect: \(cmd)"
+        )
+        XCTAssertTrue(
+            cmd.contains("--ask-for-approval never"),
+            "an unattended pane cannot answer an approval prompt: \(cmd)"
+        )
+    }
+
+    func test_aGeminiLeaderActsUnattended() {
+        XCTAssertTrue(command(cli: "gemini").contains("--yolo"))
+    }
+
+    /// Claude carries its own equivalent and must keep it.
+    func test_aClaudeLeaderKeepsItsPermissionBypass() {
+        XCTAssertTrue(command(cli: "claude").contains("--dangerously-skip-permissions"))
+    }
+
+    /// kiro has no such flag. Inventing one would fail at launch instead of
+    /// at the first socket call, which is strictly worse.
+    func test_kiroIsNotGivenAFlagItDoesNotHave() {
+        XCTAssertTrue(TeamOrchestrator.leaderAutonomyFlags(cli: "kiro").isEmpty)
+    }
+
+    /// The flags must precede the launch directive: codex reads the first
+    /// non-flag argument as the prompt, so a flag after it becomes prompt text.
+    func test_flagsComeBeforeTheLaunchDirective() {
+        let cmd = command(cli: "codex")
+        guard let sandbox = cmd.range(of: "--sandbox"),
+              let directive = cmd.range(of: "term-mesh-leader-prompt-TEST.txt")
+        else { return XCTFail("command lost a required part: \(cmd)") }
+        XCTAssertLessThan(
+            sandbox.lowerBound, directive.lowerBound,
+            "a flag after the prompt argument is prompt text, not a flag: \(cmd)"
+        )
+    }
+}
+
+extension RemoteLeaderAutonomyFlagsTests {
+    /// Workers keep their CLI's own sandbox. Their results come back through
+    /// pane output, so they never needed the socket, and opening every peer
+    /// worker to full access without a failure asking for it is not a change
+    /// to make as a side effect of fixing the leader.
+    func test_aWorkerIsNotGivenTheLeadersAccess() {
+        let worker = command(cli: "codex", isLeader: false)
+        XCTAssertFalse(worker.contains("danger-full-access"), worker)
+        XCTAssertTrue(worker.contains("--model"), "the worker still launches: \(worker)")
+    }
+}

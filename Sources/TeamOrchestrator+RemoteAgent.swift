@@ -3380,7 +3380,13 @@ extension TeamOrchestrator {
         workingDirectory: String,
         systemPromptFile: String? = nil,
         environment: [String: String] = [:],
-        hostBinDirs: [String] = []
+        hostBinDirs: [String] = [],
+        // Off for workers on purpose. A worker's results come back through
+        // pane output, which is why peer workers already function with their
+        // CLI's own sandbox; a leader's do not, so only it needs the socket
+        // that sandbox denies. Widening every peer worker to full access
+        // without a failure that calls for it is not a change to make quietly.
+        needsSocketAccess: Bool = false
     ) -> String {
         let quotedDir = workingDirectory.replacingOccurrences(of: "'", with: "'\\''")
         // `mkdir -p` before `cd`, because a project on another machine has
@@ -3411,18 +3417,48 @@ extension TeamOrchestrator {
                 + " --system-prompt \"$TERMMESH_LEADER_PROMPT\""
                 + " --dangerously-skip-permissions"
         case "codex", "kiro", "gemini":
+            let autonomy = needsSocketAccess ? Self.leaderAutonomyFlags(cli: cli) : []
+            let flags = autonomy.isEmpty ? "" : " " + autonomy.joined(separator: " ")
             guard let systemPromptFile else {
-                return "\(enter) && \(envPrefix)\(cli) --model \(quotedModel)"
+                return "\(enter) && \(envPrefix)\(cli) --model \(quotedModel)\(flags)"
             }
             let directive = LeaderParallelPolicy.launchDirective(promptFile: systemPromptFile)
             switch cli {
             case "kiro":
-                return "\(enter) && \(envPrefix)kiro chat --model \(quotedModel) \(shellQuoted(directive))"
+                return "\(enter) && \(envPrefix)kiro chat --model \(quotedModel)\(flags)"
+                    + " \(shellQuoted(directive))"
             default:
-                return "\(enter) && \(envPrefix)\(cli) --model \(quotedModel) \(shellQuoted(directive))"
+                return "\(enter) && \(envPrefix)\(cli) --model \(quotedModel)\(flags)"
+                    + " \(shellQuoted(directive))"
             }
         default:
             return "\(enter) && \(envPrefix)\(cli) --model \(quotedModel)"
+        }
+    }
+
+    /// The flags a leader CLI needs to act without a human at the keyboard.
+    ///
+    /// A leader's whole job is `tm-agent`, and `tm-agent` reaches the app over
+    /// a Unix socket. Codex's default sandbox denies that connect with EPERM,
+    /// so `detect_socket` finds nothing and every team command answers
+    /// "no socket found" — the leader can name its teammates and cannot reach
+    /// one. Approval prompts fail the same way for a pane nobody is watching.
+    ///
+    /// The local launch path has passed these since it was written; only the
+    /// peer path omitted them, which is why a codex leader was inert on a peer
+    /// and fine on this machine. Claude carries its own equivalent
+    /// (`--dangerously-skip-permissions`) in the branch above.
+    static func leaderAutonomyFlags(cli: String) -> [String] {
+        switch cli.lowercased() {
+        case "codex":
+            return ["--ask-for-approval", "never", "--sandbox", "danger-full-access"]
+        case "gemini":
+            return ["--yolo"]
+        default:
+            // kiro has no such flag today. Returning nothing is the honest
+            // answer; inventing one would fail at launch instead of at the
+            // first socket call.
+            return []
         }
     }
 
@@ -3453,7 +3489,8 @@ extension TeamOrchestrator {
             workingDirectory: workingDirectory,
             systemPromptFile: systemPromptFile,
             environment: environment,
-            hostBinDirs: hostBinDirs
+            hostBinDirs: hostBinDirs,
+            needsSocketAccess: true
         )
         // `export` applies to the final CLI, unlike a shell assignment prefix
         // before `mkdir`, which would have scoped the grant to that one setup
