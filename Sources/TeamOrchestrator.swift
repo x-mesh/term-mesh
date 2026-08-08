@@ -3082,7 +3082,8 @@ final class TeamOrchestrator: ObservableObject {
         teamName: String,
         rows: [TeamAgentRow],
         remoteWorkingDirectory: String,
-        remoteSocketPath: String
+        remoteSocketPath: String,
+        hostCLIBinDirs: [String] = []
     ) -> String {
         let agentList = rows.enumerated().map { index, row in
             let instructions = row.customInstructions
@@ -3109,7 +3110,113 @@ final class TeamOrchestrator: ObservableObject {
             teamName: teamName,
             agentList: agentList,
             runbookSection: remoteRunbooks,
-            tmAgent: "tm-agent",
+            tmAgent: remoteTMAgentCommand(hostCLIBinDirs: hostCLIBinDirs),
+            socketPath: remoteSocketPath
+        )
+    }
+
+    /// The leader contract for a peer leader that is not Claude — codex,
+    /// kiro, gemini.
+    ///
+    /// Such a leader used to receive `LeaderParallelPolicy.renderedInstructions`
+    /// and nothing else: how to schedule work, with no team name, no roster,
+    /// and no `tm-agent` at all. It came up unable to name a single teammate
+    /// while four of them sat idle beside it. A Claude leader on the same
+    /// host got the full briefing, so the difference was the CLI, not the
+    /// placement.
+    ///
+    /// Same rows-not-roster reasoning as `remoteLeaderClaudeSystemPrompt`:
+    /// the leader is attached before the members are recorded, so reading
+    /// `team.agents` here yields an empty list.
+    /// The `tm-agent` a peer leader should actually invoke.
+    ///
+    /// The launch line puts the peer's bundled bin directory first on PATH,
+    /// and that ordering does not survive every CLI: codex runs its shell tool
+    /// through a fresh login shell, which rebuilt PATH with `$HOME/bin` ahead
+    /// of it. A leader then silently used whatever `tm-agent` someone had
+    /// installed there — an 0.175.1 build against a 0.176.1 app, which failed
+    /// in that generation's ways and blamed a missing `git-kit`.
+    ///
+    /// An absolute path cannot be reordered. `hostCLIBinDirs` is the peer's
+    /// own answer for where its binaries live, from the handshake. Falling
+    /// back to the bare name keeps a host that reports nothing working exactly
+    /// as before rather than pointing at a path that may not exist.
+    static func remoteTMAgentCommand(hostCLIBinDirs: [String]) -> String {
+        guard let dir = hostCLIBinDirs.first(where: {
+            !$0.trimmingCharacters(in: .whitespaces).isEmpty
+        }) else { return "tm-agent" }
+        return (dir as NSString).appendingPathComponent("tm-agent")
+    }
+
+    static func remoteLeaderNonClaudeSystemPrompt(
+        teamName: String,
+        rows: [TeamAgentRow],
+        remoteWorkingDirectory: String,
+        remoteSocketPath: String,
+        hostCLIBinDirs: [String] = []
+    ) -> String {
+        let agentList = rows.enumerated().map { index, row in
+            let instructions = row.customInstructions
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            let source = instructions.isEmpty ? row.preset.instructions : instructions
+            let summary = oneLinerFromInstructions(source)
+            return summary.isEmpty
+                ? "  \(index + 1). \(row.preset.name) (\(row.preset.name))"
+                : "  \(index + 1). \(row.preset.name) (\(row.preset.name)) — \(summary)"
+        }.joined(separator: "\n")
+        // Deliberately the same wording the Claude peer prompt uses: the
+        // runbooks live on the peer, not here, so the path is the peer's.
+        let remoteRunbooks = """
+        ## Agent Runbooks
+
+        Source of truth on this machine: `.agent-runbooks/<role>.md` under \(remoteWorkingDirectory).
+        Each worker receives its composed role brief when its pane starts.
+
+        Useful commands:
+        ```
+        tm-agent runbook status
+        tm-agent runbook install --tool all
+        ```
+        """
+        return renderNonClaudeLeaderPrompt(
+            teamName: teamName,
+            agentList: agentList,
+            runbookSection: remoteRunbooks,
+            // Peer members get their own checkouts from PeerProjectBootstrap
+            // rather than from this team's worktree mode, so there is no
+            // worktree table to state here.
+            worktreeSection: "",
+            tmAgent: remoteTMAgentCommand(hostCLIBinDirs: hostCLIBinDirs),
+            socketPath: remoteSocketPath
+        )
+    }
+
+    /// `remoteLeaderNonClaudeSystemPrompt`, rebuilt after a host restart
+    /// removed the original peer surface. The durable roster is authoritative
+    /// here — by recovery time the members are recorded, and the creation rows
+    /// are gone.
+    static func remoteLeaderNonClaudeRecoverySystemPrompt(
+        teamName: String,
+        agents: [AgentMember],
+        remoteWorkingDirectory: String,
+        remoteSocketPath: String,
+        hostCLIBinDirs: [String] = []
+    ) -> String {
+        let agentList = agents.enumerated().map { index, agent in
+            let summary = oneLinerFromInstructions(agent.instructions)
+            return summary.isEmpty
+                ? "  \(index + 1). \(agent.name) (\(agent.agentType))"
+                : "  \(index + 1). \(agent.name) (\(agent.agentType)) — \(summary)"
+        }.joined(separator: "\n")
+        return renderNonClaudeLeaderPrompt(
+            teamName: teamName,
+            agentList: agentList,
+            runbookSection: runbookLeaderSection(
+                workingDirectory: remoteWorkingDirectory,
+                roles: agents.map(\.agentType)
+            ),
+            worktreeSection: "",
+            tmAgent: remoteTMAgentCommand(hostCLIBinDirs: hostCLIBinDirs),
             socketPath: remoteSocketPath
         )
     }
@@ -3121,7 +3228,8 @@ final class TeamOrchestrator: ObservableObject {
         teamName: String,
         agents: [AgentMember],
         remoteWorkingDirectory: String,
-        remoteSocketPath: String
+        remoteSocketPath: String,
+        hostCLIBinDirs: [String] = []
     ) -> String {
         let agentList = agents.enumerated().map { index, agent in
             let summary = oneLinerFromInstructions(agent.instructions)
@@ -3136,7 +3244,7 @@ final class TeamOrchestrator: ObservableObject {
                 workingDirectory: remoteWorkingDirectory,
                 roles: agents.map(\.agentType)
             ),
-            tmAgent: "tm-agent",
+            tmAgent: remoteTMAgentCommand(hostCLIBinDirs: hostCLIBinDirs),
             socketPath: remoteSocketPath
         )
     }
@@ -3196,6 +3304,32 @@ final class TeamOrchestrator: ObservableObject {
             worktreeSection = ""
         }
 
+        return Self.renderNonClaudeLeaderPrompt(
+            teamName: teamName,
+            agentList: agentList,
+            runbookSection: runbookSection,
+            worktreeSection: worktreeSection,
+            tmAgent: tmAgent,
+            socketPath: socketPath
+        )
+    }
+
+    /// The non-Claude leader contract, from parts its two callers assemble
+    /// differently.
+    ///
+    /// A leader started at project-creation time reads its roster from the
+    /// creation rows, because the team record has no agents yet — the leader
+    /// is attached before them, so the project opens around it. A leader
+    /// started any other time reads the durable roster. Same contract either
+    /// way, which is the point of rendering it in one place.
+    static func renderNonClaudeLeaderPrompt(
+        teamName: String,
+        agentList: String,
+        runbookSection: String,
+        worktreeSection: String,
+        tmAgent: String,
+        socketPath: String
+    ) -> String {
         return """
         You are the TEAM LEADER for team '\(teamName)'. You direct agent workers running in terminal split panes.
 

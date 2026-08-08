@@ -1412,6 +1412,8 @@ class TerminalController {
             return v2Result(id: id, self.v2DebugPeerCapabilitiesProbe(params: params))
         case "debug.peer.open_remote_pane":
             return v2Result(id: id, self.v2DebugPeerOpenRemotePane(params: params))
+        case "debug.session_host.reconcile":
+            return v2Result(id: id, self.v2DebugSessionHostReconcile())
         case "debug.peer.open_workspace_mirror":
             return v2Result(id: id, self.v2DebugPeerOpenWorkspaceMirror(params: params))
         case "debug.peer.mirror_status":

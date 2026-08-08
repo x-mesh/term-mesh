@@ -50,6 +50,12 @@ struct NewProjectView: View {
         _ progress: @escaping @MainActor (ProjectCreationEvent) -> Void
     ) async throws -> Void
     let onClose: () -> Void
+    /// Undo a creation that came up incomplete: the team, its workspace, and
+    /// the checkouts it made on every peer.
+    ///
+    /// The default is deliberately a no-op rather than a required argument —
+    /// the previews and tests that build this sheet have nothing to discard.
+    var onDiscard: (_ name: String) async -> Void = { _ in }
     /// Local repositories the app already knows about. Their `origin` remotes
     /// become lightweight autocomplete suggestions; no home-directory scan is
     /// needed just to open this sheet.
@@ -133,6 +139,8 @@ struct NewProjectView: View {
     @State private var creationStartedAt: Date?
     @State private var bootSteps: [ProjectBootStep] = []
     @State private var showsBootCommands = true
+    @State private var showsFailureDetail = false
+    @State private var isDiscarding = false
     @State private var agentPlacementMode: AgentPlacementMode = .sameAsLeader
     @State private var allAgentsHostKey: String?
 
@@ -344,6 +352,9 @@ struct NewProjectView: View {
             }
 
             Divider()
+            if creationError != nil, showsFailureDetail {
+                bootFailureDetail
+            }
             Toggle("Show launch commands", isOn: $showsBootCommands)
                 .toggleStyle(.switch)
                 .controlSize(.small)
@@ -352,6 +363,50 @@ struct NewProjectView: View {
                 .padding(.vertical, 12)
         }
         .accessibilityIdentifier("newProject.bootProgress")
+    }
+
+    /// What is known about the failure, opened by Troubleshoot.
+    ///
+    /// The actions themselves live in the sheet's one footer — a second row of
+    /// buttons here meant two Retries and two default-action shortcuts.
+    private var bootFailureDetail: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            ForEach(failedStepMessages, id: \.self) { message in
+                Text(message)
+                    .font(.system(.caption, design: .monospaced))
+                    .textSelection(.enabled)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            Divider()
+            Text("Full log: \(RemoteWorkLog.path)")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .textSelection(.enabled)
+            Text("A machine that cannot be reached at all shows up in Settings → Peer Hosts → Test.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .padding(12)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Color.secondary.opacity(0.08), in: RoundedRectangle(cornerRadius: 6))
+        .padding(.horizontal, 24)
+        .padding(.bottom, 12)
+        .accessibilityIdentifier("newProject.failure.detail")
+    }
+
+    private var failedStepMessages: [String] {
+        var messages = bootSteps
+            .sorted(by: { $0.order < $1.order })
+            .compactMap { step -> String? in
+                guard case let .failed(message) = step.status else { return nil }
+                return "\(step.title): \(message)"
+            }
+        // A failure with no step to pin it on still has to be readable.
+        if messages.isEmpty, let creationError {
+            messages = [creationError]
+        }
+        return messages
     }
 
     private func bootStepRow(_ step: ProjectBootStep) -> some View {
@@ -1520,15 +1575,36 @@ struct NewProjectView: View {
             HStack(spacing: 10) {
                 if showsCreationProgress {
                     if creationError != nil {
+                        Button(showsFailureDetail ? "Hide details" : "Troubleshoot") {
+                            showsFailureDetail.toggle()
+                        }
+                        .accessibilityIdentifier("newProject.failure.troubleshoot")
                         Button("Back to settings") {
                             showsCreationProgress = false
                             creationError = nil
+                            showsFailureDetail = false
                         }
                         .keyboardShortcut(.cancelAction)
+                        // Closing onto a project whose leader never arrived is
+                        // what left checkouts on peers that nothing would use,
+                        // so it is a deliberate choice rather than the way out.
+                        Button("Keep as is", action: onClose)
+                            .accessibilityIdentifier("newProject.failure.keep")
                         Button("Retry project") {
                             startCreation()
                         }
+                        .accessibilityIdentifier("newProject.failure.retry")
+                        Button("Discard and close") {
+                            Task { @MainActor in
+                                isDiscarding = true
+                                await onDiscard(effectiveName)
+                                isDiscarding = false
+                                onClose()
+                            }
+                        }
                         .keyboardShortcut(.defaultAction)
+                        .disabled(isDiscarding)
+                        .accessibilityIdentifier("newProject.failure.discard")
                     } else {
                         Button("Starting…") {}
                             .disabled(true)
@@ -1580,6 +1656,10 @@ struct NewProjectView: View {
         showsCreationProgress = true
         creationStartedAt = Date()
         creationError = nil
+        // Retry runs through here again, so the previous attempt's red rows and
+        // opened detail have to go with it — otherwise the second run reads as
+        // the first one still failing.
+        showsFailureDetail = false
         bootSteps = plannedLaunchSteps(source: source, leader: leader)
 
         Task { @MainActor in
@@ -2605,6 +2685,23 @@ enum ProjectCreationFlow {
         /// repository to reproduce it from. See
         /// `PeerProjectBootstrap.requiresRepositoryURL`.
         case repositoryURLRequired(host: String, sourceHost: String)
+        /// The team exists and some of it came up, but not all. Thrown so the
+        /// sheet stays on screen with the per-step detail rather than closing
+        /// onto a project whose leader never arrived.
+        case attachIncomplete(failures: [String])
+        /// Nothing reported back within the budget. Distinct from a failure —
+        /// the work may still be in flight on the peer, which is why the sheet
+        /// offers to retry rather than only to clean up.
+        case attachTimedOut(seconds: Int, pending: [String])
+        /// Retry found the team from a previous attempt and could not get its
+        /// leader up either. Distinct from the first failure: the checkouts are
+        /// already there, so the next step is not to build them again.
+        case leaderRepairFailed(detail: String?)
+        /// The project is there and some of its members are not. Retry cannot
+        /// put them back on its own: a failed agent's checkout is reclaimed
+        /// when it fails, so re-attaching needs one made again — which is
+        /// creation, not repair.
+        case membersMissing(names: [String])
 
         var errorDescription: String? {
             switch self {
@@ -2625,6 +2722,73 @@ enum ProjectCreationFlow {
                 folder it cannot verify is this project. Add the repository's \
                 URL, or keep every agent on \(sourceHost).
                 """
+            case .attachIncomplete(let failures):
+                failures.count == 1
+                    ? failures[0]
+                    : "\(failures.count) parts of the project did not start:\n"
+                        + failures.map { "• \($0)" }.joined(separator: "\n")
+            case .attachTimedOut(let seconds, let pending):
+                "Nothing reported back within \(seconds)s. Still waiting on: "
+                    + pending.joined(separator: ", ")
+            case .membersMissing(let names):
+                "This project is missing " + names.joined(separator: ", ")
+                    + ". Discard and create it again to bring them back."
+            case .leaderRepairFailed(let detail):
+                detail.map { "Could not start the leader on retry: \($0)" }
+                    ?? "Could not start the leader on retry."
+            }
+        }
+    }
+
+    /// How long the sheet waits for every peer attach to report.
+    ///
+    /// Above the leader's own attach deadline so a leader that times out is
+    /// reported as *that*, with its host and reason, instead of being swallowed
+    /// by a shorter outer budget that can only say "nothing came back".
+    static let attachBudgetSeconds = 180
+
+    /// Who has an attach to wait on, and what to call them if they never report.
+    static func remoteParticipantLabels(
+        leaderEndpoint: LeaderEndpoint,
+        rows: [TeamAgentRow]
+    ) -> [(stepID: String, label: String)] {
+        var participants: [(stepID: String, label: String)] = []
+        if case .peer = leaderEndpoint {
+            participants.append((stepID: "leader", label: "leader"))
+        }
+        for row in rows where row.hostKey != nil {
+            participants.append((
+                stepID: "agent:\(row.id.uuidString)",
+                label: row.preset.displayName
+            ))
+        }
+        return participants
+    }
+
+    /// Wait to be told the attaches settled, or give up after `seconds`.
+    ///
+    /// `register` receives the "settled" closure to hold onto; calling it ends
+    /// the wait. A flag decides which of the two arrivals wins, because a
+    /// continuation resumed twice traps.
+    ///
+    /// Returns true when the budget ran out.
+    @MainActor
+    static func waitForSettle(
+        seconds: Int,
+        register: @MainActor (@escaping @MainActor () -> Void) -> Void
+    ) async -> Bool {
+        var finished = false
+        return await withCheckedContinuation { continuation in
+            register {
+                guard !finished else { return }
+                finished = true
+                continuation.resume(returning: false)
+            }
+            Task { @MainActor in
+                try? await Task.sleep(nanoseconds: UInt64(seconds) * 1_000_000_000)
+                guard !finished else { return }
+                finished = true
+                continuation.resume(returning: true)
             }
         }
     }
@@ -2640,12 +2804,48 @@ enum ProjectCreationFlow {
         progress: @escaping @MainActor (ProjectCreationEvent) -> Void = { _ in },
         tabManager: TabManager
     ) async throws {
-        // A name already in use means the project is open, not that something
-        // failed. Creating one silently returned nil and the sheet just
-        // closed, which reads as the button not working — so go to the one
-        // that is there.
+        // A name already in use usually means the project is open, not that
+        // something failed. Creating one silently returned nil and the sheet
+        // just closed, which reads as the button not working — so go to the
+        // one that is there.
+        //
+        // Unless it is the wreckage of a previous attempt. Keeping the sheet up
+        // on failure means a failed run leaves its team and workspace behind,
+        // so `Retry project` arrives here and this used to select the
+        // half-built workspace and report success — the recovery button closing
+        // the sheet without recovering anything. `leaderReady` is the
+        // difference: false while a requested peer leader is still connecting
+        // or failed to launch.
         if let existing = TeamOrchestrator.shared.teams[name],
            let workspace = tabManager.tabs.first(where: { $0.id == existing.workspaceId }) {
+            // A member the form asked for that never joined leaves the same
+            // false success as a missing leader, and `leaderReady` says nothing
+            // about it: an agent failure appends to the sheet's own list and
+            // writes nothing to the team. Reported rather than repaired,
+            // because re-attaching needs a checkout this one no longer has —
+            // a failed agent's checkout is reclaimed at the point it fails.
+            let joined = Set(existing.agents.map(\.name))
+            let missing = rows
+                .filter { $0.hostKey != nil && !joined.contains($0.preset.name) }
+                .map(\.preset.name)
+            guard missing.isEmpty else {
+                tabManager.selectWorkspace(workspace)
+                throw CreationError.membersMissing(names: missing)
+            }
+            guard existing.leaderReady else {
+                // Repair rather than rebuild: the checkouts exist, and
+                // `recoverRemoteLeaderIfNeeded` is documented as safe for an
+                // initial attach that failed before a surface was recorded.
+                tabManager.selectWorkspace(workspace)
+                let repaired = await TeamOrchestrator.shared
+                    .recoverRemoteLeaderIfNeeded(teamName: name)
+                guard repaired else {
+                    throw CreationError.leaderRepairFailed(
+                        detail: TeamOrchestrator.shared.teams[name]?.leaderFailureDescription
+                    )
+                }
+                return
+            }
             tabManager.selectWorkspace(workspace)
             return
         }
@@ -2693,6 +2893,54 @@ enum ProjectCreationFlow {
             )))
         }
         await Task.yield()
+
+        // The outcome callback names an agent; the sheet's rows are keyed by
+        // the row's id, so keep the way back.
+        var stepIDsByAgentName: [String: String] = [:]
+        for row in prepared.rows {
+            stepIDsByAgentName[row.preset.name] = "agent:\(row.id.uuidString)"
+        }
+        let remoteParticipants = Self.remoteParticipantLabels(
+            leaderEndpoint: leader.endpoint,
+            rows: prepared.rows
+        )
+
+        var settleResume: (@MainActor () -> Void)?
+        var hasSettled = false
+        var failures: [String] = []
+        var reported = Set<String>()
+
+        let onAttach: (TeamOrchestrator.RemoteAttachOutcome) -> Void = { outcome in
+            switch outcome {
+            case .leaderAttached(let host):
+                reported.insert("leader")
+                progress(.completed(
+                    id: "leader",
+                    detail: "\(leader.mode.capitalized) started on \(hostDisplayName(host))"
+                ))
+            case .leaderFailed(_, let message):
+                reported.insert("leader")
+                failures.append(message)
+                progress(.failed(id: "leader", message: message))
+            case .agentAttached(let agentName, let host):
+                guard let id = stepIDsByAgentName[agentName] else { break }
+                reported.insert(id)
+                progress(.completed(
+                    id: id,
+                    detail: "\(agentName) started on \(hostDisplayName(host))"
+                ))
+            case .agentFailed(let agentName, _, let message):
+                failures.append(message)
+                guard let id = stepIDsByAgentName[agentName] else { break }
+                reported.insert(id)
+                progress(.failed(id: id, message: message))
+            case .settled:
+                hasSettled = true
+                settleResume?()
+                settleResume = nil
+            }
+        }
+
         guard TeamOrchestrator.shared.createTeam(
             named: name,
             rows: prepared.rows,
@@ -2706,20 +2954,58 @@ enum ProjectCreationFlow {
                 ? "isolated"
                 : "off",
             projectSource: source,
+            onRemoteAttach: onAttach,
             tabManager: tabManager
         ) != nil else {
             progress(.failed(id: "leader", message: "Could not create the project team."))
             throw CreationError.teamCreationFailed
         }
-        progress(.completed(
-            id: "leader",
-            detail: "\(leader.mode.capitalized) launched on \(hostDisplayName(leader.endpoint.hostKey)) · \(leaderPath)"
-        ))
-        for row in prepared.rows {
+
+        // Local participants are running the moment the team exists; only the
+        // peer ones have an attach to wait on, and `settled` covers those.
+        if !remoteParticipants.isEmpty && !hasSettled {
+            let timedOut = await Self.waitForSettle(seconds: attachBudgetSeconds) { resume in
+                if hasSettled {
+                    resume()
+                } else {
+                    settleResume = resume
+                }
+            }
+            if timedOut {
+                let pending = remoteParticipants.filter { !reported.contains($0.stepID) }
+                for participant in pending {
+                    progress(.failed(
+                        id: participant.stepID,
+                        message: "did not report back within \(attachBudgetSeconds)s"
+                    ))
+                }
+                throw CreationError.attachTimedOut(
+                    seconds: attachBudgetSeconds,
+                    pending: pending.map(\.label)
+                )
+            }
+        }
+
+        // Anything that never reported is running locally, so it is up.
+        if !reported.contains("leader") {
             progress(.completed(
-                id: "agent:\(row.id.uuidString)",
+                id: "leader",
+                detail: "\(leader.mode.capitalized) launched on \(hostDisplayName(leader.endpoint.hostKey)) · \(leaderPath)"
+            ))
+        }
+        for row in prepared.rows {
+            let id = "agent:\(row.id.uuidString)"
+            guard !reported.contains(id) else { continue }
+            progress(.completed(
+                id: id,
                 detail: "\(row.preset.displayName) launch requested on \(hostDisplayName(row.hostKey))"
             ))
+        }
+
+        // The team is real either way — the sheet stays up so the failure can
+        // be read and acted on, rather than closing onto a half-started project.
+        guard failures.isEmpty else {
+            throw CreationError.attachIncomplete(failures: failures)
         }
         // A project with agents in it is what the board is for, so making one
         // puts it up.

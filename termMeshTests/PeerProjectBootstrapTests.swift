@@ -1833,4 +1833,278 @@ final class PeerProjectBootstrapTests: XCTestCase {
         XCTAssertNil(TerminalController.decodeFixedHex("0011aa", byteCount: 4))
         XCTAssertNil(TerminalController.decodeFixedHex("0011zzff", byteCount: 4))
     }
+
+    // MARK: - Who the creation sheet waits for
+    //
+    // `createTeam` returns as soon as the team record exists while the peer
+    // attaches run on behind it, so the sheet used to close on a success that
+    // had not happened. A leader could then fail to start with nothing left on
+    // screen to say so — the only report was a log line and a pane title set on
+    // a pane the failure had prevented from existing. These fix who is expected
+    // to report, which is what the wait is measured against.
+
+    @MainActor
+    func test_onlyPeerParticipantsAreWaitedFor() {
+        let participants = ProjectCreationFlow.remoteParticipantLabels(
+            leaderEndpoint: .peer(hostKey: "ssh:mac-sub"),
+            rows: [
+                row("executor", hostKey: "ssh:mac-sub", directory: "/w/e"),
+                row("reviewer", hostKey: nil)
+            ]
+        )
+        XCTAssertEqual(participants.map(\.label), ["leader", "Executor"],
+                       "a local agent has no attach to wait on")
+        XCTAssertEqual(participants.first?.stepID, "leader")
+    }
+
+    @MainActor
+    func test_aLocalLeaderIsNotWaitedFor() {
+        let participants = ProjectCreationFlow.remoteParticipantLabels(
+            leaderEndpoint: .local,
+            rows: [row("executor", hostKey: "ssh:mac-sub", directory: "/w/e")]
+        )
+        XCTAssertEqual(participants.map(\.label), ["Executor"])
+    }
+
+    @MainActor
+    func test_anAllLocalTeamWaitsForNobody() {
+        XCTAssertTrue(
+            ProjectCreationFlow.remoteParticipantLabels(
+                leaderEndpoint: .local,
+                rows: [row("executor", hostKey: nil)]
+            ).isEmpty,
+            "waiting on a settle that will never be reported would hang the sheet"
+        )
+    }
+
+    // MARK: - Seeding a pane into a freshly created peer workspace
+    //
+    // The leader is placed by creating a workspace on the peer and then asking
+    // it to open a tab. That ask carries an empty `pane_id` — the workspace has
+    // no pane to name yet — and a `workspace_id`, which is the field the proto
+    // added for exactly this. The Rust host reads both. The Mac host read only
+    // `pane_id`, so the empty id failed its guard and the request did nothing:
+    // the placement loop then waited fifteen polls for a pane nobody was going
+    // to open, and the project came up with every agent running and no leader.
+
+    func test_anEmptyPaneIDFallsBackToTheNamedWorkspace() {
+        XCTAssertEqual(
+            GhosttyPaneSurfaceProvider.newTabTarget(
+                paneResolved: false,
+                hasWorkspaceID: true,
+                workspaceFound: true,
+                workspaceHasPanels: false
+            ),
+            .seedWorkspace
+        )
+    }
+
+    func test_aResolvablePaneWins() {
+        XCTAssertEqual(
+            GhosttyPaneSurfaceProvider.newTabTarget(
+                paneResolved: true,
+                hasWorkspaceID: true,
+                workspaceFound: true,
+                workspaceHasPanels: false
+            ),
+            .besidePane,
+            "workspace_id is the empty-workspace fallback, not an override"
+        )
+    }
+
+    /// Once the workspace has a panel, an unresolvable pane id is a stale
+    /// locator — seeding another terminal off it would be a second, unasked-for
+    /// tab every time a client retried with an old id.
+    ///
+    /// The condition counts *panels*, not surfaces, and the difference is the
+    /// whole second half of this bug: `createWorkspace` leaves a workspace with
+    /// one panel and no surface, so this correctly declines to seed while the
+    /// asking machine still reports an empty workspace. Realizing that panel is
+    /// a separate job (`TabManager.surfaceRealizationPins`) — reading this
+    /// parameter as "has surfaces" sends you to seed a pane that already exists.
+    func test_aWorkspaceThatAlreadyHasAPanelIsNotSeededAgain() {
+        XCTAssertEqual(
+            GhosttyPaneSurfaceProvider.newTabTarget(
+                paneResolved: false,
+                hasWorkspaceID: true,
+                workspaceFound: true,
+                workspaceHasPanels: true
+            ),
+            .ignore
+        )
+    }
+
+    func test_nothingToActOnIsIgnored() {
+        XCTAssertEqual(
+            GhosttyPaneSurfaceProvider.newTabTarget(
+                paneResolved: false,
+                hasWorkspaceID: false,
+                workspaceFound: false,
+                workspaceHasPanels: false
+            ),
+            .ignore,
+            "the pre-fix behaviour for every request, which is why it was silent"
+        )
+        XCTAssertEqual(
+            GhosttyPaneSurfaceProvider.newTabTarget(
+                paneResolved: false,
+                hasWorkspaceID: true,
+                workspaceFound: false,
+                workspaceHasPanels: false
+            ),
+            .ignore,
+            "a workspace id this host does not know is not a licence to guess one"
+        )
+    }
+
+    /// The failure that started this carried only a host name, so the sheet had
+    /// nothing to show and Troubleshoot had nothing to open.
+    func test_workspaceUnavailableSaysWhatItWaitedForAndWhetherItAsked() {
+        let asked = TeamOrchestrator.RemoteAgentError.projectWorkspaceUnavailable(
+            host: "mac-sub",
+            workspaceID: "a1b2c3d4",
+            attempts: 15,
+            seedRequested: true
+        ).description
+        XCTAssertTrue(asked.contains("15 time(s)"), asked)
+        XCTAssertTrue(asked.contains("a1b2c3d4"), asked)
+        XCTAssertTrue(asked.contains("after asking it to open one"), asked)
+
+        let neverAsked = TeamOrchestrator.RemoteAgentError.projectWorkspaceUnavailable(
+            host: "mac-sub",
+            workspaceID: "a1b2c3d4",
+            attempts: 3,
+            seedRequested: false
+        ).description
+        XCTAssertTrue(neverAsked.contains("without getting as far as asking"), neverAsked)
+
+        let noWorkspace = TeamOrchestrator.RemoteAgentError.projectWorkspaceUnavailable(
+            host: "mac-sub",
+            workspaceID: nil,
+            attempts: 0,
+            seedRequested: false
+        ).description
+        XCTAssertTrue(noWorkspace.contains("never reported a workspace"), noWorkspace)
+    }
+}
+
+/// Findings from the adversarial review of #196, each verified in the code
+/// before being fixed. Two of the three were introduced by that PR itself:
+/// keeping the sheet up on failure is what leaves a team behind for `Retry`
+/// to trip over, and letting `auto` step aside is what made a run without
+/// isolation indistinguishable from one with it.
+@MainActor
+final class ProjectCreationRecoveryTests: XCTestCase {
+
+    /// `leaderReady` is documented as "false while a requested peer leader is
+    /// still connecting or failed to launch" — the one field that separates a
+    /// project that is open from the wreckage of an attempt that was not.
+    /// Without consulting it, `Retry project` selected the half-built
+    /// workspace and returned success: the recovery button closing the sheet
+    /// without recovering anything.
+    func test_theFieldThatSeparatesAnOpenProjectFromAFailedAttempt() {
+        var team = TeamOrchestrator.Team(
+            id: "xm",
+            leaderSessionId: UUID().uuidString,
+            leaderMode: "codex",
+            leaderModel: "gpt-5.6-sol",
+            leaderCli: "codex",
+            leaderPanelId: UUID(),
+            workingDirectory: "/w",
+            workspaceId: UUID(),
+            agents: [],
+            createdAt: Date(),
+            worktreeMode: "off"
+        )
+        XCTAssertTrue(team.leaderReady, "a team is usable until something says otherwise")
+
+        team.leaderReady = false
+        team.leaderFailureDescription = "could not prepare the project workspace"
+        XCTAssertFalse(
+            team.leaderReady,
+            "Retry must see this and repair rather than select and report success"
+        )
+    }
+
+    /// The leader is not the only thing that can be missing, and `leaderReady`
+    /// says nothing about the rest: an agent failure appends to the sheet's own
+    /// list and writes nothing to the team. Retry checking only the leader
+    /// still reported success for a project with no executor in it.
+    func test_aMissingMemberIsNoticedEvenWhenTheLeaderIsFine() {
+        let requested = ["executor", "reviewer"]
+        let joined: Set<String> = ["reviewer"]
+        let missing = requested.filter { !joined.contains($0) }
+        XCTAssertEqual(
+            missing, ["executor"],
+            "a healthy leader must not make a half-empty team read as complete"
+        )
+    }
+
+    /// Local members are left out on purpose: they are created by the local
+    /// engine under names this comparison does not own, and reporting them as
+    /// missing would block Retry on a project that is fine.
+    func test_onlyRemoteMembersAreComparedAgainstTheRoster() {
+        let rows: [(name: String, remote: Bool)] = [
+            ("executor", true), ("planner", false), ("reviewer", true),
+        ]
+        let joined: Set<String> = ["reviewer"]
+        let missing = rows.filter { $0.remote && !joined.contains($0.name) }.map(\.name)
+        XCTAssertEqual(missing, ["executor"])
+    }
+
+    /// Deletion tears down against a snapshot taken when it starts. An attach
+    /// still in flight commits by writing a surface record and a checkout, so
+    /// one that lands after that snapshot leaves a remote process running with
+    /// nothing pointing at it. Retiring the generation makes the attach fail
+    /// its next `ensureCurrent` instead.
+    func test_retiringTheGenerationStopsAnAttachThatIsStillInFlight() {
+        let gate = TeamOrchestrator.LeaderAttachGenerationGate.shared
+        let inFlight = gate.begin(teamName: "xm-race")
+        XCTAssertTrue(gate.isCurrent(inFlight))
+
+        gate.invalidateAll(teamName: "xm-race")
+        XCTAssertFalse(
+            gate.isCurrent(inFlight),
+            "an attach past this point must compensate rather than register anything"
+        )
+    }
+
+    /// An agent attach is not the leader and carries no attempt, so it notices
+    /// a retirement by snapshotting the value instead. Without this it commits
+    /// a surface record and a team member into a roster the deletion has
+    /// already walked past, and the remote process outlives both.
+    func test_anAgentAttachNoticesARetirementWithoutHoldingAGeneration() {
+        let gate = TeamOrchestrator.LeaderAttachGenerationGate.shared
+        let snapshot = gate.current(teamName: "xm-agents")
+        XCTAssertTrue(gate.isCurrent(teamName: "xm-agents", value: snapshot))
+
+        gate.invalidateAll(teamName: "xm-agents")
+        XCTAssertFalse(
+            gate.isCurrent(teamName: "xm-agents", value: snapshot),
+            "the attach must refuse to commit from here"
+        )
+    }
+
+    /// The leader's own gate and an agent's snapshot read the same counter, so
+    /// one deletion retires both rather than only whichever mechanism the
+    /// caller happened to use.
+    func test_oneRetirementCoversTheLeaderAndItsAgents() {
+        let gate = TeamOrchestrator.LeaderAttachGenerationGate.shared
+        let leader = gate.begin(teamName: "xm-both")
+        let agentSnapshot = gate.current(teamName: "xm-both")
+
+        gate.invalidateAll(teamName: "xm-both")
+        XCTAssertFalse(gate.isCurrent(leader))
+        XCTAssertFalse(gate.isCurrent(teamName: "xm-both", value: agentSnapshot))
+    }
+
+    /// A caller holding no generation is exactly the deletion case, and it
+    /// must still retire one that was never begun — a team whose first attach
+    /// has not started yet is not a team that may be raced later.
+    func test_retiringWorksForATeamThatNeverBeganAnAttach() {
+        let gate = TeamOrchestrator.LeaderAttachGenerationGate.shared
+        gate.invalidateAll(teamName: "xm-never-began")
+        let after = gate.begin(teamName: "xm-never-began")
+        XCTAssertTrue(gate.isCurrent(after), "a later attach starts clean")
+    }
 }

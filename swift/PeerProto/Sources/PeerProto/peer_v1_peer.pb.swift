@@ -910,7 +910,20 @@ public nonisolated struct Termmesh_Peer_V1_Hello: Sendable {
   public var appVersion: String = String()
 
   /// Absolute directories containing CLIs shipped beside this host process.
+  /// Consumers require host.cli-bin-dirs.v1 and successful authentication.
   public var cliBinDirs: [String] = []
+
+  /// Absolute path, on this machine, where a session owner that outlives this
+  /// process serves the same protocol. Empty when there is none, which is the
+  /// honest answer for a host whose sessions end when it does.
+  ///
+  /// A GUI host answers here rather than serving `ensure` itself: its surfaces
+  /// live in its own process, so a session it owns cannot survive it, and a
+  /// client that reached one would be told it may reattach later and be wrong.
+  /// The daemon can, so the daemon is named. A client that wants a session to
+  /// outlive anything connects here instead of guessing a path — the sockets
+  /// are already keyed by target AND path, so both are reachable at once.
+  public var sessionHostSocket: String = String()
 
   public var unknownFields = SwiftProtobuf.UnknownStorage()
 
@@ -3373,7 +3386,7 @@ nonisolated extension Termmesh_Peer_V1_Envelope: SwiftProtobuf.Message, SwiftPro
 
 nonisolated extension Termmesh_Peer_V1_Hello: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
   public static let protoMessageName: String = _protobuf_package + ".Hello"
-  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{3}protocol_version\0\u{3}peer_id\0\u{3}display_name\0\u{1}capabilities\0\u{3}app_version\0\u{3}cli_bin_dirs\0")
+  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{3}protocol_version\0\u{3}peer_id\0\u{3}display_name\0\u{1}capabilities\0\u{3}app_version\0\u{3}cli_bin_dirs\0\u{3}session_host_socket\0")
 
   public mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
     while let fieldNumber = try decoder.nextFieldNumber() {
@@ -3387,6 +3400,7 @@ nonisolated extension Termmesh_Peer_V1_Hello: SwiftProtobuf.Message, SwiftProtob
       case 4: try { try decoder.decodeRepeatedStringField(value: &self.capabilities) }()
       case 5: try { try decoder.decodeSingularStringField(value: &self.appVersion) }()
       case 6: try { try decoder.decodeRepeatedStringField(value: &self.cliBinDirs) }()
+      case 7: try { try decoder.decodeSingularStringField(value: &self.sessionHostSocket) }()
       default: break
       }
     }
@@ -3411,6 +3425,9 @@ nonisolated extension Termmesh_Peer_V1_Hello: SwiftProtobuf.Message, SwiftProtob
     if !self.cliBinDirs.isEmpty {
       try visitor.visitRepeatedStringField(value: self.cliBinDirs, fieldNumber: 6)
     }
+    if !self.sessionHostSocket.isEmpty {
+      try visitor.visitSingularStringField(value: self.sessionHostSocket, fieldNumber: 7)
+    }
     try unknownFields.traverse(visitor: &visitor)
   }
 
@@ -3421,6 +3438,7 @@ nonisolated extension Termmesh_Peer_V1_Hello: SwiftProtobuf.Message, SwiftProtob
     if lhs.capabilities != rhs.capabilities {return false}
     if lhs.appVersion != rhs.appVersion {return false}
     if lhs.cliBinDirs != rhs.cliBinDirs {return false}
+    if lhs.sessionHostSocket != rhs.sessionHostSocket {return false}
     if lhs.unknownFields != rhs.unknownFields {return false}
     return true
   }
@@ -5297,7 +5315,7 @@ nonisolated extension Termmesh_Peer_V1_Resize: SwiftProtobuf.Message, SwiftProto
     if self.pixelHeight != 0 {
       try visitor.visitSingularUInt32Field(value: self.pixelHeight, fieldNumber: 5)
     }
-    if self.claimAuthority {
+    if self.claimAuthority != false {
       try visitor.visitSingularBoolField(value: self.claimAuthority, fieldNumber: 6)
     }
     try unknownFields.traverse(visitor: &visitor)

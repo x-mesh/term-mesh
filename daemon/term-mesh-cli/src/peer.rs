@@ -753,6 +753,8 @@ fn connect_and_authenticate(
                 capabilities: capability::supported_vec(),
                 app_version: env!("CARGO_PKG_VERSION").into(),
                 cli_bin_dirs: vec![],
+                // A client owns no sessions, so it names no owner.
+                session_host_socket: String::new(),
             })),
         },
     )?;

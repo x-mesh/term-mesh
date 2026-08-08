@@ -181,6 +181,14 @@ final class TerminalPanel: Panel, ObservableObject {
         // host lease (the last pane on a host stops its SSH tunnel).
         // Must precede the surface close so the relay binary's exit is
         // an orderly teardown, not a broken-pipe surprise.
+        //
+        // Closing a pane onto this machine's own session host also has to
+        // *stay* closed. The session keeps running — that is the point of it —
+        // so without this the next reconcile finds it unshown and opens it
+        // again a few seconds later.
+        if let session = peerPaneSession {
+            SessionHostPanes.noteClosedByUser(surfaceID: session.originSurface.surfaceID)
+        }
         peerPaneSession?.teardown()
         // Terminate agent session if bound (kills agent process + unbinds panel)
         if let sessionId = agentSessionId {

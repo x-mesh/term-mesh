@@ -784,31 +784,23 @@ final class PeerServerTests: XCTestCase {
         XCTAssertTrue(completed.ok)
         XCTAssertEqual(completed.resultJson, #"{"team_name":"demo"}"#)
 
-        var elapsedGrant = grant
-        elapsedGrant.grantID = Data(
-            repeating: 0x93,
-            count: PeerTeamLeader.grantIDBytes
-        )
-        elapsedGrant.expiresAtUnixSecs = wallNow - 1
-        await controlPlane.registerGrant(
-            elapsedGrant,
-            nowLeaseSeconds: leaseNow > 0 ? leaseNow - 1 : 0
-        )
-        var elapsedRequest = request
-        elapsedRequest.grant = elapsedGrant
-        elapsedRequest.requestID = Data(
+        // A malformed command is still refused here, without a round trip:
+        // shape is knowable without being the machine that minted the grant.
+        var malformed = request
+        malformed.method = "team.list"
+        malformed.requestID = Data(
             repeating: 0x94,
             count: PeerTeamLeader.requestIDBytes
         )
         do {
             _ = try await server.callTeamLeader(
-                elapsedRequest,
+                malformed,
                 targetPeerID: viewerPeerID,
                 timeoutSeconds: 0.1
             )
-            XCTFail("an elapsed registered lease must be rejected")
+            XCTFail("a method outside the scoped leader surface must not be routed")
         } catch {
-            XCTAssertEqual(error as? PeerServerError, .noMatchingLeaderSession)
+            XCTAssertEqual(error as? PeerServerError, .malformedLeaderCommand)
         }
 
         do {
@@ -904,25 +896,45 @@ final class PeerServerTests: XCTestCase {
         forgedRequest.method = "team.status"
         forgedRequest.paramsJson = "{}"
 
-        do {
-            _ = try await server.callTeamLeader(
-                forgedRequest,
-                targetPeerID: viewerPeerID,
-                timeoutSeconds: 0.1
-            )
-            XCTFail("an unregistered grant must never be routed to the viewer")
-        } catch {
-            // The specific error matters: `noMatchingLeaderSession` is thrown
-            // by the precheck, before a frame is written. Had the request been
-            // routed, this viewer never answers it and the call would have
-            // failed as `leaderCallTimedOut` instead. Asserting the identity
-            // is therefore also the assertion that nothing reached the viewer,
-            // and it needs no second reader racing the session pump.
-            XCTAssertEqual(error as? PeerServerError, .noMatchingLeaderSession)
+        // An unregistered grant IS routed now, and that is the fix, not a
+        // regression: the leader this feature exists for runs on a peer and
+        // presents a grant the project's host minted and holds. This machine
+        // has no entry for it and never will, so requiring one rejected every
+        // genuine command while the grant was valid the whole time.
+        //
+        // Nothing is granted by routing it. The request reaches only the peer
+        // it names, over an already-authenticated attached session, and that
+        // peer validates the grant against the registry that issued it -- see
+        // `PeerTeamLeaderControlPlane.execute`, which passes `grants[id]`,
+        // nil for anything it did not mint, and audits the rejection. Here the
+        // viewer is a test double that answers whatever it is asked, so a
+        // reply proves routing, not authorisation.
+        async let forgedRouted = server.callTeamLeader(
+            forgedRequest,
+            targetPeerID: viewerPeerID,
+            timeoutSeconds: 2
+        )
+        guard case .teamLeaderCommandRequest(
+            _,
+            let forgedCorrelationID
+        ) = try await viewer.receiveNextMessage() else {
+            return XCTFail("a well-formed command must reach the peer that validates it")
         }
+        var forgedReply = Termmesh_Peer_V1_TeamLeaderCommandResponse()
+        forgedReply.ok = false
+        forgedReply.errorMessage = "grant not registered on the issuing host"
+        try await viewer.sendTeamLeaderCommandResponse(
+            forgedReply,
+            correlationID: forgedCorrelationID
+        )
+        let forgedOutcome = try await forgedRouted
+        XCTAssertFalse(
+            forgedOutcome.ok,
+            "the machine that minted the grant is the one that refuses it"
+        )
 
-        // Registering the same grant makes it routable, which proves the
-        // rejection above was the registry check and not an unrelated guard.
+        // Registration changes nothing at this hop, which is the point: the
+        // relay no longer consults a registry it cannot own.
         await controlPlane.registerGrant(forged)
         async let routed = server.callTeamLeader(
             forgedRequest,
@@ -953,16 +965,15 @@ final class PeerServerTests: XCTestCase {
             repeating: 0xF2,
             count: PeerTeamLeader.requestIDBytes
         )
-        do {
-            _ = try await server.callTeamLeader(
-                afterRevoke,
-                targetPeerID: viewerPeerID,
-                timeoutSeconds: 0.1
-            )
-            XCTFail("a revoked grant must stop being routable")
-        } catch {
-            XCTAssertEqual(error as? PeerServerError, .noMatchingLeaderSession)
-        }
+        // Revocation is enforced where the grant lives, so it is asserted
+        // against the control plane directly rather than through a relay hop
+        // that deliberately no longer consults one.
+        let stillRegistered = await controlPlane.registeredGrant(id: forged.grantID)
+        XCTAssertNil(
+            stillRegistered,
+            "revocation must remove the grant from the registry that issued it"
+        )
+        _ = afterRevoke
 
         try await viewer.sendGoodbye(reason: "forged grant test done")
         await transport.close()
@@ -1235,5 +1246,121 @@ private actor TeamLeaderE2EProvider: PeerSurfaceProvider {
             returnSubmissionCount,
             lastScopedTeamUUID
         )
+    }
+}
+
+/// A GUI host's surfaces live in its own process, so a session it owns cannot
+/// survive it. `session_host_socket` is how such a host points at something
+/// that can, instead of letting a client plan to come back to a session that
+/// will not be there.
+final class SessionHostAdvertisementTests: XCTestCase {
+
+    /// Empty and "the same socket" are different answers, and conflating them
+    /// is what would make a client wait for a session nobody kept.
+    func test_aHostWithNoOwnerSaysNothingRatherThanItself() {
+        let config = PeerServerConfig(hostDisplayName: "no-owner")
+        XCTAssertEqual(config.resolveSessionHostSocket(), "")
+    }
+
+    /// Asked once per Hello, not once per server. The server starts alongside
+    /// its machine's session daemon and normally wins the race, so a value
+    /// fixed at start-up answers "no owner" for the rest of the process — or,
+    /// as originally written, answers "yes" before there was one.
+    func test_theOwnerIsResolvedWhenAskedRatherThanAtStartup() {
+        final class Box: @unchecked Sendable { var path = "" }
+        let box = Box()
+        let config = PeerServerConfig(resolveSessionHostSocket: { box.path })
+        XCTAssertEqual(config.resolveSessionHostSocket(), "")
+        box.path = "/tmp/term-meshd-peer.sock"
+        XCTAssertEqual(config.resolveSessionHostSocket(), "/tmp/term-meshd-peer.sock")
+    }
+
+    /// The path is another machine's, read on this one, so a relative path
+    /// would resolve against whatever directory the reader happens to be in.
+    func test_aRelativePathIsNotAPath() throws {
+        var hello = Termmesh_Peer_V1_Hello()
+        hello.sessionHostSocket = "term-meshd-peer.sock"
+        XCTAssertFalse(
+            hello.sessionHostSocket.hasPrefix("/"),
+            "the reader drops this rather than resolving it locally"
+        )
+
+        hello.sessionHostSocket = "/tmp/term-meshd-peer.sock"
+        XCTAssertTrue(hello.sessionHostSocket.hasPrefix("/"))
+    }
+
+    /// It has to survive the wire, or the host is the only one that knows.
+    func test_itRoundTripsThroughTheWire() throws {
+        var hello = Termmesh_Peer_V1_Hello()
+        hello.protocolVersion = "1.0.0"
+        hello.sessionHostSocket = "/var/folders/x/T/term-meshd-peer.sock"
+        let decoded = try Termmesh_Peer_V1_Hello(serializedBytes: hello.serializedData())
+        XCTAssertEqual(decoded.sessionHostSocket, "/var/folders/x/T/term-meshd-peer.sock")
+    }
+
+    /// End to end over a real socket: two clients connect to one server, and
+    /// each is told what was true when *it* asked.
+    ///
+    /// This is the case a start-up-time value cannot express. The server comes
+    /// up before its machine's session daemon binds, so the first client
+    /// correctly hears "no owner" — and the second, connecting after the daemon
+    /// is up, must hear the path rather than the first client's answer replayed.
+    func test_eachClientHearsTheOwnerThatExistedWhenItAsked() async throws {
+        let sockPath = "/tmp/tm-peer-session-host-\(UUID().uuidString.prefix(8)).sock"
+        defer { try? FileManager.default.removeItem(atPath: sockPath) }
+
+        final class Box: @unchecked Sendable { var path = "" }
+        let box = Box()
+        var config = PeerServerConfig()
+        config.hostDisplayName = "session-host-itest"
+        config.resolveSessionHostSocket = { box.path }
+
+        let server = PeerServer(
+            socketPath: sockPath,
+            provider: StaticSurfaceProvider(surfaces: []),
+            config: config
+        )
+        try await server.start()
+        defer { Task { await server.stop() } }
+
+        func handshake() async throws -> PeerSessionInfo {
+            let transport = try await UnixSocketTransport.connect(socketPath: sockPath)
+            let session = PeerSession(
+                read: { try await transport.read() },
+                write: { try await transport.write($0) }
+            )
+            var options = PeerSessionOptions()
+            options.displayName = "session-host-itest-client"
+            return try await session.handshake(options: options)
+        }
+
+        let deadline = Date().addingTimeInterval(2)
+        while !FileManager.default.fileExists(atPath: sockPath) {
+            if Date() > deadline {
+                XCTFail("listener never created socket file at \(sockPath)")
+                return
+            }
+            try await Task.sleep(nanoseconds: 50_000_000)
+        }
+
+        let before = try await handshake()
+        XCTAssertEqual(
+            before.sessionHostSocketPath, "",
+            "no owner yet — promising one here is what sent a client to a dead socket"
+        )
+
+        box.path = "/tmp/term-meshd-peer.sock"
+        let after = try await handshake()
+        XCTAssertEqual(after.sessionHostSocketPath, "/tmp/term-meshd-peer.sock")
+    }
+
+    /// An older host sends no such field, and must read as "no owner" rather
+    /// than as a parse failure — this field is additive on purpose.
+    func test_aHostThatPredatesTheFieldReadsAsNoOwner() throws {
+        var old = Termmesh_Peer_V1_Hello()
+        old.protocolVersion = "1.0.0"
+        old.displayName = "older-host"
+        let decoded = try Termmesh_Peer_V1_Hello(serializedBytes: old.serializedData())
+        XCTAssertEqual(decoded.sessionHostSocket, "")
     }
 }

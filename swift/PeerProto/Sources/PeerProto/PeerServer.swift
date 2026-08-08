@@ -341,6 +341,13 @@ public enum PeerServerError: Error, Equatable {
     case alreadyRunning
     case notRunning
     case noMatchingLeaderSession
+    /// The request could not be a leader command whatever machine minted its
+    /// grant — oversized, an unknown method, a malformed id. Distinct from
+    /// `noMatchingLeaderSession` because a relay hop rejecting a malformed
+    /// frame and a relay hop having no session to route through are different
+    /// problems, and reporting both as the latter sent an afternoon looking
+    /// for a session that was fine.
+    case malformedLeaderCommand
     case leaderCallTimedOut
     case leaderSessionClosed
 }
@@ -350,17 +357,33 @@ public struct PeerServerConfig: Sendable {
     public var hostAppVersion: String
     public var protocolVersion: String
     public var hostCLIBinDirs: [String]
+    /// Where a session owner that outlives this process serves the same
+    /// protocol on this machine, or empty when there is none.
+    ///
+    /// Resolved per Hello rather than fixed at start-up, because at start-up
+    /// the answer is not known yet: this server comes up alongside its
+    /// machine's session daemon and normally beats it to the socket. A value
+    /// decided there is a guess that never gets corrected — and the first
+    /// version guessed "yes" every time, so a client planned to come back to a
+    /// socket nothing was listening on. Asked at Hello, the question is
+    /// answered at the moment it is being asked.
+    ///
+    /// Empty is the honest default: a host whose sessions end when it does
+    /// should say so rather than let a client plan to come back.
+    public var resolveSessionHostSocket: @Sendable () -> String
 
     public init(
         hostDisplayName: String = "term-mesh",
         hostAppVersion: String = "0.0.0",
         protocolVersion: String = "1.0.0",
-        hostCLIBinDirs: [String] = []
+        hostCLIBinDirs: [String] = [],
+        resolveSessionHostSocket: @escaping @Sendable () -> String = { "" }
     ) {
         self.hostDisplayName = hostDisplayName
         self.hostAppVersion = hostAppVersion
         self.protocolVersion = protocolVersion
         self.hostCLIBinDirs = PeerHostCLIBinDirs.validated(hostCLIBinDirs)
+        self.resolveSessionHostSocket = resolveSessionHostSocket
     }
 }
 
@@ -1177,28 +1200,30 @@ actor PeerServerSession {
         }
         let encodedBytes = (try? request.serializedData().count)
             ?? (PeerTeamLeader.maxCommandPayloadBytes + 1)
-        // Fail closed on an unregistered grant. Falling back to
-        // `request.grant` made `validateGrant` compare the presented grant
-        // against itself: grantID, projectID, teamUuid, role and the
-        // `expiresAtUnixSecs` equality all matched by construction, and the
-        // only remaining test compared a wall-clock deadline (~1.7e9) against
-        // `systemUptime` (~1e5), so it could never fail. Every field arrives
-        // from caller-supplied socket parameters, so that fallback let any
-        // local process on this host invent a grant id and have the command
-        // routed over the authenticated peer session to the viewer.
-        guard let registered = await teamLeaderControlPlane.registeredGrant(
-            id: request.grant.grantID
-        ) else {
-            throw PeerServerError.noMatchingLeaderSession
-        }
-        guard case .success = PeerTeamLeader.validateCommand(
+        // This hop is a relay, not the authority.
+        //
+        // It used to require the grant to be registered *here*, which is
+        // unsatisfiable for the case the feature exists for: a leader placed
+        // on a peer presents a grant the project's host minted and stored on
+        // itself, so this machine has no entry for it and never will. Every
+        // genuine command was rejected as `noMatchingLeaderSession` while the
+        // grant was valid the whole time — the registry was simply on the
+        // other machine.
+        //
+        // What stops a local process here from inventing a grant is not this
+        // check. It is that routing only reaches the peer the request names,
+        // over an already-authenticated attached session
+        // (`canRouteTeamLeaderCommand`), and that the receiving host validates
+        // the grant against the registry that minted it and fails closed on an
+        // unknown one — `PeerTeamLeaderControlPlane.execute` passes
+        // `registeredGrant: grants[id]`, nil for anything it did not issue,
+        // and audits the rejection. A forged grant therefore buys a rejected
+        // round trip to one authenticated peer, not execution.
+        guard case .success = PeerTeamLeader.validateCommandShape(
             request,
-            registeredGrant: registered.value,
-            registeredValidUntilUnixSeconds: registered.validUntilLeaseSeconds,
-            encodedBytes: encodedBytes,
-            nowUnixSeconds: UInt64(ProcessInfo.processInfo.systemUptime)
+            encodedBytes: encodedBytes
         ) else {
-            throw PeerServerError.noMatchingLeaderSession
+            throw PeerServerError.malformedLeaderCommand
         }
 
         let requestSeq = nextSeq()
@@ -1345,6 +1370,11 @@ actor PeerServerSession {
                 h.peerID = randomPeerBytes(count: 16)
                 h.capabilities = advertisedCapabilities
                 h.cliBinDirs = self.config.hostCLIBinDirs
+                // A GUI host's surfaces live in its own process, so a session
+                // it owns cannot survive it. Naming a session owner that can is
+                // how a client reaches one without being told it may reattach
+                // later and then finding nothing there.
+                h.sessionHostSocket = self.config.resolveSessionHostSocket()
                 env.hello = h
             }
             try await sendEnvelope { env in
