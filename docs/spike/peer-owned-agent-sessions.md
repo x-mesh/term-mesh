@@ -118,6 +118,20 @@ because two of the three needed far less than this note first assumed.
    target AND socket, so both the app and its daemon are reachable at once
    without new transport.
 
+   *Peer-side half landed, trigger unresolved.* `SessionHostPanes` attaches a
+   pane per daemon-held session — measured opening three at once, idempotent on
+   a second pass. Mirroring was ruled out first: the daemon places ensured
+   sessions as *tabs* in one pane, deliberately, and `PeerWorkspaceMirror` has
+   no notion of a tab strip, so a mirror of a daemon holding three showed one.
+
+   What does not work yet is it running by itself. Wired to the peer server's
+   success path, it produced no log line at all on an `open`-launched app,
+   which means that path is not reached there rather than that it found
+   nothing. Every give-up now says which half was missing — no session host, no
+   workspace yet, or nothing new — so the next attempt reads the answer instead
+   of inferring it from silence. Panes restored from the previous run made this
+   look like it was working twice.
+
 5. **Return the native panel.** With an owner that can serve two views, the
    `AgentPanel` reads the structured stream while the peer's pane renders it.
    This is the step PR #196's tradeoff was deferring.

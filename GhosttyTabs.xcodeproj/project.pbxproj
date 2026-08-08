@@ -22,6 +22,7 @@
 		A14000000000000000000002 /* ProjectSyncPanelView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A14000000000000000000005 /* ProjectSyncPanelView.swift */; };
 		A14000000000000000000003 /* ProjectSyncViewModelTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A14000000000000000000006 /* ProjectSyncViewModelTests.swift */; };
 		PPBT00000000000000003 /* PeerProjectBootstrapTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = PPBT00000000000000006 /* PeerProjectBootstrapTests.swift */; };
+		SHPT00000000000000003 /* SessionHostPanesTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = SHPT00000000000000006 /* SessionHostPanesTests.swift */; };
 		DLTT00000000000000003 /* DaemonLifetimeTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = DLTT00000000000000006 /* DaemonLifetimeTests.swift */; };
 		RLBT00000000000000003 /* RemoteLeaderBriefingTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = RLBT00000000000000006 /* RemoteLeaderBriefingTests.swift */; };
 		WSRP00000000000000003 /* WorkspaceSurfaceRealizationPinTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = WSRP00000000000000006 /* WorkspaceSurfaceRealizationPinTests.swift */; };
@@ -126,6 +127,7 @@
 			A5001534 /* BrowserWindowPortal.swift in Sources */ = {isa = PBXBuildFile; fileRef = A5001533 /* BrowserWindowPortal.swift */; };
 		A5001540 /* PortScanner.swift in Sources */ = {isa = PBXBuildFile; fileRef = A5001541 /* PortScanner.swift */; };
 		A5001700 /* TermMeshDaemon.swift in Sources */ = {isa = PBXBuildFile; fileRef = A5001701 /* TermMeshDaemon.swift */; };
+		SHPS00000000000000003 /* SessionHostPanes.swift in Sources */ = {isa = PBXBuildFile; fileRef = SHPS00000000000000006 /* SessionHostPanes.swift */; };
 		F46F7DFF875543329CD15B08 /* AgentRolePreset.swift in Sources */ = {isa = PBXBuildFile; fileRef = DE801F330BAD4EB88D9D875E /* AgentRolePreset.swift */; };
 		WL00000001000000010000001 /* WorktreeLog.swift in Sources */ = {isa = PBXBuildFile; fileRef = WL00000002000000020000002 /* WorktreeLog.swift */; };
 		562D55FA859F4E8B94EB49CB /* TeamCreationView.swift in Sources */ = {isa = PBXBuildFile; fileRef = B848F672710C48B1944F70BF /* TeamCreationView.swift */; };
@@ -362,6 +364,7 @@
 			A14000000000000000000005 /* ProjectSyncPanelView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ProjectSyncPanelView.swift; sourceTree = "<group>"; };
 			A14000000000000000000006 /* ProjectSyncViewModelTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ProjectSyncViewModelTests.swift; sourceTree = "<group>"; };
 			PPBT00000000000000006 /* PeerProjectBootstrapTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PeerProjectBootstrapTests.swift; sourceTree = "<group>"; };
+			SHPT00000000000000006 /* SessionHostPanesTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SessionHostPanesTests.swift; sourceTree = "<group>"; };
 			DLTT00000000000000006 /* DaemonLifetimeTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DaemonLifetimeTests.swift; sourceTree = "<group>"; };
 			RLBT00000000000000006 /* RemoteLeaderBriefingTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RemoteLeaderBriefingTests.swift; sourceTree = "<group>"; };
 			WSRP00000000000000006 /* WorkspaceSurfaceRealizationPinTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WorkspaceSurfaceRealizationPinTests.swift; sourceTree = "<group>"; };
@@ -463,6 +466,7 @@
 			A5001533 /* BrowserWindowPortal.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BrowserWindowPortal.swift; sourceTree = "<group>"; };
 		A5001541 /* PortScanner.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PortScanner.swift; sourceTree = "<group>"; };
 		A5001701 /* TermMeshDaemon.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TermMeshDaemon.swift; sourceTree = "<group>"; };
+		SHPS00000000000000006 /* SessionHostPanes.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SessionHostPanes.swift; sourceTree = "<group>"; };
 		DE801F330BAD4EB88D9D875E /* AgentRolePreset.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AgentRolePreset.swift; sourceTree = "<group>"; };
 		WL00000002000000020000002 /* WorktreeLog.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WorktreeLog.swift; sourceTree = "<group>"; };
 		B848F672710C48B1944F70BF /* TeamCreationView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TeamCreationView.swift; sourceTree = "<group>"; };
@@ -845,6 +849,7 @@ A1740000000000000000000C /* ProcessRun.swift */,
 				TC0F0008 /* TerminalController+Parsing.swift */,
 				A5001541 /* PortScanner.swift */,
 				A5001701 /* TermMeshDaemon.swift */,
+				SHPS00000000000000006 /* SessionHostPanes.swift */,
 				A5001711 /* TeamOrchestrator.swift */,
 				LPRP0001 /* LeaderParallelPolicy.swift */,
 				A5001721 /* TeamDataStore.swift */,
@@ -1016,6 +1021,7 @@ A1740000000000000000000C /* ProcessRun.swift */,
 				PHCBDR0000000000000000A2 /* PeerHostCLIBinDirsReadinessTests.swift */,
 				A14000000000000000000006 /* ProjectSyncViewModelTests.swift */,
 				PPBT00000000000000006 /* PeerProjectBootstrapTests.swift */,
+				SHPT00000000000000006 /* SessionHostPanesTests.swift */,
 				DLTT00000000000000006 /* DaemonLifetimeTests.swift */,
 				RLBT00000000000000006 /* RemoteLeaderBriefingTests.swift */,
 				WSRP00000000000000006 /* WorkspaceSurfaceRealizationPinTests.swift */,
@@ -1295,6 +1301,7 @@ A1740000000000000000000B /* ProcessRun.swift in Sources */,
 				TC0B0008 /* TerminalController+Parsing.swift in Sources */,
 				A5001540 /* PortScanner.swift in Sources */,
 				A5001700 /* TermMeshDaemon.swift in Sources */,
+				SHPS00000000000000003 /* SessionHostPanes.swift in Sources */,
 				A5001710 /* TeamOrchestrator.swift in Sources */,
 				LPRP0002 /* LeaderParallelPolicy.swift in Sources */,
 				A5001720 /* TeamDataStore.swift in Sources */,
@@ -1438,6 +1445,7 @@ A1740000000000000000000B /* ProcessRun.swift in Sources */,
 				PHCBDR0000000000000000A1 /* PeerHostCLIBinDirsReadinessTests.swift in Sources */,
 				A14000000000000000000003 /* ProjectSyncViewModelTests.swift in Sources */,
 				PPBT00000000000000003 /* PeerProjectBootstrapTests.swift in Sources */,
+				SHPT00000000000000003 /* SessionHostPanesTests.swift in Sources */,
 				DLTT00000000000000003 /* DaemonLifetimeTests.swift in Sources */,
 				RLBT00000000000000003 /* RemoteLeaderBriefingTests.swift in Sources */,
 				WSRP00000000000000003 /* WorkspaceSurfaceRealizationPinTests.swift in Sources */,

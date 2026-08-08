@@ -292,6 +292,10 @@ final class PeerHostCoordinator: NSObject {
         do {
             try await server.start()
             markStartSucceeded(server: server, path: path, provider: provider, persistPath: persistPath)
+            // Sessions the daemon is already holding predate this app: it may
+            // have been restarted while they kept running, which is the whole
+            // reason they live there. Nothing else would show them.
+            Task { @MainActor in await SessionHostPanes.reconcileWhenReady() }
             NSLog("[peer-debug] server listening on %@", path)
             if !silent {
                 showInfo(
