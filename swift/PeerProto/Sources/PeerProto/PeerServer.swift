@@ -341,6 +341,13 @@ public enum PeerServerError: Error, Equatable {
     case alreadyRunning
     case notRunning
     case noMatchingLeaderSession
+    /// The request could not be a leader command whatever machine minted its
+    /// grant — oversized, an unknown method, a malformed id. Distinct from
+    /// `noMatchingLeaderSession` because a relay hop rejecting a malformed
+    /// frame and a relay hop having no session to route through are different
+    /// problems, and reporting both as the latter sent an afternoon looking
+    /// for a session that was fine.
+    case malformedLeaderCommand
     case leaderCallTimedOut
     case leaderSessionClosed
 }
@@ -1177,28 +1184,30 @@ actor PeerServerSession {
         }
         let encodedBytes = (try? request.serializedData().count)
             ?? (PeerTeamLeader.maxCommandPayloadBytes + 1)
-        // Fail closed on an unregistered grant. Falling back to
-        // `request.grant` made `validateGrant` compare the presented grant
-        // against itself: grantID, projectID, teamUuid, role and the
-        // `expiresAtUnixSecs` equality all matched by construction, and the
-        // only remaining test compared a wall-clock deadline (~1.7e9) against
-        // `systemUptime` (~1e5), so it could never fail. Every field arrives
-        // from caller-supplied socket parameters, so that fallback let any
-        // local process on this host invent a grant id and have the command
-        // routed over the authenticated peer session to the viewer.
-        guard let registered = await teamLeaderControlPlane.registeredGrant(
-            id: request.grant.grantID
-        ) else {
-            throw PeerServerError.noMatchingLeaderSession
-        }
-        guard case .success = PeerTeamLeader.validateCommand(
+        // This hop is a relay, not the authority.
+        //
+        // It used to require the grant to be registered *here*, which is
+        // unsatisfiable for the case the feature exists for: a leader placed
+        // on a peer presents a grant the project's host minted and stored on
+        // itself, so this machine has no entry for it and never will. Every
+        // genuine command was rejected as `noMatchingLeaderSession` while the
+        // grant was valid the whole time — the registry was simply on the
+        // other machine.
+        //
+        // What stops a local process here from inventing a grant is not this
+        // check. It is that routing only reaches the peer the request names,
+        // over an already-authenticated attached session
+        // (`canRouteTeamLeaderCommand`), and that the receiving host validates
+        // the grant against the registry that minted it and fails closed on an
+        // unknown one — `PeerTeamLeaderControlPlane.execute` passes
+        // `registeredGrant: grants[id]`, nil for anything it did not issue,
+        // and audits the rejection. A forged grant therefore buys a rejected
+        // round trip to one authenticated peer, not execution.
+        guard case .success = PeerTeamLeader.validateCommandShape(
             request,
-            registeredGrant: registered.value,
-            registeredValidUntilUnixSeconds: registered.validUntilLeaseSeconds,
-            encodedBytes: encodedBytes,
-            nowUnixSeconds: UInt64(ProcessInfo.processInfo.systemUptime)
+            encodedBytes: encodedBytes
         ) else {
-            throw PeerServerError.noMatchingLeaderSession
+            throw PeerServerError.malformedLeaderCommand
         }
 
         let requestSeq = nextSeq()

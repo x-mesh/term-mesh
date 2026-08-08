@@ -784,31 +784,23 @@ final class PeerServerTests: XCTestCase {
         XCTAssertTrue(completed.ok)
         XCTAssertEqual(completed.resultJson, #"{"team_name":"demo"}"#)
 
-        var elapsedGrant = grant
-        elapsedGrant.grantID = Data(
-            repeating: 0x93,
-            count: PeerTeamLeader.grantIDBytes
-        )
-        elapsedGrant.expiresAtUnixSecs = wallNow - 1
-        await controlPlane.registerGrant(
-            elapsedGrant,
-            nowLeaseSeconds: leaseNow > 0 ? leaseNow - 1 : 0
-        )
-        var elapsedRequest = request
-        elapsedRequest.grant = elapsedGrant
-        elapsedRequest.requestID = Data(
+        // A malformed command is still refused here, without a round trip:
+        // shape is knowable without being the machine that minted the grant.
+        var malformed = request
+        malformed.method = "team.list"
+        malformed.requestID = Data(
             repeating: 0x94,
             count: PeerTeamLeader.requestIDBytes
         )
         do {
             _ = try await server.callTeamLeader(
-                elapsedRequest,
+                malformed,
                 targetPeerID: viewerPeerID,
                 timeoutSeconds: 0.1
             )
-            XCTFail("an elapsed registered lease must be rejected")
+            XCTFail("a method outside the scoped leader surface must not be routed")
         } catch {
-            XCTAssertEqual(error as? PeerServerError, .noMatchingLeaderSession)
+            XCTAssertEqual(error as? PeerServerError, .malformedLeaderCommand)
         }
 
         do {
@@ -904,25 +896,45 @@ final class PeerServerTests: XCTestCase {
         forgedRequest.method = "team.status"
         forgedRequest.paramsJson = "{}"
 
-        do {
-            _ = try await server.callTeamLeader(
-                forgedRequest,
-                targetPeerID: viewerPeerID,
-                timeoutSeconds: 0.1
-            )
-            XCTFail("an unregistered grant must never be routed to the viewer")
-        } catch {
-            // The specific error matters: `noMatchingLeaderSession` is thrown
-            // by the precheck, before a frame is written. Had the request been
-            // routed, this viewer never answers it and the call would have
-            // failed as `leaderCallTimedOut` instead. Asserting the identity
-            // is therefore also the assertion that nothing reached the viewer,
-            // and it needs no second reader racing the session pump.
-            XCTAssertEqual(error as? PeerServerError, .noMatchingLeaderSession)
+        // An unregistered grant IS routed now, and that is the fix, not a
+        // regression: the leader this feature exists for runs on a peer and
+        // presents a grant the project's host minted and holds. This machine
+        // has no entry for it and never will, so requiring one rejected every
+        // genuine command while the grant was valid the whole time.
+        //
+        // Nothing is granted by routing it. The request reaches only the peer
+        // it names, over an already-authenticated attached session, and that
+        // peer validates the grant against the registry that issued it -- see
+        // `PeerTeamLeaderControlPlane.execute`, which passes `grants[id]`,
+        // nil for anything it did not mint, and audits the rejection. Here the
+        // viewer is a test double that answers whatever it is asked, so a
+        // reply proves routing, not authorisation.
+        async let forgedRouted = server.callTeamLeader(
+            forgedRequest,
+            targetPeerID: viewerPeerID,
+            timeoutSeconds: 2
+        )
+        guard case .teamLeaderCommandRequest(
+            _,
+            let forgedCorrelationID
+        ) = try await viewer.receiveNextMessage() else {
+            return XCTFail("a well-formed command must reach the peer that validates it")
         }
+        var forgedReply = Termmesh_Peer_V1_TeamLeaderCommandResponse()
+        forgedReply.ok = false
+        forgedReply.errorMessage = "grant not registered on the issuing host"
+        try await viewer.sendTeamLeaderCommandResponse(
+            forgedReply,
+            correlationID: forgedCorrelationID
+        )
+        let forgedOutcome = try await forgedRouted
+        XCTAssertFalse(
+            forgedOutcome.ok,
+            "the machine that minted the grant is the one that refuses it"
+        )
 
-        // Registering the same grant makes it routable, which proves the
-        // rejection above was the registry check and not an unrelated guard.
+        // Registration changes nothing at this hop, which is the point: the
+        // relay no longer consults a registry it cannot own.
         await controlPlane.registerGrant(forged)
         async let routed = server.callTeamLeader(
             forgedRequest,
@@ -953,16 +965,15 @@ final class PeerServerTests: XCTestCase {
             repeating: 0xF2,
             count: PeerTeamLeader.requestIDBytes
         )
-        do {
-            _ = try await server.callTeamLeader(
-                afterRevoke,
-                targetPeerID: viewerPeerID,
-                timeoutSeconds: 0.1
-            )
-            XCTFail("a revoked grant must stop being routable")
-        } catch {
-            XCTAssertEqual(error as? PeerServerError, .noMatchingLeaderSession)
-        }
+        // Revocation is enforced where the grant lives, so it is asserted
+        // against the control plane directly rather than through a relay hop
+        // that deliberately no longer consults one.
+        let stillRegistered = await controlPlane.registeredGrant(id: forged.grantID)
+        XCTAssertNil(
+            stillRegistered,
+            "revocation must remove the grant from the registry that issued it"
+        )
+        _ = afterRevoke
 
         try await viewer.sendGoodbye(reason: "forged grant test done")
         await transport.close()

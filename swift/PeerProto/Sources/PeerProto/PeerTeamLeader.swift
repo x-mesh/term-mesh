@@ -91,12 +91,21 @@ public enum PeerTeamLeader {
     /// Validate everything supplied by a remote leader before the owning
     /// host touches its team dispatcher. JSON parsing intentionally happens
     /// here (inside the control-plane actor), not in a MainActor provider.
-    public static func validateCommand(
+    /// Everything a machine can decide about a leader command without being
+    /// the one that minted its grant.
+    ///
+    /// Split out because a relay hop is not the authority. A leader placed on
+    /// a peer presents a grant the *project's* host minted and stored, so the
+    /// peer it runs on has no registry entry for it and never will — demanding
+    /// one there rejected every genuine command with `noMatchingLeaderSession`
+    /// while the grant was valid the whole time. Shape is still worth checking
+    /// early: an oversized or unknown-method frame is not worth a round trip.
+    ///
+    /// Authenticity — is this grant real, unexpired, and for this audience —
+    /// belongs to `validateCommand` on the machine that issued it.
+    public static func validateCommandShape(
         _ request: Termmesh_Peer_V1_TeamLeaderCommandRequest,
-        registeredGrant: Termmesh_Peer_V1_TeamLeaderGrant?,
-        registeredValidUntilUnixSeconds: UInt64? = nil,
-        encodedBytes: Int,
-        nowUnixSeconds: UInt64
+        encodedBytes: Int
     ) -> Result<Void, ValidationError> {
         guard encodedBytes <= maxCommandPayloadBytes else {
             return .failure(.payloadTooLarge)
@@ -114,6 +123,27 @@ public enum PeerTeamLeader {
         guard isSafeIdentifier(request.teamUuid, maxBytes: maxTeamUUIDBytes) else {
             return .failure(.forgedTeam)
         }
+        guard let data = request.paramsJson.data(using: .utf8),
+              let value = try? JSONSerialization.jsonObject(with: data),
+              value is [String: Any] else {
+            return .failure(.invalidParams)
+        }
+        return .success(())
+    }
+
+    public static func validateCommand(
+        _ request: Termmesh_Peer_V1_TeamLeaderCommandRequest,
+        registeredGrant: Termmesh_Peer_V1_TeamLeaderGrant?,
+        registeredValidUntilUnixSeconds: UInt64? = nil,
+        encodedBytes: Int,
+        nowUnixSeconds: UInt64
+    ) -> Result<Void, ValidationError> {
+        if case .failure(let error) = validateCommandShape(
+            request,
+            encodedBytes: encodedBytes
+        ) {
+            return .failure(error)
+        }
         let grantValidation = validateGrant(
             request.grant,
             registered: registeredGrant,
@@ -124,11 +154,6 @@ public enum PeerTeamLeader {
         )
         if case .failure = grantValidation {
             return grantValidation
-        }
-        guard let data = request.paramsJson.data(using: .utf8),
-              let value = try? JSONSerialization.jsonObject(with: data),
-              value is [String: Any] else {
-            return .failure(.invalidParams)
         }
         return .success(())
     }

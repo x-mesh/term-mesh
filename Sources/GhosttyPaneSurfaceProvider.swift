@@ -827,7 +827,7 @@ final class GhosttyPaneSurfaceProvider: PeerSurfaceProvider {
         case .setDivider(let req):
             performSetDivider(splitIDBytes: req.splitID, ratio: req.ratio)
         case .newTab(let req):
-            performNewTab(paneIDBytes: req.paneID)
+            performNewTab(paneIDBytes: req.paneID, workspaceIDBytes: req.workspaceID)
         case .activateTab(let req):
             performActivateTab(paneIDBytes: req.paneID, surfaceIDBytes: req.surfaceID)
         case .none:
@@ -855,16 +855,107 @@ final class GhosttyPaneSurfaceProvider: PeerSurfaceProvider {
         workspace.bonsplitController.selectTab(targetTabID)
     }
 
-    private func performNewTab(paneIDBytes: Data) {
-        guard let panelUUID = uuidFromSurfaceID(paneIDBytes),
-              let workspace = workspaceContaining(panelUUID: panelUUID),
-              let tabID = workspace.surfaceIdFromPanelId(panelUUID)
-        else { return }
-        let targetPaneId = workspace.bonsplitController.allPaneIds.first { paneId in
-            workspace.bonsplitController.tabs(inPane: paneId).contains { $0.id == tabID }
+    /// What a `NewTabRequest` should do, given what its two locators resolve to.
+    ///
+    /// Split out from `performNewTab` because the bug was in the decision, not
+    /// in the doing: `workspace_id` was never consulted, so the empty-workspace
+    /// case — the one the field exists for — fell out of the guard and did
+    /// nothing at all.
+    enum NewTabTarget: Equatable {
+        /// `pane_id` named a live pane; open the tab beside it.
+        case besidePane
+        /// `pane_id` could not be resolved and `workspace_id` names a workspace
+        /// with no surfaces yet. This is the seed the leader placement waits on.
+        case seedWorkspace
+        /// Neither locator is usable, or the workspace already has surfaces —
+        /// in which case an unresolvable pane id is a stale locator rather than
+        /// a request to add another tab.
+        case ignore
+    }
+
+    /// `nonisolated` because it decides from four booleans and touches nothing
+    /// — the resolving that does needs the main actor stays in `performNewTab`.
+    nonisolated static func newTabTarget(
+        paneResolved: Bool,
+        hasWorkspaceID: Bool,
+        workspaceFound: Bool,
+        workspaceHasPanels: Bool
+    ) -> NewTabTarget {
+        if paneResolved { return .besidePane }
+        guard hasWorkspaceID, workspaceFound, !workspaceHasPanels else { return .ignore }
+        return .seedWorkspace
+    }
+
+    /// Open a terminal tab, either beside a pane or in an empty workspace.
+    ///
+    /// `pane_id` names a pane to open next to, which is the ordinary case. It
+    /// is empty when the workspace was just created and has no pane to name yet
+    /// — `NewTabRequest.workspace_id` is the proto's answer to exactly that, and
+    /// the Rust host has always honoured it.
+    ///
+    /// This one used to read `pane_id` alone: the empty id failed the guard and
+    /// the request returned having done nothing. A project whose leader is
+    /// placed on a Mac peer got a fresh workspace and then waited fifteen polls
+    /// for a pane that nobody was going to open, which surfaced as "could not
+    /// prepare the project workspace" and no leader. Linux peers were unaffected
+    /// because the daemon reads both fields.
+    private func performNewTab(paneIDBytes: Data, workspaceIDBytes: Data = Data()) {
+        // Resolve both locators first, then let `newTabTarget` decide.
+        var besidePane: (workspace: Workspace, pane: PaneID)?
+        if let panelUUID = uuidFromSurfaceID(paneIDBytes),
+           let workspace = workspaceContaining(panelUUID: panelUUID),
+           let tabID = workspace.surfaceIdFromPanelId(panelUUID),
+           let targetPaneId = workspace.bonsplitController.allPaneIds.first(where: { paneId in
+               workspace.bonsplitController.tabs(inPane: paneId).contains { $0.id == tabID }
+           }) {
+            besidePane = (workspace, targetPaneId)
         }
-        guard let targetPaneId else { return }
-        _ = workspace.newTerminalSurface(inPane: targetPaneId, focus: true)
+
+        // A workspace made by `createWorkspace` has its root pane already; what
+        // it has none of is surfaces — which is also why it reports no panes to
+        // a peer listing them, since `peerPaneSummaries` walks surfaces.
+        // Keep the owning tab manager, not just the workspace: seeding a pane
+        // into it also needs the mount that only its own window can grant.
+        let named: (workspace: Workspace, tabManager: TabManager)? =
+            uuidFromSurfaceID(workspaceIDBytes).flatMap { uuid in
+                for ctx in allWindowContexts() {
+                    if let workspace = ctx.tabManager.tabs.first(where: { $0.id == uuid }) {
+                        return (workspace, ctx.tabManager)
+                    }
+                }
+                return nil
+            }
+        let namedWorkspace: Workspace? = named?.workspace
+
+        let target = Self.newTabTarget(
+            paneResolved: besidePane != nil,
+            hasWorkspaceID: !workspaceIDBytes.isEmpty,
+            workspaceFound: namedWorkspace != nil,
+            workspaceHasPanels: !(namedWorkspace?.panels.isEmpty ?? true)
+        )
+
+        switch target {
+        case .besidePane:
+            guard let besidePane else { return }
+            _ = besidePane.workspace.newTerminalSurface(inPane: besidePane.pane, focus: true)
+        case .seedWorkspace:
+            guard let named,
+                  let seedPane = named.workspace.bonsplitController.focusedPaneId
+                      ?? named.workspace.bonsplitController.allPaneIds.first
+            else { return }
+            _ = named.workspace.newTerminalSurface(inPane: seedPane, focus: true)
+            // A seeded pane is in the same position as a created workspace's
+            // root pane: the model exists, the surface does not, and only a
+            // mount makes one. Ask for the mount here too, or the caller waits
+            // out its poll budget on a pane that will never be reported.
+            pinWorkspaceUntilReportable(
+                named.workspace,
+                on: named.tabManager,
+                reason: "newTab.seed"
+            )
+        case .ignore:
+            return
+        }
     }
 
     private func performSetDivider(splitIDBytes: Data, ratio: Double) {
@@ -926,10 +1017,68 @@ final class GhosttyPaneSurfaceProvider: PeerSurfaceProvider {
         }
         let workspace = tabManager.addWorkspace(select: false)
         workspace.setCustomTitle(title)
+        // Created but not selected, so nothing mounts it, so its root pane
+        // never gets a surface and the caller sees an empty workspace forever.
+        // The pin closes that gap without granting the focus this command
+        // deliberately withholds.
+        pinWorkspaceUntilReportable(workspace, on: tabManager, reason: "createWorkspace")
         #if DEBUG
         dlog("peer.host.createWorkspace id=\(workspace.id.uuidString.prefix(8)) title=\(title)")
         #endif
         return withUnsafeBytes(of: workspace.id.uuid) { Data($0) }
+    }
+
+    /// How long a realization pin may hold a workspace in the mounted set.
+    ///
+    /// Generous next to the caller's own budget (fifteen polls, ~3s) because
+    /// the pin outliving one caller's patience is harmless, while releasing
+    /// early strands the workspace unrealized. It is bounded at all because a
+    /// pin that never resolves would keep an invisible workspace mounted for
+    /// the rest of the session, paying SwiftUI update cost for nothing.
+    static let surfaceRealizationPinTimeout: TimeInterval = 10
+
+    /// Interval between checks of the pin's exit condition.
+    static let surfaceRealizationPollInterval: Duration = .milliseconds(100)
+
+    /// Mount `workspace` off-screen until it has a pane the peer protocol will
+    /// report, then release it.
+    ///
+    /// Surfaces outlive the mount — only `panel.close()` frees one — so this
+    /// buys realization once and then gets out of the way.
+    private func pinWorkspaceUntilReportable(
+        _ workspace: Workspace,
+        on tabManager: TabManager,
+        reason: String
+    ) {
+        // Already reportable: the pane the caller wants is there, and pinning
+        // would only schedule an unmount for later.
+        guard !tabManager.workspaceHasReportablePane(workspace.id) else { return }
+        // A second request for the same workspace must not start a second
+        // waiter — both would race to unpin, and the loser would drop the pin
+        // out from under a workspace the first one is still waiting on.
+        guard !tabManager.surfaceRealizationPins.contains(workspace.id) else { return }
+
+        tabManager.pinWorkspaceForSurfaceRealization(workspace.id)
+        let workspaceID = workspace.id
+        let deadline = Date().addingTimeInterval(Self.surfaceRealizationPinTimeout)
+        Task { @MainActor [weak tabManager] in
+            defer { tabManager?.unpinWorkspaceForSurfaceRealization(workspaceID) }
+            while Date() < deadline {
+                try? await Task.sleep(for: Self.surfaceRealizationPollInterval)
+                guard let tabManager else { return }
+                guard tabManager.tabs.contains(where: { $0.id == workspaceID }) else { return }
+                if tabManager.workspaceHasReportablePane(workspaceID) { return }
+            }
+            // Reaching here means a mounted workspace still produced no
+            // reportable pane. The machine that asked is about to report
+            // "could not prepare the project workspace" with no idea why, and
+            // this is the only place that knows.
+            RemoteWorkLog.info(
+                "Workspace \(workspaceID.uuidString.prefix(8)) (\(reason)) never opened a terminal "
+                    + "after \(Int(Self.surfaceRealizationPinTimeout))s — the machine that asked "
+                    + "for it will see an empty workspace"
+            )
+        }
     }
 
     /// Rename an existing workspace's display name in place; its id
@@ -1179,7 +1328,13 @@ final class GhosttyPaneSurfaceProvider: PeerSurfaceProvider {
                   let terminal = workspace.panels[panelUUID] as? TerminalPanel,
                   !terminal.isRemoteOrigin,
                   let sfcPtr = terminal.surface.surface
-            else { return nil }
+            else {
+                // An unrealized pane is dropped here, which is why a workspace
+                // nobody has mounted reads as empty from the other end. That is
+                // the whole reason peer-created workspaces get a realization
+                // pin — see `TabManager.surfaceRealizationPins`.
+                return nil
+            }
             let ts = terminal.surface
             var paneMsg = Termmesh_Peer_V1_WorkspacePane()
             paneMsg.surfaceID = surfaceIDBytes(ts.id)

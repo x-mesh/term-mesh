@@ -77,7 +77,16 @@ extension TeamOrchestrator {
         case duplicateInstance(String)
         case cliUnavailable(String, String)
         case promptStagingFailed(String)
-        case projectWorkspaceUnavailable(String)
+        /// The peer never showed a pane in the workspace the leader was going to
+        /// take. Everything after `host` is what the placement loop already knew
+        /// and used to throw away: without it the failure reads as "it did not
+        /// work" and there is nothing for the sheet's Troubleshoot to open.
+        case projectWorkspaceUnavailable(
+            host: String,
+            workspaceID: String?,
+            attempts: Int,
+            seedRequested: Bool
+        )
         case unresolvedRemoteWorkingDirectory(host: String, path: String)
         case checkoutIsolationFailed(host: String, path: String, reason: String)
         case projectDeletionIncomplete(String)
@@ -99,8 +108,17 @@ extension TeamOrchestrator {
                 return "\(cli) is not installed on \(host)"
             case .promptStagingFailed(let host):
                 return "could not stage the leader prompt on \(host)"
-            case .projectWorkspaceUnavailable(let host):
-                return "could not prepare the project workspace on \(host)"
+            case .projectWorkspaceUnavailable(let host, let workspaceID, let attempts, let seedRequested):
+                var detail = "could not prepare the project workspace on \(host)"
+                if let workspaceID {
+                    detail += "; waited \(attempts) time(s) for a pane in workspace \(workspaceID)"
+                    detail += seedRequested
+                        ? " after asking it to open one"
+                        : " without getting as far as asking for one"
+                } else {
+                    detail += "; the host never reported a workspace to place the leader in"
+                }
+                return detail
             case .unresolvedRemoteWorkingDirectory(let host, let path):
                 return "could not resolve remote working directory for host \(host) "
                     + "from path \(path); specify --dir <remote-path> for that host"
@@ -118,6 +136,24 @@ extension TeamOrchestrator {
         }
 
         var errorDescription: String? { description }
+    }
+
+    /// What happened to each participant that had to be attached over a peer,
+    /// reported as it happens.
+    ///
+    /// `createTeam` returns as soon as the team exists, while the attaches run
+    /// on behind it — so anything watching the return value sees a success that
+    /// has not happened yet. The creation sheet used to close on exactly that,
+    /// which is how a leader could fail to start with nobody left on screen to
+    /// tell. `settled` is the signal that the attaches are done arguing and the
+    /// caller may now decide what the result was.
+    enum RemoteAttachOutcome: Equatable {
+        case leaderAttached(host: String)
+        case leaderFailed(host: String, message: String)
+        case agentAttached(name: String, host: String)
+        case agentFailed(name: String, host: String, message: String)
+        /// Every attach this team asked for has finished, successfully or not.
+        case settled
     }
 
     nonisolated static func requiredRemoteWorkingDirectory(
@@ -180,6 +216,32 @@ extension TeamOrchestrator {
         func invalidate(_ generation: LeaderAttachGeneration) {
             guard isCurrent(generation) else { return }
             generations[generation.teamName] = generation.value &+ 1
+        }
+
+        /// The value in force now, for a caller that wants to notice a retirement
+        /// without claiming a generation of its own.
+        ///
+        /// A remote agent attach is that caller: it is not the leader, so it has
+        /// no attempt to carry, but it commits the same two things a deletion
+        /// tears down — a surface record and a team member.
+        func current(teamName: String) -> UInt64 {
+            generations[teamName] ?? 0
+        }
+
+        func isCurrent(teamName: String, value: UInt64) -> Bool {
+            current(teamName: teamName) == value
+        }
+
+        /// Retire whatever generation is current, for a caller that holds none.
+        ///
+        /// Project deletion is that caller. It tears down against a snapshot of
+        /// the team taken when it starts, so an attach still in flight can
+        /// register a surface or a checkout after that snapshot is read — and
+        /// the deletion, already past it, leaves the remote process running
+        /// with nothing left pointing at it. Retiring the generation first
+        /// makes every remaining `ensureCurrent` throw and compensate instead.
+        func invalidateAll(teamName: String) {
+            generations[teamName] = (generations[teamName] ?? 0) &+ 1
         }
     }
 
@@ -549,7 +611,12 @@ extension TeamOrchestrator {
             }
             guard let workspaceID else {
                 await connection.cancel()
-                throw RemoteAgentError.projectWorkspaceUnavailable(host.displayName)
+                throw RemoteAgentError.projectWorkspaceUnavailable(
+                    host: host.displayName,
+                    workspaceID: nil,
+                    attempts: 0,
+                    seedRequested: false
+                )
             }
 
             let managedIDs = Set(
@@ -558,7 +625,9 @@ extension TeamOrchestrator {
                     .compactMap(\.surfaceID)
             )
             var requestedSeed = false
+            var attemptsMade = 0
             for attempt in 0..<15 {
+                attemptsMade = attempt + 1
 #if DEBUG
                 dlog("leader.placement.stage list host=\(host.id) attempt=\(attempt)")
 #endif
@@ -583,9 +652,14 @@ extension TeamOrchestrator {
                         useSourceDirectly: createdWorkspace || !hasManagedProjectSurface
                     )
                 }
-                if !requestedSeed {
+                // Re-ask every fifth pass rather than once. A single request
+                // makes "the peer is still opening it" and "the request never
+                // landed" the same fifteen-poll silence, and only one of those
+                // is worth waiting through. Every fifth keeps the retry cheap
+                // while still leaving a full second between asks.
+                if !requestedSeed || attempt % 5 == 0 {
 #if DEBUG
-                    dlog("leader.placement.stage seed host=\(host.id)")
+                    dlog("leader.placement.stage seed host=\(host.id) attempt=\(attempt)")
 #endif
                     try await connection.session.requestNewTab(workspaceID: workspaceID)
                     try await leaderAttempt?.ensureCurrent()
@@ -593,7 +667,12 @@ extension TeamOrchestrator {
                 }
                 try await Task.sleep(nanoseconds: 200_000_000)
             }
-            throw RemoteAgentError.projectWorkspaceUnavailable(host.displayName)
+            throw RemoteAgentError.projectWorkspaceUnavailable(
+                host: host.displayName,
+                workspaceID: workspaceID.prefix(4).map { String(format: "%02x", $0) }.joined(),
+                attempts: attemptsMade,
+                seedRequested: requestedSeed
+            )
         } catch {
             if createdWorkspace, let workspaceID {
                 // Creation is not committed until a seed surface exists.
@@ -1470,10 +1549,19 @@ extension TeamOrchestrator {
                 teamName: teamName,
                 agents: team.agents,
                 remoteWorkingDirectory: workingDirectory,
-                remoteSocketPath: host.remoteSockPath ?? "inherited from TERMMESH_SOCKET"
+                remoteSocketPath: host.remoteSockPath ?? "inherited from TERMMESH_SOCKET",
+                hostCLIBinDirs: host.hostCLIBinDirs
             )
         } else {
-            systemPrompt = LeaderParallelPolicy.renderedInstructions
+            // Recovery had the same CLI-shaped hole as creation: a restarted
+            // codex leader came back knowing how to schedule and not who for.
+            systemPrompt = Self.remoteLeaderNonClaudeRecoverySystemPrompt(
+                teamName: teamName,
+                agents: team.agents,
+                remoteWorkingDirectory: workingDirectory,
+                remoteSocketPath: host.remoteSockPath ?? "inherited from TERMMESH_SOCKET",
+                hostCLIBinDirs: host.hostCLIBinDirs
+            )
         }
 
         do {
@@ -1915,6 +2003,17 @@ extension TeamOrchestrator {
         guard host.isLaunchable else {
             throw RemoteAgentError.hostNotConnected(host.displayName)
         }
+        // An agent attach is not the leader, so it carries no attempt — but it
+        // commits the same two things a project deletion tears down: a surface
+        // record and a team member. Snapshot the generation now and refuse to
+        // commit against a retired one, or a deletion that started mid-attach
+        // finishes against a snapshot this then adds to, and the remote process
+        // outlives everything pointing at it.
+        let attachGeneration = LeaderAttachGenerationGate.shared.current(teamName: teamName)
+        func attachStillWanted() -> Bool {
+            LeaderAttachGenerationGate.shared
+                .isCurrent(teamName: teamName, value: attachGeneration)
+        }
         guard let tabManager = AppDelegate.shared?.tabManagerFor(tabId: team.workspaceId),
               let workspace = tabManager.tabs.first(where: { $0.id == team.workspaceId }) else {
             throw RemoteAgentError.workspaceGone
@@ -1983,11 +2082,24 @@ extension TeamOrchestrator {
         // Use the same incremental grid growth as local `add`/`attach`.
         let placement = nextAgentSplitPlacement(team: team, workspace: workspace)
 
-        // The leader remains a terminal, but members follow Agent Panes.
-        // An SSH-backed relay can carry the structured process stream straight
-        // into a local AgentPanel; a legacy direct-socket peer has no process
-        // channel, so it keeps the terminal relay path below.
+        // A native remote member exists only on this machine: its process is a
+        // child of this app's ssh, its stdio is that pipe, and nothing at all
+        // is created on the peer. The peer's own window then shows a project
+        // with a leader and no team, and there is nothing there to continue
+        // the work with. The terminal path below puts the member in the peer's
+        // project workspace, where both machines can see and drive it.
+        //
+        // Except for the CLIs that have no interactive UI to put in a pane —
+        // `isPipeOnly` is a turn-per-process CLI with no stdin channel, so a
+        // terminal pane would open empty. Those keep the native path and stay
+        // local-only, which is a property of the CLI rather than a choice.
+        //
+        // The cost is deliberate and bounded: a remote member renders as its
+        // raw stream rather than in an AgentPanel. Local members are
+        // unaffected. Giving the peer real ownership of the process would
+        // return the panel, and is the next step rather than this one.
         if AgentPipeTransport.canHoldNatively(cli: cli),
+           AgentPipeTransport.isPipeOnly(cli: cli),
            let sshTarget = host.sshTarget, !sshTarget.isEmpty {
             let member = try attachRemoteNativeAgent(
                 team: team,
@@ -2062,6 +2174,9 @@ extension TeamOrchestrator {
                 ) {
                     chosen = fresh
                 }
+            }
+            guard attachStillWanted() else {
+                throw RemoteAgentError.teamNotFound(teamName)
             }
             if let chosen,
                usesDedicatedWorkspace || !surfaces.contains(where: { $0.surfaceID == chosen.surfaceID }) {
@@ -2139,6 +2254,12 @@ extension TeamOrchestrator {
             hostKey: hostKey,
             originalAgentWorkDir: workingDirectory
         )
+        // Last gate before the member becomes part of the team. A deletion that
+        // began while this was attaching has already decided the roster; adding
+        // to it here is the orphan.
+        guard attachStillWanted() else {
+            throw RemoteAgentError.teamNotFound(teamName)
+        }
         guard adoptAgentMember(member, teamName: teamName) else {
             _ = workspace.closePanel(panel.id, force: true)
             if let spawnedSurfaceID {
@@ -2715,7 +2836,7 @@ extension TeamOrchestrator {
         pairModel: String = "",
         pairSpec: String = "",
         projectSource: ProjectSource? = nil,
-        onRemoteAttachFailure: ((String) -> Void)? = nil,
+        onRemoteAttach: ((RemoteAttachOutcome) -> Void)? = nil,
         tabManager: TabManager
     ) -> Team? {
         // Peer attachment is asynchronous. Record the requested endpoint from
@@ -2762,22 +2883,35 @@ extension TeamOrchestrator {
         }
         let remoteLeaderSystemPrompt: String?
         if case let .peer(hostKey) = leaderEndpoint {
-            let remoteSocketPath = RemoteHostStore.shared.sortedHosts
-                .first(where: { $0.id == hostKey })?
-                .remoteSockPath ?? "inherited from TERMMESH_SOCKET"
+            let remoteLeaderHost = RemoteHostStore.shared.sortedHosts
+                .first(where: { $0.id == hostKey })
+            let remoteSocketPath = remoteLeaderHost?.remoteSockPath
+                ?? "inherited from TERMMESH_SOCKET"
+            let remoteLeaderBinDirs = remoteLeaderHost?.hostCLIBinDirs ?? []
             if leaderMode.lowercased() == "claude" {
                 guard let resolvedRemoteLeaderWorkingDirectory else { return nil }
                 remoteLeaderSystemPrompt = Self.remoteLeaderClaudeSystemPrompt(
                     teamName: teamName,
                     rows: rows,
                     remoteWorkingDirectory: resolvedRemoteLeaderWorkingDirectory,
-                    remoteSocketPath: remoteSocketPath
+                    remoteSocketPath: remoteSocketPath,
+                    hostCLIBinDirs: remoteLeaderBinDirs
                 )
             } else {
-                // Non-Claude peer CLIs receive the same canonical payload via
-                // a staged file plus `LeaderParallelPolicy.launchDirective`.
-                // Do not copy routing rules into this launch path.
-                remoteLeaderSystemPrompt = LeaderParallelPolicy.renderedInstructions
+                // The staged file is this string, so whatever is left out here
+                // is left out entirely. Sending only the routing policy taught
+                // the leader how to schedule work it had no way to name: no
+                // team, no roster, no tm-agent. The renderer already embeds
+                // `LeaderParallelPolicy.renderedInstructions`, so the routing
+                // rules still arrive — with the team around them.
+                guard let resolvedRemoteLeaderWorkingDirectory else { return nil }
+                remoteLeaderSystemPrompt = Self.remoteLeaderNonClaudeSystemPrompt(
+                    teamName: teamName,
+                    rows: rows,
+                    remoteWorkingDirectory: resolvedRemoteLeaderWorkingDirectory,
+                    remoteSocketPath: remoteSocketPath,
+                    hostCLIBinDirs: remoteLeaderBinDirs
+                )
             }
         } else {
             remoteLeaderSystemPrompt = nil
@@ -2869,6 +3003,14 @@ extension TeamOrchestrator {
 #if DEBUG
                     dlog("leader.attach.skip reason=noRemoteWorkingDirectory host=\(hostKey)")
 #endif
+                    // Returning quietly here left the team with a leader that
+                    // was never going to arrive and no record of why.
+                    let description = "Could not start remote leader on \(hostKey): "
+                        + "no working directory was resolved for that host"
+                    RemoteWorkLog.info(description)
+                    onRemoteAttach?(.leaderFailed(host: hostKey, message: description))
+                    self.markRemoteLeaderFailed(teamName: team.id, description: description)
+                    onRemoteAttach?(.settled)
                     return
                 }
                 do {
@@ -2900,13 +3042,34 @@ extension TeamOrchestrator {
 #if DEBUG
                     dlog("leader.attach.ok host=\(hostKey)")
 #endif
+                    onRemoteAttach?(.leaderAttached(host: hostKey))
                 } catch {
 #if DEBUG
                     dlog("leader.attach.threw host=\(hostKey) error=\(error)")
 #endif
                     let description = "Could not start remote leader on \(hostKey): \(error)"
                     RemoteWorkLog.info(description)
-                    onRemoteAttachFailure?(description)
+                    onRemoteAttach?(.leaderFailed(host: hostKey, message: description))
+                    // A failed agent leaves a red row on the board; a failed
+                    // leader used to leave nothing, because its only other
+                    // channel is a pane title and the failure is what stopped
+                    // the pane existing. Same record, so neither depends on a
+                    // surface that may not be there.
+                    if let task = TeamDataStore.shared.createTask(
+                        teamName: team.id,
+                        title: "Remote attach failed: leader @ \(hostKey)",
+                        details: description,
+                        labels: ["remote-attach", "failure", "leader"],
+                        priority: 1,
+                        createdBy: "term-mesh"
+                    ) {
+                        _ = TeamDataStore.shared.updateTask(
+                            teamName: team.id,
+                            taskId: task.id,
+                            status: "failed",
+                            result: description
+                        )
+                    }
                     self.markRemoteLeaderFailed(
                         teamName: team.id,
                         description: description
@@ -2918,9 +3081,17 @@ extension TeamOrchestrator {
                     )
                 }
             }
+            let rosterGeneration = LeaderAttachGenerationGate.shared.current(teamName: team.id)
             for resolved in resolvedRemoteRows {
                 let row = resolved.row
                 guard let hostKey = row.hostKey else { continue }
+                // Stop starting new ones once a deletion has retired the
+                // generation. Attaching agents 3..N into a project that is being
+                // removed leaves exactly the checkouts and surfaces the removal
+                // has already walked past.
+                guard LeaderAttachGenerationGate.shared
+                    .isCurrent(teamName: team.id, value: rosterGeneration)
+                else { break }
                 do {
                     _ = try await self.attachRemoteAgent(
                         teamName: team.id,
@@ -2931,11 +3102,16 @@ extension TeamOrchestrator {
                         model: row.preset.model,
                         cli: row.preset.cli
                     )
+                    onRemoteAttach?(.agentAttached(name: row.preset.name, host: hostKey))
                 } catch {
                     let description =
                         "Could not start \(row.preset.name) on \(hostKey): \(error)"
                     RemoteWorkLog.info(description)
-                    onRemoteAttachFailure?(description)
+                    onRemoteAttach?(.agentFailed(
+                        name: row.preset.name,
+                        host: hostKey,
+                        message: description
+                    ))
                     if let task = TeamDataStore.shared.createTask(
                         teamName: team.id,
                         title: "Remote attach failed: \(row.preset.name) @ \(hostKey)",
@@ -2953,6 +3129,7 @@ extension TeamOrchestrator {
                     }
                 }
             }
+            onRemoteAttach?(.settled)
         }
         return team
     }
@@ -2962,6 +3139,16 @@ extension TeamOrchestrator {
         guard let team = teams[teamName] else {
             throw RemoteAgentError.teamNotFound(teamName)
         }
+        // Before anything is read, let alone removed. A leader attach that is
+        // still in flight commits by writing a surface record and a checkout;
+        // if it does that after the snapshot below, deletion has already
+        // decided what exists and the remote process is orphaned. This makes
+        // the attach fail its next `ensureCurrent` and run its own
+        // compensation instead of racing this.
+        //
+        // Covers the leader only. A remote *agent* attach carries no attempt
+        // and cannot be retired this way — see attachRemoteAgent.
+        LeaderAttachGenerationGate.shared.invalidateAll(teamName: teamName)
 
         // Read through the durable record: after a restart the team's
         // in-memory list is empty while its checkouts are still on the peers.
@@ -3276,7 +3463,13 @@ extension TeamOrchestrator {
         workingDirectory: String,
         systemPromptFile: String? = nil,
         environment: [String: String] = [:],
-        hostBinDirs: [String] = []
+        hostBinDirs: [String] = [],
+        // Off for workers on purpose. A worker's results come back through
+        // pane output, which is why peer workers already function with their
+        // CLI's own sandbox; a leader's do not, so only it needs the socket
+        // that sandbox denies. Widening every peer worker to full access
+        // without a failure that calls for it is not a change to make quietly.
+        needsSocketAccess: Bool = false
     ) -> String {
         let quotedDir = workingDirectory.replacingOccurrences(of: "'", with: "'\\''")
         // `mkdir -p` before `cd`, because a project on another machine has
@@ -3307,18 +3500,48 @@ extension TeamOrchestrator {
                 + " --system-prompt \"$TERMMESH_LEADER_PROMPT\""
                 + " --dangerously-skip-permissions"
         case "codex", "kiro", "gemini":
+            let autonomy = needsSocketAccess ? Self.leaderAutonomyFlags(cli: cli) : []
+            let flags = autonomy.isEmpty ? "" : " " + autonomy.joined(separator: " ")
             guard let systemPromptFile else {
-                return "\(enter) && \(envPrefix)\(cli) --model \(quotedModel)"
+                return "\(enter) && \(envPrefix)\(cli) --model \(quotedModel)\(flags)"
             }
             let directive = LeaderParallelPolicy.launchDirective(promptFile: systemPromptFile)
             switch cli {
             case "kiro":
-                return "\(enter) && \(envPrefix)kiro chat --model \(quotedModel) \(shellQuoted(directive))"
+                return "\(enter) && \(envPrefix)kiro chat --model \(quotedModel)\(flags)"
+                    + " \(shellQuoted(directive))"
             default:
-                return "\(enter) && \(envPrefix)\(cli) --model \(quotedModel) \(shellQuoted(directive))"
+                return "\(enter) && \(envPrefix)\(cli) --model \(quotedModel)\(flags)"
+                    + " \(shellQuoted(directive))"
             }
         default:
             return "\(enter) && \(envPrefix)\(cli) --model \(quotedModel)"
+        }
+    }
+
+    /// The flags a leader CLI needs to act without a human at the keyboard.
+    ///
+    /// A leader's whole job is `tm-agent`, and `tm-agent` reaches the app over
+    /// a Unix socket. Codex's default sandbox denies that connect with EPERM,
+    /// so `detect_socket` finds nothing and every team command answers
+    /// "no socket found" — the leader can name its teammates and cannot reach
+    /// one. Approval prompts fail the same way for a pane nobody is watching.
+    ///
+    /// The local launch path has passed these since it was written; only the
+    /// peer path omitted them, which is why a codex leader was inert on a peer
+    /// and fine on this machine. Claude carries its own equivalent
+    /// (`--dangerously-skip-permissions`) in the branch above.
+    static func leaderAutonomyFlags(cli: String) -> [String] {
+        switch cli.lowercased() {
+        case "codex":
+            return ["--ask-for-approval", "never", "--sandbox", "danger-full-access"]
+        case "gemini":
+            return ["--yolo"]
+        default:
+            // kiro has no such flag today. Returning nothing is the honest
+            // answer; inventing one would fail at launch instead of at the
+            // first socket call.
+            return []
         }
     }
 
@@ -3349,7 +3572,8 @@ extension TeamOrchestrator {
             workingDirectory: workingDirectory,
             systemPromptFile: systemPromptFile,
             environment: environment,
-            hostBinDirs: hostBinDirs
+            hostBinDirs: hostBinDirs,
+            needsSocketAccess: true
         )
         // `export` applies to the final CLI, unlike a shell assignment prefix
         // before `mkdir`, which would have scoped the grant to that one setup

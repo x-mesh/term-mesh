@@ -435,6 +435,20 @@ struct TermMeshApp: App {
                 )
             },
             onClose: { activeSheet = nil },
+            onDiscard: { name in
+                // Best effort by design: this runs because something already
+                // went wrong, and a peer that is now unreachable must not trap
+                // the sheet. What could not be removed is reported by
+                // `deleteProject` into the team's own record.
+                do {
+                    try await TeamOrchestrator.shared.deleteProject(
+                        teamName: name,
+                        tabManager: activeTabManager
+                    )
+                } catch {
+                    RemoteWorkLog.info("Could not discard \(name): \(error)")
+                }
+            },
             repositoryDirectories: (
                 activeTabManager.tabs.map(\.currentDirectory)
                 + TeamCreationRecentDirs.shared.current()
