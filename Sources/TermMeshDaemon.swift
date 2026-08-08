@@ -178,6 +178,22 @@ final class TermMeshDaemon: ObservableObject {
 
     // MARK: - Daemon Lifecycle
 
+    /// Whether this machine's daemon should outlive the app that started it.
+    ///
+    /// A daemon that dies with its app cannot hold a session for anybody. That
+    /// is the whole reason a project placed on a peer ends when someone quits
+    /// term-mesh there: the work exists only inside that app's process tree.
+    /// Serving peers is exactly the case where another machine may come back to
+    /// a session, so it is the case that decouples.
+    ///
+    /// A machine that serves nobody keeps the old contract — owned, and gone on
+    /// quit. `TERMMESH_OWNER_PID` was added so a crashed or force-reloaded app
+    /// could not leave a daemon behind, and with no one to serve, surviving is
+    /// exactly that leak rather than a feature.
+    static func daemonShouldOutliveApp(peerServingEnabled: Bool) -> Bool {
+        peerServingEnabled
+    }
+
     /// Spawn the term-meshd daemon process if not already running.
     func startDaemon() {
         queue.async { [weak self] in
@@ -186,9 +202,33 @@ final class TermMeshDaemon: ObservableObject {
             // Already running (tracked process)?
             if let proc = self.daemonProcess, proc.isRunning { return }
 
-            // Orphaned daemon from a previous app launch? Restart it so current
-            // settings (dashboard enabled/port/bind) are applied.
+            let outlivesApp = Self.daemonShouldOutliveApp(
+                peerServingEnabled: PeerFederationSettings.autoStart
+            )
+
+            // Daemon from a previous app launch?
             if self.ping() {
+                if outlivesApp {
+                    // Adopt rather than restart. Restarting is what makes a
+                    // session end at a quit: the sessions this daemon holds are
+                    // the thing another machine reattaches to, and they do not
+                    // survive being restarted to pick up a dashboard port.
+                    //
+                    // The cost is that settings changed while it was running are
+                    // not applied until it is restarted deliberately — said out
+                    // loud here rather than left to be discovered.
+                    Logger.daemon.info(
+                        "adopting the running daemon; settings changed since it started are not applied"
+                    )
+                    if let pid = self.getDaemonPeerPid() {
+                        DispatchQueue.main.async {
+                            TerminalController.shared.trustedDaemonPid = pid
+                        }
+                    }
+                    return
+                }
+                // Restart it so current settings (dashboard enabled/port/bind)
+                // are applied.
                 Logger.daemon.info("daemon already running on socket — restarting with current settings")
                 self.stopDaemon()
                 // Brief pause so the socket file is fully released
@@ -210,8 +250,11 @@ final class TermMeshDaemon: ObservableObject {
             var env = ProcessInfo.processInfo.environment
             // A GUI-owned daemon must not outlive the app after a crash,
             // forced reload, or SIGKILL. Standalone/headless launches omit
-            // this variable and retain their independent lifecycle.
-            env["TERMMESH_OWNER_PID"] = String(ProcessInfo.processInfo.processIdentifier)
+            // this variable and retain their independent lifecycle — and so
+            // does a machine serving peers, whose sessions are the point.
+            if !outlivesApp {
+                env["TERMMESH_OWNER_PID"] = String(ProcessInfo.processInfo.processIdentifier)
+            }
 
             // Ensure Resources/bin is in PATH for daemon and all its child processes.
             // When launched from Finder/Spotlight, macOS provides a minimal PATH that
@@ -293,6 +336,15 @@ final class TermMeshDaemon: ObservableObject {
     /// Stop the daemon process.
     /// Called from applicationWillTerminate — must complete quickly.
     func stopDaemon() {
+        // A daemon serving peers holds sessions another machine reattaches to.
+        // Killing it here is precisely what made "quit term-mesh on the peer"
+        // end the project, so this path declines to.
+        if Self.daemonShouldOutliveApp(peerServingEnabled: PeerFederationSettings.autoStart) {
+            daemonProcess = nil
+            Logger.daemon.info("leaving the daemon running; it holds sessions for other machines")
+            return
+        }
+
         // Case 1: We spawned the daemon — terminate directly
         if let proc = daemonProcess, proc.isRunning {
             let pid = proc.processIdentifier
