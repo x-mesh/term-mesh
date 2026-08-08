@@ -141,9 +141,37 @@ because two of the three needed far less than this note first assumed.
    workspace yet, or nothing new — so the next reader is not left inferring
    from silence.
 
-5. **Return the native panel.** With an owner that can serve two views, the
-   `AgentPanel` reads the structured stream while the peer's pane renders it.
-   This is the step PR #196's tradeoff was deferring.
+5. **Return the native panel.** *(not started — prerequisite found)*
+
+   The earlier framing was wrong. One PTY still cannot serve a TUI to one
+   viewer and NDJSON to another, and the daemon does not transform per viewer —
+   every attacher gets the same bytes. What changes with an owner is that
+   *nobody needs the TUI*: run the bridge in the session and have **both**
+   viewers draw its NDJSON with `AgentPanel`. Consistent UI on both machines,
+   and no per-viewer transform required.
+
+   The work is decoupling `AgentSession` from `Process`. The seam is narrower
+   than it looks: bytes reach `StreamResources.decoder.consume(data)` and
+   everything after that is transport-independent. What is `Process`-shaped:
+
+   - `process === p` identity on every hop back to the main actor
+   - `terminationStatus` / `takeFinishCodeIfReady`, which gate `finish`
+   - EOF as an empty `availableData` read
+   - stdin as a `FileHandle` (`send` writes to it)
+
+   Peer equivalents exist for two of those — the relay carries bytes, and
+   `PeerSession.sendInput(surfaceID:keys:)` carries writes. **A session-exit
+   signal does not.** `exit_code` appears only in `EnsureSurfaceError`, which
+   is a creation-time failure; an attached viewer is told nothing when the
+   process behind its surface ends. So step 5 starts with deciding how a turn
+   ends over a relay — a protocol addition, or treating surface-gone as the
+   end — and not with the refactor.
+
+   One hazard to carry into it: the read path's ordering is load-bearing and
+   documented as such — "the callback must enqueue its event before this method
+   releases the lock, so a later EOF callback cannot overtake an earlier data
+   callback". A transport swap that loses that ordering will look fine and
+   drop the last line of a turn.
 
 Steps 1–3 are about the peer machine alone and can be verified without any
 project. Only step 4 needs two machines.
