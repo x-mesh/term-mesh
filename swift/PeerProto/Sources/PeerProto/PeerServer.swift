@@ -360,22 +360,30 @@ public struct PeerServerConfig: Sendable {
     /// Where a session owner that outlives this process serves the same
     /// protocol on this machine, or empty when there is none.
     ///
+    /// Resolved per Hello rather than fixed at start-up, because at start-up
+    /// the answer is not known yet: this server comes up alongside its
+    /// machine's session daemon and normally beats it to the socket. A value
+    /// decided there is a guess that never gets corrected — and the first
+    /// version guessed "yes" every time, so a client planned to come back to a
+    /// socket nothing was listening on. Asked at Hello, the question is
+    /// answered at the moment it is being asked.
+    ///
     /// Empty is the honest default: a host whose sessions end when it does
     /// should say so rather than let a client plan to come back.
-    public var sessionHostSocketPath: String
+    public var resolveSessionHostSocket: @Sendable () -> String
 
     public init(
         hostDisplayName: String = "term-mesh",
         hostAppVersion: String = "0.0.0",
         protocolVersion: String = "1.0.0",
         hostCLIBinDirs: [String] = [],
-        sessionHostSocketPath: String = ""
+        resolveSessionHostSocket: @escaping @Sendable () -> String = { "" }
     ) {
         self.hostDisplayName = hostDisplayName
         self.hostAppVersion = hostAppVersion
         self.protocolVersion = protocolVersion
         self.hostCLIBinDirs = PeerHostCLIBinDirs.validated(hostCLIBinDirs)
-        self.sessionHostSocketPath = sessionHostSocketPath
+        self.resolveSessionHostSocket = resolveSessionHostSocket
     }
 }
 
@@ -1366,7 +1374,7 @@ actor PeerServerSession {
                 // it owns cannot survive it. Naming a session owner that can is
                 // how a client reaches one without being told it may reattach
                 // later and then finding nothing there.
-                h.sessionHostSocket = self.config.sessionHostSocketPath
+                h.sessionHostSocket = self.config.resolveSessionHostSocket()
                 env.hello = h
             }
             try await sendEnvelope { env in

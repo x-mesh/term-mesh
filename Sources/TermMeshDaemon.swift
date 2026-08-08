@@ -198,6 +198,59 @@ final class TermMeshDaemon: ObservableObject {
         Self.daemonPeerSocketPath(forDaemonSocket: socketPath)
     }
 
+    /// The path to advertise as this machine's session owner, or empty when it
+    /// has none right now.
+    ///
+    /// Deciding this from settings does not work, and the first attempt proved
+    /// it twice over. `daemonShouldOutliveApp(peerServingEnabled: true)` is
+    /// `true` by inspection, so the guard advertised a session owner
+    /// unconditionally; and even a guard reading the real setting would be
+    /// wrong for an *adopted* daemon, which was started by an earlier run whose
+    /// setting nobody here can see. Ask the socket instead — the answer is
+    /// about the daemon, not about this app's preferences.
+    static func advertisedSessionHostSocket(
+        peerSocketPath: String,
+        isListening: (String) -> Bool
+    ) -> String {
+        isListening(peerSocketPath) ? peerSocketPath : ""
+    }
+
+    var advertisedSessionHostSocket: String {
+        Self.advertisedSessionHostSocket(
+            peerSocketPath: daemonPeerSocketPath,
+            isListening: Self.isListening(atUnixSocketPath:)
+        )
+    }
+
+    /// Whether something is listening on a unix socket right now.
+    ///
+    /// A file at the path is not a daemon behind it: one killed uncleanly
+    /// leaves its socket file, and pointing a client at that is the same broken
+    /// promise as pointing it at nothing. `connect` is the only answer that
+    /// tells the two apart, and against a local socket it costs microseconds.
+    static func isListening(atUnixSocketPath path: String) -> Bool {
+        guard path.hasPrefix("/") else { return false }
+        var addr = sockaddr_un()
+        // `sun_path` is a fixed 104-byte buffer; `strcpy` past it would smash
+        // the stack rather than fail, so refuse the path instead.
+        guard path.utf8.count < MemoryLayout.size(ofValue: addr.sun_path) else { return false }
+        let fd = Darwin.socket(AF_UNIX, SOCK_STREAM, 0)
+        guard fd >= 0 else { return false }
+        defer { Darwin.close(fd) }
+        addr.sun_family = sa_family_t(AF_UNIX)
+        withUnsafeMutablePointer(to: &addr.sun_path) { ptr in
+            path.withCString { cstr in
+                _ = strcpy(UnsafeMutableRawPointer(ptr).assumingMemoryBound(to: CChar.self), cstr)
+            }
+        }
+        let connected = withUnsafePointer(to: &addr) { ptr in
+            ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sockPtr in
+                Darwin.connect(fd, sockPtr, socklen_t(MemoryLayout<sockaddr_un>.size))
+            }
+        }
+        return connected == 0
+    }
+
     // MARK: - Daemon Lifecycle
 
     /// Whether this machine's daemon should outlive the app that started it.

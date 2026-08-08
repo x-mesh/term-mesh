@@ -79,3 +79,64 @@ final class DaemonPeerSocketTests: XCTestCase {
         )
     }
 }
+
+/// Naming a session owner is a promise that a client can come back to a session
+/// later. The first version made it unconditionally: the guard read
+/// `daemonShouldOutliveApp(peerServingEnabled: true)`, which is `true` by
+/// inspection, so every host advertised an owner whether or not it had one.
+final class SessionHostAdvertisementDecisionTests: XCTestCase {
+
+    /// Advertise only what is actually there. Anything else sends a client to a
+    /// socket that will refuse it.
+    func test_anOwnerIsNamedOnlyWhileSomethingIsListening() {
+        XCTAssertEqual(
+            TermMeshDaemon.advertisedSessionHostSocket(
+                peerSocketPath: "/tmp/term-meshd-peer.sock",
+                isListening: { _ in true }
+            ),
+            "/tmp/term-meshd-peer.sock"
+        )
+        XCTAssertEqual(
+            TermMeshDaemon.advertisedSessionHostSocket(
+                peerSocketPath: "/tmp/term-meshd-peer.sock",
+                isListening: { _ in false }
+            ),
+            ""
+        )
+    }
+
+    /// The decision is about the daemon, not about this app's settings. An
+    /// *adopted* daemon was started by an earlier run whose setting nobody here
+    /// can read, so a settings-derived guard is wrong even when it is not a
+    /// tautology.
+    func test_theAnswerComesFromTheSocketRatherThanASetting() {
+        var asked: [String] = []
+        _ = TermMeshDaemon.advertisedSessionHostSocket(
+            peerSocketPath: "/tmp/term-meshd-dev-tag-peer.sock",
+            isListening: { asked.append($0); return false }
+        )
+        XCTAssertEqual(asked, ["/tmp/term-meshd-dev-tag-peer.sock"])
+    }
+
+    /// A socket file outlives an uncleanly killed daemon, so existence is not
+    /// the question — `connect` is. Nothing listens on either of these.
+    func test_aPathWithNothingBehindItIsNotAnOwner() {
+        XCTAssertFalse(
+            TermMeshDaemon.isListening(atUnixSocketPath: "/tmp/term-mesh-no-such-socket-\(UUID().uuidString).sock")
+        )
+        // A regular file exists and still has no listener; the old
+        // file-existence check would have called this an owner.
+        let regularFile = NSTemporaryDirectory() + "not-a-socket-\(UUID().uuidString)"
+        FileManager.default.createFile(atPath: regularFile, contents: Data("x".utf8))
+        defer { try? FileManager.default.removeItem(atPath: regularFile) }
+        XCTAssertTrue(FileManager.default.fileExists(atPath: regularFile))
+        XCTAssertFalse(TermMeshDaemon.isListening(atUnixSocketPath: regularFile))
+    }
+
+    /// `sun_path` is a fixed 104-byte buffer, and the copy into it is `strcpy`:
+    /// an over-long path would smash the stack rather than fail. Refuse it.
+    func test_anOverlongPathIsRefusedRatherThanCopied() {
+        XCTAssertFalse(TermMeshDaemon.isListening(atUnixSocketPath: "/" + String(repeating: "a", count: 200)))
+        XCTAssertFalse(TermMeshDaemon.isListening(atUnixSocketPath: "term-meshd-peer.sock"))
+    }
+}

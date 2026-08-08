@@ -1259,7 +1259,20 @@ final class SessionHostAdvertisementTests: XCTestCase {
     /// is what would make a client wait for a session nobody kept.
     func test_aHostWithNoOwnerSaysNothingRatherThanItself() {
         let config = PeerServerConfig(hostDisplayName: "no-owner")
-        XCTAssertEqual(config.sessionHostSocketPath, "")
+        XCTAssertEqual(config.resolveSessionHostSocket(), "")
+    }
+
+    /// Asked once per Hello, not once per server. The server starts alongside
+    /// its machine's session daemon and normally wins the race, so a value
+    /// fixed at start-up answers "no owner" for the rest of the process — or,
+    /// as originally written, answers "yes" before there was one.
+    func test_theOwnerIsResolvedWhenAskedRatherThanAtStartup() {
+        final class Box: @unchecked Sendable { var path = "" }
+        let box = Box()
+        let config = PeerServerConfig(resolveSessionHostSocket: { box.path })
+        XCTAssertEqual(config.resolveSessionHostSocket(), "")
+        box.path = "/tmp/term-meshd-peer.sock"
+        XCTAssertEqual(config.resolveSessionHostSocket(), "/tmp/term-meshd-peer.sock")
     }
 
     /// The path is another machine's, read on this one, so a relative path
@@ -1283,6 +1296,62 @@ final class SessionHostAdvertisementTests: XCTestCase {
         hello.sessionHostSocket = "/var/folders/x/T/term-meshd-peer.sock"
         let decoded = try Termmesh_Peer_V1_Hello(serializedBytes: hello.serializedData())
         XCTAssertEqual(decoded.sessionHostSocket, "/var/folders/x/T/term-meshd-peer.sock")
+    }
+
+    /// End to end over a real socket: two clients connect to one server, and
+    /// each is told what was true when *it* asked.
+    ///
+    /// This is the case a start-up-time value cannot express. The server comes
+    /// up before its machine's session daemon binds, so the first client
+    /// correctly hears "no owner" — and the second, connecting after the daemon
+    /// is up, must hear the path rather than the first client's answer replayed.
+    func test_eachClientHearsTheOwnerThatExistedWhenItAsked() async throws {
+        let sockPath = "/tmp/tm-peer-session-host-\(UUID().uuidString.prefix(8)).sock"
+        defer { try? FileManager.default.removeItem(atPath: sockPath) }
+
+        final class Box: @unchecked Sendable { var path = "" }
+        let box = Box()
+        var config = PeerServerConfig()
+        config.hostDisplayName = "session-host-itest"
+        config.resolveSessionHostSocket = { box.path }
+
+        let server = PeerServer(
+            socketPath: sockPath,
+            provider: StaticSurfaceProvider(surfaces: []),
+            config: config
+        )
+        try await server.start()
+        defer { Task { await server.stop() } }
+
+        func handshake() async throws -> PeerSessionInfo {
+            let transport = try await UnixSocketTransport.connect(socketPath: sockPath)
+            let session = PeerSession(
+                read: { try await transport.read() },
+                write: { try await transport.write($0) }
+            )
+            var options = PeerSessionOptions()
+            options.displayName = "session-host-itest-client"
+            return try await session.handshake(options: options)
+        }
+
+        let deadline = Date().addingTimeInterval(2)
+        while !FileManager.default.fileExists(atPath: sockPath) {
+            if Date() > deadline {
+                XCTFail("listener never created socket file at \(sockPath)")
+                return
+            }
+            try await Task.sleep(nanoseconds: 50_000_000)
+        }
+
+        let before = try await handshake()
+        XCTAssertEqual(
+            before.sessionHostSocketPath, "",
+            "no owner yet — promising one here is what sent a client to a dead socket"
+        )
+
+        box.path = "/tmp/term-meshd-peer.sock"
+        let after = try await handshake()
+        XCTAssertEqual(after.sessionHostSocketPath, "/tmp/term-meshd-peer.sock")
     }
 
     /// An older host sends no such field, and must read as "no owner" rather

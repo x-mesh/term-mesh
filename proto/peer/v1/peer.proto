@@ -128,6 +128,12 @@ message Hello {
   // The daemon can, so the daemon is named. A client that wants a session to
   // outlive anything connects here instead of guessing a path — the sockets
   // are already keyed by target AND path, so both are reachable at once.
+  //
+  // Like cli_bin_dirs, this rides the pre-auth Hello but is a filesystem path
+  // on the host: consumers must require successful authentication before
+  // acting on it. Hosts advertise a path only while something is listening on
+  // it, so an unauthenticated reader learns nothing a connection attempt would
+  // not already tell it.
   string session_host_socket = 7;
 }
 

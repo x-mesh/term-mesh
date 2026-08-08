@@ -192,6 +192,10 @@ final class PeerHostCoordinator: NSObject {
             return true
         }
         lifecycle = .stopping(socketPath)
+        // Stop looking for this machine's own sessions: it is no longer a host,
+        // and a poller that outlived the server would keep opening panes for
+        // one.
+        SessionHostPanes.stopPolling()
         self.server = nil
         self.provider = nil
         let oldPath = socketPath
@@ -281,12 +285,14 @@ final class PeerHostCoordinator: NSObject {
             ]
         }
         // This app's surfaces die with it, so a client that wants a session to
-        // outlive a quit is pointed at the daemon instead. Only named when the
-        // daemon is actually decoupled — otherwise it dies here too, and saying
-        // so would be a promise this machine cannot keep.
-        if TermMeshDaemon.daemonShouldOutliveApp(peerServingEnabled: true) {
-            config.sessionHostSocketPath = TermMeshDaemon.shared.daemonPeerSocketPath
-        }
+        // outlive a quit is pointed at the daemon instead. Named only while
+        // something is actually listening there — otherwise the session dies
+        // here too, and saying otherwise is a promise this machine cannot keep.
+        //
+        // Resolved per Hello rather than decided here: this server usually
+        // finishes starting before the daemon has bound its socket, so any
+        // answer available at this line is a guess.
+        config.resolveSessionHostSocket = { TermMeshDaemon.shared.advertisedSessionHostSocket }
 
         let server = PeerServer(socketPath: path, provider: provider, config: config)
         do {
@@ -294,8 +300,11 @@ final class PeerHostCoordinator: NSObject {
             markStartSucceeded(server: server, path: path, provider: provider, persistPath: persistPath)
             // Sessions the daemon is already holding predate this app: it may
             // have been restarted while they kept running, which is the whole
-            // reason they live there. Nothing else would show them.
-            Task { @MainActor in await SessionHostPanes.reconcileWhenReady() }
+            // reason they live there. Nothing else would show them — and
+            // nothing would show the ones created after this line either,
+            // which is most of them, so this keeps looking rather than asking
+            // once.
+            SessionHostPanes.startPolling()
             NSLog("[peer-debug] server listening on %@", path)
             if !silent {
                 showInfo(
