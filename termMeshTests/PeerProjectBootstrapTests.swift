@@ -2026,6 +2026,32 @@ final class ProjectCreationRecoveryTests: XCTestCase {
         )
     }
 
+    /// The leader is not the only thing that can be missing, and `leaderReady`
+    /// says nothing about the rest: an agent failure appends to the sheet's own
+    /// list and writes nothing to the team. Retry checking only the leader
+    /// still reported success for a project with no executor in it.
+    func test_aMissingMemberIsNoticedEvenWhenTheLeaderIsFine() {
+        let requested = ["executor", "reviewer"]
+        let joined: Set<String> = ["reviewer"]
+        let missing = requested.filter { !joined.contains($0) }
+        XCTAssertEqual(
+            missing, ["executor"],
+            "a healthy leader must not make a half-empty team read as complete"
+        )
+    }
+
+    /// Local members are left out on purpose: they are created by the local
+    /// engine under names this comparison does not own, and reporting them as
+    /// missing would block Retry on a project that is fine.
+    func test_onlyRemoteMembersAreComparedAgainstTheRoster() {
+        let rows: [(name: String, remote: Bool)] = [
+            ("executor", true), ("planner", false), ("reviewer", true),
+        ]
+        let joined: Set<String> = ["reviewer"]
+        let missing = rows.filter { $0.remote && !joined.contains($0.name) }.map(\.name)
+        XCTAssertEqual(missing, ["executor"])
+    }
+
     /// Deletion tears down against a snapshot taken when it starts. An attach
     /// still in flight commits by writing a surface record and a checkout, so
     /// one that lands after that snapshot leaves a remote process running with

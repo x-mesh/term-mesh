@@ -2697,6 +2697,11 @@ enum ProjectCreationFlow {
         /// leader up either. Distinct from the first failure: the checkouts are
         /// already there, so the next step is not to build them again.
         case leaderRepairFailed(detail: String?)
+        /// The project is there and some of its members are not. Retry cannot
+        /// put them back on its own: a failed agent's checkout is reclaimed
+        /// when it fails, so re-attaching needs one made again — which is
+        /// creation, not repair.
+        case membersMissing(names: [String])
 
         var errorDescription: String? {
             switch self {
@@ -2725,6 +2730,9 @@ enum ProjectCreationFlow {
             case .attachTimedOut(let seconds, let pending):
                 "Nothing reported back within \(seconds)s. Still waiting on: "
                     + pending.joined(separator: ", ")
+            case .membersMissing(let names):
+                "This project is missing " + names.joined(separator: ", ")
+                    + ". Discard and create it again to bring them back."
             case .leaderRepairFailed(let detail):
                 detail.map { "Could not start the leader on retry: \($0)" }
                     ?? "Could not start the leader on retry."
@@ -2810,6 +2818,20 @@ enum ProjectCreationFlow {
         // or failed to launch.
         if let existing = TeamOrchestrator.shared.teams[name],
            let workspace = tabManager.tabs.first(where: { $0.id == existing.workspaceId }) {
+            // A member the form asked for that never joined leaves the same
+            // false success as a missing leader, and `leaderReady` says nothing
+            // about it: an agent failure appends to the sheet's own list and
+            // writes nothing to the team. Reported rather than repaired,
+            // because re-attaching needs a checkout this one no longer has —
+            // a failed agent's checkout is reclaimed at the point it fails.
+            let joined = Set(existing.agents.map(\.name))
+            let missing = rows
+                .filter { $0.hostKey != nil && !joined.contains($0.preset.name) }
+                .map(\.preset.name)
+            guard missing.isEmpty else {
+                tabManager.selectWorkspace(workspace)
+                throw CreationError.membersMissing(names: missing)
+            }
             guard existing.leaderReady else {
                 // Repair rather than rebuild: the checkouts exist, and
                 // `recoverRemoteLeaderIfNeeded` is documented as safe for an
