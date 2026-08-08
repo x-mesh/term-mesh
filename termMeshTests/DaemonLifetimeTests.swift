@@ -39,3 +39,43 @@ final class DaemonLifetimeTests: XCTestCase {
         }
     }
 }
+
+/// The daemon has always been able to serve the peer protocol — `main.rs`
+/// starts `peer::serve` when `TERMMESH_PEER_SOCKET` names a path, which is how
+/// a Linux peer works at all. On a Mac the app took that role and never set the
+/// variable, so the one component that can own a session past a quit was the
+/// one not serving the protocol that reaches sessions.
+final class DaemonPeerSocketTests: XCTestCase {
+
+    /// Derived from the JSON-RPC socket so a tagged build's isolation is
+    /// inherited rather than re-earned. Two apps on one machine handing each
+    /// other's daemons the same path is the failure this prevents.
+    func test_aTaggedBuildKeepsItsIsolation() {
+        XCTAssertEqual(
+            TermMeshDaemon.daemonPeerSocketPath(forDaemonSocket: "/tmp/term-meshd-dev-projfix.sock"),
+            "/tmp/term-meshd-dev-projfix-peer.sock"
+        )
+        XCTAssertEqual(
+            TermMeshDaemon.daemonPeerSocketPath(forDaemonSocket: "/tmp/term-meshd-dev-other.sock"),
+            "/tmp/term-meshd-dev-other-peer.sock"
+        )
+    }
+
+    /// Distinct from the daemon's own JSON-RPC socket: they are different
+    /// protocols, and binding one over the other loses whichever lost the race.
+    func test_itNeverCollidesWithTheJSONRPCSocket() {
+        for socket in ["/tmp/term-meshd.sock",
+                       "/var/folders/x/T/term-meshd.sock",
+                       "/tmp/term-meshd-dev-tag.sock"] {
+            XCTAssertNotEqual(TermMeshDaemon.daemonPeerSocketPath(forDaemonSocket: socket), socket)
+        }
+    }
+
+    /// A path without the suffix still yields one path, not a truncation.
+    func test_aSocketPathWithoutTheSuffixStillDerives() {
+        XCTAssertEqual(
+            TermMeshDaemon.daemonPeerSocketPath(forDaemonSocket: "/tmp/term-meshd"),
+            "/tmp/term-meshd-peer.sock"
+        )
+    }
+}

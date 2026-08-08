@@ -176,6 +176,28 @@ final class TermMeshDaemon: ObservableObject {
         return (tmpDir as NSString).appendingPathComponent("term-meshd.sock")
     }
 
+    /// Where this machine's daemon serves the peer protocol.
+    ///
+    /// The daemon has always been able to: `main.rs` starts `peer::serve` when
+    /// `TERMMESH_PEER_SOCKET` names a path. On Linux that is how a peer works
+    /// at all. On a Mac the app took that role and never set the variable, so
+    /// the one component that can own a session past a quit was the one not
+    /// serving the protocol that reaches sessions.
+    ///
+    /// Derived from the JSON-RPC socket rather than configured separately, so a
+    /// tagged build's isolation is inherited instead of re-earned — two apps on
+    /// one machine must not hand each other's daemons the same path.
+    static func daemonPeerSocketPath(forDaemonSocket socketPath: String) -> String {
+        let base = socketPath.hasSuffix(".sock")
+            ? String(socketPath.dropLast(".sock".count))
+            : socketPath
+        return base + "-peer.sock"
+    }
+
+    var daemonPeerSocketPath: String {
+        Self.daemonPeerSocketPath(forDaemonSocket: socketPath)
+    }
+
     // MARK: - Daemon Lifecycle
 
     /// Whether this machine's daemon should outlive the app that started it.
@@ -254,6 +276,12 @@ final class TermMeshDaemon: ObservableObject {
             // does a machine serving peers, whose sessions are the point.
             if !outlivesApp {
                 env["TERMMESH_OWNER_PID"] = String(ProcessInfo.processInfo.processIdentifier)
+            } else {
+                // A daemon that outlives the app is the only component here that
+                // can hold a session across a quit. Serving the peer protocol is
+                // how anything reaches one — this app included, which attaches
+                // to it exactly as it attaches to another machine's.
+                env["TERMMESH_PEER_SOCKET"] = self.daemonPeerSocketPath
             }
 
             // Ensure Resources/bin is in PATH for daemon and all its child processes.
