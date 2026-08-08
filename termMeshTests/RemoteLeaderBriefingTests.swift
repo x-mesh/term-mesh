@@ -287,3 +287,48 @@ extension RemoteLeaderBriefingTests {
         }
     }
 }
+
+/// A native remote member exists only on the machine that started it: its
+/// process is a child of that app's ssh, its stdio is that pipe, and nothing
+/// is created on the peer. The peer's own window then shows a project with a
+/// leader and no team — nothing there to continue the work with.
+@MainActor
+final class RemoteAgentPlacementTests: XCTestCase {
+
+    /// The CLIs that can hold a terminal go to the peer's project workspace,
+    /// where both machines can see and drive them.
+    func test_aTerminalCapableRemoteAgentDoesNotTakeTheNativePath() {
+        for cli in ["claude", "codex", "kiro"] {
+            XCTAssertTrue(
+                AgentPipeTransport.supports(cli: cli),
+                "\(cli) is a native-capable CLI, which is what makes this a choice"
+            )
+            XCTAssertFalse(
+                AgentPipeTransport.isPipeOnly(cli: cli),
+                "\(cli) can hold a terminal, so a remote one belongs on the peer"
+            )
+        }
+    }
+
+    /// A turn-per-process CLI has no interactive UI and no stdin channel, so a
+    /// terminal pane would open empty. Those keep the native path — a property
+    /// of the CLI, not a placement choice.
+    func test_aPipeOnlyRemoteAgentKeepsTheNativePath() {
+        for cli in ["cursor", "agy"] {
+            XCTAssertTrue(AgentPipeTransport.isPipeOnly(cli: cli))
+            XCTAssertTrue(
+                AgentPipeTransport.supports(cli: cli),
+                "if the native path stopped supporting these they would have no path at all"
+            )
+        }
+    }
+
+    /// Local members are untouched: the whole point is that only the remote
+    /// case had a peer with nothing in it.
+    func test_theTerminalCapableSetIsExactlyWhatTheRemotePathRedirects() {
+        let redirected = AgentRolePreset.knownCLIs.filter {
+            AgentPipeTransport.supports(cli: $0) && !AgentPipeTransport.isPipeOnly(cli: $0)
+        }
+        XCTAssertEqual(Set(redirected), ["claude", "codex", "kiro"])
+    }
+}

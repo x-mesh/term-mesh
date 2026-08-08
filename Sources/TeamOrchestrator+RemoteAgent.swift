@@ -2045,11 +2045,24 @@ extension TeamOrchestrator {
         // Use the same incremental grid growth as local `add`/`attach`.
         let placement = nextAgentSplitPlacement(team: team, workspace: workspace)
 
-        // The leader remains a terminal, but members follow Agent Panes.
-        // An SSH-backed relay can carry the structured process stream straight
-        // into a local AgentPanel; a legacy direct-socket peer has no process
-        // channel, so it keeps the terminal relay path below.
+        // A native remote member exists only on this machine: its process is a
+        // child of this app's ssh, its stdio is that pipe, and nothing at all
+        // is created on the peer. The peer's own window then shows a project
+        // with a leader and no team, and there is nothing there to continue
+        // the work with. The terminal path below puts the member in the peer's
+        // project workspace, where both machines can see and drive it.
+        //
+        // Except for the CLIs that have no interactive UI to put in a pane —
+        // `isPipeOnly` is a turn-per-process CLI with no stdin channel, so a
+        // terminal pane would open empty. Those keep the native path and stay
+        // local-only, which is a property of the CLI rather than a choice.
+        //
+        // The cost is deliberate and bounded: a remote member renders as its
+        // raw stream rather than in an AgentPanel. Local members are
+        // unaffected. Giving the peer real ownership of the process would
+        // return the panel, and is the next step rather than this one.
         if AgentPipeTransport.canHoldNatively(cli: cli),
+           AgentPipeTransport.isPipeOnly(cli: cli),
            let sshTarget = host.sshTarget, !sshTarget.isEmpty {
             let member = try attachRemoteNativeAgent(
                 team: team,
