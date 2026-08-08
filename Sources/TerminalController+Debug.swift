@@ -689,7 +689,18 @@ extension TerminalController {
                                 leaderMode: leaderMode,
                                 leaderModel: leaderModel,
                                 leaderEndpoint: leaderEndpoint,
-                                leaderWorkingDirectory: remotePath,
+                                // The leader's machine is not always the
+                                // agents'. Reusing `remote_path` for both made
+                                // this probe unable to express the mixed
+                                // placement New Project supports — a leader on
+                                // a Mac peer got the Linux agents' `/root/...`
+                                // and died on `mkdir: Read-only file system`,
+                                // which looked like a product bug and was the
+                                // probe. Production computes a separate
+                                // `leaderProjectPath`; `leader_directory` is
+                                // how a caller says the same thing here.
+                                leaderWorkingDirectory: (params["leader_directory"] as? String)
+                                    .flatMap { $0.isEmpty ? nil : $0 } ?? remotePath,
                                 projectSource: ProjectSource(
                                     hostKey: hostKey,
                                     projectPath: remotePath,

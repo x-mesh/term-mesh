@@ -1523,7 +1523,8 @@ extension TeamOrchestrator {
                 teamName: teamName,
                 agents: team.agents,
                 remoteWorkingDirectory: workingDirectory,
-                remoteSocketPath: host.remoteSockPath ?? "inherited from TERMMESH_SOCKET"
+                remoteSocketPath: host.remoteSockPath ?? "inherited from TERMMESH_SOCKET",
+                hostCLIBinDirs: host.hostCLIBinDirs
             )
         } else {
             // Recovery had the same CLI-shaped hole as creation: a restarted
@@ -1532,7 +1533,8 @@ extension TeamOrchestrator {
                 teamName: teamName,
                 agents: team.agents,
                 remoteWorkingDirectory: workingDirectory,
-                remoteSocketPath: host.remoteSockPath ?? "inherited from TERMMESH_SOCKET"
+                remoteSocketPath: host.remoteSockPath ?? "inherited from TERMMESH_SOCKET",
+                hostCLIBinDirs: host.hostCLIBinDirs
             )
         }
 
@@ -2822,16 +2824,19 @@ extension TeamOrchestrator {
         }
         let remoteLeaderSystemPrompt: String?
         if case let .peer(hostKey) = leaderEndpoint {
-            let remoteSocketPath = RemoteHostStore.shared.sortedHosts
-                .first(where: { $0.id == hostKey })?
-                .remoteSockPath ?? "inherited from TERMMESH_SOCKET"
+            let remoteLeaderHost = RemoteHostStore.shared.sortedHosts
+                .first(where: { $0.id == hostKey })
+            let remoteSocketPath = remoteLeaderHost?.remoteSockPath
+                ?? "inherited from TERMMESH_SOCKET"
+            let remoteLeaderBinDirs = remoteLeaderHost?.hostCLIBinDirs ?? []
             if leaderMode.lowercased() == "claude" {
                 guard let resolvedRemoteLeaderWorkingDirectory else { return nil }
                 remoteLeaderSystemPrompt = Self.remoteLeaderClaudeSystemPrompt(
                     teamName: teamName,
                     rows: rows,
                     remoteWorkingDirectory: resolvedRemoteLeaderWorkingDirectory,
-                    remoteSocketPath: remoteSocketPath
+                    remoteSocketPath: remoteSocketPath,
+                    hostCLIBinDirs: remoteLeaderBinDirs
                 )
             } else {
                 // The staged file is this string, so whatever is left out here
@@ -2845,7 +2850,8 @@ extension TeamOrchestrator {
                     teamName: teamName,
                     rows: rows,
                     remoteWorkingDirectory: resolvedRemoteLeaderWorkingDirectory,
-                    remoteSocketPath: remoteSocketPath
+                    remoteSocketPath: remoteSocketPath,
+                    hostCLIBinDirs: remoteLeaderBinDirs
                 )
             }
         } else {

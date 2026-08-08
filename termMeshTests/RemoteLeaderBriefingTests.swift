@@ -241,3 +241,49 @@ extension RemoteLeaderAutonomyFlagsTests {
         XCTAssertTrue(worker.contains("--model"), "the worker still launches: \(worker)")
     }
 }
+
+extension RemoteLeaderBriefingTests {
+    /// term-mesh puts the peer's bundled bin directory first on PATH, and that
+    /// ordering does not survive every CLI: codex runs its shell tool through a
+    /// fresh login shell, which rebuilt PATH with `$HOME/bin` ahead of it. A
+    /// leader then silently used an 0.175.1 `tm-agent` against a 0.176.1 app
+    /// and failed in that generation's ways. Observed on a live peer:
+    /// `command -v tm-agent` answered `/Users/jinwoo/bin/tm-agent`.
+    func test_theBriefingNamesAnAbsoluteTMAgentWhenTheHostReportsOne() {
+        let prompt = TeamOrchestrator.remoteLeaderNonClaudeSystemPrompt(
+            teamName: "xm",
+            rows: rows,
+            remoteWorkingDirectory: "/Users/jinwoo/work/tm-projects/xm",
+            remoteSocketPath: "/tmp/term-mesh.sock",
+            hostCLIBinDirs: ["/Applications/term-mesh.app/Contents/Resources/bin"]
+        )
+        XCTAssertTrue(
+            prompt.contains("/Applications/term-mesh.app/Contents/Resources/bin/tm-agent delegate"),
+            "a bare name is whatever the CLI's own shell resolves it to"
+        )
+    }
+
+    /// A host that reports no bin directory keeps working exactly as before,
+    /// rather than being pointed at a path that may not exist there.
+    func test_aHostThatReportsNoBinDirKeepsTheBareName() {
+        XCTAssertEqual(TeamOrchestrator.remoteTMAgentCommand(hostCLIBinDirs: []), "tm-agent")
+        XCTAssertEqual(TeamOrchestrator.remoteTMAgentCommand(hostCLIBinDirs: ["  "]), "tm-agent")
+    }
+
+    /// Claude leaders were never broken by this, but they read the same field,
+    /// so the two must not drift apart again.
+    func test_bothLeaderKindsGetTheSameAbsolutePath() {
+        let dirs = ["/opt/term-mesh/bin"]
+        let claude = TeamOrchestrator.remoteLeaderClaudeSystemPrompt(
+            teamName: "xm", rows: rows,
+            remoteWorkingDirectory: "/w", remoteSocketPath: "/s", hostCLIBinDirs: dirs
+        )
+        let other = TeamOrchestrator.remoteLeaderNonClaudeSystemPrompt(
+            teamName: "xm", rows: rows,
+            remoteWorkingDirectory: "/w", remoteSocketPath: "/s", hostCLIBinDirs: dirs
+        )
+        for prompt in [claude, other] {
+            XCTAssertTrue(prompt.contains("/opt/term-mesh/bin/tm-agent status"), prompt.prefix(200).description)
+        }
+    }
+}

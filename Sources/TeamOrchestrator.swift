@@ -3082,7 +3082,8 @@ final class TeamOrchestrator: ObservableObject {
         teamName: String,
         rows: [TeamAgentRow],
         remoteWorkingDirectory: String,
-        remoteSocketPath: String
+        remoteSocketPath: String,
+        hostCLIBinDirs: [String] = []
     ) -> String {
         let agentList = rows.enumerated().map { index, row in
             let instructions = row.customInstructions
@@ -3109,7 +3110,7 @@ final class TeamOrchestrator: ObservableObject {
             teamName: teamName,
             agentList: agentList,
             runbookSection: remoteRunbooks,
-            tmAgent: "tm-agent",
+            tmAgent: remoteTMAgentCommand(hostCLIBinDirs: hostCLIBinDirs),
             socketPath: remoteSocketPath
         )
     }
@@ -3127,11 +3128,32 @@ final class TeamOrchestrator: ObservableObject {
     /// Same rows-not-roster reasoning as `remoteLeaderClaudeSystemPrompt`:
     /// the leader is attached before the members are recorded, so reading
     /// `team.agents` here yields an empty list.
+    /// The `tm-agent` a peer leader should actually invoke.
+    ///
+    /// The launch line puts the peer's bundled bin directory first on PATH,
+    /// and that ordering does not survive every CLI: codex runs its shell tool
+    /// through a fresh login shell, which rebuilt PATH with `$HOME/bin` ahead
+    /// of it. A leader then silently used whatever `tm-agent` someone had
+    /// installed there — an 0.175.1 build against a 0.176.1 app, which failed
+    /// in that generation's ways and blamed a missing `git-kit`.
+    ///
+    /// An absolute path cannot be reordered. `hostCLIBinDirs` is the peer's
+    /// own answer for where its binaries live, from the handshake. Falling
+    /// back to the bare name keeps a host that reports nothing working exactly
+    /// as before rather than pointing at a path that may not exist.
+    static func remoteTMAgentCommand(hostCLIBinDirs: [String]) -> String {
+        guard let dir = hostCLIBinDirs.first(where: {
+            !$0.trimmingCharacters(in: .whitespaces).isEmpty
+        }) else { return "tm-agent" }
+        return (dir as NSString).appendingPathComponent("tm-agent")
+    }
+
     static func remoteLeaderNonClaudeSystemPrompt(
         teamName: String,
         rows: [TeamAgentRow],
         remoteWorkingDirectory: String,
-        remoteSocketPath: String
+        remoteSocketPath: String,
+        hostCLIBinDirs: [String] = []
     ) -> String {
         let agentList = rows.enumerated().map { index, row in
             let instructions = row.customInstructions
@@ -3164,7 +3186,7 @@ final class TeamOrchestrator: ObservableObject {
             // rather than from this team's worktree mode, so there is no
             // worktree table to state here.
             worktreeSection: "",
-            tmAgent: "tm-agent",
+            tmAgent: remoteTMAgentCommand(hostCLIBinDirs: hostCLIBinDirs),
             socketPath: remoteSocketPath
         )
     }
@@ -3177,7 +3199,8 @@ final class TeamOrchestrator: ObservableObject {
         teamName: String,
         agents: [AgentMember],
         remoteWorkingDirectory: String,
-        remoteSocketPath: String
+        remoteSocketPath: String,
+        hostCLIBinDirs: [String] = []
     ) -> String {
         let agentList = agents.enumerated().map { index, agent in
             let summary = oneLinerFromInstructions(agent.instructions)
@@ -3193,7 +3216,7 @@ final class TeamOrchestrator: ObservableObject {
                 roles: agents.map(\.agentType)
             ),
             worktreeSection: "",
-            tmAgent: "tm-agent",
+            tmAgent: remoteTMAgentCommand(hostCLIBinDirs: hostCLIBinDirs),
             socketPath: remoteSocketPath
         )
     }
@@ -3205,7 +3228,8 @@ final class TeamOrchestrator: ObservableObject {
         teamName: String,
         agents: [AgentMember],
         remoteWorkingDirectory: String,
-        remoteSocketPath: String
+        remoteSocketPath: String,
+        hostCLIBinDirs: [String] = []
     ) -> String {
         let agentList = agents.enumerated().map { index, agent in
             let summary = oneLinerFromInstructions(agent.instructions)
@@ -3220,7 +3244,7 @@ final class TeamOrchestrator: ObservableObject {
                 workingDirectory: remoteWorkingDirectory,
                 roles: agents.map(\.agentType)
             ),
-            tmAgent: "tm-agent",
+            tmAgent: remoteTMAgentCommand(hostCLIBinDirs: hostCLIBinDirs),
             socketPath: remoteSocketPath
         )
     }
