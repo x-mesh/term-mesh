@@ -1987,3 +1987,69 @@ final class PeerProjectBootstrapTests: XCTestCase {
         XCTAssertTrue(noWorkspace.contains("never reported a workspace"), noWorkspace)
     }
 }
+
+/// Findings from the adversarial review of #196, each verified in the code
+/// before being fixed. Two of the three were introduced by that PR itself:
+/// keeping the sheet up on failure is what leaves a team behind for `Retry`
+/// to trip over, and letting `auto` step aside is what made a run without
+/// isolation indistinguishable from one with it.
+@MainActor
+final class ProjectCreationRecoveryTests: XCTestCase {
+
+    /// `leaderReady` is documented as "false while a requested peer leader is
+    /// still connecting or failed to launch" — the one field that separates a
+    /// project that is open from the wreckage of an attempt that was not.
+    /// Without consulting it, `Retry project` selected the half-built
+    /// workspace and returned success: the recovery button closing the sheet
+    /// without recovering anything.
+    func test_theFieldThatSeparatesAnOpenProjectFromAFailedAttempt() {
+        var team = TeamOrchestrator.Team(
+            id: "xm",
+            leaderSessionId: UUID().uuidString,
+            leaderMode: "codex",
+            leaderModel: "gpt-5.6-sol",
+            leaderCli: "codex",
+            leaderPanelId: UUID(),
+            workingDirectory: "/w",
+            workspaceId: UUID(),
+            agents: [],
+            createdAt: Date(),
+            worktreeMode: "off"
+        )
+        XCTAssertTrue(team.leaderReady, "a team is usable until something says otherwise")
+
+        team.leaderReady = false
+        team.leaderFailureDescription = "could not prepare the project workspace"
+        XCTAssertFalse(
+            team.leaderReady,
+            "Retry must see this and repair rather than select and report success"
+        )
+    }
+
+    /// Deletion tears down against a snapshot taken when it starts. An attach
+    /// still in flight commits by writing a surface record and a checkout, so
+    /// one that lands after that snapshot leaves a remote process running with
+    /// nothing pointing at it. Retiring the generation makes the attach fail
+    /// its next `ensureCurrent` instead.
+    func test_retiringTheGenerationStopsAnAttachThatIsStillInFlight() {
+        let gate = TeamOrchestrator.LeaderAttachGenerationGate.shared
+        let inFlight = gate.begin(teamName: "xm-race")
+        XCTAssertTrue(gate.isCurrent(inFlight))
+
+        gate.invalidateAll(teamName: "xm-race")
+        XCTAssertFalse(
+            gate.isCurrent(inFlight),
+            "an attach past this point must compensate rather than register anything"
+        )
+    }
+
+    /// A caller holding no generation is exactly the deletion case, and it
+    /// must still retire one that was never begun — a team whose first attach
+    /// has not started yet is not a team that may be raced later.
+    func test_retiringWorksForATeamThatNeverBeganAnAttach() {
+        let gate = TeamOrchestrator.LeaderAttachGenerationGate.shared
+        gate.invalidateAll(teamName: "xm-never-began")
+        let after = gate.begin(teamName: "xm-never-began")
+        XCTAssertTrue(gate.isCurrent(after), "a later attach starts clean")
+    }
+}

@@ -217,6 +217,18 @@ extension TeamOrchestrator {
             guard isCurrent(generation) else { return }
             generations[generation.teamName] = generation.value &+ 1
         }
+
+        /// Retire whatever generation is current, for a caller that holds none.
+        ///
+        /// Project deletion is that caller. It tears down against a snapshot of
+        /// the team taken when it starts, so an attach still in flight can
+        /// register a surface or a checkout after that snapshot is read — and
+        /// the deletion, already past it, leaves the remote process running
+        /// with nothing left pointing at it. Retiring the generation first
+        /// makes every remaining `ensureCurrent` throw and compensate instead.
+        func invalidateAll(teamName: String) {
+            generations[teamName] = (generations[teamName] ?? 0) &+ 1
+        }
     }
 
     @MainActor
@@ -3085,6 +3097,16 @@ extension TeamOrchestrator {
         guard let team = teams[teamName] else {
             throw RemoteAgentError.teamNotFound(teamName)
         }
+        // Before anything is read, let alone removed. A leader attach that is
+        // still in flight commits by writing a surface record and a checkout;
+        // if it does that after the snapshot below, deletion has already
+        // decided what exists and the remote process is orphaned. This makes
+        // the attach fail its next `ensureCurrent` and run its own
+        // compensation instead of racing this.
+        //
+        // Covers the leader only. A remote *agent* attach carries no attempt
+        // and cannot be retired this way — see attachRemoteAgent.
+        LeaderAttachGenerationGate.shared.invalidateAll(teamName: teamName)
 
         // Read through the durable record: after a restart the team's
         // in-memory list is empty while its checkouts are still on the peers.

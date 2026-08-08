@@ -2693,6 +2693,10 @@ enum ProjectCreationFlow {
         /// the work may still be in flight on the peer, which is why the sheet
         /// offers to retry rather than only to clean up.
         case attachTimedOut(seconds: Int, pending: [String])
+        /// Retry found the team from a previous attempt and could not get its
+        /// leader up either. Distinct from the first failure: the checkouts are
+        /// already there, so the next step is not to build them again.
+        case leaderRepairFailed(detail: String?)
 
         var errorDescription: String? {
             switch self {
@@ -2721,6 +2725,9 @@ enum ProjectCreationFlow {
             case .attachTimedOut(let seconds, let pending):
                 "Nothing reported back within \(seconds)s. Still waiting on: "
                     + pending.joined(separator: ", ")
+            case .leaderRepairFailed(let detail):
+                detail.map { "Could not start the leader on retry: \($0)" }
+                    ?? "Could not start the leader on retry."
             }
         }
     }
@@ -2789,12 +2796,34 @@ enum ProjectCreationFlow {
         progress: @escaping @MainActor (ProjectCreationEvent) -> Void = { _ in },
         tabManager: TabManager
     ) async throws {
-        // A name already in use means the project is open, not that something
-        // failed. Creating one silently returned nil and the sheet just
-        // closed, which reads as the button not working — so go to the one
-        // that is there.
+        // A name already in use usually means the project is open, not that
+        // something failed. Creating one silently returned nil and the sheet
+        // just closed, which reads as the button not working — so go to the
+        // one that is there.
+        //
+        // Unless it is the wreckage of a previous attempt. Keeping the sheet up
+        // on failure means a failed run leaves its team and workspace behind,
+        // so `Retry project` arrives here and this used to select the
+        // half-built workspace and report success — the recovery button closing
+        // the sheet without recovering anything. `leaderReady` is the
+        // difference: false while a requested peer leader is still connecting
+        // or failed to launch.
         if let existing = TeamOrchestrator.shared.teams[name],
            let workspace = tabManager.tabs.first(where: { $0.id == existing.workspaceId }) {
+            guard existing.leaderReady else {
+                // Repair rather than rebuild: the checkouts exist, and
+                // `recoverRemoteLeaderIfNeeded` is documented as safe for an
+                // initial attach that failed before a surface was recorded.
+                tabManager.selectWorkspace(workspace)
+                let repaired = await TeamOrchestrator.shared
+                    .recoverRemoteLeaderIfNeeded(teamName: name)
+                guard repaired else {
+                    throw CreationError.leaderRepairFailed(
+                        detail: TeamOrchestrator.shared.teams[name]?.leaderFailureDescription
+                    )
+                }
+                return
+            }
             tabManager.selectWorkspace(workspace)
             return
         }

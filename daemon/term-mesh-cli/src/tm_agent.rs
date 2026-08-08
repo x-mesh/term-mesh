@@ -39,6 +39,10 @@ const DEFAULT_AGENT_COLORS: &[&str] = &["green", "blue", "yellow", "magenta", "c
 /// `worktree_isolation_unavailable`, never by eyeballing a message.
 const GIT_KIT_MISSING: &str = "git-kit is not installed on this machine";
 
+/// `worktree_policy` for a task that asked for isolation and ran without it.
+/// Distinct from "off", which is a caller who never wanted any.
+const WORKTREE_POLICY_DEGRADED: &str = "auto-degraded";
+
 /// Whether a worktree failure means isolation is simply unavailable here.
 fn worktree_isolation_unavailable(error: &str) -> bool {
     error.contains(GIT_KIT_MISSING)
@@ -11566,6 +11570,34 @@ fn update_task_with_worktree(
     rpc_call(sock, "team.task.update", params)
 }
 
+/// Record on the task that isolation was asked for and could not be had.
+///
+/// `auto` selects a worktree because the work mutates, so the case where this
+/// fires is exactly the case isolation exists for. Leaving it on stderr only
+/// meant the board showed a task indistinguishable from an isolated one, while
+/// the repository contract requires same-checkout concurrent writes to have
+/// explicit disjoint ownership or isolation.
+///
+/// Written into `worktree_policy` rather than a new column: the value is
+/// already carried, displayed and queried, and adding a field would mean a
+/// schema migration for something a distinct value says just as plainly.
+///
+/// NOTE: this makes the state visible; it does not make it safe. Refusing a
+/// second concurrent write to the same checkout needs the working directory on
+/// the task, which the schema does not carry today.
+fn mark_task_isolation_degraded(sock: &PathBuf, team: &str, task_id: &str, reason: &str) {
+    let _ = rpc_call(
+        sock,
+        "team.task.update",
+        json!({
+            "team_name": team,
+            "task_id": task_id,
+            "worktree_policy": WORKTREE_POLICY_DEGRADED,
+            "worktree_init": reason,
+        }),
+    );
+}
+
 fn block_task_for_worktree_error(sock: &PathBuf, team: &str, task_id: &str, reason: &str) {
     let _ = rpc_call(
         sock,
@@ -11744,9 +11776,11 @@ fn run_delegate_result_with_worktree(
             task = updated["result"].clone();
         }
         Err(e) if !worktree_failure_is_fatal(worktree_policy, &e) => {
-            // Say it rather than silently dropping isolation: the task runs in
-            // the shared checkout from here, which is a different concurrency
-            // story than the caller's policy implied.
+            // Record it on the task, not only on stderr. `auto` asked for
+            // isolation because the work mutates, so a run without it is a
+            // different concurrency story than the board would otherwise
+            // show -- and stderr is gone by the time anyone reads the board.
+            mark_task_isolation_degraded(sock, team, &task_id, &e);
             eprintln!(
                 "note: {e}; running {task_id} in the shared checkout without worktree isolation"
             );
@@ -14630,6 +14664,7 @@ fn run_claim(sock: &PathBuf, team: &str, agent: &str) {
                             }
                         }
                         Err(e) if !worktree_failure_is_fatal(policy, &e) => {
+                            mark_task_isolation_degraded(sock, team, &task_id, &e);
                             eprintln!(
                                 "note: {e}; running {task_id} in the shared checkout \
                                  without worktree isolation"
@@ -16486,6 +16521,28 @@ mod worktree_availability_tests {
         let refused = "gk wt acquire: branch is checked out elsewhere";
         assert!(!worktree_isolation_unavailable(refused));
         assert!(worktree_failure_is_fatal(WorktreePolicyArg::Auto, refused));
+    }
+
+    /// "off" is a caller who never wanted isolation; this is one who wanted it
+    /// and could not have it. A board that shows them the same cannot tell a
+    /// deliberate shared-checkout run from a silently degraded one.
+    #[test]
+    fn a_degraded_run_is_not_recorded_as_isolation_off() {
+        assert_ne!(WORKTREE_POLICY_DEGRADED, worktree_policy_name(WorktreePolicyArg::Off));
+        assert_ne!(WORKTREE_POLICY_DEGRADED, worktree_policy_name(WorktreePolicyArg::Auto));
+        assert_ne!(WORKTREE_POLICY_DEGRADED, worktree_policy_name(WorktreePolicyArg::Always));
+    }
+
+    /// The value is written into an existing column, so it has to round-trip
+    /// through the same parser the policy field uses without being mistaken
+    /// for one of the real policies.
+    #[test]
+    fn the_degraded_marker_does_not_parse_back_as_a_policy() {
+        assert_eq!(
+            parse_worktree_policy_name(Some(WORKTREE_POLICY_DEGRADED)),
+            WorktreePolicyArg::Auto,
+            "unknown values fall back to auto; the marker must not read as off or always"
+        );
     }
 
     /// The marker has to survive being wrapped by the callers that prefix it.
