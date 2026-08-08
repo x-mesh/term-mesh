@@ -106,6 +106,18 @@ because two of the three needed far less than this note first assumed.
    a session instead of spawning over ssh. Observable: the member appears on
    both machines and survives the host disconnecting.
 
+   *Protocol half done — `cb51bfbd`.* A host had no way to say "my sessions
+   end with me, but that one over there does not". `Hello.session_host_socket`
+   is that sentence: a Mac app names its daemon, and only when the daemon is
+   actually decoupled, since otherwise it dies too. Verified on the wire from
+   another machine — field 7 of a live Mac peer's Hello carried its daemon's
+   socket path.
+
+   What remains is the consumer: `attachRemoteAgent` taking a second lease to
+   that path instead of spawning over ssh. `PeerPaneHostKey` already keys by
+   target AND socket, so both the app and its daemon are reachable at once
+   without new transport.
+
 5. **Return the native panel.** With an owner that can serve two views, the
    `AgentPanel` reads the structured stream while the peer's pane renders it.
    This is the step PR #196's tradeoff was deferring.
