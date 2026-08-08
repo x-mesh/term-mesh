@@ -921,12 +921,24 @@ final class GhosttyPaneSurfaceProvider: PeerSurfaceProvider {
                 .first { $0.id == uuid }
         }
 
-        switch Self.newTabTarget(
+        let target = Self.newTabTarget(
             paneResolved: besidePane != nil,
             hasWorkspaceID: !workspaceIDBytes.isEmpty,
             workspaceFound: namedWorkspace != nil,
             workspaceHasSurfaces: !(namedWorkspace?.panels.isEmpty ?? true)
-        ) {
+        )
+        // A peer host runs Release, where `dlog` is compiled out and its socket
+        // refuses outside callers — so this path was unobservable from the
+        // machine asking for the tab. RemoteWorkLog writes to a file at every
+        // level, which is the one channel that survives both.
+        RemoteWorkLog.info(
+            "newTab target=\(target) pane=\(paneIDBytes.count)B "
+                + "ws=\(workspaceIDBytes.count)B found=\(namedWorkspace != nil) "
+                + "panels=\(namedWorkspace?.panels.count ?? -1) "
+                + "panes=\(namedWorkspace?.bonsplitController.allPaneIds.count ?? -1)"
+        )
+
+        switch target {
         case .besidePane:
             guard let besidePane else { return }
             _ = besidePane.workspace.newTerminalSurface(inPane: besidePane.pane, focus: true)
@@ -934,8 +946,15 @@ final class GhosttyPaneSurfaceProvider: PeerSurfaceProvider {
             guard let workspace = namedWorkspace,
                   let seedPane = workspace.bonsplitController.focusedPaneId
                       ?? workspace.bonsplitController.allPaneIds.first
-            else { return }
-            _ = workspace.newTerminalSurface(inPane: seedPane, focus: true)
+            else {
+                RemoteWorkLog.info("newTab seed ABORTED: no pane to seed into")
+                return
+            }
+            let created = workspace.newTerminalSurface(inPane: seedPane, focus: true)
+            RemoteWorkLog.info(
+                "newTab seeded panel=\(created?.id.uuidString.prefix(8) ?? "nil") "
+                    + "surfaceRealized=\(created?.surface.surface != nil)"
+            )
         case .ignore:
             return
         }
@@ -1253,7 +1272,24 @@ final class GhosttyPaneSurfaceProvider: PeerSurfaceProvider {
                   let terminal = workspace.panels[panelUUID] as? TerminalPanel,
                   !terminal.isRemoteOrigin,
                   let sfcPtr = terminal.surface.surface
-            else { return nil }
+            else {
+                // Which of the six is missing decides whether a client waiting
+                // for this pane is waiting on a tab that was never made or on a
+                // surface that was never realized — indistinguishable from the
+                // other end, where both read as "the workspace has no panes".
+                let tabStr = pane.selectedTabId ?? pane.tabs.first?.id
+                let panel = tabStr
+                    .flatMap { UUID(uuidString: $0) }
+                    .flatMap { workspace.surfaceIdToPanelId[TabID(uuid: $0)] }
+                RemoteWorkLog.debug(
+                    "layout.pane dropped ws=\(workspace.id.uuidString.prefix(8)) "
+                        + "tabs=\(pane.tabs.count) tab=\(tabStr?.prefix(8) ?? "nil") "
+                        + "panel=\(panel?.uuidString.prefix(8) ?? "nil") "
+                        + "isTerminal=\(panel.flatMap { workspace.panels[$0] } is TerminalPanel) "
+                        + "realized=\(panel.flatMap { workspace.panels[$0] as? TerminalPanel }?.surface.surface != nil)"
+                )
+                return nil
+            }
             let ts = terminal.surface
             var paneMsg = Termmesh_Peer_V1_WorkspacePane()
             paneMsg.surfaceID = surfaceIDBytes(ts.id)
