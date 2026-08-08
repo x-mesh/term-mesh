@@ -827,7 +827,7 @@ final class GhosttyPaneSurfaceProvider: PeerSurfaceProvider {
         case .setDivider(let req):
             performSetDivider(splitIDBytes: req.splitID, ratio: req.ratio)
         case .newTab(let req):
-            performNewTab(paneIDBytes: req.paneID)
+            performNewTab(paneIDBytes: req.paneID, workspaceIDBytes: req.workspaceID)
         case .activateTab(let req):
             performActivateTab(paneIDBytes: req.paneID, surfaceIDBytes: req.surfaceID)
         case .none:
@@ -855,16 +855,47 @@ final class GhosttyPaneSurfaceProvider: PeerSurfaceProvider {
         workspace.bonsplitController.selectTab(targetTabID)
     }
 
-    private func performNewTab(paneIDBytes: Data) {
-        guard let panelUUID = uuidFromSurfaceID(paneIDBytes),
-              let workspace = workspaceContaining(panelUUID: panelUUID),
-              let tabID = workspace.surfaceIdFromPanelId(panelUUID)
-        else { return }
-        let targetPaneId = workspace.bonsplitController.allPaneIds.first { paneId in
-            workspace.bonsplitController.tabs(inPane: paneId).contains { $0.id == tabID }
+    /// Open a terminal tab, either beside a pane or in an empty workspace.
+    ///
+    /// `pane_id` names a pane to open next to, which is the ordinary case. It
+    /// is empty when the workspace was just created and has no pane to name yet
+    /// — `NewTabRequest.workspace_id` is the proto's answer to exactly that, and
+    /// the Rust host has always honoured it.
+    ///
+    /// This one used to read `pane_id` alone: the empty id failed the guard and
+    /// the request returned having done nothing. A project whose leader is
+    /// placed on a Mac peer got a fresh workspace and then waited fifteen polls
+    /// for a pane that nobody was going to open, which surfaced as "could not
+    /// prepare the project workspace" and no leader. Linux peers were unaffected
+    /// because the daemon reads both fields.
+    private func performNewTab(paneIDBytes: Data, workspaceIDBytes: Data = Data()) {
+        if let panelUUID = uuidFromSurfaceID(paneIDBytes),
+           let workspace = workspaceContaining(panelUUID: panelUUID),
+           let tabID = workspace.surfaceIdFromPanelId(panelUUID),
+           let targetPaneId = workspace.bonsplitController.allPaneIds.first(where: { paneId in
+               workspace.bonsplitController.tabs(inPane: paneId).contains { $0.id == tabID }
+           }) {
+            _ = workspace.newTerminalSurface(inPane: targetPaneId, focus: true)
+            return
         }
-        guard let targetPaneId else { return }
-        _ = workspace.newTerminalSurface(inPane: targetPaneId, focus: true)
+        // No pane to open beside. Fall back to the named workspace, which is
+        // only meaningful while it holds no surfaces — after that, a request
+        // carrying an unresolvable pane id is a stale locator, not a seed.
+        //
+        // A workspace made by `createWorkspace` has its root pane already; what
+        // it has none of is surfaces, which is also why it reports no panes to
+        // a peer listing them (`peerPaneSummaries` walks surfaces).
+        guard !workspaceIDBytes.isEmpty,
+              let workspaceUUID = uuidFromSurfaceID(workspaceIDBytes),
+              let workspace = allWindowContexts()
+                  .lazy
+                  .flatMap({ $0.tabManager.tabs })
+                  .first(where: { $0.id == workspaceUUID }),
+              workspace.panels.isEmpty,
+              let seedPane = workspace.bonsplitController.focusedPaneId
+                  ?? workspace.bonsplitController.allPaneIds.first
+        else { return }
+        _ = workspace.newTerminalSurface(inPane: seedPane, focus: true)
     }
 
     private func performSetDivider(splitIDBytes: Data, ratio: Double) {
