@@ -19,16 +19,6 @@ import XCTest
 @MainActor
 final class SessionHostPanesTests: XCTestCase {
 
-    override func setUp() {
-        super.setUp()
-        SessionHostPanes.forgetAll()
-    }
-
-    override func tearDown() {
-        SessionHostPanes.forgetAll()
-        super.tearDown()
-    }
-
     private func sid(_ byte: UInt8) -> Data { Data(repeating: byte, count: 16) }
 
     // MARK: - Which sessions get a pane
@@ -70,40 +60,77 @@ final class SessionHostPanesTests: XCTestCase {
         )
     }
 
-    // MARK: - Bookkeeping
+    // MARK: - Where "already shown" comes from
 
-    func test_markingShownAndClosedTracksWhatIsOnScreen() {
-        SessionHostPanes.markShown(sid(7))
+    /// The shown set is read off the panes, not remembered.
+    ///
+    /// It used to be a `Set` this type maintained, and each way it could drift
+    /// from the screen was its own bug: closing an auto-opened pane left the id
+    /// marked forever, because nothing ever called the release, so that session
+    /// could never come back. A brief loss of the daemon cleared the whole set
+    /// while the panes were still up, so the next pass opened a duplicate for
+    /// every one. With no window at all there is nothing on screen, and the
+    /// honest answer is the empty set rather than a remembered one.
+    func test_nothingIsShownWhenThereIsNoWindow() {
+        XCTAssertTrue(SessionHostPanes.shownSurfaceIDs().isEmpty)
+    }
+
+    /// Whatever the screen says, feeding it back in is what makes a second pass
+    /// a no-op — the property the removed bookkeeping was there to provide.
+    func test_whatIsOnScreenIsNotOpenedAgain() {
+        let onScreen = SessionHostPanes.shownSurfaceIDs().union([sid(7)])
         XCTAssertEqual(
             SessionHostPanes.sessionsNeedingPanes(
-                daemonSurfaces: [(sid(7), true)],
-                alreadyShown: SessionHostPanes.shownSurfaceIDs
+                daemonSurfaces: [(sid(7), true), (sid(8), true)],
+                alreadyShown: onScreen
             ),
-            []
-        )
-        SessionHostPanes.markClosed(sid(7))
-        XCTAssertEqual(
-            SessionHostPanes.sessionsNeedingPanes(
-                daemonSurfaces: [(sid(7), true)],
-                alreadyShown: SessionHostPanes.shownSurfaceIDs
-            ),
-            [sid(7)]
+            [sid(8)]
         )
     }
 
-    /// A daemon that went away and came back brings the same ids with it —
-    /// they are derived from keys — so a session returning under an id we
-    /// remember must be re-shown, not mistaken for one already up.
-    func test_aRestartedDaemonsSessionsAreShownAgain() {
-        SessionHostPanes.markShown(sid(9))
-        SessionHostPanes.forgetAll()
+    // MARK: - A closed pane stays closed
+
+    /// Reading "already shown" off the screen is also what undoes a close: the
+    /// daemon still holds the session, so the next pass finds it missing and
+    /// opens it again. Measured on a live app before this existed — a pane
+    /// closed at 23:02:15 was back at 23:02:25.
+    func test_aClosedPaneIsNotReopenedByTheNextPass() {
+        SessionHostPanes.forgetDismissalsForTests()
+        defer { SessionHostPanes.forgetDismissalsForTests() }
+
+        SessionHostPanes.noteClosedByUser(surfaceID: sid(4))
         XCTAssertEqual(
             SessionHostPanes.sessionsNeedingPanes(
-                daemonSurfaces: [(sid(9), true)],
-                alreadyShown: SessionHostPanes.shownSurfaceIDs
+                daemonSurfaces: [(sid(4), true), (sid(5), true)],
+                alreadyShown: SessionHostPanes.dismissedSurfaceIDsForTests
             ),
-            [sid(9)]
+            [sid(5)]
         )
+    }
+
+    /// A dismissal is safe to remember where the old "shown" bookkeeping was
+    /// not, because a close is its own owner — but only if the set cannot grow
+    /// for the life of the process.
+    func test_dismissalsAreDroppedOnceTheSessionIsGone() {
+        SessionHostPanes.forgetDismissalsForTests()
+        defer { SessionHostPanes.forgetDismissalsForTests() }
+
+        SessionHostPanes.noteClosedByUser(surfaceID: sid(4))
+        SessionHostPanes.noteClosedByUser(surfaceID: sid(5))
+        XCTAssertEqual(SessionHostPanes.dismissedSurfaceIDsForTests.count, 2)
+
+        SessionHostPanes.pruneDismissalsForTests(stillHeld: [sid(5)])
+        XCTAssertEqual(SessionHostPanes.dismissedSurfaceIDsForTests, [sid(5)])
+    }
+
+    /// Panes that were never a session get no entry — a remote pane on another
+    /// machine closes through the same funnel.
+    func test_aPaneWithNoSurfaceIdIsNotRecorded() {
+        SessionHostPanes.forgetDismissalsForTests()
+        defer { SessionHostPanes.forgetDismissalsForTests() }
+
+        SessionHostPanes.noteClosedByUser(surfaceID: Data())
+        XCTAssertTrue(SessionHostPanes.dismissedSurfaceIDsForTests.isEmpty)
     }
 
     // MARK: - Whether to look at all
@@ -130,7 +157,7 @@ extension SessionHostPanesTests {
     /// and nothing did. Panes restored from the previous run made that look
     /// like it had worked.
     func test_startupWaitsLongEnoughForADaemonToBind() {
-        let window = SessionHostPanes.startupSettleInterval * SessionHostPanes.startupSettleAttempts
+        let window = SessionHostPanes.startupSettleWindow
         XCTAssertGreaterThanOrEqual(
             window, .seconds(3),
             "a shorter window is the single-attempt bug with extra steps"
@@ -138,6 +165,32 @@ extension SessionHostPanesTests {
         XCTAssertLessThanOrEqual(
             window, .seconds(30),
             "a machine with no daemon serving is ordinary, not something to wait on"
+        )
+    }
+
+    /// The last attempt does not sleep after itself, so `attempts × interval`
+    /// overstates the wait by one interval. Asserting the overstated number
+    /// would let the real window shrink below the floor above without any test
+    /// noticing.
+    func test_theStatedWindowIsTheOneActuallyWaited() {
+        XCTAssertEqual(
+            SessionHostPanes.startupSettleWindow,
+            SessionHostPanes.startupSettleInterval * (SessionHostPanes.startupSettleAttempts - 1)
+        )
+    }
+
+    /// Sessions appear after startup — a peer-placed project creates one
+    /// minutes or hours in — so a single pass at server-start covered the case
+    /// this type exists for worst of all. Slow on purpose: a pass walks the
+    /// window list and opens a connection.
+    func test_itKeepsLookingAfterStartupRatherThanAskingOnce() {
+        XCTAssertGreaterThanOrEqual(
+            SessionHostPanes.pollInterval, .seconds(5),
+            "a pass is not free; noticing a minutes-old session within a second buys nothing"
+        )
+        XCTAssertLessThanOrEqual(
+            SessionHostPanes.pollInterval, .seconds(60),
+            "longer than this and a session created now feels like it was dropped"
         )
     }
 }
