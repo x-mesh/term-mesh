@@ -67,20 +67,40 @@ machine's daemon rather than a remote one.
 
 Each step is worth doing alone and ends somewhere observable.
 
-1. **Decouple the daemon's lifetime.** Stop terminating it in
+Steps 1–3 are done. What each one turned out to need is recorded with it,
+because two of the three needed far less than this note first assumed.
+
+1. **Decouple the daemon's lifetime.** *(done — `60b6669e`)* Stop terminating it in
    `applicationWillTerminate`; adopt a running daemon on start instead of
    assuming ownership. Observable: kill the app, `term-meshd` survives, restart
    the app, it reuses the same daemon.
 
-2. **`ensure` on a macOS peer.** Route `EnsureSurfaceRequest` from the Swift
-   peer server to that machine's `term-meshd` rather than answering it as
-   unsupported. Observable: `EnsureSurface` against a Mac peer returns a
-   surface id, and `tm-agent` on that machine sees the process.
+   The mechanism already existed — omitting `TERMMESH_OWNER_PID` leaves
+   `wait_for_owner_exit` waiting forever. What was missing was deciding when to
+   use it, so the change is a policy and its two call sites. Measured on a Mac
+   peer: app killed, daemon kept its pid; app restarted, adopted the same one;
+   daemon count stayed 1.
 
-3. **The app as a viewer of its own daemon.** Attach a pane to a local
-   daemon-owned surface through the existing peer-pane path. Observable: the
-   surface's output appears in a pane the app did not spawn, and survives that
-   pane closing.
+2. **`ensure` on a macOS peer.** *(done — `611b5ab9`)* No routing was needed:
+   the daemon serves the whole peer protocol when `TERMMESH_PEER_SOCKET` names
+   a path, which is how a Linux peer works. Setting it on the same condition as
+   step 1 was the entire change — a session nobody can reach and a session that
+   dies at a quit are the same non-feature. Measured: the daemon advertises
+   `surface.ensure.v1`, `EnsureSurface` returned CREATED, and the spawned
+   process's parent was the daemon rather than the app. With step 1, killing
+   the app left both daemon and session running and a restart found the same
+   two.
+
+3. **The app as a viewer of its own daemon.** *(done — no product change)*
+   Already possible and unused. `PeerPaneHostSpec.direct(sockPath:)` is a plain
+   local socket, and the self-attach guard compares against the *app's* peer
+   socket, so the daemon's is a different path and passes — correctly, since
+   the daemon's surfaces are not the app's and no loop exists. Measured: a
+   session created on the daemon by a client that was not the app, opened via
+   `debug.peer.open_remote_pane`, and the pane rendered its output.
+
+   That the remaining steps are about *choosing* this path rather than building
+   it is the main thing this spike established.
 
 4. **Place a remote member on it.** `attachRemoteAgent` asks the peer to ensure
    a session instead of spawning over ssh. Observable: the member appears on
