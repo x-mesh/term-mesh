@@ -855,6 +855,37 @@ final class GhosttyPaneSurfaceProvider: PeerSurfaceProvider {
         workspace.bonsplitController.selectTab(targetTabID)
     }
 
+    /// What a `NewTabRequest` should do, given what its two locators resolve to.
+    ///
+    /// Split out from `performNewTab` because the bug was in the decision, not
+    /// in the doing: `workspace_id` was never consulted, so the empty-workspace
+    /// case — the one the field exists for — fell out of the guard and did
+    /// nothing at all.
+    enum NewTabTarget: Equatable {
+        /// `pane_id` named a live pane; open the tab beside it.
+        case besidePane
+        /// `pane_id` could not be resolved and `workspace_id` names a workspace
+        /// with no surfaces yet. This is the seed the leader placement waits on.
+        case seedWorkspace
+        /// Neither locator is usable, or the workspace already has surfaces —
+        /// in which case an unresolvable pane id is a stale locator rather than
+        /// a request to add another tab.
+        case ignore
+    }
+
+    /// `nonisolated` because it decides from four booleans and touches nothing
+    /// — the resolving that does needs the main actor stays in `performNewTab`.
+    nonisolated static func newTabTarget(
+        paneResolved: Bool,
+        hasWorkspaceID: Bool,
+        workspaceFound: Bool,
+        workspaceHasSurfaces: Bool
+    ) -> NewTabTarget {
+        if paneResolved { return .besidePane }
+        guard hasWorkspaceID, workspaceFound, !workspaceHasSurfaces else { return .ignore }
+        return .seedWorkspace
+    }
+
     /// Open a terminal tab, either beside a pane or in an empty workspace.
     ///
     /// `pane_id` names a pane to open next to, which is the ordinary case. It
@@ -869,33 +900,45 @@ final class GhosttyPaneSurfaceProvider: PeerSurfaceProvider {
     /// prepare the project workspace" and no leader. Linux peers were unaffected
     /// because the daemon reads both fields.
     private func performNewTab(paneIDBytes: Data, workspaceIDBytes: Data = Data()) {
+        // Resolve both locators first, then let `newTabTarget` decide.
+        var besidePane: (workspace: Workspace, pane: PaneID)?
         if let panelUUID = uuidFromSurfaceID(paneIDBytes),
            let workspace = workspaceContaining(panelUUID: panelUUID),
            let tabID = workspace.surfaceIdFromPanelId(panelUUID),
            let targetPaneId = workspace.bonsplitController.allPaneIds.first(where: { paneId in
                workspace.bonsplitController.tabs(inPane: paneId).contains { $0.id == tabID }
            }) {
-            _ = workspace.newTerminalSurface(inPane: targetPaneId, focus: true)
+            besidePane = (workspace, targetPaneId)
+        }
+
+        // A workspace made by `createWorkspace` has its root pane already; what
+        // it has none of is surfaces — which is also why it reports no panes to
+        // a peer listing them, since `peerPaneSummaries` walks surfaces.
+        let namedWorkspace: Workspace? = uuidFromSurfaceID(workspaceIDBytes).flatMap { uuid in
+            allWindowContexts()
+                .lazy
+                .flatMap { $0.tabManager.tabs }
+                .first { $0.id == uuid }
+        }
+
+        switch Self.newTabTarget(
+            paneResolved: besidePane != nil,
+            hasWorkspaceID: !workspaceIDBytes.isEmpty,
+            workspaceFound: namedWorkspace != nil,
+            workspaceHasSurfaces: !(namedWorkspace?.panels.isEmpty ?? true)
+        ) {
+        case .besidePane:
+            guard let besidePane else { return }
+            _ = besidePane.workspace.newTerminalSurface(inPane: besidePane.pane, focus: true)
+        case .seedWorkspace:
+            guard let workspace = namedWorkspace,
+                  let seedPane = workspace.bonsplitController.focusedPaneId
+                      ?? workspace.bonsplitController.allPaneIds.first
+            else { return }
+            _ = workspace.newTerminalSurface(inPane: seedPane, focus: true)
+        case .ignore:
             return
         }
-        // No pane to open beside. Fall back to the named workspace, which is
-        // only meaningful while it holds no surfaces — after that, a request
-        // carrying an unresolvable pane id is a stale locator, not a seed.
-        //
-        // A workspace made by `createWorkspace` has its root pane already; what
-        // it has none of is surfaces, which is also why it reports no panes to
-        // a peer listing them (`peerPaneSummaries` walks surfaces).
-        guard !workspaceIDBytes.isEmpty,
-              let workspaceUUID = uuidFromSurfaceID(workspaceIDBytes),
-              let workspace = allWindowContexts()
-                  .lazy
-                  .flatMap({ $0.tabManager.tabs })
-                  .first(where: { $0.id == workspaceUUID }),
-              workspace.panels.isEmpty,
-              let seedPane = workspace.bonsplitController.focusedPaneId
-                  ?? workspace.bonsplitController.allPaneIds.first
-        else { return }
-        _ = workspace.newTerminalSurface(inPane: seedPane, focus: true)
     }
 
     private func performSetDivider(splitIDBytes: Data, ratio: Double) {

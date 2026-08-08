@@ -1877,6 +1877,79 @@ final class PeerProjectBootstrapTests: XCTestCase {
         )
     }
 
+    // MARK: - Seeding a pane into a freshly created peer workspace
+    //
+    // The leader is placed by creating a workspace on the peer and then asking
+    // it to open a tab. That ask carries an empty `pane_id` — the workspace has
+    // no pane to name yet — and a `workspace_id`, which is the field the proto
+    // added for exactly this. The Rust host reads both. The Mac host read only
+    // `pane_id`, so the empty id failed its guard and the request did nothing:
+    // the placement loop then waited fifteen polls for a pane nobody was going
+    // to open, and the project came up with every agent running and no leader.
+
+    func test_anEmptyPaneIDFallsBackToTheNamedWorkspace() {
+        XCTAssertEqual(
+            GhosttyPaneSurfaceProvider.newTabTarget(
+                paneResolved: false,
+                hasWorkspaceID: true,
+                workspaceFound: true,
+                workspaceHasSurfaces: false
+            ),
+            .seedWorkspace
+        )
+    }
+
+    func test_aResolvablePaneWins() {
+        XCTAssertEqual(
+            GhosttyPaneSurfaceProvider.newTabTarget(
+                paneResolved: true,
+                hasWorkspaceID: true,
+                workspaceFound: true,
+                workspaceHasSurfaces: false
+            ),
+            .besidePane,
+            "workspace_id is the empty-workspace fallback, not an override"
+        )
+    }
+
+    /// Once the workspace has surfaces, an unresolvable pane id is a stale
+    /// locator — seeding another terminal off it would be a second, unasked-for
+    /// tab every time a client retried with an old id.
+    func test_aWorkspaceThatAlreadyHasSurfacesIsNotSeededAgain() {
+        XCTAssertEqual(
+            GhosttyPaneSurfaceProvider.newTabTarget(
+                paneResolved: false,
+                hasWorkspaceID: true,
+                workspaceFound: true,
+                workspaceHasSurfaces: true
+            ),
+            .ignore
+        )
+    }
+
+    func test_nothingToActOnIsIgnored() {
+        XCTAssertEqual(
+            GhosttyPaneSurfaceProvider.newTabTarget(
+                paneResolved: false,
+                hasWorkspaceID: false,
+                workspaceFound: false,
+                workspaceHasSurfaces: false
+            ),
+            .ignore,
+            "the pre-fix behaviour for every request, which is why it was silent"
+        )
+        XCTAssertEqual(
+            GhosttyPaneSurfaceProvider.newTabTarget(
+                paneResolved: false,
+                hasWorkspaceID: true,
+                workspaceFound: false,
+                workspaceHasSurfaces: false
+            ),
+            .ignore,
+            "a workspace id this host does not know is not a licence to guess one"
+        )
+    }
+
     /// The failure that started this carried only a host name, so the sheet had
     /// nothing to show and Troubleshoot had nothing to open.
     func test_workspaceUnavailableSaysWhatItWaitedForAndWhetherItAsked() {
