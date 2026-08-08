@@ -218,6 +218,20 @@ extension TeamOrchestrator {
             generations[generation.teamName] = generation.value &+ 1
         }
 
+        /// The value in force now, for a caller that wants to notice a retirement
+        /// without claiming a generation of its own.
+        ///
+        /// A remote agent attach is that caller: it is not the leader, so it has
+        /// no attempt to carry, but it commits the same two things a deletion
+        /// tears down — a surface record and a team member.
+        func current(teamName: String) -> UInt64 {
+            generations[teamName] ?? 0
+        }
+
+        func isCurrent(teamName: String, value: UInt64) -> Bool {
+            current(teamName: teamName) == value
+        }
+
         /// Retire whatever generation is current, for a caller that holds none.
         ///
         /// Project deletion is that caller. It tears down against a snapshot of
@@ -1989,6 +2003,17 @@ extension TeamOrchestrator {
         guard host.isLaunchable else {
             throw RemoteAgentError.hostNotConnected(host.displayName)
         }
+        // An agent attach is not the leader, so it carries no attempt — but it
+        // commits the same two things a project deletion tears down: a surface
+        // record and a team member. Snapshot the generation now and refuse to
+        // commit against a retired one, or a deletion that started mid-attach
+        // finishes against a snapshot this then adds to, and the remote process
+        // outlives everything pointing at it.
+        let attachGeneration = LeaderAttachGenerationGate.shared.current(teamName: teamName)
+        func attachStillWanted() -> Bool {
+            LeaderAttachGenerationGate.shared
+                .isCurrent(teamName: teamName, value: attachGeneration)
+        }
         guard let tabManager = AppDelegate.shared?.tabManagerFor(tabId: team.workspaceId),
               let workspace = tabManager.tabs.first(where: { $0.id == team.workspaceId }) else {
             throw RemoteAgentError.workspaceGone
@@ -2150,6 +2175,9 @@ extension TeamOrchestrator {
                     chosen = fresh
                 }
             }
+            guard attachStillWanted() else {
+                throw RemoteAgentError.teamNotFound(teamName)
+            }
             if let chosen,
                usesDedicatedWorkspace || !surfaces.contains(where: { $0.surfaceID == chosen.surfaceID }) {
                 spawnedSurface = true
@@ -2226,6 +2254,12 @@ extension TeamOrchestrator {
             hostKey: hostKey,
             originalAgentWorkDir: workingDirectory
         )
+        // Last gate before the member becomes part of the team. A deletion that
+        // began while this was attaching has already decided the roster; adding
+        // to it here is the orphan.
+        guard attachStillWanted() else {
+            throw RemoteAgentError.teamNotFound(teamName)
+        }
         guard adoptAgentMember(member, teamName: teamName) else {
             _ = workspace.closePanel(panel.id, force: true)
             if let spawnedSurfaceID {
@@ -3047,9 +3081,17 @@ extension TeamOrchestrator {
                     )
                 }
             }
+            let rosterGeneration = LeaderAttachGenerationGate.shared.current(teamName: team.id)
             for resolved in resolvedRemoteRows {
                 let row = resolved.row
                 guard let hostKey = row.hostKey else { continue }
+                // Stop starting new ones once a deletion has retired the
+                // generation. Attaching agents 3..N into a project that is being
+                // removed leaves exactly the checkouts and surfaces the removal
+                // has already walked past.
+                guard LeaderAttachGenerationGate.shared
+                    .isCurrent(teamName: team.id, value: rosterGeneration)
+                else { break }
                 do {
                     _ = try await self.attachRemoteAgent(
                         teamName: team.id,

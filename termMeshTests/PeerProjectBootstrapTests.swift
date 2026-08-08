@@ -2043,6 +2043,35 @@ final class ProjectCreationRecoveryTests: XCTestCase {
         )
     }
 
+    /// An agent attach is not the leader and carries no attempt, so it notices
+    /// a retirement by snapshotting the value instead. Without this it commits
+    /// a surface record and a team member into a roster the deletion has
+    /// already walked past, and the remote process outlives both.
+    func test_anAgentAttachNoticesARetirementWithoutHoldingAGeneration() {
+        let gate = TeamOrchestrator.LeaderAttachGenerationGate.shared
+        let snapshot = gate.current(teamName: "xm-agents")
+        XCTAssertTrue(gate.isCurrent(teamName: "xm-agents", value: snapshot))
+
+        gate.invalidateAll(teamName: "xm-agents")
+        XCTAssertFalse(
+            gate.isCurrent(teamName: "xm-agents", value: snapshot),
+            "the attach must refuse to commit from here"
+        )
+    }
+
+    /// The leader's own gate and an agent's snapshot read the same counter, so
+    /// one deletion retires both rather than only whichever mechanism the
+    /// caller happened to use.
+    func test_oneRetirementCoversTheLeaderAndItsAgents() {
+        let gate = TeamOrchestrator.LeaderAttachGenerationGate.shared
+        let leader = gate.begin(teamName: "xm-both")
+        let agentSnapshot = gate.current(teamName: "xm-both")
+
+        gate.invalidateAll(teamName: "xm-both")
+        XCTAssertFalse(gate.isCurrent(leader))
+        XCTAssertFalse(gate.isCurrent(teamName: "xm-both", value: agentSnapshot))
+    }
+
     /// A caller holding no generation is exactly the deletion case, and it
     /// must still retire one that was never begun — a team whose first attach
     /// has not started yet is not a team that may be raced later.
