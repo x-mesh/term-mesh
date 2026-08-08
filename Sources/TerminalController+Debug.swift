@@ -2999,3 +2999,22 @@ extension TerminalController {
 
 
 }
+
+extension TerminalController {
+    /// Show this machine's daemon-held sessions now, rather than waiting for
+    /// whatever would have triggered it. Exists so the behaviour can be driven
+    /// and observed without a project and a second machine.
+    ///
+    /// Reports that it started, not how many it opened. Waiting for the count
+    /// would mean blocking the main actor on work that needs the main actor —
+    /// which this did, deadlocked for its whole timeout, and then answered
+    /// `opened: 0` while the panes it had opened were appearing on screen. The
+    /// count lands in the log; a probe that lies is worse than one that says
+    /// less.
+    func v2DebugSessionHostReconcile() -> V2CallResult {
+        Task { @MainActor in
+            await SessionHostPanes.reconcile()
+        }
+        return .ok(["started": true])
+    }
+}

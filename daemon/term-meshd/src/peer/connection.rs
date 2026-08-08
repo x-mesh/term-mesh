@@ -1448,6 +1448,11 @@ fn host_hello(seq_counter: &AtomicU64, has_teams: bool) -> Envelope {
                 .collect(),
             app_version: env!("CARGO_PKG_VERSION").into(),
             cli_bin_dirs: executable_bin_dir().into_iter().collect(),
+            // This process *is* the session owner: it serves this protocol on
+            // the socket it was told to, and it outlives whatever started it.
+            // Naming it lets a client reach sessions here directly instead of
+            // guessing a path from a socket layout it does not control.
+            session_host_socket: std::env::var("TERMMESH_PEER_SOCKET").unwrap_or_default(),
         })),
     }
 }
