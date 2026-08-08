@@ -34,6 +34,33 @@ const DEFAULT_AGENT_NAMES: &[&str] = &[
 ];
 const DEFAULT_AGENT_COLORS: &[&str] = &["green", "blue", "yellow", "magenta", "cyan", "red"];
 
+/// Marker for "git-kit is not on this machine", so a caller can tell an
+/// absent tool from a tool that ran and said no. Matched by
+/// `worktree_isolation_unavailable`, never by eyeballing a message.
+const GIT_KIT_MISSING: &str = "git-kit is not installed on this machine";
+
+/// Whether a worktree failure means isolation is simply unavailable here.
+fn worktree_isolation_unavailable(error: &str) -> bool {
+    error.contains(GIT_KIT_MISSING)
+}
+
+/// Whether a failed worktree acquire should stop the delegation.
+///
+/// `always` is the caller demanding isolation, so an unavailable tool is a
+/// real failure. `auto` is a heuristic — "isolate mutating executor work" —
+/// and a heuristic that cannot run should step aside, not block the task. It
+/// used to block: a peer leader delegating anything mutating died on
+/// `worktree acquire failed: failed to run git-kit: No such file or directory`,
+/// naming a tool the user never asked term-mesh to use, on a machine that had
+/// no reason to have it. Neither peer in a two-machine project had git-kit.
+fn worktree_failure_is_fatal(policy: WorktreePolicyArg, error: &str) -> bool {
+    match policy {
+        WorktreePolicyArg::Off => true,
+        WorktreePolicyArg::Always => true,
+        WorktreePolicyArg::Auto => !worktree_isolation_unavailable(error),
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 enum WorktreePolicyArg {
     Auto,
@@ -11388,9 +11415,18 @@ fn run_gk_json(args: &[String], cwd: Option<&str>) -> Result<Value, String> {
     if let Some(cwd) = cwd {
         cmd.current_dir(cwd);
     }
-    let output = cmd
-        .output()
-        .map_err(|e| format!("failed to run git-kit: {e}"))?;
+    let output = cmd.output().map_err(|e| {
+        // Distinguish "the tool is not installed here" from "the tool ran and
+        // objected". Only the first is safe to shrug off: a peer is a machine
+        // term-mesh was pointed at, not one it provisioned, so git-kit being
+        // absent says nothing about the repository. A git-kit that exists and
+        // refuses is telling us something, and callers must keep failing on it.
+        if e.kind() == std::io::ErrorKind::NotFound {
+            GIT_KIT_MISSING.to_string()
+        } else {
+            format!("failed to run git-kit: {e}")
+        }
+    })?;
     let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
     let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
     if !stdout.is_empty() {
@@ -11696,17 +11732,31 @@ fn run_delegate_result_with_worktree(
         .to_string();
 
     let branch = worktree_branch_for_task(team, &task, text);
-    let meta = match gk_wt_acquire(&branch, from_ref, working_directory) {
-        Ok(meta) => meta,
+    // `null` when isolation was unavailable and the policy allowed proceeding,
+    // so the caller can tell "isolated at this path" from "shared checkout"
+    // instead of inferring it from a field's absence.
+    let mut worktree_path = Value::Null;
+    match gk_wt_acquire(&branch, from_ref, working_directory) {
+        Ok(meta) => {
+            worktree_path = Value::String(meta.path.clone());
+            let updated = update_task_with_worktree(sock, team, &task_id, &meta, worktree_policy)
+                .map_err(|e| format!("task.update worktree metadata failed: {e}"))?;
+            task = updated["result"].clone();
+        }
+        Err(e) if !worktree_failure_is_fatal(worktree_policy, &e) => {
+            // Say it rather than silently dropping isolation: the task runs in
+            // the shared checkout from here, which is a different concurrency
+            // story than the caller's policy implied.
+            eprintln!(
+                "note: {e}; running {task_id} in the shared checkout without worktree isolation"
+            );
+        }
         Err(e) => {
             let reason = format!("worktree acquire failed: {e}");
             block_task_for_worktree_error(sock, team, &task_id, &reason);
             return Err(format!("{reason} (task_id={task_id})"));
         }
-    };
-    let updated = update_task_with_worktree(sock, team, &task_id, &meta, worktree_policy)
-        .map_err(|e| format!("task.update worktree metadata failed: {e}"))?;
-    task = updated["result"].clone();
+    }
 
     let instruction =
         format_task_instruction(sock, team, &task, text, no_report, context, fix_budget);
@@ -11734,7 +11784,7 @@ fn run_delegate_result_with_worktree(
                     "delivery failed; task blocked: {reason} (task_id={task_id})"
                 ));
             }
-            return Ok(json!({ "task": task, "send": { "ok": sent_ok }, "worktree": meta.path }));
+            return Ok(json!({ "task": task, "send": { "ok": sent_ok }, "worktree": worktree_path }));
         }
     }
 
@@ -11768,7 +11818,7 @@ fn run_delegate_result_with_worktree(
         panel_id,
         agent_instance_id,
     );
-    Ok(json!({ "task": task, "send": sent, "worktree": meta.path }))
+    Ok(json!({ "task": task, "send": sent, "worktree": worktree_path }))
 }
 
 fn run_delegate(
@@ -14579,6 +14629,12 @@ fn run_claim(sock: &PathBuf, team: &str, agent: &str) {
                                 }
                             }
                         }
+                        Err(e) if !worktree_failure_is_fatal(policy, &e) => {
+                            eprintln!(
+                                "note: {e}; running {task_id} in the shared checkout \
+                                 without worktree isolation"
+                            );
+                        }
                         Err(e) => {
                             let reason = format!("worktree acquire failed: {e}");
                             block_task_for_worktree_error(sock, team, &task_id, &reason);
@@ -16393,5 +16449,50 @@ mod version_skew_tests {
     #[test]
     fn an_unknown_app_build_is_not_a_mismatch() {
         assert_eq!(version_skew_note("abc123456", "", "0.170.1", "unknown"), None);
+    }
+}
+
+#[cfg(test)]
+mod worktree_availability_tests {
+    use super::*;
+
+    /// The failure that started this: a leader on one peer delegating to an
+    /// agent on another died on `worktree acquire failed: failed to run
+    /// git-kit: No such file or directory`. Neither machine had git-kit, and
+    /// neither had any reason to — term-mesh was pointed at them, it did not
+    /// provision them.
+    #[test]
+    fn a_missing_tool_is_not_fatal_under_auto() {
+        let missing = GIT_KIT_MISSING.to_string();
+        assert!(worktree_isolation_unavailable(&missing));
+        assert!(!worktree_failure_is_fatal(WorktreePolicyArg::Auto, &missing));
+    }
+
+    /// `always` is the caller demanding isolation. An unavailable tool is then
+    /// a real failure, and silently dropping isolation would hand two writers
+    /// the same checkout while the task board claimed otherwise.
+    #[test]
+    fn a_missing_tool_is_still_fatal_under_always() {
+        assert!(worktree_failure_is_fatal(
+            WorktreePolicyArg::Always,
+            GIT_KIT_MISSING
+        ));
+    }
+
+    /// A git-kit that ran and objected is saying something about the
+    /// repository. Only absence is shrugged off.
+    #[test]
+    fn a_tool_that_ran_and_refused_is_fatal_even_under_auto() {
+        let refused = "gk wt acquire: branch is checked out elsewhere";
+        assert!(!worktree_isolation_unavailable(refused));
+        assert!(worktree_failure_is_fatal(WorktreePolicyArg::Auto, refused));
+    }
+
+    /// The marker has to survive being wrapped by the callers that prefix it.
+    #[test]
+    fn the_marker_survives_the_wrapping_callers_add() {
+        let wrapped = format!("worktree acquire failed: {GIT_KIT_MISSING}");
+        assert!(worktree_isolation_unavailable(&wrapped));
+        assert!(!worktree_failure_is_fatal(WorktreePolicyArg::Auto, &wrapped));
     }
 }
