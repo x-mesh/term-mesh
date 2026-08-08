@@ -352,76 +352,47 @@ struct NewProjectView: View {
             }
 
             Divider()
-            if creationError == nil {
-                Toggle("Show launch commands", isOn: $showsBootCommands)
-                    .toggleStyle(.switch)
-                    .controlSize(.small)
-                    .font(.caption)
-                    .padding(.horizontal, 24)
-                    .padding(.vertical, 12)
-            } else {
-                bootFailureActions
+            if creationError != nil, showsFailureDetail {
+                bootFailureDetail
             }
+            Toggle("Show launch commands", isOn: $showsBootCommands)
+                .toggleStyle(.switch)
+                .controlSize(.small)
+                .font(.caption)
+                .padding(.horizontal, 24)
+                .padding(.vertical, 12)
         }
         .accessibilityIdentifier("newProject.bootProgress")
     }
 
-    /// What to do about a project that did not fully start.
+    /// What is known about the failure, opened by Troubleshoot.
     ///
-    /// The sheet stays here rather than closing, because this is the only
-    /// moment the person is still looking. Discard leads, because a project
-    /// whose leader never arrived leaves checkouts on every peer that nothing
-    /// will ever use — and the previous behaviour, closing onto it silently, is
-    /// how eight of them accumulated unnoticed.
-    private var bootFailureActions: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            if showsFailureDetail {
-                VStack(alignment: .leading, spacing: 6) {
-                    ForEach(failedStepMessages, id: \.self) { message in
-                        Text(message)
-                            .font(.system(.caption, design: .monospaced))
-                            .textSelection(.enabled)
-                            .fixedSize(horizontal: false, vertical: true)
-                    }
-                    Divider()
-                    Text("Full log: \(RemoteWorkLog.path)")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .textSelection(.enabled)
-                    Text("A machine that cannot be reached at all shows up in Settings → Peer Hosts → Test.")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
-                .padding(12)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .background(Color.secondary.opacity(0.08), in: RoundedRectangle(cornerRadius: 6))
+    /// The actions themselves live in the sheet's one footer — a second row of
+    /// buttons here meant two Retries and two default-action shortcuts.
+    private var bootFailureDetail: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            ForEach(failedStepMessages, id: \.self) { message in
+                Text(message)
+                    .font(.system(.caption, design: .monospaced))
+                    .textSelection(.enabled)
+                    .fixedSize(horizontal: false, vertical: true)
             }
-            HStack(spacing: 10) {
-                Button("Troubleshoot") { showsFailureDetail.toggle() }
-                    .accessibilityIdentifier("newProject.failure.troubleshoot")
-                Button("Keep as is") {
-                    onClose()
-                }
-                .accessibilityIdentifier("newProject.failure.keep")
-                Spacer()
-                Button("Retry") { startCreation() }
-                    .accessibilityIdentifier("newProject.failure.retry")
-                Button("Discard and close") {
-                    Task { @MainActor in
-                        isDiscarding = true
-                        await onDiscard(effectiveName)
-                        isDiscarding = false
-                        onClose()
-                    }
-                }
-                .keyboardShortcut(.defaultAction)
-                .disabled(isDiscarding)
-                .accessibilityIdentifier("newProject.failure.discard")
-            }
+            Divider()
+            Text("Full log: \(RemoteWorkLog.path)")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .textSelection(.enabled)
+            Text("A machine that cannot be reached at all shows up in Settings → Peer Hosts → Test.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
         }
+        .padding(12)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Color.secondary.opacity(0.08), in: RoundedRectangle(cornerRadius: 6))
         .padding(.horizontal, 24)
-        .padding(.vertical, 14)
+        .padding(.bottom, 12)
+        .accessibilityIdentifier("newProject.failure.detail")
     }
 
     private var failedStepMessages: [String] {
@@ -1604,15 +1575,36 @@ struct NewProjectView: View {
             HStack(spacing: 10) {
                 if showsCreationProgress {
                     if creationError != nil {
+                        Button(showsFailureDetail ? "Hide details" : "Troubleshoot") {
+                            showsFailureDetail.toggle()
+                        }
+                        .accessibilityIdentifier("newProject.failure.troubleshoot")
                         Button("Back to settings") {
                             showsCreationProgress = false
                             creationError = nil
+                            showsFailureDetail = false
                         }
                         .keyboardShortcut(.cancelAction)
+                        // Closing onto a project whose leader never arrived is
+                        // what left checkouts on peers that nothing would use,
+                        // so it is a deliberate choice rather than the way out.
+                        Button("Keep as is", action: onClose)
+                            .accessibilityIdentifier("newProject.failure.keep")
                         Button("Retry project") {
                             startCreation()
                         }
+                        .accessibilityIdentifier("newProject.failure.retry")
+                        Button("Discard and close") {
+                            Task { @MainActor in
+                                isDiscarding = true
+                                await onDiscard(effectiveName)
+                                isDiscarding = false
+                                onClose()
+                            }
+                        }
                         .keyboardShortcut(.defaultAction)
+                        .disabled(isDiscarding)
+                        .accessibilityIdentifier("newProject.failure.discard")
                     } else {
                         Button("Starting…") {}
                             .disabled(true)
