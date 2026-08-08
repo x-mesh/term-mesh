@@ -118,19 +118,28 @@ because two of the three needed far less than this note first assumed.
    target AND socket, so both the app and its daemon are reachable at once
    without new transport.
 
-   *Peer-side half landed, trigger unresolved.* `SessionHostPanes` attaches a
+   *(done — `910bc505`)* `SessionHostPanes` attaches a
    pane per daemon-held session — measured opening three at once, idempotent on
    a second pass. Mirroring was ruled out first: the daemon places ensured
    sessions as *tabs* in one pane, deliberately, and `PeerWorkspaceMirror` has
    no notion of a tab strip, so a mirror of a daemon holding three showed one.
 
-   What does not work yet is it running by itself. Wired to the peer server's
-   success path, it produced no log line at all on an `open`-launched app,
-   which means that path is not reached there rather than that it found
-   nothing. Every give-up now says which half was missing — no session host, no
-   workspace yet, or nothing new — so the next attempt reads the answer instead
-   of inferring it from silence. Panes restored from the previous run made this
-   look like it was working twice.
+   It runs by itself too. Measured end to end: three sessions created on the
+   daemon by a client that was not the app, the app killed, the app reopened —
+   `Showing 4 sessions this machine's daemon is holding`, with each pane
+   attached to the surviving daemon.
+
+   That took three false negatives to see, all the same mistake. `reload.sh`
+   replaces the daemon, so a "restart" through it takes the sessions with it.
+   Panes restored from the previous run look exactly like panes this opened.
+   And an `open`-launched tagged app does not carry `TERMMESH_TAG`, so
+   `RemoteWorkLog` writes to `/tmp/term-mesh-remote-work.log` and not the
+   tagged file — reading the tagged one and finding nothing is not evidence
+   that nothing happened.
+
+   Every give-up path now names which half was missing — no session host, no
+   workspace yet, or nothing new — so the next reader is not left inferring
+   from silence.
 
 5. **Return the native panel.** With an owner that can serve two views, the
    `AgentPanel` reads the structured stream while the peer's pane renders it.
