@@ -22,6 +22,7 @@
 		A14000000000000000000002 /* ProjectSyncPanelView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A14000000000000000000005 /* ProjectSyncPanelView.swift */; };
 		A14000000000000000000003 /* ProjectSyncViewModelTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A14000000000000000000006 /* ProjectSyncViewModelTests.swift */; };
 		PPBT00000000000000003 /* PeerProjectBootstrapTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = PPBT00000000000000006 /* PeerProjectBootstrapTests.swift */; };
+		RLBT00000000000000003 /* RemoteLeaderBriefingTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = RLBT00000000000000006 /* RemoteLeaderBriefingTests.swift */; };
 		WSRP00000000000000003 /* WorkspaceSurfaceRealizationPinTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = WSRP00000000000000006 /* WorkspaceSurfaceRealizationPinTests.swift */; };
 		SMRT00000000000000003 /* StrayMouseReportTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = SMRT00000000000000006 /* StrayMouseReportTests.swift */; };
 		PPPT00000000000000003 /* PredictedProjectPathTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = PPPT00000000000000006 /* PredictedProjectPathTests.swift */; };
@@ -360,6 +361,7 @@
 			A14000000000000000000005 /* ProjectSyncPanelView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ProjectSyncPanelView.swift; sourceTree = "<group>"; };
 			A14000000000000000000006 /* ProjectSyncViewModelTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ProjectSyncViewModelTests.swift; sourceTree = "<group>"; };
 			PPBT00000000000000006 /* PeerProjectBootstrapTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PeerProjectBootstrapTests.swift; sourceTree = "<group>"; };
+			RLBT00000000000000006 /* RemoteLeaderBriefingTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RemoteLeaderBriefingTests.swift; sourceTree = "<group>"; };
 			WSRP00000000000000006 /* WorkspaceSurfaceRealizationPinTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WorkspaceSurfaceRealizationPinTests.swift; sourceTree = "<group>"; };
 			SMRT00000000000000006 /* StrayMouseReportTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StrayMouseReportTests.swift; sourceTree = "<group>"; };
 			PPPT00000000000000006 /* PredictedProjectPathTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PredictedProjectPathTests.swift; sourceTree = "<group>"; };
@@ -1012,6 +1014,7 @@ A1740000000000000000000C /* ProcessRun.swift */,
 				PHCBDR0000000000000000A2 /* PeerHostCLIBinDirsReadinessTests.swift */,
 				A14000000000000000000006 /* ProjectSyncViewModelTests.swift */,
 				PPBT00000000000000006 /* PeerProjectBootstrapTests.swift */,
+				RLBT00000000000000006 /* RemoteLeaderBriefingTests.swift */,
 				WSRP00000000000000006 /* WorkspaceSurfaceRealizationPinTests.swift */,
 				SMRT00000000000000006 /* StrayMouseReportTests.swift */,
 				PPPT00000000000000006 /* PredictedProjectPathTests.swift */,
@@ -1432,6 +1435,7 @@ A1740000000000000000000B /* ProcessRun.swift in Sources */,
 				PHCBDR0000000000000000A1 /* PeerHostCLIBinDirsReadinessTests.swift in Sources */,
 				A14000000000000000000003 /* ProjectSyncViewModelTests.swift in Sources */,
 				PPBT00000000000000003 /* PeerProjectBootstrapTests.swift in Sources */,
+				RLBT00000000000000003 /* RemoteLeaderBriefingTests.swift in Sources */,
 				WSRP00000000000000003 /* WorkspaceSurfaceRealizationPinTests.swift in Sources */,
 				SMRT00000000000000003 /* StrayMouseReportTests.swift in Sources */,
 				PPPT00000000000000003 /* PredictedProjectPathTests.swift in Sources */,

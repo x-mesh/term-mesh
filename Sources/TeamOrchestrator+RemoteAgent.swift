@@ -1526,7 +1526,14 @@ extension TeamOrchestrator {
                 remoteSocketPath: host.remoteSockPath ?? "inherited from TERMMESH_SOCKET"
             )
         } else {
-            systemPrompt = LeaderParallelPolicy.renderedInstructions
+            // Recovery had the same CLI-shaped hole as creation: a restarted
+            // codex leader came back knowing how to schedule and not who for.
+            systemPrompt = Self.remoteLeaderNonClaudeRecoverySystemPrompt(
+                teamName: teamName,
+                agents: team.agents,
+                remoteWorkingDirectory: workingDirectory,
+                remoteSocketPath: host.remoteSockPath ?? "inherited from TERMMESH_SOCKET"
+            )
         }
 
         do {
@@ -2827,10 +2834,19 @@ extension TeamOrchestrator {
                     remoteSocketPath: remoteSocketPath
                 )
             } else {
-                // Non-Claude peer CLIs receive the same canonical payload via
-                // a staged file plus `LeaderParallelPolicy.launchDirective`.
-                // Do not copy routing rules into this launch path.
-                remoteLeaderSystemPrompt = LeaderParallelPolicy.renderedInstructions
+                // The staged file is this string, so whatever is left out here
+                // is left out entirely. Sending only the routing policy taught
+                // the leader how to schedule work it had no way to name: no
+                // team, no roster, no tm-agent. The renderer already embeds
+                // `LeaderParallelPolicy.renderedInstructions`, so the routing
+                // rules still arrive — with the team around them.
+                guard let resolvedRemoteLeaderWorkingDirectory else { return nil }
+                remoteLeaderSystemPrompt = Self.remoteLeaderNonClaudeSystemPrompt(
+                    teamName: teamName,
+                    rows: rows,
+                    remoteWorkingDirectory: resolvedRemoteLeaderWorkingDirectory,
+                    remoteSocketPath: remoteSocketPath
+                )
             }
         } else {
             remoteLeaderSystemPrompt = nil
