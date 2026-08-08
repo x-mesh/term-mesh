@@ -1893,7 +1893,7 @@ final class PeerProjectBootstrapTests: XCTestCase {
                 paneResolved: false,
                 hasWorkspaceID: true,
                 workspaceFound: true,
-                workspaceHasSurfaces: false
+                workspaceHasPanels: false
             ),
             .seedWorkspace
         )
@@ -1905,23 +1905,30 @@ final class PeerProjectBootstrapTests: XCTestCase {
                 paneResolved: true,
                 hasWorkspaceID: true,
                 workspaceFound: true,
-                workspaceHasSurfaces: false
+                workspaceHasPanels: false
             ),
             .besidePane,
             "workspace_id is the empty-workspace fallback, not an override"
         )
     }
 
-    /// Once the workspace has surfaces, an unresolvable pane id is a stale
+    /// Once the workspace has a panel, an unresolvable pane id is a stale
     /// locator — seeding another terminal off it would be a second, unasked-for
     /// tab every time a client retried with an old id.
-    func test_aWorkspaceThatAlreadyHasSurfacesIsNotSeededAgain() {
+    ///
+    /// The condition counts *panels*, not surfaces, and the difference is the
+    /// whole second half of this bug: `createWorkspace` leaves a workspace with
+    /// one panel and no surface, so this correctly declines to seed while the
+    /// asking machine still reports an empty workspace. Realizing that panel is
+    /// a separate job (`TabManager.surfaceRealizationPins`) — reading this
+    /// parameter as "has surfaces" sends you to seed a pane that already exists.
+    func test_aWorkspaceThatAlreadyHasAPanelIsNotSeededAgain() {
         XCTAssertEqual(
             GhosttyPaneSurfaceProvider.newTabTarget(
                 paneResolved: false,
                 hasWorkspaceID: true,
                 workspaceFound: true,
-                workspaceHasSurfaces: true
+                workspaceHasPanels: true
             ),
             .ignore
         )
@@ -1933,7 +1940,7 @@ final class PeerProjectBootstrapTests: XCTestCase {
                 paneResolved: false,
                 hasWorkspaceID: false,
                 workspaceFound: false,
-                workspaceHasSurfaces: false
+                workspaceHasPanels: false
             ),
             .ignore,
             "the pre-fix behaviour for every request, which is why it was silent"
@@ -1943,7 +1950,7 @@ final class PeerProjectBootstrapTests: XCTestCase {
                 paneResolved: false,
                 hasWorkspaceID: true,
                 workspaceFound: false,
-                workspaceHasSurfaces: false
+                workspaceHasPanels: false
             ),
             .ignore,
             "a workspace id this host does not know is not a licence to guess one"

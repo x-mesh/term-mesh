@@ -17,6 +17,24 @@ class TabManager {
     var tabs: [Workspace] = []
     private(set) var isWorkspaceCycleHot: Bool = false
 
+    /// Workspaces held in the mounted set only so their Ghostty surfaces come
+    /// into existence.
+    ///
+    /// A workspace made over the peer protocol is deliberately not selected —
+    /// creating one carries no focus intent. But a workspace nobody selects is
+    /// never mounted, an unmounted pane has no view, and `createSurface` needs
+    /// a view inside a window. The pane then stays unrealized, and
+    /// `translateBonsplitNode` drops an unrealized pane from the layout the
+    /// asking machine reads. From over there it looks like an empty workspace,
+    /// which is exactly the shape of "could not prepare the project workspace".
+    ///
+    /// Pinning mounts it the way a retiring workspace is mounted during
+    /// handoff: present in the view tree, opacity ~0, hit-testing off. Nothing
+    /// is shown and no focus moves. Once the surface exists it outlives the
+    /// mount — only `panel.close()` frees it — so the pin is released as soon
+    /// as it has done its job.
+    private(set) var surfaceRealizationPins: Set<UUID> = []
+
     /// Titlebar progress bar state. Set to non-nil to show, nil to hide.
     var titlebarProgress: TitlebarProgress?
 
@@ -321,6 +339,40 @@ class TabManager {
         for panel in workspace.panels.values {
             guard let terminalPanel = panel as? TerminalPanel else { continue }
             terminalPanel.sendText(textWithReturn)
+        }
+    }
+
+    /// Hold `id` in the mounted set until its panes have surfaces.
+    ///
+    /// See `surfaceRealizationPins`. Idempotent: pinning a workspace that is
+    /// already pinned changes nothing, so a repeated peer request cannot leak
+    /// a second pin that the release path then fails to clear.
+    func pinWorkspaceForSurfaceRealization(_ id: UUID) {
+        guard !surfaceRealizationPins.contains(id) else { return }
+        surfaceRealizationPins.insert(id)
+    }
+
+    /// Release a realization pin. Safe to call for an id that was never
+    /// pinned — the caller's timeout and its success path both end here.
+    func unpinWorkspaceForSurfaceRealization(_ id: UUID) {
+        guard surfaceRealizationPins.contains(id) else { return }
+        surfaceRealizationPins.remove(id)
+    }
+
+    /// Whether `id` now holds a pane the peer protocol would actually report.
+    ///
+    /// This is the pin's exit condition, so it must match what
+    /// `translateBonsplitNode` accepts rather than merely "a surface exists".
+    /// A remote-origin pane owns a surface and is still never reported — a
+    /// looser test here would drop the mount while the asking machine still
+    /// sees an empty workspace, which is the failure the pin exists to
+    /// prevent. A workspace with no such pane answers false: there is nothing
+    /// to release yet.
+    func workspaceHasReportablePane(_ id: UUID) -> Bool {
+        guard let workspace = tabs.first(where: { $0.id == id }) else { return false }
+        return workspace.panels.values.contains { panel in
+            guard let terminal = panel as? TerminalPanel else { return false }
+            return !terminal.isRemoteOrigin && terminal.surface.surface != nil
         }
     }
 

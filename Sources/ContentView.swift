@@ -1788,6 +1788,12 @@ struct ContentView: View {
             reconcileMountedWorkspaceIds()
         })
 
+        // A peer-created workspace is pinned from outside the view, so nothing
+        // else in this body would notice it needs mounting.
+        view = AnyView(view.onChange(of: tabManager.surfaceRealizationPins) { _ in
+            reconcileMountedWorkspaceIds()
+        })
+
         view = AnyView(view.onReceive(NotificationCenter.default.publisher(for: .ghosttyDidSetTitle)) { notification in
             guard let tabId = notification.userInfo?[GhosttyNotificationKey.tabId] as? UUID,
                   tabId == tabManager.selectedTabId else { return }
@@ -2203,9 +2209,14 @@ struct ContentView: View {
         let currentTabs = tabs ?? tabManager.tabs
         let orderedTabIds = currentTabs.map { $0.id }
         let effectiveSelectedId = selectedId ?? tabManager.selectedTabId
-        let pinnedIds = retiringWorkspaceId.map { Set([ $0 ]) } ?? []
+        let handoffPinnedIds = retiringWorkspaceId.map { Set([ $0 ]) } ?? []
+        // Realization pins ride the same retention slot as a handoff pin, but
+        // they are not a handoff: `shouldKeepHandoffPair` must keep reading
+        // only the retiring workspace, or a peer creating a workspace mid-cycle
+        // would silently change the cycling mount budget.
+        let pinnedIds = handoffPinnedIds.union(tabManager.surfaceRealizationPins)
         let isCycleHot = tabManager.isWorkspaceCycleHot
-        let shouldKeepHandoffPair = isCycleHot && !pinnedIds.isEmpty
+        let shouldKeepHandoffPair = isCycleHot && !handoffPinnedIds.isEmpty
         let baseMaxMounted = shouldKeepHandoffPair
             ? WorkspaceMountPolicy.maxMountedWorkspacesDuringCycle
             : WorkspaceMountPolicy.maxMountedWorkspaces
