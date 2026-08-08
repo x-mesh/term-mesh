@@ -1833,4 +1833,77 @@ final class PeerProjectBootstrapTests: XCTestCase {
         XCTAssertNil(TerminalController.decodeFixedHex("0011aa", byteCount: 4))
         XCTAssertNil(TerminalController.decodeFixedHex("0011zzff", byteCount: 4))
     }
+
+    // MARK: - Who the creation sheet waits for
+    //
+    // `createTeam` returns as soon as the team record exists while the peer
+    // attaches run on behind it, so the sheet used to close on a success that
+    // had not happened. A leader could then fail to start with nothing left on
+    // screen to say so — the only report was a log line and a pane title set on
+    // a pane the failure had prevented from existing. These fix who is expected
+    // to report, which is what the wait is measured against.
+
+    @MainActor
+    func test_onlyPeerParticipantsAreWaitedFor() {
+        let participants = ProjectCreationFlow.remoteParticipantLabels(
+            leaderEndpoint: .peer(hostKey: "ssh:mac-sub"),
+            rows: [
+                row("executor", hostKey: "ssh:mac-sub", directory: "/w/e"),
+                row("reviewer", hostKey: nil)
+            ]
+        )
+        XCTAssertEqual(participants.map(\.label), ["leader", "Executor"],
+                       "a local agent has no attach to wait on")
+        XCTAssertEqual(participants.first?.stepID, "leader")
+    }
+
+    @MainActor
+    func test_aLocalLeaderIsNotWaitedFor() {
+        let participants = ProjectCreationFlow.remoteParticipantLabels(
+            leaderEndpoint: .local,
+            rows: [row("executor", hostKey: "ssh:mac-sub", directory: "/w/e")]
+        )
+        XCTAssertEqual(participants.map(\.label), ["Executor"])
+    }
+
+    @MainActor
+    func test_anAllLocalTeamWaitsForNobody() {
+        XCTAssertTrue(
+            ProjectCreationFlow.remoteParticipantLabels(
+                leaderEndpoint: .local,
+                rows: [row("executor", hostKey: nil)]
+            ).isEmpty,
+            "waiting on a settle that will never be reported would hang the sheet"
+        )
+    }
+
+    /// The failure that started this carried only a host name, so the sheet had
+    /// nothing to show and Troubleshoot had nothing to open.
+    func test_workspaceUnavailableSaysWhatItWaitedForAndWhetherItAsked() {
+        let asked = TeamOrchestrator.RemoteAgentError.projectWorkspaceUnavailable(
+            host: "mac-sub",
+            workspaceID: "a1b2c3d4",
+            attempts: 15,
+            seedRequested: true
+        ).description
+        XCTAssertTrue(asked.contains("15 time(s)"), asked)
+        XCTAssertTrue(asked.contains("a1b2c3d4"), asked)
+        XCTAssertTrue(asked.contains("after asking it to open one"), asked)
+
+        let neverAsked = TeamOrchestrator.RemoteAgentError.projectWorkspaceUnavailable(
+            host: "mac-sub",
+            workspaceID: "a1b2c3d4",
+            attempts: 3,
+            seedRequested: false
+        ).description
+        XCTAssertTrue(neverAsked.contains("without getting as far as asking"), neverAsked)
+
+        let noWorkspace = TeamOrchestrator.RemoteAgentError.projectWorkspaceUnavailable(
+            host: "mac-sub",
+            workspaceID: nil,
+            attempts: 0,
+            seedRequested: false
+        ).description
+        XCTAssertTrue(noWorkspace.contains("never reported a workspace"), noWorkspace)
+    }
 }

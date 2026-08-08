@@ -77,7 +77,16 @@ extension TeamOrchestrator {
         case duplicateInstance(String)
         case cliUnavailable(String, String)
         case promptStagingFailed(String)
-        case projectWorkspaceUnavailable(String)
+        /// The peer never showed a pane in the workspace the leader was going to
+        /// take. Everything after `host` is what the placement loop already knew
+        /// and used to throw away: without it the failure reads as "it did not
+        /// work" and there is nothing for the sheet's Troubleshoot to open.
+        case projectWorkspaceUnavailable(
+            host: String,
+            workspaceID: String?,
+            attempts: Int,
+            seedRequested: Bool
+        )
         case unresolvedRemoteWorkingDirectory(host: String, path: String)
         case checkoutIsolationFailed(host: String, path: String, reason: String)
         case projectDeletionIncomplete(String)
@@ -99,8 +108,17 @@ extension TeamOrchestrator {
                 return "\(cli) is not installed on \(host)"
             case .promptStagingFailed(let host):
                 return "could not stage the leader prompt on \(host)"
-            case .projectWorkspaceUnavailable(let host):
-                return "could not prepare the project workspace on \(host)"
+            case .projectWorkspaceUnavailable(let host, let workspaceID, let attempts, let seedRequested):
+                var detail = "could not prepare the project workspace on \(host)"
+                if let workspaceID {
+                    detail += "; waited \(attempts) time(s) for a pane in workspace \(workspaceID)"
+                    detail += seedRequested
+                        ? " after asking it to open one"
+                        : " without getting as far as asking for one"
+                } else {
+                    detail += "; the host never reported a workspace to place the leader in"
+                }
+                return detail
             case .unresolvedRemoteWorkingDirectory(let host, let path):
                 return "could not resolve remote working directory for host \(host) "
                     + "from path \(path); specify --dir <remote-path> for that host"
@@ -118,6 +136,24 @@ extension TeamOrchestrator {
         }
 
         var errorDescription: String? { description }
+    }
+
+    /// What happened to each participant that had to be attached over a peer,
+    /// reported as it happens.
+    ///
+    /// `createTeam` returns as soon as the team exists, while the attaches run
+    /// on behind it — so anything watching the return value sees a success that
+    /// has not happened yet. The creation sheet used to close on exactly that,
+    /// which is how a leader could fail to start with nobody left on screen to
+    /// tell. `settled` is the signal that the attaches are done arguing and the
+    /// caller may now decide what the result was.
+    enum RemoteAttachOutcome: Equatable {
+        case leaderAttached(host: String)
+        case leaderFailed(host: String, message: String)
+        case agentAttached(name: String, host: String)
+        case agentFailed(name: String, host: String, message: String)
+        /// Every attach this team asked for has finished, successfully or not.
+        case settled
     }
 
     nonisolated static func requiredRemoteWorkingDirectory(
@@ -549,7 +585,12 @@ extension TeamOrchestrator {
             }
             guard let workspaceID else {
                 await connection.cancel()
-                throw RemoteAgentError.projectWorkspaceUnavailable(host.displayName)
+                throw RemoteAgentError.projectWorkspaceUnavailable(
+                    host: host.displayName,
+                    workspaceID: nil,
+                    attempts: 0,
+                    seedRequested: false
+                )
             }
 
             let managedIDs = Set(
@@ -558,7 +599,9 @@ extension TeamOrchestrator {
                     .compactMap(\.surfaceID)
             )
             var requestedSeed = false
+            var attemptsMade = 0
             for attempt in 0..<15 {
+                attemptsMade = attempt + 1
 #if DEBUG
                 dlog("leader.placement.stage list host=\(host.id) attempt=\(attempt)")
 #endif
@@ -583,9 +626,14 @@ extension TeamOrchestrator {
                         useSourceDirectly: createdWorkspace || !hasManagedProjectSurface
                     )
                 }
-                if !requestedSeed {
+                // Re-ask every fifth pass rather than once. A single request
+                // makes "the peer is still opening it" and "the request never
+                // landed" the same fifteen-poll silence, and only one of those
+                // is worth waiting through. Every fifth keeps the retry cheap
+                // while still leaving a full second between asks.
+                if !requestedSeed || attempt % 5 == 0 {
 #if DEBUG
-                    dlog("leader.placement.stage seed host=\(host.id)")
+                    dlog("leader.placement.stage seed host=\(host.id) attempt=\(attempt)")
 #endif
                     try await connection.session.requestNewTab(workspaceID: workspaceID)
                     try await leaderAttempt?.ensureCurrent()
@@ -593,7 +641,12 @@ extension TeamOrchestrator {
                 }
                 try await Task.sleep(nanoseconds: 200_000_000)
             }
-            throw RemoteAgentError.projectWorkspaceUnavailable(host.displayName)
+            throw RemoteAgentError.projectWorkspaceUnavailable(
+                host: host.displayName,
+                workspaceID: workspaceID.prefix(4).map { String(format: "%02x", $0) }.joined(),
+                attempts: attemptsMade,
+                seedRequested: requestedSeed
+            )
         } catch {
             if createdWorkspace, let workspaceID {
                 // Creation is not committed until a seed surface exists.
@@ -2715,7 +2768,7 @@ extension TeamOrchestrator {
         pairModel: String = "",
         pairSpec: String = "",
         projectSource: ProjectSource? = nil,
-        onRemoteAttachFailure: ((String) -> Void)? = nil,
+        onRemoteAttach: ((RemoteAttachOutcome) -> Void)? = nil,
         tabManager: TabManager
     ) -> Team? {
         // Peer attachment is asynchronous. Record the requested endpoint from
@@ -2869,6 +2922,14 @@ extension TeamOrchestrator {
 #if DEBUG
                     dlog("leader.attach.skip reason=noRemoteWorkingDirectory host=\(hostKey)")
 #endif
+                    // Returning quietly here left the team with a leader that
+                    // was never going to arrive and no record of why.
+                    let description = "Could not start remote leader on \(hostKey): "
+                        + "no working directory was resolved for that host"
+                    RemoteWorkLog.info(description)
+                    onRemoteAttach?(.leaderFailed(host: hostKey, message: description))
+                    self.markRemoteLeaderFailed(teamName: team.id, description: description)
+                    onRemoteAttach?(.settled)
                     return
                 }
                 do {
@@ -2900,13 +2961,34 @@ extension TeamOrchestrator {
 #if DEBUG
                     dlog("leader.attach.ok host=\(hostKey)")
 #endif
+                    onRemoteAttach?(.leaderAttached(host: hostKey))
                 } catch {
 #if DEBUG
                     dlog("leader.attach.threw host=\(hostKey) error=\(error)")
 #endif
                     let description = "Could not start remote leader on \(hostKey): \(error)"
                     RemoteWorkLog.info(description)
-                    onRemoteAttachFailure?(description)
+                    onRemoteAttach?(.leaderFailed(host: hostKey, message: description))
+                    // A failed agent leaves a red row on the board; a failed
+                    // leader used to leave nothing, because its only other
+                    // channel is a pane title and the failure is what stopped
+                    // the pane existing. Same record, so neither depends on a
+                    // surface that may not be there.
+                    if let task = TeamDataStore.shared.createTask(
+                        teamName: team.id,
+                        title: "Remote attach failed: leader @ \(hostKey)",
+                        details: description,
+                        labels: ["remote-attach", "failure", "leader"],
+                        priority: 1,
+                        createdBy: "term-mesh"
+                    ) {
+                        _ = TeamDataStore.shared.updateTask(
+                            teamName: team.id,
+                            taskId: task.id,
+                            status: "failed",
+                            result: description
+                        )
+                    }
                     self.markRemoteLeaderFailed(
                         teamName: team.id,
                         description: description
@@ -2931,11 +3013,16 @@ extension TeamOrchestrator {
                         model: row.preset.model,
                         cli: row.preset.cli
                     )
+                    onRemoteAttach?(.agentAttached(name: row.preset.name, host: hostKey))
                 } catch {
                     let description =
                         "Could not start \(row.preset.name) on \(hostKey): \(error)"
                     RemoteWorkLog.info(description)
-                    onRemoteAttachFailure?(description)
+                    onRemoteAttach?(.agentFailed(
+                        name: row.preset.name,
+                        host: hostKey,
+                        message: description
+                    ))
                     if let task = TeamDataStore.shared.createTask(
                         teamName: team.id,
                         title: "Remote attach failed: \(row.preset.name) @ \(hostKey)",
@@ -2953,6 +3040,7 @@ extension TeamOrchestrator {
                     }
                 }
             }
+            onRemoteAttach?(.settled)
         }
         return team
     }
