@@ -1248,3 +1248,50 @@ private actor TeamLeaderE2EProvider: PeerSurfaceProvider {
         )
     }
 }
+
+/// A GUI host's surfaces live in its own process, so a session it owns cannot
+/// survive it. `session_host_socket` is how such a host points at something
+/// that can, instead of letting a client plan to come back to a session that
+/// will not be there.
+final class SessionHostAdvertisementTests: XCTestCase {
+
+    /// Empty and "the same socket" are different answers, and conflating them
+    /// is what would make a client wait for a session nobody kept.
+    func test_aHostWithNoOwnerSaysNothingRatherThanItself() {
+        let config = PeerServerConfig(hostDisplayName: "no-owner")
+        XCTAssertEqual(config.sessionHostSocketPath, "")
+    }
+
+    /// The path is another machine's, read on this one, so a relative path
+    /// would resolve against whatever directory the reader happens to be in.
+    func test_aRelativePathIsNotAPath() throws {
+        var hello = Termmesh_Peer_V1_Hello()
+        hello.sessionHostSocket = "term-meshd-peer.sock"
+        XCTAssertFalse(
+            hello.sessionHostSocket.hasPrefix("/"),
+            "the reader drops this rather than resolving it locally"
+        )
+
+        hello.sessionHostSocket = "/tmp/term-meshd-peer.sock"
+        XCTAssertTrue(hello.sessionHostSocket.hasPrefix("/"))
+    }
+
+    /// It has to survive the wire, or the host is the only one that knows.
+    func test_itRoundTripsThroughTheWire() throws {
+        var hello = Termmesh_Peer_V1_Hello()
+        hello.protocolVersion = "1.0.0"
+        hello.sessionHostSocket = "/var/folders/x/T/term-meshd-peer.sock"
+        let decoded = try Termmesh_Peer_V1_Hello(serializedBytes: hello.serializedData())
+        XCTAssertEqual(decoded.sessionHostSocket, "/var/folders/x/T/term-meshd-peer.sock")
+    }
+
+    /// An older host sends no such field, and must read as "no owner" rather
+    /// than as a parse failure — this field is additive on purpose.
+    func test_aHostThatPredatesTheFieldReadsAsNoOwner() throws {
+        var old = Termmesh_Peer_V1_Hello()
+        old.protocolVersion = "1.0.0"
+        old.displayName = "older-host"
+        let decoded = try Termmesh_Peer_V1_Hello(serializedBytes: old.serializedData())
+        XCTAssertEqual(decoded.sessionHostSocket, "")
+    }
+}

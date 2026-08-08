@@ -357,17 +357,25 @@ public struct PeerServerConfig: Sendable {
     public var hostAppVersion: String
     public var protocolVersion: String
     public var hostCLIBinDirs: [String]
+    /// Where a session owner that outlives this process serves the same
+    /// protocol on this machine, or empty when there is none.
+    ///
+    /// Empty is the honest default: a host whose sessions end when it does
+    /// should say so rather than let a client plan to come back.
+    public var sessionHostSocketPath: String
 
     public init(
         hostDisplayName: String = "term-mesh",
         hostAppVersion: String = "0.0.0",
         protocolVersion: String = "1.0.0",
-        hostCLIBinDirs: [String] = []
+        hostCLIBinDirs: [String] = [],
+        sessionHostSocketPath: String = ""
     ) {
         self.hostDisplayName = hostDisplayName
         self.hostAppVersion = hostAppVersion
         self.protocolVersion = protocolVersion
         self.hostCLIBinDirs = PeerHostCLIBinDirs.validated(hostCLIBinDirs)
+        self.sessionHostSocketPath = sessionHostSocketPath
     }
 }
 
@@ -1354,6 +1362,11 @@ actor PeerServerSession {
                 h.peerID = randomPeerBytes(count: 16)
                 h.capabilities = advertisedCapabilities
                 h.cliBinDirs = self.config.hostCLIBinDirs
+                // A GUI host's surfaces live in its own process, so a session
+                // it owns cannot survive it. Naming a session owner that can is
+                // how a client reaches one without being told it may reattach
+                // later and then finding nothing there.
+                h.sessionHostSocket = self.config.sessionHostSocketPath
                 env.hello = h
             }
             try await sendEnvelope { env in

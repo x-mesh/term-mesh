@@ -171,6 +171,14 @@ public struct PeerSessionInfo: Sendable, Equatable {
     public let hostCapabilities: PeerCapabilities
     /// Authenticated, validated and session-scoped host CLI directories.
     public let hostCLIBinDirs: [String]
+    /// Where this machine serves sessions that outlive the process just spoken
+    /// to, or empty when it has none.
+    ///
+    /// Empty and "the same socket" are different answers. A host that names a
+    /// different one is saying its own sessions end with it and pointing at
+    /// something that will still be there; a host that names nothing is saying
+    /// there is nowhere to come back to.
+    public let sessionHostSocketPath: String
 
     /// Whether the host advertised `capability` in its Hello.
     public func hasHostCapability(_ capability: String) -> Bool {
@@ -425,7 +433,13 @@ public actor PeerSession {
             hostCapabilities: hostCapabilities,
             hostCLIBinDirs: hostCapabilities.has(PeerCapability.hostCLIBinDirsV1)
                 ? PeerHostCLIBinDirs.validated(host.cliBinDirs)
-                : []
+                : [],
+            // Absolute or nothing: a relative path would be resolved against
+            // whatever directory the reader happens to be in, on a machine that
+            // is not the one that sent it.
+            sessionHostSocketPath: host.sessionHostSocket.hasPrefix("/")
+                ? host.sessionHostSocket
+                : ""
         )
     }
 

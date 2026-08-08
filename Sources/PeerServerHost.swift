@@ -280,6 +280,13 @@ final class PeerHostCoordinator: NSObject {
                 resourceURL.appendingPathComponent("bin").standardizedFileURL.path
             ]
         }
+        // This app's surfaces die with it, so a client that wants a session to
+        // outlive a quit is pointed at the daemon instead. Only named when the
+        // daemon is actually decoupled — otherwise it dies here too, and saying
+        // so would be a promise this machine cannot keep.
+        if TermMeshDaemon.daemonShouldOutliveApp(peerServingEnabled: true) {
+            config.sessionHostSocketPath = TermMeshDaemon.shared.daemonPeerSocketPath
+        }
 
         let server = PeerServer(socketPath: path, provider: provider, config: config)
         do {

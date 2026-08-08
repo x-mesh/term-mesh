@@ -118,6 +118,17 @@ message Hello {
   // Absolute directories containing CLIs shipped beside this host process.
   // Consumers require host.cli-bin-dirs.v1 and successful authentication.
   repeated string cli_bin_dirs = 6;
+  // Absolute path, on this machine, where a session owner that outlives this
+  // process serves the same protocol. Empty when there is none, which is the
+  // honest answer for a host whose sessions end when it does.
+  //
+  // A GUI host answers here rather than serving `ensure` itself: its surfaces
+  // live in its own process, so a session it owns cannot survive it, and a
+  // client that reached one would be told it may reattach later and be wrong.
+  // The daemon can, so the daemon is named. A client that wants a session to
+  // outlive anything connects here instead of guessing a path — the sockets
+  // are already keyed by target AND path, so both are reachable at once.
+  string session_host_socket = 7;
 }
 
 message AuthChallenge {
