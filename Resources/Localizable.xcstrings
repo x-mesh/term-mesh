@@ -161,6 +161,16 @@
         }
       }
     },
+    "A recovery export can restore project access. Store it offline. Revoking a device cannot be undone from that device.": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "복구 내보내기로 프로젝트 접근을 되살릴 수 있습니다. 오프라인에 보관하세요. 기기를 해지하면 그 기기에서는 되돌릴 수 없습니다."
+          }
+        }
+      }
+    },
     "About Term-Mesh": {
       "localizations": {
         "ko": {
@@ -181,12 +191,62 @@
         }
       }
     },
+    "Add": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "추가"
+          }
+        }
+      }
+    },
     "Add Peer Host…": {
       "localizations": {
         "ko": {
           "stringUnit": {
             "state": "translated",
             "value": "피어 호스트 추가…"
+          }
+        }
+      }
+    },
+    "Add Profile": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "프로파일 추가"
+          }
+        }
+      }
+    },
+    "Add a profile to customize the executable, extra args, or environment variables.": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "실행 파일, 추가 인수, 환경 변수를 지정하려면 프로파일을 추가하세요."
+          }
+        }
+      }
+    },
+    "Add custom model names per CLI. These appear alongside built-in models in the team creation picker.": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "CLI별로 사용자 지정 모델 이름을 추가합니다. 팀 생성 선택기에서 기본 제공 모델과 함께 표시됩니다."
+          }
+        }
+      }
+    },
+    "After current": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "현재 다음"
           }
         }
       }
@@ -277,6 +337,26 @@
           "stringUnit": {
             "state": "translated",
             "value": "에이전트가 앱 안에서 실행되고 앱이 직접 그립니다 — 스트리밍 텍스트, 접히는 도구 호출, 메시지 입력창. 터미널을 쓰지 않습니다."
+          }
+        }
+      }
+    },
+    "All": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "전체"
+          }
+        }
+      }
+    },
+    "All interfaces (0.0.0.0)": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "모든 인터페이스(0.0.0.0)"
           }
         }
       }
@@ -441,6 +521,16 @@
         }
       }
     },
+    "Automation mode": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "자동화 모드"
+          }
+        }
+      }
+    },
     "Back": {
       "localizations": {
         "ko": {
@@ -457,6 +547,16 @@
           "stringUnit": {
             "state": "translated",
             "value": "배경 디버그…"
+          }
+        }
+      }
+    },
+    "Bar": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "막대"
           }
         }
       }
@@ -511,6 +611,16 @@
         }
       }
     },
+    "Block": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "블록"
+          }
+        }
+      }
+    },
     "Browser": {
       "localizations": {
         "ko": {
@@ -527,6 +637,16 @@
           "stringUnit": {
             "state": "translated",
             "value": "브라우저 테마"
+          }
+        }
+      }
+    },
+    "Browse…": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "찾아보기…"
           }
         }
       }
@@ -641,6 +761,16 @@
         }
       }
     },
+    "Claude (Auto)": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Claude(자동)"
+          }
+        }
+      }
+    },
     "Claude Code Integration": {
       "localizations": {
         "ko": {
@@ -671,6 +801,16 @@
         }
       }
     },
+    "Clear": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "지우기"
+          }
+        }
+      }
+    },
     "Clear All": {
       "localizations": {
         "ko": {
@@ -687,6 +827,46 @@
           "stringUnit": {
             "state": "translated",
             "value": "브라우저 기록 지우기"
+          }
+        }
+      }
+    },
+    "Clear History": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "기록 지우기"
+          }
+        }
+      }
+    },
+    "Clear History…": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "기록 지우기…"
+          }
+        }
+      }
+    },
+    "Clear Log": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "로그 지우기"
+          }
+        }
+      }
+    },
+    "Click a shortcut value to record a new shortcut.": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "단축키 값을 클릭하면 새 단축키를 녹화합니다."
           }
         }
       }
@@ -881,6 +1061,36 @@
         }
       }
     },
+    "Controls access to the local Unix socket for programmatic control. Choose a mode that matches your threat model.": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "프로그래밍 방식 제어에 쓰이는 로컬 Unix 소켓의 접근을 제어합니다. 보안 요구에 맞는 모드를 선택하세요."
+          }
+        }
+      }
+    },
+    "Controls which HTTP (non-HTTPS) hosts can open in Term-Mesh without a warning prompt. Defaults include localhost, 127.0.0.1, ::1, 0.0.0.0, and *.localtest.me.": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "경고 없이 Term-Mesh에서 열 수 있는 HTTP(비HTTPS) 호스트를 정합니다. 기본값에는 localhost, 127.0.0.1, ::1, 0.0.0.0, *.localtest.me가 있습니다."
+          }
+        }
+      }
+    },
+    "Copy Diagnostics": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "진단 정보 복사"
+          }
+        }
+      }
+    },
     "Copy Focus Logs": {
       "localizations": {
         "ko": {
@@ -927,6 +1137,36 @@
           "stringUnit": {
             "state": "translated",
             "value": "커서 모양"
+          }
+        }
+      }
+    },
+    "Custom Colors": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "사용자 지정 색상"
+          }
+        }
+      }
+    },
+    "Custom colors: none yet. Use \"Choose Custom Color...\" from a workspace context menu.": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "사용자 지정 색상이 아직 없습니다. 워크스페이스 컨텍스트 메뉴에서 \"Choose Custom Color...\"를 사용하세요."
+          }
+        }
+      }
+    },
+    "Customize the workspace color palette used by Sidebar > Tab Color. \"Choose Custom Color...\" entries are persisted below.": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "사이드바 > 탭 색상에서 쓰는 워크스페이스 색상 팔레트를 설정합니다. \"Choose Custom Color...\"로 만든 항목은 아래에 저장됩니다."
           }
         }
       }
@@ -981,6 +1221,16 @@
         }
       }
     },
+    "Dashboard settings auto-restart the daemon when changed. The dashboard shows system metrics, team status, agents, and task boards.": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "대시보드 설정을 바꾸면 데몬이 자동으로 다시 시작됩니다. 대시보드에는 시스템 지표, 팀 상태, 에이전트, 태스크 보드가 표시됩니다."
+          }
+        }
+      }
+    },
     "Debug": {
       "localizations": {
         "ko": {
@@ -1017,6 +1267,16 @@
           "stringUnit": {
             "state": "translated",
             "value": "디버그 창"
+          }
+        }
+      }
+    },
+    "Default (from config)": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "기본값(설정 파일)"
           }
         }
       }
@@ -1067,6 +1327,16 @@
           "stringUnit": {
             "state": "translated",
             "value": "이 Mac에서 새 프로젝트를 만들 때 사용할 기본 상위 폴더입니다."
+          }
+        }
+      }
+    },
+    "Delete and discard changes": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "삭제하고 변경 사항 버리기"
           }
         }
       }
@@ -1151,12 +1421,62 @@
         }
       }
     },
+    "Done": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "완료"
+          }
+        }
+      }
+    },
+    "Each workspace gets TERMMESH_PORT and TERMMESH_PORT_END env vars with a dedicated port range. New terminals inherit these values.": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "워크스페이스마다 전용 포트 범위와 함께 TERMMESH_PORT, TERMMESH_PORT_END 환경 변수가 주어집니다. 새 터미널이 이 값을 물려받습니다."
+          }
+        }
+      }
+    },
+    "Edit": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "편집"
+          }
+        }
+      }
+    },
+    "Enable Full Open Access": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "완전 개방 허용"
+          }
+        }
+      }
+    },
     "Enable peer server": {
       "localizations": {
         "ko": {
           "stringUnit": {
             "state": "translated",
             "value": "피어 서버 사용"
+          }
+        }
+      }
+    },
+    "End": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "맨 아래"
           }
         }
       }
@@ -1177,6 +1497,46 @@
           "stringUnit": {
             "state": "translated",
             "value": "피어 소켓 경로를 입력하세요."
+          }
+        }
+      }
+    },
+    "Environment Variables": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "환경 변수"
+          }
+        }
+      }
+    },
+    "Existing peer pairings may stop working. Restart active peer sessions after regenerating this ID.": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "기존 피어 페어링이 동작하지 않을 수 있습니다. ID를 다시 만든 뒤에는 활성 피어 세션을 다시 시작하세요."
+          }
+        }
+      }
+    },
+    "Export…": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "내보내기…"
+          }
+        }
+      }
+    },
+    "Extra Args": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "추가 인수"
           }
         }
       }
@@ -1291,6 +1651,16 @@
         }
       }
     },
+    "Force Repair": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "강제 복구"
+          }
+        }
+      }
+    },
     "Force TUI redraw on attach": {
       "localizations": {
         "ko": {
@@ -1307,6 +1677,16 @@
           "stringUnit": {
             "state": "translated",
             "value": "앞으로"
+          }
+        }
+      }
+    },
+    "Full open access": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "완전 개방"
           }
         }
       }
@@ -1357,6 +1737,16 @@
           "stringUnit": {
             "state": "translated",
             "value": "HTTP 대시보드"
+          }
+        }
+      }
+    },
+    "HTTP Hosts Allowed in Embedded Browser": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "내장 브라우저에서 허용할 HTTP 호스트"
           }
         }
       }
@@ -1491,6 +1881,16 @@
         }
       }
     },
+    "Init": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "초기화"
+          }
+        }
+      }
+    },
     "Initial-attach snapshot is plain text; full-screen TUIs keep their text but lose styling until they redraw on their own.": {
       "localizations": {
         "ko": {
@@ -1551,6 +1951,16 @@
         }
       }
     },
+    "Install": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "설치"
+          }
+        }
+      }
+    },
     "Intercept open http(s) in Terminal": {
       "localizations": {
         "ko": {
@@ -1567,6 +1977,16 @@
           "stringUnit": {
             "state": "translated",
             "value": "최근 읽지 않은 항목으로 이동"
+          }
+        }
+      }
+    },
+    "Keep it": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "유지"
           }
         }
       }
@@ -1627,6 +2047,16 @@
           "stringUnit": {
             "state": "translated",
             "value": "리더가 Claude를 자동으로 실행합니다. (핀이 없을 때만 사용)"
+          }
+        }
+      }
+    },
+    "Left Rail": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "왼쪽 레일"
           }
         }
       }
@@ -1701,6 +2131,16 @@
         }
       }
     },
+    "Manage Profiles…": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "프로파일 관리…"
+          }
+        }
+      }
+    },
     "Managed projections match their source runbooks.": {
       "localizations": {
         "ko": {
@@ -1741,6 +2181,16 @@
         }
       }
     },
+    "Missing": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "없음"
+          }
+        }
+      }
+    },
     "Model used for new agents when creating a team.": {
       "localizations": {
         "ko": {
@@ -1757,6 +2207,16 @@
           "stringUnit": {
             "state": "translated",
             "value": "알림을 받은 워크스페이스를 맨 위로 올립니다. 단축키 위치를 고정하려면 끄세요."
+          }
+        }
+      }
+    },
+    "Native": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "네이티브"
           }
         }
       }
@@ -1961,6 +2421,16 @@
         }
       }
     },
+    "No profiles yet.": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "아직 프로파일이 없습니다."
+          }
+        }
+      }
+    },
     "No saved pages yet.": {
       "localizations": {
         "ko": {
@@ -2021,6 +2491,26 @@
         }
       }
     },
+    "No worktrees found.": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "워크트리를 찾을 수 없습니다."
+          }
+        }
+      }
+    },
+    "None (use team default)": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "없음(팀 기본값 사용)"
+          }
+        }
+      }
+    },
     "Not found": {
       "localizations": {
         "ko": {
@@ -2067,6 +2557,36 @@
           "stringUnit": {
             "state": "translated",
             "value": "확인"
+          }
+        }
+      }
+    },
+    "Off": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "끔"
+          }
+        }
+      }
+    },
+    "One KEY=VALUE per line.": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "한 줄에 KEY=VALUE 하나씩 적습니다."
+          }
+        }
+      }
+    },
+    "One host or wildcard per line (for example: localhost, 127.0.0.1, ::1, 0.0.0.0, *.localtest.me).": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "한 줄에 호스트 하나 또는 와일드카드를 적습니다(예: localhost, 127.0.0.1, ::1, 0.0.0.0, *.localtest.me)."
           }
         }
       }
@@ -2171,6 +2691,16 @@
         }
       }
     },
+    "Overrides: TERMMESH_SOCKET_ENABLE, TERMMESH_SOCKET_MODE, and TERMMESH_SOCKET_PATH (set TERMMESH_ALLOW_SOCKET_OVERRIDE=1 for stable/nightly builds). Legacy CMUX_* prefixes also accepted.": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "재정의 항목: TERMMESH_SOCKET_ENABLE, TERMMESH_SOCKET_MODE, TERMMESH_SOCKET_PATH(stable/nightly 빌드에서는 TERMMESH_ALLOW_SOCKET_OVERRIDE=1 필요). 예전 CMUX_* 접두사도 인식합니다."
+          }
+        }
+      }
+    },
     "PID": {
       "localizations": {
         "ko": {
@@ -2207,6 +2737,16 @@
           "stringUnit": {
             "state": "translated",
             "value": "암호"
+          }
+        }
+      }
+    },
+    "Password mode": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "암호 모드"
           }
         }
       }
@@ -2327,6 +2867,16 @@
           "stringUnit": {
             "state": "translated",
             "value": "피어 연결 실패"
+          }
+        }
+      }
+    },
+    "Peer federation lets another term-mesh.app instance attach this Mac's terminal panes via SSH (workspace mirror with live layout sync). \"Enable peer server\" controls the running state right now; \"Auto-start at app launch\" persists across restarts.": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "피어 연합을 쓰면 다른 term-mesh.app이 SSH로 이 Mac의 터미널 pane에 attach할 수 있습니다(배치가 실시간 동기화되는 워크스페이스 미러). \"피어 서버 사용\"은 지금의 실행 상태를 제어하고, \"앱 시작 시 자동 실행\"은 재시작 후에도 유지됩니다."
           }
         }
       }
@@ -2471,6 +3021,16 @@
         }
       }
     },
+    "Project discovery is not exposed by the current daemon. Register a project before starting a manifest scan.": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "현재 데몬은 프로젝트 검색을 제공하지 않습니다. 매니페스트 검사를 시작하기 전에 프로젝트를 등록하세요."
+          }
+        }
+      }
+    },
     "Projection Drift": {
       "localizations": {
         "ko": {
@@ -2497,6 +3057,16 @@
           "stringUnit": {
             "state": "translated",
             "value": "Term-Mesh 종료"
+          }
+        }
+      }
+    },
+    "REPL (Manual)": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "REPL(수동)"
           }
         }
       }
@@ -2561,6 +3131,36 @@
         }
       }
     },
+    "Refresh": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "새로 고침"
+          }
+        }
+      }
+    },
+    "Regenerate": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "다시 생성"
+          }
+        }
+      }
+    },
+    "Regenerate Peer ID": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "피어 ID 다시 생성"
+          }
+        }
+      }
+    },
     "Reload Configuration": {
       "localizations": {
         "ko": {
@@ -2597,6 +3197,16 @@
           "stringUnit": {
             "state": "translated",
             "value": "원격 작업"
+          }
+        }
+      }
+    },
+    "Remove": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "제거"
           }
         }
       }
@@ -2711,12 +3321,32 @@
         }
       }
     },
+    "Reset All Settings": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "모든 설정 초기화"
+          }
+        }
+      }
+    },
     "Reset Palette": {
       "localizations": {
         "ko": {
           "stringUnit": {
             "state": "translated",
             "value": "팔레트 초기화"
+          }
+        }
+      }
+    },
+    "Restart": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "다시 시작"
           }
         }
       }
@@ -2737,6 +3367,46 @@
           "stringUnit": {
             "state": "translated",
             "value": "기본값을 되돌리고 사용자 지정 색상을 모두 지웁니다."
+          }
+        }
+      }
+    },
+    "Restore previous session": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "이전 세션 복원"
+          }
+        }
+      }
+    },
+    "Retry": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "다시 시도"
+          }
+        }
+      }
+    },
+    "Reveal in Finder": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Finder에서 보기"
+          }
+        }
+      }
+    },
+    "Revoke…": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "해지…"
           }
         }
       }
@@ -2781,6 +3451,16 @@
         }
       }
     },
+    "Runbooks are loaded from .agent-runbooks/<role>.md. Claude, Codex, and OpenCode files are generated projections.": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "런북은 .agent-runbooks/<role>.md에서 불러옵니다. Claude, Codex, OpenCode 파일은 생성된 프로젝션입니다."
+          }
+        }
+      }
+    },
     "SSH Tunnel Failed": {
       "localizations": {
         "ko": {
@@ -2791,12 +3471,32 @@
         }
       }
     },
+    "Save": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "저장"
+          }
+        }
+      }
+    },
     "Save Copied Text to Paste Shelf": {
       "localizations": {
         "ko": {
           "stringUnit": {
             "state": "translated",
             "value": "복사한 텍스트를 붙여넣기 선반에 저장"
+          }
+        }
+      }
+    },
+    "Scan Manifest": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "매니페스트 검사"
           }
         }
       }
@@ -2817,6 +3517,16 @@
           "stringUnit": {
             "state": "translated",
             "value": "검색"
+          }
+        }
+      }
+    },
+    "Select or create profiles to customize path, extra args, and env per CLI. Active profile takes priority over auto-detect.": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "CLI별로 경로·추가 인수·환경 변수를 지정할 프로파일을 선택하거나 만듭니다. 활성 프로파일이 자동 감지보다 우선합니다."
           }
         }
       }
@@ -3161,12 +3871,32 @@
         }
       }
     },
+    "Solid Fill": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "단색 채우기"
+          }
+        }
+      }
+    },
     "Sources": {
       "localizations": {
         "ko": {
           "stringUnit": {
             "state": "translated",
             "value": "원본"
+          }
+        }
+      }
+    },
+    "Space-separated. Appended after term-mesh's built-in flags.": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "공백으로 구분합니다. term-mesh 기본 플래그 뒤에 덧붙습니다."
           }
         }
       }
@@ -3261,6 +3991,16 @@
         }
       }
     },
+    "Start fresh": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "새로 시작"
+          }
+        }
+      }
+    },
     "Start one first via Start Peer Server…": {
       "localizations": {
         "ko": {
@@ -3317,6 +4057,16 @@
           "stringUnit": {
             "state": "translated",
             "value": "상태를 불러오지 못했습니다."
+          }
+        }
+      }
+    },
+    "Stop": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "중지"
           }
         }
       }
@@ -3421,6 +4171,16 @@
         }
       }
     },
+    "Term-Mesh processes only": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Term-Mesh 프로세스만"
+          }
+        }
+      }
+    },
     "Terminal": {
       "localizations": {
         "ko": {
@@ -3437,6 +4197,16 @@
           "stringUnit": {
             "state": "translated",
             "value": "IME 입력 막대의 글자 크기(pt)입니다."
+          }
+        }
+      }
+    },
+    "The IME input bar (Cmd+Shift+I) provides a native text field for CJK composition. Adjust font size and bar height to your preference.": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "IME 입력 막대(Cmd+Shift+I)는 한중일 입력을 위한 네이티브 텍스트 필드를 제공합니다. 글자 크기와 막대 높이를 원하는 대로 조절하세요."
           }
         }
       }
@@ -3471,12 +4241,52 @@
         }
       }
     },
+    "These settings override your ghostty config file. Select \"Default\" or \"Reset\" to use the config file value.": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "이 설정은 ghostty 설정 파일보다 우선합니다. 설정 파일 값을 쓰려면 \"기본값\" 또는 \"초기화\"를 선택하세요."
+          }
+        }
+      }
+    },
+    "This can overwrite custom runbook projection files.": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "사용자 지정 런북 프로젝션 파일을 덮어쓸 수 있습니다."
+          }
+        }
+      }
+    },
+    "This disables ancestry and password checks and opens the socket to all local users. Only enable when you understand the risk.": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "상위 프로세스 검사와 암호 검사를 끄고 모든 로컬 사용자에게 소켓을 엽니다. 위험을 이해할 때만 켜세요."
+          }
+        }
+      }
+    },
     "This remote workspace is no longer available on the host.": {
       "localizations": {
         "ko": {
           "stringUnit": {
             "state": "translated",
             "value": "이 원격 워크스페이스는 호스트에 더 이상 없습니다."
+          }
+        }
+      }
+    },
+    "This removes visited-page suggestions from the browser omnibar.": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "브라우저 주소창 제안에서 방문한 페이지를 제거합니다."
           }
         }
       }
@@ -3561,6 +4371,16 @@
         }
       }
     },
+    "Top": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "맨 위"
+          }
+        }
+      }
+    },
     "Touch ID or the macOS password is required before secret export.": {
       "localizations": {
         "ko": {
@@ -3601,12 +4421,32 @@
         }
       }
     },
+    "Underline": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "밑줄"
+          }
+        }
+      }
+    },
     "Unfocused Split Opacity": {
       "localizations": {
         "ko": {
           "stringUnit": {
             "state": "translated",
             "value": "비활성 분할 불투명도"
+          }
+        }
+      }
+    },
+    "Unlimited": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "무제한"
           }
         }
       }
@@ -3711,6 +4551,16 @@
         }
       }
     },
+    "View Log": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "로그 보기"
+          }
+        }
+      }
+    },
     "Wait for the current stop operation to finish before starting it again.": {
       "localizations": {
         "ko": {
@@ -3731,6 +4581,16 @@
         }
       }
     },
+    "Warning: Full open access makes the control socket world-readable/writable on this Mac and disables auth checks. Use only for local debugging.": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "경고: 완전 개방은 이 Mac에서 제어 소켓을 누구나 읽고 쓸 수 있게 만들고 인증 검사를 끕니다. 로컬 디버깅에만 사용하세요."
+          }
+        }
+      }
+    },
     "Web dashboard at %@:%@": {
       "localizations": {
         "ko": {
@@ -3747,6 +4607,16 @@
           "stringUnit": {
             "state": "translated",
             "value": "환영 화면"
+          }
+        }
+      }
+    },
+    "When enabled, Term-Mesh wraps the claude command to inject session tracking and notification hooks. Disable if you prefer to manage Claude Code hooks yourself.": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "켜면 Term-Mesh가 claude 명령을 감싸 세션 추적과 알림 훅을 넣습니다. Claude Code 훅을 직접 관리하려면 끄세요."
           }
         }
       }
@@ -3831,12 +4701,32 @@
         }
       }
     },
+    "Worktree Log": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "워크트리 로그"
+          }
+        }
+      }
+    },
     "Worktrees": {
       "localizations": {
         "ko": {
           "stringUnit": {
             "state": "translated",
             "value": "워크트리"
+          }
+        }
+      }
+    },
+    "Worktrees on Disk": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "디스크의 워크트리"
           }
         }
       }

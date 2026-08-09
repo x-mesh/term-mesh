@@ -767,7 +767,7 @@ struct SettingsView: View {
                         ) {
                             Picker("", selection: $newWorkspacePlacement) {
                                 ForEach(NewWorkspacePlacement.allCases) { placement in
-                                    Text(placement.displayName).tag(placement.rawValue)
+                                    Text(LocalizedStringKey(placement.displayName)).tag(placement.rawValue)
                                 }
                             }
                             .labelsHidden()
@@ -800,7 +800,7 @@ struct SettingsView: View {
                         ) {
                             Picker("", selection: $sessionRestoreMode) {
                                 ForEach(SessionRestoreMode.allCases) { mode in
-                                    Text(mode.displayName).tag(mode.rawValue)
+                                    Text(LocalizedStringKey(mode.displayName)).tag(mode.rawValue)
                                 }
                             }
                             .labelsHidden()
@@ -1172,7 +1172,7 @@ struct SettingsView: View {
                         ) {
                             Picker("", selection: sidebarIndicatorStyleSelection) {
                                 ForEach(SidebarActiveTabIndicatorStyle.allCases) { style in
-                                    Text(style.displayName).tag(style.rawValue)
+                                    Text(LocalizedStringKey(style.displayName)).tag(style.rawValue)
                                 }
                             }
                             .labelsHidden()
@@ -1268,7 +1268,7 @@ struct SettingsView: View {
                         ) {
                             Picker("", selection: socketModeSelection) {
                                 ForEach(SocketControlMode.uiCases) { mode in
-                                    Text(mode.displayName).tag(mode.rawValue)
+                                    Text(LocalizedStringKey(mode.displayName)).tag(mode.rawValue)
                                 }
                             }
                             .labelsHidden()
@@ -2017,7 +2017,8 @@ struct SettingsView: View {
                         ) {
                             Picker("", selection: $browserSearchEngine) {
                                 ForEach(BrowserSearchEngine.allCases) { engine in
-                                    Text(engine.displayName).tag(engine.rawValue)
+                                    // Brand names — never translated.
+                                    Text(verbatim: engine.displayName).tag(engine.rawValue)
                                 }
                             }
                             .labelsHidden()
@@ -2046,7 +2047,7 @@ struct SettingsView: View {
                         ) {
                             Picker("", selection: browserThemeModeSelection) {
                                 ForEach(BrowserThemeMode.allCases) { mode in
-                                    Text(mode.displayName).tag(mode.rawValue)
+                                    Text(LocalizedStringKey(mode.displayName)).tag(mode.rawValue)
                                 }
                             }
                             .labelsHidden()
