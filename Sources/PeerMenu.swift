@@ -24,7 +24,7 @@ import PeerProto
 enum PeerMenu {
     static func item() -> NSMenuItem {
         let item = NSMenuItem(
-            title: "Connect to Peer…",
+            title: LanguageSettings.localized("Connect to Peer…"),
             action: #selector(PeerClientCoordinator.promptAndRun(_:)),
             keyEquivalent: ""
         )
@@ -34,7 +34,7 @@ enum PeerMenu {
 
     static func relayWorkspaceItem() -> NSMenuItem {
         let item = NSMenuItem(
-            title: "Connect to Peer Workspace via Ghostty Relay…",
+            title: LanguageSettings.localized("Connect to Peer Workspace via Ghostty Relay…"),
             action: #selector(PeerClientCoordinator.promptAndRunRelayWorkspace(_:)),
             keyEquivalent: ""
         )
@@ -45,8 +45,9 @@ enum PeerMenu {
     /// The sidebar-first replacement for the legacy SSH connect dialog:
     /// opens the saved-host editor sheet in the main window's sidebar.
     static func addRemoteHostItem() -> NSMenuItem {
-        let item = NSMenuItem(title: "Peer Hosts", action: nil, keyEquivalent: "")
-        let submenu = NSMenu(title: "Peer Hosts")
+        let title = LanguageSettings.localized("Peer Hosts")
+        let item = NSMenuItem(title: title, action: nil, keyEquivalent: "")
+        let submenu = NSMenu(title: title)
         submenu.delegate = PeerClientCoordinator.shared
         item.submenu = submenu
         PeerClientCoordinator.shared.populatePeerHostsMenu(submenu)
@@ -55,7 +56,7 @@ enum PeerMenu {
 
     static func connectionsItem() -> NSMenuItem {
         let item = NSMenuItem(
-            title: "Show Peer Connections…",
+            title: LanguageSettings.localized("Show Peer Connections…"),
             action: #selector(PeerClientCoordinator.showConnections(_:)),
             keyEquivalent: ""
         )
@@ -298,8 +299,11 @@ final class PeerClientCoordinator: NSObject, NSMenuDelegate {
     private func beginConnectionFlow(_ flow: ConnectionFlow) -> Bool {
         guard !activeConnectionFlows.contains(flow) else {
             showAlert(
-                title: "Connection Already in Progress",
-                body: "term-mesh is already connecting to \(flow.displayName)."
+                title: LanguageSettings.localized("Connection Already in Progress"),
+                body: String(
+                    format: LanguageSettings.localized("term-mesh is already connecting to %@."),
+                    flow.displayName
+                )
             )
             return false
         }
@@ -330,7 +334,7 @@ final class PeerClientCoordinator: NSObject, NSMenuDelegate {
     func populatePeerHostsMenu(_ menu: NSMenu) {
         menu.removeAllItems()
         let add = NSMenuItem(
-            title: "Add Peer Host…",
+            title: LanguageSettings.localized("Add Peer Host…"),
             action: #selector(addRemoteHost(_:)),
             keyEquivalent: ""
         )
@@ -343,7 +347,11 @@ final class PeerClientCoordinator: NSObject, NSMenuDelegate {
         for profile in profiles {
             guard let runner = profile.savedRunner else { continue }
             let item = NSMenuItem(
-                title: "Run \(profile.effectiveDisplayName) · \(runner.surface.cwd)",
+                title: String(
+                    format: LanguageSettings.localized("Run %@ · %@"),
+                    profile.effectiveDisplayName,
+                    runner.surface.cwd
+                ),
                 action: #selector(runSavedProfileFromMenu(_:)),
                 keyEquivalent: ""
             )
@@ -536,8 +544,11 @@ final class PeerClientCoordinator: NSObject, NSMenuDelegate {
             code: code, context: context
         )
         showAlert(
-            title: "Remote Runner Failed",
-            body: "Stage: \(stage.rawValue)\nMachine: \(machine)\nCWD: \(cwd)\nError: \(code)\n\(context)"
+            title: LanguageSettings.localized("Remote Runner Failed"),
+            body: String(
+                format: LanguageSettings.localized("Stage: %@\nMachine: %@\nCWD: %@\nError: %@\n%@"),
+                stage.rawValue, machine, cwd, code, context
+            )
         )
     }
 
@@ -683,7 +694,7 @@ final class PeerClientCoordinator: NSObject, NSMenuDelegate {
                 remote = try await PeerSocketProber.probe(sshTarget: target)
             } catch {
                 self.showAlert(
-                    title: "Socket Auto-Detect Failed",
+                    title: LanguageSettings.localized("Socket Auto-Detect Failed"),
                     body: Self.probeFailureBody(error, target: target)
                 )
                 return
@@ -700,7 +711,7 @@ final class PeerClientCoordinator: NSObject, NSMenuDelegate {
         do {
             try await tunnel.start()
         } catch {
-            self.showAlert(title: "SSH Tunnel Failed",
+            self.showAlert(title: LanguageSettings.localized("SSH Tunnel Failed"),
                            body: String(describing: error))
             return
         }
@@ -736,7 +747,7 @@ final class PeerClientCoordinator: NSObject, NSMenuDelegate {
                 remote = try await PeerSocketProber.probe(sshTarget: target)
             } catch {
                 self.showAlert(
-                    title: "Socket Auto-Detect Failed",
+                    title: LanguageSettings.localized("Socket Auto-Detect Failed"),
                     body: Self.probeFailureBody(error, target: target)
                 )
                 return
@@ -792,8 +803,8 @@ final class PeerClientCoordinator: NSObject, NSMenuDelegate {
         // before a connection is even opened.
         guard !spec.targetsLocalPeerServer else {
             self.showAlert(
-                title: "Cannot Attach Local Peer",
-                body: "Choose a different peer host; a terminal cannot be attached to itself."
+                title: LanguageSettings.localized("Cannot Attach Local Peer"),
+                body: LanguageSettings.localized("Choose a different peer host; a terminal cannot be attached to itself.")
             )
             return false
         }
@@ -801,7 +812,7 @@ final class PeerClientCoordinator: NSObject, NSMenuDelegate {
         do {
             lease = try await PeerPaneHostRegistry.shared.acquire(spec)
         } catch {
-            self.showAlert(title: "Peer Connection Failed", body: String(describing: error))
+            self.showAlert(title: LanguageSettings.localized("Peer Connection Failed"), body: String(describing: error))
             return false
         }
         let registry = PeerPaneHostRegistry.shared
@@ -816,8 +827,8 @@ final class PeerClientCoordinator: NSObject, NSMenuDelegate {
                     // falling back to some other workspace's panes.
                     registry.release(lease)
                     self.showAlert(
-                        title: "Workspace Unavailable",
-                        body: "This remote workspace is no longer available on the host."
+                        title: LanguageSettings.localized("Workspace Unavailable"),
+                        body: LanguageSettings.localized("This remote workspace is no longer available on the host.")
                     )
                     return false
                 }
@@ -827,17 +838,17 @@ final class PeerClientCoordinator: NSObject, NSMenuDelegate {
             }
         } catch {
             registry.release(lease)
-            self.showAlert(title: "Surface List Failed", body: String(describing: error))
+            self.showAlert(title: LanguageSettings.localized("Surface List Failed"), body: String(describing: error))
             return false
         }
         let attachable = surfaces.filter { $0.attachable }
         guard !attachable.isEmpty else {
             registry.release(lease)
             self.showAlert(
-                title: "No Attachable Surfaces",
+                title: LanguageSettings.localized("No Attachable Surfaces"),
                 body: workspaceID == nil
-                    ? "The host reports no surfaces that allow per-surface attach."
-                    : "This workspace has no panes to attach."
+                    ? LanguageSettings.localized("The host reports no surfaces that allow per-surface attach.")
+                    : LanguageSettings.localized("This workspace has no panes to attach.")
             )
             return false
         }
@@ -892,8 +903,8 @@ final class PeerClientCoordinator: NSObject, NSMenuDelegate {
         guard let workspace = Self.currentWorkspaceForPaneOpen() else {
             registry.release(lease)
             self.showAlert(
-                title: "No Active Workspace",
-                body: "Open a terminal workspace first, then add the remote pane."
+                title: LanguageSettings.localized("No Active Workspace"),
+                body: LanguageSettings.localized("Open a terminal workspace first, then add the remote pane.")
             )
             return false
         }
@@ -908,7 +919,7 @@ final class PeerClientCoordinator: NSObject, NSMenuDelegate {
             )
         } catch {
             registry.release(lease)
-            self.showAlert(title: "Attach Failed", body: String(describing: error))
+            self.showAlert(title: LanguageSettings.localized("Attach Failed"), body: String(describing: error))
             return false
         }
         // Browse ref done — the pane session holds its own ref now.
@@ -917,8 +928,8 @@ final class PeerClientCoordinator: NSObject, NSMenuDelegate {
         guard workspace.openRemotePane(session: session, lifetime: lifetime) != nil else {
             session.teardown()
             self.showAlert(
-                title: "Pane Open Failed",
-                body: "No focused terminal pane to split from in the current workspace."
+                title: LanguageSettings.localized("Pane Open Failed"),
+                body: LanguageSettings.localized("No focused terminal pane to split from in the current workspace.")
             )
             return false
         }
@@ -1708,7 +1719,7 @@ final class PeerClientCoordinator: NSObject, NSMenuDelegate {
         do {
             lease = try await registry.acquire(spec)
         } catch {
-            self.showAlert(title: "Reconnect Failed", body: String(describing: error))
+            self.showAlert(title: LanguageSettings.localized("Reconnect Failed"), body: String(describing: error))
             return
         }
         let surfaces: [Termmesh_Peer_V1_SurfaceInfo]
@@ -1716,7 +1727,7 @@ final class PeerClientCoordinator: NSObject, NSMenuDelegate {
             surfaces = try await PeerPaneSession.listSurfaces(on: lease)
         } catch {
             registry.release(lease)
-            self.showAlert(title: "Reconnect Failed", body: String(describing: error))
+            self.showAlert(title: LanguageSettings.localized("Reconnect Failed"), body: String(describing: error))
             return
         }
         let match = surfaces.first { $0.surfaceID == wanted.surfaceID && $0.attachable }
@@ -1724,8 +1735,8 @@ final class PeerClientCoordinator: NSObject, NSMenuDelegate {
         guard let match else {
             registry.release(lease)
             self.showAlert(
-                title: "Surface Gone",
-                body: "The remote surface no longer exists on the host."
+                title: LanguageSettings.localized("Surface Gone"),
+                body: LanguageSettings.localized("The remote surface no longer exists on the host.")
             )
             return
         }
@@ -1739,7 +1750,7 @@ final class PeerClientCoordinator: NSObject, NSMenuDelegate {
             )
         } catch {
             registry.release(lease)
-            self.showAlert(title: "Reconnect Failed", body: String(describing: error))
+            self.showAlert(title: LanguageSettings.localized("Reconnect Failed"), body: String(describing: error))
             return
         }
         registry.release(lease)
@@ -1751,8 +1762,8 @@ final class PeerClientCoordinator: NSObject, NSMenuDelegate {
         guard workspace.openRemotePane(session: session, from: panelId) != nil else {
             session.teardown()
             self.showAlert(
-                title: "Reconnect Failed",
-                body: "Could not open a replacement pane in the workspace."
+                title: LanguageSettings.localized("Reconnect Failed"),
+                body: LanguageSettings.localized("Could not open a replacement pane in the workspace.")
             )
             return
         }
@@ -1793,7 +1804,7 @@ final class PeerClientCoordinator: NSObject, NSMenuDelegate {
         } catch {
             tunnel?.stop()
             await MainActor.run {
-                self.showAlert(title: "Peer Workspace Failed",
+                self.showAlert(title: LanguageSettings.localized("Peer Workspace Failed"),
                                body: String(describing: error))
             }
             return
@@ -1808,7 +1819,10 @@ final class PeerClientCoordinator: NSObject, NSMenuDelegate {
             tunnel?.stop()
             await MainActor.run {
                 self.showAlert(title: "Peer Workspace Failed",
-                               body: "listWorkspaces failed: \(error)")
+                               body: String(
+                                format: LanguageSettings.localized("listWorkspaces failed: %@"),
+                                String(describing: error)
+                               ))
             }
             return
         }
@@ -1819,7 +1833,7 @@ final class PeerClientCoordinator: NSObject, NSMenuDelegate {
             tunnel?.stop()
             await MainActor.run {
                 self.showAlert(title: "Peer Workspace Failed",
-                               body: "Host did not return any workspaces.")
+                               body: LanguageSettings.localized("Host did not return any workspaces."))
             }
             return
         }
@@ -1870,23 +1884,26 @@ final class PeerClientCoordinator: NSObject, NSMenuDelegate {
 
     @objc func promptAndRunRelayWorkspace(_ sender: Any?) {
         let alert = NSAlert()
-        alert.messageText = "Connect to Peer Workspace via Ghostty Relay"
-        alert.informativeText = "Path to a Swift peer server socket. Picks one of the host's workspaces and mirrors its split layout in a single window."
+        alert.messageText = LanguageSettings.localized("Connect to Peer Workspace via Ghostty Relay")
+        alert.informativeText = LanguageSettings.localized("Path to a Swift peer server socket. Picks one of the host's workspaces and mirrors its split layout in a single window.")
 
         let input = NSTextField(frame: NSRect(x: 0, y: 0, width: 360, height: 24))
         input.stringValue = ProcessInfo.processInfo.environment["TERMMESH_DEBUG_PEER_SERVER_PATH"]
             ?? PeerHostCoordinator.shared.currentSocketPath
             ?? PeerFederationSettings.socketPath
         alert.accessoryView = input
-        alert.addButton(withTitle: "Connect")
-        alert.addButton(withTitle: "Cancel")
+        alert.addButton(withTitle: LanguageSettings.localized("Connect"))
+        alert.addButton(withTitle: LanguageSettings.localized("Cancel"))
 
         Task { @MainActor in
             let resp = await Self.runModalAsSheet(alert)
             guard resp == .alertFirstButtonReturn else { return }
             let path = self.normalizedSocketPath(from: input.stringValue)
             guard !path.isEmpty else {
-                self.showAlert(title: "Peer Socket Required", body: "Enter a peer socket path.")
+                self.showAlert(
+                    title: LanguageSettings.localized("Peer Socket Required"),
+                    body: LanguageSettings.localized("Enter a peer socket path.")
+                )
                 return
             }
             guard self.validateLocalSocketPathForConnect(path) else { return }
@@ -1960,8 +1977,12 @@ final class PeerClientCoordinator: NSObject, NSMenuDelegate {
         from workspaces: [Termmesh_Peer_V1_Workspace]
     ) async -> Termmesh_Peer_V1_Workspace? {
         let alert = NSAlert()
-        alert.messageText = "Choose a workspace"
-        alert.informativeText = "Host has \(workspaces.count) workspaces. The chosen one will open in a single window with its host split layout."
+        alert.messageText = LanguageSettings.localized("Choose a workspace")
+        alert.informativeText = String(
+            format: LanguageSettings.localized("Host has %lld workspaces. The chosen one will open in a single window with its host split layout."),
+            locale: LanguageSettings.currentLocale(),
+            workspaces.count
+        )
 
         let popup = NSPopUpButton(
             frame: NSRect(x: 0, y: 0, width: 360, height: 26),
@@ -1996,8 +2017,13 @@ final class PeerClientCoordinator: NSObject, NSMenuDelegate {
                 )
                 let count = countLeaves(w.layout)
                 let idHex = w.workspaceID.prefix(4).map { String(format: "%02x", $0) }.joined()
-                let item = NSMenuItem(title: "\(title)  ·  \(count) panes  [\(idHex)]",
-                                      action: nil, keyEquivalent: "")
+                let item = NSMenuItem(
+                    title: String(
+                        format: LanguageSettings.localized("%@  ·  %@ panes  [%@]"),
+                        title, String(count), idHex
+                    ),
+                    action: nil, keyEquivalent: ""
+                )
                 // Stash the workspace itself so the index→workspace mapping
                 // survives the interleaved (non-selectable) header rows.
                 item.representedObject = w
@@ -2010,8 +2036,8 @@ final class PeerClientCoordinator: NSObject, NSMenuDelegate {
             popup.select(firstReal)
         }
         alert.accessoryView = popup
-        alert.addButton(withTitle: "Open")
-        alert.addButton(withTitle: "Cancel")
+        alert.addButton(withTitle: LanguageSettings.localized("Open"))
+        alert.addButton(withTitle: LanguageSettings.localized("Cancel"))
 
         let resp = await Self.runModalAsSheet(alert)
         guard resp == .alertFirstButtonReturn else { return nil }
@@ -2032,8 +2058,12 @@ final class PeerClientCoordinator: NSObject, NSMenuDelegate {
         from surfaces: [Termmesh_Peer_V1_SurfaceInfo]
     ) async -> Termmesh_Peer_V1_SurfaceInfo? {
         let alert = NSAlert()
-        alert.messageText = "Choose a remote surface"
-        alert.informativeText = "Host exposes \(surfaces.count) surfaces. Pick which one this relay window should mirror."
+        alert.messageText = LanguageSettings.localized("Choose a remote surface")
+        alert.informativeText = String(
+            format: LanguageSettings.localized("Host exposes %lld surfaces. Pick which one this relay window should mirror."),
+            locale: LanguageSettings.currentLocale(),
+            surfaces.count
+        )
 
         let popup = NSPopUpButton(
             frame: NSRect(x: 0, y: 0, width: 360, height: 26),
@@ -2066,8 +2096,8 @@ final class PeerClientCoordinator: NSObject, NSMenuDelegate {
             popup.menu?.addItem(item)
         }
         alert.accessoryView = popup
-        alert.addButton(withTitle: "Open")
-        alert.addButton(withTitle: "Cancel")
+        alert.addButton(withTitle: LanguageSettings.localized("Open"))
+        alert.addButton(withTitle: LanguageSettings.localized("Cancel"))
 
         let resp = await Self.runModalAsSheet(alert)
         guard resp == .alertFirstButtonReturn else { return nil }
@@ -2078,22 +2108,25 @@ final class PeerClientCoordinator: NSObject, NSMenuDelegate {
 
     @objc func promptAndRun(_ sender: Any?) {
         let alert = NSAlert()
-        alert.messageText = "Connect to peer socket"
-        alert.informativeText = "Path to a term-meshd peer socket (see TERMMESH_PEER_SOCKET)."
+        alert.messageText = LanguageSettings.localized("Connect to peer socket")
+        alert.informativeText = LanguageSettings.localized("Path to a term-meshd peer socket (see TERMMESH_PEER_SOCKET).")
 
         let input = NSTextField(frame: NSRect(x: 0, y: 0, width: 360, height: 24))
         input.stringValue = defaultSocketPath()
         input.placeholderString = "/tmp/termmesh-peer.sock"
         alert.accessoryView = input
-        alert.addButton(withTitle: "Connect")
-        alert.addButton(withTitle: "Cancel")
+        alert.addButton(withTitle: LanguageSettings.localized("Connect"))
+        alert.addButton(withTitle: LanguageSettings.localized("Cancel"))
 
         Task { @MainActor in
             let resp = await Self.runModalAsSheet(alert)
             guard resp == .alertFirstButtonReturn else { return }
             let path = self.normalizedSocketPath(from: input.stringValue)
             guard !path.isEmpty else {
-                self.showAlert(title: "Peer Socket Required", body: "Enter a peer socket path.")
+                self.showAlert(
+                    title: LanguageSettings.localized("Peer Socket Required"),
+                    body: LanguageSettings.localized("Enter a peer socket path.")
+                )
                 return
             }
             guard self.validateLocalSocketPathForConnect(path) else { return }
@@ -2110,7 +2143,7 @@ final class PeerClientCoordinator: NSObject, NSMenuDelegate {
         do {
             transport = try await UnixSocketTransport.connect(socketPath: socketPath)
         } catch {
-            showAlert(title: "Peer connection failed", body: String(describing: error))
+            showAlert(title: LanguageSettings.localized("Peer connection failed"), body: String(describing: error))
             return
         }
 
@@ -2124,7 +2157,13 @@ final class PeerClientCoordinator: NSObject, NSMenuDelegate {
             let surfaces = try await session.listSurfaces()
             guard let chosen = surfaces.first(where: { $0.attachable }) ?? surfaces.first else {
                 await transport.close()
-                showAlert(title: "No surfaces on host", body: "\(info.hostDisplayName) reports no exposable surfaces.")
+                showAlert(
+                    title: LanguageSettings.localized("No surfaces on host"),
+                    body: String(
+                        format: LanguageSettings.localized("%@ reports no exposable surfaces."),
+                        info.hostDisplayName
+                    )
+                )
                 return
             }
 
@@ -2154,7 +2193,7 @@ final class PeerClientCoordinator: NSObject, NSMenuDelegate {
             self.postRelaysChanged()
         } catch {
             await transport.close()
-            showAlert(title: "Peer connection failed", body: String(describing: error))
+            showAlert(title: LanguageSettings.localized("Peer connection failed"), body: String(describing: error))
         }
     }
 
@@ -2163,7 +2202,7 @@ final class PeerClientCoordinator: NSObject, NSMenuDelegate {
         alert.messageText = title
         alert.informativeText = body
         alert.alertStyle = .warning
-        alert.addButton(withTitle: "OK")
+        alert.addButton(withTitle: LanguageSettings.localized("OK"))
         Self.presentAsSheetIfPossible(alert) { _ in }
     }
 
@@ -2175,7 +2214,7 @@ final class PeerClientCoordinator: NSObject, NSMenuDelegate {
 
     private func validateLocalSocketPathForConnect(_ path: String) -> Bool {
         if let message = localSocketPathValidationMessage(path) {
-            showAlert(title: "Peer Socket Unavailable", body: message)
+            showAlert(title: LanguageSettings.localized("Peer Socket Unavailable"), body: message)
             return false
         }
         return true

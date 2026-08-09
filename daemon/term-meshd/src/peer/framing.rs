@@ -105,6 +105,7 @@ mod tests {
                 capabilities: vec![placeholder.to_string()],
                 app_version: "test".into(),
                 cli_bin_dirs: vec![],
+                session_host_socket: String::new(),
             })),
         };
         let mut encoded = env.encode_to_vec();

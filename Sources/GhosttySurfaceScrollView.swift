@@ -296,12 +296,12 @@ final class GhosttySurfaceScrollView: NSView {
     private let flashLayer: CAShapeLayer
     private let remotePasteTransferIndicator = RemotePasteTransferIndicator(frame: .zero)
     private var remotePasteTransferCount = 0
-    private var searchOverlayHostingView: NSHostingView<SurfaceSearchOverlay>?
-    private var scrollToBottomHostingView: NSHostingView<ScrollToBottomButton>?
-    private var pasteShelfOverlayHostingView: NSHostingView<PasteShelfOverlay>?
+    private var searchOverlayHostingView: NSHostingView<TermMeshHostedRoot<SurfaceSearchOverlay>>?
+    private var scrollToBottomHostingView: NSHostingView<TermMeshHostedRoot<ScrollToBottomButton>>?
+    private var pasteShelfOverlayHostingView: NSHostingView<TermMeshHostedRoot<PasteShelfOverlay>>?
     private let pasteShelfOverlayState = PasteShelfOverlayState()
     private var pasteShelfKeyMonitor: Any?
-    private var imeInputBarHostingView: NSHostingView<IMEInputBar>?
+    private var imeInputBarHostingView: NSHostingView<TermMeshHostedRoot<IMEInputBar>>?
     private var imeBarDragHandle: IMEBarDragHandle?
     private static let imeMinBarHeight: CGFloat = 60
     private static let imeMinTerminalHeight: CGFloat = 40
@@ -1003,7 +1003,7 @@ final class GhosttySurfaceScrollView: NSView {
         }
 
         if let overlay = scrollToBottomHostingView {
-            overlay.rootView = rootView
+            overlay.rootView = TermMeshHostedRoot(rootView)
             if overlay.superview !== self {
                 overlay.removeFromSuperview()
                 addSubview(overlay, positioned: .above, relativeTo: nil)
@@ -1012,7 +1012,7 @@ final class GhosttySurfaceScrollView: NSView {
             return
         }
 
-        let overlay = NSHostingView(rootView: rootView)
+        let overlay = NSHostingView(rootView: TermMeshHostedRoot(rootView))
         addSubview(overlay, positioned: .above, relativeTo: nil)
         scrollToBottomHostingView = overlay
         needsLayout = true
@@ -1054,7 +1054,7 @@ final class GhosttySurfaceScrollView: NSView {
         )
 
         if let overlay = searchOverlayHostingView {
-            overlay.rootView = rootView
+            overlay.rootView = TermMeshHostedRoot(rootView)
             if overlay.superview !== self {
                 overlay.removeFromSuperview()
                 addSubview(overlay)
@@ -1068,7 +1068,7 @@ final class GhosttySurfaceScrollView: NSView {
             return
         }
 
-        let overlay = NSHostingView(rootView: rootView)
+        let overlay = NSHostingView(rootView: TermMeshHostedRoot(rootView))
         overlay.translatesAutoresizingMaskIntoConstraints = false
         addSubview(overlay)
         NSLayoutConstraint.activate([
@@ -1200,7 +1200,7 @@ final class GhosttySurfaceScrollView: NSView {
             slashCommandAliases: self.imeSlashCommandAliases()
         )
 
-        let overlay = NSHostingView(rootView: rootView)
+        let overlay = NSHostingView(rootView: TermMeshHostedRoot(rootView))
         addSubview(overlay)
         imeInputBarHostingView = overlay
 
@@ -1497,7 +1497,7 @@ final class GhosttySurfaceScrollView: NSView {
             },
             onClose: { [weak self] in self?.dismissPasteShelfOverlay() }
         )
-        let overlay = NSHostingView(rootView: rootView)
+        let overlay = NSHostingView(rootView: TermMeshHostedRoot(rootView))
         overlay.translatesAutoresizingMaskIntoConstraints = false
         addSubview(overlay, positioned: .above, relativeTo: nil)
         NSLayoutConstraint.activate([

@@ -468,6 +468,13 @@ fn translate_terminal_csi_input(seq: &[u8]) -> Option<Vec<u8>> {
     }
     let final_byte = *seq.last()?;
     if final_byte != b'u' {
+        // Ghostty uses xterm's modifyOtherKeys encoding when the kitty
+        // keyboard protocol is not active. In that mode Shift+Enter is
+        // `CSI 27;2;13~` rather than `CSI 13;2u`. Normalize both forms so
+        // remote multiline editors receive the same LF.
+        if seq == b"\x1B[27;2;13~" {
+            return Some(vec![b'\n']);
+        }
         return translate_kitty_special_csi_input(seq);
     }
 
@@ -1040,6 +1047,20 @@ mod tests {
         assert_eq!(filter(b"\x1B[13;2u"), b"\n");
         assert_eq!(filter(b"\x1B[13;2:1u"), b"\n");
         assert_eq!(filter(b"\x1B[13;2:2u"), b"\n");
+        assert_eq!(filter(b"\x1B[27;2;13~"), b"\n");
+    }
+
+    #[test]
+    fn translates_modify_other_keys_shift_enter_split_across_reads() {
+        let mut f = TerminalResponseFilter::default();
+        assert!(f.process(b"\x1B[27;2;").is_empty());
+        assert_eq!(f.process(b"13~"), b"\n");
+    }
+
+    #[test]
+    fn passes_other_modify_other_keys_sequences_unchanged() {
+        assert_eq!(filter(b"\x1B[27;5;99~"), b"\x1B[27;5;99~");
+        assert_eq!(filter(b"\x1B[27;2;9~"), b"\x1B[27;2;9~");
     }
 
     #[test]

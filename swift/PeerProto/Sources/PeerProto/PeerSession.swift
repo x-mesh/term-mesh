@@ -968,9 +968,13 @@ public actor PeerSession {
     /// PtyData frame is observable through the protocol byte sequence, so the
     /// relay's existing gap/resume path can repair it. Pong is consumed above
     /// and never reaches this buffer; errors/goodbye/layout pushes are retained.
+    ///
+    /// The cap is enforced on arrival of *any* message, not only PtyData:
+    /// gating it on the incoming type meant a run of control messages could
+    /// push the buffer past the limit unchecked, which is the unbounded growth
+    /// the cap exists to prevent.
     private func bufferIncoming(_ message: PeerIncomingMessage) {
         if bufferedIncomingMessages.count >= Self.maxBufferedIncomingMessages,
-           case .ptyData = message,
            let oldestPty = bufferedIncomingMessages.firstIndex(where: {
                if case .ptyData = $0 { return true }
                return false

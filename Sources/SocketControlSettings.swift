@@ -1,5 +1,6 @@
 import Foundation
 import Security
+import SwiftUI
 import os
 
 enum SocketControlMode: String, CaseIterable, Identifiable {
@@ -29,7 +30,8 @@ enum SocketControlMode: String, CaseIterable, Identifiable {
         }
     }
 
-    var description: String {
+    /// Localized: this is UI wording, not data.
+    var description: LocalizedStringKey {
         switch self {
         case .off:
             return "Disable the local control socket."

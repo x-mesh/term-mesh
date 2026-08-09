@@ -655,6 +655,7 @@ mod integration_tests {
                     capabilities: peer_proto::capability::supported_vec(),
                     app_version: "test".into(),
                     cli_bin_dirs: vec![],
+                    session_host_socket: String::new(),
                 })),
             },
         )
@@ -862,6 +863,7 @@ mod integration_tests {
                     capabilities: peer_proto::capability::supported_vec(),
                     app_version: "test".into(),
                     cli_bin_dirs: vec![],
+                    session_host_socket: String::new(),
                 })),
             },
         )
@@ -987,6 +989,7 @@ mod integration_tests {
                     capabilities: peer_proto::capability::supported_vec(),
                     app_version: "live".into(),
                     cli_bin_dirs: vec![],
+                    session_host_socket: String::new(),
                 })),
             },
         )
@@ -1179,6 +1182,7 @@ mod integration_tests {
                     capabilities: peer_proto::capability::supported_vec(),
                     app_version: "test".into(),
                     cli_bin_dirs: vec![],
+                    session_host_socket: String::new(),
                 })),
             },
         )
@@ -1277,6 +1281,7 @@ mod integration_tests {
                     capabilities: peer_proto::capability::supported_vec(),
                     app_version: "test".into(),
                     cli_bin_dirs: vec![],
+                    session_host_socket: String::new(),
                 })),
             },
         )
@@ -2128,6 +2133,7 @@ mod integration_tests {
                     capabilities: caps,
                     app_version: "test".into(),
                     cli_bin_dirs: vec![],
+                    session_host_socket: String::new(),
                 })),
             },
         )
@@ -2487,6 +2493,7 @@ mod integration_tests {
                     capabilities: peer_proto::capability::supported_vec(),
                     app_version: "test".into(),
                     cli_bin_dirs: vec![],
+                    session_host_socket: String::new(),
                 })),
             },
         )
@@ -2700,6 +2707,7 @@ mod integration_tests {
                     capabilities: peer_proto::capability::supported_vec(),
                     app_version: "test".into(),
                     cli_bin_dirs: vec![],
+                    session_host_socket: String::new(),
                 })),
             },
         )
@@ -2778,6 +2786,7 @@ mod integration_tests {
                     capabilities,
                     app_version: "test".into(),
                     cli_bin_dirs: vec![],
+                    session_host_socket: String::new(),
                 })),
             },
         )
@@ -3156,6 +3165,7 @@ mod integration_tests {
                     capabilities: peer_proto::capability::supported_vec(),
                     app_version: "test".into(),
                     cli_bin_dirs: vec![],
+                    session_host_socket: String::new(),
                 })),
             },
         )

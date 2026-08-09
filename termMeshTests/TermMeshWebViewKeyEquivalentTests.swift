@@ -86,6 +86,287 @@ final class AppLaunchEnvironmentTests: XCTestCase {
     }
 }
 
+final class LanguageSettingsTests: XCTestCase {
+    func testInvalidStoredLanguageFallsBackToSystemAndRepairsDefaults() {
+        let suiteName = "LanguageSettingsTests.Invalid.\(UUID().uuidString)"
+        guard let defaults = UserDefaults(suiteName: suiteName) else {
+            return XCTFail("Failed to create isolated UserDefaults suite")
+        }
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+
+        defaults.set("unsupported", forKey: LanguageSettings.languageModeKey)
+
+        XCTAssertEqual(LanguageSettings.resolvedMode(defaults: defaults), .system)
+        XCTAssertEqual(
+            defaults.string(forKey: LanguageSettings.languageModeKey),
+            AppLanguage.system.rawValue
+        )
+    }
+
+    func testExplicitLanguagesOverrideSystemPreference() {
+        XCTAssertTrue(
+            LanguageSettings.locale(
+                for: AppLanguage.english.rawValue,
+                preferredLanguages: ["ko-KR"]
+            ).identifier.hasPrefix("en")
+        )
+        XCTAssertTrue(
+            LanguageSettings.locale(
+                for: AppLanguage.korean.rawValue,
+                preferredLanguages: ["en-US"]
+            ).identifier.hasPrefix("ko")
+        )
+    }
+
+    func testSystemLanguageUsesMacOSPreferredLanguage() {
+        let locale = LanguageSettings.locale(
+            for: AppLanguage.system.rawValue,
+            preferredLanguages: ["ja-JP", "ko-KR", "en-US"]
+        )
+
+        XCTAssertTrue(locale.identifier.hasPrefix("ko"))
+    }
+
+    func testSystemLanguageFallsBackToEnglishWhenNoPreferredLanguageIsSupported() {
+        let locale = LanguageSettings.locale(
+            for: AppLanguage.system.rawValue,
+            preferredLanguages: ["ja-JP", "fr-FR"]
+        )
+
+        XCTAssertTrue(locale.identifier.hasPrefix("en"))
+    }
+
+    func testKoreanCatalogIsAvailableFromAppBundle() {
+        XCTAssertEqual(
+            String(
+                localized: "Language",
+                bundle: .main,
+                locale: Locale(identifier: "ko")
+            ),
+            "언어"
+        )
+    }
+
+    // MARK: - The chosen language must not drag the region with it
+
+    func testSupportedLanguageCodesAreDerivedFromTheCases() {
+        XCTAssertEqual(AppLanguage.supportedLanguageCodes, ["en", "ko"])
+        XCTAssertNil(AppLanguage.system.languageCode)
+    }
+
+    /// Language and region are configured separately in System Settings, so
+    /// 한국어 + United States is a real setup. Rebuilding the locale from the
+    /// language identifier alone would silently move the user to Korea.
+    func testSystemModeChoosesTheLanguageButKeepsTheRegion() {
+        let locale = LanguageSettings.locale(
+            for: AppLanguage.system.rawValue,
+            preferredLanguages: ["ko-KR", "en-US"],
+            systemLocale: Locale(identifier: "ko_US")
+        )
+
+        XCTAssertEqual(locale.language.languageCode?.identifier, "ko")
+        XCTAssertEqual(locale.region?.identifier, "US")
+    }
+
+    func testExplicitLanguageKeepsTheSystemRegion() {
+        let locale = LanguageSettings.locale(
+            for: AppLanguage.english.rawValue,
+            preferredLanguages: ["ko-KR"],
+            systemLocale: Locale(identifier: "ko_KR")
+        )
+
+        XCTAssertEqual(locale.language.languageCode?.identifier, "en")
+        XCTAssertEqual(locale.region?.identifier, "KR")
+    }
+
+    func testUnsupportedSystemLanguageFallsBackToEnglishAndKeepsTheRegion() {
+        let locale = LanguageSettings.locale(
+            for: AppLanguage.system.rawValue,
+            preferredLanguages: ["ja-JP", "fr-FR"],
+            systemLocale: Locale(identifier: "ja_JP")
+        )
+
+        XCTAssertEqual(locale.language.languageCode?.identifier, "en")
+        XCTAssertEqual(locale.region?.identifier, "JP")
+    }
+
+    func testOverridingTheLanguagePreservesTheHourCycle() {
+        var components = Locale.Components(identifier: "ko_KR")
+        components.hourCycle = .oneToTwelve
+
+        let locale = LanguageSettings.locale(
+            for: AppLanguage.english.rawValue,
+            preferredLanguages: ["ko-KR"],
+            systemLocale: Locale(components: components)
+        )
+
+        XCTAssertEqual(locale.language.languageCode?.identifier, "en")
+        XCTAssertEqual(locale.hourCycle, .oneToTwelve)
+    }
+
+    /// Hangul is not a script for English: carrying `Kore` over would produce
+    /// `en-Kore-KR` and hand the bundle a localization to negotiate that does
+    /// not exist. Clearing it lets ICU infer the right script for the incoming
+    /// language instead — reading `script` back yields `Latn`, not nil.
+    func testGraftingALanguageDropsTheOutgoingScript() {
+        let locale = Locale(identifier: "ko_Kore_KR").withLanguageCode("en")
+
+        XCTAssertEqual(locale.language.languageCode?.identifier, "en")
+        XCTAssertNotEqual(locale.language.script?.identifier, "Kore")
+        XCTAssertFalse(locale.identifier.contains("Kore"))
+        XCTAssertEqual(locale.region?.identifier, "KR")
+    }
+
+    func testGraftingTheSameLanguageIsIdentity() {
+        let original = Locale(identifier: "ko_KR")
+        XCTAssertEqual(original.withLanguageCode("ko"), original)
+    }
+
+    // MARK: - AppKit lookup
+
+    private func isolatedDefaults(
+        _ label: String,
+        language: AppLanguage,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) -> UserDefaults? {
+        let suiteName = "LanguageSettingsTests.\(label).\(UUID().uuidString)"
+        guard let defaults = UserDefaults(suiteName: suiteName) else {
+            XCTFail("Failed to create isolated UserDefaults suite", file: file, line: line)
+            return nil
+        }
+        addTeardownBlock { defaults.removePersistentDomain(forName: suiteName) }
+        defaults.set(language.rawValue, forKey: LanguageSettings.languageModeKey)
+        return defaults
+    }
+
+    func testAppKitLookupFollowsTheKoreanOverride() {
+        guard let defaults = isolatedDefaults("Korean", language: .korean) else { return }
+
+        XCTAssertEqual(LanguageSettings.localized("Show Notifications", defaults: defaults), "알림 보기")
+        XCTAssertEqual(LanguageSettings.localized("Clear All", defaults: defaults), "모두 지우기")
+    }
+
+    /// The app ships no `en.lproj` (English is the source language), so an
+    /// English override must fall through to the key itself. Resolving against
+    /// `Bundle.main` instead would return the *system*-negotiated language and
+    /// hand Korean text to someone who explicitly chose English.
+    func testEnglishOverrideNeverFallsBackToTheSystemLanguage() {
+        guard let defaults = isolatedDefaults("English", language: .english) else { return }
+
+        XCTAssertNil(LanguageSettings.bundle(for: Locale(identifier: "en")))
+        XCTAssertEqual(LanguageSettings.localized("Show Notifications", defaults: defaults), "Show Notifications")
+        XCTAssertEqual(LanguageSettings.localized("Clear All", defaults: defaults), "Clear All")
+    }
+
+    func testUnknownKeyResolvesToItself() {
+        guard let defaults = isolatedDefaults("Unknown", language: .korean) else { return }
+
+        XCTAssertEqual(
+            LanguageSettings.localized("A string that is not in the catalog", defaults: defaults),
+            "A string that is not in the catalog"
+        )
+    }
+
+    func testMenuBarStateHintFollowsTheOverride() {
+        guard let defaults = isolatedDefaults("StateHint", language: .korean) else { return }
+        defaults.set(AppLanguage.korean.rawValue, forKey: LanguageSettings.languageModeKey)
+        UserDefaults.standard.set(AppLanguage.korean.rawValue, forKey: LanguageSettings.languageModeKey)
+        addTeardownBlock {
+            UserDefaults.standard.removeObject(forKey: LanguageSettings.languageModeKey)
+        }
+
+        XCTAssertEqual(NotificationMenuSnapshotBuilder.stateHintTitle(unreadCount: 0), "읽지 않은 알림 없음")
+        XCTAssertEqual(NotificationMenuSnapshotBuilder.stateHintTitle(unreadCount: 1), "읽지 않은 알림 1개")
+        XCTAssertEqual(NotificationMenuSnapshotBuilder.stateHintTitle(unreadCount: 7), "읽지 않은 알림 7개")
+    }
+
+    // MARK: - Language picker
+
+    /// A user who lands in a language they cannot read has to be able to find
+    /// their own, so language names are never translated.
+    func testLanguagesAreListedUnderTheirOwnNames() {
+        XCTAssertEqual(AppLanguage.english.endonym, "English")
+        XCTAssertEqual(AppLanguage.korean.endonym, "한국어")
+        // `.system` follows macOS, so it is labelled in the current UI language.
+        XCTAssertNil(AppLanguage.system.endonym)
+    }
+
+    // MARK: - Searching in the display language
+
+    /// Rows are tagged with English keywords. In Korean the user types 테마,
+    /// which appears in none of them, so the query is mapped back through the
+    /// catalog to the English terms.
+    func testKoreanQueryMapsBackToEnglishKeywords() {
+        let ko = Locale(identifier: "ko")
+
+        let theme = SettingsSearchIndex.englishTerms(matching: "테마", locale: ko)
+        XCTAssertTrue(theme.contains("theme"), "expected 'theme' among \(theme)")
+
+        let notifications = SettingsSearchIndex.englishTerms(matching: "알림", locale: ko)
+        XCTAssertTrue(notifications.contains("notifications"), "expected 'notifications' among \(notifications)")
+    }
+
+    func testQueryWithNoTranslationYieldsNoTerms() {
+        XCTAssertTrue(
+            SettingsSearchIndex.englishTerms(
+                matching: "존재하지않는설정이름",
+                locale: Locale(identifier: "ko")
+            ).isEmpty
+        )
+    }
+
+    /// English ships no `.lproj`, so there is nothing to reverse — English
+    /// queries already match the keyword lists directly.
+    func testSourceLanguageHasNoReverseTable() {
+        XCTAssertTrue(SettingsSearchIndex.table(for: Locale(identifier: "en")).isEmpty)
+    }
+
+    // MARK: - Catalog keys must match the keys SwiftUI actually builds
+
+    /// `Text("… \(value)")` does not key on the source text — SwiftUI rewrites
+    /// each interpolation into a format specifier. A catalog entry written by
+    /// hand with the wrong specifier compiles, ships, and silently never
+    /// matches, which is how `%arg` left the settings-search message English.
+    private func swiftUIKey(_ key: LocalizedStringKey) -> String? {
+        Mirror(reflecting: key).children
+            .first { $0.label == "key" }?
+            .value as? String
+    }
+
+    func testInterpolatedSettingsSearchKeyMatchesTheCatalog() {
+        let key = swiftUIKey("No settings match \"\(  "peer"  )\"")
+        XCTAssertEqual(key, "No settings match \"%@\"")
+
+        guard let key else { return }
+        let localized = String(
+            localized: String.LocalizationValue(key),
+            bundle: .main,
+            locale: Locale(identifier: "ko")
+        )
+        XCTAssertNotEqual(localized, key, "catalog has no ko entry for the key SwiftUI builds")
+        XCTAssertTrue(localized.contains("%@"), "translated value dropped the format specifier")
+    }
+
+    /// Every format specifier must survive translation; a Korean value that
+    /// loses one crashes `String(format:)` or prints a stray literal.
+    func testFormattedMenuStringsKeepTheirSpecifiers() {
+        guard let defaults = isolatedDefaults("Format", language: .korean) else { return }
+
+        let brew = LanguageSettings.localized("Restart and Update term-mesh (%@ → %@)", defaults: defaults)
+        XCTAssertEqual(brew.components(separatedBy: "%@").count - 1, 2)
+        XCTAssertEqual(String(format: brew, "1.0.0", "1.1.0"), "term-mesh 재시작 후 업데이트(1.0.0 → 1.1.0)")
+
+        let focus = LanguageSettings.localized("Focus a %@ agent pane to enable", defaults: defaults)
+        XCTAssertEqual(focus.components(separatedBy: "%@").count - 1, 1)
+
+        for key in ["%lld unread notification", "%lld unread notifications"] {
+            let value = LanguageSettings.localized(key, defaults: defaults)
+            XCTAssertTrue(value.contains("%lld"), "\(key) lost its %lld specifier")
+        }
+    }
+}
+
 final class SidebarTeamRuntimeSnapshotTests: XCTestCase {
     private let baseline = SidebarTeamRuntimeSnapshot(
         teamName: "term-mesh",

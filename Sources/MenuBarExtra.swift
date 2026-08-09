@@ -18,6 +18,7 @@ final class MenuBarExtraController: NSObject, NSMenuDelegate {
     private var notificationsCancellable: AnyCancellable?
     private var brewUpdateCancellable: AnyCancellable?
     private var peerServerObserver: NSObjectProtocol?
+    private var languageObserver: NSObjectProtocol?
     private let buildHintTitle: String?
 
     private let stateHintItem = NSMenuItem(title: "No unread notifications", action: nil, keyEquivalent: "")
@@ -104,6 +105,14 @@ final class MenuBarExtraController: NSObject, NSMenuDelegate {
             self?.updateProfileSubmenu()
         }
 
+        // AppKit menus are built once and mutated in place, so they need an
+        // explicit signal to re-title themselves when the language changes.
+        languageObserver = LanguageSettings.observeChanges { [weak self] in
+            self?.applyLocalizedTitles()
+            self?.updateProfileSubmenu()
+            self?.refreshUI()
+        }
+
         refreshUI()
     }
 
@@ -176,6 +185,25 @@ final class MenuBarExtraController: NSObject, NSMenuDelegate {
         quitItem.target = self
         quitItem.action = #selector(quitAction)
         menu.addItem(quitItem)
+
+        applyLocalizedTitles()
+    }
+
+    /// Re-titles every statically-worded item from the app-language bundle.
+    ///
+    /// `NSMenuItem` titles are plain strings, so the SwiftUI `\.locale`
+    /// environment never reaches them. Items whose text is derived from data
+    /// (notification lines, profile names) are titled by their own builders.
+    private func applyLocalizedTitles() {
+        showNotificationsItem.title = LanguageSettings.localized("Show Notifications")
+        jumpToUnreadItem.title = LanguageSettings.localized("Jump to Latest Unread")
+        markAllReadItem.title = LanguageSettings.localized("Mark All Read")
+        clearAllItem.title = LanguageSettings.localized("Clear All")
+        checkForUpdatesItem.title = LanguageSettings.localized("Check for Updates…")
+        preferencesItem.title = LanguageSettings.localized("Preferences…")
+        quitItem.title = LanguageSettings.localized("Quit Term-Mesh")
+        profileSubmenuItem.title = LanguageSettings.localized("CLI Profile")
+        profileSubmenu.title = profileSubmenuItem.title
     }
 
     func menuWillOpen(_ menu: NSMenu) {
@@ -221,9 +249,11 @@ final class MenuBarExtraController: NSObject, NSMenuDelegate {
             )
             var toolTip = displayedUnreadCount == 0
                 ? "Term-Mesh"
-                : "Term-Mesh: \(displayedUnreadCount) unread notification\(displayedUnreadCount == 1 ? "" : "s")"
+                : "Term-Mesh: " + NotificationMenuSnapshotBuilder.stateHintTitle(
+                    unreadCount: displayedUnreadCount
+                )
             if peerActive {
-                toolTip += " · Peer server: on"
+                toolTip += " · " + LanguageSettings.localized("Peer server: on")
             }
             button.toolTip = toolTip
         }
@@ -301,7 +331,11 @@ final class MenuBarExtraController: NSObject, NSMenuDelegate {
             return
         }
         brewUpdateItem.isHidden = false
-        brewUpdateItem.title = "Restart and Update term-mesh (\(installed) → \(latest))"
+        brewUpdateItem.title = String(
+            format: LanguageSettings.localized("Restart and Update term-mesh (%@ → %@)"),
+            installed,
+            latest
+        )
     }
 
     @objc private func restartAndUpdateBrewAction() {
@@ -334,7 +368,11 @@ final class MenuBarExtraController: NSObject, NSMenuDelegate {
             let active = CLIPathSettings.activeProfile(for: cli)
 
             if profiles.isEmpty {
-                let emptyItem = NSMenuItem(title: "  (no profiles)", action: nil, keyEquivalent: "")
+                let emptyItem = NSMenuItem(
+                    title: "  " + LanguageSettings.localized("(no profiles)"),
+                    action: nil,
+                    keyEquivalent: ""
+                )
                 emptyItem.isEnabled = false
                 profileSubmenu.addItem(emptyItem)
             } else {
@@ -353,7 +391,7 @@ final class MenuBarExtraController: NSObject, NSMenuDelegate {
 
             let hasFocusedAgent = focusedAgentPaneInfo(for: cli) != nil
             let applyItem = NSMenuItem(
-                title: "  Apply to Active Pane (Restart)",
+                title: "  " + LanguageSettings.localized("Apply to Active Pane (Restart)"),
                 action: #selector(applyProfileToActivePaneAction(_:)),
                 keyEquivalent: ""
             )
@@ -361,7 +399,10 @@ final class MenuBarExtraController: NSObject, NSMenuDelegate {
             applyItem.representedObject = cli
             applyItem.isEnabled = hasFocusedAgent
             if !hasFocusedAgent {
-                applyItem.toolTip = "Focus a \(cli) agent pane to enable"
+                applyItem.toolTip = String(
+                    format: LanguageSettings.localized("Focus a %@ agent pane to enable"),
+                    cli
+                )
             }
             profileSubmenu.addItem(applyItem)
 
@@ -473,9 +514,18 @@ enum NotificationMenuSnapshotBuilder {
     }
 
     static func stateHintTitle(unreadCount: Int) -> String {
-        unreadCount == 0
-            ? "No unread notifications"
-            : "\(unreadCount) unread notification\(unreadCount == 1 ? "" : "s")"
+        guard unreadCount != 0 else {
+            return LanguageSettings.localized("No unread notifications")
+        }
+        // Two keys rather than a plural variation: Korean has no plural form,
+        // and this keeps the lookup in the .strings table that
+        // `LanguageSettings.localized` reads.
+        let key = unreadCount == 1 ? "%lld unread notification" : "%lld unread notifications"
+        return String(
+            format: LanguageSettings.localized(key),
+            locale: LanguageSettings.currentLocale(),
+            unreadCount
+        )
     }
 }
 
