@@ -483,6 +483,62 @@ final class PeerWorkspaceMirrorTests: XCTestCase {
 /// which stays impractical to verify through the flaky live workspace-mirror
 /// path, so it's exercised directly here via the `onHeal` callback rather
 /// than by counting `Resize` frames.
+final class RelayResumeTransitionGateTests: XCTestCase {
+
+    func testOldOutputBeforeBoundaryPassesAndLaterOutputBuffers() {
+        let gate = RelayResumeTransitionGate()
+        XCTAssertEqual(gate.route(endWireSeq: 3, data: Data("old".utf8)), .forward(Data("old".utf8)))
+
+        let transition = gate.begin()
+        XCTAssertEqual(transition.resumeWireSeq, 3)
+        XCTAssertEqual(gate.route(endWireSeq: 7, data: Data("held".utf8)), .suppress)
+    }
+
+    func testSuccessfulAttachDiscardsOldBytesAndForwardsReplayOnce() {
+        let gate = RelayResumeTransitionGate()
+        var displayed = Data()
+        if case .forward(let data) = gate.route(endWireSeq: 3, data: Data("one".utf8)) {
+            displayed.append(data)
+        }
+
+        let transition = gate.begin()
+        XCTAssertEqual(gate.route(endWireSeq: 6, data: Data("two".utf8)), .suppress)
+        XCTAssertTrue(gate.commit(transition))
+        XCTAssertEqual(gate.route(endWireSeq: 9, data: Data("old".utf8)), .suppress)
+
+        gate.adoptCommittedSession()
+        if case .forward(let replay) = gate.route(endWireSeq: 6, data: Data("two".utf8)) {
+            displayed.append(replay)
+        }
+        XCTAssertEqual(displayed, Data("onetwo".utf8), "old live bytes and replay must not both render")
+    }
+
+    func testFailedAttachFlushesBufferedOutputInOrder() {
+        let gate = RelayResumeTransitionGate()
+        _ = gate.route(endWireSeq: 1, data: Data("0".utf8))
+        let transition = gate.begin()
+        XCTAssertEqual(gate.route(endWireSeq: 2, data: Data("1".utf8)), .suppress)
+
+        XCTAssertEqual(gate.abort(transition), Data("1".utf8))
+        XCTAssertEqual(gate.route(endWireSeq: 3, data: Data("2".utf8)), .suppress)
+        XCTAssertEqual(gate.finishDrain(transition), Data("2".utf8))
+        XCTAssertNil(gate.finishDrain(transition))
+        XCTAssertEqual(gate.route(endWireSeq: 4, data: Data("3".utf8)), .forward(Data("3".utf8)))
+    }
+
+    func testOverflowRestoresOldStreamAndInvalidatesAttach() {
+        let gate = RelayResumeTransitionGate(maxBufferedBytes: 3)
+        let transition = gate.begin()
+        XCTAssertEqual(gate.route(endWireSeq: 2, data: Data("12".utf8)), .suppress)
+        XCTAssertEqual(
+            gate.route(endWireSeq: 4, data: Data("34".utf8)),
+            .overflowFlush(Data("1234".utf8))
+        )
+        XCTAssertFalse(gate.commit(transition))
+        XCTAssertEqual(gate.route(endWireSeq: 5, data: Data("5".utf8)), .forward(Data("5".utf8)))
+    }
+}
+
 final class RelayResizeCoalescerHealTests: XCTestCase {
 
     /// Accumulates the `cols` of every `Resize` frame the coalescer sends
