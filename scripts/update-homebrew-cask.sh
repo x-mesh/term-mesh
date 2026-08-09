@@ -178,7 +178,17 @@ echo "================================================"
 if [[ "${SMOKE_TEST:-1}" != "0" ]]; then
   echo ""
   echo "==> Smoke test: fresh brew install + version check"
-  brew update >/dev/null 2>&1 || true
+  # The cask was pushed seconds ago; `brew update` can still serve the previous
+  # revision, and then `brew install` happily installs the old version and the
+  # check below fails on a release that is actually fine. Wait for the tap to
+  # report the version we just published.
+  for _ in 1 2 3 4 5 6; do
+    brew update >/dev/null 2>&1 || true
+    if brew info --cask "${TAP_REPO%%/*}/tap/term-mesh" 2>/dev/null | head -1 | grep -q "$VERSION"; then
+      break
+    fi
+    sleep 5
+  done
   brew uninstall --cask --force term-mesh >/dev/null 2>&1 || true
   if ! brew install --cask "${TAP_REPO%%/*}/tap/term-mesh"; then
     echo "ERROR: smoke test brew install failed" >&2
@@ -187,7 +197,11 @@ if [[ "${SMOKE_TEST:-1}" != "0" ]]; then
   ACTUAL=$(/usr/bin/defaults read /Applications/term-mesh.app/Contents/Info CFBundleShortVersionString 2>/dev/null || echo "<missing>")
   if [[ "$ACTUAL" != "$VERSION" ]]; then
     echo "ERROR: smoke test failed — installed=$ACTUAL expected=$VERSION" >&2
-    echo "       The cask was published but `brew install` did not produce the expected version." >&2
+    # Single quotes: backticks inside a double-quoted string are command
+    # substitution, so this line used to *run* `brew install` (with no
+    # arguments) and print its usage error on top of the real failure.
+    echo '       The cask was published but `brew install` did not produce the expected version.' >&2
+    echo "       Usually a stale tap: 'brew update' then reinstall." >&2
     exit 2
   fi
   echo "==> Smoke test OK: /Applications/term-mesh.app reports $ACTUAL"
