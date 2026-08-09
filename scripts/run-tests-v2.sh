@@ -307,18 +307,43 @@ run_test_with_retry() {
   return 1
 }
 
+# Stopping at the first failure means a suite with several pre-existing
+# failures can only be surveyed by re-running with a growing exclusion list,
+# and every re-run repeats the tests that already passed. `--keep-going`
+# collects them in one pass instead. The exit status is unchanged: any
+# failure still exits non-zero.
+KEEP_GOING="${TERMMESH_E2E_KEEP_GOING:-0}"
+positional=()
+for arg in "$@"; do
+  case "$arg" in
+    --keep-going)
+      KEEP_GOING=1
+      ;;
+    *)
+      # bash 3.2 (the macOS system bash) has no `+=` on empty arrays under
+      # `set -u`, so index explicitly.
+      positional[${#positional[@]}]="$arg"
+      ;;
+  esac
+done
+
 echo "== tests (v2) =="
 fail=0
-if [ "$#" -gt 0 ]; then
-  test_files=("$@")
+if [ "${#positional[@]}" -gt 0 ]; then
+  test_files=("${positional[@]}")
 else
   test_files=(tests_v2/test_*.py)
 fi
+
+passed=0
+skipped=0
+failed_tests=()
 
 for f in "${test_files[@]}"; do
   base=$(basename "$f")
   if [ "$base" = "test_ctrl_interactive.py" ]; then
     echo "SKIP $f"
+    skipped=$((skipped + 1))
     continue
   fi
 
@@ -327,9 +352,27 @@ for f in "${test_files[@]}"; do
   if ! run_test_with_retry "$f"; then
     echo "FAIL $f" >&2
     fail=1
-    break
+    failed_tests[${#failed_tests[@]}]="$f"
+    if [ "$KEEP_GOING" != "1" ]; then
+      break
+    fi
+  else
+    passed=$((passed + 1))
   fi
 done
+
+echo "== summary =="
+echo "passed:  $passed"
+echo "failed:  ${#failed_tests[@]}"
+echo "skipped: $skipped"
+if [ "${#failed_tests[@]}" -gt 0 ]; then
+  for t in "${failed_tests[@]}"; do
+    echo "  FAIL $t"
+  done
+fi
+if [ "$fail" != "0" ] && [ "$KEEP_GOING" != "1" ]; then
+  echo "  (stopped at the first failure; pass --keep-going to survey them all)"
+fi
 
 echo "== cleanup =="
 cleanup
