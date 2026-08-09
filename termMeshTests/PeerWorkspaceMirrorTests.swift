@@ -485,6 +485,64 @@ final class PeerWorkspaceMirrorTests: XCTestCase {
 /// than by counting `Resize` frames.
 final class RelayResumeTransitionGateTests: XCTestCase {
 
+    /// Reconnect replaces the session wholesale, so a transition that was in
+    /// flight when the transport died must not keep suppressing output — the
+    /// bytes it was holding for belong to a stream that no longer exists.
+    func testResetClearsAnInFlightTransition() {
+        let gate = RelayResumeTransitionGate()
+        let transition = gate.begin()
+        XCTAssertEqual(gate.route(endWireSeq: 5, data: Data("held".utf8)), .suppress)
+
+        gate.reset()
+
+        XCTAssertEqual(gate.route(endWireSeq: 1, data: Data("new".utf8)), .forward(Data("new".utf8)))
+        XCTAssertEqual(gate.currentWireSeq(), 1)
+        XCTAssertNil(gate.abort(transition), "the stale transition must no longer control the gate")
+        XCTAssertFalse(gate.commit(transition))
+    }
+
+    func testResetClearsACommittedTransition() {
+        let gate = RelayResumeTransitionGate()
+        let transition = gate.begin()
+        XCTAssertTrue(gate.commit(transition))
+        XCTAssertEqual(gate.route(endWireSeq: 2, data: Data("x".utf8)), .suppress)
+
+        gate.reset()
+
+        XCTAssertEqual(gate.route(endWireSeq: 3, data: Data("y".utf8)), .forward(Data("y".utf8)))
+    }
+
+    /// `begin()` reports the wire position as a side effect of starting to
+    /// buffer; reconnect needs the value without that.
+    func testCurrentWireSeqDoesNotOpenATransition() {
+        let gate = RelayResumeTransitionGate()
+        _ = gate.route(endWireSeq: 9, data: Data("a".utf8))
+
+        XCTAssertEqual(gate.currentWireSeq(), 9)
+        XCTAssertEqual(gate.route(endWireSeq: 10, data: Data("b".utf8)), .forward(Data("b".utf8)))
+    }
+
+    /// `.buffering` is capped; `.draining` must be too, or a busy stream grows
+    /// it without limit while the abort flush is in flight.
+    func testDrainingIsBoundedLikeBuffering() {
+        let gate = RelayResumeTransitionGate(maxBufferedBytes: 4)
+        let transition = gate.begin()
+        XCTAssertEqual(gate.route(endWireSeq: 1, data: Data("ab".utf8)), .suppress)
+        XCTAssertEqual(gate.abort(transition), Data("ab".utf8))
+
+        // `abort` emptied the buffer, so the cap applies to what accumulates
+        // after it: 2 bytes fit, the next 3 do not.
+        XCTAssertEqual(gate.route(endWireSeq: 2, data: Data("cd".utf8)), .suppress)
+        XCTAssertEqual(
+            gate.route(endWireSeq: 3, data: Data("efg".utf8)),
+            .overflowFlush(Data("cdefg".utf8)),
+            "an over-cap drain must flush in order instead of growing"
+        )
+        XCTAssertEqual(gate.route(endWireSeq: 4, data: Data("h".utf8)), .forward(Data("h".utf8)))
+        XCTAssertNil(gate.finishDrain(transition))
+    }
+
+
     func testOldOutputBeforeBoundaryPassesAndLaterOutputBuffers() {
         let gate = RelayResumeTransitionGate()
         XCTAssertEqual(gate.route(endWireSeq: 3, data: Data("old".utf8)), .forward(Data("old".utf8)))

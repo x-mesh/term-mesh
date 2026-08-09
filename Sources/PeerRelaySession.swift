@@ -666,6 +666,28 @@ final class RelayResumeTransitionGate: @unchecked Sendable {
         lock.unlock()
     }
 
+    /// The last processed wire position, without opening a transition.
+    /// `begin()` also reports it, but only as the side effect of starting to
+    /// buffer — reconnect needs the value alone.
+    func currentWireSeq() -> UInt64 {
+        lock.lock()
+        defer { lock.unlock() }
+        return wireSeq
+    }
+
+    /// Drop any in-flight transition and restart sequence accounting.
+    ///
+    /// For the reconnect path, where the session is replaced wholesale after
+    /// its transport died. Any buffered old-session bytes are unreachable — the
+    /// stream they belonged to is gone — so holding them would only suppress
+    /// the new session's output.
+    func reset() {
+        lock.lock()
+        phase = .idle
+        wireSeq = 0
+        lock.unlock()
+    }
+
     func begin() -> Transition {
         lock.lock()
         defer { lock.unlock() }
@@ -697,6 +719,18 @@ final class RelayResumeTransitionGate: @unchecked Sendable {
         case .draining(_, let buffer):
             // An abort flush is already in progress. Keep later bytes behind
             // that batch so they cannot overtake it at RelayFrameWriter.
+            guard buffer.count + data.count <= maxBufferedBytes else {
+                // The drain is not keeping up with the pump. Bounded like
+                // `.buffering` for the same reason — otherwise a busy stream
+                // grows this without limit and the drain loop, which runs
+                // until the buffer empties, may never terminate. Hand the
+                // combined batch to the pump and stop mediating; ordering
+                // still holds because everything buffered goes out ahead of
+                // the bytes that triggered the overflow.
+                buffer.append(data)
+                phase = .idle
+                return .overflowFlush(buffer.take())
+            }
             buffer.append(data)
             return .suppress
         }
@@ -1060,6 +1094,8 @@ final class PeerRelaySession {
 
     var onError: (@MainActor (Error) -> Void)?
     var onDisconnect: (@MainActor () -> Void)?
+    var onReconnecting: (@MainActor (_ attempt: Int) -> Void)?
+    var onReconnected: (@MainActor () -> Void)?
 
     /// How many resume-heals this pane has performed. A pane that dies
     /// mid-flood dies *after* a run of these, and the count is the only
@@ -1925,6 +1961,18 @@ final class PeerRelaySession {
                             resumeTransitionGate.adoptCommittedSession()
                             continue pumpLoop
                         }
+                        if ownsSession,
+                           await self.reconnectOwnedSession(afterLosing: currentSession),
+                           let swapped = await self.session, swapped !== currentSession {
+                            #if DEBUG
+                            dlog("peer.relay.receive.reconnected failed=\(failedTag) adopted=\(Self.sessionTag(swapped))")
+                            #endif
+                            currentSession = swapped
+                            expectedByteSeq = nil
+                            gapBytesTotal = 0
+                            gapCount = 0
+                            continue pumpLoop
+                        }
                         try? await writer.enqueue(type: kTypeGoodbye, payload: Data("host-error".utf8))
                         // Carry the error itself, not just the fact that one
                         // happened: `unexpectedEof` (host dropped the socket),
@@ -2348,6 +2396,98 @@ final class PeerRelaySession {
         #if DEBUG
         dlog("peer.relay.gap.heal.resume.swapped heal#\(resumeHealCount) retired=\(retiredTag) adopted=\(Self.sessionTag(newConnection.session)) newInitialSeq=\(outcome.initialByteSeq)")
         #endif
+    }
+
+    /// Recover an owned pane in place after its transport dies. The local
+    /// relay helper and Ghostty surface remain alive while this retries, so
+    /// the same pane resumes once the same remote surface is reachable.
+    /// Workspace-mirror panes use their controller's shared reconnect loop.
+    private func reconnectOwnedSession(afterLosing failedSession: PeerSession) async -> Bool {
+        guard ownsSession, !isTorndown, session === failedSession else {
+            return session !== failedSession
+        }
+        await failedSession.stopHeartbeat()
+        var attempt = 0
+        while !isTorndown, session === failedSession {
+            attempt += 1
+            let delay = Self.reconnectDelaySeconds(attempt: attempt)
+            if delay > 0 {
+                try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
+            }
+            guard !isTorndown, session === failedSession else { break }
+            #if DEBUG
+            dlog("peer.relay.reconnect.attempt n=\(attempt) delay=\(delay)")
+            #endif
+            onReconnecting?(attempt)
+            if await attemptOwnedSessionReconnect(from: failedSession) {
+                onReconnected?()
+                RemoteWorkLog.infoOffMain("Remote pane reconnected on attempt \(attempt)")
+                return true
+            }
+            if attempt <= 3 || attempt % 10 == 0 {
+                RemoteWorkLog.debugOffMain("Remote pane reconnect attempt \(attempt) failed")
+            }
+        }
+        return session !== failedSession
+    }
+
+    /// One reconnect attempt after the old receive loop has already failed.
+    /// Unlike gap healing, no old-session bytes can race this attach boundary.
+    private func attemptOwnedSessionReconnect(from failedSession: PeerSession) async -> Bool {
+        guard !isTorndown, session === failedSession else { return false }
+        let size = await resizeCoalescer?.snapshotSize() ?? (remoteCols, remoteRows)
+        let connection: PeerRelayConnection
+        do {
+            connection = try await Self.connect(hostSockPath: hostSockPath)
+        } catch {
+            #if DEBUG
+            dlog("peer.relay.reconnect.connectFailed error=\(error)")
+            #endif
+            return false
+        }
+        guard !isTorndown, session === failedSession else {
+            await connection.cancel()
+            return false
+        }
+        let resumeFromSeq = hostSupportsReplayRing
+            ? (attachInitialSeq &+ resumeTransitionGate.currentWireSeq())
+            : 0
+        let outcome: PeerAttachOutcome
+        do {
+            outcome = try await connection.session.attachSurface(
+                id: surfaceID, mode: .coWrite, cols: size.cols, rows: size.rows,
+                resumeFromSeq: resumeFromSeq
+            )
+        } catch {
+            #if DEBUG
+            dlog("peer.relay.reconnect.attachFailed error=\(error)")
+            #endif
+            await connection.cancel()
+            return false
+        }
+        guard outcome.surfaceID == surfaceID, !isTorndown, session === failedSession else {
+            await connection.cancel()
+            return false
+        }
+
+        session = connection.session
+        transport = connection.transport
+        attachInitialSeq = outcome.initialByteSeq
+        // Full reset, not just the wire position: a resume-heal transition may
+        // have been mid-flight when the transport died, and this replaces the
+        // session wholesale. Leaving the gate in `buffering`/`committed` would
+        // suppress the reconnected session's output forever — the old bytes it
+        // was holding for can no longer arrive.
+        resumeTransitionGate.reset()
+        hostSupportsReplayRing = connection.hostCapabilities.has(PeerCapability.replayRingV1)
+        await resizeCoalescer?.adopt(session: connection.session)
+        await startHeartbeatMonitoring(session: connection.session, transport: connection.transport)
+        return true
+    }
+
+    static func reconnectDelaySeconds(attempt: Int) -> Double {
+        guard attempt > 1 else { return 0 }
+        return min(30, pow(2, Double(min(attempt - 1, 5))))
     }
 
     private func abortResumeTransition(_ transition: RelayResumeTransitionGate.Transition) async {
