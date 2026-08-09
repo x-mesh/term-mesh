@@ -102,6 +102,12 @@ struct TermMeshApp: App {
         // so the Settings picker and the AppKit lookups agree on a value that
         // is actually in AppLanguage rather than each falling back separately.
         LanguageSettings.resolvedMode()
+        // Seed this build's override directory from the shared pre-isolation
+        // one, before either file is written. Both writes below regenerate
+        // from UserDefaults anyway, so this only matters for what a build
+        // inherits the first time it runs after the isolation landed — see
+        // TerminalOverrideLocation.
+        TerminalOverrideLocation.migrateLegacyFilesIfNeeded()
         // Ensure terminal theme override exists at startup (covers fresh install).
         // The settings file goes first: its `theme` line depends on the appearance
         // mode, and a build that shipped before that was true leaves a stale pair
