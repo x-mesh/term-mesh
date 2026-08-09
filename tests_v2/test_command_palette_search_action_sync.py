@@ -78,10 +78,11 @@ def main():
             message="palette search input did not focus",
         )
 
-        client.simulate_shortcut("cmd+a")
-        client.simulate_type(">open")
+        # The palette opens already seeded with the ">" commands prefix, so type
+        # the term alone — ">open" would land as ">>open" and match nothing.
+        client.simulate_type("open")
         _wait_until(
-            lambda: "open" in str(_palette_results(client, window_id).get("query") or "").strip().lower(),
+            lambda: str(_palette_results(client, window_id).get("query") or "").strip().lower() == "open",
             message="palette query did not become 'open'",
         )
 
@@ -94,10 +95,15 @@ def main():
         if "open" not in before_title and ".open" not in before_top.lower():
             raise termmeshError(f"unexpected top command for 'open': {before_rows[0]}")
 
-        client.simulate_shortcut("cmd+a")
-        client.simulate_type(">rename")
+        # Replacing the whole query, not appending: cmd+a followed by typing is
+        # not reliable here (the selection does not always take, leaving the old
+        # text in place), so set the field outright.
+        client._call(
+            "debug.command_palette.set_query",
+            {"window_id": window_id, "query": ">rename"},
+        )
         _wait_until(
-            lambda: "rename" in str(_palette_results(client, window_id).get("query") or "").strip().lower(),
+            lambda: str(_palette_results(client, window_id).get("query") or "").strip().lower() == "rename",
             message="palette query did not become 'rename' after replacement",
         )
         after = _palette_results(client, window_id, limit=8)
