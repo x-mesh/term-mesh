@@ -147,6 +147,81 @@ final class LanguageSettingsTests: XCTestCase {
         )
     }
 
+    // MARK: - The chosen language must not drag the region with it
+
+    func testSupportedLanguageCodesAreDerivedFromTheCases() {
+        XCTAssertEqual(AppLanguage.supportedLanguageCodes, ["en", "ko"])
+        XCTAssertNil(AppLanguage.system.languageCode)
+    }
+
+    /// Language and region are configured separately in System Settings, so
+    /// 한국어 + United States is a real setup. Rebuilding the locale from the
+    /// language identifier alone would silently move the user to Korea.
+    func testSystemModeChoosesTheLanguageButKeepsTheRegion() {
+        let locale = LanguageSettings.locale(
+            for: AppLanguage.system.rawValue,
+            preferredLanguages: ["ko-KR", "en-US"],
+            systemLocale: Locale(identifier: "ko_US")
+        )
+
+        XCTAssertEqual(locale.language.languageCode?.identifier, "ko")
+        XCTAssertEqual(locale.region?.identifier, "US")
+    }
+
+    func testExplicitLanguageKeepsTheSystemRegion() {
+        let locale = LanguageSettings.locale(
+            for: AppLanguage.english.rawValue,
+            preferredLanguages: ["ko-KR"],
+            systemLocale: Locale(identifier: "ko_KR")
+        )
+
+        XCTAssertEqual(locale.language.languageCode?.identifier, "en")
+        XCTAssertEqual(locale.region?.identifier, "KR")
+    }
+
+    func testUnsupportedSystemLanguageFallsBackToEnglishAndKeepsTheRegion() {
+        let locale = LanguageSettings.locale(
+            for: AppLanguage.system.rawValue,
+            preferredLanguages: ["ja-JP", "fr-FR"],
+            systemLocale: Locale(identifier: "ja_JP")
+        )
+
+        XCTAssertEqual(locale.language.languageCode?.identifier, "en")
+        XCTAssertEqual(locale.region?.identifier, "JP")
+    }
+
+    func testOverridingTheLanguagePreservesTheHourCycle() {
+        var components = Locale.Components(identifier: "ko_KR")
+        components.hourCycle = .oneToTwelve
+
+        let locale = LanguageSettings.locale(
+            for: AppLanguage.english.rawValue,
+            preferredLanguages: ["ko-KR"],
+            systemLocale: Locale(components: components)
+        )
+
+        XCTAssertEqual(locale.language.languageCode?.identifier, "en")
+        XCTAssertEqual(locale.hourCycle, .oneToTwelve)
+    }
+
+    /// Hangul is not a script for English: carrying `Kore` over would produce
+    /// `en-Kore-KR` and hand the bundle a localization to negotiate that does
+    /// not exist. Clearing it lets ICU infer the right script for the incoming
+    /// language instead — reading `script` back yields `Latn`, not nil.
+    func testGraftingALanguageDropsTheOutgoingScript() {
+        let locale = Locale(identifier: "ko_Kore_KR").withLanguageCode("en")
+
+        XCTAssertEqual(locale.language.languageCode?.identifier, "en")
+        XCTAssertNotEqual(locale.language.script?.identifier, "Kore")
+        XCTAssertFalse(locale.identifier.contains("Kore"))
+        XCTAssertEqual(locale.region?.identifier, "KR")
+    }
+
+    func testGraftingTheSameLanguageIsIdentity() {
+        let original = Locale(identifier: "ko_KR")
+        XCTAssertEqual(original.withLanguageCode("ko"), original)
+    }
+
     // MARK: - AppKit lookup
 
     private func isolatedDefaults(

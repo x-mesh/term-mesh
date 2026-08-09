@@ -244,7 +244,10 @@ final class WindowCommandPaletteOverlayController: NSObject {
     func update(rootView: AnyView, isVisible: Bool) {
         guard ensureInstalled() else { return }
         if isVisible {
-            hostingView.rootView = rootView
+            // The palette is hosted straight off the window's theme frame, so
+            // it inherits no SwiftUI environment and needs the app language
+            // applied here.
+            hostingView.rootView = AnyView(TermMeshHostedRoot(rootView))
             containerView.capturesMouseEvents = true
             containerView.isHidden = false
             containerView.alphaValue = 1

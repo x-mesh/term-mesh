@@ -15,6 +15,22 @@ enum AppLanguage: String, CaseIterable, Identifiable {
         case .korean: return "Korean"
         }
     }
+
+    /// The catalog language this mode pins, or nil for `.system`, which
+    /// negotiates one from macOS instead.
+    var languageCode: String? {
+        switch self {
+        case .system: return nil
+        case .english: return "en"
+        case .korean: return "ko"
+        }
+    }
+
+    /// Every language the app ships a catalog for. Derived from the cases so
+    /// adding a language is one edit here, not a second hardcoded set.
+    static var supportedLanguageCodes: Set<String> {
+        Set(allCases.compactMap(\.languageCode))
+    }
 }
 
 enum LanguageSettings {
@@ -38,26 +54,37 @@ enum LanguageSettings {
         return resolved
     }
 
+    /// The locale to publish as `\.locale`, choosing a language without
+    /// discarding the rest of the user's regional setup.
+    ///
+    /// Language and region are configured separately in System Settings —
+    /// 한국어 with region United States and a 12-hour clock is a normal setup.
+    /// Rebuilding the locale from a bare language identifier (`Locale("ko-KR")`)
+    /// silently drops the region, calendar and hour cycle, so dates and numbers
+    /// would start formatting for a place the user does not live in. Instead we
+    /// keep `systemLocale` and only graft the chosen language onto it.
     static func locale(
         for rawValue: String?,
         preferredLanguages: [String] = Locale.preferredLanguages,
-        fallback: Locale = Locale(identifier: "en")
+        systemLocale: Locale = .autoupdatingCurrent,
+        fallbackLanguageCode: String = "en"
     ) -> Locale {
-        switch mode(for: rawValue) {
-        case .system:
-            let supportedLanguageCodes = Set(["en", "ko"])
-            guard let preferredLanguage = preferredLanguages.first(where: { identifier in
-                guard let languageCode = Locale(identifier: identifier).language.languageCode?.identifier else {
-                    return false
-                }
-                return supportedLanguageCodes.contains(languageCode)
-            }) else {
-                return fallback
-            }
-            return Locale(identifier: preferredLanguage)
-        case .english: return Locale(identifier: "en")
-        case .korean: return Locale(identifier: "ko")
+        let languageCode = mode(for: rawValue).languageCode
+            ?? negotiatedLanguageCode(from: preferredLanguages)
+            ?? fallbackLanguageCode
+        return systemLocale.withLanguageCode(languageCode)
+    }
+
+    /// The first of macOS's preferred languages the app actually has a catalog
+    /// for — the same negotiation `Bundle` performs, made explicit so the
+    /// result can be grafted onto the system locale.
+    private static func negotiatedLanguageCode(from preferredLanguages: [String]) -> String? {
+        for identifier in preferredLanguages {
+            guard let code = Locale(identifier: identifier).language.languageCode?.identifier,
+                  AppLanguage.supportedLanguageCodes.contains(code) else { continue }
+            return code
         }
+        return nil
     }
 
     /// The locale currently in effect for the app, honoring the override.
@@ -134,6 +161,21 @@ private struct AppLanguageEnvironmentModifier: ViewModifier {
     }
 }
 
+extension Locale {
+    /// This locale with its language replaced, preserving region, calendar,
+    /// hour cycle and every other component.
+    func withLanguageCode(_ code: String) -> Locale {
+        guard language.languageCode?.identifier != code else { return self }
+        var components = Locale.Components(locale: self)
+        components.languageComponents.languageCode = Locale.LanguageCode(code)
+        // Clear the outgoing language's script: Hangul is not a script for
+        // English, and keeping it would produce `en-Kore-KR` for the bundle to
+        // negotiate. ICU infers the right one for the incoming language.
+        components.languageComponents.script = nil
+        return Locale(components: components)
+    }
+}
+
 extension View {
     /// Applies the app's language override while keeping "System Setting"
     /// tied to macOS's current locale. Each AppKit-hosted SwiftUI root uses
@@ -141,6 +183,26 @@ extension View {
     /// environment.
     func termMeshLanguage() -> some View {
         modifier(AppLanguageEnvironmentModifier())
+    }
+}
+
+/// Wraps a SwiftUI view that an `NSHostingView` owns directly.
+///
+/// A hosting view roots a fresh SwiftUI environment: nothing above it in the
+/// AppKit view tree can inject `\.locale`, so overlays mounted this way (the
+/// find bar, the IME input bar, the paste shelf, the command palette) ignored
+/// the language override and rendered in whatever language macOS negotiated.
+/// This is a named type rather than an inline modifier so the hosting views can
+/// keep declaring their concrete `NSHostingView<…>` element type.
+struct TermMeshHostedRoot<Content: View>: View {
+    private let content: Content
+
+    init(_ content: Content) {
+        self.content = content
+    }
+
+    var body: some View {
+        content.termMeshLanguage()
     }
 }
 
