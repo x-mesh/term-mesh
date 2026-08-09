@@ -229,6 +229,11 @@ public actor PeerSession {
     private var activeEnsureRequestIDs: Set<Data> = []
     private var inboundPumpTask: Task<Void, Never>?
     private var bufferedIncomingMessages: [PeerIncomingMessage] = []
+    /// Keep the transport reader independent from a slow downstream consumer.
+    /// Relay output ultimately drains through a bounded local socket writer; if
+    /// that writer stalls, tying socket reads to `receiveNextMessage()` leaves
+    /// Pong frames unread and can make a healthy host look dead.
+    private static let maxBufferedIncomingMessages = 256
     private var incomingWaiters: [UUID: CheckedContinuation<PeerIncomingMessage, Error>] = [:]
     private var inboundTerminalError: Error?
     private var didCloseTransport = false
@@ -349,6 +354,7 @@ public actor PeerSession {
                 }
             }
         }
+        startInboundPumpIfNeeded()
     }
 
     /// Cancel any in-flight heartbeat task. Safe to call multiple
@@ -910,7 +916,9 @@ public actor PeerSession {
 
     private func runInboundPump() async {
         while !Task.isCancelled {
-            guard !activeEnsureRequestIDs.isEmpty || !incomingWaiters.isEmpty else {
+            guard heartbeatTask != nil
+                    || !activeEnsureRequestIDs.isEmpty
+                    || !incomingWaiters.isEmpty else {
                 inboundPumpTask = nil
                 return
             }
@@ -947,13 +955,29 @@ public actor PeerSession {
                let continuation = incomingWaiters.removeValue(forKey: key) {
                 continuation.resume(returning: message)
             } else {
-                bufferedIncomingMessages.append(message)
+                bufferIncoming(message)
             }
             if case .goodbye(let reason) = message {
                 await terminateInbound(with: PeerSessionError.sessionClosed(reason: reason))
                 return
             }
         }
+    }
+
+    /// Bound PTY backlog without sacrificing control messages. Dropping an old
+    /// PtyData frame is observable through the protocol byte sequence, so the
+    /// relay's existing gap/resume path can repair it. Pong is consumed above
+    /// and never reaches this buffer; errors/goodbye/layout pushes are retained.
+    private func bufferIncoming(_ message: PeerIncomingMessage) {
+        if bufferedIncomingMessages.count >= Self.maxBufferedIncomingMessages,
+           case .ptyData = message,
+           let oldestPty = bufferedIncomingMessages.firstIndex(where: {
+               if case .ptyData = $0 { return true }
+               return false
+           }) {
+            bufferedIncomingMessages.remove(at: oldestPty)
+        }
+        bufferedIncomingMessages.append(message)
     }
 
     private func terminateInbound(with error: Error) async {

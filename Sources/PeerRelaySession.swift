@@ -948,6 +948,8 @@ final class PeerRelaySession {
 
     var onError: (@MainActor (Error) -> Void)?
     var onDisconnect: (@MainActor () -> Void)?
+    var onReconnecting: (@MainActor (_ attempt: Int) -> Void)?
+    var onReconnected: (@MainActor () -> Void)?
 
     /// How many resume-heals this pane has performed. A pane that dies
     /// mid-flood dies *after* a run of these, and the count is the only
@@ -1811,6 +1813,18 @@ final class PeerRelaySession {
                             gapCount = 0
                             continue pumpLoop
                         }
+                        if ownsSession,
+                           await self.reconnectOwnedSession(afterLosing: currentSession),
+                           let swapped = await self.session, swapped !== currentSession {
+                            #if DEBUG
+                            dlog("peer.relay.receive.reconnected failed=\(failedTag) adopted=\(Self.sessionTag(swapped))")
+                            #endif
+                            currentSession = swapped
+                            expectedByteSeq = nil
+                            gapBytesTotal = 0
+                            gapCount = 0
+                            continue pumpLoop
+                        }
                         try? await writer.enqueue(type: kTypeGoodbye, payload: Data("host-error".utf8))
                         // Carry the error itself, not just the fact that one
                         // happened: `unexpectedEof` (host dropped the socket),
@@ -2213,6 +2227,93 @@ final class PeerRelaySession {
         #if DEBUG
         dlog("peer.relay.gap.heal.resume.swapped heal#\(resumeHealCount) retired=\(retiredTag) adopted=\(Self.sessionTag(newConnection.session)) newInitialSeq=\(outcome.initialByteSeq)")
         #endif
+    }
+
+    /// Recover an owned pane in place after its transport dies. The local
+    /// relay helper and Ghostty surface remain alive while this retries, so
+    /// the same pane resumes once the same remote surface is reachable.
+    /// Workspace-mirror panes use their controller's shared reconnect loop.
+    private func reconnectOwnedSession(afterLosing failedSession: PeerSession) async -> Bool {
+        guard ownsSession, !isTorndown, session === failedSession else {
+            return session !== failedSession
+        }
+        await failedSession.stopHeartbeat()
+        var attempt = 0
+        while !isTorndown, session === failedSession {
+            attempt += 1
+            let delay = Self.reconnectDelaySeconds(attempt: attempt)
+            if delay > 0 {
+                try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
+            }
+            guard !isTorndown, session === failedSession else { break }
+            #if DEBUG
+            dlog("peer.relay.reconnect.attempt n=\(attempt) delay=\(delay)")
+            #endif
+            onReconnecting?(attempt)
+            if await attemptOwnedSessionReconnect(from: failedSession) {
+                onReconnected?()
+                RemoteWorkLog.infoOffMain("Remote pane reconnected on attempt \(attempt)")
+                return true
+            }
+            if attempt <= 3 || attempt % 10 == 0 {
+                RemoteWorkLog.debugOffMain("Remote pane reconnect attempt \(attempt) failed")
+            }
+        }
+        return session !== failedSession
+    }
+
+    /// One reconnect attempt after the old receive loop has already failed.
+    /// Unlike gap healing, no old-session bytes can race this attach boundary.
+    private func attemptOwnedSessionReconnect(from failedSession: PeerSession) async -> Bool {
+        guard !isTorndown, session === failedSession else { return false }
+        let size = await resizeCoalescer?.snapshotSize() ?? (remoteCols, remoteRows)
+        let connection: PeerRelayConnection
+        do {
+            connection = try await Self.connect(hostSockPath: hostSockPath)
+        } catch {
+            #if DEBUG
+            dlog("peer.relay.reconnect.connectFailed error=\(error)")
+            #endif
+            return false
+        }
+        guard !isTorndown, session === failedSession else {
+            await connection.cancel()
+            return false
+        }
+        let resumeFromSeq = hostSupportsReplayRing
+            ? (attachInitialSeq &+ wireSeqTracker.read())
+            : 0
+        let outcome: PeerAttachOutcome
+        do {
+            outcome = try await connection.session.attachSurface(
+                id: surfaceID, mode: .coWrite, cols: size.cols, rows: size.rows,
+                resumeFromSeq: resumeFromSeq
+            )
+        } catch {
+            #if DEBUG
+            dlog("peer.relay.reconnect.attachFailed error=\(error)")
+            #endif
+            await connection.cancel()
+            return false
+        }
+        guard outcome.surfaceID == surfaceID, !isTorndown, session === failedSession else {
+            await connection.cancel()
+            return false
+        }
+
+        session = connection.session
+        transport = connection.transport
+        attachInitialSeq = outcome.initialByteSeq
+        wireSeqTracker.update(0)
+        hostSupportsReplayRing = connection.hostCapabilities.has(PeerCapability.replayRingV1)
+        await resizeCoalescer?.adopt(session: connection.session)
+        await startHeartbeatMonitoring(session: connection.session, transport: connection.transport)
+        return true
+    }
+
+    static func reconnectDelaySeconds(attempt: Int) -> Double {
+        guard attempt > 1 else { return 0 }
+        return min(30, pow(2, Double(min(attempt - 1, 5))))
     }
 
     private func disconnect(reason: String) {

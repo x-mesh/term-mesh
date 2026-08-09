@@ -926,6 +926,51 @@ final class PeerSessionTests: XCTestCase {
         pongTask.cancel()
     }
 
+    /// A relay consumer can stop asking for messages while its local output
+    /// socket is backed up. Heartbeat must continue reading Pong frames on its
+    /// own instead of declaring the live transport dead.
+    func testHeartbeatStaysAliveWithoutDownstreamDrain() async throws {
+        let transport = MockTransport()
+        let session = PeerSession(
+            read: { await transport.clientRead() },
+            write: { await transport.clientWrite($0) }
+        )
+
+        let pongTask = Task<Void, Never> {
+            var pending = Data()
+            var serverSeq: UInt64 = 0
+            while !Task.isCancelled {
+                let chunk = await transport.serverRead()
+                if chunk.isEmpty { break }
+                pending.append(chunk)
+                while let env = try? decodeFrame(from: &pending) {
+                    guard case .ping(let ping) = env.payload else { continue }
+                    var reply = Termmesh_Peer_V1_Envelope()
+                    serverSeq += 1
+                    reply.seq = serverSeq
+                    var pong = Termmesh_Peer_V1_Pong()
+                    pong.nonce = ping.nonce
+                    reply.pong = pong
+                    if let frame = try? encodeFrame(reply) {
+                        await transport.serverWrite(frame)
+                    }
+                }
+            }
+        }
+
+        let deadFlag = AsyncFlag()
+        await session.startHeartbeat(intervalSeconds: 0.05, deadAfterSeconds: 0.3) {
+            Task { await deadFlag.signal() }
+        }
+
+        // Deliberately never call receiveNextMessage().
+        let fired = await deadFlag.wait(timeoutSeconds: 0.7)
+        XCTAssertFalse(fired, "heartbeat must read Pong while downstream output is stalled")
+
+        await session.stopHeartbeat()
+        pongTask.cancel()
+    }
+
     /// Regression for the measured pane-close root cause: under a sustained
     /// host→client output flood the pump loop is too backpressured to
     /// *process* the Pong within `deadAfterSeconds`, yet the connection is

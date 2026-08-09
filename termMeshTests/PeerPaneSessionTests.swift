@@ -11,6 +11,15 @@ import PeerProto
 
 final class PeerPaneSessionTests: XCTestCase {
 
+    @MainActor
+    func testOwnedRelayReconnectBackoffRetriesImmediatelyThenCapsAtThirtySeconds() {
+        XCTAssertEqual(PeerRelaySession.reconnectDelaySeconds(attempt: 1), 0)
+        XCTAssertEqual(PeerRelaySession.reconnectDelaySeconds(attempt: 2), 2)
+        XCTAssertEqual(PeerRelaySession.reconnectDelaySeconds(attempt: 3), 4)
+        XCTAssertEqual(PeerRelaySession.reconnectDelaySeconds(attempt: 6), 30)
+        XCTAssertEqual(PeerRelaySession.reconnectDelaySeconds(attempt: 20), 30)
+    }
+
     func testRelayPalettePrefixPreservesSourceTerminalDefaults() {
         let prefix = peerTerminalPalettePrefix(
             foreground: NSColor(

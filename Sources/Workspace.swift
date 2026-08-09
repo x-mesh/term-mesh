@@ -2644,6 +2644,18 @@ final class Workspace: Identifiable {
         session.relaySession.onError = { error in
             showBanner("\(hostLabel): \(String(describing: error))")
         }
+        session.relaySession.onReconnecting = { [weak panel] attempt in
+            panel?.hostedView.showPeerDisconnectBanner(
+                reason: "Remote pane disconnected — reconnecting to \(hostLabel) (try \(attempt))…",
+                onReconnect: nil,
+                onClosePane: { [weak self] in
+                    _ = self?.closePanel(panelId, force: true)
+                }
+            )
+        }
+        session.relaySession.onReconnected = { [weak panel] in
+            panel?.hostedView.hidePeerDisconnectBanner()
+        }
         PeerTitlebarAccentController.refresh()
         #if DEBUG
         dlog("peer.pane.open workspace=\(id.uuidString.prefix(8)) host=\(session.lease.key) title=\(session.surfaceTitle)")
