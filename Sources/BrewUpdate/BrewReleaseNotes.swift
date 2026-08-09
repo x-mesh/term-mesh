@@ -212,11 +212,11 @@ struct BrewReleaseNotesAccessoryView: View {
 extension BrewReleaseNotesAccessoryView {
     /// Wrap in an NSHostingView sized for NSAlert.accessoryView.
     static func nsHostingView(markdown: String, version: String, releaseURL: URL?) -> NSView {
-        let view = NSHostingView(rootView: BrewReleaseNotesAccessoryView(
+        let view = NSHostingView(rootView: TermMeshHostedRoot(BrewReleaseNotesAccessoryView(
             markdown: markdown,
             version: version,
             releaseURL: releaseURL
-        ))
+        )))
         view.translatesAutoresizingMaskIntoConstraints = true
         view.frame = NSRect(x: 0, y: 0, width: 420, height: 260)
         return view

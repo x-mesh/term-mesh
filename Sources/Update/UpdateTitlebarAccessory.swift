@@ -130,21 +130,21 @@ final class TitlebarControlsViewModel: ObservableObject {
         // First, because on the project axis it is also what the button itself
         // does — the menu should not bury the primary action.
         if let onNewProject {
-            let projectItem = ClosureMenuItem(title: "New Project…", keyEquivalent: "n") {
+            let projectItem = ClosureMenuItem(title: LanguageSettings.localized("New Project…"), keyEquivalent: "n") {
                 onNewProject()
             }
             projectItem.keyEquivalentModifierMask = [.command, .option, .control]
             menu.addItem(projectItem)
         }
 
-        let newWorkspaceItem = ClosureMenuItem(title: "New Workspace", keyEquivalent: "t") {
+        let newWorkspaceItem = ClosureMenuItem(title: LanguageSettings.localized("New Workspace"), keyEquivalent: "t") {
             onNewTab()
         }
         newWorkspaceItem.keyEquivalentModifierMask = .command
         menu.addItem(newWorkspaceItem)
 
         if let onNewAgentTeam {
-            let teamItem = ClosureMenuItem(title: "New Agent Team…", keyEquivalent: "t") {
+            let teamItem = ClosureMenuItem(title: LanguageSettings.localized("New Agent Team…"), keyEquivalent: "t") {
                 onNewAgentTeam()
             }
             teamItem.keyEquivalentModifierMask = [.command, .option]
@@ -152,7 +152,7 @@ final class TitlebarControlsViewModel: ObservableObject {
         }
 
         if let onSpawnCLI {
-            let spawnItem = ClosureMenuItem(title: "Spawn CLI…", keyEquivalent: "a") {
+            let spawnItem = ClosureMenuItem(title: LanguageSettings.localized("Spawn CLI…"), keyEquivalent: "a") {
                 onSpawnCLI()
             }
             spawnItem.keyEquivalentModifierMask = [.command, .shift]

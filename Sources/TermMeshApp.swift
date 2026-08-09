@@ -14,6 +14,7 @@ struct TermMeshApp: App {
     private let browserHistory: any BrowserHistoryService = BrowserHistoryStore.shared
     private let primaryWindowId = UUID()
     @AppStorage(AppearanceSettings.appearanceModeKey) private var appearanceMode = AppearanceSettings.defaultMode.rawValue
+    @AppStorage(LanguageSettings.languageModeKey) private var languageMode = LanguageSettings.defaultMode.rawValue
     @AppStorage(TerminalSettingsOverride.fontFamilyKey) private var terminalFontFamily = ""
     @AppStorage(TerminalSettingsOverride.fontSizeKey) private var terminalFontSize: Double = 0
     @AppStorage(TerminalSettingsOverride.themeLightKey) private var terminalThemeLight = ""
@@ -97,6 +98,10 @@ struct TermMeshApp: App {
 
         let startupAppearance = AppearanceSettings.resolvedMode()
         Self.applyAppearance(startupAppearance)
+        // Repair an unreadable stored language the same way appearance does,
+        // so the Settings picker and the AppKit lookups agree on a value that
+        // is actually in AppLanguage rather than each falling back separately.
+        LanguageSettings.resolvedMode()
         // Ensure terminal theme override exists at startup (covers fresh install).
         // The settings file goes first: its `theme` line depends on the appearance
         // mode, and a build that shipped before that was true leaves a stale pair
@@ -501,7 +506,9 @@ struct TermMeshApp: App {
         // with their own TabManager, avoiding the shared-@StateObject problem.
         WindowGroup(id: "term-mesh-primary") {
             primaryWindowContent
+                .termMeshLanguage()
         }
+        .environment(\.locale, LanguageSettings.locale(for: languageMode))
         // Prevent macOS from creating duplicate WindowGroup scenes via
         // state restoration, dock clicks, or external events. Only the
         // initial scene should use this WindowGroup; additional windows
@@ -511,59 +518,75 @@ struct TermMeshApp: App {
         .defaultSize(width: 1200, height: 800)
         .commands {
             // MARK: - Agents Menu (combined agents + worktrees)
-            CommandMenu("Agents") {
+            CommandMenu(LanguageSettings.localized("Agents")) {
                 // -- Create --
-                Button("New Agent Team…") {
+                Button {
                     present(.teamCreation(tabManager: requestingTabManager(), mode: "new"))
+                } label: {
+                    commandLabel("New Agent Team…")
                 }
                 .keyboardShortcut("t", modifiers: [.command, .option])
 
-                Button("Spawn CLI…") {
+                Button {
                     Task { @MainActor in
                         await showSpawnCLIDialog()
                     }
+                } label: {
+                    commandLabel("Spawn CLI…")
                 }
                 .keyboardShortcut("a", modifiers: [.command, .shift])
 
                 // -- Manage --
                 Divider()
 
-                Button("Reconnect Agent…") {
+                Button {
                     Task { @MainActor in
                         await showReconnectAgentDialog()
                     }
+                } label: {
+                    commandLabel("Reconnect Agent…")
                 }
                 .keyboardShortcut("a", modifiers: [.command, .option])
 
-                Button("Destroy Team…") {
+                Button {
                     Task { @MainActor in
                         await showDestroyTeamDialog()
                     }
+                } label: {
+                    commandLabel("Destroy Team…")
                 }
 
-                Button("Collect All Results") {
+                Button {
                     Task { @MainActor in
                         await showCollectResultsDialog()
                     }
+                } label: {
+                    commandLabel("Collect All Results")
                 }
 
                 Divider()
 
-                Button("Recycle Focused Agent…") {
+                Button {
                     showRecycleFocusedAgentDialog(force: false)
+                } label: {
+                    commandLabel("Recycle Focused Agent…")
                 }
                 .keyboardShortcut("r", modifiers: [.command, .control])
 
-                Button("Recycle Focused Agent (Force)…") {
+                Button {
                     showRecycleFocusedAgentDialog(force: true)
+                } label: {
+                    commandLabel("Recycle Focused Agent (Force)…")
                 }
                 .keyboardShortcut("r", modifiers: [.command, .control, .shift])
 
                 // -- Worktrees --
                 Divider()
 
-                Button("New Worktree Workspace") {
+                Button {
                     NotificationCenter.default.post(name: .worktreeWorkspaceRequested, object: nil)
+                } label: {
+                    commandLabel("New Worktree Workspace")
                 }
                 .keyboardShortcut("n", modifiers: [.command, .option, .shift])
 
@@ -590,86 +613,120 @@ struct TermMeshApp: App {
                     }
                 }
 
-                Toggle("Worktree Auto-Cleanup", isOn: $worktreeAutoCleanup)
+                Toggle(isOn: $worktreeAutoCleanup) { commandLabel("Worktree Auto-Cleanup") }
 
                 Divider()
 
-                Button("Clean Up Stale Worktrees") {
+                Button {
                     cleanupStaleWorktrees()
+                } label: {
+                    commandLabel("Clean Up Stale Worktrees")
                 }
 
-                Button("Open Worktree Directory…") {
+                Button {
                     let path = termMeshDaemon.worktreeBaseDir
                     NSWorkspace.shared.open(URL(fileURLWithPath: path, isDirectory: true))
+                } label: {
+                    commandLabel("Open Worktree Directory…")
                 }
             }
 
             CommandGroup(replacing: .appSettings) {
-                Button("Settings…") {
+                Button {
                     showSettingsPanel()
+                } label: {
+                    commandLabel("Settings…")
                 }
                 .keyboardShortcut(",", modifiers: .command)
             }
 
             CommandGroup(replacing: .appInfo) {
-                Button("About Term-Mesh") {
+                Button {
                     showAboutPanel()
+                } label: {
+                    commandLabel("About Term-Mesh")
                 }
-                Button("Welcome Screen") {
+                Button {
                     UserDefaults.standard.set(false, forKey: "hideWelcomeScreen")
+                } label: {
+                    commandLabel("Welcome Screen")
                 }
                 Divider()
-                Button("Ghostty Settings…") {
+                Button {
                     configProvider.openConfigurationInTextEdit()
+                } label: {
+                    commandLabel("Ghostty Settings…")
                 }
-                Button("Reload Configuration") {
+                Button {
                     configProvider.reloadConfiguration(source: "menu.reload_configuration")
+                } label: {
+                    commandLabel("Reload Configuration")
                 }
                 .keyboardShortcut(",", modifiers: [.command, .shift])
                 Divider()
-                Button("Check for Updates…") {
+                Button {
                     appDelegate.checkForUpdates(nil)
+                } label: {
+                    commandLabel("Check for Updates…")
                 }
                 InstallUpdateMenuItem(model: appDelegate.updateViewModel)
                 Divider()
-                Button("Term-Mesh Dashboard (Window)") {
+                Button {
                     DashboardController.shared.showDashboard()
+                } label: {
+                    commandLabel("Term-Mesh Dashboard (Window)")
                 }
-                Button("Term-Mesh Dashboard (Split)") {
+                Button {
                     openDashboardSplit()
+                } label: {
+                    commandLabel("Term-Mesh Dashboard (Split)")
                 }
             }
 
 #if DEBUG
-            CommandMenu("Update Pill") {
-                Button("Show Update Pill") {
+            CommandMenu(LanguageSettings.localized("Update Pill")) {
+                Button {
                     appDelegate.showUpdatePill(nil)
+                } label: {
+                    commandLabel("Show Update Pill")
                 }
-                Button("Show Long Nightly Pill") {
+                Button {
                     appDelegate.showUpdatePillLongNightly(nil)
+                } label: {
+                    commandLabel("Show Long Nightly Pill")
                 }
-                Button("Show Loading State") {
+                Button {
                     appDelegate.showUpdatePillLoading(nil)
+                } label: {
+                    commandLabel("Show Loading State")
                 }
-                Button("Hide Update Pill") {
+                Button {
                     appDelegate.hideUpdatePill(nil)
+                } label: {
+                    commandLabel("Hide Update Pill")
                 }
-                Button("Automatic Update Pill") {
+                Button {
                     appDelegate.clearUpdatePillOverride(nil)
+                } label: {
+                    commandLabel("Automatic Update Pill")
                 }
             }
 #endif
 
             CommandGroup(after: .help) {
-                Button("Copy Update Logs") {
+                Button {
                     appDelegate.copyUpdateLogs(nil)
+                } label: {
+                    commandLabel("Copy Update Logs")
                 }
-                Button("Copy Focus Logs") {
+                Button {
                     appDelegate.copyFocusLogs(nil)
+                } label: {
+                    commandLabel("Copy Focus Logs")
                 }
             }
 
-            CommandMenu("Notifications") {
+            CommandMenu(LanguageSettings.localized("Notifications")) {
                 let snapshot = notificationMenuSnapshot
 
                 Button(snapshot.stateHintTitle) {}
@@ -696,24 +753,32 @@ struct TermMeshApp: App {
                 }
                 .disabled(!snapshot.hasUnreadNotifications)
 
-                Button("Mark All Read") {
+                Button {
                     notificationStore.markAllRead()
+                } label: {
+                    commandLabel("Mark All Read")
                 }
                 .disabled(!snapshot.hasUnreadNotifications)
 
-                Button("Clear All") {
+                Button {
                     notificationStore.clearAll()
+                } label: {
+                    commandLabel("Clear All")
                 }
                 .disabled(!snapshot.hasNotifications)
             }
 
-            CommandMenu("Peer") {
-                Menu("Host This Mac") {
-                    Button("Start Peer Server…") {
+            CommandMenu(LanguageSettings.localized("Peer")) {
+                Menu(LanguageSettings.localized("Host This Mac")) {
+                    Button {
                         PeerHostCoordinator.shared.startServer(nil)
+                    } label: {
+                        commandLabel("Start Peer Server…")
                     }
-                    Button("Stop Peer Server") {
+                    Button {
                         PeerHostCoordinator.shared.stopServer(nil)
+                    } label: {
+                        commandLabel("Stop Peer Server")
                     }
                 }
 
@@ -739,116 +804,156 @@ struct TermMeshApp: App {
                     )
                 }
 
-                Button("Add Peer Host…") {
+                Button {
                     PeerClientCoordinator.shared.addRemoteHost(nil)
+                } label: {
+                    commandLabel("Add Peer Host…")
                 }
 
 #if DEBUG
-                Menu("Debug Connect") {
-                    Button("Connect to Peer…") {
+                Menu(LanguageSettings.localized("Debug Connect")) {
+                    Button {
                         PeerClientCoordinator.shared.promptAndRun(nil)
+                    } label: {
+                        commandLabel("Connect to Peer…")
                     }
-                    Button("Connect to Workspace via Relay…") {
+                    Button {
                         PeerClientCoordinator.shared.promptAndRunRelayWorkspace(nil)
+                    } label: {
+                        commandLabel("Connect to Workspace via Relay…")
                     }
                 }
 #endif
 
-                Button("Show Peer Connections…") {
+                Button {
                     PeerClientCoordinator.shared.showConnections(nil)
+                } label: {
+                    commandLabel("Show Peer Connections…")
                 }
 
                 Divider()
 
-                Button("Peer Federation Settings…") {
+                Button {
                     showSettingsPanel(navigateTo: .peerFederation)
+                } label: {
+                    commandLabel("Peer Federation Settings…")
                 }
             }
 
-            CommandMenu("Remote Work") {
-                Button("Toggle Review Board") {
+            CommandMenu(LanguageSettings.localized("Remote Work")) {
+                Button {
                     ReviewBoardSettings.toggleVisible()
+                } label: {
+                    commandLabel("Toggle Review Board")
                 }
                 .keyboardShortcut("b", modifiers: [.command, .control])
 
-                Button("Toggle Activity Drawer") {
+                Button {
                     AppDelegate.shared?.tabManager?.selectedWorkspace?
                         .retrievalStore.togglePresentation(.drawer)
+                } label: {
+                    commandLabel("Toggle Activity Drawer")
                 }
                 .keyboardShortcut("d", modifiers: [.command, .control])
 
-                Button("Toggle Changes Inspector") {
+                Button {
                     AppDelegate.shared?.tabManager?.selectedWorkspace?
                         .retrievalStore.togglePresentation(.inspector)
+                } label: {
+                    commandLabel("Toggle Changes Inspector")
                 }
                 .keyboardShortcut("i", modifiers: [.command, .control])
 
-                Button("Checkpoint Now") {
+                Button {
                     guard let workspace = AppDelegate.shared?.tabManager?.selectedWorkspace,
                           let panelID = workspace.retrievalStore.selectedPane?.panelID else { return }
                     Task { await workspace.checkpointRemotePane(panelID: panelID, closeAfterCheckpoint: false) }
+                } label: {
+                    commandLabel("Checkpoint Now")
                 }
                 .keyboardShortcut("k", modifiers: [.command, .control])
             }
 
 #if DEBUG
-            CommandMenu("Debug") {
-                Button("New Tab With Lorem Search Text") {
+            CommandMenu(LanguageSettings.localized("Debug")) {
+                Button {
                     appDelegate.openDebugLoremTab(nil)
+                } label: {
+                    commandLabel("New Tab With Lorem Search Text")
                 }
 
-                Button("New Tab With Large Scrollback") {
+                Button {
                     appDelegate.openDebugScrollbackTab(nil)
+                } label: {
+                    commandLabel("New Tab With Large Scrollback")
                 }
 
-                Button("Open Workspaces for All Tab Colors") {
+                Button {
                     appDelegate.openDebugColorComparisonWorkspaces(nil)
+                } label: {
+                    commandLabel("Open Workspaces for All Tab Colors")
                 }
 
                 Divider()
-                Menu("Debug Windows") {
-                    Button("Debug Window Controls…") {
+                Menu(LanguageSettings.localized("Debug Windows")) {
+                    Button {
                         DebugWindowControlsWindowController.shared.show()
+                    } label: {
+                        commandLabel("Debug Window Controls…")
                     }
 
-                    Button("Settings/About Titlebar Debug…") {
+                    Button {
                         SettingsAboutTitlebarDebugWindowController.shared.show()
+                    } label: {
+                        commandLabel("Settings/About Titlebar Debug…")
                     }
 
                     Divider()
-                    Button("Sidebar Debug…") {
+                    Button {
                         SidebarDebugWindowController.shared.show()
+                    } label: {
+                        commandLabel("Sidebar Debug…")
                     }
 
-                    Button("Background Debug…") {
+                    Button {
                         BackgroundDebugWindowController.shared.show()
+                    } label: {
+                        commandLabel("Background Debug…")
                     }
 
-                    Button("Menu Bar Extra Debug…") {
+                    Button {
                         MenuBarExtraDebugWindowController.shared.show()
+                    } label: {
+                        commandLabel("Menu Bar Extra Debug…")
                     }
 
                     Divider()
 
-                    Button("Open All Debug Windows") {
+                    Button {
                         openAllDebugWindows()
+                    } label: {
+                        commandLabel("Open All Debug Windows")
                     }
                 }
 
-                Toggle("Always Show Shortcut Hints", isOn: $alwaysShowShortcutHints)
+                Toggle(isOn: $alwaysShowShortcutHints) { commandLabel("Always Show Shortcut Hints") }
 
                 Divider()
 
-                Picker("Titlebar Controls Style", selection: $titlebarControlsStyle) {
+                Picker(selection: $titlebarControlsStyle) {
                     ForEach(TitlebarControlsStyle.allCases) { style in
-                        Text(style.menuTitle).tag(style.rawValue)
+                        commandLabel(style.menuTitle).tag(style.rawValue)
                     }
+                } label: {
+                    commandLabel("Titlebar Controls Style")
                 }
 
                 Divider()
 
-                Button("Trigger Sentry Test Crash") {
+                Button {
                     appDelegate.triggerSentryTestCrash(nil)
+                } label: {
+                    commandLabel("Trigger Sentry Test Crash")
                 }
             }
 #endif
@@ -879,15 +984,19 @@ struct TermMeshApp: App {
 
             // Close tab/workspace
             CommandGroup(after: .newItem) {
-                Button("Go to Workspace or Tab…") {
+                Button {
                     let targetWindow = NSApp.keyWindow ?? NSApp.mainWindow
                     NotificationCenter.default.post(name: .commandPaletteSwitcherRequested, object: targetWindow)
+                } label: {
+                    commandLabel("Go to Workspace or Tab…")
                 }
                 .keyboardShortcut("p", modifiers: [.command])
 
-                Button("Command Palette…") {
+                Button {
                     let targetWindow = NSApp.keyWindow ?? NSApp.mainWindow
                     NotificationCenter.default.post(name: .commandPaletteRequested, object: targetWindow)
+                } label: {
+                    commandLabel("Command Palette…")
                 }
                 .keyboardShortcut("p", modifiers: [.command, .shift])
 
@@ -896,8 +1005,10 @@ struct TermMeshApp: App {
                 // Terminal semantics:
                 // Cmd+W closes the focused tab (with confirmation if needed). If this is the last
                 // tab in the last workspace, it closes the window.
-                Button("Close Tab") {
+                Button {
                     closePanelOrWindow()
+                } label: {
+                    commandLabel("Close Tab")
                 }
                 .keyboardShortcut("w", modifiers: .command)
 
@@ -907,42 +1018,54 @@ struct TermMeshApp: App {
                     closeTabOrWindow()
                 }
 
-                Button("Reopen Closed Browser Panel") {
+                Button {
                     _ = activeTabManager.reopenMostRecentlyClosedBrowserPanel()
+                } label: {
+                    commandLabel("Reopen Closed Browser Panel")
                 }
                 .keyboardShortcut("t", modifiers: [.command, .shift])
             }
 
             // Find
             CommandGroup(after: .textEditing) {
-                Menu("Find") {
-                    Button("Find…") {
+                Menu(LanguageSettings.localized("Find")) {
+                    Button {
                         activeTabManager.startSearch()
+                    } label: {
+                        commandLabel("Find…")
                     }
                     .keyboardShortcut("f", modifiers: .command)
 
-                    Button("Find Next") {
+                    Button {
                         activeTabManager.findNext()
+                    } label: {
+                        commandLabel("Find Next")
                     }
                     .keyboardShortcut("g", modifiers: .command)
 
-                    Button("Find Previous") {
+                    Button {
                         activeTabManager.findPrevious()
+                    } label: {
+                        commandLabel("Find Previous")
                     }
                     .keyboardShortcut("g", modifiers: [.command, .shift])
 
                     Divider()
 
-                    Button("Hide Find Bar") {
+                    Button {
                         activeTabManager.hideFind()
+                    } label: {
+                        commandLabel("Hide Find Bar")
                     }
                     .keyboardShortcut("f", modifiers: [.command, .shift])
                     .disabled(!(activeTabManager.isFindVisible))
 
                     Divider()
 
-                    Button("Use Selection for Find") {
+                    Button {
                         activeTabManager.searchSelection()
+                    } label: {
+                        commandLabel("Use Selection for Find")
                     }
                     .keyboardShortcut("e", modifiers: .command)
                     .disabled(!(activeTabManager.canUseSelectionForFind))
@@ -950,8 +1073,10 @@ struct TermMeshApp: App {
 
                 Divider()
 
-                Button("IME Input Bar") {
+                Button {
                     activeTabManager.toggleIMEInputBar()
+                } label: {
+                    commandLabel("IME Input Bar")
                 }
                 .keyboardShortcut("i", modifiers: [.command, .shift])
             }
@@ -974,18 +1099,24 @@ struct TermMeshApp: App {
                     activeTabManager.selectPreviousSurface()
                 }
 
-                Button("Back") {
+                Button {
                     activeTabManager.focusedBrowserPanel?.goBack()
+                } label: {
+                    commandLabel("Back")
                 }
                 .keyboardShortcut("[", modifiers: .command)
 
-                Button("Forward") {
+                Button {
                     activeTabManager.focusedBrowserPanel?.goForward()
+                } label: {
+                    commandLabel("Forward")
                 }
                 .keyboardShortcut("]", modifiers: .command)
 
-                Button("Reload Page") {
+                Button {
                     activeTabManager.focusedBrowserPanel?.reload()
+                } label: {
+                    commandLabel("Reload Page")
                 }
                 .keyboardShortcut("r", modifiers: .command)
 
@@ -1003,23 +1134,31 @@ struct TermMeshApp: App {
                     }
                 }
 
-                Button("Zoom In") {
+                Button {
                     _ = activeTabManager.zoomInFocusedBrowser()
+                } label: {
+                    commandLabel("Zoom In")
                 }
                 .keyboardShortcut("=", modifiers: .command)
 
-                Button("Zoom Out") {
+                Button {
                     _ = activeTabManager.zoomOutFocusedBrowser()
+                } label: {
+                    commandLabel("Zoom Out")
                 }
                 .keyboardShortcut("-", modifiers: .command)
 
-                Button("Actual Size") {
+                Button {
                     _ = activeTabManager.resetZoomFocusedBrowser()
+                } label: {
+                    commandLabel("Actual Size")
                 }
                 .keyboardShortcut("0", modifiers: .command)
 
-                Button("Clear Browser History") {
+                Button {
                     browserHistory.clearHistory()
+                } label: {
+                    commandLabel("Clear Browser History")
                 }
 
                 splitCommandButton(title: "Next Workspace", shortcut: nextWorkspaceMenuShortcut) {
@@ -1060,11 +1199,19 @@ struct TermMeshApp: App {
 
                 // Cmd+1 through Cmd+9 for workspace selection (9 = last workspace)
                 ForEach(1...9, id: \.self) { number in
-                    Button("Workspace \(number)") {
+                    Button {
                         let manager = activeTabManager
                         if let targetIndex = WorkspaceShortcutMapper.workspaceIndex(forCommandDigit: number, workspaceCount: manager.tabs.count) {
                             manager.selectTab(at: targetIndex)
                         }
+                    } label: {
+                        // Interpolating here would key on "Workspace 1", "Workspace 2", …
+                        // — nine entries that all say the same thing. Format instead.
+                        Text(verbatim: String(
+                            format: LanguageSettings.localized("Workspace %lld"),
+                            locale: LanguageSettings.currentLocale(),
+                            number
+                        ))
                     }
                     .keyboardShortcut(KeyEquivalent(Character("\(number)")), modifiers: .command)
                 }
@@ -1740,14 +1887,29 @@ struct TermMeshApp: App {
     /// Use this for shortcuts already handled by the local NSEvent monitor to
     /// prevent SwiftUI from processing the shortcut independently (which can
     /// cause WindowGroup to create a duplicate window).
+    ///
+    /// The label is built with `commandLabel` rather than `Button(title,…)`:
+    /// passing a `String` selects SwiftUI's verbatim overload, which never
+    /// consults the string catalog, so every menu item routed through here
+    /// stayed English regardless of the language setting.
     @ViewBuilder
     private func splitCommandButton(title: String, shortcut: StoredShortcut, registerShortcut: Bool, action: @escaping () -> Void) -> some View {
         if registerShortcut, let key = shortcut.keyEquivalent {
-            Button(title, action: action)
+            Button(action: action) { commandLabel(title) }
                 .keyboardShortcut(key, modifiers: shortcut.eventModifiers)
         } else {
-            Button(title, action: action)
+            Button(action: action) { commandLabel(title) }
         }
+    }
+
+    /// Resolves a menu string against the app-language bundle explicitly.
+    ///
+    /// Menu bar commands live on the `Scene`, outside the window content that
+    /// `termMeshLanguage()` decorates, so they cannot be relied on to inherit
+    /// the `\.locale` environment. Looking the string up here keeps the app
+    /// menu, the status-item menu and the in-window UI on one language.
+    private func commandLabel(_ title: String) -> Text {
+        Text(verbatim: LanguageSettings.localized(title))
     }
 
     private func closePanelOrWindow() {

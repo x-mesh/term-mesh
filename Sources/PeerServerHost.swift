@@ -11,7 +11,7 @@ import PeerProto
 enum PeerServerMenu {
     static func startItem() -> NSMenuItem {
         let item = NSMenuItem(
-            title: "Start Peer Server…",
+            title: LanguageSettings.localized("Start Peer Server…"),
             action: #selector(PeerHostCoordinator.startServer(_:)),
             keyEquivalent: ""
         )
@@ -21,7 +21,7 @@ enum PeerServerMenu {
 
     static func stopItem() -> NSMenuItem {
         let item = NSMenuItem(
-            title: "Stop Peer Server",
+            title: LanguageSettings.localized("Stop Peer Server"),
             action: #selector(PeerHostCoordinator.stopServer(_:)),
             keyEquivalent: ""
         )
@@ -117,20 +117,26 @@ final class PeerHostCoordinator: NSObject {
         switch lifecycle {
         case .running(let existing):
             showInfo(
-                title: "Peer server is already running.",
-                body: "Listening at \(existing). Stop it first if you want a new path."
+                title: LanguageSettings.localized("Peer server is already running."),
+                body: String(
+                    format: LanguageSettings.localized("Listening at %@. Stop it first if you want a new path."),
+                    existing
+                )
             )
             return
         case .starting(let path):
             showInfo(
-                title: "Peer server is starting",
-                body: "Already starting at \(path)."
+                title: LanguageSettings.localized("Peer server is starting"),
+                body: String(
+                    format: LanguageSettings.localized("Already starting at %@."),
+                    path
+                )
             )
             return
         case .stopping:
             showInfo(
-                title: "Peer server is stopping",
-                body: "Wait for the current stop operation to finish before starting it again."
+                title: LanguageSettings.localized("Peer server is stopping"),
+                body: LanguageSettings.localized("Wait for the current stop operation to finish before starting it again.")
             )
             return
         case .stopped:
@@ -139,14 +145,14 @@ final class PeerHostCoordinator: NSObject {
         guard !startDialogOpen else { return }
 
         let alert = NSAlert()
-        alert.messageText = "Start peer server"
-        alert.informativeText = "term-mesh.app will listen on this Unix socket. Existing file at the path will be overwritten."
+        alert.messageText = LanguageSettings.localized("Start peer server")
+        alert.informativeText = LanguageSettings.localized("term-mesh.app will listen on this Unix socket. Existing file at the path will be overwritten.")
 
         let input = NSTextField(frame: NSRect(x: 0, y: 0, width: 360, height: 24))
         input.stringValue = PeerFederationSettings.socketPath
         alert.accessoryView = input
-        alert.addButton(withTitle: "Start")
-        alert.addButton(withTitle: "Cancel")
+        alert.addButton(withTitle: LanguageSettings.localized("Start"))
+        alert.addButton(withTitle: LanguageSettings.localized("Cancel"))
         startDialogOpen = true
         presentAlert(alert) { [weak self] response in
             self?.startDialogOpen = false
@@ -167,14 +173,20 @@ final class PeerHostCoordinator: NSObject {
         switch lifecycle {
         case .starting(let path):
             showInfo(
-                title: "Peer server is starting",
-                body: "Already starting at \(path). Wait for startup to finish before stopping it."
+                title: LanguageSettings.localized("Peer server is starting"),
+                body: String(
+                    format: LanguageSettings.localized("Already starting at %@. Wait for startup to finish before stopping it."),
+                    path
+                )
             )
             return
         case .stopping:
             return
         case .stopped:
-            showInfo(title: "No server running", body: "Start one first via Start Peer Server…")
+            showInfo(
+                title: LanguageSettings.localized("No server running"),
+                body: LanguageSettings.localized("Start one first via Start Peer Server…")
+            )
             return
         case .running:
             break
@@ -208,8 +220,10 @@ final class PeerHostCoordinator: NSObject {
         postStateChange()
         if showStoppedAlert {
             showInfo(
-                title: "Peer server stopped",
-                body: oldPath.map { "Socket \($0) is gone." } ?? "Socket removed."
+                title: LanguageSettings.localized("Peer server stopped"),
+                body: oldPath.map {
+                    String(format: LanguageSettings.localized("Socket %@ is gone."), $0)
+                } ?? LanguageSettings.localized("Socket removed.")
             )
         }
         return true
@@ -308,14 +322,17 @@ final class PeerHostCoordinator: NSObject {
             NSLog("[peer-debug] server listening on %@", path)
             if !silent {
                 showInfo(
-                    title: "Peer server listening",
-                    body: """
-                        Socket: \(path)
+                    title: LanguageSettings.localized("Peer server listening"),
+                    body: String(
+                        format: LanguageSettings.localized("""
+                            Socket: %@
 
-                        Try from a terminal:
-                          tm-agent peer list \(path)
-                          tm-agent peer attach \(path) --name echo
-                        """
+                            Try from a terminal:
+                              tm-agent peer list %@
+                              tm-agent peer attach %@ --name echo
+                            """),
+                        path, path, path
+                    )
                 )
             }
         } catch {
@@ -323,7 +340,7 @@ final class PeerHostCoordinator: NSObject {
             NSLog("[peer-debug] server failed to start at %@: %@", path, String(describing: error))
             if !silent {
                 showInfo(
-                    title: "Failed to start peer server",
+                    title: LanguageSettings.localized("Failed to start peer server"),
                     body: String(describing: error)
                 )
             }
@@ -462,7 +479,7 @@ final class PeerHostCoordinator: NSObject {
         alert.messageText = title
         alert.informativeText = body
         alert.alertStyle = .informational
-        alert.addButton(withTitle: "OK")
+        alert.addButton(withTitle: LanguageSettings.localized("OK"))
         guard !infoAlertOpen else { return }
         infoAlertOpen = true
         presentAlert(alert) { [weak self] _ in
