@@ -80,7 +80,7 @@ enum SettingsSection: String, CaseIterable, Identifiable {
 
     var searchKeywords: [String] {
         switch self {
-        case .app: return ["app", "language", "system", "english", "korean", "언어", "시스템", "영어", "한국어", "theme", "appearance", "dark", "light", "workspace", "placement", "session", "restore", "dock", "badge", "quit", "warn", "rename", "sidebar", "branch", "reorder", "notification", "experimental", "mirror", "peer hosts", "distributed", "coordinator", "review board"]
+        case .app: return ["app", "language", "system", "english", "korean", "theme", "appearance", "dark", "light", "workspace", "placement", "session", "restore", "dock", "badge", "quit", "warn", "rename", "sidebar", "branch", "reorder", "notification", "experimental", "mirror", "peer hosts", "distributed", "coordinator", "review board"]
         case .terminal: return ["terminal", "font", "size", "theme", "monospace", "family"]
         case .workspaceColors: return ["workspace", "color", "indicator", "palette", "custom"]
         case .automation: return ["automation", "socket", "claude", "port", "integration", "password"]
@@ -291,11 +291,15 @@ struct SettingsView: View {
     private var browserHistorySubtitle: String {
         switch browserHistoryEntryCount {
         case 0:
-            return "No saved pages yet."
+            return LanguageSettings.localized("No saved pages yet.")
         case 1:
-            return "1 saved page appears in omnibar suggestions."
+            return LanguageSettings.localized("1 saved page appears in omnibar suggestions.")
         default:
-            return "\(browserHistoryEntryCount) saved pages appear in omnibar suggestions."
+            return String(
+                format: LanguageSettings.localized("%lld saved pages appear in omnibar suggestions."),
+                locale: LanguageSettings.currentLocale(),
+                browserHistoryEntryCount
+            )
         }
     }
 
@@ -349,17 +353,36 @@ struct SettingsView: View {
     }
 
     private func settingsMatch(_ keywords: String...) -> Bool {
-        let q = normalizedSearchQuery
-        guard !q.isEmpty else { return true }
-        return keywords.contains { $0.lowercased().contains(q) }
+        matchesQuery(keywords)
     }
 
     private func sectionVisible(_ sectionKeywords: [String], rowKeywords: [[String]]) -> Bool {
         let q = normalizedSearchQuery
         guard !q.isEmpty else { return true }
-        if sectionKeywords.contains(where: { $0.lowercased().contains(q) }) { return true }
-        return rowKeywords.contains { group in
-            group.contains { $0.lowercased().contains(q) }
+        if matchesQuery(sectionKeywords) { return true }
+        return rowKeywords.contains { matchesQuery($0) }
+    }
+
+    /// Matches the query against a row's keywords, which are always written in
+    /// English.
+    ///
+    /// Once the UI is Korean the user types 테마, which appears in no keyword
+    /// list. Rather than duplicating every list per language, the query is
+    /// mapped back through the string catalog — 테마 translates "Theme", so
+    /// "theme" joins the terms being matched. Keyword lists stay single-source.
+    private func matchesQuery(_ keywords: [String]) -> Bool {
+        let q = normalizedSearchQuery
+        guard !q.isEmpty else { return true }
+        if keywords.contains(where: { $0.lowercased().contains(q) }) { return true }
+
+        let translated = SettingsSearchIndex.englishTerms(
+            matching: q,
+            locale: LanguageSettings.locale(for: languageMode)
+        )
+        guard !translated.isEmpty else { return false }
+        return keywords.contains { keyword in
+            let k = keyword.lowercased()
+            return translated.contains { $0.contains(k) || k.contains($0) }
         }
     }
 
@@ -697,7 +720,7 @@ struct SettingsView: View {
     @ViewBuilder
     private var sectionApp: some View {
         SettingsCard {
-                        let showsLanguageSetting = settingsMatch("language", "system", "english", "korean", "언어", "시스템", "영어", "한국어", "app")
+                        let showsLanguageSetting = settingsMatch("language", "system", "english", "korean", "app")
                         if showsLanguageSetting {
                         SettingsCardRow(
                             "Language",
@@ -706,7 +729,11 @@ struct SettingsView: View {
                         ) {
                             Picker("Language", selection: $languageMode) {
                                 ForEach(AppLanguage.allCases) { language in
-                                    Text(LocalizedStringKey(language.displayName)).tag(language.rawValue)
+                                    if let endonym = language.endonym {
+                                        Text(verbatim: endonym).tag(language.rawValue)
+                                    } else {
+                                        Text(LocalizedStringKey(language.displayName)).tag(language.rawValue)
+                                    }
                                 }
                             }
                             .labelsHidden()
@@ -1077,7 +1104,9 @@ struct SettingsView: View {
 
                 SettingsCardRow(
                     "Unfocused Split Opacity",
-                    subtitle: terminalUnfocusedOpacity < 0 ? "Using ghostty config value" : "\(Int(terminalUnfocusedOpacity * 100))%",
+                    verbatimSubtitle: terminalUnfocusedOpacity < 0
+                        ? LanguageSettings.localized("Using ghostty config value")
+                        : "\(Int(terminalUnfocusedOpacity * 100))%",
                     controlWidth: pickerColumnWidth
                 ) {
                     HStack(spacing: 6) {
@@ -1106,7 +1135,12 @@ struct SettingsView: View {
 
                 SettingsCardRow(
                     "Scrollback Limit",
-                    subtitle: terminalScrollback == 0 ? "Using ghostty config value" : "\(terminalScrollback.formatted()) bytes",
+                    verbatimSubtitle: terminalScrollback == 0
+                        ? LanguageSettings.localized("Using ghostty config value")
+                        : String(
+                            format: LanguageSettings.localized("%@ bytes"),
+                            terminalScrollback.formatted()
+                          ),
                     controlWidth: pickerColumnWidth
                 ) {
                     Picker("", selection: $terminalScrollback) {
@@ -1154,8 +1188,8 @@ struct SettingsView: View {
                                 SettingsCardDivider()
                             }
                             SettingsCardRow(
-                                entry.name,
-                                subtitle: "Base: \(baseTabColorHex(for: entry.name))"
+                                verbatim: entry.name,
+                                verbatimSubtitle: "Base: \(baseTabColorHex(for: entry.name))"
                             ) {
                                 HStack(spacing: 8) {
                                     ColorPicker(
@@ -1427,8 +1461,7 @@ struct SettingsView: View {
 
                         SettingsCardRow(
                             "Find Repositories In",
-                            subtitle: "Folders scanned for already-cloned repositories, "
-                                + "one per line. Empty uses Projects Under."
+                            subtitle: "Folders scanned for already-cloned repositories, one per line. Empty uses Projects Under."
                         ) {
                             TextEditor(text: $repositorySearchRoots)
                                 .font(.system(.caption, design: .monospaced))
@@ -1443,8 +1476,8 @@ struct SettingsView: View {
 
                         SettingsCardRow(
                             "Default Working Directory",
-                            subtitle: teamDefaultWorkingDirectory.isEmpty
-                                ? "Uses the current workspace directory."
+                            verbatimSubtitle: teamDefaultWorkingDirectory.isEmpty
+                                ? LanguageSettings.localized("Uses the current workspace directory.")
                                 : teamDefaultWorkingDirectory
                         ) {
                             HStack(spacing: 8) {
@@ -1539,9 +1572,17 @@ struct SettingsView: View {
 
                         SettingsCardRow(
                             "Auto-recycle default",
-                            subtitle: autoRecycleGlobalDefault == 0
-                                ? "Disabled — new teams will not auto-recycle agents."
-                                : "New teams will auto-recycle agents every \(autoRecycleGlobalDefault) completed task\(autoRecycleGlobalDefault == 1 ? "" : "s")."
+                            verbatimSubtitle: autoRecycleGlobalDefault == 0
+                                ? LanguageSettings.localized("Disabled — new teams will not auto-recycle agents.")
+                                : String(
+                                    format: LanguageSettings.localized(
+                                        autoRecycleGlobalDefault == 1
+                                            ? "New teams will auto-recycle agents every %lld completed task."
+                                            : "New teams will auto-recycle agents every %lld completed tasks."
+                                    ),
+                                    locale: LanguageSettings.currentLocale(),
+                                    autoRecycleGlobalDefault
+                                  )
                         ) {
                             Stepper(value: $autoRecycleGlobalDefault, in: 0...100, step: 1) {
                                 Text(autoRecycleGlobalDefault == 0 ? "Off" : "\(autoRecycleGlobalDefault) tasks")
@@ -1648,10 +1689,13 @@ struct SettingsView: View {
         SettingsCard {
                         SettingsCardRow(
                             "HTTP Dashboard",
-                            subtitle: dashboardEnabled
-                                ? "Web dashboard at \(dashboardLocalhostOnly ? "localhost" : "0.0.0.0"):\(dashboardPort)"
-                                    + (dashboardPassword.isEmpty ? "" : " 🔒")
-                                : "Dashboard is disabled. Daemon runs without HTTP server."
+                            verbatimSubtitle: dashboardEnabled
+                                ? String(
+                                    format: LanguageSettings.localized("Web dashboard at %@:%@"),
+                                    dashboardLocalhostOnly ? "localhost" : "0.0.0.0",
+                                    String(dashboardPort)
+                                  ) + (dashboardPassword.isEmpty ? "" : " 🔒")
+                                : LanguageSettings.localized("Dashboard is disabled. Daemon runs without HTTP server.")
                         ) {
                             Toggle("", isOn: $dashboardEnabled)
                                 .labelsHidden()
@@ -1720,7 +1764,7 @@ struct SettingsView: View {
                         if let status = daemonStatusInfo {
                             SettingsCardRow(
                                 "App Variant",
-                                subtitle: "\(status.bundleIdentifier)"
+                                verbatimSubtitle: status.bundleIdentifier
                             ) {
                                 Text(status.appVariant)
                                     .font(.system(size: 12, weight: .medium, design: .monospaced))
@@ -1733,7 +1777,7 @@ struct SettingsView: View {
                         // -- Daemon connection status row --
                         SettingsCardRow(
                             "Daemon (term-meshd)",
-                            subtitle: daemonStatusSubtitle
+                            verbatimSubtitle: daemonStatusSubtitle
                         ) {
                             HStack(spacing: 8) {
                                 Circle()
@@ -1751,7 +1795,7 @@ struct SettingsView: View {
                         if let status = daemonStatusInfo {
                             SettingsCardRow(
                                 "Socket",
-                                subtitle: status.socketPath
+                                verbatimSubtitle: status.socketPath
                             ) {
                                 HStack(spacing: 6) {
                                     Circle()
@@ -1767,7 +1811,8 @@ struct SettingsView: View {
 
                             SettingsCardRow(
                                 "Binary",
-                                subtitle: status.binaryPath ?? "(not found)"
+                                verbatimSubtitle: status.binaryPath
+                                    ?? LanguageSettings.localized("(not found)")
                             ) {
                                 HStack(spacing: 6) {
                                     Circle()
@@ -1794,7 +1839,7 @@ struct SettingsView: View {
 
                             SettingsCardRow(
                                 "Log",
-                                subtitle: status.logPath
+                                verbatimSubtitle: status.logPath
                             ) {
                                 HStack(spacing: 6) {
                                     Circle()
@@ -1833,8 +1878,8 @@ struct SettingsView: View {
                             // -- Subsystem rows --
                             ForEach(status.subsystems) { sub in
                                 SettingsCardRow(
-                                    sub.name,
-                                    subtitle: sub.detail
+                                    verbatim: sub.name,
+                                    verbatimSubtitle: sub.detail
                                 ) {
                                     HStack(spacing: 6) {
                                         Circle()
@@ -1991,9 +2036,12 @@ struct SettingsView: View {
 
                         SettingsCardRow(
                             "Browser Theme",
-                            subtitle: selectedBrowserThemeMode == .system
-                                ? "System follows app and macOS appearance."
-                                : "\(selectedBrowserThemeMode.displayName) forces that color scheme for compatible pages.",
+                            verbatimSubtitle: selectedBrowserThemeMode == .system
+                                ? LanguageSettings.localized("System follows app and macOS appearance.")
+                                : String(
+                                    format: LanguageSettings.localized("%@ forces that color scheme for compatible pages."),
+                                    LanguageSettings.localized(selectedBrowserThemeMode.displayName)
+                                  ),
                             controlWidth: pickerColumnWidth
                         ) {
                             Picker("", selection: browserThemeModeSelection) {
@@ -2119,7 +2167,7 @@ struct SettingsView: View {
 
                         SettingsCardDivider()
 
-                        SettingsCardRow("Browsing History", subtitle: browserHistorySubtitle) {
+                        SettingsCardRow("Browsing History", verbatimSubtitle: browserHistorySubtitle) {
                             Button("Clear History…") {
                                 showClearBrowserHistoryConfirmation = true
                             }
@@ -2185,9 +2233,12 @@ struct SettingsView: View {
         SettingsCard {
             SettingsCardRow(
                 "Enable peer server",
-                subtitle: peerFederationServerRunning
-                    ? "Listening at \(peerFederationSocketPath). Remote clients can attach now."
-                    : "Server is off. Toggle on to accept incoming relay attaches."
+                verbatimSubtitle: peerFederationServerRunning
+                    ? String(
+                        format: LanguageSettings.localized("Listening at %@. Remote clients can attach now."),
+                        peerFederationSocketPath
+                      )
+                    : LanguageSettings.localized("Server is off. Toggle on to accept incoming relay attaches.")
             ) {
                 Toggle("", isOn: $peerFederationServerRunning)
                     .labelsHidden()
@@ -2348,16 +2399,29 @@ struct SettingsView: View {
     // MARK: - Services / Doctor
 
     private var daemonStatusSubtitle: String {
-        guard let status = daemonStatusInfo else { return "Checking..." }
+        guard let status = daemonStatusInfo else {
+            return LanguageSettings.localized("Checking...")
+        }
         if !status.connected {
-            if !status.binaryExists { return "Binary not found. Build the daemon first." }
-            if !status.socketExists { return "Socket missing. Daemon may not be running." }
-            return "Not responding on \(status.socketPath)"
+            if !status.binaryExists {
+                return LanguageSettings.localized("Binary not found. Build the daemon first.")
+            }
+            if !status.socketExists {
+                return LanguageSettings.localized("Socket missing. Daemon may not be running.")
+            }
+            return String(
+                format: LanguageSettings.localized("Not responding on %@"),
+                status.socketPath
+            )
         }
         if let pid = status.pid, let uptime = status.uptimeSecs {
-            return "PID \(pid) — up \(formatUptime(uptime))"
+            return String(
+                format: LanguageSettings.localized("PID %@ — up %@"),
+                String(pid),
+                formatUptime(uptime)
+            )
         }
-        return "Connected"
+        return LanguageSettings.localized("Connected")
     }
 
     private var resolvedDaemon: (any DaemonService)? {
@@ -2512,7 +2576,7 @@ struct SettingsView: View {
     @ViewBuilder
     private var shellIntegrationHealthCard: some View {
         SettingsCard {
-            SettingsCardRow("Shell Integration", subtitle: shellHealthSummary) {
+            SettingsCardRow("Shell Integration", verbatimSubtitle: shellHealthSummary) {
                 HStack(spacing: 8) {
                     Circle()
                         .fill(shellHealthOverallColor)
@@ -2529,8 +2593,10 @@ struct SettingsView: View {
 
                     let displayStatus = entry.isAgentPanel ? IntegrationStatus.agentMode : entry.health.status
                     SettingsCardRow(
-                        "\(entry.workspaceTitle) / \(entry.panelTitle)",
-                        subtitle: entry.isAgentPanel ? "TUI agent — shell integration N/A" : shellHealthDetail(entry)
+                        verbatim: "\(entry.workspaceTitle) / \(entry.panelTitle)",
+                        verbatimSubtitle: entry.isAgentPanel
+                            ? LanguageSettings.localized("TUI agent — shell integration N/A")
+                            : shellHealthDetail(entry)
                     ) {
                         HStack(spacing: 6) {
                             Circle()
@@ -2580,8 +2646,15 @@ struct SettingsView: View {
 
     private var shellHealthSummary: String {
         let total = shellHealthEntries.count
-        if total == 0 { return "No terminal panels detected" }
-        return "\(total) terminal panel\(total == 1 ? "" : "s") across all workspaces"
+        if total == 0 { return LanguageSettings.localized("No terminal panels detected") }
+        let key = total == 1
+            ? "%lld terminal panel across all workspaces"
+            : "%lld terminal panels across all workspaces"
+        return String(
+            format: LanguageSettings.localized(key),
+            locale: LanguageSettings.currentLocale(),
+            total
+        )
     }
 
     private var shellHealthOverallColor: Color {
@@ -2966,16 +3039,84 @@ struct SettingsCard<Content: View>: View {
     }
 }
 
+/// A settings row.
+///
+/// Title and subtitle are `LocalizedStringKey`, not `String`, so the compiler
+/// separates UI wording from data. When these were `String` the view turned
+/// every one into a catalog key, which silently translated runtime values: a
+/// peer named "Terminal" rendered as 터미널. Pass runtime text through the
+/// `verbatim` initializers instead — the distinction is then checked, not
+/// remembered.
 struct SettingsCardRow<Trailing: View>: View {
-    let title: String
-    let subtitle: String?
+    private let title: Text
+    private let subtitle: Text?
     let controlWidth: CGFloat?
     @ViewBuilder let trailing: Trailing
 
     init(
-        _ title: String,
-        subtitle: String? = nil,
+        _ title: LocalizedStringKey,
+        subtitle: LocalizedStringKey? = nil,
         controlWidth: CGFloat? = nil,
+        @ViewBuilder trailing: () -> Trailing
+    ) {
+        self.init(
+            title: Text(title),
+            subtitle: subtitle.map { Text($0) },
+            controlWidth: controlWidth,
+            trailing: trailing
+        )
+    }
+
+    /// A translated title with a subtitle that carries runtime data (a path, a
+    /// summary, a formatted count).
+    init(
+        _ title: LocalizedStringKey,
+        verbatimSubtitle: String?,
+        controlWidth: CGFloat? = nil,
+        @ViewBuilder trailing: () -> Trailing
+    ) {
+        self.init(
+            title: Text(title),
+            subtitle: verbatimSubtitle.map { Text(verbatim: $0) },
+            controlWidth: controlWidth,
+            trailing: trailing
+        )
+    }
+
+    /// A row whose title is data — a device, project, model or role name.
+    init(
+        verbatim title: String,
+        verbatimSubtitle: String? = nil,
+        controlWidth: CGFloat? = nil,
+        @ViewBuilder trailing: () -> Trailing
+    ) {
+        self.init(
+            title: Text(verbatim: title),
+            subtitle: verbatimSubtitle.map { Text(verbatim: $0) },
+            controlWidth: controlWidth,
+            trailing: trailing
+        )
+    }
+
+    /// A data title with a translated subtitle (a "built-in" / "custom" tag).
+    init(
+        verbatim title: String,
+        subtitle: LocalizedStringKey?,
+        controlWidth: CGFloat? = nil,
+        @ViewBuilder trailing: () -> Trailing
+    ) {
+        self.init(
+            title: Text(verbatim: title),
+            subtitle: subtitle.map { Text($0) },
+            controlWidth: controlWidth,
+            trailing: trailing
+        )
+    }
+
+    private init(
+        title: Text,
+        subtitle: Text?,
+        controlWidth: CGFloat?,
         @ViewBuilder trailing: () -> Trailing
     ) {
         self.title = title
@@ -2987,10 +3128,10 @@ struct SettingsCardRow<Trailing: View>: View {
     var body: some View {
         HStack(alignment: .center, spacing: 12) {
             VStack(alignment: .leading, spacing: subtitle == nil ? 0 : 3) {
-                Text(LocalizedStringKey(title))
+                title
                     .font(.system(size: 13, weight: .medium))
                 if let subtitle {
-                    Text(LocalizedStringKey(subtitle))
+                    subtitle
                         .font(.caption)
                         .foregroundColor(.secondary)
                         .lineLimit(2)
@@ -3048,8 +3189,10 @@ private struct CLIPathRow: View {
 
     var body: some View {
         SettingsCardRow(
-            label,
-            subtitle: resolvedPath.isEmpty ? "Not found" : resolvedPath
+            verbatim: label,
+            verbatimSubtitle: resolvedPath.isEmpty
+                ? LanguageSettings.localized("Not found")
+                : resolvedPath
         ) {
             HStack(spacing: 6) {
                 Circle()
@@ -3518,7 +3661,7 @@ private struct WorktreeLogSection: View {
             .padding(.horizontal, 2)
 
             SettingsCard {
-                SettingsCardRow("Log File", subtitle: WorktreeLog.logFile.path) {
+                SettingsCardRow("Log File", verbatimSubtitle: WorktreeLog.logFile.path) {
                     HStack(spacing: 8) {
                         Text(fileSize)
                             .font(.caption)
@@ -3533,7 +3676,12 @@ private struct WorktreeLogSection: View {
 
                 SettingsCardDivider()
 
-                SettingsCardRow("Last Modified", subtitle: lastModified.isEmpty ? "No log yet" : lastModified) {
+                SettingsCardRow(
+                    "Last Modified",
+                    verbatimSubtitle: lastModified.isEmpty
+                        ? LanguageSettings.localized("No log yet")
+                        : lastModified
+                ) {
                     EmptyView()
                 }
 
@@ -3629,7 +3777,7 @@ private struct CLICustomModelsSection: View {
             SettingsCard {
                 // Built-in models (read-only)
                 ForEach(AgentRolePreset.builtInModels(for: cli), id: \.self) { model in
-                    SettingsCardRow(model, subtitle: "built-in") {
+                    SettingsCardRow(verbatim: model, subtitle: "built-in") {
                         EmptyView()
                     }
                     SettingsCardDivider()
@@ -3637,7 +3785,7 @@ private struct CLICustomModelsSection: View {
 
                 // Custom models (editable)
                 ForEach(customModels, id: \.self) { model in
-                    SettingsCardRow(model, subtitle: "custom") {
+                    SettingsCardRow(verbatim: model, subtitle: "custom") {
                         Button(role: .destructive) {
                             AgentRolePreset.removeCustomModel(model, for: cli)
                             customModels = AgentRolePreset.customModels(for: cli)

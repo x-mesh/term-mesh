@@ -281,6 +281,47 @@ final class LanguageSettingsTests: XCTestCase {
         XCTAssertEqual(NotificationMenuSnapshotBuilder.stateHintTitle(unreadCount: 7), "읽지 않은 알림 7개")
     }
 
+    // MARK: - Language picker
+
+    /// A user who lands in a language they cannot read has to be able to find
+    /// their own, so language names are never translated.
+    func testLanguagesAreListedUnderTheirOwnNames() {
+        XCTAssertEqual(AppLanguage.english.endonym, "English")
+        XCTAssertEqual(AppLanguage.korean.endonym, "한국어")
+        // `.system` follows macOS, so it is labelled in the current UI language.
+        XCTAssertNil(AppLanguage.system.endonym)
+    }
+
+    // MARK: - Searching in the display language
+
+    /// Rows are tagged with English keywords. In Korean the user types 테마,
+    /// which appears in none of them, so the query is mapped back through the
+    /// catalog to the English terms.
+    func testKoreanQueryMapsBackToEnglishKeywords() {
+        let ko = Locale(identifier: "ko")
+
+        let theme = SettingsSearchIndex.englishTerms(matching: "테마", locale: ko)
+        XCTAssertTrue(theme.contains("theme"), "expected 'theme' among \(theme)")
+
+        let notifications = SettingsSearchIndex.englishTerms(matching: "알림", locale: ko)
+        XCTAssertTrue(notifications.contains("notifications"), "expected 'notifications' among \(notifications)")
+    }
+
+    func testQueryWithNoTranslationYieldsNoTerms() {
+        XCTAssertTrue(
+            SettingsSearchIndex.englishTerms(
+                matching: "존재하지않는설정이름",
+                locale: Locale(identifier: "ko")
+            ).isEmpty
+        )
+    }
+
+    /// English ships no `.lproj`, so there is nothing to reverse — English
+    /// queries already match the keyword lists directly.
+    func testSourceLanguageHasNoReverseTable() {
+        XCTAssertTrue(SettingsSearchIndex.table(for: Locale(identifier: "en")).isEmpty)
+    }
+
     // MARK: - Catalog keys must match the keys SwiftUI actually builds
 
     /// `Text("… \(value)")` does not key on the source text — SwiftUI rewrites

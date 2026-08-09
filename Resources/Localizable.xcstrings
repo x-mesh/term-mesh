@@ -1,6 +1,96 @@
 {
   "sourceLanguage": "en",
   "strings": {
+    "%@ bytes": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "%@바이트"
+          }
+        }
+      }
+    },
+    "%@ forces that color scheme for compatible pages.": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "%@은(는) 호환되는 페이지에 해당 색 구성을 강제합니다."
+          }
+        }
+      }
+    },
+    "%@ issues across source runbooks.": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "원본 런북 전체에서 문제 %@건."
+          }
+        }
+      }
+    },
+    "%@ managed projections need regeneration.": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "관리 중인 프로젝션 %@개를 다시 생성해야 합니다."
+          }
+        }
+      }
+    },
+    "%@ managed, %@ custom, %@ missing.": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "관리 %@개, 사용자 지정 %@개, 누락 %@개."
+          }
+        }
+      }
+    },
+    "%@/%@ managed, %@ custom, %@ outdated.": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "관리 %@/%@개, 사용자 지정 %@개, 오래됨 %@개."
+          }
+        }
+      }
+    },
+    "%lld saved pages appear in omnibar suggestions.": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "저장된 페이지 %lld개가 주소창 제안에 표시됩니다."
+          }
+        }
+      }
+    },
+    "%lld terminal panel across all workspaces": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "전체 워크스페이스에서 터미널 패널 %lld개"
+          }
+        }
+      }
+    },
+    "%lld terminal panels across all workspaces": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "전체 워크스페이스에서 터미널 패널 %lld개"
+          }
+        }
+      }
+    },
     "%lld unread notification": {
       "localizations": {
         "ko": {
@@ -37,6 +127,16 @@
           "stringUnit": {
             "state": "translated",
             "value": "(찾을 수 없음)"
+          }
+        }
+      }
+    },
+    "1 saved page appears in omnibar suggestions.": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "저장된 페이지 1개가 주소창 제안에 표시됩니다."
           }
         }
       }
@@ -141,6 +241,26 @@
         }
       }
     },
+    "Allow any local process and user to connect with no auth. Unsafe.": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "인증 없이 모든 로컬 프로세스와 사용자의 연결을 허용합니다. 안전하지 않습니다."
+          }
+        }
+      }
+    },
+    "Allow external local automation clients from this macOS user (no ancestry check).": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "이 macOS 사용자에서 실행되는 외부 로컬 자동화 클라이언트를 허용합니다(상위 프로세스 검사 없음)."
+          }
+        }
+      }
+    },
     "App": {
       "localizations": {
         "ko": {
@@ -157,6 +277,16 @@
           "stringUnit": {
             "state": "translated",
             "value": "앱 종류"
+          }
+        }
+      }
+    },
+    "Append new workspaces to the bottom of the list.": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "새 워크스페이스를 목록 맨 아래에 추가합니다."
           }
         }
       }
@@ -251,6 +381,16 @@
         }
       }
     },
+    "Binary not found. Build the daemon first.": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "실행 파일을 찾을 수 없습니다. 데몬을 먼저 빌드하세요."
+          }
+        }
+      }
+    },
     "Bind Address": {
       "localizations": {
         "ko": {
@@ -317,6 +457,16 @@
           "stringUnit": {
             "state": "translated",
             "value": "업데이트 확인…"
+          }
+        }
+      }
+    },
+    "Checking...": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "확인 중…"
           }
         }
       }
@@ -407,6 +557,26 @@
           "stringUnit": {
             "state": "translated",
             "value": "Command Palette에서 이름을 바꿀 때 전체 텍스트를 선택한 상태로 시작합니다."
+          }
+        }
+      }
+    },
+    "Conflicts": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "충돌"
+          }
+        }
+      }
+    },
+    "Connected": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "연결됨"
           }
         }
       }
@@ -537,6 +707,16 @@
           "stringUnit": {
             "state": "translated",
             "value": "삭제된 헤드리스 팀 세션을 이 기간(일) 동안 다시 이어서 쓸 수 있고, 그 뒤에 정리됩니다."
+          }
+        }
+      }
+    },
+    "Disable the local control socket.": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "로컬 제어 소켓을 끕니다."
           }
         }
       }
@@ -681,6 +861,16 @@
         }
       }
     },
+    "GC Root": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "GC 루트"
+          }
+        }
+      }
+    },
     "General": {
       "localizations": {
         "ko": {
@@ -821,6 +1011,26 @@
         }
       }
     },
+    "Insert new workspaces at the top of the list.": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "새 워크스페이스를 목록 맨 위에 넣습니다."
+          }
+        }
+      }
+    },
+    "Insert new workspaces directly after the active workspace.": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "새 워크스페이스를 현재 워크스페이스 바로 뒤에 넣습니다."
+          }
+        }
+      }
+    },
     "Intercept open http(s) in Terminal": {
       "localizations": {
         "ko": {
@@ -921,6 +1131,16 @@
         }
       }
     },
+    "Listening at %@. Remote clients can attach now.": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "%@에서 수신 중입니다. 이제 원격 클라이언트가 attach할 수 있습니다."
+          }
+        }
+      }
+    },
     "Local Unix socket the peer server binds. SSH clients tunnel into this path on the remote machine.": {
       "localizations": {
         "ko": {
@@ -947,6 +1167,26 @@
           "stringUnit": {
             "state": "translated",
             "value": "로그 파일"
+          }
+        }
+      }
+    },
+    "Managed projections match their source runbooks.": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "관리 중인 프로젝션이 원본 런북과 일치합니다."
+          }
+        }
+      }
+    },
+    "Manifest scans run without changing app or pane focus.": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "매니페스트 검사는 앱이나 pane 포커스를 바꾸지 않고 실행됩니다."
           }
         }
       }
@@ -1051,12 +1291,42 @@
         }
       }
     },
+    "New teams will auto-recycle agents every %lld completed task.": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "새 팀은 완료된 태스크 %lld개마다 에이전트를 자동으로 재활용합니다."
+          }
+        }
+      }
+    },
+    "New teams will auto-recycle agents every %lld completed tasks.": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "새 팀은 완료된 태스크 %lld개마다 에이전트를 자동으로 재활용합니다."
+          }
+        }
+      }
+    },
     "Next Surface": {
       "localizations": {
         "ko": {
           "stringUnit": {
             "state": "translated",
             "value": "다음 서피스"
+          }
+        }
+      }
+    },
+    "No active operation": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "진행 중인 작업 없음"
           }
         }
       }
@@ -1081,12 +1351,32 @@
         }
       }
     },
+    "No saved pages yet.": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "아직 저장된 페이지가 없습니다."
+          }
+        }
+      }
+    },
     "No settings match \"%@\"": {
       "localizations": {
         "ko": {
           "stringUnit": {
             "state": "translated",
             "value": "\"%@\"와 일치하는 설정이 없습니다"
+          }
+        }
+      }
+    },
+    "No terminal panels detected": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "감지된 터미널 패널 없음"
           }
         }
       }
@@ -1107,6 +1397,16 @@
           "stringUnit": {
             "state": "translated",
             "value": "찾을 수 없음"
+          }
+        }
+      }
+    },
+    "Not responding on %@": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "%@에서 응답이 없습니다"
           }
         }
       }
@@ -1151,6 +1451,16 @@
         }
       }
     },
+    "Only processes started inside term-mesh terminals can send commands.": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "term-mesh 터미널 안에서 시작된 프로세스만 명령을 보낼 수 있습니다."
+          }
+        }
+      }
+    },
     "Open Peer Workspace…": {
       "localizations": {
         "ko": {
@@ -1177,6 +1487,16 @@
           "stringUnit": {
             "state": "translated",
             "value": "PID"
+          }
+        }
+      }
+    },
+    "PID %@ — up %@": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "PID %@ — 가동 %@"
           }
         }
       }
@@ -1291,6 +1611,16 @@
         }
       }
     },
+    "Projection Drift": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "프로젝션 드리프트"
+          }
+        }
+      }
+    },
     "Projects Under": {
       "localizations": {
         "ko": {
@@ -1317,6 +1647,16 @@
           "stringUnit": {
             "state": "translated",
             "value": "최근 로그"
+          }
+        }
+      }
+    },
+    "Recovery Export": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "복구 내보내기"
           }
         }
       }
@@ -1371,12 +1711,42 @@
         }
       }
     },
+    "Repository": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "저장소"
+          }
+        }
+      }
+    },
     "Require a password to access the dashboard. Leave empty to disable auth.": {
       "localizations": {
         "ko": {
           "stringUnit": {
             "state": "translated",
             "value": "대시보드 접근에 암호를 요구합니다. 비워 두면 인증을 끕니다."
+          }
+        }
+      }
+    },
+    "Require socket authentication with a password stored in your keychain.": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "키체인에 저장된 암호로 소켓 인증을 요구합니다."
+          }
+        }
+      }
+    },
+    "Required sections are present in existing source runbooks.": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "기존 원본 런북에 필수 섹션이 모두 있습니다."
           }
         }
       }
@@ -1417,6 +1787,26 @@
           "stringUnit": {
             "state": "translated",
             "value": "기본값을 되돌리고 사용자 지정 색상을 모두 지웁니다."
+          }
+        }
+      }
+    },
+    "Runbook Lint": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "런북 린트"
+          }
+        }
+      }
+    },
+    "Runbooks": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "런북"
           }
         }
       }
@@ -1651,12 +2041,32 @@
         }
       }
     },
+    "Socket missing. Daemon may not be running.": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "소켓이 없습니다. 데몬이 실행 중이 아닐 수 있습니다."
+          }
+        }
+      }
+    },
     "Socket path": {
       "localizations": {
         "ko": {
           "stringUnit": {
             "state": "translated",
             "value": "소켓 경로"
+          }
+        }
+      }
+    },
+    "Sources": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "원본"
           }
         }
       }
@@ -1697,6 +2107,26 @@
           "stringUnit": {
             "state": "translated",
             "value": "TERMMESH_PORT 환경 변수의 시작 포트입니다."
+          }
+        }
+      }
+    },
+    "Status not loaded": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "상태를 불러오지 못함"
+          }
+        }
+      }
+    },
+    "Status not loaded.": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "상태를 불러오지 못했습니다."
           }
         }
       }
@@ -1801,6 +2231,26 @@
         }
       }
     },
+    "Tool Projections": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "도구 프로젝션"
+          }
+        }
+      }
+    },
+    "Touch ID or the macOS password is required before secret export.": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "비밀 내보내기 전에 Touch ID 또는 macOS 암호가 필요합니다."
+          }
+        }
+      }
+    },
     "Tracks projects and team leaders across machines. Needs TERMMESH_COORDINATOR_ENABLED=1 in the environment to actually launch the coordinator.": {
       "localizations": {
         "ko": {
@@ -1851,6 +2301,26 @@
         }
       }
     },
+    "User Presence": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "사용자 확인"
+          }
+        }
+      }
+    },
+    "User presence is not required by the current fixture.": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "현재 구성에서는 사용자 확인이 필요하지 않습니다."
+          }
+        }
+      }
+    },
     "Uses the current workspace directory.": {
       "localizations": {
         "ko": {
@@ -1897,6 +2367,16 @@
           "stringUnit": {
             "state": "translated",
             "value": "종료 전 경고"
+          }
+        }
+      }
+    },
+    "Web dashboard at %@:%@": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "웹 대시보드: %@:%@"
           }
         }
       }

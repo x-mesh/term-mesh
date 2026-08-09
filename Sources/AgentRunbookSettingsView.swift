@@ -35,7 +35,7 @@ struct AgentRunbookSettingsView: View {
         SettingsCard {
             SettingsCardRow(
                 "Repository",
-                subtitle: status?.projectRoot ?? workingDirectory
+                verbatimSubtitle: status?.projectRoot ?? workingDirectory
             ) {
                 HStack(spacing: 8) {
                     if let status {
@@ -59,7 +59,7 @@ struct AgentRunbookSettingsView: View {
 
             SettingsCardRow(
                 "Sources",
-                subtitle: sourceSummary
+                verbatimSubtitle: sourceSummary
             ) {
                 HStack(spacing: 8) {
                     Button {
@@ -86,7 +86,7 @@ struct AgentRunbookSettingsView: View {
 
             SettingsCardRow(
                 "Tool Projections",
-                subtitle: projectionSummary
+                verbatimSubtitle: projectionSummary
             ) {
                 HStack(spacing: 8) {
                     Menu {
@@ -143,7 +143,7 @@ struct AgentRunbookSettingsView: View {
         SettingsCard {
             SettingsCardRow(
                 "Projection Drift",
-                subtitle: driftSummary
+                verbatimSubtitle: driftSummary
             ) {
                 Button {
                     runCommand(["install", "--tool", "all"], label: "Update projections")
@@ -160,7 +160,7 @@ struct AgentRunbookSettingsView: View {
 
             SettingsCardRow(
                 "Runbook Lint",
-                subtitle: lintSummary
+                verbatimSubtitle: lintSummary
             ) {
                 if let status, status.lintIssueCount > 0 {
                     Text("\(status.lintIssueCount)")
@@ -186,8 +186,8 @@ struct AgentRunbookSettingsView: View {
                         SettingsCardDivider()
                     }
                     SettingsCardRow(
-                        roleStatus.role,
-                        subtitle: roleStatus.sourcePath
+                        verbatim: roleStatus.role,
+                        verbatimSubtitle: roleStatus.sourcePath
                     ) {
                         HStack(spacing: 8) {
                             stateBadge(roleStatus.sourceState)
@@ -212,33 +212,50 @@ struct AgentRunbookSettingsView: View {
     }
 
     private var sourceSummary: String {
-        guard let status else { return "Status not loaded." }
-        return "\(status.managedSourceCount) managed, \(status.customSourceCount) custom, \(status.missingSourceCount) missing."
+        guard let status else { return LanguageSettings.localized("Status not loaded.") }
+        return String(
+            format: LanguageSettings.localized("%@ managed, %@ custom, %@ missing."),
+            String(status.managedSourceCount),
+            String(status.customSourceCount),
+            String(status.missingSourceCount)
+        )
     }
 
     private var projectionSummary: String {
-        guard let status else { return "Status not loaded." }
+        guard let status else { return LanguageSettings.localized("Status not loaded.") }
         let projectionCount = status.roles.flatMap(\.projections).count
         let managed = status.roles.flatMap(\.projections).filter { $0.state == .managed }.count
         let custom = status.roles.flatMap(\.projections).filter { $0.state == .custom }.count
         let outdated = status.outdatedProjectionCount
-        return "\(managed)/\(projectionCount) managed, \(custom) custom, \(outdated) outdated."
+        return String(
+            format: LanguageSettings.localized("%@/%@ managed, %@ custom, %@ outdated."),
+            String(managed),
+            String(projectionCount),
+            String(custom),
+            String(outdated)
+        )
     }
 
     private var driftSummary: String {
-        guard let status else { return "Status not loaded." }
+        guard let status else { return LanguageSettings.localized("Status not loaded.") }
         if status.outdatedProjectionCount == 0 {
-            return "Managed projections match their source runbooks."
+            return LanguageSettings.localized("Managed projections match their source runbooks.")
         }
-        return "\(status.outdatedProjectionCount) managed projections need regeneration."
+        return String(
+            format: LanguageSettings.localized("%@ managed projections need regeneration."),
+            String(status.outdatedProjectionCount)
+        )
     }
 
     private var lintSummary: String {
-        guard let status else { return "Status not loaded." }
+        guard let status else { return LanguageSettings.localized("Status not loaded.") }
         if status.lintIssueCount == 0 {
-            return "Required sections are present in existing source runbooks."
+            return LanguageSettings.localized("Required sections are present in existing source runbooks.")
         }
-        return "\(status.lintIssueCount) issues across source runbooks."
+        return String(
+            format: LanguageSettings.localized("%@ issues across source runbooks."),
+            String(status.lintIssueCount)
+        )
     }
 
     private func refreshStatus() {

@@ -16,6 +16,20 @@ enum AppLanguage: String, CaseIterable, Identifiable {
         }
     }
 
+    /// The language's own name for its own speakers.
+    ///
+    /// Shown verbatim, never translated: someone who picked a language they
+    /// cannot read has to be able to find their way back, and "영어" is no help
+    /// to a reader of English. `.system` has no endonym — it follows whatever
+    /// macOS chose, so it is labelled in the current UI language.
+    var endonym: String? {
+        switch self {
+        case .system: return nil
+        case .english: return "English"
+        case .korean: return "한국어"
+        }
+    }
+
     /// The catalog language this mode pins, or nil for `.system`, which
     /// negotiates one from macOS instead.
     var languageCode: String? {
@@ -183,6 +197,40 @@ extension View {
     /// environment.
     func termMeshLanguage() -> some View {
         modifier(AppLanguageEnvironmentModifier())
+    }
+}
+
+/// Maps a search query in the display language back to the English terms the
+/// settings keyword lists are written in.
+///
+/// Reads the compiled catalog for the active language and looks it up in
+/// reverse: any entry whose translated value contains the query contributes its
+/// English key. That keeps one keyword list per row instead of one per
+/// language, and means a new translation makes its row searchable for free.
+enum SettingsSearchIndex {
+    private static var tableCache: [String: [String: String]] = [:]
+
+    /// The catalog for `locale`, keyed by source string. Empty for the source
+    /// language, which ships no `.lproj` — its keys already are English.
+    static func table(for locale: Locale) -> [String: String] {
+        let key = locale.language.languageCode?.identifier ?? locale.identifier
+        if let cached = tableCache[key] { return cached }
+        guard let bundle = LanguageSettings.bundle(for: locale),
+              let url = bundle.url(forResource: "Localizable", withExtension: "strings"),
+              let table = NSDictionary(contentsOf: url) as? [String: String] else {
+            tableCache[key] = [:]
+            return [:]
+        }
+        tableCache[key] = table
+        return table
+    }
+
+    static func englishTerms(matching query: String, locale: Locale) -> [String] {
+        let needle = query.lowercased()
+        guard !needle.isEmpty else { return [] }
+        return table(for: locale)
+            .filter { $0.value.lowercased().contains(needle) }
+            .map { $0.key.lowercased() }
     }
 }
 

@@ -98,6 +98,10 @@ struct TermMeshApp: App {
 
         let startupAppearance = AppearanceSettings.resolvedMode()
         Self.applyAppearance(startupAppearance)
+        // Repair an unreadable stored language the same way appearance does,
+        // so the Settings picker and the AppKit lookups agree on a value that
+        // is actually in AppLanguage rather than each falling back separately.
+        LanguageSettings.resolvedMode()
         // Ensure terminal theme override exists at startup (covers fresh install).
         // The settings file goes first: its `theme` line depends on the appearance
         // mode, and a build that shipped before that was true leaves a stale pair

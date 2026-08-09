@@ -92,7 +92,8 @@ enum NewWorkspacePlacement: String, CaseIterable, Identifiable {
         }
     }
 
-    var description: String {
+    /// Localized: this is UI wording, not data.
+    var description: LocalizedStringKey {
         switch self {
         case .top:
             return "Insert new workspaces at the top of the list."
