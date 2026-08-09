@@ -63,6 +63,7 @@ struct PeerHostEditorView: View {
     @State private var doctorState: DoctorState = .idle
     @State private var showInstallConfirm = false
     @State private var showUpdateConfirm = false
+    @State private var showForceReinstallConfirm = false
     /// Suppresses the Update button after one SUCCESSFUL update attempt
     /// this sheet session, even if the post-update retest still reports
     /// outdated/legacy — avoids nagging the user in a retry loop. Reset
@@ -285,6 +286,11 @@ struct PeerHostEditorView: View {
                     Button("Update term-meshd…") { showUpdateConfirm = true }
                         .disabled(doctorBusy)
                 }
+                if showsForceReinstallButton {
+                    Button("Reinstall term-meshd…") { showForceReinstallConfirm = true }
+                        .disabled(doctorBusy)
+                        .help("Install the latest release on this host regardless of the version it reports")
+                }
                 if showsAgentInstallButton {
                     Button("Set up notifications…") { showAgentInstallConfirm = true }
                         .disabled(doctorBusy)
@@ -331,6 +337,18 @@ struct PeerHostEditorView: View {
             Button("Cancel", role: .cancel) {}
         } message: {
             Text("Updating restarts the remote daemon and terminates all sessions on this host.")
+        }
+        .confirmationDialog(
+            "Reinstall term-meshd on \"\(profile.sshTarget)\"?",
+            isPresented: $showForceReinstallConfirm
+        ) {
+            // No `updateAttempted = true` here, unlike the Update flow:
+            // this button exists to be repeatable (see
+            // `showsForceReinstallButton`).
+            Button("Reinstall") { runInstall() }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("Runs the official install script over SSH whatever version this host reports — downloads the latest release, replaces the binary, and restarts the daemon. All sessions on this host are terminated.")
         }
         .confirmationDialog(
             "Set up agent notifications on \"\(profile.sshTarget)\"?",
@@ -381,6 +399,43 @@ struct PeerHostEditorView: View {
         switch doctorState {
         case .updateAvailable, .legacyDaemon: return true
         default: return false
+        }
+    }
+
+    /// The unconditional escape hatch: reinstall whatever this host says
+    /// it is running.
+    ///
+    /// Every other install action is gated on a version claim, and those
+    /// claims fail in ordinary ways — an exhausted GitHub API budget
+    /// answers 403 for the rest of the hour, which lands the sheet on
+    /// `.okVersionUnknown` and takes Install AND Update off the screen
+    /// while the host sits several releases behind. `.relayFailed` is the
+    /// same shape from the other side: reachable host, handshake refused,
+    /// often precisely because the daemon is too old to speak the current
+    /// protocol — the one case where reinstalling is the whole fix and
+    /// nothing offered it.
+    ///
+    /// Shown only where a Test has already proved SSH works, and only
+    /// when no other install button is on screen, so there is never more
+    /// than one install action at a time. Deliberately NOT suppressed by
+    /// `updateAttempted`: "force" that works once is not a force.
+    private var showsForceReinstallButton: Bool {
+        guard testedDraft != nil else { return false }
+        // A Mac host serves the peer from the app bundle, and this button
+        // runs the Linux install script — its `uname` guard would die
+        // immediately. `doctorMessageWithMacHint` carries the manual
+        // `brew upgrade` path for those hosts instead.
+        if testedHostKind == .app || daemonMissingHostKind == .app { return false }
+        if showsUpdateButton { return false }
+        switch doctorState {
+        // `.daemonMissing` has its own Install button; the rest of these
+        // are states where SSH answered and there is something installed
+        // (or half-installed) worth replacing.
+        case .ok, .okUpToDate, .okVersionUnknown, .updateAvailable,
+             .legacyDaemon, .relayFailed, .installFailed, .diagnosed:
+            return true
+        case .idle, .testing, .daemonMissing, .installing, .diagnosing, .sshFailed:
+            return false
         }
     }
 
@@ -709,6 +764,7 @@ struct PeerHostEditorView: View {
         updateAttempted = false
         showInstallConfirm = false
         showUpdateConfirm = false
+        showForceReinstallConfirm = false
         agentStackState = .idle
         showAgentInstallConfirm = false
     }
