@@ -431,6 +431,7 @@ mod tests {
                 capabilities: vec!["grid-snapshot-v1".into()],
                 app_version: "0.98.2".into(),
                 cli_bin_dirs: vec![],
+                session_host_socket: String::new(),
             })),
         };
 
@@ -517,6 +518,7 @@ mod tests {
                 capabilities: vec![],
                 app_version: "0.0.0".into(),
                 cli_bin_dirs: vec![],
+                session_host_socket: String::new(),
             })),
         };
         let bytes = env.encode_to_vec();
@@ -547,6 +549,7 @@ mod tests {
                 capabilities: unknown.clone(),
                 app_version: "9.9.9".into(),
                 cli_bin_dirs: vec![],
+                session_host_socket: String::new(),
             })),
         };
         let bytes = env.encode_to_vec();
@@ -572,6 +575,7 @@ mod tests {
                 capabilities: many.clone(),
                 app_version: "1.2.3".into(),
                 cli_bin_dirs: vec![],
+                session_host_socket: String::new(),
             })),
         };
         let bytes = env.encode_to_vec();
@@ -603,6 +607,7 @@ mod tests {
                 capabilities: vec![placeholder.to_string()],
                 app_version: "0.0.0".into(),
                 cli_bin_dirs: vec![],
+                session_host_socket: String::new(),
             })),
         };
         let mut bytes = env.encode_to_vec();
