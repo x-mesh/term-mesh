@@ -613,7 +613,7 @@ struct TermMeshApp: App {
                     }
                 }
 
-                Toggle("Worktree Auto-Cleanup", isOn: $worktreeAutoCleanup)
+                Toggle(isOn: $worktreeAutoCleanup) { commandLabel("Worktree Auto-Cleanup") }
 
                 Divider()
 
@@ -769,7 +769,7 @@ struct TermMeshApp: App {
             }
 
             CommandMenu(LanguageSettings.localized("Peer")) {
-                Menu("Host This Mac") {
+                Menu(LanguageSettings.localized("Host This Mac")) {
                     Button {
                         PeerHostCoordinator.shared.startServer(nil)
                     } label: {
@@ -811,7 +811,7 @@ struct TermMeshApp: App {
                 }
 
 #if DEBUG
-                Menu("Debug Connect") {
+                Menu(LanguageSettings.localized("Debug Connect")) {
                     Button {
                         PeerClientCoordinator.shared.promptAndRun(nil)
                     } label: {
@@ -895,7 +895,7 @@ struct TermMeshApp: App {
                 }
 
                 Divider()
-                Menu("Debug Windows") {
+                Menu(LanguageSettings.localized("Debug Windows")) {
                     Button {
                         DebugWindowControlsWindowController.shared.show()
                     } label: {
@@ -936,14 +936,16 @@ struct TermMeshApp: App {
                     }
                 }
 
-                Toggle("Always Show Shortcut Hints", isOn: $alwaysShowShortcutHints)
+                Toggle(isOn: $alwaysShowShortcutHints) { commandLabel("Always Show Shortcut Hints") }
 
                 Divider()
 
-                Picker("Titlebar Controls Style", selection: $titlebarControlsStyle) {
+                Picker(selection: $titlebarControlsStyle) {
                     ForEach(TitlebarControlsStyle.allCases) { style in
-                        Text(style.menuTitle).tag(style.rawValue)
+                        commandLabel(style.menuTitle).tag(style.rawValue)
                     }
+                } label: {
+                    commandLabel("Titlebar Controls Style")
                 }
 
                 Divider()
@@ -1026,7 +1028,7 @@ struct TermMeshApp: App {
 
             // Find
             CommandGroup(after: .textEditing) {
-                Menu("Find") {
+                Menu(LanguageSettings.localized("Find")) {
                     Button {
                         activeTabManager.startSearch()
                     } label: {
