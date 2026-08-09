@@ -59,6 +59,70 @@ enum LanguageSettings {
         case .korean: return Locale(identifier: "ko")
         }
     }
+
+    /// The locale currently in effect for the app, honoring the override.
+    static func currentLocale(defaults: UserDefaults = .standard) -> Locale {
+        locale(for: defaults.string(forKey: languageModeKey))
+    }
+
+    /// The `.lproj` bundle matching `locale`, or nil when the app ships no
+    /// catalog for that language.
+    ///
+    /// Returning nil rather than `Bundle.main` matters: the source language
+    /// (`en`) has no `.lproj` of its own, and `Bundle.main.localizedString`
+    /// resolves against the *system*-negotiated localization. Falling back to
+    /// it would hand a Korean string back to someone who explicitly picked
+    /// English while macOS is set to Korean — the very override this exists to
+    /// honor.
+    static func bundle(for locale: Locale) -> Bundle? {
+        guard let languageCode = locale.language.languageCode?.identifier,
+              let path = Bundle.main.path(forResource: languageCode, ofType: "lproj") else {
+            return nil
+        }
+        return Bundle(path: path)
+    }
+
+    /// Resolves a catalog key for AppKit surfaces.
+    ///
+    /// `NSMenuItem`, `NSStatusItem` tooltips and other AppKit views never see
+    /// the SwiftUI `\.locale` environment, so `termMeshLanguage()` cannot reach
+    /// them. Without this they render `Bundle.main`'s system-negotiated
+    /// language and ignore the in-app override entirely, which is how the same
+    /// command ends up Korean in one surface and English in another.
+    ///
+    /// SwiftUI code should keep using `Text`/`LocalizedStringKey` under
+    /// `termMeshLanguage()` instead of calling this.
+    static func localized(_ key: String, defaults: UserDefaults = .standard) -> String {
+        guard let bundle = bundle(for: currentLocale(defaults: defaults)) else {
+            // No catalog for this language, so the key already is the
+            // source-language string.
+            return key
+        }
+        return bundle.localizedString(forKey: key, value: key, table: nil)
+    }
+
+    /// Calls `handler` whenever the effective app language changes.
+    ///
+    /// AppKit menus are built once and mutated in place, so they need an
+    /// explicit signal to re-title themselves; SwiftUI views get this for free
+    /// through `@AppStorage`.
+    static func observeChanges(
+        on center: NotificationCenter = .default,
+        defaults: UserDefaults = .standard,
+        handler: @escaping () -> Void
+    ) -> NSObjectProtocol {
+        var lastIdentifier = currentLocale(defaults: defaults).identifier
+        return center.addObserver(
+            forName: UserDefaults.didChangeNotification,
+            object: nil,
+            queue: .main
+        ) { _ in
+            let identifier = currentLocale(defaults: defaults).identifier
+            guard identifier != lastIdentifier else { return }
+            lastIdentifier = identifier
+            handler()
+        }
+    }
 }
 
 private struct AppLanguageEnvironmentModifier: ViewModifier {

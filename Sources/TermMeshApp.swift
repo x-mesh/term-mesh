@@ -514,10 +514,12 @@ struct TermMeshApp: App {
         .defaultSize(width: 1200, height: 800)
         .commands {
             // MARK: - Agents Menu (combined agents + worktrees)
-            CommandMenu("Agents") {
+            CommandMenu(LanguageSettings.localized("Agents")) {
                 // -- Create --
-                Button("New Agent Team…") {
+                Button {
                     present(.teamCreation(tabManager: requestingTabManager(), mode: "new"))
+                } label: {
+                    commandLabel("New Agent Team…")
                 }
                 .keyboardShortcut("t", modifiers: [.command, .option])
 
@@ -608,30 +610,42 @@ struct TermMeshApp: App {
             }
 
             CommandGroup(replacing: .appSettings) {
-                Button("Settings…") {
+                Button {
                     showSettingsPanel()
+                } label: {
+                    commandLabel("Settings…")
                 }
                 .keyboardShortcut(",", modifiers: .command)
             }
 
             CommandGroup(replacing: .appInfo) {
-                Button("About Term-Mesh") {
+                Button {
                     showAboutPanel()
+                } label: {
+                    commandLabel("About Term-Mesh")
                 }
-                Button("Welcome Screen") {
+                Button {
                     UserDefaults.standard.set(false, forKey: "hideWelcomeScreen")
+                } label: {
+                    commandLabel("Welcome Screen")
                 }
                 Divider()
-                Button("Ghostty Settings…") {
+                Button {
                     configProvider.openConfigurationInTextEdit()
+                } label: {
+                    commandLabel("Ghostty Settings…")
                 }
-                Button("Reload Configuration") {
+                Button {
                     configProvider.reloadConfiguration(source: "menu.reload_configuration")
+                } label: {
+                    commandLabel("Reload Configuration")
                 }
                 .keyboardShortcut(",", modifiers: [.command, .shift])
                 Divider()
-                Button("Check for Updates…") {
+                Button {
                     appDelegate.checkForUpdates(nil)
+                } label: {
+                    commandLabel("Check for Updates…")
                 }
                 InstallUpdateMenuItem(model: appDelegate.updateViewModel)
                 Divider()
@@ -672,7 +686,7 @@ struct TermMeshApp: App {
                 }
             }
 
-            CommandMenu("Notifications") {
+            CommandMenu(LanguageSettings.localized("Notifications")) {
                 let snapshot = notificationMenuSnapshot
 
                 Button(snapshot.stateHintTitle) {}
@@ -699,18 +713,22 @@ struct TermMeshApp: App {
                 }
                 .disabled(!snapshot.hasUnreadNotifications)
 
-                Button("Mark All Read") {
+                Button {
                     notificationStore.markAllRead()
+                } label: {
+                    commandLabel("Mark All Read")
                 }
                 .disabled(!snapshot.hasUnreadNotifications)
 
-                Button("Clear All") {
+                Button {
                     notificationStore.clearAll()
+                } label: {
+                    commandLabel("Clear All")
                 }
                 .disabled(!snapshot.hasNotifications)
             }
 
-            CommandMenu("Peer") {
+            CommandMenu(LanguageSettings.localized("Peer")) {
                 Menu("Host This Mac") {
                     Button("Start Peer Server…") {
                         PeerHostCoordinator.shared.startServer(nil)
@@ -1743,14 +1761,29 @@ struct TermMeshApp: App {
     /// Use this for shortcuts already handled by the local NSEvent monitor to
     /// prevent SwiftUI from processing the shortcut independently (which can
     /// cause WindowGroup to create a duplicate window).
+    ///
+    /// The label is built with `commandLabel` rather than `Button(title,…)`:
+    /// passing a `String` selects SwiftUI's verbatim overload, which never
+    /// consults the string catalog, so every menu item routed through here
+    /// stayed English regardless of the language setting.
     @ViewBuilder
     private func splitCommandButton(title: String, shortcut: StoredShortcut, registerShortcut: Bool, action: @escaping () -> Void) -> some View {
         if registerShortcut, let key = shortcut.keyEquivalent {
-            Button(title, action: action)
+            Button(action: action) { commandLabel(title) }
                 .keyboardShortcut(key, modifiers: shortcut.eventModifiers)
         } else {
-            Button(title, action: action)
+            Button(action: action) { commandLabel(title) }
         }
+    }
+
+    /// Resolves a menu string against the app-language bundle explicitly.
+    ///
+    /// Menu bar commands live on the `Scene`, outside the window content that
+    /// `termMeshLanguage()` decorates, so they cannot be relied on to inherit
+    /// the `\.locale` environment. Looking the string up here keeps the app
+    /// menu, the status-item menu and the in-window UI on one language.
+    private func commandLabel(_ title: String) -> Text {
+        Text(verbatim: LanguageSettings.localized(title))
     }
 
     private func closePanelOrWindow() {

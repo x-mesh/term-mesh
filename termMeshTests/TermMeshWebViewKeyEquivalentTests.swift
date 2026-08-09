@@ -146,6 +146,109 @@ final class LanguageSettingsTests: XCTestCase {
             "언어"
         )
     }
+
+    // MARK: - AppKit lookup
+
+    private func isolatedDefaults(
+        _ label: String,
+        language: AppLanguage,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) -> UserDefaults? {
+        let suiteName = "LanguageSettingsTests.\(label).\(UUID().uuidString)"
+        guard let defaults = UserDefaults(suiteName: suiteName) else {
+            XCTFail("Failed to create isolated UserDefaults suite", file: file, line: line)
+            return nil
+        }
+        addTeardownBlock { defaults.removePersistentDomain(forName: suiteName) }
+        defaults.set(language.rawValue, forKey: LanguageSettings.languageModeKey)
+        return defaults
+    }
+
+    func testAppKitLookupFollowsTheKoreanOverride() {
+        guard let defaults = isolatedDefaults("Korean", language: .korean) else { return }
+
+        XCTAssertEqual(LanguageSettings.localized("Show Notifications", defaults: defaults), "알림 보기")
+        XCTAssertEqual(LanguageSettings.localized("Clear All", defaults: defaults), "모두 지우기")
+    }
+
+    /// The app ships no `en.lproj` (English is the source language), so an
+    /// English override must fall through to the key itself. Resolving against
+    /// `Bundle.main` instead would return the *system*-negotiated language and
+    /// hand Korean text to someone who explicitly chose English.
+    func testEnglishOverrideNeverFallsBackToTheSystemLanguage() {
+        guard let defaults = isolatedDefaults("English", language: .english) else { return }
+
+        XCTAssertNil(LanguageSettings.bundle(for: Locale(identifier: "en")))
+        XCTAssertEqual(LanguageSettings.localized("Show Notifications", defaults: defaults), "Show Notifications")
+        XCTAssertEqual(LanguageSettings.localized("Clear All", defaults: defaults), "Clear All")
+    }
+
+    func testUnknownKeyResolvesToItself() {
+        guard let defaults = isolatedDefaults("Unknown", language: .korean) else { return }
+
+        XCTAssertEqual(
+            LanguageSettings.localized("A string that is not in the catalog", defaults: defaults),
+            "A string that is not in the catalog"
+        )
+    }
+
+    func testMenuBarStateHintFollowsTheOverride() {
+        guard let defaults = isolatedDefaults("StateHint", language: .korean) else { return }
+        defaults.set(AppLanguage.korean.rawValue, forKey: LanguageSettings.languageModeKey)
+        UserDefaults.standard.set(AppLanguage.korean.rawValue, forKey: LanguageSettings.languageModeKey)
+        addTeardownBlock {
+            UserDefaults.standard.removeObject(forKey: LanguageSettings.languageModeKey)
+        }
+
+        XCTAssertEqual(NotificationMenuSnapshotBuilder.stateHintTitle(unreadCount: 0), "읽지 않은 알림 없음")
+        XCTAssertEqual(NotificationMenuSnapshotBuilder.stateHintTitle(unreadCount: 1), "읽지 않은 알림 1개")
+        XCTAssertEqual(NotificationMenuSnapshotBuilder.stateHintTitle(unreadCount: 7), "읽지 않은 알림 7개")
+    }
+
+    // MARK: - Catalog keys must match the keys SwiftUI actually builds
+
+    /// `Text("… \(value)")` does not key on the source text — SwiftUI rewrites
+    /// each interpolation into a format specifier. A catalog entry written by
+    /// hand with the wrong specifier compiles, ships, and silently never
+    /// matches, which is how `%arg` left the settings-search message English.
+    private func swiftUIKey(_ key: LocalizedStringKey) -> String? {
+        Mirror(reflecting: key).children
+            .first { $0.label == "key" }?
+            .value as? String
+    }
+
+    func testInterpolatedSettingsSearchKeyMatchesTheCatalog() {
+        let key = swiftUIKey("No settings match \"\(  "peer"  )\"")
+        XCTAssertEqual(key, "No settings match \"%@\"")
+
+        guard let key else { return }
+        let localized = String(
+            localized: String.LocalizationValue(key),
+            bundle: .main,
+            locale: Locale(identifier: "ko")
+        )
+        XCTAssertNotEqual(localized, key, "catalog has no ko entry for the key SwiftUI builds")
+        XCTAssertTrue(localized.contains("%@"), "translated value dropped the format specifier")
+    }
+
+    /// Every format specifier must survive translation; a Korean value that
+    /// loses one crashes `String(format:)` or prints a stray literal.
+    func testFormattedMenuStringsKeepTheirSpecifiers() {
+        guard let defaults = isolatedDefaults("Format", language: .korean) else { return }
+
+        let brew = LanguageSettings.localized("Restart and Update term-mesh (%@ → %@)", defaults: defaults)
+        XCTAssertEqual(brew.components(separatedBy: "%@").count - 1, 2)
+        XCTAssertEqual(String(format: brew, "1.0.0", "1.1.0"), "term-mesh 재시작 후 업데이트(1.0.0 → 1.1.0)")
+
+        let focus = LanguageSettings.localized("Focus a %@ agent pane to enable", defaults: defaults)
+        XCTAssertEqual(focus.components(separatedBy: "%@").count - 1, 1)
+
+        for key in ["%lld unread notification", "%lld unread notifications"] {
+            let value = LanguageSettings.localized(key, defaults: defaults)
+            XCTAssertTrue(value.contains("%lld"), "\(key) lost its %lld specifier")
+        }
+    }
 }
 
 final class SidebarTeamRuntimeSnapshotTests: XCTestCase {
