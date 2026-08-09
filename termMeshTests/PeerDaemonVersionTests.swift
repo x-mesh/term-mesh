@@ -389,6 +389,78 @@ final class PeerDaemonVersionTests: XCTestCase {
         )
     }
 
+    // MARK: - PeerDaemonVersion.parseTagFromReleaseURL (API-free fallback)
+
+    func test_parseTagFromReleaseURL_extractsTagFromRedirectTarget() {
+        XCTAssertEqual(
+            PeerDaemonVersion.parseTagFromReleaseURL(
+                "https://github.com/x-mesh/term-mesh/releases/tag/v0.178.0"
+            ),
+            "v0.178.0"
+        )
+    }
+
+    /// A repo with no published releases never redirects, so the final
+    /// URL is still `…/releases/latest`. Inventing a tag from that would
+    /// be compared against the host's real version and reported as an
+    /// available update — nil is the only honest answer.
+    func test_parseTagFromReleaseURL_unredirectedLatestIsNil() {
+        XCTAssertNil(
+            PeerDaemonVersion.parseTagFromReleaseURL(
+                "https://github.com/x-mesh/term-mesh/releases/latest"
+            )
+        )
+        XCTAssertNil(PeerDaemonVersion.parseTagFromReleaseURL(""))
+        XCTAssertNil(
+            PeerDaemonVersion.parseTagFromReleaseURL("https://github.com/x-mesh/term-mesh")
+        )
+    }
+
+    /// A trailing path segment means this is not the tag page itself
+    /// (`…/tag/v1.0.0/whatever`), and a bare `…/tag/` carries no tag.
+    func test_parseTagFromReleaseURL_rejectsNonTerminalAndEmptyTag() {
+        XCTAssertNil(
+            PeerDaemonVersion.parseTagFromReleaseURL(
+                "https://github.com/x-mesh/term-mesh/releases/tag/v0.178.0/files"
+            )
+        )
+        XCTAssertNil(
+            PeerDaemonVersion.parseTagFromReleaseURL(
+                "https://github.com/x-mesh/term-mesh/releases/tag/"
+            )
+        )
+    }
+
+    func test_parseTagFromReleaseURL_stripsQueryAndFragment() {
+        XCTAssertEqual(
+            PeerDaemonVersion.parseTagFromReleaseURL(
+                "https://github.com/x-mesh/term-mesh/releases/tag/v0.178.0?foo=1"
+            ),
+            "v0.178.0"
+        )
+        XCTAssertEqual(
+            PeerDaemonVersion.parseTagFromReleaseURL(
+                "https://github.com/x-mesh/term-mesh/releases/tag/v0.178.0#notes"
+            ),
+            "v0.178.0"
+        )
+    }
+
+    /// The parsed tag feeds straight into `compare`, so it has to come
+    /// out in a shape that parses — this is the whole contract between
+    /// the fallback and the version comparison.
+    func test_parseTagFromReleaseURL_resultComparesAsOutdated() {
+        guard let tag = PeerDaemonVersion.parseTagFromReleaseURL(
+            "https://github.com/x-mesh/term-mesh/releases/tag/v0.178.0"
+        ) else {
+            return XCTFail("expected a tag")
+        }
+        XCTAssertEqual(
+            PeerDaemonVersion.compare(installed: "0.170.2", latest: tag),
+            .outdated(latest: "v0.178.0")
+        )
+    }
+
     // MARK: - PeerHostDoctor.waitForExit (runRemote's SIGTERM→SIGKILL escalation)
 
     /// Exercises the exact building block runRemote's timeout branch
