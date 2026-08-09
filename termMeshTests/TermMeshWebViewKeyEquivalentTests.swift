@@ -86,6 +86,68 @@ final class AppLaunchEnvironmentTests: XCTestCase {
     }
 }
 
+final class LanguageSettingsTests: XCTestCase {
+    func testInvalidStoredLanguageFallsBackToSystemAndRepairsDefaults() {
+        let suiteName = "LanguageSettingsTests.Invalid.\(UUID().uuidString)"
+        guard let defaults = UserDefaults(suiteName: suiteName) else {
+            return XCTFail("Failed to create isolated UserDefaults suite")
+        }
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+
+        defaults.set("unsupported", forKey: LanguageSettings.languageModeKey)
+
+        XCTAssertEqual(LanguageSettings.resolvedMode(defaults: defaults), .system)
+        XCTAssertEqual(
+            defaults.string(forKey: LanguageSettings.languageModeKey),
+            AppLanguage.system.rawValue
+        )
+    }
+
+    func testExplicitLanguagesOverrideSystemPreference() {
+        XCTAssertTrue(
+            LanguageSettings.locale(
+                for: AppLanguage.english.rawValue,
+                preferredLanguages: ["ko-KR"]
+            ).identifier.hasPrefix("en")
+        )
+        XCTAssertTrue(
+            LanguageSettings.locale(
+                for: AppLanguage.korean.rawValue,
+                preferredLanguages: ["en-US"]
+            ).identifier.hasPrefix("ko")
+        )
+    }
+
+    func testSystemLanguageUsesMacOSPreferredLanguage() {
+        let locale = LanguageSettings.locale(
+            for: AppLanguage.system.rawValue,
+            preferredLanguages: ["ja-JP", "ko-KR", "en-US"]
+        )
+
+        XCTAssertTrue(locale.identifier.hasPrefix("ko"))
+    }
+
+    func testSystemLanguageFallsBackToEnglishWhenNoPreferredLanguageIsSupported() {
+        let locale = LanguageSettings.locale(
+            for: AppLanguage.system.rawValue,
+            preferredLanguages: ["ja-JP", "fr-FR"]
+        )
+
+        XCTAssertTrue(locale.identifier.hasPrefix("en"))
+    }
+
+    func testKoreanCatalogIsAvailableFromAppBundle() {
+        XCTAssertEqual(
+            String(
+                localized: "Language",
+                bundle: .main,
+                locale: Locale(identifier: "ko")
+            ),
+            "언어"
+        )
+    }
+}
+
 final class SidebarTeamRuntimeSnapshotTests: XCTestCase {
     private let baseline = SidebarTeamRuntimeSnapshot(
         teamName: "term-mesh",

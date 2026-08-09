@@ -1,6 +1,85 @@
 import AppKit
 import SwiftUI
 
+enum AppLanguage: String, CaseIterable, Identifiable {
+    case system
+    case english
+    case korean
+
+    var id: String { rawValue }
+
+    var displayName: String {
+        switch self {
+        case .system: return "System Setting"
+        case .english: return "English"
+        case .korean: return "Korean"
+        }
+    }
+}
+
+enum LanguageSettings {
+    static let languageModeKey = "appLanguage"
+    static let defaultMode: AppLanguage = .system
+
+    static func mode(for rawValue: String?) -> AppLanguage {
+        guard let rawValue, let mode = AppLanguage(rawValue: rawValue) else {
+            return defaultMode
+        }
+        return mode
+    }
+
+    @discardableResult
+    static func resolvedMode(defaults: UserDefaults = .standard) -> AppLanguage {
+        let stored = defaults.string(forKey: languageModeKey)
+        let resolved = mode(for: stored)
+        if stored != resolved.rawValue {
+            defaults.set(resolved.rawValue, forKey: languageModeKey)
+        }
+        return resolved
+    }
+
+    static func locale(
+        for rawValue: String?,
+        preferredLanguages: [String] = Locale.preferredLanguages,
+        fallback: Locale = Locale(identifier: "en")
+    ) -> Locale {
+        switch mode(for: rawValue) {
+        case .system:
+            let supportedLanguageCodes = Set(["en", "ko"])
+            guard let preferredLanguage = preferredLanguages.first(where: { identifier in
+                guard let languageCode = Locale(identifier: identifier).language.languageCode?.identifier else {
+                    return false
+                }
+                return supportedLanguageCodes.contains(languageCode)
+            }) else {
+                return fallback
+            }
+            return Locale(identifier: preferredLanguage)
+        case .english: return Locale(identifier: "en")
+        case .korean: return Locale(identifier: "ko")
+        }
+    }
+}
+
+private struct AppLanguageEnvironmentModifier: ViewModifier {
+    @AppStorage(LanguageSettings.languageModeKey)
+    private var languageMode = LanguageSettings.defaultMode.rawValue
+
+    func body(content: Content) -> some View {
+        content.environment(\.locale, LanguageSettings.locale(for: languageMode))
+    }
+}
+
+extension View {
+    /// Applies the app's language override while keeping "System Setting"
+    /// tied to macOS's current locale. Each AppKit-hosted SwiftUI root uses
+    /// this modifier because those windows do not inherit the WindowGroup
+    /// environment.
+    func termMeshLanguage() -> some View {
+        modifier(AppLanguageEnvironmentModifier())
+    }
+}
+
 enum AppearanceMode: String, CaseIterable, Identifiable {
     case system
     case light

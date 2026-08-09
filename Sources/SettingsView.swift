@@ -80,7 +80,7 @@ enum SettingsSection: String, CaseIterable, Identifiable {
 
     var searchKeywords: [String] {
         switch self {
-        case .app: return ["app", "theme", "appearance", "dark", "light", "workspace", "placement", "session", "restore", "dock", "badge", "quit", "warn", "rename", "sidebar", "branch", "reorder", "notification", "experimental", "mirror", "peer hosts", "distributed", "coordinator", "review board"]
+        case .app: return ["app", "language", "system", "english", "korean", "언어", "시스템", "영어", "한국어", "theme", "appearance", "dark", "light", "workspace", "placement", "session", "restore", "dock", "badge", "quit", "warn", "rename", "sidebar", "branch", "reorder", "notification", "experimental", "mirror", "peer hosts", "distributed", "coordinator", "review board"]
         case .terminal: return ["terminal", "font", "size", "theme", "monospace", "family"]
         case .workspaceColors: return ["workspace", "color", "indicator", "palette", "custom"]
         case .automation: return ["automation", "socket", "claude", "port", "integration", "password"]
@@ -115,6 +115,7 @@ struct SettingsView: View {
     private let pickerColumnWidth: CGFloat = 196
 
     @AppStorage(AppearanceSettings.appearanceModeKey) private var appearanceMode = AppearanceSettings.defaultMode.rawValue
+    @AppStorage(LanguageSettings.languageModeKey) private var languageMode = LanguageSettings.defaultMode.rawValue
     @AppStorage(SocketControlSettings.appStorageKey) private var socketControlMode = SocketControlSettings.defaultMode.rawValue
     @AppStorage(ClaudeCodeIntegrationSettings.hooksEnabledKey)
     private var claudeCodeHooksEnabled = ClaudeCodeIntegrationSettings.defaultHooksEnabled
@@ -515,7 +516,7 @@ struct SettingsView: View {
                             if section != sections.first {
                                 Spacer().frame(height: 8)
                             }
-                            Text(section.category.rawValue)
+                            Text(LocalizedStringKey(section.category.rawValue))
                                 .font(.system(size: 10, weight: .semibold))
                                 .foregroundColor(.secondary.opacity(0.7))
                                 .textCase(.uppercase)
@@ -532,7 +533,7 @@ struct SettingsView: View {
                                     .font(.system(size: 11))
                                     .frame(width: 16, alignment: .center)
                                     .foregroundColor(selectedSection == section ? .white : .secondary)
-                                Text(section.title)
+                                Text(LocalizedStringKey(section.title))
                                     .font(.system(size: 12))
                                     .foregroundColor(selectedSection == section ? .white : .primary)
                                 Spacer(minLength: 0)
@@ -593,7 +594,7 @@ struct SettingsView: View {
                 .opacity(0.14 + (topBlurOpacity * 0.86))
 
             HStack(spacing: 12) {
-                Text(selectedSection.title)
+                Text(LocalizedStringKey(selectedSection.title))
                     .font(.system(size: 16, weight: .semibold))
                     .foregroundColor(.primary.opacity(0.92))
                 Spacer(minLength: 0)
@@ -696,11 +697,32 @@ struct SettingsView: View {
     @ViewBuilder
     private var sectionApp: some View {
         SettingsCard {
+                        let showsLanguageSetting = settingsMatch("language", "system", "english", "korean", "언어", "시스템", "영어", "한국어", "app")
+                        if showsLanguageSetting {
+                        SettingsCardRow(
+                            "Language",
+                            subtitle: "Follow the macOS language, or choose a language for term-mesh.",
+                            controlWidth: pickerColumnWidth
+                        ) {
+                            Picker("Language", selection: $languageMode) {
+                                ForEach(AppLanguage.allCases) { language in
+                                    Text(LocalizedStringKey(language.displayName)).tag(language.rawValue)
+                                }
+                            }
+                            .labelsHidden()
+                            .pickerStyle(.menu)
+                        }
+                        }
+
                         if settingsMatch("theme", "appearance", "dark", "light", "app") {
+                        if showsLanguageSetting {
+                            SettingsCardDivider()
+                        }
+
                         SettingsCardRow("Theme", controlWidth: pickerColumnWidth) {
-                            Picker("", selection: $appearanceMode) {
+                            Picker("Theme", selection: $appearanceMode) {
                                 ForEach(AppearanceMode.visibleCases) { mode in
-                                    Text(mode.displayName).tag(mode.rawValue)
+                                    Text(LocalizedStringKey(mode.displayName)).tag(mode.rawValue)
                                 }
                             }
                             .labelsHidden()
@@ -2795,6 +2817,7 @@ struct SettingsView: View {
     }
 
     private func resetAllSettings() {
+        languageMode = LanguageSettings.defaultMode.rawValue
         appearanceMode = AppearanceSettings.defaultMode.rawValue
         terminalFontFamily = ""
         terminalFontSize = 0
@@ -2913,7 +2936,7 @@ private struct SettingsSectionHeader: View {
     let title: String
 
     var body: some View {
-        Text(title)
+        Text(LocalizedStringKey(title))
             .font(.system(size: 13, weight: .semibold))
             .foregroundColor(.secondary)
             .padding(.leading, 2)
@@ -2964,10 +2987,10 @@ struct SettingsCardRow<Trailing: View>: View {
     var body: some View {
         HStack(alignment: .center, spacing: 12) {
             VStack(alignment: .leading, spacing: subtitle == nil ? 0 : 3) {
-                Text(title)
+                Text(LocalizedStringKey(title))
                     .font(.system(size: 13, weight: .medium))
                 if let subtitle {
-                    Text(subtitle)
+                    Text(LocalizedStringKey(subtitle))
                         .font(.caption)
                         .foregroundColor(.secondary)
                         .lineLimit(2)
@@ -4121,6 +4144,7 @@ extension Notification.Name {
 struct SettingsRootView: View {
     var body: some View {
         SettingsView()
+            .termMeshLanguage()
             .background(WindowAccessor { window in
                 configureSettingsWindow(window)
             })

@@ -14,6 +14,7 @@ struct TermMeshApp: App {
     private let browserHistory: any BrowserHistoryService = BrowserHistoryStore.shared
     private let primaryWindowId = UUID()
     @AppStorage(AppearanceSettings.appearanceModeKey) private var appearanceMode = AppearanceSettings.defaultMode.rawValue
+    @AppStorage(LanguageSettings.languageModeKey) private var languageMode = LanguageSettings.defaultMode.rawValue
     @AppStorage(TerminalSettingsOverride.fontFamilyKey) private var terminalFontFamily = ""
     @AppStorage(TerminalSettingsOverride.fontSizeKey) private var terminalFontSize: Double = 0
     @AppStorage(TerminalSettingsOverride.themeLightKey) private var terminalThemeLight = ""
@@ -501,7 +502,9 @@ struct TermMeshApp: App {
         // with their own TabManager, avoiding the shared-@StateObject problem.
         WindowGroup(id: "term-mesh-primary") {
             primaryWindowContent
+                .termMeshLanguage()
         }
+        .environment(\.locale, LanguageSettings.locale(for: languageMode))
         // Prevent macOS from creating duplicate WindowGroup scenes via
         // state restoration, dock clicks, or external events. Only the
         // initial scene should use this WindowGroup; additional windows
