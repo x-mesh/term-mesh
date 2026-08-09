@@ -20,6 +20,7 @@ private struct TermMeshWindowRoot<Content: View>: View {
     var body: some View {
         content()
             .environment(\.ghosttyTheme, ghosttyTheme)
+            .termMeshLanguage()
             .onReceive(NotificationCenter.default.publisher(for: .ghosttyDefaultBackgroundDidChange)) { _ in
                 ghosttyTheme = .current
             }

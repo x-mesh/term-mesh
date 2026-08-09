@@ -76,12 +76,14 @@ def main() -> int:
         _set_palette_visible(client, window_id, False)
         _set_palette_visible(client, window_id, True)
 
-        # Force command mode query regardless transient field-editor selection state.
+        # The palette opens already seeded with the ">" commands prefix, so type
+        # the term alone. Typing ">rename" here produced ">>rename", whose
+        # matching string is ">rename" — it matches nothing, and the substring
+        # wait below still passed, hiding the cause behind an empty result set.
         time.sleep(0.2)
-        client.simulate_shortcut("cmd+a")
-        client.simulate_type(">rename")
+        client.simulate_type("rename")
         _wait_until(
-            lambda: "rename" in str(_palette_results(client, window_id).get("query") or "").strip().lower(),
+            lambda: str(_palette_results(client, window_id).get("query") or "").strip().lower() == "rename",
             message="palette query did not update to 'rename'",
         )
 
@@ -99,10 +101,14 @@ def main() -> int:
                 f"unexpected top result for 'rename': id={top_id!r} title={top_title!r} results={titles}"
             )
 
-        client.simulate_shortcut("cmd+a")
-        client.simulate_type(">retab")
+        # Replacing "rename" with "retab", so set the field outright rather than
+        # relying on cmd+a selecting before the next keystroke.
+        client._call(
+            "debug.command_palette.set_query",
+            {"window_id": window_id, "query": ">retab"},
+        )
         _wait_until(
-            lambda: "retab" in str(_palette_results(client, window_id).get("query") or "").strip().lower(),
+            lambda: str(_palette_results(client, window_id).get("query") or "").strip().lower() == "retab",
             message="palette query did not update to 'retab'",
         )
 

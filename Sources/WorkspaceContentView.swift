@@ -180,9 +180,14 @@ struct WorkspaceContentView: View {
                 .onTapGesture {
                     workspace.bonsplitController.focusPane(paneId)
                 }
+                // Bonsplit hosts every pane in its own NSHostingController, which
+                // starts a fresh SwiftUI environment — the window root's language
+                // does not reach in here.
+                .termMeshLanguage()
             } else {
                 // Fallback for tabs without panels (shouldn't happen normally)
                 EmptyPanelView(workspace: workspace, paneId: paneId)
+                    .termMeshLanguage()
             }
         } emptyPane: { paneId in
             // Empty pane content
@@ -190,6 +195,7 @@ struct WorkspaceContentView: View {
                 .onTapGesture {
                     workspace.bonsplitController.focusPane(paneId)
                 }
+                .termMeshLanguage()
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .onAppear {

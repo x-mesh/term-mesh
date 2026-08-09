@@ -26,7 +26,7 @@ struct ProjectSyncPanelView: View {
         VStack(alignment: .leading, spacing: 8) {
             sectionTitle("Project")
             SettingsCard {
-                SettingsCardRow(viewModel.snapshot.projectName, subtitle: projectSubtitle) {
+                SettingsCardRow(verbatim: viewModel.snapshot.projectName, verbatimSubtitle: projectSubtitle) {
                     statusLabel(projectStatusText, systemImage: projectStatusImage, color: projectStatusColor)
                 }
                 if viewModel.snapshot.projectID == nil {
@@ -46,7 +46,7 @@ struct ProjectSyncPanelView: View {
                 } else {
                     ForEach(Array(viewModel.snapshot.devices.enumerated()), id: \.element.id) { index, device in
                         if index > 0 { SettingsCardDivider() }
-                        SettingsCardRow(device.name, subtitle: deviceSubtitle(device)) {
+                        SettingsCardRow(verbatim: device.name, verbatimSubtitle: deviceSubtitle(device)) {
                             HStack(spacing: 8) {
                                 statusLabel(
                                     device.status == .approved ? "Approved" : "Revoked",
@@ -73,7 +73,7 @@ struct ProjectSyncPanelView: View {
             sectionTitle("Active Operation")
             SettingsCard {
                 if let operation = viewModel.snapshot.activeOperation {
-                    SettingsCardRow(operationTitle(operation), subtitle: operationSubtitle(operation)) {
+                    SettingsCardRow(verbatim: operationTitle(operation), verbatimSubtitle: operationSubtitle(operation)) {
                         operationActions(operation)
                     }
                 } else {
@@ -100,7 +100,7 @@ struct ProjectSyncPanelView: View {
             SettingsCard {
                 SettingsCardRow(
                     "Conflicts",
-                    subtitle: viewModel.snapshot.conflicts.isEmpty
+                    verbatimSubtitle: viewModel.snapshot.conflicts.isEmpty
                         ? unavailableText(.conflicts, fallback: "No conflicts")
                         : viewModel.snapshot.conflicts.map(\.path).joined(separator: ", ")
                 ) {
@@ -110,7 +110,7 @@ struct ProjectSyncPanelView: View {
                         .accessibilityLabel("\(viewModel.snapshot.conflicts.count) conflicts")
                 }
                 SettingsCardDivider()
-                SettingsCardRow("GC Root", subtitle: gcSubtitle) {
+                SettingsCardRow("GC Root", verbatimSubtitle: gcSubtitle) {
                     statusLabel(
                         viewModel.snapshot.gcRoot == nil ? "Unavailable" : "Protected",
                         systemImage: viewModel.snapshot.gcRoot == nil ? "questionmark.circle" : "lock.shield",
@@ -141,7 +141,10 @@ struct ProjectSyncPanelView: View {
                     .accessibilityIdentifier("projectSync.userPresence")
                 }
                 SettingsCardDivider()
-                SettingsCardRow("Recovery Export", subtitle: unavailableText(.recoveryExport, fallback: "Ready for protected export")) {
+                SettingsCardRow(
+                    "Recovery Export",
+                    verbatimSubtitle: unavailableText(.recoveryExport, fallback: "Ready for protected export")
+                ) {
                     Button("Export…") {
                         viewModel.reportUnavailable(.recoveryExport)
                     }

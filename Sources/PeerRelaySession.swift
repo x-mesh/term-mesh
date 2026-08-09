@@ -607,27 +607,171 @@ actor RelayResizeCoalescer {
     }
 }
 
-/// R3 (peer-relay-bulk-loss): the last-processed wire `byte_seq` (this
-/// attach's own 0-based space — see `PeerServer.swift`'s wire↔host seq
-/// mapping doc), written by the hot host→relay pump loop on every PtyData
-/// chunk (thousands/sec under load) and read only by the rare resume-heal
-/// path (`PeerRelaySession.performResumeHeal`, at most ~once per
-/// `healMaxWaitSeconds`). A plain `NSLock` box rather than a MainActor
-/// property or an actor: the write side must never pay a cross-context hop.
-private final class WireSeqTracker: @unchecked Sendable {
-    private let lock = NSLock()
-    private var value: UInt64 = 0
+/// Coordinates the exact hand-off between an owned session's live stream and
+/// a resume attach. Once a boundary is taken, old-session bytes are held until
+/// the attach either commits (the new replay replaces them) or aborts (they are
+/// flushed back to the relay in order). It also tracks the last processed wire
+/// sequence under the same lock; the hot pump must not pay a MainActor hop.
+final class RelayResumeTransitionGate: @unchecked Sendable {
+    private final class Buffer {
+        var data = Data()
 
-    func update(_ newValue: UInt64) {
+        var count: Int { data.count }
+
+        func append(_ chunk: Data) {
+            data.append(chunk)
+        }
+
+        func take() -> Data {
+            let result = data
+            data = Data()
+            return result
+        }
+    }
+
+    struct Transition: Equatable {
+        let id: UInt64
+        let resumeWireSeq: UInt64
+    }
+
+    enum Route: Equatable {
+        case forward(Data)
+        case suppress
+        /// The bounded transition buffer filled up. The pump that observed
+        /// the overflow owns this combined, ordered flush; the in-flight
+        /// attach will see its transition token invalidated and be discarded.
+        case overflowFlush(Data)
+    }
+
+    private enum Phase {
+        case idle
+        case buffering(id: UInt64, buffer: Buffer)
+        case committed(id: UInt64)
+        case draining(id: UInt64, buffer: Buffer)
+    }
+
+    private let lock = NSLock()
+    private let maxBufferedBytes: Int
+    private var wireSeq: UInt64 = 0
+    private var nextID: UInt64 = 0
+    private var phase: Phase = .idle
+
+    init(maxBufferedBytes: Int = 1_048_576) {
+        self.maxBufferedBytes = max(1, maxBufferedBytes)
+    }
+
+    func resetWireSeq() {
         lock.lock()
-        value = newValue
+        wireSeq = 0
         lock.unlock()
     }
 
-    func read() -> UInt64 {
+    /// The last processed wire position, without opening a transition.
+    /// `begin()` also reports it, but only as the side effect of starting to
+    /// buffer — reconnect needs the value alone.
+    func currentWireSeq() -> UInt64 {
         lock.lock()
         defer { lock.unlock() }
-        return value
+        return wireSeq
+    }
+
+    /// Drop any in-flight transition and restart sequence accounting.
+    ///
+    /// For the reconnect path, where the session is replaced wholesale after
+    /// its transport died. Any buffered old-session bytes are unreachable — the
+    /// stream they belonged to is gone — so holding them would only suppress
+    /// the new session's output.
+    func reset() {
+        lock.lock()
+        phase = .idle
+        wireSeq = 0
+        lock.unlock()
+    }
+
+    func begin() -> Transition {
+        lock.lock()
+        defer { lock.unlock() }
+        nextID &+= 1
+        phase = .buffering(id: nextID, buffer: Buffer())
+        return Transition(id: nextID, resumeWireSeq: wireSeq)
+    }
+
+    func route(endWireSeq: UInt64, data: Data) -> Route {
+        lock.lock()
+        defer { lock.unlock() }
+        wireSeq = endWireSeq
+        switch phase {
+        case .idle:
+            return .forward(data)
+        case .buffering(_, let buffer):
+            guard buffer.count + data.count <= maxBufferedBytes else {
+                buffer.append(data)
+                phase = .idle
+                return .overflowFlush(buffer.take())
+            }
+            buffer.append(data)
+            return .suppress
+        case .committed:
+            // The replacement attach includes every byte after the boundary.
+            // Keep suppressing the old session until the receive loop adopts
+            // the replacement, otherwise its final frames duplicate replay.
+            return .suppress
+        case .draining(_, let buffer):
+            // An abort flush is already in progress. Keep later bytes behind
+            // that batch so they cannot overtake it at RelayFrameWriter.
+            guard buffer.count + data.count <= maxBufferedBytes else {
+                // The drain is not keeping up with the pump. Bounded like
+                // `.buffering` for the same reason — otherwise a busy stream
+                // grows this without limit and the drain loop, which runs
+                // until the buffer empties, may never terminate. Hand the
+                // combined batch to the pump and stop mediating; ordering
+                // still holds because everything buffered goes out ahead of
+                // the bytes that triggered the overflow.
+                buffer.append(data)
+                phase = .idle
+                return .overflowFlush(buffer.take())
+            }
+            buffer.append(data)
+            return .suppress
+        }
+    }
+
+    func commit(_ transition: Transition) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        guard case .buffering(let id, _) = phase, id == transition.id else { return false }
+        phase = .committed(id: id)
+        return true
+    }
+
+    func adoptCommittedSession() {
+        lock.lock()
+        if case .committed = phase {
+            phase = .idle
+            wireSeq = 0
+        }
+        lock.unlock()
+    }
+
+    /// Starts an ordered rollback and returns its first batch. Call
+    /// `finishDrain` after enqueueing each batch until it returns nil.
+    func abort(_ transition: Transition) -> Data? {
+        lock.lock()
+        defer { lock.unlock() }
+        guard case .buffering(let id, let buffer) = phase, id == transition.id else { return nil }
+        phase = .draining(id: id, buffer: buffer)
+        return buffer.take()
+    }
+
+    func finishDrain(_ transition: Transition) -> Data? {
+        lock.lock()
+        defer { lock.unlock() }
+        guard case .draining(let id, let buffer) = phase, id == transition.id else { return nil }
+        guard buffer.count > 0 else {
+            phase = .idle
+            return nil
+        }
+        return buffer.take()
     }
 }
 
@@ -635,7 +779,7 @@ private final class WireSeqTracker: @unchecked Sendable {
 /// MainActor (wheel events enter/steer the browse) and the pump task
 /// (which must suppress live PtyData while a past window is on screen —
 /// otherwise live output paints over the browsed history). Same
-/// NSLock-box shape as `WireSeqTracker`, for the same reason: the pump
+/// NSLock-box shape as `RelayResumeTransitionGate`, for the same reason: the pump
 /// touches this per chunk and must not pay a MainActor hop.
 private final class ScrollbackBrowse: @unchecked Sendable {
     private let lock = NSLock()
@@ -766,7 +910,7 @@ protocol PeerScrollbackBrowseHandling: AnyObject {
 ///
 /// Lock-guarded and deliberately outside the MainActor annotation below: the
 /// counters are written from the pump loop, so an actor hop per chunk would
-/// be a real cost. Same shape as `WireSeqTracker` above.
+/// be a real cost. Same shape as `RelayResumeTransitionGate` above.
 private final class RelayIOStats: @unchecked Sendable {
     private let lock = NSLock()
     private var received: UInt64 = 0
@@ -819,7 +963,7 @@ final class PeerRelaySession {
     /// short enough that the marker lands while the incident is live.
     private static let firstByteWatchdogSeconds: TimeInterval = 3
 
-    /// Byte counters for this session. Private like `WireSeqTracker`: the
+    /// Byte counters for this session. Private like `RelayResumeTransitionGate`: the
     /// project's default isolation pins an internal type to MainActor, and
     /// these are written from the pump loop. Exposed through `ioSnapshot`.
     private let ioStats = RelayIOStats()
@@ -906,7 +1050,8 @@ final class PeerRelaySession {
     //
     // Absolute host seq (`PtyChunk.seq` space) that this attach's wire
     // byte_seq == 0 maps to — see `PeerServer.swift`'s wire↔host seq
-    // mapping doc for the full contract. Together with `wireSeqTracker`
+    // mapping doc for the full contract. Together with
+    // `resumeTransitionGate`'s wire position
     // this is everything `performResumeHeal` needs to compute
     // `resume_from_seq = attachInitialSeq + <last processed wire seq>`.
     // Updated on the initial attach and on every successful resume
@@ -917,7 +1062,7 @@ final class PeerRelaySession {
     // `resume_from_seq`, so this client gates it explicitly rather than
     // relying on the host silently ignoring an unrecognized field.
     private var hostSupportsReplayRing: Bool
-    private let wireSeqTracker = WireSeqTracker()
+    private let resumeTransitionGate = RelayResumeTransitionGate()
     /// Scrollback browse state (tmux copy-mode model). Shared with the
     /// pump task, hence a lock box rather than MainActor state.
     private let scrollbackBrowse = ScrollbackBrowse()
@@ -926,6 +1071,7 @@ final class PeerRelaySession {
     // debounce and throttle heal paths both fire before the first one
     // finishes.
     private var resumeInFlight = false
+    private var relayFrameWriter: RelayFrameWriter?
 
     // ── Session ownership (P1 narrow session sharing) ────────────────
     //
@@ -948,6 +1094,8 @@ final class PeerRelaySession {
 
     var onError: (@MainActor (Error) -> Void)?
     var onDisconnect: (@MainActor () -> Void)?
+    var onReconnecting: (@MainActor (_ attempt: Int) -> Void)?
+    var onReconnected: (@MainActor () -> Void)?
 
     /// How many resume-heals this pane has performed. A pane that dies
     /// mid-flood dies *after* a run of these, and the count is the only
@@ -1676,6 +1824,7 @@ final class PeerRelaySession {
             Task { @MainActor in self?.onError?(error) }
             disconnect("writer-failure")
         }
+        relayFrameWriter = writer
         let reader = RelayFrameReader(relay: relay)
         let resizeCoalescer = RelayResizeCoalescer(
             session: session,
@@ -1699,7 +1848,7 @@ final class PeerRelaySession {
         let mySurfaceID = surfaceID
         // R3: plain Sendable reference, captured like `writer`/`reader` above
         // rather than read via `self.` inside the detached closures below.
-        let wireSeqTracker = self.wireSeqTracker
+        let resumeTransitionGate = self.resumeTransitionGate
         let scrollbackBrowse = self.scrollbackBrowse
 
         pumpTask = Task.detached(priority: .userInitiated) {
@@ -1809,6 +1958,19 @@ final class PeerRelaySession {
                             expectedByteSeq = nil
                             gapBytesTotal = 0
                             gapCount = 0
+                            resumeTransitionGate.adoptCommittedSession()
+                            continue pumpLoop
+                        }
+                        if ownsSession,
+                           await self.reconnectOwnedSession(afterLosing: currentSession),
+                           let swapped = await self.session, swapped !== currentSession {
+                            #if DEBUG
+                            dlog("peer.relay.receive.reconnected failed=\(failedTag) adopted=\(Self.sessionTag(swapped))")
+                            #endif
+                            currentSession = swapped
+                            expectedByteSeq = nil
+                            gapBytesTotal = 0
+                            gapCount = 0
                             continue pumpLoop
                         }
                         try? await writer.enqueue(type: kTypeGoodbye, payload: Data("host-error".utf8))
@@ -1886,7 +2048,13 @@ final class PeerRelaySession {
                         // the wire position `performResumeHeal` resumes from on
                         // the next heal. Written every chunk (hot path), so a
                         // lock-protected box rather than a MainActor hop.
-                        wireSeqTracker.update(expectedByteSeq!)
+                        let isBrowsingScrollback = scrollbackBrowse.isBrowsing
+                        let route = resumeTransitionGate.route(
+                            endWireSeq: expectedByteSeq!,
+                            // Browsing intentionally drops live display bytes;
+                            // do not resurrect them if a resume attempt fails.
+                            data: isBrowsingScrollback ? Data() : data
+                        )
                         if self.ioStats.noteReceived(data.count) {
                             #if DEBUG
                             dlog("peer.relay.firstByte path=owned bytes=\(data.count)")
@@ -1898,15 +2066,20 @@ final class PeerRelaySession {
                         // is the host's own current screen, so nothing is
                         // lost — the same contract tmux's copy-mode has.
                         // Seq accounting above stays live either way.
-                        if scrollbackBrowse.isBrowsing {
+                        if isBrowsingScrollback {
                             break
                         }
-                        do {
-                            try await writer.enqueue(type: kTypePtyData, payload: data)
-                            self.ioStats.noteEnqueued(data.count)
-                        } catch {
-                            endReason = "hostToRelay-enqueue-failed error=\(error)"
-                            break pumpLoop
+                        switch route {
+                        case .forward(let payload), .overflowFlush(let payload):
+                            do {
+                                try await writer.enqueue(type: kTypePtyData, payload: payload)
+                                self.ioStats.noteEnqueued(payload.count)
+                            } catch {
+                                endReason = "hostToRelay-enqueue-failed error=\(error)"
+                                break pumpLoop
+                            }
+                        case .suppress:
+                            break
                         }
                     case .gridSnapshot(let sid, _, _, let ansi) where sid == mySurfaceID:
                         // The host just proved it speaks the grid model —
@@ -1931,7 +2104,7 @@ final class PeerRelaySession {
                         // would read as a jump, fire a spurious gap log, and
                         // schedule a needless redraw heal.
                         expectedByteSeq = 0
-                        wireSeqTracker.update(0)
+                        resumeTransitionGate.resetWireSeq()
                         if self.ioStats.noteReceived(payload.count) {
                             #if DEBUG
                             dlog("peer.relay.firstByte path=owned-snapshot bytes=\(payload.count)")
@@ -2133,11 +2306,11 @@ final class PeerRelaySession {
             return
         }
 
-        // Read the resume anchor as late as possible: the old (lagging)
-        // session keeps pumping frames while `connect` is in flight, and
-        // every one it delivers past an anchor read earlier would come back
-        // again in the resume replay as duplicate output. Reading after the
-        // connect round trip shrinks that window to the attach RPC alone.
+        // Take an exact hand-off boundary after the connection round trip.
+        // From here until commit/abort, the old pump advances sequence
+        // accounting but buffers its display bytes. A successful new attach
+        // replays those bytes, while a failed attach flushes the old bytes in
+        // order. This closes the attach-RPC race that used to paint both.
         //
         // Gating: an older host that never advertised replay.ring.v1 has no
         // replay ring to serve a resume from, so this client doesn't rely on
@@ -2154,8 +2327,10 @@ final class PeerRelaySession {
         // crashed the whole app here (arithmetic overflow) on the first gap
         // heal of such an attach, and since the heal IS the recovery path, the
         // pane could never come back.
-        let lastWireSeq = wireSeqTracker.read()
-        let resumeFromSeq: UInt64 = hostSupportsReplayRing ? (attachInitialSeq &+ lastWireSeq) : 0
+        let transition = resumeTransitionGate.begin()
+        let resumeFromSeq: UInt64 = hostSupportsReplayRing
+            ? (attachInitialSeq &+ transition.resumeWireSeq)
+            : 0
 
         #if DEBUG
         dlog("peer.relay.gap.heal.resume reason=\(reason) resumeFromSeq=\(resumeFromSeq) gated=\(hostSupportsReplayRing) cols=\(size.cols) rows=\(size.rows)")
@@ -2175,9 +2350,18 @@ final class PeerRelaySession {
             dlog("peer.relay.gap.heal.resume.attachFailed error=\(error)")
             #endif
             await newConnection.cancel()
+            await abortResumeTransition(transition)
             return
         }
         guard outcome.surfaceID == surfaceID, !isTorndown else {
+            await newConnection.cancel()
+            await abortResumeTransition(transition)
+            return
+        }
+        guard resumeTransitionGate.commit(transition) else {
+            // The bounded buffer overflowed while attach was in flight. Its
+            // old bytes have already been restored by the pump, so adopting
+            // this replay would duplicate them. Keep the old session.
             await newConnection.cancel()
             return
         }
@@ -2202,7 +2386,6 @@ final class PeerRelaySession {
         session = newConnection.session
         transport = newConnection.transport
         attachInitialSeq = outcome.initialByteSeq
-        wireSeqTracker.update(0)
         hostSupportsReplayRing = newConnection.hostCapabilities.has(PeerCapability.replayRingV1)
         await resizeCoalescer?.adopt(session: newConnection.session)
         await startHeartbeatMonitoring(session: newConnection.session, transport: newConnection.transport)
@@ -2213,6 +2396,115 @@ final class PeerRelaySession {
         #if DEBUG
         dlog("peer.relay.gap.heal.resume.swapped heal#\(resumeHealCount) retired=\(retiredTag) adopted=\(Self.sessionTag(newConnection.session)) newInitialSeq=\(outcome.initialByteSeq)")
         #endif
+    }
+
+    /// Recover an owned pane in place after its transport dies. The local
+    /// relay helper and Ghostty surface remain alive while this retries, so
+    /// the same pane resumes once the same remote surface is reachable.
+    /// Workspace-mirror panes use their controller's shared reconnect loop.
+    private func reconnectOwnedSession(afterLosing failedSession: PeerSession) async -> Bool {
+        guard ownsSession, !isTorndown, session === failedSession else {
+            return session !== failedSession
+        }
+        await failedSession.stopHeartbeat()
+        var attempt = 0
+        while !isTorndown, session === failedSession {
+            attempt += 1
+            let delay = Self.reconnectDelaySeconds(attempt: attempt)
+            if delay > 0 {
+                try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
+            }
+            guard !isTorndown, session === failedSession else { break }
+            #if DEBUG
+            dlog("peer.relay.reconnect.attempt n=\(attempt) delay=\(delay)")
+            #endif
+            onReconnecting?(attempt)
+            if await attemptOwnedSessionReconnect(from: failedSession) {
+                onReconnected?()
+                RemoteWorkLog.infoOffMain("Remote pane reconnected on attempt \(attempt)")
+                return true
+            }
+            if attempt <= 3 || attempt % 10 == 0 {
+                RemoteWorkLog.debugOffMain("Remote pane reconnect attempt \(attempt) failed")
+            }
+        }
+        return session !== failedSession
+    }
+
+    /// One reconnect attempt after the old receive loop has already failed.
+    /// Unlike gap healing, no old-session bytes can race this attach boundary.
+    private func attemptOwnedSessionReconnect(from failedSession: PeerSession) async -> Bool {
+        guard !isTorndown, session === failedSession else { return false }
+        let size = await resizeCoalescer?.snapshotSize() ?? (remoteCols, remoteRows)
+        let connection: PeerRelayConnection
+        do {
+            connection = try await Self.connect(hostSockPath: hostSockPath)
+        } catch {
+            #if DEBUG
+            dlog("peer.relay.reconnect.connectFailed error=\(error)")
+            #endif
+            return false
+        }
+        guard !isTorndown, session === failedSession else {
+            await connection.cancel()
+            return false
+        }
+        let resumeFromSeq = hostSupportsReplayRing
+            ? (attachInitialSeq &+ resumeTransitionGate.currentWireSeq())
+            : 0
+        let outcome: PeerAttachOutcome
+        do {
+            outcome = try await connection.session.attachSurface(
+                id: surfaceID, mode: .coWrite, cols: size.cols, rows: size.rows,
+                resumeFromSeq: resumeFromSeq
+            )
+        } catch {
+            #if DEBUG
+            dlog("peer.relay.reconnect.attachFailed error=\(error)")
+            #endif
+            await connection.cancel()
+            return false
+        }
+        guard outcome.surfaceID == surfaceID, !isTorndown, session === failedSession else {
+            await connection.cancel()
+            return false
+        }
+
+        session = connection.session
+        transport = connection.transport
+        attachInitialSeq = outcome.initialByteSeq
+        // Full reset, not just the wire position: a resume-heal transition may
+        // have been mid-flight when the transport died, and this replaces the
+        // session wholesale. Leaving the gate in `buffering`/`committed` would
+        // suppress the reconnected session's output forever — the old bytes it
+        // was holding for can no longer arrive.
+        resumeTransitionGate.reset()
+        hostSupportsReplayRing = connection.hostCapabilities.has(PeerCapability.replayRingV1)
+        await resizeCoalescer?.adopt(session: connection.session)
+        await startHeartbeatMonitoring(session: connection.session, transport: connection.transport)
+        return true
+    }
+
+    static func reconnectDelaySeconds(attempt: Int) -> Double {
+        guard attempt > 1 else { return 0 }
+        return min(30, pow(2, Double(min(attempt - 1, 5))))
+    }
+
+    private func abortResumeTransition(_ transition: RelayResumeTransitionGate.Transition) async {
+        guard let writer = relayFrameWriter else { return }
+        var pending = resumeTransitionGate.abort(transition)
+        while let payload = pending {
+            if !payload.isEmpty {
+                do {
+                    try await writer.enqueue(type: kTypePtyData, payload: payload)
+                    ioStats.noteEnqueued(payload.count)
+                } catch {
+                    disconnect(reason: "resume-abort-enqueue-failed error=\(error)")
+                    return
+                }
+            }
+            pending = resumeTransitionGate.finishDrain(transition)
+        }
     }
 
     private func disconnect(reason: String) {
@@ -2237,6 +2529,7 @@ final class PeerRelaySession {
         RemoteWorkLog.infoOffMain("Relay session ended: \(reason)")
         pumpTask?.cancel()
         pumpTask = nil
+        relayFrameWriter = nil
         relaySocket?.close()
         relaySocket = nil
         let transport = self.transport

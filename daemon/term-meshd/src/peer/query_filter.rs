@@ -248,6 +248,12 @@ fn csi_query_reply(pending: &[u8]) -> Option<&'static [u8]> {
             b"6" => Some(b"\x1B[1;1R"), // Cursor Position Report: row 1, col 1
             _ => None,
         },
+        b'q' if body == b">" || body == b">0" => {
+            // XTVERSION. Claude queries this while starting up. If it reaches
+            // the relay renderer, local Ghostty answers with its own version
+            // and that DCS reply travels back as ordinary remote input.
+            Some(b"\x1BP>|term-mesh\x1B\\")
+        }
         _ => None,
     }
 }
@@ -334,6 +340,33 @@ mod tests {
         let (out, resp, _events) = process(&mut f, b"\x1B[6n");
         assert!(out.is_empty());
         assert_eq!(resp, b"\x1B[1;1R");
+    }
+
+    #[test]
+    fn intercepts_xtversion() {
+        let mut f = QueryFilter::default();
+        let (out, resp, _events) = process(&mut f, b"\x1B[>q");
+        assert!(out.is_empty(), "XTVERSION should be stripped");
+        assert_eq!(resp, b"\x1BP>|term-mesh\x1B\\");
+    }
+
+    #[test]
+    fn intercepts_xtversion_zero_param_across_chunks() {
+        let mut f = QueryFilter::default();
+        let (o1, r1, _events) = process(&mut f, b"\x1B[>");
+        assert!(o1.is_empty());
+        assert!(r1.is_empty());
+        let (o2, r2, _events) = process(&mut f, b"0q");
+        assert!(o2.is_empty());
+        assert_eq!(r2, b"\x1BP>|term-mesh\x1B\\");
+    }
+
+    #[test]
+    fn passes_non_xtversion_q_through() {
+        let mut f = QueryFilter::default();
+        let (out, resp, _events) = process(&mut f, b"\x1B[>1q");
+        assert_eq!(out, b"\x1B[>1q");
+        assert!(resp.is_empty());
     }
 
     #[test]
