@@ -253,4 +253,87 @@ final class PeerHostStatsTests: XCTestCase {
         XCTAssertFalse(PeerHostStats.rendersIdentically(nil, sample),
                        "a first sample has nothing to match and must publish")
     }
+
+    // MARK: - Mac host: monitor.snapshot → HostStats
+
+    /// Keys are the Rust `SystemSnapshot` field names verbatim. A rename there
+    /// would surface as a figure silently reading zero, so this fixture is
+    /// deliberately spelled out rather than generated.
+    private func monitorSnapshotJSON() -> [String: Any] {
+        [
+            "load_avg": [1.5, 2.25, 3.0],
+            "cpu_count": 10,
+            "memory_percent": 42.5,
+            "used_memory_bytes": 8_000_000_000,
+            "total_memory_bytes": 16_000_000_000,
+            "disk_read_bytes_per_sec": 1_024,
+            "disk_write_bytes_per_sec": 2_048,
+            "disk_total_bytes": 500_000_000_000,
+            "disk_available_bytes": 120_000_000_000,
+            "network_io": [
+                ["name": "en0", "rx_rate": 1_000.0, "tx_rate": 500.0],
+                ["name": "utun0", "rx_rate": 250.0, "tx_rate": 125.0],
+            ],
+        ]
+    }
+
+    func testMonitorSnapshotMapsEveryField() throws {
+        let stats = try XCTUnwrap(LocalHostStatsSample.make(from: monitorSnapshotJSON()))
+        XCTAssertEqual(stats.load1M, 1.5)
+        XCTAssertEqual(stats.load5M, 2.25)
+        XCTAssertEqual(stats.load15M, 3.0)
+        XCTAssertEqual(stats.cpuCount, 10)
+        XCTAssertEqual(stats.memoryPercent, 42.5)
+        XCTAssertEqual(stats.memoryUsedBytes, 8_000_000_000)
+        XCTAssertEqual(stats.memoryTotalBytes, 16_000_000_000)
+        XCTAssertEqual(stats.diskReadBytesPerSec, 1_024)
+        XCTAssertEqual(stats.diskWriteBytesPerSec, 2_048)
+        XCTAssertEqual(stats.diskTotalBytes, 500_000_000_000)
+        XCTAssertEqual(stats.diskAvailableBytes, 120_000_000_000)
+    }
+
+    /// The daemon sums across interfaces before sending; a Mac host that
+    /// reported only `en0` would under-report every machine with a VPN up.
+    func testNetworkRatesAreSummedAcrossInterfaces() throws {
+        let stats = try XCTUnwrap(LocalHostStatsSample.make(from: monitorSnapshotJSON()))
+        XCTAssertEqual(stats.netRxBytesPerSec, 1_250)
+        XCTAssertEqual(stats.netTxBytesPerSec, 625)
+    }
+
+    /// An older daemon, or one that has not finished its first tick, can be
+    /// missing keys. Zero is the honest answer for each — the client renders
+    /// "not measured" from it and never a stale figure.
+    func testMissingKeysBecomeZeroRatherThanFailing() throws {
+        let stats = try XCTUnwrap(LocalHostStatsSample.make(from: ["cpu_count": 8]))
+        XCTAssertEqual(stats.cpuCount, 8)
+        XCTAssertEqual(stats.load1M, 0)
+        XCTAssertEqual(stats.diskTotalBytes, 0, "zero total must read as unmeasured, not as a full disk")
+        XCTAssertEqual(stats.netRxBytesPerSec, 0)
+    }
+
+    func testShortLoadAverageArrayIsIgnoredRatherThanCrashing() throws {
+        let stats = try XCTUnwrap(LocalHostStatsSample.make(from: ["load_avg": [1.0]]))
+        XCTAssertEqual(stats.load1M, 0)
+        XCTAssertEqual(stats.load15M, 0)
+    }
+
+    /// A counter reset can hand back a negative delta; the wire field is
+    /// unsigned, so clamping is what keeps it from wrapping to an enormous
+    /// rate.
+    func testNegativeRatesClampToZero() throws {
+        let stats = try XCTUnwrap(LocalHostStatsSample.make(from: [
+            "network_io": [["name": "en0", "rx_rate": -50.0, "tx_rate": -10.0]],
+        ]))
+        XCTAssertEqual(stats.netRxBytesPerSec, 0)
+        XCTAssertEqual(stats.netTxBytesPerSec, 0)
+    }
+
+    /// The whole point of the mapping: what the daemon reports must come out
+    /// the far end as the same rendered line a Linux peer would produce.
+    func testMappedSampleRendersLikeAnyOtherHost() throws {
+        let stats = try XCTUnwrap(LocalHostStatsSample.make(from: monitorSnapshotJSON()))
+        let rendered = PeerHostStats(stats)
+        XCTAssertTrue(rendered.summary.contains("load 1.5 2.2 3.0"), "got \(rendered.summary)")
+        XCTAssertFalse(rendered.isDiskLow, "120GB of 500GB is not low")
+    }
 }

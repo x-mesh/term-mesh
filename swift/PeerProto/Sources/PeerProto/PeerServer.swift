@@ -372,18 +372,42 @@ public struct PeerServerConfig: Sendable {
     /// should say so rather than let a client plan to come back.
     public var resolveSessionHostSocket: @Sendable () -> String
 
+    /// Reads this machine's current load, or nil when it cannot be measured.
+    ///
+    /// Injected rather than implemented here for two reasons. This module
+    /// knows the wire, not the platform — and on a Mac the numbers already
+    /// exist: the app's own `term-meshd` samples them for the resource
+    /// monitor, so the provider is a lookup rather than a second sampler
+    /// competing with the first.
+    ///
+    /// **Nil is a contract, not an omission.** A host with no provider does
+    /// not advertise `host.stats.v1` (see `advertisedCapabilities`) and never
+    /// starts the push loop, mirroring the daemon, where the test and embedder
+    /// constructors leave the host without a monitor and simply never push.
+    /// Before this existed the Mac host advertised the capability and then
+    /// sent nothing, so a viewer waited for a frame that was never coming and
+    /// showed an empty field with no way to tell why.
+    public var hostStatsProvider: (@Sendable () async -> Termmesh_Peer_V1_HostStats?)?
+
+    /// How often the push loop samples. Matches the daemon's monitor tick, so
+    /// a viewer sees the same cadence whichever kind of host it is attached to
+    /// — `PeerHostStats.staleAfter` on the client is written against it.
+    public var hostStatsInterval: Duration = .seconds(2)
+
     public init(
         hostDisplayName: String = "term-mesh",
         hostAppVersion: String = "0.0.0",
         protocolVersion: String = "1.0.0",
         hostCLIBinDirs: [String] = [],
-        resolveSessionHostSocket: @escaping @Sendable () -> String = { "" }
+        resolveSessionHostSocket: @escaping @Sendable () -> String = { "" },
+        hostStatsProvider: (@Sendable () async -> Termmesh_Peer_V1_HostStats?)? = nil
     ) {
         self.hostDisplayName = hostDisplayName
         self.hostAppVersion = hostAppVersion
         self.protocolVersion = protocolVersion
         self.hostCLIBinDirs = PeerHostCLIBinDirs.validated(hostCLIBinDirs)
         self.resolveSessionHostSocket = resolveSessionHostSocket
+        self.hostStatsProvider = hostStatsProvider
     }
 }
 
@@ -394,6 +418,9 @@ public actor PeerServer {
     private let teamLeaderControlPlane: PeerTeamLeaderControlPlane
     private var listenerFd: Int32 = -1
     private var acceptTask: Task<Void, Never>?
+    /// The machine-load push loop, present only when `config` carries a
+    /// provider. See `startHostStatsLoopIfConfigured()`.
+    private var hostStatsTask: Task<Void, Never>?
     // Internal (not private) so `@testable import PeerProto` tests can
     // inspect a live session's `hasClientCapability(_:)` after a real
     // handshake — see PeerServerTests.swift. No visibility change outside
@@ -494,9 +521,30 @@ public actor PeerServer {
                 server: self
             )
         }
+        startHostStatsLoopIfConfigured()
+    }
+
+    /// Starts the machine-load push loop, or does nothing when this host has
+    /// no way to measure itself. A host without a provider stays silent AND
+    /// stops claiming `host.stats.v1` — the two go together.
+    private func startHostStatsLoopIfConfigured() {
+        guard config.hostStatsProvider != nil else { return }
+        let interval = config.hostStatsInterval
+        hostStatsTask = Task { [weak self] in
+            while !Task.isCancelled {
+                // Sleep first: a client that has just connected is still
+                // finishing its handshake, and a sample sent into that is
+                // dropped by `pushHostStats`'s `state == .ready` guard anyway.
+                try? await Task.sleep(for: interval)
+                guard !Task.isCancelled, let self else { return }
+                await self.pushHostStatsSample()
+            }
+        }
     }
 
     public func stop() async {
+        hostStatsTask?.cancel()
+        hostStatsTask = nil
         acceptTask?.cancel()
         acceptTask = nil
         if listenerFd >= 0 {
@@ -548,6 +596,22 @@ public actor PeerServer {
     public func broadcastWorkspaceRemoved(workspaceID: Data) async {
         for session in activeSessions {
             try? await session.pushWorkspaceRemoved(workspaceID: workspaceID)
+        }
+    }
+
+    /// Sample this machine once and hand the result to every connected
+    /// session.
+    ///
+    /// One sample per tick regardless of how many peers are attached: the
+    /// reading describes the machine, not the connection, and sampling per
+    /// session would make the cost of being watched grow with the number of
+    /// watchers.
+    private func pushHostStatsSample() async {
+        guard let provider = config.hostStatsProvider else { return }
+        guard !activeSessions.isEmpty else { return }
+        guard let stats = await provider() else { return }
+        for session in activeSessions {
+            try? await session.pushHostStats(stats)
         }
     }
 
@@ -1308,6 +1372,16 @@ actor PeerServerSession {
         }
     }
 
+    /// Push one machine-load sample. Unsolicited, like the workspace pushes
+    /// above — the client's `PeerSession` already treats `hostStats` as a
+    /// frame that arrives on its own schedule rather than as a reply.
+    func pushHostStats(_ stats: Termmesh_Peer_V1_HostStats) async throws {
+        guard state == .ready else { return }
+        try await sendEnvelope { env in
+            env.hostStats = stats
+        }
+    }
+
     /// Push a full workspace roster to an explicitly subscribed client. Full
     /// snapshots make reconnect and deletion convergence idempotent: clients
     /// replace their cached roster rather than merging deltas from a possibly
@@ -1361,7 +1435,17 @@ actor PeerServerSession {
             // host advertised nothing, and the host had nothing to advertise
             // because no leader had been bootstrapped. Observed as a project
             // that never finished creating on a peer whose team list was empty.
-            let advertisedCapabilities = PeerCapability.supported
+            // `host.stats.v1` is the exception to the paragraph above, and for
+            // the opposite reason: it is not "implemented protocol support"
+            // this host can honour unconditionally, but a promise to send
+            // frames it may have no way to produce. A Mac host with no stats
+            // provider advertised it anyway and then never pushed, so a viewer
+            // waited forever and drew an empty field with nothing to explain
+            // it. Claim it only when the push loop will actually run.
+            var advertisedCapabilities = PeerCapability.supported
+            if config.hostStatsProvider == nil {
+                advertisedCapabilities.removeAll { $0 == PeerCapability.hostStatsV1 }
+            }
             try await sendEnvelope { env in
                 var h = Termmesh_Peer_V1_Hello()
                 h.protocolVersion = self.config.protocolVersion

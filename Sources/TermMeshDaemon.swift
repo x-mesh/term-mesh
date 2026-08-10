@@ -755,6 +755,16 @@ final class TermMeshDaemon: ObservableObject {
         let _ = rpcCall(method: "usage.scan", params: [:])
     }
 
+    /// The resource monitor's latest system-wide sample, or nil when the
+    /// daemon has not taken one yet (it answers `{}` until its first tick).
+    ///
+    /// Blocking, like every call here — never invoke it from the main actor.
+    func monitorSnapshot() -> [String: Any]? {
+        guard let response = rpcCall(method: "monitor.snapshot", params: [:]) as? [String: Any],
+              !response.isEmpty else { return nil }
+        return response
+    }
+
     // MARK: - Watcher (F-05)
 
     /// Normalize a file-watch target and reject paths whose recursive event
