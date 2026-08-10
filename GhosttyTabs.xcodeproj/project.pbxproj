@@ -81,6 +81,7 @@
 			CVB00083 /* GhosttyPaneSurfaceProvider.swift in Sources */ = {isa = PBXBuildFile; fileRef = CVS00083 /* GhosttyPaneSurfaceProvider.swift */; };
 			CVB00084 /* PeerRelaySession.swift in Sources */ = {isa = PBXBuildFile; fileRef = CVS00084 /* PeerRelaySession.swift */; };
 			CVB00105 /* PeerHostStatsStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = CVS00105 /* PeerHostStatsStore.swift */; };
+			CVB00931 /* PeerTerminalQueryStripper.swift in Sources */ = {isa = PBXBuildFile; fileRef = CVS00931 /* PeerTerminalQueryStripper.swift */; };
 			CVB00085 /* PeerRelayWindowController.swift in Sources */ = {isa = PBXBuildFile; fileRef = CVS00085 /* PeerRelayWindowController.swift */; };
 			CVB00086 /* PeerRelayWorkspaceWindowController.swift in Sources */ = {isa = PBXBuildFile; fileRef = CVS00086 /* PeerRelayWorkspaceWindowController.swift */; };
 			CVB00087 /* PeerSSHTunnel.swift in Sources */ = {isa = PBXBuildFile; fileRef = CVS00087 /* PeerSSHTunnel.swift */; };
@@ -289,6 +290,7 @@
 				FB000000A1B2C3D4E5F60718 /* PeerPaneSessionTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = FB000001A1B2C3D4E5F60718 /* PeerPaneSessionTests.swift */; };
 				FC000000A1B2C3D4E5F60718 /* PeerWorkspaceMirrorTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = FC000001A1B2C3D4E5F60718 /* PeerWorkspaceMirrorTests.swift */; };
 				FD000000A1B2C3D4E5F60718 /* PeerDaemonVersionTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = FD000001A1B2C3D4E5F60718 /* PeerDaemonVersionTests.swift */; };
+			FD000020A1B2C3D4E5F60718 /* PeerTerminalQueryStripperTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = FD000021A1B2C3D4E5F60718 /* PeerTerminalQueryStripperTests.swift */; };
 				FE000000A1B2C3D4E5F60718 /* PeerHostProfileDedupeTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = FE000001A1B2C3D4E5F60718 /* PeerHostProfileDedupeTests.swift */; };
 				PHCBDR0000000000000000A1 /* PeerHostCLIBinDirsReadinessTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = PHCBDR0000000000000000A2 /* PeerHostCLIBinDirsReadinessTests.swift */; };
 		/* End PBXBuildFile section */
@@ -420,6 +422,7 @@
 			CVS00083 /* GhosttyPaneSurfaceProvider.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GhosttyPaneSurfaceProvider.swift; sourceTree = "<group>"; };
 			CVS00084 /* PeerRelaySession.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PeerRelaySession.swift; sourceTree = "<group>"; };
 			CVS00105 /* PeerHostStatsStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PeerHostStatsStore.swift; sourceTree = "<group>"; };
+			CVS00931 /* PeerTerminalQueryStripper.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PeerTerminalQueryStripper.swift; sourceTree = "<group>"; };
 			CVS00085 /* PeerRelayWindowController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PeerRelayWindowController.swift; sourceTree = "<group>"; };
 			CVS00086 /* PeerRelayWorkspaceWindowController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PeerRelayWorkspaceWindowController.swift; sourceTree = "<group>"; };
 			CVS00087 /* PeerSSHTunnel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PeerSSHTunnel.swift; sourceTree = "<group>"; };
@@ -629,6 +632,7 @@
 			FB000001A1B2C3D4E5F60718 /* PeerPaneSessionTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PeerPaneSessionTests.swift; sourceTree = "<group>"; };
 			FC000001A1B2C3D4E5F60718 /* PeerWorkspaceMirrorTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PeerWorkspaceMirrorTests.swift; sourceTree = "<group>"; };
 			FD000001A1B2C3D4E5F60718 /* PeerDaemonVersionTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PeerDaemonVersionTests.swift; sourceTree = "<group>"; };
+			FD000021A1B2C3D4E5F60718 /* PeerTerminalQueryStripperTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PeerTerminalQueryStripperTests.swift; sourceTree = "<group>"; };
 			FE000001A1B2C3D4E5F60718 /* PeerHostProfileDedupeTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PeerHostProfileDedupeTests.swift; sourceTree = "<group>"; };
 			PHCBDR0000000000000000A2 /* PeerHostCLIBinDirsReadinessTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PeerHostCLIBinDirsReadinessTests.swift; sourceTree = "<group>"; };
 		/* End PBXFileReference section */
@@ -782,6 +786,7 @@ A1740000000000000000000C /* ProcessRun.swift */,
 				CVS00083 /* GhosttyPaneSurfaceProvider.swift */,
 				CVS00084 /* PeerRelaySession.swift */,
 				CVS00105 /* PeerHostStatsStore.swift */,
+				CVS00931 /* PeerTerminalQueryStripper.swift */,
 				CVS00085 /* PeerRelayWindowController.swift */,
 				CVS00086 /* PeerRelayWorkspaceWindowController.swift */,
 				CVS00087 /* PeerSSHTunnel.swift */,
@@ -1021,6 +1026,7 @@ A1740000000000000000000C /* ProcessRun.swift */,
 				FB000001A1B2C3D4E5F60718 /* PeerPaneSessionTests.swift */,
 				FC000001A1B2C3D4E5F60718 /* PeerWorkspaceMirrorTests.swift */,
 				FD000001A1B2C3D4E5F60718 /* PeerDaemonVersionTests.swift */,
+				FD000021A1B2C3D4E5F60718 /* PeerTerminalQueryStripperTests.swift */,
 				FE000001A1B2C3D4E5F60718 /* PeerHostProfileDedupeTests.swift */,
 				PHCBDR0000000000000000A2 /* PeerHostCLIBinDirsReadinessTests.swift */,
 				A14000000000000000000006 /* ProjectSyncViewModelTests.swift */,
@@ -1234,6 +1240,7 @@ A1740000000000000000000B /* ProcessRun.swift in Sources */,
 				CVB00083 /* GhosttyPaneSurfaceProvider.swift in Sources */,
 				CVB00084 /* PeerRelaySession.swift in Sources */,
 				CVB00105 /* PeerHostStatsStore.swift in Sources */,
+				CVB00931 /* PeerTerminalQueryStripper.swift in Sources */,
 				CVB00085 /* PeerRelayWindowController.swift in Sources */,
 				CVB00086 /* PeerRelayWorkspaceWindowController.swift in Sources */,
 				CVB00087 /* PeerSSHTunnel.swift in Sources */,
@@ -1446,6 +1453,7 @@ A1740000000000000000000B /* ProcessRun.swift in Sources */,
 				FB000000A1B2C3D4E5F60718 /* PeerPaneSessionTests.swift in Sources */,
 				FC000000A1B2C3D4E5F60718 /* PeerWorkspaceMirrorTests.swift in Sources */,
 				FD000000A1B2C3D4E5F60718 /* PeerDaemonVersionTests.swift in Sources */,
+				FD000020A1B2C3D4E5F60718 /* PeerTerminalQueryStripperTests.swift in Sources */,
 				FE000000A1B2C3D4E5F60718 /* PeerHostProfileDedupeTests.swift in Sources */,
 				PHCBDR0000000000000000A1 /* PeerHostCLIBinDirsReadinessTests.swift in Sources */,
 				A14000000000000000000003 /* ProjectSyncViewModelTests.swift in Sources */,

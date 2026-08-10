@@ -129,6 +129,13 @@ final class PtyTapHub: @unchecked Sendable {
     private let lock = NSLock()
     private var continuations: [UUID: AsyncStream<PtyTapChunk>.Continuation] = [:]
     private var replay = ReplayBuffer()
+    /// Strips terminal-control queries before anything downstream sees them.
+    ///
+    /// Held here rather than per-consumer because its state is a property of
+    /// the PTY stream, not of who is watching: a sequence split across two
+    /// reads has to reassemble once. Mutated only under `lock`, alongside
+    /// `replay`, on Ghostty's IO reader thread.
+    private var queryStripper = PeerTerminalQueryStripper()
     /// Cumulative bytes ever broadcast through this hub. Advanced under
     /// `lock` for EVERY chunk — including ones a consumer's bounded
     /// buffer then drops — and stamped onto each `PtyTapChunk.seq`, so a
@@ -265,6 +272,20 @@ final class PtyTapHub: @unchecked Sendable {
         // until after `unlock()` below so logging never happens while
         // holding the lock, even though drops are expected to be rare.
         lock.lock()
+        // Strip first, so neither the live stream nor the replay buffer ever
+        // carries a query. A viewer that answered one would send its reply
+        // back across the link and into the shell prompt — see
+        // `PeerTerminalQueryStripper`. Replaying a stored query at attach time
+        // would do the same thing later, which is why this sits ahead of both.
+        //
+        // Returns the same buffer untouched when there is nothing to strip,
+        // and `tapSeq` counts what actually goes out, so a stripped query
+        // consumes no offsets and gap detection stays exact.
+        let bytes = queryStripper.strip(bytes)
+        guard !bytes.isEmpty else {
+            lock.unlock()
+            return
+        }
         replay.push(bytes)
         // Stamp BEFORE fan-out and advance unconditionally: a dropped
         // yield must still consume tap offsets, or the drop is invisible
