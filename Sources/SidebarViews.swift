@@ -2576,19 +2576,20 @@ struct RemoteHostGroupView: View, Equatable {
     /// the failure mode is a job that dies mid-run with no obvious cause. A
     /// host that reports no capacity — an older build, or one that cannot
     /// measure it — shows nothing rather than a fake reading.
+    ///
+    /// The figure itself lives in the tooltip, not on the row. Spelled out it
+    /// ran to `166.1GB free`, which is wider than the host name it sits beside
+    /// and truncated it to `term-mesh-…`. The row's job is to say *which host*
+    /// and *that something is wrong*; how many gigabytes remain is what you
+    /// read once you have decided to look, and by then a hover costs nothing.
     @ViewBuilder
     private var diskBadge: some View {
         if host.isConnected,
            let text = diskWarningText {
-            HStack(spacing: 2) {
-                Image(systemName: "externaldrive.badge.exclamationmark")
-                    .font(.system(size: 8, weight: .semibold))
-                Text(text)
-                    .font(.system(size: 9))
-                    .monospacedDigit()
-            }
-            .foregroundColor(.orange)
-            .help("Low disk space on \(host.displayName) — agent checkouts and builds may fail. Reclaim with `tm-agent gc plan` on that host.")
+            Image(systemName: "externaldrive.badge.exclamationmark")
+                .font(.system(size: 8, weight: .semibold))
+                .foregroundColor(.orange)
+                .help("Low disk space on \(host.displayName) — \(text). Agent checkouts and builds may fail. Reclaim with `tm-agent gc plan` on that host.")
         }
     }
 

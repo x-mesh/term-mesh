@@ -975,6 +975,156 @@ final class AgentSessionTests: XCTestCase {
                        AgentSession.topGap(before: entries[17], after: nil))
     }
 
+    func testVisibleTranscriptSnapshotMatchesNativeRowsAndAppliesTailLimit() {
+        let longThought = String(repeating: "x", count: 20) + String(repeating: "y", count: 120)
+        let rows = AgentSession.rows(for: [
+            .said(id: UUID(), .leader, "inspect this"),
+            .answered(id: UUID(), "alpha\nbeta"),
+            .thought(id: UUID(), longThought),
+            .tool(id: UUID(), .init(name: "Bash", headline: "swift test", result: "folded output")),
+            .turnEnded(id: UUID(), .init(
+                stop: "end_turn",
+                failed: false,
+                cost: 0.25,
+                duration: 1.2,
+                tokensIn: 3,
+                tokensOut: 5
+            )),
+            .notice(id: UUID(), "connection restored"),
+        ])
+
+        let snapshot = AgentSession.visibleTranscriptText(rows: rows)
+        XCTAssertTrue(snapshot.contains("leader: inspect this"))
+        XCTAssertTrue(snapshot.contains("alpha\nbeta"), "streaming answers remain readable in full")
+        XCTAssertFalse(snapshot.contains("✻"), "reasoning cannot reproduce the UI's two-line clamp off-screen")
+        XCTAssertFalse(snapshot.contains(longThought))
+        XCTAssertTrue(snapshot.contains("Bash swift test"))
+        XCTAssertFalse(snapshot.contains("folded output"), "collapsed tool output is not user-visible")
+        XCTAssertTrue(snapshot.contains("end_turn · 1.2s · $0.2500 · 3→5 tok"))
+        XCTAssertTrue(snapshot.hasSuffix("! connection restored"))
+
+        XCTAssertEqual(
+            AgentSession.visibleTranscriptText(rows: rows, lineLimit: 2),
+            "end_turn · 1.2s · $0.2500 · 3→5 tok\n! connection restored"
+        )
+        XCTAssertEqual(AgentSession.visibleTranscriptText(rows: rows, lineLimit: 0), "")
+    }
+
+    func testVisibleTranscriptRedactsAndBoundsToolHeadlineBeforeKeepingItsTail() {
+        let secret = "tail-secret-credential"
+        let raw = "curl https://example.test\n" + String(repeating: "argument ", count: 40)
+            + "--token \"\(secret) with spaces\""
+        let rows = AgentSession.rows(for: [
+            .tool(id: UUID(), .init(name: "Bash", headline: raw)),
+        ])
+
+        let projected = AgentSession.projectedToolHeadline(raw)
+        XCTAssertLessThanOrEqual(projected.utf8.count, 160)
+        XCTAssertFalse(projected.contains("\n"))
+        XCTAssertTrue(projected.contains("[redacted]"))
+        XCTAssertFalse(projected.contains(secret))
+
+        let snapshot = AgentSession.visibleTranscriptText(rows: rows)
+        XCTAssertFalse(snapshot.contains(secret), "middle-tail retention must happen only after redaction")
+        XCTAssertLessThanOrEqual(snapshot.utf8.count, 165)
+    }
+
+    func testToolHeadlineRedactsPortableEnvironmentCredentialsAndProviderTokens() {
+        let cases = [
+            ("AWS_SECRET_ACCESS_KEY='aws-secret-value' run", "aws-secret-value"),
+            ("AWS_SESSION_TOKEN=aws-session-value run", "aws-session-value"),
+            ("DATABASE_URL=postgresql://dbuser:postgres-password@db.example/app run", "postgres-password"),
+            ("connect ssh://user:standalone-uri-password@host", "standalone-uri-password"),
+            ("use ghp_abcdefghijklmnopqrstuvwxyz1234567890", "ghp_abcdefghijklmnopqrstuvwxyz1234567890"),
+            ("use github_pat_abcdefghijklmnopqrstuvwxyz_1234567890", "github_pat_abcdefghijklmnopqrstuvwxyz_1234567890"),
+            ("use sk-proj-abcdefghijklmnopqrstuvwxyz1234567890", "sk-proj-abcdefghijklmnopqrstuvwxyz1234567890"),
+            ("-----BEGIN PRIVATE KEY----- private-key-material -----END PRIVATE KEY-----", "private-key-material"),
+        ]
+
+        for (raw, secret) in cases {
+            let projected = AgentSession.projectedToolHeadline(raw)
+            XCTAssertFalse(projected.contains(secret), "credential leaked: \(secret)")
+            XCTAssertTrue(projected.contains("[redacted"), "missing redaction marker for: \(raw)")
+            XCTAssertLessThanOrEqual(projected.utf8.count, 160)
+        }
+    }
+
+    func testTeamReadOutputRedactsCorrelationTokensButPreservesResponseText() {
+        let correlation = "corr-token-123"
+        let instance = "agent-instance-456"
+        let input = """
+        [REQUIRED CORRELATED REPLY for instance \(instance)]
+        tm-agent reply --reply-to \(correlation) <<'TERMMESH_REPLY_EOF'
+        user response text remains exactly here
+        user response may discuss correlation_id=customer-visible without being routing metadata
+        TERMMESH_REPLY_EOF
+        [tm-agent-reply:\(correlation):\(instance)]
+        """
+
+        let sanitized = TerminalController.sanitizedTeamReadOutput(input)
+
+        XCTAssertFalse(sanitized.contains(correlation))
+        XCTAssertFalse(sanitized.contains(instance))
+        XCTAssertTrue(sanitized.contains("tm-agent reply --reply-to [REDACTED]"))
+        XCTAssertTrue(sanitized.contains("user response text remains exactly here"))
+        XCTAssertTrue(sanitized.contains("correlation_id=customer-visible"))
+        XCTAssertTrue(sanitized.contains("[tm-agent-reply:[REDACTED]]"))
+    }
+
+    func testTeamReadOutputRedactsSoftWrappedGeneratedCorrelationTokensWithoutDigestFalsePositive() {
+        let token = String(repeating: "0123456789abcdef", count: 4)
+        let unrelatedDigest = String(repeating: "fedcba9876543210", count: 4)
+        let wrappedCommand = """
+        tm-agent reply --
+        reply-to 0123456789abcdef01234567
+        89abcdef0123456789abcdef0123456789abcdef <<'TERMMESH_REPLY_EOF'
+        response body stays visible
+        """
+        let wrappedMarker = """
+        [tm-agent-reply:0123456789abcdef0123456789ab
+        cdef0123456789abcdef0123456789abcdef:agent-instance-
+        456]
+        """
+        let input = wrappedCommand + "\n" + wrappedMarker
+            + "\nunrelated digest \(unrelatedDigest)"
+
+        let sanitized = TerminalController.sanitizedTeamReadOutput(input)
+
+        XCTAssertFalse(sanitized.contains(token))
+        XCTAssertFalse(sanitized.contains("01234567\n89abcdef"), "no wrapped token suffix may survive")
+        XCTAssertFalse(sanitized.contains("agent-instance-\n456"))
+        XCTAssertTrue(sanitized.contains("tm-agent reply --\nreply-to [REDACTED]"))
+        XCTAssertTrue(sanitized.contains("[tm-agent-reply:[REDACTED]]"))
+        XCTAssertTrue(sanitized.contains("response body stays visible"))
+        XCTAssertTrue(sanitized.contains(unrelatedDigest), "unscoped user digests must remain unchanged")
+    }
+
+    func testVisibleTranscriptHasAbsoluteLineAndByteBoundsWithoutALinesArgument() {
+        let rows = AgentSession.rows(for: [
+            .answered(id: UUID(), String(repeating: "1234567890\n", count: 8_000)),
+        ])
+
+        let snapshot = AgentSession.visibleTranscriptText(rows: rows)
+        XCTAssertLessThanOrEqual(snapshot.split(separator: "\n").count, 500)
+        XCTAssertLessThanOrEqual(snapshot.utf8.count, 64 * 1024)
+    }
+
+    func testVisibleTranscriptSnapshotIncludesStreamingChangesWhilePaneIsHidden() {
+        let session = AgentSession()
+        session.isVisible = false
+        session.ingestForTesting(event([
+            "type": "assistant",
+            "message": ["content": [["type": "text", "text": "latest hidden answer"]]],
+        ]))
+
+        XCTAssertTrue(session.rows.isEmpty, "hidden panes intentionally defer their UI projection")
+        XCTAssertEqual(
+            session.visibleTranscriptText(),
+            "latest hidden answer",
+            "tm-agent read must rebuild the same bounded projection without making the pane visible"
+        )
+    }
+
     // MARK: - Visibility gating
     //
     // Two experiments said the streaming cost is neither the transcript's width
@@ -2333,5 +2483,322 @@ final class AgentSessionTests: XCTestCase {
         let call = AgentSession.ToolCall(name: "Bash", headline: "ls", result: "")
 
         XCTAssertFalse(call.canExpand)
+    }
+
+    // MARK: - A session over the peer wire
+    //
+    // A remote agent surface has no local Process: the peer daemon owns the
+    // bridge, `PtyData` payloads arrive as raw bytes for `consume(_:)`, and
+    // outgoing turns leave through the sink `startRemote` installed —
+    // `PeerRelaySession.sendRemoteKeys` carries each line as `Input.keys`.
+
+    /// The whole NDJSON vocabulary through the remote entry point: what the
+    /// local pipe hands `apply`, the peer relay hands `consume(_:)`.
+    /// `consume` decodes off-main and applies coalesced batches on the main
+    /// queue, so the assertions wait for the batch to land — same contract
+    /// the local pipe path has.
+    func testARemoteSessionConsumesTheStreamAndEndsItsTurn() async throws {
+        var ended: [(String, AgentSession.TurnEnd)] = []
+        let s = AgentSession()
+        s.onTurnEnd = { text, end, _ in ended.append((text, end)) }
+        s.startRemote { _ in }
+        XCTAssertTrue(s.isRunning, "a remote session runs without any Process")
+
+        let wire = [
+            event(["type": "assistant", "message": ["content": [
+                ["type": "tool_use", "id": "t1", "name": "Bash",
+                 "input": ["command": "cargo build"]]]]]),
+            event(["type": "user", "message": ["content": [
+                ["type": "tool_result", "tool_use_id": "t1",
+                 "content": "ok", "is_error": false]]]]),
+            blockStart(0, "text"), delta(0, "answer over the wire"), blockStop(0),
+            event(["type": "result", "stop_reason": "end_turn",
+                   "result": "answer over the wire"]),
+        ].map { $0 + "\n" }.joined()
+        s.consume(Data(wire.utf8))
+
+        let turnEnded = await waitUntil { ended.count == 1 }
+        XCTAssertTrue(turnEnded, "the batched apply must reach the main actor")
+        XCTAssertEqual(ended.count, 1)
+        XCTAssertEqual(ended.first?.0, "answer over the wire")
+        guard case .tool(_, let call) = try XCTUnwrap(s.entries.first) else {
+            return XCTFail("expected the tool row")
+        }
+        XCTAssertEqual(call.result, "ok")
+        XCTAssertTrue(s.entries.contains {
+            if case .answered(_, let text) = $0 { return text == "answer over the wire" }
+            return false
+        })
+    }
+
+    /// The completion path a remote pane uses: no `.events` file and no
+    /// polling tick — the turn's final text goes through `onTurnEnd`, and the
+    /// same static header parser the file watcher uses reads the verdict.
+    func testARemoteTurnEndFeedsTheStaticHeaderParserWithoutAnyFilePolling() async throws {
+        var reported: String?
+        let s = AgentSession()
+        s.onTurnEnd = { text, _, _ in reported = text }
+        s.startRemote { _ in }
+
+        s.consume(Data((event([
+            "type": "result", "stop_reason": "end_turn",
+            "result": "STATUS: DONE\nFILES: none\nVERIFY: n/a\nNEXT: NONE\nFULL_REPORT: n/a",
+        ]) + "\n").utf8))
+
+        let turnEnded = await waitUntil { reported != nil }
+        XCTAssertTrue(turnEnded)
+        let header = AgentPipeCompletion.headerEvent(from: try XCTUnwrap(reported))
+        XCTAssertEqual(header.status, "DONE")
+    }
+
+    /// The wire guarantees line boundaries only for lines under 64KiB; a
+    /// bigger line arrives split mid-line across several `PtyData` chunks.
+    /// The decoder must reassemble it into one event.
+    func testAnOversizedLineSplitAcrossChunksIsReassembled() async throws {
+        let s = AgentSession()
+        s.startRemote { _ in }
+        let big = String(repeating: "x", count: 100_000)
+        let bytes = Data((event(["type": "assistant", "message": ["content": [
+            ["type": "text", "text": big]]]]) + "\n").utf8)
+        XCTAssertGreaterThan(bytes.count, 64 * 1024,
+                             "the fixture must exceed the line-boundary guarantee")
+
+        var offset = 0
+        while offset < bytes.count {
+            let end = min(offset + 64 * 1024, bytes.count)
+            s.consume(bytes.subdata(in: offset..<end))
+            if end < bytes.count {
+                // Trivially true while the pipeline is still decoding, but
+                // a partial line can never produce an event however the
+                // timing falls — the decoder holds it whole.
+                XCTAssertTrue(s.entries.isEmpty, "half a line is not an event")
+            }
+            offset = end
+        }
+
+        let reassembled = await waitUntil { !s.entries.isEmpty }
+        XCTAssertTrue(reassembled)
+        guard case .answered(_, let text) = try XCTUnwrap(s.entries.first) else {
+            return XCTFail("expected the reassembled answer")
+        }
+        XCTAssertEqual(text, big)
+    }
+
+    /// The bridge's stdout carries `[bridge] …` diagnostics between events,
+    /// and a relay chunk can carry bytes that are not UTF-8 at all. Neither
+    /// may derail the events around them.
+    func testBridgeNoiseAndNonUtf8BytesDoNotDerailTheStream() async {
+        let s = AgentSession()
+        s.startRemote { _ in }
+        var wire = Data("[bridge] codex handshake ok\n".utf8)
+        wire.append(Data([0xFF, 0xFE, 0x80, 0x0A]))  // not UTF-8, then newline
+        wire.append(Data((event(["type": "assistant", "message": ["content": [
+            ["type": "text", "text": "still parsing"]]]]) + "\n").utf8))
+
+        s.consume(wire)
+
+        let landed = await waitUntil { s.entries.count >= 2 }
+        XCTAssertTrue(landed, "the batch must reach the main actor")
+        XCTAssertTrue(s.entries.contains {
+            if case .notice(_, let text) = $0 { return text.contains("[bridge]") }
+            return false
+        }, "the diagnostic is shown as a notice")
+        XCTAssertTrue(s.entries.contains {
+            if case .answered(_, let text) = $0 { return text == "still parsing" }
+            return false
+        }, "the event after the garbage still lands")
+    }
+
+    /// A turn goes to the sink exactly as it would go to stdin: one NDJSON
+    /// line, newline included — the relay carries it verbatim as `Input.keys`.
+    func testASentTurnReachesTheSinkAsOneNdjsonLine() async throws {
+        let sink = RemoteSinkRecorder()
+        let s = AgentSession()
+        s.startRemote { sink.record($0) }
+
+        try s.send("fix the build", from: .person)
+
+        let delivered = await waitUntil { sink.all.count == 1 }
+        XCTAssertTrue(delivered)
+        let payload = try XCTUnwrap(sink.all.first)
+        XCTAssertEqual(payload.last, 0x0A, "the newline travels with the line")
+        let object = try XCTUnwrap(try JSONSerialization.jsonObject(
+            with: payload.dropLast()) as? [String: Any])
+        XCTAssertEqual(object["type"] as? String, "user")
+        let message = try XCTUnwrap(object["message"] as? [String: Any])
+        XCTAssertEqual(message["content"] as? String, "fix the build")
+    }
+
+    /// Interrupt travels the same wire: claude's `control_request` on the
+    /// session's own stdin stream — remote only relocates the stdin.
+    func testInterruptReachesTheSinkAsAControlRequest() async throws {
+        let sink = RemoteSinkRecorder()
+        let s = AgentSession()
+        s.startRemote(interruptible: true) { sink.record($0) }
+        try s.send("long task", from: .person)  // opens the turn
+
+        s.interrupt()
+
+        let delivered = await waitUntil { sink.all.count == 2 }
+        XCTAssertTrue(delivered)
+        let payload = try XCTUnwrap(sink.all.last)
+        XCTAssertEqual(payload.last, 0x0A)
+        let object = try XCTUnwrap(try JSONSerialization.jsonObject(
+            with: payload.dropLast()) as? [String: Any])
+        XCTAssertEqual(object["type"] as? String, "control_request")
+        XCTAssertEqual((object["request"] as? [String: Any])?["subtype"] as? String,
+                       "interrupt")
+    }
+
+    /// Leader serialisation survives the move: a second task queued behind a
+    /// remote turn is written to the sink only once the first turn's `result`
+    /// arrives — one instruction, one turn, one result, same as local.
+    func testAQueuedLeaderTurnDrainsThroughTheSinkAfterResult() async throws {
+        let sink = RemoteSinkRecorder()
+        let s = AgentSession()
+        s.startRemote { sink.record($0) }
+
+        try s.send("TASK_ID: aaaa1111\nfirst", from: .leader)
+        try s.send("TASK_ID: bbbb2222\nsecond", from: .leader)
+
+        var delivered = await waitUntil { sink.all.count == 1 }
+        XCTAssertTrue(delivered, "the second turn must wait for the first result")
+        XCTAssertEqual(sink.all.count, 1)
+
+        s.consume(Data((event(["type": "result", "stop_reason": "end_turn",
+                               "result": "first done"]) + "\n").utf8))
+
+        delivered = await waitUntil { sink.all.count == 2 }
+        XCTAssertTrue(delivered)
+        let second = try XCTUnwrap(sink.all.last)
+        XCTAssertTrue(String(data: second, encoding: .utf8)?
+            .contains("bbbb2222") == true)
+    }
+
+    /// Stopping a remote session ends the turn in flight — its task must not
+    /// sit `in_progress` for a pane that is gone — and resets the line
+    /// decoder, so a session restarted on the same model does not glue a
+    /// stale partial line onto the new stream. (A replay from seq 0 still
+    /// requires a new `AgentSession`: `consume` is not idempotent.)
+    func testStoppingARemoteSessionEndsTheTurnAndResetsTheDecoder() async throws {
+        var stops: [String] = []
+        let s = AgentSession()
+        s.onTurnEnd = { _, end, _ in stops.append(end.stop) }
+        s.startRemote { _ in }
+        try s.send("do the thing", from: .person)
+        // Half a line sits in the decoder when the session stops.
+        s.consume(Data("{\"type\":\"assistant".utf8))
+
+        s.stop()
+
+        XCTAssertFalse(s.isRunning)
+        XCTAssertEqual(stops, ["session_stopped"])
+
+        s.startRemote { _ in }
+        XCTAssertTrue(s.isRunning, "a stopped remote session can start again")
+        s.consume(Data((event(["type": "assistant", "message": ["content": [
+            ["type": "text", "text": "fresh stream"]]]]) + "\n").utf8))
+        let fresh = await waitUntil {
+            s.entries.contains {
+                if case .answered(_, let text) = $0 { return text == "fresh stream" }
+                return false
+            }
+        }
+        XCTAssertTrue(fresh, "the stale half-line must not corrupt the fresh stream")
+    }
+
+    func testSurfaceExitFinishesRemoteTurnAsFailureAndClearsRunningState() async throws {
+        var completions: [(String, AgentSession.TurnEnd)] = []
+        let s = AgentSession()
+        s.onTurnEnd = { text, end, _ in completions.append((text, end)) }
+        s.startRemote { _ in }
+        try s.send("TASK_ID: deadbeef\nfinish the review", from: .leader)
+
+        await s.finishRemoteSurfaceExited(exitCode: 0, signal: 15, reason: "signaled")
+
+        XCTAssertFalse(s.isRunning)
+        XCTAssertFalse(s.isThinking)
+        XCTAssertEqual(completions.count, 1)
+        XCTAssertEqual(completions.first?.1.stop, "process_exited")
+        XCTAssertTrue(completions.first?.1.failed == true)
+        XCTAssertTrue(s.entries.contains {
+            if case .notice(_, let text) = $0 { return text.contains("signal 15") }
+            return false
+        })
+    }
+
+    func testSurfaceExitDrainsFinalResultBeforeTearingDownRemotePipeline() async throws {
+        var completions: [(String, AgentSession.TurnEnd)] = []
+        let s = AgentSession()
+        s.onTurnEnd = { text, end, _ in completions.append((text, end)) }
+        s.startRemote { _ in }
+        try s.send("finish", from: .person)
+
+        // Deliberately do not wait for the off-main decoder. The authoritative
+        // exit arriving immediately after the final wire chunk must itself be
+        // the drain barrier that preserves this result.
+        s.consume(Data(event([
+            "type": "result",
+            "stop_reason": "end_turn",
+            "result": "final answer",
+        ]).utf8))
+        await s.finishRemoteSurfaceExited(exitCode: 0, signal: 0, reason: "exited")
+
+        XCTAssertFalse(s.isRunning)
+        XCTAssertEqual(completions.count, 1)
+        XCTAssertEqual(completions.first?.0, "final answer")
+        XCTAssertEqual(completions.first?.1.stop, "end_turn")
+        XCTAssertFalse(completions.first?.1.failed == true,
+                       "a decoded result must not be replaced by process_exited failure")
+    }
+
+    /// One session, one transport. A local start while the remote session is
+    /// live would hand the decoders two interleaved streams; it is refused,
+    /// and `canInterrupt` — which a local start would have overwritten — is
+    /// the witness.
+    func testASessionRefusesALocalStartWhileRemote() {
+        let s = AgentSession()
+        s.startRemote(interruptible: true) { _ in }
+
+        s.start(.init(executable: "/bin/sleep", arguments: ["30"],
+                      workingDirectory: NSTemporaryDirectory(),
+                      environment: ProcessInfo.processInfo.environment))
+
+        XCTAssertTrue(s.canInterrupt,
+                      "the live remote session must not be displaced by a local start")
+        s.stop()
+        XCTAssertFalse(s.isRunning)
+    }
+
+    /// The panel forwards the remote start, and `close()` — the pane going
+    /// away — still stops the session even though there is no process.
+    func testAPanelCanStartItsSessionRemotelyAndCloseStopsIt() {
+        let panel = AgentPanel(agentName: "reviewer", teamName: "wire-test",
+                               workingDirectory: "/tmp", cli: "codex")
+        panel.startRemote { _ in }
+        XCTAssertTrue(panel.session.isRunning)
+
+        panel.close()
+
+        XCTAssertFalse(panel.session.isRunning)
+    }
+}
+
+/// Collects what a remote session wrote, across whatever executor the
+/// delivery task ran on.
+private final class RemoteSinkRecorder: @unchecked Sendable {
+    private let lock = NSLock()
+    private var payloads: [Data] = []
+
+    func record(_ data: Data) {
+        lock.lock()
+        payloads.append(data)
+        lock.unlock()
+    }
+
+    var all: [Data] {
+        lock.lock()
+        defer { lock.unlock() }
+        return payloads
     }
 }

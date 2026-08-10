@@ -100,4 +100,328 @@ final class AgentTransportHardeningRegression169Tests: XCTestCase {
         XCTAssertEqual(language, "swift")
         XCTAssertEqual(String(code.characters), "let value = 1")
     }
+
+    func testTeamSendAcknowledgedWriteStatesItsLimitedDeliveryScope() throws {
+        let response = TerminalController.shared.teamSendDeliveryResponse(
+            id: 17,
+            dispatched: true,
+            textDelivered: true,
+            teamName: "review",
+            agentName: "security",
+            agentInstanceId: "instance-1",
+            sendSequenceID: "sequence-1"
+        )
+        let object = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: Data(response.utf8)) as? [String: Any]
+        )
+        XCTAssertEqual(object["ok"] as? Bool, true)
+        let result = try XCTUnwrap(object["result"] as? [String: Any])
+        XCTAssertEqual(result["sent"] as? Bool, true)
+        XCTAssertEqual(result["text_delivered"] as? Bool, true)
+        XCTAssertEqual(result["delivery_scope"] as? String, "transport_write")
+        XCTAssertEqual(result["transport_dispatched"] as? Bool, true)
+        XCTAssertEqual(result["send_sequence_id"] as? String, "sequence-1")
+        XCTAssertNil(result["consumed"])
+        XCTAssertNil(result["replied"])
+    }
+
+    func testTeamSendMissingWriteAckIsDeliveryFailureNotSuccess() throws {
+        let response = TerminalController.shared.teamSendDeliveryResponse(
+            id: 18,
+            dispatched: true,
+            textDelivered: false,
+            teamName: "review",
+            agentName: "security",
+            agentInstanceId: "instance-1"
+        )
+        let object = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: Data(response.utf8)) as? [String: Any]
+        )
+        XCTAssertEqual(object["ok"] as? Bool, false)
+        let error = try XCTUnwrap(object["error"] as? [String: Any])
+        XCTAssertEqual(error["code"] as? String, "delivery_failed")
+        let data = try XCTUnwrap(error["data"] as? [String: Any])
+        XCTAssertEqual(data["sent"] as? Bool, false)
+        XCTAssertEqual(data["text_delivered"] as? Bool, false)
+        XCTAssertEqual(data["delivery_scope"] as? String, "transport_write")
+        XCTAssertEqual(data["transport_dispatched"] as? Bool, true)
+    }
+
+    func testSlowAndFastSendKeysCompleteOnlyTheirOwnedGate() async {
+        let key = "gate-test/\(UUID().uuidString)"
+        let (_, slow) = await MainActor.run {
+            TerminalController.enqueueSendGate(agentKey: key)
+        }
+        let (previous, fast) = await MainActor.run {
+            TerminalController.enqueueSendGate(agentKey: key)
+        }
+        XCTAssertTrue(previous === slow)
+        slow.markAwaitingReturn()
+        fast.markAwaitingReturn()
+
+        let completedFast = await MainActor.run {
+            TerminalController.takeAcknowledgedSendGate(
+                agentKey: key, sequenceID: fast.sequenceID
+            )
+        }
+        XCTAssertTrue(completedFast === fast)
+
+        // A delayed retry for fast must not consume the still-pending slow gate.
+        let staleRetry = await MainActor.run {
+            TerminalController.takeAcknowledgedSendGate(
+                agentKey: key, sequenceID: fast.sequenceID
+            )
+        }
+        XCTAssertNil(staleRetry)
+
+        let completedSlow = await MainActor.run {
+            TerminalController.takeAcknowledgedSendGate(
+                agentKey: key, sequenceID: slow.sequenceID
+            )
+        }
+        XCTAssertTrue(completedSlow === slow)
+        await MainActor.run {
+            TerminalController.discardSendGate(fast, agentKey: key)
+            TerminalController.discardSendGate(slow, agentKey: key)
+        }
+    }
+
+    func testWatchdogCleanupRemovesOnlyTheExpiredGateIdentity() async {
+        let key = "gate-watchdog-test/\(UUID().uuidString)"
+        let (_, expired) = await MainActor.run {
+            TerminalController.enqueueSendGate(agentKey: key)
+        }
+        let (_, newer) = await MainActor.run {
+            TerminalController.enqueueSendGate(agentKey: key)
+        }
+        newer.markAwaitingReturn()
+
+        await MainActor.run {
+            TerminalController.discardSendGate(expired, agentKey: key)
+        }
+
+        let tokenlessDelegateReturn = await MainActor.run {
+            TerminalController.takeAcknowledgedSendGate(agentKey: key, sequenceID: nil)
+        }
+        XCTAssertNil(
+            tokenlessDelegateReturn,
+            "a tokenless delegate Return must not steal an unrelated send gate"
+        )
+
+        let completedNewer = await MainActor.run {
+            TerminalController.takeAcknowledgedSendGate(
+                agentKey: key, sequenceID: newer.sequenceID
+            )
+        }
+        XCTAssertTrue(completedNewer === newer)
+        await MainActor.run {
+            TerminalController.discardSendGate(newer, agentKey: key)
+        }
+    }
+
+    func testTokenlessReturnClaimsOnlyLegacyGateWithoutTouchingSequenceGate() async {
+        let key = "gate-version-test/\(UUID().uuidString)"
+        let (_, sequenceGate) = await MainActor.run {
+            TerminalController.enqueueSendGate(agentKey: key, sequenceAware: true)
+        }
+        let (previous, legacyGate) = await MainActor.run {
+            TerminalController.enqueueSendGate(agentKey: key, sequenceAware: false)
+        }
+        XCTAssertTrue(previous === sequenceGate, "protocol generations still share serialization order")
+        sequenceGate.markAwaitingReturn()
+        legacyGate.markAwaitingReturn()
+
+        let claimedLegacy = await MainActor.run {
+            TerminalController.takeAcknowledgedSendGate(agentKey: key, sequenceID: nil)
+        }
+        XCTAssertTrue(claimedLegacy === legacyGate)
+
+        let claimedSequence = await MainActor.run {
+            TerminalController.takeAcknowledgedSendGate(
+                agentKey: key,
+                sequenceID: sequenceGate.sequenceID
+            )
+        }
+        XCTAssertTrue(claimedSequence === sequenceGate)
+        await MainActor.run {
+            TerminalController.discardSendGate(legacyGate, agentKey: key)
+            TerminalController.discardSendGate(sequenceGate, agentKey: key)
+        }
+    }
+
+    func testClaimedAwareAndLegacyGateRemainSerializationPredecessorsUntilCompletion() async {
+        for sequenceAware in [true, false] {
+            let key = "gate-claim-race-\(sequenceAware)-\(UUID().uuidString)"
+            let (_, claimed) = await MainActor.run {
+                TerminalController.enqueueSendGate(
+                    agentKey: key,
+                    sequenceAware: sequenceAware
+                )
+            }
+            claimed.markAwaitingReturn()
+            let ownershipClaim = await MainActor.run {
+                TerminalController.takeAcknowledgedSendGate(
+                    agentKey: key,
+                    sequenceID: sequenceAware ? claimed.sequenceID : nil
+                )
+            }
+            XCTAssertTrue(ownershipClaim === claimed)
+
+            let (predecessor, next) = await MainActor.run {
+                TerminalController.enqueueSendGate(
+                    agentKey: key,
+                    sequenceAware: !sequenceAware
+                )
+            }
+            XCTAssertTrue(
+                predecessor === claimed,
+                "claim must not let the next paste overtake Return delivery"
+            )
+
+            await MainActor.run {
+                TerminalController.discardSendGate(claimed, agentKey: key)
+                TerminalController.discardSendGate(next, agentKey: key)
+            }
+        }
+    }
+
+    func testCorrelationMailboxSurvivesMoreThanMessageRetentionNoise() {
+        let store = TeamDataStore.shared
+        let team = "correlation-noise-\(UUID().uuidString)"
+        let token = String(repeating: "a", count: 32)
+        store.registerTeam(team, agents: [
+            .init(name: "reviewer", instanceId: "instance-1"),
+        ])
+        defer { store.unregisterTeam(team) }
+
+        XCTAssertTrue(store.registerCorrelation(
+            teamName: team,
+            token: token,
+            expectedAgentName: "reviewer",
+            expectedAgentInstanceId: "instance-1",
+            expiresAt: Date().addingTimeInterval(60)
+        ))
+        guard case .completed = store.completeCorrelation(
+            teamName: team,
+            token: token,
+            agentName: "reviewer",
+            agentInstanceId: "instance-1",
+            content: "durable reply"
+        ) else { return XCTFail("owner could not complete mailbox") }
+        for index in 0..<600 {
+            XCTAssertNotNil(store.postMessage(
+                teamName: team,
+                from: "reviewer",
+                to: "leader",
+                content: "noise \(index)",
+                type: "note"
+            ))
+        }
+        guard case .ready(let reply) = store.correlation(
+            teamName: team, token: token, consume: false
+        ) else {
+            return XCTFail("correlated reply was evicted by ordinary messages")
+        }
+        XCTAssertEqual(reply.content, "durable reply")
+    }
+
+    func testCorrelationMailboxRejectsWrongTokenIdentityAndDuplicate() {
+        let store = TeamDataStore.shared
+        let team = "correlation-identity-\(UUID().uuidString)"
+        let token = String(repeating: "b", count: 32)
+        store.registerTeam(team, agents: [
+            .init(name: "reviewer", instanceId: "instance-1"),
+            .init(name: "reviewer", instanceId: "instance-2"),
+        ])
+        defer { store.unregisterTeam(team) }
+        XCTAssertTrue(store.registerCorrelation(
+            teamName: team,
+            token: token,
+            expectedAgentName: "reviewer",
+            expectedAgentInstanceId: "instance-1",
+            expiresAt: Date().addingTimeInterval(60)
+        ))
+
+        XCTAssertEqual(store.completeCorrelation(
+            teamName: team,
+            token: String(repeating: "c", count: 32),
+            agentName: "reviewer",
+            agentInstanceId: "instance-1",
+            content: "forged"
+        ), .notFound)
+        XCTAssertEqual(store.completeCorrelation(
+            teamName: team,
+            token: token,
+            agentName: "reviewer",
+            agentInstanceId: "instance-2",
+            content: "sibling forged"
+        ), .identityMismatch)
+        guard case .completed = store.completeCorrelation(
+            teamName: team,
+            token: token,
+            agentName: "reviewer",
+            agentInstanceId: "instance-1",
+            content: "owned"
+        ) else { return XCTFail("owner could not complete mailbox") }
+        XCTAssertEqual(store.completeCorrelation(
+            teamName: team,
+            token: token,
+            agentName: "reviewer",
+            agentInstanceId: "instance-1",
+            content: "duplicate"
+        ), .alreadyCompleted)
+    }
+
+    func testCorrelationMailboxExpiresAndConsumesAtomically() {
+        let store = TeamDataStore.shared
+        let team = "correlation-expiry-\(UUID().uuidString)"
+        let expiredToken = String(repeating: "d", count: 32)
+        let consumedToken = String(repeating: "e", count: 32)
+        let now = Date(timeIntervalSince1970: 10_000)
+        store.registerTeam(team, agents: [
+            .init(name: "reviewer", instanceId: "instance-1"),
+        ])
+        defer { store.unregisterTeam(team) }
+
+        XCTAssertTrue(store.registerCorrelation(
+            teamName: team,
+            token: expiredToken,
+            expectedAgentName: "reviewer",
+            expectedAgentInstanceId: "instance-1",
+            expiresAt: now.addingTimeInterval(1),
+            now: now
+        ))
+        XCTAssertEqual(store.correlation(
+            teamName: team,
+            token: expiredToken,
+            consume: true,
+            now: now.addingTimeInterval(2)
+        ), .notFound)
+
+        XCTAssertTrue(store.registerCorrelation(
+            teamName: team,
+            token: consumedToken,
+            expectedAgentName: "reviewer",
+            expectedAgentInstanceId: "instance-1",
+            expiresAt: now.addingTimeInterval(10),
+            now: now
+        ))
+        XCTAssertEqual(store.correlation(
+            teamName: team, token: consumedToken, consume: true, now: now
+        ), .pending, "polling must not consume a pending mailbox")
+        guard case .completed = store.completeCorrelation(
+            teamName: team,
+            token: consumedToken,
+            agentName: "reviewer",
+            agentInstanceId: "instance-1",
+            content: "once",
+            now: now
+        ) else { return XCTFail("completion failed") }
+        guard case .ready = store.correlation(
+            teamName: team, token: consumedToken, consume: true, now: now
+        ) else { return XCTFail("ready result missing") }
+        XCTAssertEqual(store.correlation(
+            teamName: team, token: consumedToken, consume: true, now: now
+        ), .notFound)
+    }
 }

@@ -17,7 +17,16 @@ pub const MAX_FRAME_BYTES: u32 = 16 * 1024 * 1024;
 /// Feature-flag strings a peer may advertise via `Hello.capabilities`
 /// (`proto/peer/v1/peer.proto` Evolution rule 3). Mirrors
 /// `swift/PeerProto/Sources/PeerProto/PeerCapabilities.swift` on the Swift
-/// side — keep the two lists in sync.
+/// side — keep the two lists in sync. "In sync" means the constants mirror;
+/// each side's advertised `supported` list adds an entry only once that side
+/// actually implements the behavior. [`SURFACE_AGENT_V1`] is the live
+/// example: this build (daemon) advertises it, while the Swift viewer keeps
+/// it out of `PeerCapability.supported` until it can render agent surfaces,
+/// and the Rust CLI strips it from its client Hello
+/// (`term-mesh-cli::peer::client_capabilities`) because it renders raw
+/// bytes to a terminal. A client Hello built straight from
+/// [`supported_vec`] would claim renderer behavior the daemon happens to
+/// implement as a HOST — filter out what the client half cannot keep.
 ///
 /// This is plumbing only (see P3 in `docs/peer-perf-proposal.md`): nothing
 /// in this codebase branches on a capability string yet. It exists so P8
@@ -52,6 +61,25 @@ pub mod capability {
     /// The host can terminate one exact ensured surface and remove its
     /// runtime, persistence, and layout state.
     pub const SURFACE_TERMINATE_V1: &str = "surface.terminate.v1";
+    /// The HOST applies `EnsureSurfaceRequest.env` to the spawned child and
+    /// includes it in ensured-surface spec identity. Clients MUST gate a
+    /// non-empty env map on this capability: protobuf-compatible older
+    /// daemons silently discard unknown field 8, which would otherwise look
+    /// like a successful ensure while launching with the wrong environment.
+    pub const SURFACE_ENSURE_ENV_V1: &str = "surface.ensure-env.v1";
+    /// Daemon-owned agent surfaces (`SurfaceInfo.surface_type == "agent"`):
+    /// non-PTY `tm-agent-bridge` children whose byte stream is NDJSON
+    /// events, not a terminal grid. Advertised by BOTH sides — a HOST
+    /// advertises that it can create and attach agent-kind ensured
+    /// surfaces; a CLIENT advertises that it can render them (AgentPanel).
+    /// To a client that did not advertise this, a host lists agent
+    /// surfaces as `attachable = false` and rejects attach attempts, so
+    /// older viewers degrade for free through the existing `attachable`
+    /// filter.
+    pub const SURFACE_AGENT_V1: &str = "surface.agent.v1";
+    /// The host reports a surface process exit after its final data frame.
+    /// Advertised by the CLIENT because it opts into the new pushed payload.
+    pub const SURFACE_EXIT_V1: &str = "surface.exit.v1";
     /// The host pushes `HostStats` (load, memory, disk and network rates)
     /// for the machine it runs on. Advertised by the client, since the
     /// client is what decides whether it wants the traffic — a host sends
@@ -97,6 +125,9 @@ pub mod capability {
         WORKSPACE_LIST_SUBSCRIBE_V1,
         SURFACE_ENSURE_V1,
         SURFACE_TERMINATE_V1,
+        SURFACE_ENSURE_ENV_V1,
+        SURFACE_AGENT_V1,
+        SURFACE_EXIT_V1,
         HOST_STATS_V1,
         GRID_SNAPSHOT_V1,
         HOST_CLI_BIN_DIRS_V1,
@@ -640,12 +671,70 @@ mod tests {
         let known = PeerCapabilities::from_hello(capability::supported_vec());
         assert!(known.has(capability::PTYDATA_COALESCE_V1));
         assert!(known.has(capability::REPLAY_RING_V1));
+        assert!(known.has(capability::SURFACE_AGENT_V1));
+        assert!(known.has(capability::SURFACE_EXIT_V1));
+        assert!(known.has(capability::SURFACE_ENSURE_ENV_V1));
         assert!(!known.has("totally.unknown.v1"));
 
         let many: Vec<String> = (0..5000).map(|i| format!("cap.{i}.v1")).collect();
         let large = PeerCapabilities::from_hello(many);
         assert!(large.has("cap.42.v1"));
         assert!(!large.has("cap.99999.v1"));
+    }
+
+    #[test]
+    fn supported_capabilities_advertise_surface_agent_v1() {
+        // The literal string is the wire contract shared with the Swift
+        // side — a typo in the constant would silently break gating on
+        // both ends, so pin it here.
+        assert_eq!(capability::SURFACE_AGENT_V1, "surface.agent.v1");
+        assert!(capability::SUPPORTED.contains(&capability::SURFACE_AGENT_V1));
+        assert_eq!(capability::supported_vec().len(), capability::SUPPORTED.len());
+
+        let unique: std::collections::HashSet<&str> =
+            capability::SUPPORTED.iter().copied().collect();
+        assert_eq!(
+            unique.len(),
+            capability::SUPPORTED.len(),
+            "SUPPORTED contains a duplicate capability string"
+        );
+    }
+
+    #[test]
+    fn supported_capabilities_advertise_ensure_env_host_support() {
+        assert_eq!(
+            capability::SURFACE_ENSURE_ENV_V1,
+            "surface.ensure-env.v1"
+        );
+        assert!(
+            capability::SUPPORTED.contains(&capability::SURFACE_ENSURE_ENV_V1),
+            "new daemons must advertise that EnsureSurfaceRequest.env is applied"
+        );
+
+        // Absence is the only safe signal for an older host: field 8 itself
+        // still decodes compatibly there, but protobuf will silently drop it.
+        let old_host = super::PeerCapabilities::from_hello(vec![
+            capability::SURFACE_ENSURE_V1.to_string(),
+            capability::SURFACE_AGENT_V1.to_string(),
+        ]);
+        assert!(!old_host.has(capability::SURFACE_ENSURE_ENV_V1));
+    }
+
+    #[test]
+    fn surface_exited_round_trips_with_terminal_status() {
+        let envelope = Envelope {
+            seq: 9,
+            correlation_id: 0,
+            payload: Some(envelope::Payload::SurfaceExited(SurfaceExited {
+                surface_id: vec![0x44; 16],
+                exit_code: 0,
+                signal: 15,
+                reason: "signaled".into(),
+            })),
+        };
+        let decoded = Envelope::decode(envelope.encode_to_vec().as_slice()).expect("decode");
+        assert_eq!(decoded, envelope);
+        assert!(capability::SUPPORTED.contains(&capability::SURFACE_EXIT_V1));
     }
 
     #[test]
@@ -662,6 +751,11 @@ mod tests {
                     executable: "/bin/sh".into(),
                     args: vec!["-lc".into(), "exec cargo test".into()],
                     restart_policy: EnsureSurfaceRestartPolicy::OnDaemonRestart as i32,
+                    // Empty means "terminal" — the pre-`kind` wire default.
+                    kind: String::new(),
+                    env: [("PROFILE_TOKEN".into(), "present".into())]
+                        .into_iter()
+                        .collect(),
                 },
             )),
         };
@@ -837,6 +931,8 @@ mod tests {
                     executable: "/bin/sh".into(),
                     args: vec!["x".repeat(MAX_FRAME_BYTES as usize)],
                     restart_policy: EnsureSurfaceRestartPolicy::Never as i32,
+                    kind: String::new(),
+                    env: Default::default(),
                 },
             )),
         };

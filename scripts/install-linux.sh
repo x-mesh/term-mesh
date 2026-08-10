@@ -150,6 +150,28 @@ else
   log "warning: this release's archive carries no ${CLI_NAME}; leaving any existing one in place"
 fi
 
+# The bridge lets this host run codex / kiro / cursor / agy agents as native
+# panels instead of raw terminal panes. It has to live HERE rather than on the
+# viewer: the bridge owns the agent process, so running it on the Mac would
+# make every agent a child of that Mac's ssh and kill them all when it
+# disconnects. Installed beside the daemon, the agents belong to this machine
+# and survive the viewer going away.
+#
+# Optional for the same reason as the CLI: an older tag's archive does not
+# carry it, and installing one of those must still work.
+#
+# No --version smoke test. The bridge is spoken to over a pipe and has no
+# version flag; the daemon check above already proved this host's glibc, which
+# is all such a test would have caught.
+BRIDGE_NAME="tm-agent-bridge"
+BRIDGE_PRESENT=0
+if [[ -f "${WORK_DIR}/${BRIDGE_NAME}" ]]; then
+  BRIDGE_PRESENT=1
+  log "bridge present in archive"
+else
+  log "warning: this release's archive carries no ${BRIDGE_NAME}; agents on codex/kiro/cursor/agy will stay plain terminal panes"
+fi
+
 # A scope switch must not leave two daemons serving different sockets. Stop,
 # disable, and remove the old unit only after the replacement has downloaded
 # and passed its smoke test. If cleanup cannot be done safely, fail closed
@@ -228,6 +250,11 @@ if [[ "$CLI_PRESENT" == 1 ]]; then
   log "installed ${PREFIX}/${CLI_NAME}"
 fi
 
+if [[ "$BRIDGE_PRESENT" == 1 ]]; then
+  install -m 0755 "${WORK_DIR}/${BRIDGE_NAME}" "${PREFIX}/${BRIDGE_NAME}"
+  log "installed ${PREFIX}/${BRIDGE_NAME}"
+fi
+
 # term-mesh launches agents through a FIXED PATH, and it is not this script's
 # PATH: `$HOME/.local/bin` comes first and `/usr/local/bin` last (see
 # `PeerHostReadiness.binDirs`). A copy left in an earlier directory keeps
@@ -244,14 +271,23 @@ TERMMESH_SEARCH_DIRS=(
   "$HOME/.bun/bin" "$HOME/.npm-global/bin" "$HOME/.npm-packages/bin"
   /opt/homebrew/bin /usr/local/bin
 )
-for name in "$BIN_NAME" "$CLI_NAME"; do
+for name in "$BIN_NAME" "$CLI_NAME" "$BRIDGE_NAME"; do
   [[ "$name" == "$CLI_NAME" && "$CLI_PRESENT" != 1 ]] && continue
+  [[ "$name" == "$BRIDGE_NAME" && "$BRIDGE_PRESENT" != 1 ]] && continue
   winner=
   for dir in "${TERMMESH_SEARCH_DIRS[@]}"; do
     if [[ -x "$dir/$name" ]]; then winner="$dir/$name"; break; fi
   done
   [[ -z "$winner" || "$winner" == "${PREFIX}/${name}" ]] && continue
-  log "warning: term-mesh will run ${winner} ($("$winner" --version 2>&1 | head -1)),"
+  # The bridge has no --version (it is spoken to over a pipe), so asking would
+  # print a usage error where a version belongs. Naming the path is the whole
+  # point of this warning either way.
+  if [[ "$name" == "$BRIDGE_NAME" ]]; then
+    winner_version="no version flag"
+  else
+    winner_version=$("$winner" --version 2>&1 | head -1)
+  fi
+  log "warning: term-mesh will run ${winner} (${winner_version}),"
   log "         not the ${name} just installed at ${PREFIX}/${name}"
   log "         it searches \$HOME/.local/bin before ${PREFIX} — remove or replace the older copy"
 done

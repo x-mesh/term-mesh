@@ -2378,6 +2378,12 @@ class TerminalController {
             return teamDataMessageList(params: params, id: id, store: store)
         case "team.message.clear":
             return teamDataMessageClear(params: params, id: id, store: store)
+        case "team.correlation.register":
+            return teamDataCorrelationRegister(params: params, id: id, store: store)
+        case "team.correlation.get":
+            return teamDataCorrelationGet(params: params, id: id, store: store)
+        case "team.correlation.cancel":
+            return teamDataCorrelationCancel(params: params, id: id, store: store)
         case "team.report":
             return teamDataReport(params: params, id: id, store: store)
         case "team.result.status":
@@ -3137,18 +3143,22 @@ class TerminalController {
         guard let agentInstanceId = selection.instanceId else {
             return v2Error(id: id, code: "not_found", message: "Agent not found")
         }
+        let sendSequenceAware = params["send_sequence_aware"] as? Bool ?? false
         // Per-agent send serialization: wait for the preceding paste+Return cycle to
         // finish (including 250 ms post-Return cooldown) before pasting new text.
         // This prevents rapid consecutive sends from racing inside the codex TUI
         // submit window and dropping every other message.
         let agentKey = "\(teamName)/\(agentInstanceId)"
-        let (prevGate, _): (SendGate?, SendGate) = await MainActor.run {
-            let prev = TerminalController.perAgentGateQueue[agentKey]?.last
-            let gate = SendGate()
-            TerminalController.perAgentGateQueue[agentKey, default: []].append(gate)
-            return (prev, gate)
+        let (prevGate, sendGate): (SendGate?, SendGate) = await MainActor.run {
+            TerminalController.enqueueSendGate(
+                agentKey: agentKey,
+                sequenceAware: sendSequenceAware
+            )
         }
         if let prev = prevGate { await prev.wait() }
+        // The watchdog belongs to the active sequence, not time spent queued
+        // behind an earlier paste+Return cycle.
+        TerminalController.startSendGateWatchdog(sendGate, agentKey: agentKey)
 
         // Stagger: dynamic gap based on team size to prevent GCD main-queue saturation
         // when the CLI sends to 10+ agents in rapid succession.
@@ -3196,11 +3206,62 @@ class TerminalController {
                 if !ok { resume(false) }
             }
         }
-        return dispatched
-            ? v2Ok(id: id, result: ["sent": true, "text_delivered": textDelivered,
-                                    "team_name": teamName, "agent_name": agentName,
-                                    "agent_instance_id": agentInstanceId])
-            : v2Error(id: id, code: "not_found", message: "Agent or team not found")
+        if dispatched && textDelivered {
+            sendGate.markAwaitingReturn()
+        } else {
+            // No team.send_key follows a failed paste acknowledgement, so remove
+            // this send's gate instead of leaving the FIFO queue one entry behind.
+            await MainActor.run {
+                TerminalController.discardSendGate(sendGate, agentKey: agentKey)
+            }
+        }
+        return teamSendDeliveryResponse(
+            id: id,
+            dispatched: dispatched,
+            textDelivered: textDelivered,
+            teamName: teamName,
+            agentName: agentName,
+            agentInstanceId: agentInstanceId,
+            sendSequenceID: sendSequenceAware ? sendGate.sequenceID : nil
+        )
+    }
+
+    /// Formats the `team.send` delivery contract. `transport_write` means only
+    /// that the complete text reached the target transport/input field; it does
+    /// not claim that the agent consumed the text or produced a reply.
+    func teamSendDeliveryResponse(
+        id: Any?,
+        dispatched: Bool,
+        textDelivered: Bool,
+        teamName: String,
+        agentName: String,
+        agentInstanceId: String,
+        sendSequenceID: String? = nil
+    ) -> String {
+        guard dispatched else {
+            return v2Error(id: id, code: "not_found", message: "Agent or team not found")
+        }
+        var delivery: [String: Any] = [
+            "sent": textDelivered,
+            "text_delivered": textDelivered,
+            "delivery_scope": "transport_write",
+            "transport_dispatched": true,
+            "team_name": teamName,
+            "agent_name": agentName,
+            "agent_instance_id": agentInstanceId,
+        ]
+        if textDelivered, let sendSequenceID {
+            delivery["send_sequence_id"] = sendSequenceID
+        }
+        guard textDelivered else {
+            return v2Error(
+                id: id,
+                code: "delivery_failed",
+                message: "Agent transport was dispatched but text delivery was not acknowledged",
+                data: delivery
+            )
+        }
+        return v2Ok(id: id, result: delivery)
     }
 
     private func asyncTeamLeaderSend(params: [String: Any], id: Any?) async -> String {
@@ -3264,6 +3325,46 @@ class TerminalController {
         return v2Ok(id: id, result: ["sent_count": count, "team_name": teamName])
     }
 
+    /// Remove routing-only correlation credentials from pane snapshots without
+    /// touching the surrounding instruction or the agent's response body.
+    static func sanitizedTeamReadOutput(_ text: String) -> String {
+        var sanitized = text
+        // `ghostty_surface_read_text` returns the rectangular terminal grid,
+        // so a soft wrap becomes whitespace/newlines even in the middle of a
+        // command or token. The generated bearer is exactly 64 hex digits:
+        // constrain the wrap-tolerant patterns to that signature and known
+        // protocol literals so an unrelated digest in the response survives.
+        let generatedToken = #"[0-9A-Fa-f](?:[ \t\r\n]*[0-9A-Fa-f]){63}"#
+        let wrappedIdentity = #"(?:[A-Za-z0-9_-][ \t\r\n]*){1,128}"#
+        let wrappedCommand = softWrappedLiteralPattern("tm-agent reply --reply-to")
+        let wrappedMarker = softWrappedLiteralPattern("[tm-agent-reply:")
+        let wrappedRequired = softWrappedLiteralPattern("[REQUIRED CORRELATED REPLY for instance")
+        let redactions = [
+            (#"(?i)(\b\#(wrappedCommand))\#(generatedToken)"#, "$1[REDACTED]"),
+            (#"(?i)\#(wrappedMarker)\#(generatedToken)[ \t\r\n]*:[ \t\r\n]*\#(wrappedIdentity)\]"#, "[tm-agent-reply:[REDACTED]]"),
+            (#"(?i)(\#(wrappedRequired))\#(wrappedIdentity)\]"#, "$1[REDACTED]]"),
+            (#"(?i)(\btm-agent\s+reply\b[^\r\n]*?\s--reply-to(?:=|\s+))(?:\"[A-Za-z0-9_-]{1,128}\"|'[A-Za-z0-9_-]{1,128}'|[A-Za-z0-9_-]{1,128})"#, "$1[REDACTED]"),
+            (#"(?i)\[tm-agent-reply:[A-Za-z0-9_-]{1,128}:[A-Za-z0-9_-]{1,128}\]"#, "[tm-agent-reply:[REDACTED]]"),
+            (#"(?i)(\[REQUIRED CORRELATED REPLY for instance\s+)[A-Za-z0-9_-]{1,128}(\])"#, "$1[REDACTED]$2"),
+        ]
+        for (pattern, template) in redactions {
+            guard let regex = try? NSRegularExpression(pattern: pattern) else { continue }
+            sanitized = regex.stringByReplacingMatches(
+                in: sanitized,
+                range: NSRange(sanitized.startIndex..<sanitized.endIndex, in: sanitized),
+                withTemplate: template
+            )
+        }
+        return sanitized
+    }
+
+    private static func softWrappedLiteralPattern(_ literal: String) -> String {
+        literal.compactMap { character -> String? in
+            guard !character.isWhitespace else { return nil }
+            return NSRegularExpression.escapedPattern(for: String(character)) + #"[ \t\r\n]*"#
+        }.joined()
+    }
+
     private func asyncTeamRead(params: [String: Any], id: Any?) async -> String {
         guard let teamName = params["team_name"] as? String else {
             return v2Error(id: id, code: "invalid_params", message: "Missing team_name")
@@ -3278,40 +3379,45 @@ class TerminalController {
         }
         let lineLimit = params["lines"] as? Int
 
-        // Minimal MainActor hold: only read terminal raw bytes, decode base64 off-main
-        let (response, nativeText, errResult): (String?, String?, V2CallResult?) = await MainActor.run {
+        // Minimal MainActor hold: snapshot either native transcript rows or
+        // terminal raw bytes. Terminal base64 decoding remains off-main.
+        let (response, isNative, errResult): (String?, Bool, V2CallResult?) = await MainActor.run {
+            if let session = TeamOrchestrator.shared.nativeAgentSession(
+                teamName: teamName,
+                agentName: agentName,
+                agentInstanceId: agentInstanceId
+            ) {
+                return (session.visibleTranscriptText(lineLimit: lineLimit), true, nil)
+            }
             let tabManager = TeamOrchestrator.shared.resolveTabManager(teamName: teamName) ?? self.tabManager
             guard let tabManager else {
-                return (nil, nil, .err(code: "unavailable", message: "TabManager not available", data: nil))
+                return (nil, false, .err(code: "unavailable", message: "TabManager not available", data: nil))
             }
             if let panel = TeamOrchestrator.shared.agentPanel(
                 teamName: teamName, agentName: agentName, agentInstanceId: agentInstanceId, tabManager: tabManager
-            ) {
-                return (self.readTerminalTextBase64(
-                    terminalPanel: panel, includeScrollback: true, lineLimit: lineLimit
-                ), nil, nil)
+            ) else {
+                return (nil, false, .err(code: "not_found", message: "Agent not found", data: nil))
             }
-            if let panel = TeamOrchestrator.shared.agentNativePanel(
-                teamName: teamName, agentName: agentName, agentInstanceId: agentInstanceId
-            ) {
-                return (nil, panel.session.transcriptText(lineLimit: lineLimit), nil)
-            }
-            return (nil, nil, .err(code: "not_found", message: "Agent pane not found", data: nil))
+            return (self.readTerminalTextBase64(
+                terminalPanel: panel, includeScrollback: true, lineLimit: lineLimit
+            ), false, nil)
         }
 
-        // Base64 decode off-main
         if let errResult {
             return v2Result(id: id, errResult)
         }
-        if let nativeText {
-            return v2Ok(id: id, result: ["text": nativeText, "agent_name": agentName,
+        if isNative {
+            let text = Self.sanitizedTeamReadOutput(response ?? "")
+            return v2Ok(id: id, result: ["text": text, "agent_name": agentName,
                                         "agent_instance_id": agentInstanceId, "team_name": teamName])
         }
+        // Base64 decode off-main.
         guard let response, response.hasPrefix("OK ") else {
             return v2Result(id: id, .err(code: "internal_error", message: response ?? "No response", data: nil))
         }
         let base64 = String(response.dropFirst(3)).trimmingCharacters(in: .whitespacesAndNewlines)
-        let text = Data(base64Encoded: base64).flatMap { String(data: $0, encoding: .utf8) } ?? ""
+        let decoded = Data(base64Encoded: base64).flatMap { String(data: $0, encoding: .utf8) } ?? ""
+        let text = Self.sanitizedTeamReadOutput(decoded)
         return v2Ok(id: id, result: ["text": text, "agent_name": agentName,
                                     "agent_instance_id": agentInstanceId, "team_name": teamName])
     }
@@ -4275,12 +4381,33 @@ class TerminalController {
         guard let key = params["key"] as? String else {
             return v2Error(id: id, code: "invalid_params", message: "Missing key")
         }
+        let sendSequenceID = params["send_sequence_id"] as? String
         let selection = await resolveTeamAgentInstance(
             params: params, teamName: teamName, agentName: agentName
         )
         if let failure = selection.failure { return v2Result(id: id, failure) }
         guard let agentInstanceId = selection.instanceId else {
             return v2Error(id: id, code: "not_found", message: "Agent not found")
+        }
+        let agentKey = "\(teamName)/\(agentInstanceId)"
+        // Claim ownership before touching the keyboard. Merely using the token
+        // during cleanup is too late: a stale Return could already have
+        // submitted a newer sequence's pasted text.
+        let claimedGate: SendGate? = key.lowercased() == "return"
+            ? await MainActor.run {
+                TerminalController.takeAcknowledgedSendGate(
+                    agentKey: agentKey,
+                    sequenceID: sendSequenceID
+                )
+            }
+            : nil
+        if key.lowercased() == "return", let sendSequenceID, claimedGate == nil {
+            return v2Error(
+                id: id,
+                code: "stale_send_sequence",
+                message: "Return delivery does not own an active send sequence",
+                data: ["sent": false, "send_sequence_id": sendSequenceID]
+            )
         }
         // An agent held natively has no keyboard to press Return on, and needs
         // none: the write to its stdin was already a whole turn, submitted the
@@ -4294,6 +4421,11 @@ class TerminalController {
                    teamName: teamName, agentName: agentName, agentInstanceId: agentInstanceId
                )
            }) {
+            if let claimedGate {
+                await MainActor.run {
+                    TerminalController.discardSendGate(claimedGate, agentKey: agentKey)
+                }
+            }
             return v2Ok(id: id, result: ["sent": true, "no_keyboard": true,
                                          "team_name": teamName, "agent_name": agentName])
         }
@@ -4352,21 +4484,23 @@ class TerminalController {
         // gate enqueued in asyncTeamSend; together they serialize consecutive sends to
         // the same codex/agent pane and prevent TUI submit-window drops.
         if result.sent && key.lowercased() == "return" {
-            let agentKey = "\(teamName)/\(agentInstanceId)"
             await MainActor.run {
                 TeamOrchestrator.shared.clearPendingReturnTarget(
                     teamName: teamName, agentName: agentName, agentInstanceId: agentInstanceId
                 )
             }
             try? await Task.sleep(nanoseconds: TerminalController.kPostReturnCooldownNs)
-            let gateToOpen: SendGate? = await MainActor.run {
-                guard var queue = TerminalController.perAgentGateQueue[agentKey],
-                      !queue.isEmpty else { return nil }
-                let gate = queue.removeFirst()
-                TerminalController.perAgentGateQueue[agentKey] = queue.isEmpty ? nil : queue
-                return gate
+            if let claimedGate {
+                await MainActor.run {
+                    TerminalController.discardSendGate(claimedGate, agentKey: agentKey)
+                }
             }
-            gateToOpen?.open()
+        } else if key.lowercased() == "return", let claimedGate {
+            // The CLI may retry the same sequence after a transient key-send
+            // failure. Restore its ownership without opening the next paste.
+            await MainActor.run {
+                TerminalController.restoreClaimedSendGate(claimedGate, agentKey: agentKey)
+            }
         }
 
         return result.sent
@@ -4391,17 +4525,30 @@ class TerminalController {
 
     /// One-shot async gate used to serialize paste+Return sequences per agent.
     /// asyncTeamSend enqueues a gate; asyncTeamSendKey opens it after the post-Return
-    /// cooldown. A 2 s watchdog auto-opens to prevent deadlock on orphaned sequences.
-    private final class SendGate: @unchecked Sendable {
+    /// cooldown. A watchdog removes this exact sequence by identity before
+    /// opening it, so a stale Return can never dequeue a newer queue head.
+    final class SendGate: @unchecked Sendable {
+        let sequenceID = UUID().uuidString
+        let sequenceAware: Bool
         private var cont: CheckedContinuation<Void, Never>?
         private var opened = false
+        private var awaitingReturn = false
         private let lock = NSLock()
 
-        init() {
-            Task.detached { [weak self] in
-                try? await Task.sleep(nanoseconds: 2_000_000_000) // 2 s watchdog
-                self?.open()
-            }
+        init(sequenceAware: Bool = true) {
+            self.sequenceAware = sequenceAware
+        }
+
+        func markAwaitingReturn() {
+            lock.withLock { awaitingReturn = true }
+        }
+
+        var isAwaitingReturn: Bool {
+            lock.withLock { awaitingReturn }
+        }
+
+        var isOpen: Bool {
+            lock.withLock { opened }
         }
 
         func wait() async {
@@ -4422,10 +4569,105 @@ class TerminalController {
         }
     }
 
-    /// FIFO gate queues per agent key ("teamName/agentName"). Protected by @MainActor.
-    /// asyncTeamSend appends its gate and waits for the preceding one;
-    /// asyncTeamSendKey dequeues and opens the head gate after the post-Return cooldown.
+    /// All protocol generations share one serialization order, while Return
+    /// ownership is indexed separately. A tokenless legacy Return can therefore
+    /// release only a legacy send and can never guess at a sequence-aware gate.
+    @MainActor private static var perAgentSerializationQueue: [String: [SendGate]] = [:]
     @MainActor private static var perAgentGateQueue: [String: [SendGate]] = [:]
+    @MainActor private static var perAgentLegacyGateQueue: [String: [SendGate]] = [:]
+
+    @MainActor static func enqueueSendGate(
+        agentKey: String,
+        sequenceAware: Bool = true
+    ) -> (SendGate?, SendGate) {
+        let previous = perAgentSerializationQueue[agentKey]?.last
+        let gate = SendGate(sequenceAware: sequenceAware)
+        perAgentSerializationQueue[agentKey, default: []].append(gate)
+        if sequenceAware {
+            perAgentGateQueue[agentKey, default: []].append(gate)
+        } else {
+            perAgentLegacyGateQueue[agentKey, default: []].append(gate)
+        }
+        return (previous, gate)
+    }
+
+    /// Covers the 12 s paste acknowledgement window plus the CLI's ~11 s
+    /// Return retry ladder and cooldown. Starting it only after the gate becomes
+    /// active prevents a queued send from expiring behind a slow predecessor.
+    private static let kSendGateWatchdogNs: UInt64 = 30_000_000_000
+
+    private static func startSendGateWatchdog(_ gate: SendGate, agentKey: String) {
+        Task.detached {
+            try? await Task.sleep(nanoseconds: kSendGateWatchdogNs)
+            await MainActor.run {
+                discardSendGate(gate, agentKey: agentKey)
+            }
+        }
+    }
+
+    /// A token-aware Return owns exactly one new-protocol sequence. A tokenless
+    /// Return can claim only the oldest acknowledged legacy send; delegate and
+    /// native compatibility Returns see nil when no such legacy send exists.
+    /// Claim removes only the Return-ownership index: the shared serialization
+    /// entry remains until successful delivery plus cooldown (or watchdog), so
+    /// a concurrently arriving paste cannot overtake the Return in progress.
+    @MainActor static func takeAcknowledgedSendGate(
+        agentKey: String,
+        sequenceID: String?
+    ) -> SendGate? {
+        var queue: [SendGate]
+        let index: Array<SendGate>.Index?
+        if let sequenceID {
+            guard let awareQueue = perAgentGateQueue[agentKey] else { return nil }
+            queue = awareQueue
+            index = queue.firstIndex {
+                $0.sequenceID == sequenceID && $0.isAwaitingReturn
+            }
+        } else {
+            guard let legacyQueue = perAgentLegacyGateQueue[agentKey] else { return nil }
+            queue = legacyQueue
+            index = queue.firstIndex { $0.isAwaitingReturn }
+        }
+        guard let index else { return nil }
+        let gate = queue.remove(at: index)
+        if sequenceID == nil {
+            perAgentLegacyGateQueue[agentKey] = queue.isEmpty ? nil : queue
+        } else {
+            perAgentGateQueue[agentKey] = queue.isEmpty ? nil : queue
+        }
+        return gate
+    }
+
+    @MainActor static func restoreClaimedSendGate(_ gate: SendGate, agentKey: String) {
+        guard !gate.isOpen else { return }
+        if gate.sequenceAware {
+            guard !(perAgentGateQueue[agentKey]?.contains(where: { $0 === gate }) ?? false) else { return }
+            perAgentGateQueue[agentKey, default: []].insert(gate, at: 0)
+        } else {
+            guard !(perAgentLegacyGateQueue[agentKey]?.contains(where: { $0 === gate }) ?? false) else { return }
+            perAgentLegacyGateQueue[agentKey, default: []].insert(gate, at: 0)
+        }
+    }
+
+    /// Removes a send that will never receive the companion `team.send_key`.
+    /// Identity matching keeps an earlier/later in-flight send's gate intact.
+    @MainActor static func discardSendGate(_ gate: SendGate, agentKey: String) {
+        removeGateIdentity(gate, from: &perAgentSerializationQueue, agentKey: agentKey)
+        removeGateIdentity(gate, from: &perAgentGateQueue, agentKey: agentKey)
+        removeGateIdentity(gate, from: &perAgentLegacyGateQueue, agentKey: agentKey)
+        gate.open()
+    }
+
+    @MainActor private static func removeGateIdentity(
+        _ gate: SendGate,
+        from queues: inout [String: [SendGate]],
+        agentKey: String
+    ) {
+        guard var queue = queues[agentKey],
+              let index = queue.firstIndex(where: { $0 === gate }) else { return }
+        queue.remove(at: index)
+        queues[agentKey] = queue.isEmpty ? nil : queue
+    }
 
     /// Cooldown after Return delivery before the next paste is allowed (ms → ns).
     private static let kPostReturnCooldownNs: UInt64 = 250_000_000 // 250 ms
@@ -4466,6 +4708,9 @@ class TerminalController {
         "team.message.post",
         "team.message.list",
         "team.message.clear",
+        "team.correlation.register",
+        "team.correlation.get",
+        "team.correlation.cancel",
         "team.report",
         "team.result.status",
         "team.result.collect",
@@ -4507,6 +4752,12 @@ class TerminalController {
                 return teamDataMessageList(params: params, id: id, store: store)
             case "team.message.clear":
                 return teamDataMessageClear(params: params, id: id, store: store)
+            case "team.correlation.register":
+                return teamDataCorrelationRegister(params: params, id: id, store: store)
+            case "team.correlation.get":
+                return teamDataCorrelationGet(params: params, id: id, store: store)
+            case "team.correlation.cancel":
+                return teamDataCorrelationCancel(params: params, id: id, store: store)
             case "team.report":
                 return teamDataReport(params: params, id: id, store: store)
             case "team.result.status":
@@ -4571,6 +4822,62 @@ class TerminalController {
         }
         let type = params["type"] as? String ?? "report"
         let to = params["to"] as? String
+        if let correlationToken = params["correlation_token"] as? String {
+            guard Self.isValidCorrelationToken(correlationToken) else {
+                return v2Error(id: id, code: "invalid_params", message: "Invalid correlation_token")
+            }
+            guard type == "note", to == "leader" else {
+                return v2Error(
+                    id: id,
+                    code: "invalid_params",
+                    message: "Correlated replies require type=note and to=leader"
+                )
+            }
+            guard let agentInstanceId = params["agent_instance_id"] as? String,
+                  !agentInstanceId.isEmpty else {
+                return v2Error(
+                    id: id,
+                    code: "invalid_params",
+                    message: "Correlated replies require agent_instance_id"
+                )
+            }
+            guard !content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                  content.utf8.count <= 1_048_576 else {
+                return v2Error(
+                    id: id,
+                    code: "invalid_params",
+                    message: "Correlated reply content must be non-empty and at most 1 MiB"
+                )
+            }
+            switch store.completeCorrelation(
+                teamName: teamName,
+                token: correlationToken,
+                agentName: from,
+                agentInstanceId: agentInstanceId,
+                content: content
+            ) {
+            case .completed(let messageId):
+                return v2Ok(id: id, result: ["posted": true, "message_id": messageId])
+            case .notFound:
+                return v2Error(
+                    id: id,
+                    code: "correlation_not_found",
+                    message: "Correlation is unknown or expired"
+                )
+            case .identityMismatch:
+                return v2Error(
+                    id: id,
+                    code: "correlation_mismatch",
+                    message: "Reply identity does not own this correlation"
+                )
+            case .alreadyCompleted:
+                return v2Error(
+                    id: id,
+                    code: "correlation_already_completed",
+                    message: "Correlation already has a reply"
+                )
+            }
+        }
         if let msg = store.postMessage(teamName: teamName, from: from, to: to, content: content, type: type) {
             // Auto-push notification to the recipient agent's terminal.
             // This eliminates the need for agents to poll inbox — messages arrive instantly.
@@ -4586,6 +4893,100 @@ class TerminalController {
             return v2Ok(id: id, result: store.messageDictionary(msg))
         }
         return v2Error(id: id, code: "internal_error", message: "Failed to post message")
+    }
+
+    private static func isValidCorrelationToken(_ token: String) -> Bool {
+        (24...128).contains(token.utf8.count)
+            && token.utf8.allSatisfy {
+                (48...57).contains($0) || (65...90).contains($0)
+                    || (97...122).contains($0) || $0 == 45 || $0 == 95
+            }
+    }
+
+    private func teamDataCorrelationRegister(
+        params: [String: Any], id: Any?, store: TeamDataStore
+    ) -> String {
+        guard let teamName = params["team_name"] as? String,
+              let token = params["correlation_token"] as? String,
+              let agentName = params["expected_agent_name"] as? String,
+              let agentInstanceId = params["expected_agent_instance_id"] as? String else {
+            return v2Error(id: id, code: "invalid_params", message: "Missing correlation registration fields")
+        }
+        guard Self.isValidCorrelationToken(token) else {
+            return v2Error(id: id, code: "invalid_params", message: "Invalid correlation_token")
+        }
+        guard let expiresInSeconds = params["expires_in_seconds"] as? Int,
+              (1...86_400).contains(expiresInSeconds) else {
+            return v2Error(
+                id: id,
+                code: "invalid_params",
+                message: "expires_in_seconds must be between 1 and 86400"
+            )
+        }
+        let expiresAt = Date().addingTimeInterval(TimeInterval(expiresInSeconds))
+        guard store.registerCorrelation(
+            teamName: teamName,
+            token: token,
+            expectedAgentName: agentName,
+            expectedAgentInstanceId: agentInstanceId,
+            expiresAt: expiresAt
+        ) else {
+            return v2Error(
+                id: id,
+                code: "correlation_registration_refused",
+                message: "Correlation token already exists or target identity is not registered"
+            )
+        }
+        return v2Ok(id: id, result: [
+            "registered": true,
+            "expires_at": ISO8601DateFormatter().string(from: expiresAt),
+        ])
+    }
+
+    private func teamDataCorrelationGet(
+        params: [String: Any], id: Any?, store: TeamDataStore
+    ) -> String {
+        guard let teamName = params["team_name"] as? String,
+              let token = params["correlation_token"] as? String else {
+            return v2Error(id: id, code: "invalid_params", message: "Missing correlation lookup fields")
+        }
+        guard Self.isValidCorrelationToken(token) else {
+            return v2Error(id: id, code: "invalid_params", message: "Invalid correlation_token")
+        }
+        let consume = params["consume"] as? Bool ?? true
+        switch store.correlation(teamName: teamName, token: token, consume: consume) {
+        case .pending:
+            return v2Ok(id: id, result: ["ready": false])
+        case .ready(let reply):
+            return v2Ok(id: id, result: [
+                "ready": true,
+                "content": reply.content,
+                "message_id": reply.messageId,
+                "agent_name": reply.agentName,
+                "agent_instance_id": reply.agentInstanceId,
+            ])
+        case .notFound:
+            return v2Error(
+                id: id,
+                code: "correlation_not_found",
+                message: "Correlation is unknown, expired, or already consumed"
+            )
+        }
+    }
+
+    private func teamDataCorrelationCancel(
+        params: [String: Any], id: Any?, store: TeamDataStore
+    ) -> String {
+        guard let teamName = params["team_name"] as? String,
+              let token = params["correlation_token"] as? String else {
+            return v2Error(id: id, code: "invalid_params", message: "Missing correlation cancellation fields")
+        }
+        guard Self.isValidCorrelationToken(token) else {
+            return v2Error(id: id, code: "invalid_params", message: "Invalid correlation_token")
+        }
+        return v2Ok(id: id, result: [
+            "cancelled": store.cancelCorrelation(teamName: teamName, token: token),
+        ])
     }
 
     private func teamDataMessageList(params: [String: Any], id: Any?, store: TeamDataStore) -> String {
@@ -5391,7 +5792,8 @@ class TerminalController {
                 return
             }
             let base64 = String(response.dropFirst(3)).trimmingCharacters(in: .whitespacesAndNewlines)
-            let text = Data(base64Encoded: base64).flatMap { String(data: $0, encoding: .utf8) } ?? ""
+            let decoded = Data(base64Encoded: base64).flatMap { String(data: $0, encoding: .utf8) } ?? ""
+            let text = Self.sanitizedTeamReadOutput(decoded)
             result = .ok([
                 "text": text,
                 "agent_name": agentName,

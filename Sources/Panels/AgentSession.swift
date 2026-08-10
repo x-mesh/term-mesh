@@ -73,6 +73,25 @@ final class AgentStreamDecoder {
         }
         return output
     }
+
+    /// Treat the unread tail as the stream's final record. NDJSON producers
+    /// normally terminate every record with `\n`, but an authoritative EOF
+    /// must not silently discard a complete final JSON object merely because
+    /// its trailing newline raced with process teardown.
+    func finish() -> [Output] {
+        guard !bytes.isEmpty else { return [] }
+        defer {
+            bytes.removeAll(keepingCapacity: true)
+            scanOffset = 0
+        }
+        var end = bytes.count
+        if bytes[end - 1] == 0x0D { end -= 1 }
+        guard end > 0 else { return [] }
+        let tail = bytes[..<end]
+        guard tail.count <= maxLineBytes else { return [.oversized(tail.count)] }
+        guard let line = String(bytes: tail, encoding: .utf8), !line.isEmpty else { return [] }
+        return [.line(line)]
+    }
 }
 
 /// JSON objects are created and then consumed on two serial queues. Foundation
@@ -571,32 +590,153 @@ final class AgentSession {
         return (omitted, rows(for: Array(entries.suffix(maxRenderedEntries))))
     }
 
-    /// Plain-text projection used by `tm-agent read` for a native pane. The UI
-    /// keeps structured entries instead of terminal cells, so screen scraping
-    /// cannot work here; flatten only at this RPC boundary.
-    func transcriptText(lineLimit: Int? = nil) -> String {
-        let text = entries.compactMap(Self.transcriptText(for:)).joined(separator: "\n")
-        guard let lineLimit, lineLimit > 0 else { return text }
-        return text.split(separator: "\n", omittingEmptySubsequences: false)
-            .suffix(lineLimit)
-            .joined(separator: "\n")
+    /// One shared projection for the collapsed tool row and socket reads.
+    /// Tool inputs often contain an entire shell command, so this is a data
+    /// boundary as well as presentation: one line, credential-shaped values
+    /// redacted, and a fixed UTF-8 budget before either consumer sees it.
+    static func projectedToolHeadline(_ raw: String) -> String {
+        var projected = raw
+            .components(separatedBy: .newlines)
+            .joined(separator: " ")
+            .split(whereSeparator: \.isWhitespace)
+            .joined(separator: " ")
+        projected = redactingSensitiveEnvironmentAssignments(projected)
+        let redactions = [
+            (#"(?i)(bearer\s+)(?:\"[^\"]*\"|'[^']*'|[^\s]+)"#, "$1[redacted]"),
+            (#"(?i)((?:--)?(?:api[-_]?key|access[-_]?token|auth[-_]?token|token|password|passwd|secret)\s*(?:=|:)\s*)(?:\"[^\"]*\"|'[^']*'|[^\s]+)"#, "$1[redacted]"),
+            (#"(?i)((?:--)(?:api[-_]?key|token|password|passwd|secret)\s+)(?:\"[^\"]*\"|'[^']*'|[^\s]+)"#, "$1[redacted]"),
+            (#"(?i)([a-z][a-z0-9+.-]*://[^\s/:@]+:)[^\s@]+@"#, "$1[redacted]@"),
+            (#"[A-Za-z0-9_-]{16,}\.[A-Za-z0-9_-]{16,}\.[A-Za-z0-9_-]{16,}"#, "[redacted]"),
+            (#"\b(?:gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|sk-(?:proj-)?[A-Za-z0-9_-]{16,})\b"#, "[redacted]"),
+            (#"(?i)-----BEGIN(?: [A-Z0-9]+)* PRIVATE KEY-----.*"#, "[redacted private key]"),
+        ]
+        for (pattern, template) in redactions {
+            guard let regex = try? NSRegularExpression(pattern: pattern) else { continue }
+            let range = NSRange(projected.startIndex..<projected.endIndex, in: projected)
+            projected = regex.stringByReplacingMatches(
+                in: projected,
+                range: range,
+                withTemplate: template
+            )
+        }
+        return middleBounded(projected, maxUTF8Bytes: 160)
     }
 
-    private static func transcriptText(for entry: Entry) -> String? {
-        switch entry {
-        case .said(_, _, let text), .answered(_, let text), .notice(_, let text):
-            return text
-        case .thought(_, let text):
-            return text
-        case .tool(_, let call):
-            return [call.headline, call.result].compactMap { $0 }
-                .filter { !$0.isEmpty }.joined(separator: "\n")
-        case .turnEnded(_, let end):
-            guard let verdict = end.verdict else { return nil }
-            return (["STATUS: \(verdict.status)"] + verdict.details.map {
-                "\($0.0): \($0.1)"
-            }).joined(separator: "\n")
+    /// Parse portable shell environment assignments before applying the
+    /// presentation bound. Values whose key has a credential-bearing component
+    /// must disappear in full, including quoted values and URI userinfo.
+    private static func redactingSensitiveEnvironmentAssignments(_ text: String) -> String {
+        let pattern = #"(?<![A-Za-z0-9_])([A-Za-z_][A-Za-z0-9_]*)(\s*=\s*)(\"[^\"]*\"|'[^']*'|[^\s]+)"#
+        guard let regex = try? NSRegularExpression(pattern: pattern) else { return text }
+        let mutable = NSMutableString(string: text)
+        let matches = regex.matches(
+            in: text,
+            range: NSRange(text.startIndex..<text.endIndex, in: text)
+        )
+        for match in matches.reversed() {
+            guard match.numberOfRanges == 4,
+                  let keyRange = Range(match.range(at: 1), in: text),
+                  match.range(at: 3).location != NSNotFound
+            else { continue }
+            let components = text[keyRange].uppercased().split(separator: "_")
+            guard components.contains(where: {
+                $0 == "SECRET" || $0 == "TOKEN" || $0 == "PASSWORD"
+                    || $0 == "PASSWD" || $0 == "KEY" || $0 == "URL"
+            }) else { continue }
+            mutable.replaceCharacters(in: match.range(at: 3), with: "[redacted]")
         }
+        return mutable as String
+    }
+
+    private static func prefix(_ text: String, withinUTF8Bytes budget: Int) -> String {
+        var used = 0
+        var result = ""
+        for character in text {
+            let width = String(character).utf8.count
+            guard used + width <= budget else { break }
+            result.append(character)
+            used += width
+        }
+        return result
+    }
+
+    private static func suffix(_ text: String, withinUTF8Bytes budget: Int) -> String {
+        String(prefix(String(text.reversed()), withinUTF8Bytes: budget).reversed())
+    }
+
+    private static func middleBounded(_ text: String, maxUTF8Bytes: Int) -> String {
+        guard text.utf8.count > maxUTF8Bytes else { return text }
+        let marker = "…"
+        let available = max(0, maxUTF8Bytes - marker.utf8.count)
+        let headBudget = (available * 2) / 3
+        let tailBudget = available - headBudget
+        return prefix(text, withinUTF8Bytes: headBudget)
+            + marker
+            + suffix(text, withinUTF8Bytes: tailBudget)
+    }
+
+    private static func tailBoundedTranscript(_ text: String, lineLimit: Int?) -> String {
+        let absoluteLineLimit = 500
+        let requested = lineLimit.map { max(0, min($0, absoluteLineLimit)) }
+            ?? absoluteLineLimit
+        guard requested > 0 else { return "" }
+        let lines = text.split(separator: "\n", omittingEmptySubsequences: false)
+        let lineBounded = lines.count > requested
+            ? lines.suffix(requested).joined(separator: "\n")
+            : text
+        let absoluteByteLimit = 64 * 1024
+        guard lineBounded.utf8.count > absoluteByteLimit else { return lineBounded }
+        return suffix(lineBounded, withinUTF8Bytes: absoluteByteLimit)
+    }
+
+    /// Flatten exactly the bounded transcript projection the native panel is
+    /// drawing (or would draw when a hidden pane becomes visible). Rebuilding
+    /// the bounded rows from `entries` matters for hidden panes: their observed
+    /// `rows` intentionally stay stale during streaming to avoid SwiftUI work.
+    /// Taking the projection on the main actor makes a streaming answer one
+    /// coherent snapshot rather than a mix of two deltas.
+    func visibleTranscriptText(lineLimit: Int? = nil) -> String {
+        Self.visibleTranscriptText(
+            rows: Self.displayRows(for: entries).rows,
+            lineLimit: lineLimit
+        )
+    }
+
+    static func visibleTranscriptText(
+        rows: [Row],
+        lineLimit: Int? = nil
+    ) -> String {
+        let text = rows.compactMap { row -> String? in
+            switch row.entry {
+            case .said(_, let speaker, let text):
+                let instruction = read(instruction: text)
+                return "\(speaker == .person ? "you" : "leader"): \(instruction.headline)"
+            case .answered(_, let text):
+                return text
+            case .thought:
+                // Reasoning is visually clamped to two layout-dependent lines.
+                // A socket has no pane width with which to reproduce that
+                // projection, so omission is the conservative equivalent.
+                return nil
+            case .tool(_, let call):
+                return "\(call.name) \(projectedToolHeadline(call.headline))"
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+            case .turnEnded(_, let end):
+                var parts: [String] = []
+                if let status = end.verdict?.status, !status.isEmpty { parts.append(status) }
+                parts.append(end.stop)
+                if let duration = end.duration { parts.append(String(format: "%.1fs", duration)) }
+                if let cost = end.cost { parts.append(String(format: "$%.4f", cost)) }
+                if end.tokensIn != nil || end.tokensOut != nil {
+                    parts.append("\(end.tokensIn ?? 0)→\(end.tokensOut ?? 0) tok")
+                }
+                return parts.joined(separator: " · ")
+            case .notice(_, let text):
+                return "! \(text)"
+            }
+        }.joined(separator: "\n")
+
+        return tailBoundedTranscript(text, lineLimit: lineLimit)
     }
 
     /// 300 is the shipped bound. The override exists so the bound itself can be
@@ -695,6 +835,59 @@ final class AgentSession {
         streamingIds.removeAll()
     }
 
+    /// NDJSON line batching shared by the local pipe path and the remote
+    /// peer-wire path — one owner for the coalescing contract: merge
+    /// adjacent deltas, flush at `maxPendingBatchBytes`, immediately on a
+    /// barrier, otherwise at `batchInterval`. Confined to the owner's
+    /// serial stream `queue`; it is intentionally not thread-safe.
+    private final class AgentLineBatcher {
+        /// The owner's serial stream queue — used only to schedule the
+        /// deferred flush, so the timer serializes with every other event
+        /// on that stream.
+        private let queue: DispatchQueue
+        private var pending: [AgentParsedLine] = []
+        private var pendingBytes = 0
+        private var flushScheduled = false
+
+        init(queue: DispatchQueue) {
+            self.queue = queue
+        }
+
+        /// Called only on `queue`. At most one timer is outstanding.
+        func enqueue(_ parsed: [AgentParsedLine], flush: @escaping @Sendable ([AgentParsedLine]) -> Void) {
+            guard !parsed.isEmpty else { return }
+            for item in parsed {
+                if let last = pending.last, let merged = last.merging(item) {
+                    pending[pending.count - 1] = merged
+                } else {
+                    pending.append(item)
+                }
+                pendingBytes += item.sourceBytes
+                if pendingBytes >= AgentStreamDecoder.maxPendingBatchBytes {
+                    flushPending(flush)
+                }
+            }
+            if parsed.contains(where: \.isBarrier) {
+                flushPending(flush)
+                return
+            }
+            guard !flushScheduled else { return }
+            flushScheduled = true
+            queue.asyncAfter(deadline: .now() + AgentStreamDecoder.batchInterval) { [weak self] in
+                self?.flushPending(flush)
+            }
+        }
+
+        func flushPending(_ flush: @escaping @Sendable ([AgentParsedLine]) -> Void) {
+            flushScheduled = false
+            guard !pending.isEmpty else { return }
+            let batch = pending
+            pending.removeAll(keepingCapacity: true)
+            pendingBytes = 0
+            flush(batch)
+        }
+    }
+
     /// Lifecycle state is confined to `queue`. `ioLock` protects FileHandle reads
     /// against asynchronous close; MainActor never waits on either synchronization
     /// primitive.
@@ -709,9 +902,7 @@ final class AgentSession {
         var terminationStatus: Int32?
         var finishScheduled = false
         let decoder = AgentStreamDecoder(maxLineBytes: AgentStreamDecoder.defaultMaxLineBytes)
-        var pending: [AgentParsedLine] = []
-        var pendingBytes = 0
-        var flushScheduled = false
+        let batcher: AgentLineBatcher
 
         /// Protects FileHandle read/notification/close operations only.
         private let ioLock = NSLock()
@@ -720,6 +911,7 @@ final class AgentSession {
         init(output: FileHandle, error: FileHandle) {
             self.output = output
             self.error = error
+            self.batcher = AgentLineBatcher(queue: queue)
         }
 
         /// Called by a Foundation readability callback, never by `queue`.
@@ -768,53 +960,88 @@ final class AgentSession {
             return terminationStatus
         }
 
-        /// Called only on `queue`. At most one timer is outstanding.
+        /// Called only on `queue`; forwards to the shared batcher so both
+        /// stream paths keep one coalescing contract.
         func enqueue(_ parsed: [AgentParsedLine], flush: @escaping @Sendable ([AgentParsedLine]) -> Void) {
-            guard !parsed.isEmpty else { return }
-            for item in parsed {
-                if let last = pending.last, let merged = last.merging(item) {
-                    pending[pending.count - 1] = merged
-                } else {
-                    pending.append(item)
-                }
-                pendingBytes += item.sourceBytes
-                if pendingBytes >= AgentStreamDecoder.maxPendingBatchBytes {
-                    flushPending(flush)
-                }
-            }
-            if parsed.contains(where: \.isBarrier) {
-                flushPending(flush)
-                return
-            }
-            guard !flushScheduled else { return }
-            flushScheduled = true
-            queue.asyncAfter(deadline: .now() + AgentStreamDecoder.batchInterval) { [weak self] in
-                self?.flushPending(flush)
-            }
+            batcher.enqueue(parsed, flush: flush)
         }
 
         func flushPending(_ flush: @escaping @Sendable ([AgentParsedLine]) -> Void) {
-            flushScheduled = false
-            guard !pending.isEmpty else { return }
-            let batch = pending
-            pending.removeAll(keepingCapacity: true)
-            pendingBytes = 0
-            flush(batch)
+            batcher.flushPending(flush)
+        }
+    }
+
+    /// Off-main pipeline for a remote transport's bytes: the peer-wire twin
+    /// of `StreamResources` — same serial-queue decode, same coalescing
+    /// contract (via the shared `AgentLineBatcher`) — minus everything that
+    /// is pipe lifecycle (EOF, termination, handle closing): the peer
+    /// daemon owns the process, so none of that has a remote counterpart.
+    ///
+    /// `@unchecked Sendable`: `closed`, the decoder and the batcher are
+    /// confined to `queue`; other threads only pass the instance around
+    /// (through `RemoteStreamsBox`) and dispatch onto it.
+    private final class RemoteStreamResources: @unchecked Sendable {
+        let queue = DispatchQueue(label: "com.termmesh.agent-session.remote-stream")
+        /// Read and written only on `queue`.
+        var closed = false
+        let decoder = AgentStreamDecoder(maxLineBytes: AgentStreamDecoder.defaultMaxLineBytes)
+        let batcher: AgentLineBatcher
+
+        init() {
+            self.batcher = AgentLineBatcher(queue: queue)
+        }
+    }
+
+    /// Home of the live remote pipeline pointer, shared between `consume`
+    /// (called from the relay pump's detached task) and the MainActor
+    /// lifecycle (`startRemote`/`teardownRemote`) that swaps it. Same
+    /// NSLock-box shape as `PeerRelaySession`'s pump-facing state, for the
+    /// same reason: the hot path must not pay a MainActor hop per chunk.
+    private final class RemoteStreamsBox: @unchecked Sendable {
+        private let lock = NSLock()
+        private var streams: RemoteStreamResources?
+
+        func current() -> RemoteStreamResources? {
+            lock.lock()
+            defer { lock.unlock() }
+            return streams
+        }
+
+        func set(_ new: RemoteStreamResources?) {
+            lock.lock()
+            streams = new
+            lock.unlock()
         }
     }
 
     @ObservationIgnored private var process: Process?
     @ObservationIgnored private var stdin: FileHandle?
+    /// The remote replacement for `stdin`, installed by `startRemote`: one
+    /// call per NDJSON line, newline included. The peer plumbing points this
+    /// at `PeerRelaySession.sendRemoteKeys`, which carries the line to the
+    /// peer as `Input.keys` bytes.
+    @ObservationIgnored private var remoteSink: ((Data) async throws -> Void)?
+    /// Remote sends leave in the order they were written: each awaits the one
+    /// before it. The generation stamp keeps a send scheduled before a stop
+    /// from landing on a later session's transport.
+    @ObservationIgnored private var remoteSendTail: Task<Void, Never>?
+    @ObservationIgnored private var remoteGeneration = 0
+    /// The remote receive pipeline (`startRemote` installs one, teardown
+    /// removes it). Boxed rather than stored directly because `consume`
+    /// reads it from the relay pump's thread.
+    @ObservationIgnored private let remoteStreamsBox = RemoteStreamsBox()
     @ObservationIgnored private var streamResources: StreamResources?
-    /// Bytes, not a string.
+    #if DEBUG
+    /// Synchronous decoder behind `consumeForTesting` only — production
+    /// bytes (local pipe and remote pipeline alike) decode off-main on
+    /// their own serial queues. Kept so decoder-contract tests can feed
+    /// split chunks and assert without waiting.
     ///
-    /// A pipe read ends wherever the kernel handed the buffer over, which can
-    /// be the middle of a multi-byte character. Decoding each chunk on arrival
-    /// and dropping it when that fails loses the whole chunk — for a Korean
-    /// answer that is most of a line, and if the line it lands in is `result`
-    /// the turn never ends at all. Split on newlines in the bytes; decode only
-    /// what is whole.
+    /// Bytes, not a string: a read ends wherever the transport handed the
+    /// buffer over, which can be the middle of a multi-byte character.
+    /// Split on newlines in the bytes; decode only what is whole.
     @ObservationIgnored private var directDecoder = AgentStreamDecoder(maxLineBytes: AgentSession.maxLineBytes)
+    #endif
 
     /// A line that never arrives must not grow forever. Far above any real
     /// event: a long tool result is tens of kilobytes.
@@ -1067,7 +1294,7 @@ final class AgentSession {
     }
 
     func start(_ launch: Launch) {
-        guard process == nil else { return }
+        guard process == nil, remoteSink == nil else { return }
         let p = Process()
         p.executableURL = URL(fileURLWithPath: launch.executable)
         p.arguments = launch.arguments
@@ -1200,7 +1427,36 @@ final class AgentSession {
         setCanInterrupt(launch.interruptible)
     }
 
+    /// Run the session over a transport somebody else owns.
+    ///
+    /// A remote agent surface has no local `Process`: the peer daemon owns
+    /// the bridge, and this side only sees bytes. Input arrives from outside
+    /// through `consume(_:)`; outgoing turns leave through `sink`, one NDJSON
+    /// line per call with its newline attached. `isRunning` therefore means
+    /// "there is a session", not "there is a process" — on here, off at
+    /// `stop()`.
+    ///
+    /// `interruptible` is the same promise `Launch.interruptible` makes: only
+    /// a CLI measured to take `control_request`/`interrupt` on its stdin
+    /// stream should offer the button.
+    func startRemote(interruptible: Bool = false,
+                     sink: @escaping @Sendable (Data) async throws -> Void) {
+        guard process == nil, remoteSink == nil else { return }
+        remoteSink = sink
+        // A fresh pipeline per session: the decoder must start at a clean
+        // line boundary, and batches from any earlier pipeline must keep
+        // failing `apply`'s identity guard.
+        remoteStreamsBox.set(RemoteStreamResources())
+        setRunning(true)
+        setCanInterrupt(interruptible)
+    }
+
     func stop() {
+        if process == nil, remoteSink != nil {
+            teardownRemote()
+            finishAfterDrain(code: 0, stopped: true)
+            return
+        }
         guard let process else { return }
         _ = teardown(process: process, terminate: true)
         // A deliberate stop is still the end of whatever turn was running, and
@@ -1211,6 +1467,82 @@ final class AgentSession {
         // measured leaving exactly that. Nobody said the work succeeded, so it
         // reports as NEEDS_REVIEW — the same verdict a process that died gets.
         finishAfterDrain(code: 0, stopped: true)
+    }
+
+    /// Finish a transport-owned agent from the host's authoritative process
+    /// status. Unlike `stop()`, this is a failure completion: a turn in flight
+    /// did not finish, and queued work will never be delivered. Idempotence is
+    /// provided by the remote sink guard so a later socket disconnect cannot
+    /// complete the same session twice.
+    func finishRemoteSurfaceExited(exitCode: Int32, signal: Int32, reason: String) async {
+        guard process == nil, remoteSink != nil,
+              let streams = remoteStreamsBox.current() else { return }
+        // SurfaceExited is ordered after the final PtyData on the wire, but
+        // consume(_:) decodes on `streams.queue` and batches onto MainActor.
+        // Put this barrier on that same queue: every earlier chunk is decoded,
+        // its pending batch is flushed, and the final MainActor block is queued
+        // strictly after the corresponding apply block. Only then revoke the
+        // pipeline identity; otherwise the identity guard drops the last result.
+        await withCheckedContinuation { continuation in
+            streams.queue.async { [weak self, streams] in
+                guard !streams.closed else {
+                    continuation.resume()
+                    return
+                }
+                streams.closed = true
+                let flush: @Sendable ([AgentParsedLine]) -> Void = { [weak self] batch in
+                    DispatchQueue.main.async { [weak self] in
+                        guard let self,
+                              self.remoteStreamsBox.current() === streams else { return }
+                        self.apply(batch)
+                    }
+                }
+                let finalParsed = streams.decoder.finish().map { output -> AgentParsedLine in
+                    switch output {
+                    case .line(let line):
+                        return AgentParsedLine(line)
+                    case .oversized(let count):
+                        return AgentParsedLine(
+                            "dropped an unterminated line of \(count) bytes"
+                        )
+                    }
+                }
+                streams.batcher.enqueue(finalParsed, flush: flush)
+                streams.batcher.flushPending(flush)
+                DispatchQueue.main.async { [weak self] in
+                    guard let self,
+                          self.remoteStreamsBox.current() === streams else {
+                        continuation.resume()
+                        return
+                    }
+                    self.finishRemoteSurfaceExitedAfterDrain(
+                        exitCode: exitCode,
+                        signal: signal,
+                        reason: reason
+                    )
+                    continuation.resume()
+                }
+            }
+        }
+    }
+
+    private func finishRemoteSurfaceExitedAfterDrain(
+        exitCode: Int32,
+        signal: Int32,
+        reason: String
+    ) {
+        let summary: String
+        if signal != 0 {
+            summary = "the remote agent was terminated by signal \(signal)"
+        } else if exitCode != 0 {
+            summary = "the remote agent exited (\(exitCode))"
+        } else {
+            let safeReason = reason.isEmpty ? "exited" : reason
+            summary = "the remote agent surface ended (\(safeReason))"
+        }
+        append(.notice(id: UUID(), summary))
+        teardownRemote()
+        finishAfterDrain(code: 0)
     }
 
     /// The sole natural-exit entry point. The stream queue has already drained
@@ -1256,7 +1588,9 @@ final class AgentSession {
         stdin = nil
         streamResources = nil
         process = nil
+        #if DEBUG
         directDecoder = AgentStreamDecoder(maxLineBytes: Self.maxLineBytes)
+        #endif
         setRunning(false)
         setCanInterrupt(false)
 
@@ -1271,6 +1605,31 @@ final class AgentSession {
             streams.closeHandles()
         }
         return true
+    }
+
+    /// The remote counterpart of `teardown`. Releasing the sink is what ends
+    /// the session; bumping the generation strands any delivery still queued
+    /// behind a slow transport so it cannot land on a later session. The
+    /// receive pipeline is retired with it — its decoder dies too, because
+    /// `consume` is not idempotent: a restart must begin at a clean line
+    /// boundary (a fresh pipeline), and a replay from the beginning belongs
+    /// to a brand-new `AgentSession`, not this one. Batches the retired
+    /// pipeline already dispatched to the main queue fail `apply`'s
+    /// identity guard, mirroring `teardown`'s `process === p` revocation.
+    private func teardownRemote() {
+        guard remoteSink != nil else { return }
+        remoteSink = nil
+        remoteGeneration &+= 1
+        remoteSendTail = nil
+        if let streams = remoteStreamsBox.current() {
+            remoteStreamsBox.set(nil)
+            streams.queue.async { streams.closed = true }
+        }
+        #if DEBUG
+        directDecoder = AgentStreamDecoder(maxLineBytes: Self.maxLineBytes)
+        #endif
+        setRunning(false)
+        setCanInterrupt(false)
     }
 
     private func finishAfterDrain(code: Int32, stopped: Bool = false) {
@@ -1348,9 +1707,9 @@ final class AgentSession {
 
     @discardableResult
     private func write(_ text: String, from speaker: Speaker, taskId: String?) throws -> Int {
-        guard let stdin, isRunning else { throw SendError.notRunning }
+        guard isRunning else { throw SendError.notRunning }
         let payload = try Self.encode(text: text)
-        try stdin.write(contentsOf: payload)
+        try writeToTransport(payload)
         // Shown from the receipt (`isReplay`) rather than from here, so what is
         // drawn is what the agent confirmed receiving — not what was hoped for.
         pendingSpeaker = speaker
@@ -1359,6 +1718,47 @@ final class AgentSession {
         if speaker == .leader { currentTaskId = taskId }
         setThinking(true)
         return payload.count
+    }
+
+    /// One NDJSON line onto whatever carries this session's input — the local
+    /// process's stdin, or the sink `startRemote` installed. Every writer
+    /// (turns, queued turns, interrupts) passes through here, so a transport
+    /// cannot be missed by one of them.
+    private func writeToTransport(_ payload: Data) throws {
+        if let stdin {
+            try stdin.write(contentsOf: payload)
+            return
+        }
+        guard let remoteSink else { throw SendError.notRunning }
+        deliverRemote(payload, via: remoteSink)
+    }
+
+    private var hasInputTransport: Bool { stdin != nil || remoteSink != nil }
+
+    /// Chained rather than fired: an unstructured `Task` per line makes no
+    /// ordering promise, and two turns swapping on the wire is exactly the
+    /// bug the leader queue exists to prevent.
+    private func deliverRemote(
+        _ payload: Data,
+        via sink: @escaping @Sendable (Data) async throws -> Void
+    ) {
+        let generation = remoteGeneration
+        let previous = remoteSendTail
+        remoteSendTail = Task { [weak self] in
+            await previous?.value
+            guard let self, self.remoteGeneration == generation else { return }
+            do {
+                try await sink(payload)
+            } catch {
+                // The turn already opened optimistically; the transport's
+                // owner sees the same failure and decides the session's
+                // fate. Here it is only worth saying out loud.
+                self.append(.notice(
+                    id: UUID(),
+                    "could not deliver to the remote agent: \(error.localizedDescription)"
+                ))
+            }
+        }
     }
 
     /// The task this turn is answering, named by the capsule that carried it.
@@ -1412,7 +1812,7 @@ final class AgentSession {
     /// turns arrive on, ends the turn, and carries on. Measured — half a
     /// second to `result`, process alive, next turn answered normally.
     func interrupt() {
-        guard canInterrupt, turnInFlight || isThinking, let stdin else { return }
+        guard canInterrupt, turnInFlight || isThinking, hasInputTransport else { return }
         let control: [String: Any] = [
             "type": "control_request",
             "request_id": UUID().uuidString,
@@ -1420,7 +1820,7 @@ final class AgentSession {
         ]
         guard var data = try? JSONSerialization.data(withJSONObject: control) else { return }
         data.append(0x0A)
-        try? stdin.write(contentsOf: data)
+        try? writeToTransport(data)
         stopRequested = true
     }
 
@@ -1431,17 +1831,52 @@ final class AgentSession {
 
     // MARK: - Reading the stream
 
-    private func consume(_ data: Data) {
-        withEntryTransaction {
-            for output in directDecoder.consume(data) {
+    /// Bytes from a transport somebody else read — for a remote agent
+    /// surface, each `PtyData` payload the relay hands over, exactly as it
+    /// arrived. Callable from any thread; the relay pump calls it straight
+    /// from its detached task.
+    ///
+    /// Decode and parse run on the pipeline's serial queue, and only
+    /// coalesced batches hop to the main actor — the same contract the
+    /// local pipe path has, so a streaming flood costs the main thread one
+    /// `apply` per BATCH (bounded by `AgentStreamDecoder`'s
+    /// `maxPendingBatchBytes` / `batchInterval` / barrier flushes), never
+    /// one parse per chunk. Ordering is one serial queue end to end —
+    /// deliberately not a Task per chunk, which would make no ordering
+    /// promise and could tear an NDJSON line that crossed a chunk boundary
+    /// (legal beyond the wire's 64KiB line-boundary guarantee).
+    ///
+    /// Chunk boundaries may fall anywhere: mid-character, mid-line. The
+    /// decoder reassembles across calls; non-JSON lines (the bridge's
+    /// `[bridge] …` diagnostics) surface as notices, and bytes that are not
+    /// UTF-8 are dropped without derailing the events around them.
+    ///
+    /// Dropped unless `startRemote` installed a pipeline. Not idempotent: a
+    /// stream replayed from the beginning must be fed to a fresh
+    /// `AgentSession`, never re-fed to this one.
+    nonisolated func consume(_ data: Data) {
+        guard let streams = remoteStreamsBox.current() else { return }
+        streams.queue.async { [weak self] in
+            guard !streams.closed else { return }
+            let parsed = streams.decoder.consume(data).map { output -> AgentParsedLine in
                 switch output {
                 case .line(let line):
-                    handle(AgentParsedLine(line))
+                    return AgentParsedLine(line)
                 case .oversized(let count):
-                    append(.notice(
-                        id: UUID(),
+                    // A raw (non-JSON) line renders as a notice in `handle`.
+                    return AgentParsedLine(
                         "dropped an unterminated line of \(count) bytes"
-                    ))
+                    )
+                }
+            }
+            streams.batcher.enqueue(parsed) { [weak self] batch in
+                DispatchQueue.main.async { [weak self] in
+                    // The identity guard is the remote twin of the local
+                    // path's `self.process === p`: a batch from a retired
+                    // pipeline (stop, restart) must not land on the
+                    // session that replaced it.
+                    guard let self, self.remoteStreamsBox.current() === streams else { return }
+                    self.apply(batch)
                 }
             }
         }
@@ -1636,7 +2071,7 @@ final class AgentSession {
             ? preparedChange
             : AgentDiff.change(tool: name, input: args)
         append(.tool(id: UUID(),
-                     ToolCall(name: name, headline: headline, change: change)))
+                     ToolCall(name: name, headline: Self.projectedToolHeadline(headline), change: change)))
         if let id = block["id"] as? String { openTools[id] = entries.count - 1 }
     }
 
@@ -1704,8 +2139,10 @@ final class AgentSession {
         currentTaskId = nil
         onTurnEnd?(final, end, answered)
 
-        // The next leader turn only now, so it gets a turn of its own.
-        if isRunning, process?.isRunning == true, !queued.isEmpty {
+        // The next leader turn only now, so it gets a turn of its own. A
+        // remote session has no local process to ask; the sink still being
+        // installed is what "still deliverable" means there.
+        if isRunning, process?.isRunning == true || remoteSink != nil, !queued.isEmpty {
             let next = queued.removeFirst()
             try? write(next.text, from: .leader, taskId: next.taskId)
         }
@@ -1823,7 +2260,24 @@ final class AgentSession {
     }
 
     /// Bytes as the reader would hand them over, boundaries and all.
-    func consumeForTesting(_ data: Data) { consume(data) }
+    /// Synchronous on purpose: decoder-contract tests (split chunks,
+    /// partial trailing lines) assert immediately after feeding bytes.
+    /// Production remote bytes take `consume`'s off-main pipeline instead.
+    func consumeForTesting(_ data: Data) {
+        withEntryTransaction {
+            for output in directDecoder.consume(data) {
+                switch output {
+                case .line(let line):
+                    handle(AgentParsedLine(line))
+                case .oversized(let count):
+                    append(.notice(
+                        id: UUID(),
+                        "dropped an unterminated line of \(count) bytes"
+                    ))
+                }
+            }
+        }
+    }
 
     /// A production-style parsed batch without a Process or pipe.
     func applyBatchForTesting(_ lines: [String]) {

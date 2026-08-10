@@ -93,6 +93,9 @@ public struct PeerAttachOutcome: Sendable, Equatable {
 /// so callers don't have to handle every oneof variant.
 public enum PeerIncomingMessage: Sendable {
     case ptyData(surfaceID: Data, byteSeq: UInt64, payload: Data)
+    /// Terminal status for one surface process, delivered after its final
+    /// `PtyData`. Gated behind client capability `surface.exit.v1`.
+    case surfaceExited(surfaceID: Data, exitCode: Int32, signal: Int32, reason: String)
     /// Fresh-attach screen keyframe (capability "grid.snapshot.v1"): the
     /// rendered current screen as ANSI, consistent with `byteSeq`. The
     /// consumer must reset its wire-gap baseline to `byteSeq` — snapshot
@@ -804,13 +807,22 @@ public actor PeerSession {
 
     /// Reconcile one logical runner key to a daemon-owned PTY. Calls may run
     /// concurrently: request ids, not arrival order, select the continuation.
+    ///
+    /// `kind` selects what the daemon spawns behind the key: empty (or
+    /// `"terminal"`) is the PTY that predates the field, `"agent"` is a
+    /// non-PTY `tm-agent-bridge` child whose stdout is NDJSON. It is passed
+    /// through verbatim rather than validated here — the daemon refuses an
+    /// unknown value with INVALID_REQUEST, and duplicating the vocabulary on
+    /// this side would only add a second place to forget to update.
     public func ensureSurface(
         requestID suppliedRequestID: Data? = nil,
         key: String,
         cwd: String,
         executable: String,
         args: [String] = [],
-        restartPolicy: Termmesh_Peer_V1_EnsureSurfaceRestartPolicy = .never
+        restartPolicy: Termmesh_Peer_V1_EnsureSurfaceRestartPolicy = .never,
+        kind: String = "",
+        environment: [String: String] = [:]
     ) async throws -> PeerEnsureSurfaceOutcome {
         if let inboundTerminalError { throw inboundTerminalError }
         guard !directResponseRPCInFlight else {
@@ -823,7 +835,8 @@ public actor PeerSession {
             cwd: cwd,
             executable: executable,
             args: args,
-            restartPolicy: restartPolicy
+            restartPolicy: restartPolicy,
+            environment: environment
         )
 
         return try await withTaskCancellationHandler {
@@ -834,7 +847,9 @@ public actor PeerSession {
                 cwd: cwd,
                 executable: executable,
                 args: args,
-                restartPolicy: restartPolicy
+                restartPolicy: restartPolicy,
+                kind: kind,
+                environment: environment
             )
         } onCancel: {
             Task { await self.cancelEnsure(requestID: requestID) }
@@ -847,7 +862,9 @@ public actor PeerSession {
         cwd: String,
         executable: String,
         args: [String],
-        restartPolicy: Termmesh_Peer_V1_EnsureSurfaceRestartPolicy
+        restartPolicy: Termmesh_Peer_V1_EnsureSurfaceRestartPolicy,
+        kind: String,
+        environment: [String: String]
     ) async throws -> PeerEnsureSurfaceOutcome {
         guard activeEnsureRequestIDs.insert(requestID).inserted else {
             throw PeerSessionError.duplicateEnsureRequestID
@@ -861,7 +878,9 @@ public actor PeerSession {
                 cwd: cwd,
                 executable: executable,
                 args: args,
-                restartPolicy: restartPolicy
+                restartPolicy: restartPolicy,
+                kind: kind,
+                environment: environment
             )
         } catch {
             activeEnsureRequestIDs.remove(requestID)
@@ -1009,7 +1028,9 @@ public actor PeerSession {
         cwd: String,
         executable: String,
         args: [String],
-        restartPolicy: Termmesh_Peer_V1_EnsureSurfaceRestartPolicy
+        restartPolicy: Termmesh_Peer_V1_EnsureSurfaceRestartPolicy,
+        kind: String,
+        environment: [String: String]
     ) async throws {
         try await sendEnvelope { env in
             var request = Termmesh_Peer_V1_EnsureSurfaceRequest()
@@ -1019,6 +1040,8 @@ public actor PeerSession {
             request.executable = executable
             request.args = args
             request.restartPolicy = restartPolicy
+            request.kind = kind
+            request.env = environment
             env.ensureSurfaceRequest = request
         }
     }
@@ -1034,7 +1057,8 @@ public actor PeerSession {
         cwd: String,
         executable: String,
         args: [String],
-        restartPolicy: Termmesh_Peer_V1_EnsureSurfaceRestartPolicy
+        restartPolicy: Termmesh_Peer_V1_EnsureSurfaceRestartPolicy,
+        environment: [String: String]
     ) throws {
         guard requestID.count == 16 else {
             throw PeerSessionError.invalidEnsureRequest("request_id must be 16 bytes")
@@ -1051,12 +1075,65 @@ public actor PeerSession {
         guard args.count <= 256, args.allSatisfy({ $0.utf8.count <= 65_536 }) else {
             throw PeerSessionError.invalidEnsureRequest("args exceed protocol limits")
         }
+        do {
+            try PeerEnsureEnvironment.validate(environment)
+        } catch {
+            throw PeerSessionError.invalidEnsureRequest(
+                (error as? LocalizedError)?.errorDescription ?? String(describing: error)
+            )
+        }
         switch restartPolicy {
         case .never, .onDaemonRestart:
             break
         case .unspecified, .UNRECOGNIZED:
             throw PeerSessionError.invalidEnsureRequest("restart_policy must be recognized and specified")
         }
+    }
+
+    /// Remove one ensured surface from the host's registry, durable ensured
+    /// state, and workspace layout.
+    ///
+    /// This is the only way to stop an *agent* surface: it is deliberately
+    /// never placed in the workspace tree, so `requestClosePane` finds
+    /// nothing and silently succeeds. NOT_FOUND is a success — the proto
+    /// defines it as the idempotent outcome, which is what a cleanup path
+    /// retrying after a dropped response needs.
+    ///
+    /// Shaped as a direct-response RPC, so it belongs on a connection with no
+    /// ensure in flight and no inbound pump running (`beginDirectResponseRPC`
+    /// rejects the rest) — in practice a connection opened for the teardown
+    /// itself.
+    @discardableResult
+    public func terminateSurface(
+        requestID suppliedRequestID: Data? = nil,
+        surfaceID: Data
+    ) async throws -> Termmesh_Peer_V1_TerminateSurfaceResult {
+        try requireHostCapability(PeerCapability.surfaceTerminateV1)
+        let requestID = suppliedRequestID ?? Self.makeEnsureRequestID()
+        guard requestID.count == 16 else {
+            throw PeerSessionError.invalidEnsureRequest("request_id must be 16 bytes")
+        }
+        guard surfaceID.count == 16 else {
+            throw PeerSessionError.invalidEnsureRequest("surface_id must be 16 bytes")
+        }
+        try beginDirectResponseRPC()
+        defer { directResponseRPCInFlight = false }
+        try await sendEnvelope { env in
+            var request = Termmesh_Peer_V1_TerminateSurfaceRequest()
+            request.requestID = requestID
+            request.surfaceID = surfaceID
+            env.terminateSurfaceRequest = request
+        }
+        let reply = try await readFrame()
+        guard case .terminateSurfaceResponse(let response) = reply.payload else {
+            throw PeerSessionError.unexpectedMessage(
+                "expected TerminateSurfaceResponse, got \(String(describing: reply.payload))"
+            )
+        }
+        guard response.requestID == requestID else {
+            throw PeerSessionError.malformedEnsureResponse("request_id does not echo the request")
+        }
+        return response.result
     }
 
     public func attachSurface(
@@ -1140,6 +1217,13 @@ public actor PeerSession {
             return .other
         case .ptyData(let p):
             return .ptyData(surfaceID: p.surfaceID, byteSeq: p.byteSeq, payload: p.payload)
+        case .surfaceExited(let exited):
+            return .surfaceExited(
+                surfaceID: exited.surfaceID,
+                exitCode: exited.exitCode,
+                signal: exited.signal,
+                reason: exited.reason
+            )
         case .gridSnapshot(let g):
             return .gridSnapshot(
                 surfaceID: g.surfaceID,

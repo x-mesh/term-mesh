@@ -1,7 +1,12 @@
 //  Feature-flag strings a peer may advertise via `Hello.capabilities`
 //  (`proto/peer/v1/peer.proto` Evolution rule 3). Mirrors
 //  `daemon/peer-proto/src/lib.rs`'s `capability` module on the Rust side —
-//  keep the two lists in sync.
+//  keep the two lists in sync. "In sync" means the constants mirror; each
+//  side's advertised `supported` list adds an entry only once that side
+//  actually implements the behavior. `surfaceAgentV1` walked that path:
+//  the daemon advertised it first (Phase 1), and this viewer joined
+//  `PeerCapability.supported` only once it could render agent surfaces
+//  (Phase 2, AgentPanel wiring).
 //
 //  This is plumbing only (see P3 in `docs/peer-perf-proposal.md`): nothing
 //  in this codebase branches on a capability string yet. It exists so P8
@@ -31,9 +36,39 @@ public enum PeerCapability {
     /// Deterministic daemon-owned surface reconciliation via
     /// `EnsureSurfaceRequest`/`EnsureSurfaceResponse`.
     public static let surfaceEnsureV1 = "surface.ensure.v1"
+    /// `EnsureSurfaceRequest.env` is validated and applied by the host.
+    /// A client must not infer this from `surface.ensure.v1`: older hosts
+    /// decode an unknown map field as empty and would silently launch an
+    /// agent without its configured profile/identity environment.
+    public static let surfaceEnsureEnvV1 = "surface.ensure-env.v1"
     /// Exact ensured-surface termination via
     /// `TerminateSurfaceRequest`/`TerminateSurfaceResponse`.
     public static let surfaceTerminateV1 = "surface.terminate.v1"
+    /// Daemon-owned agent surfaces (`SurfaceInfo.surface_type == "agent"`):
+    /// non-PTY `tm-agent-bridge` children whose byte stream is NDJSON
+    /// events, not a terminal grid. Direction matters — a HOST advertises
+    /// that it can create and attach agent-kind ensured surfaces; a CLIENT
+    /// advertises that it can render them (AgentPanel). To a client that
+    /// did not advertise this, a host lists agent surfaces as
+    /// `attachable = false` and rejects attach attempts, so older viewers
+    /// degrade for free through the existing `attachable` filter. Mirrors
+    /// `SURFACE_AGENT_V1` on the Rust side.
+    ///
+    /// In `supported` since Phase 2 (viewer AgentPanel wiring):
+    /// advertising tells hosts this build attaches agent surfaces as
+    /// AgentPanels rather than opening them as broken terminal panes, so
+    /// hosts now list them as attachable to this viewer. This build's
+    /// CLIENT Hello carries it; the HOST direction does not — only the
+    /// Rust daemon can host agent surfaces today, so `PeerServer` filters
+    /// this string out of its own Hello (see its `advertisedCapabilities`)
+    /// and rejects agent-kind EnsureSurface outright. That filter goes
+    /// when the Mac host learns to host agent surfaces.
+    public static let surfaceAgentV1 = "surface.agent.v1"
+    /// Host-pushed terminal process status for an attached surface. The host
+    /// sends `SurfaceExited` only after its final `PtyData`, allowing a viewer
+    /// to finish the matching session without guessing from socket lifetime.
+    /// Client-advertised: sending it opts this connection into the new push.
+    public static let surfaceExitV1 = "surface.exit.v1"
     /// `HostStats` pushes — load, memory, disk and network rates for the
     /// machine hosting the panes. Advertised by the side that WANTS them,
     /// so a host sends them only to a client that asked. Mirrors
@@ -65,7 +100,7 @@ public enum PeerCapability {
     /// Every capability this build supports. Single source of truth for
     /// populating outgoing `Hello.capabilities` — don't hand-roll the list
     /// at each call site.
-    public static let supported: [String] = [ptyDataCoalesceV1, replayRingV1, workspaceLifecycleV1, workspaceListSubscribeV1, surfaceEnsureV1, surfaceTerminateV1, hostStatsV1, gridSnapshotV1, hostCLIBinDirsV1, teamRosterV1, teamCallV1, teamLeaderV1]
+    public static let supported: [String] = [ptyDataCoalesceV1, replayRingV1, workspaceLifecycleV1, workspaceListSubscribeV1, surfaceEnsureV1, surfaceEnsureEnvV1, surfaceTerminateV1, surfaceAgentV1, surfaceExitV1, hostStatsV1, gridSnapshotV1, hostCLIBinDirsV1, teamRosterV1, teamCallV1, teamLeaderV1]
 }
 
 /// Strict validation for host-controlled Hello.cli_bin_dirs. Invalid input

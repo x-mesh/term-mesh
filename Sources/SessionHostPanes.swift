@@ -17,7 +17,23 @@ import PeerProto
 @MainActor
 enum SessionHostPanes {
 
-    /// Sessions the daemon holds that have no pane here yet.
+    /// The `SurfaceInfo.surface_type` value naming a daemon-owned agent
+    /// surface: a non-PTY `tm-agent-bridge` child whose byte stream is
+    /// NDJSON events, not a terminal grid. Single Swift home for the
+    /// literal — the router below and `Workspace`'s pane factories must
+    /// agree on it or a surface routes one way and renders another.
+    static let agentSurfaceType = "agent"
+
+    /// Exact match only. The daemon writes this string; anything else —
+    /// including the empty string every pre-agent daemon sends — is a
+    /// terminal, which is what every unknown type has always been opened
+    /// as.
+    static func isAgentSurfaceType(_ surfaceType: String) -> Bool {
+        surfaceType == agentSurfaceType
+    }
+
+    /// Sessions the daemon holds that have no pane here yet, split by the
+    /// renderer they need.
     ///
     /// "Held by the daemon" is the whole test. Anything it owns is a session
     /// that survives this app, which is exactly what deserves a window here;
@@ -27,13 +43,23 @@ enum SessionHostPanes {
     /// Unattachable surfaces are skipped rather than attempted: attaching to
     /// one fails at the far end, and a failure per pass is a log full of the
     /// same line.
+    ///
+    /// An agent surface must never land in the terminal list: opened as a
+    /// terminal it would spawn the relay helper into a pane and render raw
+    /// NDJSON as if it were a shell. It gets its own list — the caller
+    /// routes it to `Workspace.openRemoteAgentPane` — rather than being
+    /// dropped, because the daemon holding it is still the reason to show
+    /// it.
     static func sessionsNeedingPanes(
-        daemonSurfaces: [(id: Data, attachable: Bool)],
+        daemonSurfaces: [(id: Data, attachable: Bool, surfaceType: String)],
         alreadyShown: Set<Data>
-    ) -> [Data] {
-        daemonSurfaces
+    ) -> (terminal: [Data], agent: [Data]) {
+        let wanted = daemonSurfaces
             .filter { $0.attachable && !alreadyShown.contains($0.id) }
-            .map(\.id)
+        return (
+            terminal: wanted.filter { !isAgentSurfaceType($0.surfaceType) }.map(\.id),
+            agent: wanted.filter { isAgentSurfaceType($0.surfaceType) }.map(\.id)
+        )
     }
 
     /// Whether this machine has a session owner worth looking at.
@@ -73,6 +99,13 @@ enum SessionHostPanes {
                     else { continue }
                     shown.insert(session.originSurface.surfaceID)
                 }
+                // Agent panes: an AgentPanel deliberately knows nothing
+                // about transports, so its peer session lives in the
+                // workspace's binding map rather than on the panel.
+                for session in workspace.remoteAgentPaneSessions.values
+                where !session.isTorndown {
+                    shown.insert(session.originSurface.surfaceID)
+                }
             }
         }
         return shown
@@ -107,6 +140,10 @@ enum SessionHostPanes {
     /// closes that whenever a pass sees the gap, which is the common case.
     private static func pruneDismissals(stillHeld: Set<Data>) {
         dismissedSurfaceIDs.formIntersection(stillHeld)
+        // The reopen governor's history is bounded the same way, for the
+        // same reason: a surface the daemon no longer holds can never be
+        // reopened, so its drop record is dead weight.
+        agentPaneDropHistory = agentPaneDropHistory.filter { stillHeld.contains($0.key) }
     }
 
     /// Test seam: this state is process-global, so a test that adds to it must
@@ -119,6 +156,42 @@ enum SessionHostPanes {
 
     static func pruneDismissalsForTests(stillHeld: Set<Data>) {
         pruneDismissals(stillHeld: stillHeld)
+    }
+
+    // ── Agent-pane reopen governor ───────────────────────────────────
+    //
+    // `Workspace.dropRemoteAgentPane` closes the pane and kicks an
+    // immediate `reconcile()` so a healthy rewind (stream restarted, fresh
+    // AgentSession needed) comes back without waiting for the poller. A
+    // host that accepts the attach and disconnects at once turns that
+    // favor into a spin: drop → kick → reopen → drop, as fast as the round
+    // trips land. The governor lets a burst through — rewinds ARE bursts
+    // of one or two — and demotes anything past it to `pollInterval`
+    // cadence, where the same reconcile still reopens the pane once the
+    // host recovers.
+
+    /// Immediate-kick drops allowed per surface within `agentReopenWindow`.
+    static let agentReopenBurstLimit = 3
+    /// How far back a drop still counts against the limit.
+    static let agentReopenWindow: TimeInterval = 30
+    private static var agentPaneDropHistory: [Data: [Date]] = [:]
+
+    /// Record one dropped agent pane. Returns whether the caller may kick
+    /// an immediate reconcile (true), or must leave the reopen to the
+    /// poller's own cadence (false — the surface has been recreated
+    /// `agentReopenBurstLimit` times within `agentReopenWindow` already).
+    static func noteAgentPaneDropped(surfaceID: Data, now: Date = Date()) -> Bool {
+        guard !surfaceID.isEmpty else { return true }
+        var recent = (agentPaneDropHistory[surfaceID] ?? []).filter {
+            now.timeIntervalSince($0) < agentReopenWindow
+        }
+        recent.append(now)
+        agentPaneDropHistory[surfaceID] = recent
+        return recent.count <= agentReopenBurstLimit
+    }
+
+    static func forgetAgentPaneDropsForTests() {
+        agentPaneDropHistory.removeAll()
     }
 
     /// How long to keep looking for a session host that is still coming up.
@@ -258,10 +331,14 @@ extension SessionHostPanes {
         }
 
         pruneDismissals(stillHeld: Set(surfaces.map(\.surfaceID)))
-        let wanted = sessionsNeedingPanes(
-            daemonSurfaces: surfaces.map { (id: $0.surfaceID, attachable: $0.attachable) },
+        let routed = sessionsNeedingPanes(
+            daemonSurfaces: surfaces.map {
+                (id: $0.surfaceID, attachable: $0.attachable, surfaceType: $0.surfaceType)
+            },
             alreadyShown: shownSurfaceIDs().union(dismissedSurfaceIDs)
         )
+        let agentIDs = Set(routed.agent)
+        let wanted = routed.terminal + routed.agent
         guard !wanted.isEmpty else { return 0 }
 
         var opened = 0
@@ -287,7 +364,17 @@ extension SessionHostPanes {
                 )
                 // Never steal focus: this runs on its own schedule, not
                 // because anyone asked for a pane right now.
-                guard workspace.openRemotePane(session: session, focus: false) != nil else {
+                //
+                // An agent surface gets an AgentPanel, never a terminal:
+                // its bytes are NDJSON events, and `openRemotePane`
+                // refuses it by contract. The attach above already
+                // selected callback delivery from the same surfaceType
+                // (`PeerPaneSession.attach`), which is what
+                // `openRemoteAgentPane` requires.
+                let openedPane: Bool = agentIDs.contains(surfaceID)
+                    ? workspace.openRemoteAgentPane(session: session, focus: false) != nil
+                    : workspace.openRemotePane(session: session, focus: false) != nil
+                guard openedPane else {
                     session.teardown()
                     continue
                 }

@@ -96,6 +96,12 @@ jobs:
         run: |
           cargo zigbuild --release -p term-meshd --target ${{ matrix.rust_target }}.2.17
           cargo zigbuild --release -p term-mesh-cli --bin tm-agent --target ${{ matrix.rust_target }}.2.17
+          # The bridge speaks the protocols term-mesh cannot write to directly
+          # (codex, kiro, cursor, agy). It has to run wherever the agent's
+          # process should live: run it on the Mac and the agent becomes a child
+          # of that Mac's ssh and dies with it, which is the whole reason a peer
+          # agent is a terminal pane today.
+          cargo zigbuild --release -p tm-agent-bridge --target ${{ matrix.rust_target }}.2.17
 
       - name: verify glibc floor
         working-directory: daemon
@@ -108,7 +114,7 @@ jobs:
           command -v objdump >/dev/null || { echo "ERROR: objdump is required for the GLIBC gate" >&2; exit 1; }
           # Both shipped binaries, not just the daemon: an asset that loads on
           # an old host is only half the promise if the CLI beside it does not.
-          for name in term-meshd tm-agent; do
+          for name in term-meshd tm-agent tm-agent-bridge; do
             bin="target/${{ matrix.rust_target }}/release/$name"
             objdump_output=$(objdump -T "$bin")
             # awk deliberately succeeds when there are no GLIBC imports (for
@@ -139,7 +145,7 @@ jobs:
           # this exact name — but it now carries the CLI too. `install-linux.sh`
           # treats tm-agent as optional so it can still install an older tag
           # whose archive holds only the daemon.
-          tar -czf "$ASSET" -C "daemon/target/${{ matrix.rust_target }}/release" term-meshd tm-agent
+          tar -czf "$ASSET" -C "daemon/target/${{ matrix.rust_target }}/release" term-meshd tm-agent tm-agent-bridge
           echo "asset=$ASSET" >> "$GITHUB_OUTPUT"
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           sha256sum "$ASSET" > "$ASSET.sha256"

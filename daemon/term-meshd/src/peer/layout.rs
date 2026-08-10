@@ -33,7 +33,7 @@ use crate::monitor::SystemSnapshot;
 use super::persist::PersistedWorkspace;
 use super::surface::{
     surface_id_from_name, EnsureError, EnsureOutcome, PtyManager, PtySurface, SpawnSpec,
-    SurfaceSpec,
+    SurfaceKind, SurfaceSpec,
 };
 
 pub type SurfaceId = Vec<u8>;
@@ -1084,7 +1084,16 @@ impl PeerHost {
             }
         }
 
-        let surfaces = pty.list();
+        // PTY surfaces only: an agent surface never tiles into a workspace
+        // tree. `WorkspacePane` carries no surface_type, so a viewer reading
+        // the layout could only render such a pane as a terminal — until the
+        // wire can name the kind, staying out of the tree IS the contract
+        // (the surface remains reachable through SurfaceList/attach).
+        let surfaces: Vec<Arc<PtySurface>> = pty
+            .list()
+            .into_iter()
+            .filter(|s| s.kind() == SurfaceKind::Pty)
+            .collect();
         let mut surface_workspace = HashMap::new();
         let mut workspaces = HashMap::new();
         let mut default_id = None;
@@ -1210,6 +1219,15 @@ impl PeerHost {
             .lock()
             .map_err(|_| EnsureError::Internal("host surface lifecycle lock poisoned"))?;
         let outcome = self.pty.ensure(key, spec)?;
+        // An agent surface is ensured, attachable, and listed in
+        // SurfaceList — but NEVER placed in a workspace tree. See
+        // `with_workspaces` for why non-exposure is the contract. Skipping
+        // the reverse index too keeps its invariant ("workspace whose tree
+        // holds this surface"): `terminate_surface` then simply finds no
+        // layout entry, which is the truth.
+        if spec.kind != SurfaceKind::Pty {
+            return Ok(outcome);
+        }
         let workspace_id = self.default_id();
         let changed = {
             let mut workspaces = self.workspaces.lock().unwrap();
@@ -1793,6 +1811,8 @@ impl PeerHost {
             cols: 80,
             rows: 24,
             cwd,
+            kind: super::surface::SurfaceKind::Pty,
+            agent_cli: String::new(),
         };
         self.pty
             .register_and_spawn_ephemeral(surface_id.clone(), spec);
@@ -1953,7 +1973,15 @@ impl PeerHost {
             .map(|entry| entry.store.is_empty())
             .unwrap_or(false);
         if needs_reseed {
-            let surfaces = self.pty.list();
+            // Reseed from PTY surfaces only — an empty default tree must
+            // not sweep an agent surface in through the back door (same
+            // contract as `ensure_surface`/`with_workspaces`).
+            let surfaces: Vec<Arc<PtySurface>> = self
+                .pty
+                .list()
+                .into_iter()
+                .filter(|s| s.kind() == SurfaceKind::Pty)
+                .collect();
             if !surfaces.is_empty() {
                 {
                     let mut workspaces = self.workspaces.lock().unwrap();
@@ -3247,6 +3275,8 @@ mod tests {
             executable: "/bin/cat".into(),
             args: Vec::new(),
             restart_policy: super::super::surface::EnsureRestartPolicy::OnDaemonRestart,
+            kind: super::super::surface::SurfaceKind::Pty,
+            agent_cli: String::new(),
         };
 
         let created = host
@@ -3276,6 +3306,175 @@ mod tests {
         .is_empty());
     }
 
+    /// An ensured agent spec: `/bin/cat` stands in for the bridge — pipes
+    /// only, no PTY, stays alive until stdin closes.
+    fn agent_spec(cli: &str) -> SurfaceSpec {
+        SurfaceSpec {
+            cwd: "/tmp".into(),
+            executable: "/bin/cat".into(),
+            args: Vec::new(),
+            restart_policy: super::super::surface::EnsureRestartPolicy::OnDaemonRestart,
+            kind: SurfaceKind::Agent,
+            agent_cli: cli.into(),
+        }
+    }
+
+    /// Every surface id `ListWorkspaces` would put on the wire for this
+    /// layout: pane actives, their tabs, both split halves — recursively.
+    fn collect_wire_surface_ids(layout: Option<&WorkspaceLayout>, out: &mut Vec<SurfaceId>) {
+        let Some(node) = layout.and_then(|l| l.node.as_ref()) else {
+            return;
+        };
+        match node {
+            workspace_layout::Node::Pane(pane) => {
+                out.push(pane.surface_id.clone());
+                out.extend(pane.tabs.iter().map(|t| t.surface_id.clone()));
+            }
+            workspace_layout::Node::Split(split) => {
+                collect_wire_surface_ids(split.first.as_deref(), out);
+                collect_wire_surface_ids(split.second.as_deref(), out);
+            }
+        }
+    }
+
+    /// Phase 1 non-exposure contract: an ensured agent surface exists in
+    /// the runtime (SurfaceList/attach reach it) but never appears in any
+    /// workspace tree — `WorkspacePane` has no surface_type, so a viewer
+    /// reading the layout could only open it as a terminal pane.
+    #[tokio::test]
+    async fn agent_surface_is_ensured_but_never_exposed_in_workspaces() {
+        let manager = Arc::new(PtyManager::new());
+        let host = Arc::new(PeerHost::new(Arc::clone(&manager)));
+
+        let agent = host
+            .ensure_surface("agent-hidden", &agent_spec("codex"))
+            .expect("ensure agent");
+        let terminal_spec = SurfaceSpec {
+            cwd: "/tmp".into(),
+            executable: "/bin/cat".into(),
+            args: Vec::new(),
+            restart_policy: super::super::surface::EnsureRestartPolicy::OnDaemonRestart,
+            kind: SurfaceKind::Pty,
+            agent_cli: String::new(),
+        };
+        let terminal = host
+            .ensure_surface("terminal-visible", &terminal_spec)
+            .expect("ensure terminal");
+
+        // The runtime knows both…
+        assert!(manager
+            .list()
+            .iter()
+            .any(|s| s.surface_id == agent.surface_id));
+        // …the workspace tree and reverse index know only the terminal.
+        let workspace_id = host.default_id();
+        assert_eq!(
+            host.with_store(&workspace_id, |store| store.surface_ids())
+                .unwrap(),
+            vec![terminal.surface_id.clone()]
+        );
+        assert_eq!(host.workspace_id_for_surface(&agent.surface_id), None);
+        assert_eq!(
+            host.workspace_id_for_surface(&terminal.surface_id),
+            Some(workspace_id)
+        );
+
+        // What ListWorkspaces serializes, across every workspace.
+        let mut wire_ids = Vec::new();
+        for entry in host.list_workspaces() {
+            collect_wire_surface_ids(entry.layout.as_ref(), &mut wire_ids);
+        }
+        assert!(wire_ids.contains(&terminal.surface_id));
+        assert!(
+            !wire_ids.contains(&agent.surface_id),
+            "agent surface leaked into the ListWorkspaces wire"
+        );
+
+        assert!(host.terminate_surface(&agent.surface_id).unwrap());
+        assert!(host.terminate_surface(&terminal.surface_id).unwrap());
+    }
+
+    /// `terminate_surface` on an agent surface: no layout entry exists (by
+    /// contract), so the runtime teardown alone must carry the result —
+    /// true once, false on repeat, roster and logical persistence cleaned.
+    #[tokio::test]
+    async fn agent_surface_terminates_cleanly_without_a_layout_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace_path = dir.path().join("peer-workspaces.json");
+        let manager = Arc::new(PtyManager::new());
+        let host = Arc::new(PeerHost::new(Arc::clone(&manager)));
+        host.set_persist_path(workspace_path.clone());
+
+        let created = host
+            .ensure_surface("agent-terminate", &agent_spec("codex"))
+            .expect("ensure agent");
+        assert!(host.terminate_surface(&created.surface_id).unwrap());
+        assert!(!host.terminate_surface(&created.surface_id).unwrap());
+        assert!(!manager
+            .list()
+            .iter()
+            .any(|s| s.surface_id == created.surface_id));
+        assert!(crate::peer::persist::load_ensured_surfaces(
+            &crate::peer::persist::ensured_surfaces_path(&workspace_path)
+        )
+        .is_empty());
+    }
+
+    /// The reseed back door: an empty default tree repopulates from
+    /// `pty.list()` at snapshot time, which must not sweep an agent
+    /// surface in either.
+    #[tokio::test]
+    async fn empty_default_reseed_skips_agent_surfaces() {
+        let manager = Arc::new(PtyManager::new());
+        let host = Arc::new(PeerHost::new(Arc::clone(&manager)));
+        let agent = host
+            .ensure_surface("agent-reseed", &agent_spec("codex"))
+            .expect("ensure agent");
+
+        // Agent-only roster: the reseed finds nothing tileable.
+        assert!(host.layout_snapshot().is_none());
+        assert_eq!(host.workspace_id_for_surface(&agent.surface_id), None);
+
+        // A PTY appearing later reseeds exactly as before — without the agent.
+        let base = PtySurface::spawn(sid("base"), "cat".into(), "/bin/cat", &[], 80, 24, None)
+            .expect("spawn /bin/cat");
+        manager.insert_surface(base);
+        let snapshot = host.layout_snapshot().expect("tree reseeds from the pty");
+        let mut ids = Vec::new();
+        collect_wire_surface_ids(Some(&snapshot), &mut ids);
+        assert_eq!(ids, vec![sid("base"), sid("base")], "one pane, one tab");
+        assert_eq!(host.workspace_id_for_surface(&agent.surface_id), None);
+
+        assert!(host.terminate_surface(&agent.surface_id).unwrap());
+        manager.remove(&sid("base"));
+    }
+
+    /// Boot tiling (`with_workspaces`) obeys the same contract: a manager
+    /// that already holds an agent surface tiles only its PTY surfaces
+    /// into the default workspace.
+    #[tokio::test]
+    async fn boot_tiling_skips_agent_surfaces() {
+        let manager = Arc::new(PtyManager::new());
+        let agent = manager
+            .ensure("agent-boot", &agent_spec("codex"))
+            .expect("ensure agent");
+        let base = PtySurface::spawn(sid("base"), "cat".into(), "/bin/cat", &[], 80, 24, None)
+            .expect("spawn /bin/cat");
+        manager.insert_surface(base);
+
+        let host = Arc::new(PeerHost::new(Arc::clone(&manager)));
+        let workspace_id = host.default_id();
+        assert_eq!(
+            host.with_store(&workspace_id, |store| store.surface_ids())
+                .unwrap(),
+            vec![sid("base")]
+        );
+        assert_eq!(host.workspace_id_for_surface(&agent.surface_id), None);
+
+        manager.remove(&agent.surface_id);
+        manager.remove(&sid("base"));
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn ensure_and_terminate_race_never_leaves_cross_registry_stale_state() {
         let dir = tempfile::tempdir().unwrap();
@@ -3286,6 +3485,8 @@ mod tests {
             executable: "/bin/cat".into(),
             args: Vec::new(),
             restart_policy: super::super::surface::EnsureRestartPolicy::OnDaemonRestart,
+            kind: super::super::surface::SurfaceKind::Pty,
+            agent_cli: String::new(),
         };
 
         // Keep the process count low: this module already has PTY-cap stress
@@ -3355,6 +3556,8 @@ mod tests {
             executable: "/bin/cat".into(),
             args: Vec::new(),
             restart_policy: super::super::surface::EnsureRestartPolicy::OnDaemonRestart,
+            kind: super::super::surface::SurfaceKind::Pty,
+            agent_cli: String::new(),
         };
         let created = host
             .ensure_surface("save-failure-runner", &spec)

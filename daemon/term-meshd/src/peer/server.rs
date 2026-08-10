@@ -516,6 +516,8 @@ mod integration_tests {
             cols: 80,
             rows: 24,
             cwd: None,
+            kind: crate::peer::surface::SurfaceKind::Pty,
+            agent_cli: String::new(),
         };
         manager.register_and_spawn(declared.clone(), spec("declared"));
         manager.register_and_spawn_ephemeral(spawned.clone(), spec("spawned"));
@@ -556,6 +558,8 @@ mod integration_tests {
                 cols: 80,
                 rows: 24,
                 cwd: None,
+                kind: crate::peer::surface::SurfaceKind::Pty,
+                agent_cli: String::new(),
             },
         );
         let host = Arc::new(PeerHost::new(manager.clone()));
@@ -2377,6 +2381,8 @@ mod integration_tests {
                 cols: 80,
                 rows: 24,
                 cwd: None,
+                kind: crate::peer::surface::SurfaceKind::Pty,
+                agent_cli: String::new(),
             },
         );
 
@@ -2460,6 +2466,8 @@ mod integration_tests {
                     cols: 80,
                     rows: 24,
                     cwd: None,
+                    kind: crate::peer::surface::SurfaceKind::Pty,
+                    agent_cli: String::new(),
                 },
             );
         }
@@ -2606,6 +2614,8 @@ mod integration_tests {
                 cols: 80,
                 rows: 24,
                 cwd: Some(spawn_cwd.clone()),
+                kind: crate::peer::surface::SurfaceKind::Pty,
+                agent_cli: String::new(),
             },
         );
 
