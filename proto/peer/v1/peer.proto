@@ -95,6 +95,9 @@ message Envelope {
     Pong pong = 51;
 
     Goodbye goodbye = 60;
+    // Host-pushed after the final PtyData for a dead surface. Gated behind
+    // capability "surface.exit.v1".
+    SurfaceExited surface_exited = 61;
 
     Error error = 99;
   }
@@ -286,8 +289,22 @@ message EnsureSurfaceRequest {
   // part of the surface spec: a terminal<->agent change on the same key is
   // an ENSURE_SURFACE_RESULT_SPEC_CONFLICT, never a silent conversion.
   string kind = 7;
-  // Field 8 is set aside for a future per-surface environment map (`env`);
-  // do not assign field 8 to anything else.
+  // Explicit child environment overrides. Keys and values are validated and
+  // bounded by the host; omitted on older senders and decoded as empty.
+  map<string, string> env = 8;
+}
+
+// Terminal notification for one surface process. Sent only after every final
+// PtyData chunk has been queued, so a receiver may close the stream as soon as
+// it handles this frame without losing child output.
+message SurfaceExited {
+  bytes surface_id = 1;
+  // Normal exit status, or zero when the process was signaled/unknown.
+  int32 exit_code = 2;
+  // Unix terminating signal, or zero for a normal/unknown exit.
+  int32 signal = 3;
+  // Stable, non-secret summary: "exited", "signaled", or "unknown".
+  string reason = 4;
 }
 
 enum EnsureSurfaceResult {
@@ -350,7 +367,8 @@ message EnsureSurfaceResponse {
   uint64 generation = 5;
   // Host process id for diagnostics; zero when no process is running.
   uint32 pid = 6;
-  // Canonical hash of cwd/executable/args/restart_policy. Never raw secrets.
+  // Canonical hash of cwd/executable/args/restart_policy/kind/env. Never raw
+  // secrets; the hash is opaque and cannot be reversed into environment values.
   bytes spec_hash = 7;
   // Present for SPEC_CONFLICT and FAILED; absent on success.
   EnsureSurfaceError error = 8;

@@ -61,6 +61,12 @@ pub mod capability {
     /// The host can terminate one exact ensured surface and remove its
     /// runtime, persistence, and layout state.
     pub const SURFACE_TERMINATE_V1: &str = "surface.terminate.v1";
+    /// The HOST applies `EnsureSurfaceRequest.env` to the spawned child and
+    /// includes it in ensured-surface spec identity. Clients MUST gate a
+    /// non-empty env map on this capability: protobuf-compatible older
+    /// daemons silently discard unknown field 8, which would otherwise look
+    /// like a successful ensure while launching with the wrong environment.
+    pub const SURFACE_ENSURE_ENV_V1: &str = "surface.ensure-env.v1";
     /// Daemon-owned agent surfaces (`SurfaceInfo.surface_type == "agent"`):
     /// non-PTY `tm-agent-bridge` children whose byte stream is NDJSON
     /// events, not a terminal grid. Advertised by BOTH sides — a HOST
@@ -71,6 +77,9 @@ pub mod capability {
     /// older viewers degrade for free through the existing `attachable`
     /// filter.
     pub const SURFACE_AGENT_V1: &str = "surface.agent.v1";
+    /// The host reports a surface process exit after its final data frame.
+    /// Advertised by the CLIENT because it opts into the new pushed payload.
+    pub const SURFACE_EXIT_V1: &str = "surface.exit.v1";
     /// The host pushes `HostStats` (load, memory, disk and network rates)
     /// for the machine it runs on. Advertised by the client, since the
     /// client is what decides whether it wants the traffic — a host sends
@@ -116,7 +125,9 @@ pub mod capability {
         WORKSPACE_LIST_SUBSCRIBE_V1,
         SURFACE_ENSURE_V1,
         SURFACE_TERMINATE_V1,
+        SURFACE_ENSURE_ENV_V1,
         SURFACE_AGENT_V1,
+        SURFACE_EXIT_V1,
         HOST_STATS_V1,
         GRID_SNAPSHOT_V1,
         HOST_CLI_BIN_DIRS_V1,
@@ -661,6 +672,8 @@ mod tests {
         assert!(known.has(capability::PTYDATA_COALESCE_V1));
         assert!(known.has(capability::REPLAY_RING_V1));
         assert!(known.has(capability::SURFACE_AGENT_V1));
+        assert!(known.has(capability::SURFACE_EXIT_V1));
+        assert!(known.has(capability::SURFACE_ENSURE_ENV_V1));
         assert!(!known.has("totally.unknown.v1"));
 
         let many: Vec<String> = (0..5000).map(|i| format!("cap.{i}.v1")).collect();
@@ -688,6 +701,43 @@ mod tests {
     }
 
     #[test]
+    fn supported_capabilities_advertise_ensure_env_host_support() {
+        assert_eq!(
+            capability::SURFACE_ENSURE_ENV_V1,
+            "surface.ensure-env.v1"
+        );
+        assert!(
+            capability::SUPPORTED.contains(&capability::SURFACE_ENSURE_ENV_V1),
+            "new daemons must advertise that EnsureSurfaceRequest.env is applied"
+        );
+
+        // Absence is the only safe signal for an older host: field 8 itself
+        // still decodes compatibly there, but protobuf will silently drop it.
+        let old_host = super::PeerCapabilities::from_hello(vec![
+            capability::SURFACE_ENSURE_V1.to_string(),
+            capability::SURFACE_AGENT_V1.to_string(),
+        ]);
+        assert!(!old_host.has(capability::SURFACE_ENSURE_ENV_V1));
+    }
+
+    #[test]
+    fn surface_exited_round_trips_with_terminal_status() {
+        let envelope = Envelope {
+            seq: 9,
+            correlation_id: 0,
+            payload: Some(envelope::Payload::SurfaceExited(SurfaceExited {
+                surface_id: vec![0x44; 16],
+                exit_code: 0,
+                signal: 15,
+                reason: "signaled".into(),
+            })),
+        };
+        let decoded = Envelope::decode(envelope.encode_to_vec().as_slice()).expect("decode");
+        assert_eq!(decoded, envelope);
+        assert!(capability::SUPPORTED.contains(&capability::SURFACE_EXIT_V1));
+    }
+
+    #[test]
     fn ensure_surface_request_and_response_round_trip() {
         let request_id = vec![0x11; 16];
         let request = Envelope {
@@ -703,6 +753,9 @@ mod tests {
                     restart_policy: EnsureSurfaceRestartPolicy::OnDaemonRestart as i32,
                     // Empty means "terminal" — the pre-`kind` wire default.
                     kind: String::new(),
+                    env: [("PROFILE_TOKEN".into(), "present".into())]
+                        .into_iter()
+                        .collect(),
                 },
             )),
         };
@@ -879,6 +932,7 @@ mod tests {
                     args: vec!["x".repeat(MAX_FRAME_BYTES as usize)],
                     restart_policy: EnsureSurfaceRestartPolicy::Never as i32,
                     kind: String::new(),
+                    env: Default::default(),
                 },
             )),
         };

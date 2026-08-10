@@ -36,6 +36,11 @@ public enum PeerCapability {
     /// Deterministic daemon-owned surface reconciliation via
     /// `EnsureSurfaceRequest`/`EnsureSurfaceResponse`.
     public static let surfaceEnsureV1 = "surface.ensure.v1"
+    /// `EnsureSurfaceRequest.env` is validated and applied by the host.
+    /// A client must not infer this from `surface.ensure.v1`: older hosts
+    /// decode an unknown map field as empty and would silently launch an
+    /// agent without its configured profile/identity environment.
+    public static let surfaceEnsureEnvV1 = "surface.ensure-env.v1"
     /// Exact ensured-surface termination via
     /// `TerminateSurfaceRequest`/`TerminateSurfaceResponse`.
     public static let surfaceTerminateV1 = "surface.terminate.v1"
@@ -59,6 +64,11 @@ public enum PeerCapability {
     /// and rejects agent-kind EnsureSurface outright. That filter goes
     /// when the Mac host learns to host agent surfaces.
     public static let surfaceAgentV1 = "surface.agent.v1"
+    /// Host-pushed terminal process status for an attached surface. The host
+    /// sends `SurfaceExited` only after its final `PtyData`, allowing a viewer
+    /// to finish the matching session without guessing from socket lifetime.
+    /// Client-advertised: sending it opts this connection into the new push.
+    public static let surfaceExitV1 = "surface.exit.v1"
     /// `HostStats` pushes — load, memory, disk and network rates for the
     /// machine hosting the panes. Advertised by the side that WANTS them,
     /// so a host sends them only to a client that asked. Mirrors
@@ -90,7 +100,7 @@ public enum PeerCapability {
     /// Every capability this build supports. Single source of truth for
     /// populating outgoing `Hello.capabilities` — don't hand-roll the list
     /// at each call site.
-    public static let supported: [String] = [ptyDataCoalesceV1, replayRingV1, workspaceLifecycleV1, workspaceListSubscribeV1, surfaceEnsureV1, surfaceTerminateV1, surfaceAgentV1, hostStatsV1, gridSnapshotV1, hostCLIBinDirsV1, teamRosterV1, teamCallV1, teamLeaderV1]
+    public static let supported: [String] = [ptyDataCoalesceV1, replayRingV1, workspaceLifecycleV1, workspaceListSubscribeV1, surfaceEnsureV1, surfaceEnsureEnvV1, surfaceTerminateV1, surfaceAgentV1, surfaceExitV1, hostStatsV1, gridSnapshotV1, hostCLIBinDirsV1, teamRosterV1, teamCallV1, teamLeaderV1]
 }
 
 /// Strict validation for host-controlled Hello.cli_bin_dirs. Invalid input
