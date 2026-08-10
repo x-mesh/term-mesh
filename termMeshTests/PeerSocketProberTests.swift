@@ -297,4 +297,63 @@ final class PeerSocketProberTests: XCTestCase {
             stderr: stderr.trimmingCharacters(in: .whitespacesAndNewlines)
         )
     }
+
+    // MARK: - Peer socket path is scoped per build
+
+    /// The installed app must keep the unsuffixed path: saved host profiles on
+    /// other machines store this exact string in `remoteSocket`, so moving it
+    /// would break every peer that has already connected here.
+    func testProductionBundleKeepsTheUnsuffixedPath() {
+        XCTAssertEqual(
+            PeerFederationSettings.socketPath(uid: 501, bundleIdentifier: "com.termmesh.app"),
+            "/tmp/term-mesh-peer-501/peer.sock"
+        )
+    }
+
+    /// Everything else gets its own. A `--tag` build binding the installed
+    /// app's path unlinked it first, leaving that app with a listener nothing
+    /// could reach.
+    func testOtherBundlesGetTheirOwnPath() {
+        let debug = PeerFederationSettings.socketPath(
+            uid: 501, bundleIdentifier: "com.termmesh.app.debug"
+        )
+        let tagged = PeerFederationSettings.socketPath(
+            uid: 501, bundleIdentifier: "com.termmesh.app.debug.mirror.forwarded.close"
+        )
+        let production = PeerFederationSettings.socketPath(
+            uid: 501, bundleIdentifier: "com.termmesh.app"
+        )
+        XCTAssertNotEqual(debug, production)
+        XCTAssertNotEqual(tagged, production)
+        XCTAssertNotEqual(debug, tagged, "two dev builds must not share one either")
+    }
+
+    /// A sockaddr_un path is capped near 104 bytes, which is why the bundle id
+    /// is digested rather than spelled out — tags are descriptive and long.
+    func testPathStaysShortForALongBundleIdentifier() {
+        let path = PeerFederationSettings.socketPath(
+            uid: 501,
+            bundleIdentifier: "com.termmesh.app.debug.a-very-long-descriptive-tag-name-here"
+        )
+        XCTAssertLessThan(path.utf8.count, 104)
+    }
+
+    /// Swift seeds `hashValue` per process, so a socket path built from it
+    /// would move on every launch. This one must not.
+    func testDigestIsStableAcrossCalls() {
+        let a = PeerFederationSettings.shortDigest("com.termmesh.app.debug")
+        let b = PeerFederationSettings.shortDigest("com.termmesh.app.debug")
+        XCTAssertEqual(a, b)
+        XCTAssertEqual(a.count, 8)
+        XCTAssertNotEqual(a, PeerFederationSettings.shortDigest("com.termmesh.app.debug2"))
+    }
+
+    /// No bundle identifier at all (XCTest host, bare binary) keeps the old
+    /// behaviour rather than inventing a path from nothing.
+    func testMissingBundleIdentifierFallsBackToTheSharedPath() {
+        XCTAssertEqual(
+            PeerFederationSettings.socketPath(uid: 501, bundleIdentifier: nil),
+            "/tmp/term-mesh-peer-501/peer.sock"
+        )
+    }
 }

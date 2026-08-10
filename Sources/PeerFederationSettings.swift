@@ -19,9 +19,57 @@ enum PeerFederationSettings {
     static let forwardDashboardKey = "peerFederationForwardDashboard"
     static let remoteDashboardPortKey = "peerFederationRemoteDashboardPort"
 
+    /// The bundle whose peer socket keeps the unsuffixed path.
+    ///
+    /// Only the installed app gets it, because saved host profiles on OTHER
+    /// machines already store this exact path in `remoteSocket`. Moving it
+    /// would break every peer that has ever connected here.
+    static let productionBundleIdentifier = "com.termmesh.app"
+
+    /// Where this build serves its peer socket.
+    ///
+    /// **Scoped for every build except the installed one.** The path used to be
+    /// `uid` and nothing else, so a Debug or `--tag` app served the same path
+    /// as the installed app — and `PeerServer.start()` unlinks before binding,
+    /// so whichever started LAST silently took it. The first one kept a
+    /// listener bound to an unlinked inode: alive, reachable by nothing.
+    ///
+    /// That is not hypothetical. A `--tag` build launched at 10:50 rebound this
+    /// path at 11:02 while the installed app had held it since 07:31; from then
+    /// on a viewer's existing mirror talked to one app while every new attach
+    /// reached the other, and a workspace mirrored as 2 of its 7 panes.
+    ///
+    /// Same fix as the terminal override files, and for the same reason: two
+    /// builds of this app must not share a writable name.
     static var defaultSocketPath: String {
-        let uid = getuid()
-        return "/tmp/term-mesh-peer-\(uid)/peer.sock"
+        socketPath(uid: getuid(), bundleIdentifier: Bundle.main.bundleIdentifier)
+    }
+
+    /// Pure form of the rule above, so the production-keeps-the-path guarantee
+    /// is testable without being the production bundle.
+    static func socketPath(uid: uid_t, bundleIdentifier: String?) -> String {
+        let base = "/tmp/term-mesh-peer-\(uid)"
+        guard let bundleID = bundleIdentifier,
+              bundleID != productionBundleIdentifier
+        else {
+            return "\(base)/peer.sock"
+        }
+        // A digest rather than the identifier itself: a sockaddr_un path is
+        // capped near 104 bytes, and `com.termmesh.app.debug.<tag>` with a
+        // descriptive tag can spend most of that on its own.
+        return "\(base)-\(Self.shortDigest(bundleID))/peer.sock"
+    }
+
+    /// FNV-1a, 8 hex chars. Deterministic across launches, unlike
+    /// `hashValue`, which Swift seeds randomly per process — a socket path
+    /// that moved on every start would be worse than one that collides.
+    static func shortDigest(_ value: String) -> String {
+        var hash: UInt64 = 0xcbf2_9ce4_8422_2325
+        for byte in value.utf8 {
+            hash ^= UInt64(byte)
+            hash &*= 0x1000_0000_01b3
+        }
+        return String(format: "%08x", UInt32(truncatingIfNeeded: hash))
     }
     static var defaultDisplayName: String {
         ProcessInfo.processInfo.hostName
