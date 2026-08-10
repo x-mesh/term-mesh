@@ -3279,24 +3279,33 @@ class TerminalController {
         let lineLimit = params["lines"] as? Int
 
         // Minimal MainActor hold: only read terminal raw bytes, decode base64 off-main
-        let (response, errResult): (String?, V2CallResult?) = await MainActor.run {
+        let (response, nativeText, errResult): (String?, String?, V2CallResult?) = await MainActor.run {
             let tabManager = TeamOrchestrator.shared.resolveTabManager(teamName: teamName) ?? self.tabManager
             guard let tabManager else {
-                return (nil, .err(code: "unavailable", message: "TabManager not available", data: nil))
+                return (nil, nil, .err(code: "unavailable", message: "TabManager not available", data: nil))
             }
-            guard let panel = TeamOrchestrator.shared.agentPanel(
+            if let panel = TeamOrchestrator.shared.agentPanel(
                 teamName: teamName, agentName: agentName, agentInstanceId: agentInstanceId, tabManager: tabManager
-            ) else {
-                return (nil, .err(code: "not_found", message: "Agent not found", data: nil))
+            ) {
+                return (self.readTerminalTextBase64(
+                    terminalPanel: panel, includeScrollback: true, lineLimit: lineLimit
+                ), nil, nil)
             }
-            return (self.readTerminalTextBase64(
-                terminalPanel: panel, includeScrollback: true, lineLimit: lineLimit
-            ), nil)
+            if let panel = TeamOrchestrator.shared.agentNativePanel(
+                teamName: teamName, agentName: agentName, agentInstanceId: agentInstanceId
+            ) {
+                return (nil, panel.session.transcriptText(lineLimit: lineLimit), nil)
+            }
+            return (nil, nil, .err(code: "not_found", message: "Agent pane not found", data: nil))
         }
 
         // Base64 decode off-main
         if let errResult {
             return v2Result(id: id, errResult)
+        }
+        if let nativeText {
+            return v2Ok(id: id, result: ["text": nativeText, "agent_name": agentName,
+                                        "agent_instance_id": agentInstanceId, "team_name": teamName])
         }
         guard let response, response.hasPrefix("OK ") else {
             return v2Result(id: id, .err(code: "internal_error", message: response ?? "No response", data: nil))

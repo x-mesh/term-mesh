@@ -21,7 +21,9 @@ mod prompts;
 use clap::{Parser, Subcommand, ValueEnum};
 use serde_json::{json, Value};
 use std::fs;
-use std::io::{BufRead, BufReader, ErrorKind, IsTerminal, Write};
+use std::hash::{DefaultHasher, Hash, Hasher};
+use std::io::{BufRead, BufReader, ErrorKind, IsTerminal, Read, Write};
+use std::os::unix::fs::MetadataExt;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -324,6 +326,21 @@ mod project_sync_cli_tests {
                 ..
             } if panel == "panel-2"
         ));
+
+        let expect_reply = Cli::try_parse_from([
+            "tm-agent", "send", "reviewer", "message",
+            "--expect-reply", "--timeout", "45",
+        ]).unwrap();
+        assert!(matches!(
+            expect_reply.command,
+            Commands::Send {
+                expect_reply: true, timeout: 45, no_report: false, ..
+            }
+        ));
+        assert!(Cli::try_parse_from([
+            "tm-agent", "send", "reviewer", "message",
+            "--expect-reply", "--no-report",
+        ]).is_err());
 
         let remove = Cli::try_parse_from([
             "tm-agent",
@@ -961,8 +978,14 @@ enum Commands {
     Send {
         agent: String,
         text: String,
-        #[arg(long)]
+        #[arg(long, conflicts_with = "expect_reply")]
         no_report: bool,
+        /// Wait for this agent's next durable reply and include it in the response
+        #[arg(long)]
+        expect_reply: bool,
+        /// Maximum seconds to wait for --expect-reply
+        #[arg(long, default_value_t = 120)]
+        timeout: u64,
         /// Target a specific pane by panel_id (deterministic; overrides name round-robin)
         #[arg(long, conflicts_with = "agent_instance_id")]
         panel: Option<String>,
@@ -3244,6 +3267,22 @@ mod runbook_tests {
     }
 
     #[test]
+    fn rpc_failure_envelopes_are_process_failures() {
+        assert!(rpc_response_failed(&json!({
+            "ok": false,
+            "error": {"code": "not_found", "message": "Team not found"}
+        })));
+        assert!(rpc_response_failed(&json!({
+            "jsonrpc": "2.0",
+            "error": {"code": -32601, "message": "method not found"}
+        })));
+        assert!(!rpc_response_failed(&json!({"ok": true, "result": {}})));
+        assert!(!rpc_response_failed(
+            &json!({"jsonrpc": "2.0", "result": {}})
+        ));
+    }
+
+    #[test]
     fn runbook_parse_tools_accepts_all_and_aliases() {
         let all = parse_runbook_tools("all").unwrap();
         assert_eq!(all.len(), 4);
@@ -3756,6 +3795,99 @@ mod runbook_tests {
             return_retry_delays_ms(true, "team.create.init"),
             &[250, 400, 600, 800, 1000, 1500, 2500, 4000]
         );
+    }
+
+    #[test]
+    fn send_delivery_contract_requires_paste_and_return() {
+        let success = send_delivery_response(
+            json!({"ok": true, "result": {"sent": true, "text_delivered": true}}), true,
+        );
+        assert_eq!(success["ok"], true);
+        assert_eq!(success["result"]["sent"], true);
+        assert_eq!(success["result"]["return_submitted"], true);
+        assert_eq!(success["result"]["delivery_state"], "submitted");
+
+        let paste_failed = send_delivery_response(
+            json!({"ok": true, "result": {"sent": true, "text_delivered": false}}), false,
+        );
+        assert_eq!(paste_failed["ok"], false);
+        assert_eq!(paste_failed["result"]["sent"], false);
+        assert_eq!(paste_failed["result"]["delivery_state"], "paste_failed");
+        assert_eq!(paste_failed["error"]["code"], "delivery_failed");
+
+        let return_failed = send_delivery_response(
+            json!({"ok": true, "result": {"sent": true, "text_delivered": true}}), false,
+        );
+        assert_eq!(return_failed["ok"], false);
+        assert_eq!(return_failed["result"]["sent"], false);
+        assert_eq!(return_failed["result"]["delivery_state"], "return_failed");
+    }
+
+    #[test]
+    fn expected_reply_resolves_unique_instance_without_changing_send_selector() {
+        let agents = vec![json!({
+            "name": "architect", "agent_instance_id": "instance-a", "panel_id": "panel-a"
+        })];
+        assert_eq!(
+            expected_reply_instance_from_agents(&agents, "architect", None).unwrap().as_deref(),
+            Some("instance-a")
+        );
+        assert_eq!(
+            expected_reply_instance_from_agents(&agents, "architect", Some("explicit"))
+                .unwrap().as_deref(),
+            Some("explicit")
+        );
+    }
+
+    #[test]
+    fn reply_waiter_detects_creation_and_atomic_replacement() {
+        let dir = tempfile::tempdir().unwrap();
+        let created = dir.path().join("created.md");
+        let writer = { let path = created.clone(); thread::spawn(move || {
+            thread::sleep(Duration::from_millis(20));
+            atomic_write_file(&path, "created reply").unwrap();
+        }) };
+        let reply = wait_for_reply_file(
+            &created, None, Duration::from_secs(1), Duration::from_millis(5),
+        ).unwrap().expect("created reply");
+        writer.join().unwrap();
+        assert_eq!(reply.content, "created reply");
+
+        let replaced = dir.path().join("replaced.md");
+        atomic_write_file(&replaced, "old reply").unwrap();
+        let before = snapshot_reply_file(&replaced).unwrap().unwrap();
+        let writer = { let path = replaced.clone(); thread::spawn(move || {
+            thread::sleep(Duration::from_millis(20));
+            atomic_write_file(&path, "new reply").unwrap();
+        }) };
+        let reply = wait_for_reply_file(
+            &replaced, Some(&before), Duration::from_secs(1), Duration::from_millis(5),
+        ).unwrap().expect("replacement reply");
+        writer.join().unwrap();
+        assert_eq!(reply.content, "new reply");
+    }
+
+    #[test]
+    fn reply_waiter_times_out_without_returning_stale_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("reply.md");
+        atomic_write_file(&path, "stale reply").unwrap();
+        let before = snapshot_reply_file(&path).unwrap().unwrap();
+        let reply = wait_for_reply_file(
+            &path, Some(&before), Duration::from_millis(25), Duration::from_millis(5),
+        ).unwrap();
+        assert_eq!(reply, None);
+
+        let response = attach_expected_reply(
+            json!({"ok": true, "result": {
+                "sent": true, "text_delivered": true,
+                "return_submitted": true, "delivery_state": "submitted",
+            }}), None, &path, 1,
+        );
+        assert_eq!(response["ok"], false);
+        assert_eq!(response["error"]["code"], "reply_timeout");
+        assert_eq!(response["result"]["sent"], true);
+        assert_eq!(response["result"]["reply_received"], false);
     }
 }
 
@@ -5104,6 +5236,102 @@ fn reply_alias_filename(agent_name: &str, agent_instance_id: Option<&str>) -> St
         .unwrap_or_else(|| format!("{agent_name}-reply.md"))
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ReplyFileSnapshot {
+    device: u64,
+    inode: u64,
+    size: u64,
+    modified_seconds: i64,
+    modified_nanoseconds: i64,
+    content_hash: u64,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct ObservedReply { content: String }
+
+fn read_reply_file(path: &Path) -> Result<Option<(ReplyFileSnapshot, ObservedReply)>, String> {
+    let mut file = match fs::File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(format!("open reply {}: {error}", path.display())),
+    };
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)
+        .map_err(|error| format!("read reply {}: {error}", path.display()))?;
+    let metadata = file.metadata()
+        .map_err(|error| format!("stat reply {}: {error}", path.display()))?;
+    let mut hasher = DefaultHasher::new();
+    bytes.hash(&mut hasher);
+    Ok(Some((ReplyFileSnapshot {
+        device: metadata.dev(), inode: metadata.ino(), size: metadata.len(),
+        modified_seconds: metadata.mtime(), modified_nanoseconds: metadata.mtime_nsec(),
+        content_hash: hasher.finish(),
+    }, ObservedReply { content: String::from_utf8_lossy(&bytes).into_owned() })))
+}
+
+fn snapshot_reply_file(path: &Path) -> Result<Option<ReplyFileSnapshot>, String> {
+    Ok(read_reply_file(path)?.map(|(snapshot, _)| snapshot))
+}
+
+fn wait_for_reply_file(
+    path: &Path, before: Option<&ReplyFileSnapshot>, timeout: Duration, poll_interval: Duration,
+) -> Result<Option<ObservedReply>, String> {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if let Some((snapshot, reply)) = read_reply_file(path)? {
+            if before != Some(&snapshot) { return Ok(Some(reply)); }
+        }
+        let now = std::time::Instant::now();
+        if now >= deadline { return Ok(None); }
+        thread::sleep(poll_interval.min(deadline.saturating_duration_since(now)));
+    }
+}
+
+fn send_delivery_response(mut response: Value, return_submitted: bool) -> Value {
+    let text_delivered = response["result"]["text_delivered"].as_bool().unwrap_or(false);
+    let sent = text_delivered && return_submitted;
+    let delivery_state = if !text_delivered { "paste_failed" }
+        else if !return_submitted { "return_failed" } else { "submitted" };
+    if !response["result"].is_object() { response["result"] = json!({}); }
+    response["result"]["sent"] = json!(sent);
+    response["result"]["text_delivered"] = json!(text_delivered);
+    response["result"]["return_submitted"] = json!(return_submitted);
+    response["result"]["delivery_state"] = json!(delivery_state);
+    response["ok"] = json!(sent);
+    if sent {
+        if let Some(object) = response.as_object_mut() { object.remove("error"); }
+    } else {
+        response["error"] = json!({"code": "delivery_failed", "message":
+            if text_delivered { "Instruction text was delivered but Return submission failed" }
+            else { "Instruction text was not delivered" }
+        });
+    }
+    response
+}
+
+fn headless_send_delivery_response(mut response: Value) -> Value {
+    if !response["result"].is_object() { response["result"] = json!({}); }
+    response["result"]["text_delivered"] = json!(true);
+    send_delivery_response(response, true)
+}
+
+fn attach_expected_reply(
+    mut response: Value, reply: Option<ObservedReply>, reply_path: &Path, timeout_seconds: u64,
+) -> Value {
+    if let Some(reply) = reply {
+        response["result"]["reply_received"] = json!(true);
+        response["result"]["reply"] = json!(reply.content);
+        response["result"]["reply_path"] = json!(reply_path.to_string_lossy());
+        return response;
+    }
+    response["ok"] = json!(false);
+    response["result"]["reply_received"] = json!(false);
+    response["result"]["reply_path"] = json!(reply_path.to_string_lossy());
+    response["error"] = json!({"code": "reply_timeout",
+        "message": format!("No new reply was recorded within {timeout_seconds} seconds")});
+    response
+}
+
 fn write_result_file(team: &str, filename: &str, content: &str) -> Result<PathBuf, String> {
     let path = result_file_path(team, filename);
     atomic_write_file(&path, content)?;
@@ -5659,6 +5887,33 @@ fn command_agent_instance_id(
         .as_array()
         .ok_or_else(|| "team.status response has no agents array".to_string())?;
     instance_id_from_agents(agents, target, Some(panel_id))
+}
+
+fn expected_reply_instance_from_agents(
+    agents: &[Value],
+    target: &str,
+    selected_instance_id: Option<&str>,
+) -> Result<Option<String>, String> {
+    if let Some(instance_id) = selected_instance_id {
+        return Ok(Some(instance_id.to_string()));
+    }
+    instance_id_from_agents(agents, target, None)
+}
+
+fn expected_reply_instance_id(
+    sock: &PathBuf,
+    team: &str,
+    target: &str,
+    selected_instance_id: Option<&str>,
+) -> Result<Option<String>, String> {
+    if selected_instance_id.is_some() {
+        return Ok(selected_instance_id.map(str::to_string));
+    }
+    let status = rpc_call(sock, "team.status", json!({ "team_name": team }))?;
+    let agents = status["result"]["agents"]
+        .as_array()
+        .ok_or_else(|| "team.status response has no agents array".to_string())?;
+    expected_reply_instance_from_agents(agents, target, None)
 }
 
 fn instance_id_from_agents(
@@ -7222,6 +7477,8 @@ fn main() {
             agent: ref target,
             text,
             no_report,
+            expect_reply,
+            timeout,
             panel,
             agent_instance_id,
         } => {
@@ -7233,14 +7490,25 @@ fn main() {
             if panel.is_none() && agent_instance_id.is_none() {
                 if let Some(daemon_sock) = detect_daemon_socket() {
                     if let Some(agent_id) = is_headless_agent(&daemon_sock, &team, target) {
-                        print_result(rpc_call(
+                        let reply_path = result_file_path(&team, &reply_alias_filename(target, None));
+                        let before = if expect_reply { match snapshot_reply_file(&reply_path) {
+                            Ok(snapshot) => snapshot,
+                            Err(error) => { print_result(Err(error)); return; }
+                        }} else { None };
+                        let result = rpc_call(
                             &daemon_sock,
                             "headless.send",
                             json!({
                                 "agent_id": agent_id,
                                 "text": format!("{text}\n"),
                             }),
-                        ));
+                        ).map(headless_send_delivery_response).and_then(|response| {
+                            if rpc_response_failed(&response) || !expect_reply { return Ok(response); }
+                            wait_for_reply_file(&reply_path, before.as_ref(),
+                                Duration::from_secs(timeout), Duration::from_millis(100))
+                                .map(|reply| attach_expected_reply(response, reply, &reply_path, timeout))
+                        });
+                        print_result(result);
                         return;
                     }
                 }
@@ -7258,6 +7526,22 @@ fn main() {
                     process::exit(1);
                 }
             };
+            let reply_instance_id = if expect_reply {
+                match expected_reply_instance_id(
+                    &sock, &team, target, selected_instance_id.as_deref()
+                ) {
+                    Ok(instance_id) => instance_id,
+                    Err(error) => { print_result(Err(error)); return; }
+                }
+            } else {
+                selected_instance_id.clone()
+            };
+            let reply_path = result_file_path(
+                &team, &reply_alias_filename(target, reply_instance_id.as_deref()));
+            let before = if expect_reply { match snapshot_reply_file(&reply_path) {
+                Ok(snapshot) => snapshot,
+                Err(error) => { print_result(Err(error)); return; }
+            }} else { None };
             let send_result = rpc_call(
                 &sock,
                 "team.send",
@@ -7271,22 +7555,26 @@ fn main() {
             // Send Return key via team.send_key (reliable sendNamedKey path).
             // The Return MUST carry the SAME panel_id as the paste so both land on
             // the same pane (otherwise text lands on pane X, Return on name-match Y).
-            if let Ok(ref r) = send_result {
-                let text_delivered = r["result"]["text_delivered"].as_bool().unwrap_or(false);
-                if !text_delivered {
-                    eprintln!("text.delivered.false reason=team.send_ack agent={target}");
-                }
-                let _ = send_return_key_with_retry(
-                    &sock,
-                    &team,
-                    target,
-                    text_delivered,
-                    "team.send",
-                    panel.as_deref(),
-                    selected_instance_id.as_deref(),
-                );
-            }
-            print_result(send_result);
+            let delivery_result = if let Ok(ref r) = send_result {
+                if !rpc_response_failed(r) {
+                    let text_delivered =
+                        r["result"]["text_delivered"].as_bool().unwrap_or(false);
+                    if !text_delivered {
+                        eprintln!("text.delivered.false reason=team.send_ack agent={target}");
+                    }
+                    let return_submitted = text_delivered && send_return_key_with_retry(
+                        &sock, &team, target, true, "team.send", panel.as_deref(),
+                        selected_instance_id.as_deref());
+                    send_result.map(|response| send_delivery_response(response, return_submitted))
+                } else { send_result }
+            } else { send_result };
+            let final_result = delivery_result.and_then(|response| {
+                if rpc_response_failed(&response) || !expect_reply { return Ok(response); }
+                wait_for_reply_file(&reply_path, before.as_ref(),
+                    Duration::from_secs(timeout), Duration::from_millis(100))
+                    .map(|reply| attach_expected_reply(response, reply, &reply_path, timeout))
+            });
+            print_result(final_result);
             return;
         }
         Commands::Broadcast { text, no_report } => {
@@ -8143,13 +8431,27 @@ fn render_gc_sweep(value: &Value, applied: bool) {
 
 fn print_result(result: Result<Value, String>) {
     match result {
-        Ok(resp) => println!("{}", pretty(&resp)),
+        Ok(resp) => {
+            println!("{}", pretty(&resp));
+            if rpc_response_failed(&resp) {
+                process::exit(1);
+            }
+        }
         Err(e) => {
             eprintln!("Error: {e}");
             eprint_version_skew();
             process::exit(1);
         }
     }
+}
+
+/// Transport success is not command success. The app's v2 protocol returns an
+/// ordinary JSON value for both, and historically `tm-agent` printed
+/// `{ok:false}` then exited 0, causing agents to report undelivered messages as
+/// sent. Standard JSON-RPC error envelopes are failures for the same reason.
+fn rpc_response_failed(response: &Value) -> bool {
+    response.get("ok").and_then(Value::as_bool) == Some(false)
+        || response.get("error").is_some_and(|error| !error.is_null())
 }
 
 /// Say so when this binary and the app it just failed to talk to are from

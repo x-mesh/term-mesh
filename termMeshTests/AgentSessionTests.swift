@@ -535,6 +535,40 @@ final class AgentSessionTests: XCTestCase {
         XCTAssertTrue(launch.arguments.contains("--include-partial-messages"))
     }
 
+    func testNativeLaunchKeepsInjectedTeamEnvironment() {
+        let environment = [
+            "HOME": "/Users/test",
+            "PATH": "/bundle/bin:/usr/bin",
+            "TERMMESH_TEAM": "ebpf",
+            "TERMMESH_AGENT_NAME": "architect",
+            "TERMMESH_WORKSPACE_ID": "workspace-id",
+            "TERMMESH_SOCKET": "/tmp/term-mesh.sock",
+        ]
+
+        let claude = AgentSession.claudeLaunch(
+            claudePath: "/usr/local/bin/claude", model: "sonnet",
+            instructions: "", extraArgs: [], workingDirectory: "/tmp",
+            environment: environment)
+        let bridged = AgentSession.bridgeLaunch(
+            cli: "codex", bridgePath: "/bundle/bridge", model: "gpt-5",
+            workingDirectory: "/tmp", environment: environment)
+
+        XCTAssertEqual(claude.environment, environment)
+        XCTAssertEqual(bridged.environment, environment)
+    }
+
+    func testNativeTranscriptCanBeReadWithLineLimit() {
+        let s = session([
+            event(["type": "user", "isReplay": true,
+                   "message": ["role": "user", "content": "first\nsecond"]]),
+            event(["type": "assistant", "message": ["content": [
+                ["type": "text", "text": "third\nfourth"]]]]),
+        ])
+
+        XCTAssertEqual(s.transcriptText(), "first\nsecond\nthird\nfourth")
+        XCTAssertEqual(s.transcriptText(lineLimit: 2), "third\nfourth")
+    }
+
     // MARK: - The header is a value, not prose
 
     /// Measured on a real transcript: an answer was six lines, five of them

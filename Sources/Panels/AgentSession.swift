@@ -571,6 +571,34 @@ final class AgentSession {
         return (omitted, rows(for: Array(entries.suffix(maxRenderedEntries))))
     }
 
+    /// Plain-text projection used by `tm-agent read` for a native pane. The UI
+    /// keeps structured entries instead of terminal cells, so screen scraping
+    /// cannot work here; flatten only at this RPC boundary.
+    func transcriptText(lineLimit: Int? = nil) -> String {
+        let text = entries.compactMap(Self.transcriptText(for:)).joined(separator: "\n")
+        guard let lineLimit, lineLimit > 0 else { return text }
+        return text.split(separator: "\n", omittingEmptySubsequences: false)
+            .suffix(lineLimit)
+            .joined(separator: "\n")
+    }
+
+    private static func transcriptText(for entry: Entry) -> String? {
+        switch entry {
+        case .said(_, _, let text), .answered(_, let text), .notice(_, let text):
+            return text
+        case .thought(_, let text):
+            return text
+        case .tool(_, let call):
+            return [call.headline, call.result].compactMap { $0 }
+                .filter { !$0.isEmpty }.joined(separator: "\n")
+        case .turnEnded(_, let end):
+            guard let verdict = end.verdict else { return nil }
+            return (["STATUS: \(verdict.status)"] + verdict.details.map {
+                "\($0.0): \($0.1)"
+            }).joined(separator: "\n")
+        }
+    }
+
     /// 300 is the shipped bound. The override exists so the bound itself can be
     /// measured: the transcript stack is not lazy, so `ScrollView` sizes every
     /// mounted row on each streamed delta, and that cost scales with this number

@@ -52,10 +52,12 @@ final class AgentPanel: ObservableObject, Panel {
     }
 
     func start(claudePath: String, model: String, instructions: String,
-               extraArgs: [String] = []) {
+               extraArgs: [String] = [],
+               environment: [String: String] = ProcessInfo.processInfo.environment) {
         session.start(AgentSession.claudeLaunch(
             claudePath: claudePath, model: model, instructions: instructions,
-            extraArgs: extraArgs, workingDirectory: workingDirectory
+            extraArgs: extraArgs, workingDirectory: workingDirectory,
+            environment: environment
         ))
     }
 
@@ -63,10 +65,12 @@ final class AgentPanel: ObservableObject, Panel {
     /// first turn instead of a system prompt — the bridge has no equivalent of
     /// `--append-system-prompt`, and none of these CLIs agree on one.
     func start(bridgedCli: String, bridgePath: String, model: String,
-               cliPath: String = "") {
+               cliPath: String = "",
+               environment: [String: String] = ProcessInfo.processInfo.environment) {
         session.start(AgentSession.bridgeLaunch(
             cli: bridgedCli, bridgePath: bridgePath, model: model,
-            cliPath: cliPath, workingDirectory: workingDirectory
+            cliPath: cliPath, workingDirectory: workingDirectory,
+            environment: environment
         ))
     }
 
