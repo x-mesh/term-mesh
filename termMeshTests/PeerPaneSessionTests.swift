@@ -1468,3 +1468,1247 @@ final class PeerRelaySessionCallbackDeliveryTests: XCTestCase {
         await feed.finish()
     }
 }
+
+// MARK: - Peer-owned agent surfaces (Phase 3, T3.1)
+
+/// The third remote-agent factory: `ensure(kind: "agent")` against a peer
+/// daemon that owns `tm-agent-bridge` itself.
+///
+/// What is pinned here is everything that is decided BEFORE any UI exists —
+/// which factory a member gets, what the ensure request actually carries, and
+/// how a surface that outlived its attach is taken back down. The pane itself
+/// is `Workspace.openRemoteAgentPane`, tested with the rest of Phase 2.
+final class PeerOwnedAgentSurfaceTests: XCTestCase {
+
+    // MARK: Factory selection matrix
+
+    /// The whole routing table in one place.
+    ///
+    /// The two exclusions are the ones most likely to be "simplified" away
+    /// later, so they are asserted rather than described: claude never takes
+    /// the peer-owned path (`tm-agent-bridge --cli` has no claude value), and
+    /// cursor/agy stay on the local bridge until their own change lands.
+    @MainActor
+    func test_factoryMatrix_capabilityTimesBridgeTimesCLI() {
+        func route(
+            _ cli: String,
+            capability: Bool,
+            bridgePath: String = "/usr/local/bin/tm-agent-bridge",
+            sshTarget: String? = "root@jw-server"
+        ) -> TeamOrchestrator.RemoteAgentFactory {
+            TeamOrchestrator.remoteAgentFactory(
+                cli: cli,
+                hostAdvertisesAgentSurfaces: capability,
+                peerBridgePath: bridgePath,
+                sshTarget: sshTarget
+            )
+        }
+
+        // Only codex and kiro move, and only when the host can hold them.
+        for cli in ["codex", "kiro"] {
+            XCTAssertEqual(route(cli, capability: true), .peerOwnedAgent, cli)
+            XCTAssertEqual(
+                route(cli, capability: false), .terminal,
+                "\(cli): a daemon without surface.agent.v1 must fall back, not fail"
+            )
+            XCTAssertEqual(
+                route(cli, capability: true, bridgePath: ""), .terminal,
+                "\(cli): no bridge on the host means nothing to ensure"
+            )
+            XCTAssertEqual(
+                route(cli, capability: true, sshTarget: nil), .terminal,
+                "\(cli): a host with no ssh target cannot be probed for paths"
+            )
+        }
+
+        // Turn-per-process CLIs keep today's local bridge (R8).
+        for cli in ["cursor", "agy"] {
+            XCTAssertEqual(route(cli, capability: true), .localNativeBridge, cli)
+            XCTAssertEqual(
+                route(cli, capability: false), .localNativeBridge,
+                "\(cli): unaffected by the host capability — nothing runs there"
+            )
+            XCTAssertEqual(
+                route(cli, capability: true, sshTarget: nil), .terminal,
+                "\(cli): the local bridge is an ssh child; without a target there is none"
+            )
+        }
+
+        // claude has no bridge protocol at all, so it stays a terminal pane
+        // however capable the host is.
+        XCTAssertEqual(route("claude", capability: true), .terminal)
+        XCTAssertEqual(route("claude", capability: false), .terminal)
+        // gemini: the bridge speaks it, but no native panel holds it today.
+        XCTAssertEqual(route("gemini", capability: true), .terminal)
+    }
+
+    /// Turning native panes off must take every native route with it — the
+    /// setting is the user saying "give me terminal panes".
+    @MainActor
+    func test_factoryMatrix_nativePanesOffCollapsesEverythingToTerminal() {
+        let defaults = UserDefaults.standard
+        let key = AgentPipeTransport.nativePanelKey
+        let previous = defaults.object(forKey: key)
+        defaults.set(false, forKey: key)
+        defer {
+            if let previous { defaults.set(previous, forKey: key) }
+            else { defaults.removeObject(forKey: key) }
+        }
+
+        for cli in ["claude", "codex", "kiro", "cursor", "agy", "gemini"] {
+            XCTAssertEqual(
+                TeamOrchestrator.remoteAgentFactory(
+                    cli: cli,
+                    hostAdvertisesAgentSurfaces: true,
+                    peerBridgePath: "/usr/local/bin/tm-agent-bridge",
+                    sshTarget: "root@jw-server"
+                ),
+                .terminal,
+                cli
+            )
+        }
+    }
+
+    /// The routing table in full, as literal data.
+    ///
+    /// The test above asserts the intentions; this one asserts that nothing
+    /// else changed while they were being honoured. `isPipeOnly` used to be
+    /// the whole gate, so every remote member that was not cursor or agy went
+    /// to a terminal pane — two of these 48 cells are what that removal moved,
+    /// and the other 46 are what it must not have.
+    ///
+    /// Columns are (ssh, capability, bridge) counted in binary, the same order
+    /// for every row, so one row is one CLI's entire story.
+    @MainActor
+    func test_factoryMatrix_isTotalOverSSHCapabilityAndBridge() {
+        let restore = Self.forceNativePanes(true)
+        defer { restore() }
+
+        typealias Factory = TeamOrchestrator.RemoteAgentFactory
+        let T = Factory.terminal
+        let P = Factory.peerOwnedAgent
+        let L = Factory.localNativeBridge
+
+        //                         no ssh          ssh
+        //                     ---------------  ---------------
+        //   (cap, bridge) →   00  01  10  11   00  01  10  11
+        let table: [(String, [Factory])] = [
+            // No peer-owned recipe exists for these two, at any host.
+            ("claude", [T, T, T, T, T, T, T, T]),
+            ("gemini", [T, T, T, T, T, T, T, T]),
+            // The change: a capable host with a bridge, reached over ssh.
+            ("codex", [T, T, T, T, T, T, T, P]),
+            ("kiro", [T, T, T, T, T, T, T, P]),
+            // Unmoved (R8). The bridge these run is this Mac's, so the peer's
+            // capability and the peer's bridge are both irrelevant to them.
+            ("cursor", [T, T, T, T, L, L, L, L]),
+            ("agy", [T, T, T, T, L, L, L, L]),
+        ]
+
+        for (cli, expected) in table {
+            for index in 0..<8 {
+                let ssh = index & 0b100 != 0
+                let capability = index & 0b010 != 0
+                let bridge = index & 0b001 != 0
+                XCTAssertEqual(
+                    TeamOrchestrator.remoteAgentFactory(
+                        cli: cli,
+                        hostAdvertisesAgentSurfaces: capability,
+                        peerBridgePath: bridge ? "/usr/local/bin/tm-agent-bridge" : "",
+                        sshTarget: ssh ? "root@jw-server" : nil
+                    ),
+                    expected[index],
+                    "\(cli): ssh=\(ssh) capability=\(capability) bridge=\(bridge)"
+                )
+            }
+        }
+    }
+
+    /// An empty ssh target is the same fact as a nil one — a host reached on a
+    /// local socket cannot be probed for paths, so neither remote factory has
+    /// anything to work with.
+    @MainActor
+    func test_factoryMatrix_anEmptySSHTargetCountsAsNoSSHTarget() {
+        let restore = Self.forceNativePanes(true)
+        defer { restore() }
+
+        for cli in ["codex", "kiro", "cursor", "agy"] {
+            XCTAssertEqual(
+                TeamOrchestrator.remoteAgentFactory(
+                    cli: cli,
+                    hostAdvertisesAgentSurfaces: true,
+                    peerBridgePath: "/usr/local/bin/tm-agent-bridge",
+                    sshTarget: ""
+                ),
+                .terminal,
+                cli
+            )
+        }
+    }
+
+    // MARK: Why a fallback happened
+
+    /// The availability check must answer for the CLIs that could never use
+    /// the peer-owned path WITHOUT reaching for the network — both because a
+    /// handshake per claude member is pure latency, and because `notApplicable`
+    /// and `blocked` mean opposite things to the caller: one is a fallback the
+    /// user should be told about, the other is simply how that CLI runs.
+    @MainActor
+    func test_availability_separatesNothingWasLostFromSomethingWasLost() async {
+        let restore = Self.forceNativePanes(true)
+        defer { restore() }
+
+        let bridged = TeamOrchestrator.RemoteAgentBinaries(
+            cliPath: "/root/.local/bin/codex",
+            bridgePath: "/usr/local/bin/tm-agent-bridge",
+            cliAvailable: true
+        )
+
+        // Never had the path: no probe, no report.
+        for cli in ["claude", "gemini", "cursor", "agy"] {
+            let answer = await TeamOrchestrator.canUsePeerOwnedAgent(
+                host: Self.agentHostEntry(),
+                cli: cli,
+                binaries: bridged
+            )
+            XCTAssertEqual(answer, .notApplicable, cli)
+        }
+
+        // Reached without ssh: same — there is no path to resolve, so this is
+        // how the member runs rather than something it lost.
+        let noSSH = await TeamOrchestrator.canUsePeerOwnedAgent(
+            host: Self.agentHostEntry(sshTarget: nil),
+            cli: "codex",
+            binaries: bridged
+        )
+        XCTAssertEqual(noSSH, .notApplicable)
+
+        // Had the path and lost it: each with its own repair.
+        let noBridge = await TeamOrchestrator.canUsePeerOwnedAgent(
+            host: Self.agentHostEntry(),
+            cli: "codex",
+            binaries: TeamOrchestrator.RemoteAgentBinaries(
+                cliPath: "/root/.local/bin/codex", bridgePath: "", cliAvailable: true
+            )
+        )
+        XCTAssertEqual(noBridge, .blocked(.bridgeMissing))
+
+        let noSocket = await TeamOrchestrator.canUsePeerOwnedAgent(
+            host: Self.agentHostEntry(activeSockPath: ""),
+            cli: "codex",
+            binaries: bridged
+        )
+        XCTAssertEqual(
+            noSocket, .blocked(.hostUnreachable),
+            "with no socket the capability is unknown, which is not the same as absent"
+        )
+    }
+
+    /// The line the user actually reads. Every reason must name the CLI, the
+    /// host and what opened instead — and the two most easily confused repairs
+    /// ("install it there" vs "update it there") must not read alike, because
+    /// following the wrong one leaves the pane exactly as it was.
+    @MainActor
+    func test_fallbackMessage_namesTheCLITheHostAndOneRepair() {
+        var seen: Set<String> = []
+        for block in TeamOrchestrator.PeerOwnedAgentBlock.allCases {
+            let message = TeamOrchestrator.peerOwnedAgentFallbackMessage(
+                block, cli: "codex", hostName: "jw-server"
+            )
+            XCTAssertTrue(message.contains("codex"), "\(block): names the CLI")
+            XCTAssertTrue(message.contains("jw-server"), "\(block): names the host")
+            XCTAssertTrue(
+                message.contains("terminal pane"),
+                "\(block): says what opened instead"
+            )
+            XCTAssertTrue(seen.insert(message).inserted, "\(block): reads like another reason")
+        }
+
+        XCTAssertTrue(
+            TeamOrchestrator.peerOwnedAgentFallbackMessage(
+                .bridgeMissing, cli: "codex", hostName: "jw-server"
+            ).contains("Install term-mesh")
+        )
+        XCTAssertTrue(
+            TeamOrchestrator.peerOwnedAgentFallbackMessage(
+                .daemonTooOld, cli: "codex", hostName: "jw-server"
+            ).contains("Update term-mesh")
+        )
+        XCTAssertTrue(
+            TeamOrchestrator.peerOwnedAgentFallbackMessage(
+                .ensureRefused, cli: "codex", hostName: "jw-server"
+            ).contains("Nothing was left running there"),
+            "a refused ensure creates nothing on the peer, and saying so is what "
+                + "stops someone going to look for a stray bridge"
+        )
+    }
+
+    // MARK: Fixtures
+
+    /// Pin both transport defaults for the duration of a test. They live in
+    /// `UserDefaults.standard`, which the whole test process shares, so a
+    /// routing assertion that reads them implicitly is one unrelated test away
+    /// from being about something else.
+    @MainActor
+    private static func forceNativePanes(_ enabled: Bool) -> () -> Void {
+        let defaults = UserDefaults.standard
+        let keys = [AgentPipeTransport.enabledKey, AgentPipeTransport.nativePanelKey]
+        let previous = keys.map { ($0, defaults.object(forKey: $0)) }
+        for key in keys { defaults.set(enabled, forKey: key) }
+        return {
+            for (key, value) in previous {
+                if let value { defaults.set(value, forKey: key) }
+                else { defaults.removeObject(forKey: key) }
+            }
+        }
+    }
+
+    /// A connected ssh host, minus everything the availability check does not
+    /// read. Nothing here reaches a network: the assertions using it all stop
+    /// at a guard before the handshake.
+    @MainActor
+    private static func agentHostEntry(
+        sshTarget: String? = "root@jw-server",
+        activeSockPath: String = "/tmp/term-mesh-peer-501/jw-server.sock"
+    ) -> HostEntry {
+        HostEntry(
+            id: "ssh:root@jw-server",
+            displayName: "jw-server",
+            connectionState: .connected,
+            workspaces: [],
+            activeSockPath: activeSockPath,
+            sshTarget: sshTarget,
+            remoteSockPath: "/run/user/0/tm-peer.sock"
+        )
+    }
+
+    // MARK: Ensure recipe
+
+    /// The daemon spawns `executable` + `args` verbatim, so this vector IS the
+    /// contract. Three things in it are load-bearing rather than cosmetic and
+    /// each has cost a debugging session somewhere:
+    ///  - `executable` must be the PEER's bridge, never this Mac's;
+    ///  - `--cli` must be present, because the daemon reads
+    ///    `SurfaceInfo.agent_cli` back out of the args (there is no field);
+    ///  - `--exe` must be absolute, because term-meshd runs under systemd's
+    ///    PATH and would not find a `$HOME/.local/bin` CLI by name. It comes
+    ///    from `execPath`, the binary the BRIDGE spawns, which for kiro is not
+    ///    the file the role is named after.
+    @MainActor
+    func test_ensureSpec_carriesThePeersBridgeAndAnAbsoluteCLIPath() {
+        let spec = TeamOrchestrator.peerAgentSurfaceSpec(
+            teamName: "my-team",
+            agentInstanceId: "11111111-2222-3333-4444-555555555555",
+            cli: "codex",
+            workingDirectory: "/root/work/term-mesh",
+            model: "gpt-5",
+            binaries: TeamOrchestrator.RemoteAgentBinaries(
+                cliPath: "/root/.local/bin/codex",
+                execPath: "/root/.local/bin/codex",
+                bridgePath: "/usr/local/bin/tm-agent-bridge",
+                cliAvailable: true
+            )
+        )
+
+        XCTAssertEqual(spec.executable, "/usr/local/bin/tm-agent-bridge")
+        XCTAssertEqual(spec.cwd, "/root/work/term-mesh")
+        XCTAssertEqual(spec.kind, SessionHostPanes.agentSurfaceType)
+        XCTAssertEqual(spec.restartPolicy, .never)
+        XCTAssertEqual(
+            Array(spec.args[0..<4]),
+            ["--cli", "codex", "--cwd", "/root/work/term-mesh"]
+        )
+        XCTAssertTrue(spec.args.contains("--exe"))
+        XCTAssertEqual(
+            spec.args.last, "/root/.local/bin/codex",
+            "--exe is what makes the CLI findable from a systemd PATH"
+        )
+        // The label the daemon will echo back as SurfaceInfo.agent_cli.
+        let cliFlag = spec.args.firstIndex(of: "--cli").map { spec.args[$0 + 1] }
+        XCTAssertEqual(cliFlag, "codex")
+    }
+
+    /// A CLI the probe could not resolve still gets a surface: the bridge
+    /// falls back to a bare name, which is right more often than failing.
+    @MainActor
+    func test_ensureSpec_omitsExeWhenTheProbeResolvedNothing() {
+        let spec = TeamOrchestrator.peerAgentSurfaceSpec(
+            teamName: "my-team",
+            agentInstanceId: UUID().uuidString,
+            cli: "kiro",
+            workingDirectory: "/root/work",
+            model: "sonnet",
+            binaries: TeamOrchestrator.RemoteAgentBinaries(
+                cliPath: "",
+                bridgePath: "/usr/local/bin/tm-agent-bridge",
+                cliAvailable: true
+            )
+        )
+        XCTAssertFalse(spec.args.contains("--exe"))
+        XCTAssertEqual(Array(spec.args[0..<2]), ["--cli", "kiro"])
+    }
+
+    /// Two members of one team must never share an ensure key: the daemon
+    /// would answer REUSED and hand the second member the first one's bridge.
+    /// The instance id is therefore never the part that gets trimmed.
+    @MainActor
+    func test_ensureKey_isUniquePerInstanceAndFitsTheProtocolLimit() {
+        let instanceA = UUID().uuidString
+        let instanceB = UUID().uuidString
+        let keyA = TeamOrchestrator.peerAgentEnsureKey(teamName: "team", agentInstanceId: instanceA)
+        let keyB = TeamOrchestrator.peerAgentEnsureKey(teamName: "team", agentInstanceId: instanceB)
+        XCTAssertNotEqual(keyA, keyB)
+        XCTAssertTrue(keyA.contains(instanceA))
+
+        let absurdTeam = String(repeating: "가", count: 400)
+        let long = TeamOrchestrator.peerAgentEnsureKey(
+            teamName: absurdTeam, agentInstanceId: instanceA
+        )
+        XCTAssertLessThanOrEqual(
+            long.utf8.count, 256,
+            "the daemon rejects a key over 256 UTF-8 bytes outright"
+        )
+        XCTAssertTrue(
+            long.contains(instanceA),
+            "trimming must eat the team name, never the uniqueness"
+        )
+    }
+
+    // MARK: Probe parsing
+
+    /// A login shell prints its own greeting around the answer, and
+    /// `command -v` also names shell functions and builtins — neither of
+    /// which the daemon can spawn.
+    @MainActor
+    func test_probeParsing_takesAbsolutePathsOutOfLoginShellNoise() {
+        let output = """
+        Welcome to Ubuntu 24.04 LTS
+        __TERMMESH_CLI_AVAILABLE__
+        __TERMMESH_CLI_PATH__=/root/.local/bin/codex
+        __TERMMESH_BRIDGE_PATH__=/usr/local/bin/tm-agent-bridge
+        """
+        let parsed = TeamOrchestrator.parseRemoteAgentBinaries(output)
+        XCTAssertTrue(parsed.cliAvailable)
+        XCTAssertEqual(parsed.cliPath, "/root/.local/bin/codex")
+        XCTAssertEqual(parsed.bridgePath, "/usr/local/bin/tm-agent-bridge")
+
+        let noBridge = TeamOrchestrator.parseRemoteAgentBinaries("""
+        __TERMMESH_CLI_AVAILABLE__
+        __TERMMESH_CLI_PATH__=/usr/bin/kiro-cli
+        __TERMMESH_BRIDGE_PATH__=
+        """)
+        XCTAssertTrue(noBridge.cliAvailable)
+        XCTAssertEqual(noBridge.bridgePath, "", "an absent bridge is data, not an error")
+
+        let shellFunction = TeamOrchestrator.parseRemoteAgentBinaries("""
+        __TERMMESH_CLI_AVAILABLE__
+        __TERMMESH_CLI_PATH__=codex () { ... }
+        __TERMMESH_BRIDGE_PATH__=
+        """)
+        XCTAssertTrue(
+            shellFunction.cliAvailable,
+            "the terminal path types a bare name, where a function works fine"
+        )
+        XCTAssertEqual(
+            shellFunction.cliPath, "",
+            "but --exe needs a path, and a function is not one"
+        )
+
+        let missing = TeamOrchestrator.parseRemoteAgentBinaries("""
+        __TERMMESH_CLI_PATH__=
+        __TERMMESH_BRIDGE_PATH__=/usr/local/bin/tm-agent-bridge
+        """)
+        XCTAssertFalse(missing.cliAvailable)
+    }
+
+    /// The probe has to survive `sh -c '…'` quoting, and it must search the
+    /// same PATH the launcher does — a probe that looks elsewhere answers a
+    /// different question than the one asked.
+    @MainActor
+    func test_probeScript_isSingleQuoteSafeAndAsksForBothBinaries() {
+        let script = TeamOrchestrator.remoteAgentBinariesProbe(
+            cli: "codex", hostBinDirs: ["/opt/tools/bin"]
+        )
+        XCTAssertTrue(script.contains("tm-agent-bridge"))
+        XCTAssertTrue(script.contains("'codex'"))
+        XCTAssertTrue(script.contains("/opt/tools/bin"))
+        XCTAssertTrue(script.hasPrefix("export PATH="))
+    }
+
+    // MARK: Wire shape and teardown
+
+    @MainActor
+    func test_ensureAndAttach_sendsAgentKindAndTakesCallbackDelivery() async throws {
+        let socketPath = "/tmp/peer-agent-test-\(getpid())-\(UUID().uuidString.prefix(8)).sock"
+        let host = AgentSurfaceMockHost(
+            socketPath: socketPath,
+            capabilities: [
+                PeerCapability.surfaceEnsureV1,
+                PeerCapability.surfaceAgentV1,
+                PeerCapability.surfaceTerminateV1,
+            ]
+        )
+        let hostTask = try host.start()
+        defer { host.stop() }
+
+        let hostSpec = PeerPaneHostSpec.direct(sockPath: socketPath)
+        let lease = try await PeerPaneHostRegistry.shared.acquire(hostSpec)
+        defer { PeerPaneHostRegistry.shared.release(lease) }
+
+        let spec = TeamOrchestrator.peerAgentSurfaceSpec(
+            teamName: "my-team",
+            agentInstanceId: "abcdef01-0000-0000-0000-000000000000",
+            cli: "codex",
+            workingDirectory: "/root/work/term-mesh",
+            model: "sonnet",
+            binaries: TeamOrchestrator.RemoteAgentBinaries(
+                cliPath: "/root/.local/bin/codex",
+                execPath: "/root/.local/bin/codex",
+                bridgePath: "/usr/local/bin/tm-agent-bridge",
+                cliAvailable: true
+            )
+        )
+
+        let ensured = try await PeerPaneSession.ensureAndAttach(
+            lease: lease,
+            surfaceSpec: spec,
+            attachment: PeerRunnerAttachment(title: "reviewer", lifetime: .keepAlive),
+            hostSpec: hostSpec,
+            agentCli: "codex"
+        )
+        defer { ensured.session.teardown() }
+
+        let request = try XCTUnwrap(host.ensureRequests().first)
+        XCTAssertEqual(request.kind, "agent", "without this the daemon spawns a PTY")
+        XCTAssertEqual(request.executable, "/usr/local/bin/tm-agent-bridge")
+        XCTAssertEqual(request.cwd, "/root/work/term-mesh")
+        // The model is translated per CLI by `bridgeModelArg` — what this
+        // pins is the vector's shape and that nothing got dropped between
+        // building the spec and putting it on the wire.
+        XCTAssertEqual(
+            request.args,
+            ["--cli", "codex", "--cwd", "/root/work/term-mesh",
+             "--model", TeamOrchestrator.bridgeModelArg(cli: "codex", model: "sonnet"),
+             "--exe", "/root/.local/bin/codex"]
+        )
+
+        let surface = ensured.session.originSurface
+        XCTAssertEqual(surface.surfaceType, SessionHostPanes.agentSurfaceType)
+        XCTAssertEqual(
+            surface.agentCli, "codex",
+            "openRemoteAgentPane reads this to pick the renderer"
+        )
+        guard case .callback = ensured.session.relaySession.ptyDelivery else {
+            return XCTFail("an agent surface must not be delivered through the relay helper")
+        }
+    }
+
+    /// A daemon that never advertised `surface.agent.v1` must be refused
+    /// locally — the caller needs a decision it can fall back from, not a
+    /// wire error, and no surface may be created on the way to finding out.
+    @MainActor
+    func test_ensureAndAttach_refusesAgentKindOnAHostWithoutTheCapability() async throws {
+        let socketPath = "/tmp/peer-agent-nocap-\(getpid())-\(UUID().uuidString.prefix(8)).sock"
+        let host = AgentSurfaceMockHost(
+            socketPath: socketPath,
+            capabilities: [PeerCapability.surfaceEnsureV1]
+        )
+        let hostTask = try host.start()
+        defer { host.stop() }
+
+        let hostSpec = PeerPaneHostSpec.direct(sockPath: socketPath)
+        let lease = try await PeerPaneHostRegistry.shared.acquire(hostSpec)
+        defer { PeerPaneHostRegistry.shared.release(lease) }
+
+        do {
+            let ensured = try await PeerPaneSession.ensureAndAttach(
+                lease: lease,
+                surfaceSpec: TeamOrchestrator.peerAgentSurfaceSpec(
+                    teamName: "my-team",
+                    agentInstanceId: UUID().uuidString,
+                    cli: "codex",
+                    workingDirectory: "/root/work",
+                    model: "sonnet",
+                    binaries: TeamOrchestrator.RemoteAgentBinaries(
+                        cliPath: "/root/.local/bin/codex",
+                        bridgePath: "/usr/local/bin/tm-agent-bridge",
+                        cliAvailable: true
+                    )
+                ),
+                attachment: PeerRunnerAttachment(title: "reviewer", lifetime: .keepAlive),
+                hostSpec: hostSpec,
+                agentCli: "codex"
+            )
+            ensured.session.teardown()
+            XCTFail("an agent ensure must not be issued to a host without surface.agent.v1")
+        } catch {
+            XCTAssertTrue(
+                String(describing: error).contains(PeerCapability.surfaceAgentV1),
+                "the refusal must name the missing capability, got \(error)"
+            )
+        }
+        XCTAssertTrue(
+            host.ensureRequests().isEmpty,
+            "nothing may be created on a host that cannot own it"
+        )
+        _ = hostTask
+    }
+
+    /// The cleanup verb. `requestClosePane` cannot do this job: an agent
+    /// surface is deliberately never placed in the workspace tree, so a close
+    /// by pane id finds nothing and reports success while the bridge keeps
+    /// running on the peer.
+    @MainActor
+    func test_terminatePeerAgentSurface_addressesTheSurfaceRegistryDirectly() async throws {
+        let socketPath = "/tmp/peer-agent-term-\(getpid())-\(UUID().uuidString.prefix(8)).sock"
+        let host = AgentSurfaceMockHost(
+            socketPath: socketPath,
+            capabilities: [
+                PeerCapability.surfaceEnsureV1,
+                PeerCapability.surfaceAgentV1,
+                PeerCapability.surfaceTerminateV1,
+            ]
+        )
+        let hostTask = try host.start()
+        defer { host.stop() }
+
+        await TeamOrchestrator.terminatePeerAgentSurface(
+            hostSockPath: socketPath,
+            surfaceID: host.surfaceID
+        )
+
+        XCTAssertEqual(host.terminatedIDs(), [host.surfaceID])
+        _ = hostTask
+    }
+
+    /// Best effort, both ways: an unreachable host and an empty id are
+    /// no-ops rather than a second failure stacked on the one being unwound.
+    @MainActor
+    func test_terminatePeerAgentSurface_isANoOpWithNothingToTalkTo() async {
+        await TeamOrchestrator.terminatePeerAgentSurface(
+            hostSockPath: "", surfaceID: Data(repeating: 1, count: 16)
+        )
+        await TeamOrchestrator.terminatePeerAgentSurface(
+            hostSockPath: "/tmp/does-not-exist-\(getpid()).sock",
+            surfaceID: Data(repeating: 1, count: 16)
+        )
+    }
+
+    // MARK: Compensation after a committed ensure
+
+    /// The ensure is the point of no return on the host, and the attach can
+    /// still fail after it. Without compensation that failure produced the
+    /// worst object in the system: a `tm-agent-bridge` running on the peer
+    /// whose surface id nobody kept — not in the workspace tree (agent
+    /// surfaces are never placed there), not in `ManagedPeerSurfaceStore`, not
+    /// in any roster, so reachable by no cleanup UI at all. The caller then
+    /// fell through to the terminal path and started a SECOND CLI in the same
+    /// checkout, while telling the user "nothing was left running there".
+    @MainActor
+    func test_ensureAndAttach_takesTheSurfaceBackDownWhenTheAttachFails() async throws {
+        let socketPath = "/tmp/peer-agent-orphan-\(getpid())-\(UUID().uuidString.prefix(8)).sock"
+        let host = AgentSurfaceMockHost(
+            socketPath: socketPath,
+            capabilities: [
+                PeerCapability.surfaceEnsureV1,
+                PeerCapability.surfaceAgentV1,
+                PeerCapability.surfaceTerminateV1,
+            ]
+        )
+        host.redirectsAttach = true
+        let hostTask = try host.start()
+        defer { host.stop() }
+
+        let hostSpec = PeerPaneHostSpec.direct(sockPath: socketPath)
+        let lease = try await PeerPaneHostRegistry.shared.acquire(hostSpec)
+        defer { PeerPaneHostRegistry.shared.release(lease) }
+
+        do {
+            let ensured = try await PeerPaneSession.ensureAndAttach(
+                lease: lease,
+                surfaceSpec: TeamOrchestrator.peerAgentSurfaceSpec(
+                    teamName: "my-team",
+                    agentInstanceId: UUID().uuidString,
+                    cli: "codex",
+                    workingDirectory: "/root/work",
+                    model: "sonnet",
+                    binaries: TeamOrchestrator.RemoteAgentBinaries(
+                        cliPath: "/root/.local/bin/codex",
+                        execPath: "/root/.local/bin/codex",
+                        bridgePath: "/usr/local/bin/tm-agent-bridge",
+                        cliAvailable: true
+                    )
+                ),
+                attachment: PeerRunnerAttachment(title: "reviewer", lifetime: .keepAlive),
+                hostSpec: hostSpec,
+                agentCli: "codex"
+            )
+            ensured.session.teardown()
+            XCTFail("a redirected attach must not be reported as a successful one")
+        } catch {
+            // The failure itself is expected; what it must not do is keep the
+            // surface.
+        }
+
+        XCTAssertEqual(host.ensureRequests().count, 1, "the ensure did commit a child")
+        XCTAssertEqual(
+            host.terminatedIDs(), [host.surfaceID],
+            "the failed attach must spend the ensured surface id on the way out — "
+                + "it is the only thing that can ever name that bridge again"
+        )
+        _ = hostTask
+    }
+
+    /// A saved *runner* surface is the opposite case and must survive the same
+    /// failure: it is keyed to a profile the user re-launches, and reusing that
+    /// exact surface is the contract
+    /// (`test_savedRunnerRepeatedLaunchReusesExactEnsuredSurfaceID`).
+    /// Terminating one because an attach blipped would throw away the session
+    /// it exists to preserve.
+    @MainActor
+    func test_ensureAndAttach_leavesATerminalRunnerSurfaceAloneWhenTheAttachFails() async throws {
+        let socketPath = "/tmp/peer-runner-orphan-\(getpid())-\(UUID().uuidString.prefix(8)).sock"
+        let host = AgentSurfaceMockHost(
+            socketPath: socketPath,
+            capabilities: [
+                PeerCapability.surfaceEnsureV1,
+                PeerCapability.surfaceTerminateV1,
+            ]
+        )
+        host.redirectsAttach = true
+        let hostTask = try host.start()
+        defer { host.stop() }
+
+        let hostSpec = PeerPaneHostSpec.direct(sockPath: socketPath)
+        let lease = try await PeerPaneHostRegistry.shared.acquire(hostSpec)
+        defer { PeerPaneHostRegistry.shared.release(lease) }
+
+        do {
+            let ensured = try await PeerPaneSession.ensureAndAttach(
+                lease: lease,
+                surfaceSpec: PeerRunnerSurfaceSpec(
+                    key: "runner/build",
+                    cwd: "/root/work",
+                    executable: "/bin/bash"
+                ),
+                attachment: PeerRunnerAttachment(title: "Runner", lifetime: .keepAlive),
+                hostSpec: hostSpec
+            )
+            ensured.session.teardown()
+            XCTFail("a redirected attach must not be reported as a successful one")
+        } catch {
+        }
+
+        XCTAssertEqual(host.ensureRequests().count, 1)
+        XCTAssertTrue(
+            host.terminatedIDs().isEmpty,
+            "a runner surface outlives its attach on purpose — that is what makes "
+                + "re-launching a saved profile reuse the same session"
+        )
+        _ = hostTask
+    }
+}
+
+// MARK: - Peer-owned agent lifecycle (Phase 3 repairs)
+
+/// The paths that have to know a peer-owned agent from every other kind of
+/// member, and what each of them gets wrong when it does not.
+///
+/// The trap they all share: a peer-owned agent is the first member to have
+/// BOTH an `AgentPanel` on this Mac and a `remoteSurfaceID` on a peer. Every
+/// pre-existing branch treated those as mutually exclusive.
+final class PeerOwnedAgentLifecycleTests: XCTestCase {
+
+    /// `--exe` names an executable, not a role. kiro is the one CLI where
+    /// those differ: the role is `kiro`, the ACP server the bridge spawns is
+    /// `kiro-cli` (`daemon/tm-agent-bridge/src/main.rs` defaults to it, and
+    /// `defaultLaunchCommand` has said the same for as long as kiro has been
+    /// supported). Resolving `kiro` and passing it as `--exe` overrode that
+    /// correct default with a launcher that cannot speak ACP.
+    @MainActor
+    func test_bridgeExecutableName_isTheBinaryNotTheRole() {
+        XCTAssertEqual(TeamOrchestrator.peerAgentExecutableName(cli: "kiro"), "kiro-cli")
+        XCTAssertEqual(TeamOrchestrator.peerAgentExecutableName(cli: "codex"), "codex")
+        XCTAssertEqual(TeamOrchestrator.peerAgentExecutableName(cli: "cursor"), "cursor")
+    }
+
+    /// The probe asks for both names because they have different consumers:
+    /// the terminal path types the ROLE at a login shell, `--exe` needs the
+    /// binary the bridge spawns.
+    @MainActor
+    func test_probeScript_asksForTheBridgesExecutableTooNotJustTheRole() {
+        let kiro = TeamOrchestrator.remoteAgentBinariesProbe(cli: "kiro", hostBinDirs: [])
+        XCTAssertTrue(kiro.contains("'kiro'"), "the terminal path still types the role name")
+        XCTAssertTrue(
+            kiro.contains("'kiro-cli'"),
+            "and --exe still needs the binary tm-agent-bridge actually spawns"
+        )
+    }
+
+    /// Two markers, two answers. A host where `kiro` is a wrapper and
+    /// `kiro-cli` is the real server must not have the wrapper's path end up
+    /// on the bridge's command line.
+    @MainActor
+    func test_probeParsing_keepsTheRolePathAndTheExecutablePathApart() {
+        let parsed = TeamOrchestrator.parseRemoteAgentBinaries("""
+        __TERMMESH_CLI_AVAILABLE__
+        __TERMMESH_CLI_PATH__=/usr/local/bin/kiro
+        __TERMMESH_EXE_PATH__=/root/.local/bin/kiro-cli
+        __TERMMESH_BRIDGE_PATH__=/usr/local/bin/tm-agent-bridge
+        """)
+        XCTAssertEqual(parsed.cliPath, "/usr/local/bin/kiro")
+        XCTAssertEqual(parsed.execPath, "/root/.local/bin/kiro-cli")
+        XCTAssertEqual(parsed.bridgePath, "/usr/local/bin/tm-agent-bridge")
+
+        let spec = TeamOrchestrator.peerAgentSurfaceSpec(
+            teamName: "team",
+            agentInstanceId: UUID().uuidString,
+            cli: "kiro",
+            workingDirectory: "/root/work",
+            model: "sonnet",
+            binaries: parsed
+        )
+        XCTAssertEqual(
+            spec.args.last, "/root/.local/bin/kiro-cli",
+            "--exe must be the ACP server, never the launcher named after the role"
+        )
+    }
+
+    /// An absent executable path is data: `--exe` is omitted and the bridge
+    /// falls back to its own default, which for kiro is already `kiro-cli`.
+    @MainActor
+    func test_ensureSpec_stillOmitsExeWhenNoExecutableWasResolved() {
+        let spec = TeamOrchestrator.peerAgentSurfaceSpec(
+            teamName: "team",
+            agentInstanceId: UUID().uuidString,
+            cli: "kiro",
+            workingDirectory: "/root/work",
+            model: "sonnet",
+            binaries: TeamOrchestrator.RemoteAgentBinaries(
+                cliPath: "/usr/local/bin/kiro",
+                execPath: "",
+                bridgePath: "/usr/local/bin/tm-agent-bridge",
+                cliAvailable: true
+            )
+        )
+        XCTAssertFalse(
+            spec.args.contains("--exe"),
+            "the role's own path is not a substitute for the executable's"
+        )
+    }
+
+    /// Which daemon holds a surface decides who can reopen its pane.
+    /// `SessionHostPanes.reconcile()` lists this Mac's daemon socket and
+    /// nothing else, so answering "yes, local" for a peer surface is what
+    /// silently retired a team member on the first healthy stream rewind.
+    @MainActor
+    func test_isLocalSessionHost_separatesThisMacsDaemonFromEveryPeer() {
+        XCTAssertFalse(
+            Workspace.isLocalSessionHost(
+                .ssh(
+                    target: "root@jw-server",
+                    remoteSockPath: "/run/user/0/tm-peer.sock",
+                    port: nil,
+                    identityFile: nil
+                )
+            ),
+            "an ssh peer is never reopened by the local poller"
+        )
+        XCTAssertFalse(
+            Workspace.isLocalSessionHost(.direct(sockPath: "/tmp/some-other-daemon.sock"))
+        )
+        XCTAssertFalse(
+            Workspace.isLocalSessionHost(.direct(sockPath: "")),
+            "an empty path matches nothing, including an unset daemon path"
+        )
+        let daemonPath = TermMeshDaemon.shared.daemonPeerSocketPath
+        if !daemonPath.isEmpty {
+            XCTAssertTrue(Workspace.isLocalSessionHost(.direct(sockPath: daemonPath)))
+        }
+    }
+
+    /// A hard restart can only build a LOCAL pane: it resolves this Mac's CLI
+    /// binary, hands it a working directory that exists on the peer, and calls
+    /// a spawn that takes no host at all. Completing that swap would also
+    /// overwrite the member with one carrying no `remoteSurfaceID` — throwing
+    /// away the only handle on a bridge that is in no workspace tree and no
+    /// `ManagedPeerSurfaceStore`, so no sweep could ever find it.
+    @MainActor
+    func test_recycle_refusesAPeerOwnedAgentInsteadOfRelocatingIt() async {
+        let orchestrator = TeamOrchestrator.shared
+        let teamName = "peer-owned-recycle-\(UUID().uuidString.prefix(8))"
+        defer { orchestrator.forgetTeamForTests(teamName) }
+
+        let member = TeamOrchestrator.AgentMember(
+            id: "reviewer@\(teamName)",
+            name: "reviewer",
+            teamName: teamName,
+            cli: "codex",
+            launchCommand: "codex",
+            model: "sonnet",
+            agentType: "reviewer",
+            color: "green",
+            instructions: "",
+            workspaceId: UUID(),
+            panelId: UUID(),
+            createdAt: Date(),
+            remoteSurfaceID: Data(repeating: 0x5A, count: 16),
+            remoteSurfaceSpawned: true,
+            remoteAgentSurface: true,
+            hostKey: "ssh:root@jw-server",
+            originalAgentWorkDir: "/root/work/term-mesh"
+        )
+        orchestrator.installTeamForTests(name: teamName, agents: [member])
+
+        let outcome = await orchestrator.restartAgentPaneHard(
+            teamName: teamName,
+            agentName: "reviewer"
+        )
+        guard case .failure(let error) = outcome else {
+            return XCTFail("a peer-owned agent must not be respawned as a local pane")
+        }
+        XCTAssertEqual(error.code, "peer_owned_agent")
+        XCTAssertEqual(
+            orchestrator.teams[teamName]?.agents.first?.remoteSurfaceID,
+            Data(repeating: 0x5A, count: 16),
+            "the refusal must leave the surface id in the roster — it is the last "
+                + "thing that can address the bridge"
+        )
+    }
+
+    /// Detach/delete/destroy all funnel through this: a member whose bridge
+    /// the peer owns gets the terminate, and nothing else does. A local native
+    /// agent has no peer surface, and a borrowed (not spawned) surface belongs
+    /// to the host's operator.
+    @MainActor
+    func test_releasePeerOwnedAgentSurface_onlyActsOnAPeerOwnedAgent() {
+        func member(
+            remoteAgentSurface: Bool,
+            spawned: Bool = true,
+            surfaceID: Data? = Data(repeating: 0x5A, count: 16),
+            hostKey: String? = "ssh:root@jw-server"
+        ) -> TeamOrchestrator.AgentMember {
+            TeamOrchestrator.AgentMember(
+                id: "reviewer@t",
+                name: "reviewer",
+                teamName: "t",
+                cli: "codex",
+                launchCommand: "codex",
+                model: "sonnet",
+                agentType: "reviewer",
+                color: "green",
+                instructions: "",
+                workspaceId: UUID(),
+                panelId: UUID(),
+                createdAt: Date(),
+                remoteSurfaceID: surfaceID,
+                remoteSurfaceSpawned: spawned,
+                remoteAgentSurface: remoteAgentSurface,
+                hostKey: hostKey
+            )
+        }
+        // No host is registered in a unit test, so every call is a no-op at
+        // the store lookup — what is pinned here is that none of them trap or
+        // reach a `Task` with a half-built target.
+        TeamOrchestrator.releasePeerOwnedAgentSurface(member(remoteAgentSurface: false))
+        TeamOrchestrator.releasePeerOwnedAgentSurface(
+            member(remoteAgentSurface: true, spawned: false)
+        )
+        TeamOrchestrator.releasePeerOwnedAgentSurface(
+            member(remoteAgentSurface: true, surfaceID: nil)
+        )
+        TeamOrchestrator.releasePeerOwnedAgentSurface(
+            member(remoteAgentSurface: true, hostKey: nil)
+        )
+        TeamOrchestrator.releasePeerOwnedAgentSurface(member(remoteAgentSurface: true))
+    }
+
+    /// The field the three cleanup paths read. Defaulting it to false is what
+    /// keeps every pre-existing member — local, native, terminal-backed peer —
+    /// on exactly the branch it had before.
+    @MainActor
+    func test_remoteAgentSurface_defaultsToFalseForEveryOtherKindOfMember() {
+        let terminalBacked = TeamOrchestrator.AgentMember(
+            id: "reviewer@t",
+            name: "reviewer",
+            teamName: "t",
+            cli: "codex",
+            launchCommand: "codex",
+            model: "sonnet",
+            agentType: "reviewer",
+            color: "green",
+            instructions: "",
+            workspaceId: UUID(),
+            panelId: UUID(),
+            createdAt: Date(),
+            remoteSurfaceID: Data(repeating: 0x5A, count: 16),
+            remoteSurfaceSpawned: true,
+            hostKey: "ssh:root@jw-server"
+        )
+        XCTAssertFalse(terminalBacked.remoteAgentSurface)
+    }
+}
+
+/// A peer daemon that answers ensure / attach / terminate and records what it
+/// was asked for. Deliberately generic where `RunnerMockHost` is scripted:
+/// these tests care about the SHAPE of the requests, and one of them checks
+/// that a request never arrives at all.
+private final class AgentSurfaceMockHost: @unchecked Sendable {
+    enum Failure: Error {
+        case syscall(String, Int32)
+        case unexpectedMessage(String)
+        case timedOut(String)
+    }
+
+    let socketPath: String
+    let surfaceID = Data(repeating: 0x5A, count: 16)
+    /// Answer every attach with a DIFFERENT surface id, which is how a host
+    /// redirects an attachment and what `PeerRelaySession.attach` refuses with
+    /// `surfaceIDMismatch`. The cheapest way to reach the one window that
+    /// matters: the ensure has committed a child on the host and the attach
+    /// then fails.
+    var redirectsAttach = false
+    private let capabilities: [String]
+    private let lock = NSLock()
+    private var listenerFD: Int32 = -1
+    private var clientFDs: Set<Int32> = []
+    private var ensures: [Termmesh_Peer_V1_EnsureSurfaceRequest] = []
+    private var terminated: [Data] = []
+    private var deadline: Date = .distantFuture
+    private static let listenerBudget: TimeInterval = 60
+
+    init(socketPath: String, capabilities: [String]) {
+        self.socketPath = socketPath
+        self.capabilities = capabilities
+    }
+
+    func ensureRequests() -> [Termmesh_Peer_V1_EnsureSurfaceRequest] {
+        lock.lock(); defer { lock.unlock() }
+        return ensures
+    }
+
+    func terminatedIDs() -> [Data] {
+        lock.lock(); defer { lock.unlock() }
+        return terminated
+    }
+
+    func start() throws -> Task<Void, Error> {
+        deadline = Date().addingTimeInterval(Self.listenerBudget)
+        unlink(socketPath)
+        let fd = socket(AF_UNIX, SOCK_STREAM, 0)
+        guard fd >= 0 else { throw Failure.syscall("socket", errno) }
+        var address = sockaddr_un()
+        address.sun_family = sa_family_t(AF_UNIX)
+        let path = Array(socketPath.utf8)
+        let capacity = MemoryLayout.size(ofValue: address.sun_path)
+        guard path.count < capacity else {
+            close(fd)
+            throw Failure.syscall("socket path", ENAMETOOLONG)
+        }
+        withUnsafeMutablePointer(to: &address.sun_path) { pointer in
+            pointer.withMemoryRebound(to: CChar.self, capacity: capacity) { bytes in
+                for (offset, byte) in path.enumerated() {
+                    bytes[offset] = CChar(bitPattern: byte)
+                }
+            }
+        }
+        let bound = withUnsafePointer(to: &address) { pointer in
+            pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                Darwin.bind(fd, $0, socklen_t(MemoryLayout<sockaddr_un>.size))
+            }
+        }
+        guard bound == 0 else {
+            let code = errno
+            close(fd)
+            throw Failure.syscall("bind", code)
+        }
+        guard listen(fd, 4) == 0 else {
+            let code = errno
+            close(fd)
+            throw Failure.syscall("listen", code)
+        }
+        listenerFD = fd
+        return Task.detached { [self] in
+            defer { finishListener(fd) }
+            while true {
+                do {
+                    try waitForEvent(fd: fd, event: Int16(POLLIN), operation: "accept")
+                } catch {
+                    return
+                }
+                let client = Darwin.accept(fd, nil, nil)
+                guard client >= 0 else { return }
+                register(client)
+                defer {
+                    unregister(client)
+                    close(client)
+                }
+                // A closed connection is how every one of these ends; the
+                // conversation itself is what the tests assert on.
+                try? serve(client: client)
+            }
+        }
+    }
+
+    func stop() {
+        lock.lock()
+        let fd = listenerFD
+        listenerFD = -1
+        let clients = clientFDs
+        lock.unlock()
+        for client in clients { Darwin.shutdown(client, SHUT_RDWR) }
+        if fd >= 0 {
+            Darwin.shutdown(fd, SHUT_RDWR)
+            close(fd)
+        }
+        unlink(socketPath)
+    }
+
+    private func finishListener(_ fd: Int32) {
+        lock.lock()
+        let owns = listenerFD == fd
+        if owns { listenerFD = -1 }
+        lock.unlock()
+        if owns { close(fd) }
+        unlink(socketPath)
+    }
+
+    private func register(_ fd: Int32) {
+        lock.lock(); clientFDs.insert(fd); lock.unlock()
+    }
+
+    private func unregister(_ fd: Int32) {
+        lock.lock(); clientFDs.remove(fd); lock.unlock()
+    }
+
+    private func serve(client: Int32) throws {
+        guard case .hello = try readEnvelope(client).payload else {
+            throw Failure.unexpectedMessage("expected Hello")
+        }
+        var hello = Termmesh_Peer_V1_Hello()
+        hello.protocolVersion = "1.0.0"
+        hello.peerID = Data(repeating: 0x31, count: 16)
+        hello.displayName = "agent-mock"
+        hello.appVersion = "test"
+        hello.capabilities = capabilities
+        try send(client) { $0.hello = hello }
+
+        var challenge = Termmesh_Peer_V1_AuthChallenge()
+        challenge.nonce = Data(repeating: 0x42, count: 32)
+        challenge.supportedMethods = ["ssh-passthrough"]
+        try send(client) { $0.authChallenge = challenge }
+        guard case .auth = try readEnvelope(client).payload else {
+            throw Failure.unexpectedMessage("expected Auth")
+        }
+        var authResult = Termmesh_Peer_V1_AuthResult()
+        authResult.accepted = true
+        authResult.sessionID = Data(repeating: 0x51, count: 16)
+        try send(client) { $0.authResult = authResult }
+
+        while true {
+            let envelope = try readEnvelope(client)
+            switch envelope.payload {
+            case .ensureSurfaceRequest(let request):
+                lock.lock(); ensures.append(request); lock.unlock()
+                var response = Termmesh_Peer_V1_EnsureSurfaceResponse()
+                response.requestID = request.requestID
+                response.result = .created
+                response.surfaceID = surfaceID
+                response.instanceID = Data(repeating: 0x62, count: 16)
+                response.generation = 1
+                response.pid = 2424
+                response.specHash = Data(repeating: 0x73, count: 32)
+                try send(client) { $0.ensureSurfaceResponse = response }
+            case .attachSurface(let attach):
+                var attached = Termmesh_Peer_V1_AttachResult()
+                attached.accepted = true
+                attached.surfaceID = redirectsAttach
+                    ? Data(repeating: 0x11, count: 16)
+                    : attach.surfaceID
+                attached.grantedMode = attach.mode
+                try send(client) { $0.attachResult = attached }
+            case .terminateSurfaceRequest(let request):
+                lock.lock(); terminated.append(request.surfaceID); lock.unlock()
+                var response = Termmesh_Peer_V1_TerminateSurfaceResponse()
+                response.requestID = request.requestID
+                response.result = .terminated
+                response.surfaceID = request.surfaceID
+                try send(client) { $0.terminateSurfaceResponse = response }
+            case .goodbye:
+                return
+            default:
+                continue
+            }
+        }
+    }
+
+    private func waitForEvent(fd: Int32, event: Int16, operation: String) throws {
+        while true {
+            let remaining = deadline.timeIntervalSinceNow
+            guard remaining > 0 else { throw Failure.timedOut(operation) }
+            var descriptor = pollfd(fd: fd, events: event, revents: 0)
+            let timeoutMS = Int32(min(remaining * 1_000, Double(Int32.max)))
+            let result = Darwin.poll(&descriptor, 1, timeoutMS)
+            if result < 0 && errno == EINTR { continue }
+            guard result > 0 else {
+                if result == 0 { throw Failure.timedOut(operation) }
+                throw Failure.syscall("poll \(operation)", errno)
+            }
+            guard descriptor.revents & event != 0 else {
+                throw Failure.syscall("poll \(operation)", ECONNRESET)
+            }
+            return
+        }
+    }
+
+    private func send(
+        _ fd: Int32,
+        configure: (inout Termmesh_Peer_V1_Envelope) -> Void
+    ) throws {
+        var envelope = Termmesh_Peer_V1_Envelope()
+        configure(&envelope)
+        try writeAll(fd, try encodeFrame(envelope))
+    }
+
+    private func readEnvelope(_ fd: Int32) throws -> Termmesh_Peer_V1_Envelope {
+        var prefix = Data(count: 4)
+        try readAll(fd, into: &prefix)
+        let length = Int(prefix.withUnsafeBytes {
+            UInt32(littleEndian: $0.loadUnaligned(as: UInt32.self))
+        })
+        var payload = Data(count: length)
+        try readAll(fd, into: &payload)
+        var frame = prefix + payload
+        guard let envelope = try decodeFrame(from: &frame) else {
+            throw Failure.unexpectedMessage("incomplete frame")
+        }
+        return envelope
+    }
+
+    private func readAll(_ fd: Int32, into data: inout Data) throws {
+        var offset = 0
+        let totalCount = data.count
+        while offset < totalCount {
+            try waitForEvent(fd: fd, event: Int16(POLLIN), operation: "read")
+            let count = data.withUnsafeMutableBytes {
+                Darwin.read(fd, $0.baseAddress! + offset, totalCount - offset)
+            }
+            if count < 0 && errno == EINTR { continue }
+            guard count > 0 else { throw Failure.syscall("read", errno) }
+            offset += count
+        }
+    }
+
+    private func writeAll(_ fd: Int32, _ data: Data) throws {
+        var offset = 0
+        while offset < data.count {
+            try waitForEvent(fd: fd, event: Int16(POLLOUT), operation: "write")
+            let count = data.withUnsafeBytes {
+                Darwin.write(fd, $0.baseAddress! + offset, data.count - offset)
+            }
+            if count < 0 && errno == EINTR { continue }
+            guard count > 0 else { throw Failure.syscall("write", errno) }
+            offset += count
+        }
+    }
+}

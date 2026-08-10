@@ -76,6 +76,20 @@ final class TeamOrchestrator: ObservableObject {
         /// and closing it would take away something they offered to everyone.
         /// One we asked for is ours to clean up.
         var remoteSurfaceSpawned: Bool = false
+        /// Whether `remoteSurfaceID` names an *agent* surface — a
+        /// `tm-agent-bridge` the peer's daemon owns and streams NDJSON from —
+        /// rather than the peer PTY every other remote member gets.
+        ///
+        /// Recorded rather than inferred because the obvious inference stopped
+        /// working. "Has a `remoteSurfaceID`" used to mean "is a terminal
+        /// pane", since a native agent never had one; a peer-owned agent has
+        /// both a `remoteSurfaceID` and an `AgentPanel`. Three lifecycle paths
+        /// read that distinction and each does something different with it:
+        /// project deletion picks a close verb (TerminateSurface, never
+        /// ClosePane — an agent surface is not in the workspace tree),
+        /// detached-project restore picks a renderer, and a hard restart has
+        /// to refuse outright because it can only build a local pane.
+        var remoteAgentSurface: Bool = false
         /// The peer this agent's pane runs on (`ssh:root@jw-server`), or nil
         /// when it runs here.
         ///
@@ -223,6 +237,12 @@ final class TeamOrchestrator: ObservableObject {
     /// per surface, with the first set of panes orphaned because
     /// `progress.agentPanelIDs` keeps only the last writer.
     var projectRestoreInFlight: Set<String> = []
+    /// Same single-flight need as the two above, one level down: a rewound
+    /// stream can drop the same peer-owned agent pane twice before the first
+    /// reattach has opened its replacement, and two reattaches would leave two
+    /// panes on one surface with the roster naming only the last.
+    /// Keyed by `agentOperationKey`, so duplicate-named members do not collide.
+    var peerAgentRecoveryInFlight: Set<String> = []
 
     enum RemoteLeaderRecoveryPresentation: Equatable {
         case replaceAnchor
@@ -5197,6 +5217,8 @@ final class TeamOrchestrator: ObservableObject {
         case workspaceMissing
         case spawnFailed
         case alreadyMigrating
+        /// The member's CLI is a `tm-agent-bridge` the PEER's daemon owns.
+        case peerOwnedAgent
 
         var code: String {
             switch self {
@@ -5205,6 +5227,7 @@ final class TeamOrchestrator: ObservableObject {
             case .workspaceMissing: return "workspace_missing"
             case .spawnFailed: return "spawn_failed"
             case .alreadyMigrating: return "migration_locked"
+            case .peerOwnedAgent: return "peer_owned_agent"
             }
         }
         var message: String {
@@ -5214,9 +5237,39 @@ final class TeamOrchestrator: ObservableObject {
             case .workspaceMissing: return "Workspace for agent no longer alive"
             case .spawnFailed: return "Failed to spawn new agent pane"
             case .alreadyMigrating: return "Another migration is already in progress for this agent"
+            case .peerOwnedAgent:
+                return "This agent runs on a peer host; detach and attach it again "
+                    + "instead of recycling"
             }
         }
     }
+
+#if DEBUG
+    /// Test seam. `teams` is `private(set)` so the roster cannot drift from
+    /// the paths that maintain it, but a test asserting a guard still needs a
+    /// member on the roster to guard. Everything not named here is a filler
+    /// value the guard under test never reads.
+    func installTeamForTests(name: String, agents: [AgentMember]) {
+        teams[name] = Team(
+            id: name,
+            leaderSessionId: UUID().uuidString,
+            leaderMode: "adopted",
+            leaderModel: "sonnet",
+            leaderCli: nil,
+            leaderPanelId: UUID(),
+            workingDirectory: "/tmp",
+            workspaceId: agents.first?.workspaceId ?? UUID(),
+            agents: agents,
+            createdAt: Date(),
+            gitRepoRoot: nil,
+            worktreeMode: "off"
+        )
+    }
+
+    func forgetTeamForTests(_ name: String) {
+        teams.removeValue(forKey: name)
+    }
+#endif
 
     /// PanelId-keyed entry point. Use this from UI sites that already know the
     /// exact panel being restarted (e.g. the pane-header ↻ button) so duplicate
@@ -5275,6 +5328,19 @@ final class TeamOrchestrator: ObservableObject {
         let old = team.agents[idx]
         guard let oldPid = old.panelId else {
             return .failure(.headlessNoPane)
+        }
+        // A peer-owned agent cannot be respawned by this path, and failing
+        // loudly is the repair rather than a limitation. Everything below
+        // builds a LOCAL pane: `agentBinaryPath` resolves this Mac's CLI while
+        // `originalAgentWorkDir` is a directory on the peer, and
+        // `addAgentPaneToWorkspace` takes no host at all. The swap at the end
+        // would then overwrite the member with one carrying no `hostKey` and
+        // no `remoteSurfaceID` — discarding the only copy of the id that can
+        // address the bridge still running on the peer, which is in no
+        // workspace tree and in no `ManagedPeerSurfaceStore` to be found by
+        // any sweep. Recycling this member means detach and attach again.
+        guard !old.remoteAgentSurface else {
+            return .failure(.peerOwnedAgent)
         }
         // The pane id is replaced by this operation.  The durable instance id
         // keeps migration, paste draining and the post-restart refresh tied to
@@ -6004,6 +6070,17 @@ final class TeamOrchestrator: ObservableObject {
             archivePaneTeamIfApplicable(team)
         }
         closeRemoteLeaderSurfaceIfNeeded(teamName: name)
+
+        // A peer-owned agent's `tm-agent-bridge` is a child of the FAR
+        // daemon. Nothing below reaches it: the Ctrl-C and `exit` sent later
+        // go to `terminalPanel(for:)`, which is nil for an `AgentPanel`, and
+        // closing the workspace only tears down this side's session. Destroy
+        // is also the last moment anything knows the surface id — an agent
+        // surface is in no workspace tree and in no `ManagedPeerSurfaceStore`,
+        // so once the roster goes, no sweep and no `tm-agent gc` can find it.
+        for agent in team.agents where agent.remoteAgentSurface {
+            Self.releasePeerOwnedAgentSurface(agent)
+        }
 
         // D3-A P2 (b): release any pending claude-sid watcher slots so
         // FSEventStream(s) for this team's workdirs tear down promptly.
