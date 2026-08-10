@@ -7399,6 +7399,27 @@ final class TeamOrchestrator: ObservableObject {
         return workspace.terminalPanel(for: pid)
     }
 
+    /// Native counterpart to `agentPanel`. Resolve the durable instance first,
+    /// then locate its current panel so duplicate names and pane migration use
+    /// the same routing contract as send/restart.
+    func nativeAgentSession(
+        teamName: String,
+        agentName: String,
+        agentInstanceId: String
+    ) -> AgentSession? {
+        guard let agent = resolveAgentForRPC(
+            teamName: teamName,
+            agentName: agentName,
+            agentInstanceId: agentInstanceId
+        ).agent,
+              let panelId = agent.panelId
+        else { return nil }
+        return nativeAgentPanel(
+            workspaceId: agent.workspaceId,
+            panelId: panelId
+        )?.session
+    }
+
     /// Get all agent panels for a team.
     func allAgentPanels(teamName: String, tabManager: TabManager) -> [(name: String, instanceId: String, panel: TerminalPanel)] {
         guard let team = teams[teamName] else { return [] }

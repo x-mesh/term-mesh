@@ -1303,7 +1303,7 @@ private struct ToolRow: View {
             HStack(spacing: 6) {
                 mark
                 Text(call.name).font(.system(size: 11, weight: .medium))
-                Text(call.headline)
+                Text(AgentSession.projectedToolHeadline(call.headline))
                     .font(.system(size: 11).monospaced())
                     .foregroundStyle(.secondary)
                     .lineLimit(1)

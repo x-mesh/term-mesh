@@ -590,6 +590,155 @@ final class AgentSession {
         return (omitted, rows(for: Array(entries.suffix(maxRenderedEntries))))
     }
 
+    /// One shared projection for the collapsed tool row and socket reads.
+    /// Tool inputs often contain an entire shell command, so this is a data
+    /// boundary as well as presentation: one line, credential-shaped values
+    /// redacted, and a fixed UTF-8 budget before either consumer sees it.
+    static func projectedToolHeadline(_ raw: String) -> String {
+        var projected = raw
+            .components(separatedBy: .newlines)
+            .joined(separator: " ")
+            .split(whereSeparator: \.isWhitespace)
+            .joined(separator: " ")
+        projected = redactingSensitiveEnvironmentAssignments(projected)
+        let redactions = [
+            (#"(?i)(bearer\s+)(?:\"[^\"]*\"|'[^']*'|[^\s]+)"#, "$1[redacted]"),
+            (#"(?i)((?:--)?(?:api[-_]?key|access[-_]?token|auth[-_]?token|token|password|passwd|secret)\s*(?:=|:)\s*)(?:\"[^\"]*\"|'[^']*'|[^\s]+)"#, "$1[redacted]"),
+            (#"(?i)((?:--)(?:api[-_]?key|token|password|passwd|secret)\s+)(?:\"[^\"]*\"|'[^']*'|[^\s]+)"#, "$1[redacted]"),
+            (#"(?i)([a-z][a-z0-9+.-]*://[^\s/:@]+:)[^\s@]+@"#, "$1[redacted]@"),
+            (#"[A-Za-z0-9_-]{16,}\.[A-Za-z0-9_-]{16,}\.[A-Za-z0-9_-]{16,}"#, "[redacted]"),
+            (#"\b(?:gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|sk-(?:proj-)?[A-Za-z0-9_-]{16,})\b"#, "[redacted]"),
+            (#"(?i)-----BEGIN(?: [A-Z0-9]+)* PRIVATE KEY-----.*"#, "[redacted private key]"),
+        ]
+        for (pattern, template) in redactions {
+            guard let regex = try? NSRegularExpression(pattern: pattern) else { continue }
+            let range = NSRange(projected.startIndex..<projected.endIndex, in: projected)
+            projected = regex.stringByReplacingMatches(
+                in: projected,
+                range: range,
+                withTemplate: template
+            )
+        }
+        return middleBounded(projected, maxUTF8Bytes: 160)
+    }
+
+    /// Parse portable shell environment assignments before applying the
+    /// presentation bound. Values whose key has a credential-bearing component
+    /// must disappear in full, including quoted values and URI userinfo.
+    private static func redactingSensitiveEnvironmentAssignments(_ text: String) -> String {
+        let pattern = #"(?<![A-Za-z0-9_])([A-Za-z_][A-Za-z0-9_]*)(\s*=\s*)(\"[^\"]*\"|'[^']*'|[^\s]+)"#
+        guard let regex = try? NSRegularExpression(pattern: pattern) else { return text }
+        let mutable = NSMutableString(string: text)
+        let matches = regex.matches(
+            in: text,
+            range: NSRange(text.startIndex..<text.endIndex, in: text)
+        )
+        for match in matches.reversed() {
+            guard match.numberOfRanges == 4,
+                  let keyRange = Range(match.range(at: 1), in: text),
+                  match.range(at: 3).location != NSNotFound
+            else { continue }
+            let components = text[keyRange].uppercased().split(separator: "_")
+            guard components.contains(where: {
+                $0 == "SECRET" || $0 == "TOKEN" || $0 == "PASSWORD"
+                    || $0 == "PASSWD" || $0 == "KEY" || $0 == "URL"
+            }) else { continue }
+            mutable.replaceCharacters(in: match.range(at: 3), with: "[redacted]")
+        }
+        return mutable as String
+    }
+
+    private static func prefix(_ text: String, withinUTF8Bytes budget: Int) -> String {
+        var used = 0
+        var result = ""
+        for character in text {
+            let width = String(character).utf8.count
+            guard used + width <= budget else { break }
+            result.append(character)
+            used += width
+        }
+        return result
+    }
+
+    private static func suffix(_ text: String, withinUTF8Bytes budget: Int) -> String {
+        String(prefix(String(text.reversed()), withinUTF8Bytes: budget).reversed())
+    }
+
+    private static func middleBounded(_ text: String, maxUTF8Bytes: Int) -> String {
+        guard text.utf8.count > maxUTF8Bytes else { return text }
+        let marker = "…"
+        let available = max(0, maxUTF8Bytes - marker.utf8.count)
+        let headBudget = (available * 2) / 3
+        let tailBudget = available - headBudget
+        return prefix(text, withinUTF8Bytes: headBudget)
+            + marker
+            + suffix(text, withinUTF8Bytes: tailBudget)
+    }
+
+    private static func tailBoundedTranscript(_ text: String, lineLimit: Int?) -> String {
+        let absoluteLineLimit = 500
+        let requested = lineLimit.map { max(0, min($0, absoluteLineLimit)) }
+            ?? absoluteLineLimit
+        guard requested > 0 else { return "" }
+        let lines = text.split(separator: "\n", omittingEmptySubsequences: false)
+        let lineBounded = lines.count > requested
+            ? lines.suffix(requested).joined(separator: "\n")
+            : text
+        let absoluteByteLimit = 64 * 1024
+        guard lineBounded.utf8.count > absoluteByteLimit else { return lineBounded }
+        return suffix(lineBounded, withinUTF8Bytes: absoluteByteLimit)
+    }
+
+    /// Flatten exactly the bounded transcript projection the native panel is
+    /// drawing (or would draw when a hidden pane becomes visible). Rebuilding
+    /// the bounded rows from `entries` matters for hidden panes: their observed
+    /// `rows` intentionally stay stale during streaming to avoid SwiftUI work.
+    /// Taking the projection on the main actor makes a streaming answer one
+    /// coherent snapshot rather than a mix of two deltas.
+    func visibleTranscriptText(lineLimit: Int? = nil) -> String {
+        Self.visibleTranscriptText(
+            rows: Self.displayRows(for: entries).rows,
+            lineLimit: lineLimit
+        )
+    }
+
+    static func visibleTranscriptText(
+        rows: [Row],
+        lineLimit: Int? = nil
+    ) -> String {
+        let text = rows.compactMap { row -> String? in
+            switch row.entry {
+            case .said(_, let speaker, let text):
+                let instruction = read(instruction: text)
+                return "\(speaker == .person ? "you" : "leader"): \(instruction.headline)"
+            case .answered(_, let text):
+                return text
+            case .thought:
+                // Reasoning is visually clamped to two layout-dependent lines.
+                // A socket has no pane width with which to reproduce that
+                // projection, so omission is the conservative equivalent.
+                return nil
+            case .tool(_, let call):
+                return "\(call.name) \(projectedToolHeadline(call.headline))"
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+            case .turnEnded(_, let end):
+                var parts: [String] = []
+                if let status = end.verdict?.status, !status.isEmpty { parts.append(status) }
+                parts.append(end.stop)
+                if let duration = end.duration { parts.append(String(format: "%.1fs", duration)) }
+                if let cost = end.cost { parts.append(String(format: "$%.4f", cost)) }
+                if end.tokensIn != nil || end.tokensOut != nil {
+                    parts.append("\(end.tokensIn ?? 0)→\(end.tokensOut ?? 0) tok")
+                }
+                return parts.joined(separator: " · ")
+            case .notice(_, let text):
+                return "! \(text)"
+            }
+        }.joined(separator: "\n")
+
+        return tailBoundedTranscript(text, lineLimit: lineLimit)
+    }
+
     /// 300 is the shipped bound. The override exists so the bound itself can be
     /// measured: the transcript stack is not lazy, so `ScrollView` sizes every
     /// mounted row on each streamed delta, and that cost scales with this number
@@ -1922,7 +2071,7 @@ final class AgentSession {
             ? preparedChange
             : AgentDiff.change(tool: name, input: args)
         append(.tool(id: UUID(),
-                     ToolCall(name: name, headline: headline, change: change)))
+                     ToolCall(name: name, headline: Self.projectedToolHeadline(headline), change: change)))
         if let id = block["id"] as? String { openTools[id] = entries.count - 1 }
     }
 

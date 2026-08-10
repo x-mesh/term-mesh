@@ -62,6 +62,33 @@ final class TeamDataStore: ObservableObject, @unchecked Sendable {
         let instanceId: String?
     }
 
+    struct CorrelatedReply: Equatable {
+        let messageId: String
+        let agentName: String
+        let agentInstanceId: String
+        let content: String
+    }
+
+    enum CorrelationCompletion: Equatable {
+        case completed(messageId: String)
+        case notFound
+        case identityMismatch
+        case alreadyCompleted
+    }
+
+    enum CorrelationLookup: Equatable {
+        case pending
+        case ready(CorrelatedReply)
+        case notFound
+    }
+
+    private struct CorrelationMailboxEntry {
+        let expectedAgentName: String
+        let expectedAgentInstanceId: String
+        let expiresAt: Date
+        var reply: CorrelatedReply?
+    }
+
     // Team registry: name → agents. `name` is a legacy routing alias; result
     // ownership uses the durable per-pane instance id whenever it is known.
     private var teamRegistry: [String: [AgentRegistration]] = [:]
@@ -101,6 +128,10 @@ final class TeamDataStore: ObservableObject, @unchecked Sendable {
 
     // Data collections (previously in TeamOrchestrator, now lock-protected)
     private var messages: [String: [TeamOrchestrator.TeamMessage]] = [:]
+    /// One-shot bearer-capability mailboxes used by `send --expect-reply`.
+    /// Kept outside the ordinary retained message queue so unrelated traffic
+    /// cannot evict or expose a correlated reply before its owner consumes it.
+    private var correlationMailboxes: [String: [String: CorrelationMailboxEntry]] = [:]
     private var taskBoards: [String: [TeamOrchestrator.TeamTask]] = [:]
     private var heartbeats: [String: [String: (at: Date, summary: String?)]] = [:]
     private var contextStore: [String: [String: ContextEntry]] = [:]
@@ -132,6 +163,10 @@ final class TeamDataStore: ObservableObject, @unchecked Sendable {
 
     /// Max messages retained per team before oldest are dropped.
     private let maxMessagesPerTeam = 500
+    /// A stuck or malicious caller cannot turn long expiries into unbounded
+    /// bearer-mailbox growth. Normal `send --expect-reply` fan-out is far below
+    /// this per-team ceiling.
+    private let maxCorrelationMailboxesPerTeam = 512
 
     /// Called after data changes to sync state to the daemon (fire-and-forget).
     var onDataChanged: (() -> Void)?
@@ -171,6 +206,7 @@ final class TeamDataStore: ObservableObject, @unchecked Sendable {
         lock.lock()
         teamRegistry.removeValue(forKey: name)
         messages.removeValue(forKey: name)
+        correlationMailboxes.removeValue(forKey: name)
         taskBoards.removeValue(forKey: name)
         heartbeats.removeValue(forKey: name)
         contextStore.removeValue(forKey: name)
@@ -525,6 +561,111 @@ final class TeamDataStore: ObservableObject, @unchecked Sendable {
     }
 
     // MARK: - Messages
+
+    /// Register one exact reply route before dispatching the instruction that
+    /// carries its bearer token. The expected durable instance must still be
+    /// present in the roster; a stale or caller-invented identity is refused.
+    @discardableResult
+    func registerCorrelation(
+        teamName: String,
+        token: String,
+        expectedAgentName: String,
+        expectedAgentInstanceId: String,
+        expiresAt: Date,
+        now: Date = Date()
+    ) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        guard expiresAt > now,
+              teamRegistry[teamName]?.contains(where: {
+                  $0.name == expectedAgentName && $0.instanceId == expectedAgentInstanceId
+              }) == true else {
+            return false
+        }
+        pruneExpiredCorrelationsLocked(teamName: teamName, now: now)
+        guard correlationMailboxes[teamName]?[token] == nil,
+              (correlationMailboxes[teamName]?.count ?? 0) < maxCorrelationMailboxesPerTeam else {
+            return false
+        }
+        correlationMailboxes[teamName, default: [:]][token] = CorrelationMailboxEntry(
+            expectedAgentName: expectedAgentName,
+            expectedAgentInstanceId: expectedAgentInstanceId,
+            expiresAt: expiresAt,
+            reply: nil
+        )
+        return true
+    }
+
+    /// Complete a registered mailbox without copying its bearer token into the
+    /// ordinary message queue. Possession of the token and the exact durable
+    /// roster identity are both required.
+    func completeCorrelation(
+        teamName: String,
+        token: String,
+        agentName: String,
+        agentInstanceId: String,
+        content: String,
+        now: Date = Date()
+    ) -> CorrelationCompletion {
+        lock.lock()
+        defer { lock.unlock() }
+        pruneExpiredCorrelationsLocked(teamName: teamName, now: now)
+        guard var entry = correlationMailboxes[teamName]?[token] else { return .notFound }
+        guard entry.expectedAgentName == agentName,
+              entry.expectedAgentInstanceId == agentInstanceId else {
+            return .identityMismatch
+        }
+        guard entry.reply == nil else { return .alreadyCompleted }
+        let messageId = UUID().uuidString
+        entry.reply = CorrelatedReply(
+            messageId: messageId,
+            agentName: agentName,
+            agentInstanceId: agentInstanceId,
+            content: content
+        )
+        correlationMailboxes[teamName]?[token] = entry
+        return .completed(messageId: messageId)
+    }
+
+    /// Exact-token lookup. `consume` atomically removes only a ready result;
+    /// polling a pending mailbox never destroys the future reply route.
+    func correlation(
+        teamName: String,
+        token: String,
+        consume: Bool,
+        now: Date = Date()
+    ) -> CorrelationLookup {
+        lock.lock()
+        defer { lock.unlock() }
+        pruneExpiredCorrelationsLocked(teamName: teamName, now: now)
+        guard let entry = correlationMailboxes[teamName]?[token] else { return .notFound }
+        guard let reply = entry.reply else { return .pending }
+        if consume {
+            correlationMailboxes[teamName]?.removeValue(forKey: token)
+            if correlationMailboxes[teamName]?.isEmpty == true {
+                correlationMailboxes.removeValue(forKey: teamName)
+            }
+        }
+        return .ready(reply)
+    }
+
+    @discardableResult
+    func cancelCorrelation(teamName: String, token: String, now: Date = Date()) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        pruneExpiredCorrelationsLocked(teamName: teamName, now: now)
+        let removed = correlationMailboxes[teamName]?.removeValue(forKey: token) != nil
+        if correlationMailboxes[teamName]?.isEmpty == true {
+            correlationMailboxes.removeValue(forKey: teamName)
+        }
+        return removed
+    }
+
+    private func pruneExpiredCorrelationsLocked(teamName: String, now: Date) {
+        guard let entries = correlationMailboxes[teamName] else { return }
+        let live = entries.filter { $0.value.expiresAt > now }
+        correlationMailboxes[teamName] = live.isEmpty ? nil : live
+    }
 
     @discardableResult
     func postMessage(teamName: String, from: String, to: String? = nil, content: String, type: String = "report") -> TeamOrchestrator.TeamMessage? {

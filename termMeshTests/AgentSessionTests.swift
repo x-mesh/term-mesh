@@ -941,6 +941,156 @@ final class AgentSessionTests: XCTestCase {
                        AgentSession.topGap(before: entries[17], after: nil))
     }
 
+    func testVisibleTranscriptSnapshotMatchesNativeRowsAndAppliesTailLimit() {
+        let longThought = String(repeating: "x", count: 20) + String(repeating: "y", count: 120)
+        let rows = AgentSession.rows(for: [
+            .said(id: UUID(), .leader, "inspect this"),
+            .answered(id: UUID(), "alpha\nbeta"),
+            .thought(id: UUID(), longThought),
+            .tool(id: UUID(), .init(name: "Bash", headline: "swift test", result: "folded output")),
+            .turnEnded(id: UUID(), .init(
+                stop: "end_turn",
+                failed: false,
+                cost: 0.25,
+                duration: 1.2,
+                tokensIn: 3,
+                tokensOut: 5
+            )),
+            .notice(id: UUID(), "connection restored"),
+        ])
+
+        let snapshot = AgentSession.visibleTranscriptText(rows: rows)
+        XCTAssertTrue(snapshot.contains("leader: inspect this"))
+        XCTAssertTrue(snapshot.contains("alpha\nbeta"), "streaming answers remain readable in full")
+        XCTAssertFalse(snapshot.contains("✻"), "reasoning cannot reproduce the UI's two-line clamp off-screen")
+        XCTAssertFalse(snapshot.contains(longThought))
+        XCTAssertTrue(snapshot.contains("Bash swift test"))
+        XCTAssertFalse(snapshot.contains("folded output"), "collapsed tool output is not user-visible")
+        XCTAssertTrue(snapshot.contains("end_turn · 1.2s · $0.2500 · 3→5 tok"))
+        XCTAssertTrue(snapshot.hasSuffix("! connection restored"))
+
+        XCTAssertEqual(
+            AgentSession.visibleTranscriptText(rows: rows, lineLimit: 2),
+            "end_turn · 1.2s · $0.2500 · 3→5 tok\n! connection restored"
+        )
+        XCTAssertEqual(AgentSession.visibleTranscriptText(rows: rows, lineLimit: 0), "")
+    }
+
+    func testVisibleTranscriptRedactsAndBoundsToolHeadlineBeforeKeepingItsTail() {
+        let secret = "tail-secret-credential"
+        let raw = "curl https://example.test\n" + String(repeating: "argument ", count: 40)
+            + "--token \"\(secret) with spaces\""
+        let rows = AgentSession.rows(for: [
+            .tool(id: UUID(), .init(name: "Bash", headline: raw)),
+        ])
+
+        let projected = AgentSession.projectedToolHeadline(raw)
+        XCTAssertLessThanOrEqual(projected.utf8.count, 160)
+        XCTAssertFalse(projected.contains("\n"))
+        XCTAssertTrue(projected.contains("[redacted]"))
+        XCTAssertFalse(projected.contains(secret))
+
+        let snapshot = AgentSession.visibleTranscriptText(rows: rows)
+        XCTAssertFalse(snapshot.contains(secret), "middle-tail retention must happen only after redaction")
+        XCTAssertLessThanOrEqual(snapshot.utf8.count, 165)
+    }
+
+    func testToolHeadlineRedactsPortableEnvironmentCredentialsAndProviderTokens() {
+        let cases = [
+            ("AWS_SECRET_ACCESS_KEY='aws-secret-value' run", "aws-secret-value"),
+            ("AWS_SESSION_TOKEN=aws-session-value run", "aws-session-value"),
+            ("DATABASE_URL=postgresql://dbuser:postgres-password@db.example/app run", "postgres-password"),
+            ("connect ssh://user:standalone-uri-password@host", "standalone-uri-password"),
+            ("use ghp_abcdefghijklmnopqrstuvwxyz1234567890", "ghp_abcdefghijklmnopqrstuvwxyz1234567890"),
+            ("use github_pat_abcdefghijklmnopqrstuvwxyz_1234567890", "github_pat_abcdefghijklmnopqrstuvwxyz_1234567890"),
+            ("use sk-proj-abcdefghijklmnopqrstuvwxyz1234567890", "sk-proj-abcdefghijklmnopqrstuvwxyz1234567890"),
+            ("-----BEGIN PRIVATE KEY----- private-key-material -----END PRIVATE KEY-----", "private-key-material"),
+        ]
+
+        for (raw, secret) in cases {
+            let projected = AgentSession.projectedToolHeadline(raw)
+            XCTAssertFalse(projected.contains(secret), "credential leaked: \(secret)")
+            XCTAssertTrue(projected.contains("[redacted"), "missing redaction marker for: \(raw)")
+            XCTAssertLessThanOrEqual(projected.utf8.count, 160)
+        }
+    }
+
+    func testTeamReadOutputRedactsCorrelationTokensButPreservesResponseText() {
+        let correlation = "corr-token-123"
+        let instance = "agent-instance-456"
+        let input = """
+        [REQUIRED CORRELATED REPLY for instance \(instance)]
+        tm-agent reply --reply-to \(correlation) <<'TERMMESH_REPLY_EOF'
+        user response text remains exactly here
+        user response may discuss correlation_id=customer-visible without being routing metadata
+        TERMMESH_REPLY_EOF
+        [tm-agent-reply:\(correlation):\(instance)]
+        """
+
+        let sanitized = TerminalController.sanitizedTeamReadOutput(input)
+
+        XCTAssertFalse(sanitized.contains(correlation))
+        XCTAssertFalse(sanitized.contains(instance))
+        XCTAssertTrue(sanitized.contains("tm-agent reply --reply-to [REDACTED]"))
+        XCTAssertTrue(sanitized.contains("user response text remains exactly here"))
+        XCTAssertTrue(sanitized.contains("correlation_id=customer-visible"))
+        XCTAssertTrue(sanitized.contains("[tm-agent-reply:[REDACTED]]"))
+    }
+
+    func testTeamReadOutputRedactsSoftWrappedGeneratedCorrelationTokensWithoutDigestFalsePositive() {
+        let token = String(repeating: "0123456789abcdef", count: 4)
+        let unrelatedDigest = String(repeating: "fedcba9876543210", count: 4)
+        let wrappedCommand = """
+        tm-agent reply --
+        reply-to 0123456789abcdef01234567
+        89abcdef0123456789abcdef0123456789abcdef <<'TERMMESH_REPLY_EOF'
+        response body stays visible
+        """
+        let wrappedMarker = """
+        [tm-agent-reply:0123456789abcdef0123456789ab
+        cdef0123456789abcdef0123456789abcdef:agent-instance-
+        456]
+        """
+        let input = wrappedCommand + "\n" + wrappedMarker
+            + "\nunrelated digest \(unrelatedDigest)"
+
+        let sanitized = TerminalController.sanitizedTeamReadOutput(input)
+
+        XCTAssertFalse(sanitized.contains(token))
+        XCTAssertFalse(sanitized.contains("01234567\n89abcdef"), "no wrapped token suffix may survive")
+        XCTAssertFalse(sanitized.contains("agent-instance-\n456"))
+        XCTAssertTrue(sanitized.contains("tm-agent reply --\nreply-to [REDACTED]"))
+        XCTAssertTrue(sanitized.contains("[tm-agent-reply:[REDACTED]]"))
+        XCTAssertTrue(sanitized.contains("response body stays visible"))
+        XCTAssertTrue(sanitized.contains(unrelatedDigest), "unscoped user digests must remain unchanged")
+    }
+
+    func testVisibleTranscriptHasAbsoluteLineAndByteBoundsWithoutALinesArgument() {
+        let rows = AgentSession.rows(for: [
+            .answered(id: UUID(), String(repeating: "1234567890\n", count: 8_000)),
+        ])
+
+        let snapshot = AgentSession.visibleTranscriptText(rows: rows)
+        XCTAssertLessThanOrEqual(snapshot.split(separator: "\n").count, 500)
+        XCTAssertLessThanOrEqual(snapshot.utf8.count, 64 * 1024)
+    }
+
+    func testVisibleTranscriptSnapshotIncludesStreamingChangesWhilePaneIsHidden() {
+        let session = AgentSession()
+        session.isVisible = false
+        session.ingestForTesting(event([
+            "type": "assistant",
+            "message": ["content": [["type": "text", "text": "latest hidden answer"]]],
+        ]))
+
+        XCTAssertTrue(session.rows.isEmpty, "hidden panes intentionally defer their UI projection")
+        XCTAssertEqual(
+            session.visibleTranscriptText(),
+            "latest hidden answer",
+            "tm-agent read must rebuild the same bounded projection without making the pane visible"
+        )
+    }
+
     // MARK: - Visibility gating
     //
     // Two experiments said the streaming cost is neither the transcript's width
