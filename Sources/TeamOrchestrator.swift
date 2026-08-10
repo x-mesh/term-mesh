@@ -1017,6 +1017,7 @@ final class TeamOrchestrator: ObservableObject {
         agentName: String,
         agentType: String,
         agentCli: String,
+        agentInstanceId: String,
         windowId: String?,
         workspaceId: UUID
     ) -> [String: String] {
@@ -1034,10 +1035,16 @@ final class TeamOrchestrator: ObservableObject {
             "/usr/sbin",
             "/sbin"
         ]
-        let appPath = ProcessInfo.processInfo.environment["PATH"] ?? ""
-        let existingPaths = Set(appPath.split(separator: ":").map(String.init))
-        let missingPaths = essentialPaths.filter { !existingPaths.contains($0) }
-        let currentPath = (appPath.isEmpty ? essentialPaths : appPath.split(separator: ":").map(String.init) + missingPaths).joined(separator: ":")
+        let appPaths = (ProcessInfo.processInfo.environment["PATH"] ?? "")
+            .split(separator: ":").map(String.init)
+        // The bundled tm-agent must win over stale user-installed copies. The
+        // correlation protocol evolves with the app, so choosing an older CLI
+        // can turn a delivered instruction into a reply timeout.
+        var orderedPaths: [String] = []
+        for path in essentialPaths + appPaths where !path.isEmpty && !orderedPaths.contains(path) {
+            orderedPaths.append(path)
+        }
+        let currentPath = orderedPaths.joined(separator: ":")
         let socketPath = SocketControlSettings.socketPath()
 
         var env: [String: String] = [
@@ -1062,6 +1069,7 @@ final class TeamOrchestrator: ObservableObject {
         // Per-agent routing — 2026-03-19 regression guard.
         env["TERMMESH_AGENT_NAME"] = agentName
         env["TERMMESH_AGENT_ROLE"] = agentType
+        env["TERMMESH_AGENT_INSTANCE_ID"] = agentInstanceId
         if let windowId = windowId, !windowId.isEmpty {
             env["TERMMESH_WINDOW_ID"] = windowId
         }
@@ -1268,6 +1276,7 @@ final class TeamOrchestrator: ObservableObject {
             agentName: agentName,
             agentType: agentType,
             agentCli: agentCli,
+            agentInstanceId: agentInstanceId,
             windowId: windowId,
             workspaceId: workspace.id
         )
@@ -1296,10 +1305,9 @@ final class TeamOrchestrator: ObservableObject {
                cli: agentCli,
                color: agentColor
            ) {
-            // `Process.environment` replaces the whole environment. A terminal
-            // surface overlays `paneEnv` on its inherited environment, so do
-            // the same here or HOME/TMPDIR and other ordinary process values
-            // disappear while fixing the TERMMESH_* values.
+            // `Process.environment` replaces rather than overlays its parent.
+            // Keep ordinary launch values such as HOME and TMPDIR while the
+            // pane-specific team identity wins on collisions.
             let nativeEnvironment = ProcessInfo.processInfo.environment
                 .merging(paneEnv) { _, paneValue in paneValue }
             if AgentPipeTransport.needsBridge(cli: agentCli),
@@ -1308,7 +1316,7 @@ final class TeamOrchestrator: ObservableObject {
                     bridgedCli: agentCli, bridgePath: bridge,
                     model: Self.bridgeModelArg(cli: agentCli, model: agentModel),
                     cliPath: cliPath,
-                    environment: paneEnv
+                    environment: nativeEnvironment
                 )
                 // A bridged CLI has no `--append-system-prompt`, and none of
                 // them agree on an equivalent, so its role has to arrive as a
@@ -1339,7 +1347,7 @@ final class TeamOrchestrator: ObservableObject {
                     model: Self.resolveClaudeModelArg(agentModel),
                     instructions: agentInstructions,
                     extraArgs: extraArgs,
-                    environment: paneEnv
+                    environment: nativeEnvironment
                 )
             }
             // The turn states its own end and carries its final text, so the
@@ -7437,26 +7445,6 @@ final class TeamOrchestrator: ObservableObject {
             results.append((name: agent.name, instanceId: agent.agentInstanceId, panel: panel))
         }
         return results
-    }
-
-    /// Return the process-backed native pane for an agent. Native panes have no
-    /// `TerminalPanel`, so callers such as `team.read` must not treat a missing
-    /// terminal surface as a missing agent.
-    func agentNativePanel(
-        teamName: String,
-        agentName: String,
-        agentInstanceId: String?
-    ) -> AgentPanel? {
-        guard let team = teams[teamName],
-              let agent = agentInstanceId.flatMap({ instanceId in
-                  resolveAgentForRPC(
-                      teamName: teamName, agentName: agentName,
-                      agentInstanceId: instanceId
-                  ).agent
-              }) ?? team.agents.first(where: { $0.name == agentName }),
-              let panelId = agent.panelId
-        else { return nil }
-        return nativeAgentPanel(workspaceId: agent.workspaceId, panelId: panelId)
     }
 
     // MARK: - C: Message Queue

@@ -565,8 +565,8 @@ final class AgentSessionTests: XCTestCase {
                 ["type": "text", "text": "third\nfourth"]]]]),
         ])
 
-        XCTAssertEqual(s.transcriptText(), "first\nsecond\nthird\nfourth")
-        XCTAssertEqual(s.transcriptText(lineLimit: 2), "third\nfourth")
+        XCTAssertEqual(s.visibleTranscriptText(), "leader: first\nsecond\nthird\nfourth")
+        XCTAssertEqual(s.visibleTranscriptText(lineLimit: 2), "third\nfourth")
     }
 
     // MARK: - The header is a value, not prose
@@ -1344,6 +1344,29 @@ final class AgentSessionTests: XCTestCase {
             workingDirectory: "/tmp")
         XCTAssertEqual(binary.arguments.first, "/bundle/bin/tm-agent-bridge")
         XCTAssertFalse(binary.arguments.contains("python3"))
+    }
+
+    func testNativePaneEnvironmentCarriesItsDurableInstance() {
+        let workspaceId = UUID()
+        let environment = TeamOrchestrator.buildAgentPaneEnv(
+            teamName: "ebpf",
+            agentName: "executor",
+            agentType: "executor",
+            agentCli: "claude",
+            agentInstanceId: "instance-b",
+            windowId: "window-id",
+            workspaceId: workspaceId
+        )
+
+        XCTAssertEqual(environment["TERMMESH_TEAM"], "ebpf")
+        XCTAssertEqual(environment["TERMMESH_AGENT_NAME"], "executor")
+        XCTAssertEqual(environment["TERMMESH_AGENT_INSTANCE_ID"], "instance-b")
+        XCTAssertEqual(environment["TERMMESH_WORKSPACE_ID"], workspaceId.uuidString)
+        XCTAssertEqual(
+            environment["PATH"]?.split(separator: ":").first.map(String.init),
+            Bundle.main.resourcePath.map { "\($0)/bin" }
+        )
+        XCTAssertTrue(environment["PATH"]?.contains("/usr/bin") == true)
     }
 
     func testTheTerminalLaunchLineDropsPython3ForTheCompiledBridge() {

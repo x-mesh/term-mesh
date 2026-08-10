@@ -3393,7 +3393,7 @@ class TerminalController {
             guard let tabManager else {
                 return (nil, false, .err(code: "unavailable", message: "TabManager not available", data: nil))
             }
-            if let panel = TeamOrchestrator.shared.agentPanel(
+            guard let panel = TeamOrchestrator.shared.agentPanel(
                 teamName: teamName, agentName: agentName, agentInstanceId: agentInstanceId, tabManager: tabManager
             ) else {
                 return (nil, false, .err(code: "not_found", message: "Agent not found", data: nil))
