@@ -322,6 +322,9 @@ final class Workspace: Identifiable {
         command: String? = nil,
         environment: [String: String] = [:]
     ) {
+        // Installs the reconnect observer and retries durable peer-agent
+        // tombstones restored from a previous app run.
+        _ = PendingPeerAgentSurfaceCleanupStore.shared
         self.id = UUID()
         self.portOrdinal = portOrdinal
         self.processTitle = title
@@ -2899,6 +2902,14 @@ final class Workspace: Identifiable {
         // byte from reaching the retired session.
         relay.onPtyDeliveryRestart = { [weak self] in
             self?.dropRemoteAgentPane(panelId: panelId, reason: "stream rewound")
+        }
+        relay.onSurfaceExited = { [weak self] exitCode, signal, reason in
+            await (self?.panels[panelId] as? AgentPanel)?.session
+                .finishRemoteSurfaceExited(
+                    exitCode: exitCode,
+                    signal: signal,
+                    reason: reason
+                )
         }
         // Terminal death of the relay session (heartbeat kill, writer
         // failure, host teardown). Same recovery as a rewind: the daemon

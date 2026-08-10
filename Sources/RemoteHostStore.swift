@@ -518,6 +518,18 @@ final class RemoteHostStore: ObservableObject {
         hostCapabilities.has(PeerCapability.surfaceAgentV1)
     }
 
+    /// Creating a new peer-owned agent has a stronger contract than merely
+    /// viewing an existing agent surface: its environment must arrive intact
+    /// and its authoritative exit must close the AgentSession. Missing any
+    /// one capability selects the established terminal fallback.
+    nonisolated static func hostSupportsPeerOwnedAgentFactory(
+        _ hostCapabilities: PeerCapabilities
+    ) -> Bool {
+        hostCapabilities.has(PeerCapability.surfaceAgentV1)
+            && hostCapabilities.has(PeerCapability.surfaceExitV1)
+            && hostCapabilities.has(PeerCapability.surfaceEnsureEnvV1)
+    }
+
     /// Fired after a successful sidebar connect so the mounted host
     /// group force-expands (its fold state is view-local @State).
     struct ExpandSignal: Equatable {

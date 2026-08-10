@@ -221,15 +221,14 @@ struct PeerHostProfile: Codable, Identifiable, Equatable {
 /// Everything that runs on a peer goes through a shell at some point, so
 /// there is exactly one quoting/validation story, here.
 enum PeerHostEnvironment {
-    /// Keys a POSIX shell accepts as assignments. Anything else is dropped
-    /// rather than quoted into something surprising — a bad key is a typo,
-    /// and typos should not become shell words.
+    /// Legacy shell-prefix callers keep valid siblings when one saved entry
+    /// is malformed. Each entry uses the same portable-key/value bounds as
+    /// ensure, but aggregate count/size limits belong only to the typed ensure
+    /// map and are enforced fail-closed before that request is sent.
     static func sanitized(_ environment: [String: String]) -> [(key: String, value: String)] {
         environment
-            .filter { key, _ in
-                guard let first = key.first,
-                      first.isLetter || first == "_" else { return false }
-                return key.allSatisfy { $0.isLetter || $0.isNumber || $0 == "_" }
+            .filter { key, value in
+                (try? PeerEnsureEnvironment.validate([key: value])) != nil
             }
             .sorted { $0.key < $1.key }
             .map { (key: $0.key, value: $0.value) }

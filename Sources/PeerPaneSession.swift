@@ -502,8 +502,15 @@ final class PeerPaneSession {
         attachment: PeerRunnerAttachment,
         hostSpec: PeerPaneHostSpec,
         agentCli: String = "",
-        onEnsured: () -> Void = {}
+        environment: [String: String] = [:],
+        onEnsured: () -> Void = {},
+        onAgentPostEnsureFailure: ((Data) -> Void)? = nil
     ) async throws -> (session: PeerPaneSession, outcome: PeerEnsureSurfaceOutcome) {
+        // Validate before opening a transport or issuing EnsureSurface. Keeping
+        // the typed local error intact gives callers an actionable key/limit
+        // diagnosis instead of misreporting invalid saved/profile data as a
+        // generic refusal by the host. Validation errors never include values.
+        try PeerEnsureEnvironment.validate(environment)
         let conn = try await PeerRelaySession.connect(hostSockPath: lease.hostSockPath)
         if lease.hostDisplayName.isEmpty {
             lease.hostDisplayName = conn.hostDisplayName
@@ -511,7 +518,11 @@ final class PeerPaneSession {
 
         let outcome: PeerEnsureSurfaceOutcome
         do {
-            outcome = try await PeerRelaySession.ensureSurface(conn, spec: surfaceSpec)
+            outcome = try await PeerRelaySession.ensureSurface(
+                conn,
+                spec: surfaceSpec,
+                environment: environment
+            )
         } catch {
             await conn.cancel()
             throw error
@@ -555,6 +566,10 @@ final class PeerPaneSession {
         // single agent instance that no longer exists once this throws.
         func compensateEnsure() async {
             guard isAgent else { return }
+            if let onAgentPostEnsureFailure {
+                onAgentPostEnsureFailure(outcome.surfaceID)
+                return
+            }
             await terminateSurface(
                 hostSockPath: lease.hostSockPath,
                 surfaceID: outcome.surfaceID

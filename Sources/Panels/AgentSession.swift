@@ -73,6 +73,25 @@ final class AgentStreamDecoder {
         }
         return output
     }
+
+    /// Treat the unread tail as the stream's final record. NDJSON producers
+    /// normally terminate every record with `\n`, but an authoritative EOF
+    /// must not silently discard a complete final JSON object merely because
+    /// its trailing newline raced with process teardown.
+    func finish() -> [Output] {
+        guard !bytes.isEmpty else { return [] }
+        defer {
+            bytes.removeAll(keepingCapacity: true)
+            scanOffset = 0
+        }
+        var end = bytes.count
+        if bytes[end - 1] == 0x0D { end -= 1 }
+        guard end > 0 else { return [] }
+        let tail = bytes[..<end]
+        guard tail.count <= maxLineBytes else { return [.oversized(tail.count)] }
+        guard let line = String(bytes: tail, encoding: .utf8), !line.isEmpty else { return [] }
+        return [.line(line)]
+    }
 }
 
 /// JSON objects are created and then consumed on two serial queues. Foundation
@@ -1299,6 +1318,82 @@ final class AgentSession {
         // measured leaving exactly that. Nobody said the work succeeded, so it
         // reports as NEEDS_REVIEW — the same verdict a process that died gets.
         finishAfterDrain(code: 0, stopped: true)
+    }
+
+    /// Finish a transport-owned agent from the host's authoritative process
+    /// status. Unlike `stop()`, this is a failure completion: a turn in flight
+    /// did not finish, and queued work will never be delivered. Idempotence is
+    /// provided by the remote sink guard so a later socket disconnect cannot
+    /// complete the same session twice.
+    func finishRemoteSurfaceExited(exitCode: Int32, signal: Int32, reason: String) async {
+        guard process == nil, remoteSink != nil,
+              let streams = remoteStreamsBox.current() else { return }
+        // SurfaceExited is ordered after the final PtyData on the wire, but
+        // consume(_:) decodes on `streams.queue` and batches onto MainActor.
+        // Put this barrier on that same queue: every earlier chunk is decoded,
+        // its pending batch is flushed, and the final MainActor block is queued
+        // strictly after the corresponding apply block. Only then revoke the
+        // pipeline identity; otherwise the identity guard drops the last result.
+        await withCheckedContinuation { continuation in
+            streams.queue.async { [weak self, streams] in
+                guard !streams.closed else {
+                    continuation.resume()
+                    return
+                }
+                streams.closed = true
+                let flush: @Sendable ([AgentParsedLine]) -> Void = { [weak self] batch in
+                    DispatchQueue.main.async { [weak self] in
+                        guard let self,
+                              self.remoteStreamsBox.current() === streams else { return }
+                        self.apply(batch)
+                    }
+                }
+                let finalParsed = streams.decoder.finish().map { output -> AgentParsedLine in
+                    switch output {
+                    case .line(let line):
+                        return AgentParsedLine(line)
+                    case .oversized(let count):
+                        return AgentParsedLine(
+                            "dropped an unterminated line of \(count) bytes"
+                        )
+                    }
+                }
+                streams.batcher.enqueue(finalParsed, flush: flush)
+                streams.batcher.flushPending(flush)
+                DispatchQueue.main.async { [weak self] in
+                    guard let self,
+                          self.remoteStreamsBox.current() === streams else {
+                        continuation.resume()
+                        return
+                    }
+                    self.finishRemoteSurfaceExitedAfterDrain(
+                        exitCode: exitCode,
+                        signal: signal,
+                        reason: reason
+                    )
+                    continuation.resume()
+                }
+            }
+        }
+    }
+
+    private func finishRemoteSurfaceExitedAfterDrain(
+        exitCode: Int32,
+        signal: Int32,
+        reason: String
+    ) {
+        let summary: String
+        if signal != 0 {
+            summary = "the remote agent was terminated by signal \(signal)"
+        } else if exitCode != 0 {
+            summary = "the remote agent exited (\(exitCode))"
+        } else {
+            let safeReason = reason.isEmpty ? "exited" : reason
+            summary = "the remote agent surface ended (\(safeReason))"
+        }
+        append(.notice(id: UUID(), summary))
+        teardownRemote()
+        finishAfterDrain(code: 0)
     }
 
     /// The sole natural-exit entry point. The stream queue has already drained

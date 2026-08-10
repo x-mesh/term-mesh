@@ -1328,6 +1328,13 @@ final class PeerRelaySession {
 
     var onError: (@MainActor (Error) -> Void)?
     var onDisconnect: (@MainActor () -> Void)?
+    /// Host-confirmed terminal status for this exact attached surface. Fired
+    /// after its final output chunk and before the ordinary disconnect hook.
+    var onSurfaceExited: (@MainActor (
+        _ exitCode: Int32,
+        _ signal: Int32,
+        _ reason: String
+    ) async -> Void)?
     var onReconnecting: (@MainActor (_ attempt: Int) -> Void)?
     var onReconnected: (@MainActor () -> Void)?
 
@@ -1573,7 +1580,8 @@ final class PeerRelaySession {
     /// surface roster is fetched and no picker can influence the returned id.
     static func ensureSurface(
         _ connection: PeerRelayConnection,
-        spec: PeerRunnerSurfaceSpec
+        spec: PeerRunnerSurfaceSpec,
+        environment: [String: String] = [:]
     ) async throws -> PeerEnsureSurfaceOutcome {
         guard connection.hostCapabilities.has(PeerCapability.surfaceEnsureV1) else {
             throw RelayError.capabilityUnavailable(PeerCapability.surfaceEnsureV1)
@@ -1583,8 +1591,14 @@ final class PeerRelaySession {
         // would answer INVALID_REQUEST anyway; refusing here keeps the caller
         // choosing a fallback instead of reading a wire error to find out.
         if SessionHostPanes.isAgentSurfaceType(spec.kind),
-           !RemoteHostStore.hostSupportsAgentSurfaces(connection.hostCapabilities) {
-            throw RelayError.capabilityUnavailable(PeerCapability.surfaceAgentV1)
+           !RemoteHostStore.hostSupportsPeerOwnedAgentFactory(connection.hostCapabilities) {
+            for capability in [
+                PeerCapability.surfaceAgentV1,
+                PeerCapability.surfaceExitV1,
+                PeerCapability.surfaceEnsureEnvV1,
+            ] where !connection.hostCapabilities.has(capability) {
+                throw RelayError.capabilityUnavailable(capability)
+            }
         }
         await connection.transport.setReadTimeoutSeconds(setupReadTimeoutSeconds)
         let outcome: PeerEnsureSurfaceOutcome
@@ -1595,7 +1609,8 @@ final class PeerRelaySession {
                 executable: spec.executable,
                 args: spec.args,
                 restartPolicy: spec.restartPolicy.wireValue,
-                kind: spec.kind
+                kind: spec.kind,
+                environment: environment
             )
         } catch {
             await connection.transport.setReadTimeoutSeconds(nil)
@@ -2115,6 +2130,11 @@ final class PeerRelaySession {
                 self?.disconnect(reason: reason)
             }
         }
+        let disconnectWithoutRecovery: @Sendable (String) -> Void = { [weak self] reason in
+            Task { @MainActor in
+                self?.disconnect(reason: reason, notifyDisconnect: false)
+            }
+        }
         // Relay delivery gets the framed writer/reader pair; callback
         // delivery gets neither — bytes leave through `ptyDataSink` and
         // input arrives via `sendRemoteKeys`, so there is no second socket
@@ -2284,6 +2304,11 @@ final class PeerRelaySession {
                 // just the switch — a bare `break` inside the switch would keep
                 // looping and silently drop frames to a dead writer.
                 var endReason = "hostToRelay-loop-end"
+                // An authoritative process exit is not a transport failure.
+                // Its owner keeps the finished AgentPanel visible, whereas a
+                // transport loss invokes onDisconnect so Workspace can recover
+                // the still-live daemon session in a fresh pane.
+                var notifyDisconnect = true
                 // nil until the first PtyData establishes the baseline — without
                 // this the initial frame (whose byte_seq may be the attach's
                 // non-zero initial_seq) reads as a spurious gap vs 0.
@@ -2457,6 +2482,29 @@ final class PeerRelaySession {
                         case .suppress:
                             break
                         }
+                    case .surfaceExited(let sid, let exitCode, let signal, let reason)
+                        where sid == mySurfaceID:
+                        // The capability contract guarantees this follows the
+                        // final PtyData, so the callback can finish the agent
+                        // immediately without racing any later output.
+                        if let onSurfaceExited = await self.onSurfaceExited {
+                            await onSurfaceExited(exitCode, signal, reason)
+                        }
+                        endReason = "surface-exited code=\(exitCode) signal=\(signal) reason=\(reason)"
+                        notifyDisconnect = false
+                        break pumpLoop
+                    case .error(let code, let message):
+                        // Protocol errors are connection-scoped (the wire
+                        // message has no surface_id). On an owned agent
+                        // connection that means this pane can no longer trust
+                        // the stream. Surface the host's bounded, secret-free
+                        // diagnostic and take the ordinary recovery path.
+                        let error = RelayError.ioError("host error \(code): \(message)")
+                        await MainActor.run {
+                            self.onError?(error)
+                        }
+                        endReason = "host-error code=\(code) message=\(message)"
+                        break pumpLoop
                     case .gridSnapshot(let sid, _, _, let ansi) where sid == mySurfaceID:
                         guard let writer else {
                             // Callback (agent) delivery: the wire contract says
@@ -2562,7 +2610,11 @@ final class PeerRelaySession {
                         break
                     }
                 }
-                disconnect(endReason)
+                if notifyDisconnect {
+                    disconnect(endReason)
+                } else {
+                    disconnectWithoutRecovery(endReason)
+                }
             }
 
             // Relay → host: read frames from relay socket, forward to
@@ -3003,7 +3055,7 @@ final class PeerRelaySession {
     var listenerFileDescriptorForTesting: Int32 { listenerFd }
     #endif
 
-    private func disconnect(reason: String) {
+    private func disconnect(reason: String, notifyDisconnect: Bool = true) {
         // Multiple teardown paths (writer onFailure, hostToRelay end,
         // relayToHost end) all funnel here; without this guard onDisconnect?()
         // fires 2-3 times per session.
@@ -3048,7 +3100,9 @@ final class PeerRelaySession {
             let detach = onSharedDetach
             Task { await detach?() }
         }
-        onDisconnect?()
+        if notifyDisconnect {
+            onDisconnect?()
+        }
     }
 
     func stop() async {

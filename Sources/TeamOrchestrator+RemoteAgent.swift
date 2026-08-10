@@ -42,6 +42,253 @@ enum RemoteLeaderReattachOutcome: Equatable {
     }
 }
 
+/// Durable tombstones for peer-owned agent surfaces that still need to be
+/// terminated. The team roster cannot be that tombstone: detach/destroy removes
+/// it immediately, and an agent surface appears in neither the workspace tree
+/// nor `ManagedPeerSurfaceStore`.
+@MainActor
+final class PendingPeerAgentSurfaceCleanupStore {
+    typealias HostSockPath = @MainActor (String) -> String?
+    typealias Terminator = @MainActor (String, Data) async -> Bool
+    struct Record: Codable, Equatable, Identifiable {
+        let hostKey: String
+        let surfaceIDBase64: String
+        let createdAt: Date
+
+        var id: String { "\(hostKey)\u{0000}\(surfaceIDBase64)" }
+        var surfaceID: Data? { Data(base64Encoded: surfaceIDBase64) }
+    }
+
+    static let shared = PendingPeerAgentSurfaceCleanupStore()
+    private static let storageKey = "termmesh.pendingPeerAgentSurfaceCleanup"
+
+    private let defaults: UserDefaults
+    private var records: [Record]
+    private var observer: NSObjectProtocol?
+    private var retryTask: Task<Void, Never>?
+    private var retryInFlight = false
+    private let automaticRetryDelay: TimeInterval
+    private let hostSockPathProvider: HostSockPath
+    private let terminator: Terminator
+
+    /// Cleanup only needs the authenticated transport that already backs the
+    /// connected host row. CLI launch metadata is resolved by a later RPC and
+    /// must not hold a termination tombstone hostage while that probe is
+    /// pending or failed.
+    nonisolated static func connectedHostSockPath(
+        for hostKey: String,
+        in hosts: [HostEntry]
+    ) -> String? {
+        guard let host = hosts.first(where: { $0.id == hostKey }),
+              host.isConnected,
+              !host.activeSockPath.isEmpty
+        else { return nil }
+        return host.activeSockPath
+    }
+
+    init(
+        defaults: UserDefaults = .standard,
+        observeNotifications: Bool = true,
+        automaticRetryDelay: TimeInterval = 30,
+        hostSockPathProvider: @escaping HostSockPath = { hostKey in
+            PendingPeerAgentSurfaceCleanupStore.connectedHostSockPath(
+                for: hostKey,
+                in: RemoteHostStore.shared.sortedHosts
+            )
+        },
+        terminator: @escaping Terminator = { sockPath, surfaceID in
+            await TeamOrchestrator.terminatePeerAgentSurfaceConfirmed(
+                hostSockPath: sockPath,
+                surfaceID: surfaceID
+            )
+        }
+    ) {
+        self.defaults = defaults
+        self.automaticRetryDelay = automaticRetryDelay
+        self.hostSockPathProvider = hostSockPathProvider
+        self.terminator = terminator
+        if let data = defaults.data(forKey: Self.storageKey),
+           let decoded = try? JSONDecoder().decode([Record].self, from: data) {
+            records = decoded
+        } else {
+            records = []
+        }
+        if observeNotifications {
+            observer = NotificationCenter.default.addObserver(
+                forName: PeerClientCoordinator.relaysDidChangeNotification,
+                object: nil,
+                queue: .main
+            ) { _ in
+                Task { @MainActor in
+                    PendingPeerAgentSurfaceCleanupStore.shared.scheduleRetry()
+                }
+            }
+            // Covers records restored after an app restart when the host is
+            // already connected and therefore emits no new relay transition.
+            Task { @MainActor [weak self] in self?.scheduleRetry() }
+        }
+    }
+
+    deinit {
+        if let observer { NotificationCenter.default.removeObserver(observer) }
+    }
+
+    var pendingRecords: [Record] { records }
+
+    func enqueue(hostKey: String, surfaceID: Data) {
+        guard !hostKey.isEmpty, !surfaceID.isEmpty else { return }
+        let encoded = surfaceID.base64EncodedString()
+        guard !records.contains(where: {
+            $0.hostKey == hostKey && $0.surfaceIDBase64 == encoded
+        }) else { return }
+        records.append(Record(
+            hostKey: hostKey,
+            surfaceIDBase64: encoded,
+            createdAt: Date()
+        ))
+        persist()
+    }
+
+    func scheduleRetry() {
+        retryTask?.cancel()
+        retryTask = nil
+        guard !retryInFlight, !records.isEmpty else { return }
+        retryInFlight = true
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            await retryPending(
+                hostSockPath: hostSockPathProvider,
+                terminate: terminator
+            )
+            retryInFlight = false
+            scheduleSlowRetryIfNeeded()
+        }
+    }
+
+    private func scheduleSlowRetryIfNeeded() {
+        guard retryTask == nil, !records.isEmpty else { return }
+        retryTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            let nanoseconds = UInt64(max(0, automaticRetryDelay) * 1_000_000_000)
+            if nanoseconds > 0 { try? await Task.sleep(nanoseconds: nanoseconds) }
+            guard !Task.isCancelled else { return }
+            retryTask = nil
+            scheduleRetry()
+        }
+    }
+
+    /// One pass only. Failed/unreachable records remain durable and the next
+    /// relay transition starts another pass.
+    func retryPending(
+        hostSockPath: (String) -> String?,
+        terminate: (String, Data) async -> Bool
+    ) async {
+        let snapshot = records
+        for record in snapshot {
+            guard let surfaceID = record.surfaceID,
+                  let sockPath = hostSockPath(record.hostKey),
+                  !sockPath.isEmpty,
+                  await terminate(sockPath, surfaceID)
+            else { continue }
+            records.removeAll { $0.id == record.id }
+            persist()
+        }
+    }
+
+    private func persist() {
+        guard let data = try? JSONEncoder().encode(records) else { return }
+        defaults.set(data, forKey: Self.storageKey)
+    }
+}
+
+@MainActor
+final class PeerAgentPaneRecoveryCoordinator {
+    typealias RetryAction = @MainActor () async -> Void
+    struct Request: Equatable {
+        let teamName: String
+        let agentInstanceID: String
+        let closedPanelID: UUID
+        let surfaceID: Data
+
+        var key: String { "\(teamName)/\(agentInstanceID)" }
+    }
+
+    static let shared = PeerAgentPaneRecoveryCoordinator()
+    private var requests: [String: Request] = [:]
+    private var observer: NSObjectProtocol?
+    private var retryTask: Task<Void, Never>?
+    private var retryInFlight = false
+    private let automaticRetryDelay: TimeInterval
+    private let retryAction: RetryAction
+
+    init(
+        observeNotifications: Bool = true,
+        automaticRetryDelay: TimeInterval = 30,
+        retryAction: @escaping RetryAction = {
+            await TeamOrchestrator.shared.retryPendingPeerAgentPaneRecoveries()
+        }
+    ) {
+        self.automaticRetryDelay = automaticRetryDelay
+        self.retryAction = retryAction
+        if observeNotifications {
+            observer = NotificationCenter.default.addObserver(
+                forName: PeerClientCoordinator.relaysDidChangeNotification,
+                object: nil,
+                queue: .main
+            ) { _ in
+                Task { @MainActor in
+                    PeerAgentPaneRecoveryCoordinator.shared.retryNow()
+                }
+            }
+        }
+    }
+
+    deinit {
+        if let observer { NotificationCenter.default.removeObserver(observer) }
+    }
+
+    var pending: [Request] { Array(requests.values) }
+    func remember(_ request: Request) { requests[request.key] = request }
+    func forget(_ request: Request) {
+        guard requests[request.key] == request else { return }
+        requests.removeValue(forKey: request.key)
+        if requests.isEmpty {
+            retryTask?.cancel()
+            retryTask = nil
+        }
+    }
+
+    func retryNow() {
+        retryTask?.cancel()
+        retryTask = nil
+        guard !requests.isEmpty else { return }
+        runRetryAction()
+    }
+
+    func scheduleRetryIfNeeded() {
+        guard retryTask == nil, !requests.isEmpty else { return }
+        retryTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            let nanoseconds = UInt64(max(0, automaticRetryDelay) * 1_000_000_000)
+            if nanoseconds > 0 { try? await Task.sleep(nanoseconds: nanoseconds) }
+            guard !Task.isCancelled else { return }
+            retryTask = nil
+            runRetryAction()
+        }
+    }
+
+    private func runRetryAction() {
+        guard !retryInFlight, !requests.isEmpty else { return }
+        retryInFlight = true
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            await retryAction()
+            retryInFlight = false
+            scheduleRetryIfNeeded()
+        }
+    }
+}
+
 extension TeamOrchestrator {
     struct PeerShellCleanupItem: Identifiable, Equatable {
         enum State: Equatable {
@@ -2280,9 +2527,10 @@ extension TeamOrchestrator {
         // child of the peer daemon, so quitting here leaves the turn running
         // and a reattach picks the same surface back up, while its NDJSON
         // draws in an AgentPanel instead of scrolling past as a wire dump.
-        // What it still costs is environment: the ensure request carries none,
-        // so `TERMMESH_TEAM_*` never reaches the CLI and the standing brief is
-        // the only thing telling it what it is.
+        // The ensure carries the same environment contract as other remote
+        // native launches: active CLI profile, explicit host overrides, then
+        // non-spoofable TERMMESH identity. Hosts must advertise the dedicated
+        // ensure-env capability so an older decoder cannot silently drop it.
         //
         // **The local bridge** is kept for exactly cursor and agy. A turn is a
         // whole process for those two and they have no interactive UI, so a
@@ -2294,8 +2542,9 @@ extension TeamOrchestrator {
         // **Terminal** is everything else, and is exactly the behaviour every
         // remote member had before any of this: claude and gemini have no
         // peer-owned recipe (`tm-agent-bridge --cli` has no claude value, and
-        // no native panel holds gemini), and a host whose daemon predates
-        // `surface.agent.v1` or has no bridge installed keeps its PTY pane.
+        // no native panel holds gemini), and a host whose daemon lacks any of
+        // `surface.agent.v1`, `surface.exit.v1`, or `surface.ensure-env.v1`
+        // (or has no bridge installed) keeps its PTY pane.
         // Falling back is never silent — each reason is logged below with the
         // one thing that would give the agent pane back.
         let availability = await Self.canUsePeerOwnedAgent(
@@ -2341,6 +2590,15 @@ extension TeamOrchestrator {
                 // path would reach the same answer after spawning a second
                 // surface for nothing, so it is reported rather than retried.
                 throw error
+            } catch let error as PeerEnsureEnvironment.ValidationError {
+                // This is a local configuration refusal, not the host saying
+                // no. Values never enter the diagnostic; the shared validator
+                // reports only the offending key or aggregate limit.
+                RemoteWorkLog.info(
+                    Self.peerOwnedAgentInvalidEnvironmentFallbackMessage(
+                        error, cli: cli, hostName: host.displayName
+                    )
+                )
             } catch {
                 // The host's answer, not ours. `canUsePeerOwnedAgent` read the
                 // capability off a connection it then closed, so the host can
@@ -2764,7 +3022,8 @@ extension TeamOrchestrator {
     enum PeerOwnedAgentBlock: String, Equatable, Sendable, CaseIterable {
         /// No `tm-agent-bridge` on the host.
         case bridgeMissing
-        /// Its `term-meshd` does not advertise `surface.agent.v1`.
+        /// Its `term-meshd` lacks one of the peer-owned agent contract's
+        /// agent, authoritative-exit, or ensure-environment capabilities.
         case daemonTooOld
         /// The handshake that would have answered could not be made.
         case hostUnreachable
@@ -2802,7 +3061,8 @@ extension TeamOrchestrator {
             return lead + ": that host has no tm-agent-bridge. "
                 + "Install term-mesh on \(hostName) to get one."
         case .daemonTooOld:
-            return lead + ": its term-meshd predates surface.agent.v1. "
+            return lead + ": its term-meshd lacks the required agent, exit, "
+                + "or ensure-environment protocol capability. "
                 + "Update term-mesh on \(hostName) to get one."
         case .hostUnreachable:
             return lead + ": its term-meshd could not be asked what it supports. "
@@ -2811,6 +3071,16 @@ extension TeamOrchestrator {
             return lead + ": the host refused to start the bridge. "
                 + "Nothing was left running there; attach again to retry."
         }
+    }
+
+    static func peerOwnedAgentInvalidEnvironmentFallbackMessage(
+        _ error: PeerEnsureEnvironment.ValidationError,
+        cli: String,
+        hostName: String
+    ) -> String {
+        "\(cli) on \(hostName) opens as a terminal pane instead of a native agent pane: "
+            + "the configured peer environment is invalid (\(error.localizedDescription)). "
+            + "Fix the active CLI profile or explicit host environment to restore the native pane."
     }
 
     /// Ask the host connection itself whether the peer-owned path is open.
@@ -2840,7 +3110,9 @@ extension TeamOrchestrator {
                   hostSockPath: host.activeSockPath
               )
         else { return .blocked(.hostUnreachable) }
-        let supported = RemoteHostStore.hostSupportsAgentSurfaces(connection.hostCapabilities)
+        let supported = RemoteHostStore.hostSupportsPeerOwnedAgentFactory(
+            connection.hostCapabilities
+        )
         await connection.cancel()
         return supported ? .available : .blocked(.daemonTooOld)
     }
@@ -2939,10 +3211,33 @@ extension TeamOrchestrator {
         hostSockPath: String,
         surfaceID: Data
     ) async {
-        await PeerPaneSession.terminateSurface(
+        _ = await terminatePeerAgentSurfaceConfirmed(
             hostSockPath: hostSockPath,
             surfaceID: surfaceID
         )
+    }
+
+    /// Returns true only when the host authoritatively says the surface is gone.
+    /// A dropped response is deliberately false: the request may have applied,
+    /// and a retry then receives the idempotent `.notFound` confirmation.
+    static func terminatePeerAgentSurfaceConfirmed(
+        hostSockPath: String,
+        surfaceID: Data
+    ) async -> Bool {
+        guard !hostSockPath.isEmpty, !surfaceID.isEmpty,
+              let connection = try? await PeerRelaySession.connect(hostSockPath: hostSockPath)
+        else { return false }
+        do {
+            let result = try await connection.session.terminateSurface(surfaceID: surfaceID)
+            await connection.cancel()
+            return result == .terminated || result == .notFound
+        } catch {
+            await connection.cancel()
+            RemoteWorkLog.infoOffMain(
+                "Could not confirm peer agent termination: \(String(describing: error))"
+            )
+            return false
+        }
     }
 
     /// Stop the peer bridge behind one roster member, if that is what it has.
@@ -2953,16 +3248,42 @@ extension TeamOrchestrator {
     /// that drops the member — detach, project delete, team destroy — has to
     /// spend that id on the way out or the bridge runs on the peer forever.
     static func releasePeerOwnedAgentSurface(_ agent: AgentMember) {
+        releasePeerOwnedAgentSurface(agent, cleanup: .shared)
+    }
+
+    static func releasePeerOwnedAgentSurface(
+        _ agent: AgentMember,
+        cleanup: PendingPeerAgentSurfaceCleanupStore
+    ) {
         guard agent.remoteAgentSurface, agent.remoteSurfaceSpawned,
               let surfaceID = agent.remoteSurfaceID, !surfaceID.isEmpty,
-              let hostKey = agent.hostKey,
-              let host = RemoteHostStore.shared.sortedHosts.first(where: { $0.id == hostKey }),
-              !host.activeSockPath.isEmpty
+              let hostKey = agent.hostKey, !hostKey.isEmpty
         else { return }
-        let sockPath = host.activeSockPath
-        Task { @MainActor in
-            await Self.terminatePeerAgentSurface(hostSockPath: sockPath, surfaceID: surfaceID)
-        }
+        cleanup.enqueue(hostKey: hostKey, surfaceID: surfaceID)
+        cleanup.scheduleRetry()
+    }
+
+    /// Record cleanup before dropping the only local handle to a peer-owned
+    /// surface. This is also used between ensure and roster adoption, where no
+    /// `AgentMember` exists yet for the normal detach cleanup path to inspect.
+    static func enqueuePendingPeerAgentSurfaceCleanup(
+        hostKey: String,
+        surfaceID: Data
+    ) {
+        enqueuePendingPeerAgentSurfaceCleanup(
+            hostKey: hostKey,
+            surfaceID: surfaceID,
+            cleanup: .shared
+        )
+    }
+
+    static func enqueuePendingPeerAgentSurfaceCleanup(
+        hostKey: String,
+        surfaceID: Data,
+        cleanup: PendingPeerAgentSurfaceCleanupStore
+    ) {
+        cleanup.enqueue(hostKey: hostKey, surfaceID: surfaceID)
+        cleanup.scheduleRetry()
     }
 
     /// The team's half of a peer-owned agent pane: which member it is, whether
@@ -3039,41 +3360,118 @@ extension TeamOrchestrator {
     /// the daemon's ring. Failure is not fatal and not silent — the member
     /// keeps its surface id so a later attempt (or a detach) can still address
     /// the bridge.
+    enum PeerAgentPaneRecoveryResult: Equatable {
+        case recovered
+        case authoritativeMissing
+        case transientFailure
+    }
+
+    static func peerAgentRecoveryDelay(attempt: Int) -> TimeInterval {
+        guard attempt > 0 else { return 0 }
+        return min(8, pow(2, Double(attempt - 1)))
+    }
+
+    static func retryPeerAgentPaneRecovery(
+        maxAttempts: Int = 6,
+        sleep: (TimeInterval) async -> Void = { delay in
+            guard delay > 0 else { return }
+            try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
+        },
+        attempt: () async -> PeerAgentPaneRecoveryResult
+    ) async -> PeerAgentPaneRecoveryResult {
+        guard maxAttempts > 0 else { return .transientFailure }
+        for index in 0..<maxAttempts {
+            let result = await attempt()
+            guard result == .transientFailure else { return result }
+            if index + 1 < maxAttempts {
+                await sleep(peerAgentRecoveryDelay(attempt: index + 1))
+            }
+        }
+        return .transientFailure
+    }
+
     @discardableResult
     func recoverPeerOwnedAgentPane(closedPanelID: UUID, surfaceID: Data) async -> Bool {
         guard let (teamName, agent) = peerOwnedAgentMember(
             panelID: closedPanelID, surfaceID: surfaceID
         ) else { return false }
+        let request = PeerAgentPaneRecoveryCoordinator.Request(
+            teamName: teamName,
+            agentInstanceID: agent.agentInstanceId,
+            closedPanelID: closedPanelID,
+            surfaceID: surfaceID
+        )
+        PeerAgentPaneRecoveryCoordinator.shared.remember(request)
+        let result = await retryPeerOwnedAgentPaneRecovery(request)
+        return result == .recovered
+    }
+
+    func retryPendingPeerAgentPaneRecoveries() async {
+        for request in PeerAgentPaneRecoveryCoordinator.shared.pending {
+            _ = await retryPeerOwnedAgentPaneRecovery(request)
+        }
+    }
+
+    private func retryPeerOwnedAgentPaneRecovery(
+        _ request: PeerAgentPaneRecoveryCoordinator.Request
+    ) async -> PeerAgentPaneRecoveryResult {
         // Same shape as `agentOperationKey`, which is file-private to
         // TeamOrchestrator.swift: team plus durable instance id, so two
         // members named `executor` do not share one recovery slot.
-        let recoveryKey = "\(teamName)/\(agent.agentInstanceId)"
-        guard !peerAgentRecoveryInFlight.contains(recoveryKey) else { return false }
+        let recoveryKey = request.key
+        guard !peerAgentRecoveryInFlight.contains(recoveryKey) else {
+            return .transientFailure
+        }
         peerAgentRecoveryInFlight.insert(recoveryKey)
         defer { peerAgentRecoveryInFlight.remove(recoveryKey) }
 
+        let result = await Self.retryPeerAgentPaneRecovery { [weak self] in
+            guard let self else { return .transientFailure }
+            return await self.attemptPeerOwnedAgentPaneRecovery(request)
+        }
+        if result != .transientFailure {
+            PeerAgentPaneRecoveryCoordinator.shared.forget(request)
+        } else {
+            PeerAgentPaneRecoveryCoordinator.shared.scheduleRetryIfNeeded()
+        }
+        return result
+    }
+
+    private func attemptPeerOwnedAgentPaneRecovery(
+        _ request: PeerAgentPaneRecoveryCoordinator.Request
+    ) async -> PeerAgentPaneRecoveryResult {
+        guard let team = teams[request.teamName],
+              let agent = team.agents.first(where: {
+                  $0.agentInstanceId == request.agentInstanceID
+                      && $0.remoteSurfaceID == request.surfaceID
+              })
+        else {
+            // Detach/destroy retired the owner while a retry was sleeping.
+            return .authoritativeMissing
+        }
+
         guard let hostKey = agent.hostKey,
               let host = RemoteHostStore.shared.sortedHosts.first(where: { $0.id == hostKey }),
-              host.isConnected
+              host.isLaunchable
         else {
             RemoteWorkLog.info(
                 "\(agent.name)'s host is disconnected; its pane will come back "
                     + "when the host does"
             )
-            return false
+            return .transientFailure
         }
         guard let workspace = AppDelegate.shared?.tabManager?.tabs
             .first(where: { $0.id == agent.workspaceId })
-            ?? resolveTabManager(teamName: teamName)?.tabs
+            ?? resolveTabManager(teamName: request.teamName)?.tabs
             .first(where: { $0.id == agent.workspaceId })
-        else { return false }
+        else { return .transientFailure }
 
         let lease: PeerPaneHostLease
         do {
             lease = try await PeerPaneHostRegistry.shared.acquire(host.paneHostSpec)
         } catch {
             RemoteWorkLog.info("Cannot reattach \(agent.name) on \(host.displayName): \(error)")
-            return false
+            return .transientFailure
         }
         let session: PeerPaneSession
         do {
@@ -3082,13 +3480,13 @@ extension TeamOrchestrator {
             // its daemon restarted with `restartPolicy: .never`. There is
             // nothing to reattach to and nothing left to terminate; say so
             // rather than retrying a surface that does not exist.
-            guard let surface = surfaces.first(where: { $0.surfaceID == surfaceID }) else {
+            guard let surface = surfaces.first(where: { $0.surfaceID == request.surfaceID }) else {
                 PeerPaneHostRegistry.shared.release(lease)
                 RemoteWorkLog.info(
                     "\(agent.name) on \(host.displayName) has ended: its host no longer "
                         + "holds that agent surface. Detach and attach it again to restart it."
                 )
-                return false
+                return .authoritativeMissing
             }
             session = try await PeerPaneSession.attach(
                 lease: lease,
@@ -3099,26 +3497,36 @@ extension TeamOrchestrator {
         } catch {
             PeerPaneHostRegistry.shared.release(lease)
             RemoteWorkLog.info("Cannot reattach \(agent.name) on \(host.displayName): \(error)")
-            return false
+            return .transientFailure
         }
         PeerPaneHostRegistry.shared.release(lease)
+
+        // `listSurfaces` and `attach` both suspend. Detach/team destruction may
+        // have retired this owner while the remote session was being opened;
+        // never resurrect a pane after that authoritative local decision.
+        guard validatePeerAgentRecoveryOwnership(
+            teamName: request.teamName,
+            agentInstanceID: request.agentInstanceID,
+            surfaceID: request.surfaceID,
+            onMismatch: { session.teardown() }
+        ) else { return .authoritativeMissing }
 
         guard let panel = workspace.openRemoteAgentPane(session: session, focus: false) else {
             session.teardown()
             RemoteWorkLog.info("Cannot reattach \(agent.name): no local pane can host it")
-            return false
+            return .transientFailure
         }
         Self.bindPeerOwnedAgentPanel(
             panel: panel,
             workspace: workspace,
-            teamName: teamName,
+            teamName: request.teamName,
             agentName: agent.name,
             agentInstanceId: agent.agentInstanceId,
             color: agent.color,
             hostDisplayName: host.displayName
         )
         replaceRemoteAgentPresentation(
-            teamName: teamName,
+            teamName: request.teamName,
             agentInstanceID: agent.agentInstanceId,
             workspaceID: workspace.id,
             panelID: panel.id
@@ -3126,10 +3534,40 @@ extension TeamOrchestrator {
         scheduleAgentGridEqualization(workspace: workspace)
 #if DEBUG
         dlog(
-            "peer.agentPane.recover team=\(teamName) agent=\(agent.name) "
+            "peer.agentPane.recover team=\(request.teamName) agent=\(agent.name) "
                 + "panel=\(panel.id.uuidString.prefix(8))"
         )
 #endif
+        return .recovered
+    }
+
+    func ownsPeerAgentSurface(
+        teamName: String,
+        agentInstanceID: String,
+        surfaceID: Data
+    ) -> Bool {
+        teams[teamName]?.agents.contains(where: {
+            $0.agentInstanceId == agentInstanceID
+                && $0.remoteAgentSurface
+                && $0.remoteSurfaceID == surfaceID
+        }) == true
+    }
+
+    @discardableResult
+    func validatePeerAgentRecoveryOwnership(
+        teamName: String,
+        agentInstanceID: String,
+        surfaceID: Data,
+        onMismatch: () -> Void
+    ) -> Bool {
+        guard ownsPeerAgentSurface(
+            teamName: teamName,
+            agentInstanceID: agentInstanceID,
+            surfaceID: surfaceID
+        ) else {
+            onMismatch()
+            return false
+        }
         return true
     }
 
@@ -3163,12 +3601,14 @@ extension TeamOrchestrator {
     /// delivered straight into `AgentSession` (so the pane draws turns rather
     /// than a wire dump).
     ///
-    /// What it costs relative to `attachRemoteNativeAgent`: the ensure
-    /// request carries no environment, so `TERMMESH_TEAM_*` never reaches the
-    /// CLI and the standing brief is the only thing telling it what it is.
-    /// That is why the briefing below is not optional decoration. The reply
-    /// path does not depend on it — `onTurnEnd` files the report from this
-    /// side, exactly as the local native path does.
+    /// The ensure request carries the validated remote-native environment:
+    /// active CLI profile first, explicit peer-host values overriding it, and
+    /// term-mesh identity last so configured values cannot impersonate another
+    /// team/member. This factory is therefore available only when the host
+    /// advertises agent, authoritative-exit, and ensure-environment support.
+    /// The standing brief remains required for role instructions; the reply
+    /// path does not depend on it — `onTurnEnd` files the report from this side,
+    /// exactly as the local native path does.
     ///
     /// Callers must treat a thrown `RelayError` as "take the terminal path",
     /// not as a failed attach. `canUsePeerOwnedAgent` reads the capability off
@@ -3183,6 +3623,20 @@ extension TeamOrchestrator {
     /// that no longer dies with anything local, so committing it to a roster
     /// that was already retired strands a bridge on the peer for good.
     @MainActor
+    static func peerOwnedAgentEnvironment(
+        profile: [String: String],
+        explicitHost: [String: String],
+        internalIdentity: [String: String]
+    ) throws -> [String: String] {
+        let merged = profile
+            .merging(explicitHost) { _, hostValue in hostValue }
+            .merging(internalIdentity) { _, internalValue in internalValue }
+        try PeerEnsureEnvironment.validate(merged)
+        return Dictionary(
+            uniqueKeysWithValues: try PeerEnsureEnvironment.validatedPairs(merged)
+        )
+    }
+
     private func attachPeerOwnedAgent(
         team: Team,
         workspace: Workspace,
@@ -3217,6 +3671,22 @@ extension TeamOrchestrator {
             model: model,
             binaries: binaries
         )
+        // Match the documented remote-native launch contract: active CLI
+        // profile at the bottom, explicit peer-host values above it, and
+        // term-mesh's identity last so configuration cannot impersonate
+        // another team/member.
+        let environment = try Self.peerOwnedAgentEnvironment(
+            profile: CLIPathSettings.activeProfile(for: cli)?.env ?? [:],
+            explicitHost: PeerHostEnvironment.stored(forHostKey: host.id),
+            internalIdentity: Self.remoteNativeAgentEnvironment(
+                teamName: team.id,
+                agentName: agentName,
+                agentType: agentType,
+                agentCli: cli,
+                workspaceId: workspace.id,
+                socketPath: host.remoteSockPath
+            )
+        )
 
         let registry = PeerPaneHostRegistry.shared
         let lease = try await registry.acquire(host.paneHostSpec)
@@ -3227,7 +3697,14 @@ extension TeamOrchestrator {
                 surfaceSpec: spec,
                 attachment: PeerRunnerAttachment(title: agentName, lifetime: .keepAlive),
                 hostSpec: host.paneHostSpec,
-                agentCli: cli
+                agentCli: cli,
+                environment: environment,
+                onAgentPostEnsureFailure: { surfaceID in
+                    Self.enqueuePendingPeerAgentSurfaceCleanup(
+                        hostKey: host.id,
+                        surfaceID: surfaceID
+                    )
+                }
             )
             registry.release(lease)
         } catch {
@@ -3240,10 +3717,10 @@ extension TeamOrchestrator {
         // From here on the surface exists on the peer. Every exit has to take
         // it back down, or a failed attach leaves a bridge running there with
         // nothing on this side pointing at it.
-        func abandonSurface() async {
+        func abandonSurface() {
             session.teardown()
-            await Self.terminatePeerAgentSurface(
-                hostSockPath: host.activeSockPath,
+            Self.enqueuePendingPeerAgentSurfaceCleanup(
+                hostKey: host.id,
                 surfaceID: surfaceID
             )
         }
@@ -3252,7 +3729,7 @@ extension TeamOrchestrator {
         // building anything on top of it. A deletion that began while this was
         // ensuring has already decided the roster.
         guard stillWanted() else {
-            await abandonSurface()
+            abandonSurface()
             throw RemoteAgentError.teamNotFound(team.id)
         }
 
@@ -3262,7 +3739,7 @@ extension TeamOrchestrator {
             focus: false,
             from: splitFrom
         ) else {
-            await abandonSurface()
+            abandonSurface()
             throw RemoteAgentError.paneCreationFailed
         }
         Self.bindPeerOwnedAgentPanel(
@@ -3310,12 +3787,12 @@ extension TeamOrchestrator {
         // already finished with is what orphans the peer's bridge.
         guard stillWanted() else {
             _ = workspace.closePanel(panel.id, force: true)
-            await abandonSurface()
+            abandonSurface()
             throw RemoteAgentError.teamNotFound(team.id)
         }
         guard adoptAgentMember(member, teamName: team.id) else {
             _ = workspace.closePanel(panel.id, force: true)
-            await abandonSurface()
+            abandonSurface()
             throw RemoteAgentError.duplicateInstance(member.agentInstanceId)
         }
         scheduleAgentGridEqualization(workspace: workspace)
