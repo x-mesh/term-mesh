@@ -21,7 +21,7 @@ fn validated_signal_pid(pid: u32) -> Result<libc::pid_t, String> {
     Ok(pid as libc::pid_t)
 }
 
-fn signal_agent_process_group(pid: u32, signal: libc::c_int) -> Result<(), String> {
+pub(crate) fn signal_agent_process_group(pid: u32, signal: libc::c_int) -> Result<(), String> {
     let pid_i32 = validated_signal_pid(pid)?;
     let pgid = unsafe { libc::getpgid(pid_i32) };
     if pgid > 1 {

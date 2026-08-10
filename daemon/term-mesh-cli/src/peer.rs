@@ -725,6 +725,24 @@ fn probe_remote_socket(host: &str) -> Result<String, PeerCliError> {
     }
 }
 
+/// `Hello.capabilities` for this CLI — NOT `capability::supported_vec()`.
+///
+/// That list is "everything this BUILD implements", and since
+/// `surface.agent.v1` it contains a capability whose CLIENT half is a
+/// renderer promise: "I can render an agent surface's NDJSON event stream"
+/// (the viewer's AgentPanel — see `peer_proto::capability::SURFACE_AGENT_V1`).
+/// This CLI renders raw bytes to a terminal and pipes raw keystrokes back,
+/// so advertising it would talk the daemon's two gates (the
+/// `attachable = false` listing downgrade and the attach refusal) into
+/// permitting exactly the mispairing they exist to prevent: NDJSON dumped
+/// into a terminal, and stray key bytes parsed as agent turn input.
+fn client_capabilities() -> Vec<String> {
+    capability::supported_vec()
+        .into_iter()
+        .filter(|cap| cap != capability::SURFACE_AGENT_V1)
+        .collect()
+}
+
 /// Establish a connection, run the Hello/Auth handshake, and return the
 /// stream halves + the running seq counter. Used by both `list_cmd` and
 /// `attach_cmd` so their handshake stays in sync.
@@ -750,7 +768,7 @@ fn connect_and_authenticate(
                 peer_id,
                 display_name: std::env::var("TERMMESH_PEER_CLIENT_NAME")
                     .unwrap_or_else(|_| "tm-agent-peer".into()),
-                capabilities: capability::supported_vec(),
+                capabilities: client_capabilities(),
                 app_version: env!("CARGO_PKG_VERSION").into(),
                 cli_bin_dirs: vec![],
                 // A client owns no sessions, so it names no owner.
@@ -967,6 +985,9 @@ fn ensure_remote(
                     RestartPolicy::Never => EnsureSurfaceRestartPolicy::Never,
                     RestartPolicy::OnDaemonRestart => EnsureSurfaceRestartPolicy::OnDaemonRestart,
                 } as i32,
+                // Empty kind means "terminal" (backward-compatible default); the
+                // CLI ensure path only creates terminal surfaces today.
+                kind: String::new(),
             })),
         },
     )
@@ -1537,7 +1558,19 @@ fn select_surface(
                     })
             }
             None => surfaces
-                .first()
+                .iter()
+                // Prefer the first ATTACHABLE surface, as documented above:
+                // a host downgrades surfaces this client must not attach
+                // (e.g. agent surfaces, since `client_capabilities()` does
+                // not advertise `surface.agent.v1`) to `attachable = false`,
+                // and defaulting onto one of those would only earn a
+                // refusal. Fall back to the raw first surface when nothing
+                // is attachable — a dead-child PTY surface lists as
+                // non-attachable but an explicit attach revives it
+                // (`get_or_respawn`), and an agent surface picked this way
+                // still gets the host's explicit, diagnosable refusal.
+                .find(|s| s.attachable)
+                .or_else(|| surfaces.first())
                 .cloned()
                 .ok_or_else(|| anyhow::anyhow!("host reports no attachable surfaces")),
         },
@@ -2814,7 +2847,53 @@ mod tests {
             attachable: true,
             cwd: "/tmp".into(),
             branch: "develop".into(),
+            agent_cli: String::new(),
         }
+    }
+
+    /// Adversarial finding, peer agent surface: the CLI must NOT advertise
+    /// `surface.agent.v1` — its client half is a renderer promise
+    /// (AgentPanel) this raw-byte terminal client cannot keep. Advertising
+    /// it would defeat both daemon gates and dump NDJSON into the user's
+    /// terminal while raw keystrokes feed the bridge's stdin. The rest of
+    /// the build's list must survive the filter untouched.
+    #[test]
+    fn client_hello_does_not_advertise_agent_surface_rendering() {
+        let caps = client_capabilities();
+        assert!(
+            !caps.iter().any(|c| c == capability::SURFACE_AGENT_V1),
+            "CLI must not claim it can render agent surfaces"
+        );
+        // Everything else the build supports still travels.
+        let expected: Vec<String> = capability::supported_vec()
+            .into_iter()
+            .filter(|c| c != capability::SURFACE_AGENT_V1)
+            .collect();
+        assert_eq!(caps, expected);
+        assert_eq!(caps.len() + 1, capability::supported_vec().len());
+    }
+
+    /// The default (no name, no id) pick must skip non-attachable rows —
+    /// that is where a host parks surfaces this client must not attach
+    /// (agent surfaces, given the capability filter above). Only when
+    /// nothing is attachable does it fall back to the first row, keeping
+    /// the dead-PTY revival path reachable.
+    #[test]
+    fn select_surface_default_prefers_attachable_rows() {
+        let mut agent = surface_info(0x11, "agent");
+        agent.surface_type = "agent".into();
+        agent.attachable = false;
+        let terminal = surface_info(0x22, "terminal");
+
+        let picked = select_surface(&[agent.clone(), terminal.clone()], None, None).unwrap();
+        assert_eq!(picked.surface_id, terminal.surface_id);
+
+        // Nothing attachable: fall back to the first row (explicit attach
+        // may revive a dead PTY; an agent row earns the host's refusal).
+        let mut dead = surface_info(0x33, "dead");
+        dead.attachable = false;
+        let picked = select_surface(&[dead.clone(), agent], None, None).unwrap();
+        assert_eq!(picked.surface_id, dead.surface_id);
     }
 
     #[test]
