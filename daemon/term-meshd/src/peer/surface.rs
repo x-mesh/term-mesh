@@ -17,10 +17,11 @@
 //! winsize arbitration, screen model) is absent, encapsulated behind
 //! [`SurfaceIo`] so callers keep a single `Arc<PtySurface>` type.
 
-use std::collections::{BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::os::unix::io::{AsRawFd, OwnedFd, RawFd};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::mpsc as std_mpsc;
 use std::sync::{Arc, Mutex, RwLock, Weak};
 
 use peer_proto::v1::SurfaceInfo;
@@ -71,6 +72,9 @@ const READ_BUF_SIZE: usize = 65536;
 /// reassemble). Same value as `READ_BUF_SIZE` so both surface kinds make
 /// the same structural promise downstream.
 const AGENT_CHUNK_MAX_BYTES: usize = READ_BUF_SIZE;
+/// Per-agent ordered input backlog. `try_send` makes socket control traffic
+/// independent of a child that stopped consuming stdin.
+const AGENT_INPUT_QUEUE_CAPACITY: usize = 16;
 /// Fan-out channel capacity. If a slow subscriber falls behind by this many
 /// chunks, it starts getting `RecvError::Lagged` on `recv()`; the connection
 /// layer handles that as a gap (eventual reconnect will re-snapshot).
@@ -484,9 +488,15 @@ struct AgentIo {
     /// Which CLI this agent child is bridging ("codex", "kiro", …),
     /// reported verbatim as `SurfaceInfo.agent_cli`.
     agent_cli: String,
-    /// Blocking write end of the child's stdin. `None` only after a
-    /// poisoned teardown; a live surface always holds it.
-    stdin: Mutex<Option<std::process::ChildStdin>>,
+    /// Bounded, ordered handoff to the one blocking stdin writer thread.
+    input_tx: std_mpsc::SyncSender<Vec<u8>>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SurfaceExitInfo {
+    pub exit_code: i32,
+    pub signal: i32,
+    pub reason: &'static str,
 }
 
 pub struct PtySurface {
@@ -538,6 +548,7 @@ enum ChildState {
 struct ChildLifecycle {
     pid: libc::pid_t,
     state: ChildState,
+    exit: Option<SurfaceExitInfo>,
 }
 
 /// The "please exit" signal for this surface's child: SIGHUP for a PTY
@@ -611,6 +622,171 @@ impl SizeArbiter {
     }
 }
 
+fn agent_login_shell() -> String {
+    let passwd_shell = passwd_login_shell();
+    let candidate = resolve_login_shell(
+        std::env::var("SHELL").ok().as_deref(),
+        passwd_shell.as_deref(),
+    );
+    match candidate.rsplit('/').next().unwrap_or("") {
+        "sh" | "bash" | "zsh" | "dash" | "ksh" | "mksh" => candidate,
+        // `agent-env` is explicitly a Bourne-compatible fragment. Accounts
+        // using fish/csh still get a deterministic compatible loader.
+        _ => "/bin/sh".into(),
+    }
+}
+
+fn agent_environment_failure_action(message: &'static str, code: i32) -> String {
+    let event = serde_json::json!({
+        "type": "result",
+        "subtype": "error",
+        "is_error": true,
+        "stop_reason": "environment_failed",
+        "result": message,
+    })
+    .to_string();
+    format!(
+        "printf '%s\\n' {}; exit {code}",
+        tm_agent_bridge::location::shell_quote(&event)
+    )
+}
+
+fn is_agent_env_name(key: &str) -> bool {
+    !key.is_empty()
+        && key.bytes().enumerate().all(|(index, byte)| {
+            byte == b'_'
+                || byte.is_ascii_alphabetic()
+                || (index > 0 && byte.is_ascii_digit())
+        })
+}
+
+/// Command body run by the account's login shell for a peer-owned agent.
+/// The shell has already loaded its normal login profile. This adds the
+/// documented literal-profile fallback and agent-env fragment, then overlays
+/// requested values and finally unforgeable internal identity.
+fn agent_launch_script(
+    shell: &str,
+    command: &str,
+    args: &[&str],
+    requested_env: &[(String, String)],
+    identity_env: &[(String, String)],
+    nonce: &str,
+) -> std::io::Result<(String, Vec<(String, String)>)> {
+    let profile_failure = agent_environment_failure_action(
+        "remote agent could not load ~/.profile",
+        tm_agent_bridge::location::PROFILE_LOAD_EXIT,
+    );
+    let agent_env_failure = agent_environment_failure_action(
+        "remote agent could not load ~/.config/term-mesh/agent-env",
+        tm_agent_bridge::location::AGENT_ENV_LOAD_EXIT,
+    );
+    // fd 1/2 were hidden while the login shell automatically loaded its
+    // profile; restore the bridge's protocol/stdout and diagnostics/stderr.
+    let mut script = format!(
+        "exec 1>&3 2>&4 3>&- 4>&-; SHELL={}; export SHELL; ",
+        tm_agent_bridge::location::shell_quote(shell)
+    );
+    script.push_str(&tm_agent_bridge::location::login_environment_prelude(
+        &profile_failure,
+        &agent_env_failure,
+    ));
+    script.push_str(&format!(
+        r#"export PATH="{}"; "#,
+        tm_agent_bridge::location::REMOTE_PATH
+    ));
+
+    let mut merged: BTreeMap<String, String> = requested_env.iter().cloned().collect();
+    merged.extend(identity_env.iter().cloned());
+    // Values travel in inherited environment slots rather than the shell's
+    // argv, where `ps` would expose API keys. Random names keep profiles from
+    // colliding with the saved overlay. `env -u` removes every slot before
+    // exec, while quoted shell expansion restores the real key/value only
+    // after all sourcing has completed.
+    let mut saved_env = Vec::new();
+    let mut unset_args = Vec::new();
+    let mut assignments = Vec::new();
+    for (index, (key, value)) in merged
+        .into_iter()
+        // Same explicit exception as the SSH bridge: CLI locations are
+        // configured paths, while PATH is a fixed remote safety baseline.
+        .filter(|(key, _)| key != "PATH")
+        .enumerate()
+    {
+        if !is_agent_env_name(&key) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "agent environment contains an invalid key",
+            ));
+        }
+        let saved = format!("TERMMESH_LAUNCH_{nonce}_{index}");
+        saved_env.push((saved.clone(), value));
+        // `key` was wire-validated as a portable identifier and `saved` is
+        // generated from a UUID/index, so only the VALUE needs quoting. The
+        // expansion must remain live shell syntax; shell_join would quote the
+        // dollar sign itself and pass the placeholder literally.
+        unset_args.push(format!("-u {saved}"));
+        assignments.push(format!(r#"{key}="${{{saved}}}""#));
+    }
+    script.push_str("exec env ");
+    // BSD env stops parsing options at the first assignment, so every -u
+    // must precede every restored KEY=value.
+    script.push_str(&unset_args.join(" "));
+    if !unset_args.is_empty() {
+        script.push(' ');
+    }
+    script.push_str(&assignments.join(" "));
+    if !assignments.is_empty() {
+        script.push(' ');
+    }
+    let mut command_argv = vec![command.to_string()];
+    command_argv.extend(args.iter().map(|arg| (*arg).to_string()));
+    script.push_str(&tm_agent_bridge::location::shell_join(&command_argv));
+    Ok((script, saved_env))
+}
+
+fn agent_shell_wrapper(shell: &str, launch_script: String) -> String {
+    let shell_argv = vec![shell.to_string(), "-l".into(), "-c".into(), launch_script];
+    format!(
+        "exec 3>&1 4>&2; exec {} >/dev/null 2>&1",
+        tm_agent_bridge::location::shell_join(&shell_argv)
+    )
+}
+
+/// The daemon process can carry auth tokens, peer credentials and control
+/// sockets that an authenticated peer must not recover by ensuring
+/// `/usr/bin/env`. Start from nothing and pass only account identity plus
+/// locale inputs needed by a login shell. PATH is deliberately absent here:
+/// the shared launch script installs the fixed remote PATH after sourcing.
+fn configure_agent_command_environment(
+    command: &mut std::process::Command,
+    shell: &str,
+    saved_env: Vec<(String, String)>,
+) {
+    const ALLOWLIST: &[&str] = &[
+        "HOME",
+        "USER",
+        "LOGNAME",
+        "LANG",
+        "LANGUAGE",
+        "LC_ALL",
+        "LC_CTYPE",
+        "LC_COLLATE",
+        "LC_MESSAGES",
+        "LC_MONETARY",
+        "LC_NUMERIC",
+        "LC_TIME",
+        "TZ",
+    ];
+    command.env_clear();
+    for key in ALLOWLIST {
+        if let Some(value) = std::env::var_os(key) {
+            command.env(key, value);
+        }
+    }
+    command.env("SHELL", shell);
+    command.envs(saved_env);
+}
+
 impl PtySurface {
     pub fn spawn(
         surface_id: Vec<u8>,
@@ -621,7 +797,25 @@ impl PtySurface {
         rows: u16,
         cwd: Option<&str>,
     ) -> std::io::Result<Arc<Self>> {
-        let child = pty::spawn(command, args, cols, rows, cwd, &pane_environment(&surface_id))?;
+        Self::spawn_with_env(surface_id, title, command, args, cols, rows, cwd, &[])
+    }
+
+    fn spawn_with_env(
+        surface_id: Vec<u8>,
+        title: String,
+        command: &str,
+        args: &[&str],
+        cols: u16,
+        rows: u16,
+        cwd: Option<&str>,
+        requested_env: &[(String, String)],
+    ) -> std::io::Result<Arc<Self>> {
+        // Explicit profile env overlays the daemon environment; term-mesh's
+        // internal identity is appended last and therefore cannot be forged.
+        let mut merged_env: BTreeMap<String, String> = requested_env.iter().cloned().collect();
+        merged_env.extend(pane_environment(&surface_id));
+        let child_env: Vec<(String, String)> = merged_env.into_iter().collect();
+        let child = pty::spawn(command, args, cols, rows, cwd, &child_env)?;
         pty::set_nonblocking(child.master_fd)?;
         let (tx, _rx) = broadcast::channel::<PtyChunk>(BROADCAST_CAPACITY);
 
@@ -652,6 +846,7 @@ impl PtySurface {
             child: Mutex::new(ChildLifecycle {
                 pid: child.pid,
                 state: ChildState::Running,
+                exit: None,
             }),
             signal_owners: AtomicUsize::new(0),
             reap_owners: AtomicUsize::new(0),
@@ -801,10 +996,15 @@ impl PtySurface {
                     Err(_would_block) => continue,
                 }
             }
-            if !reader_surface.child_has_exited() {
-                reader_surface.hangup();
-            }
-            reader_surface.mark_dead();
+            // Final bytes are in replay+broadcast before death becomes
+            // observable. Reap off the async worker so EOF cannot leave a
+            // zombie when waitpid(WNOHANG) loses the process-exit race.
+            let reap_surface = reader_surface.clone();
+            let _ = tokio::task::spawn_blocking(move || {
+                reap_surface.finish_after_eof();
+                reap_surface.mark_dead();
+            })
+            .await;
         });
 
         Ok(surface)
@@ -838,21 +1038,34 @@ impl PtySurface {
         args: &[&str],
         cwd: Option<&str>,
         agent_cli: String,
+        requested_env: &[(String, String)],
     ) -> std::io::Result<Arc<Self>> {
         use std::os::unix::process::CommandExt;
 
-        let mut cmd = std::process::Command::new(command);
-        cmd.args(args)
+        let shell = agent_login_shell();
+        let nonce = uuid::Uuid::new_v4().simple().to_string();
+        let (launch_script, saved_env) = agent_launch_script(
+            &shell,
+            command,
+            args,
+            requested_env,
+            &identity_environment(&surface_id),
+            &nonce,
+        )?;
+        // Preserve the child's real stdout/stderr on fd 3/4, but hide output
+        // from the shell's automatic login profile. The inner script restores
+        // them before loading the explicit fallback files and launching the
+        // bridge, so only fixed, value-free load errors reach the protocol.
+        let outer = agent_shell_wrapper(&shell, launch_script);
+        let mut cmd = std::process::Command::new("/bin/sh");
+        cmd.args(["-c", &outer])
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
+        configure_agent_command_environment(&mut cmd, &shell, saved_env);
         if let Some(dir) = cwd {
             cmd.current_dir(dir);
         }
-        // Identity only — no TERM/COLORTERM: there is no terminal behind an
-        // agent surface, and claiming one invites ANSI decoration in a
-        // stream the viewer parses as NDJSON.
-        cmd.envs(identity_environment(&surface_id));
         // Safety: setsid is async-signal-safe; nothing else runs pre-exec.
         unsafe {
             cmd.pre_exec(|| {
@@ -878,6 +1091,19 @@ impl PtySurface {
         // `std::process::Child::drop` is a no-op for process lifetime.
         drop(child);
 
+        let (input_tx, input_rx) = std_mpsc::sync_channel::<Vec<u8>>(AGENT_INPUT_QUEUE_CAPACITY);
+        std::thread::Builder::new()
+            .name(format!("term-mesh-agent-input-{}", hex_short(&surface_id)))
+            .spawn(move || {
+                use std::io::Write;
+                let mut stdin = stdin;
+                while let Ok(bytes) = input_rx.recv() {
+                    if stdin.write_all(&bytes).and_then(|_| stdin.flush()).is_err() {
+                        break;
+                    }
+                }
+            })?;
+
         let (tx, _rx) = broadcast::channel::<PtyChunk>(BROADCAST_CAPACITY);
         let resolved_cwd = cwd.map(|c| c.to_string()).unwrap_or_else(|| {
             std::env::current_dir()
@@ -901,11 +1127,12 @@ impl PtySurface {
             replay: Mutex::new(ReplayBuffer::default()),
             io: SurfaceIo::Agent(AgentIo {
                 agent_cli,
-                stdin: Mutex::new(Some(stdin)),
+                input_tx,
             }),
             child: Mutex::new(ChildLifecycle {
                 pid,
                 state: ChildState::Running,
+                exit: None,
             }),
             signal_owners: AtomicUsize::new(0),
             reap_owners: AtomicUsize::new(0),
@@ -1022,10 +1249,12 @@ impl PtySurface {
                 pending.push(b'\n');
                 emit(pending);
             }
-            if !reader_surface.child_has_exited() {
-                reader_surface.hangup();
-            }
-            reader_surface.mark_dead();
+            let reap_surface = reader_surface.clone();
+            let _ = tokio::task::spawn_blocking(move || {
+                reap_surface.finish_after_eof();
+                reap_surface.mark_dead();
+            })
+            .await;
         });
 
         // stderr drain: discarded (the event contract lives on stdout), but
@@ -1152,6 +1381,26 @@ impl PtySurface {
         Self::reap_after_kill_locked(&mut child, &self.reap_owners);
     }
 
+    /// Finish ownership after the output pipe reaches EOF. A normal child
+    /// commonly closes stdout a few scheduler ticks before `waitpid(WNOHANG)`
+    /// can observe its exit. Signalling immediately in that window rewrites a
+    /// clean exit into SIGTERM, so first give it the same bounded grace used
+    /// by polite shutdown without delivering any signal. Only a process that
+    /// remains alive after that grace is forcefully torn down.
+    fn finish_after_eof(&self) {
+        let Ok(mut child) = self.child.lock() else {
+            return;
+        };
+        for _ in 0..FORCE_KILL_GRACE_POLLS {
+            if Self::observe_exit_locked(&mut child, &self.reap_owners) {
+                return;
+            }
+            std::thread::sleep(FORCE_KILL_GRACE_INTERVAL);
+        }
+        drop(child);
+        self.shutdown_forcibly();
+    }
+
     /// Reap the child after a SIGKILL, giving up after a bounded window.
     ///
     /// This used to be a plain blocking `waitpid` (no `WNOHANG`), on the
@@ -1182,6 +1431,11 @@ impl PtySurface {
             pid = child.pid,
             "SIGKILLed child not reapable within the teardown window; abandoning its pid"
         );
+        child.exit = Some(SurfaceExitInfo {
+            exit_code: 0,
+            signal: libc::SIGKILL,
+            reason: "signaled",
+        });
         child.state = ChildState::Abandoned;
     }
 
@@ -1209,10 +1463,36 @@ impl PtySurface {
             // Safety: all waitpid calls for this surface are serialized by
             // `child`; no second owner can reap or signal concurrently.
             let result = unsafe { libc::waitpid(child.pid, &mut status, libc::WNOHANG) };
-            if result == child.pid
-                || (result < 0
-                    && std::io::Error::last_os_error().raw_os_error() == Some(libc::ECHILD))
+            if result == child.pid {
+                child.exit = Some(if libc::WIFEXITED(status) {
+                    SurfaceExitInfo {
+                        exit_code: libc::WEXITSTATUS(status),
+                        signal: 0,
+                        reason: "exited",
+                    }
+                } else if libc::WIFSIGNALED(status) {
+                    SurfaceExitInfo {
+                        exit_code: 0,
+                        signal: libc::WTERMSIG(status),
+                        reason: "signaled",
+                    }
+                } else {
+                    SurfaceExitInfo {
+                        reason: "unknown",
+                        ..Default::default()
+                    }
+                });
+                child.state = ChildState::Reaped;
+                reap_owners.fetch_add(1, Ordering::Relaxed);
+                return true;
+            }
+            if result < 0
+                && std::io::Error::last_os_error().raw_os_error() == Some(libc::ECHILD)
             {
+                child.exit = Some(SurfaceExitInfo {
+                    reason: "unknown",
+                    ..Default::default()
+                });
                 child.state = ChildState::Reaped;
                 reap_owners.fetch_add(1, Ordering::Relaxed);
                 return true;
@@ -1393,23 +1673,30 @@ impl PtySurface {
         match &self.io {
             SurfaceIo::Pty(pty) => pty::write_all(pty.master_fd, bytes),
             SurfaceIo::Agent(agent) => {
-                // Viewer turn input goes to the agent child's stdin. The
-                // handle is blocking (std, not tokio), so `write_all` here
-                // has the same blocking semantics as the PTY branch.
-                use std::io::Write;
-                let mut guard = agent.stdin.lock().map_err(|_| {
-                    std::io::Error::new(std::io::ErrorKind::Other, "agent stdin lock poisoned")
-                })?;
-                let Some(stdin) = guard.as_mut() else {
-                    return Err(std::io::Error::new(
+                match agent.input_tx.try_send(bytes.to_vec()) {
+                    Ok(()) => Ok(()),
+                    Err(std_mpsc::TrySendError::Full(_)) => Err(std::io::Error::new(
+                        std::io::ErrorKind::WouldBlock,
+                        "agent input queue full",
+                    )),
+                    Err(std_mpsc::TrySendError::Disconnected(_)) => Err(std::io::Error::new(
                         std::io::ErrorKind::BrokenPipe,
-                        "agent stdin closed",
-                    ));
-                };
-                stdin.write_all(bytes)?;
-                stdin.flush()
+                        "agent input writer closed",
+                    )),
+                }
             }
         }
+    }
+
+    pub fn exit_info(&self) -> SurfaceExitInfo {
+        self.child
+            .lock()
+            .ok()
+            .and_then(|child| child.exit.clone())
+            .unwrap_or(SurfaceExitInfo {
+                reason: "unknown",
+                ..Default::default()
+            })
     }
 
     pub fn resize(&self, cols: u16, rows: u16) -> std::io::Result<()> {
@@ -1869,6 +2156,10 @@ impl SurfaceSpec {
     /// strings. This is stable across process runs and cannot confuse field or
     /// argument boundaries (`["a", "bc"]` and `["ab", "c"]` differ).
     pub fn canonical_hash(&self) -> [u8; 32] {
+        self.canonical_hash_with_env(&[])
+    }
+
+    pub fn canonical_hash_with_env(&self, env: &[(String, String)]) -> [u8; 32] {
         fn field(hasher: &mut Sha256, bytes: &[u8]) {
             hasher.update((bytes.len() as u64).to_be_bytes());
             hasher.update(bytes);
@@ -1883,6 +2174,16 @@ impl SurfaceSpec {
             field(&mut hasher, arg.as_bytes());
         }
         hasher.update([self.restart_policy.canonical_byte()]);
+        if !env.is_empty() {
+            hasher.update(b"term-mesh.surface-env.v1\0");
+            let mut env = env.to_vec();
+            env.sort_by(|a, b| a.0.cmp(&b.0));
+            hasher.update((env.len() as u64).to_be_bytes());
+            for (key, value) in env {
+                field(&mut hasher, key.as_bytes());
+                field(&mut hasher, value.as_bytes());
+            }
+        }
         // Appended ONLY for a non-terminal kind: a terminal spec must keep
         // hashing byte-identically to the pre-kind encoding, because
         // `peer-ensured-surfaces.json` persists only the hash — a changed
@@ -2300,15 +2601,24 @@ impl PtyManager {
     /// and before any registry or process mutation. A different spec can
     /// therefore never replace the existing process as a side effect.
     pub fn ensure(&self, key: &str, spec: &SurfaceSpec) -> Result<EnsureOutcome, EnsureError> {
+        self.ensure_with_env(key, spec, &[])
+    }
+
+    pub fn ensure_with_env(
+        &self,
+        key: &str,
+        spec: &SurfaceSpec,
+        env: &[(String, String)],
+    ) -> Result<EnsureOutcome, EnsureError> {
         Self::validate_ensure_key(key)?;
         let surface_id = surface_id_from_name(key);
-        let requested_spec_hash = spec.canonical_hash();
+        let requested_spec_hash = spec.canonical_hash_with_env(env);
         let reservation = self.surface_reservation(&surface_id)?;
         let result = {
             let _guard = reservation
                 .lock()
                 .map_err(|_| EnsureError::Internal("surface reservation poisoned"))?;
-            self.ensure_locked(&surface_id, key, spec, requested_spec_hash)
+            self.ensure_locked(&surface_id, key, spec, env, requested_spec_hash)
         };
         self.release_surface_reservation(&surface_id, &reservation);
         result
@@ -2319,6 +2629,7 @@ impl PtyManager {
         surface_id: &[u8],
         key: &str,
         spec: &SurfaceSpec,
+        env: &[(String, String)],
         requested_spec_hash: [u8; 32],
     ) -> Result<EnsureOutcome, EnsureError> {
         if self.is_closing(surface_id)? {
@@ -2381,8 +2692,8 @@ impl PtyManager {
                     requested_spec_hash,
                 });
             }
-            let surface =
-                spawn_from_spec(surface_id, &spec.spawn_spec(key)).map_err(EnsureError::Spawn)?;
+            let surface = spawn_from_spec_with_env(surface_id, &spec.spawn_spec(key), env)
+                .map_err(EnsureError::Spawn)?;
             let instance_id = uuid::Uuid::new_v4().as_bytes().to_vec();
             let generation = record
                 .generation
@@ -2444,8 +2755,8 @@ impl PtyManager {
             });
         }
 
-        let surface =
-            spawn_from_spec(surface_id, &spec.spawn_spec(key)).map_err(EnsureError::Spawn)?;
+        let surface = spawn_from_spec_with_env(surface_id, &spec.spawn_spec(key), env)
+            .map_err(EnsureError::Spawn)?;
         let instance_id = uuid::Uuid::new_v4().as_bytes().to_vec();
         let record = EnsuredRecord {
             key: key.to_string(),
@@ -2861,9 +3172,17 @@ impl PtyManager {
 }
 
 fn spawn_from_spec(surface_id: &[u8], spec: &SpawnSpec) -> std::io::Result<Arc<PtySurface>> {
+    spawn_from_spec_with_env(surface_id, spec, &[])
+}
+
+fn spawn_from_spec_with_env(
+    surface_id: &[u8],
+    spec: &SpawnSpec,
+    env: &[(String, String)],
+) -> std::io::Result<Arc<PtySurface>> {
     let arg_refs: Vec<&str> = spec.args.iter().map(String::as_str).collect();
     match spec.kind {
-        SurfaceKind::Pty => PtySurface::spawn(
+        SurfaceKind::Pty => PtySurface::spawn_with_env(
             surface_id.to_vec(),
             spec.title.clone(),
             &spec.command,
@@ -2871,6 +3190,7 @@ fn spawn_from_spec(surface_id: &[u8], spec: &SpawnSpec) -> std::io::Result<Arc<P
             spec.cols,
             spec.rows,
             spec.cwd.as_deref(),
+            env,
         ),
         SurfaceKind::Agent => PtySurface::spawn_agent(
             surface_id.to_vec(),
@@ -2879,6 +3199,7 @@ fn spawn_from_spec(surface_id: &[u8], spec: &SpawnSpec) -> std::io::Result<Arc<P
             &arg_refs,
             spec.cwd.as_deref(),
             spec.agent_cli.clone(),
+            env,
         ),
     }
 }
@@ -2927,6 +3248,177 @@ mod tests {
             kind: SurfaceKind::Agent,
             agent_cli: "codex".into(),
         }
+    }
+
+    fn run_agent_launch_script(
+        home: &std::path::Path,
+        requested_env: &[(String, String)],
+        identity_env: &[(String, String)],
+    ) -> std::process::Output {
+        let (script, saved_env) = agent_launch_script(
+            "/bin/bash",
+            "/usr/bin/env",
+            &[],
+            requested_env,
+            identity_env,
+            "testnonce",
+        )
+        .expect("valid launch environment");
+        let mut command = std::process::Command::new("/bin/sh");
+        command.args(["-c", &agent_shell_wrapper("/bin/bash", script)]);
+        configure_agent_command_environment(&mut command, "/bin/bash", saved_env);
+        command
+            .env("HOME", home)
+            .output()
+            .expect("login wrapper runs")
+    }
+
+    #[test]
+    fn peer_agent_loads_profiles_then_requested_env_then_internal_identity() {
+        let home = tempfile::tempdir().expect("temp home");
+        std::fs::write(
+            home.path().join(".bash_profile"),
+            "export LOGIN_ONLY=login\nexport ORDER=login\nprintf 'login-noise\\n'\nprintf 'login-secret\\n' >&2\n",
+        )
+        .unwrap();
+        std::fs::write(
+            home.path().join(".profile"),
+            "export PROFILE_ONLY=profile\nexport ORDER=profile\n",
+        )
+        .unwrap();
+        let agent_env = home.path().join(".config/term-mesh/agent-env");
+        std::fs::create_dir_all(agent_env.parent().unwrap()).unwrap();
+        std::fs::write(
+            agent_env,
+            "AGENT_ONLY=agent\nORDER=agent\nTERMMESH_SURFACE_ID=from-file\n",
+        )
+        .unwrap();
+
+        let output = run_agent_launch_script(
+            home.path(),
+            &[
+                ("REQUESTED_ONLY".into(), "requested".into()),
+                ("ORDER".into(), "requested".into()),
+                ("PATH".into(), "/forged".into()),
+                ("TERMMESH_SURFACE_ID".into(), "forged".into()),
+            ],
+            &[("TERMMESH_SURFACE_ID".into(), "internal".into())],
+        );
+        assert!(output.status.success(), "{:?}", output.status);
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        let values: BTreeMap<&str, &str> = stdout
+            .lines()
+            .filter_map(|line| line.split_once('='))
+            .collect();
+        assert_eq!(values.get("LOGIN_ONLY"), Some(&"login"));
+        assert_eq!(values.get("PROFILE_ONLY"), Some(&"profile"));
+        assert_eq!(values.get("AGENT_ONLY"), Some(&"agent"));
+        assert_eq!(values.get("REQUESTED_ONLY"), Some(&"requested"));
+        assert_eq!(values.get("ORDER"), Some(&"requested"));
+        assert_eq!(values.get("TERMMESH_SURFACE_ID"), Some(&"internal"));
+        assert_ne!(values.get("PATH"), Some(&"/forged"));
+        assert!(values
+            .get("PATH")
+            .is_some_and(|path| path.starts_with(home.path().join(".local/bin").to_str().unwrap())));
+        assert!(!stdout.contains("login-noise"));
+        assert!(!String::from_utf8_lossy(&output.stderr).contains("login-secret"));
+    }
+
+    #[test]
+    fn peer_agent_profile_failure_is_value_free_and_actionable() {
+        let home = tempfile::tempdir().expect("temp home");
+        std::fs::write(home.path().join(".bash_profile"), "").unwrap();
+        std::fs::write(
+            home.path().join(".profile"),
+            "printf 'TOP_SECRET_VALUE\\n'\nprintf 'TOP_SECRET_ERROR\\n' >&2\nfalse\n",
+        )
+        .unwrap();
+
+        let output = run_agent_launch_script(home.path(), &[], &[]);
+        assert_eq!(
+            output.status.code(),
+            Some(tm_agent_bridge::location::PROFILE_LOAD_EXIT)
+        );
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        assert!(!stdout.contains("TOP_SECRET"));
+        assert!(!String::from_utf8_lossy(&output.stderr).contains("TOP_SECRET"));
+        let event: serde_json::Value = serde_json::from_str(stdout.trim()).expect("safe NDJSON");
+        assert_eq!(event["type"], "result");
+        assert_eq!(event["is_error"], true);
+        assert_eq!(event["stop_reason"], "environment_failed");
+        assert_eq!(event["result"], "remote agent could not load ~/.profile");
+    }
+
+    #[test]
+    fn peer_agent_requested_values_do_not_leak_into_process_argv() {
+        let secret = "api-key-with spaces ' quotes $ dollars";
+        let (script, saved_env) = agent_launch_script(
+            "/bin/bash",
+            "/usr/bin/true",
+            &[],
+            &[("API_KEY".into(), secret.into())],
+            &[("TERMMESH_SURFACE_ID".into(), "internal-id".into())],
+            "fixednonce",
+        )
+        .expect("valid launch environment");
+        let wrapper = agent_shell_wrapper("/bin/bash", script);
+        assert!(!wrapper.contains(secret));
+        assert!(!wrapper.contains("internal-id"));
+        assert!(saved_env.iter().any(|(_, value)| value == secret));
+        assert!(saved_env.iter().any(|(_, value)| value == "internal-id"));
+    }
+
+    #[test]
+    fn peer_agent_child_cannot_read_daemon_only_environment() {
+        let home = tempfile::tempdir().expect("temp home");
+        std::fs::write(home.path().join(".bash_profile"), "").unwrap();
+        let (script, saved_env) = agent_launch_script(
+            "/bin/bash",
+            "/usr/bin/env",
+            &[],
+            &[],
+            &[("TERMMESH_SURFACE_ID".into(), "internal-id".into())],
+            "fixednonce",
+        )
+        .expect("valid launch environment");
+        let mut command = std::process::Command::new("/bin/sh");
+        command
+            .args(["-c", &agent_shell_wrapper("/bin/bash", script)])
+            // Model secrets already attached to the daemon's Command
+            // environment before the peer-owned spawn is configured.
+            .env("DAEMON_ONLY_SECRET", "must-not-cross-boundary")
+            .env("TERMMESH_SOCKET", "/private/control.sock")
+            .env("SSH_AUTH_SOCK", "/private/agent.sock");
+        configure_agent_command_environment(&mut command, "/bin/bash", saved_env);
+        command.env("HOME", home.path());
+        let output = command.output().expect("sanitized agent launch");
+        assert!(output.status.success(), "{:?}", output.status);
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        assert!(!stdout.contains("DAEMON_ONLY_SECRET"));
+        assert!(!stdout.contains("must-not-cross-boundary"));
+        assert!(!stdout.contains("TERMMESH_SOCKET"));
+        assert!(!stdout.contains("/private/control.sock"));
+        assert!(!stdout.contains("SSH_AUTH_SOCK"));
+        assert!(!stdout.contains("/private/agent.sock"));
+        assert!(stdout.lines().any(|line| line == "TERMMESH_SURFACE_ID=internal-id"));
+        assert!(stdout.lines().any(|line| line.starts_with("PATH=")));
+        assert!(!stdout.lines().any(|line| line.starts_with("TERMMESH_LAUNCH_")));
+    }
+
+    #[test]
+    fn peer_agent_shell_wrapper_rejects_invalid_env_keys() {
+        let error = agent_launch_script(
+            "/bin/bash",
+            "/usr/bin/true",
+            &[],
+            &[("BAD; touch /tmp/injected".into(), "value".into())],
+            &[],
+            "fixednonce",
+        )
+        .expect_err("invalid key must not reach shell syntax");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(!error.to_string().contains("BAD;"));
+        assert!(!error.to_string().contains("value"));
     }
 
     fn stop_ensured(manager: &PtyManager, outcome: &EnsureOutcome) {
@@ -3822,6 +4314,61 @@ mod tests {
         manager.remove(&outcome.surface_id);
     }
 
+    #[tokio::test]
+    async fn agent_input_backpressure_fails_fast_instead_of_blocking_control_plane() {
+        let manager = PtyManager::new();
+        let outcome = manager
+            .ensure("agent-input-backpressure", &agent_ensure_spec("exec sleep 30"))
+            .expect("ensure non-reading agent");
+        let surface = outcome.surface.clone();
+        let payload = vec![b'x'; 64 * 1024];
+        let started = std::time::Instant::now();
+        let mut overflow = None;
+        for _ in 0..128 {
+            if let Err(error) = surface.write_all(&payload) {
+                overflow = Some(error);
+                break;
+            }
+        }
+        let overflow = overflow.expect("bounded queue must reject excess input");
+        assert_eq!(overflow.kind(), std::io::ErrorKind::WouldBlock);
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+        manager.remove(&outcome.surface_id);
+    }
+
+    #[tokio::test]
+    async fn requested_env_reaches_agent_but_internal_identity_wins() {
+        let manager = PtyManager::new();
+        let spec = agent_ensure_spec(
+            r#"printf '%s|%s\n' "$PROFILE_ONLY" "$TERMMESH_SURFACE_ID""#,
+        );
+        let env = vec![
+            ("PROFILE_ONLY".into(), "present".into()),
+            ("TERMMESH_SURFACE_ID".into(), "forged".into()),
+        ];
+        let outcome = manager
+            .ensure_with_env("agent-env-order", &spec, &env)
+            .expect("ensure env agent");
+        let surface = outcome.surface.clone();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while !surface.dead.load(Ordering::Acquire) {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("agent exits");
+        let bytes: Vec<u8> = surface
+            .replay_snapshot()
+            .into_iter()
+            .flat_map(|chunk| chunk.bytes)
+            .collect();
+        let output = String::from_utf8(bytes).expect("utf8 output");
+        assert!(output.starts_with("present|"));
+        assert!(!output.contains("forged"));
+        assert!(output.trim_end().ends_with(&hex_id(&outcome.surface_id)));
+        manager.remove(&outcome.surface_id);
+    }
+
     /// EOF/child-exit follows the PTY contract: the reader marks the
     /// surface dead, `attachable` flips off, and the final line still
     /// landed in the replay ring before the flag flipped.
@@ -3829,7 +4376,7 @@ mod tests {
     async fn agent_surface_marks_dead_on_child_exit() {
         let manager = PtyManager::new();
         let outcome = manager
-            .ensure("agent-eof", &agent_ensure_spec(r#"printf 'bye\n'"#))
+            .ensure("agent-eof", &agent_ensure_spec(r#"printf 'bye\n'; exit 7"#))
             .expect("ensure agent surface");
         let surface = outcome.surface.clone();
 
@@ -3847,6 +4394,10 @@ mod tests {
         let replay = surface.replay_snapshot();
         assert_eq!(replay.len(), 1);
         assert_eq!(replay[0].bytes, b"bye\n".to_vec());
+        assert_eq!(surface.exit_info().exit_code, 7);
+        assert_eq!(surface.exit_info().signal, 0);
+        assert_eq!(surface.exit_info().reason, "exited");
+        assert_eq!(surface.reap_owners.load(Ordering::Relaxed), 1);
 
         manager.remove(&outcome.surface_id);
     }

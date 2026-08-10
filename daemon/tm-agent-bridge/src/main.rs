@@ -25,10 +25,11 @@ mod acp;
 mod codex;
 mod emitter;
 mod jsonrpc;
-mod location;
 mod per_turn;
 mod text;
 mod transport;
+
+use tm_agent_bridge::location;
 
 use std::io::Read;
 use std::sync::mpsc::{self, Receiver};

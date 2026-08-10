@@ -988,6 +988,7 @@ fn ensure_remote(
                 // Empty kind means "terminal" (backward-compatible default); the
                 // CLI ensure path only creates terminal surfaces today.
                 kind: String::new(),
+                env: Default::default(),
             })),
         },
     )

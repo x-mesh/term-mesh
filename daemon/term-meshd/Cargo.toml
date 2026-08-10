@@ -58,6 +58,7 @@ getrandom = "0.2"
 
 # Peer federation protocol bindings
 peer-proto = { path = "../peer-proto" }
+tm-agent-bridge = { path = "../tm-agent-bridge" }
 sync-protocol = { path = "../sync-protocol" }
 prost = "0.13"
 
