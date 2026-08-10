@@ -356,4 +356,75 @@ final class PeerSocketProberTests: XCTestCase {
             "/tmp/term-mesh-peer-501/peer.sock"
         )
     }
+
+    // MARK: - Existing installs are migrated off the shared path
+
+    /// Scoping the DEFAULT does not reach a build that already persisted the
+    /// old shared path — and `SettingsView` pre-fills that field with it, so
+    /// any dev build whose Peer Federation settings were ever touched has it
+    /// stored. Without this, such a build keeps serving the installed app's
+    /// socket and the collision survives the fix.
+    func testStoredSharedPathIsMigratedForANonProductionBuild() {
+        XCTAssertEqual(
+            PeerFederationSettings.migratedSocketPath(
+                stored: "/tmp/term-mesh-peer-501/peer.sock",
+                uid: 501,
+                bundleIdentifier: "com.termmesh.app.debug"
+            ),
+            PeerFederationSettings.socketPath(
+                uid: 501, bundleIdentifier: "com.termmesh.app.debug"
+            )
+        )
+    }
+
+    /// The one build entitled to that path still gets it, stored or not.
+    /// Other machines' saved profiles point at this exact string.
+    func testProductionKeepsTheStoredSharedPath() {
+        XCTAssertEqual(
+            PeerFederationSettings.migratedSocketPath(
+                stored: "/tmp/term-mesh-peer-501/peer.sock",
+                uid: 501,
+                bundleIdentifier: "com.termmesh.app"
+            ),
+            "/tmp/term-mesh-peer-501/peer.sock"
+        )
+    }
+
+    /// A path someone actually chose is not second-guessed — only the value the
+    /// settings field pre-filled is. This is the difference between repairing a
+    /// default and overriding a decision.
+    func testACustomStoredPathIsLeftAlone() {
+        let custom = "/tmp/my-own-peer/peer.sock"
+        XCTAssertEqual(
+            PeerFederationSettings.migratedSocketPath(
+                stored: custom, uid: 501, bundleIdentifier: "com.termmesh.app.debug"
+            ),
+            custom
+        )
+    }
+
+    /// Nothing stored means nothing to migrate: the scoped default applies.
+    func testNoStoredPathUsesTheScopedDefault() {
+        XCTAssertEqual(
+            PeerFederationSettings.migratedSocketPath(
+                stored: "", uid: 501, bundleIdentifier: "com.termmesh.app.debug"
+            ),
+            PeerFederationSettings.socketPath(
+                uid: 501, bundleIdentifier: "com.termmesh.app.debug"
+            )
+        )
+    }
+
+    /// An XCTest host has no bundle identifier, so its scoped path IS the
+    /// shared one. Migration must be a no-op there rather than looping.
+    func testMissingBundleIdentifierIsNotMigrated() {
+        XCTAssertEqual(
+            PeerFederationSettings.migratedSocketPath(
+                stored: "/tmp/term-mesh-peer-501/peer.sock",
+                uid: 501,
+                bundleIdentifier: nil
+            ),
+            "/tmp/term-mesh-peer-501/peer.sock"
+        )
+    }
 }

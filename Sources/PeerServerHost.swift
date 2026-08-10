@@ -338,7 +338,31 @@ final class PeerHostCoordinator: NSObject {
         } catch {
             markStartFailed()
             NSLog("[peer-debug] server failed to start at %@: %@", path, String(describing: error))
-            if !silent {
+            // `socketInUse` is reported even when `silent` — and autostart is
+            // always silent, which is where this one actually happens.
+            //
+            // Every other start failure is a syscall going wrong on a path
+            // nobody else wants, so a quiet log is proportionate. This one says
+            // another live server holds the path, which used to be the case
+            // where THIS app silently unlinked it and took over. Refusing
+            // instead is correct, but refusing quietly during autostart just
+            // moves the silence: peer serving is simply off, with nothing
+            // anywhere saying why, and the symptom (a viewer that cannot
+            // attach) looks identical to the bug that was fixed.
+            if case PeerServerError.socketInUse(let takenPath) = error {
+                showInfo(
+                    title: LanguageSettings.localized("Peer server is already running"),
+                    body: String(
+                        format: LanguageSettings.localized("""
+                            Another term-mesh build is already serving this socket, so this one did not start:
+                            %@
+
+                            Whichever app got there first keeps serving. Quit it to serve from this build, or give this build its own socket path in Settings → Peer Federation.
+                            """),
+                        takenPath
+                    )
+                )
+            } else if !silent {
                 showInfo(
                     title: LanguageSettings.localized("Failed to start peer server"),
                     body: String(describing: error)

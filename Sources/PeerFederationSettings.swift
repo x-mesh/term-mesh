@@ -71,6 +71,40 @@ enum PeerFederationSettings {
         }
         return String(format: "%08x", UInt32(truncatingIfNeeded: hash))
     }
+
+    /// The path a non-production build must NOT keep serving, whatever its
+    /// stored preference says.
+    ///
+    /// Scoping `defaultSocketPath` alone does not reach an existing install.
+    /// `socketPath` prefers the stored value and falls back to the default only
+    /// when there is none — and `SettingsView` declares
+    /// `@AppStorage(socketPathKey) = defaultSocketPath`, so a build that ever
+    /// wrote that field has the OLD shared path persisted. Such a build would
+    /// go on serving it, and the collision this all exists to stop would
+    /// survive the fix.
+    ///
+    /// So one value is treated as "never chosen deliberately": the shared path
+    /// itself, seen by a build that is not production. Nobody types that on
+    /// purpose in a Debug build — it is what the field was pre-filled with —
+    /// and preferring the scoped default there costs nothing, because the one
+    /// build entitled to that path still gets it.
+    ///
+    /// A genuinely custom path is left alone. That is the setting doing its
+    /// job, and a person who names a path is answering for it.
+    static func migratedSocketPath(
+        stored: String,
+        uid: uid_t,
+        bundleIdentifier: String?
+    ) -> String {
+        let scoped = socketPath(uid: uid, bundleIdentifier: bundleIdentifier)
+        guard !stored.isEmpty else { return scoped }
+        let sharedPath = socketPath(uid: uid, bundleIdentifier: productionBundleIdentifier)
+        if stored == sharedPath, scoped != sharedPath {
+            return scoped
+        }
+        return stored
+    }
+
     static var defaultDisplayName: String {
         ProcessInfo.processInfo.hostName
     }
@@ -79,9 +113,19 @@ enum PeerFederationSettings {
         UserDefaults.standard.bool(forKey: autoStartKey)
     }
 
+    /// The path this build actually serves.
+    ///
+    /// Runs the stored value through `migratedSocketPath` rather than trusting
+    /// it outright: an existing install can have the old shared path persisted
+    /// from before that path was scoped, and honouring it would keep two builds
+    /// fighting over one socket. See `migratedSocketPath`.
     static var socketPath: String {
-        let v = UserDefaults.standard.string(forKey: socketPathKey) ?? ""
-        return v.isEmpty ? defaultSocketPath : v
+        let stored = UserDefaults.standard.string(forKey: socketPathKey) ?? ""
+        return migratedSocketPath(
+            stored: stored,
+            uid: getuid(),
+            bundleIdentifier: Bundle.main.bundleIdentifier
+        )
     }
 
     static var displayName: String {
