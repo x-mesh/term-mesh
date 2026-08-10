@@ -314,9 +314,7 @@ enum TerminalThemeOverride {
     static let overrideFileName = "terminal-theme.config"
 
     static func overrideURL() -> URL? {
-        FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first?
-            .appendingPathComponent("term-mesh", isDirectory: true)
-            .appendingPathComponent(overrideFileName)
+        TerminalOverrideLocation.url(forFileName: overrideFileName)
     }
 
     /// Write (or remove) the theme override file based on the current appearance mode.

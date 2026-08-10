@@ -1,6 +1,93 @@
 import AppKit
 import Foundation
 
+// MARK: - Override File Location
+
+/// Where this build keeps its ghostty config override files.
+///
+/// **Scoped to the bundle identifier, and that is the entire point.** These
+/// files are generated FROM UserDefaults, which macOS already separates per
+/// bundle — but the files themselves used to sit at one fixed path that every
+/// build wrote to. So a Debug build, whose own defaults are empty, would
+/// regenerate the shared file from nothing and hand the installed app a
+/// terminal configuration the user never chose. Launching the Debug app was
+/// enough; `TermMeshApp.init()` writes on every start.
+///
+/// Observed: `unfocused-split-opacity = 0.00` in the shared file while
+/// `com.termmesh.app`'s defaults still held the user's `1`. The setting was
+/// never lost — the app was reading a file a different build had written.
+///
+/// A `--tag` build, a STAGING build and the installed app now each own their
+/// copy, so running one can no longer reconfigure another.
+enum TerminalOverrideLocation {
+    /// The pre-isolation shared directory. Still read once, by the migration
+    /// below, and otherwise dead.
+    static func legacyDirectory(
+        appSupport: URL? = FileManager.default.urls(
+            for: .applicationSupportDirectory, in: .userDomainMask
+        ).first
+    ) -> URL? {
+        appSupport?.appendingPathComponent("term-mesh", isDirectory: true)
+    }
+
+    /// This build's own directory.
+    ///
+    /// Falls back to the legacy shared path when there is no bundle
+    /// identifier — an XCTest host or a bare binary. Behaviour there is
+    /// then exactly what it was before, which is the safe direction for a
+    /// context that has no identity to isolate by.
+    static func directory(
+        bundleIdentifier: String? = Bundle.main.bundleIdentifier,
+        appSupport: URL? = FileManager.default.urls(
+            for: .applicationSupportDirectory, in: .userDomainMask
+        ).first
+    ) -> URL? {
+        guard let legacy = legacyDirectory(appSupport: appSupport) else { return nil }
+        guard let bundleIdentifier, !bundleIdentifier.isEmpty else { return legacy }
+        return legacy.appendingPathComponent(bundleIdentifier, isDirectory: true)
+    }
+
+    static func url(forFileName fileName: String) -> URL? {
+        directory()?.appendingPathComponent(fileName)
+    }
+
+    /// Every override file this module owns. Migration copies exactly these.
+    static let managedFileNames = [
+        TerminalSettingsOverride.fileName,
+        TerminalThemeOverride.overrideFileName,
+    ]
+
+    /// Seeds a build's directory from the old shared one, once.
+    ///
+    /// Copy, not move, and only when the destination does not exist: the
+    /// installed app and a Debug build migrate independently, and whichever
+    /// runs first must not take the settings away from the other. The legacy
+    /// file is deliberately left in place — an older build rolled back onto
+    /// this machine still reads it, and nothing current does.
+    ///
+    /// A file that fails to copy is skipped rather than reported: the caller
+    /// (`TermMeshApp.init()`) rewrites both files from UserDefaults moments
+    /// later anyway, so a failed migration costs at most one appearance of
+    /// the defaults, never a broken launch.
+    static func migrateLegacyFilesIfNeeded(
+        fileManager: FileManager = .default,
+        legacy: URL? = legacyDirectory(),
+        destination: URL? = directory()
+    ) {
+        guard let legacy, let destination, legacy != destination else { return }
+        for name in managedFileNames {
+            let source = legacy.appendingPathComponent(name)
+            let target = destination.appendingPathComponent(name)
+            guard fileManager.fileExists(atPath: source.path),
+                  !fileManager.fileExists(atPath: target.path) else { continue }
+            try? fileManager.createDirectory(
+                at: destination, withIntermediateDirectories: true
+            )
+            try? fileManager.copyItem(at: source, to: target)
+        }
+    }
+}
+
 // MARK: - Terminal Settings Override
 
 /// Manages a ghostty config override file for GUI-configured terminal settings
@@ -21,26 +108,33 @@ enum TerminalSettingsOverride {
     static let splitDividerColorKey = "terminalSplitDividerColor"
 
     static func overrideURL() -> URL? {
-        FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first?
-            .appendingPathComponent("term-mesh", isDirectory: true)
-            .appendingPathComponent(fileName)
+        TerminalOverrideLocation.url(forFileName: fileName)
     }
 
-    /// Write the override file from UserDefaults. Only non-empty values are written.
-    static func write(defaults: UserDefaults = .standard) {
-        guard let url = overrideURL() else { return }
-        let fm = FileManager.default
+    /// Reads a key that uses a negative sentinel for "not set".
+    ///
+    /// `defaults.double(forKey:)` cannot express absence — it answers `0` for
+    /// a key that was never written, which for an opacity is a legitimate
+    /// value (fully transparent) rather than an obvious error. That collision
+    /// is what let an empty Debug build write `unfocused-split-opacity = 0.00`
+    /// into the shared override file and blank out the installed app's splits.
+    /// Asking for the object first keeps "absent" and "zero" distinct.
+    static func storedDouble(_ defaults: UserDefaults, forKey key: String) -> Double? {
+        (defaults.object(forKey: key) as? NSNumber)?.doubleValue
+    }
 
+    /// The file's contents for a given defaults + appearance mode, or nil when
+    /// nothing is overridden. Pure — no filesystem — so the "an unset key must
+    /// not produce a line" rule is directly testable.
+    static func configLines(defaults: UserDefaults, mode: AppearanceMode) -> [String]? {
         let fontFamily = defaults.string(forKey: fontFamilyKey) ?? ""
         let fontSize = defaults.double(forKey: fontSizeKey)
         let themeLight = defaults.string(forKey: themeLightKey) ?? ""
         let themeDark = defaults.string(forKey: themeDarkKey) ?? ""
-        let bgOpacity = defaults.double(forKey: backgroundOpacityKey)
         let cursorColor = defaults.string(forKey: cursorColorKey) ?? ""
         let cursorStyle = defaults.string(forKey: cursorStyleKey) ?? ""
         let scrollback = defaults.integer(forKey: scrollbackLimitKey)
-        let unfocusedOpacity = defaults.double(forKey: unfocusedSplitOpacityKey)
-        let dividerColor = defaults.string(forKey: splitDividerColorKey) ?? ""
+        let unfocusedOpacity = storedDouble(defaults, forKey: unfocusedSplitOpacityKey)
 
         var lines: [String] = ["# Term-Mesh terminal settings override (auto-generated)"]
 
@@ -52,8 +146,7 @@ enum TerminalSettingsOverride {
         if fontSize > 0 {
             lines.append("font-size = \(Int(fontSize))")
         }
-        if let theme = themeLine(light: themeLight, dark: themeDark,
-                                 mode: AppearanceSettings.resolvedMode(defaults: defaults)) {
+        if let theme = themeLine(light: themeLight, dark: themeDark, mode: mode) {
             lines.append(theme)
         }
         // background-opacity: requires CAMetalLayer.isOpaque=false in ghostty — not supported yet
@@ -68,13 +161,29 @@ enum TerminalSettingsOverride {
         }
         // unfocused-split-opacity is handled by GhosttyConfig (Swift-side).
         // Write to override file so GhosttyConfig.load() can read it.
-        if unfocusedOpacity >= 0 {
+        //
+        // `storedDouble` returning nil means the user never set this, which is
+        // NOT the same as setting it to zero — see its doc comment. The
+        // negative check keeps honouring the `-1` sentinel that @AppStorage
+        // declares as its default, for defaults that already carry it.
+        if let unfocusedOpacity, unfocusedOpacity >= 0 {
             lines.append("unfocused-split-opacity = \(String(format: "%.2f", unfocusedOpacity))")
         }
         // split-divider-color: requires Bonsplit public API — not supported yet
 
-        // If only the header line remains, there are no overrides — remove the file
-        if lines.count <= 1 {
+        // Only the header means nothing is overridden.
+        return lines.count <= 1 ? nil : lines
+    }
+
+    /// Write the override file from UserDefaults. Only non-empty values are written.
+    static func write(defaults: UserDefaults = .standard) {
+        guard let url = overrideURL() else { return }
+        let fm = FileManager.default
+
+        guard let lines = configLines(
+            defaults: defaults,
+            mode: AppearanceSettings.resolvedMode(defaults: defaults)
+        ) else {
             try? fm.removeItem(at: url)
             return
         }

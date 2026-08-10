@@ -3,8 +3,30 @@ import SwiftUI
 import Darwin
 import Bonsplit
 
+/// Runs before every other `TermMeshApp` stored-property initializer. That
+/// ordering is load-bearing: `NSApplicationDelegateAdaptor` constructs an
+/// `AppDelegate`, whose default config provider touches `GhosttyApp.shared`
+/// and finalizes Ghostty's config. The scoped override files must exist before
+/// that first singleton access, not merely before the `init()` body finishes.
+private enum TermMeshLaunchPreflight {
+    static func prepare() -> AppearanceMode {
+        GhosttyEnvironment.configureOnce()
+        let appearance = AppearanceSettings.resolvedMode()
+        // `TerminalThemeOverride` consults the effective AppKit appearance for
+        // system/auto. Establish NSApp and its saved override before writing,
+        // otherwise an early preflight with no NSApp would default to dark.
+        TermMeshApp.applyAppearance(appearance)
+        TerminalOverrideLocation.migrateLegacyFilesIfNeeded()
+        TerminalSettingsOverride.write()
+        TerminalThemeOverride.write(for: appearance.rawValue)
+        return appearance
+    }
+}
+
 @main
 struct TermMeshApp: App {
+    /// Keep first. See `TermMeshLaunchPreflight`.
+    private let startupAppearance = TermMeshLaunchPreflight.prepare()
     @State private var tabManager: TabManager
     @StateObject private var notificationStore = TerminalNotificationStore.shared
     @StateObject private var sidebarState = SidebarState()
@@ -91,23 +113,11 @@ struct TermMeshApp: App {
     @State private var ghosttyTheme = GhosttyTheme.current
 
     init() {
-        // Idempotent, and already done if a `GhosttyApp.shared` touch got here
-        // first. It must run before ghostty_init either way — see
-        // GhosttyEnvironment.
-        GhosttyEnvironment.configureOnce()
-
-        let startupAppearance = AppearanceSettings.resolvedMode()
         Self.applyAppearance(startupAppearance)
         // Repair an unreadable stored language the same way appearance does,
         // so the Settings picker and the AppKit lookups agree on a value that
         // is actually in AppLanguage rather than each falling back separately.
         LanguageSettings.resolvedMode()
-        // Ensure terminal theme override exists at startup (covers fresh install).
-        // The settings file goes first: its `theme` line depends on the appearance
-        // mode, and a build that shipped before that was true leaves a stale pair
-        // behind — which is what made a fresh install come up light on a Light Mac.
-        TerminalSettingsOverride.write()
-        TerminalThemeOverride.write(for: startupAppearance.rawValue)
         // Unit-test bundles run inside the real app host. Do not restore the
         // user's terminal session before XCTest establishes its connection.
         let isRunningUnderXCTest = AppLaunchEnvironment.isRunningUnderXCTest(
@@ -1318,7 +1328,7 @@ struct TermMeshApp: App {
         configProvider.reloadConfiguration(source: "settings.terminal")
     }
 
-    private static func applyAppearance(_ mode: AppearanceMode) {
+    fileprivate static func applyAppearance(_ mode: AppearanceMode) {
         switch mode {
         case .system:
             NSApplication.shared.appearance = nil
