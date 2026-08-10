@@ -405,4 +405,20 @@ final class RemoteHostAgentSurfaceGateTests: XCTestCase {
             "this build's own advertised capability set passes its own gate"
         )
     }
+
+    func test_peerOwnedFactoryRequiresAgentExitAndEnsureEnvironmentCapabilities() {
+        let required = [
+            PeerCapability.surfaceAgentV1,
+            PeerCapability.surfaceExitV1,
+            PeerCapability.surfaceEnsureEnvV1,
+        ]
+        for missing in required {
+            XCTAssertFalse(RemoteHostStore.hostSupportsPeerOwnedAgentFactory(
+                PeerCapabilities(required.filter { $0 != missing })
+            ), "missing \(missing)")
+        }
+        XCTAssertTrue(RemoteHostStore.hostSupportsPeerOwnedAgentFactory(
+            PeerCapabilities(required)
+        ))
+    }
 }

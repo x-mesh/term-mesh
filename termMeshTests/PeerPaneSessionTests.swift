@@ -1143,6 +1143,31 @@ final class PeerRelaySessionCallbackDeliveryTests: XCTestCase {
         return try! encodeFrame(envelope)
     }
 
+    private func surfaceExitedFrame(
+        surfaceID: Data,
+        exitCode: Int32,
+        signal: Int32,
+        reason: String
+    ) -> Data {
+        var exited = Termmesh_Peer_V1_SurfaceExited()
+        exited.surfaceID = surfaceID
+        exited.exitCode = exitCode
+        exited.signal = signal
+        exited.reason = reason
+        var envelope = Termmesh_Peer_V1_Envelope()
+        envelope.surfaceExited = exited
+        return try! encodeFrame(envelope)
+    }
+
+    private func errorFrame(code: UInt32, message: String) -> Data {
+        var peerError = Termmesh_Peer_V1_Error()
+        peerError.code = code
+        peerError.message = message
+        var envelope = Termmesh_Peer_V1_Envelope()
+        envelope.error = peerError
+        return try! encodeFrame(envelope)
+    }
+
     /// `ownsSession: false` on purpose: a scripted stream end must end the
     /// pump, not start the owned-path reconnect loop dialing a host that
     /// does not exist.
@@ -1441,6 +1466,56 @@ final class PeerRelaySessionCallbackDeliveryTests: XCTestCase {
         try await waitUntil { disconnected }
     }
 
+    // A host-confirmed process exit is terminal application state, not a
+    // broken transport to heal. Workspace keeps the completed AgentPanel so
+    // its final output and exit notice remain visible; onDisconnect would
+    // otherwise immediately close it and start authoritative-missing recovery.
+    @MainActor
+    func testSurfaceExitFinishesWithoutInvokingDisconnectRecovery() async throws {
+        let surfaceID = Data(repeating: 0xAF, count: 16)
+        let feed = FrameFeed()
+        let relay = makeCallbackSession(feed: feed, surfaceID: surfaceID)
+        var observedExit: (Int32, Int32, String)?
+        var disconnected = false
+        relay.onSurfaceExited = { observedExit = ($0, $1, $2) }
+        relay.onDisconnect = { disconnected = true }
+        try await relay.start()
+
+        await feed.push(surfaceExitedFrame(
+            surfaceID: surfaceID,
+            exitCode: 23,
+            signal: 0,
+            reason: "bridge exited"
+        ))
+        try await waitUntil { observedExit != nil }
+
+        XCTAssertEqual(observedExit?.0, 23)
+        XCTAssertEqual(observedExit?.1, 0)
+        XCTAssertEqual(observedExit?.2, "bridge exited")
+        XCTAssertFalse(disconnected,
+                       "authoritative surface exit must leave the completed agent pane visible")
+    }
+
+    // A host protocol error is connection-scoped and cannot safely be ignored:
+    // expose it to the panel owner, then use the existing disconnect recovery
+    // because the remote process may still be alive after the broken stream.
+    @MainActor
+    func testHostErrorIsVisibleAndInvokesDisconnectRecovery() async throws {
+        let surfaceID = Data(repeating: 0xB0, count: 16)
+        let feed = FrameFeed()
+        let relay = makeCallbackSession(feed: feed, surfaceID: surfaceID)
+        var observedError = ""
+        var disconnected = false
+        relay.onError = { observedError = String(describing: $0) }
+        relay.onDisconnect = { disconnected = true }
+        try await relay.start()
+
+        await feed.push(errorFrame(code: 8, message: "input queue overflow"))
+        try await waitUntil { disconnected }
+
+        XCTAssertTrue(observedError.contains("host error 8: input queue overflow"))
+    }
+
     // Defensive contract: an agent surface never sends GridSnapshot, but if
     // one arrives its rendered-cell ANSI must not reach the NDJSON consumer
     // — while the wire-seq reset it implies still applies.
@@ -1479,6 +1554,37 @@ final class PeerRelaySessionCallbackDeliveryTests: XCTestCase {
 /// how a surface that outlived its attach is taken back down. The pane itself
 /// is `Workspace.openRemoteAgentPane`, tested with the rest of Phase 2.
 final class PeerOwnedAgentSurfaceTests: XCTestCase {
+
+    @MainActor
+    func test_peerOwnedEnvironmentPrecedenceAndValidationAreDeterministic() throws {
+        let merged = try TeamOrchestrator.peerOwnedAgentEnvironment(
+            profile: ["SHARED": "profile", "PROFILE_ONLY": "yes"],
+            explicitHost: ["SHARED": "host", "HOST_ONLY": "yes", "TERMMESH_TEAM": "spoof"],
+            internalIdentity: ["TERMMESH_TEAM": "real", "INTERNAL_ONLY": "yes"]
+        )
+        XCTAssertEqual(merged["SHARED"], "host")
+        XCTAssertEqual(merged["PROFILE_ONLY"], "yes")
+        XCTAssertEqual(merged["HOST_ONLY"], "yes")
+        XCTAssertEqual(merged["TERMMESH_TEAM"], "real")
+        XCTAssertEqual(merged["INTERNAL_ONLY"], "yes")
+
+        XCTAssertThrowsError(try TeamOrchestrator.peerOwnedAgentEnvironment(
+            profile: ["유니코드": "TOP_SECRET_VALUE"],
+            explicitHost: [:],
+            internalIdentity: [:]
+        )) { error in
+            XCTAssertTrue(error.localizedDescription.contains("ASCII identifier"))
+            let message = TeamOrchestrator.peerOwnedAgentInvalidEnvironmentFallbackMessage(
+                error as! PeerEnsureEnvironment.ValidationError,
+                cli: "codex",
+                hostName: "jw-server"
+            )
+            XCTAssertTrue(message.contains("active CLI profile"))
+            XCTAssertTrue(message.contains("유니코드"))
+            XCTAssertFalse(message.contains("TOP_SECRET_VALUE"),
+                           "environment values must never be logged")
+        }
+    }
 
     // MARK: Factory selection matrix
 
@@ -1945,6 +2051,8 @@ final class PeerOwnedAgentSurfaceTests: XCTestCase {
             capabilities: [
                 PeerCapability.surfaceEnsureV1,
                 PeerCapability.surfaceAgentV1,
+                PeerCapability.surfaceExitV1,
+                PeerCapability.surfaceEnsureEnvV1,
                 PeerCapability.surfaceTerminateV1,
             ]
         )
@@ -2054,6 +2162,52 @@ final class PeerOwnedAgentSurfaceTests: XCTestCase {
         _ = hostTask
     }
 
+    @MainActor
+    func test_ensureAndAttachRejectsInvalidEnvironmentBeforeHostRequest() async throws {
+        let socketPath = "/tmp/peer-agent-bad-env-\(getpid())-\(UUID().uuidString.prefix(8)).sock"
+        let host = AgentSurfaceMockHost(
+            socketPath: socketPath,
+            capabilities: [
+                PeerCapability.surfaceEnsureV1,
+                PeerCapability.surfaceAgentV1,
+                PeerCapability.surfaceExitV1,
+                PeerCapability.surfaceEnsureEnvV1,
+            ]
+        )
+        let hostTask = try host.start()
+        defer { host.stop() }
+        let hostSpec = PeerPaneHostSpec.direct(sockPath: socketPath)
+        let lease = try await PeerPaneHostRegistry.shared.acquire(hostSpec)
+        defer { PeerPaneHostRegistry.shared.release(lease) }
+
+        do {
+            _ = try await PeerPaneSession.ensureAndAttach(
+                lease: lease,
+                surfaceSpec: TeamOrchestrator.peerAgentSurfaceSpec(
+                    teamName: "my-team",
+                    agentInstanceId: UUID().uuidString,
+                    cli: "codex",
+                    workingDirectory: "/root/work",
+                    model: "sonnet",
+                    binaries: TeamOrchestrator.RemoteAgentBinaries(
+                        cliPath: "/root/.local/bin/codex",
+                        bridgePath: "/usr/local/bin/tm-agent-bridge",
+                        cliAvailable: true
+                    )
+                ),
+                attachment: PeerRunnerAttachment(title: "reviewer", lifetime: .keepAlive),
+                hostSpec: hostSpec,
+                agentCli: "codex",
+                environment: ["유니코드": "invalid"]
+            )
+            XCTFail("invalid environment must be rejected locally")
+        } catch {
+            XCTAssertTrue(error.localizedDescription.contains("ASCII identifier"))
+        }
+        XCTAssertTrue(host.ensureRequests().isEmpty)
+        _ = hostTask
+    }
+
     /// The cleanup verb. `requestClosePane` cannot do this job: an agent
     /// surface is deliberately never placed in the workspace tree, so a close
     /// by pane id finds nothing and reports success while the bridge keeps
@@ -2066,6 +2220,8 @@ final class PeerOwnedAgentSurfaceTests: XCTestCase {
             capabilities: [
                 PeerCapability.surfaceEnsureV1,
                 PeerCapability.surfaceAgentV1,
+                PeerCapability.surfaceExitV1,
+                PeerCapability.surfaceEnsureEnvV1,
                 PeerCapability.surfaceTerminateV1,
             ]
         )
@@ -2112,6 +2268,8 @@ final class PeerOwnedAgentSurfaceTests: XCTestCase {
             capabilities: [
                 PeerCapability.surfaceEnsureV1,
                 PeerCapability.surfaceAgentV1,
+                PeerCapability.surfaceExitV1,
+                PeerCapability.surfaceEnsureEnvV1,
                 PeerCapability.surfaceTerminateV1,
             ]
         )
@@ -2156,6 +2314,98 @@ final class PeerOwnedAgentSurfaceTests: XCTestCase {
             "the failed attach must spend the ensured surface id on the way out — "
                 + "it is the only thing that can ever name that bridge again"
         )
+        _ = hostTask
+    }
+
+    /// The remote-agent caller cannot rely on the best-effort compensation
+    /// RPC: the same disconnect that breaks attach can break terminate too.
+    /// It must durably record the ensured id before unwinding so reconnect can
+    /// retry until the host confirms TERMINATED/NOT_FOUND.
+    @MainActor
+    func test_ensureAndAttach_durablyQueuesAgentWhenPostEnsureCleanupFails() async throws {
+        let suiteName = "PostEnsureAgentCleanup-\(UUID().uuidString)"
+        guard let defaults = UserDefaults(suiteName: suiteName) else {
+            return XCTFail("could not create isolated defaults")
+        }
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let hostKey = "ssh:root@peer:/run/user/1000/term-mesh.sock"
+        var cleanupAttempts = 0
+        let cleanup = PendingPeerAgentSurfaceCleanupStore(
+            defaults: defaults,
+            observeNotifications: false,
+            automaticRetryDelay: 60,
+            hostSockPathProvider: { _ in "/tmp/unreachable-peer.sock" },
+            terminator: { _, _ in
+                cleanupAttempts += 1
+                return false
+            }
+        )
+        let socketPath = "/tmp/peer-agent-durable-cleanup-\(getpid())-\(UUID().uuidString.prefix(8)).sock"
+        let host = AgentSurfaceMockHost(
+            socketPath: socketPath,
+            capabilities: [
+                PeerCapability.surfaceEnsureV1,
+                PeerCapability.surfaceAgentV1,
+                PeerCapability.surfaceExitV1,
+                PeerCapability.surfaceEnsureEnvV1,
+                PeerCapability.surfaceTerminateV1,
+            ]
+        )
+        host.redirectsAttach = true
+        let hostTask = try host.start()
+        defer { host.stop() }
+
+        let hostSpec = PeerPaneHostSpec.direct(sockPath: socketPath)
+        let lease = try await PeerPaneHostRegistry.shared.acquire(hostSpec)
+        defer { PeerPaneHostRegistry.shared.release(lease) }
+
+        do {
+            _ = try await PeerPaneSession.ensureAndAttach(
+                lease: lease,
+                surfaceSpec: TeamOrchestrator.peerAgentSurfaceSpec(
+                    teamName: "my-team",
+                    agentInstanceId: UUID().uuidString,
+                    cli: "codex",
+                    workingDirectory: "/root/work",
+                    model: "sonnet",
+                    binaries: TeamOrchestrator.RemoteAgentBinaries(
+                        cliPath: "/root/.local/bin/codex",
+                        execPath: "/root/.local/bin/codex",
+                        bridgePath: "/usr/local/bin/tm-agent-bridge",
+                        cliAvailable: true
+                    )
+                ),
+                attachment: PeerRunnerAttachment(title: "reviewer", lifetime: .keepAlive),
+                hostSpec: hostSpec,
+                agentCli: "codex",
+                onAgentPostEnsureFailure: { surfaceID in
+                    TeamOrchestrator.enqueuePendingPeerAgentSurfaceCleanup(
+                        hostKey: hostKey,
+                        surfaceID: surfaceID,
+                        cleanup: cleanup
+                    )
+                }
+            )
+            XCTFail("a redirected attach must fail")
+        } catch {
+            // Expected after ensure committed the remote child.
+        }
+
+        for _ in 0..<20 where cleanupAttempts == 0 {
+            await Task.yield()
+        }
+        XCTAssertGreaterThanOrEqual(cleanupAttempts, 1, "the scheduler should try immediately")
+        XCTAssertEqual(cleanup.pendingRecords.first?.surfaceID, host.surfaceID)
+        XCTAssertTrue(
+            host.terminatedIDs().isEmpty,
+            "the caller-owned compensation must not race a second one-shot terminate"
+        )
+        let restored = PendingPeerAgentSurfaceCleanupStore(
+            defaults: defaults,
+            observeNotifications: false
+        )
+        XCTAssertEqual(restored.pendingRecords.first?.hostKey, hostKey)
+        XCTAssertEqual(restored.pendingRecords.first?.surfaceID, host.surfaceID)
         _ = hostTask
     }
 
@@ -2382,6 +2632,17 @@ final class PeerOwnedAgentLifecycleTests: XCTestCase {
     /// to the host's operator.
     @MainActor
     func test_releasePeerOwnedAgentSurface_onlyActsOnAPeerOwnedAgent() {
+        let suiteName = "PeerOwnedAgentReleaseTests-\(UUID().uuidString)"
+        guard let defaults = UserDefaults(suiteName: suiteName) else {
+            return XCTFail("could not create isolated defaults")
+        }
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let cleanup = PendingPeerAgentSurfaceCleanupStore(
+            defaults: defaults,
+            observeNotifications: false,
+            hostSockPathProvider: { _ in nil },
+            terminator: { _, _ in false }
+        )
         func member(
             remoteAgentSurface: Bool,
             spawned: Bool = true,
@@ -2410,17 +2671,335 @@ final class PeerOwnedAgentLifecycleTests: XCTestCase {
         // No host is registered in a unit test, so every call is a no-op at
         // the store lookup — what is pinned here is that none of them trap or
         // reach a `Task` with a half-built target.
-        TeamOrchestrator.releasePeerOwnedAgentSurface(member(remoteAgentSurface: false))
         TeamOrchestrator.releasePeerOwnedAgentSurface(
-            member(remoteAgentSurface: true, spawned: false)
+            member(remoteAgentSurface: false), cleanup: cleanup
         )
         TeamOrchestrator.releasePeerOwnedAgentSurface(
-            member(remoteAgentSurface: true, surfaceID: nil)
+            member(remoteAgentSurface: true, spawned: false), cleanup: cleanup
         )
         TeamOrchestrator.releasePeerOwnedAgentSurface(
-            member(remoteAgentSurface: true, hostKey: nil)
+            member(remoteAgentSurface: true, surfaceID: nil), cleanup: cleanup
         )
-        TeamOrchestrator.releasePeerOwnedAgentSurface(member(remoteAgentSurface: true))
+        TeamOrchestrator.releasePeerOwnedAgentSurface(
+            member(remoteAgentSurface: true, hostKey: nil), cleanup: cleanup
+        )
+        XCTAssertTrue(cleanup.pendingRecords.isEmpty)
+        TeamOrchestrator.releasePeerOwnedAgentSurface(
+            member(remoteAgentSurface: true), cleanup: cleanup
+        )
+        XCTAssertEqual(cleanup.pendingRecords.count, 1)
+    }
+
+    @MainActor
+    func testPendingPeerAgentCleanupPersistsUntilTerminationIsConfirmed() async {
+        let suiteName = "PendingPeerAgentCleanupTests-\(UUID().uuidString)"
+        guard let defaults = UserDefaults(suiteName: suiteName) else {
+            return XCTFail("could not create isolated defaults")
+        }
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let hostKey = "ssh:root@peer:/run/user/1000/term-mesh.sock"
+        let surfaceID = Data(repeating: 0x4A, count: 16)
+
+        let first = PendingPeerAgentSurfaceCleanupStore(
+            defaults: defaults, observeNotifications: false
+        )
+        first.enqueue(hostKey: hostKey, surfaceID: surfaceID)
+        XCTAssertEqual(first.pendingRecords.count, 1)
+
+        let restored = PendingPeerAgentSurfaceCleanupStore(
+            defaults: defaults, observeNotifications: false
+        )
+        XCTAssertEqual(restored.pendingRecords.first?.surfaceID, surfaceID)
+
+        await restored.retryPending(
+            hostSockPath: { _ in "/tmp/peer.sock" },
+            terminate: { _, _ in false }
+        )
+        XCTAssertEqual(
+            restored.pendingRecords.count, 1,
+            "a transport/RPC failure must retain the only durable cleanup handle"
+        )
+
+        await restored.retryPending(
+            hostSockPath: { _ in "/tmp/peer.sock" },
+            terminate: { _, _ in true }
+        )
+        XCTAssertTrue(restored.pendingRecords.isEmpty)
+        let afterConfirmation = PendingPeerAgentSurfaceCleanupStore(
+            defaults: defaults, observeNotifications: false
+        )
+        XCTAssertTrue(afterConfirmation.pendingRecords.isEmpty)
+    }
+
+    @MainActor
+    func testPendingPeerAgentCleanupUsesConnectedSocketBeforeLaunchMetadataResolves() async {
+        let suiteName = "PendingPeerAgentCleanupUnresolvedMetadata-\(UUID().uuidString)"
+        guard let defaults = UserDefaults(suiteName: suiteName) else {
+            return XCTFail("could not create isolated defaults")
+        }
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let hostKey = "ssh:root@peer"
+        let socketPath = "/tmp/authenticated-peer.sock"
+        let host = HostEntry(
+            id: hostKey,
+            displayName: "peer",
+            connectionState: .connected,
+            workspaces: [],
+            activeSockPath: socketPath,
+            sshTarget: "root@peer",
+            remoteSockPath: "/run/user/0/term-mesh.sock"
+        )
+        XCTAssertFalse(host.isLaunchable, "the launch metadata fixture must remain unresolved")
+        var attemptedSocket: String?
+        let cleanup = PendingPeerAgentSurfaceCleanupStore(
+            defaults: defaults,
+            observeNotifications: false,
+            automaticRetryDelay: 60,
+            hostSockPathProvider: { requestedHostKey in
+                PendingPeerAgentSurfaceCleanupStore.connectedHostSockPath(
+                    for: requestedHostKey,
+                    in: [host]
+                )
+            },
+            terminator: { resolvedSocket, _ in
+                attemptedSocket = resolvedSocket
+                return true
+            }
+        )
+
+        cleanup.enqueue(hostKey: hostKey, surfaceID: Data(repeating: 0x31, count: 16))
+        cleanup.scheduleRetry()
+        for _ in 0..<20 where attemptedSocket == nil {
+            await Task.yield()
+        }
+
+        XCTAssertEqual(attemptedSocket, socketPath)
+        XCTAssertTrue(cleanup.pendingRecords.isEmpty, "confirmed termination removes the tombstone")
+        XCTAssertNil(
+            PendingPeerAgentSurfaceCleanupStore.connectedHostSockPath(
+                for: hostKey,
+                in: [HostEntry(
+                    id: hostKey,
+                    displayName: "peer",
+                    connectionState: .saved,
+                    workspaces: [],
+                    activeSockPath: socketPath,
+                    sshTarget: "root@peer",
+                    remoteSockPath: "/run/user/0/term-mesh.sock"
+                )]
+            ),
+            "a disconnected row must not reuse its stale socket"
+        )
+    }
+
+    @MainActor
+    func testPreMemberPeerAgentCleanupQueuesDurableSurfaceHandle() {
+        let suiteName = "PreMemberPeerAgentCleanup-\(UUID().uuidString)"
+        guard let defaults = UserDefaults(suiteName: suiteName) else {
+            return XCTFail("could not create isolated defaults")
+        }
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let cleanup = PendingPeerAgentSurfaceCleanupStore(
+            defaults: defaults,
+            observeNotifications: false,
+            hostSockPathProvider: { _ in nil },
+            terminator: { _, _ in false }
+        )
+        let surfaceID = Data(repeating: 0x52, count: 16)
+
+        TeamOrchestrator.enqueuePendingPeerAgentSurfaceCleanup(
+            hostKey: "ssh:root@peer:/run/user/1000/term-mesh.sock",
+            surfaceID: surfaceID,
+            cleanup: cleanup
+        )
+
+        XCTAssertEqual(cleanup.pendingRecords.first?.surfaceID, surfaceID)
+        let restored = PendingPeerAgentSurfaceCleanupStore(
+            defaults: defaults,
+            observeNotifications: false
+        )
+        XCTAssertEqual(restored.pendingRecords.first?.surfaceID, surfaceID)
+    }
+
+    @MainActor
+    func testPendingPeerAgentCleanupAutomaticallyRetriesWithoutRelayNotification() async {
+        let suiteName = "PendingPeerAgentCleanupAutoRetry-\(UUID().uuidString)"
+        guard let defaults = UserDefaults(suiteName: suiteName) else {
+            return XCTFail("could not create isolated defaults")
+        }
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        var attempts = 0
+        let store = PendingPeerAgentSurfaceCleanupStore(
+            defaults: defaults,
+            observeNotifications: false,
+            automaticRetryDelay: 0.01,
+            hostSockPathProvider: { _ in "/tmp/peer.sock" },
+            terminator: { _, _ in
+                attempts += 1
+                return attempts >= 2
+            }
+        )
+        store.enqueue(
+            hostKey: "ssh:root@peer:/run/user/1000/term-mesh.sock",
+            surfaceID: Data(repeating: 0x6B, count: 16)
+        )
+        store.scheduleRetry()
+        try? await Task.sleep(nanoseconds: 100_000_000)
+        XCTAssertGreaterThanOrEqual(attempts, 2)
+        XCTAssertTrue(store.pendingRecords.isEmpty)
+    }
+
+    @MainActor
+    func testPeerAgentRecoveryRetriesTransientFailuresAndStopsOnSuccess() async {
+        var attempts = 0
+        var delays: [TimeInterval] = []
+        let result = await TeamOrchestrator.retryPeerAgentPaneRecovery(
+            maxAttempts: 6,
+            sleep: { delays.append($0) },
+            attempt: {
+                attempts += 1
+                return attempts < 3 ? .transientFailure : .recovered
+            }
+        )
+        XCTAssertEqual(result, .recovered)
+        XCTAssertEqual(attempts, 3)
+        XCTAssertEqual(delays, [1, 2])
+    }
+
+    @MainActor
+    func testPeerAgentRecoveryDoesNotRetryAuthoritativeAbsence() async {
+        var attempts = 0
+        let result = await TeamOrchestrator.retryPeerAgentPaneRecovery(
+            maxAttempts: 6,
+            sleep: { _ in XCTFail("authoritative absence must not back off") },
+            attempt: {
+                attempts += 1
+                return .authoritativeMissing
+            }
+        )
+        XCTAssertEqual(result, .authoritativeMissing)
+        XCTAssertEqual(attempts, 1)
+    }
+
+    @MainActor
+    func testPeerAgentRecoveryIsBoundedAndRetainsCoordinatorRequest() async {
+        let coordinator = PeerAgentPaneRecoveryCoordinator(observeNotifications: false)
+        let request = PeerAgentPaneRecoveryCoordinator.Request(
+            teamName: "t",
+            agentInstanceID: "instance",
+            closedPanelID: UUID(),
+            surfaceID: Data(repeating: 0x33, count: 16)
+        )
+        coordinator.remember(request)
+        var attempts = 0
+        let result = await TeamOrchestrator.retryPeerAgentPaneRecovery(
+            maxAttempts: 3,
+            sleep: { _ in },
+            attempt: {
+                attempts += 1
+                return .transientFailure
+            }
+        )
+        XCTAssertEqual(result, .transientFailure)
+        XCTAssertEqual(attempts, 3)
+        XCTAssertEqual(coordinator.pending, [request])
+        coordinator.forget(request)
+        XCTAssertTrue(coordinator.pending.isEmpty)
+    }
+
+    @MainActor
+    func testPeerAgentRecoveryCoordinatorAutomaticallyRetriesWithoutRelayNotification() async {
+        var retries = 0
+        let coordinator = PeerAgentPaneRecoveryCoordinator(
+            observeNotifications: false,
+            automaticRetryDelay: 0.01,
+            retryAction: { retries += 1 }
+        )
+        let request = PeerAgentPaneRecoveryCoordinator.Request(
+            teamName: "t",
+            agentInstanceID: "instance",
+            closedPanelID: UUID(),
+            surfaceID: Data(repeating: 0x77, count: 16)
+        )
+        coordinator.remember(request)
+        coordinator.scheduleRetryIfNeeded()
+        try? await Task.sleep(nanoseconds: 45_000_000)
+        XCTAssertGreaterThanOrEqual(retries, 2)
+        coordinator.forget(request)
+    }
+
+    @MainActor
+    func testPeerAgentRecoveryCoordinatorStaleCompletionKeepsNewerRequest() {
+        let coordinator = PeerAgentPaneRecoveryCoordinator(observeNotifications: false)
+        let stale = PeerAgentPaneRecoveryCoordinator.Request(
+            teamName: "t",
+            agentInstanceID: "instance",
+            closedPanelID: UUID(),
+            surfaceID: Data(repeating: 0x10, count: 16)
+        )
+        let replacement = PeerAgentPaneRecoveryCoordinator.Request(
+            teamName: stale.teamName,
+            agentInstanceID: stale.agentInstanceID,
+            closedPanelID: UUID(),
+            surfaceID: Data(repeating: 0x20, count: 16)
+        )
+
+        coordinator.remember(stale)
+        coordinator.remember(replacement)
+        coordinator.forget(stale)
+
+        XCTAssertEqual(coordinator.pending, [replacement])
+        coordinator.forget(replacement)
+    }
+
+    @MainActor
+    func testPeerAgentRecoveryOwnershipRevalidationRejectsDetachedOrReplacedMember() {
+        let orchestrator = TeamOrchestrator.shared
+        let teamName = "peer-recovery-owner-\(UUID().uuidString.prefix(8))"
+        let surfaceID = Data(repeating: 0x61, count: 16)
+        let member = TeamOrchestrator.AgentMember(
+            id: "reviewer@\(teamName)",
+            agentInstanceId: "durable-instance",
+            name: "reviewer",
+            teamName: teamName,
+            cli: "codex",
+            launchCommand: "codex",
+            model: "sonnet",
+            agentType: "reviewer",
+            color: "green",
+            instructions: "",
+            workspaceId: UUID(),
+            panelId: UUID(),
+            createdAt: Date(),
+            remoteSurfaceID: surfaceID,
+            remoteSurfaceSpawned: true,
+            remoteAgentSurface: true,
+            hostKey: "ssh:root@peer",
+            originalAgentWorkDir: "/root/work"
+        )
+        defer { orchestrator.forgetTeamForTests(teamName) }
+        orchestrator.installTeamForTests(name: teamName, agents: [member])
+
+        XCTAssertTrue(orchestrator.ownsPeerAgentSurface(
+            teamName: teamName,
+            agentInstanceID: member.agentInstanceId,
+            surfaceID: surfaceID
+        ))
+        XCTAssertFalse(orchestrator.ownsPeerAgentSurface(
+            teamName: teamName,
+            agentInstanceID: member.agentInstanceId,
+            surfaceID: Data(repeating: 0x62, count: 16)
+        ))
+
+        orchestrator.forgetTeamForTests(teamName)
+        var teardownCount = 0
+        XCTAssertFalse(orchestrator.validatePeerAgentRecoveryOwnership(
+            teamName: teamName,
+            agentInstanceID: member.agentInstanceId,
+            surfaceID: surfaceID,
+            onMismatch: { teardownCount += 1 }
+        ))
+        XCTAssertEqual(teardownCount, 1, "a stale attached session must be torn down")
     }
 
     /// The field the three cleanup paths read. Defaulting it to false is what

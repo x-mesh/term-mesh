@@ -2523,6 +2523,51 @@ final class AgentSessionTests: XCTestCase {
         XCTAssertTrue(fresh, "the stale half-line must not corrupt the fresh stream")
     }
 
+    func testSurfaceExitFinishesRemoteTurnAsFailureAndClearsRunningState() async throws {
+        var completions: [(String, AgentSession.TurnEnd)] = []
+        let s = AgentSession()
+        s.onTurnEnd = { text, end, _ in completions.append((text, end)) }
+        s.startRemote { _ in }
+        try s.send("TASK_ID: deadbeef\nfinish the review", from: .leader)
+
+        await s.finishRemoteSurfaceExited(exitCode: 0, signal: 15, reason: "signaled")
+
+        XCTAssertFalse(s.isRunning)
+        XCTAssertFalse(s.isThinking)
+        XCTAssertEqual(completions.count, 1)
+        XCTAssertEqual(completions.first?.1.stop, "process_exited")
+        XCTAssertTrue(completions.first?.1.failed == true)
+        XCTAssertTrue(s.entries.contains {
+            if case .notice(_, let text) = $0 { return text.contains("signal 15") }
+            return false
+        })
+    }
+
+    func testSurfaceExitDrainsFinalResultBeforeTearingDownRemotePipeline() async throws {
+        var completions: [(String, AgentSession.TurnEnd)] = []
+        let s = AgentSession()
+        s.onTurnEnd = { text, end, _ in completions.append((text, end)) }
+        s.startRemote { _ in }
+        try s.send("finish", from: .person)
+
+        // Deliberately do not wait for the off-main decoder. The authoritative
+        // exit arriving immediately after the final wire chunk must itself be
+        // the drain barrier that preserves this result.
+        s.consume(Data(event([
+            "type": "result",
+            "stop_reason": "end_turn",
+            "result": "final answer",
+        ]).utf8))
+        await s.finishRemoteSurfaceExited(exitCode: 0, signal: 0, reason: "exited")
+
+        XCTAssertFalse(s.isRunning)
+        XCTAssertEqual(completions.count, 1)
+        XCTAssertEqual(completions.first?.0, "final answer")
+        XCTAssertEqual(completions.first?.1.stop, "end_turn")
+        XCTAssertFalse(completions.first?.1.failed == true,
+                       "a decoded result must not be replaced by process_exited failure")
+    }
+
     /// One session, one transport. A local start while the remote session is
     /// live would hand the decoders two interleaved streams; it is refused,
     /// and `canInterrupt` — which a local start would have overwritten — is

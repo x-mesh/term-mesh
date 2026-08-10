@@ -330,6 +330,8 @@ final class PeerServerTests: XCTestCase {
     /// filters it back out -- see the handshake test above.)
     func testSupportedAdvertisesAgentSurfaceCapability() {
         XCTAssertTrue(PeerCapability.supported.contains(PeerCapability.surfaceAgentV1))
+        XCTAssertTrue(PeerCapability.supported.contains(PeerCapability.surfaceExitV1))
+        XCTAssertTrue(PeerCapability.supported.contains(PeerCapability.surfaceEnsureEnvV1))
         // `supported` feeds Hello.capabilities verbatim; a duplicate entry
         // would be advertised twice on the wire.
         XCTAssertEqual(Set(PeerCapability.supported).count, PeerCapability.supported.count)

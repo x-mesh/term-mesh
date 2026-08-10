@@ -107,6 +107,96 @@ final class PeerSessionEnsureTests: XCTestCase {
         case rejected
     }
 
+    func testEnsureCarriesExplicitEnvironmentMap() async throws {
+        let transport = MockTransport()
+        let host = EnsureMockHost(transport: transport)
+        let session = PeerSession(
+            read: { await transport.clientRead() },
+            write: { await transport.clientWrite($0) }
+        )
+        let requestID = Data(repeating: 0x31, count: 16)
+        let pending = Task {
+            try await session.ensureSurface(
+                requestID: requestID,
+                key: "agent-env",
+                cwd: "/tmp",
+                executable: "/bin/sh",
+                kind: "agent",
+                environment: [
+                    "HTTPS_PROXY": "http://proxy.example:8080",
+                    "TERMMESH_AGENT_NAME": "reviewer",
+                ]
+            )
+        }
+
+        let request = try await host.readRequest()
+        XCTAssertEqual(request.env["HTTPS_PROXY"], "http://proxy.example:8080")
+        XCTAssertEqual(request.env["TERMMESH_AGENT_NAME"], "reviewer")
+        try await host.sendResponse(requestID: requestID)
+        _ = try await pending.value
+    }
+
+    func testEnsureEnvironmentUsesPortableBoundedValidationBeforeWriting() async throws {
+        let invalid: [[String: String]] = [
+            ["한글": "value"],
+            ["9STARTS_WITH_DIGIT": "value"],
+            ["OK": String(repeating: "x", count: PeerEnsureEnvironment.maximumValueUTF8Bytes + 1)],
+            ["OK": "bad\0value"],
+            Dictionary(uniqueKeysWithValues: (0...PeerEnsureEnvironment.maximumCount).map {
+                ("K\($0)", "v")
+            }),
+        ]
+        for environment in invalid {
+            let writes = CloseCounter()
+            let session = PeerSession(
+                read: { Data() },
+                write: { _ in await writes.increment() }
+            )
+            do {
+                _ = try await session.ensureSurface(
+                    key: "invalid-env",
+                    cwd: "/tmp",
+                    executable: "/bin/sh",
+                    environment: environment
+                )
+                XCTFail("invalid environment must fail before writing")
+            } catch {
+                XCTAssertTrue(String(describing: error).contains("Environment"))
+            }
+            let writeCount = await writes.value
+            XCTAssertEqual(writeCount, 0)
+        }
+    }
+
+    func testSurfaceExitedIsClassifiedWithExactStatus() async throws {
+        let transport = MockTransport()
+        let session = PeerSession(
+            read: { await transport.clientRead() },
+            write: { await transport.clientWrite($0) }
+        )
+        let surfaceID = Data(repeating: 0x52, count: 16)
+        var exited = Termmesh_Peer_V1_SurfaceExited()
+        exited.surfaceID = surfaceID
+        exited.exitCode = 17
+        exited.signal = 0
+        exited.reason = "exited"
+        var envelope = Termmesh_Peer_V1_Envelope()
+        envelope.seq = 1
+        envelope.surfaceExited = exited
+
+        let waiting = Task { try await session.receiveNextMessage() }
+        await transport.serverWrite(try encodeFrame(envelope))
+
+        guard case .surfaceExited(let actualID, let code, let signal, let reason) =
+            try await waiting.value else {
+            return XCTFail("expected SurfaceExited")
+        }
+        XCTAssertEqual(actualID, surfaceID)
+        XCTAssertEqual(code, 17)
+        XCTAssertEqual(signal, 0)
+        XCTAssertEqual(reason, "exited")
+    }
+
     func testConcurrentEnsureCorrelatesOutOfOrderResponses() async throws {
         let transport = MockTransport()
         let host = EnsureMockHost(transport: transport)
