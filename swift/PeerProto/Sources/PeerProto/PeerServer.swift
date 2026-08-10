@@ -335,6 +335,11 @@ public actor EchoSurfaceProvider: PeerSurfaceProvider {
 // MARK: - PeerServer
 
 public enum PeerServerError: Error, Equatable {
+    /// Another process is already serving this path and answered a connect.
+    /// Distinct from `bindFailed`: nothing went wrong at the syscall level —
+    /// the path is simply taken, and taking it anyway would strand whoever
+    /// holds it.
+    case socketInUse(path: String)
     case bindFailed(errno: Int32, message: String)
     case listenFailed(errno: Int32)
     case acceptFailed(errno: Int32)
@@ -415,7 +420,23 @@ public actor PeerServer {
     public func start() throws {
         guard listenerFd < 0 else { throw PeerServerError.alreadyRunning }
         try Self.prepareSocketParentDirectory(for: socketPath)
-        // Remove any stale socket file first; an old entry would make bind fail.
+        // A socket file here may be a leftover — or another live server. Ask
+        // before removing it.
+        //
+        // This used to unlink unconditionally, on the assumption that anything
+        // present was stale. When it was not, the running server kept a
+        // listener bound to an unlinked inode: still accepting on the fd it
+        // already had, unreachable to anything that dialled the path. Nothing
+        // failed and nothing said so. A `--tag` build did exactly this to the
+        // installed app, and a viewer then held an established mirror to one
+        // process while every new attach landed in the other.
+        //
+        // Refusing is the honest outcome. Whoever is already serving keeps
+        // serving, and the second start reports why it did not.
+        if Self.isSocketAlive(atPath: socketPath) {
+            throw PeerServerError.socketInUse(path: socketPath)
+        }
+        // Now it really is stale (or absent) — an old entry would make bind fail.
         unlink(socketPath)
 
         let fd = socket(AF_UNIX, SOCK_STREAM, 0)
@@ -493,6 +514,39 @@ public actor PeerServer {
                 teamLeaderControlPlane: myTeamLeaderControlPlane,
                 server: self
             )
+        }
+    }
+
+    /// Whether something is listening on `path` right now.
+    ///
+    /// A connect, not a stat: the file existing says nothing — a crashed
+    /// server leaves its entry behind, and clearing that entry is exactly what
+    /// the unlink in `start()` is for. Only a completed connect separates
+    /// "stale file" from "live server".
+    ///
+    /// `false` on any error, including a path too long to express. The caller
+    /// then goes on to bind and gets a real diagnosis from the kernel instead
+    /// of a refusal invented here.
+    static func isSocketAlive(atPath path: String) -> Bool {
+        var addr = sockaddr_un()
+        addr.sun_family = sa_family_t(AF_UNIX)
+        let maxPathLen = MemoryLayout.size(ofValue: addr.sun_path)
+        let pathBytes = Array(path.utf8)
+        guard pathBytes.count < maxPathLen else { return false }
+        withUnsafeMutablePointer(to: &addr.sun_path) { tuplePtr in
+            tuplePtr.withMemoryRebound(to: CChar.self, capacity: maxPathLen) { cPtr in
+                for (i, byte) in pathBytes.enumerated() {
+                    cPtr[i] = CChar(bitPattern: byte)
+                }
+            }
+        }
+        let fd = socket(AF_UNIX, SOCK_STREAM, 0)
+        guard fd >= 0 else { return false }
+        defer { close(fd) }
+        return withUnsafePointer(to: &addr) { ptr -> Bool in
+            ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sockPtr in
+                connect(fd, sockPtr, socklen_t(MemoryLayout<sockaddr_un>.size)) == 0
+            }
         }
     }
 
