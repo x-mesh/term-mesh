@@ -223,11 +223,34 @@ struct TabItemView: View {
         return max(TabBarMetrics.closeButtonSize, shortcutHintWidth(for: label) + positiveDebugInset)
     }
 
+    /// Width of a shortcut hint, measured once per distinct label.
+    ///
+    /// Both inputs are fixed: the label is `"\(modifier)\(digit)"` and the font
+    /// derives from `TabBarMetrics.titleFontSize`, a `static let`. Nothing here
+    /// varies with window or tab width — the `max(closeButtonSize, …)` at the
+    /// call site is a floor, not a response to available space. So the whole
+    /// input space is a handful of strings ("⌃1"…"⌃9"), and measuring them
+    /// again on every body evaluation is work whose answer cannot have changed.
+    ///
+    /// It showed up as roughly half of `TabItemView.body`'s samples in a
+    /// profile: `NSFont` construction plus `NSString.size(withAttributes:)`,
+    /// per tab, per evaluation. Caching keeps the same contract the rest of
+    /// this view follows — layout values are read at draw time, not computed
+    /// there.
     private func shortcutHintWidth(for label: String) -> CGFloat {
+        if let cached = Self.shortcutHintWidths[label] { return cached }
         let font = NSFont.systemFont(ofSize: max(8, TabBarMetrics.titleFontSize - 2), weight: .semibold)
         let textWidth = (label as NSString).size(withAttributes: [.font: font]).width
-        return ceil(textWidth) + 8
+        let width = ceil(textWidth) + 8
+        Self.shortcutHintWidths[label] = width
+        return width
     }
+
+    /// Keyed by label alone, because the font is a compile-time constant (see
+    /// above). Bounded by the number of shortcut labels that exist, so it needs
+    /// no eviction. Main-actor isolated: every read happens during body
+    /// evaluation.
+    @MainActor private static var shortcutHintWidths: [String: CGFloat] = [:]
 
     @ViewBuilder
     private var trailingAccessory: some View {
