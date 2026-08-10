@@ -292,6 +292,12 @@ final class PeerServerTests: XCTestCase {
         // real actors over a real Unix socket -- not a mock.
         XCTAssertTrue(info.hasHostCapability(PeerCapability.ptyDataCoalesceV1))
         XCTAssertTrue(info.hasHostCapability(PeerCapability.replayRingV1))
+        // Phase 2 (viewer agent-panel) host/client asymmetry: the CLIENT
+        // Hello advertises surface.agent.v1 (this build renders agent
+        // surfaces), but the HOST direction must not -- a Swift GUI host
+        // publishes terminal panes only and cannot host an agent surface,
+        // so PeerServer filters the string out of its own Hello.
+        XCTAssertFalse(info.hasHostCapability(PeerCapability.surfaceAgentV1))
         XCTAssertFalse(info.hasHostCapability("totally.unknown.v1"))
 
         let activeSessions = await server.activeSessions
@@ -299,6 +305,8 @@ final class PeerServerTests: XCTestCase {
         let hostSideSession = try XCTUnwrap(activeSessions.first)
         let sawCoalesceCapability = await hostSideSession.hasClientCapability(PeerCapability.ptyDataCoalesceV1)
         XCTAssertTrue(sawCoalesceCapability)
+        let sawAgentCapability = await hostSideSession.hasClientCapability(PeerCapability.surfaceAgentV1)
+        XCTAssertTrue(sawAgentCapability)
         let sawUnknownCapability = await hostSideSession.hasClientCapability("totally.unknown.v1")
         XCTAssertFalse(sawUnknownCapability)
 
@@ -310,6 +318,80 @@ final class PeerServerTests: XCTestCase {
         try await session.sendGoodbye(reason: "c3c3.1-itest done")
         await transport.close()
         await server.stop()
+    }
+
+    /// t12 (viewer agent-panel, Phase 2): `surface.agent.v1` may be
+    /// advertised only by a build that can actually render agent surfaces.
+    /// This build can (AgentPanel wiring), so the capability must sit in
+    /// `PeerCapability.supported` -- the single source every outgoing
+    /// CLIENT `Hello.capabilities` is populated from. Dropping it would
+    /// make hosts silently degrade agent surfaces to `attachable = false`
+    /// for this viewer and reject its attach attempts. (The HOST direction
+    /// filters it back out -- see the handshake test above.)
+    func testSupportedAdvertisesAgentSurfaceCapability() {
+        XCTAssertTrue(PeerCapability.supported.contains(PeerCapability.surfaceAgentV1))
+        // `supported` feeds Hello.capabilities verbatim; a duplicate entry
+        // would be advertised twice on the wire.
+        XCTAssertEqual(Set(PeerCapability.supported).count, PeerCapability.supported.count)
+    }
+
+    /// The second layer under the host-direction Hello filter: a client
+    /// that sends `EnsureSurfaceRequest.kind = "agent"` anyway (bypassing
+    /// the capability gate) must get a loud FAILED response echoing its
+    /// request_id -- never a timeout, and never a silently-created
+    /// terminal. kind is part of the surface spec; silent conversion is
+    /// the cross-host contract drift this guards against.
+    func testAgentKindEnsureIsRejectedLoudlyByTheSwiftHost() async throws {
+        let sockPath = NSTemporaryDirectory() + "pptest-ensure-\(UUID().uuidString.prefix(8)).sock"
+        defer { try? FileManager.default.removeItem(atPath: sockPath) }
+
+        let provider = StaticSurfaceProvider(surfaces: [])
+        let server = PeerServer(socketPath: sockPath, provider: provider, config: PeerServerConfig())
+        try await server.start()
+        defer {
+            Task { await server.stop() }
+        }
+
+        let transport = try await UnixSocketTransport.connect(socketPath: sockPath)
+        let session = PeerSession(
+            read: { try await transport.read() },
+            write: { try await transport.write($0) }
+        )
+        _ = try await session.handshake(options: PeerSessionOptions())
+
+        // Raw envelope on purpose: the client API deliberately has no way
+        // to send kind = "agent" at a host without the capability, and the
+        // server must hold the contract against exactly the caller that
+        // skips such checks.
+        var request = Termmesh_Peer_V1_EnsureSurfaceRequest()
+        request.requestID = Data(repeating: 0x5A, count: 16)
+        request.key = "agent-reject-test"
+        request.cwd = "/tmp"
+        request.executable = "/usr/bin/true"
+        request.kind = "agent"
+        var envelope = Termmesh_Peer_V1_Envelope()
+        envelope.seq = 700
+        envelope.ensureSurfaceRequest = request
+        try await transport.write(encodeFrame(envelope))
+
+        var responseBytes = Data()
+        var response: Termmesh_Peer_V1_EnsureSurfaceResponse?
+        while response == nil {
+            responseBytes.append(try await transport.read())
+            if let decoded = try decodeFrame(from: &responseBytes),
+               case .ensureSurfaceResponse(let r) = decoded.payload {
+                response = r
+            }
+        }
+        let rejected = try XCTUnwrap(response)
+        XCTAssertEqual(rejected.requestID, request.requestID)
+        XCTAssertEqual(rejected.result, .failed)
+        XCTAssertTrue(rejected.hasError)
+        XCTAssertEqual(rejected.error.code, .invalidRequest)
+        XCTAssertTrue(rejected.surfaceID.isEmpty, "nothing may be created for a rejected kind")
+
+        try await session.sendGoodbye(reason: "test done")
+        await transport.close()
     }
 
     /// P3 capability plumbing, adversarial input: a client's
