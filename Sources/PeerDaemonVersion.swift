@@ -70,7 +70,25 @@ enum PeerDaemonVersion {
     /// Fetches the repo's latest release tag (e.g. "v0.156.0"). Returns
     /// nil on any network, HTTP, or parse failure — callers treat that
     /// the same as "can't tell", never as "up to date".
+    ///
+    /// Two sources, in order: the REST API, then the plain
+    /// `releases/latest` redirect. The second is not a retry of the
+    /// first — it exists because the API's failure mode here is routine.
+    /// Unauthenticated calls share a 60-per-hour budget PER IP with
+    /// everything else on the machine touching api.github.com, and once
+    /// it is gone every call answers 403 for the rest of the hour. That
+    /// is what a peer host reporting "server version unknown" usually
+    /// means, and the cost is not cosmetic: `showsUpdateButton` in
+    /// PeerHostEditorView renders only for `.updateAvailable`/
+    /// `.legacyDaemon`, so an unknown version removes the update path
+    /// from the UI entirely while the host sits several releases behind.
     static func fetchLatestRelease(repo: String = defaultRepo) async -> String? {
+        if let tag = await fetchLatestReleaseViaAPI(repo: repo) { return tag }
+        return await fetchLatestReleaseViaRedirect(repo: repo)
+    }
+
+    /// The REST API path — one documented JSON request, exact tag.
+    static func fetchLatestReleaseViaAPI(repo: String = defaultRepo) async -> String? {
         guard let url = URL(string: "https://api.github.com/repos/\(repo)/releases/latest") else {
             return nil
         }
@@ -90,6 +108,54 @@ enum PeerDaemonVersion {
         } catch {
             return nil
         }
+    }
+
+    /// The rate-limit-free path: `github.com/<repo>/releases/latest`
+    /// redirects to the newest release's own page, so the tag is in the
+    /// final URL. `install-linux.sh` resolves `latest` exactly this way
+    /// (see its TAG resolution) — same answer, no API budget spent.
+    ///
+    /// HEAD rather than GET: only the redirect target is wanted, and the
+    /// release page body is large enough that downloading it to throw it
+    /// away would be the whole cost of the call.
+    static func fetchLatestReleaseViaRedirect(repo: String = defaultRepo) async -> String? {
+        guard let url = URL(string: "https://github.com/\(repo)/releases/latest") else {
+            return nil
+        }
+        var request = URLRequest(url: url, timeoutInterval: 10)
+        request.httpMethod = "HEAD"
+        request.setValue("term-mesh-peer-doctor", forHTTPHeaderField: "User-Agent")
+        do {
+            let (_, response) = try await URLSession.shared.data(for: request)
+            // URLSession follows the redirect itself, so `response.url`
+            // is the tag page — not the URL requested above.
+            guard let http = response as? HTTPURLResponse,
+                  http.statusCode == 200,
+                  let finalURL = http.url else {
+                return nil
+            }
+            return parseTagFromReleaseURL(finalURL.absoluteString)
+        } catch {
+            return nil
+        }
+    }
+
+    /// Pure: pulls `v0.178.0` out of `…/releases/tag/v0.178.0`.
+    ///
+    /// Returns nil when there is no `/releases/tag/` segment at all —
+    /// which is what a repo with no published releases looks like, since
+    /// nothing redirects and the final URL is still `…/releases/latest`.
+    /// Answering nil there matters: a tag invented from that URL would
+    /// be compared against the host's real version and reported as an
+    /// update.
+    static func parseTagFromReleaseURL(_ absoluteString: String) -> String? {
+        guard let marker = absoluteString.range(of: "/releases/tag/") else { return nil }
+        var tag = String(absoluteString[marker.upperBound...])
+        if let cut = tag.firstIndex(where: { $0 == "?" || $0 == "#" }) {
+            tag = String(tag[tag.startIndex..<cut])
+        }
+        guard !tag.isEmpty, !tag.contains("/") else { return nil }
+        return tag.removingPercentEncoding ?? tag
     }
 
     /// Parses a semver-ish string into numeric components. Strips a

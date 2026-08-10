@@ -113,6 +113,12 @@ enum PeerHostDoctor {
     static let versionProbeCommand =
         #"sh -c 'if [ "$(uname -s)" = Darwin ]; then v=$(/usr/bin/defaults read /Applications/term-mesh.app/Contents/Info.plist CFBundleShortVersionString 2>/dev/null) && [ -n "$v" ] && echo "term-mesh-app $v" || exit 44; else b=$(command -v term-meshd 2>/dev/null); [ -x "$b" ] || b="$HOME/.local/bin/term-meshd"; [ -x "$b" ] && "$b" --version || exit 44; fi'"#
 
+    /// OS-only fallback for states where the peer or version probe cannot
+    /// identify a serving process. The reinstall action is Linux-only, so
+    /// unknown must never be treated as Linux by default.
+    static let hostKindProbeCommand =
+        #"sh -c 'case "$(uname -s)" in Darwin) echo term-mesh-app ;; Linux) echo term-meshd ;; *) exit 44 ;; esac'"#
+
     /// One term-mesh binary a host would run, and which copy it is.
     struct BinaryEntry: Equatable {
         var path: String
@@ -563,6 +569,21 @@ enum PeerHostDoctor {
         }
     }
 
+    /// Identifies only the remote OS/process kind. Used after a successful
+    /// SSH probe when no version can be read, so Linux-only install actions
+    /// remain available without ever being offered to a Mac or unknown host.
+    static func checkHostKind(
+        sshTarget: String,
+        port: Int?,
+        identityFile: String?
+    ) async -> PeerHostKind? {
+        guard let output = try? await runRemote(
+            sshTarget: sshTarget, port: port, identityFile: identityFile,
+            command: hostKindProbeCommand, timeoutSeconds: 15
+        ) else { return nil }
+        return parseHostKindLine(from: output)
+    }
+
     /// Pure classification of a finished version-probe run — mirrors
     /// PeerSocketProber.classify so the exit-code handling (in
     /// particular versionMissingExitCode → nil) and the output parsing
@@ -595,6 +616,20 @@ enum PeerHostDoctor {
                   let versionRange = Range(match.range(at: 2), in: line) else { continue }
             let kind: PeerHostKind = line[kindRange] == "term-meshd" ? .daemon : .app
             found = (String(line[versionRange]), kind)
+        }
+        return found
+    }
+
+    /// Pure parser for `hostKindProbeCommand`; scans past MOTD noise and
+    /// accepts only the two exact process-kind sentinels.
+    static func parseHostKindLine(from output: String) -> PeerHostKind? {
+        var found: PeerHostKind?
+        for rawLine in output.split(separator: "\n", omittingEmptySubsequences: true) {
+            switch rawLine.trimmingCharacters(in: .whitespacesAndNewlines) {
+            case "term-meshd": found = .daemon
+            case "term-mesh-app": found = .app
+            default: continue
+            }
         }
         return found
     }

@@ -142,6 +142,62 @@ final class PeerDaemonVersionTests: XCTestCase {
         XCTAssertNil(PeerHostDoctor.parseHostVersionLine(from: ""))
     }
 
+    // MARK: - Host-kind fallback and install policy
+
+    func test_parseHostKindLine_distinguishesDaemonAndApp() {
+        XCTAssertEqual(PeerHostDoctor.parseHostKindLine(from: "term-meshd\n"), .daemon)
+        XCTAssertEqual(PeerHostDoctor.parseHostKindLine(from: "term-mesh-app\n"), .app)
+        XCTAssertNil(PeerHostDoctor.parseHostKindLine(from: "Darwin\n"))
+    }
+
+    func test_parseHostKindLine_ignoresMOTDAndUsesLastSentinel() {
+        XCTAssertEqual(
+            PeerHostDoctor.parseHostKindLine(
+                from: "Welcome\nterm-mesh-app\nnoise\nterm-meshd\n"
+            ),
+            .daemon
+        )
+    }
+
+    func test_forceReinstall_requiresConfirmedLinuxHost() {
+        let state = PeerHostEditorView.DoctorState.relayFailed(
+            socket: "/run/term-mesh.sock", message: "incompatible handshake"
+        )
+        XCTAssertTrue(PeerHostEditorView.shouldShowForceReinstallButton(
+            hasTestedDraft: true, hostKind: .daemon,
+            showsUpdateButton: false, doctorState: state
+        ))
+        XCTAssertFalse(PeerHostEditorView.shouldShowForceReinstallButton(
+            hasTestedDraft: true, hostKind: .app,
+            showsUpdateButton: false, doctorState: state
+        ))
+        XCTAssertFalse(PeerHostEditorView.shouldShowForceReinstallButton(
+            hasTestedDraft: true, hostKind: nil,
+            showsUpdateButton: false, doctorState: state
+        ))
+    }
+
+    func test_forceReinstall_doesNotCompeteWithUpdateAction() {
+        XCTAssertFalse(PeerHostEditorView.shouldShowForceReinstallButton(
+            hasTestedDraft: true, hostKind: .daemon, showsUpdateButton: true,
+            doctorState: .updateAvailable(
+                socket: "/run/term-mesh.sock", remote: "0.170.0", latest: "v0.178.0"
+            )
+        ))
+    }
+
+    func test_plainInstall_requiresDaemonMissingOnConfirmedLinux() {
+        XCTAssertTrue(PeerHostEditorView.shouldShowInstallButton(
+            hasTestedDraft: true, hostKind: .daemon, doctorState: .daemonMissing
+        ))
+        XCTAssertFalse(PeerHostEditorView.shouldShowInstallButton(
+            hasTestedDraft: true, hostKind: .app, doctorState: .daemonMissing
+        ))
+        XCTAssertFalse(PeerHostEditorView.shouldShowInstallButton(
+            hasTestedDraft: true, hostKind: nil, doctorState: .daemonMissing
+        ))
+    }
+
     // MARK: - parseVersionLine (back-compat daemon-only view)
 
     func test_parseVersionLine_trimsWhitespace() {
@@ -386,6 +442,78 @@ final class PeerDaemonVersionTests: XCTestCase {
         XCTAssertEqual(
             PeerDaemonVersion.compare(installed: "0.156.0", latest: "garbage"),
             .unknown
+        )
+    }
+
+    // MARK: - PeerDaemonVersion.parseTagFromReleaseURL (API-free fallback)
+
+    func test_parseTagFromReleaseURL_extractsTagFromRedirectTarget() {
+        XCTAssertEqual(
+            PeerDaemonVersion.parseTagFromReleaseURL(
+                "https://github.com/x-mesh/term-mesh/releases/tag/v0.178.0"
+            ),
+            "v0.178.0"
+        )
+    }
+
+    /// A repo with no published releases never redirects, so the final
+    /// URL is still `…/releases/latest`. Inventing a tag from that would
+    /// be compared against the host's real version and reported as an
+    /// available update — nil is the only honest answer.
+    func test_parseTagFromReleaseURL_unredirectedLatestIsNil() {
+        XCTAssertNil(
+            PeerDaemonVersion.parseTagFromReleaseURL(
+                "https://github.com/x-mesh/term-mesh/releases/latest"
+            )
+        )
+        XCTAssertNil(PeerDaemonVersion.parseTagFromReleaseURL(""))
+        XCTAssertNil(
+            PeerDaemonVersion.parseTagFromReleaseURL("https://github.com/x-mesh/term-mesh")
+        )
+    }
+
+    /// A trailing path segment means this is not the tag page itself
+    /// (`…/tag/v1.0.0/whatever`), and a bare `…/tag/` carries no tag.
+    func test_parseTagFromReleaseURL_rejectsNonTerminalAndEmptyTag() {
+        XCTAssertNil(
+            PeerDaemonVersion.parseTagFromReleaseURL(
+                "https://github.com/x-mesh/term-mesh/releases/tag/v0.178.0/files"
+            )
+        )
+        XCTAssertNil(
+            PeerDaemonVersion.parseTagFromReleaseURL(
+                "https://github.com/x-mesh/term-mesh/releases/tag/"
+            )
+        )
+    }
+
+    func test_parseTagFromReleaseURL_stripsQueryAndFragment() {
+        XCTAssertEqual(
+            PeerDaemonVersion.parseTagFromReleaseURL(
+                "https://github.com/x-mesh/term-mesh/releases/tag/v0.178.0?foo=1"
+            ),
+            "v0.178.0"
+        )
+        XCTAssertEqual(
+            PeerDaemonVersion.parseTagFromReleaseURL(
+                "https://github.com/x-mesh/term-mesh/releases/tag/v0.178.0#notes"
+            ),
+            "v0.178.0"
+        )
+    }
+
+    /// The parsed tag feeds straight into `compare`, so it has to come
+    /// out in a shape that parses — this is the whole contract between
+    /// the fallback and the version comparison.
+    func test_parseTagFromReleaseURL_resultComparesAsOutdated() {
+        guard let tag = PeerDaemonVersion.parseTagFromReleaseURL(
+            "https://github.com/x-mesh/term-mesh/releases/tag/v0.178.0"
+        ) else {
+            return XCTFail("expected a tag")
+        }
+        XCTAssertEqual(
+            PeerDaemonVersion.compare(installed: "0.170.2", latest: tag),
+            .outdated(latest: "v0.178.0")
         )
     }
 
