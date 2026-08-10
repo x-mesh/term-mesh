@@ -755,6 +755,27 @@ final class TermMeshDaemon: ObservableObject {
         let _ = rpcCall(method: "usage.scan", params: [:])
     }
 
+    /// The resource monitor's latest system-wide sample, or nil when the
+    /// daemon has not taken one yet (it answers `{}` until its first tick).
+    ///
+    /// The socket call is blocking, so it runs on the daemon's utility queue.
+    /// Callers suspend without pinning their actor — notably `PeerServer`,
+    /// whose list/attach control plane must stay responsive while a telemetry
+    /// sample is late or the daemon socket is unavailable.
+    func monitorSnapshot() async -> [String: Any]? {
+        await withCheckedContinuation { continuation in
+            queue.async { [weak self] in
+                guard let self,
+                      let response = self.rpcCall(method: "monitor.snapshot", params: [:]) as? [String: Any],
+                      !response.isEmpty else {
+                    continuation.resume(returning: nil)
+                    return
+                }
+                continuation.resume(returning: response)
+            }
+        }
+    }
+
     // MARK: - Watcher (F-05)
 
     /// Normalize a file-watch target and reject paths whose recursive event

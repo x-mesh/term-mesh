@@ -7,6 +7,74 @@ import AppKit
 import Bonsplit
 import PeerProto
 
+/// Builds the wire `HostStats` from the daemon's `monitor.snapshot` JSON.
+///
+/// A translation, not a measurement: the daemon already samples every figure
+/// here for the resource monitor, and `term-meshd`'s own peer path builds the
+/// same message from the same struct (`host_stats_from` in
+/// `peer/connection.rs`). Keeping this a pure function over the decoded JSON
+/// is what makes the field mapping testable without a daemon.
+///
+/// Field names are the Rust struct's, verbatim — `SystemSnapshot` derives
+/// `Serialize` with no `rename_all`, so a rename there would surface here as
+/// a figure quietly reading zero. That is why every lookup below is explicit
+/// rather than driven by a decoder that would tolerate absence.
+enum LocalHostStatsSample {
+    static func make(from snapshot: [String: Any]) -> Termmesh_Peer_V1_HostStats? {
+        var stats = Termmesh_Peer_V1_HostStats()
+
+        // `load_avg` is [1m, 5m, 15m]. The first says how busy the machine is;
+        // the other two say whether that is a spike or a trend, which is why
+        // all three travel together rather than just the first.
+        if let load = snapshot["load_avg"] as? [Any], load.count >= 3 {
+            stats.load1M = double(load[0])
+            stats.load5M = double(load[1])
+            stats.load15M = double(load[2])
+        }
+        stats.cpuCount = uint32(snapshot["cpu_count"])
+        stats.memoryPercent = Float(double(snapshot["memory_percent"]))
+        stats.memoryUsedBytes = uint64(snapshot["used_memory_bytes"])
+        stats.memoryTotalBytes = uint64(snapshot["total_memory_bytes"])
+        stats.diskReadBytesPerSec = uint64(snapshot["disk_read_bytes_per_sec"])
+        stats.diskWriteBytesPerSec = uint64(snapshot["disk_write_bytes_per_sec"])
+        // Absolute capacity, so a viewer can warn before this machine runs out
+        // of room. Zero total means "not measured" to the client, never "full".
+        stats.diskTotalBytes = uint64(snapshot["disk_total_bytes"])
+        stats.diskAvailableBytes = uint64(snapshot["disk_available_bytes"])
+
+        // Summed across interfaces, matching the daemon: the question a viewer
+        // asks is how much traffic this machine is moving, not which NIC moved
+        // it. Rates are already per-second; the clamp only guards a negative
+        // that a counter reset could produce.
+        var rx = 0.0
+        var tx = 0.0
+        for case let interface as [String: Any] in snapshot["network_io"] as? [Any] ?? [] {
+            rx += double(interface["rx_rate"])
+            tx += double(interface["tx_rate"])
+        }
+        stats.netRxBytesPerSec = UInt64(max(0, rx))
+        stats.netTxBytesPerSec = UInt64(max(0, tx))
+
+        return stats
+    }
+
+    /// JSON numbers arrive as `NSNumber` whatever their Rust type was, so one
+    /// coercion per width rather than a cast that silently fails on the other.
+    private static func double(_ value: Any?) -> Double {
+        (value as? NSNumber)?.doubleValue ?? 0
+    }
+
+    private static func uint64(_ value: Any?) -> UInt64 {
+        guard let number = value as? NSNumber else { return 0 }
+        return UInt64(max(0, number.doubleValue))
+    }
+
+    private static func uint32(_ value: Any?) -> UInt32 {
+        guard let number = value as? NSNumber else { return 0 }
+        return UInt32(max(0, min(Double(UInt32.max), number.doubleValue)))
+    }
+}
+
 @MainActor
 enum PeerServerMenu {
     static func startItem() -> NSMenuItem {
@@ -307,6 +375,21 @@ final class PeerHostCoordinator: NSObject {
         // finishes starting before the daemon has bound its socket, so any
         // answer available at this line is a guess.
         config.resolveSessionHostSocket = { TermMeshDaemon.shared.advertisedSessionHostSocket }
+        // How loaded this Mac is, for a viewer's titlebar and its low-disk
+        // badge. The daemon beside this app already samples all of it for the
+        // resource monitor, so this reads that rather than starting a second
+        // sampler — which also keeps the syscalls off this process's main
+        // thread, where a two-second tick would land in the middle of SwiftUI's
+        // update cycle.
+        //
+        // Returning nil (no daemon, or no sample yet) skips that tick. The
+        // provider itself is still configured, so the host advertises
+        // `host.stats.v1`: capabilities describe implemented support, while a
+        // temporarily absent sample is normal during daemon startup.
+        config.hostStatsProvider = {
+            guard let snapshot = await TermMeshDaemon.shared.monitorSnapshot() else { return nil }
+            return LocalHostStatsSample.make(from: snapshot)
+        }
 
         let server = PeerServer(socketPath: path, provider: provider, config: config)
         do {
