@@ -771,7 +771,10 @@ final class PeerServerTests: XCTestCase {
                 "\(method) must not be reachable from a peer"
             )
         }
-        for method in ["team.send", "team.delegate", "team.read", "team.status"] {
+        for method in [
+            "team.send", "team.delegate", "team.read", "team.status",
+            "team.correlation.register", "team.correlation.get", "team.correlation.cancel",
+        ] {
             XCTAssertTrue(PeerTeamCall.isAllowed(method))
         }
     }

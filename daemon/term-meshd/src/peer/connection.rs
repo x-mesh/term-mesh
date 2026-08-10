@@ -1414,6 +1414,9 @@ const TEAM_CALL_ALLOWED_METHODS: &[&str] = &[
     "team.result.collect",
     "team.inbox",
     "team.message.list",
+    "team.correlation.register",
+    "team.correlation.get",
+    "team.correlation.cancel",
     "team.send",
     "team.broadcast",
     "team.delegate",
@@ -3684,6 +3687,9 @@ mod team_call_allow_list_tests {
         daemon_methods.sort();
 
         assert_eq!(cli_methods, daemon_methods);
+        assert!(team_call_allowed("team.correlation.register"));
+        assert!(team_call_allowed("team.correlation.get"));
+        assert!(team_call_allowed("team.correlation.cancel"));
         assert!(team_call_allowed("team.task.done"));
         assert!(!team_call_allowed("team.task.reassign"));
     }

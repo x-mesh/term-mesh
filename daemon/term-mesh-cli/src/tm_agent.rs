@@ -21,10 +21,10 @@ mod prompts;
 use clap::{Parser, Subcommand, ValueEnum};
 use serde_json::{json, Value};
 use std::fs;
-use std::io::{BufRead, BufReader, ErrorKind, IsTerminal, Write};
+use std::io::{BufRead, BufReader, ErrorKind, IsTerminal, Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use std::{env, process, thread};
 
 // ── Constants ────────────────────────────────────────────────────────
@@ -366,6 +366,228 @@ mod project_sync_cli_tests {
             "instance-2",
         ])
         .is_err());
+        assert!(Cli::try_parse_from([
+            "tm-agent",
+            "send",
+            "reviewer",
+            "check this",
+            "--expect-reply",
+            "--reply-timeout",
+            "0",
+        ])
+        .is_err());
+    }
+
+    #[test]
+    fn send_expect_reply_and_correlated_reply_flags_parse() {
+        let send = Cli::try_parse_from([
+            "tm-agent",
+            "send",
+            "reviewer",
+            "check this",
+            "--expect-reply",
+            "--reply-timeout",
+            "7",
+        ])
+        .unwrap();
+        assert!(matches!(
+            send.command,
+            Commands::Send {
+                expect_reply: true,
+                reply_timeout: 7,
+                ..
+            }
+        ));
+
+        let reply = Cli::try_parse_from([
+            "tm-agent",
+            "reply",
+            "--reply-to",
+            "tm-agent-42-7",
+            "done",
+        ])
+        .unwrap();
+        assert!(matches!(
+            reply.command,
+            Commands::Reply {
+                reply_to: Some(ref id),
+                ..
+            } if id == "tm-agent-42-7"
+        ));
+
+        assert!(Cli::try_parse_from([
+            "tm-agent",
+            "send",
+            "reviewer",
+            "check this",
+            "--reply-timeout",
+            "7",
+        ])
+        .is_err());
+    }
+
+    #[test]
+    fn ok_false_is_a_cli_failure_even_when_transport_succeeded() {
+        let failure = successful_rpc_envelope(Ok(json!({
+            "ok": false,
+            "error": { "code": "not_found", "message": "agent missing" }
+        })))
+        .unwrap_err();
+        assert!(failure.contains("ok:false"));
+        assert!(failure.contains("agent missing"));
+
+        let success = successful_rpc_envelope(Ok(json!({
+            "ok": true,
+            "result": { "delivered": true }
+        })))
+        .unwrap();
+        assert_eq!(success["result"]["delivered"], true);
+    }
+
+    #[test]
+    fn batch_team_send_opts_into_sequence_gate_contract() {
+        let payloads = parse_batch_commands("send reviewer:check", "team-a").unwrap();
+        let request: Value = serde_json::from_str(&payloads[0]).unwrap();
+        assert_eq!(request["method"], "team.send");
+        assert_eq!(request["params"]["send_sequence_aware"], true);
+    }
+
+    #[test]
+    fn live_team_fallback_has_fixed_value_free_diagnostic() {
+        let resolution = resolve_team_name_inputs(None, None, None);
+        assert_eq!(resolution.name, "live-team");
+        assert_eq!(resolution.source, TeamNameSource::LiveTeamFallback);
+        assert!(LIVE_TEAM_FALLBACK_WARNING.contains("--team <name>"));
+        assert!(LIVE_TEAM_FALLBACK_WARNING.contains("falling back to live-team"));
+
+        let explicit =
+            resolve_team_name_inputs(Some("chosen"), Some("secret-env-team"), Some("ws-secret"));
+        assert_eq!(explicit.name, "chosen");
+        assert_eq!(explicit.source, TeamNameSource::Explicit);
+        assert!(!LIVE_TEAM_FALLBACK_WARNING.contains("secret-env-team"));
+        assert!(!LIVE_TEAM_FALLBACK_WARNING.contains("ws-secret"));
+    }
+
+    #[test]
+    fn correlated_reply_mailbox_is_typed_identity_bound_and_deadline_aware() {
+        let token = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let params = correlated_reply_params(
+            "team-a",
+            "reviewer",
+            token,
+            "instance-7",
+            "finished",
+        )
+        .unwrap();
+        assert_eq!(params["to"], "leader");
+        assert_eq!(params["type"], "note");
+        assert_eq!(params["agent_instance_id"], "instance-7");
+        assert_eq!(params["correlation_token"], token);
+        assert_eq!(params["content"], "finished");
+        let instruction =
+            append_correlated_reply_instruction("check", token, "instance-7").unwrap();
+        assert!(instruction.contains("<<'TERMMESH_REPLY_EOF'"));
+        assert!(!instruction.contains("'<response>'"));
+
+        let response = json!({
+            "ok": true,
+            "result": {
+                "ready": true,
+                "message_id": "matched",
+                "agent_name": "reviewer",
+                "agent_instance_id": "instance-7",
+                "content": "finished"
+            }
+        });
+        let reply = correlated_reply_from_mailbox(response, "reviewer", "instance-7", token)
+            .unwrap()
+            .unwrap();
+        assert_eq!(reply["result"]["content"], "finished");
+        assert_eq!(reply["result"]["message_id"], "matched");
+
+        let pending = json!({ "ok": true, "result": { "ready": false } });
+        let mut polled = false;
+        let timeout = wait_for_correlated_reply_with(
+            "reviewer",
+            "instance-7",
+            token,
+            Duration::ZERO,
+            |_| {
+                polled = true;
+                Ok(pending.clone())
+            },
+        )
+        .unwrap_err();
+        assert!(timeout.contains("timed out"));
+        assert!(!polled, "an expired deadline must not start an RPC");
+
+        let rpc_error = wait_for_correlated_reply_with(
+            "reviewer",
+            "instance-7",
+            token,
+            Duration::from_secs(1),
+            |_| Err("socket closed".to_string()),
+        )
+        .unwrap_err();
+        assert_eq!(rpc_error, "socket closed");
+
+        let rejected = wait_for_correlated_reply_with(
+            "reviewer",
+            "instance-7",
+            token,
+            Duration::from_secs(1),
+            |_| {
+                Ok(json!({
+                    "ok": false,
+                    "error": { "code": "denied", "message": "mailbox denied" }
+                }))
+            },
+        )
+        .unwrap_err();
+        assert!(rejected.contains("ok:false"));
+        assert!(rejected.contains("mailbox denied"));
+
+        let mismatch = correlated_reply_from_mailbox(
+            json!({
+                "ok": true,
+                "result": {
+                    "ready": true,
+                    "message_id": "wrong",
+                    "agent_name": "reviewer",
+                    "agent_instance_id": "instance-6",
+                    "content": "wrong pane"
+                }
+            }),
+            "reviewer",
+            "instance-7",
+            token,
+        )
+        .unwrap_err();
+        assert!(mismatch.contains("mismatched identity"));
+
+        let token_a = new_correlation_token().unwrap();
+        let token_b = new_correlation_token().unwrap();
+        assert_eq!(token_a.len(), 64);
+        assert!(validate_reply_correlation_id(&token_a).is_ok());
+        assert_ne!(token_a, token_b);
+
+        assert!(validate_correlated_reply_overrides(true, false, false).is_err());
+        assert!(validate_correlated_reply_overrides(false, true, false).is_err());
+        assert!(validate_correlated_reply_overrides(false, false, true).is_err());
+        assert!(validate_correlated_reply_overrides(false, false, false).is_ok());
+    }
+
+    #[test]
+    fn best_effort_rpc_retries_ok_false_without_exiting() {
+        let mut calls = 0;
+        run_best_effort_rpc_with_retry("test.post", || {
+            calls += 1;
+            Ok(json!({
+                "ok": false,
+                "error": { "code": "rejected", "message": "try again" }
+            }))
+        });
+        assert_eq!(calls, 2);
     }
 
     #[test]
@@ -963,6 +1185,17 @@ enum Commands {
         text: String,
         #[arg(long)]
         no_report: bool,
+        /// Wait for an exact reply posted with `tm-agent reply --reply-to <id>`.
+        #[arg(long)]
+        expect_reply: bool,
+        /// Maximum seconds to wait for `--expect-reply`.
+        #[arg(
+            long,
+            default_value_t = 60,
+            requires = "expect_reply",
+            value_parser = clap::value_parser!(u64).range(1..=86_400)
+        )]
+        reply_timeout: u64,
         /// Target a specific pane by panel_id (deterministic; overrides name round-robin)
         #[arg(long, conflicts_with = "agent_instance_id")]
         panel: Option<String>,
@@ -1099,6 +1332,9 @@ enum Commands {
         text: Vec<String>,
         #[arg(long)]
         from: Option<String>,
+        /// Post a one-shot reply correlated to `send --expect-reply`.
+        #[arg(long = "reply-to")]
+        reply_to: Option<String>,
         /// Explicit task id to close (skips auto-selection when multiple active tasks exist)
         #[arg(long = "task-id")]
         task_id: Option<String>,
@@ -3757,6 +3993,22 @@ mod runbook_tests {
             &[250, 400, 600, 800, 1000, 1500, 2500, 4000]
         );
     }
+
+    #[test]
+    fn return_key_echoes_the_send_gate_sequence_id() {
+        let params = send_return_key_params(
+            "team-a",
+            "reviewer",
+            Some("panel-7"),
+            Some("instance-7"),
+            Some("sequence-42"),
+        );
+        assert_eq!(params["send_sequence_id"], "sequence-42");
+        assert_eq!(params["agent_instance_id"], "instance-7");
+
+        let legacy = send_return_key_params("team-a", "reviewer", None, None, None);
+        assert!(legacy["send_sequence_id"].is_null());
+    }
 }
 
 // ── Socket / RPC infrastructure ──────────────────────────────────────
@@ -3842,9 +4094,18 @@ fn rpc_call(sock: &PathBuf, method: &str, params: Value) -> Result<Value, String
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
         .unwrap_or(6);
+    rpc_call_with_timeout_secs(sock, method, params, timeout)
+}
+
+fn rpc_call_with_timeout_secs(
+    sock: &PathBuf,
+    method: &str,
+    params: Value,
+    timeout_secs: u64,
+) -> Result<Value, String> {
     match remote_leader_rpc_policy(remote_leader_route().is_some(), method) {
         RemoteLeaderRpcPolicy::Proxy => {
-            return remote_leader_rpc_call(sock, method, params, timeout);
+            return remote_leader_rpc_call(sock, method, params, timeout_secs);
         }
         // A remote leader's TERMMESH_SOCKET points at the peer host's local
         // app. Falling through for a disallowed team method therefore acts on
@@ -3860,7 +4121,24 @@ fn rpc_call(sock: &PathBuf, method: &str, params: Value) -> Result<Value, String
         }
         RemoteLeaderRpcPolicy::Local => {}
     }
-    rpc_call_timeout(sock, method, params, timeout)
+    rpc_call_timeout(sock, method, params, timeout_secs)
+}
+
+fn rpc_call_with_timeout_duration(
+    sock: &PathBuf,
+    method: &str,
+    params: Value,
+    timeout: Duration,
+) -> Result<Value, String> {
+    match remote_leader_rpc_policy(remote_leader_route().is_some(), method) {
+        RemoteLeaderRpcPolicy::Proxy => {
+            remote_leader_rpc_call_duration(sock, method, params, timeout)
+        }
+        RemoteLeaderRpcPolicy::RejectTeam => Err(format!(
+            "{method} is not allowed from a scoped remote leader; use the owning project window to change team lifecycle"
+        )),
+        RemoteLeaderRpcPolicy::Local => rpc_call_timeout_duration(sock, method, params, timeout),
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -3945,6 +4223,9 @@ fn remote_leader_method_allowed(method: &str) -> bool {
             | "team.result.collect"
             | "team.inbox"
             | "team.message.list"
+            | "team.correlation.register"
+            | "team.correlation.get"
+            | "team.correlation.cancel"
             | "team.send"
             | "team.broadcast"
             | "team.delegate"
@@ -3998,6 +4279,35 @@ fn remote_leader_rpc_call(
     let outer = match first {
         Ok(value) => value,
         Err(_) => rpc_call_timeout(sock, "peer.leader.call", proxy_params, timeout)?,
+    };
+    remote_leader_proxy_result(decode_daemon_response(outer)?)
+}
+
+fn remote_leader_rpc_call_duration(
+    sock: &PathBuf,
+    method: &str,
+    params: Value,
+    timeout: Duration,
+) -> Result<Value, String> {
+    let route = remote_leader_route().ok_or_else(|| "invalid remote leader route".to_string())?;
+    let request_id_hex = remote_leader_request_id_hex();
+    let proxy_params = remote_leader_proxy_params(&route, method, params, &request_id_hex)?;
+    let deadline = Instant::now() + timeout;
+    let first = rpc_call_timeout_duration(
+        sock,
+        "peer.leader.call",
+        proxy_params.clone(),
+        timeout,
+    );
+    let outer = match first {
+        Ok(value) => value,
+        Err(first_error) => {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(first_error);
+            }
+            rpc_call_timeout_duration(sock, "peer.leader.call", proxy_params, remaining)?
+        }
     };
     remote_leader_proxy_result(decode_daemon_response(outer)?)
 }
@@ -4224,12 +4534,19 @@ fn rpc_call_timeout(
     params: Value,
     timeout_secs: u64,
 ) -> Result<Value, String> {
+    rpc_call_timeout_duration(sock, method, params, Duration::from_secs(timeout_secs))
+}
+
+fn rpc_call_timeout_duration(
+    sock: &PathBuf,
+    method: &str,
+    params: Value,
+    timeout: Duration,
+) -> Result<Value, String> {
+    let deadline = Instant::now() + timeout;
     let stream = UnixStream::connect(sock).map_err(|e| format!("connect: {e}"))?;
     stream
-        .set_read_timeout(Some(Duration::from_secs(timeout_secs)))
-        .ok();
-    stream
-        .set_write_timeout(Some(Duration::from_secs(timeout_secs)))
+        .set_write_timeout(Some(timeout))
         .ok();
 
     let request = json!({
@@ -4247,6 +4564,12 @@ fn rpc_call_timeout(
         .write_all(line.as_bytes())
         .map_err(|e| format!("write: {e}"))?;
     writer.flush().map_err(|e| format!("flush: {e}"))?;
+
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        return Err("RPC deadline expired before response read".to_string());
+    }
+    stream.set_read_timeout(Some(remaining)).ok();
 
     let mut reader = BufReader::new(&stream);
     let mut response = String::new();
@@ -4416,7 +4739,8 @@ fn parse_batch_commands(commands: &str, team: &str) -> Result<Vec<String>, Strin
                     "params": {
                         "team_name": team,
                         "agent_name": agent_name,
-                        "text": format!("{text}\n")
+                        "text": format!("{text}\n"),
+                        "send_sequence_aware": true
                     }
                 })
             }
@@ -5534,6 +5858,23 @@ fn return_retry_delays_ms(text_delivered: bool, context: &str) -> &'static [u64]
     }
 }
 
+fn send_return_key_params(
+    team: &str,
+    target: &str,
+    panel_id: Option<&str>,
+    agent_instance_id: Option<&str>,
+    send_sequence_id: Option<&str>,
+) -> Value {
+    json!({
+        "team_name": team,
+        "agent_name": target,
+        "key": "return",
+        "panel_id": panel_id,
+        "agent_instance_id": agent_instance_id,
+        "send_sequence_id": send_sequence_id,
+    })
+}
+
 fn send_return_key_with_retry(
     sock: &PathBuf,
     team: &str,
@@ -5542,6 +5883,7 @@ fn send_return_key_with_retry(
     context: &str,
     panel_id: Option<&str>,
     agent_instance_id: Option<&str>,
+    send_sequence_id: Option<&str>,
 ) -> bool {
     let delays = return_retry_delays_ms(text_delivered, context);
     eprintln!(
@@ -5562,13 +5904,13 @@ fn send_return_key_with_retry(
         match rpc_call(
             sock,
             "team.send_key",
-            json!({
-                "team_name": team,
-                "agent_name": target,
-                "key": "return",
-                "panel_id": panel_id,
-                "agent_instance_id": agent_instance_id,
-            }),
+            send_return_key_params(
+                team,
+                target,
+                panel_id,
+                agent_instance_id,
+                send_sequence_id,
+            ),
         ) {
             Ok(r) if r["ok"].as_bool().unwrap_or(false) => return true,
             Ok(_) | Err(_) => {}
@@ -5659,6 +6001,34 @@ fn command_agent_instance_id(
         .as_array()
         .ok_or_else(|| "team.status response has no agents array".to_string())?;
     instance_id_from_agents(agents, target, Some(panel_id))
+}
+
+fn exact_command_agent_instance_id(
+    sock: &PathBuf,
+    team: &str,
+    target: &str,
+    panel_id: Option<&str>,
+    explicit_instance_id: Option<&str>,
+) -> Result<String, String> {
+    if let Some(instance_id) = command_agent_instance_id(
+        sock,
+        team,
+        target,
+        panel_id,
+        explicit_instance_id,
+    )? {
+        return Ok(instance_id);
+    }
+    let status = successful_rpc_envelope(rpc_call(
+        sock,
+        "team.status",
+        json!({ "team_name": team }),
+    ))?;
+    let agents = status["result"]["agents"]
+        .as_array()
+        .ok_or_else(|| "team.status response has no agents array".to_string())?;
+    instance_id_from_agents(agents, target, None)?
+        .ok_or_else(|| format!("agent {target} has no unique durable agent_instance_id"))
 }
 
 fn instance_id_from_agents(
@@ -7222,10 +7592,91 @@ fn main() {
             agent: ref target,
             text,
             no_report,
+            expect_reply,
+            reply_timeout,
             panel,
             agent_instance_id,
         } => {
-            let text = append_report_suffix(&text, no_report);
+            if expect_reply && reply_timeout == 0 {
+                print_result(Err("--reply-timeout must be at least 1 second".to_string()));
+                return;
+            }
+            let reply_instance_id = if expect_reply {
+                match exact_command_agent_instance_id(
+                    &sock,
+                    &team,
+                    target,
+                    panel.as_deref(),
+                    agent_instance_id.as_deref(),
+                ) {
+                    Ok(instance_id) => Some(instance_id),
+                    Err(error) => {
+                        print_result(Err(error));
+                        return;
+                    }
+                }
+            } else {
+                None
+            };
+            let reply_deadline = expect_reply
+                .then(|| Instant::now() + Duration::from_secs(reply_timeout));
+            let reply_correlation = if expect_reply {
+                match new_correlation_token() {
+                    Ok(token) => Some(token),
+                    Err(error) => {
+                        print_result(Err(error));
+                        return;
+                    }
+                }
+            } else {
+                None
+            };
+            let text = if let Some(correlation_id) = reply_correlation.as_deref() {
+                match append_correlated_reply_instruction(
+                    &text,
+                    correlation_id,
+                    reply_instance_id
+                        .as_deref()
+                        .expect("expect-reply resolves an instance"),
+                ) {
+                    Ok(text) => text,
+                    Err(error) => {
+                        print_result(Err(error));
+                        return;
+                    }
+                }
+            } else {
+                append_report_suffix(&text, no_report)
+            };
+            if let (Some(correlation_id), Some(instance_id)) =
+                (reply_correlation.as_deref(), reply_instance_id.as_deref())
+            {
+                if let Err(error) = register_correlation_mailbox(
+                    &sock,
+                    &team,
+                    correlation_id,
+                    target,
+                    instance_id,
+                    reply_timeout,
+                    reply_deadline
+                        .expect("expect-reply establishes a deadline")
+                        .saturating_duration_since(Instant::now()),
+                ) {
+                    print_result(Err(error));
+                    return;
+                }
+                if reply_deadline
+                    .expect("expect-reply establishes a deadline")
+                    .saturating_duration_since(Instant::now())
+                    .is_zero()
+                {
+                    cancel_correlation_mailbox(&sock, &team, correlation_id);
+                    print_result(Err(format!(
+                        "timed out before sending correlated request to {target}"
+                    )));
+                    return;
+                }
+            }
             // Check if agent is headless — route to daemon socket. An
             // explicit --panel/--agent-instance-id names a GUI pane, so it
             // must reach the GUI resolution path below rather than being
@@ -7233,7 +7684,7 @@ fn main() {
             if panel.is_none() && agent_instance_id.is_none() {
                 if let Some(daemon_sock) = detect_daemon_socket() {
                     if let Some(agent_id) = is_headless_agent(&daemon_sock, &team, target) {
-                        print_result(rpc_call(
+                        let delivery = successful_rpc_envelope(rpc_call(
                             &daemon_sock,
                             "headless.send",
                             json!({
@@ -7241,24 +7692,55 @@ fn main() {
                                 "text": format!("{text}\n"),
                             }),
                         ));
+                        if let Err(error) = delivery {
+                            if let Some(correlation_id) = reply_correlation.as_deref() {
+                                cancel_correlation_mailbox(&sock, &team, correlation_id);
+                            }
+                            print_result(Err(error));
+                            return;
+                        }
+                        if let Some(correlation_id) = reply_correlation.as_deref() {
+                            let reply = wait_for_correlated_reply(
+                                &sock,
+                                &team,
+                                target,
+                                reply_instance_id
+                                    .as_deref()
+                                    .expect("expect-reply resolves an instance"),
+                                correlation_id,
+                                reply_deadline
+                                    .expect("expect-reply establishes a deadline")
+                                    .saturating_duration_since(Instant::now()),
+                            );
+                            if reply.is_err() {
+                                cancel_correlation_mailbox(&sock, &team, correlation_id);
+                            }
+                            print_result(reply);
+                        } else {
+                            print_result(delivery);
+                        }
                         return;
                     }
                 }
             }
-            let selected_instance_id = match command_agent_instance_id(
-                &sock,
-                &team,
-                target,
-                panel.as_deref(),
-                agent_instance_id.as_deref(),
-            ) {
-                Ok(id) => id,
-                Err(e) => {
-                    eprintln!("Error: {e}");
-                    process::exit(1);
+            let selected_instance_id = if let Some(instance_id) = reply_instance_id.clone() {
+                Some(instance_id)
+            } else {
+                match command_agent_instance_id(
+                    &sock,
+                    &team,
+                    target,
+                    panel.as_deref(),
+                    agent_instance_id.as_deref(),
+                ) {
+                    Ok(id) => id,
+                    Err(e) => {
+                        eprintln!("Error: {e}");
+                        process::exit(1);
+                    }
                 }
             };
-            let send_result = rpc_call(
+            let send_result = successful_rpc_envelope(rpc_call(
                 &sock,
                 "team.send",
                 json!({
@@ -7266,8 +7748,16 @@ fn main() {
                     "text": format!("{text}\n"),
                     "panel_id": panel,
                     "agent_instance_id": selected_instance_id,
+                    "send_sequence_aware": true,
                 }),
-            );
+            ));
+            if let Err(error) = &send_result {
+                if let Some(correlation_id) = reply_correlation.as_deref() {
+                    cancel_correlation_mailbox(&sock, &team, correlation_id);
+                }
+                print_result(Err(error.clone()));
+                return;
+            }
             // Send Return key via team.send_key (reliable sendNamedKey path).
             // The Return MUST carry the SAME panel_id as the paste so both land on
             // the same pane (otherwise text lands on pane X, Return on name-match Y).
@@ -7284,9 +7774,29 @@ fn main() {
                     "team.send",
                     panel.as_deref(),
                     selected_instance_id.as_deref(),
+                    r["result"]["send_sequence_id"].as_str(),
                 );
             }
-            print_result(send_result);
+            if let Some(correlation_id) = reply_correlation.as_deref() {
+                let reply = wait_for_correlated_reply(
+                    &sock,
+                    &team,
+                    target,
+                    reply_instance_id
+                        .as_deref()
+                        .expect("expect-reply resolves an instance"),
+                    correlation_id,
+                    reply_deadline
+                        .expect("expect-reply establishes a deadline")
+                        .saturating_duration_since(Instant::now()),
+                );
+                if reply.is_err() {
+                    cancel_correlation_mailbox(&sock, &team, correlation_id);
+                }
+                print_result(reply);
+            } else {
+                print_result(send_result);
+            }
             return;
         }
         Commands::Broadcast { text, no_report } => {
@@ -7593,9 +8103,11 @@ fn main() {
         Commands::Reply {
             text,
             from,
+            reply_to,
             task_id: explicit_task_id,
             agent_instance_id: explicit_agent_instance_id,
         } => {
+            let has_sender_override = from.is_some();
             let sender = from.unwrap_or_else(|| agent.clone());
             let mut content = text.join(" ");
             // stdin fallback: agents frequently submit the body via a heredoc
@@ -7610,6 +8122,64 @@ fn main() {
                 if std::io::stdin().read_to_string(&mut piped).is_ok() && !piped.trim().is_empty() {
                     content = piped;
                 }
+            }
+            if let Some(correlation_id) = reply_to.as_deref() {
+                if let Err(error) = validate_correlated_reply_overrides(
+                    has_sender_override,
+                    explicit_task_id.is_some(),
+                    explicit_agent_instance_id.is_some(),
+                ) {
+                    print_result(Err(error));
+                    return;
+                }
+                let identity_sender = match env::var("TERMMESH_AGENT_NAME") {
+                    Ok(name) if !name.is_empty() => name,
+                    _ => {
+                        print_result(Err(
+                            "--reply-to requires TERMMESH_AGENT_NAME identity".to_string(),
+                        ));
+                        return;
+                    }
+                };
+                let env_instance = env::var("TERMMESH_AGENT_INSTANCE_ID")
+                    .ok()
+                    .filter(|id| !id.is_empty());
+                let identity_instance = match reply_agent_instance_id(
+                    &sock,
+                    &team,
+                    &identity_sender,
+                    env_instance.as_deref(),
+                    None,
+                ) {
+                    Ok(Some(instance_id)) => instance_id,
+                    Ok(None) => {
+                        print_result(Err(
+                            "--reply-to requires a durable agent instance identity".to_string(),
+                        ));
+                        return;
+                    }
+                    Err(error) => {
+                        print_result(Err(format!(
+                            "could not verify correlated reply identity: {error}"
+                        )));
+                        return;
+                    }
+                };
+                let params = match correlated_reply_params(
+                    &team,
+                    &identity_sender,
+                    correlation_id,
+                    &identity_instance,
+                    &content,
+                ) {
+                    Ok(params) => params,
+                    Err(error) => {
+                        print_result(Err(error));
+                        return;
+                    }
+                };
+                print_result(rpc_call(&sock, "team.message.post", params));
+                return;
             }
             // STATUS enforce (C1) — map protocol STATUS to task state before any I/O
             let (reply_headers, body_summary) = reply_header_and_summary(&content, 1500);
@@ -7740,15 +8310,9 @@ fn main() {
             // the task is completed afterward, so a transient inbox-post failure
             // must not abort the reply (which would skip task completion and hang
             // the leader's wait). Mirrors the team.report handling just below.
-            match rpc_call(&sock, "team.message.post", msg_params.clone()) {
-                Ok(v) => print_result(Ok(v)),
-                Err(e) => {
-                    eprintln!("  Warning: team.message.post failed: {e}, retrying...");
-                    if let Err(e2) = rpc_call(&sock, "team.message.post", msg_params) {
-                        eprintln!("  Warning: team.message.post retry failed: {e2}");
-                    }
-                }
-            }
+            run_best_effort_rpc_with_retry("team.message.post", || {
+                rpc_call(&sock, "team.message.post", msg_params.clone())
+            });
             // Auto-submit report for wait detection (with result_path)
             let mut report_params = json!({
                 "team_name": team, "agent_name": sender, "content": summary,
@@ -8141,8 +8705,25 @@ fn render_gc_sweep(value: &Value, applied: bool) {
     }
 }
 
+fn successful_rpc_envelope(result: Result<Value, String>) -> Result<Value, String> {
+    let response = result?;
+    if response.get("ok").and_then(Value::as_bool) == Some(false) {
+        let detail = response
+            .get("error")
+            .and_then(|error| {
+                error
+                    .as_str()
+                    .or_else(|| error.get("message").and_then(Value::as_str))
+                    .or_else(|| error.get("code").and_then(Value::as_str))
+            })
+            .unwrap_or("request rejected");
+        return Err(format!("RPC returned ok:false: {detail}"));
+    }
+    Ok(response)
+}
+
 fn print_result(result: Result<Value, String>) {
-    match result {
+    match successful_rpc_envelope(result) {
         Ok(resp) => println!("{}", pretty(&resp)),
         Err(e) => {
             eprintln!("Error: {e}");
@@ -8150,6 +8731,244 @@ fn print_result(result: Result<Value, String>) {
             process::exit(1);
         }
     }
+}
+
+fn run_best_effort_rpc_with_retry<F>(label: &str, mut call: F)
+where
+    F: FnMut() -> Result<Value, String>,
+{
+    for attempt in 0..2 {
+        match successful_rpc_envelope(call()) {
+            Ok(response) => {
+                println!("{}", pretty(&response));
+                return;
+            }
+            Err(error) if attempt == 0 => {
+                eprintln!("  Warning: {label} failed: {error}, retrying...");
+            }
+            Err(error) => eprintln!("  Warning: {label} retry failed: {error}"),
+        }
+    }
+}
+
+fn validate_reply_correlation_id(id: &str) -> Result<(), String> {
+    if id.len() < 24
+        || id.len() > 128
+        || !id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    {
+        return Err("invalid --reply-to correlation id".to_string());
+    }
+    Ok(())
+}
+
+fn validate_correlation_identity_component(value: &str) -> Result<(), String> {
+    if value.is_empty()
+        || value.len() > 128
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    {
+        return Err("invalid correlated reply identity".to_string());
+    }
+    Ok(())
+}
+
+fn new_correlation_token() -> Result<String, String> {
+    let mut bytes = [0_u8; 32];
+    fs::File::open("/dev/urandom")
+        .and_then(|mut file| file.read_exact(&mut bytes))
+        .map_err(|error| format!("failed to generate correlation token: {error}"))?;
+    Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
+}
+
+fn correlated_reply_params(
+    team: &str,
+    sender: &str,
+    id: &str,
+    instance_id: &str,
+    body: &str,
+) -> Result<Value, String> {
+    validate_reply_correlation_id(id)?;
+    validate_correlation_identity_component(instance_id)?;
+    if body.trim().is_empty() {
+        return Err("correlated reply body must not be empty".to_string());
+    }
+    Ok(json!({
+        "team_name": team,
+        "from": sender,
+        "to": "leader",
+        "type": "note",
+        "agent_instance_id": instance_id,
+        "correlation_token": id,
+        "content": body,
+    }))
+}
+
+fn validate_correlated_reply_overrides(
+    has_sender_override: bool,
+    has_task_override: bool,
+    has_instance_override: bool,
+) -> Result<(), String> {
+    if has_sender_override || has_task_override || has_instance_override {
+        return Err(
+            "--reply-to cannot be combined with --from, --task-id, or --agent-instance-id"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
+fn append_correlated_reply_instruction(
+    text: &str,
+    id: &str,
+    instance_id: &str,
+) -> Result<String, String> {
+    validate_reply_correlation_id(id)?;
+    validate_correlation_identity_component(instance_id)?;
+    Ok(format!(
+        "{text}\n\n[REQUIRED CORRELATED REPLY for instance {instance_id}]\nWhen finished, run this literal heredoc command exactly once, replacing only the response body:\ntm-agent reply --reply-to {id} <<'TERMMESH_REPLY_EOF'\n<response body>\nTERMMESH_REPLY_EOF"
+    ))
+}
+
+fn register_correlation_mailbox(
+    sock: &PathBuf,
+    team: &str,
+    token: &str,
+    expected_agent: &str,
+    expected_instance_id: &str,
+    expires_in_seconds: u64,
+    timeout: Duration,
+) -> Result<Value, String> {
+    validate_reply_correlation_id(token)?;
+    if timeout.is_zero() {
+        return Err("correlation registration deadline expired".to_string());
+    }
+    successful_rpc_envelope(rpc_call_with_timeout_duration(
+        sock,
+        "team.correlation.register",
+        json!({
+            "team_name": team,
+            "correlation_token": token,
+            "expected_agent_name": expected_agent,
+            "expected_agent_instance_id": expected_instance_id,
+            "expires_in_seconds": expires_in_seconds,
+        }),
+        timeout,
+    ))
+}
+
+fn cancel_correlation_mailbox(sock: &PathBuf, team: &str, token: &str) {
+    let _ = successful_rpc_envelope(rpc_call_with_timeout_duration(
+        sock,
+        "team.correlation.cancel",
+        json!({
+            "team_name": team,
+            "correlation_token": token,
+        }),
+        Duration::from_millis(500),
+    ));
+}
+
+fn correlated_reply_from_mailbox(
+    response: Value,
+    expected_agent: &str,
+    expected_instance_id: &str,
+    correlation_id: &str,
+) -> Result<Option<Value>, String> {
+    validate_reply_correlation_id(correlation_id)?;
+    let response = successful_rpc_envelope(Ok(response))?;
+    let result = response
+        .get("result")
+        .ok_or_else(|| "PROTOCOL_ERROR: team.correlation.get has no result".to_string())?;
+    if result.get("ready").and_then(Value::as_bool) != Some(true) {
+        return Ok(None);
+    }
+    if result.get("agent_name").and_then(Value::as_str) != Some(expected_agent)
+        || result.get("agent_instance_id").and_then(Value::as_str) != Some(expected_instance_id)
+    {
+        return Err("PROTOCOL_ERROR: correlation mailbox returned a mismatched identity".to_string());
+    }
+    let body = result
+        .get("content")
+        .and_then(Value::as_str)
+        .filter(|body| !body.trim().is_empty())
+        .ok_or_else(|| "PROTOCOL_ERROR: correlation mailbox returned an empty reply".to_string())?;
+    Ok(Some(json!({
+        "ok": true,
+        "result": {
+            "agent": expected_agent,
+            "agent_instance_id": expected_instance_id,
+            "content": body,
+            "message_id": result.get("message_id").cloned().unwrap_or(Value::Null),
+        }
+    })))
+}
+
+fn wait_for_correlated_reply_with<P>(
+    expected_agent: &str,
+    expected_instance_id: &str,
+    correlation_id: &str,
+    timeout: Duration,
+    mut poll: P,
+) -> Result<Value, String>
+where
+    P: FnMut(Duration) -> Result<Value, String>,
+{
+    let deadline = Instant::now() + timeout;
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(format!(
+                "timed out waiting for correlated reply from {expected_agent}"
+            ));
+        }
+        let response = poll(remaining)?;
+        if let Some(reply) = correlated_reply_from_mailbox(
+            response,
+            expected_agent,
+            expected_instance_id,
+            correlation_id,
+        )? {
+            return Ok(reply);
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(format!(
+                "timed out waiting for correlated reply from {expected_agent}"
+            ));
+        }
+        thread::sleep(remaining.min(Duration::from_millis(100)));
+    }
+}
+
+fn wait_for_correlated_reply(
+    sock: &PathBuf,
+    team: &str,
+    expected_agent: &str,
+    expected_instance_id: &str,
+    correlation_id: &str,
+    timeout: Duration,
+) -> Result<Value, String> {
+    wait_for_correlated_reply_with(
+        expected_agent,
+        expected_instance_id,
+        correlation_id,
+        timeout,
+        |remaining| {
+            rpc_call_with_timeout_duration(
+                sock,
+                "team.correlation.get",
+                json!({
+                    "team_name": team,
+                    "correlation_token": correlation_id,
+                    "consume": true,
+                }),
+                remaining,
+            )
+        },
+    )
 }
 
 /// Say so when this binary and the app it just failed to talk to are from
@@ -9435,6 +10254,7 @@ fn run_create(
                     json!({
                         "team_name": team, "agent_name": name,
                         "text": format!("{init_text}\n"),
+                        "send_sequence_aware": true,
                     }),
                     3,
                 ) {
@@ -9454,6 +10274,7 @@ fn run_create(
                             "team.create.init",
                             None,
                             None,
+                            r["result"]["send_sequence_id"].as_str(),
                         );
                         eprintln!("  \u{2713} {name}: init prompt sent");
                     }
@@ -9828,20 +10649,70 @@ fn validate_agent_name(name: &str) -> Result<(), String> {
 ///    via [`resolve_workspace_team_name`], so workspace-local teams resolve
 ///    symmetrically across all commands,
 /// 4. `live-team` — create-based / legacy default.
-fn resolve_team_name(explicit: Option<&str>) -> String {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TeamNameSource {
+    Explicit,
+    Environment,
+    Workspace,
+    LiveTeamFallback,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct TeamNameResolution {
+    name: String,
+    source: TeamNameSource,
+}
+
+const LIVE_TEAM_FALLBACK_WARNING: &str = "Warning: no --team, TERMMESH_TEAM, or usable TERMMESH_WORKSPACE_ID; falling back to live-team. Pass --team <name> to select a team explicitly.";
+
+fn resolve_team_name_inputs(
+    explicit: Option<&str>,
+    environment: Option<&str>,
+    workspace: Option<&str>,
+) -> TeamNameResolution {
     if let Some(t) = explicit {
         if !t.is_empty() {
-            return t.to_string();
+            return TeamNameResolution {
+                name: t.to_string(),
+                source: TeamNameSource::Explicit,
+            };
         }
     }
-    if let Ok(t) = env::var("TERMMESH_TEAM") {
+    if let Some(t) = environment {
         if !t.is_empty() {
-            return t;
+            return TeamNameResolution {
+                name: t.to_string(),
+                source: TeamNameSource::Environment,
+            };
         }
     }
-    // resolve_workspace_team_name re-checks TERMMESH_TEAM (already handled above)
-    // then derives ws-<hex> from TERMMESH_WORKSPACE_ID; any error → default.
-    resolve_workspace_team_name().unwrap_or_else(|_| "live-team".to_string())
+    match workspace {
+        Some(name) if !name.is_empty() => TeamNameResolution {
+            name: name.to_string(),
+            source: TeamNameSource::Workspace,
+        },
+        _ => TeamNameResolution {
+            name: "live-team".to_string(),
+            source: TeamNameSource::LiveTeamFallback,
+        },
+    }
+}
+
+fn resolve_team_name_with_source(explicit: Option<&str>) -> TeamNameResolution {
+    let environment = env::var("TERMMESH_TEAM").ok();
+    // resolve_workspace_team_name re-checks TERMMESH_TEAM (already handled by
+    // `resolve_team_name_inputs`) and otherwise derives ws-<hex>; errors are
+    // intentionally reduced to absence so diagnostics never expose env values.
+    let workspace = resolve_workspace_team_name().ok();
+    resolve_team_name_inputs(explicit, environment.as_deref(), workspace.as_deref())
+}
+
+fn resolve_team_name(explicit: Option<&str>) -> String {
+    let resolution = resolve_team_name_with_source(explicit);
+    if resolution.source == TeamNameSource::LiveTeamFallback {
+        eprintln!("{LIVE_TEAM_FALLBACK_WARNING}");
+    }
+    resolution.name
 }
 
 fn resolve_workspace_team_name() -> Result<String, String> {
@@ -10909,6 +11780,7 @@ fn run_delegate_result(
                         "text": format!("{instruction}\n"),
                         "panel_id": panel_id,
                         "agent_instance_id": selected_instance_id,
+                        "send_sequence_aware": true,
                     }),
                 );
                 match &retry {
@@ -10926,6 +11798,7 @@ fn run_delegate_result(
                                 "team.delegate.retry",
                                 panel_id,
                                 selected_instance_id.as_deref(),
+                                rv["result"]["send_sequence_id"].as_str(),
                             );
                         }
                         return Ok(patched);
@@ -10982,6 +11855,7 @@ fn run_delegate_result(
                 "team.delegate",
                 panel_id,
                 selected_instance_id.as_deref(),
+                v["result"]["send_sequence_id"].as_str(),
             );
 
             return Ok(v);
@@ -11092,6 +11966,7 @@ fn run_delegate_result(
             "text": &send_text,
             "panel_id": panel_id,
             "agent_instance_id": selected_instance_id,
+            "send_sequence_aware": true,
         }),
     )
     .map_err(|e| format!("team.send: {e}"))?;
@@ -11109,6 +11984,7 @@ fn run_delegate_result(
                 "text": &send_text,
                 "panel_id": panel_id,
                 "agent_instance_id": selected_instance_id,
+                "send_sequence_aware": true,
             }),
         );
         match retry {
@@ -11831,6 +12707,7 @@ fn run_delegate_result_with_worktree(
             "text": &send_text,
             "panel_id": panel_id,
             "agent_instance_id": agent_instance_id,
+            "send_sequence_aware": true,
         }),
     )
     .map_err(|e| format!("team.send: {e}"))?;
@@ -11851,6 +12728,7 @@ fn run_delegate_result_with_worktree(
         "team.delegate.worktree",
         panel_id,
         agent_instance_id,
+        sent["result"]["send_sequence_id"].as_str(),
     );
     Ok(json!({ "task": task, "send": sent, "worktree": worktree_path }))
 }
@@ -14706,6 +15584,7 @@ fn run_claim(sock: &PathBuf, team: &str, agent: &str) {
                                 "team_name": team,
                                 "agent_name": agent,
                                 "text": &send_text,
+                                "send_sequence_aware": true,
                             }),
                         )
                     }
@@ -14717,6 +15596,7 @@ fn run_claim(sock: &PathBuf, team: &str, agent: &str) {
                             "team_name": team,
                             "agent_name": agent,
                             "text": &send_text,
+                            "send_sequence_aware": true,
                         }),
                     )
                 };
@@ -14731,6 +15611,7 @@ fn run_claim(sock: &PathBuf, team: &str, agent: &str) {
                             "team.task.claim",
                             None,
                             None,
+                            sent["result"]["send_sequence_id"].as_str(),
                         );
                         println!(
                             "{}",
