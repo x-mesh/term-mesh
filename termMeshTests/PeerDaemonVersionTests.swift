@@ -142,6 +142,62 @@ final class PeerDaemonVersionTests: XCTestCase {
         XCTAssertNil(PeerHostDoctor.parseHostVersionLine(from: ""))
     }
 
+    // MARK: - Host-kind fallback and install policy
+
+    func test_parseHostKindLine_distinguishesDaemonAndApp() {
+        XCTAssertEqual(PeerHostDoctor.parseHostKindLine(from: "term-meshd\n"), .daemon)
+        XCTAssertEqual(PeerHostDoctor.parseHostKindLine(from: "term-mesh-app\n"), .app)
+        XCTAssertNil(PeerHostDoctor.parseHostKindLine(from: "Darwin\n"))
+    }
+
+    func test_parseHostKindLine_ignoresMOTDAndUsesLastSentinel() {
+        XCTAssertEqual(
+            PeerHostDoctor.parseHostKindLine(
+                from: "Welcome\nterm-mesh-app\nnoise\nterm-meshd\n"
+            ),
+            .daemon
+        )
+    }
+
+    func test_forceReinstall_requiresConfirmedLinuxHost() {
+        let state = PeerHostEditorView.DoctorState.relayFailed(
+            socket: "/run/term-mesh.sock", message: "incompatible handshake"
+        )
+        XCTAssertTrue(PeerHostEditorView.shouldShowForceReinstallButton(
+            hasTestedDraft: true, hostKind: .daemon,
+            showsUpdateButton: false, doctorState: state
+        ))
+        XCTAssertFalse(PeerHostEditorView.shouldShowForceReinstallButton(
+            hasTestedDraft: true, hostKind: .app,
+            showsUpdateButton: false, doctorState: state
+        ))
+        XCTAssertFalse(PeerHostEditorView.shouldShowForceReinstallButton(
+            hasTestedDraft: true, hostKind: nil,
+            showsUpdateButton: false, doctorState: state
+        ))
+    }
+
+    func test_forceReinstall_doesNotCompeteWithUpdateAction() {
+        XCTAssertFalse(PeerHostEditorView.shouldShowForceReinstallButton(
+            hasTestedDraft: true, hostKind: .daemon, showsUpdateButton: true,
+            doctorState: .updateAvailable(
+                socket: "/run/term-mesh.sock", remote: "0.170.0", latest: "v0.178.0"
+            )
+        ))
+    }
+
+    func test_plainInstall_requiresDaemonMissingOnConfirmedLinux() {
+        XCTAssertTrue(PeerHostEditorView.shouldShowInstallButton(
+            hasTestedDraft: true, hostKind: .daemon, doctorState: .daemonMissing
+        ))
+        XCTAssertFalse(PeerHostEditorView.shouldShowInstallButton(
+            hasTestedDraft: true, hostKind: .app, doctorState: .daemonMissing
+        ))
+        XCTAssertFalse(PeerHostEditorView.shouldShowInstallButton(
+            hasTestedDraft: true, hostKind: nil, doctorState: .daemonMissing
+        ))
+    }
+
     // MARK: - parseVersionLine (back-compat daemon-only view)
 
     func test_parseVersionLine_trimsWhitespace() {
