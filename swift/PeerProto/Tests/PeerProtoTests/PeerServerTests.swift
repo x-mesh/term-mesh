@@ -2,6 +2,103 @@ import XCTest
 @testable import PeerProto
 
 final class PeerServerTests: XCTestCase {
+    func testHostStatsCapabilityTracksConfiguredProvider() async throws {
+        func handshake(config: PeerServerConfig, suffix: String) async throws -> PeerSessionInfo {
+            let sockPath = "/tmp/tm-peer-stats-cap-\(suffix)-\(UUID().uuidString.prefix(8)).sock"
+            defer { try? FileManager.default.removeItem(atPath: sockPath) }
+            let server = PeerServer(
+                socketPath: sockPath,
+                provider: StaticSurfaceProvider(surfaces: []),
+                config: config
+            )
+            try await server.start()
+            defer { Task { await server.stop() } }
+            let transport = try await UnixSocketTransport.connect(socketPath: sockPath)
+            let session = PeerSession(transport: transport)
+            let info = try await session.handshake()
+            try await session.sendGoodbye(reason: "stats capability test done")
+            await transport.close()
+            return info
+        }
+
+        let absent = try await handshake(config: PeerServerConfig(), suffix: "absent")
+        XCTAssertFalse(absent.hasHostCapability(PeerCapability.hostStatsV1))
+
+        var configured = PeerServerConfig(hostStatsProvider: { nil })
+        configured.hostStatsInterval = .milliseconds(10)
+        let present = try await handshake(config: configured, suffix: "present")
+        XCTAssertTrue(
+            present.hasHostCapability(PeerCapability.hostStatsV1),
+            "a temporarily missing sample must not erase implemented support"
+        )
+    }
+
+    func testHostStatsProviderDoesNotRunForClientWithoutCapability() async throws {
+        actor CallCount {
+            var value = 0
+            func increment() { value += 1 }
+        }
+        let calls = CallCount()
+        var config = PeerServerConfig(hostStatsProvider: {
+            await calls.increment()
+            return Termmesh_Peer_V1_HostStats()
+        })
+        config.hostStatsInterval = .milliseconds(10)
+        let sockPath = "/tmp/tm-peer-stats-gate-\(UUID().uuidString.prefix(8)).sock"
+        defer { try? FileManager.default.removeItem(atPath: sockPath) }
+        let server = PeerServer(
+            socketPath: sockPath,
+            provider: StaticSurfaceProvider(surfaces: []),
+            config: config
+        )
+        try await server.start()
+        defer { Task { await server.stop() } }
+
+        let transport = try await UnixSocketTransport.connect(socketPath: sockPath)
+        let session = PeerSession(transport: transport)
+        var options = PeerSessionOptions()
+        options.capabilities = []
+        _ = try await session.handshake(options: options)
+        try await Task.sleep(for: .milliseconds(80))
+
+        let callCount = await calls.value
+        XCTAssertEqual(
+            callCount,
+            0,
+            "legacy clients must neither receive stats nor trigger sampling cost"
+        )
+        try await session.sendGoodbye(reason: "stats gate test done")
+        await transport.close()
+    }
+
+    func testHostStatsReachClientThatAdvertisedCapability() async throws {
+        var sample = Termmesh_Peer_V1_HostStats()
+        sample.load1M = 3.25
+        let expectedSample = sample
+        var config = PeerServerConfig(hostStatsProvider: { expectedSample })
+        config.hostStatsInterval = .milliseconds(10)
+        let sockPath = "/tmp/tm-peer-stats-push-\(UUID().uuidString.prefix(8)).sock"
+        defer { try? FileManager.default.removeItem(atPath: sockPath) }
+        let server = PeerServer(
+            socketPath: sockPath,
+            provider: StaticSurfaceProvider(surfaces: []),
+            config: config
+        )
+        try await server.start()
+        defer { Task { await server.stop() } }
+
+        let transport = try await UnixSocketTransport.connect(socketPath: sockPath)
+        let session = PeerSession(transport: transport)
+        _ = try await session.handshake()
+
+        guard case .hostStats(let received) = try await session.receiveNextMessage() else {
+            return XCTFail("capable client must receive the configured sample")
+        }
+        XCTAssertEqual(received.load1M, 3.25, accuracy: 0.001)
+        try await session.sendGoodbye(reason: "stats push test done")
+        await transport.close()
+    }
+
     func testWorkspaceRosterSubscriptionReceivesInitialAndChangedSnapshots() async throws {
         let sockPath = "/tmp/tm-peer-roster-\(UUID().uuidString.prefix(8)).sock"
         defer { try? FileManager.default.removeItem(atPath: sockPath) }

@@ -380,13 +380,12 @@ public struct PeerServerConfig: Sendable {
     /// monitor, so the provider is a lookup rather than a second sampler
     /// competing with the first.
     ///
-    /// **Nil is a contract, not an omission.** A host with no provider does
+    /// **A nil provider is a contract, not an omitted sample.** A host with no provider does
     /// not advertise `host.stats.v1` (see `advertisedCapabilities`) and never
     /// starts the push loop, mirroring the daemon, where the test and embedder
     /// constructors leave the host without a monitor and simply never push.
-    /// Before this existed the Mac host advertised the capability and then
-    /// sent nothing, so a viewer waited for a frame that was never coming and
-    /// showed an empty field with no way to tell why.
+    /// A configured provider may return nil for an individual tick while its
+    /// sampler starts; that does not change the host's implemented support.
     public var hostStatsProvider: (@Sendable () async -> Termmesh_Peer_V1_HostStats?)?
 
     /// How often the push loop samples. Matches the daemon's monitor tick, so
@@ -602,15 +601,21 @@ public actor PeerServer {
     /// Sample this machine once and hand the result to every connected
     /// session.
     ///
-    /// One sample per tick regardless of how many peers are attached: the
+    /// One sample per tick regardless of how many interested peers are attached: the
     /// reading describes the machine, not the connection, and sampling per
     /// session would make the cost of being watched grow with the number of
     /// watchers.
     private func pushHostStatsSample() async {
         guard let provider = config.hostStatsProvider else { return }
-        guard !activeSessions.isEmpty else { return }
-        guard let stats = await provider() else { return }
+        var interestedSessions: [PeerServerSession] = []
         for session in activeSessions {
+            if await session.hasClientCapability(PeerCapability.hostStatsV1) {
+                interestedSessions.append(session)
+            }
+        }
+        guard !interestedSessions.isEmpty else { return }
+        guard let stats = await provider() else { return }
+        for session in interestedSessions {
             try? await session.pushHostStats(stats)
         }
     }
@@ -1435,13 +1440,9 @@ actor PeerServerSession {
             // host advertised nothing, and the host had nothing to advertise
             // because no leader had been bootstrapped. Observed as a project
             // that never finished creating on a peer whose team list was empty.
-            // `host.stats.v1` is the exception to the paragraph above, and for
-            // the opposite reason: it is not "implemented protocol support"
-            // this host can honour unconditionally, but a promise to send
-            // frames it may have no way to produce. A Mac host with no stats
-            // provider advertised it anyway and then never pushed, so a viewer
-            // waited forever and drew an empty field with nothing to explain
-            // it. Claim it only when the push loop will actually run.
+            // `host.stats.v1` is available only when this embedder configured
+            // a provider. A nil result from that provider merely skips one
+            // tick; the capability still describes implemented support.
             var advertisedCapabilities = PeerCapability.supported
             if config.hostStatsProvider == nil {
                 advertisedCapabilities.removeAll { $0 == PeerCapability.hostStatsV1 }

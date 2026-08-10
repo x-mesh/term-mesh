@@ -382,11 +382,12 @@ final class PeerHostCoordinator: NSObject {
         // thread, where a two-second tick would land in the middle of SwiftUI's
         // update cycle.
         //
-        // Returning nil (no daemon, or no sample yet) makes the server stay
-        // quiet AND drop `host.stats.v1` from its Hello, so a viewer is never
-        // promised frames that will not arrive.
+        // Returning nil (no daemon, or no sample yet) skips that tick. The
+        // provider itself is still configured, so the host advertises
+        // `host.stats.v1`: capabilities describe implemented support, while a
+        // temporarily absent sample is normal during daemon startup.
         config.hostStatsProvider = {
-            guard let snapshot = TermMeshDaemon.shared.monitorSnapshot() else { return nil }
+            guard let snapshot = await TermMeshDaemon.shared.monitorSnapshot() else { return nil }
             return LocalHostStatsSample.make(from: snapshot)
         }
 
