@@ -135,6 +135,12 @@ enum PeerHostDoctor {
         var cliShadowed: [BinaryEntry] = []
         var daemon: BinaryEntry?
         var daemonShadowed: [BinaryEntry] = []
+        /// The bridge this host would run an agent through, when it has one.
+        ///
+        /// Carries no version — it has no `--version` flag — so only the path
+        /// is meaningful here. Absent means codex / kiro / cursor / agy agents
+        /// on this host cannot be held as native panels.
+        var bridge: BinaryEntry?
     }
 
     /// Fixed inventory probe: which term-mesh binaries this host would run,
@@ -162,7 +168,12 @@ enum PeerHostDoctor {
             .joined(separator: ":")
         let body = "export PATH=\(path):\"$PATH\"; "
             + #"if [ "$(uname -s)" = Darwin ]; then v=$(/usr/bin/defaults read /Applications/term-mesh.app/Contents/Info.plist CFBundleShortVersionString 2>/dev/null); [ -n "$v" ] && echo "app=$v"; fi; "#
-            + #"for b in tm-agent term-meshd; do first=1; seen=""; for d in $(echo "$PATH" | tr : " "); do p="$d/$b"; case " $seen " in *" $p "*) continue ;; esac; if [ -x "$p" ]; then seen="$seen $p"; v=$("$p" --version 2>/dev/null | head -1); if [ "$first" = 1 ]; then echo "$b=$p|$v"; first=0; else echo "$b.shadowed=$p|$v"; fi; fi; done; done; exit 0"#
+            // tm-agent-bridge is asked for but never `--version`ed: it is
+            // spoken to over a pipe and has no such flag. Presence is the
+            // whole question — without it this host cannot run a codex / kiro
+            // / cursor / agy agent as a native panel, and nothing on either
+            // side says so.
+            + #"for b in tm-agent term-meshd tm-agent-bridge; do first=1; seen=""; for d in $(echo "$PATH" | tr : " "); do p="$d/$b"; case " $seen " in *" $p "*) continue ;; esac; if [ -x "$p" ]; then seen="$seen $p"; if [ "$b" = tm-agent-bridge ]; then v=""; else v=$("$p" --version 2>/dev/null | head -1); fi; if [ "$first" = 1 ]; then echo "$b=$p|$v"; first=0; else echo "$b.shadowed=$p|$v"; fi; fi; done; done; exit 0"#
         return "sh -c '\(body)'"
     }
 
@@ -473,6 +484,11 @@ enum PeerHostDoctor {
             case "tm-agent.shadowed": inventory.cliShadowed.append(entry)
             case "term-meshd": inventory.daemon = entry
             case "term-meshd.shadowed": inventory.daemonShadowed.append(entry)
+            case "tm-agent-bridge": inventory.bridge = entry
+            // A shadowed bridge is not drift the way a shadowed CLI is: with
+            // no version to compare, two copies are indistinguishable. The
+            // first one found is the one that runs, which is all this reports.
+            case "tm-agent-bridge.shadowed": continue
             default: continue
             }
         }
@@ -500,6 +516,21 @@ enum PeerHostDoctor {
                         + "\(other.path) (\(other.version)) is shadowed by it."
                 )
             }
+        }
+        // A daemon without a bridge beside it. Not drift — a capability this
+        // host does not have, and the one place a person is already looking at
+        // that host. Agents still run there; they just cannot be held as
+        // native panels, which otherwise shows up only as "why is this a
+        // terminal pane" with nothing to answer it.
+        //
+        // Only said when the host runs a daemon at all: a Mac peer serves from
+        // the app bundle, which carries its own bridge, so asking about PATH
+        // there would report a problem that does not exist.
+        if inventory.daemon != nil, inventory.bridge == nil {
+            warnings.append(
+                "tm-agent-bridge is not installed here — codex/kiro/cursor/agy agents "
+                    + "on this host stay plain terminal panes. Reinstall term-meshd to add it."
+            )
         }
         if let appVersion = inventory.appVersion,
            let cli = inventory.cli,
