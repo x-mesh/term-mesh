@@ -847,4 +847,47 @@ final class RelayResizeCoalescerHealTests: XCTestCase {
         XCTAssertTrue(reasons.isEmpty, "a 0-col size must not fire onHeal; got \(reasons)")
         await coalescer.cancel()
     }
+
+    // MARK: - Orphaned mapping sweep
+
+    private func sid(_ byte: UInt8) -> Data { Data([byte]) }
+
+    /// The condition behind a host reporting 7 panes while 2 render: the
+    /// mapping survives, so `missing` skips the leaf and `buildSplits` cannot
+    /// seed its split.
+    func testOrphanedSurfaceIDsFindsMappingWhosePanelIsGone() {
+        let alive = UUID()
+        let dead = UUID()
+        let orphaned = PeerWorkspaceMirrorController.orphanedSurfaceIDs(
+            panelBySurfaceID: [sid(1): alive, sid(2): dead],
+            livePanelIDs: [alive]
+        )
+        XCTAssertEqual(orphaned, [sid(2)])
+    }
+
+    /// A healthy mirror must sweep nothing — this runs on every reconcile.
+    func testOrphanedSurfaceIDsIsEmptyWhenEveryPanelIsLive() {
+        let a = UUID(), b = UUID()
+        XCTAssertTrue(
+            PeerWorkspaceMirrorController.orphanedSurfaceIDs(
+                panelBySurfaceID: [sid(1): a, sid(2): b],
+                livePanelIDs: [a, b]
+            ).isEmpty
+        )
+    }
+
+    /// After `markAllPanesStale()` the map is already empty; the sweep must not
+    /// invent work for a workspace that legitimately has no panels yet.
+    func testOrphanedSurfaceIDsHandlesEmptyInputs() {
+        XCTAssertTrue(
+            PeerWorkspaceMirrorController.orphanedSurfaceIDs(panelBySurfaceID: [:], livePanelIDs: []).isEmpty
+        )
+        let only = UUID()
+        XCTAssertEqual(
+            PeerWorkspaceMirrorController.orphanedSurfaceIDs(
+                panelBySurfaceID: [sid(9): only], livePanelIDs: []
+            ),
+            [sid(9)]
+        )
+    }
 }

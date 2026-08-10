@@ -43,6 +43,32 @@ extension PeerWorkspaceMirrorController {
     func reconcile(target: Termmesh_Peer_V1_WorkspaceLayout) async throws {
         guard let workspace, !isTornDown else { return }
 
+        // Drop mappings whose local panel is gone before anything reads them.
+        //
+        // B3 below only sweeps surfaces the HOST stopped reporting. A panel
+        // that disappeared on THIS side while the host still lists its surface
+        // has no sweep at all, so its entry survives every future reconcile —
+        // and it is load-bearing in two places at once. `missing` skips that
+        // leaf (nothing left to attach), and `buildSplits` cannot resolve it to
+        // a live tab, so every split seeded by it collapses into its first
+        // subtree.
+        //
+        // Observed: a host reporting 7 panes rendered as 2, unchanged across
+        // five consecutive layout pushes, each logging "0 spawned" with no
+        // attach failure behind it. Nothing recovered it because nothing could:
+        // the host kept reporting those surfaces, which is exactly the
+        // condition under which the existing sweep declines to act.
+        let orphaned = Self.orphanedSurfaceIDs(
+            panelBySurfaceID: panelBySurfaceID,
+            livePanelIDs: Set(workspace.panels.keys)
+        )
+        if !orphaned.isEmpty {
+            for surfaceID in orphaned { panelBySurfaceID.removeValue(forKey: surfaceID) }
+            RemoteWorkLog.debugOffMain(
+                "Dropped \(orphaned.count) mirror mapping(s) whose pane was already gone — they will be re-attached"
+            )
+        }
+
         // Fast paths below must only fire once every target leaf is
         // actually mirrored — see `allTargetLeavesMapped`.
         let targetLeaves = Self.preorderLeaves(target)
@@ -288,6 +314,18 @@ extension PeerWorkspaceMirrorController {
         panelBySurfaceID: [Data: UUID]
     ) -> Bool {
         leaves.allSatisfy { panelBySurfaceID[$0.surfaceID] != nil }
+    }
+
+    /// Surface ids whose mapped panel no longer exists in the workspace.
+    ///
+    /// Pure so the sweep can be tested without a live mirror: the condition it
+    /// exists for — host still reporting a surface whose local pane is gone —
+    /// is not reachable from a unit test any other way.
+    nonisolated static func orphanedSurfaceIDs(
+        panelBySurfaceID: [Data: UUID],
+        livePanelIDs: Set<UUID>
+    ) -> [Data] {
+        panelBySurfaceID.compactMap { livePanelIDs.contains($0.value) ? nil : $0.key }
     }
 
     /// Structure + leaf surfaceIDs + divider ratios (ε) all match —
