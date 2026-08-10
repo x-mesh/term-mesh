@@ -1,6 +1,6 @@
 # Peer Federation Protocol Spec
 
-Last updated: April 23, 2026
+Last updated: August 10, 2026
 Status: Draft (Phase 1) — companion to `peer-federation.md`
 
 This document specifies the wire protocol for term-mesh peer attach. Phase 0 (`peer-federation.md`) defines what is being built and why; this document defines the on-wire bytes.
@@ -90,8 +90,9 @@ A connection may send one `Ping` every 15 s by default; if no `Pong` arrives wit
 2. Major numbers MUST match exactly for the connection to proceed.
 3. Minor differences are allowed: the side with the lower minor advertises its supported capabilities; the higher side MUST NOT use capabilities the lower side did not advertise.
 4. Patch differences are ignored.
-5. Capability flags are string tags in `Hello.capabilities` (e.g. `"grid-snapshot-v1"`, `"browser-surface"`).
-6. Version mismatch surfaces in the client sidebar as a human-readable error: "Host runs 2.x; this client speaks 1.x. Upgrade one side."
+5. Capability flags are string tags in `Hello.capabilities` (e.g. `"grid.snapshot.v1"`, `"surface.ensure.v1"`, `"surface.agent.v1"`). The authoritative list is `daemon/peer-proto/src/lib.rs` (`capability` module), mirrored by `swift/PeerProto/Sources/PeerProto/PeerCapabilities.swift`.
+6. `surface.agent.v1` gates agent surfaces (`SurfaceInfo.surface_type = "agent"`, see §ListSurfaces / SurfaceList). Advertised by a client that can render an agent's NDJSON stream, and by a host that can create and own agent surfaces. Host-side enforcement is mandatory: for a client that did not advertise the capability, the host downgrades agent surfaces to `attachable = false` in `SurfaceList` and rejects `AttachSurface` on them. Client-side: check the host's capabilities before requesting `EnsureSurfaceRequest.kind = "agent"`.
+7. Version mismatch surfaces in the client sidebar as a human-readable error: "Host runs 2.x; this client speaks 1.x. Upgrade one side."
 
 ## Message Reference
 
@@ -145,10 +146,51 @@ message SurfaceInfo {
   string title        = 3;
   uint32 cols         = 4;
   uint32 rows         = 5;
-  string surface_type = 6;   // "terminal" | "browser"
+  string surface_type = 6;   // "terminal" | "browser" | "agent"
   bool   attachable   = 7;   // host policy may forbid attach per-surface
+  string cwd          = 8;   // resolved when the host answers; follows `cd`
+  string branch       = 9;   // git branch of `cwd`, or empty
+  string agent_cli    = 10;  // "agent" only: bridged CLI ("codex", "kiro", ...); else empty
 }
 ```
+
+#### Agent surfaces (`surface_type = "agent"`)
+
+An agent surface is a daemon-owned **non-PTY** child (`tm-agent-bridge`):
+its stdout is a normalized NDJSON event stream, not terminal bytes. Agent
+surfaces reuse the existing byte-stream machinery rather than a new message
+set:
+
+1. The NDJSON stream rides ordinary `PtyData` frames. Hosts push
+   line-aligned chunks so a reconnect cut never splits a JSON line;
+   `byte_seq`, the replay ring, and `resume_from_seq` semantics are
+   identical to terminal surfaces.
+2. Turn input from the client returns as `Input.keys` bytes written to the
+   bridge's stdin.
+3. A `GridSnapshot` is **never** sent for an agent surface — there is no
+   grid. A resume that falls outside the replay ring loses history, the
+   same contract a terminal surface has.
+4. `Resize` is accepted and ignored (there is no PTY to resize).
+5. `agent_cli` names the CLI the bridge is driving ("codex", "kiro", ...);
+   it is empty for terminal/browser surfaces.
+
+Gating — capability `surface.agent.v1` (see §Versioning):
+
+1. To a client that did not advertise `surface.agent.v1`, the host MUST
+   downgrade agent surfaces to `attachable = false` in `SurfaceList` and
+   MUST reject `AttachSurface` on them, so an older client never feeds an
+   NDJSON stream to a terminal renderer.
+2. A client MUST NOT request an agent surface from a host that did not
+   advertise `surface.agent.v1`.
+
+Creation goes through the ensure path (`surface.ensure.v1`):
+`EnsureSurfaceRequest.kind` selects the kind — empty means `"terminal"`
+(the only kind that existed before the field, keeping older senders and
+daemons compatible by default), `"agent"` spawns the bridge as a non-PTY
+child. The kind is part of the surface spec, so a terminal↔agent change on
+the same key is a `SPEC_CONFLICT`, never a silent conversion.
+`EnsureSurfaceRequest` field 8 is set aside (comment-reserved in the
+schema) for a future per-surface environment map.
 
 ### AttachSurface / AttachResult / DetachSurface
 

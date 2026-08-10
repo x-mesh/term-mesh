@@ -1,7 +1,11 @@
 //  Feature-flag strings a peer may advertise via `Hello.capabilities`
 //  (`proto/peer/v1/peer.proto` Evolution rule 3). Mirrors
 //  `daemon/peer-proto/src/lib.rs`'s `capability` module on the Rust side —
-//  keep the two lists in sync.
+//  keep the two lists in sync. "In sync" means the constants mirror; each
+//  side's advertised `supported` list adds an entry only once that side
+//  actually implements the behavior. `surfaceAgentV1` is the live example:
+//  the daemon advertises it, while this viewer keeps it out of
+//  `PeerCapability.supported` until it can render agent surfaces.
 //
 //  This is plumbing only (see P3 in `docs/peer-perf-proposal.md`): nothing
 //  in this codebase branches on a capability string yet. It exists so P8
@@ -34,6 +38,21 @@ public enum PeerCapability {
     /// Exact ensured-surface termination via
     /// `TerminateSurfaceRequest`/`TerminateSurfaceResponse`.
     public static let surfaceTerminateV1 = "surface.terminate.v1"
+    /// Daemon-owned agent surfaces (`SurfaceInfo.surface_type == "agent"`):
+    /// non-PTY `tm-agent-bridge` children whose byte stream is NDJSON
+    /// events, not a terminal grid. Advertised by BOTH sides — a HOST
+    /// advertises that it can create and attach agent-kind ensured
+    /// surfaces; a CLIENT advertises that it can render them (AgentPanel).
+    /// To a client that did not advertise this, a host lists agent
+    /// surfaces as `attachable = false` and rejects attach attempts, so
+    /// older viewers degrade for free through the existing `attachable`
+    /// filter. Mirrors `SURFACE_AGENT_V1` on the Rust side.
+    ///
+    /// NOT in `supported` yet: this viewer cannot render agent surfaces
+    /// until the AgentPanel wiring lands (Phase 2), and advertising before
+    /// that would make hosts offer attachable agent surfaces this build
+    /// can only open as broken terminal panes.
+    public static let surfaceAgentV1 = "surface.agent.v1"
     /// `HostStats` pushes — load, memory, disk and network rates for the
     /// machine hosting the panes. Advertised by the side that WANTS them,
     /// so a host sends them only to a client that asked. Mirrors
