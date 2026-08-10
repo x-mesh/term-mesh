@@ -42,6 +42,68 @@ final class PeerPaneSessionTests: XCTestCase {
         )
     }
 
+    // MARK: - Reconnect surface match (terminal panes only)
+
+    private func surface(
+        id: UInt8, title: String, type: String = "terminal", attachable: Bool = true
+    ) -> Termmesh_Peer_V1_SurfaceInfo {
+        var info = Termmesh_Peer_V1_SurfaceInfo()
+        info.surfaceID = Data(repeating: id, count: 16)
+        info.title = title
+        info.surfaceType = type
+        info.attachable = attachable
+        return info
+    }
+
+    @MainActor
+    func testReconnectMatchPrefersSameSurfaceIdOverSameTitle() {
+        let wanted = surface(id: 1, title: "build")
+        let byTitle = surface(id: 2, title: "build")
+        let match = PeerClientCoordinator.reconnectSurfaceMatch(
+            surfaces: [byTitle, wanted], wanted: wanted
+        )
+        XCTAssertEqual(match?.surfaceID, wanted.surfaceID)
+    }
+
+    /// The realistic collision: the dead terminal's title also names an agent
+    /// surface. Reconnect replaces a TERMINAL pane — attaching the agent would
+    /// pick callback delivery only for `openRemotePane` to refuse it, tearing
+    /// the fresh session down behind a "Reconnect Failed" alert.
+    @MainActor
+    func testReconnectTitleFallbackSkipsAgentSurfaces() {
+        let wanted = surface(id: 1, title: "reviewer")
+        let agent = surface(id: 2, title: "reviewer", type: "agent")
+        let terminal = surface(id: 3, title: "reviewer")
+        let match = PeerClientCoordinator.reconnectSurfaceMatch(
+            surfaces: [agent, terminal], wanted: wanted
+        )
+        XCTAssertEqual(match?.surfaceID, terminal.surfaceID)
+    }
+
+    /// When the only candidates are agent surfaces the reconnect must say
+    /// "Surface Gone" rather than attach-and-refuse.
+    @MainActor
+    func testReconnectMatchReturnsNilWhenOnlyAgentSurfacesRemain() {
+        let wanted = surface(id: 1, title: "reviewer")
+        let agentSameTitle = surface(id: 2, title: "reviewer", type: "agent")
+        XCTAssertNil(
+            PeerClientCoordinator.reconnectSurfaceMatch(
+                surfaces: [agentSameTitle], wanted: wanted
+            )
+        )
+    }
+
+    @MainActor
+    func testReconnectMatchSkipsUnattachableSurfaces() {
+        let wanted = surface(id: 1, title: "build")
+        let unattachable = surface(id: 1, title: "build", attachable: false)
+        XCTAssertNil(
+            PeerClientCoordinator.reconnectSurfaceMatch(
+                surfaces: [unattachable], wanted: wanted
+            )
+        )
+    }
+
     private final class RunnerMockHost: @unchecked Sendable {
         enum Failure: Error {
             case syscall(String, Int32)
@@ -980,5 +1042,429 @@ final class RemoteViewerSizeArbitrationTests: XCTestCase {
         )
         XCTAssertEqual(size.w, 1200)
         XCTAssertEqual(size.h, 800)
+    }
+}
+
+// ── t14: callback (agent) delivery ───────────────────────────────────
+
+/// Exercises `PeerRelaySession`'s `.callback` PtyData delivery: arrival-order
+/// preservation on the live path (owned and shared), the resume-transition
+/// gate's exactly-once contract riding the same delivery path, the
+/// defensive GridSnapshot drop, and the absence of every relay-only fixture
+/// (listener socket, secret, helper handshake).
+///
+/// Sessions are built through the internal initializer around a scripted
+/// `PeerSession(read:write:)` — the factories all require a live
+/// handshake/attach round trip that a unit test has no host for.
+final class PeerRelaySessionCallbackDeliveryTests: XCTestCase {
+
+    private struct TimedOut: Error {}
+
+    /// Collects callback deliveries. The pump invokes `onPtyData` off the
+    /// main actor, so a lock box rather than test-local state.
+    private final class ChunkCollector: @unchecked Sendable {
+        private let lock = NSLock()
+        private var chunks: [Data] = []
+
+        func append(_ data: Data) {
+            lock.lock()
+            chunks.append(data)
+            lock.unlock()
+        }
+
+        var all: [Data] {
+            lock.lock()
+            defer { lock.unlock() }
+            return chunks
+        }
+
+        var count: Int { all.count }
+
+        /// Every delivered byte, in delivery order — chunk boundaries may
+        /// legally differ between live chunks and an abort-flush batch, so
+        /// content assertions compare the joined stream.
+        var joined: String {
+            String(decoding: all.reduce(Data(), +), as: UTF8.self)
+        }
+    }
+
+    /// Scripted inbound side of a `PeerSession`: `push` hands the session's
+    /// read closure one already-encoded frame, `finish` makes the next read
+    /// throw (the transport died).
+    private actor FrameFeed {
+        struct EndOfScript: Error {}
+
+        private var pending: [Data] = []
+        private var waiters: [CheckedContinuation<Data, Error>] = []
+        private var finished = false
+
+        func push(_ frame: Data) {
+            if waiters.isEmpty {
+                pending.append(frame)
+            } else {
+                waiters.removeFirst().resume(returning: frame)
+            }
+        }
+
+        func finish() {
+            finished = true
+            let parked = waiters
+            waiters = []
+            for waiter in parked {
+                waiter.resume(throwing: EndOfScript())
+            }
+        }
+
+        func next() async throws -> Data {
+            if !pending.isEmpty { return pending.removeFirst() }
+            if finished { throw EndOfScript() }
+            return try await withCheckedThrowingContinuation { waiters.append($0) }
+        }
+    }
+
+    private func ptyDataFrame(surfaceID: Data, byteSeq: UInt64, payload: Data) -> Data {
+        var pty = Termmesh_Peer_V1_PtyData()
+        pty.surfaceID = surfaceID
+        pty.byteSeq = byteSeq
+        pty.payload = payload
+        var envelope = Termmesh_Peer_V1_Envelope()
+        envelope.ptyData = pty
+        return try! encodeFrame(envelope)
+    }
+
+    private func gridSnapshotFrame(surfaceID: Data, ansi: Data) -> Data {
+        var snapshot = Termmesh_Peer_V1_GridSnapshot()
+        snapshot.surfaceID = surfaceID
+        snapshot.byteSeq = 0
+        snapshot.altScreen = false
+        snapshot.ansi = ansi
+        var envelope = Termmesh_Peer_V1_Envelope()
+        envelope.gridSnapshot = snapshot
+        return try! encodeFrame(envelope)
+    }
+
+    /// `ownsSession: false` on purpose: a scripted stream end must end the
+    /// pump, not start the owned-path reconnect loop dialing a host that
+    /// does not exist.
+    @MainActor
+    private func makeCallbackSession(
+        feed: FrameFeed,
+        surfaceID: Data,
+        ptyStream: AsyncStream<PeerPtyChunk>? = nil
+    ) -> PeerRelaySession {
+        let session = PeerSession(
+            read: { try await feed.next() },
+            write: { _ in }
+        )
+        return PeerRelaySession(
+            hostSockPath: "/nonexistent/term-mesh-callback-test.sock",
+            hostDisplayName: "callback-test",
+            relaySockPath: "",
+            relaySecret: "",
+            surfaceID: surfaceID,
+            remoteCols: 80,
+            remoteRows: 24,
+            session: session,
+            transport: nil,
+            ownsSession: false,
+            ptyStream: ptyStream,
+            onSharedDetach: nil,
+            attachInitialSeq: 0,
+            hostSupportsReplayRing: true,
+            ptyDelivery: .callback
+        )
+    }
+
+    @MainActor
+    private func waitUntil(
+        timeout: TimeInterval = 5,
+        _ message: String = "condition not met in time",
+        file: StaticString = #filePath,
+        line: UInt = #line,
+        condition: () -> Bool
+    ) async throws {
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            if condition() { return }
+            try await Task.sleep(nanoseconds: 20_000_000)
+        }
+        if condition() { return }
+        XCTFail(message, file: file, line: line)
+        throw TimedOut()
+    }
+
+    @MainActor
+    private func receivedBytes(_ relay: PeerRelaySession) -> UInt64 {
+        relay.ioSnapshot["bytes_received"] as? UInt64 ?? 0
+    }
+
+    // (a) + (c): live chunks reach the callback in arrival order, and none
+    // of the relay-only setup exists to gate them.
+    @MainActor
+    func testCallbackDeliveryPreservesArrivalOrderWithoutARelayHelper() async throws {
+        let surfaceID = Data(repeating: 0xA7, count: 16)
+        let feed = FrameFeed()
+        let relay = makeCallbackSession(feed: feed, surfaceID: surfaceID)
+        let received = ChunkCollector()
+        relay.onPtyData = { received.append($0) }
+
+        // Relay-only setup must be inert: no socket path was allocated, no
+        // listener is bound, and prepareListener neither throws (there is
+        // no relay binary at "") nor binds anything.
+        XCTAssertTrue(relay.relaySockPath.isEmpty)
+        XCTAssertNoThrow(try relay.prepareListener())
+        XCTAssertEqual(relay.listenerFileDescriptorForTesting, -1)
+
+        // In relay mode start() would block in acceptRelay until a helper
+        // dials in (and then time out). Callback mode must come up alone.
+        try await relay.start()
+        XCTAssertEqual(relay.listenerFileDescriptorForTesting, -1)
+
+        var expected: [Data] = []
+        var byteSeq: UInt64 = 0
+        for index in 0..<50 {
+            let payload = Data("{\"line\":\(index)}\n".utf8)
+            expected.append(payload)
+            await feed.push(ptyDataFrame(surfaceID: surfaceID, byteSeq: byteSeq, payload: payload))
+            byteSeq += UInt64(payload.count)
+        }
+
+        try await waitUntil("expected 50 chunks, got \(received.count)") { received.count == 50 }
+        XCTAssertEqual(received.all, expected, "chunks must arrive exactly once, in arrival order")
+
+        await relay.stop()
+        await feed.finish()
+    }
+
+    // Contract item: the callback owner must be swappable (the
+    // recreated-AgentSession path). Chunks after a reassignment land on the
+    // new consumer only.
+    @MainActor
+    func testCallbackOwnerSwapRedirectsSubsequentChunks() async throws {
+        let surfaceID = Data(repeating: 0xA8, count: 16)
+        let feed = FrameFeed()
+        let relay = makeCallbackSession(feed: feed, surfaceID: surfaceID)
+        let first = ChunkCollector()
+        relay.onPtyData = { first.append($0) }
+        try await relay.start()
+
+        await feed.push(ptyDataFrame(surfaceID: surfaceID, byteSeq: 0, payload: Data("one".utf8)))
+        try await waitUntil { first.count == 1 }
+
+        let second = ChunkCollector()
+        relay.onPtyData = { second.append($0) }
+        await feed.push(ptyDataFrame(surfaceID: surfaceID, byteSeq: 3, payload: Data("two".utf8)))
+
+        try await waitUntil { second.count == 1 }
+        XCTAssertEqual(first.joined, "one", "the retired consumer must not receive post-swap chunks")
+        XCTAssertEqual(second.joined, "two")
+
+        await relay.stop()
+        await feed.finish()
+    }
+
+    // (b) abort side: bytes suppressed behind an open resume transition are
+    // flushed to the callback in order — exactly once, nothing lost.
+    @MainActor
+    func testResumeAbortFlushesSuppressedBytesToCallbackInOrder() async throws {
+        let surfaceID = Data(repeating: 0xA9, count: 16)
+        let feed = FrameFeed()
+        let relay = makeCallbackSession(feed: feed, surfaceID: surfaceID)
+        let received = ChunkCollector()
+        relay.onPtyData = { received.append($0) }
+        try await relay.start()
+
+        await feed.push(ptyDataFrame(surfaceID: surfaceID, byteSeq: 0, payload: Data("A".utf8)))
+        try await waitUntil { received.joined == "A" }
+
+        let transition = relay.beginResumeTransitionForTesting()
+        await feed.push(ptyDataFrame(surfaceID: surfaceID, byteSeq: 1, payload: Data("B".utf8)))
+        await feed.push(ptyDataFrame(surfaceID: surfaceID, byteSeq: 2, payload: Data("C".utf8)))
+
+        // Wait until the pump has *processed* (counted) both suppressed
+        // chunks, then confirm none of them rendered.
+        try await waitUntil { self.receivedBytes(relay) == 3 }
+        XCTAssertEqual(received.joined, "A", "bytes behind an open transition must be suppressed")
+
+        await relay.abortResumeTransitionForTesting(transition)
+        try await waitUntil { received.joined == "ABC" }
+
+        await feed.push(ptyDataFrame(surfaceID: surfaceID, byteSeq: 3, payload: Data("D".utf8)))
+        try await waitUntil { received.joined == "ABCD" }
+        XCTAssertEqual(received.joined, "ABCD", "abort flush must deliver exactly once, in order")
+
+        await relay.stop()
+        await feed.finish()
+    }
+
+    // (b) commit side: old-session bytes buffered across the boundary are
+    // discarded (the replay re-carries them), and the replay itself is
+    // delivered exactly once through the same callback path.
+    @MainActor
+    func testResumeCommitDiscardsOldBytesAndDeliversReplayOnce() async throws {
+        let surfaceID = Data(repeating: 0xAA, count: 16)
+        let feed = FrameFeed()
+        let relay = makeCallbackSession(feed: feed, surfaceID: surfaceID)
+        let received = ChunkCollector()
+        relay.onPtyData = { received.append($0) }
+        try await relay.start()
+
+        await feed.push(ptyDataFrame(surfaceID: surfaceID, byteSeq: 0, payload: Data("A".utf8)))
+        try await waitUntil { received.joined == "A" }
+
+        let transition = relay.beginResumeTransitionForTesting()
+        await feed.push(ptyDataFrame(surfaceID: surfaceID, byteSeq: 1, payload: Data("B".utf8)))
+        try await waitUntil { self.receivedBytes(relay) == 2 }
+        XCTAssertTrue(relay.commitResumeTransitionForTesting(transition))
+
+        // Old-session tail after the commit: suppressed until the swap, and
+        // never rendered from the old stream — the replay re-carries it.
+        await feed.push(ptyDataFrame(surfaceID: surfaceID, byteSeq: 2, payload: Data("C".utf8)))
+        try await waitUntil { self.receivedBytes(relay) == 3 }
+        XCTAssertEqual(received.joined, "A", "old-session bytes past the boundary must not render")
+
+        // The receive loop adopting the resumed session resets the wire-seq
+        // space; the replay then re-carries everything after the boundary.
+        relay.adoptCommittedResumeSessionForTesting()
+        await feed.push(ptyDataFrame(surfaceID: surfaceID, byteSeq: 0, payload: Data("BC".utf8)))
+        try await waitUntil { received.joined == "ABC" }
+
+        await feed.push(ptyDataFrame(surfaceID: surfaceID, byteSeq: 2, payload: Data("D".utf8)))
+        try await waitUntil { received.joined == "ABCD" }
+        XCTAssertEqual(
+            received.joined, "ABCD",
+            "suppressed old bytes and their replay must not both render"
+        )
+
+        await relay.stop()
+        await feed.finish()
+    }
+
+    // Repair C: host broadcast Lag on callback delivery must not advance
+    // the heal anchor past the dropped bytes — an NDJSON consumer has no
+    // repainting GridSnapshot to cover a hole. A gapped chunk opens a
+    // capture at the last DELIVERED position and suppresses the post-gap
+    // stream behind it; the heal ADOPTS that anchor, so the ring replay
+    // re-carries the gap plus the suppressed bytes exactly once.
+    @MainActor
+    func testALaggedGapAnchorsTheHealAtTheLastDeliveredByte() async throws {
+        let surfaceID = Data(repeating: 0xAD, count: 16)
+        let feed = FrameFeed()
+        let relay = makeCallbackSession(feed: feed, surfaceID: surfaceID)
+        let received = ChunkCollector()
+        relay.onPtyData = { received.append($0) }
+        try await relay.start()
+
+        await feed.push(ptyDataFrame(surfaceID: surfaceID, byteSeq: 0, payload: Data("A".utf8)))
+        try await waitUntil { received.joined == "A" }
+
+        // byte_seq jumps 1 → 5: the host's broadcast lagged and dropped
+        // four bytes. The post-gap chunk must be captured, not delivered.
+        await feed.push(ptyDataFrame(surfaceID: surfaceID, byteSeq: 5, payload: Data("F".utf8)))
+        try await waitUntil { self.receivedBytes(relay) == 2 }
+        XCTAssertEqual(received.joined, "A",
+                       "post-gap bytes must be suppressed until the heal resolves")
+
+        // The heal joins the pump-opened capture: anchored at the end of
+        // the last delivered chunk (wire seq 1), not past the gap (6).
+        let transition = relay.beginResumeTransitionForTesting()
+        XCTAssertEqual(transition.resumeWireSeq, 1,
+                       "the heal must resume from the last delivered byte, not skip the gap")
+
+        XCTAssertTrue(relay.commitResumeTransitionForTesting(transition))
+        relay.adoptCommittedResumeSessionForTesting()
+
+        // The resumed attach replays everything after the anchor — the
+        // dropped bytes AND the suppressed post-gap chunk — exactly once.
+        await feed.push(ptyDataFrame(surfaceID: surfaceID, byteSeq: 0, payload: Data("bcdeF".utf8)))
+        try await waitUntil { received.joined == "AbcdeF" }
+        XCTAssertEqual(received.joined, "AbcdeF",
+                       "the ring replay must fill the gap without duplicating delivered bytes")
+
+        await relay.stop()
+        await feed.finish()
+    }
+
+    // E4: a chunk emitted while `onPtyData` is unset is a DROP, not an
+    // enqueue — otherwise received≈enqueued reads as healthy on a session
+    // that rendered nothing.
+    @MainActor
+    func testConsumerlessChunksCountAsDroppedNotEnqueued() async throws {
+        let surfaceID = Data(repeating: 0xAE, count: 16)
+        let feed = FrameFeed()
+        let relay = makeCallbackSession(feed: feed, surfaceID: surfaceID)
+        // Deliberately no onPtyData yet.
+        try await relay.start()
+
+        await feed.push(ptyDataFrame(surfaceID: surfaceID, byteSeq: 0, payload: Data("lost".utf8)))
+        try await waitUntil { self.receivedBytes(relay) == 4 }
+        XCTAssertEqual(relay.ioSnapshot["bytes_dropped"] as? UInt64, 4)
+        XCTAssertEqual(relay.ioSnapshot["bytes_enqueued"] as? UInt64, 0,
+                       "a consumer-less emit must never count as enqueued")
+
+        let received = ChunkCollector()
+        relay.onPtyData = { received.append($0) }
+        await feed.push(ptyDataFrame(surfaceID: surfaceID, byteSeq: 4, payload: Data("kept".utf8)))
+        try await waitUntil { received.joined == "kept" }
+        XCTAssertEqual(relay.ioSnapshot["bytes_enqueued"] as? UInt64, 4)
+        XCTAssertEqual(relay.ioSnapshot["bytes_dropped"] as? UInt64, 4,
+                       "delivered bytes go back to the enqueued tally only")
+
+        await relay.stop()
+        await feed.finish()
+    }
+
+    // Shared (pre-demuxed ptyStream) path: same callback, same order, and
+    // stream end tears the session down.
+    @MainActor
+    func testSharedPathDeliversToCallbackAndDisconnectsOnStreamEnd() async throws {
+        let surfaceID = Data(repeating: 0xAB, count: 16)
+        var continuation: AsyncStream<PeerPtyChunk>.Continuation!
+        let stream = AsyncStream<PeerPtyChunk> { continuation = $0 }
+        let relay = makeCallbackSession(
+            feed: FrameFeed(),
+            surfaceID: surfaceID,
+            ptyStream: stream
+        )
+        let received = ChunkCollector()
+        relay.onPtyData = { received.append($0) }
+        var disconnected = false
+        relay.onDisconnect = { disconnected = true }
+        try await relay.start()
+
+        continuation.yield(PeerPtyChunk(byteSeq: 0, payload: Data("hello ".utf8)))
+        continuation.yield(PeerPtyChunk(byteSeq: 6, payload: Data("world".utf8)))
+        try await waitUntil { received.joined == "hello world" }
+        XCTAssertEqual(received.count, 2, "shared-path chunks must arrive individually, in order")
+
+        continuation.finish()
+        try await waitUntil { disconnected }
+    }
+
+    // Defensive contract: an agent surface never sends GridSnapshot, but if
+    // one arrives its rendered-cell ANSI must not reach the NDJSON consumer
+    // — while the wire-seq reset it implies still applies.
+    @MainActor
+    func testGridSnapshotIsDroppedButItsSeqResetStillApplies() async throws {
+        let surfaceID = Data(repeating: 0xAC, count: 16)
+        let feed = FrameFeed()
+        let relay = makeCallbackSession(feed: feed, surfaceID: surfaceID)
+        let received = ChunkCollector()
+        relay.onPtyData = { received.append($0) }
+        try await relay.start()
+
+        await feed.push(ptyDataFrame(surfaceID: surfaceID, byteSeq: 0, payload: Data("A".utf8)))
+        try await waitUntil { received.joined == "A" }
+
+        await feed.push(gridSnapshotFrame(surfaceID: surfaceID, ansi: Data("JUNK-ANSI".utf8)))
+        // Post-snapshot the wire seq restarts at 0; the next live chunk
+        // must be delivered without a spurious gap heal (or JUNK bytes).
+        await feed.push(ptyDataFrame(surfaceID: surfaceID, byteSeq: 0, payload: Data("B".utf8)))
+
+        try await waitUntil { received.joined == "AB" }
+        XCTAssertEqual(received.joined, "AB", "snapshot ANSI must never reach the callback")
+
+        await relay.stop()
+        await feed.finish()
     }
 }

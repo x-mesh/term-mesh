@@ -112,6 +112,15 @@ final class AgentPanel: ObservableObject, Panel {
         ))
     }
 
+    /// A session whose process lives on a peer, reached over the peer
+    /// protocol rather than ssh. The relay feeds arriving bytes into
+    /// `session.consume(_:)`; outgoing turns leave through `sink` as one
+    /// NDJSON line per call, newline included.
+    func startRemote(interruptible: Bool = false,
+                     sink: @escaping @Sendable (Data) async throws -> Void) {
+        session.startRemote(interruptible: interruptible, sink: sink)
+    }
+
     // MARK: - Panel
 
     func close() {
