@@ -184,9 +184,13 @@ final class PeerHostStatsStore: ObservableObject {
     /// A host coming back from stale always publishes: its groups are
     /// unchanged by definition (the same numbers it went quiet on), but the
     /// stale state itself is what the view was last told about.
-    func record(_ stats: Termmesh_Peer_V1_HostStats, for host: PeerPaneHostKey) {
+    func record(
+        _ stats: Termmesh_Peer_V1_HostStats,
+        for host: PeerPaneHostKey,
+        receivedAt: Date = Date()
+    ) {
         let previous = byHost[host]
-        let next = PeerHostStats(stats)
+        let next = PeerHostStats(stats, receivedAt: receivedAt)
         byHost[host] = next
         let wasStale = previous?.isStale ?? true
         guard wasStale || !PeerHostStats.rendersIdentically(previous, next) else { return }

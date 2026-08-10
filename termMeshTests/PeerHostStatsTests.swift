@@ -223,6 +223,26 @@ final class PeerHostStatsTests: XCTestCase {
         XCTAssertNotEqual(store.generation, afterFirst)
     }
 
+    /// Returning from stale is itself a visible state change, even when every
+    /// displayed number matches the last sample the host sent before silence.
+    @MainActor
+    func testFreshSampleAfterStaleIdenticalReadingPublishes() {
+        let store = PeerHostStatsStore.shared
+        let host = PeerPaneHostKey.ssh(target: "a@returned", remoteSockPath: "/run/r.sock", port: nil)
+        defer { store.forget(host) }
+
+        let staleArrival = Date().addingTimeInterval(-(PeerHostStats.staleAfter + 1))
+        store.record(wire(load: 1.0), for: host, receivedAt: staleArrival)
+        XCTAssertNil(store.stats(for: host), "the first sample must be stale before recovery")
+        let afterStale = store.generation
+
+        store.record(wire(load: 1.0), for: host, receivedAt: Date())
+
+        XCTAssertNotEqual(store.generation, afterStale,
+                          "a host returning from stale must wake observers")
+        XCTAssertNotNil(store.stats(for: host))
+    }
+
     /// Suppression must key on what is drawn, not on the whole value: the disk
     /// badge reads fields that never appear in `groups`.
     @MainActor
