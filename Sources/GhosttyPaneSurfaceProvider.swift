@@ -127,14 +127,19 @@ final class PtyTapHub: @unchecked Sendable {
     static let replayCapacityBytes = 64 * 1024
 
     private let lock = NSLock()
+    /// Serializes the stateful query filter without extending the shared hub
+    /// lock across a scan/allocation of every PTY chunk. The handoff in
+    /// `broadcast(_:)` acquires `lock` before releasing this lock, preserving
+    /// callback order across both filtered output and sequence offsets.
+    private let filterLock = NSLock()
     private var continuations: [UUID: AsyncStream<PtyTapChunk>.Continuation] = [:]
     private var replay = ReplayBuffer()
     /// Strips terminal-control queries before anything downstream sees them.
     ///
     /// Held here rather than per-consumer because its state is a property of
     /// the PTY stream, not of who is watching: a sequence split across two
-    /// reads has to reassemble once. Mutated only under `lock`, alongside
-    /// `replay`, on Ghostty's IO reader thread.
+    /// reads has to reassemble once. Mutated only under `filterLock` on
+    /// Ghostty's IO reader thread.
     private var queryStripper = PeerTerminalQueryStripper()
     /// Cumulative bytes ever broadcast through this hub. Advanced under
     /// `lock` for EVERY chunk — including ones a consumer's bounded
@@ -256,6 +261,19 @@ final class PtyTapHub: @unchecked Sendable {
     }
 
     func broadcast(_ bytes: Data) {
+        // Filtering is stateful but potentially scans and allocates for the
+        // whole chunk. Keep that work out of the shared replay/subscriber
+        // lock. Hold `filterLock` until `lock` is acquired so another callback
+        // cannot overtake this one between filtering and sequence stamping.
+        filterLock.lock()
+        let bytes = queryStripper.strip(bytes)
+        guard !bytes.isEmpty else {
+            filterLock.unlock()
+            return
+        }
+        lock.lock()
+        filterLock.unlock()
+
         // Yield directly under the lock — `AsyncStream.Continuation.yield`
         // with `bufferingNewest(256)` is a non-blocking enqueue into a
         // bounded ring buffer, so holding the lock for the duration is
@@ -271,21 +289,15 @@ final class PtyTapHub: @unchecked Sendable {
         // already had; the actual `dlog` call (I/O-adjacent) is deferred
         // until after `unlock()` below so logging never happens while
         // holding the lock, even though drops are expected to be rare.
-        lock.lock()
-        // Strip first, so neither the live stream nor the replay buffer ever
-        // carries a query. A viewer that answered one would send its reply
-        // back across the link and into the shell prompt — see
-        // `PeerTerminalQueryStripper`. Replaying a stored query at attach time
-        // would do the same thing later, which is why this sits ahead of both.
+        // The chunk was stripped before this lock acquisition, so neither the
+        // live stream nor the replay buffer ever carries a query. A viewer
+        // that answered one would send its reply back across the link and into
+        // the shell prompt — see `PeerTerminalQueryStripper`. Replaying a
+        // stored query at attach time would do the same thing later.
         //
         // Returns the same buffer untouched when there is nothing to strip,
         // and `tapSeq` counts what actually goes out, so a stripped query
         // consumes no offsets and gap detection stays exact.
-        let bytes = queryStripper.strip(bytes)
-        guard !bytes.isEmpty else {
-            lock.unlock()
-            return
-        }
         replay.push(bytes)
         // Stamp BEFORE fan-out and advance unconditionally: a dropped
         // yield must still consume tap offsets, or the drop is invisible

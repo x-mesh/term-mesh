@@ -67,6 +67,12 @@ final class PeerTerminalQueryStripperTests: XCTestCase {
         XCTAssertEqual(stripOnce([0x1B] + esc("[6n")), [])
     }
 
+    func testDeviceAttributesQueriesAreStripped() {
+        for body in ["[c", "[0c", "[>c", "[>0c", "[=c", "[=1c"] {
+            XCTAssertEqual(stripOnce([0x1B] + esc(body)), [], "\(body) should be stripped")
+        }
+    }
+
     func testBackgroundColorQueryIsStrippedWithBELTerminator() {
         XCTAssertEqual(stripOnce([0x1B] + esc("]11;?") + [0x07]), [])
     }
@@ -97,6 +103,12 @@ final class PeerTerminalQueryStripperTests: XCTestCase {
         XCTAssertEqual(strip(esc(";?") + [0x07], with: &stripper), [])
     }
 
+    func testDeviceAttributesQuerySplitAcrossChunksIsStripped() {
+        var stripper = PeerTerminalQueryStripper()
+        XCTAssertEqual(strip([0x1B] + esc("[>"), with: &stripper), [])
+        XCTAssertEqual(strip(esc("0c"), with: &stripper), [])
+    }
+
     /// Text on either side of a split query has to survive intact.
     func testTextAroundASplitQuerySurvives() {
         var stripper = PeerTerminalQueryStripper()
@@ -113,26 +125,51 @@ final class PeerTerminalQueryStripperTests: XCTestCase {
         XCTAssertEqual(stripOnce(input), esc("beforeafter"))
     }
 
+    func testFreshQueryAfterInterruptedCSIIsStillStripped() {
+        let interrupted = [UInt8]([0x1B]) + esc("[12")
+        let query = [UInt8]([0x1B]) + esc("[6n")
+        XCTAssertEqual(stripOnce(interrupted + query), interrupted + [0x18])
+    }
+
+    func testFreshQueryAfterInterruptedOSCIsStillStripped() {
+        let interrupted = [UInt8]([0x1B]) + esc("]0;unfinished")
+        let query = [UInt8]([0x1B]) + esc("[>q")
+        XCTAssertEqual(stripOnce(interrupted + query), interrupted + [0x18])
+    }
+
+    func testFreshOSCQueryAfterInterruptedCSILeavesParserGrounded() {
+        let interrupted = [UInt8]([0x1B]) + esc("[12")
+        let query = [UInt8]([0x1B]) + esc("]11;?") + [0x07]
+        XCTAssertEqual(stripOnce(interrupted + query), interrupted + [0x18])
+    }
+
+    /// Bytes 0x9B and 0x9D can occur as UTF-8 continuation bytes. The PTY
+    /// stream decoder treats them as text, not raw C1 CSI/OSC introducers.
+    func testUTF8ContainingC1ByteValuesPassesThrough() {
+        let input = Array("ěĝ".utf8)
+        XCTAssertTrue(input.contains(0x9B))
+        XCTAssertTrue(input.contains(0x9D))
+        XCTAssertEqual(stripOnce(input), input)
+    }
+
     // MARK: - Malformed input is flushed, never swallowed
 
     /// A CSI that never terminates would otherwise hold bytes back forever.
     func testOverlongCSIIsFlushed() {
         let long: [UInt8] = [0x1B, UInt8(ascii: "[")] + Array(repeating: UInt8(ascii: "1"), count: 300)
-        let out = stripOnce(long)
-        XCTAssertGreaterThan(out.count, 200, "content must not be swallowed")
+        XCTAssertEqual(stripOnce(long), long)
     }
 
     /// An ESC inside an OSC that is not a String Terminator.
     func testOSCWithNonTerminatorEscapeIsFlushed() {
         let input: [UInt8] = [0x1B] + esc("]11;?") + [0x1B] + esc("X")
-        let out = stripOnce(input)
-        XCTAssertFalse(out.isEmpty, "an unterminated OSC must not vanish")
+        XCTAssertEqual(stripOnce(input), input)
     }
 
     // MARK: - The set matches the daemon's
 
     func testCSIQueryPredicateMatchesTheDaemonSet() {
-        for body in [">q", ">0q", "5n", "6n"] {
+        for body in ["c", "0c", ">c", ">0c", "=c", "=1c", ">q", ">0q", "5n", "6n"] {
             XCTAssertTrue(
                 PeerTerminalQueryStripper.isCSIQuery([0x1B, UInt8(ascii: "[")] + esc(body)),
                 "\(body) should be recognised"
