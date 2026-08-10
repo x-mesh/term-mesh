@@ -99,6 +99,101 @@ final class PeerServerTests: XCTestCase {
         await transport.close()
     }
 
+    /// A provider that cannot sample must not be retried at the full cadence
+    /// forever — an app whose daemon is down answers nil indefinitely.
+    func testUnavailableProviderBacksOffInsteadOfRetryingEveryTick() async throws {
+        actor CallCount {
+            var value = 0
+            func increment() { value += 1 }
+        }
+        let calls = CallCount()
+        var config = PeerServerConfig(hostStatsProvider: {
+            await calls.increment()
+            return nil
+        })
+        config.hostStatsInterval = .milliseconds(10)
+        config.hostStatsMaxInterval = .milliseconds(80)
+        let sockPath = "/tmp/tm-peer-stats-backoff-\(UUID().uuidString.prefix(8)).sock"
+        defer { try? FileManager.default.removeItem(atPath: sockPath) }
+        let server = PeerServer(
+            socketPath: sockPath,
+            provider: StaticSurfaceProvider(surfaces: []),
+            config: config
+        )
+        try await server.start()
+        defer { Task { await server.stop() } }
+
+        let transport = try await UnixSocketTransport.connect(socketPath: sockPath)
+        let session = PeerSession(transport: transport)
+        _ = try await session.handshake()
+        try await Task.sleep(for: .milliseconds(400))
+
+        // At a flat 10ms cadence this window holds ~40 attempts. Doubling to an
+        // 80ms ceiling caps it near 10, so the assertion distinguishes the two
+        // without depending on exact scheduling.
+        let callCount = await calls.value
+        XCTAssertGreaterThan(callCount, 0, "the loop must still try while unavailable")
+        XCTAssertLessThan(
+            callCount, 20,
+            "a provider that keeps answering nil must be retried at a widening interval"
+        )
+        try await session.sendGoodbye(reason: "stats backoff test done")
+        await transport.close()
+    }
+
+    /// Backoff must not outlive the condition: once the daemon answers again
+    /// the loop returns to the normal cadence rather than staying slow.
+    func testProviderRecoveryRestoresTheNormalCadence() async throws {
+        actor Sampler {
+            private var remainingFailures: Int
+            private(set) var successes = 0
+            init(failures: Int) { remainingFailures = failures }
+            func next() -> Termmesh_Peer_V1_HostStats? {
+                if remainingFailures > 0 {
+                    remainingFailures -= 1
+                    return nil
+                }
+                successes += 1
+                var stats = Termmesh_Peer_V1_HostStats()
+                stats.load1M = 1.5
+                return stats
+            }
+        }
+        let sampler = Sampler(failures: 3)
+        var config = PeerServerConfig(hostStatsProvider: { await sampler.next() })
+        config.hostStatsInterval = .milliseconds(10)
+        config.hostStatsMaxInterval = .milliseconds(40)
+        let sockPath = "/tmp/tm-peer-stats-recover-\(UUID().uuidString.prefix(8)).sock"
+        defer { try? FileManager.default.removeItem(atPath: sockPath) }
+        let server = PeerServer(
+            socketPath: sockPath,
+            provider: StaticSurfaceProvider(surfaces: []),
+            config: config
+        )
+        try await server.start()
+        defer { Task { await server.stop() } }
+
+        let transport = try await UnixSocketTransport.connect(socketPath: sockPath)
+        let session = PeerSession(transport: transport)
+        _ = try await session.handshake()
+
+        guard case .hostStats(let received) = try await session.receiveNextMessage() else {
+            return XCTFail("a recovered provider must still deliver a sample")
+        }
+        XCTAssertEqual(received.load1M, 1.5, accuracy: 0.001)
+
+        // Back at the 10ms cadence, several more samples land quickly. Under a
+        // stuck 40ms interval this window would hold roughly one.
+        try await Task.sleep(for: .milliseconds(150))
+        let successes = await sampler.successes
+        XCTAssertGreaterThan(
+            successes, 3,
+            "one success must return the loop to hostStatsInterval"
+        )
+        try await session.sendGoodbye(reason: "stats recovery test done")
+        await transport.close()
+    }
+
     func testWorkspaceRosterSubscriptionReceivesInitialAndChangedSnapshots() async throws {
         let sockPath = "/tmp/tm-peer-roster-\(UUID().uuidString.prefix(8)).sock"
         defer { try? FileManager.default.removeItem(atPath: sockPath) }

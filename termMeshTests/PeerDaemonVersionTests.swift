@@ -186,7 +186,7 @@ final class PeerDaemonVersionTests: XCTestCase {
         ))
     }
 
-    func test_plainInstall_requiresDaemonMissingOnConfirmedLinux() {
+    func test_plainInstall_requiresDaemonMissingAndIsHiddenOnlyForMacs() {
         XCTAssertTrue(PeerHostEditorView.shouldShowInstallButton(
             hasTestedDraft: true, hostKind: .daemon, doctorState: .daemonMissing
         ))
@@ -194,8 +194,32 @@ final class PeerDaemonVersionTests: XCTestCase {
             hasTestedDraft: true, hostKind: .app, doctorState: .daemonMissing
         ))
         XCTAssertFalse(PeerHostEditorView.shouldShowInstallButton(
-            hasTestedDraft: true, hostKind: nil, doctorState: .daemonMissing
+            hasTestedDraft: false, hostKind: .daemon, doctorState: .daemonMissing
         ))
+        XCTAssertFalse(PeerHostEditorView.shouldShowInstallButton(
+            hasTestedDraft: true, hostKind: .daemon, doctorState: .idle
+        ))
+    }
+
+    /// The OS probe is a second SSH round trip, and it can fail on a host that
+    /// is perfectly installable. It must not hold a veto over the ONE action
+    /// `.daemonMissing` exists to offer: a nil kind there is "could not ask",
+    /// not "not Linux", and Reinstall does not cover the gap because it
+    /// requires a confirmed `.daemon`.
+    func test_plainInstall_survivesAnInconclusiveHostKindProbe() {
+        XCTAssertTrue(
+            PeerHostEditorView.shouldShowInstallButton(
+                hasTestedDraft: true, hostKind: nil, doctorState: .daemonMissing
+            ),
+            "an unknown host kind must not remove the only install path"
+        )
+        XCTAssertFalse(
+            PeerHostEditorView.shouldShowForceReinstallButton(
+                hasTestedDraft: true, hostKind: nil,
+                showsUpdateButton: false, doctorState: .daemonMissing
+            ),
+            "reinstall stays gated on a confirmed Linux host, so it cannot stand in"
+        )
     }
 
     // MARK: - parseVersionLine (back-compat daemon-only view)

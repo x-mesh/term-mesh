@@ -10,7 +10,27 @@ final class TermMeshDaemon: ObservableObject {
 
     private var daemonProcess: Process?
     private let queue = DispatchQueue(label: "term-mesh.daemon", qos: .utility)
+    /// Telemetry reads that nothing waits on, kept off `queue`.
+    ///
+    /// `queue` is the daemon's control path — spawn, adopt, restart, stop — and
+    /// it is serial. An RPC on it blocks for as long as the socket takes to
+    /// answer, up to the receive timeout, so a periodic read landing there puts
+    /// a recurring multi-second occupant in front of lifecycle work. The peer
+    /// host stats push samples every couple of seconds, which is exactly that
+    /// shape. Nothing sequences these reads against a spawn or a stop, so they
+    /// do not belong in the same lane; concurrent is right for them, since each
+    /// opens its own short-lived socket.
+    private let telemetryQueue = DispatchQueue(
+        label: "term-mesh.daemon.telemetry", qos: .utility, attributes: .concurrent
+    )
     private var nextId: Int = 1
+    /// Guards `nextId` alone.
+    ///
+    /// A lock rather than `queue.sync`: `rpcCall` runs both ON `queue` (from
+    /// the lifecycle blocks) and off it, and a `sync` back onto a serial queue
+    /// from within that queue deadlocks. The counter needs mutual exclusion,
+    /// not the daemon's ordering.
+    private let idLock = NSLock()
 
     // Cancellation token for the events.subscribe streaming Task.
     private var eventSubscriptionTask: Task<Void, Never>?
@@ -758,15 +778,29 @@ final class TermMeshDaemon: ObservableObject {
     /// The resource monitor's latest system-wide sample, or nil when the
     /// daemon has not taken one yet (it answers `{}` until its first tick).
     ///
-    /// The socket call is blocking, so it runs on the daemon's utility queue.
+    /// The socket call is blocking, so it runs off the caller's thread.
     /// Callers suspend without pinning their actor — notably `PeerServer`,
     /// whose list/attach control plane must stay responsive while a telemetry
     /// sample is late or the daemon socket is unavailable.
+    ///
+    /// On `telemetryQueue`, NOT `queue`: this is polled every couple of
+    /// seconds by the peer host stats loop, and `queue` is the serial lane that
+    /// spawn/adopt/restart/stop run in. A read that can block until the receive
+    /// timeout has no business ahead of those, and nothing here needs to be
+    /// ordered against them.
+    ///
+    /// The timeout is deliberately short. A sample is worth having only while
+    /// it is current — the next tick is seconds away, and the client treats a
+    /// reading older than `staleAfter` as no reading at all — so waiting the
+    /// default five seconds for one would produce a figure with no remaining
+    /// value.
     func monitorSnapshot() async -> [String: Any]? {
         await withCheckedContinuation { continuation in
-            queue.async { [weak self] in
+            telemetryQueue.async { [weak self] in
                 guard let self,
-                      let response = self.rpcCall(method: "monitor.snapshot", params: [:]) as? [String: Any],
+                      let response = self.rpcCall(
+                          method: "monitor.snapshot", params: [:], timeout: 2
+                      ) as? [String: Any],
                       !response.isEmpty else {
                     continuation.resume(returning: nil)
                     return
@@ -1251,11 +1285,11 @@ final class TermMeshDaemon: ObservableObject {
 
     /// Thread-safe RPC ID increment (called from multiple threads).
     private func nextRpcId() -> Int {
-        queue.sync {
-            let id = nextId
-            nextId += 1
-            return id
-        }
+        idLock.lock()
+        defer { idLock.unlock() }
+        let id = nextId
+        nextId += 1
+        return id
     }
 
     /// Raw RPC call that returns the result as a JSON string (for injecting into WKWebView).
@@ -1268,8 +1302,11 @@ final class TermMeshDaemon: ObservableObject {
     // MARK: - Private
 
     private func rpcCall(method: String, params: [String: Any], timeout timeoutSec: Int = 5) -> Any? {
-        let id = nextId
-        nextId += 1
+        // Serialised by `idLock`, not by `queue`: this method is called from
+        // `queue` and from arbitrary threads (telemetry, WebView, callers of
+        // `monitorSnapshot()`), so the bare read-modify-write it used to do
+        // here was a data race the moment any of those overlapped.
+        let id = nextRpcId()
 
         let request: [String: Any] = ["id": id, "method": method, "params": params]
         guard let data = try? JSONSerialization.data(withJSONObject: request),

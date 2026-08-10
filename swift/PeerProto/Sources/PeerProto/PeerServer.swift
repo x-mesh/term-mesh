@@ -389,14 +389,32 @@ public struct PeerServerConfig: Sendable {
     /// not advertise `host.stats.v1` (see `advertisedCapabilities`) and never
     /// starts the push loop, mirroring the daemon, where the test and embedder
     /// constructors leave the host without a monitor and simply never push.
-    /// A configured provider may return nil for an individual tick while its
-    /// sampler starts; that does not change the host's implemented support.
+    ///
+    /// A CONFIGURED provider returning nil is a different thing, and the
+    /// capability stays advertised through it: the host does implement the
+    /// frame, and its sampler being late — or its daemon being down for a
+    /// while — is not a change in what the host supports. Renegotiating that
+    /// per connection would make an attach's advertised feature set depend on
+    /// which second it happened in. What a sustained nil must not do is cost
+    /// anything, which is what `hostStatsMaxInterval` is for.
     public var hostStatsProvider: (@Sendable () async -> Termmesh_Peer_V1_HostStats?)?
 
     /// How often the push loop samples. Matches the daemon's monitor tick, so
     /// a viewer sees the same cadence whichever kind of host it is attached to
     /// — `PeerHostStats.staleAfter` on the client is written against it.
     public var hostStatsInterval: Duration = .seconds(2)
+
+    /// The ceiling the push loop backs off to while the provider keeps
+    /// answering nil.
+    ///
+    /// A provider that cannot sample is not always a passing condition — an app
+    /// whose daemon is not running answers nil indefinitely — and at the normal
+    /// cadence that is a sampling attempt every two seconds, forever, for a
+    /// frame nobody will receive. Backing off costs only the delay before the
+    /// FIRST sample once the daemon is back; there is nothing to be stale
+    /// against in the meantime, because nothing was ever sent. One success
+    /// returns the loop to `hostStatsInterval`.
+    public var hostStatsMaxInterval: Duration = .seconds(30)
 
     public init(
         hostDisplayName: String = "term-mesh",
@@ -550,14 +568,28 @@ public actor PeerServer {
     private func startHostStatsLoopIfConfigured() {
         guard config.hostStatsProvider != nil else { return }
         let interval = config.hostStatsInterval
+        let maxInterval = config.hostStatsMaxInterval
         hostStatsTask = Task { [weak self] in
+            // Grows only while the provider cannot answer. See
+            // `hostStatsMaxInterval`: an app whose daemon is not running
+            // answers nil for as long as that is true, and retrying every two
+            // seconds forever is the cost this avoids.
+            var delay = interval
             while !Task.isCancelled {
                 // Sleep first: a client that has just connected is still
                 // finishing its handshake, and a sample sent into that is
                 // dropped by `pushHostStats`'s `state == .ready` guard anyway.
-                try? await Task.sleep(for: interval)
+                try? await Task.sleep(for: delay)
                 guard !Task.isCancelled, let self else { return }
-                await self.pushHostStatsSample()
+                let outcome = await self.pushHostStatsSample()
+                switch outcome {
+                case .pushed, .noInterestedClients:
+                    // Nobody watching is not a failure to measure, so it must
+                    // not slow the cadence for the client that attaches next.
+                    delay = interval
+                case .unavailable:
+                    delay = min(maxInterval, delay * 2)
+                }
             }
         }
     }
@@ -652,6 +684,15 @@ public actor PeerServer {
         }
     }
 
+    /// What one tick of the push loop achieved, so the loop can tell "nobody
+    /// is watching" apart from "this host cannot measure itself right now".
+    /// Only the latter backs the cadence off.
+    enum HostStatsTickOutcome {
+        case pushed
+        case noInterestedClients
+        case unavailable
+    }
+
     /// Sample this machine once and hand the result to every connected
     /// session.
     ///
@@ -659,19 +700,21 @@ public actor PeerServer {
     /// reading describes the machine, not the connection, and sampling per
     /// session would make the cost of being watched grow with the number of
     /// watchers.
-    private func pushHostStatsSample() async {
-        guard let provider = config.hostStatsProvider else { return }
+    @discardableResult
+    private func pushHostStatsSample() async -> HostStatsTickOutcome {
+        guard let provider = config.hostStatsProvider else { return .unavailable }
         var interestedSessions: [PeerServerSession] = []
         for session in activeSessions {
             if await session.hasClientCapability(PeerCapability.hostStatsV1) {
                 interestedSessions.append(session)
             }
         }
-        guard !interestedSessions.isEmpty else { return }
-        guard let stats = await provider() else { return }
+        guard !interestedSessions.isEmpty else { return .noInterestedClients }
+        guard let stats = await provider() else { return .unavailable }
         for session in interestedSessions {
             try? await session.pushHostStats(stats)
         }
+        return .pushed
     }
 
     /// Publish one complete roster to sidebar-only subscribers. This is kept

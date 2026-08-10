@@ -402,9 +402,22 @@ struct PeerHostEditorView: View {
         }
     }
 
-    /// The install script is Linux-only. A missing version does not prove a
-    /// Linux host, so wait for the OS-only probe instead of treating unknown
-    /// as daemon by default.
+    /// The install script is Linux-only, so a host known to be a Mac never
+    /// gets this button. An UNKNOWN kind still does.
+    ///
+    /// That asymmetry is deliberate, and it is the difference between the two
+    /// install actions. `.daemonMissing` already means SSH answered and no
+    /// daemon is serving — installing one is the whole remedy, and it is the
+    /// only remedy on offer. Requiring a confirmed `.daemon` here would hand
+    /// the OS probe a veto over the primary path: `checkHostKind` is a second
+    /// SSH round trip that can time out, or return output whose sentinel is
+    /// buried by an unusual MOTD, and a nil from it would leave a plain Linux
+    /// host with no install button at all. Reinstall cannot cover for it
+    /// either, since that one does require `.daemon`.
+    ///
+    /// So unknown offers the action and lets the install script answer: on a
+    /// non-Linux host it fails and says so, which is recoverable. A missing
+    /// button is not.
     private var showsInstallButton: Bool {
         Self.shouldShowInstallButton(
             hasTestedDraft: testedDraft != nil,
@@ -418,7 +431,7 @@ struct PeerHostEditorView: View {
         hostKind: PeerHostKind?,
         doctorState: DoctorState
     ) -> Bool {
-        guard hasTestedDraft, hostKind == .daemon else { return false }
+        guard hasTestedDraft, hostKind != .app else { return false }
         if case .daemonMissing = doctorState { return true }
         return false
     }
