@@ -2,6 +2,198 @@ import XCTest
 @testable import PeerProto
 
 final class PeerServerTests: XCTestCase {
+    func testHostStatsCapabilityTracksConfiguredProvider() async throws {
+        func handshake(config: PeerServerConfig, suffix: String) async throws -> PeerSessionInfo {
+            let sockPath = "/tmp/tm-peer-stats-cap-\(suffix)-\(UUID().uuidString.prefix(8)).sock"
+            defer { try? FileManager.default.removeItem(atPath: sockPath) }
+            let server = PeerServer(
+                socketPath: sockPath,
+                provider: StaticSurfaceProvider(surfaces: []),
+                config: config
+            )
+            try await server.start()
+            defer { Task { await server.stop() } }
+            let transport = try await UnixSocketTransport.connect(socketPath: sockPath)
+            let session = PeerSession(transport: transport)
+            let info = try await session.handshake()
+            try await session.sendGoodbye(reason: "stats capability test done")
+            await transport.close()
+            return info
+        }
+
+        let absent = try await handshake(config: PeerServerConfig(), suffix: "absent")
+        XCTAssertFalse(absent.hasHostCapability(PeerCapability.hostStatsV1))
+
+        var configured = PeerServerConfig(hostStatsProvider: { nil })
+        configured.hostStatsInterval = .milliseconds(10)
+        let present = try await handshake(config: configured, suffix: "present")
+        XCTAssertTrue(
+            present.hasHostCapability(PeerCapability.hostStatsV1),
+            "a temporarily missing sample must not erase implemented support"
+        )
+    }
+
+    func testHostStatsProviderDoesNotRunForClientWithoutCapability() async throws {
+        actor CallCount {
+            var value = 0
+            func increment() { value += 1 }
+        }
+        let calls = CallCount()
+        var config = PeerServerConfig(hostStatsProvider: {
+            await calls.increment()
+            return Termmesh_Peer_V1_HostStats()
+        })
+        config.hostStatsInterval = .milliseconds(10)
+        let sockPath = "/tmp/tm-peer-stats-gate-\(UUID().uuidString.prefix(8)).sock"
+        defer { try? FileManager.default.removeItem(atPath: sockPath) }
+        let server = PeerServer(
+            socketPath: sockPath,
+            provider: StaticSurfaceProvider(surfaces: []),
+            config: config
+        )
+        try await server.start()
+        defer { Task { await server.stop() } }
+
+        let transport = try await UnixSocketTransport.connect(socketPath: sockPath)
+        let session = PeerSession(transport: transport)
+        var options = PeerSessionOptions()
+        options.capabilities = []
+        _ = try await session.handshake(options: options)
+        try await Task.sleep(for: .milliseconds(80))
+
+        let callCount = await calls.value
+        XCTAssertEqual(
+            callCount,
+            0,
+            "legacy clients must neither receive stats nor trigger sampling cost"
+        )
+        try await session.sendGoodbye(reason: "stats gate test done")
+        await transport.close()
+    }
+
+    func testHostStatsReachClientThatAdvertisedCapability() async throws {
+        var sample = Termmesh_Peer_V1_HostStats()
+        sample.load1M = 3.25
+        let expectedSample = sample
+        var config = PeerServerConfig(hostStatsProvider: { expectedSample })
+        config.hostStatsInterval = .milliseconds(10)
+        let sockPath = "/tmp/tm-peer-stats-push-\(UUID().uuidString.prefix(8)).sock"
+        defer { try? FileManager.default.removeItem(atPath: sockPath) }
+        let server = PeerServer(
+            socketPath: sockPath,
+            provider: StaticSurfaceProvider(surfaces: []),
+            config: config
+        )
+        try await server.start()
+        defer { Task { await server.stop() } }
+
+        let transport = try await UnixSocketTransport.connect(socketPath: sockPath)
+        let session = PeerSession(transport: transport)
+        _ = try await session.handshake()
+
+        guard case .hostStats(let received) = try await session.receiveNextMessage() else {
+            return XCTFail("capable client must receive the configured sample")
+        }
+        XCTAssertEqual(received.load1M, 3.25, accuracy: 0.001)
+        try await session.sendGoodbye(reason: "stats push test done")
+        await transport.close()
+    }
+
+    /// A provider that cannot sample must not be retried at the full cadence
+    /// forever — an app whose daemon is down answers nil indefinitely.
+    func testUnavailableProviderBacksOffInsteadOfRetryingEveryTick() async throws {
+        actor CallCount {
+            var value = 0
+            func increment() { value += 1 }
+        }
+        let calls = CallCount()
+        var config = PeerServerConfig(hostStatsProvider: {
+            await calls.increment()
+            return nil
+        })
+        config.hostStatsInterval = .milliseconds(10)
+        config.hostStatsMaxInterval = .milliseconds(80)
+        let sockPath = "/tmp/tm-peer-stats-backoff-\(UUID().uuidString.prefix(8)).sock"
+        defer { try? FileManager.default.removeItem(atPath: sockPath) }
+        let server = PeerServer(
+            socketPath: sockPath,
+            provider: StaticSurfaceProvider(surfaces: []),
+            config: config
+        )
+        try await server.start()
+        defer { Task { await server.stop() } }
+
+        let transport = try await UnixSocketTransport.connect(socketPath: sockPath)
+        let session = PeerSession(transport: transport)
+        _ = try await session.handshake()
+        try await Task.sleep(for: .milliseconds(400))
+
+        // At a flat 10ms cadence this window holds ~40 attempts. Doubling to an
+        // 80ms ceiling caps it near 10, so the assertion distinguishes the two
+        // without depending on exact scheduling.
+        let callCount = await calls.value
+        XCTAssertGreaterThan(callCount, 0, "the loop must still try while unavailable")
+        XCTAssertLessThan(
+            callCount, 20,
+            "a provider that keeps answering nil must be retried at a widening interval"
+        )
+        try await session.sendGoodbye(reason: "stats backoff test done")
+        await transport.close()
+    }
+
+    /// Backoff must not outlive the condition: once the daemon answers again
+    /// the loop returns to the normal cadence rather than staying slow.
+    func testProviderRecoveryRestoresTheNormalCadence() async throws {
+        actor Sampler {
+            private var remainingFailures: Int
+            private(set) var successes = 0
+            init(failures: Int) { remainingFailures = failures }
+            func next() -> Termmesh_Peer_V1_HostStats? {
+                if remainingFailures > 0 {
+                    remainingFailures -= 1
+                    return nil
+                }
+                successes += 1
+                var stats = Termmesh_Peer_V1_HostStats()
+                stats.load1M = 1.5
+                return stats
+            }
+        }
+        let sampler = Sampler(failures: 3)
+        var config = PeerServerConfig(hostStatsProvider: { await sampler.next() })
+        config.hostStatsInterval = .milliseconds(10)
+        config.hostStatsMaxInterval = .milliseconds(40)
+        let sockPath = "/tmp/tm-peer-stats-recover-\(UUID().uuidString.prefix(8)).sock"
+        defer { try? FileManager.default.removeItem(atPath: sockPath) }
+        let server = PeerServer(
+            socketPath: sockPath,
+            provider: StaticSurfaceProvider(surfaces: []),
+            config: config
+        )
+        try await server.start()
+        defer { Task { await server.stop() } }
+
+        let transport = try await UnixSocketTransport.connect(socketPath: sockPath)
+        let session = PeerSession(transport: transport)
+        _ = try await session.handshake()
+
+        guard case .hostStats(let received) = try await session.receiveNextMessage() else {
+            return XCTFail("a recovered provider must still deliver a sample")
+        }
+        XCTAssertEqual(received.load1M, 1.5, accuracy: 0.001)
+
+        // Back at the 10ms cadence, several more samples land quickly. Under a
+        // stuck 40ms interval this window would hold roughly one.
+        try await Task.sleep(for: .milliseconds(150))
+        let successes = await sampler.successes
+        XCTAssertGreaterThan(
+            successes, 3,
+            "one success must return the loop to hostStatsInterval"
+        )
+        try await session.sendGoodbye(reason: "stats recovery test done")
+        await transport.close()
+    }
+
     func testWorkspaceRosterSubscriptionReceivesInitialAndChangedSnapshots() async throws {
         let sockPath = "/tmp/tm-peer-roster-\(UUID().uuidString.prefix(8)).sock"
         defer { try? FileManager.default.removeItem(atPath: sockPath) }
@@ -1362,5 +1554,52 @@ final class SessionHostAdvertisementTests: XCTestCase {
         old.displayName = "older-host"
         let decoded = try Termmesh_Peer_V1_Hello(serializedBytes: old.serializedData())
         XCTAssertEqual(decoded.sessionHostSocket, "")
+    }
+
+    // MARK: - Not stealing a live socket
+
+    /// The path being occupied is the normal case for a second launch, and
+    /// unlinking it strands whoever holds it: their listener stays bound to an
+    /// inode nothing can reach, accepting only on connections they already had.
+    func testStartRefusesAPathAnotherServerIsServing() async throws {
+        let sockPath = "/tmp/tm-peer-inuse-\(UUID().uuidString.prefix(8)).sock"
+        defer { try? FileManager.default.removeItem(atPath: sockPath) }
+
+        let first = PeerServer(socketPath: sockPath, provider: StaticSurfaceProvider(surfaces: []))
+        try await first.start()
+        defer { Task { await first.stop() } }
+
+        let second = PeerServer(socketPath: sockPath, provider: StaticSurfaceProvider(surfaces: []))
+        do {
+            try await second.start()
+            XCTFail("second start must not take a path that is being served")
+        } catch let error as PeerServerError {
+            XCTAssertEqual(error, .socketInUse(path: sockPath))
+        }
+
+        // And the first server is still the one on the path.
+        XCTAssertTrue(PeerServer.isSocketAlive(atPath: sockPath))
+    }
+
+    /// A crashed server leaves its entry behind. That file must still be
+    /// cleared, or nothing could ever restart.
+    func testStartClaimsAStaleSocketFile() async throws {
+        let sockPath = "/tmp/tm-peer-stale-\(UUID().uuidString.prefix(8)).sock"
+        defer { try? FileManager.default.removeItem(atPath: sockPath) }
+        FileManager.default.createFile(atPath: sockPath, contents: Data())
+
+        XCTAssertFalse(PeerServer.isSocketAlive(atPath: sockPath),
+                       "a plain file answers no connect")
+
+        let server = PeerServer(socketPath: sockPath, provider: StaticSurfaceProvider(surfaces: []))
+        try await server.start()
+        defer { Task { await server.stop() } }
+        XCTAssertTrue(PeerServer.isSocketAlive(atPath: sockPath))
+    }
+
+    func testIsSocketAliveIsFalseForAnAbsentPath() {
+        XCTAssertFalse(
+            PeerServer.isSocketAlive(atPath: "/tmp/tm-peer-absent-\(UUID().uuidString).sock")
+        )
     }
 }

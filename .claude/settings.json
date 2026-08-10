@@ -33,5 +33,5 @@
         ]
       }
     ]
-  ,"Stop":[{"hooks":[{"command":"\"/Users/jinwoo/.local/bin/git-kit\" agents hook run --stop","timeout":120,"type":"command"}]}]}
+  }
 }

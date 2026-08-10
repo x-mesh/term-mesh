@@ -335,6 +335,11 @@ public actor EchoSurfaceProvider: PeerSurfaceProvider {
 // MARK: - PeerServer
 
 public enum PeerServerError: Error, Equatable {
+    /// Another process is already serving this path and answered a connect.
+    /// Distinct from `bindFailed`: nothing went wrong at the syscall level —
+    /// the path is simply taken, and taking it anyway would strand whoever
+    /// holds it.
+    case socketInUse(path: String)
     case bindFailed(errno: Int32, message: String)
     case listenFailed(errno: Int32)
     case acceptFailed(errno: Int32)
@@ -372,18 +377,59 @@ public struct PeerServerConfig: Sendable {
     /// should say so rather than let a client plan to come back.
     public var resolveSessionHostSocket: @Sendable () -> String
 
+    /// Reads this machine's current load, or nil when it cannot be measured.
+    ///
+    /// Injected rather than implemented here for two reasons. This module
+    /// knows the wire, not the platform — and on a Mac the numbers already
+    /// exist: the app's own `term-meshd` samples them for the resource
+    /// monitor, so the provider is a lookup rather than a second sampler
+    /// competing with the first.
+    ///
+    /// **A nil provider is a contract, not an omitted sample.** A host with no provider does
+    /// not advertise `host.stats.v1` (see `advertisedCapabilities`) and never
+    /// starts the push loop, mirroring the daemon, where the test and embedder
+    /// constructors leave the host without a monitor and simply never push.
+    ///
+    /// A CONFIGURED provider returning nil is a different thing, and the
+    /// capability stays advertised through it: the host does implement the
+    /// frame, and its sampler being late — or its daemon being down for a
+    /// while — is not a change in what the host supports. Renegotiating that
+    /// per connection would make an attach's advertised feature set depend on
+    /// which second it happened in. What a sustained nil must not do is cost
+    /// anything, which is what `hostStatsMaxInterval` is for.
+    public var hostStatsProvider: (@Sendable () async -> Termmesh_Peer_V1_HostStats?)?
+
+    /// How often the push loop samples. Matches the daemon's monitor tick, so
+    /// a viewer sees the same cadence whichever kind of host it is attached to
+    /// — `PeerHostStats.staleAfter` on the client is written against it.
+    public var hostStatsInterval: Duration = .seconds(2)
+
+    /// The ceiling the push loop backs off to while the provider keeps
+    /// answering nil.
+    ///
+    /// A provider that cannot sample is not always a passing condition — an app
+    /// whose daemon is not running answers nil indefinitely — and at the normal
+    /// cadence that is a sampling attempt every two seconds, forever, for a
+    /// frame nobody will receive. Backing off costs only the delay before the
+    /// FIRST sample once the daemon is back; there is nothing to be stale
+    /// against in the meantime, because nothing was ever sent. One success
+    /// returns the loop to `hostStatsInterval`.
+    public var hostStatsMaxInterval: Duration = .seconds(30)
+
     public init(
         hostDisplayName: String = "term-mesh",
         hostAppVersion: String = "0.0.0",
         protocolVersion: String = "1.0.0",
         hostCLIBinDirs: [String] = [],
-        resolveSessionHostSocket: @escaping @Sendable () -> String = { "" }
+        resolveSessionHostSocket: @escaping @Sendable () -> String = { "" },
+        hostStatsProvider: (@Sendable () async -> Termmesh_Peer_V1_HostStats?)? = nil
     ) {
         self.hostDisplayName = hostDisplayName
         self.hostAppVersion = hostAppVersion
         self.protocolVersion = protocolVersion
         self.hostCLIBinDirs = PeerHostCLIBinDirs.validated(hostCLIBinDirs)
         self.resolveSessionHostSocket = resolveSessionHostSocket
+        self.hostStatsProvider = hostStatsProvider
     }
 }
 
@@ -394,6 +440,9 @@ public actor PeerServer {
     private let teamLeaderControlPlane: PeerTeamLeaderControlPlane
     private var listenerFd: Int32 = -1
     private var acceptTask: Task<Void, Never>?
+    /// The machine-load push loop, present only when `config` carries a
+    /// provider. See `startHostStatsLoopIfConfigured()`.
+    private var hostStatsTask: Task<Void, Never>?
     // Internal (not private) so `@testable import PeerProto` tests can
     // inspect a live session's `hasClientCapability(_:)` after a real
     // handshake — see PeerServerTests.swift. No visibility change outside
@@ -415,7 +464,23 @@ public actor PeerServer {
     public func start() throws {
         guard listenerFd < 0 else { throw PeerServerError.alreadyRunning }
         try Self.prepareSocketParentDirectory(for: socketPath)
-        // Remove any stale socket file first; an old entry would make bind fail.
+        // A socket file here may be a leftover — or another live server. Ask
+        // before removing it.
+        //
+        // This used to unlink unconditionally, on the assumption that anything
+        // present was stale. When it was not, the running server kept a
+        // listener bound to an unlinked inode: still accepting on the fd it
+        // already had, unreachable to anything that dialled the path. Nothing
+        // failed and nothing said so. A `--tag` build did exactly this to the
+        // installed app, and a viewer then held an established mirror to one
+        // process while every new attach landed in the other.
+        //
+        // Refusing is the honest outcome. Whoever is already serving keeps
+        // serving, and the second start reports why it did not.
+        if Self.isSocketAlive(atPath: socketPath) {
+            throw PeerServerError.socketInUse(path: socketPath)
+        }
+        // Now it really is stale (or absent) — an old entry would make bind fail.
         unlink(socketPath)
 
         let fd = socket(AF_UNIX, SOCK_STREAM, 0)
@@ -494,9 +559,77 @@ public actor PeerServer {
                 server: self
             )
         }
+        startHostStatsLoopIfConfigured()
+    }
+
+    /// Starts the machine-load push loop, or does nothing when this host has
+    /// no way to measure itself. A host without a provider stays silent AND
+    /// stops claiming `host.stats.v1` — the two go together.
+    private func startHostStatsLoopIfConfigured() {
+        guard config.hostStatsProvider != nil else { return }
+        let interval = config.hostStatsInterval
+        let maxInterval = config.hostStatsMaxInterval
+        hostStatsTask = Task { [weak self] in
+            // Grows only while the provider cannot answer. See
+            // `hostStatsMaxInterval`: an app whose daemon is not running
+            // answers nil for as long as that is true, and retrying every two
+            // seconds forever is the cost this avoids.
+            var delay = interval
+            while !Task.isCancelled {
+                // Sleep first: a client that has just connected is still
+                // finishing its handshake, and a sample sent into that is
+                // dropped by `pushHostStats`'s `state == .ready` guard anyway.
+                try? await Task.sleep(for: delay)
+                guard !Task.isCancelled, let self else { return }
+                let outcome = await self.pushHostStatsSample()
+                switch outcome {
+                case .pushed, .noInterestedClients:
+                    // Nobody watching is not a failure to measure, so it must
+                    // not slow the cadence for the client that attaches next.
+                    delay = interval
+                case .unavailable:
+                    delay = min(maxInterval, delay * 2)
+                }
+            }
+        }
+    }
+
+    /// Whether something is listening on `path` right now.
+    ///
+    /// A connect, not a stat: the file existing says nothing — a crashed
+    /// server leaves its entry behind, and clearing that entry is exactly what
+    /// the unlink in `start()` is for. Only a completed connect separates
+    /// "stale file" from "live server".
+    ///
+    /// `false` on any error, including a path too long to express. The caller
+    /// then goes on to bind and gets a real diagnosis from the kernel instead
+    /// of a refusal invented here.
+    static func isSocketAlive(atPath path: String) -> Bool {
+        var addr = sockaddr_un()
+        addr.sun_family = sa_family_t(AF_UNIX)
+        let maxPathLen = MemoryLayout.size(ofValue: addr.sun_path)
+        let pathBytes = Array(path.utf8)
+        guard pathBytes.count < maxPathLen else { return false }
+        withUnsafeMutablePointer(to: &addr.sun_path) { tuplePtr in
+            tuplePtr.withMemoryRebound(to: CChar.self, capacity: maxPathLen) { cPtr in
+                for (i, byte) in pathBytes.enumerated() {
+                    cPtr[i] = CChar(bitPattern: byte)
+                }
+            }
+        }
+        let fd = socket(AF_UNIX, SOCK_STREAM, 0)
+        guard fd >= 0 else { return false }
+        defer { close(fd) }
+        return withUnsafePointer(to: &addr) { ptr -> Bool in
+            ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sockPtr in
+                connect(fd, sockPtr, socklen_t(MemoryLayout<sockaddr_un>.size)) == 0
+            }
+        }
     }
 
     public func stop() async {
+        hostStatsTask?.cancel()
+        hostStatsTask = nil
         acceptTask?.cancel()
         acceptTask = nil
         if listenerFd >= 0 {
@@ -549,6 +682,39 @@ public actor PeerServer {
         for session in activeSessions {
             try? await session.pushWorkspaceRemoved(workspaceID: workspaceID)
         }
+    }
+
+    /// What one tick of the push loop achieved, so the loop can tell "nobody
+    /// is watching" apart from "this host cannot measure itself right now".
+    /// Only the latter backs the cadence off.
+    enum HostStatsTickOutcome {
+        case pushed
+        case noInterestedClients
+        case unavailable
+    }
+
+    /// Sample this machine once and hand the result to every connected
+    /// session.
+    ///
+    /// One sample per tick regardless of how many interested peers are attached: the
+    /// reading describes the machine, not the connection, and sampling per
+    /// session would make the cost of being watched grow with the number of
+    /// watchers.
+    @discardableResult
+    private func pushHostStatsSample() async -> HostStatsTickOutcome {
+        guard let provider = config.hostStatsProvider else { return .unavailable }
+        var interestedSessions: [PeerServerSession] = []
+        for session in activeSessions {
+            if await session.hasClientCapability(PeerCapability.hostStatsV1) {
+                interestedSessions.append(session)
+            }
+        }
+        guard !interestedSessions.isEmpty else { return .noInterestedClients }
+        guard let stats = await provider() else { return .unavailable }
+        for session in interestedSessions {
+            try? await session.pushHostStats(stats)
+        }
+        return .pushed
     }
 
     /// Publish one complete roster to sidebar-only subscribers. This is kept
@@ -1308,6 +1474,16 @@ actor PeerServerSession {
         }
     }
 
+    /// Push one machine-load sample. Unsolicited, like the workspace pushes
+    /// above — the client's `PeerSession` already treats `hostStats` as a
+    /// frame that arrives on its own schedule rather than as a reply.
+    func pushHostStats(_ stats: Termmesh_Peer_V1_HostStats) async throws {
+        guard state == .ready else { return }
+        try await sendEnvelope { env in
+            env.hostStats = stats
+        }
+    }
+
     /// Push a full workspace roster to an explicitly subscribed client. Full
     /// snapshots make reconnect and deletion convergence idempotent: clients
     /// replace their cached roster rather than merging deltas from a possibly
@@ -1361,7 +1537,13 @@ actor PeerServerSession {
             // host advertised nothing, and the host had nothing to advertise
             // because no leader had been bootstrapped. Observed as a project
             // that never finished creating on a peer whose team list was empty.
-            let advertisedCapabilities = PeerCapability.supported
+            // `host.stats.v1` is available only when this embedder configured
+            // a provider. A nil result from that provider merely skips one
+            // tick; the capability still describes implemented support.
+            var advertisedCapabilities = PeerCapability.supported
+            if config.hostStatsProvider == nil {
+                advertisedCapabilities.removeAll { $0 == PeerCapability.hostStatsV1 }
+            }
             try await sendEnvelope { env in
                 var h = Termmesh_Peer_V1_Hello()
                 h.protocolVersion = self.config.protocolVersion

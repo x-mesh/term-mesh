@@ -53,8 +53,16 @@ def _pane_status(c) -> dict:
 
 def main() -> int:
     with termmesh() as c:
-        # ── seed workspace A with a split (2 leaves)
-        sid = c.new_surface(panel_type="terminal")
+        # ── seed workspace A with a split (2 leaves). The runner already
+        # creates one terminal surface in a fresh workspace. Reuse it instead
+        # of adding a second tab to the same pane: ClosePane closes one active
+        # tab first, so a hidden sibling tab would replace the visible leaf
+        # and correctly keep the pane count unchanged.
+        surfaces = c.list_surfaces()
+        sid = next((surface_id for _, surface_id, focused in surfaces if focused), None)
+        sid = sid or (surfaces[0][1] if surfaces else None)
+        if not sid:
+            raise termmeshError("fresh workspace has no seed surface")
         c.focus_surface(sid)
         if not _wait(lambda: c.read_terminal_text(sid).strip() != "", timeout_s=10):
             raise termmeshError("seed surface never rendered")
