@@ -925,7 +925,17 @@ final class PeerClientCoordinator: NSObject, NSMenuDelegate {
         // Browse ref done — the pane session holds its own ref now.
         registry.release(lease)
 
-        guard workspace.openRemotePane(session: session, lifetime: lifetime) != nil else {
+        // An agent surface renders as a native AgentPanel, never a terminal
+        // pane — `openRemotePane` refuses it by contract. This routing is
+        // what makes the picker row usable at all: without it a successful
+        // attach was immediately torn down behind a "no focused terminal
+        // pane" alert that had nothing to do with the cause. The attach
+        // above already selected callback delivery from the same
+        // surfaceType, which is what `openRemoteAgentPane` requires.
+        let openedPane = SessionHostPanes.isAgentSurfaceType(chosen.surfaceType)
+            ? workspace.openRemoteAgentPane(session: session) != nil
+            : workspace.openRemotePane(session: session, lifetime: lifetime) != nil
+        guard openedPane else {
             session.teardown()
             self.showAlert(
                 title: LanguageSettings.localized("Pane Open Failed"),
@@ -1585,14 +1595,21 @@ final class PeerClientCoordinator: NSObject, NSMenuDelegate {
                         spec: spec
                     )
                     registry.release(lease)
-                    guard let panel = workspace.openRemotePane(session: session, focus: focus) else {
+                    // Same routing as the picker flow: an agent surface gets
+                    // an AgentPanel — `openRemotePane` refuses it, and the
+                    // refusal here surfaced as a bogus
+                    // "no_focused_terminal_pane" after a successful attach.
+                    let panelId: UUID? = SessionHostPanes.isAgentSurfaceType(chosen.surfaceType)
+                        ? workspace.openRemoteAgentPane(session: session, focus: focus)?.id
+                        : workspace.openRemotePane(session: session, focus: focus)?.id
+                    guard let panelId else {
                         session.teardown()
                         self.debugLastPaneOpenResult = ["ok": false, "error": "no_focused_terminal_pane"]
                         return
                     }
                     self.debugLastPaneOpenResult = [
                         "ok": true,
-                        "panel_id": panel.id.uuidString,
+                        "panel_id": panelId.uuidString,
                         "host_key": String(describing: session.lease.key),
                     ]
                 } catch {
@@ -1694,6 +1711,25 @@ final class PeerClientCoordinator: NSObject, NSMenuDelegate {
     /// double sessions).
     private var reconnectingPanelIds: Set<UUID> = []
 
+    /// Which surface a terminal pane's reconnect banner should re-attach:
+    /// same id first, then same title. Agent surfaces are never candidates —
+    /// reconnect replaces a TERMINAL pane, and an agent surface attached
+    /// here would pick callback delivery only for `openRemotePane` to
+    /// refuse it, tearing the fresh session down behind a "Reconnect
+    /// Failed" alert. The realistic collision is the title fallback
+    /// matching an agent named like the dead terminal. Pure so the match
+    /// is testable without a live session.
+    static func reconnectSurfaceMatch(
+        surfaces: [Termmesh_Peer_V1_SurfaceInfo],
+        wanted: Termmesh_Peer_V1_SurfaceInfo
+    ) -> Termmesh_Peer_V1_SurfaceInfo? {
+        let candidates = surfaces.filter {
+            !SessionHostPanes.isAgentSurfaceType($0.surfaceType)
+        }
+        return candidates.first { $0.surfaceID == wanted.surfaceID && $0.attachable }
+            ?? candidates.first { $0.title == wanted.title && $0.attachable }
+    }
+
     /// Reconnect action for a remote pane's disconnect banner: re-lease
     /// the host, find the original surface again (by id, then by title),
     /// attach a fresh session, and swap the dead pane IN PLACE — the new
@@ -1730,8 +1766,7 @@ final class PeerClientCoordinator: NSObject, NSMenuDelegate {
             self.showAlert(title: LanguageSettings.localized("Reconnect Failed"), body: String(describing: error))
             return
         }
-        let match = surfaces.first { $0.surfaceID == wanted.surfaceID && $0.attachable }
-            ?? surfaces.first { $0.title == wanted.title && $0.attachable }
+        let match = Self.reconnectSurfaceMatch(surfaces: surfaces, wanted: wanted)
         guard let match else {
             registry.release(lease)
             self.showAlert(

@@ -410,7 +410,15 @@ final class PeerPaneSession {
         while Date() < deadline {
             try? await Task.sleep(nanoseconds: 400_000_000)
             let now = try await listSurfaces(on: lease)
-            if let fresh = now.first(where: { !before.contains($0.surfaceID) && $0.attachable }) {
+            // "New since the split request" is the whole detection, so an
+            // agent surface someone ensured concurrently would match too —
+            // and the caller is waiting for a SHELL to type a launch
+            // command into. Only a terminal-typed surface counts as the
+            // split this asked for.
+            if let fresh = now.first(where: {
+                !before.contains($0.surfaceID) && $0.attachable
+                    && !SessionHostPanes.isAgentSurfaceType($0.surfaceType)
+            }) {
                 return fresh
             }
         }
@@ -434,7 +442,15 @@ final class PeerPaneSession {
         }
         let relay: PeerRelaySession
         do {
-            relay = try await PeerRelaySession.attach(conn, surface: surface)
+            // Agent surfaces carry NDJSON, not a terminal byte stream: route
+            // their PtyData to the in-process callback (AgentSession.consume)
+            // instead of spawning the relay binary as a pane shell.
+            relay = try await PeerRelaySession.attach(
+                conn,
+                surface: surface,
+                ptyDelivery: SessionHostPanes.isAgentSurfaceType(surface.surfaceType)
+                    ? .callback : .relaySocket
+            )
         } catch {
             await conn.cancel()
             throw error

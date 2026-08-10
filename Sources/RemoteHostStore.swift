@@ -492,6 +492,32 @@ final class RemoteHostStore: ObservableObject {
         hosts.filter { $0.isLaunchable && !(($0.sshTarget ?? "").isEmpty) }
     }
 
+    /// Whether the viewer may take the agent-surface path against this host
+    /// connection at all. Check it BEFORE opening or ensuring an agent
+    /// surface (`SurfaceInfo.surface_type == "agent"` /
+    /// `EnsureSurfaceRequest.kind = "agent"`), passing the connection's
+    /// negotiated `hostCapabilities` (`conn.hostCapabilities`, the same
+    /// value the workspace-lifecycle and roster gates below read). A host
+    /// that did not advertise `surface.agent.v1` in its Hello is an older
+    /// daemon that cannot own a `tm-agent-bridge` child: the agent path is
+    /// not issued against it, and the existing terminal path is left
+    /// exactly as it was.
+    ///
+    /// For listing-driven paths this is deliberate defensive duplication:
+    /// an old daemon never reports `surface_type == "agent"` in the first
+    /// place, and a Phase 1 daemon enforces its own half of the gate by
+    /// demoting agent surfaces to `attachable = false` (and rejecting
+    /// attach) for clients that did not advertise the capability. The
+    /// primary consumer is the request the viewer originates on its own —
+    /// `EnsureSurfaceRequest.kind = "agent"` (Phase 3, the team
+    /// orchestrator's remote agent factory) — where no host-side listing
+    /// has filtered anything before the request leaves this machine.
+    nonisolated static func hostSupportsAgentSurfaces(
+        _ hostCapabilities: PeerCapabilities
+    ) -> Bool {
+        hostCapabilities.has(PeerCapability.surfaceAgentV1)
+    }
+
     /// Fired after a successful sidebar connect so the mounted host
     /// group force-expands (its fold state is view-local @State).
     struct ExpandSignal: Equatable {
