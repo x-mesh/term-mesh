@@ -30,19 +30,39 @@ struct PeerRunnerSurfaceSpec: Codable, Equatable, Sendable {
     var executable: String
     var args: [String]
     var restartPolicy: PeerRunnerRestartPolicy
+    /// What the daemon spawns behind this key: `""` (the PTY that predates
+    /// the field) or `SessionHostPanes.agentSurfaceType`, a non-PTY
+    /// `tm-agent-bridge` child streaming NDJSON. Defaulted and optional in
+    /// the decoder so profiles saved before the field still load — and so a
+    /// saved runner keeps meaning "terminal" without having said so.
+    var kind: String
 
     init(
         key: String,
         cwd: String,
         executable: String,
         args: [String] = [],
-        restartPolicy: PeerRunnerRestartPolicy = .onDaemonRestart
+        restartPolicy: PeerRunnerRestartPolicy = .onDaemonRestart,
+        kind: String = ""
     ) {
         self.key = key
         self.cwd = cwd
         self.executable = executable
         self.args = args
         self.restartPolicy = restartPolicy
+        self.kind = kind
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        key = try container.decode(String.self, forKey: .key)
+        cwd = try container.decode(String.self, forKey: .cwd)
+        executable = try container.decode(String.self, forKey: .executable)
+        args = try container.decodeIfPresent([String].self, forKey: .args) ?? []
+        restartPolicy = try container.decodeIfPresent(
+            PeerRunnerRestartPolicy.self, forKey: .restartPolicy
+        ) ?? .onDaemonRestart
+        kind = try container.decodeIfPresent(String.self, forKey: .kind) ?? ""
     }
 }
 

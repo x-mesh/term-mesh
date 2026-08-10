@@ -1653,10 +1653,19 @@ extension TeamOrchestrator {
         }
 
         // Compatibility recovery for a project detached before Workspace
-        // preservation existed. Only terminal-backed peer agents have a
-        // durable surface identity that can be reattached losslessly. Native
-        // agents are owned by their preserved AgentSession and must never
-        // enter this fallback as a partial 0/N reconstruction.
+        // preservation existed. The test is a durable surface identity on the
+        // PEER — a surface its daemon still holds and this side can name — and
+        // both remote kinds have one: a terminal-backed member's PTY and a
+        // peer-owned agent's `tm-agent-bridge` alike. What must never enter
+        // this fallback is a LOCAL native agent, whose process is a child of
+        // this app owned by its preserved `AgentSession`; it has no
+        // `remoteSurfaceID`, which is what this guard reads.
+        //
+        // `attachRestoredRemoteSurface` picks the renderer from the surface
+        // type the host reports, so an agent surface comes back as an
+        // `AgentPanel` rather than being pushed through `openRemotePane` —
+        // which refuses it by contract and would fail every retry at the same
+        // point, forever.
         guard original.agents.allSatisfy({
             $0.hostKey != nil && $0.remoteSurfaceID != nil
         }) else {
@@ -1712,7 +1721,22 @@ extension TeamOrchestrator {
                 surfaceID: surfaceID,
                 title: originalAgent.name,
                 panelTitle: "\(Self.colorEmoji(originalAgent.color)) \(originalAgent.name)",
-                workspace: workspace
+                workspace: workspace,
+                // A restored `AgentPanel` is a brand new `AgentSession`, so it
+                // arrives with none of the team's closures on it. Without this
+                // the pane renders, turns run, and no reply is ever filed —
+                // the quietest way for a restored member to be broken.
+                onAgentPanel: { panel, host in
+                    Self.bindPeerOwnedAgentPanel(
+                        panel: panel,
+                        workspace: workspace,
+                        teamName: teamName,
+                        agentName: originalAgent.name,
+                        agentInstanceId: originalAgent.agentInstanceId,
+                        color: originalAgent.color,
+                        hostDisplayName: host.displayName
+                    )
+                }
             ) {
                 progress.agentPanelIDs[originalAgent.agentInstanceId] = panelID
             }
@@ -1770,12 +1794,26 @@ extension TeamOrchestrator {
         return true
     }
 
+    /// Reattach one surviving peer surface and give it a local pane again.
+    ///
+    /// The renderer is chosen from the surface type the HOST reports, not from
+    /// anything this side remembers. An agent surface carries NDJSON for
+    /// `AgentSession`, and `openRemotePane` refuses it by contract — routing
+    /// one there returns nil at the same point on every retry, so a project
+    /// with a single peer-owned agent member could never finish restoring.
+    ///
+    /// `onAgentPanel` is how the caller puts its own meaning back on a
+    /// restored `AgentPanel` (a fresh `AgentSession` has none of the team's
+    /// closures). A caller that passes none is declaring it cannot host one —
+    /// the leader is never an agent surface — and gets nil rather than a pane
+    /// wired to nobody.
     private func attachRestoredRemoteSurface(
         hostKey: String,
         surfaceID: Data,
         title: String,
         panelTitle: String,
-        workspace: Workspace
+        workspace: Workspace,
+        onAgentPanel: ((AgentPanel, HostEntry) -> Void)? = nil
     ) async -> UUID? {
         guard let host = RemoteHostStore.shared.sortedHosts.first(where: { $0.id == hostKey }),
               host.isConnected else { return nil }
@@ -1787,12 +1825,14 @@ extension TeamOrchestrator {
             return nil
         }
         let session: PeerPaneSession
+        let isAgentSurface: Bool
         do {
             let surfaces = try await PeerPaneSession.listSurfaces(on: lease)
             guard let surface = surfaces.first(where: { $0.surfaceID == surfaceID }) else {
                 PeerPaneHostRegistry.shared.release(lease)
                 return nil
             }
+            isAgentSurface = SessionHostPanes.isAgentSurfaceType(surface.surfaceType)
             session = try await PeerPaneSession.attach(
                 lease: lease,
                 surface: surface,
@@ -1805,6 +1845,27 @@ extension TeamOrchestrator {
             return nil
         }
         PeerPaneHostRegistry.shared.release(lease)
+
+        if isAgentSurface {
+            guard let onAgentPanel else {
+                session.teardown()
+                RemoteWorkLog.info(
+                    "Cannot restore \(title) on \(hostKey): it is an agent surface, "
+                        + "which this pane cannot host"
+                )
+                return nil
+            }
+            guard let panel = workspace.openRemoteAgentPane(
+                session: session,
+                focus: false
+            ) else {
+                session.teardown()
+                return nil
+            }
+            onAgentPanel(panel, host)
+            return panel.id
+        }
+
         guard let panel = workspace.openRemotePane(
             session: session,
             focus: false,
@@ -1863,15 +1924,129 @@ extension TeamOrchestrator {
         await connection.cancel()
     }
 
-    private static func ensureRemoteCLIAvailable(cli: String, host: HostEntry) async throws {
-        guard let sshTarget = host.sshTarget, !sshTarget.isEmpty else { return }
+    /// What one login-shell probe found on a host for a given agent CLI.
+    ///
+    /// Both entries are absolute paths or empty. Empty is data, not an error:
+    /// a host with no `tm-agent-bridge` simply cannot own an agent surface and
+    /// the terminal path is taken instead.
+    struct RemoteAgentBinaries: Equatable, Sendable {
+        /// Where the login shell resolves the agent CLI. Empty when it is not
+        /// on that PATH at all, or resolves to something that is not a path
+        /// (a shell function, a builtin).
+        var cliPath: String = ""
+        /// Where the login shell resolves the binary the BRIDGE spawns, which
+        /// is not always the same file as `cliPath` — see
+        /// `peerAgentExecutableName`. This, not `cliPath`, is what `--exe`
+        /// gets. Empty when the probe found nothing usable, which is a signal
+        /// to omit `--exe` and let the bridge use its own default.
+        var execPath: String = ""
+        /// Where `tm-agent-bridge` lives on this host. Empty when absent.
+        var bridgePath: String = ""
+        /// Whether the CLI is runnable at all — `command -v` succeeded, even
+        /// if what it named was not a path. This, not `cliPath`, is what the
+        /// terminal path needs: it types a bare CLI name at a login shell,
+        /// where a function or alias works exactly as well as a binary.
+        var cliAvailable: Bool = false
+    }
+
+    /// Markers for `remoteAgentBinariesProbe`. Prefixes rather than bare
+    /// sentinels because a login shell prints its own greeting around them.
+    private static let remoteCLIAvailableMarker = "__TERMMESH_CLI_AVAILABLE__"
+    private static let remoteCLIPathMarker = "__TERMMESH_CLI_PATH__="
+    private static let remoteExecPathMarker = "__TERMMESH_EXE_PATH__="
+    private static let remoteBridgePathMarker = "__TERMMESH_BRIDGE_PATH__="
+
+    /// The binary `tm-agent-bridge` actually spawns for a role CLI.
+    ///
+    /// Usually the role name IS the binary, and for kiro it is not: the role
+    /// is `kiro`, the ACP server is `kiro-cli`
+    /// (`daemon/tm-agent-bridge/src/main.rs` defaults `--exe` to `kiro-cli`,
+    /// and `TeamOrchestrator.defaultLaunchCommand` has said the same for as
+    /// long as kiro has been supported). `--exe` names an executable, not a
+    /// role — handing it a `kiro` launcher/wrapper overrides the correct
+    /// default with something that cannot speak ACP, and the bridge exits at
+    /// the handshake behind an agent pane that already opened.
+    static func peerAgentExecutableName(cli: String) -> String {
+        cli == "kiro" ? "kiro-cli" : cli
+    }
+
+    /// One round trip for four questions. A second ssh to ask where the
+    /// bridge is would double the wait before a member's pane appears, and
+    /// the answers are only meaningful together anyway.
+    ///
+    /// The login shell is asked deliberately. `term-meshd` runs under systemd
+    /// with its default PATH, which does not include `$HOME/.local/bin` — so
+    /// the daemon cannot find a `codex` the user installed there. Resolving
+    /// the path *here*, where the login profile has run, and handing the
+    /// daemon `--exe <absolute path>` is what closes that gap.
+    ///
+    /// The role CLI and the bridge's executable are asked for separately
+    /// because they are separate questions with separate consumers: the
+    /// terminal path types the role name at a login shell, while `--exe` needs
+    /// the binary the bridge spawns (`peerAgentExecutableName`). For every CLI
+    /// but kiro they resolve to the same file, and asking twice costs nothing.
+    static func remoteAgentBinariesProbe(
+        cli: String,
+        hostBinDirs: [String]
+    ) -> String {
+        RemoteShellPath.prologue(hostBinDirs: hostBinDirs)
+            + "cli_path=$(command -v \(shellQuoted(cli)) 2>/dev/null || true); "
+            + "exe_path=$(command -v \(shellQuoted(peerAgentExecutableName(cli: cli))) "
+            + "2>/dev/null || true); "
+            + "bridge_path=$(command -v tm-agent-bridge 2>/dev/null || true); "
+            + "if [ -n \"$cli_path\" ]; then "
+            + "printf '%s\\n' \(shellQuoted(remoteCLIAvailableMarker)); fi; "
+            + "printf '%s%s\\n' \(shellQuoted(remoteCLIPathMarker)) \"$cli_path\"; "
+            + "printf '%s%s\\n' \(shellQuoted(remoteExecPathMarker)) \"$exe_path\"; "
+            + "printf '%s%s\\n' \(shellQuoted(remoteBridgePathMarker)) \"$bridge_path\""
+    }
+
+    /// Read the probe's answer out of whatever the login shell printed around
+    /// it. Only absolute paths are accepted: `command -v` also names shell
+    /// functions and builtins, and neither is something the daemon can spawn.
+    static func parseRemoteAgentBinaries(_ output: String) -> RemoteAgentBinaries {
+        var result = RemoteAgentBinaries()
+        result.cliAvailable = output.contains(remoteCLIAvailableMarker)
+        for line in output.split(separator: "\n", omittingEmptySubsequences: false) {
+            let text = line.trimmingCharacters(in: .whitespaces)
+            func value(after marker: String) -> String? {
+                guard let range = text.range(of: marker) else { return nil }
+                let candidate = String(text[range.upperBound...])
+                return candidate.hasPrefix("/") ? candidate : ""
+            }
+            if let cliPath = value(after: remoteCLIPathMarker), result.cliPath.isEmpty {
+                result.cliPath = cliPath
+            }
+            if let execPath = value(after: remoteExecPathMarker), result.execPath.isEmpty {
+                result.execPath = execPath
+            }
+            if let bridgePath = value(after: remoteBridgePathMarker), result.bridgePath.isEmpty {
+                result.bridgePath = bridgePath
+            }
+        }
+        return result
+    }
+
+    /// Fail before opening a pane when the CLI is not on the host, and report
+    /// back what the same probe found — the CLI's absolute path and the
+    /// bridge's, which is what the peer-owned agent factory needs.
+    ///
+    /// A host reached without ssh cannot be probed at all; it answers "no
+    /// paths, assume available", which is exactly the pre-existing contract
+    /// (this used to `return` early) and routes such a host to the terminal
+    /// path, where nothing needs a path.
+    @discardableResult
+    private static func ensureRemoteCLIAvailable(
+        cli: String,
+        host: HostEntry
+    ) async throws -> RemoteAgentBinaries {
+        guard let sshTarget = host.sshTarget, !sshTarget.isEmpty else {
+            return RemoteAgentBinaries(cliAvailable: true)
+        }
         guard AgentRolePreset.knownCLIs.contains(cli) else {
             throw RemoteAgentError.cliUnavailable(cli, host.displayName)
         }
-        let marker = "__TERMMESH_CLI_AVAILABLE__"
-        let probe = RemoteShellPath.prologue(hostBinDirs: host.hostCLIBinDirs)
-            + "command -v \(shellQuoted(cli)) >/dev/null 2>&1 "
-            + "&& printf %s \(shellQuoted(marker))"
+        let probe = remoteAgentBinariesProbe(cli: cli, hostBinDirs: host.hostCLIBinDirs)
         do {
             let output = try await PeerHostReadinessChecker.runScript(
                 sshTarget: sshTarget,
@@ -1880,9 +2055,11 @@ extension TeamOrchestrator {
                 script: "exec \"${SHELL:-/bin/sh}\" -lc \(shellQuoted(probe))",
                 timeoutSeconds: 15
             )
-            guard output.contains(marker) else {
+            let binaries = parseRemoteAgentBinaries(output)
+            guard binaries.cliAvailable else {
                 throw RemoteAgentError.cliUnavailable(cli, host.displayName)
             }
+            return binaries
         } catch {
             throw RemoteAgentError.cliUnavailable(cli, host.displayName)
         }
@@ -1904,7 +2081,8 @@ extension TeamOrchestrator {
             if systemPrompt != nil {
                 throw RemoteAgentError.promptStagingFailed(host.displayName)
             }
-            return try await ensureRemoteCLIAvailable(cli: cli, host: host)
+            try await ensureRemoteCLIAvailable(cli: cli, host: host)
+            return
         }
         guard AgentRolePreset.knownCLIs.contains(cli) else {
             throw RemoteAgentError.cliUnavailable(cli, host.displayName)
@@ -2019,10 +2197,14 @@ extension TeamOrchestrator {
             throw RemoteAgentError.workspaceGone
         }
 
-        // Fail before opening either kind of pane. Otherwise a missing remote
+        // Fail before opening any kind of pane. Otherwise a missing remote
         // executable leaves a dead native bridge or a terminal that looks like
         // an agent but only contains "command not found".
-        try await Self.ensureRemoteCLIAvailable(cli: cli, host: host)
+        //
+        // The same probe reports where the CLI and `tm-agent-bridge` live on
+        // that host. Both are what the peer-owned factory below ensures with,
+        // so asking here costs no extra round trip.
+        let binaries = try await Self.ensureRemoteCLIAvailable(cli: cli, host: host)
 
         // A late member joining one of this project's own checkouts gets an
         // instance-tagged worktree. The requested path may be the prefilled
@@ -2082,41 +2264,128 @@ extension TeamOrchestrator {
         // Use the same incremental grid growth as local `add`/`attach`.
         let placement = nextAgentSplitPlacement(team: team, workspace: workspace)
 
-        // A native remote member exists only on this machine: its process is a
-        // child of this app's ssh, its stdio is that pipe, and nothing at all
-        // is created on the peer. The peer's own window then shows a project
-        // with a leader and no team, and there is nothing there to continue
-        // the work with. The terminal path below puts the member in the peer's
-        // project workspace, where both machines can see and drive it.
+        // Which of the three factories builds this member, and why.
         //
-        // Except for the CLIs that have no interactive UI to put in a pane —
-        // `isPipeOnly` is a turn-per-process CLI with no stdin channel, so a
-        // terminal pane would open empty. Those keep the native path and stay
-        // local-only, which is a property of the CLI rather than a choice.
+        // The difference that matters is *who owns the CLI process*, because
+        // that is what decides whether the work survives this Mac:
         //
-        // The cost is deliberate and bounded: a remote member renders as its
-        // raw stream rather than in an AgentPanel. Local members are
-        // unaffected. Giving the peer real ownership of the process would
-        // return the panel, and is the next step rather than this one.
-        if AgentPipeTransport.canHoldNatively(cli: cli),
-           AgentPipeTransport.isPipeOnly(cli: cli),
-           let sshTarget = host.sshTarget, !sshTarget.isEmpty {
-            let member = try attachRemoteNativeAgent(
-                team: team,
-                workspace: workspace,
-                tabManager: tabManager,
-                host: host,
-                sshTarget: sshTarget,
-                splitFrom: placement.panelId,
-                orientation: placement.orientation,
-                agentName: agentName,
-                workingDirectory: workingDirectory,
-                agentType: agentType,
-                model: model,
-                cli: cli
+        // | factory | owner | survives this Mac | renders as |
+        // |---|---|---|---|
+        // | peer-owned agent | the peer's `term-meshd` | yes | AgentPanel |
+        // | local native bridge | this app's ssh child | no | AgentPanel |
+        // | terminal | the peer's `term-meshd` (PTY) | yes | terminal pane |
+        //
+        // **Peer-owned** is the only one that gives up neither, so codex and
+        // kiro take it whenever the host can hold it: `tm-agent-bridge` is a
+        // child of the peer daemon, so quitting here leaves the turn running
+        // and a reattach picks the same surface back up, while its NDJSON
+        // draws in an AgentPanel instead of scrolling past as a wire dump.
+        // What it still costs is environment: the ensure request carries none,
+        // so `TERMMESH_TEAM_*` never reaches the CLI and the standing brief is
+        // the only thing telling it what it is.
+        //
+        // **The local bridge** is kept for exactly cursor and agy. A turn is a
+        // whole process for those two and they have no interactive UI, so a
+        // terminal pane would open empty — the native path is not an upgrade
+        // there but the only thing that works at all. Moving them to the peer
+        // is a separate change with its own live verification (R8), and until
+        // it lands they stay a child of this app and die with it.
+        //
+        // **Terminal** is everything else, and is exactly the behaviour every
+        // remote member had before any of this: claude and gemini have no
+        // peer-owned recipe (`tm-agent-bridge --cli` has no claude value, and
+        // no native panel holds gemini), and a host whose daemon predates
+        // `surface.agent.v1` or has no bridge installed keeps its PTY pane.
+        // Falling back is never silent — each reason is logged below with the
+        // one thing that would give the agent pane back.
+        let availability = await Self.canUsePeerOwnedAgent(
+            host: host, cli: cli, binaries: binaries
+        )
+        if case .blocked(let block) = availability {
+            RemoteWorkLog.info(
+                Self.peerOwnedAgentFallbackMessage(
+                    block, cli: cli, hostName: host.displayName
+                )
             )
-            recordIsolatedCheckout()
-            return member
+        }
+        switch Self.remoteAgentFactory(
+            cli: cli,
+            hostAdvertisesAgentSurfaces: availability == .available,
+            peerBridgePath: binaries.bridgePath,
+            sshTarget: host.sshTarget
+        ) {
+        case .peerOwnedAgent:
+            guard attachStillWanted() else {
+                throw RemoteAgentError.teamNotFound(teamName)
+            }
+            do {
+                let member = try await attachPeerOwnedAgent(
+                    team: team,
+                    workspace: workspace,
+                    host: host,
+                    binaries: binaries,
+                    splitFrom: placement.panelId,
+                    orientation: placement.orientation,
+                    agentName: agentName,
+                    workingDirectory: workingDirectory,
+                    agentType: agentType,
+                    model: model,
+                    cli: cli,
+                    stillWanted: attachStillWanted
+                )
+                recordIsolatedCheckout()
+                return member
+            } catch let error as RemoteAgentError {
+                // A decision this side made — the roster already holds this
+                // member, or the team was retired mid-attach. The terminal
+                // path would reach the same answer after spawning a second
+                // surface for nothing, so it is reported rather than retried.
+                throw error
+            } catch {
+                // The host's answer, not ours. `canUsePeerOwnedAgent` read the
+                // capability off a connection it then closed, so the host can
+                // stop advertising it in between — and an ensure refused
+                // locally or on the wire creates nothing there. Falling
+                // through costs a pane that renders less well; refusing would
+                // cost the member entirely.
+                RemoteWorkLog.info(
+                    Self.peerOwnedAgentFallbackMessage(
+                        .ensureRefused, cli: cli, hostName: host.displayName
+                    )
+                )
+            }
+        case .localNativeBridge:
+            if let sshTarget = host.sshTarget, !sshTarget.isEmpty {
+                let member = try attachRemoteNativeAgent(
+                    team: team,
+                    workspace: workspace,
+                    tabManager: tabManager,
+                    host: host,
+                    sshTarget: sshTarget,
+                    splitFrom: placement.panelId,
+                    orientation: placement.orientation,
+                    agentName: agentName,
+                    workingDirectory: workingDirectory,
+                    agentType: agentType,
+                    model: model,
+                    cli: cli
+                )
+                recordIsolatedCheckout()
+                return member
+            }
+        case .terminal:
+            // The one terminal pane that is not a graceful degradation: a
+            // turn-per-process CLI has no interactive UI to put in it, so the
+            // pane opens and stays blank. Say so rather than letting the user
+            // discover it by staring at it.
+            if AgentPipeTransport.isPipeOnly(cli: cli) {
+                RemoteWorkLog.info(
+                    "\(cli) has no interactive terminal UI, so \(agentName) on "
+                        + "\(host.displayName) will open an empty pane. It needs a "
+                        + "native agent pane: turn Agent Panes back to Native, or "
+                        + "reach that host over SSH."
+                )
+            }
         }
 
         let registry = PeerPaneHostRegistry.shared
@@ -2415,6 +2684,649 @@ extension TeamOrchestrator {
         locations.filter { !($0.hostKey == hostKey && $0.path == path) }
     }
 
+    // MARK: - Peer-owned agent surface
+
+    /// Which of the three factories builds a remote member.
+    ///
+    /// They differ in *who owns the process*, which is the only difference
+    /// that matters when the Mac goes away:
+    ///
+    /// | factory | owner | survives the Mac | renders as |
+    /// |---|---|---|---|
+    /// | `peerOwnedAgent` | the peer's `term-meshd` | yes | AgentPanel |
+    /// | `localNativeBridge` | this app's ssh child | no | AgentPanel |
+    /// | `terminal` | the peer's `term-meshd` (PTY) | yes | terminal pane |
+    enum RemoteAgentFactory: String, Equatable, Sendable {
+        /// `ensure(kind: "agent")` — the peer daemon holds `tm-agent-bridge`
+        /// as a non-PTY child and streams its NDJSON here.
+        case peerOwnedAgent
+        /// The bridge runs as a child of this app's ssh. Nothing exists on
+        /// the peer, so the member dies with this process.
+        case localNativeBridge
+        /// A peer PTY the member's CLI is typed into.
+        case terminal
+    }
+
+    /// Decide which factory a remote member gets, from facts alone.
+    ///
+    /// Deliberately total and free of I/O so the matrix can be pinned in a
+    /// test: every combination of CLI, host capability and bridge presence
+    /// has one answer here, and the call site does no second-guessing.
+    ///
+    /// The conservative half is `isPipeOnly` (cursor / agy). They already run
+    /// natively and moving them is a separate change with its own live
+    /// verification, so they keep the local bridge until that lands.
+    ///
+    /// Claude is excluded for harder reasons, and they are worth writing down
+    /// because "claude speaks NDJSON directly, so it needs no bridge" reads
+    /// like an argument for including it:
+    ///  - `tm-agent-bridge --cli` has no `claude` value at all
+    ///    (`daemon/tm-agent-bridge/src/main.rs`), so the peer-owned recipe
+    ///    this file builds does not cover it. Spawning `claude --print …`
+    ///    directly would be a second, differently shaped ensure spec.
+    ///  - the daemon reads `SurfaceInfo.agent_cli` out of the request's own
+    ///    `--cli` argument (`connection.rs`, `agent_cli_from_args`), which a
+    ///    direct claude vector does not carry — the surface would report an
+    ///    empty CLI label and a reattach would have nothing to pick a
+    ///    renderer by.
+    ///  - claude takes its runbook as `--append-system-prompt <text>`, and
+    ///    `args` join `SurfaceSpec::canonical_hash` on the daemon. The
+    ///    runbook would become part of the surface's identity, so editing it
+    ///    would turn every reattach into a SPEC_CONFLICT — which is exactly
+    ///    the reattach this whole path exists for.
+    /// None of that is unfixable, and none of it is a flag flip.
+    static func remoteAgentFactory(
+        cli: String,
+        hostAdvertisesAgentSurfaces: Bool,
+        peerBridgePath: String,
+        sshTarget: String?
+    ) -> RemoteAgentFactory {
+        let reachableOverSSH = !(sshTarget ?? "").isEmpty
+        // Native panes off, or a CLI no panel can hold (gemini): unchanged.
+        guard AgentPipeTransport.canHoldNatively(cli: cli) else { return .terminal }
+        if AgentPipeTransport.isPipeOnly(cli: cli) {
+            return reachableOverSSH ? .localNativeBridge : .terminal
+        }
+        // What is left that the bridge can drive is exactly codex and kiro.
+        guard AgentPipeTransport.needsBridge(cli: cli) else { return .terminal }
+        guard reachableOverSSH,
+              hostAdvertisesAgentSurfaces,
+              !peerBridgePath.isEmpty
+        else { return .terminal }
+        return .peerOwnedAgent
+    }
+
+    /// What stopped a member that could have had a peer-owned agent pane.
+    ///
+    /// Only reasons a *user* can act on. The distinction between them is the
+    /// whole point: "install term-mesh there" and "update term-mesh there" are
+    /// different repairs, and one message covering both tells nobody which.
+    enum PeerOwnedAgentBlock: String, Equatable, Sendable, CaseIterable {
+        /// No `tm-agent-bridge` on the host.
+        case bridgeMissing
+        /// Its `term-meshd` does not advertise `surface.agent.v1`.
+        case daemonTooOld
+        /// The handshake that would have answered could not be made.
+        case hostUnreachable
+        /// It was open at the check and refused at the ensure — the host
+        /// changed underneath, or said no for its own reason.
+        case ensureRefused
+    }
+
+    /// Whether the peer-owned path is open for this member.
+    ///
+    /// `notApplicable` is not a failure and must not be reported as one: a
+    /// claude member never had this path, so nothing was given up by not
+    /// taking it. Only `blocked` describes something the user lost.
+    enum PeerOwnedAgentAvailability: Equatable, Sendable {
+        case available
+        case notApplicable
+        case blocked(PeerOwnedAgentBlock)
+    }
+
+    /// The one line the user sees when a native agent pane was possible and
+    /// did not happen.
+    ///
+    /// Pure and separate from the check so the wording is pinned by a test
+    /// rather than by whoever reads the log next: what opened instead, on
+    /// which host, and the single action that would give the agent pane back.
+    static func peerOwnedAgentFallbackMessage(
+        _ block: PeerOwnedAgentBlock,
+        cli: String,
+        hostName: String
+    ) -> String {
+        let lead = "\(cli) on \(hostName) opens as a terminal pane instead of a "
+            + "native agent pane"
+        switch block {
+        case .bridgeMissing:
+            return lead + ": that host has no tm-agent-bridge. "
+                + "Install term-mesh on \(hostName) to get one."
+        case .daemonTooOld:
+            return lead + ": its term-meshd predates surface.agent.v1. "
+                + "Update term-mesh on \(hostName) to get one."
+        case .hostUnreachable:
+            return lead + ": its term-meshd could not be asked what it supports. "
+                + "Reconnect \(hostName) and attach again to get one."
+        case .ensureRefused:
+            return lead + ": the host refused to start the bridge. "
+                + "Nothing was left running there; attach again to retry."
+        }
+    }
+
+    /// Ask the host connection itself whether the peer-owned path is open.
+    ///
+    /// The capability is only knowable from a live handshake — nothing is
+    /// cached on `HostEntry` — so this opens a connection, reads
+    /// `hostCapabilities`, and closes it. Never fatal: every answer other than
+    /// `available` sends the caller to the terminal path, which is what every
+    /// remote member did before this existed.
+    ///
+    /// Reporting is the caller's, deliberately. This is also the shape of the
+    /// answer the factory wants, and a function that both decides and
+    /// announces cannot be asked the question twice.
+    static func canUsePeerOwnedAgent(
+        host: HostEntry,
+        cli: String,
+        binaries: RemoteAgentBinaries
+    ) async -> PeerOwnedAgentAvailability {
+        guard AgentPipeTransport.canHoldNatively(cli: cli),
+              AgentPipeTransport.needsBridge(cli: cli),
+              !AgentPipeTransport.isPipeOnly(cli: cli),
+              let sshTarget = host.sshTarget, !sshTarget.isEmpty
+        else { return .notApplicable }
+        guard !binaries.bridgePath.isEmpty else { return .blocked(.bridgeMissing) }
+        guard !host.activeSockPath.isEmpty,
+              let connection = try? await PeerRelaySession.connect(
+                  hostSockPath: host.activeSockPath
+              )
+        else { return .blocked(.hostUnreachable) }
+        let supported = RemoteHostStore.hostSupportsAgentSurfaces(connection.hostCapabilities)
+        await connection.cancel()
+        return supported ? .available : .blocked(.daemonTooOld)
+    }
+
+    /// The logical key an agent surface is ensured under.
+    ///
+    /// The instance id is what makes it unique and is never truncated — two
+    /// members of one team must not collide on a key, because ensure would
+    /// then answer REUSED and hand the second member the first one's bridge.
+    /// The team name is there for whoever reads `tm-agent gc` output on the
+    /// peer, and is trimmed to fit the protocol's 256-byte key limit.
+    static func peerAgentEnsureKey(teamName: String, agentInstanceId: String) -> String {
+        let prefix = "termmesh/team/"
+        let suffix = "/agent/\(agentInstanceId)"
+        let budget = 256 - prefix.utf8.count - suffix.utf8.count
+        guard budget > 0 else { return "termmesh/agent/\(agentInstanceId)" }
+        var team = teamName.replacingOccurrences(of: "\u{0}", with: "")
+        while team.utf8.count > budget { team.removeLast() }
+        return prefix + team + suffix
+    }
+
+    /// The argument vector the peer daemon spawns `tm-agent-bridge` with.
+    ///
+    /// `--cli` is not optional and not merely descriptive: the daemon reads
+    /// `SurfaceInfo.agent_cli` back out of this vector (there is no wire field
+    /// for it), and that label is what picks the renderer on reattach. It also
+    /// joins the spec hash, so changing it under the same key is a
+    /// SPEC_CONFLICT rather than a silent relabel.
+    ///
+    /// `--exe` matters just as much and for a duller reason: `term-meshd`
+    /// runs under systemd's default PATH, which does not contain
+    /// `$HOME/.local/bin` — so a bare `codex` would simply not be found.
+    /// Omitted only when the probe could not resolve a path, where the
+    /// bridge's own default (`peerAgentExecutableName`'s binary, by name) is
+    /// still a better guess than failing outright.
+    ///
+    /// `remoteCLIPath` is the path of the binary the BRIDGE spawns, which for
+    /// kiro is `kiro-cli` and not the `kiro` the role is named after. Passing
+    /// the role's own path here would override the bridge's correct default
+    /// with a wrapper that cannot speak ACP.
+    static func peerAgentBridgeArgs(
+        cli: String,
+        workingDirectory: String,
+        model: String,
+        remoteCLIPath: String
+    ) -> [String] {
+        var args = ["--cli", cli, "--cwd", workingDirectory]
+        let modelArg = Self.bridgeModelArg(cli: cli, model: model)
+        if !modelArg.isEmpty { args += ["--model", modelArg] }
+        if !remoteCLIPath.isEmpty { args += ["--exe", remoteCLIPath] }
+        return args
+    }
+
+    /// The full ensure recipe for a peer-owned agent surface.
+    ///
+    /// `restartPolicy` is `.never` on purpose. The survivability this whole
+    /// path exists for is "the Mac went away", and the daemon keeps the child
+    /// running through that on its own. A daemon *restart* is different: the
+    /// bridge would come back with an empty conversation behind a pane whose
+    /// transcript says otherwise, which is worse than a pane that visibly
+    /// ended.
+    static func peerAgentSurfaceSpec(
+        teamName: String,
+        agentInstanceId: String,
+        cli: String,
+        workingDirectory: String,
+        model: String,
+        binaries: RemoteAgentBinaries
+    ) -> PeerRunnerSurfaceSpec {
+        PeerRunnerSurfaceSpec(
+            key: peerAgentEnsureKey(teamName: teamName, agentInstanceId: agentInstanceId),
+            cwd: workingDirectory,
+            executable: binaries.bridgePath,
+            args: peerAgentBridgeArgs(
+                cli: cli,
+                workingDirectory: workingDirectory,
+                model: model,
+                remoteCLIPath: binaries.execPath
+            ),
+            restartPolicy: .never,
+            kind: SessionHostPanes.agentSurfaceType
+        )
+    }
+
+    /// Stop an ensured agent surface on the peer.
+    ///
+    /// `requestClosePane` is the wrong verb here and fails silently: an agent
+    /// surface is deliberately never placed in the workspace tree, so a close
+    /// by pane id finds nothing and reports success while the bridge keeps
+    /// running. TerminateSurface addresses the registry directly.
+    ///
+    /// Best effort by design — every caller is already unwinding a failure,
+    /// and a host that cannot be reached to clean up is not a second error to
+    /// report on top of the first.
+    static func terminatePeerAgentSurface(
+        hostSockPath: String,
+        surfaceID: Data
+    ) async {
+        await PeerPaneSession.terminateSurface(
+            hostSockPath: hostSockPath,
+            surfaceID: surfaceID
+        )
+    }
+
+    /// Stop the peer bridge behind one roster member, if that is what it has.
+    ///
+    /// The roster is the last place that knows a peer-owned agent's surface
+    /// id: it is in no workspace tree (so no Peer Shells sweep sees it) and in
+    /// no `ManagedPeerSurfaceStore` (so no reclaim UI lists it). Every path
+    /// that drops the member — detach, project delete, team destroy — has to
+    /// spend that id on the way out or the bridge runs on the peer forever.
+    static func releasePeerOwnedAgentSurface(_ agent: AgentMember) {
+        guard agent.remoteAgentSurface, agent.remoteSurfaceSpawned,
+              let surfaceID = agent.remoteSurfaceID, !surfaceID.isEmpty,
+              let hostKey = agent.hostKey,
+              let host = RemoteHostStore.shared.sortedHosts.first(where: { $0.id == hostKey }),
+              !host.activeSockPath.isEmpty
+        else { return }
+        let sockPath = host.activeSockPath
+        Task { @MainActor in
+            await Self.terminatePeerAgentSurface(hostSockPath: sockPath, surfaceID: surfaceID)
+        }
+    }
+
+    /// The team's half of a peer-owned agent pane: which member it is, whether
+    /// it is busy, and where a finished turn's report goes.
+    ///
+    /// Split out because a peer-owned agent pane is created three times over
+    /// its life, not once — at attach, when a rewound stream forces a fresh
+    /// pane (`Workspace.dropRemoteAgentPane` → `recoverPeerOwnedAgentPane`),
+    /// and when a detached project is restored. The bridge on the peer is the
+    /// same process throughout; only the local view is rebuilt. Miss this
+    /// wiring on any of those and the member goes quiet in the way that is
+    /// hardest to see: the pane renders, turns run, and no reply is ever filed.
+    ///
+    /// What it deliberately does NOT touch is the data path.
+    /// `openRemoteAgentPane` installs that (startRemote's sink, `onPtyData`,
+    /// the lifecycle hooks); a second `startRemote` would replace a live sink
+    /// mid-turn.
+    @MainActor
+    static func bindPeerOwnedAgentPanel(
+        panel: AgentPanel,
+        workspace: Workspace,
+        teamName: String,
+        agentName: String,
+        agentInstanceId: String,
+        color: String,
+        hostDisplayName: String
+    ) {
+        workspace.setPanelCustomTitle(
+            panelId: panel.id,
+            title: "\(Self.colorEmoji(color)) \(agentName) @\(hostDisplayName)"
+        )
+        panel.session.onBusyChanged = { [teamName, agentName, agentInstanceId] busy in
+            TeamDataStore.shared.setAgentBusy(
+                teamName: teamName, agentName: agentName,
+                agentInstanceId: agentInstanceId, busy: busy
+            )
+        }
+        panel.session.onTurnEnd = { [teamName, agentName, agentInstanceId] final, _, taskId in
+            Self.fileReport(
+                teamName: teamName, agentName: agentName,
+                agentInstanceId: agentInstanceId,
+                taskId: taskId, text: final
+            )
+            guard let taskId else { return }
+            AutoReplyEmit.emit(
+                teamName: teamName,
+                agentName: agentName,
+                event: AgentPipeCompletion.headerEvent(from: final),
+                preferredTaskId: taskId,
+                agentInstanceId: agentInstanceId
+            )
+        }
+    }
+
+    /// Rebuild the local pane for a peer-owned agent whose previous one was
+    /// dropped, and point the roster at it.
+    ///
+    /// `Workspace.dropRemoteAgentPane` closes a peer agent pane whenever the
+    /// stream rewinds past what this side already consumed (a *healthy*
+    /// resume: `AgentSession.consume` is not idempotent, so a replayed stream
+    /// needs a fresh `AgentSession`, and `AgentPanel.session` is fixed for the
+    /// panel's life) or the relay dies for good. It then hands recovery to
+    /// `SessionHostPanes.reconcile()`, which is correct for the surfaces that
+    /// path was built for and useless here: that poller lists **this Mac's own
+    /// daemon** (`TermMeshDaemon.shared.daemonPeerSocketPath`), and a surface
+    /// held by jw-server is never in that list. Until this existed, a single
+    /// rewind retired a team member permanently — the pane never came back,
+    /// `AgentMember.panelId` pointed at a closed panel so `delegate`/`send`
+    /// could not reach it, and the peer's bridge kept running with nothing
+    /// naming it.
+    ///
+    /// The peer's daemon still holds the surface, so this is a reattach, not a
+    /// respawn: same surface id, same bridge, same conversation, replayed from
+    /// the daemon's ring. Failure is not fatal and not silent — the member
+    /// keeps its surface id so a later attempt (or a detach) can still address
+    /// the bridge.
+    @discardableResult
+    func recoverPeerOwnedAgentPane(closedPanelID: UUID, surfaceID: Data) async -> Bool {
+        guard let (teamName, agent) = peerOwnedAgentMember(
+            panelID: closedPanelID, surfaceID: surfaceID
+        ) else { return false }
+        // Same shape as `agentOperationKey`, which is file-private to
+        // TeamOrchestrator.swift: team plus durable instance id, so two
+        // members named `executor` do not share one recovery slot.
+        let recoveryKey = "\(teamName)/\(agent.agentInstanceId)"
+        guard !peerAgentRecoveryInFlight.contains(recoveryKey) else { return false }
+        peerAgentRecoveryInFlight.insert(recoveryKey)
+        defer { peerAgentRecoveryInFlight.remove(recoveryKey) }
+
+        guard let hostKey = agent.hostKey,
+              let host = RemoteHostStore.shared.sortedHosts.first(where: { $0.id == hostKey }),
+              host.isConnected
+        else {
+            RemoteWorkLog.info(
+                "\(agent.name)'s host is disconnected; its pane will come back "
+                    + "when the host does"
+            )
+            return false
+        }
+        guard let workspace = AppDelegate.shared?.tabManager?.tabs
+            .first(where: { $0.id == agent.workspaceId })
+            ?? resolveTabManager(teamName: teamName)?.tabs
+            .first(where: { $0.id == agent.workspaceId })
+        else { return false }
+
+        let lease: PeerPaneHostLease
+        do {
+            lease = try await PeerPaneHostRegistry.shared.acquire(host.paneHostSpec)
+        } catch {
+            RemoteWorkLog.info("Cannot reattach \(agent.name) on \(host.displayName): \(error)")
+            return false
+        }
+        let session: PeerPaneSession
+        do {
+            let surfaces = try await PeerPaneSession.listSurfaces(on: lease)
+            // Absent means the peer no longer holds the bridge — it exited, or
+            // its daemon restarted with `restartPolicy: .never`. There is
+            // nothing to reattach to and nothing left to terminate; say so
+            // rather than retrying a surface that does not exist.
+            guard let surface = surfaces.first(where: { $0.surfaceID == surfaceID }) else {
+                PeerPaneHostRegistry.shared.release(lease)
+                RemoteWorkLog.info(
+                    "\(agent.name) on \(host.displayName) has ended: its host no longer "
+                        + "holds that agent surface. Detach and attach it again to restart it."
+                )
+                return false
+            }
+            session = try await PeerPaneSession.attach(
+                lease: lease,
+                surface: surface,
+                title: agent.name,
+                spec: host.paneHostSpec
+            )
+        } catch {
+            PeerPaneHostRegistry.shared.release(lease)
+            RemoteWorkLog.info("Cannot reattach \(agent.name) on \(host.displayName): \(error)")
+            return false
+        }
+        PeerPaneHostRegistry.shared.release(lease)
+
+        guard let panel = workspace.openRemoteAgentPane(session: session, focus: false) else {
+            session.teardown()
+            RemoteWorkLog.info("Cannot reattach \(agent.name): no local pane can host it")
+            return false
+        }
+        Self.bindPeerOwnedAgentPanel(
+            panel: panel,
+            workspace: workspace,
+            teamName: teamName,
+            agentName: agent.name,
+            agentInstanceId: agent.agentInstanceId,
+            color: agent.color,
+            hostDisplayName: host.displayName
+        )
+        replaceRemoteAgentPresentation(
+            teamName: teamName,
+            agentInstanceID: agent.agentInstanceId,
+            workspaceID: workspace.id,
+            panelID: panel.id
+        )
+        scheduleAgentGridEqualization(workspace: workspace)
+#if DEBUG
+        dlog(
+            "peer.agentPane.recover team=\(teamName) agent=\(agent.name) "
+                + "panel=\(panel.id.uuidString.prefix(8))"
+        )
+#endif
+        return true
+    }
+
+    /// The roster member a dropped peer-owned agent pane belonged to.
+    ///
+    /// Matched on the surface id first and the panel id only as a tiebreak:
+    /// the panel is minted per attach and is exactly the thing that just went
+    /// away, while the surface id is the peer's own durable name for the
+    /// bridge.
+    private func peerOwnedAgentMember(
+        panelID: UUID,
+        surfaceID: Data
+    ) -> (teamName: String, agent: AgentMember)? {
+        for (teamName, team) in teams {
+            for agent in team.agents where agent.remoteAgentSurface {
+                if !surfaceID.isEmpty, agent.remoteSurfaceID == surfaceID {
+                    return (teamName, agent)
+                }
+                if agent.panelId == panelID { return (teamName, agent) }
+            }
+        }
+        return nil
+    }
+
+    /// Attach an agent whose process the PEER owns, rendered here as a native
+    /// `AgentPanel`.
+    ///
+    /// The third factory, and the only one that gets both halves: the bridge
+    /// is a child of the peer's `term-meshd` (so quitting this app leaves it
+    /// running and another machine can pick it up), and its stdout is NDJSON
+    /// delivered straight into `AgentSession` (so the pane draws turns rather
+    /// than a wire dump).
+    ///
+    /// What it costs relative to `attachRemoteNativeAgent`: the ensure
+    /// request carries no environment, so `TERMMESH_TEAM_*` never reaches the
+    /// CLI and the standing brief is the only thing telling it what it is.
+    /// That is why the briefing below is not optional decoration. The reply
+    /// path does not depend on it — `onTurnEnd` files the report from this
+    /// side, exactly as the local native path does.
+    ///
+    /// Callers must treat a thrown `RelayError` as "take the terminal path",
+    /// not as a failed attach. `canUsePeerOwnedAgent` reads the capability off
+    /// a connection that is then closed, so a host can stop advertising it
+    /// between that check and this ensure; the ensure refuses locally with
+    /// `RelayError.capabilityUnavailable` and nothing is created there. A
+    /// `RemoteAgentError` is the opposite — a decision this side made, which
+    /// the terminal path would reach identically.
+    ///
+    /// `stillWanted` is the team-deletion gate, and it matters more here than
+    /// on any other path: what this creates is a process on another machine
+    /// that no longer dies with anything local, so committing it to a roster
+    /// that was already retired strands a bridge on the peer for good.
+    @MainActor
+    private func attachPeerOwnedAgent(
+        team: Team,
+        workspace: Workspace,
+        host: HostEntry,
+        binaries: RemoteAgentBinaries,
+        splitFrom: UUID,
+        orientation: SplitOrientation,
+        agentName: String,
+        workingDirectory: String,
+        agentType: String,
+        model: String,
+        cli: String,
+        stillWanted: () -> Bool
+    ) async throws -> AgentMember {
+        let agentInstanceId = UUID().uuidString
+        let color = Self.agentColor(
+            forRole: agentType,
+            taken: Set(team.agents.map(\.color))
+        )
+        let instructions = AgentRunbookService.shared.composeInstructions(
+            roleName: agentType,
+            presetInstructions: "",
+            customInstructions: nil,
+            workingDirectory: workingDirectory,
+            mode: .digest
+        )
+        let spec = Self.peerAgentSurfaceSpec(
+            teamName: team.id,
+            agentInstanceId: agentInstanceId,
+            cli: cli,
+            workingDirectory: workingDirectory,
+            model: model,
+            binaries: binaries
+        )
+
+        let registry = PeerPaneHostRegistry.shared
+        let lease = try await registry.acquire(host.paneHostSpec)
+        let ensured: (session: PeerPaneSession, outcome: PeerEnsureSurfaceOutcome)
+        do {
+            ensured = try await PeerPaneSession.ensureAndAttach(
+                lease: lease,
+                surfaceSpec: spec,
+                attachment: PeerRunnerAttachment(title: agentName, lifetime: .keepAlive),
+                hostSpec: host.paneHostSpec,
+                agentCli: cli
+            )
+            registry.release(lease)
+        } catch {
+            registry.release(lease)
+            throw error
+        }
+        let session = ensured.session
+        let surfaceID = ensured.outcome.surfaceID
+
+        // From here on the surface exists on the peer. Every exit has to take
+        // it back down, or a failed attach leaves a bridge running there with
+        // nothing on this side pointing at it.
+        func abandonSurface() async {
+            session.teardown()
+            await Self.terminatePeerAgentSurface(
+                hostSockPath: host.activeSockPath,
+                surfaceID: surfaceID
+            )
+        }
+
+        // The ensure is the point of no return on the peer, so re-ask before
+        // building anything on top of it. A deletion that began while this was
+        // ensuring has already decided the roster.
+        guard stillWanted() else {
+            await abandonSurface()
+            throw RemoteAgentError.teamNotFound(team.id)
+        }
+
+        guard let panel = workspace.openRemoteAgentPane(
+            session: session,
+            orientation: orientation,
+            focus: false,
+            from: splitFrom
+        ) else {
+            await abandonSurface()
+            throw RemoteAgentError.paneCreationFailed
+        }
+        Self.bindPeerOwnedAgentPanel(
+            panel: panel,
+            workspace: workspace,
+            teamName: team.id,
+            agentName: agentName,
+            agentInstanceId: agentInstanceId,
+            color: color,
+            hostDisplayName: host.displayName
+        )
+        // A bridged CLI has no `--append-system-prompt` equivalent, so the
+        // runbook arrives as the first turn — the same contract the local
+        // bridged path uses.
+        if !instructions.isEmpty {
+            let briefing = Self.withoutTerminalProtocol(instructions)
+                + "\n\nThis is your standing brief, not a task. "
+                + "Do no work now: reply with exactly "
+                + "\"Agent \(agentName) ready.\" and wait."
+            try? panel.session.send(briefing, from: .leader)
+        }
+
+        let member = AgentMember(
+            id: "\(agentName)@\(team.id)",
+            agentInstanceId: agentInstanceId,
+            name: agentName,
+            teamName: team.id,
+            cli: cli,
+            launchCommand: cli,
+            model: model,
+            agentType: agentType,
+            color: color,
+            instructions: instructions,
+            workspaceId: workspace.id,
+            panelId: panel.id,
+            createdAt: Date(),
+            remoteSurfaceID: surfaceID,
+            remoteSurfaceSpawned: true,
+            remoteAgentSurface: true,
+            hostKey: host.id,
+            originalAgentWorkDir: workingDirectory
+        )
+        // Last gate before the member becomes part of the team, for the same
+        // reason the terminal path has one: adding to a roster a deletion has
+        // already finished with is what orphans the peer's bridge.
+        guard stillWanted() else {
+            _ = workspace.closePanel(panel.id, force: true)
+            await abandonSurface()
+            throw RemoteAgentError.teamNotFound(team.id)
+        }
+        guard adoptAgentMember(member, teamName: team.id) else {
+            _ = workspace.closePanel(panel.id, force: true)
+            await abandonSurface()
+            throw RemoteAgentError.duplicateInstance(member.agentInstanceId)
+        }
+        scheduleAgentGridEqualization(workspace: workspace)
+        RemoteProjectPaths.shared.remember(
+            host: host.id,
+            localRoot: team.workingDirectory,
+            path: workingDirectory
+        )
+        return member
+    }
+
     @MainActor
     private func attachRemoteNativeAgent(
         team: Team,
@@ -2613,6 +3525,23 @@ extension TeamOrchestrator {
                   let ws = located.tabManager.tabs.first(where: { $0.id == located.workspaceId })
             else { return nil }
             return ws.terminalPanel(for: id)
+        }
+
+        // Asked before the panel, deliberately. A peer-owned agent's process
+        // is a child of the FAR daemon, and the surface id in the roster is
+        // the only thing that can address it — it is in no workspace tree (so
+        // no Peer Shells sweep sees it) and in no `ManagedPeerSurfaceStore`
+        // (so no reclaim UI lists it). Deciding by "does a panel exist here"
+        // would skip the terminate entirely for a member whose pane was
+        // already dropped by a rewind, and drop the terminal branch's `/exit`
+        // + ClosePane onto a surface that answers neither.
+        if agent.remoteAgentSurface {
+            if let workspace, let panelId {
+                _ = workspace.closePanel(panelId, force: true)
+            }
+            Self.releasePeerOwnedAgentSurface(agent)
+            reapDetachedAgentWorktree(agent, teamName: teamName)
+            return
         }
 
         // A native remote member is an SSH child owned by AgentSession.
@@ -3182,7 +4111,9 @@ extension TeamOrchestrator {
         }
 
         let workspace = tabManager.tabs.first(where: { $0.id == team.workspaceId })
-        var remoteSurfaces: [(socket: String, hostKey: String, surfaceID: Data)] = []
+        var remoteSurfaces: [
+            (socket: String, hostKey: String, surfaceID: Data, isAgent: Bool)
+        ] = []
         if case let .peer(hostKey) = team.leaderEndpoint,
            let host = RemoteHostStore.shared.sortedHosts.first(where: { $0.id == hostKey }) {
             let panel = workspace?.terminalPanel(for: team.leaderPanelId)
@@ -3197,20 +4128,34 @@ extension TeamOrchestrator {
                     teamName: teamName
                 )?.surfaceID
             if let surfaceID {
-                remoteSurfaces.append((host.activeSockPath, hostKey, surfaceID))
+                remoteSurfaces.append((host.activeSockPath, hostKey, surfaceID, false))
             }
         }
 
         for agent in team.agents {
-            guard let panelID = agent.panelId else { continue }
-            if workspace?.agentPanel(for: panelID) != nil {
-                _ = workspace?.closePanel(panelID, force: true)
-            } else if agent.remoteSurfaceSpawned,
-                      let surfaceID = agent.remoteSurfaceID,
-                      let hostKey = agent.hostKey,
-                      let host = RemoteHostStore.shared.sortedHosts.first(where: { $0.id == hostKey }) {
-                remoteSurfaces.append((host.activeSockPath, hostKey, surfaceID))
+            // Order matters, and it is the peer-owned agent that made it
+            // matter. Such a member has BOTH an `AgentPanel` here and a live
+            // bridge on the peer, so asking "is there a panel?" first closed
+            // the local view and stopped — the far `tm-agent-bridge` kept
+            // running in a project that no longer exists, with the roster
+            // holding the only copy of its surface id, about to be discarded.
+            // Ask about the peer's copy first, close the local view too, and
+            // let both branches reach the removal loop.
+            let peerSurface: (socket: String, hostKey: String, surfaceID: Data, isAgent: Bool)?
+            if agent.remoteSurfaceSpawned,
+               let surfaceID = agent.remoteSurfaceID,
+               let hostKey = agent.hostKey,
+               let host = RemoteHostStore.shared.sortedHosts.first(where: { $0.id == hostKey }) {
+                peerSurface = (
+                    host.activeSockPath, hostKey, surfaceID, agent.remoteAgentSurface
+                )
+            } else {
+                peerSurface = nil
             }
+            if let panelID = agent.panelId, workspace?.agentPanel(for: panelID) != nil {
+                _ = workspace?.closePanel(panelID, force: true)
+            }
+            if let peerSurface { remoteSurfaces.append(peerSurface) }
         }
 
         for remote in remoteSurfaces {
@@ -3222,22 +4167,47 @@ extension TeamOrchestrator {
             }
             do {
                 let connection = try await PeerRelaySession.connect(hostSockPath: remote.socket)
-                do {
-                    try await connection.session.requestClosePane(paneID: remote.surfaceID)
-                } catch {
+                if remote.isAgent {
+                    // An agent surface is never placed in the workspace tree,
+                    // so ClosePane finds nothing and reports success — and
+                    // `waitForRemoteRemoval`, which reads the layout, then
+                    // confirms a removal that never happened. TerminateSurface
+                    // addresses the registry and answers for itself:
+                    // TERMINATED, or NOT_FOUND, which the proto defines as the
+                    // idempotent success a retried cleanup needs.
+                    let result: Termmesh_Peer_V1_TerminateSurfaceResult
+                    do {
+                        result = try await connection.session.terminateSurface(
+                            surfaceID: remote.surfaceID
+                        )
+                    } catch {
+                        await connection.cancel()
+                        throw error
+                    }
                     await connection.cancel()
-                    throw error
-                }
-                // Cancelled exactly once, before confirmation: the removal
-                // poll opens its own probes.
-                await connection.cancel()
-                guard try await waitForRemoteRemoval(
-                    hostSockPath: remote.socket,
-                    surfaceID: remote.surfaceID
-                ) else {
-                    throw RemoteAgentError.projectDeletionIncomplete(
-                        "host did not confirm removal of \(label)"
-                    )
+                    guard result == .terminated || result == .notFound else {
+                        throw RemoteAgentError.projectDeletionIncomplete(
+                            "host refused to terminate \(label) (\(result))"
+                        )
+                    }
+                } else {
+                    do {
+                        try await connection.session.requestClosePane(paneID: remote.surfaceID)
+                    } catch {
+                        await connection.cancel()
+                        throw error
+                    }
+                    // Cancelled exactly once, before confirmation: the removal
+                    // poll opens its own probes.
+                    await connection.cancel()
+                    guard try await waitForRemoteRemoval(
+                        hostSockPath: remote.socket,
+                        surfaceID: remote.surfaceID
+                    ) else {
+                        throw RemoteAgentError.projectDeletionIncomplete(
+                            "host did not confirm removal of \(label)"
+                        )
+                    }
                 }
                 ManagedPeerSurfaceStore.shared.forget(
                     hostKey: remote.hostKey,

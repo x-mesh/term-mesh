@@ -1578,6 +1578,14 @@ final class PeerRelaySession {
         guard connection.hostCapabilities.has(PeerCapability.surfaceEnsureV1) else {
             throw RelayError.capabilityUnavailable(PeerCapability.surfaceEnsureV1)
         }
+        // An agent kind asks the host to own a `tm-agent-bridge` child, which
+        // a daemon that never advertised `surface.agent.v1` cannot do. It
+        // would answer INVALID_REQUEST anyway; refusing here keeps the caller
+        // choosing a fallback instead of reading a wire error to find out.
+        if SessionHostPanes.isAgentSurfaceType(spec.kind),
+           !RemoteHostStore.hostSupportsAgentSurfaces(connection.hostCapabilities) {
+            throw RelayError.capabilityUnavailable(PeerCapability.surfaceAgentV1)
+        }
         await connection.transport.setReadTimeoutSeconds(setupReadTimeoutSeconds)
         let outcome: PeerEnsureSurfaceOutcome
         do {
@@ -1586,7 +1594,8 @@ final class PeerRelaySession {
                 cwd: spec.cwd,
                 executable: spec.executable,
                 args: spec.args,
-                restartPolicy: spec.restartPolicy.wireValue
+                restartPolicy: spec.restartPolicy.wireValue,
+                kind: spec.kind
             )
         } catch {
             await connection.transport.setReadTimeoutSeconds(nil)

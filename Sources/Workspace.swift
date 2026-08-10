@@ -2932,6 +2932,8 @@ final class Workspace: Identifiable {
         // away. Safe when already stopped.
         (panels[panelId] as? AgentPanel)?.session.stop()
         session.teardown()
+        let surfaceID = session.originSurface.surfaceID
+        let isLocalDaemonSession = Self.isLocalSessionHost(session.originSpec)
         _ = closePanel(panelId, force: true)
         // Reopen promptly when the daemon still holds the session — the
         // poller would get there on its own schedule, this just asks now.
@@ -2940,15 +2942,57 @@ final class Workspace: Identifiable {
         // the kick into a destroy/recreate spin, so past a burst the
         // governor withholds it and the reopen falls back to the poller's
         // own cadence.
-        if SessionHostPanes.noteAgentPaneDropped(
-            surfaceID: session.originSurface.surfaceID
-        ) {
+        let mayReopenNow = SessionHostPanes.noteAgentPaneDropped(surfaceID: surfaceID)
+        // WHICH daemon holds it decides who can bring it back, and only one
+        // of the two answers is the poller's. `SessionHostPanes.reconcile()`
+        // lists this Mac's own daemon socket and nothing else, so a surface
+        // owned by a peer is never in its result — before this branch existed,
+        // one rewind (which the comment above rightly calls a healthy case)
+        // retired a peer-owned team member for good: pane gone, roster still
+        // naming the closed panel, and the peer's `tm-agent-bridge` still
+        // running with nothing left pointing at it. A peer's surface is
+        // reattached by the team that owns the member, which is the only side
+        // that knows the host, the instance, and the report wiring to restore.
+        guard !isLocalDaemonSession else {
+            guard mayReopenNow else {
+                #if DEBUG
+                dlog("peer.agentPane.drop.backoff surface reopen demoted to poller cadence")
+                #endif
+                return
+            }
             Task { await SessionHostPanes.reconcile() }
-        } else {
-            #if DEBUG
-            dlog("peer.agentPane.drop.backoff surface reopen demoted to poller cadence")
-            #endif
+            return
         }
+        Task { @MainActor in
+            // The governor means something different on this side. For a local
+            // surface, withholding the kick costs nothing — the poller reopens
+            // it on its own schedule anyway. A peer surface has no poller
+            // behind it, so withholding would BE the permanent loss this
+            // branch exists to prevent. The burst limit therefore buys a wait
+            // instead of a give-up: same anti-spin effect, same eventual
+            // reopen once the host settles.
+            if !mayReopenNow {
+                #if DEBUG
+                dlog("peer.agentPane.drop.backoff peer reattach delayed one poll interval")
+                #endif
+                try? await Task.sleep(for: SessionHostPanes.pollInterval)
+            }
+            await TeamOrchestrator.shared.recoverPeerOwnedAgentPane(
+                closedPanelID: panelId,
+                surfaceID: surfaceID
+            )
+        }
+    }
+
+    /// Whether a pane session is held by THIS machine's daemon — the only
+    /// surfaces `SessionHostPanes.reconcile()` can see, and therefore the only
+    /// ones it can reopen.
+    static func isLocalSessionHost(_ spec: PeerPaneHostSpec) -> Bool {
+        guard case let .direct(sockPath) = spec else { return false }
+        let daemonPath = TermMeshDaemon.shared.daemonPeerSocketPath
+        guard !daemonPath.isEmpty, !sockPath.isEmpty else { return false }
+        return (sockPath as NSString).standardizingPath
+            == (daemonPath as NSString).standardizingPath
     }
 
     /// A closed agent pane must close its peer session. `TerminalPanel`
