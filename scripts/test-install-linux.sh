@@ -44,7 +44,17 @@ if [[ "${MOCK_ARCHIVE_HAS_CLI:-1}" == 1 ]]; then
 echo 'tm-agent test'
 BIN
   chmod +x "$stage/tm-agent"
-  members="term-meshd tm-agent"
+  members="$members tm-agent"
+fi
+# MOCK_ARCHIVE_HAS_BRIDGE=0 reproduces an asset from before the bridge shipped.
+# The bridge is optional: its absence warns, never fails.
+if [[ "${MOCK_ARCHIVE_HAS_BRIDGE:-1}" == 1 ]]; then
+  cat > "$stage/tm-agent-bridge" <<'BIN'
+#!/usr/bin/env bash
+echo 'tm-agent-bridge test'
+BIN
+  chmod +x "$stage/tm-agent-bridge"
+  members="$members tm-agent-bridge"
 fi
 tar -czf "$out" -C "$stage" $members
 rm -rf "$stage"
@@ -160,5 +170,21 @@ MOCK_ARCHIVE_HAS_CLI=0 TERMMESH_INSTALL_PREFIX=/opt/term-mesh-nocli \
 [[ -x /opt/term-mesh-nocli/term-meshd ]]
 [[ ! -e /opt/term-mesh-nocli/tm-agent ]]
 grep -q 'carries no tm-agent' /tmp/nocli-install.log
+
+# The bridge rides the same asset so a Linux peer can hold native codex/kiro
+# agents. It has no --version (pipe-only), so presence and mode are the checks.
+echo '==> the bridge ships and installs beside the daemon'
+TERMMESH_INSTALL_PREFIX=/opt/term-mesh-bridge bash "$INSTALLER" > /tmp/bridge-install.log 2>&1
+[[ -x /opt/term-mesh-bridge/tm-agent-bridge ]] || { echo 'tm-agent-bridge was not installed' >&2; exit 1; }
+grep -q 'installed /opt/term-mesh-bridge/tm-agent-bridge' /tmp/bridge-install.log
+
+# An archive from before the bridge shipped must warn, not fail — peers on
+# older tags keep updating their daemon either way.
+echo '==> an archive without the bridge still installs the daemon'
+MOCK_ARCHIVE_HAS_BRIDGE=0 TERMMESH_INSTALL_PREFIX=/opt/term-mesh-nobridge \
+  bash "$INSTALLER" > /tmp/nobridge-install.log 2>&1
+[[ -x /opt/term-mesh-nobridge/term-meshd ]]
+[[ ! -e /opt/term-mesh-nobridge/tm-agent-bridge ]]
+grep -q 'carries no tm-agent-bridge' /tmp/nobridge-install.log
 
 echo '==> installer scope simulations passed'
