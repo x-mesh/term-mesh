@@ -188,4 +188,69 @@ final class PeerHostStatsTests: XCTestCase {
 
         store.forget(hostB)
     }
+
+    // MARK: - Publishing only on a visible change
+
+    /// A host sitting at the same load still sends a sample every ~2s. The
+    /// sidebar observes this store directly, so publishing each one re-evaluated
+    /// its rows for numbers that had not moved — multiplied by the number of
+    /// connected hosts.
+    @MainActor
+    func testRepeatedIdenticalSamplesDoNotPublish() {
+        let store = PeerHostStatsStore.shared
+        let host = PeerPaneHostKey.ssh(target: "a@quiet", remoteSockPath: "/run/q.sock", port: nil)
+        defer { store.forget(host) }
+
+        store.record(wire(load: 1.0), for: host)
+        let afterFirst = store.generation
+        store.record(wire(load: 1.0), for: host)
+        store.record(wire(load: 1.0), for: host)
+
+        XCTAssertEqual(store.generation, afterFirst,
+                       "identical samples must not wake observers")
+    }
+
+    @MainActor
+    func testChangedReadingPublishes() {
+        let store = PeerHostStatsStore.shared
+        let host = PeerPaneHostKey.ssh(target: "a@busy", remoteSockPath: "/run/b.sock", port: nil)
+        defer { store.forget(host) }
+
+        store.record(wire(load: 1.0), for: host)
+        let afterFirst = store.generation
+        store.record(wire(load: 2.0), for: host)
+
+        XCTAssertNotEqual(store.generation, afterFirst)
+    }
+
+    /// Suppression must key on what is drawn, not on the whole value: the disk
+    /// badge reads fields that never appear in `groups`.
+    @MainActor
+    func testDiskOnlyChangePublishes() {
+        let store = PeerHostStatsStore.shared
+        let host = PeerPaneHostKey.ssh(target: "a@disk", remoteSockPath: "/run/d.sock", port: nil)
+        defer { store.forget(host) }
+
+        store.record(wire(load: 1.0, diskTotal: 100_000_000_000, diskAvailable: 60_000_000_000), for: host)
+        let afterFirst = store.generation
+        store.record(wire(load: 1.0, diskTotal: 100_000_000_000, diskAvailable: 3_000_000_000), for: host)
+
+        XCTAssertNotEqual(store.generation, afterFirst,
+                          "the sidebar's low-disk badge depends on this")
+    }
+
+    /// `receivedAt` differs on every sample by construction, so an
+    /// `Equatable`-based comparison would never suppress anything.
+    func testRendersIdenticallyIgnoresArrivalTime() {
+        let earlier = PeerHostStats(wire(load: 1.0), receivedAt: Date(timeIntervalSince1970: 1_000))
+        let later = PeerHostStats(wire(load: 1.0), receivedAt: Date(timeIntervalSince1970: 2_000))
+        XCTAssertNotEqual(earlier, later, "the values themselves still differ by timestamp")
+        XCTAssertTrue(PeerHostStats.rendersIdentically(earlier, later))
+    }
+
+    func testRendersIdenticallyIsFalseWithoutAPreviousSample() {
+        let sample = PeerHostStats(wire(load: 1.0))
+        XCTAssertFalse(PeerHostStats.rendersIdentically(nil, sample),
+                       "a first sample has nothing to match and must publish")
+    }
 }

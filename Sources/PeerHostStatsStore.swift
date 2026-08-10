@@ -68,6 +68,19 @@ struct PeerHostStats: Equatable, Sendable {
         return diskFreeText
     }
 
+    /// Whether two samples would draw the same, ignoring `receivedAt`.
+    ///
+    /// Deliberately not `Equatable`: `==` includes the timestamp, which differs
+    /// on every sample and would make this comparison always false. Everything
+    /// a view can see is covered — the rendered groups, and the disk figures
+    /// behind the sidebar badge.
+    static func rendersIdentically(_ a: PeerHostStats?, _ b: PeerHostStats?) -> Bool {
+        guard let a, let b else { return false }
+        return a.groups == b.groups
+            && a.diskAvailableBytes == b.diskAvailableBytes
+            && a.diskTotalBytes == b.diskTotalBytes
+    }
+
     init(_ wire: Termmesh_Peer_V1_HostStats, receivedAt: Date = Date()) {
         var groups: [Group] = []
         // Three figures, not one: the first says how busy the machine is,
@@ -155,8 +168,28 @@ final class PeerHostStatsStore: ObservableObject {
 
     private init() {}
 
+    /// Stores a host's sample, and publishes only when what the UI draws
+    /// actually differs.
+    ///
+    /// The sample itself is always stored, because `receivedAt` is what keeps
+    /// `stats(for:)` from serving a stale reading. But `receivedAt` changes on
+    /// every sample by definition, so publishing on it would invalidate every
+    /// observer of this store twice a minute per host regardless of whether a
+    /// single rendered figure moved — and the comparison the titlebar already
+    /// performs (`ContentView`'s `titlebarHostStats != hostStats`) would then
+    /// discard the result. The sidebar has no such guard: it observes this
+    /// store directly, so a host that has been sitting at the same load for
+    /// minutes was re-evaluating its rows anyway.
+    ///
+    /// A host coming back from stale always publishes: its groups are
+    /// unchanged by definition (the same numbers it went quiet on), but the
+    /// stale state itself is what the view was last told about.
     func record(_ stats: Termmesh_Peer_V1_HostStats, for host: PeerPaneHostKey) {
-        byHost[host] = PeerHostStats(stats)
+        let previous = byHost[host]
+        let next = PeerHostStats(stats)
+        byHost[host] = next
+        let wasStale = previous?.isStale ?? true
+        guard wasStale || !PeerHostStats.rendersIdentically(previous, next) else { return }
         generation &+= 1
     }
 
