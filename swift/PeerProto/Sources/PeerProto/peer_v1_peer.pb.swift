@@ -923,6 +923,12 @@ public nonisolated struct Termmesh_Peer_V1_Hello: Sendable {
   /// The daemon can, so the daemon is named. A client that wants a session to
   /// outlive anything connects here instead of guessing a path — the sockets
   /// are already keyed by target AND path, so both are reachable at once.
+  ///
+  /// Like cli_bin_dirs, this rides the pre-auth Hello but is a filesystem path
+  /// on the host: consumers must require successful authentication before
+  /// acting on it. Hosts advertise a path only while something is listening on
+  /// it, so an unauthenticated reader learns nothing a connection attempt would
+  /// not already tell it.
   public var sessionHostSocket: String = String()
 
   public var unknownFields = SwiftProtobuf.UnknownStorage()
@@ -1021,7 +1027,20 @@ public nonisolated struct Termmesh_Peer_V1_SurfaceInfo: Sendable {
 
   public var rows: UInt32 = 0
 
-  /// "terminal" or "browser"; more types may be added later.
+  /// "terminal", "browser", or "agent"; more types may be added later.
+  ///
+  /// "agent" is a daemon-owned NON-PTY child (tm-agent-bridge): its stdout is
+  /// an NDJSON event stream, not terminal bytes. The stream rides ordinary
+  /// PtyData frames (hosts push line-aligned chunks so a reconnect cut never
+  /// splits a JSON line), turn input returns as Input.keys, a GridSnapshot is
+  /// never sent (there is no grid), and Resize is accepted-and-ignored.
+  /// byte_seq / replay-ring / resume semantics are identical to "terminal".
+  ///
+  /// Gated behind capability "surface.agent.v1" (Hello.capabilities,
+  /// evolution rule 3): to a client that did not advertise it the host MUST
+  /// downgrade agent surfaces to attachable=false in SurfaceList and MUST
+  /// reject AttachSurface on them, so an older client never feeds an NDJSON
+  /// stream to a terminal renderer.
   public var surfaceType: String = String()
 
   /// Host policy may forbid per-surface attach.
@@ -1039,6 +1058,11 @@ public nonisolated struct Termmesh_Peer_V1_SurfaceInfo: Sendable {
   /// Git branch of `cwd`, resolved when the host answers, or empty if not
   /// a git repo. Follows `cwd` into a different repository.
   public var branch: String = String()
+
+  /// Which CLI an "agent" surface is bridging: "codex", "kiro", etc.
+  /// Optional semantics — empty for terminal/browser surfaces and on hosts
+  /// that predate agent surfaces (missing-on-wire decodes to "").
+  public var agentCli: String = String()
 
   public var unknownFields = SwiftProtobuf.UnknownStorage()
 
@@ -1125,6 +1149,16 @@ public nonisolated struct Termmesh_Peer_V1_EnsureSurfaceRequest: Sendable {
   public var args: [String] = []
 
   public var restartPolicy: Termmesh_Peer_V1_EnsureSurfaceRestartPolicy = .unspecified
+
+  /// Surface kind to create. Empty means "terminal" — the only kind that
+  /// existed before this field, so older senders and older daemons remain
+  /// compatible by default. "agent" asks the daemon to own `executable` as a
+  /// non-PTY child whose stdout NDJSON rides PtyData (see
+  /// SurfaceInfo.surface_type). Senders MUST NOT send "agent" to a host that
+  /// did not advertise "surface.agent.v1" (Hello.capabilities). The kind is
+  /// part of the surface spec: a terminal<->agent change on the same key is
+  /// an ENSURE_SURFACE_RESULT_SPEC_CONFLICT, never a silent conversion.
+  public var kind: String = String()
 
   public var unknownFields = SwiftProtobuf.UnknownStorage()
 
@@ -3610,7 +3644,7 @@ nonisolated extension Termmesh_Peer_V1_SurfaceList: SwiftProtobuf.Message, Swift
 
 nonisolated extension Termmesh_Peer_V1_SurfaceInfo: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
   public static let protoMessageName: String = _protobuf_package + ".SurfaceInfo"
-  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{3}surface_id\0\u{3}workspace_name\0\u{1}title\0\u{1}cols\0\u{1}rows\0\u{3}surface_type\0\u{1}attachable\0\u{1}cwd\0\u{1}branch\0")
+  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{3}surface_id\0\u{3}workspace_name\0\u{1}title\0\u{1}cols\0\u{1}rows\0\u{3}surface_type\0\u{1}attachable\0\u{1}cwd\0\u{1}branch\0\u{3}agent_cli\0")
 
   public mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
     while let fieldNumber = try decoder.nextFieldNumber() {
@@ -3627,6 +3661,7 @@ nonisolated extension Termmesh_Peer_V1_SurfaceInfo: SwiftProtobuf.Message, Swift
       case 7: try { try decoder.decodeSingularBoolField(value: &self.attachable) }()
       case 8: try { try decoder.decodeSingularStringField(value: &self.cwd) }()
       case 9: try { try decoder.decodeSingularStringField(value: &self.branch) }()
+      case 10: try { try decoder.decodeSingularStringField(value: &self.agentCli) }()
       default: break
       }
     }
@@ -3660,6 +3695,9 @@ nonisolated extension Termmesh_Peer_V1_SurfaceInfo: SwiftProtobuf.Message, Swift
     if !self.branch.isEmpty {
       try visitor.visitSingularStringField(value: self.branch, fieldNumber: 9)
     }
+    if !self.agentCli.isEmpty {
+      try visitor.visitSingularStringField(value: self.agentCli, fieldNumber: 10)
+    }
     try unknownFields.traverse(visitor: &visitor)
   }
 
@@ -3673,6 +3711,7 @@ nonisolated extension Termmesh_Peer_V1_SurfaceInfo: SwiftProtobuf.Message, Swift
     if lhs.attachable != rhs.attachable {return false}
     if lhs.cwd != rhs.cwd {return false}
     if lhs.branch != rhs.branch {return false}
+    if lhs.agentCli != rhs.agentCli {return false}
     if lhs.unknownFields != rhs.unknownFields {return false}
     return true
   }
@@ -3810,7 +3849,7 @@ nonisolated extension Termmesh_Peer_V1_DetachSurface: SwiftProtobuf.Message, Swi
 
 nonisolated extension Termmesh_Peer_V1_EnsureSurfaceRequest: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
   public static let protoMessageName: String = _protobuf_package + ".EnsureSurfaceRequest"
-  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{3}request_id\0\u{1}key\0\u{1}cwd\0\u{1}executable\0\u{1}args\0\u{3}restart_policy\0")
+  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{3}request_id\0\u{1}key\0\u{1}cwd\0\u{1}executable\0\u{1}args\0\u{3}restart_policy\0\u{1}kind\0")
 
   public mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
     while let fieldNumber = try decoder.nextFieldNumber() {
@@ -3824,6 +3863,7 @@ nonisolated extension Termmesh_Peer_V1_EnsureSurfaceRequest: SwiftProtobuf.Messa
       case 4: try { try decoder.decodeSingularStringField(value: &self.executable) }()
       case 5: try { try decoder.decodeRepeatedStringField(value: &self.args) }()
       case 6: try { try decoder.decodeSingularEnumField(value: &self.restartPolicy) }()
+      case 7: try { try decoder.decodeSingularStringField(value: &self.kind) }()
       default: break
       }
     }
@@ -3848,6 +3888,9 @@ nonisolated extension Termmesh_Peer_V1_EnsureSurfaceRequest: SwiftProtobuf.Messa
     if self.restartPolicy != .unspecified {
       try visitor.visitSingularEnumField(value: self.restartPolicy, fieldNumber: 6)
     }
+    if !self.kind.isEmpty {
+      try visitor.visitSingularStringField(value: self.kind, fieldNumber: 7)
+    }
     try unknownFields.traverse(visitor: &visitor)
   }
 
@@ -3858,6 +3901,7 @@ nonisolated extension Termmesh_Peer_V1_EnsureSurfaceRequest: SwiftProtobuf.Messa
     if lhs.executable != rhs.executable {return false}
     if lhs.args != rhs.args {return false}
     if lhs.restartPolicy != rhs.restartPolicy {return false}
+    if lhs.kind != rhs.kind {return false}
     if lhs.unknownFields != rhs.unknownFields {return false}
     return true
   }
