@@ -2386,6 +2386,7 @@ struct RemoteHostGroupView: View, Equatable {
     let onEdit: (PeerHostEditorContext) -> Void
     @State private var isExpanded: Bool
     @State private var showDeleteConfirm = false
+    @State private var showForceDisconnectConfirm = false
     @State private var showNewWorkspaceAlert = false
     @State private var newWorkspaceTitle = ""
     @State private var showShellCleanup = false
@@ -2718,10 +2719,28 @@ struct RemoteHostGroupView: View, Equatable {
                 .disabled(host.supportsWorkspaceLifecycle != true)
 
                 Divider()
-                // No confirmation: the host keeps running, so reconnecting
-                // picks the work back up. Guarding a reversible action wears
-                // out the habit that has to still work for Clean Up Panes.
-                Button("Disconnect") { store.forceDisconnectSavedHost(host) }
+                // Two different things, and they must stay two.
+                //
+                // Disconnect drops this Mac's end of the link and leaves every
+                // pane running on the host, so reconnecting picks the work back
+                // up — that reversibility is exactly why it needs no
+                // confirmation. Force Disconnect reaches across the link and
+                // closes those panes, which nothing here can undo.
+                //
+                // These were merged into one unconfirmed "Disconnect" calling
+                // the force path, while the comment above it still described
+                // the safe one. The guard had been removed on the strength of a
+                // property the remaining action did not have, and a routine
+                // disconnect closed five live panes on a peer.
+                if store.hasSidebarLease(for: host.id) {
+                    Button("Disconnect") { store.disconnectSavedHost(host) }
+                }
+                Button("Force Disconnect (Close All Panes)…", role: .destructive) {
+                    Task { @MainActor in
+                        try? await Task.sleep(nanoseconds: 50_000_000)
+                        showForceDisconnectConfirm = true
+                    }
+                }
 
                 Divider()
                 Button("Clean Up Panes…", role: .destructive) {
@@ -2830,6 +2849,21 @@ struct RemoteHostGroupView: View, Equatable {
             Button("Cancel", role: .cancel) {}
         } message: {
             Text("The saved host profile is removed. Open panes and mirrors stay connected.")
+        }
+        .confirmationDialog(
+            "Force disconnect \"\(host.displayName)\"?",
+            isPresented: $showForceDisconnectConfirm
+        ) {
+            Button("Force Disconnect", role: .destructive) {
+                store.forceDisconnectSavedHost(host)
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            // Worth saying plainly: the panes close here, but whatever was
+            // running inside them keeps running on the host. That is what
+            // makes the difference from Disconnect recoverable at all — the
+            // work survives, only the view of it is gone.
+            Text("Closes every pane, mirror and relay window opened from this host. Remote processes keep running on the host.")
         }
         .alert("New Workspace", isPresented: $showNewWorkspaceAlert) {
             TextField("Workspace name", text: $newWorkspaceTitle)

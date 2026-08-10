@@ -1460,4 +1460,51 @@ final class SessionHostAdvertisementTests: XCTestCase {
         let decoded = try Termmesh_Peer_V1_Hello(serializedBytes: old.serializedData())
         XCTAssertEqual(decoded.sessionHostSocket, "")
     }
+
+    // MARK: - Not stealing a live socket
+
+    /// The path being occupied is the normal case for a second launch, and
+    /// unlinking it strands whoever holds it: their listener stays bound to an
+    /// inode nothing can reach, accepting only on connections they already had.
+    func testStartRefusesAPathAnotherServerIsServing() async throws {
+        let sockPath = "/tmp/tm-peer-inuse-\(UUID().uuidString.prefix(8)).sock"
+        defer { try? FileManager.default.removeItem(atPath: sockPath) }
+
+        let first = PeerServer(socketPath: sockPath, provider: StaticSurfaceProvider(surfaces: []))
+        try await first.start()
+        defer { Task { await first.stop() } }
+
+        let second = PeerServer(socketPath: sockPath, provider: StaticSurfaceProvider(surfaces: []))
+        do {
+            try await second.start()
+            XCTFail("second start must not take a path that is being served")
+        } catch let error as PeerServerError {
+            XCTAssertEqual(error, .socketInUse(path: sockPath))
+        }
+
+        // And the first server is still the one on the path.
+        XCTAssertTrue(PeerServer.isSocketAlive(atPath: sockPath))
+    }
+
+    /// A crashed server leaves its entry behind. That file must still be
+    /// cleared, or nothing could ever restart.
+    func testStartClaimsAStaleSocketFile() async throws {
+        let sockPath = "/tmp/tm-peer-stale-\(UUID().uuidString.prefix(8)).sock"
+        defer { try? FileManager.default.removeItem(atPath: sockPath) }
+        FileManager.default.createFile(atPath: sockPath, contents: Data())
+
+        XCTAssertFalse(PeerServer.isSocketAlive(atPath: sockPath),
+                       "a plain file answers no connect")
+
+        let server = PeerServer(socketPath: sockPath, provider: StaticSurfaceProvider(surfaces: []))
+        try await server.start()
+        defer { Task { await server.stop() } }
+        XCTAssertTrue(PeerServer.isSocketAlive(atPath: sockPath))
+    }
+
+    func testIsSocketAliveIsFalseForAnAbsentPath() {
+        XCTAssertFalse(
+            PeerServer.isSocketAlive(atPath: "/tmp/tm-peer-absent-\(UUID().uuidString).sock")
+        )
+    }
 }
