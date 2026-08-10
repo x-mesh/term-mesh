@@ -1257,11 +1257,14 @@ struct PeerHostEditorView: View {
             }
             let key = String(kv[0]).trimmingCharacters(in: .whitespaces)
             let value = String(kv[1]).trimmingCharacters(in: .whitespaces)
-            guard PeerHostEnvironment.sanitized([key: value]).count == 1 else {
-                validationError = "Invalid environment variable name: \(key)"
-                return nil
-            }
             environment[key] = value
+        }
+        do {
+            try PeerEnsureEnvironment.validate(environment)
+        } catch {
+            validationError = (error as? LocalizedError)?.errorDescription
+                ?? "Invalid peer environment: \(error)"
+            return nil
         }
         draft.environment = environment.isEmpty ? nil : environment
         if let identity = draft.identityFile {
