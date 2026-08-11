@@ -1029,6 +1029,44 @@ final class AgentSessionTests: XCTestCase {
         XCTAssertLessThanOrEqual(snapshot.utf8.count, 165)
     }
 
+    /// Measured against a live native pane: the tool row already read
+    /// `Bash echo API_KEY=[redacted]` while the agent's own answer repeated the
+    /// value verbatim on the next line, and a socket read carried it off the
+    /// machine. Redaction belongs to the read, not to one row kind.
+    func testVisibleTranscriptRedactsCredentialsInEveryRowKindNotOnlyTools() {
+        let token = "sk-proj-FAKEFAKEFAKEFAKE1234"
+        let rows = AgentSession.rows(for: [
+            .said(id: UUID(), .leader, "run this: echo API_KEY=\(token)"),
+            .tool(id: UUID(), .init(name: "Bash", headline: "echo API_KEY=\(token)")),
+            .answered(id: UUID(), "the command printed:\nAPI_KEY=\(token)"),
+            .notice(id: UUID(), "reconnected with token=\(token)"),
+        ])
+
+        let snapshot = AgentSession.visibleTranscriptText(rows: rows)
+        XCTAssertFalse(snapshot.contains(token),
+                       "no transcript row may carry a credential off-process")
+        XCTAssertTrue(snapshot.contains("[redacted]"))
+    }
+
+    /// Answers are not tool headlines: they keep their line structure and are
+    /// bounded by the transcript tail, never by the 160-byte row budget.
+    func testAnswerRedactionKeepsAnswerShape() {
+        let token = "ghp_abcdefghijklmnopqrstuvwxyz1234567890"
+        let body = String(repeating: "detail line\n", count: 20)
+        let rows = AgentSession.rows(for: [
+            .answered(id: UUID(), "start \(token)\n" + body + "end"),
+        ])
+
+        let snapshot = AgentSession.visibleTranscriptText(rows: rows)
+        XCTAssertFalse(snapshot.contains(token))
+        XCTAssertTrue(snapshot.contains("[redacted]"))
+        XCTAssertTrue(snapshot.contains("detail line\ndetail line"),
+                      "answers keep their line structure")
+        XCTAssertTrue(snapshot.hasSuffix("end"))
+        XCTAssertGreaterThan(snapshot.utf8.count, 160,
+                             "the tool row's byte budget must not reach answers")
+    }
+
     func testToolHeadlineRedactsPortableEnvironmentCredentialsAndProviderTokens() {
         let cases = [
             ("AWS_SECRET_ACCESS_KEY='aws-secret-value' run", "aws-secret-value"),

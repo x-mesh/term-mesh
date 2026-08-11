@@ -595,13 +595,44 @@ final class AgentSession {
     /// boundary as well as presentation: one line, credential-shaped values
     /// redacted, and a fixed UTF-8 budget before either consumer sees it.
     static func projectedToolHeadline(_ raw: String) -> String {
-        var projected = raw
+        let flattened = raw
             .components(separatedBy: .newlines)
             .joined(separator: " ")
             .split(whereSeparator: \.isWhitespace)
             .joined(separator: " ")
-        projected = redactingSensitiveEnvironmentAssignments(projected)
-        let redactions = [
+        return middleBounded(redactingCredentials(flattened), maxUTF8Bytes: 160)
+    }
+
+    /// Redaction on its own, without the tool row's flattening or byte budget.
+    ///
+    /// A credential is no less exposed for having been written into an answer
+    /// than into a shell command: an agent that reads a secret and repeats it
+    /// in prose leaves it in `.answered`, and every transcript row exits the
+    /// process through the same socket read. Rows that must keep their own
+    /// shape — answers, instructions, notices — take this alone.
+    ///
+    /// The PEM pattern still stops at a line break, so a multi-line private
+    /// key loses its header and keeps its body. That is deliberate: matching
+    /// across lines without an `-----END-----` to anchor on would swallow the
+    /// rest of the transcript.
+    static func redactingCredentials(_ text: String) -> String {
+        var redacted = redactingSensitiveEnvironmentAssignments(text)
+        for (regex, template) in credentialRedactions {
+            let range = NSRange(redacted.startIndex..<redacted.endIndex, in: redacted)
+            redacted = regex.stringByReplacingMatches(
+                in: redacted,
+                range: range,
+                withTemplate: template
+            )
+        }
+        return redacted
+    }
+
+    /// Compiled once. Every row of a read now runs the whole set, and a
+    /// transcript is bounded at 500 rows, so rebuilding these per row would
+    /// make `NSRegularExpression` compilation the dominant cost of a read.
+    private static let credentialRedactions: [(NSRegularExpression, String)] = {
+        let patterns = [
             (#"(?i)(bearer\s+)(?:\"[^\"]*\"|'[^']*'|[^\s]+)"#, "$1[redacted]"),
             (#"(?i)((?:--)?(?:api[-_]?key|access[-_]?token|auth[-_]?token|token|password|passwd|secret)\s*(?:=|:)\s*)(?:\"[^\"]*\"|'[^']*'|[^\s]+)"#, "$1[redacted]"),
             (#"(?i)((?:--)(?:api[-_]?key|token|password|passwd|secret)\s+)(?:\"[^\"]*\"|'[^']*'|[^\s]+)"#, "$1[redacted]"),
@@ -610,24 +641,20 @@ final class AgentSession {
             (#"\b(?:gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|sk-(?:proj-)?[A-Za-z0-9_-]{16,})\b"#, "[redacted]"),
             (#"(?i)-----BEGIN(?: [A-Z0-9]+)* PRIVATE KEY-----.*"#, "[redacted private key]"),
         ]
-        for (pattern, template) in redactions {
-            guard let regex = try? NSRegularExpression(pattern: pattern) else { continue }
-            let range = NSRange(projected.startIndex..<projected.endIndex, in: projected)
-            projected = regex.stringByReplacingMatches(
-                in: projected,
-                range: range,
-                withTemplate: template
-            )
+        return patterns.compactMap { pattern, template in
+            (try? NSRegularExpression(pattern: pattern)).map { ($0, template) }
         }
-        return middleBounded(projected, maxUTF8Bytes: 160)
-    }
+    }()
 
     /// Parse portable shell environment assignments before applying the
     /// presentation bound. Values whose key has a credential-bearing component
     /// must disappear in full, including quoted values and URI userinfo.
+    private static let environmentAssignmentPattern = try? NSRegularExpression(
+        pattern: #"(?<![A-Za-z0-9_])([A-Za-z_][A-Za-z0-9_]*)(\s*=\s*)(\"[^\"]*\"|'[^']*'|[^\s]+)"#
+    )
+
     private static func redactingSensitiveEnvironmentAssignments(_ text: String) -> String {
-        let pattern = #"(?<![A-Za-z0-9_])([A-Za-z_][A-Za-z0-9_]*)(\s*=\s*)(\"[^\"]*\"|'[^']*'|[^\s]+)"#
-        guard let regex = try? NSRegularExpression(pattern: pattern) else { return text }
+        guard let regex = environmentAssignmentPattern else { return text }
         let mutable = NSMutableString(string: text)
         let matches = regex.matches(
             in: text,
@@ -710,9 +737,10 @@ final class AgentSession {
             switch row.entry {
             case .said(_, let speaker, let text):
                 let instruction = read(instruction: text)
-                return "\(speaker == .person ? "you" : "leader"): \(instruction.headline)"
+                return "\(speaker == .person ? "you" : "leader"): "
+                    + redactingCredentials(instruction.headline)
             case .answered(_, let text):
-                return text
+                return redactingCredentials(text)
             case .thought:
                 // Reasoning is visually clamped to two layout-dependent lines.
                 // A socket has no pane width with which to reproduce that
@@ -732,7 +760,7 @@ final class AgentSession {
                 }
                 return parts.joined(separator: " · ")
             case .notice(_, let text):
-                return "! \(text)"
+                return "! " + redactingCredentials(text)
             }
         }.joined(separator: "\n")
 
