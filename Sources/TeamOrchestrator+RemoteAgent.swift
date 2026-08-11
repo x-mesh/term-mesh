@@ -1480,20 +1480,18 @@ extension TeamOrchestrator {
         dlog("leader.attach.stage prepare.sent host=\(hostKey)")
 #endif
 
-        let promptStages = Self.remoteLeaderPromptStageCommands(
-            systemPrompt: systemPrompt,
-            promptFile: promptFile
-        )
-        for stage in promptStages {
-            guard await sendRemoteLeaderStage(
+        if let systemPrompt, let promptFile {
+            guard await stageRemoteLeaderPrompt(
                 session: session,
-                text: stage,
-                settleDelay: 0.05
+                host: host,
+                systemPrompt: systemPrompt,
+                promptFile: promptFile
             ) else {
                 _ = await sendRemoteLeaderStage(session: session, text: "stty echo")
                 await attempt.compensate()
                 throw RemoteAgentError.promptStagingFailed(host.displayName)
             }
+            try await attempt.ensureCurrent()
         }
 
         let launch = Self.remoteLeaderCommand(
@@ -2507,6 +2505,121 @@ extension TeamOrchestrator {
             script: "rm -f -- \(shellQuoted(promptFile))",
             timeoutSeconds: 10
         )
+    }
+
+    /// Put the leader's system prompt on the host, by whichever route that
+    /// host can actually read.
+    ///
+    /// Two routes, in cost order:
+    ///
+    ///  1. **One SSH round trip.** No PTY, no size limit worth worrying about,
+    ///     one command.
+    ///  2. **Typed into the pane as base64 chunks.** Needed only when the pane
+    ///     cannot see what SSH wrote — a systemd unit with `PrivateTmp` has
+    ///     its own `/tmp`, so the file exists for SSH and is missing for the
+    ///     shell that has to read it.
+    ///
+    /// Which route applies is *asked of the pane*, not inferred from the
+    /// host's OS: the pane touches a witness file beside the prompt and SSH
+    /// looks for it. That answers the only question that matters — do these
+    /// two processes share a filesystem view — and it stays right on hosts
+    /// nobody has thought about yet.
+    ///
+    /// Route 2 is why this exists. A 7 KB prompt is ~10 KB of base64 across
+    /// ~14 typed commands, and a PTY in canonical mode holds 1024 bytes: sent
+    /// back-to-back, most of it never reaches the shell, and every write still
+    /// reports success. That is how a leader came to launch against a
+    /// zero-byte prompt while the app believed staging had worked.
+    private func stageRemoteLeaderPrompt(
+        session: PeerPaneSession,
+        host: HostEntry,
+        systemPrompt: String,
+        promptFile: String
+    ) async -> Bool {
+        if await Self.writeRemoteLeaderPromptOverSSH(
+            host: host, systemPrompt: systemPrompt, promptFile: promptFile
+        ), await paneCanSeeStagedPrompt(
+            session: session, host: host, promptFile: promptFile
+        ) {
+#if DEBUG
+            dlog("leader.prompt.stage route=ssh host=\(host.id)")
+#endif
+            return true
+        }
+#if DEBUG
+        dlog("leader.prompt.stage route=pty host=\(host.id)")
+#endif
+        RemoteWorkLog.infoOffMain(
+            "\(host.displayName): the pane cannot see files written over SSH; typing the leader prompt instead"
+        )
+        let stages = Self.remoteLeaderPromptStageCommands(
+            systemPrompt: systemPrompt,
+            promptFile: promptFile
+        )
+        for stage in stages {
+            // 0.35s, not 50ms. Each command must be consumed before the next
+            // arrives or they queue into a 1 KB PTY buffer and are lost.
+            guard await sendRemoteLeaderStage(
+                session: session, text: stage, settleDelay: 0.35
+            ) else { return false }
+        }
+        return true
+    }
+
+    private static func writeRemoteLeaderPromptOverSSH(
+        host: HostEntry,
+        systemPrompt: String,
+        promptFile: String
+    ) async -> Bool {
+        guard let sshTarget = host.sshTarget, !sshTarget.isEmpty else { return false }
+        let script = "umask 077; printf %s \(shellQuoted(systemPrompt)) > \(shellQuoted(promptFile))"
+        do {
+            _ = try await PeerHostReadinessChecker.runScript(
+                sshTarget: sshTarget,
+                port: host.sshPort,
+                identityFile: host.identityFile,
+                script: script,
+                timeoutSeconds: 20
+            )
+            return true
+        } catch {
+            return false
+        }
+    }
+
+    /// Ask the pane whether the file SSH just wrote is there, and get the
+    /// answer back over SSH.
+    ///
+    /// The witness has to travel in the direction the pane can write and SSH
+    /// can read; anything the pane merely prints would have to be scraped out
+    /// of terminal output that also carries a shell prompt and the person's
+    /// own scrollback. One short command stays far inside any line limit,
+    /// which is the whole reason this check is cheap enough to always run.
+    private func paneCanSeeStagedPrompt(
+        session: PeerPaneSession,
+        host: HostEntry,
+        promptFile: String
+    ) async -> Bool {
+        guard let sshTarget = host.sshTarget, !sshTarget.isEmpty else { return false }
+        let witness = promptFile + ".seen"
+        let probe = "[ -s \(Self.shellQuoted(promptFile)) ] && : > \(Self.shellQuoted(witness))"
+        guard await sendRemoteLeaderStage(session: session, text: probe, settleDelay: 0.2) else {
+            return false
+        }
+        let check = "if [ -f \(Self.shellQuoted(witness)) ]; then rm -f \(Self.shellQuoted(witness)); printf %s __TERMMESH_PROMPT_VISIBLE__; fi; exit 0"
+        for _ in 0..<4 {
+            if let output = try? await PeerHostReadinessChecker.runScript(
+                sshTarget: sshTarget,
+                port: host.sshPort,
+                identityFile: host.identityFile,
+                script: check,
+                timeoutSeconds: 10
+            ), output.contains("__TERMMESH_PROMPT_VISIBLE__") {
+                return true
+            }
+            try? await Task.sleep(nanoseconds: 250_000_000)
+        }
+        return false
     }
 
     /// Send one remote-leader bootstrap line directly to the attached peer
