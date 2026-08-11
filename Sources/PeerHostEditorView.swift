@@ -75,6 +75,11 @@ struct PeerHostEditorView: View {
     /// Empty on a consistent host — a warning shown on healthy hosts is
     /// one people stop reading.
     @State private var binaryWarnings: [String] = []
+    /// term-meshd processes this host keeps running while nothing points at
+    /// them. Empty on Linux hosts by design (see `refreshDaemonSnapshot`).
+    @State private var staleDaemons: [PeerHostDoctor.DaemonInstance] = []
+    @State private var showDaemonCleanupConfirm = false
+    @State private var daemonCleanupBusy = false
     /// Version reported by a binary found on the host while term-meshd
     /// itself isn't running (`.daemonMissing`). Kept out of that case's
     /// associated value since its signature must not change.
@@ -286,6 +291,7 @@ struct PeerHostEditorView: View {
 
             agentStackStatusLine
             binaryWarningLines
+            staleDaemonLine
 
             HStack {
                 Button("Test Relay", action: runTest)
@@ -309,6 +315,11 @@ struct PeerHostEditorView: View {
                 if showsAgentInstallButton {
                     Button("Set up notifications…") { showAgentInstallConfirm = true }
                         .disabled(doctorBusy)
+                }
+                if !staleDaemons.isEmpty {
+                    Button("Clean Up Daemons…") { showDaemonCleanupConfirm = true }
+                        .disabled(doctorBusy || daemonCleanupBusy)
+                        .help("Stop term-meshd processes this host is no longer using")
                 }
                 Spacer()
                 Button("Cancel", action: onCancel)
@@ -373,6 +384,65 @@ struct PeerHostEditorView: View {
             Button("Cancel", role: .cancel) {}
         } message: {
             Text("Copies agent-notify.sh and agent-title.sh to ~/.local/bin and, when Claude Code is installed there, wires its Notification and Stop hooks (existing settings are backed up).")
+        }
+        .confirmationDialog(
+            staleDaemons.count == 1
+                ? "Stop 1 unused term-meshd process on \"\(profile.sshTarget)\"?"
+                : "Stop \(staleDaemons.count) unused term-meshd processes on \"\(profile.sshTarget)\"?",
+            isPresented: $showDaemonCleanupConfirm
+        ) {
+            Button("Stop", role: .destructive) { runDaemonCleanup() }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            // Name the exact processes: this ends something on another
+            // machine, and "some daemons" is not a thing anyone can agree to.
+            Text(
+                "Stops \(staleDaemonPidSummary). The app serving this host keeps running, and open panes, mirrors and sessions are untouched — these processes are not serving any of them."
+            )
+        }
+    }
+
+    @ViewBuilder
+    private var staleDaemonLine: some View {
+        if !staleDaemons.isEmpty {
+            Label(staleDaemonMessage, systemImage: "xmark.bin")
+                .font(.caption).foregroundColor(.orange)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+    }
+
+    private var staleDaemonPidSummary: String {
+        staleDaemons.map { daemon in
+            daemon.elapsed.isEmpty ? "pid \(daemon.pid)" : "pid \(daemon.pid) (up \(daemon.elapsed))"
+        }.joined(separator: ", ")
+    }
+
+    private var staleDaemonMessage: String {
+        let lead = staleDaemons.count == 1
+            ? "1 term-meshd process here is serving nothing"
+            : "\(staleDaemons.count) term-meshd processes here are serving nothing"
+        return "\(lead) — \(staleDaemonPidSummary). "
+            + "They outlived the app that started them and this host's app is not using them."
+    }
+
+    /// Ends exactly the pids the dialog named, then re-probes so the row
+    /// reflects what actually happened rather than what was requested.
+    private func runDaemonCleanup() {
+        guard let draft = testedDraft, !staleDaemons.isEmpty else { return }
+        let pids = staleDaemons.map(\.pid)
+        let gen = doctorGeneration
+        daemonCleanupBusy = true
+        Task {
+            let killed = (try? await PeerHostDoctor.terminateDaemons(
+                sshTarget: draft.sshTarget, port: draft.sshPort,
+                identityFile: draft.identityFile, pids: pids
+            )) ?? []
+            guard gen == doctorGeneration else { return }
+            daemonCleanupBusy = false
+            RemoteWorkLog.info(
+                "Stopped \(killed.count) of \(pids.count) unused term-meshd process(es) on \(draft.sshTarget)"
+            )
+            await refreshDaemonSnapshot(draft: draft, gen: gen)
         }
     }
 
@@ -846,6 +916,9 @@ struct PeerHostEditorView: View {
         showInstallConfirm = false
         showUpdateConfirm = false
         showForceReinstallConfirm = false
+        staleDaemons = []
+        showDaemonCleanupConfirm = false
+        daemonCleanupBusy = false
         agentStackState = .idle
         showAgentInstallConfirm = false
     }
@@ -888,6 +961,7 @@ struct PeerHostEditorView: View {
                 doctorState = resolved
                 await refreshAgentStack(draft: draft, gen: gen)
                 await refreshBinaryInventory(draft: draft, gen: gen)
+                await refreshDaemonSnapshot(draft: draft, gen: gen)
             case .daemonMissing:
                 // Binary may still be present with the service just not
                 // running — surface that without touching the frozen
@@ -1045,6 +1119,26 @@ struct PeerHostEditorView: View {
         binaryWarnings = warnings
         for warning in warnings {
             RemoteWorkLog.info("\(draft.sshTarget): \(warning)")
+        }
+    }
+
+    /// Mac hosts only — the probe answers `exit 44` elsewhere, which arrives
+    /// here as nil and leaves the row silent. A Linux host's daemon is
+    /// supposed to outlive every app, so there is nothing to report there.
+    private func refreshDaemonSnapshot(draft: PeerHostProfile, gen: Int) async {
+        guard gen == doctorGeneration else { return }
+        let snapshot = await PeerHostDoctor.daemonSnapshot(
+            sshTarget: draft.sshTarget, port: draft.sshPort,
+            identityFile: draft.identityFile
+        )
+        guard gen == doctorGeneration else { return }
+        let stale = snapshot.map(PeerHostDoctor.staleDaemons) ?? []
+        staleDaemons = stale
+        if !stale.isEmpty {
+            RemoteWorkLog.info(
+                "\(draft.sshTarget): \(stale.count) term-meshd process(es) here serve nothing — "
+                    + "pid \(stale.map { String($0.pid) }.joined(separator: ", "))"
+            )
         }
     }
 
