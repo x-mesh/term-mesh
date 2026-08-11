@@ -119,6 +119,107 @@ enum PeerHostDoctor {
     static let hostKindProbeCommand =
         #"sh -c 'case "$(uname -s)" in Darwin) echo term-mesh-app ;; Linux) echo term-meshd ;; *) exit 44 ;; esac'"#
 
+    /// Which `term-meshd` processes a Mac host is running, and which sockets
+    /// each one holds — enough to tell a daemon the app is using from one
+    /// nothing points at any more.
+    ///
+    /// Darwin only (exit 44 elsewhere): a Linux host runs its daemon under
+    /// systemd, where a parent of 1 and a lifetime longer than any app are
+    /// both correct. Applying this judgement there would report every healthy
+    /// host as broken.
+    ///
+    /// `lsof -a` is not optional. Without `-a`, `-p` and `-U` are OR-ed and
+    /// every process reports every unix socket on the machine — which reads as
+    /// "the app is connected to all of them" and finds nothing stale, ever.
+    ///
+    /// No single quotes in the body (same `sh -c '…'` wrapper constraint as
+    /// remoteCommand/diagnoseCommand).
+    static let daemonInstancesProbeCommand =
+        #"sh -c 'if [ "$(uname -s)" != Darwin ]; then exit 44; fi; app=$(pgrep -f "term-mesh.app/Contents/MacOS/term-mesh" | head -1); echo "app=${app:-none}"; if [ -n "$app" ]; then echo "appsocks=$(lsof -a -p "$app" -U -F n 2>/dev/null | sed -n "s/^n//p" | grep term-mesh | sort -u | tr "\n" " ")"; fi; for p in $(pgrep -f "Resources/bin/term-meshd" 2>/dev/null); do ppid=$(ps -o ppid= -p "$p" 2>/dev/null | tr -d " "); etime=$(ps -o etime= -p "$p" 2>/dev/null | tr -d " "); socks=$(lsof -a -p "$p" -U -F n 2>/dev/null | sed -n "s/^n//p" | grep term-mesh | sort -u | tr "\n" " "); echo "daemon=$p ppid=${ppid:-0} etime=$etime socks=$socks"; done; exit 0'"#
+
+    /// One `term-meshd` process on a peer, as the probe above reports it.
+    struct DaemonInstance: Equatable {
+        var pid: Int
+        var parentPid: Int
+        /// `ps -o etime=` form (`01-05:10:54`), shown as-is; the point is
+        /// "since yesterday", not arithmetic.
+        var elapsed: String
+        var sockets: [String]
+    }
+
+    /// A Mac peer's daemon situation: the app that serves the peer socket, and
+    /// every daemon process around it.
+    struct DaemonSnapshot: Equatable {
+        var appPid: Int?
+        var appSockets: [String]
+        var daemons: [DaemonInstance]
+    }
+
+    static func parseDaemonSnapshot(_ output: String) -> DaemonSnapshot {
+        var snapshot = DaemonSnapshot(appPid: nil, appSockets: [], daemons: [])
+        for line in output.split(separator: "\n", omittingEmptySubsequences: true) {
+            let text = line.trimmingCharacters(in: .whitespaces)
+            if let value = text.dropPrefixIfPresent("app=") {
+                snapshot.appPid = Int(value)
+            } else if let value = text.dropPrefixIfPresent("appsocks=") {
+                snapshot.appSockets = splitSocketList(value)
+            } else if text.hasPrefix("daemon=") {
+                if let instance = parseDaemonInstance(text) {
+                    snapshot.daemons.append(instance)
+                }
+            }
+        }
+        return snapshot
+    }
+
+    private static func splitSocketList(_ value: String) -> [String] {
+        value.split(separator: " ", omittingEmptySubsequences: true)
+            .map(String.init)
+            .filter { $0.hasPrefix("/") }
+    }
+
+    private static func parseDaemonInstance(_ line: String) -> DaemonInstance? {
+        // `daemon=<pid> ppid=<n> etime=<t> socks=<a> <b> …` — socks runs to the
+        // end of the line, so split the head off by its known keys rather than
+        // by whitespace alone.
+        guard let socksRange = line.range(of: " socks=") else { return nil }
+        let head = String(line[line.startIndex..<socksRange.lowerBound])
+        let sockets = splitSocketList(String(line[socksRange.upperBound...]))
+        var pid: Int?
+        var parentPid = 0
+        var elapsed = ""
+        for field in head.split(separator: " ", omittingEmptySubsequences: true) {
+            let text = String(field)
+            if let value = text.dropPrefixIfPresent("daemon=") { pid = Int(value) }
+            else if let value = text.dropPrefixIfPresent("ppid=") { parentPid = Int(value) ?? 0 }
+            else if let value = text.dropPrefixIfPresent("etime=") { elapsed = value }
+        }
+        guard let pid else { return nil }
+        return DaemonInstance(
+            pid: pid, parentPid: parentPid, elapsed: elapsed, sockets: sockets
+        )
+    }
+
+    /// Daemons nothing on this host points at any more.
+    ///
+    /// The test is the app's own socket list: a daemon the app adopted appears
+    /// there as a client connection, so an empty intersection means this
+    /// process is serving nobody. Being parented to 1 is NOT the test —
+    /// outliving the app is deliberate (`daemonShouldOutliveApp`), which is
+    /// exactly why the leftovers accumulate and why a lifetime alone cannot
+    /// separate them.
+    ///
+    /// With no app running, the answer is "none": a daemon may legitimately be
+    /// holding sessions for the next launch to adopt, and killing those would
+    /// destroy the very thing outliving the app exists to protect.
+    static func staleDaemons(in snapshot: DaemonSnapshot) -> [DaemonInstance] {
+        guard snapshot.appPid != nil else { return [] }
+        let appSockets = Set(snapshot.appSockets)
+        return snapshot.daemons.filter { daemon in
+            daemon.sockets.allSatisfy { !appSockets.contains($0) }
+        }
+    }
+
     /// One term-mesh binary a host would run, and which copy it is.
     struct BinaryEntry: Equatable {
         var path: String
@@ -317,6 +418,85 @@ enum PeerHostDoctor {
     /// a remote command), wires Claude's hooks when the host has both
     /// python3 and claude, then smoke-tests the detached emission path.
     /// Throws with a stage-specific message on the first failure.
+    /// Ask a Mac host which daemons it is running. Never throws: a Linux host
+    /// answers `exit 44` by design, and an unreachable one simply has nothing
+    /// to report — neither is a condition the caller should have to handle.
+    static func daemonSnapshot(
+        sshTarget: String,
+        port: Int?,
+        identityFile: String?
+    ) async -> DaemonSnapshot? {
+        do {
+            let output = try await runRemote(
+                sshTarget: sshTarget,
+                port: port,
+                identityFile: identityFile,
+                command: daemonInstancesProbeCommand,
+                timeoutSeconds: 20
+            )
+            let snapshot = parseDaemonSnapshot(output)
+            return snapshot.daemons.isEmpty && snapshot.appPid == nil ? nil : snapshot
+        } catch {
+            return nil
+        }
+    }
+
+    /// Ends the pids fed to it on stdin, one per line.
+    ///
+    /// The pids ride on stdin rather than in the command text for the same
+    /// reason every other probe here is a fixed string: nothing this side
+    /// computes gets to become remote shell syntax. The `*[!0-9]*` guard is
+    /// the remote half of that promise — a line that is not a plain number is
+    /// skipped rather than run.
+    ///
+    /// SIGTERM only. A daemon that ignores it is a different problem, and
+    /// SIGKILL would take its unix sockets with it uncleaned.
+    static let daemonCleanupCommand =
+        #"sh -c 'while read -r pid; do case "$pid" in ""|*[!0-9]*) continue ;; esac; if kill "$pid" 2>/dev/null; then echo "killed=$pid"; else echo "failed=$pid"; fi; done'"#
+
+    /// Stop the daemons this host is no longer using.
+    ///
+    /// Deliberately takes explicit pids rather than re-deriving them here: the
+    /// caller showed the user exactly which processes it was about to end, and
+    /// a list recomputed after that dialog could differ from the one they
+    /// agreed to.
+    @discardableResult
+    static func terminateDaemons(
+        sshTarget: String,
+        port: Int?,
+        identityFile: String?,
+        pids: [Int]
+    ) async throws -> [Int] {
+        guard !pids.isEmpty else { return [] }
+        RemoteWorkLog.infoOffMain(
+            "Stopping \(pids.count) unused term-meshd process(es) on \(sshTarget)"
+        )
+        let payload = pids.map(String.init).joined(separator: "\n") + "\n"
+        let output = try await runRemote(
+            sshTarget: sshTarget,
+            port: port,
+            identityFile: identityFile,
+            command: daemonCleanupCommand,
+            timeoutSeconds: 20,
+            input: Data(payload.utf8)
+        )
+        let killed = parseTerminatedPids(output)
+        RemoteWorkLog.infoOffMain(
+            killed.count == pids.count
+                ? "Stopped \(killed.count) unused term-meshd process(es) on \(sshTarget)"
+                : "Stopped \(killed.count) of \(pids.count) on \(sshTarget) — the rest were already gone or refused"
+        )
+        return killed
+    }
+
+    static func parseTerminatedPids(_ output: String) -> [Int] {
+        output.split(separator: "\n", omittingEmptySubsequences: true).compactMap { line in
+            guard let value = line.trimmingCharacters(in: .whitespaces)
+                .dropPrefixIfPresent("killed=") else { return nil }
+            return Int(value)
+        }
+    }
+
     static func installAgentStack(
         sshTarget: String,
         port: Int?,
@@ -885,5 +1065,13 @@ enum PeerHostDoctor {
             try? await Task.sleep(nanoseconds: 50_000_000)
         }
         return true
+    }
+}
+
+private extension String {
+    /// `hasPrefix` + `dropFirst` as one step, so the probe parser reads as a
+    /// list of keys rather than a chain of index arithmetic.
+    func dropPrefixIfPresent(_ prefix: String) -> String? {
+        hasPrefix(prefix) ? String(dropFirst(prefix.count)) : nil
     }
 }
