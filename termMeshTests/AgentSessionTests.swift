@@ -280,6 +280,56 @@ final class AgentSessionTests: XCTestCase {
         XCTAssertNotEqual(launch.workingDirectory, "/remote/repo")
     }
 
+    func testRemoteLaunchUsesStagedEnvironmentPathWithoutBearerInSSHArguments() {
+        let bearer = String(repeating: "ab", count: 32)
+        let file = "/Users/peer/.cache/term-mesh/agent-env/agent-test.env"
+        let forward = (
+            remote: "/tmp/term-mesh-agent-route-test.sock",
+            local: "/tmp/term-mesh-debug-test.sock"
+        )
+        let claude = AgentSession.remoteClaudeLaunch(
+            sshTarget: "peer",
+            port: nil,
+            identityFile: nil,
+            model: "sonnet",
+            instructions: "",
+            workingDirectory: "/remote/repo",
+            remoteEnvironment: ["TERMMESH_LEADER_GRANT_ID": bearer],
+            remoteEnvironmentFile: file,
+            reverseUnixForward: forward
+        )
+        let claudeArguments = claude.arguments.joined(separator: " ")
+        XCTAssertTrue(claudeArguments.contains(file))
+        XCTAssertFalse(claudeArguments.contains(bearer))
+        XCTAssertTrue(claudeArguments.contains("rm -f"))
+        XCTAssertTrue(claudeArguments.contains("StreamLocalBindUnlink=yes"))
+        XCTAssertTrue(claudeArguments.contains("\(forward.remote):\(forward.local)"))
+
+        let bridge = AgentSession.remoteBridgeLaunch(
+            cli: "codex",
+            bridgePath: "/bundle/tm-agent-bridge",
+            model: "gpt-5",
+            sshTarget: "peer",
+            port: nil,
+            identityFile: nil,
+            workingDirectory: "/remote/repo",
+            remoteEnvironment: ["TERMMESH_LEADER_GRANT_ID": bearer],
+            remoteEnvironmentFile: file,
+            reverseUnixForward: forward,
+            environment: [:]
+        )
+        XCTAssertEqual(bridge.environment["TERMMESH_REMOTE_NATIVE_ENV_FILE"], file)
+        XCTAssertNil(bridge.environment["TERMMESH_REMOTE_NATIVE_ENV"])
+        XCTAssertFalse(bridge.arguments.joined(separator: " ").contains(bearer))
+        let sshData = try! XCTUnwrap(
+            bridge.environment["TERMMESH_REMOTE_NATIVE_SSH_ARGS"]?.data(using: .utf8)
+        )
+        let ssh = try! XCTUnwrap(
+            JSONSerialization.jsonObject(with: sshData) as? [String]
+        )
+        XCTAssertTrue(ssh.contains("\(forward.remote):\(forward.local)"))
+    }
+
     private func session(_ lines: [String]) -> AgentSession {
         let s = AgentSession()
         for line in lines { s.ingestForTesting(line) }

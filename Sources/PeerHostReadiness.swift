@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 import PeerProto
 
@@ -166,11 +167,13 @@ enum PeerHostReadinessChecker {
         port: Int?,
         identityFile: String?,
         script: String,
+        standardInput: Data? = nil,
         timeoutSeconds: TimeInterval = 60
     ) async throws -> String {
         try await run(
             sshTarget: sshTarget, port: port, identityFile: identityFile,
-            script: script, timeoutSeconds: timeoutSeconds
+            script: script, standardInput: standardInput,
+            timeoutSeconds: timeoutSeconds
         )
     }
 
@@ -184,6 +187,7 @@ enum PeerHostReadinessChecker {
         port: Int?,
         identityFile: String?,
         script: String,
+        standardInput: Data? = nil,
         timeoutSeconds: TimeInterval
     ) async throws -> String {
         try PeerSSHTunnel.validateSshTarget(sshTarget)
@@ -214,7 +218,34 @@ enum PeerHostReadinessChecker {
         let errPipe = Pipe()
         proc.standardOutput = outPipe
         proc.standardError = errPipe
-        proc.standardInput = nil
+        var inputHandle: FileHandle?
+        if let standardInput {
+            // A pipe can block before `ssh` starts reading when the payload is
+            // larger than its kernel buffer. An unlinked 0600 file gives
+            // Process a seekable stdin without leaving the prompt on disk.
+            var template = Array("\(NSTemporaryDirectory())term-mesh-ssh-stdin.XXXXXX".utf8CString)
+            let fd = mkstemp(&template)
+            guard fd >= 0 else {
+                throw PeerHostReadinessError.sshFailed("could not create SSH stdin")
+            }
+            _ = fchmod(fd, S_IRUSR | S_IWUSR)
+            _ = template.withUnsafeBufferPointer { buffer in
+                unlink(buffer.baseAddress)
+            }
+            let handle = FileHandle(fileDescriptor: fd, closeOnDealloc: true)
+            do {
+                try handle.write(contentsOf: standardInput)
+                try handle.seek(toOffset: 0)
+            } catch {
+                try? handle.close()
+                throw PeerHostReadinessError.sshFailed("could not prepare SSH stdin")
+            }
+            inputHandle = handle
+            proc.standardInput = handle
+        } else {
+            proc.standardInput = nil
+        }
+        defer { try? inputHandle?.close() }
 
         do {
             try proc.run()

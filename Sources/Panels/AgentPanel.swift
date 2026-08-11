@@ -1,6 +1,42 @@
 import Foundation
 import Combine
 
+/// Which process owns a native agent pane, and therefore what happens when
+/// the viewer app goes away.
+///
+/// A remote pane can look identical while having opposite lifetime rules.
+/// Keep the fact on the panel so it remains visible after the creation sheet
+/// and Live Activity log have gone away.
+enum AgentRuntimeOwnership: Equatable {
+    case local
+    case sshOwned(hostName: String)
+    case peerOwned(hostName: String)
+
+    var badgeTitle: String? {
+        switch self {
+        case .local: return nil
+        case .sshOwned: return "SSH-owned"
+        case .peerOwned: return "Host-owned"
+        }
+    }
+
+    var detail: String? {
+        switch self {
+        case .local:
+            return nil
+        case .sshOwned(let hostName):
+            return "SSH-owned on \(hostName) · Stops when term-mesh on this Mac quits"
+        case .peerOwned(let hostName):
+            return "Host-owned on \(hostName) · Process survives this Mac quitting; reattach after restart"
+        }
+    }
+
+    var isDurableAcrossViewerQuit: Bool {
+        if case .peerOwned = self { return true }
+        return false
+    }
+}
+
 /// A pane that hosts an agent directly, with no terminal in between.
 ///
 /// The browser panel already proved the split tree does not care what is in a
@@ -26,6 +62,7 @@ final class AgentPanel: ObservableObject, Panel {
     let color: String
 
     @Published var title: String
+    @Published var runtimeOwnership: AgentRuntimeOwnership = .local
     var displayTitle: String { title }
     var displayIcon: String? { "sparkle" }
 
@@ -92,23 +129,31 @@ final class AgentPanel: ObservableObject, Panel {
 
     func start(remoteClaudeAt target: String, port: Int?, identityFile: String?,
                model: String, instructions: String,
-               remoteEnvironment: [String: String] = [:]) {
+               remoteEnvironment: [String: String] = [:],
+               remoteEnvironmentFile: String? = nil,
+               reverseUnixForward: (remote: String, local: String)? = nil) {
         session.start(AgentSession.remoteClaudeLaunch(
             sshTarget: target, port: port, identityFile: identityFile,
             model: model, instructions: instructions,
             workingDirectory: workingDirectory,
-            remoteEnvironment: remoteEnvironment
+            remoteEnvironment: remoteEnvironment,
+            remoteEnvironmentFile: remoteEnvironmentFile,
+            reverseUnixForward: reverseUnixForward
         ))
     }
 
     func start(remoteBridgedCli cli: String, bridgePath: String, model: String,
                target: String, port: Int?, identityFile: String?,
-               remoteEnvironment: [String: String] = [:]) {
+               remoteEnvironment: [String: String] = [:],
+               remoteEnvironmentFile: String? = nil,
+               reverseUnixForward: (remote: String, local: String)? = nil) {
         session.start(AgentSession.remoteBridgeLaunch(
             cli: cli, bridgePath: bridgePath, model: model,
             sshTarget: target, port: port, identityFile: identityFile,
             workingDirectory: workingDirectory,
-            remoteEnvironment: remoteEnvironment
+            remoteEnvironment: remoteEnvironment,
+            remoteEnvironmentFile: remoteEnvironmentFile,
+            reverseUnixForward: reverseUnixForward
         ))
     }
 

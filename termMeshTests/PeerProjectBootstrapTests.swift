@@ -1067,6 +1067,53 @@ final class PeerProjectBootstrapTests: XCTestCase {
     }
 
     @MainActor
+    func test_remote_leader_prompt_streams_to_shared_cache_atomically() throws {
+        let prompt = Data(String(repeating: "leader 정책\n", count: 1_500).utf8)
+        let fileName = "term-mesh-leader-prompt-team-uuid.txt"
+
+        for shell in ["/bin/sh", "/bin/zsh"] {
+            let root = FileManager.default.temporaryDirectory
+                .appendingPathComponent("term-mesh-leader-cache-\(UUID().uuidString)")
+            try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+            defer { try? FileManager.default.removeItem(at: root) }
+
+            let process = Process()
+            let input = Pipe()
+            let output = Pipe()
+            process.executableURL = URL(fileURLWithPath: shell)
+            process.arguments = [
+                "-f", "-c",
+                TeamOrchestrator.remoteLeaderPromptSSHStageCommand(fileName: fileName),
+            ]
+            process.environment = [
+                "HOME": root.path,
+                "PATH": "/usr/bin:/bin",
+                "XDG_CACHE_HOME": "",
+            ]
+            process.standardInput = input
+            process.standardOutput = output
+            try process.run()
+            try input.fileHandleForWriting.write(contentsOf: prompt)
+            try input.fileHandleForWriting.close()
+            let path = String(
+                data: output.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8
+            )
+            process.waitUntilExit()
+
+            XCTAssertEqual(process.terminationStatus, 0, shell)
+            let expected = root.appendingPathComponent(
+                ".cache/term-mesh/leader-prompts/\(fileName)"
+            ).path
+            XCTAssertEqual(path, expected, shell)
+            XCTAssertEqual(try Data(contentsOf: URL(fileURLWithPath: expected)), prompt, shell)
+            let entries = try FileManager.default.contentsOfDirectory(
+                atPath: (expected as NSString).deletingLastPathComponent
+            )
+            XCTAssertFalse(entries.contains { $0.contains(".tmp.") }, shell)
+        }
+    }
+
+    @MainActor
     func test_remote_leader_does_not_inject_policy_into_local_anchor_shell() {
         XCTAssertTrue(
             TeamOrchestrator.shouldInjectLocalLeaderPrompt(

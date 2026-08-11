@@ -782,7 +782,7 @@ struct NewProjectView: View {
                     Picker("", selection: $allAgentsHostKey) {
                         Text("This Mac").tag(String?.none)
                         ForEach(placeableHosts, id: \.id) { host in
-                            Text(host.isConnected ? host.displayName : "\(host.displayName) — offline")
+                            Text(host.isConnected ? host.versionedDisplayName : "\(host.displayName) — offline")
                                 .tag(String?.some(host.id))
                         }
                     }
@@ -949,7 +949,7 @@ struct NewProjectView: View {
                         Picker("", selection: $runsOnHostKey) {
                             Text("This Mac").tag(String?.none)
                             ForEach(placeableHosts, id: \.id) { host in
-                                Text(host.isConnected ? host.displayName : "\(host.displayName) — offline")
+                                Text(host.isConnected ? host.versionedDisplayName : "\(host.displayName) — offline")
                                     .tag(String?.some(host.id))
                             }
                         }
@@ -1968,7 +1968,12 @@ struct NewProjectView: View {
                         startCreation()
                     }
                     .keyboardShortcut(.defaultAction)
-                    .disabled(!canCreate || !placementHostsAreReady)
+                    .disabled(
+                        !canCreate || !placementHostsAreReady
+                            || TeamAgentComposer.blocksRemoteTeamCreation(
+                                agents: agents, hosts: hostStore.sortedHosts
+                            )
+                    )
                 }
             }
             .fixedSize(horizontal: true, vertical: false)

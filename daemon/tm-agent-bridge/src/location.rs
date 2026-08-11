@@ -82,12 +82,15 @@ pub fn remote_launch_failure(code: Option<i32>) -> Option<&'static str> {
     }
 }
 
-/// The three variables the app sets when a pane's agent belongs to a peer.
+/// The variables the app sets when a pane's agent belongs to a peer.
 #[derive(Debug, Default, Clone)]
 pub struct RemoteEnv {
     pub ssh_args: Option<String>,
     pub cwd: Option<String>,
     pub env: Option<String>,
+    /// A 0600 shell fragment staged on the peer. Its contents never enter the
+    /// local ssh argv; the remote shell sources and removes it before launch.
+    pub env_file: Option<String>,
 }
 
 impl RemoteEnv {
@@ -105,6 +108,7 @@ impl RemoteEnv {
             ssh_args: var("TERMMESH_REMOTE_NATIVE_SSH_ARGS"),
             cwd: var("TERMMESH_REMOTE_NATIVE_CWD"),
             env: var("TERMMESH_REMOTE_NATIVE_ENV"),
+            env_file: var("TERMMESH_REMOTE_NATIVE_ENV_FILE"),
         }
     }
 }
@@ -190,6 +194,12 @@ pub fn process_location(
         &format!("exit {PROFILE_LOAD_EXIT}"),
         &format!("exit {AGENT_ENV_LOAD_EXIT}"),
     );
+    if let Some(env_file) = remote.env_file.as_deref() {
+        let quoted = shell_quote(env_file);
+        inner.push_str(&format!(
+            "[ -f {quoted} ] || exit 79; set -a; . {quoted} >/dev/null 2>&1 || exit 79; rm -f -- {quoted}; set +a; "
+        ));
+    }
     inner.push_str(&format!(
         r#"export PATH="{}"; "#,
         path_with_extra(extra_path.as_deref())
@@ -309,6 +319,7 @@ mod tests {
             ssh_args: Some(r#"["/usr/bin/ssh", "root@peer"]"#.to_string()),
             cwd: Some(remote_cwd.to_string()),
             env: env_json,
+            env_file: None,
         };
         let argv: Vec<String> = child.iter().map(|s| s.to_string()).collect();
         let located = process_location(&remote, &argv, "/local/project").unwrap();
@@ -361,6 +372,27 @@ mod tests {
             command.find(source).unwrap() < command.find(explicit).unwrap(),
             "the host's own value has to win, so it is applied last"
         );
+    }
+
+    #[test]
+    fn command_sources_and_removes_staged_environment_without_embedding_it() {
+        let remote = RemoteEnv {
+            ssh_args: Some(r#"["/usr/bin/ssh", "root@peer"]"#.to_string()),
+            cwd: Some("/remote/project".to_string()),
+            env_file: Some("/home/peer/.cache/term-mesh/agent-env/agent-test.env".to_string()),
+            ..Default::default()
+        };
+        let located = process_location(
+            &remote,
+            &["codex".to_string(), "app-server".to_string()],
+            "/local/project",
+        )
+        .unwrap();
+        let command = located.argv.last().unwrap();
+
+        assert!(command.contains("agent-test.env"));
+        assert!(command.contains("rm -f --"));
+        assert!(!command.contains("TERMMESH_LEADER_GRANT_ID"));
     }
 
     #[test]

@@ -229,6 +229,15 @@ final class TeamOrchestrator: ObservableObject {
     /// which minted the grant and owns the project, may extend its server lease.
     var remoteLeaderGrantKeepalives: [String: Task<Void, Never>] = [:]
     var remoteLeaderGrantIDs: [String: Data] = [:]
+    /// A remote worker cannot use this Mac's Unix app socket. Give each one a
+    /// separate scoped reverse-route grant so `tm-agent send/inbox/reply`
+    /// reaches the team that owns it without exposing that socket remotely.
+    struct RemoteAgentRouteLease {
+        let teamName: String
+        let grantID: Data
+    }
+    var remoteAgentRouteLeases: [String: RemoteAgentRouteLease] = [:]
+    var remoteAgentRouteKeepalives: [String: Task<Void, Never>] = [:]
     /// Wake observer for the keepalives above, installed once and kept for the
     /// app's life. `Task.sleep` does not advance while the Mac is asleep, so
     /// the interval alone cannot cover a closed lid — see

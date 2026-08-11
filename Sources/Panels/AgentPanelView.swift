@@ -127,6 +127,23 @@ struct AgentPanelView: View {
                 .fixedSize()
             CliBadge(cli: panel.cli, accent: providerAccent)
                 .fixedSize()
+            if let ownership = panel.runtimeOwnership.badgeTitle {
+                Text(ownership)
+                    .font(.system(size: 9, weight: .semibold))
+                    .foregroundStyle(
+                        panel.runtimeOwnership.isDurableAcrossViewerQuit
+                            ? Color.green : Color.orange
+                    )
+                    .padding(.horizontal, 5)
+                    .padding(.vertical, 2)
+                    .background(
+                        (panel.runtimeOwnership.isDurableAcrossViewerQuit
+                            ? Color.green : Color.orange).opacity(0.12),
+                        in: Capsule()
+                    )
+                    .fixedSize()
+                    .help(panel.runtimeOwnership.detail ?? ownership)
+            }
             if let summary = session.summary, !summary.isEmpty {
                 Text(summary)
                     .font(.system(size: 10))
@@ -191,6 +208,20 @@ struct AgentPanelView: View {
                     .foregroundStyle(.tertiary)
                     .lineLimit(1)
                     .truncationMode(.head)
+                if let ownership = panel.runtimeOwnership.detail {
+                    Label(
+                        ownership,
+                        systemImage: panel.runtimeOwnership.isDurableAcrossViewerQuit
+                            ? "checkmark.shield.fill" : "exclamationmark.triangle.fill"
+                    )
+                    .font(.system(size: 10, weight: .medium))
+                    .foregroundStyle(
+                        panel.runtimeOwnership.isDurableAcrossViewerQuit
+                            ? Color.green : Color.orange
+                    )
+                    .fixedSize(horizontal: false, vertical: true)
+                    .padding(.top, 3)
+                }
             }
             Spacer(minLength: 0)
         }

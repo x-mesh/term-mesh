@@ -1686,16 +1686,17 @@ final class PeerOwnedAgentSurfaceTests: XCTestCase {
             )
         }
 
-        // Only codex and kiro move, and only when the host can hold them.
+        // Codex and Kiro prefer peer ownership, but an older host changes
+        // ownership rather than the Native renderer the user selected.
         for cli in ["codex", "kiro"] {
             XCTAssertEqual(route(cli, capability: true), .peerOwnedAgent, cli)
             XCTAssertEqual(
-                route(cli, capability: false), .terminal,
-                "\(cli): a daemon without surface.agent.v1 must fall back, not fail"
+                route(cli, capability: false), .localNativeBridge,
+                "\(cli): a daemon without surface.agent.v1 must keep a Native pane over SSH"
             )
             XCTAssertEqual(
-                route(cli, capability: true, bridgePath: ""), .terminal,
-                "\(cli): no bridge on the host means nothing to ensure"
+                route(cli, capability: true, bridgePath: ""), .localNativeBridge,
+                "\(cli): no bridge on the host changes ownership, not rendering"
             )
             XCTAssertEqual(
                 route(cli, capability: true, sshTarget: nil), .terminal,
@@ -1716,10 +1717,9 @@ final class PeerOwnedAgentSurfaceTests: XCTestCase {
             )
         }
 
-        // claude has no bridge protocol at all, so it stays a terminal pane
-        // however capable the host is.
-        XCTAssertEqual(route("claude", capability: true), .terminal)
-        XCTAssertEqual(route("claude", capability: false), .terminal)
+        // Claude speaks NDJSON directly and already has an SSH-native path.
+        XCTAssertEqual(route("claude", capability: true), .localNativeBridge)
+        XCTAssertEqual(route("claude", capability: false), .localNativeBridge)
         // gemini: the bridge speaks it, but no native panel holds it today.
         XCTAssertEqual(route("gemini", capability: true), .terminal)
     }
@@ -1754,10 +1754,9 @@ final class PeerOwnedAgentSurfaceTests: XCTestCase {
     /// The routing table in full, as literal data.
     ///
     /// The test above asserts the intentions; this one asserts that nothing
-    /// else changed while they were being honoured. `isPipeOnly` used to be
-    /// the whole gate, so every remote member that was not cursor or agy went
-    /// to a terminal pane — two of these 48 cells are what that removal moved,
-    /// and the other 46 are what it must not have.
+    /// else changed while they were being honoured. Native is a renderer
+    /// contract: capability and bridge availability may only choose between
+    /// peer-owned and SSH-owned Native processes.
     ///
     /// Columns are (ssh, capability, bridge) counted in binary, the same order
     /// for every row, so one row is one CLI's entire story.
@@ -1775,12 +1774,12 @@ final class PeerOwnedAgentSurfaceTests: XCTestCase {
         //                     ---------------  ---------------
         //   (cap, bridge) →   00  01  10  11   00  01  10  11
         let table: [(String, [Factory])] = [
-            // No peer-owned recipe exists for these two, at any host.
-            ("claude", [T, T, T, T, T, T, T, T]),
+            // Claude has no peer-owned recipe, but its direct SSH stream is native.
+            ("claude", [T, T, T, T, L, L, L, L]),
             ("gemini", [T, T, T, T, T, T, T, T]),
-            // The change: a capable host with a bridge, reached over ssh.
-            ("codex", [T, T, T, T, T, T, T, P]),
-            ("kiro", [T, T, T, T, T, T, T, P]),
+            // Peer ownership only in the last cell; every other SSH cell remains native.
+            ("codex", [T, T, T, T, L, L, L, P]),
+            ("kiro", [T, T, T, T, L, L, L, P]),
             // Unmoved (R8). The bridge these run is this Mac's, so the peer's
             // capability and the peer's bridge are both irrelevant to them.
             ("cursor", [T, T, T, T, L, L, L, L]),
@@ -1887,7 +1886,7 @@ final class PeerOwnedAgentSurfaceTests: XCTestCase {
     }
 
     /// The line the user actually reads. Every reason must name the CLI, the
-    /// host and what opened instead — and the two most easily confused repairs
+    /// host and the ownership fallback — and the two most easily confused repairs
     /// ("install it there" vs "update it there") must not read alike, because
     /// following the wrong one leaves the pane exactly as it was.
     @MainActor
@@ -1900,8 +1899,8 @@ final class PeerOwnedAgentSurfaceTests: XCTestCase {
             XCTAssertTrue(message.contains("codex"), "\(block): names the CLI")
             XCTAssertTrue(message.contains("jw-server"), "\(block): names the host")
             XCTAssertTrue(
-                message.contains("terminal pane"),
-                "\(block): says what opened instead"
+                message.contains("SSH-owned native agent pane"),
+                "\(block): says which native ownership route opened"
             )
             XCTAssertTrue(seen.insert(message).inserted, "\(block): reads like another reason")
         }
@@ -1914,7 +1913,7 @@ final class PeerOwnedAgentSurfaceTests: XCTestCase {
         XCTAssertTrue(
             TeamOrchestrator.peerOwnedAgentFallbackMessage(
                 .daemonTooOld, cli: "codex", hostName: "jw-server"
-            ).contains("Update term-mesh")
+            ).contains("Restart or update term-mesh")
         )
         XCTAssertTrue(
             TeamOrchestrator.peerOwnedAgentFallbackMessage(
@@ -1923,6 +1922,166 @@ final class PeerOwnedAgentSurfaceTests: XCTestCase {
             "a refused ensure creates nothing on the peer, and saying so is what "
                 + "stops someone going to look for a stray bridge"
         )
+    }
+
+    /// Project and team creation must disclose the same ownership downgrade
+    /// the attach path will take. The warning is capability-driven and uses
+    /// the serving version from the handshake, not a binary found on PATH.
+    @MainActor
+    func test_creationPreflight_namesServingVersionBeforeNativeOwnershipFallback() {
+        let restore = Self.forceNativePanes(true)
+        defer { restore() }
+
+        var oldHost = Self.agentHostEntry()
+        oldHost.displayName = "mac-sub"
+        oldHost.servingAppVersion = "0.179.0"
+        oldHost.supportsPeerOwnedAgentHosting = false
+        oldHost.supportsRemoteTeamRoute = true
+
+        func row(_ cli: String) -> TeamAgentRow {
+            TeamAgentRow(
+                preset: AgentRolePreset(
+                    id: UUID(), name: cli, displayName: cli.capitalized,
+                    cli: cli, model: "sonnet", color: "blue",
+                    instructions: "", isBuiltIn: false
+                ),
+                customInstructions: "",
+                hostKey: oldHost.id
+            )
+        }
+
+        let notices = TeamAgentComposer.peerOwnedFallbackNotices(
+            agents: [row("codex"), row("kiro"), row("claude")],
+            hosts: [oldHost]
+        )
+        XCTAssertEqual(notices.count, 1, "one host gets one preflight warning")
+        XCTAssertEqual(notices[0].servingVersion, "v0.179.0")
+        XCTAssertEqual(notices[0].clis, ["codex", "kiro"])
+        XCTAssertTrue(notices[0].message.contains("mac-sub"))
+        XCTAssertTrue(notices[0].message.contains("term-mesh v0.179.0"))
+        XCTAssertTrue(notices[0].message.contains("through this Mac over SSH"))
+        XCTAssertTrue(notices[0].message.contains("stop if this app quits"))
+
+        oldHost.supportsRemoteTeamRoute = false
+        let blocked = TeamAgentComposer.peerOwnedFallbackNotices(
+            agents: [row("codex"), row("claude")], hosts: [oldHost]
+        )
+        XCTAssertEqual(blocked.count, 1)
+        XCTAssertFalse(blocked[0].blocksTeamMessaging)
+        XCTAssertEqual(blocked[0].clis, ["codex"])
+        XCTAssertTrue(blocked[0].message.contains("private SSH route"))
+        XCTAssertFalse(
+            TeamAgentComposer.blocksRemoteTeamCreation(
+                agents: [row("codex")], hosts: [oldHost]
+            ),
+            "SSH-owned Native has its own scoped reverse control route"
+        )
+
+        oldHost.sshTarget = nil
+        let noSSHRoute = TeamAgentComposer.peerOwnedFallbackNotices(
+            agents: [row("codex"), row("claude")], hosts: [oldHost]
+        )
+        XCTAssertEqual(noSSHRoute.count, 1)
+        XCTAssertTrue(noSSHRoute[0].blocksTeamMessaging)
+        XCTAssertEqual(noSSHRoute[0].clis, ["claude", "codex"])
+        XCTAssertTrue(noSSHRoute[0].message.contains("tm-agent returns no_app"))
+        XCTAssertTrue(noSSHRoute[0].message.contains("Update and restart"))
+
+        oldHost.supportsPeerOwnedAgentHosting = true
+        oldHost.supportsRemoteTeamRoute = true
+        XCTAssertTrue(
+            TeamAgentComposer.peerOwnedFallbackNotices(
+                agents: [row("codex")], hosts: [oldHost]
+            ).isEmpty,
+            "a compatible serving daemon needs no warning"
+        )
+        XCTAssertTrue(
+            TeamAgentComposer.peerOwnedFallbackNotices(
+                agents: [row("claude")], hosts: [{
+                    var host = oldHost
+                    host.supportsPeerOwnedAgentHosting = false
+                    return host
+                }()]
+            ).isEmpty,
+            "Claude is SSH-owned by design, not because this host is stale"
+        )
+    }
+
+    /// A remote worker reaches the owning team through the same scoped
+    /// reverse route as a peer leader. Pointing TERMMESH_SOCKET at the remote
+    /// daemon without these fields deterministically returns `no_app`.
+    @MainActor
+    func test_remoteNativeAgentEnvironmentCarriesScopedTeamRoute() {
+        var grant = Termmesh_Peer_V1_TeamLeaderGrant()
+        grant.grantID = Data(repeating: 0xab, count: PeerTeamLeader.grantIDBytes)
+        grant.projectID = "name:mesh-test"
+        grant.teamUuid = "team-uuid"
+        grant.role = .leader
+        grant.expiresAtUnixSecs = 123_456
+
+        let env = TeamOrchestrator.remoteNativeAgentEnvironment(
+            teamName: "mesh-test",
+            agentName: "executor",
+            agentType: "executor",
+            agentCli: "codex",
+            workspaceId: UUID(uuidString: "11111111-2222-3333-4444-555555555555")!,
+            socketPath: "/tmp/remote-term-mesh.sock",
+            routeGrant: grant
+        )
+
+        XCTAssertEqual(env["TERMMESH_SOCKET"], "/tmp/remote-term-mesh.sock")
+        XCTAssertEqual(env["TERMMESH_TEAM_NAME"], "mesh-test")
+        XCTAssertEqual(env["TERMMESH_AGENT_NAME"], "executor")
+        XCTAssertEqual(env["TERMMESH_LEADER_GRANT_ID"], String(repeating: "ab", count: 32))
+        XCTAssertEqual(env["TERMMESH_LEADER_PROJECT_ID"], "name:mesh-test")
+        XCTAssertEqual(env["TERMMESH_LEADER_TEAM_UUID"], "team-uuid")
+        XCTAssertEqual(env["TERMMESH_LEADER_EXPIRES_AT"], "123456")
+        XCTAssertEqual(env["TERMMESH_LEADER_PEER_ID"]?.count, 32)
+    }
+
+    @MainActor
+    func test_peerOwnedAgentEnvironmentPreservesDaemonControlSocket() {
+        let env = TeamOrchestrator.remoteNativeAgentEnvironment(
+            teamName: "mesh-test",
+            agentName: "executor",
+            agentType: "executor",
+            agentCli: "codex",
+            workspaceId: UUID(),
+            socketPath: nil
+        )
+
+        XCTAssertNil(env["TERMMESH_SOCKET"])
+        XCTAssertNil(env["CMUX_SOCKET"])
+    }
+
+    @MainActor
+    func test_sshOwnedAgentUsesPrivateReverseControlSocket() {
+        let first = TeamOrchestrator.sshOwnedAgentReverseForward(
+            agentInstanceID: "A1B2-C3D4",
+            localControlSocket: "/tmp/term-mesh-debug-route.sock"
+        )
+        let second = TeamOrchestrator.sshOwnedAgentReverseForward(
+            agentInstanceID: "FFFF-EEEE",
+            localControlSocket: "/tmp/term-mesh-debug-route.sock"
+        )
+
+        XCTAssertEqual(first.local, "/tmp/term-mesh-debug-route.sock")
+        XCTAssertEqual(first.remote, "/tmp/term-mesh-agent-route-a1b2-c3d4.sock")
+        XCTAssertNotEqual(first.remote, second.remote)
+        XCTAssertLessThan(first.remote.utf8.count, 104)
+    }
+
+    @MainActor
+    func test_agentRuntimeOwnershipExplainsTheActualLifetime() {
+        let fallback = AgentRuntimeOwnership.sshOwned(hostName: "mac-sub")
+        XCTAssertEqual(fallback.badgeTitle, "SSH-owned")
+        XCTAssertFalse(fallback.isDurableAcrossViewerQuit)
+        XCTAssertTrue(fallback.detail?.contains("Stops when term-mesh on this Mac quits") == true)
+
+        let durable = AgentRuntimeOwnership.peerOwned(hostName: "mac-sub")
+        XCTAssertEqual(durable.badgeTitle, "Host-owned")
+        XCTAssertTrue(durable.isDurableAcrossViewerQuit)
+        XCTAssertTrue(durable.detail?.contains("reattach after restart") == true)
     }
 
     // MARK: Fixtures
