@@ -1948,6 +1948,12 @@ struct NewProjectView: View {
                             .disabled(true)
                     }
                 } else {
+                    // Offered only while the machine is what blocks the run,
+                    // and next to the sentence that says so.
+                    if let retryTitle = placementRetryTitle {
+                        Button(retryTitle) { runPlacementRetry() }
+                            .accessibilityIdentifier("newProject.placementRetry")
+                    }
                     Button("Cancel", action: onClose)
                         .keyboardShortcut(.cancelAction)
                     Button(createActionLabel) {
@@ -2180,9 +2186,65 @@ struct NewProjectView: View {
         if allStillConnecting {
             return "Connecting to \(labels)…"
         }
+        // "Not ready" covers three different situations, and the button beside
+        // it does a different thing in each. Saying which one it is turns a
+        // verdict into something the person can act on.
+        if offline.count == 1,
+           let hostKey = offline.first,
+           let host = placeableHosts.first(where: { $0.id == hostKey }) {
+            switch host.connectionState {
+            case .failed(let reason):
+                return "\(labels) could not be reached — \(reason)"
+            case .saved:
+                return "\(labels) is not connected yet."
+            case .connected:
+                // Connected but not launchable: the PATH a remote CLI needs is
+                // still unresolved, so starting now would launch with the
+                // wrong search path (see `HostEntry.isLaunchable`).
+                return "\(labels) is connected but still resolving where its tools live."
+            case .connecting:
+                break
+            }
+        }
         return offline.count == 1
             ? "\(labels) is not ready to launch remote tools."
             : "These machines are not ready to launch remote tools: \(labels)."
+    }
+
+    /// The machines this sheet is waiting on, and cannot start without.
+    ///
+    /// Excludes the ones already connecting: those need patience, not another
+    /// attempt. A connected-but-not-launchable host is included on purpose —
+    /// it is still resolving the PATH a remote CLI needs, and reconnecting is
+    /// what settles it if that stalled.
+    private var placementRetryHosts: [HostEntry] {
+        let keys = Set([runsOnHostKey].compactMap { $0 } + agents.compactMap(\.hostKey))
+        return keys.compactMap { key in placeableHosts.first(where: { $0.id == key }) }
+            .filter { !$0.isLaunchable && $0.connectionState != .connecting }
+            .sorted { $0.displayName < $1.displayName }
+    }
+
+    /// Saying a machine is not ready and offering nothing to do about it is a
+    /// dead end: this sheet has no other place to connect from, and leaving it
+    /// to use the sidebar discards the form. The action is the same one the
+    /// sidebar offers — reconnect — placed where the reason is stated.
+    private var placementRetryTitle: String? {
+        let hosts = placementRetryHosts
+        guard let first = hosts.first else { return nil }
+        if hosts.count > 1 { return "Reconnect machines" }
+        if case .failed = first.connectionState { return "Retry \(first.displayName)" }
+        return "Connect \(first.displayName)"
+    }
+
+    private func runPlacementRetry() {
+        let store = RemoteHostStore.shared
+        for host in placementRetryHosts {
+            if case .failed = host.connectionState {
+                _ = store.retryConnectingHost(host)
+            } else {
+                store.connectSavedHost(host)
+            }
+        }
     }
 
     /// Peer-bound agents whose project folder is still blank.
