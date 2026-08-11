@@ -184,6 +184,13 @@ Prepare a new release for term-mesh. This command updates the changelog, bumps t
     - Run `./scripts/update-homebrew-cask.sh X.Y.Z ./term-mesh-macos-X.Y.Z.dmg`
       - Computes sha256, rewrites `Casks/term-mesh.rb` in `x-mesh/homebrew-tap`, commits as `term-mesh X.Y.Z`, and pushes to `main`.
       - Set `DRY_RUN=1` to stage the change locally without pushing.
+    - **The smoke test at the end adapts to whether term-mesh is running.** The cask
+      quits the app (`uninstall quit:` plus a preflight `pkill`) — correct for a user
+      upgrading, wrong for a release check, and it used to take the maintainer's own
+      session down mid-work. So: nothing running → real `brew install` as before;
+      something running → mount the DMG and verify the bundle's version plus the tap's
+      sha256 instead. `SMOKE_TEST=full` forces the install anyway (quit the app first),
+      `SMOKE_TEST=0` skips it.
     - Verify: `brew update && brew info --cask x-mesh/tap/term-mesh` should report the new version.
 
 15. **Return to the working branch, and re-sync `develop`**
