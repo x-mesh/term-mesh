@@ -154,10 +154,25 @@ The load order is:
 
 `agent-env` is sourced as a Bourne-compatible shell fragment. Prefer simple
 `KEY=value` or `export KEY=value` entries and do not print output from it.
-Explicit peer-host values win over profile and `agent-env` values. term-mesh
-uses a fixed remote `PATH`, so configure CLI paths explicitly rather than
-overriding `PATH` in these files. A profile or `agent-env` load failure is
-reported in the native agent pane without including environment values.
+Explicit peer-host values win over profile and `agent-env` values. A profile or
+`agent-env` load failure is reported in the native agent pane without including
+environment values.
+
+`PATH` is the one key that **adds** rather than replaces. term-mesh keeps a
+baseline (`tm_agent_bridge::location::REMOTE_PATH`) so the CLIs it installs stay
+reachable whatever a host configures, and a `PATH` saved for a peer host is
+prepended to it — in agent launches and in terminal panes alike, so the same
+value cannot mean two things in two panes. List directories plainly
+(`/opt/foo/bin:$HOME/bin`); **do not write `$PATH`** there. Nothing is being
+replaced, so there is nothing to preserve by hand, and the value reaches the
+launch without a shell expanding it — `$PATH` would arrive as four literal
+characters and break the search path outright.
+
+That baseline is narrower than the readiness probe's search path
+(`RemoteShellPath.binDirs` plus the login shell's own `PATH`). A CLI in
+`~/.npm-global/bin`, `~/bin` or a pyenv shim therefore probes as present while
+the launch cannot reach it — the pane opens and the agent never starts. Adding
+that directory here is the fix.
 
 VERIFY (stale CLI 이름·동작 불일치):
 

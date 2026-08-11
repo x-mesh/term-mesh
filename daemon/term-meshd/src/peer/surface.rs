@@ -692,7 +692,12 @@ fn agent_launch_script(
     ));
     script.push_str(&format!(
         r#"export PATH="{}"; "#,
-        tm_agent_bridge::location::REMOTE_PATH
+        tm_agent_bridge::location::path_with_extra(
+            requested_env
+                .iter()
+                .find(|(key, _)| key == "PATH")
+                .map(|(_, value)| value.as_str())
+        )
     ));
 
     let mut merged: BTreeMap<String, String> = requested_env.iter().cloned().collect();
@@ -707,8 +712,8 @@ fn agent_launch_script(
     let mut assignments = Vec::new();
     for (index, (key, value)) in merged
         .into_iter()
-        // Same explicit exception as the SSH bridge: CLI locations are
-        // configured paths, while PATH is a fixed remote safety baseline.
+        // Same explicit exception as the SSH bridge: PATH is not an assignment
+        // here, it is the extra directories folded into the export above.
         .filter(|(key, _)| key != "PATH")
         .enumerate()
     {
@@ -1979,25 +1984,45 @@ const PREFERRED_TERM: &str = "xterm-ghostty";
 /// same host, an injected `PATH` survives the login shell — the profile
 /// prepends pyenv and appends snap around it rather than overwriting.
 ///
-/// An explicit `PATH` from the host's saved environment is left exactly as
-/// configured; someone who set it means it.
+/// A `PATH` saved for the host is *added* here, exactly as it is for an agent
+/// launch — the same value must not mean "prepend these" in one pane and
+/// "replace everything" in the one beside it. Configured directories go in
+/// front, then `~/.local/bin`, then whatever the daemon inherited; the login
+/// profile still runs afterwards and keeps what it adds.
 fn pane_path(requested_env: &[(String, String)]) -> Option<String> {
-    if requested_env.iter().any(|(key, _)| key == "PATH") {
+    let configured = requested_env
+        .iter()
+        .find(|(key, _)| key == "PATH")
+        .map(|(_, value)| value.as_str());
+    let mut entries: Vec<String> = configured
+        .unwrap_or_default()
+        .split(':')
+        .map(|entry| entry.trim().to_string())
+        .filter(|entry| !entry.is_empty())
+        .collect();
+
+    if let Ok(home) = std::env::var("HOME") {
+        let local_bin = format!("{}/.local/bin", home.trim_end_matches('/'));
+        if std::path::Path::new(&local_bin).is_dir() {
+            entries.push(local_bin);
+        }
+    }
+    if entries.is_empty() {
         return None;
     }
-    let home = std::env::var("HOME").ok()?;
-    let local_bin = format!("{}/.local/bin", home.trim_end_matches('/'));
-    if !std::path::Path::new(&local_bin).is_dir() {
-        return None;
-    }
+
     let inherited = std::env::var("PATH").unwrap_or_default();
-    if inherited.split(':').any(|entry| entry == local_bin) {
+    let already: Vec<&str> = inherited.split(':').collect();
+    entries.retain(|entry| !already.contains(&entry.as_str()));
+    if entries.is_empty() {
         return None;
     }
+
+    let prefix = entries.join(":");
     Some(if inherited.is_empty() {
-        local_bin
+        prefix
     } else {
-        format!("{local_bin}:{inherited}")
+        format!("{prefix}:{inherited}")
     })
 }
 
@@ -3356,10 +3381,17 @@ mod tests {
         assert_eq!(values.get("REQUESTED_ONLY"), Some(&"requested"));
         assert_eq!(values.get("ORDER"), Some(&"requested"));
         assert_eq!(values.get("TERMMESH_SURFACE_ID"), Some(&"internal"));
+        // PATH is additive: a configured directory is searched first, and the
+        // baseline stays behind it. Replacing the baseline is what must never
+        // happen — that would strand the CLIs term-mesh installs, which is the
+        // reason this value used to be dropped outright.
         assert_ne!(values.get("PATH"), Some(&"/forged"));
         assert!(values
             .get("PATH")
-            .is_some_and(|path| path.starts_with(home.path().join(".local/bin").to_str().unwrap())));
+            .is_some_and(|path| path.starts_with("/forged:")));
+        assert!(values
+            .get("PATH")
+            .is_some_and(|path| path.contains(home.path().join(".local/bin").to_str().unwrap())));
         assert!(!stdout.contains("login-noise"));
         assert!(!String::from_utf8_lossy(&output.stderr).contains("login-secret"));
     }
