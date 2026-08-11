@@ -1402,12 +1402,7 @@ extension TeamOrchestrator {
 #if DEBUG
             dlog("leader.attach.stage prepare.begin host=\(hostKey)")
 #endif
-            try await Self.prepareRemoteLeader(
-                cli: cli,
-                host: host,
-                systemPrompt: systemPrompt,
-                promptFile: promptFile
-            )
+            try await Self.prepareRemoteLeader(cli: cli, host: host)
             try await attempt.ensureCurrent()
 #if DEBUG
             dlog("leader.attach.stage prepare.ok host=\(hostKey)")
@@ -1461,7 +1456,23 @@ extension TeamOrchestrator {
         dlog("leader.attach.stage prepare.sent host=\(hostKey)")
 #endif
 
-        let command = Self.remoteLeaderCommand(
+        let promptStages = Self.remoteLeaderPromptStageCommands(
+            systemPrompt: systemPrompt,
+            promptFile: promptFile
+        )
+        for stage in promptStages {
+            guard await sendRemoteLeaderStage(
+                session: session,
+                text: stage,
+                settleDelay: 0.05
+            ) else {
+                _ = await sendRemoteLeaderStage(session: session, text: "stty echo")
+                await attempt.compensate()
+                throw RemoteAgentError.promptStagingFailed(host.displayName)
+            }
+        }
+
+        let launch = Self.remoteLeaderCommand(
             cli: cli,
             model: model,
             teamName: teamName,
@@ -1470,6 +1481,11 @@ extension TeamOrchestrator {
             systemPromptFile: promptFile,
             environment: PeerHostEnvironment.stored(forHostKey: host.id),
             hostBinDirs: host.hostCLIBinDirs
+        )
+        let command = Self.remoteLeaderCommandCheckingPrompt(
+            launch: launch,
+            systemPrompt: systemPrompt,
+            promptFile: promptFile
         )
         let launched = await sendRemoteLeaderStage(
             session: session,
@@ -2312,22 +2328,15 @@ extension TeamOrchestrator {
         }
     }
 
-    /// Probe the CLI and stage the long Claude prompt in one SSH round trip.
-    ///
-    /// Sending the prompt through the attached terminal splits it into several
-    /// bracketed-paste transactions. Their boundary bytes then become literal
-    /// shell input inside the quoted prompt. A mode-0600 file keeps the launch
-    /// line short; the shell reads and removes it before starting Claude.
+    /// Probe only whether the requested CLI is available. Prompt staging
+    /// belongs to the attached
+    /// pane shell below: an SSH login shell may have a different /tmp namespace
+    /// from the service that owns the peer surface.
     private static func prepareRemoteLeader(
         cli: String,
-        host: HostEntry,
-        systemPrompt: String?,
-        promptFile: String?
+        host: HostEntry
     ) async throws {
         guard let sshTarget = host.sshTarget, !sshTarget.isEmpty else {
-            if systemPrompt != nil {
-                throw RemoteAgentError.promptStagingFailed(host.displayName)
-            }
             try await ensureRemoteCLIAvailable(cli: cli, host: host)
             return
         }
@@ -2339,9 +2348,6 @@ extension TeamOrchestrator {
         var script = RemoteShellPath.prologue(hostBinDirs: host.hostCLIBinDirs)
             + "if ! command -v \(shellQuoted(cli)) >/dev/null 2>&1; "
             + "then printf %s \(shellQuoted(missing)); exit 0; fi"
-        if let systemPrompt, let promptFile {
-            script += "; umask 077; printf %s \(shellQuoted(systemPrompt)) > \(shellQuoted(promptFile))"
-        }
         script += "; printf %s \(shellQuoted(marker))"
         do {
             let output = try await PeerHostReadinessChecker.runScript(
@@ -2355,15 +2361,12 @@ extension TeamOrchestrator {
                 throw RemoteAgentError.cliUnavailable(cli, host.displayName)
             }
             guard output.contains(marker) else {
-                throw RemoteAgentError.promptStagingFailed(host.displayName)
+                throw RemoteAgentError.cliUnavailable(cli, host.displayName)
             }
         } catch let error as RemoteAgentError {
             throw error
         } catch {
-            if systemPrompt == nil {
-                throw RemoteAgentError.cliUnavailable(cli, host.displayName)
-            }
-            throw RemoteAgentError.promptStagingFailed(host.displayName)
+            throw RemoteAgentError.cliUnavailable(cli, host.displayName)
         }
     }
 
@@ -5036,6 +5039,66 @@ extension TeamOrchestrator {
     /// interactive shell.
     static func remoteLeaderPrepareCommand() -> String {
         "unset HISTFILE; stty -echo"
+    }
+
+    /// Create the leader prompt from the shell that will launch the CLI.
+    ///
+    /// The SSH readiness process may live outside the peer daemon's /tmp
+    /// namespace (`PrivateTmp`, container, chroot). PTY canonical input also
+    /// has a small per-line limit, so send independently-decodable base64
+    /// chunks rather than one long command. 720 is divisible by four and keeps
+    /// every command below 1 KiB, including quoting and redirection.
+    static func remoteLeaderPromptStageCommands(
+        systemPrompt: String?,
+        promptFile: String?
+    ) -> [String] {
+        guard let systemPrompt, let promptFile else { return [] }
+        let quotedFile = shellQuoted(promptFile)
+        let encoded = Data(systemPrompt.utf8).base64EncodedString()
+        let chunkSize = 720
+        var chunks: [String] = []
+        var start = encoded.startIndex
+        while start < encoded.endIndex {
+            let end = encoded.index(
+                start,
+                offsetBy: min(chunkSize, encoded.distance(from: start, to: encoded.endIndex))
+            )
+            chunks.append(String(encoded[start..<end]))
+            start = end
+        }
+
+        var commands = [
+            "umask 077; "
+                + "if printf '' | base64 -d >/dev/null 2>&1; "
+                + "then TERMMESH_B64_FLAG='-d'; "
+                + "elif printf '' | base64 -D >/dev/null 2>&1; "
+                + "then TERMMESH_B64_FLAG='-D'; "
+                + "else TERMMESH_B64_FLAG='__missing__'; fi; "
+                + ": > \(quotedFile)"
+        ]
+        commands.append(contentsOf: chunks.map { chunk in
+            "printf %s \(shellQuoted(chunk)) | base64 \"$TERMMESH_B64_FLAG\" >> \(quotedFile)"
+        })
+        return commands
+    }
+
+    /// Refuse to launch with a missing or truncated prompt. The error path
+    /// restores terminal echo so the pane remains diagnosable instead of
+    /// looking like an unresponsive blank shell.
+    static func remoteLeaderCommandCheckingPrompt(
+        launch: String,
+        systemPrompt: String?,
+        promptFile: String?
+    ) -> String {
+        guard let systemPrompt, let promptFile else { return launch }
+        let quotedFile = shellQuoted(promptFile)
+        let byteCount = Data(systemPrompt.utf8).count
+        return "unset TERMMESH_B64_FLAG; "
+            + "if [ ! -f \(quotedFile) ] || "
+            + "[ \"$(wc -c < \(quotedFile))\" -ne \(byteCount) ]; "
+            + "then rm -f \(quotedFile); stty echo; "
+            + "printf '%s\\n' 'term-mesh: leader prompt staging failed' >&2; "
+            + "else \(launch); fi"
     }
 
     /// Wait until the relay has forwarded actual shell output before typing.
