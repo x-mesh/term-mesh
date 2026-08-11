@@ -880,6 +880,10 @@ final class RemoteHostStore: ObservableObject {
                 self.hosts[key]?.connectionState = .connected
                 self.hosts[key]?.activeSockPath = lease.hostSockPath
                 self.hosts[key]?.remoteSockPath = socket
+                // Panes that Disconnect Host kept on screen have been showing a
+                // transcript with nothing behind it. The transport exists again
+                // as of this line, so this is where they become live.
+                PeerClientCoordinator.shared.resumePanesAfterHostReconnect(spec.hostKey)
                 PeerHostProfileStore.shared.recordConnection(
                     sshTarget: target, resolvedSocket: socket
                 )

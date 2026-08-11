@@ -360,6 +360,14 @@ final class PeerPaneSession {
     /// relay shell behind.
     var requestPaneClose: (@MainActor () -> Void)?
 
+    /// Set by `Workspace.bindRemoteAgentPane` for a native agent pane that an
+    /// intentional disconnect preserves. Preserving it keeps the transcript on
+    /// screen but leaves a pane whose transport is gone, so the host coming
+    /// back is what turns it live again — the pane is rebuilt against the same
+    /// surface and the peer's daemon replays what was said meanwhile. A
+    /// terminal pane leaves this nil: it has a Reconnect banner of its own.
+    var requestHostReconnectReattach: (@MainActor () -> Void)?
+
     /// For the connections panel / sidebar roster (t7 wires this into
     /// `PeerClientCoordinator`).
     var connectionInfo: PeerRelayConnectionInfo {

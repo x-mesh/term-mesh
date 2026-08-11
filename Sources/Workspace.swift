@@ -2838,6 +2838,13 @@ final class Workspace: Identifiable {
         let agentSession = panel.session
         let panelId = panel.id
         remoteAgentPaneSessions[panelId] = session
+        // Reattach is the drop path, deliberately: the pane's AgentSession is
+        // fixed for the panel's life and `consume` is not idempotent, so a
+        // replayed stream needs a fresh pane. Dropping here rebuilds it
+        // against the same surface with the peer's replay behind it.
+        session.requestHostReconnectReattach = { [weak self] in
+            self?.dropRemoteAgentPane(panelId: panelId, reason: "host reconnected")
+        }
 
         // Input: every NDJSON line the session writes (turns, queued
         // turns, interrupts) goes out as one Input.keys frame. Weak relay:

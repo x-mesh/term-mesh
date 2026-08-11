@@ -486,6 +486,43 @@ final class PeerPaneSessionTests: XCTestCase {
         XCTAssertEqual(registry.teardownCountForTests, teardownsBefore + 2)
     }
 
+    /// Reattach-on-reconnect is for panes a person chose to disconnect. An
+    /// accidental transport loss has recovery of its own, and reattaching it
+    /// here too would rebuild the pane twice for one failure.
+    @MainActor
+    func test_reattachAfterHostReconnect_onlyForPanesADeliberateDisconnectKept() {
+        let host = PeerPaneHostSpec.direct(sockPath: "/tmp/psp-unit-reattach.sock").hostKey
+        let otherHost = PeerPaneHostSpec.direct(sockPath: "/tmp/psp-unit-other.sock").hostKey
+
+        XCTAssertTrue(
+            PeerClientCoordinator.shouldReattachAfterHostReconnect(
+                leaseKey: host, reconnectedHost: host,
+                hostTransportWasDisconnected: true, isTorndown: false
+            )
+        )
+        XCTAssertFalse(
+            PeerClientCoordinator.shouldReattachAfterHostReconnect(
+                leaseKey: otherHost, reconnectedHost: host,
+                hostTransportWasDisconnected: true, isTorndown: false
+            ),
+            "another host coming back says nothing about this pane"
+        )
+        XCTAssertFalse(
+            PeerClientCoordinator.shouldReattachAfterHostReconnect(
+                leaseKey: host, reconnectedHost: host,
+                hostTransportWasDisconnected: false, isTorndown: false
+            ),
+            "an accidental drop already recovers on its own"
+        )
+        XCTAssertFalse(
+            PeerClientCoordinator.shouldReattachAfterHostReconnect(
+                leaseKey: host, reconnectedHost: host,
+                hostTransportWasDisconnected: true, isTorndown: true
+            ),
+            "a torn-down pane has nothing to reattach"
+        )
+    }
+
     @MainActor
     func test_registry_concurrentFirstAcquireYieldsOneLease() async throws {
         let registry = PeerPaneHostRegistry.shared
