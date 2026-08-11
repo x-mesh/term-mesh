@@ -117,9 +117,17 @@ final class PeerWorkspaceMirrorController {
     /// Not advertising keeps the host on the untyped PtyData snapshot path,
     /// which the demux forwards like any other bytes. Lift this only
     /// together with a demux channel for typed frames.
+    ///
+    /// `surface.agent.v1` is also withheld: the mirror path renders agent
+    /// surfaces nowhere (attachShared has no callback delivery), so not
+    /// advertising keeps the host's demotion (attachable=false + attach
+    /// refusal) as the protocol-level guard, independent of the daemon's
+    /// layout-side agent exclusion. Lift together with mirror agent panes.
     private static var mirrorHandshakeOptions: PeerSessionOptions {
         PeerSessionOptions(
-            capabilities: PeerCapability.supported.filter { $0 != PeerCapability.gridSnapshotV1 }
+            capabilities: PeerCapability.supported.filter {
+                $0 != PeerCapability.gridSnapshotV1 && $0 != PeerCapability.surfaceAgentV1
+            }
         )
     }
 

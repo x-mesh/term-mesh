@@ -410,7 +410,15 @@ final class PeerPaneSession {
         while Date() < deadline {
             try? await Task.sleep(nanoseconds: 400_000_000)
             let now = try await listSurfaces(on: lease)
-            if let fresh = now.first(where: { !before.contains($0.surfaceID) && $0.attachable }) {
+            // "New since the split request" is the whole detection, so an
+            // agent surface someone ensured concurrently would match too —
+            // and the caller is waiting for a SHELL to type a launch
+            // command into. Only a terminal-typed surface counts as the
+            // split this asked for.
+            if let fresh = now.first(where: {
+                !before.contains($0.surfaceID) && $0.attachable
+                    && !SessionHostPanes.isAgentSurfaceType($0.surfaceType)
+            }) {
                 return fresh
             }
         }
@@ -434,7 +442,15 @@ final class PeerPaneSession {
         }
         let relay: PeerRelaySession
         do {
-            relay = try await PeerRelaySession.attach(conn, surface: surface)
+            // Agent surfaces carry NDJSON, not a terminal byte stream: route
+            // their PtyData to the in-process callback (AgentSession.consume)
+            // instead of spawning the relay binary as a pane shell.
+            relay = try await PeerRelaySession.attach(
+                conn,
+                surface: surface,
+                ptyDelivery: SessionHostPanes.isAgentSurfaceType(surface.surfaceType)
+                    ? .callback : .relaySocket
+            )
         } catch {
             await conn.cancel()
             throw error
@@ -474,13 +490,27 @@ final class PeerPaneSession {
     /// Saved-profile path: handshake → ensure → attach the exact returned id.
     /// The same open connection owns both RPCs, so no list/picker race can
     /// redirect the attachment to a different surface.
+    ///
+    /// `agentCli` labels an agent-kind ensure for the renderer. It is not a
+    /// second wire field: the daemon reads the same label out of the spec's
+    /// own `--cli <name>` argument, and `EnsureSurfaceResponse` carries no
+    /// `SurfaceInfo` to read it back from — so the exact surface synthesised
+    /// here has to be told. Ignored for a terminal kind.
     static func ensureAndAttach(
         lease: PeerPaneHostLease,
         surfaceSpec: PeerRunnerSurfaceSpec,
         attachment: PeerRunnerAttachment,
         hostSpec: PeerPaneHostSpec,
-        onEnsured: () -> Void = {}
+        agentCli: String = "",
+        environment: [String: String] = [:],
+        onEnsured: () -> Void = {},
+        onAgentPostEnsureFailure: ((Data) -> Void)? = nil
     ) async throws -> (session: PeerPaneSession, outcome: PeerEnsureSurfaceOutcome) {
+        // Validate before opening a transport or issuing EnsureSurface. Keeping
+        // the typed local error intact gives callers an actionable key/limit
+        // diagnosis instead of misreporting invalid saved/profile data as a
+        // generic refusal by the host. Validation errors never include values.
+        try PeerEnsureEnvironment.validate(environment)
         let conn = try await PeerRelaySession.connect(hostSockPath: lease.hostSockPath)
         if lease.hostDisplayName.isEmpty {
             lease.hostDisplayName = conn.hostDisplayName
@@ -488,7 +518,11 @@ final class PeerPaneSession {
 
         let outcome: PeerEnsureSurfaceOutcome
         do {
-            outcome = try await PeerRelaySession.ensureSurface(conn, spec: surfaceSpec)
+            outcome = try await PeerRelaySession.ensureSurface(
+                conn,
+                spec: surfaceSpec,
+                environment: environment
+            )
         } catch {
             await conn.cancel()
             throw error
@@ -503,21 +537,65 @@ final class PeerPaneSession {
         exactSurface.title = attachment.title.isEmpty ? "Runner" : attachment.title
         exactSurface.cols = max(attachment.cols, 1)
         exactSurface.rows = max(attachment.rows, 1)
-        exactSurface.surfaceType = "terminal"
+        // The ensured kind IS the surface type; an empty kind is the terminal
+        // that predates the field. Getting this wrong is not cosmetic — it is
+        // what `Workspace.openRemoteAgentPane` gates on, so a mislabelled
+        // agent surface renders as a terminal full of raw NDJSON.
+        exactSurface.surfaceType = surfaceSpec.kind.isEmpty
+            ? "terminal" : surfaceSpec.kind
+        let isAgent = SessionHostPanes.isAgentSurfaceType(exactSurface.surfaceType)
+        if isAgent {
+            exactSurface.agentCli = agentCli
+        }
         exactSurface.attachable = true
         exactSurface.cwd = surfaceSpec.cwd
 
+        // The ensure is the point of no return on the host: a child is running
+        // there now and `outcome.surfaceID` is the only thing that can name it.
+        // Everything below can still fail, and a plain `throw` would drop that
+        // id on the floor — leaving a bridge nobody can address, in no
+        // workspace tree, in no `ManagedPeerSurfaceStore`, reachable by no
+        // cleanup UI. So the failure pays for the ensure first.
+        //
+        // Agent kinds only, and the distinction is not caution: a terminal
+        // runner surface is keyed to a saved profile the user re-launches, and
+        // reusing that exact surface is the contract
+        // (`test_savedRunnerRepeatedLaunchReusesExactEnsuredSurfaceID`).
+        // Terminating one because an attach blipped would throw away the
+        // session it exists to preserve. An agent surface is keyed to a
+        // single agent instance that no longer exists once this throws.
+        func compensateEnsure() async {
+            guard isAgent else { return }
+            if let onAgentPostEnsureFailure {
+                onAgentPostEnsureFailure(outcome.surfaceID)
+                return
+            }
+            await terminateSurface(
+                hostSockPath: lease.hostSockPath,
+                surfaceID: outcome.surfaceID
+            )
+        }
+
         let relay: PeerRelaySession
         do {
-            relay = try await PeerRelaySession.attach(conn, surface: exactSurface)
+            // Same rule as the roster path above: an agent surface carries
+            // NDJSON for `AgentSession.consume`, not a terminal byte stream
+            // for the relay helper.
+            relay = try await PeerRelaySession.attach(
+                conn,
+                surface: exactSurface,
+                ptyDelivery: isAgent ? .callback : .relaySocket
+            )
         } catch {
             await conn.cancel()
+            await compensateEnsure()
             throw error
         }
         do {
             try relay.prepareListener()
         } catch {
             await relay.stop()
+            await compensateEnsure()
             throw error
         }
 
@@ -536,6 +614,33 @@ final class PeerPaneSession {
         dlog("peer.pane.ensureAttach surface=\(surfaceMarker) result=\(outcome.result) generation=\(outcome.generation)")
         #endif
         return (paneSession, outcome)
+    }
+
+    /// Stop one ensured surface on its host, on a connection opened for the
+    /// purpose.
+    ///
+    /// The right verb for an *agent* surface and the only one that works:
+    /// such a surface is deliberately never placed in the workspace tree, so
+    /// a close-by-pane-id finds nothing and reports success while the bridge
+    /// keeps running. TerminateSurface addresses the host's registry.
+    ///
+    /// Best effort by design. Every caller is already unwinding something, and
+    /// a host that cannot be reached to clean up is not a second error to
+    /// report on top of the first. A fresh connection is required rather than
+    /// convenient: this is a direct-response RPC, so it cannot share a
+    /// connection that has an ensure in flight or an inbound pump running.
+    static func terminateSurface(hostSockPath: String, surfaceID: Data) async {
+        guard !hostSockPath.isEmpty, !surfaceID.isEmpty,
+              let connection = try? await PeerRelaySession.connect(hostSockPath: hostSockPath)
+        else { return }
+        do {
+            try await connection.session.terminateSurface(surfaceID: surfaceID)
+        } catch {
+            RemoteWorkLog.infoOffMain(
+                "Could not terminate the peer agent surface: \(String(describing: error))"
+            )
+        }
+        await connection.cancel()
     }
 
     // ── Lifecycle ────────────────────────────────────────────────────

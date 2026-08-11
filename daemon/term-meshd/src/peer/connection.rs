@@ -18,7 +18,7 @@ use peer_proto::v1::{
     workspace_update, AttachMode, AttachResult, AuthChallenge, AuthResult, CreateWorkspaceResponse,
     EnsureSurfaceError as WireEnsureError, EnsureSurfaceErrorCode, EnsureSurfaceRequest,
     EnsureSurfaceResponse, EnsureSurfaceRestartPolicy, EnsureSurfaceResult, Envelope, Error,
-    GridSnapshot, Hello, ScrollbackChunk,
+    GridSnapshot, Hello, ScrollbackChunk, SurfaceExited,
     HostStats, Pong, PtyData, SurfaceList, TerminateSurfaceError as WireTerminateError,
     TerminateSurfaceErrorCode, TerminateSurfaceRequest, TerminateSurfaceResponse,
     Team, TeamCallResponse, TeamList, TerminateSurfaceResult, Workspace, WorkspaceList,
@@ -36,7 +36,7 @@ use super::framing::{read_envelope, write_envelope};
 use super::layout::{self, PeerHost};
 use super::surface::{
     EnsureDisposition, EnsureError, EnsureOutcome, EnsureRestartPolicy, PtyChunk, PtySurface,
-    SurfaceSpec,
+    SurfaceKind, SurfaceSpec,
 };
 use crate::headless::cli_builder::executable_bin_dir;
 use crate::monitor::SystemSnapshot;
@@ -103,7 +103,18 @@ async fn reader_loop(
     let ensure_work_gate = EnsureWorkGate::new();
     let ensure_worker: EnsureWorker = {
         let host = host.clone();
-        Arc::new(move |key, spec| host.ensure_surface(&key, &spec))
+        Arc::new(move |key, spec, env| {
+            if spec.kind == SurfaceKind::Agent {
+                host.pty.ensure_with_env(&key, &spec, &env)
+            } else if env.is_empty() {
+                host.ensure_surface(&key, &spec)
+            } else {
+                // Environment-bearing ensured surfaces are native agents in
+                // this protocol version; do not silently create an untracked
+                // terminal outside the workspace layout.
+                Err(EnsureError::Internal("terminal ensure env is unsupported"))
+            }
+        })
     };
     let terminate_worker: TerminateWorker = {
         let host = host.clone();
@@ -254,7 +265,27 @@ async fn reader_loop(
             }
 
             (HandshakeState::Ready, Payload::ListSurfaces(_)) => {
-                let surfaces = manager.list().iter().map(|s| s.info()).collect();
+                // surface.agent.v1 gate (a) of two — see peer.proto's
+                // SurfaceInfo: to a client that did not advertise the
+                // capability, an agent surface is reported with
+                // `attachable = false` so an older viewer's existing
+                // attachable filter hides it for free, and it never feeds
+                // an NDJSON stream to a terminal renderer. The row itself
+                // still travels (type, title, cwd) — only attach is off
+                // the table. Gate (b) is the AttachSurface refusal below,
+                // for a client that ignores the listing.
+                let agent_capable = peer_capabilities.has(capability::SURFACE_AGENT_V1);
+                let surfaces = manager
+                    .list()
+                    .iter()
+                    .map(|s| {
+                        let mut info = s.info();
+                        if !agent_capable && s.kind() == SurfaceKind::Agent {
+                            info.attachable = false;
+                        }
+                        info
+                    })
+                    .collect();
                 let reply = Envelope {
                     seq: next_seq(&seq_counter),
                     correlation_id: env.seq,
@@ -267,6 +298,7 @@ async fn reader_loop(
                 dispatch_ensure_surface(
                     req,
                     env.seq,
+                    &peer_capabilities,
                     &mut lifecycle_request_ids,
                     &ensure_work_gate,
                     &outgoing_tx,
@@ -509,6 +541,39 @@ async fn reader_loop(
             }
 
             (HandshakeState::Ready, Payload::AttachSurface(req)) => {
+                // surface.agent.v1 gate (b) of two: a client that did not
+                // advertise the capability MUST NOT be attached to an agent
+                // surface — its renderer would paint the NDJSON stream as
+                // terminal bytes. Refused explicitly (spec: peer.proto's
+                // SurfaceInfo, docs/peer-federation-protocol.md) rather than
+                // silently, so a misbehaving client that skipped the
+                // ListSurfaces attachable filter gets a diagnosable answer.
+                // Decided BEFORE `get_or_respawn`, from the registry alone
+                // (`registered_kind`: current instance or respawn spec, no
+                // spawning): a refused attach must not revive a dead
+                // declared agent surface as a side effect — that would
+                // manufacture an orphan child the refused client could
+                // never reach. Unknown ids answer `None` here and fall
+                // through to the "surface not found" reply below.
+                if !peer_capabilities.has(capability::SURFACE_AGENT_V1)
+                    && manager.registered_kind(&req.surface_id) == Some(SurfaceKind::Agent)
+                {
+                    let reply = Envelope {
+                        seq: next_seq(&seq_counter),
+                        correlation_id: env.seq,
+                        payload: Some(Payload::AttachResult(AttachResult {
+                            accepted: false,
+                            reason: "agent surface requires capability surface.agent.v1"
+                                .into(),
+                            surface_id: req.surface_id.clone(),
+                            initial_seq: 0,
+                            granted_mode: AttachMode::Unspecified as i32,
+                        })),
+                    };
+                    send(&outgoing_tx, reply).await?;
+                    continue;
+                }
+
                 // get_or_respawn revives a registered surface whose child
                 // has exited (e.g., the user typed `exit` in a previous
                 // attach). Unknown ids or respawn failures fall through
@@ -528,6 +593,31 @@ async fn reader_loop(
                     send(&outgoing_tx, reply).await?;
                     continue;
                 };
+
+                // Gate (b) re-checked on the actual instance: the registry
+                // answer above is not atomic with the respawn — a terminate +
+                // re-ensure under the same key can flip the kind in between
+                // (the deterministic surface id survives the flip). The
+                // pre-respawn check prevents the spawn side effect; this one
+                // is the authoritative refusal.
+                if !peer_capabilities.has(capability::SURFACE_AGENT_V1)
+                    && surface.kind() == SurfaceKind::Agent
+                {
+                    let reply = Envelope {
+                        seq: next_seq(&seq_counter),
+                        correlation_id: env.seq,
+                        payload: Some(Payload::AttachResult(AttachResult {
+                            accepted: false,
+                            reason: "agent surface requires capability surface.agent.v1"
+                                .into(),
+                            surface_id: req.surface_id.clone(),
+                            initial_seq: 0,
+                            granted_mode: AttachMode::Unspecified as i32,
+                        })),
+                    };
+                    send(&outgoing_tx, reply).await?;
+                    continue;
+                }
 
                 if attached.contains_key(&req.surface_id) {
                     let reply = Envelope {
@@ -586,6 +676,20 @@ async fn reader_loop(
                 // - `TERMMESH_PEER_FRESH_ATTACH_MODE=bytes` (or a poisoned
                 //   screen lock) falls back to the pre-snapshot tail so the
                 //   new path is revertible in the field without a rebuild.
+                // - An AGENT surface takes the byte paths by construction,
+                //   with no kind branch here: `screen_snapshot()` is `None`
+                //   (no grid → never a typed GridSnapshot, whatever the
+                //   client advertised), `mode_replay_bytes()` is empty (no
+                //   DEC modes → no mode-prefix frame), and the earlier
+                //   `request_size` was a no-op (no winsize). A fresh attach
+                //   replays the ring tail — chunks are whole NDJSON lines
+                //   (the agent reader pushes line-aligned, splitting only a
+                //   line over AGENT_CHUNK_MAX_BYTES so no frame can breach
+                //   MAX_FRAME_BYTES), and the tail cuts on chunk
+                //   boundaries, so a reconnect can never split an
+                //   ordinarily-sized event in half. Resume/replay-ring
+                //   semantics below are byte-identical to a terminal
+                //   surface.
                 //
                 // The snapshot is packaged as a single synthetic `PtyChunk`
                 // whose `seq` is BACKDATED by its own length — the same
@@ -739,6 +843,7 @@ async fn reader_loop(
                     replay,
                     mode_prefix,
                     snapshot_floor,
+                    peer_capabilities.has(capability::SURFACE_EXIT_V1),
                 );
                 host.pty.note_attached(&req.surface_id);
                 attached.insert(req.surface_id, entry);
@@ -797,15 +902,38 @@ async fn reader_loop(
                         // `PtySurface::note_input`. Before the write, so a
                         // size-sensitive redraw the input provokes already
                         // happens at the typist's size.
+                        //
+                        // Both calls are kind-routed inside the surface: on
+                        // an agent surface `note_input` is a no-op (no
+                        // winsize to arbitrate) and the write lands on the
+                        // agent child's stdin instead of a PTY master —
+                        // that is how a viewer's turn input reaches the
+                        // bridge. Mouse stays ignored for both kinds.
                         entry.surface.note_input(size_requester);
                         if let Err(e) = write_surface_input(entry.surface.clone(), keys).await {
                             tracing::warn!("PTY write failed: {e}");
+                            send_surface_input_error(
+                                &outgoing_tx,
+                                &seq_counter,
+                                env.seq,
+                                &input.surface_id,
+                                &e,
+                            )
+                            .await?;
                         }
                     }
                     Some(peer_proto::v1::input::Kind::Paste(p)) => {
                         entry.surface.note_input(size_requester);
                         if let Err(e) = write_surface_input(entry.surface.clone(), p.text).await {
                             tracing::warn!("PTY paste-write failed: {e}");
+                            send_surface_input_error(
+                                &outgoing_tx,
+                                &seq_counter,
+                                env.seq,
+                                &input.surface_id,
+                                &e,
+                            )
+                            .await?;
                         }
                     }
                     Some(peer_proto::v1::input::Kind::Mouse(_)) => {
@@ -1021,6 +1149,7 @@ fn spawn_attach_relay(
     // chunks the snapshot already contains (broadcast between subscribe()
     // and the snapshot read) must still be dropped below this seq.
     snapshot_floor: u64,
+    send_surface_exit: bool,
 ) -> AttachEntry {
     let cancel = Arc::new(Notify::new());
     let cancel_for_task = cancel.clone();
@@ -1096,7 +1225,8 @@ fn spawn_attach_relay(
         // exiting reach the viewer. (Flaky repro before this existed:
         // `surface_respawns_after_child_exit`, where the respawned child's
         // entire lifetime fits inside that race window.)
-        let mut surface_dead = false;
+        let mut surface_dead = surface_for_task.dead.load(Ordering::Acquire);
+        let mut observed_exit = false;
         loop {
             let res = if surface_dead {
                 match subscriber.try_recv() {
@@ -1107,6 +1237,7 @@ fn spawn_attach_relay(
                     Err(_) => {
                         // Empty or Closed: the backlog is flushed.
                         tracing::info!("surface died, detaching relay");
+                        observed_exit = true;
                         break;
                     }
                 }
@@ -1116,6 +1247,15 @@ fn spawn_attach_relay(
                     _ = cancel_for_task.notified() => break,
                     _ = surface_for_task.dead_notify.notified() => {
                         surface_dead = true;
+                        continue;
+                    }
+                    // `Notify::notify_waiters` does not retain a permit. The
+                    // atomic re-check closes the attach-vs-death window even
+                    // when death happened just before this waiter registered.
+                    _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {
+                        if surface_for_task.dead.load(Ordering::Acquire) {
+                            surface_dead = true;
+                        }
                         continue;
                     }
                     res = subscriber.recv() => res,
@@ -1165,6 +1305,20 @@ fn spawn_attach_relay(
                     }
                 }
             }
+        }
+        if observed_exit && send_surface_exit {
+            let exit = surface_for_task.exit_info();
+            let env = Envelope {
+                seq: seq_counter.fetch_add(1, Ordering::Relaxed) + 1,
+                correlation_id: 0,
+                payload: Some(Payload::SurfaceExited(SurfaceExited {
+                    surface_id: surface_for_task.surface_id.clone(),
+                    exit_code: exit.exit_code,
+                    signal: exit.signal,
+                    reason: exit.reason.to_string(),
+                })),
+            };
+            let _ = outgoing_tx.send(env).await;
         }
     });
 
@@ -1260,6 +1414,9 @@ const TEAM_CALL_ALLOWED_METHODS: &[&str] = &[
     "team.result.collect",
     "team.inbox",
     "team.message.list",
+    "team.correlation.register",
+    "team.correlation.get",
+    "team.correlation.cancel",
     "team.send",
     "team.broadcast",
     "team.delegate",
@@ -1534,6 +1691,38 @@ async fn write_surface_input(surface: Arc<PtySurface>, bytes: Vec<u8>) -> std::i
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::Interrupted, e.to_string()))?
 }
 
+/// Turn delivery failures must be visible to the viewer. In particular, a
+/// full agent stdin queue is intentional backpressure, not permission to
+/// silently discard the user's turn. Code 100 is the protocol's
+/// surface-fatal fallback; the envelope correlation points at the Input
+/// frame and `correlation_id_bytes` identifies its surface.
+async fn send_surface_input_error(
+    tx: &mpsc::Sender<Envelope>,
+    seq_counter: &AtomicU64,
+    input_seq: u64,
+    surface_id: &[u8],
+    error: &std::io::Error,
+) -> anyhow::Result<()> {
+    let message = match error.kind() {
+        std::io::ErrorKind::WouldBlock => "surface input queue full",
+        std::io::ErrorKind::BrokenPipe => "surface input channel closed",
+        _ => "surface input write failed",
+    };
+    send(
+        tx,
+        Envelope {
+            seq: next_seq(seq_counter),
+            correlation_id: input_seq,
+            payload: Some(Payload::Error(Error {
+                code: 100,
+                message: message.into(),
+                correlation_id_bytes: surface_id.to_vec(),
+            })),
+        },
+    )
+    .await
+}
+
 fn clamp_pty_size(cols: u32, rows: u32) -> Option<(u16, u16)> {
     if cols == 0 || rows == 0 {
         return None;
@@ -1551,6 +1740,10 @@ const ENSURE_KEY_MAX_BYTES: usize = 256;
 const ENSURE_PATH_MAX_BYTES: usize = 4096;
 const ENSURE_ARG_MAX_COUNT: usize = 256;
 const ENSURE_ARG_MAX_BYTES: usize = 64 * 1024;
+const ENSURE_ENV_MAX_COUNT: usize = 64;
+const ENSURE_ENV_KEY_MAX_BYTES: usize = 128;
+const ENSURE_ENV_VALUE_MAX_BYTES: usize = 4096;
+const ENSURE_ENV_TOTAL_MAX_BYTES: usize = 64 * 1024;
 const ENSURE_REQUEST_ID_BUDGET: usize = 65_536;
 const ENSURE_CONCURRENCY_LIMIT: usize = 16;
 
@@ -1572,7 +1765,7 @@ impl EnsureWorkGate {
 }
 
 type EnsureWorker =
-    Arc<dyn Fn(String, SurfaceSpec) -> Result<EnsureOutcome, EnsureError> + Send + Sync + 'static>;
+    Arc<dyn Fn(String, SurfaceSpec, Vec<(String, String)>) -> Result<EnsureOutcome, EnsureError> + Send + Sync + 'static>;
 type TerminateWorker = Arc<dyn Fn(Vec<u8>) -> Result<bool, EnsureError> + Send + Sync + 'static>;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1598,11 +1791,13 @@ fn admit_ensure_request_id(seen: &mut HashSet<Vec<u8>>, request_id: &[u8]) -> Re
 }
 
 /// Exact Ready-state dispatch path used by `reader_loop`. It owns request-id
-/// admission, backpressure placement, worker spawn, and correlated response
-/// enqueue so those ordering invariants can be exercised without a real PTY.
+/// admission, the `surface.agent.v1` ensure gate, backpressure placement,
+/// worker spawn, and correlated response enqueue so those ordering
+/// invariants can be exercised without a real PTY.
 async fn dispatch_ensure_surface(
     req: EnsureSurfaceRequest,
     correlation_id: u64,
+    peer_capabilities: &PeerCapabilities,
     ensure_request_ids: &mut HashSet<Vec<u8>>,
     ensure_work_gate: &EnsureWorkGate,
     outgoing_tx: &mpsc::Sender<Envelope>,
@@ -1635,6 +1830,26 @@ async fn dispatch_ensure_surface(
         RequestIdAdmission::Invalid => {}
     }
 
+    // surface.agent.v1 ensure gate: peer.proto's EnsureSurfaceRequest.kind
+    // says senders MUST NOT send "agent" to a host without the capability —
+    // and this connection's Hello is the same contract in the other
+    // direction. A client that never advertised it could not attach the
+    // surface it is asking for (the AttachSurface gate refuses it), so
+    // honoring the ensure would only manufacture an orphan agent process.
+    // Refused before any worker (= any spawn) runs. Unknown kind strings
+    // still take the normal validate path below.
+    if SurfaceKind::from_wire(&req.kind) == Some(SurfaceKind::Agent)
+        && !peer_capabilities.has(capability::SURFACE_AGENT_V1)
+    {
+        let response = failed_ensure_response(
+            request_id,
+            EnsureSurfaceErrorCode::InvalidRequest,
+            "validate",
+            "kind \"agent\" requires capability surface.agent.v1",
+        );
+        return send_ensure_response(outgoing_tx, seq_counter, correlation_id, response).await;
+    }
+
     let Ok(ensure_permit) = ensure_work_gate.acquire().await else {
         let response = failed_ensure_response(
             request_id,
@@ -1652,8 +1867,8 @@ async fn dispatch_ensure_surface(
         let request_hash = ensure_request_id_hash(&request_id);
         let safe_cwd = safe_log_cwd(&req.cwd);
         let response = match validate_ensure_request(req) {
-            Ok((key, spec)) => {
-                match tokio::task::spawn_blocking(move || ensure_worker(key, spec)).await {
+            Ok((key, spec, env)) => {
+                match tokio::task::spawn_blocking(move || ensure_worker(key, spec, env)).await {
                     Ok(result) => ensure_response_from_result(request_id, result),
                     Err(_) => failed_ensure_response(
                         request_id,
@@ -1827,7 +2042,7 @@ fn failed_terminate_response(
 
 fn validate_ensure_request(
     req: EnsureSurfaceRequest,
-) -> Result<(String, SurfaceSpec), EnsureSurfaceResponse> {
+) -> Result<(String, SurfaceSpec, Vec<(String, String)>), EnsureSurfaceResponse> {
     let request_id = req.request_id.clone();
     let invalid = |context: &'static str| {
         failed_ensure_response(
@@ -1885,11 +2100,60 @@ fn validate_ensure_request(
     if req.args.iter().any(|arg| arg.contains('\0')) {
         return Err(invalid("argument contains NUL"));
     }
+    if req.env.len() > ENSURE_ENV_MAX_COUNT {
+        return Err(too_large("env exceeds 64 entries"));
+    }
+    let mut env: Vec<(String, String)> = req.env.into_iter().collect();
+    env.sort_by(|a, b| a.0.cmp(&b.0));
+    let mut env_total = 0usize;
+    for (key, value) in &env {
+        if key.is_empty()
+            || !key.bytes().enumerate().all(|(index, byte)| {
+                byte == b'_' || byte.is_ascii_alphabetic() || (index > 0 && byte.is_ascii_digit())
+            })
+        {
+            return Err(invalid("env key is not a portable identifier"));
+        }
+        if key.len() > ENSURE_ENV_KEY_MAX_BYTES {
+            return Err(too_large("env key exceeds 128 UTF-8 bytes"));
+        }
+        if value.len() > ENSURE_ENV_VALUE_MAX_BYTES {
+            return Err(too_large("env value exceeds 4096 UTF-8 bytes"));
+        }
+        if value.contains('\0') {
+            return Err(invalid("env value contains NUL"));
+        }
+        env_total = env_total.saturating_add(key.len()).saturating_add(value.len());
+        if env_total > ENSURE_ENV_TOTAL_MAX_BYTES {
+            return Err(too_large("env exceeds 65536 UTF-8 bytes"));
+        }
+    }
 
     let restart_policy = match EnsureSurfaceRestartPolicy::try_from(req.restart_policy) {
         Ok(EnsureSurfaceRestartPolicy::Never) => EnsureRestartPolicy::Never,
         Ok(EnsureSurfaceRestartPolicy::OnDaemonRestart) => EnsureRestartPolicy::OnDaemonRestart,
         _ => return Err(invalid("restart_policy is invalid or unspecified")),
+    };
+    // Empty decodes to `Pty` — the only kind that predates the field, so an
+    // older sender keeps meaning "terminal" without saying so. An unknown
+    // string is refused here rather than defaulted: silently spawning the
+    // wrong kind would hand a viewer a byte stream its renderer cannot
+    // interpret (peer.proto, EnsureSurfaceRequest.kind).
+    let Some(kind) = SurfaceKind::from_wire(&req.kind) else {
+        return Err(invalid("kind must be empty, \"terminal\", or \"agent\""));
+    };
+    // The wire request carries no agent_cli field: the label rides the
+    // bridge-shaped `--cli <name>` argument the ensure caller already sends
+    // (the daemon spawns `executable`/`args` verbatim either way — this is
+    // display metadata, not dispatch). Best-effort: absent flag → empty
+    // label, and `SurfaceInfo.agent_cli` documents empty as valid. It joins
+    // the spec hash via `SurfaceSpec::canonical_hash`, so relabeling the
+    // CLI behind a key conflicts instead of reusing a surface that reports
+    // the old label.
+    let agent_cli = if kind == SurfaceKind::Agent {
+        agent_cli_from_args(&req.args)
+    } else {
+        String::new()
     };
     Ok((
         req.key,
@@ -1898,8 +2162,27 @@ fn validate_ensure_request(
             executable: req.executable,
             args: req.args,
             restart_policy,
+            kind,
+            agent_cli,
         },
+        env,
     ))
+}
+
+/// The CLI label an agent ensure is bridging, read out of the request's own
+/// argument vector (`--cli codex` or `--cli=codex`) — see the call site in
+/// [`validate_ensure_request`] for why the wire has no dedicated field.
+fn agent_cli_from_args(args: &[String]) -> String {
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        if let Some(value) = arg.strip_prefix("--cli=") {
+            return value.to_string();
+        }
+        if arg == "--cli" {
+            return iter.next().cloned().unwrap_or_default();
+        }
+    }
+    String::new()
 }
 
 fn ensure_response_from_result(
@@ -2283,6 +2566,45 @@ mod hostname_tests {
 }
 
 #[cfg(test)]
+mod input_error_tests {
+    use std::io;
+    use std::sync::atomic::AtomicU64;
+
+    use peer_proto::v1::envelope::Payload;
+    use tokio::sync::mpsc;
+
+    use super::send_surface_input_error;
+
+    #[tokio::test]
+    async fn queue_overflow_is_correlated_and_visible_on_the_wire() {
+        let (tx, mut rx) = mpsc::channel(1);
+        let seq = AtomicU64::new(40);
+        let surface_id = vec![0x7a; 16];
+        send_surface_input_error(
+            &tx,
+            &seq,
+            91,
+            &surface_id,
+            &io::Error::new(io::ErrorKind::WouldBlock, "queue full"),
+        )
+        .await
+        .expect("send input rejection");
+
+        let envelope = rx.recv().await.expect("wire error");
+        assert_eq!(envelope.seq, 41);
+        assert_eq!(envelope.correlation_id, 91);
+        match envelope.payload {
+            Some(Payload::Error(error)) => {
+                assert_eq!(error.code, 100);
+                assert_eq!(error.message, "surface input queue full");
+                assert_eq!(error.correlation_id_bytes, surface_id);
+            }
+            other => panic!("expected visible Error, got {other:?}"),
+        }
+    }
+}
+
+#[cfg(test)]
 mod ensure_tests {
     use std::collections::HashSet;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -2297,12 +2619,14 @@ mod ensure_tests {
     use tokio::sync::mpsc;
 
     use super::{
-        admit_ensure_request_id, dispatch_ensure_surface, ensure_response_from_result,
-        send_ensure_response, spawn_error_response, validate_ensure_request, EnsureWorkGate,
-        EnsureWorker, HandshakeState, RequestIdAdmission, ENSURE_CONCURRENCY_LIMIT,
+        admit_ensure_request_id, agent_cli_from_args, dispatch_ensure_surface,
+        ensure_response_from_result, send_ensure_response, spawn_error_response,
+        validate_ensure_request, EnsureWorkGate, EnsureWorker, HandshakeState,
+        RequestIdAdmission, ENSURE_CONCURRENCY_LIMIT, ENSURE_ENV_MAX_COUNT,
         ENSURE_REQUEST_ID_BUDGET,
     };
-    use crate::peer::surface::EnsureError;
+    use crate::peer::surface::{EnsureError, SurfaceKind};
+    use peer_proto::{capability, PeerCapabilities};
 
     fn valid_request() -> EnsureSurfaceRequest {
         EnsureSurfaceRequest {
@@ -2312,12 +2636,27 @@ mod ensure_tests {
             executable: "/bin/sh".into(),
             args: vec!["-lc".into(), "exec cargo test".into()],
             restart_policy: EnsureSurfaceRestartPolicy::OnDaemonRestart as i32,
+            kind: String::new(),
+            env: Default::default(),
         }
+    }
+
+    fn all_capabilities() -> PeerCapabilities {
+        PeerCapabilities::from_hello(capability::supported_vec())
+    }
+
+    fn capabilities_without_agent() -> PeerCapabilities {
+        PeerCapabilities::from_hello(
+            capability::supported_vec()
+                .into_iter()
+                .filter(|c| c != capability::SURFACE_AGENT_V1)
+                .collect(),
+        )
     }
 
     #[test]
     fn validates_wire_limits_and_restart_policy_without_echoing_input() {
-        let (_, spec) = validate_ensure_request(valid_request()).expect("valid request");
+        let (_, spec, _) = validate_ensure_request(valid_request()).expect("valid request");
         assert_eq!(spec.cwd, "/app/runner");
 
         let mut malformed = valid_request();
@@ -2327,6 +2666,30 @@ mod ensure_tests {
             .error
             .expect("structured error");
         assert_eq!(error.code, EnsureSurfaceErrorCode::InvalidRequest as i32);
+
+        let mut with_env = valid_request();
+        with_env.env.insert("PROFILE_TOKEN".into(), "present".into());
+        let (_, env_spec, env) = validate_ensure_request(with_env).expect("valid env");
+        assert_eq!(env, vec![("PROFILE_TOKEN".into(), "present".into())]);
+        assert_ne!(env_spec.canonical_hash(), env_spec.canonical_hash_with_env(&env));
+
+        let mut invalid_env = valid_request();
+        invalid_env.env.insert("BAD=KEY".into(), "secret".into());
+        let error = validate_ensure_request(invalid_env)
+            .expect_err("invalid env key")
+            .error
+            .expect("structured error");
+        assert_eq!(error.code, EnsureSurfaceErrorCode::InvalidRequest as i32);
+
+        let mut too_many_env = valid_request();
+        too_many_env.env = (0..=ENSURE_ENV_MAX_COUNT)
+            .map(|index| (format!("KEY_{index}"), "v".into()))
+            .collect();
+        let error = validate_ensure_request(too_many_env)
+            .expect_err("too many env entries")
+            .error
+            .expect("structured error");
+        assert_eq!(error.code, EnsureSurfaceErrorCode::RequestTooLarge as i32);
 
         let mut oversized = valid_request();
         oversized.args = vec!["x".repeat(65_537)];
@@ -2345,6 +2708,140 @@ mod ensure_tests {
             .error
             .expect("structured error");
         assert_eq!(error.code, EnsureSurfaceErrorCode::InvalidRequest as i32);
+    }
+
+    /// `EnsureSurfaceRequest.kind` wiring: empty stays terminal (the only
+    /// kind that predates the field), "agent" flows into the spec with its
+    /// CLI label read from the bridge-shaped args, and an unknown kind is
+    /// refused rather than silently defaulted to the wrong renderer.
+    #[test]
+    fn ensure_kind_parses_agent_labels_the_cli_and_refuses_unknown_kinds() {
+        let (_, spec, _) = validate_ensure_request(valid_request()).expect("empty kind");
+        assert_eq!(spec.kind, SurfaceKind::Pty);
+        assert_eq!(spec.agent_cli, "");
+
+        let mut agent = valid_request();
+        agent.kind = "agent".into();
+        agent.args = vec![
+            "--cli".into(),
+            "codex".into(),
+            "--cwd".into(),
+            "/app/runner".into(),
+        ];
+        let (_, spec, _) = validate_ensure_request(agent).expect("agent kind");
+        assert_eq!(spec.kind, SurfaceKind::Agent);
+        assert_eq!(spec.agent_cli, "codex");
+
+        // A terminal ensure never grows a label, even from bridge-shaped
+        // args — agent_cli is agent-only spec identity.
+        let mut terminal = valid_request();
+        terminal.kind = "terminal".into();
+        terminal.args = vec!["--cli".into(), "codex".into()];
+        let (_, spec, _) = validate_ensure_request(terminal).expect("explicit terminal");
+        assert_eq!(spec.kind, SurfaceKind::Pty);
+        assert_eq!(spec.agent_cli, "");
+
+        let mut unknown = valid_request();
+        unknown.kind = "browser".into();
+        let error = validate_ensure_request(unknown)
+            .expect_err("unknown kind")
+            .error
+            .expect("structured error");
+        assert_eq!(error.code, EnsureSurfaceErrorCode::InvalidRequest as i32);
+    }
+
+    /// Both spellings the bridge accepts, and the honest empty label when
+    /// the flag is absent or truncated — never a panic on adversarial args.
+    #[test]
+    fn agent_cli_label_reads_both_flag_forms_and_degrades_to_empty() {
+        let pair = |args: &[&str]| {
+            agent_cli_from_args(&args.iter().map(|s| s.to_string()).collect::<Vec<_>>())
+        };
+        assert_eq!(pair(&["--cli", "codex", "--model", "gpt"]), "codex");
+        assert_eq!(pair(&["--cli=kiro"]), "kiro");
+        assert_eq!(pair(&["--model", "gpt"]), "");
+        assert_eq!(pair(&["--cli"]), "", "truncated flag pair");
+        assert_eq!(pair(&[]), "");
+    }
+
+    /// surface.agent.v1 ensure gate (interface contract, peer.proto's
+    /// EnsureSurfaceRequest.kind): kind="agent" from a connection whose
+    /// Hello never advertised the capability is refused at dispatch,
+    /// before the worker — and therefore before any process — runs; the
+    /// byte-identical request under an advertising connection reaches the
+    /// worker. Without the gate the daemon would spawn an agent child the
+    /// requester can never attach (its AttachSurface is refused): an
+    /// orphan by construction.
+    #[tokio::test]
+    async fn agent_ensure_without_the_capability_is_refused_before_the_worker() {
+        let gate = EnsureWorkGate::new();
+        let (tx, mut rx) = mpsc::channel(4);
+        let seq = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let spawned = Arc::new(AtomicUsize::new(0));
+        let worker: EnsureWorker = Arc::new({
+            let spawned = spawned.clone();
+            move |_, _, _| {
+                spawned.fetch_add(1, Ordering::SeqCst);
+                Err(EnsureError::Internal("test worker completed"))
+            }
+        });
+        let mut agent_request = valid_request();
+        agent_request.kind = "agent".into();
+
+        let mut seen = HashSet::new();
+        dispatch_ensure_surface(
+            agent_request.clone(),
+            801,
+            &capabilities_without_agent(),
+            &mut seen,
+            &gate,
+            &tx,
+            &seq,
+            worker.clone(),
+        )
+        .await
+        .expect("dispatch refused agent ensure");
+        let response = rx.recv().await.expect("refusal response");
+        assert_eq!(response.correlation_id, 801);
+        let Some(Payload::EnsureSurfaceResponse(response)) = response.payload else {
+            panic!("wrong refusal payload");
+        };
+        assert_eq!(response.result, EnsureSurfaceResult::Failed as i32);
+        let error = response.error.expect("structured refusal error");
+        assert_eq!(error.code, EnsureSurfaceErrorCode::InvalidRequest as i32);
+        assert!(
+            error.safe_context.contains("surface.agent.v1"),
+            "refusal must name the missing capability: {}",
+            error.safe_context
+        );
+        assert_eq!(
+            spawned.load(Ordering::SeqCst),
+            0,
+            "no worker — and therefore no process — may run for a refused agent ensure"
+        );
+
+        // The identical request from an advertising connection passes the
+        // gate and reaches the worker (fresh request_id: one-shot set).
+        agent_request.request_id = vec![0x77; 16];
+        dispatch_ensure_surface(
+            agent_request,
+            802,
+            &all_capabilities(),
+            &mut seen,
+            &gate,
+            &tx,
+            &seq,
+            worker,
+        )
+        .await
+        .expect("dispatch capable agent ensure");
+        let response = rx.recv().await.expect("capable response");
+        assert_eq!(response.correlation_id, 802);
+        assert_eq!(
+            spawned.load(Ordering::SeqCst),
+            1,
+            "advertised capability must let the agent ensure through"
+        );
     }
 
     #[test]
@@ -2487,7 +2984,7 @@ mod ensure_tests {
         let worker: EnsureWorker = Arc::new({
             let entered = entered.clone();
             let releases = releases.clone();
-            move |_, _| {
+            move |_, _, _| {
                 entered.fetch_add(1, Ordering::SeqCst);
                 let (lock, wake) = &*releases;
                 let mut available = lock.lock().expect("release lock");
@@ -2508,6 +3005,7 @@ mod ensure_tests {
             dispatch_ensure_surface(
                 request,
                 correlation_id,
+                &all_capabilities(),
                 &mut seen,
                 &gate,
                 &tx,
@@ -2530,8 +3028,17 @@ mod ensure_tests {
         let Payload::EnsureSurfaceRequest(request) = frame.payload.expect("payload") else {
             panic!("wrong payload");
         };
-        let seventeenth =
-            dispatch_ensure_surface(request, correlation_id, &mut seen, &gate, &tx, &seq, worker);
+        let capabilities = all_capabilities();
+        let seventeenth = dispatch_ensure_surface(
+            request,
+            correlation_id,
+            &capabilities,
+            &mut seen,
+            &gate,
+            &tx,
+            &seq,
+            worker,
+        );
         tokio::pin!(seventeenth);
         assert!(
             tokio::time::timeout(Duration::from_millis(20), &mut seventeenth)
@@ -2736,7 +3243,7 @@ mod terminate_tests {
         let (tx, mut rx) = mpsc::channel(8);
         let seq = Arc::new(AtomicU64::new(0));
         let ensure_worker: EnsureWorker =
-            Arc::new(|_, _| Err(super::EnsureError::Internal("test ensure completed")));
+            Arc::new(|_, _, _| Err(super::EnsureError::Internal("test ensure completed")));
         let terminate_worker: TerminateWorker = Arc::new(|_| Ok(false));
         let ensure_request = |request_id: Vec<u8>| EnsureSurfaceRequest {
             request_id,
@@ -2745,13 +3252,17 @@ mod terminate_tests {
             executable: "/bin/sh".into(),
             args: Vec::new(),
             restart_policy: EnsureSurfaceRestartPolicy::OnDaemonRestart as i32,
+            kind: String::new(),
+            env: Default::default(),
         };
 
+        let capabilities = PeerCapabilities::from_hello(capability::supported_vec());
         let first_id = vec![0xa1; 16];
         let mut seen = HashSet::new();
         dispatch_ensure_surface(
             ensure_request(first_id.clone()),
             701,
+            &capabilities,
             &mut seen,
             &gate,
             &tx,
@@ -2807,6 +3318,7 @@ mod terminate_tests {
         dispatch_ensure_surface(
             ensure_request(second_id),
             704,
+            &capabilities,
             &mut seen,
             &gate,
             &tx,
@@ -3175,6 +3687,9 @@ mod team_call_allow_list_tests {
         daemon_methods.sort();
 
         assert_eq!(cli_methods, daemon_methods);
+        assert!(team_call_allowed("team.correlation.register"));
+        assert!(team_call_allowed("team.correlation.get"));
+        assert!(team_call_allowed("team.correlation.cancel"));
         assert!(team_call_allowed("team.task.done"));
         assert!(!team_call_allowed("team.task.reassign"));
     }
@@ -3284,5 +3799,765 @@ mod team_task_diff_tests {
             "{}",
             response.error_message
         );
+    }
+}
+
+/// Agent surfaces over the real wire: the full `run()` connection loop
+/// against a `PtyManager` that owns non-PTY children, driven from the
+/// client side of a socketpair.
+///
+/// Covers the two `surface.agent.v1` gates (SurfaceList demotion + attach
+/// refusal), the happy path a capable viewer takes (attach → Input turn →
+/// echoed PtyData → detach → replay reattach), and the contracts agent
+/// surfaces inherit unchanged from terminals: duplicate-attach refusal,
+/// dead-surface respawn on attach, and the out-of-ring resume fallback.
+#[cfg(test)]
+mod agent_surface_tests {
+    use std::sync::atomic::Ordering;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use peer_proto::capability;
+    use peer_proto::v1::envelope::Payload;
+    use peer_proto::v1::{
+        AttachMode, AttachSurface, Auth, DetachSurface, Envelope, Hello, Input, ListSurfaces,
+        Ping, SurfaceList,
+    };
+    use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
+    use tokio::net::UnixStream;
+
+    use super::{run, PeerHost, PROTOCOL_VERSION};
+    use crate::peer::framing::{read_envelope, write_envelope};
+    use crate::peer::surface::{
+        surface_id_from_name, EnsureRestartPolicy, PtyManager, PtySurface, SurfaceKind,
+        SurfaceSpec,
+    };
+
+    const IO_TIMEOUT: Duration = Duration::from_secs(30);
+
+    /// `/bin/cat` as the agent child: long-lived, and it echoes stdin back
+    /// to stdout, so a turn written to the bridge's stdin reappears as a
+    /// newline-terminated NDJSON-shaped line — both directions of the pipe
+    /// contract in one deterministic process.
+    fn cat_agent_spec() -> SurfaceSpec {
+        SurfaceSpec {
+            cwd: "/tmp".into(),
+            executable: "/bin/cat".into(),
+            args: Vec::new(),
+            restart_policy: EnsureRestartPolicy::OnDaemonRestart,
+            kind: SurfaceKind::Agent,
+            agent_cli: "codex".into(),
+        }
+    }
+
+    fn script_agent_spec(script: &str) -> SurfaceSpec {
+        SurfaceSpec {
+            cwd: "/tmp".into(),
+            executable: "/bin/sh".into(),
+            args: vec!["-c".into(), script.into()],
+            restart_policy: EnsureRestartPolicy::OnDaemonRestart,
+            kind: SurfaceKind::Agent,
+            agent_cli: "codex".into(),
+        }
+    }
+
+    fn capabilities_without_agent() -> Vec<String> {
+        capability::supported_vec()
+            .into_iter()
+            .filter(|c| c != capability::SURFACE_AGENT_V1)
+            .collect()
+    }
+
+    /// Socketpair against the production `run()` loop, handshaken through
+    /// Hello/Auth with the given client capabilities. The returned halves
+    /// are the CLIENT side.
+    async fn handshake(
+        host: Arc<PeerHost>,
+        capabilities: Vec<String>,
+    ) -> (OwnedReadHalf, OwnedWriteHalf) {
+        let (client, server) = UnixStream::pair().expect("socketpair");
+        tokio::spawn(async move {
+            let _ = run(server, host).await;
+        });
+        let (mut reader, mut writer) = client.into_split();
+        write_envelope(
+            &mut writer,
+            &Envelope {
+                seq: 1,
+                correlation_id: 0,
+                payload: Some(Payload::Hello(Hello {
+                    protocol_version: PROTOCOL_VERSION.into(),
+                    peer_id: vec![0x42; 16],
+                    display_name: "agent-surface-test".into(),
+                    capabilities,
+                    app_version: "test".into(),
+                    cli_bin_dirs: vec![],
+                    session_host_socket: String::new(),
+                })),
+            },
+        )
+        .await
+        .expect("send hello");
+        let _ = recv(&mut reader).await; // host hello
+        let _ = recv(&mut reader).await; // auth challenge
+        write_envelope(
+            &mut writer,
+            &Envelope {
+                seq: 2,
+                correlation_id: 0,
+                payload: Some(Payload::Auth(Auth {
+                    method: "ssh-passthrough".into(),
+                    token_id: vec![],
+                    signature: vec![],
+                })),
+            },
+        )
+        .await
+        .expect("send auth");
+        match recv(&mut reader).await.payload {
+            Some(Payload::AuthResult(result)) => assert!(result.accepted, "{}", result.reason),
+            other => panic!("expected AuthResult, got {other:?}"),
+        }
+        (reader, writer)
+    }
+
+    async fn recv(reader: &mut OwnedReadHalf) -> Envelope {
+        tokio::time::timeout(IO_TIMEOUT, read_envelope(reader))
+            .await
+            .expect("frame within timeout")
+            .expect("read envelope")
+    }
+
+    async fn list_surfaces(
+        reader: &mut OwnedReadHalf,
+        writer: &mut OwnedWriteHalf,
+        seq: u64,
+    ) -> SurfaceList {
+        write_envelope(
+            writer,
+            &Envelope {
+                seq,
+                correlation_id: 0,
+                payload: Some(Payload::ListSurfaces(ListSurfaces {})),
+            },
+        )
+        .await
+        .expect("send ListSurfaces");
+        match recv(reader).await.payload {
+            Some(Payload::SurfaceList(list)) => list,
+            other => panic!("expected SurfaceList, got {other:?}"),
+        }
+    }
+
+    /// Request an attach and read up to the AttachResult. Nothing is
+    /// expected in between on these quiet fixtures, so anything else is a
+    /// contract violation worth failing on.
+    async fn attach(
+        reader: &mut OwnedReadHalf,
+        writer: &mut OwnedWriteHalf,
+        seq: u64,
+        surface_id: Vec<u8>,
+        resume_from_seq: u64,
+    ) -> peer_proto::v1::AttachResult {
+        write_envelope(
+            writer,
+            &Envelope {
+                seq,
+                correlation_id: 0,
+                payload: Some(Payload::AttachSurface(AttachSurface {
+                    surface_id,
+                    mode: AttachMode::CoWrite as i32,
+                    client_cols: 120,
+                    client_rows: 40,
+                    resume_from_seq,
+                })),
+            },
+        )
+        .await
+        .expect("send attach");
+        match recv(reader).await.payload {
+            Some(Payload::AttachResult(result)) => result,
+            other => panic!("expected AttachResult, got {other:?}"),
+        }
+    }
+
+    async fn send_keys(writer: &mut OwnedWriteHalf, seq: u64, surface_id: Vec<u8>, keys: Vec<u8>) {
+        write_envelope(
+            writer,
+            &Envelope {
+                seq,
+                correlation_id: 0,
+                payload: Some(Payload::Input(Input {
+                    surface_id,
+                    kind: Some(peer_proto::v1::input::Kind::Keys(keys)),
+                })),
+            },
+        )
+        .await
+        .expect("send input");
+    }
+
+    /// Accumulate PtyData payloads for `surface_id` until `expected` bytes
+    /// arrived, asserting each frame's wire `byte_seq` tiles the stream
+    /// from 0 (fresh attach wire space). Non-PtyData meta frames
+    /// (WorkspaceUpdate) are skipped; a GridSnapshot is a hard failure —
+    /// agent surfaces must never produce one.
+    async fn collect_pty_data(
+        reader: &mut OwnedReadHalf,
+        surface_id: &[u8],
+        expected: usize,
+    ) -> Vec<u8> {
+        let mut acc = Vec::with_capacity(expected);
+        while acc.len() < expected {
+            match recv(reader).await.payload {
+                Some(Payload::PtyData(data)) => {
+                    assert_eq!(data.surface_id, surface_id);
+                    assert_eq!(
+                        data.byte_seq,
+                        acc.len() as u64,
+                        "wire byte_seq must tile the payload bytes"
+                    );
+                    acc.extend_from_slice(&data.payload);
+                }
+                Some(Payload::WorkspaceUpdate(_)) => continue,
+                Some(Payload::GridSnapshot(_)) => {
+                    panic!("agent surface produced a GridSnapshot")
+                }
+                other => panic!("unexpected frame while collecting PtyData: {other:?}"),
+            }
+        }
+        acc
+    }
+
+    /// Gate (a) + (b), from the client that motivates them: a viewer that
+    /// never advertised `surface.agent.v1` sees the agent surface demoted
+    /// to attachable=false (while its terminal neighbor stays attachable),
+    /// has an attach attempt refused with the capability named, and —
+    /// adversarially ignoring both answers — gets its Input for the
+    /// refused surface dropped without killing the connection.
+    #[tokio::test]
+    async fn unadvertised_client_is_demoted_refused_and_survives_its_own_input() {
+        let manager = Arc::new(PtyManager::new());
+        let agent_id = manager
+            .ensure("agent-gate", &cat_agent_spec())
+            .expect("ensure agent")
+            .surface_id;
+        let terminal = PtySurface::spawn(
+            surface_id_from_name("terminal-neighbor"),
+            "terminal-neighbor".into(),
+            "/bin/cat",
+            &[],
+            80,
+            24,
+            None,
+        )
+        .expect("spawn terminal cat");
+        manager.insert_surface(terminal);
+        let host = Arc::new(PeerHost::new(manager.clone()));
+
+        let (mut reader, mut writer) = handshake(host, capabilities_without_agent()).await;
+
+        let list = list_surfaces(&mut reader, &mut writer, 10).await;
+        let agent_row = list
+            .surfaces
+            .iter()
+            .find(|s| s.surface_type == "agent")
+            .expect("agent surface listed");
+        assert!(
+            !agent_row.attachable,
+            "agent surface must be demoted for a client without surface.agent.v1"
+        );
+        assert_eq!(
+            agent_row.agent_cli, "codex",
+            "demotion changes attachability, not identity"
+        );
+        let terminal_row = list
+            .surfaces
+            .iter()
+            .find(|s| s.surface_type == "terminal")
+            .expect("terminal surface listed");
+        assert!(
+            terminal_row.attachable,
+            "demotion must not leak onto terminal surfaces"
+        );
+
+        let refused = attach(&mut reader, &mut writer, 11, agent_id.clone(), 0).await;
+        assert!(!refused.accepted);
+        assert!(
+            refused.reason.contains("surface.agent.v1"),
+            "refusal must name the missing capability: {}",
+            refused.reason
+        );
+
+        // Adversarial follow-up: input for the surface it was refused is
+        // dropped (no attach entry), and the connection stays healthy.
+        send_keys(&mut writer, 12, agent_id, b"ignored\n".to_vec()).await;
+        write_envelope(
+            &mut writer,
+            &Envelope {
+                seq: 13,
+                correlation_id: 0,
+                payload: Some(Payload::Ping(Ping { nonce: 7 })),
+            },
+        )
+        .await
+        .expect("send ping");
+        match recv(&mut reader).await.payload {
+            Some(Payload::Pong(pong)) => assert_eq!(pong.nonce, 7),
+            other => panic!("expected Pong after ignored input, got {other:?}"),
+        }
+    }
+
+    /// The capable-viewer happy path: attach (no GridSnapshot, no
+    /// mode-prefix frame), a turn written as Input.keys reaches the agent
+    /// child's stdin and echoes back as a line-aligned PtyData chunk, and
+    /// after detach a fresh reattach replays the same bytes from the ring.
+    #[tokio::test]
+    async fn advertised_client_round_trips_a_turn_and_replays_on_reattach() {
+        let manager = Arc::new(PtyManager::new());
+        let agent_id = manager
+            .ensure("agent-turn", &cat_agent_spec())
+            .expect("ensure agent")
+            .surface_id;
+        let host = Arc::new(PeerHost::new(manager.clone()));
+
+        let (mut reader, mut writer) = handshake(host, capability::supported_vec()).await;
+
+        let list = list_surfaces(&mut reader, &mut writer, 10).await;
+        let row = list
+            .surfaces
+            .iter()
+            .find(|s| s.surface_id == agent_id)
+            .expect("agent surface listed");
+        assert_eq!(row.surface_type, "agent");
+        assert_eq!(row.agent_cli, "codex");
+        assert!(row.attachable, "capable client sees the honest value");
+
+        let granted = attach(&mut reader, &mut writer, 11, agent_id.clone(), 0).await;
+        assert!(granted.accepted, "{}", granted.reason);
+        assert_eq!(granted.granted_mode, AttachMode::CoWrite as i32);
+        assert_eq!(granted.initial_seq, 0, "nothing produced before attach");
+
+        // The frame right after AttachResult must be the WorkspaceMeta
+        // push — NOT a GridSnapshot (no grid) and NOT a mode-prefix
+        // PtyData (no DEC modes): the two skips the agent path promises.
+        match recv(&mut reader).await.payload {
+            Some(Payload::WorkspaceUpdate(_)) => {}
+            other => panic!("expected WorkspaceMeta right after AttachResult, got {other:?}"),
+        }
+
+        let turn = b"{\"type\":\"user\",\"text\":\"ping\"}\n".to_vec();
+        send_keys(&mut writer, 12, agent_id.clone(), turn.clone()).await;
+        let echoed = collect_pty_data(&mut reader, &agent_id, turn.len()).await;
+        assert_eq!(echoed, turn, "turn input must echo back through the child");
+
+        // Detach, reattach fresh: the ring replays the same bytes, in the
+        // new attach's own wire seq space, from the same initial_seq base.
+        write_envelope(
+            &mut writer,
+            &Envelope {
+                seq: 13,
+                correlation_id: 0,
+                payload: Some(Payload::DetachSurface(DetachSurface {
+                    surface_id: agent_id.clone(),
+                })),
+            },
+        )
+        .await
+        .expect("send detach");
+        let regranted = attach(&mut reader, &mut writer, 14, agent_id.clone(), 0).await;
+        assert!(regranted.accepted, "{}", regranted.reason);
+        assert_eq!(
+            regranted.initial_seq, 0,
+            "replay starts at the ring's first chunk"
+        );
+        let replayed = collect_pty_data(&mut reader, &agent_id, turn.len()).await;
+        assert_eq!(replayed, turn, "reattach must replay the buffered turn");
+
+        manager.remove(&agent_id);
+    }
+
+    #[tokio::test]
+    async fn surface_exit_is_pushed_after_the_final_agent_output() {
+        let manager = Arc::new(PtyManager::new());
+        let agent_id = manager
+            .ensure(
+                "agent-exit-event",
+                &script_agent_spec(r#"read _; printf 'final\n'; exit 7"#),
+            )
+            .expect("ensure agent")
+            .surface_id;
+        let host = Arc::new(PeerHost::new(manager.clone()));
+        let (mut reader, mut writer) = handshake(host, capability::supported_vec()).await;
+        let granted = attach(&mut reader, &mut writer, 20, agent_id.clone(), 0).await;
+        assert!(granted.accepted, "{}", granted.reason);
+        match recv(&mut reader).await.payload {
+            Some(Payload::WorkspaceUpdate(_)) => {}
+            other => panic!("expected WorkspaceMeta, got {other:?}"),
+        }
+        send_keys(&mut writer, 21, agent_id.clone(), b"go\n".to_vec()).await;
+
+        let mut saw_final = false;
+        loop {
+            match recv(&mut reader).await.payload {
+                Some(Payload::PtyData(data)) => {
+                    assert_eq!(data.surface_id, agent_id);
+                    if data.payload == b"final\n" {
+                        saw_final = true;
+                    }
+                }
+                Some(Payload::SurfaceExited(exit)) => {
+                    assert!(saw_final, "exit must follow the final PtyData");
+                    assert_eq!(exit.surface_id, agent_id);
+                    assert_eq!(exit.exit_code, 7);
+                    assert_eq!(exit.signal, 0);
+                    assert_eq!(exit.reason, "exited");
+                    break;
+                }
+                Some(Payload::WorkspaceUpdate(_)) => {}
+                other => panic!("unexpected frame before SurfaceExited: {other:?}"),
+            }
+        }
+        manager.remove(&agent_id);
+    }
+
+    #[tokio::test]
+    async fn surface_exit_is_not_pushed_without_the_capability() {
+        let manager = Arc::new(PtyManager::new());
+        let agent_id = manager
+            .ensure(
+                "agent-exit-event-gated",
+                &script_agent_spec(r#"read _; printf 'final\n'; exit 7"#),
+            )
+            .expect("ensure agent")
+            .surface_id;
+        let host = Arc::new(PeerHost::new(manager.clone()));
+        let capabilities = capability::supported_vec()
+            .into_iter()
+            .filter(|value| value != capability::SURFACE_EXIT_V1)
+            .collect();
+        let (mut reader, mut writer) = handshake(host, capabilities).await;
+        let granted = attach(&mut reader, &mut writer, 30, agent_id.clone(), 0).await;
+        assert!(granted.accepted, "{}", granted.reason);
+        match recv(&mut reader).await.payload {
+            Some(Payload::WorkspaceUpdate(_)) => {}
+            other => panic!("expected WorkspaceMeta, got {other:?}"),
+        }
+        send_keys(&mut writer, 31, agent_id.clone(), b"go\n".to_vec()).await;
+        let final_data = recv(&mut reader).await;
+        match final_data.payload {
+            Some(Payload::PtyData(data)) => assert_eq!(data.payload, b"final\n"),
+            other => panic!("expected final PtyData, got {other:?}"),
+        }
+
+        let unexpected = tokio::time::timeout(
+            std::time::Duration::from_millis(200),
+            read_envelope(&mut reader),
+        )
+        .await;
+        assert!(
+            unexpected.is_err(),
+            "SurfaceExited must be gated by surface.exit.v1"
+        );
+        manager.remove(&agent_id);
+    }
+
+    /// One attach per surface per connection — same contract as terminals,
+    /// proven for the agent kind.
+    #[tokio::test]
+    async fn duplicate_agent_attach_is_refused() {
+        let manager = Arc::new(PtyManager::new());
+        let agent_id = manager
+            .ensure("agent-dup", &cat_agent_spec())
+            .expect("ensure agent")
+            .surface_id;
+        let host = Arc::new(PeerHost::new(manager.clone()));
+
+        let (mut reader, mut writer) = handshake(host, capability::supported_vec()).await;
+        let first = attach(&mut reader, &mut writer, 10, agent_id.clone(), 0).await;
+        assert!(first.accepted, "{}", first.reason);
+        match recv(&mut reader).await.payload {
+            Some(Payload::WorkspaceUpdate(_)) => {}
+            other => panic!("expected WorkspaceMeta, got {other:?}"),
+        }
+
+        let second = attach(&mut reader, &mut writer, 11, agent_id.clone(), 0).await;
+        assert!(!second.accepted);
+        assert_eq!(second.reason, "already attached");
+
+        manager.remove(&agent_id);
+    }
+
+    /// `get_or_respawn` for the agent kind, both halves of its existing
+    /// contract (unchanged from terminals):
+    ///
+    /// - a DECLARED surface (`register_and_spawn`, respawn spec on file)
+    ///   whose child died is revived by a raw attach, and the revived
+    ///   child's output reaches the viewer — this drives
+    ///   `spawn_from_spec`'s Agent branch through the respawn path;
+    /// - an ENSURED surface registers no respawn spec, so a dead one
+    ///   answers "surface not found" — its revival path is a fresh
+    ///   EnsureSurfaceRequest (RECREATED), never a raw attach.
+    #[tokio::test]
+    async fn attaching_a_dead_agent_surface_follows_the_respawn_contract() {
+        let manager = Arc::new(PtyManager::new());
+
+        let declared_id = surface_id_from_name("agent-declared");
+        manager.register_and_spawn(
+            declared_id.clone(),
+            crate::peer::surface::SpawnSpec {
+                title: "agent-declared".into(),
+                command: "/bin/sh".into(),
+                args: vec!["-c".into(), r#"printf 'gen\n'"#.into()],
+                cols: 80,
+                rows: 24,
+                cwd: Some("/tmp".into()),
+                kind: SurfaceKind::Agent,
+                agent_cli: "codex".into(),
+            },
+        );
+        let ensured = manager
+            .ensure("agent-ensured", &script_agent_spec(r#"printf 'gen\n'"#))
+            .expect("ensure agent");
+        let ensured_id = ensured.surface_id.clone();
+
+        // Both children exit right after their one line; wait for both
+        // first instances to die.
+        let declared_surface = manager
+            .list()
+            .into_iter()
+            .find(|s| s.surface_id == declared_id)
+            .expect("declared surface registered");
+        tokio::time::timeout(IO_TIMEOUT, async {
+            while !declared_surface.dead.load(Ordering::Acquire)
+                || !ensured.surface.dead.load(Ordering::Acquire)
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("both first instances must die");
+
+        let host = Arc::new(PeerHost::new(manager.clone()));
+        let (mut reader, mut writer) = handshake(host, capability::supported_vec()).await;
+
+        let granted = attach(&mut reader, &mut writer, 10, declared_id.clone(), 0).await;
+        assert!(
+            granted.accepted,
+            "dead declared agent must respawn, not vanish: {}",
+            granted.reason
+        );
+        let line = collect_pty_data(&mut reader, &declared_id, b"gen\n".len()).await;
+        assert_eq!(line, b"gen\n".to_vec());
+
+        let refused = attach(&mut reader, &mut writer, 11, ensured_id.clone(), 0).await;
+        assert!(!refused.accepted, "no respawn spec — raw attach cannot revive");
+        assert_eq!(refused.reason, "surface not found");
+
+        manager.remove(&declared_id);
+        manager.remove(&ensured_id);
+    }
+
+    /// Gate (b) ordering: the capability refusal is decided BEFORE
+    /// `get_or_respawn`, so an unadvertised client's attach attempt at a
+    /// dead DECLARED agent surface is refused without reviving it — the
+    /// revived child would be an orphan (spawned for a client that can
+    /// never attach it), and it would sit there generating output until
+    /// something else noticed.
+    #[tokio::test]
+    async fn unadvertised_attach_does_not_respawn_a_dead_agent_surface() {
+        let manager = Arc::new(PtyManager::new());
+        let declared_id = surface_id_from_name("agent-dead-gate");
+        manager.register_and_spawn(
+            declared_id.clone(),
+            crate::peer::surface::SpawnSpec {
+                title: "agent-dead-gate".into(),
+                command: "/bin/sh".into(),
+                args: vec!["-c".into(), r#"printf 'gen\n'"#.into()],
+                cols: 80,
+                rows: 24,
+                cwd: Some("/tmp".into()),
+                kind: SurfaceKind::Agent,
+                agent_cli: "codex".into(),
+            },
+        );
+        let first_instance = manager
+            .list()
+            .into_iter()
+            .find(|s| s.surface_id == declared_id)
+            .expect("declared surface registered");
+        tokio::time::timeout(IO_TIMEOUT, async {
+            while !first_instance.dead.load(Ordering::Acquire) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("first instance must die");
+
+        let host = Arc::new(PeerHost::new(manager.clone()));
+        let (mut reader, mut writer) = handshake(host, capabilities_without_agent()).await;
+
+        let refused = attach(&mut reader, &mut writer, 10, declared_id.clone(), 0).await;
+        assert!(!refused.accepted);
+        assert!(
+            refused.reason.contains("surface.agent.v1"),
+            "refusal must name the missing capability: {}",
+            refused.reason
+        );
+
+        // No respawn as a side effect: the registered instance is still
+        // the very Arc that died, not a fresh child spawned from the spec.
+        let after = manager
+            .list()
+            .into_iter()
+            .find(|s| s.surface_id == declared_id)
+            .expect("surface still registered");
+        assert!(
+            Arc::ptr_eq(&first_instance, &after),
+            "a refused attach must not replace the dead instance"
+        );
+        assert!(
+            after.dead.load(Ordering::Acquire),
+            "still dead — the refused attach spawned nothing"
+        );
+
+        manager.remove(&declared_id);
+    }
+
+    /// In-ring partial resume for the agent kind: a reconnect that asks to
+    /// resume from a mid-stream seq must take the `replay_snapshot_from`
+    /// path and receive exactly the unseen tail, cut on a chunk (== line)
+    /// boundary — never a resend of the event it already has, and never a
+    /// mid-line fragment for ordinarily-sized lines.
+    #[tokio::test]
+    async fn in_ring_resume_replays_only_the_unseen_tail_on_a_chunk_boundary() {
+        let manager = Arc::new(PtyManager::new());
+        let outcome = manager
+            .ensure(
+                "agent-resume-in-ring",
+                &script_agent_spec(r#"printf '{"a":1}\n{"b":2}\n'; sleep 30"#),
+            )
+            .expect("ensure agent");
+        let agent_id = outcome.surface_id.clone();
+        let first_line = b"{\"a\":1}\n".to_vec();
+        let second_line = b"{\"b\":2}\n".to_vec();
+        let total = (first_line.len() + second_line.len()) as u64;
+
+        // Both lines must be buffered before the resume asks for the cut.
+        tokio::time::timeout(IO_TIMEOUT, async {
+            while outcome.surface.current_byte_seq() < total {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("agent output must reach the ring");
+
+        // Precondition for the boundary claim: the ring buffered the
+        // stream as one chunk per line, so the resume point below IS a
+        // chunk boundary.
+        let ring: Vec<Vec<u8>> = outcome
+            .surface
+            .replay_snapshot()
+            .into_iter()
+            .map(|chunk| chunk.bytes)
+            .collect();
+        assert_eq!(ring, vec![first_line.clone(), second_line.clone()]);
+
+        let host = Arc::new(PeerHost::new(manager.clone()));
+        let (mut reader, mut writer) = handshake(host, capability::supported_vec()).await;
+
+        // The client saw the first event before its connection died;
+        // resume from the exact start of the second one.
+        let resume_at = first_line.len() as u64;
+        let granted = attach(&mut reader, &mut writer, 10, agent_id.clone(), resume_at).await;
+        assert!(granted.accepted, "{}", granted.reason);
+        assert_eq!(
+            granted.initial_seq, resume_at,
+            "wire seq 0 must map to the resume point, not the ring's start"
+        );
+        let replayed = collect_pty_data(&mut reader, &agent_id, second_line.len()).await;
+        assert_eq!(
+            replayed, second_line,
+            "resume must replay exactly the unseen tail as a whole-chunk cut"
+        );
+
+        manager.remove(&agent_id);
+    }
+
+    /// A multi-megabyte Input payload (one giant NDJSON-shaped line)
+    /// crosses the socket, the blocking stdin write, the child, the
+    /// line-oriented reader, the replay ring and the relay — and comes
+    /// back intact. Guards the whole pipe path against size cliffs well
+    /// below the 16 MiB frame cap.
+    #[tokio::test]
+    async fn multi_megabyte_turn_survives_the_round_trip() {
+        let manager = Arc::new(PtyManager::new());
+        let agent_id = manager
+            .ensure("agent-large", &cat_agent_spec())
+            .expect("ensure agent")
+            .surface_id;
+        let host = Arc::new(PeerHost::new(manager.clone()));
+
+        let (mut reader, mut writer) = handshake(host, capability::supported_vec()).await;
+        let granted = attach(&mut reader, &mut writer, 10, agent_id.clone(), 0).await;
+        assert!(granted.accepted, "{}", granted.reason);
+        match recv(&mut reader).await.payload {
+            Some(Payload::WorkspaceUpdate(_)) => {}
+            other => panic!("expected WorkspaceMeta, got {other:?}"),
+        }
+
+        let mut turn = vec![b'x'; 3 * 1024 * 1024];
+        turn.push(b'\n');
+        send_keys(&mut writer, 11, agent_id.clone(), turn.clone()).await;
+        let echoed = collect_pty_data(&mut reader, &agent_id, turn.len()).await;
+        assert!(
+            echoed == turn,
+            "multi-megabyte payload corrupted in transit ({} of {} bytes)",
+            echoed.len(),
+            turn.len()
+        );
+
+        manager.remove(&agent_id);
+    }
+
+    /// A resume_from_seq beyond anything the ring ever buffered cannot be
+    /// honored exactly; the existing fallback contract (full snapshot,
+    /// initial_seq re-based at the ring's first chunk) must hold for the
+    /// agent kind unchanged.
+    #[tokio::test]
+    async fn out_of_ring_resume_falls_back_to_the_full_snapshot() {
+        let manager = Arc::new(PtyManager::new());
+        let outcome = manager
+            .ensure(
+                "agent-resume",
+                &script_agent_spec(r#"printf '{"a":1}\n{"b":2}\n'; sleep 30"#),
+            )
+            .expect("ensure agent");
+        let agent_id = outcome.surface_id.clone();
+        let expected = b"{\"a\":1}\n{\"b\":2}\n".to_vec();
+
+        // Both lines must be in the ring before the attach asks to resume
+        // past them.
+        tokio::time::timeout(IO_TIMEOUT, async {
+            while outcome.surface.current_byte_seq() < expected.len() as u64 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("agent output must reach the ring");
+
+        let host = Arc::new(PeerHost::new(manager.clone()));
+        let (mut reader, mut writer) = handshake(host, capability::supported_vec()).await;
+
+        let granted = attach(&mut reader, &mut writer, 10, agent_id.clone(), 1_000_000).await;
+        assert!(granted.accepted, "{}", granted.reason);
+        assert_eq!(
+            granted.initial_seq, 0,
+            "unsatisfiable resume re-bases at the full snapshot"
+        );
+        let replayed = collect_pty_data(&mut reader, &agent_id, expected.len()).await;
+        assert_eq!(replayed, expected, "fallback must resend the whole ring");
+
+        manager.remove(&agent_id);
     }
 }

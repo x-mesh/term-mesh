@@ -27,7 +27,7 @@ pub const AGENT_ENV_LOAD_EXIT: i32 = 78;
 
 /// term-mesh fixes the remote `PATH` rather than inheriting one, so a peer
 /// host's CLI paths are configured explicitly instead of by shell startup.
-const REMOTE_PATH: &str = "$HOME/.local/bin:/opt/homebrew/bin:/opt/homebrew/sbin:\
+pub const REMOTE_PATH: &str = "$HOME/.local/bin:/opt/homebrew/bin:/opt/homebrew/sbin:\
 /usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin";
 
 /// Turn wrapper-only exit codes into safe, actionable UI messages.
@@ -137,9 +137,6 @@ pub fn process_location(
         .map(|(key, value)| format!("{key}={value}"))
         .collect();
 
-    let profile = "$HOME/.profile";
-    let agent_env = "$HOME/.config/term-mesh/agent-env";
-
     // `-l` loads the account's shell-specific login profile. Bash skips
     // `.profile` when `.bash_profile`/`.bash_login` exists, and zsh never
     // reads it, so the literal `.profile` is added only for those two cases —
@@ -149,18 +146,10 @@ pub fn process_location(
     // profiles and before explicit host values so the host's word is final.
     // Sourced stdout is discarded: it would otherwise land in app-server's
     // JSON-RPC stream and corrupt the protocol.
-    let mut inner = String::new();
-    inner.push_str(r#"case "${SHELL##*/}" in "#);
-    inner.push_str(&format!(
-        r#"bash) if {{ [ -f "$HOME/.bash_profile" ] || [ -f "$HOME/.bash_login" ]; }} && [ -f "{profile}" ]; then . "{profile}" >/dev/null || exit {PROFILE_LOAD_EXIT}; fi ;; "#
-    ));
-    inner.push_str(&format!(
-        r#"zsh) if [ -f "{profile}" ]; then . "{profile}" >/dev/null || exit {PROFILE_LOAD_EXIT}; fi ;; "#
-    ));
-    inner.push_str("esac; ");
-    inner.push_str(&format!(
-        r#"if [ -f "{agent_env}" ]; then set -a; . "{agent_env}" >/dev/null || exit {AGENT_ENV_LOAD_EXIT}; set +a; fi; "#
-    ));
+    let mut inner = login_environment_prelude(
+        &format!("exit {PROFILE_LOAD_EXIT}"),
+        &format!("exit {AGENT_ENV_LOAD_EXIT}"),
+    );
     inner.push_str(&format!(r#"export PATH="{REMOTE_PATH}"; "#));
 
     // Peer-hosted terminal surfaces already carry IS_SANDBOX. Claude uses it
@@ -184,6 +173,37 @@ pub fn process_location(
     })
 }
 
+/// Bourne-compatible login-environment load chain shared by the SSH bridge
+/// and daemon-owned native agent processes. Callers append their explicit
+/// environment and final `exec` after this string, which preserves the
+/// required precedence: login profile < literal `~/.profile` fallback <
+/// `agent-env` < explicit values.
+///
+/// Failure actions are fixed caller-owned snippets. Every sourced byte from
+/// stdout and stderr is discarded before they run, so neither a noisy profile
+/// nor a failing assignment can disclose environment values into an agent
+/// protocol stream or daemon log.
+pub fn login_environment_prelude(
+    profile_failure_action: &str,
+    agent_env_failure_action: &str,
+) -> String {
+    let profile = "$HOME/.profile";
+    let agent_env = "$HOME/.config/term-mesh/agent-env";
+    let mut inner = String::new();
+    inner.push_str(r#"case "${SHELL##*/}" in "#);
+    inner.push_str(&format!(
+        r#"bash) if {{ [ -f "$HOME/.bash_profile" ] || [ -f "$HOME/.bash_login" ]; }} && [ -f "{profile}" ]; then . "{profile}" >/dev/null 2>&1 || {{ {profile_failure_action}; }}; fi ;; "#
+    ));
+    inner.push_str(&format!(
+        r#"zsh) if [ -f "{profile}" ]; then . "{profile}" >/dev/null 2>&1 || {{ {profile_failure_action}; }}; fi ;; "#
+    ));
+    inner.push_str("esac; ");
+    inner.push_str(&format!(
+        r#"if [ -f "{agent_env}" ]; then set -a; . "{agent_env}" >/dev/null 2>&1 || {{ {agent_env_failure_action}; }}; set +a; fi; "#
+    ));
+    inner
+}
+
 /// A name `env` will accept as an assignment rather than treat as a command.
 fn is_env_name(key: &str) -> bool {
     let mut chars = key.chars();
@@ -201,7 +221,7 @@ fn is_env_name(key: &str) -> bool {
 /// ship side by side, so this follows CPython's rule rather than inventing a
 /// tidier one: leave the safe set alone, otherwise single-quote and escape
 /// embedded quotes the long way.
-fn shell_quote(value: &str) -> String {
+pub fn shell_quote(value: &str) -> String {
     if value.is_empty() {
         return "''".to_string();
     }
@@ -215,7 +235,7 @@ fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', r#"'"'"'"#))
 }
 
-fn shell_join(parts: &[String]) -> String {
+pub fn shell_join(parts: &[String]) -> String {
     parts
         .iter()
         .map(|p| shell_quote(p))
@@ -293,7 +313,7 @@ mod tests {
         assert!(command.contains(r#"exec "${SHELL:-/bin/sh}" -lc"#));
         assert!(command.contains(r#"[ -f "$HOME/.config/term-mesh/agent-env" ]"#));
         assert!(command.contains(source));
-        assert!(command.contains(">/dev/null || exit 78"));
+        assert!(command.contains(">/dev/null 2>&1 || { exit 78; }"));
         assert!(
             command.find(source).unwrap() < command.find(explicit).unwrap(),
             "the host's own value has to win, so it is applied last"
@@ -500,7 +520,7 @@ mod tests {
 
         assert_eq!(
             command,
-            r#"mkdir -p /remote/project && cd /remote/project && exec "${SHELL:-/bin/sh}" -lc 'case "${SHELL##*/}" in bash) if { [ -f "$HOME/.bash_profile" ] || [ -f "$HOME/.bash_login" ]; } && [ -f "$HOME/.profile" ]; then . "$HOME/.profile" >/dev/null || exit 77; fi ;; zsh) if [ -f "$HOME/.profile" ]; then . "$HOME/.profile" >/dev/null || exit 77; fi ;; esac; if [ -f "$HOME/.config/term-mesh/agent-env" ]; then set -a; . "$HOME/.config/term-mesh/agent-env" >/dev/null || exit 78; set +a; fi; export PATH="$HOME/.local/bin:/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"; exec env IS_SANDBOX=1 AI_MESH_API_KEY=from-host TERMMESH_AGENT_NAME=ai codex app-server'"#
+            r#"mkdir -p /remote/project && cd /remote/project && exec "${SHELL:-/bin/sh}" -lc 'case "${SHELL##*/}" in bash) if { [ -f "$HOME/.bash_profile" ] || [ -f "$HOME/.bash_login" ]; } && [ -f "$HOME/.profile" ]; then . "$HOME/.profile" >/dev/null 2>&1 || { exit 77; }; fi ;; zsh) if [ -f "$HOME/.profile" ]; then . "$HOME/.profile" >/dev/null 2>&1 || { exit 77; }; fi ;; esac; if [ -f "$HOME/.config/term-mesh/agent-env" ]; then set -a; . "$HOME/.config/term-mesh/agent-env" >/dev/null 2>&1 || { exit 78; }; set +a; fi; export PATH="$HOME/.local/bin:/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"; exec env IS_SANDBOX=1 AI_MESH_API_KEY=from-host TERMMESH_AGENT_NAME=ai codex app-server'"#
         );
     }
 

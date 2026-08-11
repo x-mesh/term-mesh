@@ -2475,6 +2475,7 @@ dependencies = [
  "sync-protocol",
  "sysinfo",
  "tempfile",
+ "tm-agent-bridge",
  "tokio",
  "tower-http",
  "tracing",

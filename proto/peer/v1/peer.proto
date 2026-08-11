@@ -95,6 +95,9 @@ message Envelope {
     Pong pong = 51;
 
     Goodbye goodbye = 60;
+    // Host-pushed after the final PtyData for a dead surface. Gated behind
+    // capability "surface.exit.v1".
+    SurfaceExited surface_exited = 61;
 
     Error error = 99;
   }
@@ -178,7 +181,20 @@ message SurfaceInfo {
   string title = 3;
   uint32 cols = 4;
   uint32 rows = 5;
-  // "terminal" or "browser"; more types may be added later.
+  // "terminal", "browser", or "agent"; more types may be added later.
+  //
+  // "agent" is a daemon-owned NON-PTY child (tm-agent-bridge): its stdout is
+  // an NDJSON event stream, not terminal bytes. The stream rides ordinary
+  // PtyData frames (hosts push line-aligned chunks so a reconnect cut never
+  // splits a JSON line), turn input returns as Input.keys, a GridSnapshot is
+  // never sent (there is no grid), and Resize is accepted-and-ignored.
+  // byte_seq / replay-ring / resume semantics are identical to "terminal".
+  //
+  // Gated behind capability "surface.agent.v1" (Hello.capabilities,
+  // evolution rule 3): to a client that did not advertise it the host MUST
+  // downgrade agent surfaces to attachable=false in SurfaceList and MUST
+  // reject AttachSurface on them, so an older client never feeds an NDJSON
+  // stream to a terminal renderer.
   string surface_type = 6;
   // Host policy may forbid per-surface attach.
   bool attachable = 7;
@@ -193,6 +209,10 @@ message SurfaceInfo {
   // Git branch of `cwd`, resolved when the host answers, or empty if not
   // a git repo. Follows `cwd` into a different repository.
   string branch = 9;
+  // Which CLI an "agent" surface is bridging: "codex", "kiro", etc.
+  // Optional semantics — empty for terminal/browser surfaces and on hosts
+  // that predate agent surfaces (missing-on-wire decodes to "").
+  string agent_cli = 10;
 }
 
 enum AttachMode {
@@ -260,6 +280,31 @@ message EnsureSurfaceRequest {
   // Arguments exclude argv[0]. At most 256 entries, each at most 64 KiB.
   repeated string args = 5;
   EnsureSurfaceRestartPolicy restart_policy = 6;
+  // Surface kind to create. Empty means "terminal" — the only kind that
+  // existed before this field, so older senders and older daemons remain
+  // compatible by default. "agent" asks the daemon to own `executable` as a
+  // non-PTY child whose stdout NDJSON rides PtyData (see
+  // SurfaceInfo.surface_type). Senders MUST NOT send "agent" to a host that
+  // did not advertise "surface.agent.v1" (Hello.capabilities). The kind is
+  // part of the surface spec: a terminal<->agent change on the same key is
+  // an ENSURE_SURFACE_RESULT_SPEC_CONFLICT, never a silent conversion.
+  string kind = 7;
+  // Explicit child environment overrides. Keys and values are validated and
+  // bounded by the host; omitted on older senders and decoded as empty.
+  map<string, string> env = 8;
+}
+
+// Terminal notification for one surface process. Sent only after every final
+// PtyData chunk has been queued, so a receiver may close the stream as soon as
+// it handles this frame without losing child output.
+message SurfaceExited {
+  bytes surface_id = 1;
+  // Normal exit status, or zero when the process was signaled/unknown.
+  int32 exit_code = 2;
+  // Unix terminating signal, or zero for a normal/unknown exit.
+  int32 signal = 3;
+  // Stable, non-secret summary: "exited", "signaled", or "unknown".
+  string reason = 4;
 }
 
 enum EnsureSurfaceResult {
@@ -322,7 +367,8 @@ message EnsureSurfaceResponse {
   uint64 generation = 5;
   // Host process id for diagnostics; zero when no process is running.
   uint32 pid = 6;
-  // Canonical hash of cwd/executable/args/restart_policy. Never raw secrets.
+  // Canonical hash of cwd/executable/args/restart_policy/kind/env. Never raw
+  // secrets; the hash is opaque and cannot be reversed into environment values.
   bytes spec_hash = 7;
   // Present for SPEC_CONFLICT and FAILED; absent on success.
   EnsureSurfaceError error = 8;
@@ -485,6 +531,9 @@ message WorkspacePane {
   // do. Field-additive: hosts that predate this leave it empty and clients
   // fall back to guessing from `cwd`.
   string project_root = 8;
+  // Field 9 is set aside for a future `surface_type` (Phase 4 mirror
+  // support: a layout leaf alone cannot tell the client which renderer to
+  // build for an "agent" surface); do not assign field 9 to anything else.
 }
 
 message PaneTab {

@@ -51,22 +51,42 @@ final class AgentPanel: ObservableObject, Panel {
         // that property alone. What this object still announces is `title`.
     }
 
+    /// Launch the agent's CLI.
+    ///
+    /// `environment` is what tells the process which team it belongs to.
+    /// Without it the launch falls back to this app's own environment, which
+    /// has no `TERMMESH_*` in it — the app is not a team member — so
+    /// `tm-agent` inside the pane resolves its team through the last step of
+    /// its fallback chain and lands on `live-team`, a team that does not
+    /// exist on the machine. Every agent-to-agent send then fails with
+    /// `Agent 'x' not found in team 'live-team'`, and the same omission takes
+    /// `PATH` with it, so `tm-agent` is not even on it.
+    ///
+    /// Leader panes never showed this because they are built by a different
+    /// path that has always passed their environment through.
     func start(claudePath: String, model: String, instructions: String,
-               extraArgs: [String] = []) {
+               extraArgs: [String] = [],
+               environment: [String: String] = ProcessInfo.processInfo.environment) {
         session.start(AgentSession.claudeLaunch(
             claudePath: claudePath, model: model, instructions: instructions,
-            extraArgs: extraArgs, workingDirectory: workingDirectory
+            extraArgs: extraArgs, workingDirectory: workingDirectory,
+            environment: environment
         ))
     }
 
     /// A CLI whose protocol the bridge speaks. Its instructions arrive as the
     /// first turn instead of a system prompt — the bridge has no equivalent of
     /// `--append-system-prompt`, and none of these CLIs agree on one.
+    ///
+    /// `environment` carries the same team identity as the Claude launch
+    /// above, and for the same reason.
     func start(bridgedCli: String, bridgePath: String, model: String,
-               cliPath: String = "") {
+               cliPath: String = "",
+               environment: [String: String] = ProcessInfo.processInfo.environment) {
         session.start(AgentSession.bridgeLaunch(
             cli: bridgedCli, bridgePath: bridgePath, model: model,
-            cliPath: cliPath, workingDirectory: workingDirectory
+            cliPath: cliPath, workingDirectory: workingDirectory,
+            environment: environment
         ))
     }
 
@@ -90,6 +110,15 @@ final class AgentPanel: ObservableObject, Panel {
             workingDirectory: workingDirectory,
             remoteEnvironment: remoteEnvironment
         ))
+    }
+
+    /// A session whose process lives on a peer, reached over the peer
+    /// protocol rather than ssh. The relay feeds arriving bytes into
+    /// `session.consume(_:)`; outgoing turns leave through `sink` as one
+    /// NDJSON line per call, newline included.
+    func startRemote(interruptible: Bool = false,
+                     sink: @escaping @Sendable (Data) async throws -> Void) {
+        session.startRemote(interruptible: interruptible, sink: sink)
     }
 
     // MARK: - Panel

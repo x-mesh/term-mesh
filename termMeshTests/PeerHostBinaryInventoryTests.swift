@@ -83,6 +83,7 @@ final class PeerHostBinaryInventoryTests: XCTestCase {
             app=0.170.1
             tm-agent=/opt/homebrew/bin/tm-agent|tm-agent 0.170.1
             term-meshd=/usr/local/bin/term-meshd|term-meshd 0.170.1
+            tm-agent-bridge=/usr/local/bin/tm-agent-bridge|
             """)
         )
         XCTAssertEqual(warnings, [])
@@ -95,6 +96,7 @@ final class PeerHostBinaryInventoryTests: XCTestCase {
             PeerHostDoctor.parseBinaryInventory("""
             term-meshd=/root/.local/bin/term-meshd|term-meshd 0.168.0
             term-meshd.shadowed=/usr/local/bin/term-meshd|term-meshd 0.169.0
+            tm-agent-bridge=/root/.local/bin/tm-agent-bridge|
             """)
         )
         XCTAssertEqual(warnings.count, 1, "\(warnings)")
@@ -123,5 +125,55 @@ final class PeerHostBinaryInventoryTests: XCTestCase {
         """)
         XCTAssertEqual(inventory.cli?.path, "/usr/local/bin/tm-agent")
         XCTAssertNil(inventory.appVersion)
+    }
+
+    // MARK: - The bridge
+
+    /// A daemon host with no bridge cannot hold codex/kiro/cursor/agy agents
+    /// as native panels. Nothing else reports that, and the symptom on its own
+    /// is just "why did this open as a terminal pane".
+    func test_aDaemonHostWithoutABridgeIsReported() {
+        let warnings = PeerHostDoctor.inventoryWarnings(
+            PeerHostDoctor.parseBinaryInventory("""
+            term-meshd=/usr/local/bin/term-meshd|term-meshd 0.179.0
+            tm-agent=/usr/local/bin/tm-agent|tm-agent 0.179.0
+            """)
+        )
+        XCTAssertEqual(warnings.count, 1, "\(warnings)")
+        XCTAssertTrue(warnings[0].contains("tm-agent-bridge"), warnings[0])
+    }
+
+    func test_aDaemonHostWithABridgeIsSilent() {
+        let warnings = PeerHostDoctor.inventoryWarnings(
+            PeerHostDoctor.parseBinaryInventory("""
+            term-meshd=/usr/local/bin/term-meshd|term-meshd 0.179.0
+            tm-agent=/usr/local/bin/tm-agent|tm-agent 0.179.0
+            tm-agent-bridge=/usr/local/bin/tm-agent-bridge|
+            """)
+        )
+        XCTAssertEqual(warnings, [])
+    }
+
+    /// A Mac peer serves from the app bundle, which carries its own bridge.
+    /// Reporting a missing one there would describe a problem that does not
+    /// exist — the PATH this probe searches is not where it would live.
+    func test_aHostWithNoDaemonIsNotAskedAboutTheBridge() {
+        let warnings = PeerHostDoctor.inventoryWarnings(
+            PeerHostDoctor.parseBinaryInventory("""
+            app=0.179.0
+            tm-agent=/opt/homebrew/bin/tm-agent|tm-agent 0.179.0
+            """)
+        )
+        XCTAssertEqual(warnings, [])
+    }
+
+    /// The bridge has no --version, so the probe sends an empty one. That must
+    /// still count as present rather than reading as "found nothing".
+    func test_aBridgeWithoutAVersionStillCountsAsPresent() {
+        let inventory = PeerHostDoctor.parseBinaryInventory(
+            "tm-agent-bridge=/usr/local/bin/tm-agent-bridge|"
+        )
+        XCTAssertEqual(inventory.bridge?.path, "/usr/local/bin/tm-agent-bridge")
+        XCTAssertEqual(inventory.bridge?.version, "")
     }
 }

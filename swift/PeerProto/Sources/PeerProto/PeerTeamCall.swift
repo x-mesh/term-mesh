@@ -37,6 +37,12 @@ public enum PeerTeamCall {
         "team.result.collect",
         "team.inbox",
         "team.message.list",
+        // One-shot bearer mailbox used by `send --expect-reply`. These only
+        // register/read/cancel an exact token inside an existing team; they do
+        // not create agents or grant access to a filesystem path.
+        "team.correlation.register",
+        "team.correlation.get",
+        "team.correlation.cancel",
         // Directing agents that already exist.
         "team.send",
         "team.broadcast",

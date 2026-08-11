@@ -1544,6 +1544,19 @@ actor PeerServerSession {
             if config.hostStatsProvider == nil {
                 advertisedCapabilities.removeAll { $0 == PeerCapability.hostStatsV1 }
             }
+            // Host/client asymmetry: `surface.agent.v1` in
+            // `PeerCapability.supported` says this BUILD can *render* agent
+            // surfaces — the client-direction Hello advertises it so daemons
+            // list them as attachable. It must not ride this host-direction
+            // Hello: a Swift GUI host publishes TerminalPanels only
+            // (`GhosttyPaneSurfaceProvider.collectSurfaces`) and implements
+            // no agent-kind EnsureSurface, so advertising would invite
+            // `kind = "agent"` ensure/attach traffic that can only fail —
+            // the familiar "the Rust host has the contract, the Swift host
+            // doesn't" drift (#218/#219/#220). Same filter pattern as
+            // `PeerWorkspaceMirror.mirrorHandshakeOptions`. Remove this
+            // filter once the Mac host can actually host agent surfaces.
+            advertisedCapabilities.removeAll { $0 == PeerCapability.surfaceAgentV1 }
             try await sendEnvelope { env in
                 var h = Termmesh_Peer_V1_Hello()
                 h.protocolVersion = self.config.protocolVersion
@@ -1750,6 +1763,28 @@ actor PeerServerSession {
             // broadcasts once the underlying TabManager mutation
             // completes — see GhosttyPaneSurfaceProvider.deleteWorkspace.
             _ = await provider.deleteWorkspace(id: req.workspaceID)
+
+        case (.ready, .ensureSurfaceRequest(let req)) where req.kind == "agent":
+            // Second layer under the Hello filter above (see
+            // `advertisedCapabilities`): this direct GUI host cannot own a
+            // non-PTY bridge child, so an agent-kind ensure is refused
+            // loudly, echoing the request_id the client's demux keys on.
+            // Never silently create a terminal instead — kind is part of
+            // the surface spec (`EnsureSurfaceRequest.kind`), and a silent
+            // conversion is exactly the SPEC_CONFLICT contract the proto
+            // forbids. Non-agent ensures keep falling to the silent-drop
+            // default below, unchanged.
+            try await sendEnvelopeWithCorrelation(env.seq) { inner in
+                var response = Termmesh_Peer_V1_EnsureSurfaceResponse()
+                response.requestID = req.requestID
+                response.result = .failed
+                var failure = Termmesh_Peer_V1_EnsureSurfaceError()
+                failure.code = .invalidRequest
+                failure.stage = "validate"
+                failure.safeContext = "agent surfaces are not hosted by this app"
+                response.error = failure
+                inner.ensureSurfaceResponse = response
+            }
 
         case (.ready, .attachSurface(let req)):
             try await handleAttach(req, correlationID: env.seq)

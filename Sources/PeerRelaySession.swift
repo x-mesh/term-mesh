@@ -607,6 +607,87 @@ actor RelayResizeCoalescer {
     }
 }
 
+/// Gap-heal timing for callback-delivery (agent) sessions.
+///
+/// `RelayResizeCoalescer` owns this exact debounce/throttle contract for
+/// relay panes, but it is a relay-only fixture (resize frames, size
+/// bookkeeping, authority claims) that callback mode must not create. An
+/// agent surface still suffers host broadcast Lag the same way a terminal
+/// does, and the replay-ring resume (`performResumeHeal`) is how the
+/// dropped NDJSON bytes come back — so the *timing* survives here on its
+/// own: one trailing-debounce heal once a burst settles, plus periodic
+/// throttle heals while drops stream with no lull (the slow-network case).
+/// No size guard: an NDJSON stream has no geometry, and `performResumeHeal`
+/// already falls back to the attach-time size for client_cols/client_rows.
+actor RelayGapHealScheduler {
+    private let healDebounceSeconds: TimeInterval
+    private let healMaxWait: TimeInterval
+    private let onHeal: @Sendable (String) async -> Void
+    /// The single trailing-debounce task for the current gap episode —
+    /// started once per episode and self-rescheduled off `lastGapAt`, the
+    /// same no-Task-churn shape as `RelayResizeCoalescer` (the hot pump
+    /// drops thousands of chunks/sec).
+    private var healTask: Task<Void, Never>?
+    private var lastGapAt: Date = .distantPast
+    private var gapEpisodeStart: Date?
+    private var lastHealAt: Date = .distantPast
+
+    init(
+        healDebounceMs: UInt64 = 400,
+        healMaxWaitSeconds: TimeInterval = 2.0,
+        onHeal: @escaping @Sendable (String) async -> Void
+    ) {
+        self.healDebounceSeconds = TimeInterval(healDebounceMs) / 1000.0
+        self.healMaxWait = healMaxWaitSeconds
+        self.onHeal = onHeal
+    }
+
+    func noteGap() {
+        let now = Date()
+        lastGapAt = now
+        if gapEpisodeStart == nil { gapEpisodeStart = now }
+        if let episodeStart = gapEpisodeStart,
+           now.timeIntervalSince(episodeStart) >= healMaxWait,
+           now.timeIntervalSince(lastHealAt) >= healMaxWait {
+            Task { [weak self] in await self?.performHeal(reason: "throttle") }
+        }
+        if healTask == nil {
+            healTask = Task { [weak self] in await self?.runTrailingDebounce() }
+        }
+    }
+
+    func cancel() {
+        healTask?.cancel()
+        healTask = nil
+        gapEpisodeStart = nil
+    }
+
+    private func runTrailingDebounce() async {
+        while true {
+            let remaining = healDebounceSeconds - Date().timeIntervalSince(lastGapAt)
+            guard remaining > 0 else { break }
+            try? await Task.sleep(nanoseconds: UInt64(remaining * 1_000_000_000))
+            if Task.isCancelled {
+                healTask = nil
+                return
+            }
+        }
+        // Clear before healing so a gap arriving during the async heal
+        // starts a fresh debounce instead of being dropped.
+        healTask = nil
+        await performHeal(reason: "settle")
+        gapEpisodeStart = nil
+    }
+
+    private func performHeal(reason: String) async {
+        lastHealAt = Date()
+        #if DEBUG
+        dlog("peer.relay.gap.heal reason=\(reason) delivery=callback")
+        #endif
+        await onHeal(reason)
+    }
+}
+
 /// Coordinates the exact hand-off between an owned session's live stream and
 /// a resume attach. Once a boundary is taken, old-session bytes are held until
 /// the attach either commits (the new replay replaces them) or aborts (they are
@@ -645,7 +726,12 @@ final class RelayResumeTransitionGate: @unchecked Sendable {
 
     private enum Phase {
         case idle
-        case buffering(id: UInt64, buffer: Buffer)
+        /// `resumeSeq` is the wire position the transition was anchored at
+        /// (`begin`'s side of the Transition token, kept so a later
+        /// `begin()` can ADOPT a gap capture instead of re-anchoring).
+        /// `isGapCapture` marks a transition the pump opened at gap
+        /// detection (callback delivery) rather than one a heal opened.
+        case buffering(id: UInt64, resumeSeq: UInt64, isGapCapture: Bool, buffer: Buffer)
         case committed(id: UInt64)
         case draining(id: UInt64, buffer: Buffer)
     }
@@ -691,9 +777,50 @@ final class RelayResumeTransitionGate: @unchecked Sendable {
     func begin() -> Transition {
         lock.lock()
         defer { lock.unlock() }
+        // A gap capture is a transition the pump already opened at the last
+        // DELIVERED position, holding everything since. The heal joins it —
+        // beginning a fresh one here would discard that buffer and
+        // re-anchor past the gap, which is the loss this capture exists to
+        // repair. Adopted (flag cleared), it is an ordinary transition from
+        // here on: same commit/abort/overflow rules.
+        if case .buffering(let id, let resumeSeq, true, let buffer) = phase {
+            phase = .buffering(id: id, resumeSeq: resumeSeq, isGapCapture: false, buffer: buffer)
+            return Transition(id: id, resumeWireSeq: resumeSeq)
+        }
         nextID &+= 1
-        phase = .buffering(id: nextID, buffer: Buffer())
+        phase = .buffering(id: nextID, resumeSeq: wireSeq, isGapCapture: false, buffer: Buffer())
         return Transition(id: nextID, resumeWireSeq: wireSeq)
+    }
+
+    /// Callback-delivery gap repair (host broadcast Lag): open a buffering
+    /// transition anchored at the CURRENT wire position — the end of the
+    /// last chunk actually delivered — BEFORE the gapped chunk is routed.
+    /// From here the pump suppresses (buffers) the post-gap stream, so the
+    /// heal this gap also schedules can ask the host's replay ring for
+    /// everything after the anchor: the dropped bytes AND the buffered
+    /// ones, exactly once. If the heal fails instead, its abort flushes the
+    /// buffer — the gap stays lost, which is where every path started.
+    ///
+    /// Only from `.idle`: an open transition already owns the stream, and
+    /// its boundary already covers this gap. Relay (terminal) delivery
+    /// never calls this — a repainting GridSnapshot makes re-delivery
+    /// pointless there, so its heal keeps anchoring past the gap.
+    func beginGapCapture() {
+        lock.lock()
+        defer { lock.unlock() }
+        guard case .idle = phase else { return }
+        nextID &+= 1
+        phase = .buffering(id: nextID, resumeSeq: wireSeq, isGapCapture: true, buffer: Buffer())
+    }
+
+    /// The pump-opened gap capture still waiting for a heal, if any. A heal
+    /// that cannot proceed (connect failure) must abort exactly this
+    /// transition, or the capture keeps suppressing a live stream forever.
+    func activeGapCapture() -> Transition? {
+        lock.lock()
+        defer { lock.unlock() }
+        guard case .buffering(let id, let resumeSeq, true, _) = phase else { return nil }
+        return Transition(id: id, resumeWireSeq: resumeSeq)
     }
 
     func route(endWireSeq: UInt64, data: Data) -> Route {
@@ -703,7 +830,7 @@ final class RelayResumeTransitionGate: @unchecked Sendable {
         switch phase {
         case .idle:
             return .forward(data)
-        case .buffering(_, let buffer):
+        case .buffering(_, _, _, let buffer):
             guard buffer.count + data.count <= maxBufferedBytes else {
                 buffer.append(data)
                 phase = .idle
@@ -739,7 +866,7 @@ final class RelayResumeTransitionGate: @unchecked Sendable {
     func commit(_ transition: Transition) -> Bool {
         lock.lock()
         defer { lock.unlock() }
-        guard case .buffering(let id, _) = phase, id == transition.id else { return false }
+        guard case .buffering(let id, _, _, _) = phase, id == transition.id else { return false }
         phase = .committed(id: id)
         return true
     }
@@ -758,7 +885,7 @@ final class RelayResumeTransitionGate: @unchecked Sendable {
     func abort(_ transition: Transition) -> Data? {
         lock.lock()
         defer { lock.unlock() }
-        guard case .buffering(let id, let buffer) = phase, id == transition.id else { return nil }
+        guard case .buffering(let id, _, _, let buffer) = phase, id == transition.id else { return nil }
         phase = .draining(id: id, buffer: buffer)
         return buffer.take()
     }
@@ -915,6 +1042,11 @@ private final class RelayIOStats: @unchecked Sendable {
     private let lock = NSLock()
     private var received: UInt64 = 0
     private var enqueued: UInt64 = 0
+    /// Callback-delivery chunks emitted while `onPtyData` was unset. Kept
+    /// out of `enqueued` on purpose: enqueued means "handed to a consumer",
+    /// and counting a consumer-less drop there made received≈enqueued read
+    /// as healthy on a session that was rendering nothing.
+    private var dropped: UInt64 = 0
     private var chunks: UInt64 = 0
     private var sawFirst = false
 
@@ -938,16 +1070,55 @@ private final class RelayIOStats: @unchecked Sendable {
         lock.unlock()
     }
 
+    func noteDropped(_ count: Int) {
+        lock.lock()
+        dropped += UInt64(count)
+        lock.unlock()
+    }
+
     var sawFirstByte: Bool {
         lock.lock()
         defer { lock.unlock() }
         return sawFirst
     }
 
-    func read() -> (received: UInt64, enqueued: UInt64, chunks: UInt64) {
+    func read() -> (received: UInt64, enqueued: UInt64, dropped: UInt64, chunks: UInt64) {
         lock.lock()
         defer { lock.unlock() }
-        return (received, enqueued, chunks)
+        return (received, enqueued, dropped, chunks)
+    }
+}
+
+/// Lock-boxed home for the `onPtyData` callback (t14 callback delivery).
+/// The pump reads it per chunk from a detached task while the owner
+/// (re)assigns it from the main actor — same NSLock-box shape as
+/// `RelayIOStats`, for the same reason. The callback is invoked OUTSIDE
+/// the lock so a consumer that re-enters (e.g. swaps the callback from
+/// inside a delivery) cannot deadlock; the cost is that one chunk already
+/// read by the pump may still land on a just-replaced callback, which the
+/// swap contract on `onPtyData` documents.
+private final class RelayPtyDataSink: @unchecked Sendable {
+    private let lock = NSLock()
+    private var callback: (@Sendable (Data) -> Void)?
+
+    func set(_ newCallback: (@Sendable (Data) -> Void)?) {
+        lock.lock()
+        callback = newCallback
+        lock.unlock()
+    }
+
+    func current() -> (@Sendable (Data) -> Void)? {
+        lock.lock()
+        defer { lock.unlock() }
+        return callback
+    }
+
+    /// Returns false when no callback is set (the chunk was dropped).
+    @discardableResult
+    func emit(_ data: Data) -> Bool {
+        guard let callback = current() else { return false }
+        callback(data)
+        return true
     }
 }
 
@@ -957,6 +1128,19 @@ private final class RelayIOStats: @unchecked Sendable {
 /// 3. After start(), pumps data between host and relay.
 @MainActor
 final class PeerRelaySession {
+    /// How host→viewer PtyData leaves this session.
+    enum PtyDelivery: Sendable {
+        /// Classic path: framed bytes to the term-mesh-peer-relay helper
+        /// over a local Unix socket; Ghostty renders its stdout.
+        case relaySocket
+        /// Agent-surface path (t14): no helper, no local socket — each
+        /// PtyData chunk is handed to `onPtyData` in arrival order. Input
+        /// returns via `sendRemoteKeys`, and the relay-only fixtures
+        /// (listener socket, per-session secret, resize coalescer) are
+        /// never created.
+        case callback
+    }
+
     private static let setupReadTimeoutSeconds: TimeInterval = 10
     /// How long after `start()` a session may render nothing before it is
     /// worth a log line. Long enough that a slow shell spawn is not noise,
@@ -975,6 +1159,7 @@ final class PeerRelaySession {
         return [
             "bytes_received": c.received,
             "bytes_enqueued": c.enqueued,
+            "bytes_dropped": c.dropped,
             "chunks": c.chunks,
             "saw_first_byte": ioStats.sawFirstByte,
         ]
@@ -983,7 +1168,7 @@ final class PeerRelaySession {
     /// One-line counter summary for the disconnect / watchdog log lines.
     var ioSummary: String {
         let c = ioStats.read()
-        return "received=\(c.received) enqueued=\(c.enqueued) chunks=\(c.chunks)"
+        return "received=\(c.received) enqueued=\(c.enqueued) dropped=\(c.dropped) chunks=\(c.chunks)"
     }
 
     // Path the relay binary should connect to.
@@ -1030,6 +1215,11 @@ final class PeerRelaySession {
     private let remoteCols: UInt32
     private let remoteRows: UInt32
 
+    /// Which delivery mode this session was built for. Fixed at creation:
+    /// the relay-only fixtures either exist for the whole session or never
+    /// exist at all, so the mode cannot flip midway.
+    let ptyDelivery: PtyDelivery
+
     private var listenerFd: Int32 = -1
     private var relaySocket: RelaySocket?
     private var session: PeerSession?
@@ -1038,8 +1228,52 @@ final class PeerRelaySession {
     private var isTorndown = false
     // Stored (not just local to `startPumping`) so `performResumeHeal` can
     // read the live remote size and re-target its session after a swap.
+    // Relay delivery only; callback mode never creates one.
     private var resizeCoalescer: RelayResizeCoalescer?
+    /// Callback-delivery twin of `resizeCoalescer`'s heal timing (see
+    /// `RelayGapHealScheduler`). At most one of the two exists per session.
+    private var gapHealScheduler: RelayGapHealScheduler?
     private var resizeAuthorityEligible = false
+
+    // ── Callback (agent) delivery ────────────────────────────────────
+    //
+    // t14: an agent surface's NDJSON byte stream has no terminal to render
+    // into, so the relay helper (a process whose whole job is writing to
+    // Ghostty's PTY) is dead weight. `.callback` delivery hands every
+    // PtyData chunk to `onPtyData` instead — in arrival order, one chunk
+    // at a time, from the pump's detached task (NOT the main actor).
+    // Replay bytes from a resume heal and the abort flush ride the exact
+    // same path, so the exactly-once contract `RelayResumeTransitionGate`
+    // enforces for relay panes holds unchanged here.
+    private let ptyDataSink = RelayPtyDataSink()
+
+    /// The callback-delivery consumer. Ownership contract:
+    /// - Assign before `start()`; chunks emitted while unset are dropped
+    ///   (a DEBUG line records the loss).
+    /// - Reassignment (main actor) redirects delivery; at most one chunk
+    ///   already read by the pump may still reach the previous callback.
+    ///   The recreated-from-scratch reattach path relies on this: the
+    ///   owner builds a fresh AgentSession and swaps the callback inside
+    ///   `onPtyDeliveryRestart`, which fires strictly before any restarted
+    ///   byte is delivered.
+    /// - `disconnect()` stops the pump but deliberately leaves the
+    ///   callback in place — the owner decides its lifetime via
+    ///   `onDisconnect`.
+    var onPtyData: (@Sendable (Data) -> Void)? {
+        get { ptyDataSink.current() }
+        set { ptyDataSink.set(newValue) }
+    }
+
+    /// Fired (main actor) when a reconnect/resume attach could NOT resume
+    /// at the exact wire position this pane last processed — the host is
+    /// about to re-send bytes the consumer has already seen (an un-ringed
+    /// host restarts from a fresh snapshot; a ring that no longer reaches
+    /// back that far replays from earlier). An NDJSON consumer is not
+    /// idempotent, so a callback-delivery owner must swap in a fresh
+    /// consumer (via `onPtyData`) inside this hook: it fires strictly
+    /// before any byte of the restarted stream is delivered. Terminal
+    /// (relay) panes never set it — repainted bytes are harmless there.
+    var onPtyDeliveryRestart: (@MainActor () -> Void)?
 
     func setResizeAuthorityEligible(_ eligible: Bool) {
         resizeAuthorityEligible = eligible
@@ -1094,6 +1328,13 @@ final class PeerRelaySession {
 
     var onError: (@MainActor (Error) -> Void)?
     var onDisconnect: (@MainActor () -> Void)?
+    /// Host-confirmed terminal status for this exact attached surface. Fired
+    /// after its final output chunk and before the ordinary disconnect hook.
+    var onSurfaceExited: (@MainActor (
+        _ exitCode: Int32,
+        _ signal: Int32,
+        _ reason: String
+    ) async -> Void)?
     var onReconnecting: (@MainActor (_ attempt: Int) -> Void)?
     var onReconnected: (@MainActor () -> Void)?
 
@@ -1274,7 +1515,8 @@ final class PeerRelaySession {
 
     static func attach(
         _ connection: PeerRelayConnection,
-        surface: Termmesh_Peer_V1_SurfaceInfo
+        surface: Termmesh_Peer_V1_SurfaceInfo,
+        ptyDelivery: PtyDelivery = .relaySocket
     ) async throws -> PeerRelaySession {
         await connection.transport.setReadTimeoutSeconds(setupReadTimeoutSeconds)
         let outcome: PeerAttachOutcome
@@ -1301,13 +1543,24 @@ final class PeerRelaySession {
             throw RelayError.surfaceIDMismatch
         }
 
-        let relaySockPath = try Self.makeRelaySocketPath()
+        // Callback delivery has no helper to dial in, so no socket path and
+        // no secret exist to leak — they are relay-only fixtures (t14).
+        let relaySockPath: String
+        let relaySecret: String
+        switch ptyDelivery {
+        case .relaySocket:
+            relaySockPath = try Self.makeRelaySocketPath()
+            relaySecret = Self.makeRelaySecret()
+        case .callback:
+            relaySockPath = ""
+            relaySecret = ""
+        }
 
         return PeerRelaySession(
             hostSockPath: connection.hostSockPath,
             hostDisplayName: connection.hostDisplayName,
             relaySockPath: relaySockPath,
-            relaySecret: Self.makeRelaySecret(),
+            relaySecret: relaySecret,
             surfaceID: outcome.surfaceID,
             remoteCols: UInt32(surface.cols),
             remoteRows: UInt32(surface.rows),
@@ -1317,7 +1570,8 @@ final class PeerRelaySession {
             ptyStream: nil,
             onSharedDetach: nil,
             attachInitialSeq: outcome.initialByteSeq,
-            hostSupportsReplayRing: connection.hostCapabilities.has(PeerCapability.replayRingV1)
+            hostSupportsReplayRing: connection.hostCapabilities.has(PeerCapability.replayRingV1),
+            ptyDelivery: ptyDelivery
         )
     }
 
@@ -1326,10 +1580,25 @@ final class PeerRelaySession {
     /// surface roster is fetched and no picker can influence the returned id.
     static func ensureSurface(
         _ connection: PeerRelayConnection,
-        spec: PeerRunnerSurfaceSpec
+        spec: PeerRunnerSurfaceSpec,
+        environment: [String: String] = [:]
     ) async throws -> PeerEnsureSurfaceOutcome {
         guard connection.hostCapabilities.has(PeerCapability.surfaceEnsureV1) else {
             throw RelayError.capabilityUnavailable(PeerCapability.surfaceEnsureV1)
+        }
+        // An agent kind asks the host to own a `tm-agent-bridge` child, which
+        // a daemon that never advertised `surface.agent.v1` cannot do. It
+        // would answer INVALID_REQUEST anyway; refusing here keeps the caller
+        // choosing a fallback instead of reading a wire error to find out.
+        if SessionHostPanes.isAgentSurfaceType(spec.kind),
+           !RemoteHostStore.hostSupportsPeerOwnedAgentFactory(connection.hostCapabilities) {
+            for capability in [
+                PeerCapability.surfaceAgentV1,
+                PeerCapability.surfaceExitV1,
+                PeerCapability.surfaceEnsureEnvV1,
+            ] where !connection.hostCapabilities.has(capability) {
+                throw RelayError.capabilityUnavailable(capability)
+            }
         }
         await connection.transport.setReadTimeoutSeconds(setupReadTimeoutSeconds)
         let outcome: PeerEnsureSurfaceOutcome
@@ -1339,7 +1608,9 @@ final class PeerRelaySession {
                 cwd: spec.cwd,
                 executable: spec.executable,
                 args: spec.args,
-                restartPolicy: spec.restartPolicy.wireValue
+                restartPolicy: spec.restartPolicy.wireValue,
+                kind: spec.kind,
+                environment: environment
             )
         } catch {
             await connection.transport.setReadTimeoutSeconds(nil)
@@ -1485,7 +1756,11 @@ final class PeerRelaySession {
         }
     }
 
-    private init(
+    /// `internal` (not `private`) so unit tests can build a session around a
+    /// scripted `PeerSession(read:write:)` without a live transport — the
+    /// factories above all require a real handshake/attach round trip.
+    /// Production code must keep entering through the factories.
+    init(
         hostSockPath: String,
         hostDisplayName: String,
         relaySockPath: String,
@@ -1499,7 +1774,8 @@ final class PeerRelaySession {
         ptyStream: AsyncStream<PeerPtyChunk>?,
         onSharedDetach: (@Sendable () async -> Void)?,
         attachInitialSeq: UInt64,
-        hostSupportsReplayRing: Bool
+        hostSupportsReplayRing: Bool,
+        ptyDelivery: PtyDelivery = .relaySocket
     ) {
         self.hostSockPath = hostSockPath
         self.hostDisplayName = hostDisplayName
@@ -1515,7 +1791,15 @@ final class PeerRelaySession {
         self.onSharedDetach = onSharedDetach
         self.attachInitialSeq = attachInitialSeq
         self.hostSupportsReplayRing = hostSupportsReplayRing
-        self.relayBinaryPath = Self.findRelayBinary()
+        self.ptyDelivery = ptyDelivery
+        switch ptyDelivery {
+        case .relaySocket:
+            self.relayBinaryPath = Self.findRelayBinary()
+        case .callback:
+            // No helper will ever be spawned; don't probe the filesystem
+            // for a binary this mode never runs.
+            self.relayBinaryPath = ""
+        }
     }
 
     deinit {
@@ -1528,7 +1812,10 @@ final class PeerRelaySession {
         pumpTask?.cancel()
         relaySocket?.close()
         if listenerFd >= 0 { Darwin.close(listenerFd) }
-        try? FileManager.default.removeItem(atPath: relaySockPath)
+        // Callback delivery never allocates a socket path (empty string).
+        if !relaySockPath.isEmpty {
+            try? FileManager.default.removeItem(atPath: relaySockPath)
+        }
     }
 
     private static func makeRelaySocketPath() throws -> String {
@@ -1591,6 +1878,10 @@ final class PeerRelaySession {
     /// Sets up the listener socket. The Ghostty surface must be created
     /// AFTER this returns (so the relay binary can connect to relaySockPath).
     func prepareListener() throws {
+        // Callback (agent) delivery: no relay helper will ever dial in, so
+        // there is nothing to listen for. Deliberately a no-op rather than
+        // a throw, so a caller with a uniform setup sequence needs no branch.
+        guard case .relaySocket = ptyDelivery else { return }
         guard FileManager.default.fileExists(atPath: relayBinaryPath) else {
             throw RelayError.noRelayBinary("relay binary not found at \(relayBinaryPath)")
         }
@@ -1636,7 +1927,26 @@ final class PeerRelaySession {
 
     /// Call after the Ghostty surface has been created. Accepts the relay
     /// connection (with a timeout) and starts bidirectional pumping.
+    ///
+    /// Callback delivery skips the whole accept dance: nothing listens,
+    /// nothing dials in, no helper process exists. All this start does
+    /// there is arm the diagnostics/heartbeat and the pump itself.
     func start() async throws {
+        guard case .relaySocket = ptyDelivery else {
+            #if DEBUG
+            if onPtyData == nil {
+                // Not fatal — the sink drops (and logs) chunks — but an
+                // owner that meant to consume from byte one set it too late.
+                dlog("peer.relay.callback.start.noSink — set onPtyData before start(); chunks arriving now are dropped")
+            }
+            #endif
+            scheduleFirstByteWatchdog()
+            if ownsSession, let session, let transport {
+                await startHeartbeatMonitoring(session: session, transport: transport)
+            }
+            startPumping(relay: nil)
+            return
+        }
         let relay = try await acceptRelay()
         self.relaySocket = relay
         #if DEBUG
@@ -1645,27 +1955,7 @@ final class PeerRelaySession {
         // look identical after the fact.
         dlog("peer.relay.accept ok sock=\(relaySockPath)")
         #endif
-        // Watchdog: a pane that attaches and receives nothing produces no log
-        // at all today — `peer.relay.gap` only arms after a first frame sets
-        // `expectedByteSeq`, so the zero-byte case is exactly the one that
-        // stays silent. One deferred line makes it visible.
-        Task { [weak self] in
-            try? await Task.sleep(
-                nanoseconds: UInt64(Self.firstByteWatchdogSeconds * 1_000_000_000)
-            )
-            // `isTorndown` as well as the byte check: a session that
-            // disconnected before its first byte is still held by the pane
-            // (it renders the disconnect banner), so without this the
-            // watchdog fires on an already-dead connection and tells the
-            // user a closed pane "may render blank".
-            guard let self, !self.ioStats.sawFirstByte, !self.isTorndown else { return }
-            #if DEBUG
-            dlog("peer.relay.firstByte.timeout — no PtyData \(Int(Self.firstByteWatchdogSeconds))s after accept (\(self.ioSummary))")
-            #endif
-            RemoteWorkLog.infoOffMain(
-                "Remote pane has received no output \(Int(Self.firstByteWatchdogSeconds))s after connecting — it may render blank"
-            )
-        }
+        scheduleFirstByteWatchdog()
         // The listener has done its single job (one relay connection, no
         // reconnect). Release the fd + socket file now instead of holding them
         // until deinit. The accept poll has already resolved, so nothing else
@@ -1683,6 +1973,32 @@ final class PeerRelaySession {
             await startHeartbeatMonitoring(session: session, transport: transport)
         }
         startPumping(relay: relay)
+    }
+
+    /// Watchdog: a pane that attaches and receives nothing produces no log
+    /// at all otherwise — `peer.relay.gap` only arms after a first frame sets
+    /// `expectedByteSeq`, so the zero-byte case is exactly the one that
+    /// stays silent. One deferred line makes it visible. Shared by both
+    /// delivery modes; a blank AgentPanel and a blank relay pane are the
+    /// same investigation.
+    private func scheduleFirstByteWatchdog() {
+        Task { [weak self] in
+            try? await Task.sleep(
+                nanoseconds: UInt64(Self.firstByteWatchdogSeconds * 1_000_000_000)
+            )
+            // `isTorndown` as well as the byte check: a session that
+            // disconnected before its first byte is still held by the pane
+            // (it renders the disconnect banner), so without this the
+            // watchdog fires on an already-dead connection and tells the
+            // user a closed pane "may render blank".
+            guard let self, !self.ioStats.sawFirstByte, !self.isTorndown else { return }
+            #if DEBUG
+            dlog("peer.relay.firstByte.timeout — no PtyData \(Int(Self.firstByteWatchdogSeconds))s after accept (\(self.ioSummary))")
+            #endif
+            RemoteWorkLog.infoOffMain(
+                "Remote pane has received no output \(Int(Self.firstByteWatchdogSeconds))s after connecting — it may render blank"
+            )
+        }
     }
 
     /// App-level heartbeat: detect a remote daemon that has stopped
@@ -1806,7 +2122,7 @@ final class PeerRelaySession {
 
     // ── Bidirectional pumping ────────────────────────────────────────
 
-    private func startPumping(relay: RelaySocket) {
+    private func startPumping(relay: RelaySocket?) {
         guard let session else { return }
         let surfaceID = self.surfaceID
         let disconnect: @Sendable (String) -> Void = { [weak self] reason in
@@ -1814,32 +2130,99 @@ final class PeerRelaySession {
                 self?.disconnect(reason: reason)
             }
         }
-        let writer = RelayFrameWriter(relay: relay) { [weak self] error in
-            // Surface the failure instead of letting every relay I/O error look
-            // like a clean disconnect: log it (DEBUG) and fire onError so a
-            // consumer can distinguish a crash from a goodbye.
-            #if DEBUG
-            dlog("peer.relay.writer.failure error=\(error)")
-            #endif
-            Task { @MainActor in self?.onError?(error) }
-            disconnect("writer-failure")
-        }
-        relayFrameWriter = writer
-        let reader = RelayFrameReader(relay: relay)
-        let resizeCoalescer = RelayResizeCoalescer(
-            session: session,
-            surfaceID: surfaceID,
-            initialCols: remoteCols,
-            initialRows: remoteRows,
-            authorityEligible: resizeAuthorityEligible,
-            onHeal: { [weak self] reason in
-                await self?.performResumeHeal(reason: reason)
+        let disconnectWithoutRecovery: @Sendable (String) -> Void = { [weak self] reason in
+            Task { @MainActor in
+                self?.disconnect(reason: reason, notifyDisconnect: false)
             }
-        )
-        // Stored so `performResumeHeal` (an instance method outside this
-        // closure) can read the live remote size and re-target this actor's
-        // session after a resume-heal swap.
-        self.resizeCoalescer = resizeCoalescer
+        }
+        // Relay delivery gets the framed writer/reader pair; callback
+        // delivery gets neither — bytes leave through `ptyDataSink` and
+        // input arrives via `sendRemoteKeys`, so there is no second socket
+        // to pump.
+        let writer: RelayFrameWriter?
+        let reader: RelayFrameReader?
+        if let relay {
+            let liveWriter = RelayFrameWriter(relay: relay) { [weak self] error in
+                // Surface the failure instead of letting every relay I/O error look
+                // like a clean disconnect: log it (DEBUG) and fire onError so a
+                // consumer can distinguish a crash from a goodbye.
+                #if DEBUG
+                dlog("peer.relay.writer.failure error=\(error)")
+                #endif
+                Task { @MainActor in self?.onError?(error) }
+                disconnect("writer-failure")
+            }
+            relayFrameWriter = liveWriter
+            writer = liveWriter
+            reader = RelayFrameReader(relay: relay)
+        } else {
+            writer = nil
+            reader = nil
+        }
+        // Gap-heal timing. The relay path hangs it off the resize coalescer
+        // (which also owns resize forwarding and so needs the session);
+        // callback delivery has no resize traffic, so a dedicated scheduler
+        // carries the same debounce/throttle contract on its own.
+        let resizeCoalescer: RelayResizeCoalescer?
+        let gapHealScheduler: RelayGapHealScheduler?
+        let noteGapForHeal: @Sendable () async -> Void
+        if relay != nil {
+            let coalescer = RelayResizeCoalescer(
+                session: session,
+                surfaceID: surfaceID,
+                initialCols: remoteCols,
+                initialRows: remoteRows,
+                authorityEligible: resizeAuthorityEligible,
+                onHeal: { [weak self] reason in
+                    await self?.performResumeHeal(reason: reason)
+                }
+            )
+            // Stored so `performResumeHeal` (an instance method outside this
+            // closure) can read the live remote size and re-target this actor's
+            // session after a resume-heal swap.
+            self.resizeCoalescer = coalescer
+            resizeCoalescer = coalescer
+            gapHealScheduler = nil
+            noteGapForHeal = { await coalescer.noteGapForHeal() }
+        } else {
+            let scheduler = RelayGapHealScheduler(
+                onHeal: { [weak self] reason in
+                    await self?.performResumeHeal(reason: reason)
+                }
+            )
+            self.gapHealScheduler = scheduler
+            resizeCoalescer = nil
+            gapHealScheduler = scheduler
+            noteGapForHeal = { await scheduler.noteGap() }
+        }
+        // One delivery function for every PtyData exit point, so callback
+        // delivery rides the exact live/replay/abort ordering the relay
+        // path has: same pump task, same gate decisions, same order. It
+        // owns its own byte accounting: only a chunk a consumer actually
+        // took counts as enqueued — a callback emit with no `onPtyData`
+        // set is a DROP, tallied separately so a probe reading
+        // received≈enqueued cannot mistake a consumer-less session for a
+        // healthy one.
+        let ptyDataSink = self.ptyDataSink
+        let ioStats = self.ioStats
+        let deliverPtyData: @Sendable (Data) async throws -> Void
+        if let writer {
+            deliverPtyData = { data in
+                try await writer.enqueue(type: kTypePtyData, payload: data)
+                ioStats.noteEnqueued(data.count)
+            }
+        } else {
+            deliverPtyData = { data in
+                if ptyDataSink.emit(data) {
+                    ioStats.noteEnqueued(data.count)
+                } else {
+                    ioStats.noteDropped(data.count)
+                    #if DEBUG
+                    dlog("peer.relay.callback.dropped bytes=\(data.count) — onPtyData unset")
+                    #endif
+                }
+            }
+        }
         // Capture the sharing mode for the detached pumps. On the shared
         // path host→relay bytes arrive pre-demuxed via `ptyStream`; on the
         // owned path this task reads frames itself and filters by surface_id.
@@ -1895,7 +2278,7 @@ final class PeerRelaySession {
                                     "Output dropped on the shared path — \(gap) bytes (\(gapBytesTotal) total over \(gapCount) gaps); the pane is missing content"
                                 )
                             }
-                            await resizeCoalescer.noteGapForHeal()
+                            await noteGapForHeal()
                         }
                         expectedByteSeq = chunk.byteSeq + UInt64(chunk.payload.count)
                         if self.ioStats.noteReceived(chunk.payload.count) {
@@ -1907,8 +2290,7 @@ final class PeerRelaySession {
                             #endif
                         }
                         do {
-                            try await writer.enqueue(type: kTypePtyData, payload: chunk.payload)
-                            self.ioStats.noteEnqueued(chunk.payload.count)
+                            try await deliverPtyData(chunk.payload)
                         } catch {
                             disconnect("hostToRelay-enqueue-failed error=\(error)")
                             return
@@ -1922,6 +2304,11 @@ final class PeerRelaySession {
                 // just the switch — a bare `break` inside the switch would keep
                 // looping and silently drop frames to a dead writer.
                 var endReason = "hostToRelay-loop-end"
+                // An authoritative process exit is not a transport failure.
+                // Its owner keeps the finished AgentPanel visible, whereas a
+                // transport loss invokes onDisconnect so Workspace can recover
+                // the still-live daemon session in a fresh pane.
+                var notifyDisconnect = true
                 // nil until the first PtyData establishes the baseline — without
                 // this the initial frame (whose byte_seq may be the attach's
                 // non-zero initial_seq) reads as a spurious gap vs 0.
@@ -1973,7 +2360,9 @@ final class PeerRelaySession {
                             gapCount = 0
                             continue pumpLoop
                         }
-                        try? await writer.enqueue(type: kTypeGoodbye, payload: Data("host-error".utf8))
+                        if let writer {
+                            try? await writer.enqueue(type: kTypeGoodbye, payload: Data("host-error".utf8))
+                        }
                         // Carry the error itself, not just the fact that one
                         // happened: `unexpectedEof` (host dropped the socket),
                         // `sessionClosed` (host said goodbye) and `framing`
@@ -2039,9 +2428,22 @@ final class PeerRelaySession {
                                     "Host output lagged — \(gap) bytes dropped (\(gapBytesTotal) total over \(gapCount) gaps); the pane is missing content"
                                 )
                             }
+                            // Callback (agent) delivery: anchor a capture at
+                            // the end of the last DELIVERED chunk, before
+                            // this gapped chunk is routed. The pump then
+                            // buffers the post-gap stream, and the heal
+                            // below adopts the capture (`begin()`), so the
+                            // host's replay ring re-carries the dropped
+                            // NDJSON bytes plus the buffered ones exactly
+                            // once — an NDJSON consumer has no repainting
+                            // GridSnapshot to fall back on. Terminal (relay)
+                            // delivery keeps its post-gap anchor unchanged.
+                            if writer == nil {
+                                resumeTransitionGate.beginGapCapture()
+                            }
                             // P9.2: schedule a debounced redraw heal so a TUI
                             // corrupted by the drop recovers once output settles.
-                            await resizeCoalescer.noteGapForHeal()
+                            await noteGapForHeal()
                         }
                         expectedByteSeq = byteSeq + UInt64(data.count)
                         // R3: `expectedByteSeq` IS "last processed wire seq" —
@@ -2072,8 +2474,7 @@ final class PeerRelaySession {
                         switch route {
                         case .forward(let payload), .overflowFlush(let payload):
                             do {
-                                try await writer.enqueue(type: kTypePtyData, payload: payload)
-                                self.ioStats.noteEnqueued(payload.count)
+                                try await deliverPtyData(payload)
                             } catch {
                                 endReason = "hostToRelay-enqueue-failed error=\(error)"
                                 break pumpLoop
@@ -2081,7 +2482,47 @@ final class PeerRelaySession {
                         case .suppress:
                             break
                         }
+                    case .surfaceExited(let sid, let exitCode, let signal, let reason)
+                        where sid == mySurfaceID:
+                        // The capability contract guarantees this follows the
+                        // final PtyData, so the callback can finish the agent
+                        // immediately without racing any later output.
+                        if let onSurfaceExited = await self.onSurfaceExited {
+                            await onSurfaceExited(exitCode, signal, reason)
+                        }
+                        endReason = "surface-exited code=\(exitCode) signal=\(signal) reason=\(reason)"
+                        notifyDisconnect = false
+                        break pumpLoop
+                    case .error(let code, let message):
+                        // Protocol errors are connection-scoped (the wire
+                        // message has no surface_id). On an owned agent
+                        // connection that means this pane can no longer trust
+                        // the stream. Surface the host's bounded, secret-free
+                        // diagnostic and take the ordinary recovery path.
+                        let error = RelayError.ioError("host error \(code): \(message)")
+                        await MainActor.run {
+                            self.onError?(error)
+                        }
+                        endReason = "host-error code=\(code) message=\(message)"
+                        break pumpLoop
                     case .gridSnapshot(let sid, _, _, let ansi) where sid == mySurfaceID:
+                        guard let writer else {
+                            // Callback (agent) delivery: the wire contract says
+                            // an agent surface never emits GridSnapshot, and
+                            // rendered-cell ANSI means nothing to an NDJSON
+                            // consumer — drop the payload defensively rather
+                            // than corrupting the decoder. The seq bookkeeping
+                            // still applies: a typed-snapshot host restarts the
+                            // wire-seq space after this message, so skipping
+                            // the reset would misread the next live chunk as a
+                            // gap and schedule a needless heal.
+                            expectedByteSeq = 0
+                            resumeTransitionGate.resetWireSeq()
+                            #if DEBUG
+                            dlog("peer.relay.callback.gridSnapshot.ignored bytes=\(ansi.count)")
+                            #endif
+                            break
+                        }
                         // The host just proved it speaks the grid model —
                         // scrollback browsing may engage from here on.
                         scrollbackBrowse.markHostCapable()
@@ -2118,6 +2559,10 @@ final class PeerRelaySession {
                             break pumpLoop
                         }
                     case .scrollbackChunk(let sid, let effOffset, let ansi, let atTop, _) where sid == mySurfaceID:
+                        // Callback delivery never requests a scrollback browse
+                        // (no relay wheel events exist to start one), so a
+                        // stray chunk has no pane to paint — drop it.
+                        guard let writer else { break }
                         // One browse window (or, at offset 0, the live
                         // screen again). The render is a full replacement —
                         // clear+home first — so it goes down the same relay
@@ -2154,7 +2599,9 @@ final class PeerRelaySession {
                             }
                         }
                     case .goodbye:
-                        try? await writer.enqueue(type: kTypeGoodbye, payload: Data("host-goodbye".utf8))
+                        if let writer {
+                            try? await writer.enqueue(type: kTypeGoodbye, payload: Data("host-goodbye".utf8))
+                        }
                         // Tear down now so the sibling relayToHost task unblocks
                         // immediately instead of hanging until the heartbeat (~30s).
                         disconnect("host-goodbye")
@@ -2163,11 +2610,19 @@ final class PeerRelaySession {
                         break
                     }
                 }
-                disconnect(endReason)
+                if notifyDisconnect {
+                    disconnect(endReason)
+                } else {
+                    disconnectWithoutRecovery(endReason)
+                }
             }
 
-            // Relay → host: read frames from relay socket, forward to PeerSession.
-            let relayToHost = Task.detached(priority: .userInitiated) {
+            // Relay → host: read frames from relay socket, forward to
+            // PeerSession. Exists only in relay delivery — callback mode has
+            // no relay socket to read, and its input path is `sendRemoteKeys`.
+            let relayToHost: Task<Void, Never>?
+            if let reader, let resizeCoalescer {
+            relayToHost = Task.detached(priority: .userInitiated) {
                 do {
                     for try await frame in reader.frames() {
                         if Task.isCancelled { break }
@@ -2229,12 +2684,16 @@ final class PeerRelaySession {
                 await resizeCoalescer.flushNow()
                 disconnect("relayToHost-end")
             }
+            } else {
+                relayToHost = nil
+            }
 
             _ = await hostToRelay.result
-            _ = await relayToHost.result
-            writer.stop()
-            reader.stop()
-            await resizeCoalescer.cancel()
+            if let relayToHost { _ = await relayToHost.result }
+            writer?.stop()
+            reader?.stop()
+            await resizeCoalescer?.cancel()
+            await gapHealScheduler?.cancel()
         }
     }
 
@@ -2299,6 +2758,14 @@ final class PeerRelaySession {
             #if DEBUG
             dlog("peer.relay.gap.heal.resume.connectFailed error=\(error)")
             #endif
+            // A callback-delivery gap capture is buffering the live stream
+            // while it waits for this heal. The heal cannot proceed, so
+            // flush the capture back out — a transient connect failure must
+            // not leave the pane suppressed forever. The gap stays lost,
+            // which is where every path started.
+            if let capture = resumeTransitionGate.activeGapCapture() {
+                await abortResumeTransition(capture)
+            }
             return
         }
         guard !isTorndown else {
@@ -2327,6 +2794,11 @@ final class PeerRelaySession {
         // crashed the whole app here (arithmetic overflow) on the first gap
         // heal of such an attach, and since the heal IS the recovery path, the
         // pane could never come back.
+        // `begin()` adopts a pump-opened gap capture when one is buffering
+        // (callback delivery): the transition then anchors at the last
+        // DELIVERED byte, so the resume below asks the ring for the dropped
+        // bytes too. Without one it anchors at the current position — the
+        // unchanged terminal behavior.
         let transition = resumeTransitionGate.begin()
         let resumeFromSeq: UInt64 = hostSupportsReplayRing
             ? (attachInitialSeq &+ transition.resumeWireSeq)
@@ -2390,6 +2862,17 @@ final class PeerRelaySession {
         await resizeCoalescer?.adopt(session: newConnection.session)
         await startHeartbeatMonitoring(session: newConnection.session, transport: newConnection.transport)
 
+        // The host anchored the new attach somewhere other than the exact
+        // wire position this pane asked to resume from — bytes the consumer
+        // already processed are about to repeat. Tell the owner BEFORE the
+        // old transport closes: the pump cannot adopt (and so deliver from)
+        // the resumed session until that close unblocks its pending
+        // receive, so a callback owner swapping its consumer here always
+        // beats the first restarted byte.
+        if outcome.initialByteSeq != resumeFromSeq {
+            onPtyDeliveryRestart?()
+        }
+
         try? await oldSession.sendGoodbye(reason: "resume-heal reconnect")
         await oldTransport.close()
 
@@ -2449,8 +2932,15 @@ final class PeerRelaySession {
             await connection.cancel()
             return false
         }
+        // A gap capture (callback delivery) holds bytes that were never
+        // delivered; the transport died before its heal ran. Anchoring the
+        // reconnect at the capture's position lets the ring re-carry both
+        // the gap and the withheld bytes — `reset()` below then discards
+        // the buffer, which is correct only because the replay covers it.
+        // Without a capture this is the plain current position, unchanged.
         let resumeFromSeq = hostSupportsReplayRing
-            ? (attachInitialSeq &+ resumeTransitionGate.currentWireSeq())
+            ? (attachInitialSeq &+ (resumeTransitionGate.activeGapCapture()?.resumeWireSeq
+                                        ?? resumeTransitionGate.currentWireSeq()))
             : 0
         let outcome: PeerAttachOutcome
         do {
@@ -2482,6 +2972,12 @@ final class PeerRelaySession {
         hostSupportsReplayRing = connection.hostCapabilities.has(PeerCapability.replayRingV1)
         await resizeCoalescer?.adopt(session: connection.session)
         await startHeartbeatMonitoring(session: connection.session, transport: connection.transport)
+        // Same restart contract as `performResumeHeal`: the pump adopts the
+        // replacement session only after `reconnectOwnedSession` returns,
+        // so this hook always fires before the first restarted byte.
+        if outcome.initialByteSeq != resumeFromSeq {
+            onPtyDeliveryRestart?()
+        }
         return true
     }
 
@@ -2491,23 +2987,75 @@ final class PeerRelaySession {
     }
 
     private func abortResumeTransition(_ transition: RelayResumeTransitionGate.Transition) async {
-        guard let writer = relayFrameWriter else { return }
-        var pending = resumeTransitionGate.abort(transition)
-        while let payload = pending {
-            if !payload.isEmpty {
-                do {
-                    try await writer.enqueue(type: kTypePtyData, payload: payload)
-                    ioStats.noteEnqueued(payload.count)
-                } catch {
-                    disconnect(reason: "resume-abort-enqueue-failed error=\(error)")
-                    return
+        // Ordering holds in both modes for the same reason: while the gate
+        // is `.draining`, the pump routes every live chunk INTO the drain
+        // buffer instead of delivering it, so these batches cannot be
+        // overtaken (and an `.overflowFlush` hand-back atomically ends the
+        // drain before the pump delivers the combined batch itself).
+        switch ptyDelivery {
+        case .callback:
+            var pending = resumeTransitionGate.abort(transition)
+            while let payload = pending {
+                if !payload.isEmpty {
+                    // Same accounting contract as the pump's delivery
+                    // function: a consumer-less emit is a drop, never an
+                    // enqueue.
+                    if ptyDataSink.emit(payload) {
+                        ioStats.noteEnqueued(payload.count)
+                    } else {
+                        ioStats.noteDropped(payload.count)
+                    }
                 }
+                pending = resumeTransitionGate.finishDrain(transition)
             }
-            pending = resumeTransitionGate.finishDrain(transition)
+        case .relaySocket:
+            guard let writer = relayFrameWriter else { return }
+            var pending = resumeTransitionGate.abort(transition)
+            while let payload = pending {
+                if !payload.isEmpty {
+                    do {
+                        try await writer.enqueue(type: kTypePtyData, payload: payload)
+                        ioStats.noteEnqueued(payload.count)
+                    } catch {
+                        disconnect(reason: "resume-abort-enqueue-failed error=\(error)")
+                        return
+                    }
+                }
+                pending = resumeTransitionGate.finishDrain(transition)
+            }
         }
     }
 
-    private func disconnect(reason: String) {
+    #if DEBUG
+    // ── Test seams (PeerRelaySessionCallbackDeliveryTests) ───────────
+    //
+    // The resume-transition gate's begin/commit/abort normally run inside
+    // `performResumeHeal`, which needs a live host to reconnect to. These
+    // drive the same gate + delivery paths without one, so the callback
+    // mode's exactly-once contract is testable deterministically.
+
+    func beginResumeTransitionForTesting() -> RelayResumeTransitionGate.Transition {
+        resumeTransitionGate.begin()
+    }
+
+    func commitResumeTransitionForTesting(_ transition: RelayResumeTransitionGate.Transition) -> Bool {
+        resumeTransitionGate.commit(transition)
+    }
+
+    func adoptCommittedResumeSessionForTesting() {
+        resumeTransitionGate.adoptCommittedSession()
+    }
+
+    func abortResumeTransitionForTesting(_ transition: RelayResumeTransitionGate.Transition) async {
+        await abortResumeTransition(transition)
+    }
+
+    /// -1 unless a relay listener was actually bound — the callback-mode
+    /// "no listener socket" assertion reads this.
+    var listenerFileDescriptorForTesting: Int32 { listenerFd }
+    #endif
+
+    private func disconnect(reason: String, notifyDisconnect: Bool = true) {
         // Multiple teardown paths (writer onFailure, hostToRelay end,
         // relayToHost end) all funnel here; without this guard onDisconnect?()
         // fires 2-3 times per session.
@@ -2552,7 +3100,9 @@ final class PeerRelaySession {
             let detach = onSharedDetach
             Task { await detach?() }
         }
-        onDisconnect?()
+        if notifyDisconnect {
+            onDisconnect?()
+        }
     }
 
     func stop() async {

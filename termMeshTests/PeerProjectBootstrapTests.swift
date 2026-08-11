@@ -1384,6 +1384,11 @@ final class PeerProjectBootstrapTests: XCTestCase {
         XCTAssertEqual(PeerHostEnvironment.inlineAssignments([:]), "")
         XCTAssertEqual(PeerHostEnvironment.inlineAssignments(["2bad": "x", "a-b": "y"]), "")
         XCTAssertEqual(
+            PeerHostEnvironment.inlineAssignments(["GOOD": "kept", "한글": "dropped"]),
+            "GOOD='kept'",
+            "legacy shell callers keep valid siblings; typed ensure validates the whole map"
+        )
+        XCTAssertEqual(
             PeerHostEnvironment.inlineAssignments(["_OK": "v"]),
             "_OK='v'"
         )

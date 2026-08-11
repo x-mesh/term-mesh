@@ -82,8 +82,20 @@ final class Workspace: Identifiable {
             if oldValue.count != panels.count {
                 panelsCountSubject.send(panels.count)
             }
+            reconcileRemoteAgentPaneSessions()
         }
     }
+
+    /// Peer sessions bound to AgentPanel panes, keyed by panel id.
+    ///
+    /// A remote TERMINAL pane carries its `PeerPaneSession` on the
+    /// `TerminalPanel` itself and tears it down in `close()`. `AgentPanel`
+    /// deliberately knows nothing about transports — the same session
+    /// object serves a local process pipe and a peer relay — so the
+    /// workspace keeps the binding and reconciles it against `panels`:
+    /// the screen is the record, the same reasoning `SessionHostPanes`
+    /// runs on. Read by `SessionHostPanes.shownSurfaceIDs()`.
+    @ObservationIgnored private(set) var remoteAgentPaneSessions: [UUID: PeerPaneSession] = [:]
 
     /// Panel-count changes for the UI-test harnesses, which wait on a pane
     /// closing from outside SwiftUI.
@@ -310,6 +322,9 @@ final class Workspace: Identifiable {
         command: String? = nil,
         environment: [String: String] = [:]
     ) {
+        // Installs the reconnect observer and retries durable peer-agent
+        // tombstones restored from a previous app run.
+        _ = PendingPeerAgentSurfaceCleanupStore.shared
         self.id = UUID()
         self.portOrdinal = portOrdinal
         self.processTitle = title
@@ -543,6 +558,12 @@ final class Workspace: Identifiable {
         let cachedTitle: String?
         let customTitle: String?
         let manuallyUnread: Bool
+        /// A remote AgentPanel's peer session rides the transfer, because
+        /// the binding lives on the workspace rather than the panel (see
+        /// `remoteAgentPaneSessions`). Defaulted so the delegate's
+        /// construction site — which never detaches one mid-flight —
+        /// stays as it is; `detachSurface` fills it in on the way out.
+        var remoteAgentSession: PeerPaneSession? = nil
     }
 
     @ObservationIgnored var detachingTabIds: Set<TabID> = []
@@ -2008,7 +2029,15 @@ final class Workspace: Identifiable {
             return nil
         }
 
-        return pendingDetachedSurfaces.removeValue(forKey: tabId)
+        guard var transfer = pendingDetachedSurfaces.removeValue(forKey: tabId) else { return nil }
+        // A detach is a move, not a close: hand the agent pane's peer
+        // session to the transfer so the destination workspace can adopt
+        // the binding. Left behind, this workspace's deinit would tear
+        // down a session the transferred pane is still consuming.
+        if transfer.panel is AgentPanel {
+            transfer.remoteAgentSession = remoteAgentPaneSessions.removeValue(forKey: panelId)
+        }
+        return transfer
     }
 
     @discardableResult
@@ -2070,10 +2099,26 @@ final class Workspace: Identifiable {
             manualUnreadPanelIds.remove(detached.panelId)
             manualUnreadMarkedAt.removeValue(forKey: detached.panelId)
             panelSubscriptions.removeValue(forKey: detached.panelId)
+            // The binding was never adopted here (that happens below), so
+            // nothing reconciles it away — close the orphaned session
+            // rather than leaking a live peer connection. No dismissal:
+            // the daemon still holds it, and the poller reopening a fresh
+            // pane is the recovery, not a repeat of a close nobody made.
+            detached.remoteAgentSession?.relaySession.onPtyData = nil
+            detached.remoteAgentSession?.teardown()
             return nil
         }
 
         surfaceIdToPanelId[newTabId] = detached.panelId
+        if let session = detached.remoteAgentSession {
+            // Re-key the binding here and re-point the lifecycle closures
+            // at THIS workspace — the ones installed at bind time capture
+            // the source workspace, whose closePanel no longer knows this
+            // panel. The data-path closures (sink, onPtyData) reference
+            // the session and panel directly and move for free.
+            remoteAgentPaneSessions[detached.panelId] = session
+            installRemoteAgentPaneLifecycle(session: session, panelId: detached.panelId)
+        }
         if let index {
             _ = bonsplitController.reorderTab(newTabId, toIndex: index)
         }
@@ -2458,6 +2503,19 @@ final class Workspace: Identifiable {
         lifetime: RemotePaneLifetime = .temporary,
         bindingRole: PaneBindingRole = .owned
     ) -> TerminalPanel? {
+        // An agent surface has no terminal to put the relay helper in, and
+        // this entry point returns a TerminalPanel — it cannot host one.
+        // Refusing with NO side effects keeps every caller's
+        // nil-means-failed teardown correct; the agent path is
+        // `openRemoteAgentPane`, and `SessionHostPanes` routes there.
+        guard !SessionHostPanes.isAgentSurfaceType(session.originSurface.surfaceType) else {
+            RemoteWorkLog.debug(
+                "Refusing to open agent surface "
+                    + "\(session.surfaceTitle.isEmpty ? "<surface>" : session.surfaceTitle) "
+                    + "as a terminal pane — it needs openRemoteAgentPane"
+            )
+            return nil
+        }
         guard let sourcePanelId = explicitSourcePanelId ?? focusedPanelId,
               let panel = newTerminalSplit(
                   from: sourcePanelId,
@@ -2675,6 +2733,305 @@ final class Workspace: Identifiable {
                 session.teardown()
                 _ = panel
             }
+        }
+    }
+
+    // MARK: - Remote agent panes (peer-owned bridge surfaces)
+
+    /// The remote sink threw because its relay is gone — the send had
+    /// nowhere to go, and the session's notice entry should say so
+    /// rather than report a nil-silently-dropped line as delivered.
+    enum RemoteAgentPaneError: Error {
+        case transportClosed
+    }
+
+    /// "reviewer @jw-server" — the surface's title when the host gave one,
+    /// the CLI's name when it did not, and the host either way: five
+    /// identical roles on five machines must stay tellable apart, the same
+    /// reason the team path titles its panes "<name> @<host>". Pure so the
+    /// naming is testable without a workspace.
+    static func remoteAgentPaneTitle(
+        surfaceTitle: String, agentCli: String, hostLabel: String
+    ) -> String {
+        let name = surfaceTitle.isEmpty ? agentCli : surfaceTitle
+        return hostLabel.isEmpty ? name : "\(name) @\(hostLabel)"
+    }
+
+    /// Only claude is measured to take `control_request`/`interrupt` on
+    /// its NDJSON stdin stream; bridged CLIs keep the local default of
+    /// not offering a stop button that would do nothing.
+    static func remoteAgentInterruptible(agentCli: String) -> Bool {
+        agentCli == "claude"
+    }
+
+    /// Host a peer AGENT surface as a native AgentPanel pane.
+    ///
+    /// The terminal twin (`openRemotePane`) spawns the relay helper as the
+    /// pane's shell; an agent surface has no terminal to render into, so
+    /// nothing is spawned — `newAgentSplit` builds the pane and the peer
+    /// session's callback delivery feeds the panel's `AgentSession`
+    /// directly. The relay launch command and environment are deliberately
+    /// unused here.
+    ///
+    /// Refuses a session attached with relay-socket delivery: its pump
+    /// would wait on a helper that never dials in and the panel would sit
+    /// blank forever, which is strictly worse than a visible failure.
+    /// Delivery mode is fixed at attach time (`PeerRelaySession.attach`'s
+    /// `ptyDelivery`), so the caller owns getting it right.
+    func openRemoteAgentPane(
+        session: PeerPaneSession,
+        orientation: SplitOrientation = .horizontal,
+        focus: Bool = true,
+        from explicitSourcePanelId: UUID? = nil
+    ) -> AgentPanel? {
+        guard SessionHostPanes.isAgentSurfaceType(session.originSurface.surfaceType) else {
+            return nil
+        }
+        guard case .callback = session.relaySession.ptyDelivery else {
+            // Debug-level on purpose: the session-host poller retries every
+            // pass, and a failure per pass must not be a log full of the
+            // same line.
+            RemoteWorkLog.debug(
+                "Agent surface \(session.surfaceTitle.isEmpty ? "<surface>" : session.surfaceTitle) "
+                    + "was attached with relay delivery; an AgentPanel needs "
+                    + "callback delivery (PeerRelaySession.attach ptyDelivery)"
+            )
+            return nil
+        }
+        guard let sourcePanelId = explicitSourcePanelId ?? focusedPanelId else { return nil }
+        let surface = session.originSurface
+        let cli = surface.agentCli.isEmpty ? "claude" : surface.agentCli
+        let hostLabel = PeerHostProfileStore.shared.displayLabel(for: session.lease.key)
+        guard let panel = newAgentSplit(
+            from: sourcePanelId,
+            orientation: orientation,
+            agentName: Self.remoteAgentPaneTitle(
+                surfaceTitle: session.surfaceTitle, agentCli: cli, hostLabel: hostLabel
+            ),
+            teamName: "",
+            workingDirectory: surface.cwd,
+            cli: cli,
+            focus: focus
+        ) else { return nil }
+        bindRemoteAgentPane(session: session, to: panel)
+        #if DEBUG
+        dlog(
+            "peer.agentPane.open workspace=\(id.uuidString.prefix(8)) "
+                + "host=\(session.lease.key) cli=\(cli) title=\(session.surfaceTitle)"
+        )
+        #endif
+        RemoteWorkLog.info(
+            "Remote agent pane attached: "
+                + "\(session.surfaceTitle.isEmpty ? cli : session.surfaceTitle) on \(hostLabel)"
+        )
+        return panel
+    }
+
+    /// The AgentPanel counterpart of `bindRemotePane`: session ownership,
+    /// input/output wiring, lifecycle, and relay start. No Ghostty surface
+    /// and no relay helper exist on this path — arriving PtyData chunks
+    /// are NDJSON event bytes fed straight into the panel's AgentSession,
+    /// and outgoing turns leave as ordered `Input.keys` frames through the
+    /// authenticated peer session.
+    func bindRemoteAgentPane(session: PeerPaneSession, to panel: AgentPanel) {
+        let relay = session.relaySession
+        let agentSession = panel.session
+        let panelId = panel.id
+        remoteAgentPaneSessions[panelId] = session
+
+        // Input: every NDJSON line the session writes (turns, queued
+        // turns, interrupts) goes out as one Input.keys frame. Weak relay:
+        // when it is gone the send must fail visibly — the session leaves
+        // a notice — instead of vanishing into a released closure.
+        panel.startRemote(
+            interruptible: Self.remoteAgentInterruptible(agentCli: session.originSurface.agentCli),
+            sink: { [weak relay] line in
+                guard let relay else { throw RemoteAgentPaneError.transportClosed }
+                guard try await relay.sendRemoteKeys(line) else {
+                    throw RemoteAgentPaneError.transportClosed
+                }
+            }
+        )
+
+        // Output: the pump delivers chunks off-main in arrival order,
+        // straight into the session's receive pipeline — `consume` decodes
+        // and coalesces on its own serial queue (order preserved end to
+        // end) and hands the main actor only whole batches, the same
+        // contract the local pipe path has. Under a streaming flood the
+        // main thread therefore pays per batch, never per chunk.
+        relay.onPtyData = { [weak agentSession] chunk in
+            agentSession?.consume(chunk)
+        }
+
+        installRemoteAgentPaneLifecycle(session: session, panelId: panelId)
+
+        // Callback delivery has no helper to accept, so start is quick —
+        // but a failure must still be final and visible, matching
+        // `bindRemotePane`'s start contract.
+        Task { [weak self] in
+            do {
+                try await session.start()
+            } catch {
+                RemoteWorkLog.info(
+                    "Remote agent pane failed to start: \(String(describing: error))"
+                )
+                self?.dropRemoteAgentPane(panelId: panelId, reason: "start failed")
+            }
+        }
+    }
+
+    /// Lifecycle closures that capture THIS workspace. Split from
+    /// `bindRemoteAgentPane` because a cross-workspace tab detach must
+    /// re-install them on the destination (`attachDetachedSurface`) — the
+    /// data-path closures move with the session, these do not.
+    private func installRemoteAgentPaneLifecycle(session: PeerPaneSession, panelId: UUID) {
+        let relay = session.relaySession
+        // Host-side close (roster/terminate): drop the pane with the
+        // session, mirroring `bindRemotePane`'s requestPaneClose.
+        session.requestPaneClose = { [weak self] in
+            _ = self?.closePanel(panelId, force: true)
+        }
+        // The stream is about to repeat bytes this consumer already
+        // processed (resume anchored before the requested position), and
+        // `AgentSession.consume` is not idempotent — a replayed stream
+        // belongs to a fresh AgentSession. `AgentPanel.session` is fixed
+        // for the panel's life, so the recovery is a fresh PANE: drop this
+        // one without a dismissal and let the session-host poller reopen
+        // it, replay and all. The hook fires strictly before the first
+        // restarted byte, and clearing `onPtyData` inside it keeps that
+        // byte from reaching the retired session.
+        relay.onPtyDeliveryRestart = { [weak self] in
+            self?.dropRemoteAgentPane(panelId: panelId, reason: "stream rewound")
+        }
+        relay.onSurfaceExited = { [weak self] exitCode, signal, reason in
+            await (self?.panels[panelId] as? AgentPanel)?.session
+                .finishRemoteSurfaceExited(
+                    exitCode: exitCode,
+                    signal: signal,
+                    reason: reason
+                )
+        }
+        // Terminal death of the relay session (heartbeat kill, writer
+        // failure, host teardown). Same recovery as a rewind: the daemon
+        // owning the bridge is the survivability story, so if it still
+        // holds the session the poller brings the pane back with the
+        // replayed transcript; if the daemon is gone there is nothing to
+        // show a banner for.
+        relay.onDisconnect = { [weak self] in
+            self?.dropRemoteAgentPane(panelId: panelId, reason: "disconnected")
+        }
+        relay.onError = { error in
+            RemoteWorkLog.infoOffMain(
+                "Remote agent pane transport error: \(String(describing: error))"
+            )
+        }
+    }
+
+    /// Tear down an agent pane's peer binding WITHOUT marking a user
+    /// dismissal: the daemon still holds the session, and the poller
+    /// reopening it with a fresh AgentSession is the recovery path.
+    /// Removing the map entry FIRST is what keeps the panels-didSet
+    /// reconciler from recording this close as the user's.
+    private func dropRemoteAgentPane(panelId: UUID, reason: String) {
+        guard let session = remoteAgentPaneSessions.removeValue(forKey: panelId) else { return }
+        #if DEBUG
+        dlog("peer.agentPane.drop panel=\(panelId.uuidString.prefix(8)) reason=\(reason)")
+        #endif
+        session.relaySession.onPtyData = nil
+        // End any in-flight turn as session_stopped so the task board is
+        // not left holding an in_progress task for a pane that is going
+        // away. Safe when already stopped.
+        (panels[panelId] as? AgentPanel)?.session.stop()
+        session.teardown()
+        let surfaceID = session.originSurface.surfaceID
+        let isLocalDaemonSession = Self.isLocalSessionHost(session.originSpec)
+        _ = closePanel(panelId, force: true)
+        // Reopen promptly when the daemon still holds the session — the
+        // poller would get there on its own schedule, this just asks now.
+        // "Promptly" is for the healthy cases (a rewind is one or two
+        // drops); a host that disconnects every fresh attach would turn
+        // the kick into a destroy/recreate spin, so past a burst the
+        // governor withholds it and the reopen falls back to the poller's
+        // own cadence.
+        let mayReopenNow = SessionHostPanes.noteAgentPaneDropped(surfaceID: surfaceID)
+        // WHICH daemon holds it decides who can bring it back, and only one
+        // of the two answers is the poller's. `SessionHostPanes.reconcile()`
+        // lists this Mac's own daemon socket and nothing else, so a surface
+        // owned by a peer is never in its result — before this branch existed,
+        // one rewind (which the comment above rightly calls a healthy case)
+        // retired a peer-owned team member for good: pane gone, roster still
+        // naming the closed panel, and the peer's `tm-agent-bridge` still
+        // running with nothing left pointing at it. A peer's surface is
+        // reattached by the team that owns the member, which is the only side
+        // that knows the host, the instance, and the report wiring to restore.
+        guard !isLocalDaemonSession else {
+            guard mayReopenNow else {
+                #if DEBUG
+                dlog("peer.agentPane.drop.backoff surface reopen demoted to poller cadence")
+                #endif
+                return
+            }
+            Task { await SessionHostPanes.reconcile() }
+            return
+        }
+        Task { @MainActor in
+            // The governor means something different on this side. For a local
+            // surface, withholding the kick costs nothing — the poller reopens
+            // it on its own schedule anyway. A peer surface has no poller
+            // behind it, so withholding would BE the permanent loss this
+            // branch exists to prevent. The burst limit therefore buys a wait
+            // instead of a give-up: same anti-spin effect, same eventual
+            // reopen once the host settles.
+            if !mayReopenNow {
+                #if DEBUG
+                dlog("peer.agentPane.drop.backoff peer reattach delayed one poll interval")
+                #endif
+                try? await Task.sleep(for: SessionHostPanes.pollInterval)
+            }
+            await TeamOrchestrator.shared.recoverPeerOwnedAgentPane(
+                closedPanelID: panelId,
+                surfaceID: surfaceID
+            )
+        }
+    }
+
+    /// Whether a pane session is held by THIS machine's daemon — the only
+    /// surfaces `SessionHostPanes.reconcile()` can see, and therefore the only
+    /// ones it can reopen.
+    static func isLocalSessionHost(_ spec: PeerPaneHostSpec) -> Bool {
+        guard case let .direct(sockPath) = spec else { return false }
+        let daemonPath = TermMeshDaemon.shared.daemonPeerSocketPath
+        guard !daemonPath.isEmpty, !sockPath.isEmpty else { return false }
+        return (sockPath as NSString).standardizingPath
+            == (daemonPath as NSString).standardizingPath
+    }
+
+    /// A closed agent pane must close its peer session. `TerminalPanel`
+    /// does that in `close()`; `AgentPanel` has no transport of its own,
+    /// so the workspace watches the panels map instead — every close
+    /// funnel (tab close, pane close, workspace teardown paths that empty
+    /// the map) converges here. Runs on every `panels` mutation and
+    /// no-ops unless an agent binding lost its panel.
+    private func reconcileRemoteAgentPaneSessions() {
+        guard !remoteAgentPaneSessions.isEmpty else { return }
+        for (panelId, session) in remoteAgentPaneSessions where panels[panelId] == nil {
+            // A tab detach is a move, not a close: the panel is parked in
+            // `pendingDetachedSurfaces` on its way to another workspace,
+            // and `detachSurface` re-keys the binding when it hands the
+            // transfer out.
+            if pendingDetachedSurfaces.values.contains(where: { $0.panelId == panelId }) {
+                continue
+            }
+            remoteAgentPaneSessions.removeValue(forKey: panelId)
+            // Same contract as TerminalPanel.close(): a close of a
+            // session-host pane stays closed — the daemon still holds the
+            // session, so without this the next pass reopens it.
+            SessionHostPanes.noteClosedByUser(surfaceID: session.originSurface.surfaceID)
+            session.relaySession.onPtyData = nil
+            session.teardown()
+            #if DEBUG
+            dlog("peer.agentPane.close panel=\(panelId.uuidString.prefix(8))")
+            #endif
         }
     }
 
@@ -3172,8 +3529,24 @@ final class Workspace: Identifiable {
         dlog("deinit \(Self.self)")
         #endif
         let panelsToClose = panels.values.map { $0 }
+        // Agent panes: their peer sessions live on the workspace, not the
+        // panel (see `remoteAgentPaneSessions`), so a workspace torn down
+        // with panes still in it must close them here — AgentPanel.close()
+        // only stops the AgentSession.
+        let agentSessionsToClose = remoteAgentPaneSessions.values.map { $0 }
         Task { @MainActor in
             panelsToClose.forEach { $0.close() }
+            for session in agentSessionsToClose {
+                // The dismissal too, symmetric with `TerminalPanel.close()`:
+                // closing the window closed these panes, and without the
+                // record the poller resurrects them in the next workspace
+                // fifteen seconds later.
+                SessionHostPanes.noteClosedByUser(
+                    surfaceID: session.originSurface.surfaceID
+                )
+                session.relaySession.onPtyData = nil
+                session.teardown()
+            }
         }
     }
 }
