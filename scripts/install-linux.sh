@@ -6,8 +6,10 @@
 #
 # Service scope is chosen automatically: a per-user service (systemctl
 # --user) when the user's systemd bus is reachable, otherwise a system
-# service (/etc/systemd/system) when running as root. The system service
-# runs as the dedicated, unprivileged `term-mesh` account, never as root.
+# service (/etc/systemd/system) when running as root. The daemon runs as the
+# account that invoked the installer by default, so a host reached as
+# `root@host` prepares projects and launches panes under the same account.
+# Set TERMMESH_SERVICE_USER to opt into a different system-service account.
 # Hosts with no per-user bus — non-interactive ssh sessions and older
 # systemd such as RHEL/CentOS 7's 219 — take the root/system path; a
 # non-root run there stops with instructions instead of half-installing.
@@ -30,7 +32,7 @@ set -euo pipefail
 REPO="${TERMMESH_INSTALL_REPO:-x-mesh/term-mesh}"
 TAG="${TERMMESH_INSTALL_TAG:-latest}"
 PREFIX_OVERRIDE="${TERMMESH_INSTALL_PREFIX:-}"
-SERVICE_USER="${TERMMESH_SERVICE_USER:-term-mesh}"
+SERVICE_USER="${TERMMESH_SERVICE_USER:-$(id -un)}"
 BIN_NAME="term-meshd"
 
 log() { printf '==> %s\n' "$*"; }
@@ -65,7 +67,7 @@ elif [[ "$INSTALL_UID" == 0 ]]; then
   WANTED_BY=multi-user.target
   PEER_SOCKET_DEFAULT=/run/term-mesh/tm-peer.sock
   systemctl_scoped() { systemctl "$@"; }
-  log "installing a system service as ${SERVICE_USER}, not root"
+  log "installing a system service as ${SERVICE_USER}"
 else
   die "cannot reach your user systemd bus, so 'systemctl --user' will not work here.
 This host has no per-user systemd session — common over non-interactive
@@ -190,10 +192,7 @@ fi
 if [[ "$SERVICE_SCOPE" == system ]]; then
   [[ "$SERVICE_USER" =~ ^[a-z_][a-z0-9_-]*$ ]] \
     || die "TERMMESH_SERVICE_USER must be a simple system account name"
-  if id -u "$SERVICE_USER" >/dev/null 2>&1; then
-    [[ "$(id -u "$SERVICE_USER")" != 0 ]] \
-      || die "TERMMESH_SERVICE_USER must not resolve to UID 0"
-  else
+  if ! id -u "$SERVICE_USER" >/dev/null 2>&1; then
     command -v useradd >/dev/null 2>&1 \
       || die "useradd not found; create the '${SERVICE_USER}' system account first"
   fi
@@ -335,6 +334,11 @@ fi
 
 mkdir -p "$UNIT_DIR"
 if [[ "$SERVICE_SCOPE" == system ]]; then
+  if [[ "$(id -u "$SERVICE_USER")" == 0 ]]; then
+    PROTECT_HOME=false
+  else
+    PROTECT_HOME=true
+  fi
   cat > "$UNIT_PATH" <<EOF
 [Unit]
 Description=term-mesh peer host
@@ -352,7 +356,7 @@ NoNewPrivileges=true
 PrivateTmp=true
 CapabilityBoundingSet=
 ProtectSystem=full
-ProtectHome=true
+ProtectHome=${PROTECT_HOME}
 Restart=always
 RestartSec=2
 

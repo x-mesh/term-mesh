@@ -376,11 +376,11 @@ fn bind_with_tight_umask(path: &Path) -> std::io::Result<UnixListener> {
 /// The gate exists to keep *other unprivileged users* off the socket. Root
 /// is not one of them: it can already read this process's memory, its
 /// socket, and its files, so refusing it buys nothing — and it broke the
-/// installer's own root path. `install-linux.sh` running as root installs a
-/// system unit with `User=term-mesh`, so the daemon owns uid 996 while
-/// every ssh-based client arrives as uid 0 and was rejected outright.
-/// The host looked dead: the client only ever sees its handshake read
-/// return EOF, and nothing but this daemon's log said why.
+/// installer's dedicated-service-account path. A system unit explicitly
+/// installed with `TERMMESH_SERVICE_USER=term-mesh` owns uid 996 while every
+/// root SSH client arrives as uid 0; rejecting root made that configuration
+/// look dead. The client only saw its handshake read return EOF, and nothing
+/// but this daemon's log said why.
 fn peer_uid_allowed(peer_uid: u32, owner_uid: u32) -> bool {
     peer_uid == owner_uid || peer_uid == 0
 }
@@ -474,11 +474,10 @@ mod integration_tests {
         }
     }
     /// The uid gate must keep other unprivileged users out while letting
-    /// root in. `install-linux.sh` run as root installs a system unit with
-    /// `User=term-mesh`, so the daemon owns a service uid (996 on
-    /// jwserver69) and every ssh client arrives as uid 0; rejecting root
-    /// made that whole install path unreachable, and the client saw only
-    /// EOF.
+    /// root in. A system unit explicitly installed with
+    /// `TERMMESH_SERVICE_USER=term-mesh` owns a service uid (996 on
+    /// jwserver69) while every root SSH client arrives as uid 0; rejecting
+    /// root made that configuration unreachable, and the client saw only EOF.
     #[test]
     fn uid_gate_admits_the_owner_and_root_and_nobody_else() {
         let owner = 996;

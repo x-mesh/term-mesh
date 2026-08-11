@@ -93,11 +93,13 @@ struct PeerHostEditorView: View {
     @State private var testedHostKind: PeerHostKind?
     /// The exact (sshTarget, port, identityFile) — as a validated
     /// `PeerHostProfile` — that the last `runTest()` actually probed.
-    /// `runInstall()` reads ONLY this, never a fresh `validatedDraft()`,
-    /// so Install/Update always targets what was tested even if the form
-    /// fields changed afterward. Cleared by `invalidateDoctorState()`;
-    /// the Install/Update buttons also require it to be non-nil (see
-    /// `showsUpdateButton`) as a second line of defense.
+    /// Install/Update read ONLY this, never a fresh `validatedDraft()`, so
+    /// those actions always target what was tested even if the form fields
+    /// changed afterward. Force Reinstall is the deliberate exception: it
+    /// validates and snapshots the current Edit Host fields before launch.
+    /// Cleared by `invalidateDoctorState()`; the Install/Update buttons also
+    /// require it to be non-nil (see `showsUpdateButton`) as a second line of
+    /// defense.
     @State private var testedDraft: PeerHostProfile?
     /// Bumped by `invalidateDoctorState()` and at the start of every
     /// `runTest()`. Each `runTest()`/`runInstall()` Task captures the
@@ -288,8 +290,9 @@ struct PeerHostEditorView: View {
                 }
                 if showsForceReinstallButton {
                     Button("Reinstall term-meshd…") { showForceReinstallConfirm = true }
-                        .disabled(doctorBusy)
-                        .help("Install the latest release on this host regardless of the version it reports")
+                        .disabled(doctorBusy
+                                  || profile.sshTarget.trimmingCharacters(in: .whitespaces).isEmpty)
+                        .help("Force-install the latest Linux release without requiring a successful Test Relay")
                 }
                 if showsAgentInstallButton {
                     Button("Set up notifications…") { showAgentInstallConfirm = true }
@@ -324,7 +327,7 @@ struct PeerHostEditorView: View {
             Button("Install") { runInstall() }
             Button("Cancel", role: .cancel) {}
         } message: {
-            Text("Runs the official install script over SSH: downloads the latest release binary and registers a systemd user service.")
+            Text("Runs the official install script over SSH. The daemon and its panes run as the SSH account; existing sessions on this host are terminated.")
         }
         .confirmationDialog(
             "Update term-meshd on \"\(profile.sshTarget)\"?",
@@ -345,10 +348,10 @@ struct PeerHostEditorView: View {
             // No `updateAttempted = true` here, unlike the Update flow:
             // this button exists to be repeatable (see
             // `showsForceReinstallButton`).
-            Button("Reinstall") { runInstall() }
+            Button("Reinstall", role: .destructive) { runForceReinstall() }
             Button("Cancel", role: .cancel) {}
         } message: {
-            Text("Runs the official install script over SSH whatever version this host reports — downloads the latest release, replaces the binary, and restarts the daemon. All sessions on this host are terminated.")
+            Text("Runs the official install script over SSH whatever version this host reports. The daemon and its panes run as the SSH account; all sessions on this host are terminated.")
         }
         .confirmationDialog(
             "Set up agent notifications on \"\(profile.sshTarget)\"?",
@@ -436,8 +439,10 @@ struct PeerHostEditorView: View {
         return false
     }
 
-    /// The version-independent escape hatch: reinstall whatever a confirmed
-    /// Linux host says it is running.
+    /// The version-independent escape hatch. An existing saved host offers it
+    /// before Test Relay, which is the important recovery case: a broken
+    /// daemon must not have to pass its own health check before it can be
+    /// replaced. Once tested, the existing Linux/Mac guard still applies.
     ///
     /// Every other install action is gated on a version claim, and those
     /// claims fail in ordinary ways — an exhausted GitHub API budget
@@ -449,12 +454,13 @@ struct PeerHostEditorView: View {
     /// protocol — the one case where reinstalling is the whole fix and
     /// nothing offered it.
     ///
-    /// Shown only where a Test has already proved SSH works, and only
-    /// when no other install button is on screen, so there is never more
-    /// than one install action at a time. Deliberately NOT suppressed by
+    /// After a Test, shown only for a confirmed Linux host and only when no
+    /// Update action is on screen. Before a Test, Edit Host exposes it as the
+    /// explicit recovery path. Deliberately NOT suppressed by
     /// `updateAttempted`: "force" that works once is not a force.
     private var showsForceReinstallButton: Bool {
         Self.shouldShowForceReinstallButton(
+            isNew: isNew,
             hasTestedDraft: testedDraft != nil,
             hostKind: testedHostKind ?? daemonMissingHostKind,
             showsUpdateButton: showsUpdateButton,
@@ -463,15 +469,21 @@ struct PeerHostEditorView: View {
     }
 
     static func shouldShowForceReinstallButton(
+        isNew: Bool,
         hasTestedDraft: Bool,
         hostKind: PeerHostKind?,
         showsUpdateButton: Bool,
         doctorState: DoctorState
     ) -> Bool {
+        guard !isNew, !showsUpdateButton else { return false }
+        // Edit Host is itself the recovery surface. Before any probe, the
+        // official installer is the OS/account authority and rejects a
+        // non-Linux target without changing it.
+        if !hasTestedDraft, case .idle = doctorState { return true }
         // A Mac host serves the peer from the app bundle, while unknown is
         // deliberately not assumed to be Linux. Both would make the bundled
         // Linux installer a guaranteed or unbounded failure.
-        guard hasTestedDraft, hostKind == .daemon, !showsUpdateButton else { return false }
+        guard hasTestedDraft, hostKind == .daemon else { return false }
         switch doctorState {
         // `.daemonMissing` has its own Install button; the rest of these
         // are states where SSH answered and there is something installed
@@ -918,6 +930,22 @@ struct PeerHostEditorView: View {
         // `testedDraft != nil` (see `showsUpdateButton`) — this guard is
         // the second line of defense, not the only one.
         guard let draft = testedDraft else { return }
+        runInstall(using: draft)
+    }
+
+    /// Force Reinstall intentionally skips Test Relay. Validate and snapshot
+    /// the visible Edit Host target at confirmation time, then share the exact
+    /// install/retest path used by Install and Update.
+    private func runForceReinstall() {
+        guard let draft = validatedDraft() else { return }
+        doctorGeneration += 1
+        testedDraft = draft
+        testedHostKind = nil
+        daemonMissingHostKind = nil
+        runInstall(using: draft)
+    }
+
+    private func runInstall(using draft: PeerHostProfile) {
         // Capture (not bump — this Task inherits whatever generation the
         // Test that produced `testedDraft` is still running under; see
         // `doctorGeneration`'s doc comment).

@@ -45,15 +45,48 @@ final class PeerHostBinaryInventoryTests: XCTestCase {
     /// $HOME/.local/bin and the current copy shadowed behind it.
     func test_parsesAWinnerAndTheCopiesItShadows() {
         let inventory = PeerHostDoctor.parseBinaryInventory("""
+        os=Darwin
+        ssh-user=jinwoo
         app=0.170.1
         tm-agent=/Users/jinwoo/.local/bin/tm-agent|tm-agent 0.167.0
         tm-agent.shadowed=/opt/homebrew/bin/tm-agent|tm-agent 0.170.1
         """)
         XCTAssertEqual(inventory.appVersion, "0.170.1")
+        XCTAssertEqual(inventory.hostOS, "Darwin")
+        XCTAssertEqual(inventory.sshUser, "jinwoo")
         XCTAssertEqual(inventory.cli?.path, "/Users/jinwoo/.local/bin/tm-agent")
         XCTAssertEqual(inventory.cli?.version, "tm-agent 0.167.0")
         XCTAssertEqual(inventory.cliShadowed.count, 1)
         XCTAssertEqual(inventory.cliShadowed.first?.version, "tm-agent 0.170.1")
+    }
+
+    func test_reportsWhenSSHAndDaemonAccountsDifferOnLinux() {
+        let warnings = PeerHostDoctor.inventoryWarnings(
+            PeerHostDoctor.parseBinaryInventory("""
+            os=Linux
+            ssh-user=root
+            daemon-user=term-mesh
+            term-meshd=/usr/local/bin/term-meshd|term-meshd 0.180.0
+            tm-agent-bridge=/usr/local/bin/tm-agent-bridge|
+            """)
+        )
+        XCTAssertEqual(warnings.count, 1, "\(warnings)")
+        XCTAssertTrue(warnings[0].contains("SSH connects as root"), warnings[0])
+        XCTAssertTrue(warnings[0].contains("panes run as term-mesh"), warnings[0])
+        XCTAssertTrue(warnings[0].contains("Reinstall term-meshd"), warnings[0])
+    }
+
+    func test_matchingSSHAndDaemonAccountsStaySilent() {
+        let warnings = PeerHostDoctor.inventoryWarnings(
+            PeerHostDoctor.parseBinaryInventory("""
+            os=Linux
+            ssh-user=root
+            daemon-user=root
+            term-meshd=/usr/local/bin/term-meshd|term-meshd 0.180.0
+            tm-agent-bridge=/usr/local/bin/tm-agent-bridge|
+            """)
+        )
+        XCTAssertEqual(warnings, [])
     }
 
     func test_reportsBothTheShadowAndTheAppMismatch() {

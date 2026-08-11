@@ -128,6 +128,11 @@ enum PeerHostDoctor {
     /// What a host would actually execute, and what else is lying around.
     struct BinaryInventory: Equatable {
         var appVersion: String?
+        /// OS and effective accounts from the same SSH session. On Linux,
+        /// panes inherit the daemon account, not the SSH account.
+        var hostOS: String?
+        var sshUser: String?
+        var daemonUser: String?
         /// The `tm-agent` an agent launched here would get.
         var cli: BinaryEntry?
         /// Other `tm-agent` copies on the same PATH, in search order after
@@ -167,6 +172,7 @@ enum PeerHostDoctor {
             }
             .joined(separator: ":")
         let body = "export PATH=\(path):\"$PATH\"; "
+            + #"echo "os=$(uname -s 2>/dev/null)"; echo "ssh-user=$(id -un 2>/dev/null)"; daemon_user=$(ps -o user= -C term-meshd 2>/dev/null | head -1 | tr -d "[:space:]"); [ -n "$daemon_user" ] && echo "daemon-user=$daemon_user"; "#
             + #"if [ "$(uname -s)" = Darwin ]; then v=$(/usr/bin/defaults read /Applications/term-mesh.app/Contents/Info.plist CFBundleShortVersionString 2>/dev/null); [ -n "$v" ] && echo "app=$v"; fi; "#
             // tm-agent-bridge is asked for but never `--version`ed: it is
             // spoken to over a pipe and has no such flag. Presence is the
@@ -480,6 +486,9 @@ enum PeerHostDoctor {
                 version: parts.count > 1 ? String(parts[1]) : ""
             )
             switch key {
+            case "os": inventory.hostOS = value.isEmpty ? nil : value
+            case "ssh-user": inventory.sshUser = value.isEmpty ? nil : value
+            case "daemon-user": inventory.daemonUser = value.isEmpty ? nil : value
             case "tm-agent": inventory.cli = entry
             case "tm-agent.shadowed": inventory.cliShadowed.append(entry)
             case "term-meshd": inventory.daemon = entry
@@ -502,6 +511,16 @@ enum PeerHostDoctor {
     /// this one has to survive being read months from now, once.
     static func inventoryWarnings(_ inventory: BinaryInventory) -> [String] {
         var warnings: [String] = []
+        if inventory.hostOS == "Linux",
+           let sshUser = inventory.sshUser,
+           let daemonUser = inventory.daemonUser,
+           sshUser != daemonUser {
+            warnings.append(
+                "Agent account: SSH connects as \(sshUser), but term-meshd runs as "
+                    + "\(daemonUser). Projects are prepared as \(sshUser) while panes run as "
+                    + "\(daemonUser). Reinstall term-meshd to make both use \(sshUser)."
+            )
+        }
         // A copy earlier in PATH beats a newer one later, so the version that
         // matters is the one that wins — and the loser is what makes it look
         // like the host is up to date when it is not.
