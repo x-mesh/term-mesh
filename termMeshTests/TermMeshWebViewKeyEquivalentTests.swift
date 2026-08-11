@@ -5051,6 +5051,36 @@ final class NotificationMenuSnapshotBuilderTests: XCTestCase {
     }
 }
 
+final class AboutPanelLinkTests: XCTestCase {
+    /// These builds are released from x-mesh/term-mesh. The About panel used to
+    /// link commits into manaflow-ai/term-mesh, which is upstream of the
+    /// Ghostty fork — a hash from here need not exist there at all.
+    func testLinksPointAtTheRepositoryThatShipsThisApp() {
+        XCTAssertEqual(
+            AboutPanelView.commitURL(hash: "abc1234")?.absoluteString,
+            "https://github.com/x-mesh/term-mesh/commit/abc1234"
+        )
+        XCTAssertEqual(
+            AboutPanelView.releaseNotesURL(version: "0.182.0")?.absoluteString,
+            "https://github.com/x-mesh/term-mesh/releases/tag/v0.182.0"
+        )
+    }
+
+    /// `CFBundleShortVersionString` is `0.182.0` while the tag is `v0.182.0`.
+    func testReleaseNotesTagTakesTheVersionAsGivenOrAddsThePrefix() {
+        XCTAssertEqual(
+            AboutPanelView.releaseNotesURL(version: "v1.0.0")?.absoluteString,
+            "https://github.com/x-mesh/term-mesh/releases/tag/v1.0.0"
+        )
+        XCTAssertEqual(
+            AboutPanelView.releaseNotesURL(version: " 0.9.1 ")?.absoluteString,
+            "https://github.com/x-mesh/term-mesh/releases/tag/v0.9.1"
+        )
+        XCTAssertNil(AboutPanelView.releaseNotesURL(version: "  "))
+        XCTAssertNil(AboutPanelView.commitURL(hash: ""))
+    }
+}
+
 final class MenuBarBuildHintFormatterTests: XCTestCase {
     func testReleaseBuildShowsNoHint() {
         XCTAssertNil(MenuBarBuildHintFormatter.menuTitle(appName: "term-mesh DEV menubar-extra", isDebugBuild: false))
