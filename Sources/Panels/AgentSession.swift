@@ -282,8 +282,84 @@ final class AgentSession {
         let duration: TimeInterval?
         let tokensIn: Int?
         let tokensOut: Int?
+        /// Wall-clock time at which the authoritative result arrived.
+        ///
+        /// Duration answers "how long did it take"; this answers "when did it
+        /// finish" when several native panes complete while nobody is looking.
+        let completedAt: Date
         /// What the agent said about how it went, parsed rather than printed.
         var verdict: Verdict?
+
+        init(
+            stop: String,
+            failed: Bool,
+            cost: Double?,
+            duration: TimeInterval?,
+            tokensIn: Int?,
+            tokensOut: Int?,
+            completedAt: Date = Date(),
+            verdict: Verdict? = nil
+        ) {
+            self.stop = stop
+            self.failed = failed
+            self.cost = cost
+            self.duration = duration
+            self.tokensIn = tokensIn
+            self.tokensOut = tokensOut
+            self.completedAt = completedAt
+            self.verdict = verdict
+        }
+    }
+
+    /// Compact, stable timing for a completed native turn.
+    ///
+    /// The status is already a coloured capsule in the footer, so the facts
+    /// begin with the two values people compare across panes: completion time
+    /// and elapsed time. A fixed 24-hour clock avoids AM/PM widening a narrow
+    /// pane and makes adjacent workers scan as one timeline.
+    static func turnFacts(
+        _ end: TurnEnd,
+        timeZone: TimeZone = .autoupdatingCurrent
+    ) -> String {
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = timeZone
+        let components = calendar.dateComponents([.hour, .minute, .second], from: end.completedAt)
+        let clock = String(
+            format: "%02d:%02d:%02d",
+            components.hour ?? 0,
+            components.minute ?? 0,
+            components.second ?? 0
+        )
+        let timing = end.duration.map { "\(clock) (\(elapsedText($0)))" } ?? clock
+        var parts = [timing, end.stop]
+        if let cost = end.cost { parts.append(String(format: "$%.4f", cost)) }
+        if end.tokensIn != nil || end.tokensOut != nil {
+            parts.append("\(end.tokensIn ?? 0)→\(end.tokensOut ?? 0) tok")
+        }
+        return parts.joined(separator: " · ")
+    }
+
+    static func elapsedText(_ duration: TimeInterval) -> String {
+        let seconds = max(0, duration)
+        if seconds < 10 { return String(format: "%.1fs", seconds) }
+        if seconds < 60 { return "\(Int(seconds.rounded()))s" }
+        if seconds < 3_600 {
+            let total = Int(seconds.rounded())
+            return "\(total / 60)m \(total % 60)s"
+        }
+        let totalMinutes = Int((seconds / 60).rounded())
+        return "\(totalMinutes / 60)h \(totalMinutes % 60)m"
+    }
+
+    static func resolvedTurnDuration(
+        reportedMilliseconds: Double?,
+        startedAt: Date?,
+        completedAt: Date
+    ) -> TimeInterval? {
+        if let reportedMilliseconds {
+            return max(0, reportedMilliseconds / 1_000)
+        }
+        return startedAt.map { max(0, completedAt.timeIntervalSince($0)) }
     }
 
     /// The 5-field header, held as fields.
@@ -787,12 +863,7 @@ final class AgentSession {
             case .turnEnded(_, let end):
                 var parts: [String] = []
                 if let status = end.verdict?.status, !status.isEmpty { parts.append(status) }
-                parts.append(end.stop)
-                if let duration = end.duration { parts.append(String(format: "%.1fs", duration)) }
-                if let cost = end.cost { parts.append(String(format: "$%.4f", cost)) }
-                if end.tokensIn != nil || end.tokensOut != nil {
-                    parts.append("\(end.tokensIn ?? 0)→\(end.tokensOut ?? 0) tok")
-                }
+                parts.append(turnFacts(end))
                 return parts.joined(separator: " · ")
             case .notice(_, let text):
                 return "! " + redactingCredentials(text)
@@ -1760,13 +1831,21 @@ final class AgentSession {
         // its own, and its task would sit `in_progress` forever while every
         // instruction behind it waited on a queue that will never drain.
         if turnInFlight {
+            let completedAt = Date()
             let end = TurnEnd(stop: stopped ? "session_stopped" : "process_exited",
                               failed: true, cost: nil,
-                              duration: nil, tokensIn: nil, tokensOut: nil)
+                              duration: Self.resolvedTurnDuration(
+                                reportedMilliseconds: nil,
+                                startedAt: turnStartedAt,
+                                completedAt: completedAt
+                              ),
+                              tokensIn: nil, tokensOut: nil,
+                              completedAt: completedAt)
             append(.turnEnded(id: UUID(), end))
             let answered = currentTaskId
             currentTaskId = nil
             turnInFlight = false
+            turnStartedAt = nil
             // No STATUS, so this reads as NEEDS_REVIEW rather than a success —
             // nobody said it worked, and the agent is not there to say.
             onTurnEnd?(stopped ? "the session was stopped before this turn finished"
@@ -1821,6 +1900,9 @@ final class AgentSession {
     /// The person's `result` would then close the leader's task, or the CLI
     /// would merge the two and one completion would simply never arrive.
     @ObservationIgnored private var turnInFlight = false
+    /// Local fallback for providers that do not include `duration_ms` in their
+    /// result event. Kept off the observation graph: no view needs live time.
+    @ObservationIgnored private var turnStartedAt: Date?
 
     @discardableResult
     private func write(_ text: String, from speaker: Speaker, taskId: String?) throws -> Int {
@@ -1831,6 +1913,7 @@ final class AgentSession {
         // drawn is what the agent confirmed receiving — not what was hoped for.
         pendingSpeaker = speaker
         // Any write opens a turn. Only a leader's carries a task.
+        if !turnInFlight { turnStartedAt = Date() }
         turnInFlight = true
         if speaker == .leader { currentTaskId = taskId }
         setThinking(true)
@@ -2213,6 +2296,7 @@ final class AgentSession {
 
     private func result(_ o: [String: Any]) {
         let usage = o["usage"] as? [String: Any] ?? [:]
+        let completedAt = Date()
         // A turn we stopped on purpose is not a failure.
         let failed = stopRequested ? false : (o["is_error"] as? Bool ?? false)
         let reason = o["stop_reason"] as? String ?? o["subtype"] as? String ?? "?"
@@ -2220,9 +2304,14 @@ final class AgentSession {
             stop: stopRequested ? "stopped" : reason,
             failed: failed,
             cost: o["total_cost_usd"] as? Double,
-            duration: (o["duration_ms"] as? Double).map { $0 / 1000 },
+            duration: Self.resolvedTurnDuration(
+                reportedMilliseconds: o["duration_ms"] as? Double,
+                startedAt: turnStartedAt,
+                completedAt: completedAt
+            ),
             tokensIn: usage["input_tokens"] as? Int,
-            tokensOut: usage["output_tokens"] as? Int
+            tokensOut: usage["output_tokens"] as? Int,
+            completedAt: completedAt
         )
         // The header moves out of the prose and into the turn, where it is a
         // value the footer can render as a verdict. Shown raw *and* parsed was
@@ -2247,6 +2336,7 @@ final class AgentSession {
         append(.turnEnded(id: UUID(), end))
         setThinking(false)
         turnInFlight = false
+        turnStartedAt = nil
         stopRequested = false
         // `result` carries the final answer as a clean string — the boundary is
         // stated rather than inferred from a screen going quiet.

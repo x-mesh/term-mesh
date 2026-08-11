@@ -622,13 +622,7 @@ private struct TranscriptRow: View, Equatable {
     }
 
     private static func facts(_ end: AgentSession.TurnEnd) -> String {
-        var parts = [end.stop]
-        if let d = end.duration { parts.append(String(format: "%.1fs", d)) }
-        if let c = end.cost { parts.append(String(format: "$%.4f", c)) }
-        if end.tokensIn != nil || end.tokensOut != nil {
-            parts.append("\(end.tokensIn ?? 0)→\(end.tokensOut ?? 0) tok")
-        }
-        return parts.joined(separator: " · ")
+        AgentSession.turnFacts(end)
     }
 }
 
