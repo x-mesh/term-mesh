@@ -65,6 +65,10 @@ struct NewProjectView: View {
     let repositorySearchRoots: [String]
 
     @State private var directory: String = ""
+    /// A remote parent chosen through the directory browser. Clone/empty
+    /// destinations keep following the project name inside this parent;
+    /// directly typing an exact path still opts out through `folderEdited`.
+    @State private var customDestinationParent: String?
     @State private var name: String = ""
     @State private var sourceKind: ProjectSourceKind = .clone
     @State private var nameEdited = false
@@ -95,6 +99,14 @@ struct NewProjectView: View {
     @State private var branchEdited = false
     @State private var repositoryURLSuggestions: [String] = []
     @State private var isLoadingRepositorySuggestions = false
+    @State private var remoteDirectorySuggestions: [String] = []
+    @State private var isLoadingRemoteDirectorySuggestions = false
+    @State private var remoteDirectorySuggestionError: String?
+    @State private var showsRemoteDirectoryBrowser = false
+    @State private var remoteDirectoryBrowserPath = ""
+    @State private var remoteDirectoryListing: RemoteDirectoryListing?
+    @State private var isLoadingRemoteDirectoryBrowser = false
+    @State private var remoteDirectoryBrowserError: String?
     /// How many of `repositoryURLSuggestions` came from disk. The rest are
     /// from the account catalog. Kept as a count rather than a second list so
     /// matching and selection keep working on one array.
@@ -274,6 +286,9 @@ struct NewProjectView: View {
         }
         .task(id: branchLookupID) {
             await loadRepositoryBranches()
+        }
+        .task(id: remoteDirectoryAutocompleteID) {
+            await loadRemoteDirectorySuggestions()
         }
         .onChange(of: agents.map(\.id)) { _, _ in
             adoptProjectMachineForNewRows()
@@ -945,49 +960,12 @@ struct NewProjectView: View {
                 if sourceKind == .existingFolder {
                     GridRow {
                         Text("Project folder")
-                        HStack(spacing: 6) {
-                            TextField(folderPlaceholder, text: Binding(
-                                get: { directory },
-                                set: { directory = $0; folderEdited = true }
-                            ))
-                            .textFieldStyle(.roundedBorder)
-                            .focused($focusedField, equals: .directory)
-                            if runsOnHostKey == nil {
-                                Button("Choose…", action: chooseFolder)
-                            }
-                        }
+                        directoryFieldControl
                     }
                 } else {
                     GridRow {
                         Text("Destination")
-                        VStack(alignment: .leading, spacing: 5) {
-                            HStack(spacing: 8) {
-                                TextField(folderPlaceholder, text: Binding(
-                                    get: { directory },
-                                    set: { directory = $0; folderEdited = true }
-                                ))
-                                .textFieldStyle(.roundedBorder)
-                                .focused($focusedField, equals: .directory)
-
-                                if runsOnHostKey == nil {
-                                    Button("Choose…", action: chooseFolder)
-                                }
-
-                                if folderEdited {
-                                    Button("Use default") {
-                                        folderEdited = false
-                                        applyDerivedDestination()
-                                    }
-                                }
-                            }
-
-                            if !folderEdited {
-                                Text(automaticDestinationDescription)
-                                    .font(.caption)
-                                    .foregroundStyle(.secondary)
-                                    .help(automaticDestinationHelp)
-                            }
-                        }
+                        directoryFieldControl
                     }
                 }
             }
@@ -1065,6 +1043,7 @@ struct NewProjectView: View {
         .onChange(of: sourceKind) { _, kind in
             nameEdited = false
             folderEdited = false
+            customDestinationParent = nil
             if kind == .empty {
                 gitURL = ""
                 gitBranch = ""
@@ -1095,6 +1074,230 @@ struct NewProjectView: View {
         }
     }
 
+    private var directoryFieldControl: some View {
+        VStack(alignment: .leading, spacing: 5) {
+            HStack(spacing: 8) {
+                TextField(folderPlaceholder, text: Binding(
+                    get: { directory },
+                    set: {
+                        directory = RemoteDirectoryLookup.singleLine($0)
+                        customDestinationParent = nil
+                        folderEdited = true
+                    }
+                ))
+                .textFieldStyle(.roundedBorder)
+                .lineLimit(1)
+                .focused($focusedField, equals: .directory)
+                .accessibilityLabel(sourceKind == .existingFolder ? "Project folder" : "Project destination")
+
+                if runsOnHostKey == nil {
+                    Button("Choose…", action: chooseFolder)
+                } else {
+                    Button("Browse…", action: presentRemoteDirectoryBrowser)
+                        .popover(isPresented: $showsRemoteDirectoryBrowser, arrowEdge: .bottom) {
+                            remoteDirectoryBrowser
+                        }
+                        .accessibilityIdentifier("newProject.remoteDirectoryBrowse")
+                        .accessibilityLabel("Browse folders on \(machineLabel(runsOnHostKey))")
+                }
+
+                if sourceKind != .existingFolder, folderEdited {
+                    Button("Use default") {
+                        customDestinationParent = nil
+                        folderEdited = false
+                        applyDerivedDestination()
+                    }
+                }
+            }
+
+            if let runsOnHostKey, focusedField == .directory {
+                remoteDirectoryAutocomplete(hostKey: runsOnHostKey)
+            } else if sourceKind != .existingFolder, !folderEdited {
+                Text(automaticDestinationDescription)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .help(automaticDestinationHelp)
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func remoteDirectoryAutocomplete(hostKey: String) -> some View {
+        if isLoadingRemoteDirectorySuggestions {
+            VStack(alignment: .leading, spacing: 4) {
+                ForEach(0..<2, id: \.self) { _ in
+                    Label("Remote folder", systemImage: "folder")
+                        .font(.caption)
+                        .redacted(reason: .placeholder)
+                }
+            }
+            .padding(.horizontal, 8)
+            .padding(.vertical, 5)
+            .accessibilityLabel("Loading folders on \(machineLabel(hostKey))")
+        } else if !remoteDirectorySuggestions.isEmpty {
+            VStack(alignment: .leading, spacing: 0) {
+                Text("Folders on \(machineLabel(hostKey))")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 5)
+
+                ForEach(remoteDirectorySuggestions, id: \.self) { path in
+                    Button {
+                        selectRemoteDirectorySuggestion(path)
+                    } label: {
+                        HStack(spacing: 7) {
+                            Image(systemName: "folder")
+                                .foregroundStyle(.secondary)
+                            Text(path)
+                                .lineLimit(1)
+                                .truncationMode(.middle)
+                            Spacer(minLength: 0)
+                        }
+                        .contentShape(Rectangle())
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 5)
+                    }
+                    .buttonStyle(.plain)
+                    .help(path)
+                }
+            }
+            .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 6))
+            .overlay {
+                RoundedRectangle(cornerRadius: 6)
+                    .stroke(Color(nsColor: .separatorColor).opacity(0.7), lineWidth: 1)
+            }
+            .accessibilityElement(children: .contain)
+            .accessibilityLabel("Folder suggestions on \(machineLabel(hostKey))")
+        } else if let remoteDirectorySuggestionError {
+            Text(remoteDirectorySuggestionError)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .padding(.horizontal, 8)
+                .padding(.vertical, 4)
+        }
+    }
+
+    private var remoteDirectoryBrowser: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            HStack(spacing: 8) {
+                Button {
+                    if let parent = remoteDirectoryListing?.parentPath {
+                        remoteDirectoryBrowserPath = parent
+                    }
+                } label: {
+                    Image(systemName: "arrow.up")
+                }
+                .buttonStyle(.borderless)
+                .disabled(remoteDirectoryListing?.parentPath == nil)
+                .help("Parent folder")
+
+                Text(remoteDirectoryListing?.path ?? remoteDirectoryBrowserPath)
+                    .font(.system(.caption, design: .monospaced))
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                    .help(remoteDirectoryListing?.path ?? remoteDirectoryBrowserPath)
+                Spacer(minLength: 0)
+                Button {
+                    Task { await loadRemoteDirectoryBrowser() }
+                } label: {
+                    Image(systemName: "arrow.clockwise")
+                }
+                .buttonStyle(.borderless)
+                .help("Reload folders")
+            }
+            .padding(12)
+
+            Divider()
+
+            Group {
+                if isLoadingRemoteDirectoryBrowser {
+                    VStack(alignment: .leading, spacing: 10) {
+                        ForEach(0..<5, id: \.self) { _ in
+                            Label("Remote folder name", systemImage: "folder")
+                                .redacted(reason: .placeholder)
+                        }
+                    }
+                    .padding(12)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .accessibilityLabel("Loading remote folders")
+                } else if let remoteDirectoryBrowserError {
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text(remoteDirectoryBrowserError)
+                            .foregroundStyle(.secondary)
+                        Button("Retry folder list") {
+                            Task { await loadRemoteDirectoryBrowser() }
+                        }
+                    }
+                    .font(.caption)
+                    .padding(12)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                } else if let listing = remoteDirectoryListing, listing.directories.isEmpty {
+                    ContentUnavailableView(
+                        "No subfolders",
+                        systemImage: "folder",
+                        description: Text("Use this folder or go to its parent.")
+                    )
+                } else if let listing = remoteDirectoryListing {
+                    ScrollView {
+                        LazyVStack(alignment: .leading, spacing: 0) {
+                            ForEach(listing.directories, id: \.self) { path in
+                                Button {
+                                    remoteDirectoryBrowserPath = path
+                                } label: {
+                                    HStack(spacing: 8) {
+                                        Image(systemName: "folder")
+                                            .foregroundStyle(.secondary)
+                                        Text((path as NSString).lastPathComponent)
+                                            .lineLimit(1)
+                                        Spacer(minLength: 0)
+                                        Image(systemName: "chevron.right")
+                                            .font(.caption2)
+                                            .foregroundStyle(.tertiary)
+                                    }
+                                    .contentShape(Rectangle())
+                                    .padding(.horizontal, 12)
+                                    .padding(.vertical, 7)
+                                }
+                                .buttonStyle(.plain)
+                                .help(path)
+                            }
+                        }
+                    }
+                }
+            }
+            .frame(height: 230)
+
+            Divider()
+
+            HStack {
+                Text(sourceKind == .existingFolder
+                    ? "Select the folder that already contains the project."
+                    : "The project folder will be created inside this folder.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Spacer(minLength: 12)
+                Button("Cancel") {
+                    showsRemoteDirectoryBrowser = false
+                }
+                Button(sourceKind == .existingFolder ? "Use folder" : "Create project here") {
+                    guard let path = remoteDirectoryListing?.path else { return }
+                    useRemoteBrowserPath(path)
+                }
+                .keyboardShortcut(.defaultAction)
+                .disabled(remoteDirectoryListing == nil || isLoadingRemoteDirectoryBrowser)
+                .accessibilityIdentifier("newProject.remoteDirectoryUse")
+            }
+            .padding(12)
+        }
+        .frame(width: 440)
+        .task(id: remoteDirectoryBrowserLookupID) {
+            await loadRemoteDirectoryBrowser()
+        }
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel("Folders on \(machineLabel(runsOnHostKey))")
+    }
+
     private var matchingRepositoryURLSuggestions: [String] {
         RepositoryURLAutocomplete.matches(
             repositoryURLSuggestions,
@@ -1111,6 +1314,18 @@ struct NewProjectView: View {
         sourceKind == .clone
             ? gitURL.trimmingCharacters(in: .whitespacesAndNewlines)
             : ""
+    }
+
+    private var remoteDirectoryAutocompleteID: String {
+        guard let hostKey = runsOnHostKey,
+              focusedField == .directory,
+              !showsRemoteDirectoryBrowser else { return "" }
+        return "\(hostKey)\u{0}\(directory)"
+    }
+
+    private var remoteDirectoryBrowserLookupID: String {
+        guard showsRemoteDirectoryBrowser, let hostKey = runsOnHostKey else { return "" }
+        return "\(hostKey)\u{0}\(remoteDirectoryBrowserPath)"
     }
 
     private var matchingRepositoryBranches: [String] {
@@ -1188,6 +1403,118 @@ struct NewProjectView: View {
             repositoryBranchError = "Couldn’t load branches. You can enter one manually."
         }
         isLoadingRepositoryBranches = false
+    }
+
+    private func loadRemoteDirectorySuggestions() async {
+        remoteDirectorySuggestions = []
+        remoteDirectorySuggestionError = nil
+        isLoadingRemoteDirectorySuggestions = false
+
+        let requestID = remoteDirectoryAutocompleteID
+        guard !requestID.isEmpty,
+              let hostKey = runsOnHostKey,
+              let host = placeableHosts.first(where: { $0.id == hostKey }) else { return }
+
+        do {
+            try await Task.sleep(for: .milliseconds(250))
+            guard !Task.isCancelled, remoteDirectoryAutocompleteID == requestID else { return }
+            isLoadingRemoteDirectorySuggestions = true
+            let query = RemoteDirectoryLookup.completionQuery(for: directory)
+            let listing = try await RemoteDirectoryLookup.load(host: host, path: query.parentPath)
+            guard !Task.isCancelled, remoteDirectoryAutocompleteID == requestID else { return }
+            remoteDirectorySuggestions = RemoteDirectoryLookup.matches(
+                listing.directories,
+                prefix: query.prefix,
+                limit: 7
+            )
+        } catch is CancellationError {
+            return
+        } catch {
+            guard remoteDirectoryAutocompleteID == requestID else { return }
+            remoteDirectorySuggestionError = "Couldn’t load folders from \(host.displayName)."
+        }
+        isLoadingRemoteDirectorySuggestions = false
+    }
+
+    private func presentRemoteDirectoryBrowser() {
+        guard runsOnHostKey != nil else { return }
+        let query = RemoteDirectoryLookup.completionQuery(for: directory)
+        let configuredRoot = runsOnHostKey.flatMap { hostKey in
+            PeerHostProfileStore.shared.profiles
+                .first(where: { $0.stableKey == hostKey })?
+                .projectRootPath?
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        remoteDirectoryBrowserPath = customDestinationParent
+            ?? (query.parentPath.isEmpty ? nil : query.parentPath)
+            ?? configuredRoot
+            ?? "~"
+        remoteDirectoryListing = nil
+        remoteDirectoryBrowserError = nil
+        showsRemoteDirectoryBrowser = true
+    }
+
+    private func loadRemoteDirectoryBrowser() async {
+        let requestID = remoteDirectoryBrowserLookupID
+        guard !requestID.isEmpty,
+              let hostKey = runsOnHostKey,
+              let host = placeableHosts.first(where: { $0.id == hostKey }) else { return }
+        isLoadingRemoteDirectoryBrowser = true
+        remoteDirectoryBrowserError = nil
+        do {
+            let listing = try await RemoteDirectoryLookup.load(
+                host: host,
+                path: remoteDirectoryBrowserPath
+            )
+            guard !Task.isCancelled, remoteDirectoryBrowserLookupID == requestID else { return }
+            remoteDirectoryListing = listing
+            remoteDirectoryBrowserPath = listing.path
+        } catch is CancellationError {
+            return
+        } catch {
+            guard remoteDirectoryBrowserLookupID == requestID else { return }
+            remoteDirectoryListing = nil
+            remoteDirectoryBrowserError = "Couldn’t read this folder. Check the host connection and permissions."
+        }
+        isLoadingRemoteDirectoryBrowser = false
+    }
+
+    private func selectRemoteDirectorySuggestion(_ path: String) {
+        if sourceKind == .existingFolder {
+            useRemoteFolder(path)
+        } else {
+            useRemoteDestinationParent(path)
+        }
+        focusedField = nil
+    }
+
+    private func useRemoteBrowserPath(_ path: String) {
+        if sourceKind == .existingFolder {
+            useRemoteFolder(path)
+        } else {
+            useRemoteDestinationParent(path)
+        }
+        showsRemoteDirectoryBrowser = false
+        focusedField = nil
+    }
+
+    private func useRemoteFolder(_ path: String) {
+        customDestinationParent = nil
+        directory = RemoteDirectoryLookup.selectedPath(
+            sourceKind: .existingFolder,
+            folder: path,
+            projectName: effectiveName
+        )
+        folderEdited = true
+        if !nameEdited {
+            name = (path as NSString).lastPathComponent
+        }
+    }
+
+    private func useRemoteDestinationParent(_ path: String) {
+        customDestinationParent = path
+        folderEdited = true
+        applyDerivedDestination()
     }
 
     private var repositoryURLMatchCount: Int {
@@ -1301,8 +1628,18 @@ struct NewProjectView: View {
     }
 
     private func applyDerivedDestination() {
-        guard sourceKind != .existingFolder, !folderEdited else { return }
+        guard sourceKind != .existingFolder else { return }
         let projectName = effectiveName.isEmpty ? Self.placeholderProjectName : effectiveName
+        if let customDestinationParent {
+            directory = RemoteDirectoryLookup.selectedPath(
+                sourceKind: sourceKind,
+                folder: customDestinationParent,
+                projectName: projectName
+            )
+            syncInheritedAgentPlacements()
+            return
+        }
+        guard !folderEdited else { return }
         let root: String
         if let hostKey = runsOnHostKey,
            let configured = PeerHostProfileStore.shared.profiles
@@ -1521,6 +1858,7 @@ struct NewProjectView: View {
     /// can still be moved back individually.
     private func applyRunsOn(_ hostKey: String?) {
         folderEdited = false
+        customDestinationParent = nil
         guard let hostKey else {
             directory = ""
             syncInheritedAgentPlacements()
@@ -2062,6 +2400,7 @@ struct NewProjectView: View {
         panel.prompt = "Choose"
         panel.message = "Choose a folder for this project"
         guard panel.runModal() == .OK, let url = panel.url else { return }
+        customDestinationParent = nil
         directory = url.path
         folderEdited = true
         if sourceKind == .existingFolder {
@@ -2094,6 +2433,130 @@ struct NewProjectView: View {
                 .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
             return value.isEmpty ? nil : value
         }.value
+    }
+}
+
+struct RemoteDirectoryListing: Equatable {
+    let path: String
+    let parentPath: String?
+    let directories: [String]
+}
+
+enum RemoteDirectoryLookup {
+    struct CompletionQuery: Equatable {
+        let parentPath: String
+        let prefix: String
+    }
+
+    enum LookupError: LocalizedError {
+        case missingSSHRoute
+        case invalidResponse
+
+        var errorDescription: String? {
+            switch self {
+            case .missingSSHRoute: "The selected host has no SSH route."
+            case .invalidResponse: "The host returned an invalid folder list."
+            }
+        }
+    }
+
+    static func singleLine(_ raw: String) -> String {
+        String(raw.split(omittingEmptySubsequences: false, whereSeparator: \.isNewline).first ?? "")
+    }
+
+    static func completionQuery(for rawPath: String) -> CompletionQuery {
+        var path = singleLine(rawPath).trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !path.isEmpty else { return CompletionQuery(parentPath: "~", prefix: "") }
+        if path != "/", path.hasSuffix("/") {
+            while path.count > 1, path.hasSuffix("/") { path.removeLast() }
+            return CompletionQuery(parentPath: path, prefix: "")
+        }
+        if path == "/" || path == "~" {
+            return CompletionQuery(parentPath: path, prefix: "")
+        }
+        let parent = (path as NSString).deletingLastPathComponent
+        let prefix = (path as NSString).lastPathComponent
+        return CompletionQuery(
+            parentPath: parent.isEmpty ? (path.hasPrefix("/") ? "/" : "~") : parent,
+            prefix: prefix
+        )
+    }
+
+    static func matches(_ directories: [String], prefix: String, limit: Int) -> [String] {
+        guard limit > 0 else { return [] }
+        let filtered = directories.lazy.filter { path in
+            prefix.isEmpty
+                || (path as NSString).lastPathComponent.range(
+                    of: prefix,
+                    options: [.anchored, .caseInsensitive]
+                ) != nil
+        }
+        return Array(filtered.prefix(limit))
+    }
+
+    static func selectedPath(
+        sourceKind: ProjectSourceKind,
+        folder: String,
+        projectName: String
+    ) -> String {
+        switch sourceKind {
+        case .existingFolder:
+            return folder
+        case .clone, .empty:
+            return (folder as NSString).appendingPathComponent(projectName)
+        }
+    }
+
+    static func script(for rawPath: String) -> String {
+        let path = singleLine(rawPath).trimmingCharacters(in: .whitespacesAndNewlines)
+        let quoted = shellQuote(path.isEmpty ? "~" : path)
+        return "p=\(quoted); "
+            + "case \"$p\" in '~') p=\"$HOME\" ;; '~/'*) p=\"$HOME/${p#??}\" ;; esac; "
+            + "cd \"$p\" || exit 44; "
+            + "printf '%s\\0' \"$(pwd -P)\"; "
+            + "find . -mindepth 1 -maxdepth 1 -type d ! -name '.*' -print0"
+    }
+
+    static func parse(_ output: String) throws -> RemoteDirectoryListing {
+        let fields = output.split(separator: "\0", omittingEmptySubsequences: true).map(String.init)
+        guard let rawBase = fields.first else { throw LookupError.invalidResponse }
+        let base = (rawBase as NSString).standardizingPath
+        guard base.hasPrefix("/"), !base.contains("\n") else { throw LookupError.invalidResponse }
+
+        var seen = Set<String>()
+        let directories = fields.dropFirst().compactMap { raw -> String? in
+            let relative = raw.hasPrefix("./") ? String(raw.dropFirst(2)) : raw
+            guard !relative.isEmpty,
+                  !relative.hasPrefix("."),
+                  !relative.contains("/"),
+                  !relative.contains("\n") else { return nil }
+            let full = (base as NSString).appendingPathComponent(relative)
+            return seen.insert(full).inserted ? full : nil
+        }.sorted { lhs, rhs in
+            (lhs as NSString).lastPathComponent.localizedStandardCompare(
+                (rhs as NSString).lastPathComponent
+            ) == .orderedAscending
+        }
+        let parent = base == "/" ? nil : (base as NSString).deletingLastPathComponent
+        return RemoteDirectoryListing(path: base, parentPath: parent, directories: directories)
+    }
+
+    static func load(host: HostEntry, path: String) async throws -> RemoteDirectoryListing {
+        guard let sshTarget = host.sshTarget, !sshTarget.isEmpty else {
+            throw LookupError.missingSSHRoute
+        }
+        let output = try await PeerHostReadinessChecker.runScript(
+            sshTarget: sshTarget,
+            port: host.sshPort,
+            identityFile: host.identityFile,
+            script: script(for: path),
+            timeoutSeconds: 15
+        )
+        return try parse(output)
+    }
+
+    private static func shellQuote(_ value: String) -> String {
+        "'" + value.replacingOccurrences(of: "'", with: "'\\''") + "'"
     }
 }
 
