@@ -229,6 +229,11 @@ final class TeamOrchestrator: ObservableObject {
     /// which minted the grant and owns the project, may extend its server lease.
     var remoteLeaderGrantKeepalives: [String: Task<Void, Never>] = [:]
     var remoteLeaderGrantIDs: [String: Data] = [:]
+    /// Wake observer for the keepalives above, installed once and kept for the
+    /// app's life. `Task.sleep` does not advance while the Mac is asleep, so
+    /// the interval alone cannot cover a closed lid — see
+    /// `installRemoteLeaderWakeObserver`.
+    var remoteLeaderWakeObserver: NSObjectProtocol?
     /// Restoring a detached project must be single-flight for the same reason
     /// the two above are, and at the same scope. The sidebar's own
     /// `restoringTeamNames` is per-view `@State`, so a second window has its

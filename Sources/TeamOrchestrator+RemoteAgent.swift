@@ -1,3 +1,4 @@
+import AppKit
 import Bonsplit
 import Foundation
 import PeerProto
@@ -1582,6 +1583,7 @@ extension TeamOrchestrator {
     func startRemoteLeaderGrantKeepalive(teamName: String, grantID: Data) {
         stopRemoteLeaderGrantKeepalive(teamName: teamName, revoke: true)
         remoteLeaderGrantIDs[teamName] = grantID
+        installRemoteLeaderWakeObserver()
         remoteLeaderGrantKeepalives[teamName] = Task { [weak self] in
             while !Task.isCancelled {
                 try? await Task.sleep(nanoseconds: 30 * 60 * 1_000_000_000)
@@ -1604,6 +1606,58 @@ extension TeamOrchestrator {
                     self.remoteLeaderGrantIDs.removeValue(forKey: teamName)
                     return
                 }
+            }
+        }
+    }
+
+    /// Renew every live grant as soon as the machine wakes.
+    ///
+    /// The 30-minute loop is `Task.sleep`, which does not advance while the
+    /// Mac is asleep. A lid closed for longer than the remaining lease means
+    /// the next tick arrives after the grant is already gone — on a laptop
+    /// that is the ordinary case, not an edge one, and it is how a leader
+    /// that was fine at lunch is unreachable after it.
+    ///
+    /// Waking is also precisely when the network is not up yet, so a failure
+    /// here proves nothing. This pass therefore never retires a leader: the
+    /// 30-minute loop stays the only place allowed to declare a grant gone.
+    /// Renewing early can only help; misreading a cold network as a lapse
+    /// would kill a team that was about to be perfectly fine.
+    private func installRemoteLeaderWakeObserver() {
+        guard remoteLeaderWakeObserver == nil else { return }
+        remoteLeaderWakeObserver = NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.didWakeNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                await self?.renewRemoteLeaderGrantsAfterWake()
+            }
+        }
+    }
+
+    private func renewRemoteLeaderGrantsAfterWake() async {
+        // Snapshot first: a renewal can retire its own entry, and reconnect
+        // can replace one while this loop is suspended.
+        let pairs = remoteLeaderGrantIDs.map { ($0.key, $0.value) }
+        guard !pairs.isEmpty else { return }
+        // Let the network come back before asking. A few seconds costs
+        // nothing against a 30-minute interval and avoids spending the
+        // attempt on a link that is not up yet.
+        try? await Task.sleep(nanoseconds: 3 * 1_000_000_000)
+        for (teamName, grantID) in pairs {
+            guard remoteLeaderGrantIDs[teamName] == grantID else { continue }
+            let renewed = await PeerTeamLeaderControlPlane.shared.keepAliveGrant(id: grantID)
+#if DEBUG
+            dlog("leader.grant.wakeRenew team=\(teamName) renewed=\(renewed)")
+#endif
+            if !renewed {
+                // Deliberately silent for the person: the 30-minute loop
+                // reports a real lapse, and a notice here would fire on every
+                // wake where the network simply had not returned yet.
+                RemoteWorkLog.info(
+                    "Could not renew the remote leader grant for \(teamName) on wake; will retry on the next interval"
+                )
             }
         }
     }
