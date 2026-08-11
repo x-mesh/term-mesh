@@ -1078,6 +1078,37 @@ final class TeamOrchestrator: ObservableObject {
         return env
     }
 
+    /// Apply a CLI profile without letting it replace the routing contract the
+    /// app and bundled `tm-agent` share. Profiles still override ordinary
+    /// process values, and their PATH entries remain available after the
+    /// app-owned prefix.
+    static func applyAgentProfileEnvironment(
+        _ profile: [String: String],
+        to required: [String: String]
+    ) -> [String: String] {
+        var environment = required
+        for (key, value) in profile {
+            if key == "PATH" {
+                let requiredPaths = (environment[key] ?? "")
+                    .split(separator: ":").map(String.init)
+                let profilePaths = value.split(separator: ":").map(String.init)
+                var orderedPaths: [String] = []
+                for path in requiredPaths + profilePaths
+                    where !path.isEmpty && !orderedPaths.contains(path) {
+                    orderedPaths.append(path)
+                }
+                environment[key] = orderedPaths.joined(separator: ":")
+            } else if key.hasPrefix("TERMMESH_") || key.hasPrefix("CMUX_")
+                        || key == "CLAUDECODE"
+                        || key == "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS" {
+                continue
+            } else {
+                environment[key] = value
+            }
+        }
+        return environment
+    }
+
     // MARK: - Agent Pane Construction (shared helper)
 
     /// Build the kiro worker prompt embedded in the kiro agent profile at CLI startup.
@@ -1271,7 +1302,7 @@ final class TeamOrchestrator: ObservableObject {
 
         // Build env via shared helper (2026-03-19 regression guard — single source of truth)
         let windowId = AppDelegate.shared?.windowId(for: tabManager)?.uuidString
-        var paneEnv = Self.buildAgentPaneEnv(
+        let requiredPaneEnv = Self.buildAgentPaneEnv(
             teamName: teamName,
             agentName: agentName,
             agentType: agentType,
@@ -1280,10 +1311,9 @@ final class TeamOrchestrator: ObservableObject {
             windowId: windowId,
             workspaceId: workspace.id
         )
-        // Profile env is merged last — user-defined values take precedence over defaults.
-        if !extraEnv.isEmpty {
-            paneEnv.merge(extraEnv) { _, new in new }
-        }
+        // Profiles may customize ordinary launch values, but cannot replace
+        // app-owned routing identity or shadow the bundled tm-agent in PATH.
+        let paneEnv = Self.applyAgentProfileEnvironment(extraEnv, to: requiredPaneEnv)
 
         // No terminal at all: the agent is held in the pane, not run inside a
         // shell inside a PTY inside it. Everything below — the shell wrapper,

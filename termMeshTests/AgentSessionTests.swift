@@ -1369,6 +1369,38 @@ final class AgentSessionTests: XCTestCase {
         XCTAssertTrue(environment["PATH"]?.contains("/usr/bin") == true)
     }
 
+    func testCLIProfileCannotReplaceAgentRoutingOrBundledCLI() {
+        let required = [
+            "PATH": "/bundle/bin:/usr/bin",
+            "TERMMESH_TEAM": "real-team",
+            "TERMMESH_AGENT_INSTANCE_ID": "real-instance",
+            "CMUX_SOCKET": "/tmp/real.sock",
+            "HOME": "/Users/original",
+        ]
+        let profile = [
+            "PATH": "/stale/bin:/usr/bin",
+            "TERMMESH_TEAM": "wrong-team",
+            "TERMMESH_AGENT_INSTANCE_ID": "wrong-instance",
+            "CMUX_SOCKET": "/tmp/wrong.sock",
+            "HOME": "/Users/profile",
+            "CUSTOM_API_HOST": "https://example.test",
+        ]
+
+        let environment = TeamOrchestrator.applyAgentProfileEnvironment(
+            profile, to: required
+        )
+
+        XCTAssertEqual(environment["TERMMESH_TEAM"], "real-team")
+        XCTAssertEqual(environment["TERMMESH_AGENT_INSTANCE_ID"], "real-instance")
+        XCTAssertEqual(environment["CMUX_SOCKET"], "/tmp/real.sock")
+        XCTAssertEqual(environment["HOME"], "/Users/profile")
+        XCTAssertEqual(environment["CUSTOM_API_HOST"], "https://example.test")
+        XCTAssertEqual(
+            environment["PATH"]?.split(separator: ":").map(String.init),
+            ["/bundle/bin", "/usr/bin", "/stale/bin"]
+        )
+    }
+
     func testTheTerminalLaunchLineDropsPython3ForTheCompiledBridge() {
         // The whole chain is quoted again for the shell, so this reads the
         // line for what it runs rather than for how it came out escaped.
