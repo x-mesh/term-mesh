@@ -1017,6 +1017,7 @@ final class TeamOrchestrator: ObservableObject {
         agentName: String,
         agentType: String,
         agentCli: String,
+        agentInstanceId: String,
         windowId: String?,
         workspaceId: UUID
     ) -> [String: String] {
@@ -1034,10 +1035,16 @@ final class TeamOrchestrator: ObservableObject {
             "/usr/sbin",
             "/sbin"
         ]
-        let appPath = ProcessInfo.processInfo.environment["PATH"] ?? ""
-        let existingPaths = Set(appPath.split(separator: ":").map(String.init))
-        let missingPaths = essentialPaths.filter { !existingPaths.contains($0) }
-        let currentPath = (appPath.isEmpty ? essentialPaths : appPath.split(separator: ":").map(String.init) + missingPaths).joined(separator: ":")
+        let appPaths = (ProcessInfo.processInfo.environment["PATH"] ?? "")
+            .split(separator: ":").map(String.init)
+        // The bundled tm-agent must win over stale user-installed copies. The
+        // correlation protocol evolves with the app, so choosing an older CLI
+        // can turn a delivered instruction into a reply timeout.
+        var orderedPaths: [String] = []
+        for path in essentialPaths + appPaths where !path.isEmpty && !orderedPaths.contains(path) {
+            orderedPaths.append(path)
+        }
+        let currentPath = orderedPaths.joined(separator: ":")
         let socketPath = SocketControlSettings.socketPath()
 
         var env: [String: String] = [
@@ -1062,12 +1069,44 @@ final class TeamOrchestrator: ObservableObject {
         // Per-agent routing — 2026-03-19 regression guard.
         env["TERMMESH_AGENT_NAME"] = agentName
         env["TERMMESH_AGENT_ROLE"] = agentType
+        env["TERMMESH_AGENT_INSTANCE_ID"] = agentInstanceId
         if let windowId = windowId, !windowId.isEmpty {
             env["TERMMESH_WINDOW_ID"] = windowId
         }
         env["TERMMESH_WORKSPACE_ID"] = workspaceId.uuidString
 
         return env
+    }
+
+    /// Apply a CLI profile without letting it replace the routing contract the
+    /// app and bundled `tm-agent` share. Profiles still override ordinary
+    /// process values, and their PATH entries remain available after the
+    /// app-owned prefix.
+    static func applyAgentProfileEnvironment(
+        _ profile: [String: String],
+        to required: [String: String]
+    ) -> [String: String] {
+        var environment = required
+        for (key, value) in profile {
+            if key == "PATH" {
+                let requiredPaths = (environment[key] ?? "")
+                    .split(separator: ":").map(String.init)
+                let profilePaths = value.split(separator: ":").map(String.init)
+                var orderedPaths: [String] = []
+                for path in requiredPaths + profilePaths
+                    where !path.isEmpty && !orderedPaths.contains(path) {
+                    orderedPaths.append(path)
+                }
+                environment[key] = orderedPaths.joined(separator: ":")
+            } else if key.hasPrefix("TERMMESH_") || key.hasPrefix("CMUX_")
+                        || key == "CLAUDECODE"
+                        || key == "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS" {
+                continue
+            } else {
+                environment[key] = value
+            }
+        }
+        return environment
     }
 
     // MARK: - Agent Pane Construction (shared helper)
@@ -1263,18 +1302,18 @@ final class TeamOrchestrator: ObservableObject {
 
         // Build env via shared helper (2026-03-19 regression guard — single source of truth)
         let windowId = AppDelegate.shared?.windowId(for: tabManager)?.uuidString
-        var paneEnv = Self.buildAgentPaneEnv(
+        let requiredPaneEnv = Self.buildAgentPaneEnv(
             teamName: teamName,
             agentName: agentName,
             agentType: agentType,
             agentCli: agentCli,
+            agentInstanceId: agentInstanceId,
             windowId: windowId,
             workspaceId: workspace.id
         )
-        // Profile env is merged last — user-defined values take precedence over defaults.
-        if !extraEnv.isEmpty {
-            paneEnv.merge(extraEnv) { _, new in new }
-        }
+        // Profiles may customize ordinary launch values, but cannot replace
+        // app-owned routing identity or shadow the bundled tm-agent in PATH.
+        let paneEnv = Self.applyAgentProfileEnvironment(extraEnv, to: requiredPaneEnv)
 
         // No terminal at all: the agent is held in the pane, not run inside a
         // shell inside a PTY inside it. Everything below — the shell wrapper,
@@ -1296,13 +1335,18 @@ final class TeamOrchestrator: ObservableObject {
                cli: agentCli,
                color: agentColor
            ) {
+            // `Process.environment` replaces rather than overlays its parent.
+            // Keep ordinary launch values such as HOME and TMPDIR while the
+            // pane-specific team identity wins on collisions.
+            let nativeEnvironment = ProcessInfo.processInfo.environment
+                .merging(paneEnv) { _, paneValue in paneValue }
             if AgentPipeTransport.needsBridge(cli: agentCli),
                let bridge = AgentPipeTransport.bridgePath(workingDirectory: agentWorkDir) {
                 agentPanel.start(
                     bridgedCli: agentCli, bridgePath: bridge,
                     model: Self.bridgeModelArg(cli: agentCli, model: agentModel),
                     cliPath: cliPath,
-                    environment: paneEnv
+                    environment: nativeEnvironment
                 )
                 // A bridged CLI has no `--append-system-prompt`, and none of
                 // them agree on an equivalent, so its role has to arrive as a
@@ -1333,7 +1377,7 @@ final class TeamOrchestrator: ObservableObject {
                     model: Self.resolveClaudeModelArg(agentModel),
                     instructions: agentInstructions,
                     extraArgs: extraArgs,
-                    environment: paneEnv
+                    environment: nativeEnvironment
                 )
             }
             // The turn states its own end and carries its final text, so the

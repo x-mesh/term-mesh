@@ -325,6 +325,35 @@ mod project_sync_cli_tests {
             } if panel == "panel-2"
         ));
 
+        let expect_reply = Cli::try_parse_from([
+            "tm-agent",
+            "send",
+            "reviewer",
+            "message",
+            "--expect-reply",
+            "--reply-timeout",
+            "45",
+        ])
+        .unwrap();
+        assert!(matches!(
+            expect_reply.command,
+            Commands::Send {
+                expect_reply: true,
+                reply_timeout: 45,
+                no_report: false,
+                ..
+            }
+        ));
+        assert!(Cli::try_parse_from([
+            "tm-agent",
+            "send",
+            "reviewer",
+            "check this",
+            "--expect-reply",
+            "--no-report",
+        ])
+        .is_err());
+
         let remove = Cli::try_parse_from([
             "tm-agent",
             "remove",
@@ -342,10 +371,8 @@ mod project_sync_cli_tests {
             } if id == "instance-2"
         ));
 
-        let detach = Cli::try_parse_from([
-            "tm-agent", "detach", "builder", "--panel", "panel-2",
-        ])
-        .unwrap();
+        let detach =
+            Cli::try_parse_from(["tm-agent", "detach", "builder", "--panel", "panel-2"]).unwrap();
         assert!(matches!(
             detach.command,
             Commands::Detach {
@@ -399,14 +426,9 @@ mod project_sync_cli_tests {
             }
         ));
 
-        let reply = Cli::try_parse_from([
-            "tm-agent",
-            "reply",
-            "--reply-to",
-            "tm-agent-42-7",
-            "done",
-        ])
-        .unwrap();
+        let reply =
+            Cli::try_parse_from(["tm-agent", "reply", "--reply-to", "tm-agent-42-7", "done"])
+                .unwrap();
         assert!(matches!(
             reply.command,
             Commands::Reply {
@@ -445,6 +467,53 @@ mod project_sync_cli_tests {
     }
 
     #[test]
+    fn send_success_requires_both_text_and_return_delivery() {
+        let success = send_delivery_response(
+            json!({"ok": true, "result": {
+                "sent": true,
+                "text_delivered": true,
+                "delivery_scope": "transport_write"
+            }}),
+            true,
+        );
+        assert_eq!(success["result"]["sent"], true);
+        assert_eq!(success["result"]["return_submitted"], true);
+        assert_eq!(success["result"]["delivery_state"], "submitted");
+        assert_eq!(success["result"]["delivery_scope"], "transport_write");
+
+        let paste_failure = send_delivery_response(
+            json!({"ok": true, "result": {
+                "sent": false, "text_delivered": false
+            }}),
+            false,
+        );
+        assert_eq!(paste_failure["ok"], false);
+        assert_eq!(paste_failure["result"]["sent"], false);
+        assert_eq!(paste_failure["result"]["delivery_state"], "paste_failed");
+        assert_eq!(paste_failure["error"]["code"], "delivery_failed");
+
+        let return_failure = send_delivery_response(
+            json!({"ok": true, "result": {
+                "sent": true, "text_delivered": true
+            }}),
+            false,
+        );
+        assert_eq!(return_failure["ok"], false);
+        assert_eq!(return_failure["result"]["sent"], false);
+        assert_eq!(return_failure["result"]["delivery_state"], "return_failed");
+        assert!(return_failure["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("Return submission failed"));
+
+        let reply_timeout = reply_failure_response(&success, "timed out waiting for reply");
+        assert_eq!(reply_timeout["ok"], false);
+        assert_eq!(reply_timeout["error"]["code"], "reply_timeout");
+        assert_eq!(reply_timeout["result"]["sent"], true);
+        assert_eq!(reply_timeout["result"]["return_submitted"], true);
+    }
+
+    #[test]
     fn batch_team_send_opts_into_sequence_gate_contract() {
         let payloads = parse_batch_commands("send reviewer:check", "team-a").unwrap();
         let request: Value = serde_json::from_str(&payloads[0]).unwrap();
@@ -470,22 +539,16 @@ mod project_sync_cli_tests {
 
     #[test]
     fn correlated_reply_mailbox_is_typed_identity_bound_and_deadline_aware() {
-        let token = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
-        let params = correlated_reply_params(
-            "team-a",
-            "reviewer",
-            token,
-            "instance-7",
-            "finished",
-        )
-        .unwrap();
+        let token = std::iter::repeat_n('a', 64).collect::<String>();
+        let params =
+            correlated_reply_params("team-a", "reviewer", &token, "instance-7", "finished").unwrap();
         assert_eq!(params["to"], "leader");
         assert_eq!(params["type"], "note");
         assert_eq!(params["agent_instance_id"], "instance-7");
         assert_eq!(params["correlation_token"], token);
         assert_eq!(params["content"], "finished");
         let instruction =
-            append_correlated_reply_instruction("check", token, "instance-7").unwrap();
+            append_correlated_reply_instruction("check", &token, "instance-7").unwrap();
         assert!(instruction.contains("<<'TERMMESH_REPLY_EOF'"));
         assert!(!instruction.contains("'<response>'"));
 
@@ -499,7 +562,7 @@ mod project_sync_cli_tests {
                 "content": "finished"
             }
         });
-        let reply = correlated_reply_from_mailbox(response, "reviewer", "instance-7", token)
+        let reply = correlated_reply_from_mailbox(response, "reviewer", "instance-7", &token)
             .unwrap()
             .unwrap();
         assert_eq!(reply["result"]["content"], "finished");
@@ -507,24 +570,19 @@ mod project_sync_cli_tests {
 
         let pending = json!({ "ok": true, "result": { "ready": false } });
         let mut polled = false;
-        let timeout = wait_for_correlated_reply_with(
-            "reviewer",
-            "instance-7",
-            token,
-            Duration::ZERO,
-            |_| {
+        let timeout =
+            wait_for_correlated_reply_with("reviewer", "instance-7", &token, Duration::ZERO, |_| {
                 polled = true;
                 Ok(pending.clone())
-            },
-        )
-        .unwrap_err();
+            })
+            .unwrap_err();
         assert!(timeout.contains("timed out"));
         assert!(!polled, "an expired deadline must not start an RPC");
 
         let rpc_error = wait_for_correlated_reply_with(
             "reviewer",
             "instance-7",
-            token,
+            &token,
             Duration::from_secs(1),
             |_| Err("socket closed".to_string()),
         )
@@ -534,7 +592,7 @@ mod project_sync_cli_tests {
         let rejected = wait_for_correlated_reply_with(
             "reviewer",
             "instance-7",
-            token,
+            &token,
             Duration::from_secs(1),
             |_| {
                 Ok(json!({
@@ -560,7 +618,7 @@ mod project_sync_cli_tests {
             }),
             "reviewer",
             "instance-7",
-            token,
+            &token,
         )
         .unwrap_err();
         assert!(mismatch.contains("mismatched identity"));
@@ -678,13 +736,9 @@ mod project_sync_cli_tests {
 
         let dir = tempfile::tempdir().unwrap();
         let missing_socket = dir.path().join("missing.sock");
-        let error = selected_delegate_target(
-            &missing_socket,
-            "team-a",
-            "executor",
-            Some("panel-2"),
-        )
-        .unwrap_err();
+        let error =
+            selected_delegate_target(&missing_socket, "team-a", "executor", Some("panel-2"))
+                .unwrap_err();
         assert!(error.contains("cannot resolve --panel before delegate"));
     }
 
@@ -1183,7 +1237,7 @@ enum Commands {
     Send {
         agent: String,
         text: String,
-        #[arg(long)]
+        #[arg(long, conflicts_with = "expect_reply")]
         no_report: bool,
         /// Wait for an exact reply posted with `tm-agent reply --reply-to <id>`.
         #[arg(long)]
@@ -3480,6 +3534,22 @@ mod runbook_tests {
     }
 
     #[test]
+    fn rpc_failure_envelopes_are_process_failures() {
+        assert!(rpc_response_failed(&json!({
+            "ok": false,
+            "error": {"code": "not_found", "message": "Team not found"}
+        })));
+        assert!(rpc_response_failed(&json!({
+            "jsonrpc": "2.0",
+            "error": {"code": -32601, "message": "method not found"}
+        })));
+        assert!(!rpc_response_failed(&json!({"ok": true, "result": {}})));
+        assert!(!rpc_response_failed(
+            &json!({"jsonrpc": "2.0", "result": {}})
+        ));
+    }
+
+    #[test]
     fn runbook_parse_tools_accepts_all_and_aliases() {
         let all = parse_runbook_tools("all").unwrap();
         assert_eq!(all.len(), 4);
@@ -3739,7 +3809,10 @@ mod runbook_tests {
     #[test]
     fn bare_reply_keeps_single_task_compatibility() {
         let candidates = vec!["task-a".to_string()];
-        assert_eq!(unambiguous_reply_task(&candidates).unwrap().as_deref(), Some("task-a"));
+        assert_eq!(
+            unambiguous_reply_task(&candidates).unwrap().as_deref(),
+            Some("task-a")
+        );
     }
 
     #[test]
@@ -3901,8 +3974,14 @@ mod runbook_tests {
         let compact = compact_result_collect_response(resp, false);
         let item = &compact["result"]["results"][0];
         assert!(item.get("content").is_none());
-        assert_eq!(item["parallel_telemetry"]["task_id"].as_str(), Some("task-a"));
-        assert_eq!(item["parallel_telemetry"]["agent_instance_id"].as_str(), Some("instance-a"));
+        assert_eq!(
+            item["parallel_telemetry"]["task_id"].as_str(),
+            Some("task-a")
+        );
+        assert_eq!(
+            item["parallel_telemetry"]["agent_instance_id"].as_str(),
+            Some("instance-a")
+        );
         assert!(!item.to_string().contains("secret body"));
     }
 
@@ -4293,12 +4372,7 @@ fn remote_leader_rpc_call_duration(
     let request_id_hex = remote_leader_request_id_hex();
     let proxy_params = remote_leader_proxy_params(&route, method, params, &request_id_hex)?;
     let deadline = Instant::now() + timeout;
-    let first = rpc_call_timeout_duration(
-        sock,
-        "peer.leader.call",
-        proxy_params.clone(),
-        timeout,
-    );
+    let first = rpc_call_timeout_duration(sock, "peer.leader.call", proxy_params.clone(), timeout);
     let outer = match first {
         Ok(value) => value,
         Err(first_error) => {
@@ -4545,9 +4619,7 @@ fn rpc_call_timeout_duration(
 ) -> Result<Value, String> {
     let deadline = Instant::now() + timeout;
     let stream = UnixStream::connect(sock).map_err(|e| format!("connect: {e}"))?;
-    stream
-        .set_write_timeout(Some(timeout))
-        .ok();
+    stream.set_write_timeout(Some(timeout)).ok();
 
     let request = json!({
         "jsonrpc": "2.0",
@@ -5764,23 +5836,38 @@ fn reply_agent_instance_id(
     task_id: Option<&str>,
 ) -> Result<Option<String>, String> {
     if let Some(task_id) = task_id {
-        let task = rpc_call(sock, "team.task.get", json!({ "team_name": team, "task_id": task_id }))?;
+        let task = rpc_call(
+            sock,
+            "team.task.get",
+            json!({ "team_name": team, "task_id": task_id }),
+        )?;
         return task_instance_for_reply(&task["result"], task_id, sender, explicit_instance_id);
     }
     let status = rpc_call(sock, "team.status", json!({ "team_name": team }))?;
-    let matches = status["result"]["agents"].as_array().map(|agents| {
-        agents.iter().filter(|agent| agent["name"].as_str() == Some(sender)).collect::<Vec<_>>()
-    }).unwrap_or_default();
+    let matches = status["result"]["agents"]
+        .as_array()
+        .map(|agents| {
+            agents
+                .iter()
+                .filter(|agent| agent["name"].as_str() == Some(sender))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
     if let Some(explicit) = explicit_instance_id {
-        return matches.iter()
+        return matches
+            .iter()
             .any(|agent| agent["agent_instance_id"].as_str() == Some(explicit))
             .then(|| Some(explicit.to_string()))
-            .ok_or_else(|| format!("agent_instance_id {explicit} is not a {sender} in team {team}"));
+            .ok_or_else(|| {
+                format!("agent_instance_id {explicit} is not a {sender} in team {team}")
+            });
     }
     match matches.as_slice() {
         [] => Err(format!("agent {sender} not found in team {team}")),
         [agent] => Ok(agent["agent_instance_id"].as_str().map(str::to_owned)),
-        _ => Err(format!("multiple agents named {sender}; pass --task-id or --agent-instance-id")),
+        _ => Err(format!(
+            "multiple agents named {sender}; pass --task-id or --agent-instance-id"
+        )),
     }
 }
 
@@ -5796,7 +5883,9 @@ fn task_instance_for_reply(
     let instance = task["agent_instance_id"].as_str().map(str::to_owned);
     if let Some(explicit) = explicit_instance_id {
         if instance.as_deref() != Some(explicit) {
-            return Err(format!("task {task_id} does not belong to agent_instance_id {explicit}"));
+            return Err(format!(
+                "task {task_id} does not belong to agent_instance_id {explicit}"
+            ));
         }
     }
     Ok(instance)
@@ -5904,13 +5993,7 @@ fn send_return_key_with_retry(
         match rpc_call(
             sock,
             "team.send_key",
-            send_return_key_params(
-                team,
-                target,
-                panel_id,
-                agent_instance_id,
-                send_sequence_id,
-            ),
+            send_return_key_params(team, target, panel_id, agent_instance_id, send_sequence_id),
         ) {
             Ok(r) if r["ok"].as_bool().unwrap_or(false) => return true,
             Ok(_) | Err(_) => {}
@@ -6010,20 +6093,13 @@ fn exact_command_agent_instance_id(
     panel_id: Option<&str>,
     explicit_instance_id: Option<&str>,
 ) -> Result<String, String> {
-    if let Some(instance_id) = command_agent_instance_id(
-        sock,
-        team,
-        target,
-        panel_id,
-        explicit_instance_id,
-    )? {
+    if let Some(instance_id) =
+        command_agent_instance_id(sock, team, target, panel_id, explicit_instance_id)?
+    {
         return Ok(instance_id);
     }
-    let status = successful_rpc_envelope(rpc_call(
-        sock,
-        "team.status",
-        json!({ "team_name": team }),
-    ))?;
+    let status =
+        successful_rpc_envelope(rpc_call(sock, "team.status", json!({ "team_name": team })))?;
     let agents = status["result"]["agents"]
         .as_array()
         .ok_or_else(|| "team.status response has no agents array".to_string())?;
@@ -7224,6 +7300,11 @@ fn main() {
                     let mut line = String::new();
                     reader.read_line(&mut line).ok();
                     print!("{line}");
+                    if serde_json::from_str::<Value>(&line)
+                        .is_ok_and(|response| rpc_response_failed(&response))
+                    {
+                        process::exit(1);
+                    }
                     return;
                 }
                 Err(e) => {
@@ -7618,8 +7699,8 @@ fn main() {
             } else {
                 None
             };
-            let reply_deadline = expect_reply
-                .then(|| Instant::now() + Duration::from_secs(reply_timeout));
+            let reply_deadline =
+                expect_reply.then(|| Instant::now() + Duration::from_secs(reply_timeout));
             let reply_correlation = if expect_reply {
                 match new_correlation_token() {
                     Ok(token) => Some(token),
@@ -7691,7 +7772,8 @@ fn main() {
                                 "agent_id": agent_id,
                                 "text": format!("{text}\n"),
                             }),
-                        ));
+                        ))
+                        .map(headless_send_delivery_response);
                         if let Err(error) = delivery {
                             if let Some(correlation_id) = reply_correlation.as_deref() {
                                 cancel_correlation_mailbox(&sock, &team, correlation_id);
@@ -7715,7 +7797,12 @@ fn main() {
                             if reply.is_err() {
                                 cancel_correlation_mailbox(&sock, &team, correlation_id);
                             }
-                            print_result(reply);
+                            let delivery = delivery.as_ref().unwrap();
+                            print_result(
+                                reply
+                                    .map(|response| attach_delivery_metadata(response, delivery))
+                                    .or_else(|error| Ok(reply_failure_response(delivery, &error))),
+                            );
                         } else {
                             print_result(delivery);
                         }
@@ -7761,21 +7848,36 @@ fn main() {
             // Send Return key via team.send_key (reliable sendNamedKey path).
             // The Return MUST carry the SAME panel_id as the paste so both land on
             // the same pane (otherwise text lands on pane X, Return on name-match Y).
-            if let Ok(ref r) = send_result {
+            let delivery_result = if let Ok(ref r) = send_result {
                 let text_delivered = r["result"]["text_delivered"].as_bool().unwrap_or(false);
                 if !text_delivered {
                     eprintln!("text.delivered.false reason=team.send_ack agent={target}");
                 }
-                let _ = send_return_key_with_retry(
-                    &sock,
-                    &team,
-                    target,
-                    text_delivered,
-                    "team.send",
-                    panel.as_deref(),
-                    selected_instance_id.as_deref(),
-                    r["result"]["send_sequence_id"].as_str(),
-                );
+                let return_submitted = text_delivered
+                    && send_return_key_with_retry(
+                        &sock,
+                        &team,
+                        target,
+                        true,
+                        "team.send",
+                        panel.as_deref(),
+                        selected_instance_id.as_deref(),
+                        r["result"]["send_sequence_id"].as_str(),
+                    );
+                send_result.map(|response| send_delivery_response(response, return_submitted))
+            } else {
+                send_result
+            };
+            let delivery_failed = match delivery_result.as_ref() {
+                Ok(response) => rpc_response_failed(response),
+                Err(_) => true,
+            };
+            if delivery_failed {
+                if let Some(correlation_id) = reply_correlation.as_deref() {
+                    cancel_correlation_mailbox(&sock, &team, correlation_id);
+                }
+                print_result(delivery_result);
+                return;
             }
             if let Some(correlation_id) = reply_correlation.as_deref() {
                 let reply = wait_for_correlated_reply(
@@ -7793,9 +7895,20 @@ fn main() {
                 if reply.is_err() {
                     cancel_correlation_mailbox(&sock, &team, correlation_id);
                 }
-                print_result(reply);
+                print_result(
+                    reply
+                        .map(|response| {
+                            attach_delivery_metadata(response, delivery_result.as_ref().unwrap())
+                        })
+                        .or_else(|error| {
+                            Ok(reply_failure_response(
+                                delivery_result.as_ref().unwrap(),
+                                &error,
+                            ))
+                        }),
+                );
             } else {
-                print_result(send_result);
+                print_result(delivery_result);
             }
             return;
         }
@@ -8136,7 +8249,7 @@ fn main() {
                     Ok(name) if !name.is_empty() => name,
                     _ => {
                         print_result(Err(
-                            "--reply-to requires TERMMESH_AGENT_NAME identity".to_string(),
+                            "--reply-to requires TERMMESH_AGENT_NAME identity".to_string()
                         ));
                         return;
                     }
@@ -8154,7 +8267,7 @@ fn main() {
                     Ok(Some(instance_id)) => instance_id,
                     Ok(None) => {
                         print_result(Err(
-                            "--reply-to requires a durable agent instance identity".to_string(),
+                            "--reply-to requires a durable agent instance identity".to_string()
                         ));
                         return;
                     }
@@ -8478,12 +8591,7 @@ fn cmd_gc(sock: &PathBuf, command: &GcCommand) {
             roots,
             deep,
             json: raw,
-        } => gc_call(
-            sock,
-            "gc.plan",
-            gc_scope_params(categories, roots, *deep),
-        )
-        .map(|value| {
+        } => gc_call(sock, "gc.plan", gc_scope_params(categories, roots, *deep)).map(|value| {
             if *raw {
                 println!("{}", pretty(&value));
             } else {
@@ -8564,7 +8672,10 @@ fn render_gc_status(value: &Value) {
         );
     }
 
-    let total = value.get("total_bytes").and_then(Value::as_u64).unwrap_or(0);
+    let total = value
+        .get("total_bytes")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
     let reclaim = value
         .get("reclaimable_bytes")
         .and_then(Value::as_u64)
@@ -8671,10 +8782,7 @@ fn render_gc_sweep(value: &Value, applied: bool) {
         .unwrap_or_default();
 
     for outcome in &outcomes {
-        let action = outcome
-            .get("action")
-            .and_then(Value::as_str)
-            .unwrap_or("?");
+        let action = outcome.get("action").and_then(Value::as_str).unwrap_or("?");
         if action == "skipped" {
             continue;
         }
@@ -8707,7 +8815,7 @@ fn render_gc_sweep(value: &Value, applied: bool) {
 
 fn successful_rpc_envelope(result: Result<Value, String>) -> Result<Value, String> {
     let response = result?;
-    if response.get("ok").and_then(Value::as_bool) == Some(false) {
+    if rpc_response_failed(&response) {
         let detail = response
             .get("error")
             .and_then(|error| {
@@ -8722,9 +8830,101 @@ fn successful_rpc_envelope(result: Result<Value, String>) -> Result<Value, Strin
     Ok(response)
 }
 
+/// Transport success is not command success. Both the app's v2 envelope and
+/// standard JSON-RPC encode failures as ordinary JSON values.
+fn rpc_response_failed(response: &Value) -> bool {
+    response.get("ok").and_then(Value::as_bool) == Some(false)
+        || response.get("error").is_some_and(|error| !error.is_null())
+}
+
+/// A usable `send` requires both the text write and its companion Return.
+/// This remains a transport-level acknowledgement; it does not claim that the
+/// agent consumed the instruction or produced a reply.
+fn send_delivery_response(mut response: Value, return_submitted: bool) -> Value {
+    let text_delivered = response["result"]["text_delivered"]
+        .as_bool()
+        .unwrap_or(false);
+    let sent = text_delivered && return_submitted;
+    let delivery_state = if !text_delivered {
+        "paste_failed"
+    } else if !return_submitted {
+        "return_failed"
+    } else {
+        "submitted"
+    };
+    if !response["result"].is_object() {
+        response["result"] = json!({});
+    }
+    response["result"]["sent"] = json!(sent);
+    response["result"]["text_delivered"] = json!(text_delivered);
+    response["result"]["return_submitted"] = json!(return_submitted);
+    response["result"]["delivery_state"] = json!(delivery_state);
+    response["ok"] = json!(sent);
+    if sent {
+        if let Some(object) = response.as_object_mut() {
+            object.remove("error");
+        }
+    } else {
+        response["error"] = json!({
+            "code": "delivery_failed",
+            "message": if text_delivered {
+                "Instruction text was delivered but Return submission failed"
+            } else {
+                "Instruction text was not delivered"
+            }
+        });
+    }
+    response
+}
+
+fn headless_send_delivery_response(mut response: Value) -> Value {
+    if !response["result"].is_object() {
+        response["result"] = json!({});
+    }
+    response["result"]["text_delivered"] = json!(true);
+    send_delivery_response(response, true)
+}
+
+fn attach_delivery_metadata(mut response: Value, delivery: &Value) -> Value {
+    if !response["result"].is_object() {
+        response["result"] = json!({});
+    }
+    for key in [
+        "sent",
+        "text_delivered",
+        "return_submitted",
+        "delivery_state",
+    ] {
+        response["result"][key] = delivery["result"][key].clone();
+    }
+    response
+}
+
+fn reply_failure_response(delivery: &Value, message: &str) -> Value {
+    let code = if message.contains("timed out") {
+        "reply_timeout"
+    } else {
+        "reply_failed"
+    };
+    attach_delivery_metadata(
+        json!({
+            "ok": false,
+            "result": { "reply_received": false },
+            "error": { "code": code, "message": message },
+        }),
+        delivery,
+    )
+}
+
 fn print_result(result: Result<Value, String>) {
-    match successful_rpc_envelope(result) {
-        Ok(resp) => println!("{}", pretty(&resp)),
+    match result {
+        Ok(resp) => {
+            println!("{}", pretty(&resp));
+            if rpc_response_failed(&resp) {
+                eprint_version_skew();
+                process::exit(1);
+            }
+        }
         Err(e) => {
             eprintln!("Error: {e}");
             eprint_version_skew();
@@ -8888,7 +9088,9 @@ fn correlated_reply_from_mailbox(
     if result.get("agent_name").and_then(Value::as_str) != Some(expected_agent)
         || result.get("agent_instance_id").and_then(Value::as_str) != Some(expected_instance_id)
     {
-        return Err("PROTOCOL_ERROR: correlation mailbox returned a mismatched identity".to_string());
+        return Err(
+            "PROTOCOL_ERROR: correlation mailbox returned a mismatched identity".to_string(),
+        );
     }
     let body = result
         .get("content")
@@ -9025,7 +9227,11 @@ fn version_skew_note(
 }
 
 fn short_sha(sha: &str) -> &str {
-    if sha.len() > 9 { &sha[..9] } else { sha }
+    if sha.len() > 9 {
+        &sha[..9]
+    } else {
+        sha
+    }
 }
 
 /// Parse a `tm-agent daemon replay-capacity --set` value: a plain byte
@@ -11717,148 +11923,147 @@ fn run_delegate_result(
         rpc_call(sock, "team.delegate", params.clone())
     })?;
     if let UnifiedDelegateOutcome::Response(v) = unified {
-            // Check if text was actually delivered to the agent's terminal
-            let mut text_delivered = v["result"]["text_delivered"].as_bool().unwrap_or(true);
-            if !text_delivered {
-                eprintln!("text.delivered.false reason=team.delegate_ack agent={target}");
-                let task_ref = &v["result"]["task"];
-                let instruction = format_task_instruction(
-                    sock, team, task_ref, text, no_report, context, fix_budget,
-                );
+        // Check if text was actually delivered to the agent's terminal
+        let mut text_delivered = v["result"]["text_delivered"].as_bool().unwrap_or(true);
+        if !text_delivered {
+            eprintln!("text.delivered.false reason=team.delegate_ack agent={target}");
+            let task_ref = &v["result"]["task"];
+            let instruction =
+                format_task_instruction(sock, team, task_ref, text, no_report, context, fix_budget);
 
-                // Headless agent path: route via daemon socket if available
-                if let Some(daemon_sock) = detect_daemon_socket() {
-                    if let Some(agent_id) = is_headless_agent(&daemon_sock, team, target) {
-                        let headless_ok = match rpc_call(
-                            &daemon_sock,
-                            "headless.send",
+            // Headless agent path: route via daemon socket if available
+            if let Some(daemon_sock) = detect_daemon_socket() {
+                if let Some(agent_id) = is_headless_agent(&daemon_sock, team, target) {
+                    let headless_ok = match rpc_call(
+                        &daemon_sock,
+                        "headless.send",
+                        json!({
+                            "agent_id": agent_id,
+                            "text": format!("{instruction}\n"),
+                        }),
+                    ) {
+                        Ok(ref hr) => !hr["result"].is_null(),
+                        Err(_) => false,
+                    };
+                    if !headless_ok {
+                        eprintln!("  Warning: headless.send failed for {target}");
+                        let task_id = v["result"]["task"]["id"]
+                            .as_str()
+                            .unwrap_or("?")
+                            .to_string();
+                        let reason = format!("headless paste delivery failed: headless.send RPC returned null (agent={target})");
+                        let _ = rpc_call(
+                            sock,
+                            "team.task.update",
                             json!({
-                                "agent_id": agent_id,
-                                "text": format!("{instruction}\n"),
+                                "team_name": team,
+                                "task_id": &task_id,
+                                "status": "blocked",
+                                "blocked_reason": &reason,
                             }),
-                        ) {
-                            Ok(ref hr) => !hr["result"].is_null(),
-                            Err(_) => false,
-                        };
-                        if !headless_ok {
-                            eprintln!("  Warning: headless.send failed for {target}");
-                            let task_id = v["result"]["task"]["id"]
-                                .as_str()
-                                .unwrap_or("?")
-                                .to_string();
-                            let reason = format!("headless paste delivery failed: headless.send RPC returned null (agent={target})");
-                            let _ = rpc_call(
-                                sock,
-                                "team.task.update",
-                                json!({
-                                    "team_name": team,
-                                    "task_id": &task_id,
-                                    "status": "blocked",
-                                    "blocked_reason": &reason,
-                                }),
-                            );
-                            return Err(format!(
-                                "delivery failed; task blocked: {reason} (task_id={task_id})"
-                            ));
-                        }
-                        return Ok(v);
+                        );
+                        return Err(format!(
+                            "delivery failed; task blocked: {reason} (task_id={task_id})"
+                        ));
                     }
-                }
-
-                // In-app panel retry: agent is not headless, retry via team.send.
-                // The server-side already retried twice (150ms + 400ms). Give one final
-                // CLI-side attempt after a short pause for late panel init.
-                eprintln!(
-                    "  Warning: text not delivered to agent '{target}', retrying via team.send..."
-                );
-                std::thread::sleep(std::time::Duration::from_millis(300));
-                let retry = rpc_call(
-                    sock,
-                    "team.send",
-                    json!({
-                        "team_name": team, "agent_name": target,
-                        "text": format!("{instruction}\n"),
-                        "panel_id": panel_id,
-                        "agent_instance_id": selected_instance_id,
-                        "send_sequence_aware": true,
-                    }),
-                );
-                match &retry {
-                    Ok(rv) if rv["ok"].as_bool().unwrap_or(false) => {
-                        // team.send succeeded — text was delivered. Update the response.
-                        let mut patched = v.clone();
-                        patched["result"]["text_delivered"] = json!(true);
-                        text_delivered = true;
-                        if !delegate_return_already_submitted(&v) {
-                            let _ = send_return_key_with_retry(
-                                sock,
-                                team,
-                                target,
-                                text_delivered,
-                                "team.delegate.retry",
-                                panel_id,
-                                selected_instance_id.as_deref(),
-                                rv["result"]["send_sequence_id"].as_str(),
-                            );
-                        }
-                        return Ok(patched);
-                    }
-                    _ => {
-                        eprintln!("  Warning: retry also failed — task created but text may not have been delivered.");
-                        if let Some(task_id) = v["result"]["task"]["id"].as_str() {
-                            let reason = format!("paste delivery failed: surface-nil 4-retry + team.send fallback exhausted (agent={target})");
-                            let _ = rpc_call(
-                                sock,
-                                "team.task.update",
-                                json!({
-                                    "team_name": team,
-                                    "task_id": task_id,
-                                    "status": "blocked",
-                                    "blocked_reason": reason,
-                                }),
-                            );
-                        }
-                    }
+                    return Ok(v);
                 }
             }
 
-            // If text still not delivered after all retries, return failure so callers
-            // get a nonzero exit code (task was already blocked above).
-            if !text_delivered {
-                let task_id = v["result"]["task"]["id"]
-                    .as_str()
-                    .unwrap_or("?")
-                    .to_string();
-                let reason = format!("paste delivery failed: surface-nil 4-retry + team.send fallback exhausted (agent={target})");
-                return Err(format!(
-                    "delivery failed; task blocked: {reason} (task_id={task_id})"
-                ));
-            }
-
-            // Remote leader proxy asked the authoritative dispatcher to
-            // commit paste + Return inside the same deduplicated request.
-            // Sending another key here would submit the prompt twice.
-            if delegate_return_already_submitted(&v) {
-                return Ok(v);
-            }
-
-            // Send Return key separately via team.send_key RPC.
-            // delegateToAgent sends text WITHOUT Return (paste only). Return is sent
-            // through the reliable sendNamedKey path (same as surface.send_key RPC).
-            // Swift ack-based completion is the primary ordering guarantee;
-            // this sleep is a minimal safety margin only.
-            let _ = send_return_key_with_retry(
-                sock,
-                team,
-                target,
-                text_delivered,
-                "team.delegate",
-                panel_id,
-                selected_instance_id.as_deref(),
-                v["result"]["send_sequence_id"].as_str(),
+            // In-app panel retry: agent is not headless, retry via team.send.
+            // The server-side already retried twice (150ms + 400ms). Give one final
+            // CLI-side attempt after a short pause for late panel init.
+            eprintln!(
+                "  Warning: text not delivered to agent '{target}', retrying via team.send..."
             );
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            let retry = rpc_call(
+                sock,
+                "team.send",
+                json!({
+                    "team_name": team, "agent_name": target,
+                    "text": format!("{instruction}\n"),
+                    "panel_id": panel_id,
+                    "agent_instance_id": selected_instance_id,
+                    "send_sequence_aware": true,
+                }),
+            );
+            match &retry {
+                Ok(rv) if rv["ok"].as_bool().unwrap_or(false) => {
+                    // team.send succeeded — text was delivered. Update the response.
+                    let mut patched = v.clone();
+                    patched["result"]["text_delivered"] = json!(true);
+                    text_delivered = true;
+                    if !delegate_return_already_submitted(&v) {
+                        let _ = send_return_key_with_retry(
+                            sock,
+                            team,
+                            target,
+                            text_delivered,
+                            "team.delegate.retry",
+                            panel_id,
+                            selected_instance_id.as_deref(),
+                            rv["result"]["send_sequence_id"].as_str(),
+                        );
+                    }
+                    return Ok(patched);
+                }
+                _ => {
+                    eprintln!("  Warning: retry also failed — task created but text may not have been delivered.");
+                    if let Some(task_id) = v["result"]["task"]["id"].as_str() {
+                        let reason = format!("paste delivery failed: surface-nil 4-retry + team.send fallback exhausted (agent={target})");
+                        let _ = rpc_call(
+                            sock,
+                            "team.task.update",
+                            json!({
+                                "team_name": team,
+                                "task_id": task_id,
+                                "status": "blocked",
+                                "blocked_reason": reason,
+                            }),
+                        );
+                    }
+                }
+            }
+        }
 
+        // If text still not delivered after all retries, return failure so callers
+        // get a nonzero exit code (task was already blocked above).
+        if !text_delivered {
+            let task_id = v["result"]["task"]["id"]
+                .as_str()
+                .unwrap_or("?")
+                .to_string();
+            let reason = format!("paste delivery failed: surface-nil 4-retry + team.send fallback exhausted (agent={target})");
+            return Err(format!(
+                "delivery failed; task blocked: {reason} (task_id={task_id})"
+            ));
+        }
+
+        // Remote leader proxy asked the authoritative dispatcher to
+        // commit paste + Return inside the same deduplicated request.
+        // Sending another key here would submit the prompt twice.
+        if delegate_return_already_submitted(&v) {
             return Ok(v);
+        }
+
+        // Send Return key separately via team.send_key RPC.
+        // delegateToAgent sends text WITHOUT Return (paste only). Return is sent
+        // through the reliable sendNamedKey path (same as surface.send_key RPC).
+        // Swift ack-based completion is the primary ordering guarantee;
+        // this sleep is a minimal safety margin only.
+        let _ = send_return_key_with_retry(
+            sock,
+            team,
+            target,
+            text_delivered,
+            "team.delegate",
+            panel_id,
+            selected_instance_id.as_deref(),
+            v["result"]["send_sequence_id"].as_str(),
+        );
+
+        return Ok(v);
     }
 
     // Fallback: 2-RPC path (server may not support team.delegate yet).
@@ -12694,7 +12899,9 @@ fn run_delegate_result_with_worktree(
                     "delivery failed; task blocked: {reason} (task_id={task_id})"
                 ));
             }
-            return Ok(json!({ "task": task, "send": { "ok": sent_ok }, "worktree": worktree_path }));
+            return Ok(
+                json!({ "task": task, "send": { "ok": sent_ok }, "worktree": worktree_path }),
+            );
         }
     }
 
@@ -14384,10 +14591,8 @@ mod xk_bridge_tests {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(restored);
         });
-        let local_rpc =
-            LocalRpcEnv::new_with_lock_and_restore_hook(lock, Some(restore_hook));
-        let result =
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| test(local_rpc)));
+        let local_rpc = LocalRpcEnv::new_with_lock_and_restore_hook(lock, Some(restore_hook));
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| test(local_rpc)));
         let restored = observed
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -14437,10 +14642,7 @@ mod xk_bridge_tests {
 
     #[test]
     fn local_rpc_env_restores_values_during_unwind() {
-        let fixture = [(
-            REMOTE_LEADER_ENV[3],
-            Some(OsString::from("saved-expiry")),
-        )];
+        let fixture = [(REMOTE_LEADER_ENV[3], Some(OsString::from("saved-expiry")))];
         let (result, restored) = with_remote_leader_env_fixture(&fixture, |_local_rpc| {
             panic!("exercise LocalRpcEnv::drop during unwind");
         });
@@ -17203,7 +17405,10 @@ mod reply_completion_regression_169_tests {
             let path = dir.path().join("reply.md");
             let error = atomic_write_file_with_fault(&path, &full_reply, Some(fault))
                 .expect_err("injected durable write must fail");
-            assert!(!path.exists(), "a failed write must not publish a partial reply");
+            assert!(
+                !path.exists(),
+                "a failed write must not publish a partial reply"
+            );
             assert!(
                 require_durable_reply(Err(error.clone()), Some(Err(error))).is_err(),
                 "two failed durable writes must prevent reply completion"
@@ -17214,11 +17419,9 @@ mod reply_completion_regression_169_tests {
     #[test]
     fn one_durable_copy_is_enough_to_continue() {
         let durable = PathBuf::from("/tmp/task.md");
-        let (alias, task, errors) = require_durable_reply(
-            Err("alias failed".to_string()),
-            Some(Ok(durable.clone())),
-        )
-        .expect("the canonical task copy is durable");
+        let (alias, task, errors) =
+            require_durable_reply(Err("alias failed".to_string()), Some(Ok(durable.clone())))
+                .expect("the canonical task copy is durable");
         assert_eq!(alias, None);
         assert_eq!(task, Some(durable));
         assert_eq!(errors, vec!["alias failed"]);
@@ -17298,7 +17501,10 @@ mod reply_completion_regression_169_tests {
         assert_eq!(task_id, None, "no task may be closed on a guess");
         let reason = withheld.expect("a withheld transition must explain itself");
         assert!(reason.contains("--task-id"), "{reason}");
-        assert!(reason.contains("task-a") && reason.contains("task-b"), "{reason}");
+        assert!(
+            reason.contains("task-a") && reason.contains("task-b"),
+            "{reason}"
+        );
     }
 
     /// No live task at all is not ambiguous; it falls through to whatever the
@@ -17323,11 +17529,17 @@ mod reply_completion_regression_169_tests {
         assert_eq!(reply_alias_filename("executor", None), "executor-reply.md");
         // Empty is the same answer as absent: an instance id nobody could
         // resolve must not produce an `executor--reply.md`.
-        assert_eq!(reply_alias_filename("executor", Some("")), "executor-reply.md");
+        assert_eq!(
+            reply_alias_filename("executor", Some("")),
+            "executor-reply.md"
+        );
 
         let names = task_result_candidates("team-a", "task-a", "executor", None)
             .iter()
-            .filter_map(|path| path.file_name().and_then(|name| name.to_str().map(str::to_owned)))
+            .filter_map(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str().map(str::to_owned))
+            })
             .collect::<Vec<_>>();
         assert_eq!(names, vec!["task-a.md", "executor-reply.md"]);
     }
@@ -17347,7 +17559,10 @@ mod version_skew_tests {
             .expect("mismatched builds must produce a note");
         assert!(note.contains("0.167.0"), "{note}");
         assert!(note.contains("0.170.1"), "{note}");
-        assert!(note.contains("abc123456") && note.contains("def987654"), "{note}");
+        assert!(
+            note.contains("abc123456") && note.contains("def987654"),
+            "{note}"
+        );
         // The actionable half: which binary is actually running.
         assert!(note.contains("command -v tm-agent"), "{note}");
     }
@@ -17364,7 +17579,10 @@ mod version_skew_tests {
     /// warning under every unrelated failure would train people to ignore it.
     #[test]
     fn an_unknown_app_build_is_not_a_mismatch() {
-        assert_eq!(version_skew_note("abc123456", "", "0.170.1", "unknown"), None);
+        assert_eq!(
+            version_skew_note("abc123456", "", "0.170.1", "unknown"),
+            None
+        );
     }
 }
 
@@ -17381,7 +17599,10 @@ mod worktree_availability_tests {
     fn a_missing_tool_is_not_fatal_under_auto() {
         let missing = GIT_KIT_MISSING.to_string();
         assert!(worktree_isolation_unavailable(&missing));
-        assert!(!worktree_failure_is_fatal(WorktreePolicyArg::Auto, &missing));
+        assert!(!worktree_failure_is_fatal(
+            WorktreePolicyArg::Auto,
+            &missing
+        ));
     }
 
     /// `always` is the caller demanding isolation. An unavailable tool is then
@@ -17409,9 +17630,18 @@ mod worktree_availability_tests {
     /// deliberate shared-checkout run from a silently degraded one.
     #[test]
     fn a_degraded_run_is_not_recorded_as_isolation_off() {
-        assert_ne!(WORKTREE_POLICY_DEGRADED, worktree_policy_name(WorktreePolicyArg::Off));
-        assert_ne!(WORKTREE_POLICY_DEGRADED, worktree_policy_name(WorktreePolicyArg::Auto));
-        assert_ne!(WORKTREE_POLICY_DEGRADED, worktree_policy_name(WorktreePolicyArg::Always));
+        assert_ne!(
+            WORKTREE_POLICY_DEGRADED,
+            worktree_policy_name(WorktreePolicyArg::Off)
+        );
+        assert_ne!(
+            WORKTREE_POLICY_DEGRADED,
+            worktree_policy_name(WorktreePolicyArg::Auto)
+        );
+        assert_ne!(
+            WORKTREE_POLICY_DEGRADED,
+            worktree_policy_name(WorktreePolicyArg::Always)
+        );
     }
 
     /// The value is written into an existing column, so it has to round-trip
@@ -17431,6 +17661,9 @@ mod worktree_availability_tests {
     fn the_marker_survives_the_wrapping_callers_add() {
         let wrapped = format!("worktree acquire failed: {GIT_KIT_MISSING}");
         assert!(worktree_isolation_unavailable(&wrapped));
-        assert!(!worktree_failure_is_fatal(WorktreePolicyArg::Auto, &wrapped));
+        assert!(!worktree_failure_is_fatal(
+            WorktreePolicyArg::Auto,
+            &wrapped
+        ));
     }
 }

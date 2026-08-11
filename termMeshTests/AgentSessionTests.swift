@@ -535,6 +535,40 @@ final class AgentSessionTests: XCTestCase {
         XCTAssertTrue(launch.arguments.contains("--include-partial-messages"))
     }
 
+    func testNativeLaunchKeepsInjectedTeamEnvironment() {
+        let environment = [
+            "HOME": "/Users/test",
+            "PATH": "/bundle/bin:/usr/bin",
+            "TERMMESH_TEAM": "ebpf",
+            "TERMMESH_AGENT_NAME": "architect",
+            "TERMMESH_WORKSPACE_ID": "workspace-id",
+            "TERMMESH_SOCKET": "/tmp/term-mesh.sock",
+        ]
+
+        let claude = AgentSession.claudeLaunch(
+            claudePath: "/usr/local/bin/claude", model: "sonnet",
+            instructions: "", extraArgs: [], workingDirectory: "/tmp",
+            environment: environment)
+        let bridged = AgentSession.bridgeLaunch(
+            cli: "codex", bridgePath: "/bundle/bridge", model: "gpt-5",
+            workingDirectory: "/tmp", environment: environment)
+
+        XCTAssertEqual(claude.environment, environment)
+        XCTAssertEqual(bridged.environment, environment)
+    }
+
+    func testNativeTranscriptCanBeReadWithLineLimit() {
+        let s = session([
+            event(["type": "user", "isReplay": true,
+                   "message": ["role": "user", "content": "first\nsecond"]]),
+            event(["type": "assistant", "message": ["content": [
+                ["type": "text", "text": "third\nfourth"]]]]),
+        ])
+
+        XCTAssertEqual(s.visibleTranscriptText(), "leader: first\nsecond\nthird\nfourth")
+        XCTAssertEqual(s.visibleTranscriptText(lineLimit: 2), "third\nfourth")
+    }
+
     // MARK: - The header is a value, not prose
 
     /// Measured on a real transcript: an answer was six lines, five of them
@@ -1310,6 +1344,61 @@ final class AgentSessionTests: XCTestCase {
             workingDirectory: "/tmp")
         XCTAssertEqual(binary.arguments.first, "/bundle/bin/tm-agent-bridge")
         XCTAssertFalse(binary.arguments.contains("python3"))
+    }
+
+    func testNativePaneEnvironmentCarriesItsDurableInstance() {
+        let workspaceId = UUID()
+        let environment = TeamOrchestrator.buildAgentPaneEnv(
+            teamName: "ebpf",
+            agentName: "executor",
+            agentType: "executor",
+            agentCli: "claude",
+            agentInstanceId: "instance-b",
+            windowId: "window-id",
+            workspaceId: workspaceId
+        )
+
+        XCTAssertEqual(environment["TERMMESH_TEAM"], "ebpf")
+        XCTAssertEqual(environment["TERMMESH_AGENT_NAME"], "executor")
+        XCTAssertEqual(environment["TERMMESH_AGENT_INSTANCE_ID"], "instance-b")
+        XCTAssertEqual(environment["TERMMESH_WORKSPACE_ID"], workspaceId.uuidString)
+        XCTAssertEqual(
+            environment["PATH"]?.split(separator: ":").first.map(String.init),
+            Bundle.main.resourcePath.map { "\($0)/bin" }
+        )
+        XCTAssertTrue(environment["PATH"]?.contains("/usr/bin") == true)
+    }
+
+    func testCLIProfileCannotReplaceAgentRoutingOrBundledCLI() {
+        let required = [
+            "PATH": "/bundle/bin:/usr/bin",
+            "TERMMESH_TEAM": "real-team",
+            "TERMMESH_AGENT_INSTANCE_ID": "real-instance",
+            "CMUX_SOCKET": "/tmp/real.sock",
+            "HOME": "/Users/original",
+        ]
+        let profile = [
+            "PATH": "/stale/bin:/usr/bin",
+            "TERMMESH_TEAM": "wrong-team",
+            "TERMMESH_AGENT_INSTANCE_ID": "wrong-instance",
+            "CMUX_SOCKET": "/tmp/wrong.sock",
+            "HOME": "/Users/profile",
+            "CUSTOM_API_HOST": "https://example.test",
+        ]
+
+        let environment = TeamOrchestrator.applyAgentProfileEnvironment(
+            profile, to: required
+        )
+
+        XCTAssertEqual(environment["TERMMESH_TEAM"], "real-team")
+        XCTAssertEqual(environment["TERMMESH_AGENT_INSTANCE_ID"], "real-instance")
+        XCTAssertEqual(environment["CMUX_SOCKET"], "/tmp/real.sock")
+        XCTAssertEqual(environment["HOME"], "/Users/profile")
+        XCTAssertEqual(environment["CUSTOM_API_HOST"], "https://example.test")
+        XCTAssertEqual(
+            environment["PATH"]?.split(separator: ":").map(String.init),
+            ["/bundle/bin", "/usr/bin", "/stale/bin"]
+        )
     }
 
     func testTheTerminalLaunchLineDropsPython3ForTheCompiledBridge() {
