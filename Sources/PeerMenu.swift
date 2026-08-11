@@ -193,6 +193,20 @@ final class PeerClientCoordinator: NSObject, NSMenuDelegate {
         postRelaysChanged()
     }
 
+    /// Mark every pane on this host as intentionally disconnected before the
+    /// shared tunnel is stopped. Direct hosts have no tunnel, so stop each
+    /// owned relay transport explicitly; in both cases the pane object stays.
+    @discardableResult
+    func preparePanesForHostDisconnect(_ hostKey: PeerPaneHostKey) -> Int {
+        let sessions = openPaneSessions.filter { $0.lease.key == hostKey }
+        let stopRelay: Bool
+        if case .direct = hostKey { stopRelay = true } else { stopRelay = false }
+        for session in sessions {
+            session.prepareForHostTransportDisconnect(stopRelay: stopRelay)
+        }
+        return sessions.count
+    }
+
     // MARK: - Live workspace mirrors (Phase 2B)
 
     private var openWorkspaceMirrors: [PeerWorkspaceMirrorController] = []

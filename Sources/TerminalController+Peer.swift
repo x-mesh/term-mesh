@@ -158,16 +158,16 @@ extension TerminalController {
         }
     }
 
-    /// Release the sidebar's lease. Panes and mirrors opened from this host
-    /// hold their own refs and deliberately stay open, so the row can end up
-    /// back at `.connected` — the response reports the state after the fact
-    /// rather than assuming.
+    /// End the host transport while preserving local pane/mirror objects and
+    /// every remote process. The stale pane sessions remain available for the
+    /// existing reconnect UI; they do not count as a live host connection.
     func v2PeerHostDisconnect(params: [String: Any]) -> V2CallResult {
         peerDispatchHostAction(params: params, action: "disconnect") { store, host in
-            store.disconnectSavedHost(host)
+            let disconnected = store.disconnectSavedHost(host)
             let after = store.sortedHosts.first { $0.id == host.id }
             return [
                 "ok": true,
+                "transport_disconnected": disconnected,
                 "state": after.map { Self.peerStateString($0.connectionState) } ?? "saved",
                 "has_sidebar_lease": store.hasSidebarLease(for: host.id),
             ]

@@ -447,6 +447,45 @@ final class PeerPaneSessionTests: XCTestCase {
         XCTAssertNil(registry.activeLease(forKey: key))
     }
 
+    /// Disconnect retires the transport even while panes still hold refs.
+    /// Their delayed teardown must not evict a replacement lease acquired by
+    /// Reconnect for the same host key.
+    @MainActor
+    func test_registry_disconnectKeepsOldRefsButProtectsReplacementLease() async throws {
+        let registry = PeerPaneHostRegistry.shared
+        let sockPath = "/tmp/psp-unit-\(getpid())-disconnect.sock"
+        let spec = PeerPaneHostSpec.direct(sockPath: sockPath)
+        let key = spec.hostKey
+        XCTAssertNil(registry.activeLease(forKey: key))
+        let teardownsBefore = registry.teardownCountForTests
+
+        let retired = try await registry.acquire(spec)
+        registry.retain(retired) // sidebar + preserved pane
+        XCTAssertEqual(registry.disconnectTransport(for: key), sockPath)
+        XCTAssertNil(registry.activeLease(forKey: key))
+        XCTAssertEqual(registry.teardownCountForTests, teardownsBefore + 1)
+
+        let replacement = try await registry.acquire(spec)
+        XCTAssertFalse(replacement === retired)
+        XCTAssertTrue(registry.activeLease(forKey: key) === replacement)
+
+        registry.release(retired)
+        registry.release(retired)
+        XCTAssertTrue(
+            registry.activeLease(forKey: key) === replacement,
+            "a retired pane lease must not remove the reconnect lease"
+        )
+        XCTAssertEqual(
+            registry.teardownCountForTests,
+            teardownsBefore + 1,
+            "the retired transport must stop exactly once"
+        )
+
+        registry.release(replacement)
+        XCTAssertNil(registry.activeLease(forKey: key))
+        XCTAssertEqual(registry.teardownCountForTests, teardownsBefore + 2)
+    }
+
     @MainActor
     func test_registry_concurrentFirstAcquireYieldsOneLease() async throws {
         let registry = PeerPaneHostRegistry.shared

@@ -566,6 +566,11 @@ final class RemoteHostStore: ObservableObject {
     /// from here hold their own refs, so a sidebar disconnect never
     /// kills them (registry refcount semantics).
     private var sidebarLeases: [String: PeerPaneHostLease] = [:]
+    /// Preserved panes remain in the coordinator roster after an intentional
+    /// host disconnect. Ignore their retired tunnel path during rebuild so a
+    /// dead view cannot immediately promote the host back to `.connected`.
+    /// A fresh SSH lease receives a fresh local socket path.
+    private var disconnectedSockPaths: [String: Set<String>] = [:]
     private var connectTasks: [String: Task<Void, Never>] = [:]
     /// Available only after an auto socket probe. It lets Cancel stop exactly
     /// the matching pending SSH acquire, never another host's live lease.
@@ -697,6 +702,21 @@ final class RemoteHostStore: ObservableObject {
         var activeKeys = Set<String>()
         for conn in connections {
             let key = stableKey(for: conn)
+            if disconnectedSockPaths[key]?.contains(conn.hostSockPath) == true {
+                // A reconnect installs a new current lease. SSH gets a fresh
+                // path; direct sockets reuse theirs, so identity-by-path alone
+                // would suppress a successful direct reconnect forever.
+                let leaseKey: PeerPaneHostKey
+                if let existingHost = hosts[key], existingHost.sshTarget != nil {
+                    leaseKey = existingHost.paneHostSpec.hostKey
+                } else {
+                    leaseKey = .direct(sockPath: conn.hostSockPath)
+                }
+                guard PeerPaneHostRegistry.shared.activeLease(forKey: leaseKey)?
+                    .hostSockPath == conn.hostSockPath
+                else { continue }
+                disconnectedSockPaths[key]?.remove(conn.hostSockPath)
+            }
             activeKeys.insert(key)
             if hosts[key] == nil {
                 hosts[key] = HostEntry(
@@ -1057,7 +1077,7 @@ final class RemoteHostStore: ObservableObject {
     func deleteProfile(for host: HostEntry) {
         guard let profileID = host.profileID else { return }
         if hasSidebarLease(for: host.id) {
-            disconnectSavedHost(host)
+            stopBrowsingSavedHost(host)
         }
         if let target = host.sshTarget, !target.isEmpty {
             PeerHostProfileStore.shared.deleteAll(forSSHTarget: target)
@@ -1079,10 +1099,10 @@ final class RemoteHostStore: ObservableObject {
         )
     }
 
-    /// Release the sidebar's lease ref. Panes/mirrors opened from this
-    /// host hold their own refs and survive; rebuild() re-promotes the
-    /// entry if such a connection is still live.
-    func disconnectSavedHost(_ host: HostEntry) {
+    /// Stop browsing this host in the sidebar without ending its transport.
+    /// Used while deleting a saved profile: panes and mirrors retain their
+    /// refs and stay connected as ad-hoc entries.
+    func stopBrowsingSavedHost(_ host: HostEntry) {
         let key = host.id
         guard let lease = sidebarLeases[key] else { return }
         sidebarLeases[key] = nil
@@ -1100,18 +1120,61 @@ final class RemoteHostStore: ObservableObject {
         dlog("peer.sidebar.disconnect key=\(key)")
         #endif
         rebuild()
-        // Reported AFTER rebuild, because rebuild is what decides the answer:
-        // it re-promotes the entry when a pane or mirror opened from this host
-        // still holds its own lease. Saying so is the point — Disconnect
-        // leaving a live terminal open is correct, and without a line here it
-        // reads as the button having done nothing at all.
+        // Reported AFTER rebuild, because rebuild decides whether a pane or
+        // mirror keeps the host connected. This action is deliberately named
+        // Stop Browsing in the UI: it releases the sidebar lease without
+        // claiming that every connection ended.
         if hosts[key]?.connectionState == .connected {
             RemoteWorkLog.info(
-                "Disconnected the \(host.displayName) entry — panes opened from it hold their own connection and stay open"
+                "Stopped browsing \(host.displayName) — open panes stay connected"
             )
         } else {
-            RemoteWorkLog.info("Disconnected \(host.displayName)")
+            RemoteWorkLog.info("Stopped browsing \(host.displayName)")
         }
+    }
+
+    /// End only this host's pooled transport. Pane/mirror objects and remote
+    /// processes remain alive; their existing disconnected UI keeps the local
+    /// context visible and reconnects through a fresh lease when requested.
+    @discardableResult
+    func disconnectSavedHost(_ host: HostEntry) -> Bool {
+        let key = host.id
+        let registry = PeerPaneHostRegistry.shared
+        let hostKey = sidebarLeases[key]?.key ?? host.paneHostSpec.hostKey
+        PeerClientCoordinator.shared.preparePanesForHostDisconnect(hostKey)
+        let retiredPath = registry.disconnectTransport(for: hostKey)
+
+        if let lease = sidebarLeases.removeValue(forKey: key) {
+            registry.release(lease)
+        }
+        if let retiredPath, !retiredPath.isEmpty {
+            disconnectedSockPaths[key, default: []].insert(retiredPath)
+        }
+        connectAttemptIDs[key] = nil
+        connectTasks[key]?.cancel()
+        connectTasks[key] = nil
+        if let connectingKey = connectingLeaseKeys[key] {
+            registry.cancelPendingAcquire(for: connectingKey)
+        }
+        connectingLeaseKeys[key] = nil
+        fetchTasks[key]?.cancel()
+        fetchTasks[key] = nil
+        stopWorkspaceSubscription(for: key)
+        hosts[key]?.workspaces = []
+        hosts[key]?.activeSockPath = ""
+        hosts[key]?.supportsWorkspaceLifecycle = nil
+        hosts[key]?.clearAuthenticatedHostCLIBinDirs()
+        hosts[key]?.connectionState = .saved
+        rebuild()
+        #if DEBUG
+        dlog("peer.sidebar.hostDisconnect key=\(key) transportStopped=\(retiredPath != nil)")
+        #endif
+        RemoteWorkLog.info(
+            retiredPath == nil
+                ? "No active transport to disconnect for \(host.displayName)"
+                : "Disconnected \(host.displayName) — panes and remote processes remain open"
+        )
+        return retiredPath != nil
     }
 
     private func fetchWorkspaces(
