@@ -462,6 +462,14 @@ final class PeerPaneSession {
                 return fresh
             }
         }
+        // Nothing appeared. The request cannot fail loudly — it is
+        // fire-and-forget — so record what was asked of whom; the host logs
+        // its own refusal (`peer.host.splitPane rejected`), and the two lines
+        // together name a cause that neither has alone. The commonest one is a
+        // source pane the host lists but no longer holds.
+        #if DEBUG
+        dlog("peer.pane.spawnSurface timeout source=\(source.map { String(format: "%02x", $0) }.joined().prefix(8)) surfaces=\(before.count)")
+        #endif
         return nil
     }
 

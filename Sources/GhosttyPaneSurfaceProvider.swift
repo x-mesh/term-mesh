@@ -1016,12 +1016,41 @@ final class GhosttyPaneSurfaceProvider: PeerSurfaceProvider {
         _ = paneIDBytes
     }
 
+    /// Split a pane for a peer, and say so when it cannot.
+    ///
+    /// The request is fire-and-forget, so a refusal here reaches the caller
+    /// only as silence: it asks, waits for a new surface that never appears,
+    /// and reports `could not create a fresh leader surface` ten seconds later
+    /// with nothing to act on. That happened on a host whose surface list
+    /// still advertised a pane no workspace held any more — the caller picked
+    /// it, this returned at the second `guard`, and neither side recorded why.
+    ///
+    /// Both logs, because the two readers are different machines: `dlog` for a
+    /// DEBUG host being driven from a test, `RemoteWorkLog` for the release
+    /// build a person is actually running when their peer goes quiet.
     private func performSplit(paneIDBytes: Data, orientationString: String) {
-        guard let panelUUID = uuidFromSurfaceID(paneIDBytes),
-              let workspace = workspaceContaining(panelUUID: panelUUID)
-        else { return }
+        guard let panelUUID = uuidFromSurfaceID(paneIDBytes) else {
+            reportSplitRefusal(reason: "unreadable surface id", surface: nil)
+            return
+        }
+        guard let workspace = workspaceContaining(panelUUID: panelUUID) else {
+            // The surface was listed but belongs to no open workspace — the
+            // roster and the windows disagree.
+            reportSplitRefusal(reason: "no workspace holds this pane", surface: panelUUID)
+            return
+        }
         let orientation: SplitOrientation = (orientationString == "vertical") ? .vertical : .horizontal
-        _ = workspace.newTerminalSplit(from: panelUUID, orientation: orientation)
+        if workspace.newTerminalSplit(from: panelUUID, orientation: orientation) == nil {
+            reportSplitRefusal(reason: "the workspace refused the split", surface: panelUUID)
+        }
+    }
+
+    private func reportSplitRefusal(reason: String, surface: UUID?) {
+        let id = surface.map { String($0.uuidString.prefix(8)) } ?? "unknown"
+        #if DEBUG
+        dlog("peer.host.splitPane rejected reason=\(reason) surface=\(id)")
+        #endif
+        RemoteWorkLog.info("A peer asked to split \(id) and this host could not: \(reason)")
     }
 
     private func performClose(paneIDBytes: Data) {

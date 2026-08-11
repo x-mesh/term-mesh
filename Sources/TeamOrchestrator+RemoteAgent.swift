@@ -349,7 +349,14 @@ extension TeamOrchestrator {
             case .hostNotFound(let key): return "no host \(key)"
             case .hostNotConnected(let name): return "\(name) is not connected"
             case .noAttachableSurface(let name): return "\(name) has no free surface to attach"
-            case .noFreshSurface(let name): return "\(name) could not create a fresh leader surface"
+            case .noFreshSurface(let name):
+                // The split request is fire-and-forget, so this is a timeout
+                // rather than a refusal, and the person needs the likeliest
+                // cause rather than the symptom. A host whose pane list still
+                // names panes it no longer holds answers exactly this way.
+                return "\(name) did not open a new shell for the leader — "
+                    + "its pane list may still name panes that are no longer open, "
+                    + "which reconnecting or restarting term-mesh there clears"
             case .workspaceGone: return "the team's workspace is gone"
             case .paneCreationFailed: return "could not open the remote pane"
             case .duplicateName(let name): return "the team already has an agent named \(name)"
