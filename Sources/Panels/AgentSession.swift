@@ -1321,8 +1321,38 @@ final class AgentSession {
         }
     }
 
+    /// What the launch actually carried of the pane's team identity, recorded
+    /// as the process is built rather than read back off it.
+    ///
+    /// The wiring, not the CLI, is what broke: workers were launched with the
+    /// app's own environment, which has no `TERMMESH_*` in it, so `tm-agent`
+    /// inside the pane resolved no team and fell through to `live-team` — a
+    /// team that exists nowhere — and every agent-to-agent call failed. Both
+    /// ends of that path had tests; the wiring between them had none, because
+    /// nothing outside the process could see what it was handed. A pane whose
+    /// CLI is missing from the machine still answers this.
+    private(set) var launchedTeamIdentity: [String: String] = [:]
+
+    /// `PATH` left with the same omission, so `tm-agent` was not even on it.
+    /// The value is not worth exposing; whether it was passed at all is.
+    private(set) var launchCarriedPath = false
+
+    private static let teamIdentityKeys: Set<String> = [
+        "TERMMESH_TEAM",
+        "TERMMESH_TEAM_NAME",
+        "TERMMESH_TEAM_AGENT",
+        "TERMMESH_AGENT_NAME",
+        "TERMMESH_AGENT_INSTANCE_ID",
+        "TERMMESH_WORKSPACE_ID",
+        "TERMMESH_PANEL_ID",
+    ]
+
     func start(_ launch: Launch) {
         guard process == nil, remoteSink == nil else { return }
+        launchedTeamIdentity = launch.environment.filter {
+            Self.teamIdentityKeys.contains($0.key)
+        }
+        launchCarriedPath = launch.environment["PATH"] != nil
         let p = Process()
         p.executableURL = URL(fileURLWithPath: launch.executable)
         p.arguments = launch.arguments

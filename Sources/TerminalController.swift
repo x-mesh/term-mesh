@@ -2444,6 +2444,10 @@ class TerminalController {
             return await asyncTeamBroadcast(params: params, id: id)
         case "team.read":
             return await asyncTeamRead(params: params, id: id)
+#if DEBUG
+        case "debug.team.agent_launch_env":
+            return await asyncTeamAgentLaunchEnv(params: params, id: id)
+#endif
         case "team.collect":
             return await asyncTeamCollect(params: params, id: id)
         case "team.list":
@@ -3421,6 +3425,51 @@ class TerminalController {
         return v2Ok(id: id, result: ["text": text, "agent_name": agentName,
                                     "agent_instance_id": agentInstanceId, "team_name": teamName])
     }
+
+#if DEBUG
+    /// Report what a native agent pane's launch carried of its team identity.
+    ///
+    /// Test-only introspection, and the only vantage point from which the
+    /// spawn wiring is observable at all: `buildAgentPaneEnv` and
+    /// `AgentSession.Launch` are each unit-tested, while whether the former
+    /// reaches the latter was not — which is exactly where team identity was
+    /// once dropped. Values are the pane's own identifiers, never the rest of
+    /// the environment; `PATH` is reported as a flag.
+    private func asyncTeamAgentLaunchEnv(params: [String: Any], id: Any?) async -> String {
+        guard let teamName = params["team_name"] as? String else {
+            return v2Error(id: id, code: "invalid_params", message: "Missing team_name")
+        }
+        guard let agentName = params["agent_name"] as? String else {
+            return v2Error(id: id, code: "invalid_params", message: "Missing agent_name")
+        }
+        let selection = await resolveTeamAgentInstance(
+            params: params, teamName: teamName, agentName: agentName
+        )
+        if let failure = selection.failure { return v2Result(id: id, failure) }
+        guard let agentInstanceId = selection.instanceId else {
+            return v2Error(id: id, code: "not_found", message: "Agent not found")
+        }
+
+        let snapshot: (identity: [String: String], path: Bool)? = await MainActor.run {
+            guard let session = TeamOrchestrator.shared.nativeAgentSession(
+                teamName: teamName,
+                agentName: agentName,
+                agentInstanceId: agentInstanceId
+            ) else { return nil }
+            return (session.launchedTeamIdentity, session.launchCarriedPath)
+        }
+        guard let snapshot else {
+            return v2Error(id: id, code: "not_found", message: "Agent has no native pane")
+        }
+        return v2Ok(id: id, result: [
+            "team_name": teamName,
+            "agent_name": agentName,
+            "agent_instance_id": agentInstanceId,
+            "identity": snapshot.identity,
+            "path_present": snapshot.path,
+        ])
+    }
+#endif
 
     private func asyncTeamCollect(params: [String: Any], id: Any?) async -> String {
         guard let teamName = params["team_name"] as? String else {

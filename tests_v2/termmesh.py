@@ -1262,6 +1262,45 @@ class termmesh:
             params["label"] = label
         return dict(self._call("debug.window.screenshot", params) or {})
 
+    # --- Agent teams ---
+
+    def team_create(self, team_name: str, agents: List[Dict[str, Any]],
+                    leader_mode: str = "repl") -> dict:
+        return dict(self._call("team.create", {
+            "team_name": team_name,
+            "leader_mode": leader_mode,
+            "skip_runbook_init_prompt": True,
+            "agents": agents,
+        }) or {})
+
+    def team_destroy(self, team_name: str) -> dict:
+        return dict(self._call("team.destroy", {"team_name": team_name}) or {})
+
+    def team_message_post(self, team_name: str, sender: str, content: str,
+                          to: Optional[str] = None, type: str = "note") -> dict:
+        params: Dict[str, Any] = {
+            "team_name": team_name, "from": sender,
+            "content": content, "type": type,
+        }
+        if to is not None:
+            params["to"] = to
+        return dict(self._call("team.message.post", params) or {})
+
+    def team_inbox(self, team_name: str, agent_name: Optional[str] = None) -> List[Dict[str, Any]]:
+        params: Dict[str, Any] = {"team_name": team_name}
+        if agent_name is not None:
+            params["agent_name"] = agent_name
+        return list((self._call("team.inbox", params) or {}).get("items") or [])
+
+    def team_agent_launch_env(self, team_name: str, agent_name: str) -> dict:
+        """What a native agent pane's launch carried of its team identity
+        (`debug.team.agent_launch_env`, DEBUG-only). Returns `identity`
+        (dict of the pane's own `TERMMESH_*` identifiers) and `path_present`.
+        The rest of the launch environment is deliberately not exposed."""
+        return dict(self._call("debug.team.agent_launch_env", {
+            "team_name": team_name, "agent_name": agent_name,
+        }) or {})
+
 
 def main() -> None:
     import argparse
