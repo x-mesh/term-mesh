@@ -1289,6 +1289,29 @@ extension TeamOrchestrator {
     /// grant and its own daemon socket; the viewer's TERMMESH_SOCKET is never
     /// copied across the peer boundary.
     @MainActor
+    /// The second half of a leader failure that nothing else reports.
+    ///
+    /// `rpcTimedOut(operation: "listWorkspaces")` names the symptom and stops
+    /// there, and on a Mac peer the cause is often processes left behind by an
+    /// earlier run of the app. Asking once, on the way out, turns a message
+    /// nobody can act on into one that says where to go. Returns nil for Linux
+    /// hosts (their daemon outliving the app is correct), for unreachable
+    /// hosts, and whenever there is nothing to report — the failure text is
+    /// then left exactly as it was.
+    static func staleDaemonHint(hostKey: String) async -> String? {
+        guard let host = RemoteHostStore.shared.sortedHosts.first(where: { $0.id == hostKey }),
+              let target = host.sshTarget, !target.isEmpty,
+              let snapshot = await PeerHostDoctor.daemonSnapshot(
+                sshTarget: target, port: host.sshPort, identityFile: host.identityFile
+              )
+        else { return nil }
+        let stale = PeerHostDoctor.staleDaemons(in: snapshot)
+        guard !stale.isEmpty else { return nil }
+        let pids = stale.map { String($0.pid) }.joined(separator: ", ")
+        return " — this host is also running \(stale.count) term-meshd process(es) that serve nothing"
+            + " (pid \(pids)); Edit Peer Host → Clean Up Daemons stops them"
+    }
+
     func attachRemoteLeader(
         teamName: String,
         hostKey: String,
@@ -4457,6 +4480,7 @@ extension TeamOrchestrator {
                     dlog("leader.attach.threw host=\(hostKey) error=\(error)")
 #endif
                     let description = "Could not start remote leader on \(hostKey): \(error)"
+                        + (await Self.staleDaemonHint(hostKey: hostKey) ?? "")
                     RemoteWorkLog.info(description)
                     onRemoteAttach?(.leaderFailed(host: hostKey, message: description))
                     // A failed agent leaves a red row on the board; a failed
