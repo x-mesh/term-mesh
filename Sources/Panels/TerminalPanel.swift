@@ -252,7 +252,20 @@ final class TerminalPanel: Panel, ObservableObject {
     }
 
     func needsConfirmClose() -> Bool {
-        surface.needsConfirmClose()
+        // A remote pane always has a "running process": the foreground command
+        // is term-mesh's own relay helper, so ghostty answers yes every single
+        // time. Nothing it warns about is true here — closing this pane closes
+        // a VIEW. `PeerPaneSession.teardown` stops the relay and releases the
+        // lease; it sends nothing that ends the remote surface, so the shell
+        // and whatever runs in it stay alive on the peer and the daemon still
+        // holds the session to reattach to. Ending remote work is a separate,
+        // explicitly labelled action ("Close All Panes and Disconnect").
+        //
+        // So the modal was a false alarm on every close, and a modal nobody
+        // can answer correctly is worse than none: it is the reason a relay
+        // pane could sit on "Close tab?" instead of closing.
+        guard !isRemoteOrigin else { return false }
+        return surface.needsConfirmClose()
     }
 
     func triggerFlash() {
