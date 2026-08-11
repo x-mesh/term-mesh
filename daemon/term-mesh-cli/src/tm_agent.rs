@@ -539,16 +539,16 @@ mod project_sync_cli_tests {
 
     #[test]
     fn correlated_reply_mailbox_is_typed_identity_bound_and_deadline_aware() {
-        let token = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let token = std::iter::repeat_n('a', 64).collect::<String>();
         let params =
-            correlated_reply_params("team-a", "reviewer", token, "instance-7", "finished").unwrap();
+            correlated_reply_params("team-a", "reviewer", &token, "instance-7", "finished").unwrap();
         assert_eq!(params["to"], "leader");
         assert_eq!(params["type"], "note");
         assert_eq!(params["agent_instance_id"], "instance-7");
         assert_eq!(params["correlation_token"], token);
         assert_eq!(params["content"], "finished");
         let instruction =
-            append_correlated_reply_instruction("check", token, "instance-7").unwrap();
+            append_correlated_reply_instruction("check", &token, "instance-7").unwrap();
         assert!(instruction.contains("<<'TERMMESH_REPLY_EOF'"));
         assert!(!instruction.contains("'<response>'"));
 
@@ -562,7 +562,7 @@ mod project_sync_cli_tests {
                 "content": "finished"
             }
         });
-        let reply = correlated_reply_from_mailbox(response, "reviewer", "instance-7", token)
+        let reply = correlated_reply_from_mailbox(response, "reviewer", "instance-7", &token)
             .unwrap()
             .unwrap();
         assert_eq!(reply["result"]["content"], "finished");
@@ -571,7 +571,7 @@ mod project_sync_cli_tests {
         let pending = json!({ "ok": true, "result": { "ready": false } });
         let mut polled = false;
         let timeout =
-            wait_for_correlated_reply_with("reviewer", "instance-7", token, Duration::ZERO, |_| {
+            wait_for_correlated_reply_with("reviewer", "instance-7", &token, Duration::ZERO, |_| {
                 polled = true;
                 Ok(pending.clone())
             })
@@ -582,7 +582,7 @@ mod project_sync_cli_tests {
         let rpc_error = wait_for_correlated_reply_with(
             "reviewer",
             "instance-7",
-            token,
+            &token,
             Duration::from_secs(1),
             |_| Err("socket closed".to_string()),
         )
@@ -592,7 +592,7 @@ mod project_sync_cli_tests {
         let rejected = wait_for_correlated_reply_with(
             "reviewer",
             "instance-7",
-            token,
+            &token,
             Duration::from_secs(1),
             |_| {
                 Ok(json!({
@@ -618,7 +618,7 @@ mod project_sync_cli_tests {
             }),
             "reviewer",
             "instance-7",
-            token,
+            &token,
         )
         .unwrap_err();
         assert!(mismatch.contains("mismatched identity"));
