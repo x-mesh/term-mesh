@@ -447,9 +447,18 @@ final class PeerPaneSession {
         await conn.cancel()
 
         let deadline = Date().addingTimeInterval(timeout)
+        // Enough to tell the two failures apart on the next occurrence:
+        // nothing was ever added (the split did not happen, or its pane never
+        // realized) versus something was added and the filter rejected it.
+        var lastCount = before.count
+        var everAdded = 0
+        var sourceStillListed = true
         while Date() < deadline {
             try? await Task.sleep(nanoseconds: 400_000_000)
             let now = try await listSurfaces(on: lease)
+            lastCount = now.count
+            everAdded = max(everAdded, now.filter { !before.contains($0.surfaceID) }.count)
+            sourceStillListed = now.contains { $0.surfaceID == source }
             // "New since the split request" is the whole detection, so an
             // agent surface someone ensured concurrently would match too —
             // and the caller is waiting for a SHELL to type a launch
@@ -468,7 +477,10 @@ final class PeerPaneSession {
         // together name a cause that neither has alone. The commonest one is a
         // source pane the host lists but no longer holds.
         #if DEBUG
-        dlog("peer.pane.spawnSurface timeout source=\(source.map { String(format: "%02x", $0) }.joined().prefix(8)) surfaces=\(before.count)")
+        dlog("peer.pane.spawnSurface timeout "
+            + "source=\(source.map { String(format: "%02x", $0) }.joined().prefix(8)) "
+            + "before=\(before.count) last=\(lastCount) added=\(everAdded) "
+            + "sourceListed=\(sourceStillListed)")
         #endif
         return nil
     }
