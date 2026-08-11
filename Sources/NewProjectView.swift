@@ -2514,7 +2514,14 @@ enum RemoteDirectoryLookup {
             + "case \"$p\" in '~') p=\"$HOME\" ;; '~/'*) p=\"$HOME/${p#??}\" ;; esac; "
             + "cd \"$p\" || exit 44; "
             + "printf '%s\\0' \"$(pwd -P)\"; "
-            + "find . -mindepth 1 -maxdepth 1 -type d ! -name '.*' -print0"
+            // -L so a symlinked folder is listed as the folder it points at.
+            // Hosts routinely reach a checkout through a link (/srv/app ->
+            // /mnt/data/app), and without this the browser shows an empty
+            // parent while `cd` into the same path works. Depth is still 1, so
+            // there is no link cycle to walk; a dangling link fails the -type
+            // test and drops out, which is what should happen to a path that
+            // cannot be entered.
+            + "find -L . -mindepth 1 -maxdepth 1 -type d ! -name '.*' -print0"
     }
 
     static func parse(_ output: String) throws -> RemoteDirectoryListing {

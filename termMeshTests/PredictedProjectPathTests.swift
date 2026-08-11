@@ -415,6 +415,57 @@ final class PredictedProjectPathTests: XCTestCase {
         )
     }
 
+    /// A host that reaches its checkout through a link (/srv/app ->
+    /// /mnt/data/app) must still see the folder. A link to a file, and one to
+    /// nothing at all, are not folders and stay out.
+    func testRemoteDirectoryLookupListsSymlinkedFoldersButNotOtherLinks() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("term-mesh links-\(UUID().uuidString)")
+        let elsewhere = FileManager.default.temporaryDirectory
+            .appendingPathComponent("term-mesh target-\(UUID().uuidString)")
+        defer {
+            try? FileManager.default.removeItem(at: root)
+            try? FileManager.default.removeItem(at: elsewhere)
+        }
+        try FileManager.default.createDirectory(
+            at: elsewhere, withIntermediateDirectories: true
+        )
+        try FileManager.default.createDirectory(
+            at: root.appendingPathComponent("real"), withIntermediateDirectories: true
+        )
+        let plainFile = root.appendingPathComponent("note.txt")
+        try Data("x".utf8).write(to: plainFile)
+        try FileManager.default.createSymbolicLink(
+            at: root.appendingPathComponent("shared"), withDestinationURL: elsewhere
+        )
+        try FileManager.default.createSymbolicLink(
+            at: root.appendingPathComponent("file-link"), withDestinationURL: plainFile
+        )
+        try FileManager.default.createSymbolicLink(
+            at: root.appendingPathComponent("dangling"),
+            withDestinationURL: root.appendingPathComponent("gone")
+        )
+
+        let process = Process()
+        let output = Pipe()
+        process.executableURL = URL(fileURLWithPath: "/bin/sh")
+        process.arguments = ["-c", RemoteDirectoryLookup.script(for: root.path)]
+        process.standardOutput = output
+        process.standardError = FileHandle.nullDevice
+        try process.run()
+        let data = output.fileHandleForReading.readDataToEndOfFile()
+        process.waitUntilExit()
+        XCTAssertEqual(process.terminationStatus, 0)
+
+        let listing = try RemoteDirectoryLookup.parse(
+            String(data: data, encoding: .utf8) ?? ""
+        )
+        XCTAssertEqual(
+            listing.directories.map { ($0 as NSString).lastPathComponent },
+            ["real", "shared"]
+        )
+    }
+
     func testRemoteDirectoryMatchesArePrefixFilteredAndBounded() {
         XCTAssertEqual(
             RemoteDirectoryLookup.matches(
