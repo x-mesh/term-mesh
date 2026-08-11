@@ -1,5 +1,32 @@
 import SwiftUI
 
+/// A creation-time explanation for a remote Native agent whose renderer can
+/// stay Native but whose process cannot be owned by the selected host.
+struct TeamAgentHostCompatibilityNotice: Identifiable, Equatable {
+    let hostKey: String
+    let hostName: String
+    let servingVersion: String?
+    let clis: [String]
+    let blocksTeamMessaging: Bool
+
+    var id: String { hostKey }
+
+    var message: String {
+        let version = servingVersion.map { "term-mesh \($0)" }
+            ?? "an unknown term-mesh version"
+        let cliList = clis.map(\.capitalized).joined(separator: "/")
+        if blocksTeamMessaging {
+            return "\(hostName) is serving \(version), which cannot route remote team "
+                + "messages. Update and restart term-mesh on \(hostName) before creating "
+                + "this team; otherwise \(cliList) opens but tm-agent returns no_app."
+        }
+        return "\(hostName) is serving \(version). Native \(cliList) sessions will run "
+            + "through this Mac over SSH; team messaging stays available through a private "
+            + "SSH route, but the agents stop if this app quits. Restart or update "
+            + "term-mesh on \(hostName) to keep them on the host."
+    }
+}
+
 /// Composing the members of a team: who they are, what they run on, and which
 /// machine each one lives on.
 ///
@@ -77,6 +104,64 @@ struct TeamAgentComposer: View {
     /// must enforce the same readiness gate as their final launch paths.
     private var selectablePeers: [HostEntry] {
         RemoteHostStore.selectableLaunchHosts(in: hostStore.sortedHosts)
+    }
+
+    /// One warning per affected host, not one per member. The serving version
+    /// and capability came from the same authenticated handshake used to make
+    /// the host launchable, so this never compares against a merely installed
+    /// binary that may not be the process handling the team.
+    static func peerOwnedFallbackNotices(
+        agents: [TeamAgentRow],
+        hosts: [HostEntry]
+    ) -> [TeamAgentHostCompatibilityNotice] {
+        guard AgentPipeTransport.usesNativePanel else { return [] }
+        let hostByKey = Dictionary(uniqueKeysWithValues: hosts.map { ($0.id, $0) })
+        let remoteRows = Dictionary(grouping: agents.compactMap { agent -> (String, String)? in
+            guard let hostKey = agent.hostKey else { return nil }
+            let cli = agent.preset.cli.isEmpty ? "claude" : agent.preset.cli
+            return (hostKey, cli)
+        }, by: { $0.0 })
+
+        return remoteRows.compactMap { entry in
+            let (hostKey, rows) = entry
+            guard let host = hostByKey[hostKey] else { return nil }
+            let hasSSHNativeRoute = host.sshTarget?.isEmpty == false
+                && rows.allSatisfy {
+                    AgentPipeTransport.canHoldNatively(cli: $0.1)
+                }
+            let blocksTeamMessaging = host.supportsRemoteTeamRoute == false
+                && !hasSSHNativeRoute
+            guard blocksTeamMessaging || host.supportsPeerOwnedAgentHosting == false else {
+                return nil
+            }
+            let affectedCLIs = Set(rows.map { $0.1 }.filter { cli in
+                blocksTeamMessaging || (
+                    AgentPipeTransport.canHoldNatively(cli: cli)
+                        && AgentPipeTransport.needsBridge(cli: cli)
+                        && !AgentPipeTransport.isPipeOnly(cli: cli)
+                )
+            }).sorted()
+            guard !affectedCLIs.isEmpty else { return nil }
+            return TeamAgentHostCompatibilityNotice(
+                hostKey: hostKey,
+                hostName: host.displayName,
+                servingVersion: host.servingVersionDisplay,
+                clis: affectedCLIs,
+                blocksTeamMessaging: blocksTeamMessaging
+            )
+        }.sorted { $0.hostName.localizedCaseInsensitiveCompare($1.hostName) == .orderedAscending }
+    }
+
+    static func blocksRemoteTeamCreation(
+        agents: [TeamAgentRow],
+        hosts: [HostEntry]
+    ) -> Bool {
+        peerOwnedFallbackNotices(agents: agents, hosts: hosts)
+            .contains(where: \.blocksTeamMessaging)
+    }
+
+    private var peerOwnedFallbackNotices: [TeamAgentHostCompatibilityNotice] {
+        Self.peerOwnedFallbackNotices(agents: agents, hosts: hostStore.sortedHosts)
     }
 
     var body: some View {
@@ -211,7 +296,7 @@ struct TeamAgentComposer: View {
                                 }
                                 Text("This Mac").tag(Self.localPlacementTag)
                                 ForEach(selectablePeers, id: \.id) { host in
-                                    Text(host.displayName).tag(host.id)
+                                    Text(host.versionedDisplayName).tag(host.id)
                                 }
                             }
                             .frame(width: 180)
@@ -263,6 +348,23 @@ struct TeamAgentComposer: View {
                     agents.move(fromOffsets: source, toOffset: destination)
                     onComposionChanged()
                 }
+            }
+
+            if !peerOwnedFallbackNotices.isEmpty {
+                VStack(alignment: .leading, spacing: 5) {
+                    ForEach(peerOwnedFallbackNotices) { notice in
+                        HStack(alignment: .top, spacing: 6) {
+                            Image(systemName: "exclamationmark.triangle.fill")
+                                .foregroundStyle(notice.blocksTeamMessaging ? .red : .orange)
+                                .accessibilityHidden(true)
+                            Text(notice.message)
+                                .foregroundStyle(.secondary)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
+                    }
+                }
+                .font(.caption)
+                .accessibilityIdentifier("teamAgentComposer.hostCompatibility")
             }
 
             Button(action: addAgent) {
@@ -838,7 +940,7 @@ struct TeamAgentComposer: View {
             }
             Text("This Mac").tag(Self.localPlacementTag)
             ForEach(selectablePeers, id: \.id) { host in
-                Text(host.isConnected ? host.displayName : "\(host.displayName) — offline")
+                Text(host.isConnected ? host.versionedDisplayName : "\(host.displayName) — offline")
                     .tag(host.id)
             }
         }

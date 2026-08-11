@@ -358,6 +358,20 @@ struct HostEntry: Identifiable, Equatable {
     /// CRUD menu items gate on `== true` rather than treating nil as
     /// permissive, so a stale/unknown host defaults to disabled.
     var supportsWorkspaceLifecycle: Bool?
+    /// Version advertised by the process that completed the current peer
+    /// handshake. This is the serving version, not whichever binary an SSH
+    /// login shell happens to resolve, so creation UI can explain capability
+    /// fallback before launching work on the host.
+    var servingAppVersion: String? = nil
+    /// Whether the serving process can own a Native Codex/Kiro agent for its
+    /// full lifetime. Nil means no current authenticated handshake supplied
+    /// the answer; false is an explicit compatibility result, not offline.
+    var supportsPeerOwnedAgentHosting: Bool? = nil
+    /// Whether `tm-agent` inside a remote pane can reach the owning project
+    /// through the scoped `team.leader.v1` reverse route. A host may have a
+    /// newer tm-agent in its login PATH while the serving daemon is older;
+    /// only the authenticated handshake answers this correctly.
+    var supportsRemoteTeamRoute: Bool? = nil
     /// Authenticated host CLI directories. Live-session cache only: never
     /// written to PeerHostProfile/UserDefaults and cleared with the socket.
     var hostCLIBinDirs: [String] = []
@@ -378,6 +392,21 @@ struct HostEntry: Identifiable, Equatable {
     var hostCLIBinDirsProvenance: PeerHostEndpointProvenance?
 
     var isConnected: Bool { connectionState == .connected }
+    var servingVersionDisplay: String? {
+        guard let raw = servingAppVersion?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !raw.isEmpty else { return nil }
+        guard PeerDaemonVersion.parseComponents(raw) != nil else { return raw }
+        return raw.hasPrefix("v") || raw.hasPrefix("V") ? raw : "v\(raw)"
+    }
+
+    /// Compact label shared by project/team placement pickers. It names the
+    /// process actually serving the peer connection, which can differ from an
+    /// updated app bundle that has not been restarted yet.
+    var versionedDisplayName: String {
+        guard let version = servingVersionDisplay else { return displayName }
+        return "\(displayName) · \(version)"
+    }
+
     /// Use this instead of `isConnected` before starting any remote CLI
     /// process (leader/agent attach, CLI availability probes) — those
     /// consume `hostCLIBinDirs` and must not race its resolution.
@@ -392,6 +421,7 @@ struct HostEntry: Identifiable, Equatable {
         let changed = configuredEndpoint != endpoint
         if changed {
             clearAuthenticatedHostCLIBinDirs()
+            clearServingMetadata()
         }
         configuredEndpoint = endpoint
         sshTarget = endpoint.sshTarget
@@ -424,6 +454,13 @@ struct HostEntry: Identifiable, Equatable {
         hostCLIBinDirsProvenance = nil
     }
 
+    mutating func clearServingMetadata() {
+        supportsWorkspaceLifecycle = nil
+        servingAppVersion = nil
+        supportsPeerOwnedAgentHosting = nil
+        supportsRemoteTeamRoute = nil
+    }
+
     /// Detach profile-owned configuration without letting a still-live
     /// connection retain launch authority from the profile's old route. This
     /// is required when an sshTarget edit moves the profile to a new stable
@@ -435,6 +472,7 @@ struct HostEntry: Identifiable, Equatable {
         symbolName = nil
         configuredEndpoint = nil
         clearAuthenticatedHostCLIBinDirs()
+        clearServingMetadata()
     }
 
     /// Host spec for opening a pane/mirror from this entry. Prefers an owned
@@ -880,6 +918,10 @@ final class RemoteHostStore: ObservableObject {
                 self.hosts[key]?.connectionState = .connected
                 self.hosts[key]?.activeSockPath = lease.hostSockPath
                 self.hosts[key]?.remoteSockPath = socket
+                // Panes that Disconnect Host kept on screen have been showing a
+                // transcript with nothing behind it. The transport exists again
+                // as of this line, so this is where they become live.
+                PeerClientCoordinator.shared.resumePanesAfterHostReconnect(spec.hostKey)
                 PeerHostProfileStore.shared.recordConnection(
                     sshTarget: target, resolvedSocket: socket
                 )
@@ -924,7 +966,7 @@ final class RemoteHostStore: ObservableObject {
         stopWorkspaceSubscription(for: key)
         hosts[key]?.workspaces = []
         hosts[key]?.activeSockPath = ""
-        hosts[key]?.supportsWorkspaceLifecycle = nil
+        hosts[key]?.clearServingMetadata()
         hosts[key]?.clearAuthenticatedHostCLIBinDirs()
         hosts[key]?.connectionState = .saved
         #if DEBUG
@@ -964,7 +1006,7 @@ final class RemoteHostStore: ObservableObject {
         stopWorkspaceSubscription(for: key)
         hosts[key]?.workspaces = []
         hosts[key]?.activeSockPath = ""
-        hosts[key]?.supportsWorkspaceLifecycle = nil
+        hosts[key]?.clearServingMetadata()
         hosts[key]?.clearAuthenticatedHostCLIBinDirs()
         hosts[key]?.connectionState = .saved
         #if DEBUG
@@ -1052,7 +1094,7 @@ final class RemoteHostStore: ObservableObject {
         stopWorkspaceSubscription(for: key)
         hosts[key]?.workspaces = []
         hosts[key]?.activeSockPath = ""
-        hosts[key]?.supportsWorkspaceLifecycle = nil
+        hosts[key]?.clearServingMetadata()
         hosts[key]?.clearAuthenticatedHostCLIBinDirs()
         hosts[key]?.connectionState = .saved
         #if DEBUG
@@ -1111,7 +1153,7 @@ final class RemoteHostStore: ObservableObject {
         stopWorkspaceSubscription(for: key)
         hosts[key]?.workspaces = []
         hosts[key]?.activeSockPath = ""
-        hosts[key]?.supportsWorkspaceLifecycle = nil
+        hosts[key]?.clearServingMetadata()
         hosts[key]?.clearAuthenticatedHostCLIBinDirs()
         if hosts[key]?.connectionState == .connected {
             hosts[key]?.connectionState = .saved
@@ -1162,7 +1204,7 @@ final class RemoteHostStore: ObservableObject {
         stopWorkspaceSubscription(for: key)
         hosts[key]?.workspaces = []
         hosts[key]?.activeSockPath = ""
-        hosts[key]?.supportsWorkspaceLifecycle = nil
+        hosts[key]?.clearServingMetadata()
         hosts[key]?.clearAuthenticatedHostCLIBinDirs()
         hosts[key]?.connectionState = .saved
         rebuild()
@@ -1197,6 +1239,11 @@ final class RemoteHostStore: ObservableObject {
                 if !Task.isCancelled, self.hosts[key]?.activeSockPath == path {
                     self.hosts[key]?.supportsWorkspaceLifecycle =
                         conn.hostCapabilities.has(PeerCapability.workspaceLifecycleV1)
+                    self.hosts[key]?.servingAppVersion = conn.hostAppVersion
+                    self.hosts[key]?.supportsPeerOwnedAgentHosting =
+                        Self.hostSupportsPeerOwnedAgentFactory(conn.hostCapabilities)
+                    self.hosts[key]?.supportsRemoteTeamRoute =
+                        conn.hostCapabilities.has(PeerCapability.teamLeaderV1)
                     if let provenance {
                         _ = self.hosts[key]?.acceptAuthenticatedHostCLIBinDirs(
                             conn.hostCLIBinDirs, provenance: provenance

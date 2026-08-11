@@ -5011,10 +5011,73 @@ final class NotificationMenuSnapshotBuilderTests: XCTestCase {
         XCTAssertEqual(snapshot.recentNotifications.map(\.id), Array(notifications.prefix(3)).map(\.id))
     }
 
-    func testStateHintTitleHandlesSingularPluralAndZero() {
-        XCTAssertEqual(NotificationMenuSnapshotBuilder.stateHintTitle(unreadCount: 0), "No unread notifications")
-        XCTAssertEqual(NotificationMenuSnapshotBuilder.stateHintTitle(unreadCount: 1), "1 unread notification")
-        XCTAssertEqual(NotificationMenuSnapshotBuilder.stateHintTitle(unreadCount: 2), "2 unread notifications")
+    /// Pin the language rather than read the machine's: these are the English
+    /// strings, and on a Korean-language Mac the unpinned version asserted them
+    /// against 읽지 않은 알림 없음 and failed for a working app.
+    func testStateHintTitleHandlesSingularPluralAndZero() throws {
+        let suite = "state-hint-\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        defaults.set(AppLanguage.english.rawValue, forKey: LanguageSettings.languageModeKey)
+
+        XCTAssertEqual(
+            NotificationMenuSnapshotBuilder.stateHintTitle(unreadCount: 0, defaults: defaults),
+            "No unread notifications"
+        )
+        XCTAssertEqual(
+            NotificationMenuSnapshotBuilder.stateHintTitle(unreadCount: 1, defaults: defaults),
+            "1 unread notification"
+        )
+        XCTAssertEqual(
+            NotificationMenuSnapshotBuilder.stateHintTitle(unreadCount: 2, defaults: defaults),
+            "2 unread notifications"
+        )
+    }
+
+    /// The Korean side of the same call, for the same reason: a machine set to
+    /// English must still be able to prove the Korean strings are reached.
+    func testStateHintTitleUsesTheChosenLanguage() throws {
+        let suite = "state-hint-ko-\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        defaults.set(AppLanguage.korean.rawValue, forKey: LanguageSettings.languageModeKey)
+
+        let zero = NotificationMenuSnapshotBuilder.stateHintTitle(unreadCount: 0, defaults: defaults)
+        let two = NotificationMenuSnapshotBuilder.stateHintTitle(unreadCount: 2, defaults: defaults)
+        XCTAssertFalse(zero.isEmpty)
+        XCTAssertFalse(two.isEmpty)
+        XCTAssertNotEqual(zero, two)
+        XCTAssertTrue(two.contains("2"), "the count belongs in the localized string too")
+    }
+}
+
+final class AboutPanelLinkTests: XCTestCase {
+    /// These builds are released from x-mesh/term-mesh. The About panel used to
+    /// link commits into manaflow-ai/term-mesh, which is upstream of the
+    /// Ghostty fork — a hash from here need not exist there at all.
+    func testLinksPointAtTheRepositoryThatShipsThisApp() {
+        XCTAssertEqual(
+            AboutPanelView.commitURL(hash: "abc1234")?.absoluteString,
+            "https://github.com/x-mesh/term-mesh/commit/abc1234"
+        )
+        XCTAssertEqual(
+            AboutPanelView.releaseNotesURL(version: "0.182.0")?.absoluteString,
+            "https://github.com/x-mesh/term-mesh/releases/tag/v0.182.0"
+        )
+    }
+
+    /// `CFBundleShortVersionString` is `0.182.0` while the tag is `v0.182.0`.
+    func testReleaseNotesTagTakesTheVersionAsGivenOrAddsThePrefix() {
+        XCTAssertEqual(
+            AboutPanelView.releaseNotesURL(version: "v1.0.0")?.absoluteString,
+            "https://github.com/x-mesh/term-mesh/releases/tag/v1.0.0"
+        )
+        XCTAssertEqual(
+            AboutPanelView.releaseNotesURL(version: " 0.9.1 ")?.absoluteString,
+            "https://github.com/x-mesh/term-mesh/releases/tag/v0.9.1"
+        )
+        XCTAssertNil(AboutPanelView.releaseNotesURL(version: "  "))
+        XCTAssertNil(AboutPanelView.commitURL(hash: ""))
     }
 }
 

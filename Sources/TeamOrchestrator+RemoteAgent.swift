@@ -1,3 +1,4 @@
+import AppKit
 import Bonsplit
 import Foundation
 import PeerProto
@@ -324,6 +325,8 @@ extension TeamOrchestrator {
         case duplicateInstance(String)
         case cliUnavailable(String, String)
         case promptStagingFailed(String)
+        case environmentStagingFailed(String)
+        case hostUpdateRequired(host: String, version: String?)
         /// The peer never showed a pane in the workspace the leader was going to
         /// take. Everything after `host` is what the placement loop already knew
         /// and used to throw away: without it the failure reads as "it did not
@@ -346,7 +349,14 @@ extension TeamOrchestrator {
             case .hostNotFound(let key): return "no host \(key)"
             case .hostNotConnected(let name): return "\(name) is not connected"
             case .noAttachableSurface(let name): return "\(name) has no free surface to attach"
-            case .noFreshSurface(let name): return "\(name) could not create a fresh leader surface"
+            case .noFreshSurface(let name):
+                // The split request is fire-and-forget, so this is a timeout
+                // rather than a refusal, and the person needs the likeliest
+                // cause rather than the symptom. A host whose pane list still
+                // names panes it no longer holds answers exactly this way.
+                return "\(name) did not open a new shell for the leader — "
+                    + "its pane list may still name panes that are no longer open, "
+                    + "which reconnecting or restarting term-mesh there clears"
             case .workspaceGone: return "the team's workspace is gone"
             case .paneCreationFailed: return "could not open the remote pane"
             case .duplicateName(let name): return "the team already has an agent named \(name)"
@@ -355,6 +365,12 @@ extension TeamOrchestrator {
                 return "\(cli) is not installed on \(host)"
             case .promptStagingFailed(let host):
                 return "could not stage the leader prompt on \(host)"
+            case .environmentStagingFailed(let host):
+                return "could not stage the agent environment on \(host)"
+            case .hostUpdateRequired(let host, let version):
+                let serving = version.map { "term-mesh \($0)" } ?? "an unknown term-mesh version"
+                return "\(host) is serving \(serving), which cannot route remote team messages; "
+                    + "update and restart term-mesh on that host before adding agents"
             case .projectWorkspaceUnavailable(let host, let workspaceID, let attempts, let seedRequested):
                 var detail = "could not prepare the project workspace on \(host)"
                 if let workspaceID {
@@ -550,7 +566,7 @@ extension TeamOrchestrator {
         let host: HostEntry
         let hostKey: String
         let workspace: Workspace
-        let promptFile: String?
+        var promptFile: String?
         var hostSockPath: String
         var surfaceID: Data?
         var session: PeerPaneSession?
@@ -1289,6 +1305,29 @@ extension TeamOrchestrator {
     /// grant and its own daemon socket; the viewer's TERMMESH_SOCKET is never
     /// copied across the peer boundary.
     @MainActor
+    /// The second half of a leader failure that nothing else reports.
+    ///
+    /// `rpcTimedOut(operation: "listWorkspaces")` names the symptom and stops
+    /// there, and on a Mac peer the cause is often processes left behind by an
+    /// earlier run of the app. Asking once, on the way out, turns a message
+    /// nobody can act on into one that says where to go. Returns nil for Linux
+    /// hosts (their daemon outliving the app is correct), for unreachable
+    /// hosts, and whenever there is nothing to report — the failure text is
+    /// then left exactly as it was.
+    static func staleDaemonHint(hostKey: String) async -> String? {
+        guard let host = RemoteHostStore.shared.sortedHosts.first(where: { $0.id == hostKey }),
+              let target = host.sshTarget, !target.isEmpty,
+              let snapshot = await PeerHostDoctor.daemonSnapshot(
+                sshTarget: target, port: host.sshPort, identityFile: host.identityFile
+              )
+        else { return nil }
+        let stale = PeerHostDoctor.staleDaemons(in: snapshot)
+        guard !stale.isEmpty else { return nil }
+        let pids = stale.map { String($0.pid) }.joined(separator: ", ")
+        return " — this host is also running \(stale.count) term-meshd process(es) that serve nothing"
+            + " (pid \(pids)); Edit Peer Host → Clean Up Daemons stops them"
+    }
+
     func attachRemoteLeader(
         teamName: String,
         hostKey: String,
@@ -1304,7 +1343,7 @@ extension TeamOrchestrator {
             throw RemoteAgentError.hostNotFound(hostKey)
         }
         guard host.isLaunchable else { throw RemoteAgentError.hostNotConnected(host.displayName) }
-        let promptFile = systemPrompt.map { _ in
+        var promptFile = systemPrompt.map { _ in
             "/tmp/term-mesh-leader-prompt-\(teamUUID).txt"
         }
         guard let tabManager = AppDelegate.shared?.tabManagerFor(tabId: team.workspaceId),
@@ -1456,20 +1495,20 @@ extension TeamOrchestrator {
         dlog("leader.attach.stage prepare.sent host=\(hostKey)")
 #endif
 
-        let promptStages = Self.remoteLeaderPromptStageCommands(
-            systemPrompt: systemPrompt,
-            promptFile: promptFile
-        )
-        for stage in promptStages {
-            guard await sendRemoteLeaderStage(
+        if let systemPrompt, let fallbackPromptFile = promptFile {
+            guard let stagedPromptFile = await stageRemoteLeaderPrompt(
                 session: session,
-                text: stage,
-                settleDelay: 0.05
+                host: host,
+                systemPrompt: systemPrompt,
+                promptFile: fallbackPromptFile
             ) else {
                 _ = await sendRemoteLeaderStage(session: session, text: "stty echo")
                 await attempt.compensate()
                 throw RemoteAgentError.promptStagingFailed(host.displayName)
             }
+            promptFile = stagedPromptFile
+            resources.promptFile = stagedPromptFile
+            try await attempt.ensureCurrent()
         }
 
         let launch = Self.remoteLeaderCommand(
@@ -1559,6 +1598,7 @@ extension TeamOrchestrator {
     func startRemoteLeaderGrantKeepalive(teamName: String, grantID: Data) {
         stopRemoteLeaderGrantKeepalive(teamName: teamName, revoke: true)
         remoteLeaderGrantIDs[teamName] = grantID
+        installRemoteLeaderWakeObserver()
         remoteLeaderGrantKeepalives[teamName] = Task { [weak self] in
             while !Task.isCancelled {
                 try? await Task.sleep(nanoseconds: 30 * 60 * 1_000_000_000)
@@ -1585,10 +1625,163 @@ extension TeamOrchestrator {
         }
     }
 
+    /// Mint a bearer for one remote worker's reverse team route.
+    ///
+    /// The worker can only reach the daemon socket on its own host. The grant
+    /// lets that daemon carry the allow-listed team call back over the peer
+    /// session to this app; no local Unix socket path or credential crosses
+    /// machines. Workers intentionally do not share the leader's grant: a
+    /// leader reconnect can replace its bearer without cutting every agent's
+    /// `tm-agent` channel at once.
+    private func bootstrapRemoteAgentRoute(
+        teamName: String
+    ) async throws -> Termmesh_Peer_V1_TeamLeaderGrant {
+        guard let teamUUID = teams[teamName]?.teamUuid, !teamUUID.isEmpty else {
+            throw RemoteAgentError.teamNotFound(teamName)
+        }
+        var bootstrap = Termmesh_Peer_V1_TeamLeaderBootstrapRequest()
+        bootstrap.projectID = "name:\(teamName)"
+        bootstrap.leaderPlacement = .peer
+        var requestUUID = UUID().uuid
+        bootstrap.requestID = withUnsafeBytes(of: &requestUUID) { Data($0) }
+        let response = await PeerTeamLeaderControlPlane.shared.bootstrap(
+            bootstrap,
+            encodedBytes: (try? bootstrap.serializedData().count) ?? 513,
+            audiencePeerID: PeerIdentity.defaultPeerID()
+        ) { projectID in
+            projectID == "name:\(teamName)" ? teamUUID : nil
+        }
+        guard response.ok else { throw RemoteAgentError.paneCreationFailed }
+        return response.grant
+    }
+
+    private func startRemoteAgentRouteKeepalive(
+        teamName: String,
+        agentInstanceID: String,
+        grantID: Data
+    ) {
+        stopRemoteAgentRouteKeepalive(agentInstanceID: agentInstanceID, revoke: true)
+        remoteAgentRouteLeases[agentInstanceID] = RemoteAgentRouteLease(
+            teamName: teamName,
+            grantID: grantID
+        )
+        installRemoteLeaderWakeObserver()
+        remoteAgentRouteKeepalives[agentInstanceID] = Task { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: 30 * 60 * 1_000_000_000)
+                guard !Task.isCancelled,
+                      let self,
+                      let lease = self.remoteAgentRouteLeases[agentInstanceID],
+                      lease.teamName == teamName,
+                      lease.grantID == grantID,
+                      self.teams[teamName]?.agents.contains(where: {
+                          $0.agentInstanceId == agentInstanceID
+                      }) == true else { return }
+                let renewed = await PeerTeamLeaderControlPlane.shared.keepAliveGrant(id: grantID)
+                guard !Task.isCancelled,
+                      self.remoteAgentRouteLeases[agentInstanceID]?.grantID == grantID else {
+                    return
+                }
+                guard renewed else {
+                    RemoteWorkLog.info(
+                        "The remote team route for \(teamName)/\(agentInstanceID) expired; "
+                            + "detach and attach that agent again"
+                    )
+                    self.remoteAgentRouteKeepalives.removeValue(forKey: agentInstanceID)
+                    self.remoteAgentRouteLeases.removeValue(forKey: agentInstanceID)
+                    return
+                }
+            }
+        }
+    }
+
+    /// Renew every live grant as soon as the machine wakes.
+    ///
+    /// The 30-minute loop is `Task.sleep`, which does not advance while the
+    /// Mac is asleep. A lid closed for longer than the remaining lease means
+    /// the next tick arrives after the grant is already gone — on a laptop
+    /// that is the ordinary case, not an edge one, and it is how a leader
+    /// that was fine at lunch is unreachable after it.
+    ///
+    /// Waking is also precisely when the network is not up yet, so a failure
+    /// here proves nothing. This pass therefore never retires a leader: the
+    /// 30-minute loop stays the only place allowed to declare a grant gone.
+    /// Renewing early can only help; misreading a cold network as a lapse
+    /// would kill a team that was about to be perfectly fine.
+    private func installRemoteLeaderWakeObserver() {
+        guard remoteLeaderWakeObserver == nil else { return }
+        remoteLeaderWakeObserver = NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.didWakeNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                await self?.renewRemoteLeaderGrantsAfterWake()
+            }
+        }
+    }
+
+    private func renewRemoteLeaderGrantsAfterWake() async {
+        // Snapshot first: a renewal can retire its own entry, and reconnect
+        // can replace one while this loop is suspended.
+        let pairs = remoteLeaderGrantIDs.map { ($0.key, $0.value) }
+        let agentPairs = remoteAgentRouteLeases.map { ($0.key, $0.value) }
+        guard !pairs.isEmpty || !agentPairs.isEmpty else { return }
+        // Let the network come back before asking. A few seconds costs
+        // nothing against a 30-minute interval and avoids spending the
+        // attempt on a link that is not up yet.
+        try? await Task.sleep(nanoseconds: 3 * 1_000_000_000)
+        for (teamName, grantID) in pairs {
+            guard remoteLeaderGrantIDs[teamName] == grantID else { continue }
+            let renewed = await PeerTeamLeaderControlPlane.shared.keepAliveGrant(id: grantID)
+#if DEBUG
+            dlog("leader.grant.wakeRenew team=\(teamName) renewed=\(renewed)")
+#endif
+            if !renewed {
+                // Deliberately silent for the person: the 30-minute loop
+                // reports a real lapse, and a notice here would fire on every
+                // wake where the network simply had not returned yet.
+                RemoteWorkLog.info(
+                    "Could not renew the remote leader grant for \(teamName) on wake; will retry on the next interval"
+                )
+            }
+        }
+        for (agentInstanceID, lease) in agentPairs {
+            guard remoteAgentRouteLeases[agentInstanceID]?.grantID == lease.grantID else {
+                continue
+            }
+            let renewed = await PeerTeamLeaderControlPlane.shared.keepAliveGrant(
+                id: lease.grantID
+            )
+#if DEBUG
+            dlog(
+                "agent.grant.wakeRenew team=\(lease.teamName) "
+                    + "agent=\(agentInstanceID.prefix(8)) renewed=\(renewed)"
+            )
+#endif
+            if !renewed {
+                RemoteWorkLog.info(
+                    "Could not renew the remote agent route for \(lease.teamName) on wake; "
+                        + "will retry on the next interval"
+                )
+            }
+        }
+    }
+
     func stopRemoteLeaderGrantKeepalive(teamName: String, revoke: Bool) {
         remoteLeaderGrantKeepalives.removeValue(forKey: teamName)?.cancel()
         guard let grantID = remoteLeaderGrantIDs.removeValue(forKey: teamName), revoke else { return }
         Task { await PeerTeamLeaderControlPlane.shared.revokeGrant(id: grantID) }
+    }
+
+    private func stopRemoteAgentRouteKeepalive(
+        agentInstanceID: String,
+        revoke: Bool
+    ) {
+        remoteAgentRouteKeepalives.removeValue(forKey: agentInstanceID)?.cancel()
+        guard let lease = remoteAgentRouteLeases.removeValue(forKey: agentInstanceID),
+              revoke else { return }
+        Task { await PeerTeamLeaderControlPlane.shared.revokeGrant(id: lease.grantID) }
     }
 
     /// How a roster read lands, or nil when the stored surface is in the list
@@ -2190,8 +2383,8 @@ extension TeamOrchestrator {
     /// What one login-shell probe found on a host for a given agent CLI.
     ///
     /// Both entries are absolute paths or empty. Empty is data, not an error:
-    /// a host with no `tm-agent-bridge` simply cannot own an agent surface and
-    /// the terminal path is taken instead.
+    /// a host with no `tm-agent-bridge` simply cannot own an agent surface;
+    /// Native mode can still use this Mac's SSH-owned bridge instead.
     struct RemoteAgentBinaries: Equatable, Sendable {
         /// Where the login shell resolves the agent CLI. Empty when it is not
         /// on that PATH at all, or resolves to something that is not a path
@@ -2328,6 +2521,41 @@ extension TeamOrchestrator {
         }
     }
 
+    /// The daemon probe, wrapped so it can never affect the script it is
+    /// appended to. `( … ) || true` contains both the deliberate `exit 44`
+    /// that ends it on a non-Mac host and anything unexpected inside it.
+    ///
+    /// The leading `echo` is load-bearing: the readiness marker is written
+    /// with `printf %s`, so without it the probe's first line arrives glued to
+    /// the marker as `__TERMMESH_LEADER_READY__app=1234` and the parser — which
+    /// matches whole-line keys — sees no app at all. That reads as "no app
+    /// running", which is exactly the case that reports nothing stale, so the
+    /// diagnostic would have been silent on every host.
+    static let leaderDaemonDiagnostic =
+        "( echo; " + PeerHostDoctor.daemonInstancesProbeBody + " ) 2>/dev/null || true"
+
+    /// Say it before the leader starts, not only after something fails.
+    ///
+    /// Reads the diagnostic lines out of the readiness output — the parser
+    /// only looks at `app=` / `daemon=` lines, so the readiness markers
+    /// sharing that output are simply ignored. Never throws and never blocks
+    /// the launch: a host with leftovers still gets its leader, it just stops
+    /// being a silent condition.
+    private static func reportStaleDaemons(in output: String, host: HostEntry) {
+        let stale = PeerHostDoctor.staleDaemons(
+            in: PeerHostDoctor.parseDaemonSnapshot(output)
+        )
+        guard !stale.isEmpty else { return }
+        let pids = stale.map { String($0.pid) }.joined(separator: ", ")
+        RemoteWorkLog.infoOffMain(
+            "\(host.displayName): \(stale.count) term-meshd process(es) here serve nothing "
+                + "(pid \(pids)) — Edit Peer Host → Clean Up Daemons stops them"
+        )
+#if DEBUG
+        dlog("leader.prepare.staleDaemons host=\(host.id) count=\(stale.count) pids=\(pids)")
+#endif
+    }
+
     /// Probe only whether the requested CLI is available. Prompt staging
     /// belongs to the attached
     /// pane shell below: an SSH login shell may have a different /tmp namespace
@@ -2349,6 +2577,21 @@ extension TeamOrchestrator {
             + "if ! command -v \(shellQuoted(cli)) >/dev/null 2>&1; "
             + "then printf %s \(shellQuoted(missing)); exit 0; fi"
         script += "; printf %s \(shellQuoted(marker))"
+        // Ride along on the round trip that is already happening. Two rules
+        // make this safe to bolt onto the path that decides whether a leader
+        // can start at all:
+        //
+        //  1. it comes AFTER the marker, so readiness is already decided by
+        //     the time any of it runs;
+        //  2. it is a subshell ending in `|| true`, so neither its `exit 44`
+        //     on a non-Mac host nor any failure inside it reaches this
+        //     script's exit status.
+        //
+        // Both matter because the `catch` below turns *every* error into
+        // `cliUnavailable` — a diagnostic that leaked a failure out of here
+        // would report a perfectly good host as having no CLI, and no leader
+        // would start on it again.
+        script += "; " + Self.leaderDaemonDiagnostic
         do {
             let output = try await PeerHostReadinessChecker.runScript(
                 sshTarget: sshTarget,
@@ -2363,6 +2606,7 @@ extension TeamOrchestrator {
             guard output.contains(marker) else {
                 throw RemoteAgentError.cliUnavailable(cli, host.displayName)
             }
+            reportStaleDaemons(in: output, host: host)
         } catch let error as RemoteAgentError {
             throw error
         } catch {
@@ -2378,6 +2622,173 @@ extension TeamOrchestrator {
             identityFile: host.identityFile,
             script: "rm -f -- \(shellQuoted(promptFile))",
             timeoutSeconds: 10
+        )
+    }
+
+    /// Put the leader's system prompt in the pane account's shared cache.
+    ///
+    /// Two routes, in cost order:
+    ///
+    ///  1. **SSH stdin → shared cache.** The bytes never become a command-line
+    ///     argument, and the cache is outside a service's private `/tmp`.
+    ///     Root SSH logins switch to the systemd unit's `User=` account using
+    ///     the same resolver as remote paste transfer.
+    ///  2. **Typed into the pane as base64 chunks.** Retained only for peer
+    ///     connections that have no SSH route at all.
+    ///
+    /// Route 2 is why this exists. A 7 KB prompt is ~10 KB of base64 across
+    /// ~14 typed commands, and a PTY in canonical mode holds 1024 bytes: sent
+    /// back-to-back, most of it never reaches the shell, and every write still
+    /// reports success. That is how a leader came to launch against a
+    /// zero-byte prompt while the app believed staging had worked.
+    private func stageRemoteLeaderPrompt(
+        session: PeerPaneSession,
+        host: HostEntry,
+        systemPrompt: String,
+        promptFile: String
+    ) async -> String? {
+        if let sshTarget = host.sshTarget, !sshTarget.isEmpty {
+            guard let sharedPromptFile = await Self.writeRemoteLeaderPromptOverSSH(
+                host: host, systemPrompt: systemPrompt, promptFile: promptFile
+            ) else {
+#if DEBUG
+                dlog("leader.prompt.stage route=ssh_failed host=\(host.id)")
+#endif
+                RemoteWorkLog.infoOffMain(
+                    "\(host.displayName): could not stream the leader prompt over SSH"
+                )
+                return nil
+            }
+#if DEBUG
+            dlog("leader.prompt.stage route=ssh host=\(host.id)")
+#endif
+            return sharedPromptFile
+        }
+#if DEBUG
+        dlog("leader.prompt.stage route=pty host=\(host.id)")
+#endif
+        RemoteWorkLog.infoOffMain(
+            "\(host.displayName): no SSH route is available; typing the leader prompt instead"
+        )
+        let stages = Self.remoteLeaderPromptStageCommands(
+            systemPrompt: systemPrompt,
+            promptFile: promptFile
+        )
+        for stage in stages {
+            // 0.35s, not 50ms. Each command must be consumed before the next
+            // arrives or they queue into a 1 KB PTY buffer and are lost.
+            guard await sendRemoteLeaderStage(
+                session: session, text: stage, settleDelay: 0.35
+            ) else { return nil }
+        }
+        return promptFile
+    }
+
+    private static func writeRemoteLeaderPromptOverSSH(
+        host: HostEntry,
+        systemPrompt: String,
+        promptFile: String
+    ) async -> String? {
+        guard let sshTarget = host.sshTarget, !sshTarget.isEmpty else { return nil }
+        let fileName = (promptFile as NSString).lastPathComponent
+        let script = remoteLeaderPromptSSHStageCommand(fileName: fileName)
+        do {
+            let output = try await PeerHostReadinessChecker.runScript(
+                sshTarget: sshTarget,
+                port: host.sshPort,
+                identityFile: host.identityFile,
+                script: script,
+                standardInput: Data(systemPrompt.utf8),
+                timeoutSeconds: 20
+            )
+            let path = output.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard path.hasPrefix("/"),
+                  !path.contains("\n"),
+                  !path.contains("\0"),
+                  (path as NSString).lastPathComponent == fileName
+            else { return nil }
+            return path
+        } catch {
+            return nil
+        }
+    }
+
+    /// Stage an SSH-owned agent's explicit environment without placing API
+    /// keys or the scoped team-route bearer in the local ssh process argv.
+    /// PATH remains a separate additive bridge setting; every other valid
+    /// entry is sourced once and the file is removed by the remote wrapper.
+    private static func writeRemoteAgentEnvironmentOverSSH(
+        host: HostEntry,
+        environment: [String: String],
+        agentInstanceID: String
+    ) async -> String? {
+        guard let sshTarget = host.sshTarget, !sshTarget.isEmpty else { return nil }
+        let fileName = "agent-\(agentInstanceID).env"
+        let contents = PeerHostEnvironment.sanitized(environment)
+            .filter { $0.key != "PATH" }
+            .map { "export \($0.key)=\(shellQuoted($0.value))" }
+            .joined(separator: "\n") + "\n"
+        do {
+            let output = try await PeerHostReadinessChecker.runScript(
+                sshTarget: sshTarget,
+                port: host.sshPort,
+                identityFile: host.identityFile,
+                script: remoteAgentEnvironmentSSHStageCommand(fileName: fileName),
+                standardInput: Data(contents.utf8),
+                timeoutSeconds: 20
+            )
+            let path = output.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard path.hasPrefix("/"),
+                  !path.contains("\n"),
+                  !path.contains("\0"),
+                  (path as NSString).lastPathComponent == fileName
+            else { return nil }
+            return path
+        } catch {
+            return nil
+        }
+    }
+
+    private static func removeRemoteAgentEnvironmentOverSSH(
+        host: HostEntry,
+        path: String
+    ) async {
+        guard let sshTarget = host.sshTarget, !sshTarget.isEmpty else { return }
+        _ = try? await PeerHostReadinessChecker.runScript(
+            sshTarget: sshTarget,
+            port: host.sshPort,
+            identityFile: host.identityFile,
+            script: "rm -f -- \(shellQuoted(path))",
+            timeoutSeconds: 10
+        )
+    }
+
+    /// Constant-sized staging command; only the generated basename enters
+    /// argv. The environment bytes themselves travel on SSH stdin.
+    static func remoteAgentEnvironmentSSHStageCommand(fileName: String) -> String {
+        let quotedName = shellQuoted((fileName as NSString).lastPathComponent)
+        return "umask 077; "
+            + "d=\"${XDG_CACHE_HOME:-$HOME/.cache}/term-mesh/agent-env\"; "
+            + "mkdir -p \"$d\" && chmod 700 \"$d\" || exit 1; "
+            + "p=\"$d\"/\(quotedName); t=\"$p.tmp.$$\"; "
+            + "trap 'rm -f \"$t\"' 0 1 2 15; "
+            + "if cat > \"$t\" && chmod 600 \"$t\" && mv -f \"$t\" \"$p\"; "
+            + "then trap - 0 1 2 15; printf %s \"$p\"; else exit 1; fi"
+    }
+
+    /// The command is deliberately small and constant-sized. Prompt bytes
+    /// arrive on stdin, land in a private temporary file, and become visible
+    /// atomically only after the complete stream has arrived.
+    static func remoteLeaderPromptSSHStageCommand(fileName: String) -> String {
+        let quotedName = shellQuoted((fileName as NSString).lastPathComponent)
+        return RemotePasteTransfer.serviceAccountCommand(
+            "umask 077; "
+                + "d=\"${XDG_CACHE_HOME:-$HOME/.cache}/term-mesh/leader-prompts\"; "
+                + "mkdir -p \"$d\" && chmod 700 \"$d\" || exit 1; "
+                + "p=\"$d\"/\(quotedName); t=\"$p.tmp.$$\"; "
+                + "trap 'rm -f \"$t\"' 0 1 2 15; "
+                + "if cat > \"$t\" && chmod 600 \"$t\" && mv -f \"$t\" \"$p\"; "
+                + "then trap - 0 1 2 15; printf %s \"$p\"; else exit 1; fi"
         )
     }
 
@@ -2508,8 +2919,12 @@ extension TeamOrchestrator {
         let hostSSHTarget = host.sshTarget
         let hostSSHPort = host.sshPort
         let hostIdentityFile = host.identityFile
+        let agentInstanceId = UUID().uuidString
+        var unownedRouteGrant: Termmesh_Peer_V1_TeamLeaderGrant?
 
         do {
+        let routeGrant = try await bootstrapRemoteAgentRoute(teamName: teamName)
+        unownedRouteGrant = routeGrant
 
         // Use the same incremental grid growth as local `add`/`attach`.
         let placement = nextAgentSplitPlacement(team: team, workspace: workspace)
@@ -2535,24 +2950,24 @@ extension TeamOrchestrator {
         // non-spoofable TERMMESH identity. Hosts must advertise the dedicated
         // ensure-env capability so an older decoder cannot silently drop it.
         //
-        // **The local bridge** is kept for exactly cursor and agy. A turn is a
-        // whole process for those two and they have no interactive UI, so a
-        // terminal pane would open empty — the native path is not an upgrade
-        // there but the only thing that works at all. Moving them to the peer
-        // is a separate change with its own live verification (R8), and until
-        // it lands they stay a child of this app and die with it.
+        // **The local bridge** is the compatibility route for every supported
+        // CLI when the peer-owned contract is unavailable. It costs survival
+        // across this app quitting, but preserves the explicit Native setting.
         //
-        // **Terminal** is everything else, and is exactly the behaviour every
-        // remote member had before any of this: claude and gemini have no
-        // peer-owned recipe (`tm-agent-bridge --cli` has no claude value, and
-        // no native panel holds gemini), and a host whose daemon lacks any of
-        // `surface.agent.v1`, `surface.exit.v1`, or `surface.ensure-env.v1`
-        // (or has no bridge installed) keeps its PTY pane.
-        // Falling back is never silent — each reason is logged below with the
-        // one thing that would give the agent pane back.
-        let availability = await Self.canUsePeerOwnedAgent(
-            host: host, cli: cli, binaries: binaries
-        )
+        // **Terminal** now means Native was disabled, the CLI is unsupported,
+        // or no SSH route exists. Peer capability may choose ownership, never
+        // override the renderer the user selected.
+        let availability: PeerOwnedAgentAvailability
+        if host.supportsRemoteTeamRoute == false {
+            // The peer itself cannot carry team.leader.v1, but a Native
+            // SSH-owned process can use its private reverse control-socket
+            // forward and keep the exact same scoped grant contract.
+            availability = .blocked(.daemonTooOld)
+        } else {
+            availability = await Self.canUsePeerOwnedAgent(
+                host: host, cli: cli, binaries: binaries
+            )
+        }
         if case .blocked(let block) = availability {
             RemoteWorkLog.info(
                 Self.peerOwnedAgentFallbackMessage(
@@ -2560,12 +2975,53 @@ extension TeamOrchestrator {
                 )
             )
         }
-        switch Self.remoteAgentFactory(
+
+        func attachSSHOwnedNativeAgent() async throws -> AgentMember {
+            guard let sshTarget = host.sshTarget, !sshTarget.isEmpty else {
+                throw RemoteAgentError.paneCreationFailed
+            }
+            let member = try await attachRemoteNativeAgent(
+                team: team,
+                workspace: workspace,
+                tabManager: tabManager,
+                host: host,
+                sshTarget: sshTarget,
+                splitFrom: placement.panelId,
+                orientation: placement.orientation,
+                agentName: agentName,
+                agentInstanceId: agentInstanceId,
+                workingDirectory: workingDirectory,
+                agentType: agentType,
+                model: model,
+                cli: cli,
+                routeGrant: routeGrant
+            )
+            startRemoteAgentRouteKeepalive(
+                teamName: teamName,
+                agentInstanceID: member.agentInstanceId,
+                grantID: routeGrant.grantID
+            )
+            unownedRouteGrant = nil
+            recordIsolatedCheckout()
+            return member
+        }
+
+        let factory = Self.remoteAgentFactory(
             cli: cli,
             hostAdvertisesAgentSurfaces: availability == .available,
             peerBridgePath: binaries.bridgePath,
             sshTarget: host.sshTarget
-        ) {
+        )
+        // Terminal and peer-owned routes need the serving host to proxy the
+        // grant. Only SSH-owned Native has its own authenticated control hop.
+        guard host.supportsRemoteTeamRoute != false || factory == .localNativeBridge else {
+            throw RemoteAgentError.hostUpdateRequired(
+                host: host.displayName,
+                version: host.servingVersionDisplay
+            )
+        }
+
+        switch factory {
         case .peerOwnedAgent:
             guard attachStillWanted() else {
                 throw RemoteAgentError.teamNotFound(teamName)
@@ -2579,19 +3035,27 @@ extension TeamOrchestrator {
                     splitFrom: placement.panelId,
                     orientation: placement.orientation,
                     agentName: agentName,
+                    agentInstanceId: agentInstanceId,
                     workingDirectory: workingDirectory,
                     agentType: agentType,
                     model: model,
                     cli: cli,
+                    routeGrant: routeGrant,
                     stillWanted: attachStillWanted
                 )
+                startRemoteAgentRouteKeepalive(
+                    teamName: teamName,
+                    agentInstanceID: member.agentInstanceId,
+                    grantID: routeGrant.grantID
+                )
+                unownedRouteGrant = nil
                 recordIsolatedCheckout()
                 return member
             } catch let error as RemoteAgentError {
                 // A decision this side made — the roster already holds this
-                // member, or the team was retired mid-attach. The terminal
+                // member, or the team was retired mid-attach. The SSH-owned
                 // path would reach the same answer after spawning a second
-                // surface for nothing, so it is reported rather than retried.
+                // process for nothing, so it is reported rather than retried.
                 throw error
             } catch let error as PeerEnsureEnvironment.ValidationError {
                 // This is a local configuration refusal, not the host saying
@@ -2602,38 +3066,24 @@ extension TeamOrchestrator {
                         error, cli: cli, hostName: host.displayName
                     )
                 )
+                return try await attachSSHOwnedNativeAgent()
             } catch {
                 // The host's answer, not ours. `canUsePeerOwnedAgent` read the
                 // capability off a connection it then closed, so the host can
                 // stop advertising it in between — and an ensure refused
                 // locally or on the wire creates nothing there. Falling
-                // through costs a pane that renders less well; refusing would
-                // cost the member entirely.
+                // The Native setting still wins: use the existing SSH-owned
+                // renderer, sacrificing peer-owned survival rather than the
+                // pane type the user explicitly chose.
                 RemoteWorkLog.info(
                     Self.peerOwnedAgentFallbackMessage(
                         .ensureRefused, cli: cli, hostName: host.displayName
                     )
                 )
+                return try await attachSSHOwnedNativeAgent()
             }
         case .localNativeBridge:
-            if let sshTarget = host.sshTarget, !sshTarget.isEmpty {
-                let member = try attachRemoteNativeAgent(
-                    team: team,
-                    workspace: workspace,
-                    tabManager: tabManager,
-                    host: host,
-                    sshTarget: sshTarget,
-                    splitFrom: placement.panelId,
-                    orientation: placement.orientation,
-                    agentName: agentName,
-                    workingDirectory: workingDirectory,
-                    agentType: agentType,
-                    model: model,
-                    cli: cli
-                )
-                recordIsolatedCheckout()
-                return member
-            }
+            return try await attachSSHOwnedNativeAgent()
         case .terminal:
             // The one terminal pane that is not a graceful degradation: a
             // turn-per-process CLI has no interactive UI to put in it, so the
@@ -2768,6 +3218,7 @@ extension TeamOrchestrator {
 
         let member = AgentMember(
             id: "\(agentName)@\(teamName)",
+            agentInstanceId: agentInstanceId,
             name: agentName,
             teamName: teamName,
             cli: cli,
@@ -2816,8 +3267,20 @@ extension TeamOrchestrator {
         // race a local pane has, for the same reason: text that arrives while
         // a shell is still coming up lands in a buffer nobody submits.
         Task { @MainActor in
-            if let session = panel.peerPaneSession {
-                await Self.waitForRemoteShell(session: session)
+            guard let session = panel.peerPaneSession else { return }
+            await Self.waitForRemoteShell(session: session)
+            // This command carries the scoped route grant. Disable terminal
+            // echo and history first so it is neither rendered nor retained
+            // by the interactive shell.
+            guard await self.sendRemoteLeaderStage(
+                session: session,
+                text: Self.remoteLeaderPrepareCommand(),
+                settleDelay: 0.35
+            ) else {
+                RemoteWorkLog.info(
+                    "\(agentName) on \(hostName): could not prepare the shell for a secure launch"
+                )
+                return
             }
             let command = Self.remoteAgentCommand(
                 cli: cli,
@@ -2825,8 +3288,23 @@ extension TeamOrchestrator {
                 agentName: agentName,
                 teamName: teamName,
                 workingDirectory: workingDirectory,
-                environment: PeerHostEnvironment.stored(forHostKey: hostKey),
-                hostBinDirs: hostCLIBinDirs
+                environment: PeerHostEnvironment.stored(forHostKey: hostKey)
+                    .merging(Self.remoteNativeAgentEnvironment(
+                        teamName: teamName,
+                        agentName: agentName,
+                        agentType: agentType,
+                        agentCli: cli,
+                        workspaceId: workspace.id,
+                        // A peer socket speaks protobuf framing, not the app
+                        // JSON-RPC protocol. The remote pane already inherits
+                        // its owning app/daemon control socket; preserve it.
+                        socketPath: nil,
+                        routeGrant: routeGrant
+                    )) {
+                        _, internalValue in internalValue
+                    },
+                hostBinDirs: hostCLIBinDirs,
+                needsSocketAccess: true
             )
             _ = self.sendToAgentByPanel(
                 teamName: teamName,
@@ -2865,9 +3343,18 @@ extension TeamOrchestrator {
             )
         }
 
+        startRemoteAgentRouteKeepalive(
+            teamName: teamName,
+            agentInstanceID: member.agentInstanceId,
+            grantID: routeGrant.grantID
+        )
+        unownedRouteGrant = nil
         recordIsolatedCheckout()
         return member
         } catch {
+            if let grant = unownedRouteGrant {
+                await PeerTeamLeaderControlPlane.shared.revokeGrant(id: grant.grantID)
+            }
             await abandonIsolatedRemoteCheckout(
                 teamName: teamName,
                 hostKey: hostKey,
@@ -2974,13 +3461,8 @@ extension TeamOrchestrator {
     /// test: every combination of CLI, host capability and bridge presence
     /// has one answer here, and the call site does no second-guessing.
     ///
-    /// The conservative half is `isPipeOnly` (cursor / agy). They already run
-    /// natively and moving them is a separate change with its own live
-    /// verification, so they keep the local bridge until that lands.
-    ///
-    /// Claude is excluded for harder reasons, and they are worth writing down
-    /// because "claude speaks NDJSON directly, so it needs no bridge" reads
-    /// like an argument for including it:
+    /// Claude is excluded from *peer ownership* for harder reasons, while its
+    /// existing SSH-native path still satisfies the renderer contract:
     ///  - `tm-agent-bridge --cli` has no `claude` value at all
     ///    (`daemon/tm-agent-bridge/src/main.rs`), so the peer-owned recipe
     ///    this file builds does not cover it. Spawning `claude --print …`
@@ -2995,7 +3477,8 @@ extension TeamOrchestrator {
     ///    runbook would become part of the surface's identity, so editing it
     ///    would turn every reattach into a SPEC_CONFLICT — which is exactly
     ///    the reattach this whole path exists for.
-    /// None of that is unfixable, and none of it is a flag flip.
+    /// None of that prevents a Native pane; it only determines which machine
+    /// owns the process behind that pane.
     static func remoteAgentFactory(
         cli: String,
         hostAdvertisesAgentSurfaces: Bool,
@@ -3008,13 +3491,18 @@ extension TeamOrchestrator {
         if AgentPipeTransport.isPipeOnly(cli: cli) {
             return reachableOverSSH ? .localNativeBridge : .terminal
         }
-        // What is left that the bridge can drive is exactly codex and kiro.
-        guard AgentPipeTransport.needsBridge(cli: cli) else { return .terminal }
-        guard reachableOverSSH,
-              hostAdvertisesAgentSurfaces,
-              !peerBridgePath.isEmpty
-        else { return .terminal }
-        return .peerOwnedAgent
+        guard reachableOverSSH else { return .terminal }
+        // Prefer the durable peer-owned renderer for codex/kiro when the
+        // serving daemon can hold it. Native is nevertheless a rendering
+        // contract, not a durability hint: an older daemon must fall back to
+        // the already-supported SSH-owned native process, never to a terminal.
+        if AgentPipeTransport.needsBridge(cli: cli),
+           !AgentPipeTransport.isPipeOnly(cli: cli),
+           hostAdvertisesAgentSurfaces,
+           !peerBridgePath.isEmpty {
+            return .peerOwnedAgent
+        }
+        return .localNativeBridge
     }
 
     /// What stopped a member that could have had a peer-owned agent pane.
@@ -3046,8 +3534,8 @@ extension TeamOrchestrator {
         case blocked(PeerOwnedAgentBlock)
     }
 
-    /// The one line the user sees when a native agent pane was possible and
-    /// did not happen.
+    /// The one line the user sees when the durable peer-owned native process
+    /// was unavailable and the app kept the Native pane contract over SSH.
     ///
     /// Pure and separate from the check so the wording is pinned by a test
     /// rather than by whoever reads the log next: what opened instead, on
@@ -3057,22 +3545,25 @@ extension TeamOrchestrator {
         cli: String,
         hostName: String
     ) -> String {
-        let lead = "\(cli) on \(hostName) opens as a terminal pane instead of a "
-            + "native agent pane"
+        let lead = "\(cli) on \(hostName) uses an SSH-owned native agent pane"
         switch block {
         case .bridgeMissing:
-            return lead + ": that host has no tm-agent-bridge. "
-                + "Install term-mesh on \(hostName) to get one."
+            return lead + ": that host has no tm-agent-bridge, so this agent "
+                + "will not survive quitting this Mac. Install term-mesh on \(hostName) "
+                + "to make the peer own it."
         case .daemonTooOld:
-            return lead + ": its term-meshd lacks the required agent, exit, "
-                + "or ensure-environment protocol capability. "
-                + "Update term-mesh on \(hostName) to get one."
+            return lead + ": its serving term-meshd lacks the required agent, exit, "
+                + "or ensure-environment protocol capability, so this agent will not "
+                + "survive quitting this Mac. Restart or update term-mesh on \(hostName) "
+                + "to make the peer own it."
         case .hostUnreachable:
-            return lead + ": its term-meshd could not be asked what it supports. "
-                + "Reconnect \(hostName) and attach again to get one."
+            return lead + ": its term-meshd could not be asked what it supports, "
+                + "so this agent will not survive quitting this Mac. Reconnect "
+                + "\(hostName) and attach again to make the peer own it."
         case .ensureRefused:
-            return lead + ": the host refused to start the bridge. "
-                + "Nothing was left running there; attach again to retry."
+            return lead + ": the host refused to start its bridge, so this agent "
+                + "will not survive quitting this Mac. Nothing was left running "
+                + "there; attach again to retry peer ownership."
         }
     }
 
@@ -3081,9 +3572,9 @@ extension TeamOrchestrator {
         cli: String,
         hostName: String
     ) -> String {
-        "\(cli) on \(hostName) opens as a terminal pane instead of a native agent pane: "
-            + "the configured peer environment is invalid (\(error.localizedDescription)). "
-            + "Fix the active CLI profile or explicit host environment to restore the native pane."
+        "\(cli) on \(hostName) uses an SSH-owned native agent pane because the configured "
+            + "peer environment is invalid (\(error.localizedDescription)). Fix the active CLI "
+            + "profile or explicit host environment to restore peer ownership."
     }
 
     /// Ask the host connection itself whether the peer-owned path is open.
@@ -3091,8 +3582,8 @@ extension TeamOrchestrator {
     /// The capability is only knowable from a live handshake — nothing is
     /// cached on `HostEntry` — so this opens a connection, reads
     /// `hostCapabilities`, and closes it. Never fatal: every answer other than
-    /// `available` sends the caller to the terminal path, which is what every
-    /// remote member did before this existed.
+    /// `available` lets the caller preserve Native rendering with an
+    /// SSH-owned process when SSH is available.
     ///
     /// Reporting is the caller's, deliberately. This is also the shape of the
     /// answer the factory wants, and a function that both decides and
@@ -3314,6 +3805,7 @@ extension TeamOrchestrator {
         color: String,
         hostDisplayName: String
     ) {
+        panel.runtimeOwnership = .peerOwned(hostName: hostDisplayName)
         workspace.setPanelCustomTitle(
             panelId: panel.id,
             title: "\(Self.colorEmoji(color)) \(agentName) @\(hostDisplayName)"
@@ -3648,13 +4140,14 @@ extension TeamOrchestrator {
         splitFrom: UUID,
         orientation: SplitOrientation,
         agentName: String,
+        agentInstanceId: String,
         workingDirectory: String,
         agentType: String,
         model: String,
         cli: String,
+        routeGrant: Termmesh_Peer_V1_TeamLeaderGrant,
         stillWanted: () -> Bool
     ) async throws -> AgentMember {
-        let agentInstanceId = UUID().uuidString
         let color = Self.agentColor(
             forRole: agentType,
             taken: Set(team.agents.map(\.color))
@@ -3687,7 +4180,10 @@ extension TeamOrchestrator {
                 agentType: agentType,
                 agentCli: cli,
                 workspaceId: workspace.id,
-                socketPath: host.remoteSockPath
+                // Peer-owned surfaces receive the authoritative daemon
+                // control socket as protected identity environment.
+                socketPath: nil,
+                routeGrant: routeGrant
             )
         )
 
@@ -3817,12 +4313,13 @@ extension TeamOrchestrator {
         splitFrom: UUID,
         orientation: SplitOrientation,
         agentName: String,
+        agentInstanceId: String,
         workingDirectory: String,
         agentType: String,
         model: String,
-        cli: String
-    ) throws -> AgentMember {
-        let agentInstanceId = UUID().uuidString
+        cli: String,
+        routeGrant: Termmesh_Peer_V1_TeamLeaderGrant
+    ) async throws -> AgentMember {
         let bridge = AgentPipeTransport.needsBridge(cli: cli)
             ? AgentPipeTransport.bridgePath(workingDirectory: workingDirectory)
             : nil
@@ -3841,6 +4338,10 @@ extension TeamOrchestrator {
             workingDirectory: workingDirectory,
             mode: .digest
         )
+        let reverseUnixForward = Self.sshOwnedAgentReverseForward(
+            agentInstanceID: agentInstanceId,
+            localControlSocket: SocketControlSettings.socketPath()
+        )
         // The host profile's variables underneath, term-mesh's own on top —
         // a profile must be able to add a proxy, not to impersonate the team.
         let remoteEnvironment = PeerHostEnvironment.stored(forHostKey: host.id)
@@ -3850,8 +4351,20 @@ extension TeamOrchestrator {
                 agentType: agentType,
                 agentCli: cli,
                 workspaceId: workspace.id,
-                socketPath: host.remoteSockPath
+                socketPath: reverseUnixForward.remote,
+                routeGrant: routeGrant
             )) { _, internalValue in internalValue }
+        guard let remoteEnvironmentFile = await Self.writeRemoteAgentEnvironmentOverSSH(
+            host: host,
+            environment: remoteEnvironment,
+            agentInstanceID: agentInstanceId
+        ) else {
+            throw RemoteAgentError.environmentStagingFailed(host.displayName)
+        }
+        // PATH is an additive, non-secret bridge input. Everything else is
+        // sourced from the peer's 0600 file so grants and API keys never sit
+        // in the long-lived local ssh process argv.
+        let bridgeEnvironment = remoteEnvironment.filter { $0.key == "PATH" }
         guard let panel = workspace.newAgentSplit(
             from: splitFrom,
             orientation: orientation,
@@ -3861,8 +4374,12 @@ extension TeamOrchestrator {
             cli: cli,
             color: color
         ) else {
+            await Self.removeRemoteAgentEnvironmentOverSSH(
+                host: host, path: remoteEnvironmentFile
+            )
             throw RemoteAgentError.paneCreationFailed
         }
+        panel.runtimeOwnership = .sshOwned(hostName: host.displayName)
 
         if let bridge {
             panel.start(
@@ -3872,7 +4389,9 @@ extension TeamOrchestrator {
                 target: sshTarget,
                 port: host.sshPort,
                 identityFile: host.identityFile,
-                remoteEnvironment: remoteEnvironment
+                remoteEnvironment: bridgeEnvironment,
+                remoteEnvironmentFile: remoteEnvironmentFile,
+                reverseUnixForward: reverseUnixForward
             )
             if !instructions.isEmpty {
                 let briefing = Self.withoutTerminalProtocol(instructions)
@@ -3888,7 +4407,18 @@ extension TeamOrchestrator {
                 identityFile: host.identityFile,
                 model: Self.resolveClaudeModelArg(model),
                 instructions: instructions,
-                remoteEnvironment: remoteEnvironment
+                remoteEnvironment: bridgeEnvironment,
+                remoteEnvironmentFile: remoteEnvironmentFile,
+                reverseUnixForward: reverseUnixForward
+            )
+        }
+        // The remote wrapper normally unlinks the file immediately after
+        // sourcing it. This covers authentication/launch failures where that
+        // wrapper never ran, without racing a normally starting agent.
+        Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 60_000_000_000)
+            await Self.removeRemoteAgentEnvironmentOverSSH(
+                host: host, path: remoteEnvironmentFile
             )
         }
 
@@ -3948,13 +4478,14 @@ extension TeamOrchestrator {
         return member
     }
 
-    private static func remoteNativeAgentEnvironment(
+    static func remoteNativeAgentEnvironment(
         teamName: String,
         agentName: String,
         agentType: String,
         agentCli: String,
         workspaceId: UUID,
-        socketPath: String?
+        socketPath: String?,
+        routeGrant: Termmesh_Peer_V1_TeamLeaderGrant? = nil
     ) -> [String: String] {
         var env: [String: String] = [
             "TERMMESH_TEAM_AGENT": "1",
@@ -3972,11 +4503,55 @@ extension TeamOrchestrator {
             env["TERMMESH_SOCKET"] = socketPath
             env["CMUX_SOCKET"] = socketPath
         }
+        if let routeGrant {
+            env.merge(remoteTeamRouteEnvironment(routeGrant)) {
+                _, routeValue in routeValue
+            }
+        }
         if agentCli == "claude" {
             env["CLAUDECODE"] = "1"
             env["CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS"] = "1"
         }
         return env
+    }
+
+    /// A private control-socket hop for an SSH-owned Native agent.
+    ///
+    /// The peer endpoint (`peer.sock`) is a framed protobuf transport and
+    /// cannot answer tm-agent JSON-RPC. The SSH process already owns this
+    /// agent's lifetime, so let the same authenticated session reverse-forward
+    /// one per-agent Unix socket to the current app. `peer.leader.call` still
+    /// validates the short-lived scoped grant before any team command runs.
+    static func sshOwnedAgentReverseForward(
+        agentInstanceID: String,
+        localControlSocket: String
+    ) -> (remote: String, local: String) {
+        let safeID = agentInstanceID.lowercased().filter {
+            $0.isASCII && ($0.isLetter || $0.isNumber || $0 == "-")
+        }
+        let suffix = String(safeID.prefix(48))
+        return (
+            remote: "/tmp/term-mesh-agent-route-\(suffix).sock",
+            local: localControlSocket
+        )
+    }
+
+    /// Environment understood by `tm-agent`'s scoped reverse route.
+    /// The daemon socket remains local to the remote host; these values are a
+    /// one-team bearer and audience, not a path back into this Mac.
+    static func remoteTeamRouteEnvironment(
+        _ grant: Termmesh_Peer_V1_TeamLeaderGrant
+    ) -> [String: String] {
+        let grantID = grant.grantID.map { String(format: "%02x", $0) }.joined()
+        return [
+            "TERMMESH_LEADER_GRANT_ID": grantID,
+            "TERMMESH_LEADER_PROJECT_ID": grant.projectID,
+            "TERMMESH_LEADER_TEAM_UUID": grant.teamUuid,
+            "TERMMESH_LEADER_EXPIRES_AT": String(grant.expiresAtUnixSecs),
+            "TERMMESH_LEADER_PEER_ID": PeerIdentity.hexString(
+                PeerIdentity.defaultPeerID()
+            ),
+        ]
     }
 
     /// Stop what this agent left running on the other machine, then close its
@@ -3995,6 +4570,10 @@ extension TeamOrchestrator {
     /// published is theirs, and we merely borrowed it.
     @MainActor
     func releaseRemoteAgent(_ agent: AgentMember, closing workspace: Workspace?, teamName: String? = nil) {
+        stopRemoteAgentRouteKeepalive(
+            agentInstanceID: agent.agentInstanceId,
+            revoke: true
+        )
         let hostSockPath = agent.hostKey
             .flatMap { key in RemoteHostStore.shared.sortedHosts.first { $0.id == key } }
             .map(\.activeSockPath)
@@ -4457,6 +5036,7 @@ extension TeamOrchestrator {
                     dlog("leader.attach.threw host=\(hostKey) error=\(error)")
 #endif
                     let description = "Could not start remote leader on \(hostKey): \(error)"
+                        + (await Self.staleDaemonHint(hostKey: hostKey) ?? "")
                     RemoteWorkLog.info(description)
                     onRemoteAttach?(.leaderFailed(host: hostKey, message: description))
                     // A failed agent leaves a red row on the board; a failed

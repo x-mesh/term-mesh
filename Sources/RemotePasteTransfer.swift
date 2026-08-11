@@ -20,10 +20,10 @@ enum RemotePasteTransfer {
     /// (and /var/tmp), so either of those silently produces a path that exists
     /// for SSH and is missing from the pane. The connecting account's cache is
     /// shared across both processes when the installer keeps their identities
-    /// aligned. `remoteServiceAccountCommand` also switches a root SSH login
+    /// aligned. `serviceAccountCommand` also switches a root SSH login
     /// to an explicitly selected system-service account before touching it.
     static let remoteDirectoryCommand =
-        remoteServiceAccountCommand(
+        serviceAccountCommand(
             #"umask 077; d="${XDG_CACHE_HOME:-$HOME/.cache}/term-mesh/paste"; mkdir -p "$d" && chmod 700 "$d" && printf %s "$d""#
         )
 
@@ -175,7 +175,7 @@ enum RemotePasteTransfer {
         process.executableURL = URL(fileURLWithPath: "/usr/bin/ssh")
         process.arguments = [
             target,
-            remoteServiceAccountCommand("umask 077; cat > \(shellQuote(remotePath))")
+            serviceAccountCommand("umask 077; cat > \(shellQuote(remotePath))")
         ]
         process.standardInput = input
         process.standardOutput = FileHandle.nullDevice
@@ -211,7 +211,12 @@ enum RemotePasteTransfer {
     /// system unit explicitly names another User= do file operations switch
     /// to that account, matching the pane without running the daemon itself
     /// through sudo. Non-root and user-service connections stay untouched.
-    private static func remoteServiceAccountCommand(_ command: String) -> String {
+    /// Run a file operation as the account that owns the remote pane.
+    ///
+    /// Leader prompt staging shares this identity resolution with paste
+    /// transfer so the two paths cannot disagree about a system service's
+    /// `User=` account.
+    static func serviceAccountCommand(_ command: String) -> String {
         let quoted = shellQuote(command)
         return "u=$(systemctl show -p User --value term-meshd.service 2>/dev/null || true); "
             + "[ -n \"$u\" ] || u=$(id -un); "

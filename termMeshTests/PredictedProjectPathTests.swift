@@ -163,6 +163,61 @@ final class PredictedProjectPathTests: XCTestCase {
         )
     }
 
+    /// Tab completes only as far as every candidate agrees. Completing to the
+    /// first match would pick one of several valid branches for the person,
+    /// and the wrong branch is not a visible typo — it is a clone of the
+    /// wrong code.
+    func testBranchTabCompletionStopsAtTheSharedPrefix() {
+        let branches = ["main", "feature/auth", "feature/search", "release/v2"]
+        XCTAssertEqual(
+            RepositoryBranchLookup.completion(for: "fea", in: branches),
+            "feature/",
+            "two candidates agree up to the slash and no further"
+        )
+        XCTAssertEqual(
+            RepositoryBranchLookup.completion(for: "feature/s", in: branches),
+            "feature/search",
+            "one candidate completes fully"
+        )
+        XCTAssertEqual(
+            RepositoryBranchLookup.completion(for: "rel", in: branches),
+            "release/v2"
+        )
+    }
+
+    /// Nothing to add means Tab keeps its normal job of moving focus.
+    func testBranchTabCompletionYieldsWhenItCannotAdd() {
+        let branches = ["main", "feature/auth", "feature/search"]
+        XCTAssertNil(RepositoryBranchLookup.completion(for: "main", in: branches),
+                     "already complete")
+        XCTAssertNil(RepositoryBranchLookup.completion(for: "nope", in: branches),
+                     "no candidate")
+        XCTAssertNil(RepositoryBranchLookup.completion(for: "feature/", in: branches),
+                     "candidates diverge immediately")
+        XCTAssertNil(RepositoryBranchLookup.completion(for: "", in: ["main", "dev"]),
+                     "an empty field has no shared prefix to offer")
+    }
+
+    /// Matching ignores case; the result keeps the branch's own spelling, so a
+    /// completed name is one git will accept.
+    func testBranchTabCompletionCorrectsCase() {
+        XCTAssertEqual(
+            RepositoryBranchLookup.completion(for: "MAI", in: ["main", "release"]),
+            "main"
+        )
+    }
+
+    /// The caption that separates "this branch exists" from "this will fail
+    /// inside git clone".
+    func testBranchPresenceIsCaseInsensitive() {
+        let branches = ["main", "develop"]
+        XCTAssertTrue(RepositoryBranchLookup.contains("DEVELOP", in: branches))
+        XCTAssertTrue(RepositoryBranchLookup.contains("develop", in: branches))
+        XCTAssertFalse(RepositoryBranchLookup.contains("dev", in: branches),
+                       "a prefix is not the branch")
+        XCTAssertFalse(RepositoryBranchLookup.contains("", in: branches))
+    }
+
     func testRepositoryDiscoveryFindsProjectsBelowConfiguredRoot() throws {
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent("RepositoryDiscovery-\(UUID().uuidString)")
@@ -412,6 +467,57 @@ final class PredictedProjectPathTests: XCTestCase {
         XCTAssertEqual(
             listing.directories.map { ($0 as NSString).lastPathComponent },
             ["alpha", "Beta"]
+        )
+    }
+
+    /// A host that reaches its checkout through a link (/srv/app ->
+    /// /mnt/data/app) must still see the folder. A link to a file, and one to
+    /// nothing at all, are not folders and stay out.
+    func testRemoteDirectoryLookupListsSymlinkedFoldersButNotOtherLinks() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("term-mesh links-\(UUID().uuidString)")
+        let elsewhere = FileManager.default.temporaryDirectory
+            .appendingPathComponent("term-mesh target-\(UUID().uuidString)")
+        defer {
+            try? FileManager.default.removeItem(at: root)
+            try? FileManager.default.removeItem(at: elsewhere)
+        }
+        try FileManager.default.createDirectory(
+            at: elsewhere, withIntermediateDirectories: true
+        )
+        try FileManager.default.createDirectory(
+            at: root.appendingPathComponent("real"), withIntermediateDirectories: true
+        )
+        let plainFile = root.appendingPathComponent("note.txt")
+        try Data("x".utf8).write(to: plainFile)
+        try FileManager.default.createSymbolicLink(
+            at: root.appendingPathComponent("shared"), withDestinationURL: elsewhere
+        )
+        try FileManager.default.createSymbolicLink(
+            at: root.appendingPathComponent("file-link"), withDestinationURL: plainFile
+        )
+        try FileManager.default.createSymbolicLink(
+            at: root.appendingPathComponent("dangling"),
+            withDestinationURL: root.appendingPathComponent("gone")
+        )
+
+        let process = Process()
+        let output = Pipe()
+        process.executableURL = URL(fileURLWithPath: "/bin/sh")
+        process.arguments = ["-c", RemoteDirectoryLookup.script(for: root.path)]
+        process.standardOutput = output
+        process.standardError = FileHandle.nullDevice
+        try process.run()
+        let data = output.fileHandleForReading.readDataToEndOfFile()
+        process.waitUntilExit()
+        XCTAssertEqual(process.terminationStatus, 0)
+
+        let listing = try RemoteDirectoryLookup.parse(
+            String(data: data, encoding: .utf8) ?? ""
+        )
+        XCTAssertEqual(
+            listing.directories.map { ($0 as NSString).lastPathComponent },
+            ["real", "shared"]
         )
     }
 

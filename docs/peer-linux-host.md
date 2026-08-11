@@ -49,6 +49,10 @@ as the system service's `User=`, and a direct `root@host` install runs as root.
 To isolate a system install under a dedicated account instead, set
 `TERMMESH_SERVICE_USER=term-mesh`; panes then run as that account too and the
 SSH account must be root or the same account to pass the peer socket UID gate.
+An account the installer creates lives in `/var/lib/term-mesh`, which lets the
+unit keep `ProtectHome=true`. Naming an account whose home is under `/home`
+turns that off for the unit, because `ProtectHome` would otherwise hide the
+daemon's own home from it — `~/.cache` and `~/.term-mesh` included.
 Running the installer as root always selects system scope, including CentOS
 7/systemd 219 SSH sessions without a user bus. A non-root install with no user
 bus exits with a `sudo` command that preserves the connecting account instead

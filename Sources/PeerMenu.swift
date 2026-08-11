@@ -207,6 +207,46 @@ final class PeerClientCoordinator: NSObject, NSMenuDelegate {
         return sessions.count
     }
 
+    /// A pane preserved by a deliberate disconnect is reattached when its host
+    /// comes back — and only then. A pane that lost its transport by accident
+    /// already has recovery of its own, and a torn-down one has nothing left
+    /// to reattach.
+    static func shouldReattachAfterHostReconnect(
+        leaseKey: PeerPaneHostKey,
+        reconnectedHost: PeerPaneHostKey,
+        hostTransportWasDisconnected: Bool,
+        isTorndown: Bool
+    ) -> Bool {
+        leaseKey == reconnectedHost && hostTransportWasDisconnected && !isTorndown
+    }
+
+    /// The other half of `preparePanesForHostDisconnect`. Panes kept across a
+    /// Disconnect Host are live views of a transport that no longer exists;
+    /// this is the moment one can be made real again. Only native agent panes
+    /// act on it — a terminal pane offers Reconnect in its own banner.
+    @discardableResult
+    func resumePanesAfterHostReconnect(_ hostKey: PeerPaneHostKey) -> Int {
+        let sessions = openPaneSessions.filter {
+            Self.shouldReattachAfterHostReconnect(
+                leaseKey: $0.lease.key,
+                reconnectedHost: hostKey,
+                hostTransportWasDisconnected: $0.hostTransportWasDisconnected,
+                isTorndown: $0.isTorndown
+            )
+        }
+        var reattached = 0
+        for session in sessions where session.requestHostReconnectReattach != nil {
+            session.requestHostReconnectReattach?()
+            reattached += 1
+        }
+        #if DEBUG
+        if !sessions.isEmpty {
+            dlog("peer.pane.reattachAfterReconnect key=\(hostKey) panes=\(sessions.count) agent=\(reattached)")
+        }
+        #endif
+        return reattached
+    }
+
     // MARK: - Live workspace mirrors (Phase 2B)
 
     private var openWorkspaceMirrors: [PeerWorkspaceMirrorController] = []

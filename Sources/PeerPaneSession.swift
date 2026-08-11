@@ -360,6 +360,14 @@ final class PeerPaneSession {
     /// relay shell behind.
     var requestPaneClose: (@MainActor () -> Void)?
 
+    /// Set by `Workspace.bindRemoteAgentPane` for a native agent pane that an
+    /// intentional disconnect preserves. Preserving it keeps the transcript on
+    /// screen but leaves a pane whose transport is gone, so the host coming
+    /// back is what turns it live again — the pane is rebuilt against the same
+    /// surface and the peer's daemon replays what was said meanwhile. A
+    /// terminal pane leaves this nil: it has a Reconnect banner of its own.
+    var requestHostReconnectReattach: (@MainActor () -> Void)?
+
     /// For the connections panel / sidebar roster (t7 wires this into
     /// `PeerClientCoordinator`).
     var connectionInfo: PeerRelayConnectionInfo {
@@ -439,9 +447,18 @@ final class PeerPaneSession {
         await conn.cancel()
 
         let deadline = Date().addingTimeInterval(timeout)
+        // Enough to tell the two failures apart on the next occurrence:
+        // nothing was ever added (the split did not happen, or its pane never
+        // realized) versus something was added and the filter rejected it.
+        var lastCount = before.count
+        var everAdded = 0
+        var sourceStillListed = true
         while Date() < deadline {
             try? await Task.sleep(nanoseconds: 400_000_000)
             let now = try await listSurfaces(on: lease)
+            lastCount = now.count
+            everAdded = max(everAdded, now.filter { !before.contains($0.surfaceID) }.count)
+            sourceStillListed = now.contains { $0.surfaceID == source }
             // "New since the split request" is the whole detection, so an
             // agent surface someone ensured concurrently would match too —
             // and the caller is waiting for a SHELL to type a launch
@@ -454,6 +471,17 @@ final class PeerPaneSession {
                 return fresh
             }
         }
+        // Nothing appeared. The request cannot fail loudly — it is
+        // fire-and-forget — so record what was asked of whom; the host logs
+        // its own refusal (`peer.host.splitPane rejected`), and the two lines
+        // together name a cause that neither has alone. The commonest one is a
+        // source pane the host lists but no longer holds.
+        #if DEBUG
+        dlog("peer.pane.spawnSurface timeout "
+            + "source=\(source.map { String(format: "%02x", $0) }.joined().prefix(8)) "
+            + "before=\(before.count) last=\(lastCount) added=\(everAdded) "
+            + "sourceListed=\(sourceStillListed)")
+        #endif
         return nil
     }
 

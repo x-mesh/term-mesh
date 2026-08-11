@@ -1016,12 +1016,60 @@ final class GhosttyPaneSurfaceProvider: PeerSurfaceProvider {
         _ = paneIDBytes
     }
 
+    /// Split a pane for a peer, and say so when it cannot.
+    ///
+    /// The request is fire-and-forget, so a refusal here reaches the caller
+    /// only as silence: it asks, waits for a new surface that never appears,
+    /// and reports `could not create a fresh leader surface` ten seconds later
+    /// with nothing to act on. That happened on a host whose surface list
+    /// still advertised a pane no workspace held any more — the caller picked
+    /// it, this returned at the second `guard`, and neither side recorded why.
+    ///
+    /// Both logs, because the two readers are different machines: `dlog` for a
+    /// DEBUG host being driven from a test, `RemoteWorkLog` for the release
+    /// build a person is actually running when their peer goes quiet.
     private func performSplit(paneIDBytes: Data, orientationString: String) {
-        guard let panelUUID = uuidFromSurfaceID(paneIDBytes),
-              let workspace = workspaceContaining(panelUUID: panelUUID)
-        else { return }
+        guard let panelUUID = uuidFromSurfaceID(paneIDBytes) else {
+            reportSplitRefusal(reason: "unreadable surface id", surface: nil)
+            return
+        }
+        guard let (workspace, tabManager) = contextContaining(panelUUID: panelUUID) else {
+            // The surface was listed but belongs to no open workspace — the
+            // roster and the windows disagree.
+            reportSplitRefusal(reason: "no workspace holds this pane", surface: panelUUID)
+            return
+        }
         let orientation: SplitOrientation = (orientationString == "vertical") ? .vertical : .horizontal
-        _ = workspace.newTerminalSplit(from: panelUUID, orientation: orientation)
+        guard let created = workspace.newTerminalSplit(from: panelUUID, orientation: orientation) else {
+            reportSplitRefusal(reason: "the workspace refused the split", surface: panelUUID)
+            return
+        }
+        // Keep the workspace mounted until the pane the peer is waiting for
+        // exists. Without this a split into an unselected workspace produces a
+        // panel that never realizes, and the caller polls a list it will never
+        // enter — see `pinWorkspaceUntilPanelRealized`.
+        pinWorkspaceUntilPanelRealized(
+            workspace, panelID: created.id, on: tabManager, reason: "splitPane"
+        )
+    }
+
+    /// `workspaceContaining` plus the manager that owns it — the pin lives on
+    /// the TabManager, so the split path needs both.
+    private func contextContaining(panelUUID: UUID) -> (Workspace, TabManager)? {
+        for ctx in allWindowContexts() {
+            for workspace in ctx.tabManager.tabs where workspace.panels[panelUUID] != nil {
+                return (workspace, ctx.tabManager)
+            }
+        }
+        return nil
+    }
+
+    private func reportSplitRefusal(reason: String, surface: UUID?) {
+        let id = surface.map { String($0.uuidString.prefix(8)) } ?? "unknown"
+        #if DEBUG
+        dlog("peer.host.splitPane rejected reason=\(reason) surface=\(id)")
+        #endif
+        RemoteWorkLog.info("A peer asked to split \(id) and this host could not: \(reason)")
     }
 
     private func performClose(paneIDBytes: Data) {
@@ -1072,6 +1120,59 @@ final class GhosttyPaneSurfaceProvider: PeerSurfaceProvider {
 
     /// Interval between checks of the pin's exit condition.
     static let surfaceRealizationPollInterval: Duration = .milliseconds(100)
+
+    /// Mount `workspace` off-screen until ONE PARTICULAR panel has a surface.
+    ///
+    /// `pinWorkspaceUntilReportable` asks "does this workspace have any
+    /// reportable pane", which a split's source pane already answers yes to —
+    /// so the pane the caller is waiting for gets no protection at all, and
+    /// the existing pin (if any) drops the moment the first pane realizes.
+    ///
+    /// That gap is the whole failure: `maxMountedWorkspaces` is 2, so an
+    /// unselected workspace can be unmounted as soon as its pin goes, an
+    /// unmounted pane never gets a `ghostty_surface_t`
+    /// (`requestBackgroundSurfaceStartIfNeeded` requires `view.window != nil`),
+    /// and `collectSurfaces` skips panes without one. The peer that asked for
+    /// the split then polls a list the new pane will never appear in and times
+    /// out with nothing to name. It is timing-dependent — a split that lands
+    /// while the earlier pin is still held succeeds — which is why it looked
+    /// intermittent and refused to reproduce.
+    private func pinWorkspaceUntilPanelRealized(
+        _ workspace: Workspace,
+        panelID: UUID,
+        on tabManager: TabManager,
+        reason: String
+    ) {
+        guard !Self.panelHasSurface(workspace, panelID) else { return }
+        // Same single-waiter rule as the reportable pin: two waiters would race
+        // to unpin and the loser would pull the mount out from under the other.
+        guard !tabManager.surfaceRealizationPins.contains(workspace.id) else { return }
+
+        tabManager.pinWorkspaceForSurfaceRealization(workspace.id)
+        let workspaceID = workspace.id
+        let deadline = Date().addingTimeInterval(Self.surfaceRealizationPinTimeout)
+        Task { @MainActor [weak tabManager, weak workspace] in
+            defer { tabManager?.unpinWorkspaceForSurfaceRealization(workspaceID) }
+            while Date() < deadline {
+                try? await Task.sleep(for: Self.surfaceRealizationPollInterval)
+                guard let tabManager, let workspace else { return }
+                guard tabManager.tabs.contains(where: { $0.id == workspaceID }) else { return }
+                if Self.panelHasSurface(workspace, panelID) { return }
+            }
+            RemoteWorkLog.info(
+                "Pane \(panelID.uuidString.prefix(8)) (\(reason)) never opened a terminal after "
+                    + "\(Int(Self.surfaceRealizationPinTimeout))s — the machine that asked for the "
+                    + "split will not find it"
+            )
+        }
+    }
+
+    /// The exit condition above: this exact panel owns a live ghostty surface,
+    /// which is also what `collectSurfaces` requires before it will report it.
+    private static func panelHasSurface(_ workspace: Workspace, _ panelID: UUID) -> Bool {
+        guard let terminal = workspace.panels[panelID] as? TerminalPanel else { return false }
+        return terminal.surface.surface != nil
+    }
 
     /// Mount `workspace` off-screen until it has a pane the peer protocol will
     /// report, then release it.

@@ -782,7 +782,7 @@ struct NewProjectView: View {
                     Picker("", selection: $allAgentsHostKey) {
                         Text("This Mac").tag(String?.none)
                         ForEach(placeableHosts, id: \.id) { host in
-                            Text(host.isConnected ? host.displayName : "\(host.displayName) — offline")
+                            Text(host.isConnected ? host.versionedDisplayName : "\(host.displayName) — offline")
                                 .tag(String?.some(host.id))
                         }
                     }
@@ -875,6 +875,17 @@ struct NewProjectView: View {
                                 .lineLimit(1)
                                 .focused($focusedField, equals: .repositoryBranch)
                                 .accessibilityLabel("Repository branch")
+                                // Only swallow Tab when it has something to
+                                // complete; otherwise it stays the key that
+                                // moves to the next field.
+                                .backport.onKeyPress(.tab) { _ in
+                                    guard let completed = RepositoryBranchLookup.completion(
+                                        for: gitBranch, in: repositoryBranches
+                                    ) else { return .ignored }
+                                    gitBranch = completed
+                                    branchEdited = true
+                                    return .handled
+                                }
 
                                 Menu {
                                     ForEach(repositoryBranches, id: \.self) { branch in
@@ -913,11 +924,8 @@ struct NewProjectView: View {
                                 Text(repositoryBranchError)
                                     .font(.caption)
                                     .foregroundStyle(.secondary)
-                            } else if let defaultRepositoryBranch,
-                                      !repositoryBranches.isEmpty {
-                                Text("\(repositoryBranches.count) branches · Default: \(defaultRepositoryBranch)")
-                                    .font(.caption)
-                                    .foregroundStyle(.secondary)
+                            } else if !repositoryBranches.isEmpty {
+                                branchPresenceCaption
                             }
                         }
                     }
@@ -941,7 +949,7 @@ struct NewProjectView: View {
                         Picker("", selection: $runsOnHostKey) {
                             Text("This Mac").tag(String?.none)
                             ForEach(placeableHosts, id: \.id) { host in
-                                Text(host.isConnected ? host.displayName : "\(host.displayName) — offline")
+                                Text(host.isConnected ? host.versionedDisplayName : "\(host.displayName) — offline")
                                     .tag(String?.some(host.id))
                             }
                         }
@@ -1948,13 +1956,24 @@ struct NewProjectView: View {
                             .disabled(true)
                     }
                 } else {
+                    // Offered only while the machine is what blocks the run,
+                    // and next to the sentence that says so.
+                    if let retryTitle = placementRetryTitle {
+                        Button(retryTitle) { runPlacementRetry() }
+                            .accessibilityIdentifier("newProject.placementRetry")
+                    }
                     Button("Cancel", action: onClose)
                         .keyboardShortcut(.cancelAction)
                     Button(createActionLabel) {
                         startCreation()
                     }
                     .keyboardShortcut(.defaultAction)
-                    .disabled(!canCreate || !placementHostsAreReady)
+                    .disabled(
+                        !canCreate || !placementHostsAreReady
+                            || TeamAgentComposer.blocksRemoteTeamCreation(
+                                agents: agents, hosts: hostStore.sortedHosts
+                            )
+                    )
                 }
             }
             .fixedSize(horizontal: true, vertical: false)
@@ -2180,9 +2199,111 @@ struct NewProjectView: View {
         if allStillConnecting {
             return "Connecting to \(labels)…"
         }
+        // "Not ready" covers three different situations, and the button beside
+        // it does a different thing in each. Saying which one it is turns a
+        // verdict into something the person can act on.
+        if offline.count == 1,
+           let hostKey = offline.first,
+           let host = placeableHosts.first(where: { $0.id == hostKey }) {
+            switch host.connectionState {
+            case .failed(let reason):
+                return "\(labels) could not be reached — \(reason)"
+            case .saved:
+                return "\(labels) is not connected yet."
+            case .connected:
+                // Connected but not launchable: the PATH a remote CLI needs is
+                // still unresolved, so starting now would launch with the
+                // wrong search path (see `HostEntry.isLaunchable`).
+                return "\(labels) is connected but still resolving where its tools live."
+            case .connecting:
+                break
+            }
+        }
         return offline.count == 1
             ? "\(labels) is not ready to launch remote tools."
             : "These machines are not ready to launch remote tools: \(labels)."
+    }
+
+    /// Whether the branch typed here is one the remote actually has.
+    ///
+    /// Worth saying before the run rather than after: a name with no branch
+    /// behind it fails inside `git clone`, several seconds in, as a message
+    /// from git — long after the sheet has closed on it.
+    private enum BranchPresence { case unknown, exists, missing }
+
+    private var branchPresence: BranchPresence {
+        let branch = RepositoryBranchLookup.singleLine(gitBranch)
+        // An empty field means "the default branch", which is always fine, and
+        // an unlisted repository is a question this cannot answer.
+        guard !branch.isEmpty, !isLoadingRepositoryBranches, !repositoryBranches.isEmpty else {
+            return .unknown
+        }
+        return RepositoryBranchLookup.contains(branch, in: repositoryBranches) ? .exists : .missing
+    }
+
+    @ViewBuilder
+    private var branchPresenceCaption: some View {
+        switch branchPresence {
+        case .exists:
+            Label(
+                "\(RepositoryBranchLookup.singleLine(gitBranch)) exists in this repository",
+                systemImage: "checkmark.circle.fill"
+            )
+            .font(.caption)
+            .foregroundStyle(.green)
+        case .missing:
+            Label(
+                defaultRepositoryBranch.map {
+                    "No branch named \(RepositoryBranchLookup.singleLine(gitBranch)) here — the clone will fail. Default: \($0)"
+                } ?? "No branch named \(RepositoryBranchLookup.singleLine(gitBranch)) in this repository — the clone will fail",
+                systemImage: "exclamationmark.triangle.fill"
+            )
+            .font(.caption)
+            .foregroundStyle(.orange)
+            .fixedSize(horizontal: false, vertical: true)
+        case .unknown:
+            if let defaultRepositoryBranch {
+                Text("\(repositoryBranches.count) branches · Default: \(defaultRepositoryBranch)")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+        }
+    }
+
+    /// The machines this sheet is waiting on, and cannot start without.
+    ///
+    /// Excludes the ones already connecting: those need patience, not another
+    /// attempt. A connected-but-not-launchable host is included on purpose —
+    /// it is still resolving the PATH a remote CLI needs, and reconnecting is
+    /// what settles it if that stalled.
+    private var placementRetryHosts: [HostEntry] {
+        let keys = Set([runsOnHostKey].compactMap { $0 } + agents.compactMap(\.hostKey))
+        return keys.compactMap { key in placeableHosts.first(where: { $0.id == key }) }
+            .filter { !$0.isLaunchable && $0.connectionState != .connecting }
+            .sorted { $0.displayName < $1.displayName }
+    }
+
+    /// Saying a machine is not ready and offering nothing to do about it is a
+    /// dead end: this sheet has no other place to connect from, and leaving it
+    /// to use the sidebar discards the form. The action is the same one the
+    /// sidebar offers — reconnect — placed where the reason is stated.
+    private var placementRetryTitle: String? {
+        let hosts = placementRetryHosts
+        guard let first = hosts.first else { return nil }
+        if hosts.count > 1 { return "Reconnect machines" }
+        if case .failed = first.connectionState { return "Retry \(first.displayName)" }
+        return "Connect \(first.displayName)"
+    }
+
+    private func runPlacementRetry() {
+        let store = RemoteHostStore.shared
+        for host in placementRetryHosts {
+            if case .failed = host.connectionState {
+                _ = store.retryConnectingHost(host)
+            } else {
+                store.connectSavedHost(host)
+            }
+        }
     }
 
     /// Peer-bound agents whose project folder is still blank.
@@ -2514,7 +2635,14 @@ enum RemoteDirectoryLookup {
             + "case \"$p\" in '~') p=\"$HOME\" ;; '~/'*) p=\"$HOME/${p#??}\" ;; esac; "
             + "cd \"$p\" || exit 44; "
             + "printf '%s\\0' \"$(pwd -P)\"; "
-            + "find . -mindepth 1 -maxdepth 1 -type d ! -name '.*' -print0"
+            // -L so a symlinked folder is listed as the folder it points at.
+            // Hosts routinely reach a checkout through a link (/srv/app ->
+            // /mnt/data/app), and without this the browser shows an empty
+            // parent while `cd` into the same path works. Depth is still 1, so
+            // there is no link cycle to walk; a dangling link fails the -type
+            // test and drops out, which is what should happen to a path that
+            // cannot be entered.
+            + "find -L . -mindepth 1 -maxdepth 1 -type d ! -name '.*' -print0"
     }
 
     static func parse(_ output: String) throws -> RemoteDirectoryListing {
@@ -2891,6 +3019,40 @@ enum RepositoryBranchLookup {
 
     static func singleLine(_ raw: String) -> String {
         raw.split(whereSeparator: \.isWhitespace).first.map(String.init) ?? ""
+    }
+
+    /// Tab completion, shell-style: extend only as far as every candidate
+    /// agrees.
+    ///
+    /// Completing to the first match would silently pick one of several
+    /// equally valid branches, and picking the wrong branch is not a typo the
+    /// person sees — it is a clone of the wrong code. Stopping at the common
+    /// prefix leaves the choosing keystroke theirs.
+    ///
+    /// Prefix-matched (unlike the suggestion list, which is substring-matched)
+    /// because that is what a completion key means everywhere else. Matching
+    /// ignores case but the result keeps the branch's own spelling, so `MAIN`
+    /// completes to `main`.
+    static func completion(for rawQuery: String, in branches: [String]) -> String? {
+        let query = singleLine(rawQuery)
+        let candidates = branches.filter {
+            $0.lowercased().hasPrefix(query.lowercased())
+        }
+        guard let first = candidates.first else { return nil }
+        guard candidates.count > 1 else { return first == query ? nil : first }
+        var shared = first
+        for candidate in candidates.dropFirst() {
+            shared = String(zip(shared, candidate).prefix { $0 == $1 }.map(\.0))
+            if shared.isEmpty { return nil }
+        }
+        return shared.count > query.count ? shared : nil
+    }
+
+    /// Whether a branch this repository actually has was named.
+    static func contains(_ rawBranch: String, in branches: [String]) -> Bool {
+        let branch = singleLine(rawBranch)
+        guard !branch.isEmpty else { return false }
+        return branches.contains { $0.caseInsensitiveCompare(branch) == .orderedSame }
     }
 
     static func matches(

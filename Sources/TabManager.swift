@@ -1274,28 +1274,42 @@ class TabManager {
     }
 
     private func closePanelWithConfirmation(tab: Workspace, panelId: UUID) async {
-        // Cmd+W closes the focused Bonsplit tab (a "tab" in the UI). When the workspace only has
-        // a single tab left, closing it should close the workspace (and possibly the window),
-        // rather than creating a replacement terminal.
+        // Each Cmd+W schedules its own task, and a confirmation sheet lets the
+        // next one start before this one has closed anything. Without this the
+        // second press acts on a panel that is already gone: harmless in the
+        // ordinary branch, but in the last-pane branch below it would open a
+        // second replacement terminal for a pane nobody asked to close twice.
+        guard tab.panels[panelId] != nil else { return }
+        // Cmd+W closes the focused Bonsplit tab (a "tab" in the UI). The last
+        // tab in a workspace takes the workspace with it — but the last
+        // workspace does NOT take the window. Cmd+W is the close-a-pane key;
+        // closing the window is Ctrl+Cmd+W, and a key that usually removes one
+        // pane must not, on its final press, remove everything. With one
+        // workspace holding one pane — the ordinary state of a fresh window —
+        // every Cmd+W was landing on that final press.
         let isLastTabInWorkspace = tab.panels.count <= 1
         if isLastTabInWorkspace {
-            let willCloseWindow = tabs.count <= 1
-            let needsConfirm = workspaceNeedsConfirmClose(tab)
-            if needsConfirm {
-                let message = willCloseWindow
-                    ? "This will close the last tab and close the window."
+            let isLastWorkspace = tabs.count <= 1
+            if workspaceNeedsConfirmClose(tab) {
+                let message = isLastWorkspace
+                    ? "This will close the last tab and start a new terminal."
                     : "This will close the last tab and close its workspace."
                 guard await confirmClose(
                     title: "Close tab?",
                     message: message,
-                    acceptCmdD: willCloseWindow
+                    acceptCmdD: isLastWorkspace
                 ) else { return }
             }
 
-            notifications.clearNotifications(forTabId: tab.id)
-            if willCloseWindow {
-                AppDelegate.shared?.closeMainWindowContainingTabId(tab.id)
+            if isLastWorkspace {
+                // Replace rather than close: open the new terminal first, so
+                // the workspace is never momentarily empty and the pane keeps
+                // its place in the layout.
+                notifications.clearNotifications(forTabId: tab.id, surfaceId: panelId)
+                _ = tab.newTerminalSurfaceInFocusedPane(focus: true)
+                _ = tab.closePanel(panelId, force: true)
             } else {
+                notifications.clearNotifications(forTabId: tab.id)
                 closeWorkspace(tab)
             }
             return

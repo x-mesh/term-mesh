@@ -1305,7 +1305,9 @@ final class AgentSession {
         instructions: String,
         extraArgs: [String] = [],
         workingDirectory: String,
-        remoteEnvironment: [String: String] = [:]
+        remoteEnvironment: [String: String] = [:],
+        remoteEnvironmentFile: String? = nil,
+        reverseUnixForward: (remote: String, local: String)? = nil
     ) -> Launch {
         let claude = claudeLaunch(
             claudePath: "claude",
@@ -1319,14 +1321,16 @@ final class AgentSession {
             executable: claude.executable,
             arguments: claude.arguments,
             workingDirectory: workingDirectory,
-            environment: remoteEnvironment
+            environment: remoteEnvironment,
+            environmentFile: remoteEnvironmentFile
         )
         return Launch(
             executable: "/usr/bin/ssh",
             arguments: sshArguments(
                 target: sshTarget,
                 port: port,
-                identityFile: identityFile
+                identityFile: identityFile,
+                reverseUnixForward: reverseUnixForward
             ) + [command],
             // `Process` needs a local directory. The requested directory lives
             // on the peer and is created by `remoteCommand`.
@@ -1348,21 +1352,26 @@ final class AgentSession {
         identityFile: String?,
         workingDirectory: String,
         remoteEnvironment: [String: String] = [:],
+        remoteEnvironmentFile: String? = nil,
+        reverseUnixForward: (remote: String, local: String)? = nil,
         environment: [String: String] = ProcessInfo.processInfo.environment
     ) -> Launch {
         var env = environment
         let ssh = ["/usr/bin/ssh"] + sshArguments(
             target: sshTarget,
             port: port,
-            identityFile: identityFile
+            identityFile: identityFile,
+            reverseUnixForward: reverseUnixForward
         )
         if let encoded = try? JSONSerialization.data(withJSONObject: ssh),
            let value = String(data: encoded, encoding: .utf8) {
             env["TERMMESH_REMOTE_NATIVE_SSH_ARGS"] = value
         }
         env["TERMMESH_REMOTE_NATIVE_CWD"] = workingDirectory
-        if let encoded = try? JSONSerialization.data(withJSONObject: remoteEnvironment),
-           let value = String(data: encoded, encoding: .utf8) {
+        if let remoteEnvironmentFile, !remoteEnvironmentFile.isEmpty {
+            env["TERMMESH_REMOTE_NATIVE_ENV_FILE"] = remoteEnvironmentFile
+        } else if let encoded = try? JSONSerialization.data(withJSONObject: remoteEnvironment),
+                  let value = String(data: encoded, encoding: .utf8) {
             env["TERMMESH_REMOTE_NATIVE_ENV"] = value
         }
 
@@ -1379,9 +1388,23 @@ final class AgentSession {
     static func sshArguments(
         target: String,
         port: Int?,
-        identityFile: String?
+        identityFile: String?,
+        reverseUnixForward: (remote: String, local: String)? = nil
     ) -> [String] {
         var args = ["-T", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10"]
+        if let reverseUnixForward,
+           !reverseUnixForward.remote.isEmpty,
+           !reverseUnixForward.local.isEmpty {
+            // One private remote socket per SSH-owned agent. OpenSSH removes
+            // the listener when the session ends; unlinking first also makes a
+            // crashed predecessor recoverable without exposing the app's real
+            // local control-socket path to the remote process.
+            args += [
+                "-o", "ExitOnForwardFailure=yes",
+                "-o", "StreamLocalBindUnlink=yes",
+                "-R", "\(reverseUnixForward.remote):\(reverseUnixForward.local)",
+            ]
+        }
         if let port { args += ["-p", String(port)] }
         if let identityFile, !identityFile.isEmpty { args += ["-i", identityFile] }
         args.append(target)
@@ -1392,13 +1415,17 @@ final class AgentSession {
         executable: String,
         arguments: [String],
         workingDirectory: String,
-        environment: [String: String]
+        environment: [String: String],
+        environmentFile: String? = nil
     ) -> String {
         let directory = shellQuoted(workingDirectory)
         // Peer terminal surfaces receive this from term-meshd. Keep native SSH
         // equivalent: Claude otherwise rejects explicit bypass mode for a root
         // peer even though the same agent works in the relay terminal path.
-        let assignments = environment
+        let commandEnvironment = environmentFile == nil
+            ? environment
+            : environment.filter { $0.key == "PATH" }
+        let assignments = commandEnvironment
             .filter { $0.key != "PATH" }
             .filter { isSafeEnvironmentKey($0.key) }
             .sorted { $0.key < $1.key }
@@ -1408,8 +1435,17 @@ final class AgentSession {
             .joined(separator: " ")
         let remotePath = "$HOME/.local/bin:/opt/homebrew/bin:/opt/homebrew/sbin:"
             + "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+        let stagedEnvironment: String
+        if let environmentFile, !environmentFile.isEmpty {
+            let file = shellQuoted(environmentFile)
+            stagedEnvironment = "[ -f \(file) ] || exit 79; "
+                + "set -a; . \(file) >/dev/null 2>&1 || exit 79; "
+                + "rm -f -- \(file); set +a; "
+        } else {
+            stagedEnvironment = ""
+        }
         let loginLaunch = shellQuoted(
-            "export PATH=\"\(remotePath)\"; exec \(launch)"
+            stagedEnvironment + "export PATH=\"\(remotePath)\"; exec \(launch)"
         )
         return "mkdir -p \(directory) && cd \(directory) && "
             + "exec \"${SHELL:-/bin/sh}\" -lc \(loginLaunch)"

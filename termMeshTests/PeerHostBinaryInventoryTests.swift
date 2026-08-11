@@ -263,3 +263,167 @@ final class PeerHostBinaryInventoryTests: XCTestCase {
         XCTAssertEqual(inventory.bridge?.version, "")
     }
 }
+
+/// Leftover daemons are the failure that looks like nothing: the host answers,
+/// the app runs, and a process nobody points at holds sockets from yesterday.
+/// Every fixture here is a shape observed on jinwoo-macbook-pro-sub.
+final class PeerHostDaemonSnapshotTests: XCTestCase {
+    /// Same `sh -c '…'` wrapper constraint as every other fixed probe.
+    func test_command_hasNoSingleQuoteInsideBody() {
+        let cmd = PeerHostDoctor.daemonInstancesProbeCommand
+        XCTAssertTrue(cmd.hasPrefix("sh -c '"), "expected sh -c '…' wrapper")
+        XCTAssertTrue(cmd.hasSuffix("'"), "expected closing single quote")
+        let body = String(cmd.dropFirst("sh -c '".count).dropLast(1))
+        XCTAssertFalse(body.contains("'"), "probe body must not contain single quotes")
+    }
+
+    /// `lsof -p X -U` ORs its selectors: every process reports every unix
+    /// socket on the machine, the app appears connected to all of them, and
+    /// nothing is ever stale. `-a` is what makes the probe mean anything.
+    func test_command_andsTheLsofSelectors() {
+        XCTAssertTrue(
+            PeerHostDoctor.daemonInstancesProbeCommand.contains("lsof -a -p"),
+            "lsof selectors must be AND-ed or the probe silently reports nothing stale"
+        )
+    }
+
+    private let observedOutput = """
+    app=87534
+    appsocks=/tmp/term-mesh-peer-501/peer.sock /tmp/term-mesh-relays-501/cee24596.sock /tmp/term-mesh.sock
+    daemon=42767 ppid=1 etime=01-05:10:54 socks=/private/tmp/term-meshd-peer.sock /private/tmp/term-meshd.sock
+    daemon=44865 ppid=1 etime=01-05:07:10 socks=/var/folders/rd/xx/T/term-meshd-peer.sock /var/folders/rd/xx/T/term-meshd.sock
+    """
+
+    func test_parsesTheAppAndEveryDaemon() {
+        let snapshot = PeerHostDoctor.parseDaemonSnapshot(observedOutput)
+        XCTAssertEqual(snapshot.appPid, 87534)
+        XCTAssertEqual(snapshot.appSockets.count, 3)
+        XCTAssertEqual(snapshot.daemons.map(\.pid), [42767, 44865])
+        XCTAssertEqual(snapshot.daemons.first?.parentPid, 1)
+        XCTAssertEqual(snapshot.daemons.first?.elapsed, "01-05:10:54")
+        XCTAssertEqual(
+            snapshot.daemons.first?.sockets,
+            ["/private/tmp/term-meshd-peer.sock", "/private/tmp/term-meshd.sock"]
+        )
+    }
+
+    /// The observed host: two daemons from yesterday, an app that holds only
+    /// its own peer/control sockets, and no connection between them.
+    func test_daemonsTheAppIsNotUsingAreStale() {
+        let stale = PeerHostDoctor.staleDaemons(
+            in: PeerHostDoctor.parseDaemonSnapshot(observedOutput)
+        )
+        XCTAssertEqual(stale.map(\.pid), [42767, 44865])
+    }
+
+    /// An adopted daemon shows up as a client connection in the app's own
+    /// socket list. Killing that one would end the sessions another machine
+    /// reattaches to — the opposite of the point.
+    func test_anAdoptedDaemonIsNotStale() {
+        let output = """
+        app=90001
+        appsocks=/tmp/term-mesh-peer-501/peer.sock /private/tmp/term-meshd.sock
+        daemon=42767 ppid=1 etime=00:10:00 socks=/private/tmp/term-meshd-peer.sock /private/tmp/term-meshd.sock
+        daemon=44865 ppid=1 etime=01-05:07:10 socks=/var/folders/rd/xx/T/term-meshd.sock
+        """
+        let stale = PeerHostDoctor.staleDaemons(in: PeerHostDoctor.parseDaemonSnapshot(output))
+        XCTAssertEqual(stale.map(\.pid), [44865], "only the daemon outside the app's sockets")
+    }
+
+    /// With no app running, a daemon may be holding sessions for the next
+    /// launch to adopt. Outliving the app is deliberate, so "no app" is not
+    /// evidence of anything and the answer must be empty.
+    func test_noRunningAppMeansNoVerdict() {
+        let output = """
+        app=none
+        daemon=42767 ppid=1 etime=01-05:10:54 socks=/private/tmp/term-meshd.sock
+        """
+        let snapshot = PeerHostDoctor.parseDaemonSnapshot(output)
+        XCTAssertNil(snapshot.appPid)
+        XCTAssertEqual(snapshot.daemons.count, 1)
+        XCTAssertTrue(PeerHostDoctor.staleDaemons(in: snapshot).isEmpty)
+    }
+
+    /// The cleanup reply names what it actually ended. A pid that was already
+    /// gone comes back as `failed=` and must not be reported as stopped.
+    func test_parsesOnlyTheKilledPids() {
+        XCTAssertEqual(
+            PeerHostDoctor.parseTerminatedPids("killed=42767\nfailed=44865\nkilled=51000\n"),
+            [42767, 51000]
+        )
+        XCTAssertTrue(PeerHostDoctor.parseTerminatedPids("").isEmpty)
+    }
+
+    /// The pids travel on stdin; the command text stays fixed. The remote
+    /// guard is the second half of that — a non-numeric line is skipped.
+    func test_cleanupCommandRefusesNonNumericInput() {
+        let cmd = PeerHostDoctor.daemonCleanupCommand
+        XCTAssertTrue(cmd.contains("*[!0-9]*"), "non-numeric stdin must be skipped remotely")
+        XCTAssertFalse(cmd.contains("kill -9"), "SIGTERM only — SIGKILL leaves sockets behind")
+    }
+
+    /// The readiness script decides whether a leader may start, and its
+    /// catch-all turns any error into "CLI unavailable". The diagnostic
+    /// appended to it must therefore be unable to fail outward: the probe ends
+    /// in `exit 44` on every non-Mac host, and that alone would have stopped
+    /// leaders from starting on Linux.
+    func test_leaderDiagnosticCannotAffectItsHostScript() {
+        let fragment = TeamOrchestrator.leaderDaemonDiagnostic
+        XCTAssertTrue(fragment.hasPrefix("( "), "must run in a subshell")
+        XCTAssertTrue(fragment.hasSuffix("|| true"), "must swallow its own exit status")
+        XCTAssertTrue(fragment.contains("exit 44"), "still the same probe body")
+    }
+
+    /// The probe body and the standalone command must stay the same probe.
+    func test_probeCommandWrapsTheSharedBody() {
+        XCTAssertEqual(
+            PeerHostDoctor.daemonInstancesProbeCommand,
+            "sh -c '" + PeerHostDoctor.daemonInstancesProbeBody + "'"
+        )
+    }
+
+    /// Riding along on the readiness round trip means the daemon lines arrive
+    /// mixed in with readiness markers. The parser reads whole-line keys, so
+    /// the marker is not one of them — but only because the diagnostic opens
+    /// a fresh line first.
+    func test_parsesDaemonLinesOutOfReadinessOutput() {
+        let output = """
+        __TERMMESH_LEADER_READY__
+        app=87534
+        appsocks=/tmp/term-mesh-peer-501/peer.sock
+        daemon=42767 ppid=1 etime=01-05:10:54 socks=/private/tmp/term-meshd.sock
+        """
+        let snapshot = PeerHostDoctor.parseDaemonSnapshot(output)
+        XCTAssertEqual(snapshot.appPid, 87534)
+        XCTAssertEqual(PeerHostDoctor.staleDaemons(in: snapshot).map(\.pid), [42767])
+    }
+
+    /// The marker is written with `printf %s`. Without the diagnostic opening
+    /// its own line, its first key lands glued to that marker, the app is
+    /// missed, and "no app" is the case that reports nothing — a diagnostic
+    /// that is silent everywhere instead of wrong somewhere.
+    func test_diagnosticOpensItsOwnLine() {
+        XCTAssertTrue(
+            TeamOrchestrator.leaderDaemonDiagnostic.hasPrefix("( echo;"),
+            "the probe must start a fresh line or its first key merges with the marker"
+        )
+        let glued = "__TERMMESH_LEADER_READY__app=87534"
+        XCTAssertNil(
+            PeerHostDoctor.parseDaemonSnapshot(glued).appPid,
+            "documents why the newline is required"
+        )
+    }
+
+    /// A host with one app and one adopted daemon — the healthy shape, which
+    /// must never produce a cleanup prompt.
+    func test_healthyHostReportsNothing() {
+        let output = """
+        app=90001
+        appsocks=/tmp/term-mesh-peer-501/peer.sock /var/folders/rd/xx/T/term-meshd.sock
+        daemon=51000 ppid=1 etime=02:00:00 socks=/var/folders/rd/xx/T/term-meshd.sock
+        """
+        XCTAssertTrue(
+            PeerHostDoctor.staleDaemons(in: PeerHostDoctor.parseDaemonSnapshot(output)).isEmpty
+        )
+    }
+}

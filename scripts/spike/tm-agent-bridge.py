@@ -186,8 +186,16 @@ def process_location(argv: list[str], cwd: str) -> tuple[list[str], str | None]:
         f'set -a; . "{agent_env}" >/dev/null || '
         f'exit {AGENT_ENV_LOAD_EXIT}; set +a; fi; '
         f'export PATH="{remote_path}"; '
-        "exec env IS_SANDBOX=1 " + shlex.join(assignments + argv)
     )
+    env_file = os.environ.get("TERMMESH_REMOTE_NATIVE_ENV_FILE")
+    if env_file:
+        quoted_env_file = shlex.quote(env_file)
+        inner += (
+            f"[ -f {quoted_env_file} ] || exit 79; "
+            f"set -a; . {quoted_env_file} >/dev/null 2>&1 || exit 79; "
+            f"rm -f -- {quoted_env_file}; set +a; "
+        )
+    inner += "exec env IS_SANDBOX=1 " + shlex.join(assignments + argv)
     command = (
         f"mkdir -p {quoted_cwd} && cd {quoted_cwd} && "
         f'exec "${{SHELL:-/bin/sh}}" -lc {shlex.quote(inner)}'

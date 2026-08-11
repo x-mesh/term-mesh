@@ -1921,6 +1921,18 @@ class TerminalController {
             Result<Termmesh_Peer_V1_TeamLeaderCommandResponse, Error>?
         let task = Task {
             defer { semaphore.signal() }
+            // An SSH-owned Native agent reaches this app through a private
+            // reverse Unix-socket forward. Its grant audience is this peer,
+            // so there is no remote connection to traverse: validate and
+            // execute through the same scoped control plane used by an
+            // incoming peer frame. Other audiences keep the normal reverse
+            // peer route.
+            if targetPeerID == PeerIdentity.defaultPeerID() {
+                outcome = .success(
+                    await GhosttyPaneSurfaceProvider.handleRemoteLeaderCommand(request)
+                )
+                return
+            }
             do {
                 outcome = .success(
                     try await PeerHostCoordinator.shared.callTeamLeader(

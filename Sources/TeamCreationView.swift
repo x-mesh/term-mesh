@@ -2056,6 +2056,9 @@ struct TeamCreationView: View {
                 Button(executionMode == "headless" ? "Create Headless Team" : "Create Team") { createTeam() }
                     .keyboardShortcut(.defaultAction)
                     .disabled(teamName.isEmpty || agents.isEmpty || isTeamNameDuplicate || workingDirectoryError != nil
+                              || TeamAgentComposer.blocksRemoteTeamCreation(
+                                  agents: agents, hosts: hostStore.sortedHosts
+                              )
                               || (leaderPairAutoWatch && leaderMode != "repl" && leaderPairMode != "none" && executionMode != "headless"
                                   && leaderPairSpec.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty))
             }

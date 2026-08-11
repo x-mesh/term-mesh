@@ -107,6 +107,26 @@ struct AboutPanelView: View {
     @State private var commitHash: String?
     private var copyright: String? { Bundle.main.infoDictionary?["NSHumanReadableCopyright"] as? String }
 
+    /// This app is released from `x-mesh/term-mesh`. The old links pointed at
+    /// `manaflow-ai/term-mesh`, which is upstream of the Ghostty fork rather
+    /// than the source of these builds — the version there is not this one and
+    /// the commit hash need not exist at all.
+    static let repositorySlug = "x-mesh/term-mesh"
+
+    /// Release tags are `v0.182.0`; `CFBundleShortVersionString` is `0.182.0`.
+    static func releaseNotesURL(version: String) -> URL? {
+        let trimmed = version.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+        let tag = trimmed.hasPrefix("v") ? trimmed : "v" + trimmed
+        return URL(string: "https://github.com/\(repositorySlug)/releases/tag/\(tag)")
+    }
+
+    static func commitURL(hash: String) -> URL? {
+        let trimmed = hash.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+        return URL(string: "https://github.com/\(repositorySlug)/commit/\(trimmed)")
+    }
+
     private func loadCommitHash() {
         // Fast path: bundle info or env (synchronous, no I/O)
         if let value = Bundle.main.infoDictionary?["TermMeshCommit"] as? String, !value.isEmpty {
@@ -162,16 +182,23 @@ struct AboutPanelView: View {
 
                 VStack(spacing: 2) {
                     if let version {
-                        AboutPropertyRow(label: "Version", text: version)
+                        // The release notes for exactly this version — what a
+                        // person clicking a version number wants to read.
+                        AboutPropertyRow(
+                            label: "Version",
+                            text: version,
+                            url: Self.releaseNotesURL(version: version)
+                        )
                     }
                     if let build {
                         AboutPropertyRow(label: "Build", text: build)
                     }
                     let commitText = commitHash ?? "—"
-                    let commitURL = commitHash.flatMap { hash in
-                        URL(string: "https://github.com/manaflow-ai/term-mesh/commit/\(hash)")
-                    }
-                    AboutPropertyRow(label: "Commit", text: commitText, url: commitURL)
+                    AboutPropertyRow(
+                        label: "Commit",
+                        text: commitText,
+                        url: commitHash.flatMap(Self.commitURL(hash:))
+                    )
                     AboutPropertyRow(label: "Author", text: "Jinwoo")
                 }
                 .frame(maxWidth: .infinity)

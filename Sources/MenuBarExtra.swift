@@ -513,17 +513,23 @@ enum NotificationMenuSnapshotBuilder {
         )
     }
 
-    static func stateHintTitle(unreadCount: Int) -> String {
+    /// `defaults` is injectable so a test can pin the language. Without it the
+    /// expected strings are whatever language the machine running the test is
+    /// set to, which is a test that passes in California and fails in Seoul.
+    static func stateHintTitle(
+        unreadCount: Int,
+        defaults: UserDefaults = .standard
+    ) -> String {
         guard unreadCount != 0 else {
-            return LanguageSettings.localized("No unread notifications")
+            return LanguageSettings.localized("No unread notifications", defaults: defaults)
         }
         // Two keys rather than a plural variation: Korean has no plural form,
         // and this keeps the lookup in the .strings table that
         // `LanguageSettings.localized` reads.
         let key = unreadCount == 1 ? "%lld unread notification" : "%lld unread notifications"
         return String(
-            format: LanguageSettings.localized(key),
-            locale: LanguageSettings.currentLocale(),
+            format: LanguageSettings.localized(key, defaults: defaults),
+            locale: LanguageSettings.currentLocale(defaults: defaults),
             unreadCount
         )
     }
