@@ -1389,9 +1389,9 @@ final class AgentSession {
         }
         launchCarriedPath = launch.environment["PATH"] != nil
         armStartupWatchdog(
-            "\(launch.executable) has not said anything in "
-                + "\(Int(Self.startupSilenceGrace))s. It may not be at that path, or it may "
-                + "be waiting on something that never arrives — a credential, a login prompt."
+            "no output from \(launch.executable) in \(Int(Self.startupSilenceGrace))s. "
+                + "If it never starts, it is usually missing from that path, or waiting on "
+                + "something that will not arrive — a credential, a login prompt."
         )
         let p = Process()
         p.executableURL = URL(fileURLWithPath: launch.executable)
@@ -1546,10 +1546,10 @@ final class AgentSession {
         remoteSink = sink
         let named = cli.map { "`\($0)`" } ?? "the agent CLI"
         armStartupWatchdog(
-            "the remote agent has not said anything in "
-                + "\(Int(Self.startupSilenceGrace))s. This host may not have \(named) on the "
-                + "PATH its agents launch with — that search is narrower than the one "
-                + "Test Relay uses, so a CLI it finds can still be out of reach here. "
+            "no output from the remote agent in \(Int(Self.startupSilenceGrace))s. "
+                + "If it never starts, the usual cause is that this host does not have "
+                + "\(named) on the PATH its agents launch with — a narrower search than "
+                + "Test Relay uses, so a CLI that probe finds can still be out of reach. "
                 + "Edit Peer Host → Test Relay reports where it is, and PATH there adds "
                 + "directories to search."
         )
@@ -2306,9 +2306,15 @@ final class AgentSession {
     ///
     /// Long enough to cover an SSH round trip, a login profile and a CLI's own
     /// startup; short enough that nobody sits looking at an empty pane
-    /// wondering whether it is working. A pane that is merely slow loses
-    /// nothing — the notice is a line of text, and real output cancels it.
-    private static let startupSilenceGrace: TimeInterval = 15
+    /// wondering whether it is working.
+    ///
+    /// Erring long on purpose. A notice cannot be taken back once it is in the
+    /// transcript, so a pane that was merely slow keeps a wrong explanation
+    /// permanently — and sending someone after a PATH problem they do not have
+    /// costs more than the extra seconds of waiting. The message is written
+    /// the same way: it states the silence as fact and the cause as the usual
+    /// one, not as a diagnosis.
+    private static let startupSilenceGrace: TimeInterval = 30
 
     @ObservationIgnored private var startupWatchdog: DispatchWorkItem?
 

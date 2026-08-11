@@ -1078,7 +1078,7 @@ final class AgentSessionTests: XCTestCase {
         XCTAssertFalse(s.hasStartupWatchdogForTesting)
         s.fireStartupWatchdogForTesting()
         let text = AgentSession.visibleTranscriptText(rows: s.rows)
-        XCTAssertFalse(text.contains("has not said anything"), text)
+        XCTAssertFalse(text.contains("no output from"), text)
     }
 
     /// A session that was stopped has already reported itself; a late alarm
@@ -1091,7 +1091,7 @@ final class AgentSessionTests: XCTestCase {
         XCTAssertFalse(s.hasStartupWatchdogForTesting)
         s.fireStartupWatchdogForTesting()
         let text = AgentSession.visibleTranscriptText(rows: s.rows)
-        XCTAssertFalse(text.contains("has not said anything"), text)
+        XCTAssertFalse(text.contains("no output from"), text)
     }
 
     /// A PEM key spans lines, and a line-bounded pattern took only its header
