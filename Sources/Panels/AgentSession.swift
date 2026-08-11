@@ -1388,6 +1388,11 @@ final class AgentSession {
             Self.teamIdentityKeys.contains($0.key)
         }
         launchCarriedPath = launch.environment["PATH"] != nil
+        armStartupWatchdog(
+            "\(launch.executable) has not said anything in "
+                + "\(Int(Self.startupSilenceGrace))s. It may not be at that path, or it may "
+                + "be waiting on something that never arrives — a credential, a login prompt."
+        )
         let p = Process()
         p.executableURL = URL(fileURLWithPath: launch.executable)
         p.arguments = launch.arguments
@@ -1532,10 +1537,22 @@ final class AgentSession {
     /// `interruptible` is the same promise `Launch.interruptible` makes: only
     /// a CLI measured to take `control_request`/`interrupt` on its stdin
     /// stream should offer the button.
+    /// `cli` only names the binary in the watchdog's message, so a session
+    /// that does not know which CLI it is hosting still gets the backstop.
     func startRemote(interruptible: Bool = false,
+                     cli: String? = nil,
                      sink: @escaping @Sendable (Data) async throws -> Void) {
         guard process == nil, remoteSink == nil else { return }
         remoteSink = sink
+        let named = cli.map { "`\($0)`" } ?? "the agent CLI"
+        armStartupWatchdog(
+            "the remote agent has not said anything in "
+                + "\(Int(Self.startupSilenceGrace))s. This host may not have \(named) on the "
+                + "PATH its agents launch with — that search is narrower than the one "
+                + "Test Relay uses, so a CLI it finds can still be out of reach here. "
+                + "Edit Peer Host → Test Relay reports where it is, and PATH there adds "
+                + "directories to search."
+        )
         // A fresh pipeline per session: the decoder must start at a clean
         // line boundary, and batches from any earlier pipeline must keep
         // failing `apply`'s identity guard.
@@ -1668,6 +1685,10 @@ final class AgentSession {
     private func teardown(process expected: Process, terminate: Bool) -> Bool {
         guard process === expected else { return false }
 
+        // Same reasoning as `teardownRemote`: an ended session reports itself,
+        // so a pending silence alarm has nothing left to add.
+        cancelStartupWatchdog()
+
         // A deliberate stop owns completion and must not later become a second
         // process-exited finish when Foundation reports the signal.
         expected.terminationHandler = nil
@@ -1711,6 +1732,9 @@ final class AgentSession {
     /// identity guard, mirroring `teardown`'s `process === p` revocation.
     private func teardownRemote() {
         guard remoteSink != nil else { return }
+        // A session that ended has already said why, or is about to through
+        // the exit notice. Either way the silence question is settled.
+        cancelStartupWatchdog()
         remoteSink = nil
         remoteGeneration &+= 1
         remoteSendTail = nil
@@ -2266,8 +2290,56 @@ final class AgentSession {
     }
 
     private func append(_ entry: Entry) {
+        // Anything reaching the transcript is proof the launch got somewhere,
+        // which is all the startup watchdog was waiting to hear. Cancelling
+        // here rather than at each producer is deliberate: stdout batches,
+        // stderr notices and protocol events all funnel through this one call,
+        // and a new producer added later would otherwise silently re-arm the
+        // false alarm.
+        cancelStartupWatchdog()
         entries.append(entry)
         trimToCap()
+    }
+
+    /// How long a pane may stay completely silent before it says why it might
+    /// be.
+    ///
+    /// Long enough to cover an SSH round trip, a login profile and a CLI's own
+    /// startup; short enough that nobody sits looking at an empty pane
+    /// wondering whether it is working. A pane that is merely slow loses
+    /// nothing — the notice is a line of text, and real output cancels it.
+    private static let startupSilenceGrace: TimeInterval = 15
+
+    @ObservationIgnored private var startupWatchdog: DispatchWorkItem?
+
+    /// Say something when a launch produces nothing at all.
+    ///
+    /// Every failure that *ends* the process is already reported: a non-zero
+    /// exit, a signal, a closed transport. What had no reporter was the launch
+    /// that neither fails nor starts — measured with a peer agent whose CLI
+    /// was absent from the launch PATH but present to the readiness probe. The
+    /// pane opened, the process sat there, and the UI waited forever with
+    /// nothing to show. This is the backstop for that shape of failure, and
+    /// for the ones nobody has hit yet: no matter the cause, the pane
+    /// eventually explains itself instead of staying blank.
+    private func armStartupWatchdog(_ diagnosis: String) {
+        cancelStartupWatchdog()
+        let item = DispatchWorkItem { [weak self] in
+            guard let self, self.startupWatchdog != nil else { return }
+            // Cleared first: `append` cancels the watchdog, and this *is* the
+            // watchdog firing.
+            self.startupWatchdog = nil
+            self.append(.notice(id: UUID(), diagnosis))
+        }
+        startupWatchdog = item
+        DispatchQueue.main.asyncAfter(
+            deadline: .now() + Self.startupSilenceGrace, execute: item
+        )
+    }
+
+    private func cancelStartupWatchdog() {
+        startupWatchdog?.cancel()
+        startupWatchdog = nil
     }
 
     /// Drop the oldest entries once the session exceeds its cap.
@@ -2322,6 +2394,13 @@ final class AgentSession {
     }
 
     func noteAutoScrollForDebug() { debugAutoScrolls += 1 }
+
+    /// Whether a silence alarm is still pending.
+    var hasStartupWatchdogForTesting: Bool { startupWatchdog != nil }
+
+    /// Fire it now rather than waiting out `startupSilenceGrace`. A cancelled
+    /// work item performs nothing, which is exactly the behaviour under test.
+    func fireStartupWatchdogForTesting() { startupWatchdog?.perform() }
 
     /// Where the transcript's bottom marker actually sat the last time the
     /// view measured it, alongside the follow decision that measurement fed.

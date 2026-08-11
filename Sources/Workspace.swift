@@ -2845,6 +2845,7 @@ final class Workspace: Identifiable {
         // a notice — instead of vanishing into a released closure.
         panel.startRemote(
             interruptible: Self.remoteAgentInterruptible(agentCli: session.originSurface.agentCli),
+            cli: session.originSurface.agentCli,
             sink: { [weak relay] line in
                 guard let relay else { throw RemoteAgentPaneError.transportClosed }
                 guard try await relay.sendRemoteKeys(line) else {

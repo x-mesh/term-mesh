@@ -1048,6 +1048,52 @@ final class AgentSessionTests: XCTestCase {
         XCTAssertTrue(snapshot.contains("[redacted]"))
     }
 
+    // MARK: - A pane that says nothing eventually says why
+
+    /// Every failure that *ends* a launch already reports itself — a non-zero
+    /// exit, a signal, a closed transport. The one with no reporter was the
+    /// launch that neither fails nor starts: measured with a peer agent whose
+    /// CLI was missing from the launch PATH but present to the readiness
+    /// probe, the pane opened and waited forever with nothing to show.
+    func testSilentRemoteLaunchEventuallyExplainsItself() {
+        let s = AgentSession()
+        s.startRemote(cli: "codex") { _ in }
+        XCTAssertTrue(s.hasStartupWatchdogForTesting)
+
+        s.fireStartupWatchdogForTesting()
+
+        let text = AgentSession.visibleTranscriptText(rows: s.rows)
+        XCTAssertTrue(text.contains("codex"), text)
+        XCTAssertTrue(text.contains("PATH"), text)
+        XCTAssertFalse(s.hasStartupWatchdogForTesting, "it fires once, not on a timer")
+    }
+
+    /// Anything at all in the transcript proves the launch got somewhere.
+    func testAnyOutputCancelsTheSilenceAlarm() {
+        let s = AgentSession()
+        s.startRemote(cli: "codex") { _ in }
+        s.ingestForTesting(event(["type": "assistant",
+                                  "message": ["content": [["type": "text", "text": "hi"]]]]))
+
+        XCTAssertFalse(s.hasStartupWatchdogForTesting)
+        s.fireStartupWatchdogForTesting()
+        let text = AgentSession.visibleTranscriptText(rows: s.rows)
+        XCTAssertFalse(text.contains("has not said anything"), text)
+    }
+
+    /// A session that was stopped has already reported itself; a late alarm
+    /// would be noise on top of an answer the user already has.
+    func testStoppingCancelsTheSilenceAlarm() {
+        let s = AgentSession()
+        s.startRemote(cli: "codex") { _ in }
+        s.stop()
+
+        XCTAssertFalse(s.hasStartupWatchdogForTesting)
+        s.fireStartupWatchdogForTesting()
+        let text = AgentSession.visibleTranscriptText(rows: s.rows)
+        XCTAssertFalse(text.contains("has not said anything"), text)
+    }
+
     /// A PEM key spans lines, and a line-bounded pattern took only its header
     /// — the one part an attacker can retype. The body has to go with it.
     func testVisibleTranscriptRemovesMultiLinePrivateKeyBodies() {

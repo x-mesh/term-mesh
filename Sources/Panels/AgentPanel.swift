@@ -117,8 +117,9 @@ final class AgentPanel: ObservableObject, Panel {
     /// `session.consume(_:)`; outgoing turns leave through `sink` as one
     /// NDJSON line per call, newline included.
     func startRemote(interruptible: Bool = false,
+                     cli: String? = nil,
                      sink: @escaping @Sendable (Data) async throws -> Void) {
-        session.startRemote(interruptible: interruptible, sink: sink)
+        session.startRemote(interruptible: interruptible, cli: cli, sink: sink)
     }
 
     // MARK: - Panel
