@@ -1033,6 +1033,39 @@ final class PeerProjectBootstrapTests: XCTestCase {
         XCTAssertTrue(checked.contains("else exec claude; fi"))
     }
 
+    func test_remote_paste_directory_is_shared_home_cache_in_sh_and_zsh() throws {
+        XCTAssertFalse(RemotePasteTransfer.remoteDirectoryCommand.contains("/tmp"))
+        XCTAssertTrue(RemotePasteTransfer.remoteDirectoryCommand.contains("XDG_CACHE_HOME"))
+        XCTAssertTrue(RemotePasteTransfer.remoteDirectoryCommand.contains("$HOME/.cache"))
+        XCTAssertTrue(RemotePasteTransfer.remoteDirectoryCommand.contains("systemctl show -p User"))
+        XCTAssertTrue(RemotePasteTransfer.remoteDirectoryCommand.contains("runuser -u"))
+
+        for shell in ["/bin/sh", "/bin/zsh"] {
+            let root = FileManager.default.temporaryDirectory
+                .appendingPathComponent("term-mesh-paste-\(UUID().uuidString)")
+            let cache = root.appendingPathComponent("cache")
+            defer { try? FileManager.default.removeItem(at: root) }
+            let output = Pipe()
+            let process = Process()
+            process.executableURL = URL(fileURLWithPath: shell)
+            process.arguments = ["-f", "-c", RemotePasteTransfer.remoteDirectoryCommand]
+            process.environment = ProcessInfo.processInfo.environment.merging([
+                "HOME": root.path,
+                "XDG_CACHE_HOME": cache.path,
+            ]) { _, override in override }
+            process.standardOutput = output
+            try process.run()
+            let data = output.fileHandleForReading.readDataToEndOfFile()
+            process.waitUntilExit()
+
+            let expected = cache.appendingPathComponent("term-mesh/paste")
+            XCTAssertEqual(process.terminationStatus, 0, shell)
+            XCTAssertEqual(String(data: data, encoding: .utf8), expected.path, shell)
+            let attributes = try FileManager.default.attributesOfItem(atPath: expected.path)
+            XCTAssertEqual((attributes[.posixPermissions] as? NSNumber)?.intValue, 0o700)
+        }
+    }
+
     @MainActor
     func test_remote_leader_does_not_inject_policy_into_local_anchor_shell() {
         XCTAssertTrue(

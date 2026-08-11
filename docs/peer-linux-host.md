@@ -42,15 +42,17 @@ The exact paths and commands depend on the selected scope:
 | User (default) | `~/.local/bin/term-meshd` | `~/.config/term-mesh/peer.env` | `~/.config/systemd/user/term-meshd.service` | `/run/user/<uid>/tm-peer.sock` | `systemctl --user …`; `journalctl --user …` |
 | System (root installer) | `/usr/local/bin/term-meshd` | `/etc/term-mesh/peer.env` | `/etc/systemd/system/term-meshd.service` | `/run/term-mesh/tm-peer.sock` | `systemctl …`; `journalctl …` |
 
-The daemon runs as the account that invokes the installer. This keeps project
-setup and pane processes under the same identity: installing through
-`root@host` produces a root system service, while a normal account with a user
-bus gets a service under that account. To isolate a system install under a
-dedicated account instead, set `TERMMESH_SERVICE_USER=term-mesh`; panes then
-run as that account too. Running the installer as root always selects system
-scope, including CentOS 7/systemd 219 SSH sessions without a user bus. A
-non-root install with no user bus exits with instructions instead of silently
-creating a different service.
+The daemon runs as the connecting account by default. This keeps SSH project
+setup, file ownership, HOME/PATH, and pane processes under the same identity:
+a normal account with a user bus gets a user service, `sudo` keeps `SUDO_USER`
+as the system service's `User=`, and a direct `root@host` install runs as root.
+To isolate a system install under a dedicated account instead, set
+`TERMMESH_SERVICE_USER=term-mesh`; panes then run as that account too and the
+SSH account must be root or the same account to pass the peer socket UID gate.
+Running the installer as root always selects system scope, including CentOS
+7/systemd 219 SSH sessions without a user bus. A non-root install with no user
+bus exits with a `sudo` command that preserves the connecting account instead
+of silently creating a service under a different identity.
 
 In either scope the peer socket is live immediately. No separate "declare
 surfaces" step is required; a single default `$SHELL -l` surface starts if

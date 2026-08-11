@@ -65,12 +65,20 @@ printf 'loginctl %s\n' "$*" >> /tmp/term-mesh-installer-calls
 EOF
 cat > "$MOCK_BIN/sudo" <<'EOF'
 #!/usr/bin/env bash
+printf 'sudo %s\n' "$*" >> /tmp/term-mesh-installer-calls
 [[ "${1:-}" == -n ]] && shift
 exec "$@"
 EOF
 chmod +x "$MOCK_BIN/systemctl" "$MOCK_BIN/curl" "$MOCK_BIN/loginctl" "$MOCK_BIN/sudo"
 
 export PATH="$MOCK_BIN:$PATH" TERMMESH_INSTALL_TAG=vtest
+
+TERMMESH_INSTALL_LIB_ONLY=1 source "$INSTALLER"
+[[ "$(resolve_connecting_user 0 root tester '')" == root ]]
+[[ "$(resolve_connecting_user 0 root tester 1000)" == tester ]]
+[[ "$(resolve_connecting_user 0 root root 0)" == root ]]
+[[ "$(resolve_connecting_user 1000 tester '' '')" == tester ]]
+unset TERMMESH_INSTALL_LIB_ONLY
 
 echo '==> system install follows the connecting account and stays hardened'
 bash "$INSTALLER"
@@ -82,9 +90,21 @@ grep -qx 'ProtectSystem=full' /etc/systemd/system/term-meshd.service
 grep -qx 'ProtectHome=false' /etc/systemd/system/term-meshd.service
 grep -qx 'RuntimeDirectory=term-mesh' /etc/systemd/system/term-meshd.service
 grep -qx 'TERMMESH_PEER_SOCKET=/run/term-mesh/tm-peer.sock' /etc/term-mesh/peer.env
+if grep -q '^sudo ' "$CALLS"; then
+  echo 'direct root install must not invoke sudo' >&2
+  exit 1
+fi
+
+echo '==> sudo system install follows the invoking SSH account'
+useradd --create-home tester
+SUDO_USER=tester SUDO_UID=$(id -u tester) \
+  TERMMESH_INSTALL_PREFIX=/opt/term-mesh-sudo-user bash "$INSTALLER"
+grep -qx 'User=tester' /etc/systemd/system/term-meshd.service
+grep -qx 'Group=tester' /etc/systemd/system/term-meshd.service
+grep -qx 'Environment=HOME=/home/tester' /etc/systemd/system/term-meshd.service
+grep -qx 'ProtectHome=false' /etc/systemd/system/term-meshd.service
 
 echo '==> system to user switch removes the old scope first'
-useradd --create-home tester
 chmod 0777 /etc/systemd/system
 if runuser -u tester -- env HOME=/home/tester PATH="$PATH" \
   MOCK_USER_BUS=1 MOCK_FAIL_SYSTEM_CLEANUP=1 TERMMESH_INSTALL_TAG=vtest \
