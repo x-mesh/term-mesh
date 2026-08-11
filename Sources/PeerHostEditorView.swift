@@ -247,17 +247,18 @@ struct PeerHostEditorView: View {
                                     .stroke(Color(nsColor: .separatorColor), lineWidth: 1)
                             )
                             .accessibilityLabel("Environment variables, one KEY=VALUE per line")
-                        // PATH says "add these" rather than "use exactly
-                        // this": term-mesh keeps its own baseline in front of
+                        // PATH says "also look here" rather than "use exactly
+                        // this": term-mesh keeps its own baseline ahead of
                         // whatever a host configures, so the CLIs it installs
-                        // stay reachable. Spelling that out here is what stops
-                        // the `PATH=$PATH:/opt/foo/bin` attempt — nothing is
-                        // being replaced, so there is nothing to preserve, and
-                        // `$PATH` would arrive as four literal characters.
+                        // stay reachable and cannot be shadowed. Spelling that
+                        // out here is what stops the `PATH=$PATH:/opt/foo/bin`
+                        // attempt — nothing is being replaced, so there is
+                        // nothing to preserve, and `$PATH` would arrive as
+                        // four literal characters.
                         Text("KEY=VALUE per line — set for agent launches and project setup on this machine")
                             .font(.system(size: 9))
                             .foregroundColor(Color.secondary.opacity(0.8))
-                        Text("PATH adds directories to the front of the default search path — "
+                        Text("PATH adds directories to search after the defaults — "
                              + "list them plainly (/opt/foo/bin:$HOME/bin), without $PATH")
                             .font(.system(size: 9))
                             .foregroundColor(Color.secondary.opacity(0.8))

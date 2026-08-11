@@ -161,8 +161,11 @@ environment values.
 `PATH` is the one key that **adds** rather than replaces. term-mesh keeps a
 baseline (`tm_agent_bridge::location::REMOTE_PATH`) so the CLIs it installs stay
 reachable whatever a host configures, and a `PATH` saved for a peer host is
-prepended to it — in agent launches and in terminal panes alike, so the same
-value cannot mean two things in two panes. List directories plainly
+appended to it — in agent launches and in terminal panes alike, so the same
+value cannot mean two things in two panes. **After**, not before: the order is
+the safety property, since a host setting searched first could shadow
+`/usr/bin` or a term-mesh CLI with a same-named file. To pin a particular
+binary, set that CLI's absolute path instead. List directories plainly
 (`/opt/foo/bin:$HOME/bin`); **do not write `$PATH`** there. Nothing is being
 replaced, so there is nothing to preserve by hand, and the value reaches the
 launch without a shell expanding it — `$PATH` would arrive as four literal

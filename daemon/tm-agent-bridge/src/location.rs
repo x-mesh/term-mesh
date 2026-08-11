@@ -30,8 +30,8 @@ pub const AGENT_ENV_LOAD_EXIT: i32 = 78;
 pub const REMOTE_PATH: &str = "$HOME/.local/bin:/opt/homebrew/bin:/opt/homebrew/sbin:\
 /usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin";
 
-/// `PATH` for a remote launch: [`REMOTE_PATH`], with a host's configured
-/// directories in front of it.
+/// `PATH` for a remote launch: [`REMOTE_PATH`], then a host's configured
+/// directories.
 ///
 /// A `PATH` saved for a peer host used to be dropped outright — the baseline
 /// was authoritative and that was the end of it. But a CLI installed somewhere
@@ -40,11 +40,15 @@ pub const REMOTE_PATH: &str = "$HOME/.local/bin:/opt/homebrew/bin:/opt/homebrew/
 /// set and happily reported it present. The pane opened and the agent inside
 /// it never started.
 ///
-/// Treating the value as *additional* directories rather than a replacement
-/// keeps the baseline intact — the CLIs term-mesh installs stay reachable no
-/// matter what is configured — while making a configured directory actually
-/// take effect. It also removes the reason anyone reached for `$PATH` in that
-/// field: there is nothing to preserve by hand when nothing is being replaced.
+/// Configured directories are searched **after** the baseline, not before it.
+/// That order is the whole safety property: the baseline is what guarantees
+/// the binaries term-mesh installs are the ones that run, and a host setting
+/// that could shadow `/usr/bin` or a term-mesh CLI with a same-named file
+/// would take that guarantee away. Appending still solves what the setting is
+/// for — a directory the baseline never lists is now reachable — because
+/// nothing earlier in the search can answer for a CLI that only lives there.
+/// To pin a *particular* binary, configure that CLI's absolute path instead;
+/// that is what the CLI path settings are.
 ///
 /// Entries are used verbatim, so `$HOME` and `~` expand as the launching shell
 /// would. Empty segments are dropped; they would silently mean "current
@@ -53,15 +57,15 @@ pub fn path_with_extra(extra: Option<&str>) -> String {
     let Some(extra) = extra else {
         return REMOTE_PATH.to_string();
     };
-    let prefix: Vec<&str> = extra
+    let suffix: Vec<&str> = extra
         .split(':')
         .map(str::trim)
         .filter(|entry| !entry.is_empty())
         .collect();
-    if prefix.is_empty() {
+    if suffix.is_empty() {
         return REMOTE_PATH.to_string();
     }
-    format!("{}:{}", prefix.join(":"), REMOTE_PATH)
+    format!("{}:{}", REMOTE_PATH, suffix.join(":"))
 }
 
 /// Turn wrapper-only exit codes into safe, actionable UI messages.
@@ -585,22 +589,22 @@ mod path_extra_tests {
         assert_eq!(path_with_extra(Some("  ")), REMOTE_PATH);
     }
 
-    /// Configured directories are searched first, and the baseline stays whole
-    /// behind them — the CLIs term-mesh installs must remain reachable no
-    /// matter what a host configures.
+    /// Configured directories are reachable, and the baseline is searched
+    /// first. A host setting must not be able to answer for `/usr/bin` or for
+    /// a term-mesh CLI with a same-named file placed earlier in the search.
     #[test]
-    fn configured_directories_go_in_front_of_the_baseline() {
+    fn configured_directories_are_searched_after_the_baseline() {
         let path = path_with_extra(Some("/opt/foo/bin:$HOME/.npm-global/bin"));
-        assert!(path.starts_with("/opt/foo/bin:$HOME/.npm-global/bin:"));
-        assert!(path.ends_with(REMOTE_PATH));
+        assert!(path.starts_with(REMOTE_PATH));
+        assert!(path.ends_with(":/opt/foo/bin:$HOME/.npm-global/bin"));
     }
 
     /// An empty segment means "the current directory" to a shell, which is
     /// never what a trailing colon in a settings field was meant to say.
     #[test]
     fn empty_segments_are_dropped() {
-        assert_eq!(path_with_extra(Some("/opt/foo/bin::")), format!("/opt/foo/bin:{REMOTE_PATH}"));
-        assert_eq!(path_with_extra(Some(":/opt/foo/bin")), format!("/opt/foo/bin:{REMOTE_PATH}"));
-        assert_eq!(path_with_extra(Some(" /opt/foo/bin ")), format!("/opt/foo/bin:{REMOTE_PATH}"));
+        assert_eq!(path_with_extra(Some("/opt/foo/bin::")), format!("{REMOTE_PATH}:/opt/foo/bin"));
+        assert_eq!(path_with_extra(Some(":/opt/foo/bin")), format!("{REMOTE_PATH}:/opt/foo/bin"));
+        assert_eq!(path_with_extra(Some(" /opt/foo/bin ")), format!("{REMOTE_PATH}:/opt/foo/bin"));
     }
 }

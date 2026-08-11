@@ -1985,45 +1985,50 @@ const PREFERRED_TERM: &str = "xterm-ghostty";
 /// prepends pyenv and appends snap around it rather than overwriting.
 ///
 /// A `PATH` saved for the host is *added* here, exactly as it is for an agent
-/// launch — the same value must not mean "prepend these" in one pane and
-/// "replace everything" in the one beside it. Configured directories go in
-/// front, then `~/.local/bin`, then whatever the daemon inherited; the login
-/// profile still runs afterwards and keeps what it adds.
+/// launch — the same value must not mean one thing in this pane and something
+/// else in the one beside it. `~/.local/bin` comes first (it is part of the
+/// launch baseline agents get), then what the daemon inherited, then the
+/// host's configured directories last, for the same reason the agent path
+/// appends them: a host setting must not shadow a system binary. The login
+/// profile still runs afterwards and keeps whatever it adds.
 fn pane_path(requested_env: &[(String, String)]) -> Option<String> {
-    let configured = requested_env
+    let mut leading: Vec<String> = Vec::new();
+    if let Ok(home) = std::env::var("HOME") {
+        let local_bin = format!("{}/.local/bin", home.trim_end_matches('/'));
+        if std::path::Path::new(&local_bin).is_dir() {
+            leading.push(local_bin);
+        }
+    }
+    let trailing: Vec<String> = requested_env
         .iter()
         .find(|(key, _)| key == "PATH")
-        .map(|(_, value)| value.as_str());
-    let mut entries: Vec<String> = configured
+        .map(|(_, value)| value.as_str())
         .unwrap_or_default()
         .split(':')
         .map(|entry| entry.trim().to_string())
         .filter(|entry| !entry.is_empty())
         .collect();
-
-    if let Ok(home) = std::env::var("HOME") {
-        let local_bin = format!("{}/.local/bin", home.trim_end_matches('/'));
-        if std::path::Path::new(&local_bin).is_dir() {
-            entries.push(local_bin);
-        }
-    }
-    if entries.is_empty() {
+    if leading.is_empty() && trailing.is_empty() {
         return None;
     }
 
     let inherited = std::env::var("PATH").unwrap_or_default();
     let already: Vec<&str> = inherited.split(':').collect();
-    entries.retain(|entry| !already.contains(&entry.as_str()));
-    if entries.is_empty() {
+    let mut ordered: Vec<String> = Vec::new();
+    ordered.extend(leading);
+    if !inherited.is_empty() {
+        ordered.push(inherited.clone());
+    }
+    ordered.extend(
+        trailing
+            .into_iter()
+            .filter(|entry| !already.contains(&entry.as_str())),
+    );
+    let joined = ordered.join(":");
+    if joined == inherited {
         return None;
     }
-
-    let prefix = entries.join(":");
-    Some(if inherited.is_empty() {
-        prefix
-    } else {
-        format!("{prefix}:{inherited}")
-    })
+    Some(joined)
 }
 
 fn pane_environment(surface_id: &[u8]) -> Vec<(String, String)> {
@@ -3381,17 +3386,18 @@ mod tests {
         assert_eq!(values.get("REQUESTED_ONLY"), Some(&"requested"));
         assert_eq!(values.get("ORDER"), Some(&"requested"));
         assert_eq!(values.get("TERMMESH_SURFACE_ID"), Some(&"internal"));
-        // PATH is additive: a configured directory is searched first, and the
-        // baseline stays behind it. Replacing the baseline is what must never
-        // happen — that would strand the CLIs term-mesh installs, which is the
-        // reason this value used to be dropped outright.
+        // PATH is additive, and additive at the end: a configured directory is
+        // reachable but cannot answer ahead of the baseline. Neither replacing
+        // the baseline nor preceding it is allowed — the first would strand
+        // the CLIs term-mesh installs, the second would let a host setting
+        // shadow them with a same-named file.
         assert_ne!(values.get("PATH"), Some(&"/forged"));
         assert!(values
             .get("PATH")
-            .is_some_and(|path| path.starts_with("/forged:")));
+            .is_some_and(|path| path.starts_with(home.path().join(".local/bin").to_str().unwrap())));
         assert!(values
             .get("PATH")
-            .is_some_and(|path| path.contains(home.path().join(".local/bin").to_str().unwrap())));
+            .is_some_and(|path| path.ends_with(":/forged")));
         assert!(!stdout.contains("login-noise"));
         assert!(!String::from_utf8_lossy(&output.stderr).contains("login-secret"));
     }
