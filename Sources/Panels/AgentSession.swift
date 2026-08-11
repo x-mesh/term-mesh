@@ -611,12 +611,11 @@ final class AgentSession {
     /// process through the same socket read. Rows that must keep their own
     /// shape — answers, instructions, notices — take this alone.
     ///
-    /// The PEM pattern still stops at a line break, so a multi-line private
-    /// key loses its header and keeps its body. That is deliberate: matching
-    /// across lines without an `-----END-----` to anchor on would swallow the
-    /// rest of the transcript.
+    /// A PEM key is the one credential that spans lines, and it is handled
+    /// before the single-line patterns so that its body never reaches them.
     static func redactingCredentials(_ text: String) -> String {
-        var redacted = redactingSensitiveEnvironmentAssignments(text)
+        var redacted = redactingPrivateKeyBlocks(text)
+        redacted = redactingSensitiveEnvironmentAssignments(redacted)
         for (regex, template) in credentialRedactions {
             let range = NSRange(redacted.startIndex..<redacted.endIndex, in: redacted)
             redacted = regex.stringByReplacingMatches(
@@ -627,6 +626,43 @@ final class AgentSession {
         }
         return redacted
     }
+
+    /// Remove a private key including its body.
+    ///
+    /// A line-bounded pattern takes the `-----BEGIN-----` header and leaves
+    /// the base64 behind, which is the part worth having: the header is a
+    /// constant an attacker types back in. So this matches across lines to the
+    /// closing `-----END-----`, and when there is no closing marker it removes
+    /// the rest of the text instead — a key that was cut off mid-transcript is
+    /// still a key.
+    ///
+    /// Deleting to the end is bounded by the caller: every consumer applies
+    /// this to one transcript row (an answer, an instruction, a notice), and
+    /// the rows are joined afterwards. A truncated key therefore costs the
+    /// remainder of its own row, never anything that follows it.
+    private static func redactingPrivateKeyBlocks(_ text: String) -> String {
+        var result = text
+        for regex in [privateKeyBlockPattern, privateKeyOpenPattern].compactMap({ $0 }) {
+            let range = NSRange(result.startIndex..<result.endIndex, in: result)
+            result = regex.stringByReplacingMatches(
+                in: result,
+                range: range,
+                withTemplate: "[redacted private key]"
+            )
+        }
+        return result
+    }
+
+    /// Non-greedy so two keys in one row do not merge into one match, taking
+    /// everything between them with it.
+    private static let privateKeyBlockPattern = try? NSRegularExpression(
+        pattern: #"(?is)-----BEGIN(?: [A-Z0-9]+)* PRIVATE KEY-----.*?-----END(?: [A-Z0-9]+)* PRIVATE KEY-----"#
+    )
+
+    /// Whatever the block pattern left: an opening marker with no close.
+    private static let privateKeyOpenPattern = try? NSRegularExpression(
+        pattern: #"(?is)-----BEGIN(?: [A-Z0-9]+)* PRIVATE KEY-----.*"#
+    )
 
     /// Compiled once. Every row of a read now runs the whole set, and a
     /// transcript is bounded at 500 rows, so rebuilding these per row would
@@ -639,7 +675,6 @@ final class AgentSession {
             (#"(?i)([a-z][a-z0-9+.-]*://[^\s/:@]+:)[^\s@]+@"#, "$1[redacted]@"),
             (#"[A-Za-z0-9_-]{16,}\.[A-Za-z0-9_-]{16,}\.[A-Za-z0-9_-]{16,}"#, "[redacted]"),
             (#"\b(?:gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|sk-(?:proj-)?[A-Za-z0-9_-]{16,})\b"#, "[redacted]"),
-            (#"(?i)-----BEGIN(?: [A-Z0-9]+)* PRIVATE KEY-----.*"#, "[redacted private key]"),
         ]
         return patterns.compactMap { pattern, template in
             (try? NSRegularExpression(pattern: pattern)).map { ($0, template) }
