@@ -362,6 +362,58 @@ final class PeerHostDaemonSnapshotTests: XCTestCase {
         XCTAssertFalse(cmd.contains("kill -9"), "SIGTERM only — SIGKILL leaves sockets behind")
     }
 
+    /// The readiness script decides whether a leader may start, and its
+    /// catch-all turns any error into "CLI unavailable". The diagnostic
+    /// appended to it must therefore be unable to fail outward: the probe ends
+    /// in `exit 44` on every non-Mac host, and that alone would have stopped
+    /// leaders from starting on Linux.
+    func test_leaderDiagnosticCannotAffectItsHostScript() {
+        let fragment = TeamOrchestrator.leaderDaemonDiagnostic
+        XCTAssertTrue(fragment.hasPrefix("( "), "must run in a subshell")
+        XCTAssertTrue(fragment.hasSuffix("|| true"), "must swallow its own exit status")
+        XCTAssertTrue(fragment.contains("exit 44"), "still the same probe body")
+    }
+
+    /// The probe body and the standalone command must stay the same probe.
+    func test_probeCommandWrapsTheSharedBody() {
+        XCTAssertEqual(
+            PeerHostDoctor.daemonInstancesProbeCommand,
+            "sh -c '" + PeerHostDoctor.daemonInstancesProbeBody + "'"
+        )
+    }
+
+    /// Riding along on the readiness round trip means the daemon lines arrive
+    /// mixed in with readiness markers. The parser reads whole-line keys, so
+    /// the marker is not one of them — but only because the diagnostic opens
+    /// a fresh line first.
+    func test_parsesDaemonLinesOutOfReadinessOutput() {
+        let output = """
+        __TERMMESH_LEADER_READY__
+        app=87534
+        appsocks=/tmp/term-mesh-peer-501/peer.sock
+        daemon=42767 ppid=1 etime=01-05:10:54 socks=/private/tmp/term-meshd.sock
+        """
+        let snapshot = PeerHostDoctor.parseDaemonSnapshot(output)
+        XCTAssertEqual(snapshot.appPid, 87534)
+        XCTAssertEqual(PeerHostDoctor.staleDaemons(in: snapshot).map(\.pid), [42767])
+    }
+
+    /// The marker is written with `printf %s`. Without the diagnostic opening
+    /// its own line, its first key lands glued to that marker, the app is
+    /// missed, and "no app" is the case that reports nothing — a diagnostic
+    /// that is silent everywhere instead of wrong somewhere.
+    func test_diagnosticOpensItsOwnLine() {
+        XCTAssertTrue(
+            TeamOrchestrator.leaderDaemonDiagnostic.hasPrefix("( echo;"),
+            "the probe must start a fresh line or its first key merges with the marker"
+        )
+        let glued = "__TERMMESH_LEADER_READY__app=87534"
+        XCTAssertNil(
+            PeerHostDoctor.parseDaemonSnapshot(glued).appPid,
+            "documents why the newline is required"
+        )
+    }
+
     /// A host with one app and one adopted daemon — the healthy shape, which
     /// must never produce a cleanup prompt.
     func test_healthyHostReportsNothing() {

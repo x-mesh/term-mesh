@@ -2351,6 +2351,41 @@ extension TeamOrchestrator {
         }
     }
 
+    /// The daemon probe, wrapped so it can never affect the script it is
+    /// appended to. `( … ) || true` contains both the deliberate `exit 44`
+    /// that ends it on a non-Mac host and anything unexpected inside it.
+    ///
+    /// The leading `echo` is load-bearing: the readiness marker is written
+    /// with `printf %s`, so without it the probe's first line arrives glued to
+    /// the marker as `__TERMMESH_LEADER_READY__app=1234` and the parser — which
+    /// matches whole-line keys — sees no app at all. That reads as "no app
+    /// running", which is exactly the case that reports nothing stale, so the
+    /// diagnostic would have been silent on every host.
+    static let leaderDaemonDiagnostic =
+        "( echo; " + PeerHostDoctor.daemonInstancesProbeBody + " ) 2>/dev/null || true"
+
+    /// Say it before the leader starts, not only after something fails.
+    ///
+    /// Reads the diagnostic lines out of the readiness output — the parser
+    /// only looks at `app=` / `daemon=` lines, so the readiness markers
+    /// sharing that output are simply ignored. Never throws and never blocks
+    /// the launch: a host with leftovers still gets its leader, it just stops
+    /// being a silent condition.
+    private static func reportStaleDaemons(in output: String, host: HostEntry) {
+        let stale = PeerHostDoctor.staleDaemons(
+            in: PeerHostDoctor.parseDaemonSnapshot(output)
+        )
+        guard !stale.isEmpty else { return }
+        let pids = stale.map { String($0.pid) }.joined(separator: ", ")
+        RemoteWorkLog.infoOffMain(
+            "\(host.displayName): \(stale.count) term-meshd process(es) here serve nothing "
+                + "(pid \(pids)) — Edit Peer Host → Clean Up Daemons stops them"
+        )
+#if DEBUG
+        dlog("leader.prepare.staleDaemons host=\(host.id) count=\(stale.count) pids=\(pids)")
+#endif
+    }
+
     /// Probe only whether the requested CLI is available. Prompt staging
     /// belongs to the attached
     /// pane shell below: an SSH login shell may have a different /tmp namespace
@@ -2372,6 +2407,21 @@ extension TeamOrchestrator {
             + "if ! command -v \(shellQuoted(cli)) >/dev/null 2>&1; "
             + "then printf %s \(shellQuoted(missing)); exit 0; fi"
         script += "; printf %s \(shellQuoted(marker))"
+        // Ride along on the round trip that is already happening. Two rules
+        // make this safe to bolt onto the path that decides whether a leader
+        // can start at all:
+        //
+        //  1. it comes AFTER the marker, so readiness is already decided by
+        //     the time any of it runs;
+        //  2. it is a subshell ending in `|| true`, so neither its `exit 44`
+        //     on a non-Mac host nor any failure inside it reaches this
+        //     script's exit status.
+        //
+        // Both matter because the `catch` below turns *every* error into
+        // `cliUnavailable` — a diagnostic that leaked a failure out of here
+        // would report a perfectly good host as having no CLI, and no leader
+        // would start on it again.
+        script += "; " + Self.leaderDaemonDiagnostic
         do {
             let output = try await PeerHostReadinessChecker.runScript(
                 sshTarget: sshTarget,
@@ -2386,6 +2436,7 @@ extension TeamOrchestrator {
             guard output.contains(marker) else {
                 throw RemoteAgentError.cliUnavailable(cli, host.displayName)
             }
+            reportStaleDaemons(in: output, host: host)
         } catch let error as RemoteAgentError {
             throw error
         } catch {

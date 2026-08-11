@@ -134,8 +134,16 @@ enum PeerHostDoctor {
     ///
     /// No single quotes in the body (same `sh -c '…'` wrapper constraint as
     /// remoteCommand/diagnoseCommand).
-    static let daemonInstancesProbeCommand =
-        #"sh -c 'if [ "$(uname -s)" != Darwin ]; then exit 44; fi; app=$(pgrep -f "term-mesh.app/Contents/MacOS/term-mesh" | head -1); echo "app=${app:-none}"; if [ -n "$app" ]; then echo "appsocks=$(lsof -a -p "$app" -U -F n 2>/dev/null | sed -n "s/^n//p" | grep term-mesh | sort -u | tr "\n" " ")"; fi; for p in $(pgrep -f "Resources/bin/term-meshd" 2>/dev/null); do ppid=$(ps -o ppid= -p "$p" 2>/dev/null | tr -d " "); etime=$(ps -o etime= -p "$p" 2>/dev/null | tr -d " "); socks=$(lsof -a -p "$p" -U -F n 2>/dev/null | sed -n "s/^n//p" | grep term-mesh | sort -u | tr "\n" " "); echo "daemon=$p ppid=${ppid:-0} etime=$etime socks=$socks"; done; exit 0'"#
+    /// The probe body, without the `sh -c '…'` wrapper.
+    ///
+    /// Split out so a caller that already has a script of its own can append
+    /// this one instead of paying a second ssh round trip for it — see
+    /// `TeamOrchestrator.leaderDaemonDiagnostic`. Keeping one body means the
+    /// two callers cannot drift into disagreeing about what a daemon is.
+    static let daemonInstancesProbeBody =
+        #"if [ "$(uname -s)" != Darwin ]; then exit 44; fi; app=$(pgrep -f "term-mesh.app/Contents/MacOS/term-mesh" | head -1); echo "app=${app:-none}"; if [ -n "$app" ]; then echo "appsocks=$(lsof -a -p "$app" -U -F n 2>/dev/null | sed -n "s/^n//p" | grep term-mesh | sort -u | tr "\n" " ")"; fi; for p in $(pgrep -f "Resources/bin/term-meshd" 2>/dev/null); do ppid=$(ps -o ppid= -p "$p" 2>/dev/null | tr -d " "); etime=$(ps -o etime= -p "$p" 2>/dev/null | tr -d " "); socks=$(lsof -a -p "$p" -U -F n 2>/dev/null | sed -n "s/^n//p" | grep term-mesh | sort -u | tr "\n" " "); echo "daemon=$p ppid=${ppid:-0} etime=$etime socks=$socks"; done; exit 0"#
+
+    static let daemonInstancesProbeCommand = "sh -c '" + daemonInstancesProbeBody + "'"
 
     /// One `term-meshd` process on a peer, as the probe above reports it.
     struct DaemonInstance: Equatable {
