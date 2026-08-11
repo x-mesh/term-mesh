@@ -163,6 +163,61 @@ final class PredictedProjectPathTests: XCTestCase {
         )
     }
 
+    /// Tab completes only as far as every candidate agrees. Completing to the
+    /// first match would pick one of several valid branches for the person,
+    /// and the wrong branch is not a visible typo — it is a clone of the
+    /// wrong code.
+    func testBranchTabCompletionStopsAtTheSharedPrefix() {
+        let branches = ["main", "feature/auth", "feature/search", "release/v2"]
+        XCTAssertEqual(
+            RepositoryBranchLookup.completion(for: "fea", in: branches),
+            "feature/",
+            "two candidates agree up to the slash and no further"
+        )
+        XCTAssertEqual(
+            RepositoryBranchLookup.completion(for: "feature/s", in: branches),
+            "feature/search",
+            "one candidate completes fully"
+        )
+        XCTAssertEqual(
+            RepositoryBranchLookup.completion(for: "rel", in: branches),
+            "release/v2"
+        )
+    }
+
+    /// Nothing to add means Tab keeps its normal job of moving focus.
+    func testBranchTabCompletionYieldsWhenItCannotAdd() {
+        let branches = ["main", "feature/auth", "feature/search"]
+        XCTAssertNil(RepositoryBranchLookup.completion(for: "main", in: branches),
+                     "already complete")
+        XCTAssertNil(RepositoryBranchLookup.completion(for: "nope", in: branches),
+                     "no candidate")
+        XCTAssertNil(RepositoryBranchLookup.completion(for: "feature/", in: branches),
+                     "candidates diverge immediately")
+        XCTAssertNil(RepositoryBranchLookup.completion(for: "", in: ["main", "dev"]),
+                     "an empty field has no shared prefix to offer")
+    }
+
+    /// Matching ignores case; the result keeps the branch's own spelling, so a
+    /// completed name is one git will accept.
+    func testBranchTabCompletionCorrectsCase() {
+        XCTAssertEqual(
+            RepositoryBranchLookup.completion(for: "MAI", in: ["main", "release"]),
+            "main"
+        )
+    }
+
+    /// The caption that separates "this branch exists" from "this will fail
+    /// inside git clone".
+    func testBranchPresenceIsCaseInsensitive() {
+        let branches = ["main", "develop"]
+        XCTAssertTrue(RepositoryBranchLookup.contains("DEVELOP", in: branches))
+        XCTAssertTrue(RepositoryBranchLookup.contains("develop", in: branches))
+        XCTAssertFalse(RepositoryBranchLookup.contains("dev", in: branches),
+                       "a prefix is not the branch")
+        XCTAssertFalse(RepositoryBranchLookup.contains("", in: branches))
+    }
+
     func testRepositoryDiscoveryFindsProjectsBelowConfiguredRoot() throws {
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent("RepositoryDiscovery-\(UUID().uuidString)")
