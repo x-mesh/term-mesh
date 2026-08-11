@@ -1029,6 +1029,94 @@ final class AgentSessionTests: XCTestCase {
         XCTAssertLessThanOrEqual(snapshot.utf8.count, 165)
     }
 
+    /// Measured against a live native pane: the tool row already read
+    /// `Bash echo API_KEY=[redacted]` while the agent's own answer repeated the
+    /// value verbatim on the next line, and a socket read carried it off the
+    /// machine. Redaction belongs to the read, not to one row kind.
+    func testVisibleTranscriptRedactsCredentialsInEveryRowKindNotOnlyTools() {
+        let token = "sk-proj-FAKEFAKEFAKEFAKE1234"
+        let rows = AgentSession.rows(for: [
+            .said(id: UUID(), .leader, "run this: echo API_KEY=\(token)"),
+            .tool(id: UUID(), .init(name: "Bash", headline: "echo API_KEY=\(token)")),
+            .answered(id: UUID(), "the command printed:\nAPI_KEY=\(token)"),
+            .notice(id: UUID(), "reconnected with token=\(token)"),
+        ])
+
+        let snapshot = AgentSession.visibleTranscriptText(rows: rows)
+        XCTAssertFalse(snapshot.contains(token),
+                       "no transcript row may carry a credential off-process")
+        XCTAssertTrue(snapshot.contains("[redacted]"))
+    }
+
+    /// A PEM key spans lines, and a line-bounded pattern took only its header
+    /// — the one part an attacker can retype. The body has to go with it.
+    func testVisibleTranscriptRemovesMultiLinePrivateKeyBodies() {
+        let body = """
+            MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQDfakekeyline0001
+            aGVsbG90aGlzaXNub3RhcmVhbGtleWl0aXNhZml4dHVyZW9ubHl4eHh4eHh4eHh4
+            c2Vjb25kbGluZW9mZmFrZWJhc2U2NGRhdGFmb3J0ZXN0aW5ncHVycG9zZXNvbmx5
+            """
+        let key = "-----BEGIN PRIVATE KEY-----\n\(body)\n-----END PRIVATE KEY-----"
+
+        let rows = AgentSession.rows(for: [
+            .said(id: UUID(), .leader, "install this key:\n\(key)"),
+            .answered(id: UUID(), "wrote it out:\n\(key)\nfinished."),
+            .notice(id: UUID(), "restored from \(key)"),
+        ])
+
+        let snapshot = AgentSession.visibleTranscriptText(rows: rows)
+        for line in body.split(separator: "\n") {
+            XCTAssertFalse(snapshot.contains(line),
+                           "private key body survived redaction: \(line)")
+        }
+        XCTAssertFalse(snapshot.contains("-----END PRIVATE KEY-----"),
+                       "the closing marker belongs to the key and must go with it")
+        XCTAssertTrue(snapshot.contains("[redacted private key]"))
+        // A complete block ends where the key ends, so text after it survives.
+        XCTAssertTrue(snapshot.contains("finished."),
+                      "a closed key must not consume the rest of its row")
+    }
+
+    /// A key cut off mid-transcript is still a key: with no closing marker to
+    /// stop at, the rest of that row goes. The bound is the row — the entries
+    /// after it are separate rows and must survive.
+    func testVisibleTranscriptRemovesUnterminatedPrivateKeyToEndOfItsRow() {
+        let tail = "c2Vjb25kbGluZW9mZmFrZWJhc2U2NGRhdGFmb3J0ZXN0aW5ncHVycG9zZXM"
+        let truncated = "-----BEGIN OPENSSH PRIVATE KEY-----\nMIIEvQIBADANBgkq\n\(tail)"
+
+        let rows = AgentSession.rows(for: [
+            .answered(id: UUID(), "here it is:\n\(truncated)"),
+            .answered(id: UUID(), "a later answer that must survive"),
+        ])
+
+        let snapshot = AgentSession.visibleTranscriptText(rows: rows)
+        XCTAssertFalse(snapshot.contains(tail),
+                       "an unterminated key must not leave its body behind")
+        XCTAssertFalse(snapshot.contains("MIIEvQIBADANBgkq"))
+        XCTAssertTrue(snapshot.contains("[redacted private key]"))
+        XCTAssertTrue(snapshot.contains("a later answer that must survive"),
+                      "redaction is bounded by the row it started in")
+    }
+
+    /// Answers are not tool headlines: they keep their line structure and are
+    /// bounded by the transcript tail, never by the 160-byte row budget.
+    func testAnswerRedactionKeepsAnswerShape() {
+        let token = "ghp_abcdefghijklmnopqrstuvwxyz1234567890"
+        let body = String(repeating: "detail line\n", count: 20)
+        let rows = AgentSession.rows(for: [
+            .answered(id: UUID(), "start \(token)\n" + body + "end"),
+        ])
+
+        let snapshot = AgentSession.visibleTranscriptText(rows: rows)
+        XCTAssertFalse(snapshot.contains(token))
+        XCTAssertTrue(snapshot.contains("[redacted]"))
+        XCTAssertTrue(snapshot.contains("detail line\ndetail line"),
+                      "answers keep their line structure")
+        XCTAssertTrue(snapshot.hasSuffix("end"))
+        XCTAssertGreaterThan(snapshot.utf8.count, 160,
+                             "the tool row's byte budget must not reach answers")
+    }
+
     func testToolHeadlineRedactsPortableEnvironmentCredentialsAndProviderTokens() {
         let cases = [
             ("AWS_SECRET_ACCESS_KEY='aws-secret-value' run", "aws-secret-value"),

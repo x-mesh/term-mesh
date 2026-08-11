@@ -595,39 +595,101 @@ final class AgentSession {
     /// boundary as well as presentation: one line, credential-shaped values
     /// redacted, and a fixed UTF-8 budget before either consumer sees it.
     static func projectedToolHeadline(_ raw: String) -> String {
-        var projected = raw
+        let flattened = raw
             .components(separatedBy: .newlines)
             .joined(separator: " ")
             .split(whereSeparator: \.isWhitespace)
             .joined(separator: " ")
-        projected = redactingSensitiveEnvironmentAssignments(projected)
-        let redactions = [
+        return middleBounded(redactingCredentials(flattened), maxUTF8Bytes: 160)
+    }
+
+    /// Redaction on its own, without the tool row's flattening or byte budget.
+    ///
+    /// A credential is no less exposed for having been written into an answer
+    /// than into a shell command: an agent that reads a secret and repeats it
+    /// in prose leaves it in `.answered`, and every transcript row exits the
+    /// process through the same socket read. Rows that must keep their own
+    /// shape — answers, instructions, notices — take this alone.
+    ///
+    /// A PEM key is the one credential that spans lines, and it is handled
+    /// before the single-line patterns so that its body never reaches them.
+    static func redactingCredentials(_ text: String) -> String {
+        var redacted = redactingPrivateKeyBlocks(text)
+        redacted = redactingSensitiveEnvironmentAssignments(redacted)
+        for (regex, template) in credentialRedactions {
+            let range = NSRange(redacted.startIndex..<redacted.endIndex, in: redacted)
+            redacted = regex.stringByReplacingMatches(
+                in: redacted,
+                range: range,
+                withTemplate: template
+            )
+        }
+        return redacted
+    }
+
+    /// Remove a private key including its body.
+    ///
+    /// A line-bounded pattern takes the `-----BEGIN-----` header and leaves
+    /// the base64 behind, which is the part worth having: the header is a
+    /// constant an attacker types back in. So this matches across lines to the
+    /// closing `-----END-----`, and when there is no closing marker it removes
+    /// the rest of the text instead — a key that was cut off mid-transcript is
+    /// still a key.
+    ///
+    /// Deleting to the end is bounded by the caller: every consumer applies
+    /// this to one transcript row (an answer, an instruction, a notice), and
+    /// the rows are joined afterwards. A truncated key therefore costs the
+    /// remainder of its own row, never anything that follows it.
+    private static func redactingPrivateKeyBlocks(_ text: String) -> String {
+        var result = text
+        for regex in [privateKeyBlockPattern, privateKeyOpenPattern].compactMap({ $0 }) {
+            let range = NSRange(result.startIndex..<result.endIndex, in: result)
+            result = regex.stringByReplacingMatches(
+                in: result,
+                range: range,
+                withTemplate: "[redacted private key]"
+            )
+        }
+        return result
+    }
+
+    /// Non-greedy so two keys in one row do not merge into one match, taking
+    /// everything between them with it.
+    private static let privateKeyBlockPattern = try? NSRegularExpression(
+        pattern: #"(?is)-----BEGIN(?: [A-Z0-9]+)* PRIVATE KEY-----.*?-----END(?: [A-Z0-9]+)* PRIVATE KEY-----"#
+    )
+
+    /// Whatever the block pattern left: an opening marker with no close.
+    private static let privateKeyOpenPattern = try? NSRegularExpression(
+        pattern: #"(?is)-----BEGIN(?: [A-Z0-9]+)* PRIVATE KEY-----.*"#
+    )
+
+    /// Compiled once. Every row of a read now runs the whole set, and a
+    /// transcript is bounded at 500 rows, so rebuilding these per row would
+    /// make `NSRegularExpression` compilation the dominant cost of a read.
+    private static let credentialRedactions: [(NSRegularExpression, String)] = {
+        let patterns = [
             (#"(?i)(bearer\s+)(?:\"[^\"]*\"|'[^']*'|[^\s]+)"#, "$1[redacted]"),
             (#"(?i)((?:--)?(?:api[-_]?key|access[-_]?token|auth[-_]?token|token|password|passwd|secret)\s*(?:=|:)\s*)(?:\"[^\"]*\"|'[^']*'|[^\s]+)"#, "$1[redacted]"),
             (#"(?i)((?:--)(?:api[-_]?key|token|password|passwd|secret)\s+)(?:\"[^\"]*\"|'[^']*'|[^\s]+)"#, "$1[redacted]"),
             (#"(?i)([a-z][a-z0-9+.-]*://[^\s/:@]+:)[^\s@]+@"#, "$1[redacted]@"),
             (#"[A-Za-z0-9_-]{16,}\.[A-Za-z0-9_-]{16,}\.[A-Za-z0-9_-]{16,}"#, "[redacted]"),
             (#"\b(?:gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|sk-(?:proj-)?[A-Za-z0-9_-]{16,})\b"#, "[redacted]"),
-            (#"(?i)-----BEGIN(?: [A-Z0-9]+)* PRIVATE KEY-----.*"#, "[redacted private key]"),
         ]
-        for (pattern, template) in redactions {
-            guard let regex = try? NSRegularExpression(pattern: pattern) else { continue }
-            let range = NSRange(projected.startIndex..<projected.endIndex, in: projected)
-            projected = regex.stringByReplacingMatches(
-                in: projected,
-                range: range,
-                withTemplate: template
-            )
+        return patterns.compactMap { pattern, template in
+            (try? NSRegularExpression(pattern: pattern)).map { ($0, template) }
         }
-        return middleBounded(projected, maxUTF8Bytes: 160)
-    }
+    }()
 
     /// Parse portable shell environment assignments before applying the
     /// presentation bound. Values whose key has a credential-bearing component
     /// must disappear in full, including quoted values and URI userinfo.
+    private static let environmentAssignmentPattern = try? NSRegularExpression(
+        pattern: #"(?<![A-Za-z0-9_])([A-Za-z_][A-Za-z0-9_]*)(\s*=\s*)(\"[^\"]*\"|'[^']*'|[^\s]+)"#
+    )
+
     private static func redactingSensitiveEnvironmentAssignments(_ text: String) -> String {
-        let pattern = #"(?<![A-Za-z0-9_])([A-Za-z_][A-Za-z0-9_]*)(\s*=\s*)(\"[^\"]*\"|'[^']*'|[^\s]+)"#
-        guard let regex = try? NSRegularExpression(pattern: pattern) else { return text }
+        guard let regex = environmentAssignmentPattern else { return text }
         let mutable = NSMutableString(string: text)
         let matches = regex.matches(
             in: text,
@@ -710,9 +772,10 @@ final class AgentSession {
             switch row.entry {
             case .said(_, let speaker, let text):
                 let instruction = read(instruction: text)
-                return "\(speaker == .person ? "you" : "leader"): \(instruction.headline)"
+                return "\(speaker == .person ? "you" : "leader"): "
+                    + redactingCredentials(instruction.headline)
             case .answered(_, let text):
-                return text
+                return redactingCredentials(text)
             case .thought:
                 // Reasoning is visually clamped to two layout-dependent lines.
                 // A socket has no pane width with which to reproduce that
@@ -732,7 +795,7 @@ final class AgentSession {
                 }
                 return parts.joined(separator: " · ")
             case .notice(_, let text):
-                return "! \(text)"
+                return "! " + redactingCredentials(text)
             }
         }.joined(separator: "\n")
 
@@ -1293,8 +1356,38 @@ final class AgentSession {
         }
     }
 
+    /// What the launch actually carried of the pane's team identity, recorded
+    /// as the process is built rather than read back off it.
+    ///
+    /// The wiring, not the CLI, is what broke: workers were launched with the
+    /// app's own environment, which has no `TERMMESH_*` in it, so `tm-agent`
+    /// inside the pane resolved no team and fell through to `live-team` — a
+    /// team that exists nowhere — and every agent-to-agent call failed. Both
+    /// ends of that path had tests; the wiring between them had none, because
+    /// nothing outside the process could see what it was handed. A pane whose
+    /// CLI is missing from the machine still answers this.
+    private(set) var launchedTeamIdentity: [String: String] = [:]
+
+    /// `PATH` left with the same omission, so `tm-agent` was not even on it.
+    /// The value is not worth exposing; whether it was passed at all is.
+    private(set) var launchCarriedPath = false
+
+    private static let teamIdentityKeys: Set<String> = [
+        "TERMMESH_TEAM",
+        "TERMMESH_TEAM_NAME",
+        "TERMMESH_TEAM_AGENT",
+        "TERMMESH_AGENT_NAME",
+        "TERMMESH_AGENT_INSTANCE_ID",
+        "TERMMESH_WORKSPACE_ID",
+        "TERMMESH_PANEL_ID",
+    ]
+
     func start(_ launch: Launch) {
         guard process == nil, remoteSink == nil else { return }
+        launchedTeamIdentity = launch.environment.filter {
+            Self.teamIdentityKeys.contains($0.key)
+        }
+        launchCarriedPath = launch.environment["PATH"] != nil
         let p = Process()
         p.executableURL = URL(fileURLWithPath: launch.executable)
         p.arguments = launch.arguments
@@ -2222,16 +2315,41 @@ final class AgentSession {
         let renderedRows: Int
         let applyTotalMs: Double
         let applyMaxMs: Double
+        let bottomY: Double
+        let viewportHeight: Double
+        let following: Bool
+        let followDrops: Int
     }
 
     func noteAutoScrollForDebug() { debugAutoScrolls += 1 }
+
+    /// Where the transcript's bottom marker actually sat the last time the
+    /// view measured it, alongside the follow decision that measurement fed.
+    ///
+    /// `auto_scrolls` counts calls to `scrollTo`, which says the view asked;
+    /// it cannot say whether the scroll landed. A pane that is streaming,
+    /// visible, and still not at the bottom shows up here as a `bottomY` that
+    /// stays above the viewport while `following` remains true.
+    @ObservationIgnored private(set) var debugBottomY: Double = 0
+    @ObservationIgnored private(set) var debugViewportHeight: Double = 0
+    @ObservationIgnored private(set) var debugFollowing = true
+    @ObservationIgnored private(set) var debugFollowDrops = 0
+
+    func noteFollowGeometryForDebug(bottomY: Double, viewportHeight: Double, following: Bool) {
+        if debugFollowing, !following { debugFollowDrops += 1 }
+        debugBottomY = bottomY
+        debugViewportHeight = viewportHeight
+        debugFollowing = following
+    }
 
     func renderMetricsForDebug() -> RenderMetrics {
         RenderMetrics(batches: debugAppliedBatches, lines: debugAppliedLines,
                       bytes: debugAppliedBytes, revisions: revision,
                       autoScrolls: debugAutoScrolls, entries: entries.count,
                       renderedRows: rows.count, applyTotalMs: debugApplyTotalMs,
-                      applyMaxMs: debugApplyMaxMs)
+                      applyMaxMs: debugApplyMaxMs, bottomY: debugBottomY,
+                      viewportHeight: debugViewportHeight, following: debugFollowing,
+                      followDrops: debugFollowDrops)
     }
 
     /// Feed one line of the stream, as the reader would.
