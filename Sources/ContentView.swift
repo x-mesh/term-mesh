@@ -859,22 +859,43 @@ struct ContentView: View {
                 // narrow window drops whole groups from the right instead of
                 // cutting the last one mid-number. All of them rank below the
                 // branch and directory, which say where you are.
-                ForEach(titlebarHostStats, id: \.text) { group in
-                    // Separator and reading travel together so a group that
-                    // gets dropped takes its divider with it, rather than
-                    // leaving a dangling "|" at the end of the line.
-                    HStack(spacing: 5) {
-                        titlebarInfoSeparator
-                        Text(group.text)
-                            .font(.system(size: 10, weight: .regular, design: .monospaced))
-                            .foregroundColor(titlebarColor(opacity: 0.55))
-                    }
-                    .fixedSize()
-                    .layoutPriority(group.dropPriority)
+                ViewThatFits(in: .horizontal) {
+                    titlebarHostStatsRow(titlebarHostStats[...])
+                    titlebarHostStatsRow(titlebarHostStats.dropLast(1))
+                    titlebarHostStatsRow(titlebarHostStats.dropLast(2))
+                    titlebarHostStatsRow(titlebarHostStats.dropLast(3))
+                    titlebarHostStatsRow(titlebarHostStats.prefix(0))
                 }
             }
         }
         .lineLimit(1)
+    }
+
+    /// One row of host readings, for `ViewThatFits` to accept or reject whole.
+    ///
+    /// `layoutPriority` cannot express "drop this group": it decides who gets
+    /// space, not who disappears — and every group here is `fixedSize`, so
+    /// none of them can give any back. The row just overflowed instead, which
+    /// is what cut the last reading mid-number and pushed the branch name
+    /// under the sidebar.
+    ///
+    /// Candidates are offered longest-first and groups arrive in priority
+    /// order (load, mem, net, agent io), so dropping from the end sheds the
+    /// least important first — the order `dropPriority` describes.
+    ///
+    /// Separator and reading stay in one group so a dropped reading takes its
+    /// divider with it, instead of leaving a dangling "|" at the end.
+    @ViewBuilder
+    private func titlebarHostStatsRow(_ groups: ArraySlice<PeerHostStats.Group>) -> some View {
+        HStack(spacing: 5) {
+            ForEach(groups, id: \.text) { group in
+                titlebarInfoSeparator
+                Text(group.text)
+                    .font(.system(size: 10, weight: .regular, design: .monospaced))
+                    .foregroundColor(titlebarColor(opacity: 0.55))
+            }
+        }
+        .fixedSize()
     }
 
     private var titlebarInfoSeparator: some View {

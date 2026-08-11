@@ -128,6 +128,18 @@ enum PeerHostDoctor {
     /// What a host would actually execute, and what else is lying around.
     struct BinaryInventory: Equatable {
         var appVersion: String?
+        /// OS and effective accounts from the same SSH session. On Linux,
+        /// panes inherit the daemon account, not the SSH account.
+        var hostOS: String?
+        var sshUser: String?
+        var daemonUser: String?
+        /// The login shell a pane on this host would run, and the `PATH` that
+        /// shell builds. A pane's `PATH` comes from the profile, so it is
+        /// routinely different from the one this probe searches — and when a
+        /// CLI is "installed but not found", this is the pair that says why.
+        var loginShell: String?
+        var loginPath: String?
+        var homeDirectory: String?
         /// The `tm-agent` an agent launched here would get.
         var cli: BinaryEntry?
         /// Other `tm-agent` copies on the same PATH, in search order after
@@ -167,6 +179,22 @@ enum PeerHostDoctor {
             }
             .joined(separator: ":")
         let body = "export PATH=\(path):\"$PATH\"; "
+            + #"echo "os=$(uname -s 2>/dev/null)"; echo "ssh-user=$(id -un 2>/dev/null)"; daemon_user=$(ps -o user= -C term-meshd 2>/dev/null | head -1 | tr -d "[:space:]"); [ -n "$daemon_user" ] && echo "daemon-user=$daemon_user"; "#
+            // The pane's shell and PATH, resolved the way the daemon resolves
+            // them: `$SHELL` is unset here on purpose, because a daemon
+            // started by systemd has none either and falls through to the
+            // passwd entry. Reading the profile's PATH needs a login shell,
+            // and `-c` keeps it non-interactive.
+            + #"pane_shell=$(getent passwd "$(id -un)" 2>/dev/null | cut -d: -f7); "#
+            + #"case "$pane_shell" in */nologin|*/false|"") pane_shell=/bin/sh;; esac; "#
+            + #"echo "login-shell=$pane_shell"; "#
+            // `\$PATH` so the *login* shell expands it, not this one. Single
+            // quotes would be the obvious way to protect it and are exactly
+            // what this probe cannot contain — the whole body ships inside
+            // `sh -c '…'`.
+            + #"pane_path=$(env -u SHELL "$pane_shell" -lc "printf %s \$PATH" 2>/dev/null | tr -d "\n"); "#
+            + #"[ -n "$pane_path" ] && echo "login-path=$pane_path"; "#
+            + #"[ -n "$HOME" ] && echo "home=$HOME"; "#
             + #"if [ "$(uname -s)" = Darwin ]; then v=$(/usr/bin/defaults read /Applications/term-mesh.app/Contents/Info.plist CFBundleShortVersionString 2>/dev/null); [ -n "$v" ] && echo "app=$v"; fi; "#
             // tm-agent-bridge is asked for but never `--version`ed: it is
             // spoken to over a pipe and has no such flag. Presence is the
@@ -480,6 +508,12 @@ enum PeerHostDoctor {
                 version: parts.count > 1 ? String(parts[1]) : ""
             )
             switch key {
+            case "os": inventory.hostOS = value.isEmpty ? nil : value
+            case "ssh-user": inventory.sshUser = value.isEmpty ? nil : value
+            case "daemon-user": inventory.daemonUser = value.isEmpty ? nil : value
+            case "login-shell": inventory.loginShell = value.isEmpty ? nil : value
+            case "login-path": inventory.loginPath = value.isEmpty ? nil : value
+            case "home": inventory.homeDirectory = value.isEmpty ? nil : value
             case "tm-agent": inventory.cli = entry
             case "tm-agent.shadowed": inventory.cliShadowed.append(entry)
             case "term-meshd": inventory.daemon = entry
@@ -502,6 +536,45 @@ enum PeerHostDoctor {
     /// this one has to survive being read months from now, once.
     static func inventoryWarnings(_ inventory: BinaryInventory) -> [String] {
         var warnings: [String] = []
+        // A terminal pane builds its PATH from the login profile, while an
+        // agent gets a fixed one. So a CLI can be installed, found by this
+        // probe, used happily by every agent — and still be missing from the
+        // pane beside them. Measured: `~/.local/bin` held claude, codex and
+        // git-kit while the login shell's PATH did not mention it, because the
+        // line that adds it lives in `.bashrc` and a login shell skips that.
+        //
+        // `~/.local/bin` is excluded: the daemon prepends that one itself, so
+        // naming it here would report a gap that is already closed.
+        if let loginPath = inventory.loginPath,
+           let cliPath = inventory.cli?.path, cliPath.hasPrefix("/") {
+            let directory = (cliPath as NSString).deletingLastPathComponent
+            let daemonPrepends = inventory.homeDirectory.map {
+                ($0 as NSString).appendingPathComponent(".local/bin")
+            }
+            let searched = Set(loginPath.split(separator: ":").map(String.init))
+            if !directory.isEmpty,
+               !searched.contains(directory),
+               directory != daemonPrepends {
+                let shell = inventory.loginShell ?? "the login shell"
+                warnings.append(
+                    "Terminal panes cannot find tm-agent: it lives in \(directory), and "
+                        + "\(shell) builds a PATH without it. Agents are unaffected — they run "
+                        + "with a fixed PATH. Add \(directory) to the profile that shell reads "
+                        + "at login, or set PATH for this host explicitly (a literal list; "
+                        + "$PATH is not expanded there)."
+                )
+            }
+        }
+        if inventory.hostOS == "Linux",
+           let sshUser = inventory.sshUser,
+           let daemonUser = inventory.daemonUser,
+           sshUser != daemonUser {
+            warnings.append(
+                "Agent account: SSH connects as \(sshUser), but term-meshd runs as "
+                    + "\(daemonUser). Projects are prepared as \(sshUser) while panes run as "
+                    + "\(daemonUser). Reinstall term-meshd to make both use \(sshUser)."
+            )
+        }
         // A copy earlier in PATH beats a newer one later, so the version that
         // matters is the one that wins — and the loser is what makes it look
         // like the host is up to date when it is not.

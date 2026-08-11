@@ -813,6 +813,9 @@ impl PtySurface {
         // Explicit profile env overlays the daemon environment; term-mesh's
         // internal identity is appended last and therefore cannot be forged.
         let mut merged_env: BTreeMap<String, String> = requested_env.iter().cloned().collect();
+        if let Some(path) = pane_path(requested_env) {
+            merged_env.insert("PATH".to_string(), path);
+        }
         merged_env.extend(pane_environment(&surface_id));
         let child_env: Vec<(String, String)> = merged_env.into_iter().collect();
         let child = pty::spawn(command, args, cols, rows, cwd, &child_env)?;
@@ -1961,6 +1964,43 @@ const PREFERRED_TERM: &str = "xterm-ghostty";
 /// environment carries paths into the Mac's app bundle (terminfo, shell
 /// integration, its control socket); copying those here would point a remote
 /// shell at directories that do not exist.
+/// `PATH` for a terminal pane, or `None` to leave the login shell's own.
+///
+/// Agent surfaces get [`REMOTE_PATH`], a fixed baseline that guarantees the
+/// CLIs are reachable. A pane got nothing, so it inherited whatever the login
+/// profile happened to build — and on a Debian-family host that is a profile
+/// which never adds `~/.local/bin`, because the line that does lives in
+/// `.bashrc` and a login shell does not read it. Measured on a host whose
+/// `~/.local/bin` held claude, codex and git-kit: none of them were on the
+/// pane's `PATH`, while the agent beside it found all three.
+///
+/// Prepending rather than replacing, and only when the directory exists: the
+/// profile still runs afterwards and keeps whatever it adds. Measured on the
+/// same host, an injected `PATH` survives the login shell — the profile
+/// prepends pyenv and appends snap around it rather than overwriting.
+///
+/// An explicit `PATH` from the host's saved environment is left exactly as
+/// configured; someone who set it means it.
+fn pane_path(requested_env: &[(String, String)]) -> Option<String> {
+    if requested_env.iter().any(|(key, _)| key == "PATH") {
+        return None;
+    }
+    let home = std::env::var("HOME").ok()?;
+    let local_bin = format!("{}/.local/bin", home.trim_end_matches('/'));
+    if !std::path::Path::new(&local_bin).is_dir() {
+        return None;
+    }
+    let inherited = std::env::var("PATH").unwrap_or_default();
+    if inherited.split(':').any(|entry| entry == local_bin) {
+        return None;
+    }
+    Some(if inherited.is_empty() {
+        local_bin
+    } else {
+        format!("{local_bin}:{inherited}")
+    })
+}
+
 fn pane_environment(surface_id: &[u8]) -> Vec<(String, String)> {
     let mut env = vec![
         ("TERM".to_string(), resolve_term()),

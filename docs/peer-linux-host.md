@@ -1,6 +1,6 @@
 # Linux Server as a Peer Host (tmux replacement)
 
-Last updated: July 17, 2026
+Last updated: August 11, 2026
 Status: peer host and deterministic runner verified end-to-end (Ubuntu 25.10, x86-64)
 
 A Linux box can serve terminal sessions to term-mesh on your Mac with **only
@@ -42,11 +42,15 @@ The exact paths and commands depend on the selected scope:
 | User (default) | `~/.local/bin/term-meshd` | `~/.config/term-mesh/peer.env` | `~/.config/systemd/user/term-meshd.service` | `/run/user/<uid>/tm-peer.sock` | `systemctl --user …`; `journalctl --user …` |
 | System (root installer) | `/usr/local/bin/term-meshd` | `/etc/term-mesh/peer.env` | `/etc/systemd/system/term-meshd.service` | `/run/term-mesh/tm-peer.sock` | `systemctl …`; `journalctl …` |
 
-The system service still runs as the dedicated, non-login `term-mesh` user and
-uses systemd sandboxing; root only installs and manages it. Running the
-installer as root always selects this scope, including CentOS 7/systemd 219
-SSH sessions without a user bus. A non-root install with no user bus exits with
-instructions instead of silently creating a different service.
+The daemon runs as the account that invokes the installer. This keeps project
+setup and pane processes under the same identity: installing through
+`root@host` produces a root system service, while a normal account with a user
+bus gets a service under that account. To isolate a system install under a
+dedicated account instead, set `TERMMESH_SERVICE_USER=term-mesh`; panes then
+run as that account too. Running the installer as root always selects system
+scope, including CentOS 7/systemd 219 SSH sessions without a user bus. A
+non-root install with no user bus exits with instructions instead of silently
+creating a different service.
 
 In either scope the peer socket is live immediately. No separate "declare
 surfaces" step is required; a single default `$SHELL -l` surface starts if

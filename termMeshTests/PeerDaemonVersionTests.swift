@@ -164,22 +164,33 @@ final class PeerDaemonVersionTests: XCTestCase {
             socket: "/run/term-mesh.sock", message: "incompatible handshake"
         )
         XCTAssertTrue(PeerHostEditorView.shouldShowForceReinstallButton(
-            hasTestedDraft: true, hostKind: .daemon,
+            isNew: false, hasTestedDraft: true, hostKind: .daemon,
             showsUpdateButton: false, doctorState: state
         ))
         XCTAssertFalse(PeerHostEditorView.shouldShowForceReinstallButton(
-            hasTestedDraft: true, hostKind: .app,
+            isNew: false, hasTestedDraft: true, hostKind: .app,
             showsUpdateButton: false, doctorState: state
         ))
         XCTAssertFalse(PeerHostEditorView.shouldShowForceReinstallButton(
-            hasTestedDraft: true, hostKind: nil,
+            isNew: false, hasTestedDraft: true, hostKind: nil,
             showsUpdateButton: false, doctorState: state
+        ))
+    }
+
+    func test_forceReinstall_isAvailableInEditHostBeforeTest() {
+        XCTAssertTrue(PeerHostEditorView.shouldShowForceReinstallButton(
+            isNew: false, hasTestedDraft: false, hostKind: nil,
+            showsUpdateButton: false, doctorState: .idle
+        ))
+        XCTAssertFalse(PeerHostEditorView.shouldShowForceReinstallButton(
+            isNew: true, hasTestedDraft: false, hostKind: nil,
+            showsUpdateButton: false, doctorState: .idle
         ))
     }
 
     func test_forceReinstall_doesNotCompeteWithUpdateAction() {
         XCTAssertFalse(PeerHostEditorView.shouldShowForceReinstallButton(
-            hasTestedDraft: true, hostKind: .daemon, showsUpdateButton: true,
+            isNew: false, hasTestedDraft: true, hostKind: .daemon, showsUpdateButton: true,
             doctorState: .updateAvailable(
                 socket: "/run/term-mesh.sock", remote: "0.170.0", latest: "v0.178.0"
             )
@@ -215,7 +226,7 @@ final class PeerDaemonVersionTests: XCTestCase {
         )
         XCTAssertFalse(
             PeerHostEditorView.shouldShowForceReinstallButton(
-                hasTestedDraft: true, hostKind: nil,
+                isNew: false, hasTestedDraft: true, hostKind: nil,
                 showsUpdateButton: false, doctorState: .daemonMissing
             ),
             "reinstall stays gated on a confirmed Linux host, so it cannot stand in"

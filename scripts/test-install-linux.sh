@@ -72,17 +72,16 @@ chmod +x "$MOCK_BIN/systemctl" "$MOCK_BIN/curl" "$MOCK_BIN/loginctl" "$MOCK_BIN/
 
 export PATH="$MOCK_BIN:$PATH" TERMMESH_INSTALL_TAG=vtest
 
-echo '==> system install uses an unprivileged, hardened service'
+echo '==> system install follows the connecting account and stays hardened'
 bash "$INSTALLER"
-grep -qx 'User=term-mesh' /etc/systemd/system/term-meshd.service
-grep -qx 'Group=term-mesh' /etc/systemd/system/term-meshd.service
+grep -qx 'User=root' /etc/systemd/system/term-meshd.service
+grep -qx 'Group=root' /etc/systemd/system/term-meshd.service
 grep -qx 'NoNewPrivileges=true' /etc/systemd/system/term-meshd.service
 grep -qx 'CapabilityBoundingSet=' /etc/systemd/system/term-meshd.service
 grep -qx 'ProtectSystem=full' /etc/systemd/system/term-meshd.service
-grep -qx 'ProtectHome=true' /etc/systemd/system/term-meshd.service
+grep -qx 'ProtectHome=false' /etc/systemd/system/term-meshd.service
 grep -qx 'RuntimeDirectory=term-mesh' /etc/systemd/system/term-meshd.service
 grep -qx 'TERMMESH_PEER_SOCKET=/run/term-mesh/tm-peer.sock' /etc/term-mesh/peer.env
-[[ $(id -u term-mesh) != 0 ]]
 
 echo '==> system to user switch removes the old scope first'
 useradd --create-home tester
@@ -122,13 +121,12 @@ TERMMESH_INSTALL_PREFIX=/opt/term-mesh-switch bash "$INSTALLER"
 grep -qx 'ExecStart=/opt/term-mesh-switch/term-meshd' \
   /etc/systemd/system/term-meshd.service
 
-echo '==> system service user must not be root'
-if TERMMESH_SERVICE_USER=root TERMMESH_INSTALL_PREFIX=/opt/term-mesh-root \
-  bash "$INSTALLER"; then
-  echo 'expected root service user rejection' >&2
-  exit 1
-fi
-[[ ! -e /opt/term-mesh-root/term-meshd ]]
+echo '==> an explicit service account remains available'
+TERMMESH_SERVICE_USER=term-mesh TERMMESH_INSTALL_PREFIX=/opt/term-mesh-service \
+  bash "$INSTALLER"
+grep -qx 'User=term-mesh' /etc/systemd/system/term-meshd.service
+grep -qx 'Group=term-mesh' /etc/systemd/system/term-meshd.service
+grep -qx 'ProtectHome=true' /etc/systemd/system/term-meshd.service
 
 # The CLI is why the fleet drifted: the asset carried only the daemon, so
 # nothing on a Linux host could ever update tm-agent and every peer sat
