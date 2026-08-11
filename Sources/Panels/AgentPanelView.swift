@@ -309,13 +309,34 @@ struct AgentPanelView: View {
                     // reentrantly, so apply the observation on the next main
                     // run-loop turn.
                     let viewportHeight = viewport.size.height
+                    // Stamped where the geometry was read, not where it is
+                    // judged. `bottomY` is the bottom marker as of this
+                    // preference; the hop below runs whenever main is free,
+                    // and under five streaming panes that was measured at over
+                    // 0.4s late. Reading the clock down there judged an old
+                    // coordinate against a fresh deadline: the marker had been
+                    // pushed off-screen by the transcript's own growth, the
+                    // grace window had already elapsed, and following was
+                    // dropped for a scroll the user never made — 29-34 times
+                    // per pane, with a quarter of all updates left unscrolled.
+                    // Comparing at measurement time makes a delayed hop
+                    // harmless: `grewAt` has moved on by then, the interval
+                    // goes negative, and the branch simply does not fire.
+                    let measuredAt = Date()
                     DispatchQueue.main.async {
                         let isAtBottom = bottomY <= viewportHeight + 2
                         if isAtBottom {
                             if !following { following = true }
-                        } else if following, Date().timeIntervalSince(grewAt) > 0.4 {
+                        } else if following, measuredAt.timeIntervalSince(grewAt) > 0.4 {
                             following = false
                         }
+                        #if DEBUG
+                        session.noteFollowGeometryForDebug(
+                            bottomY: bottomY,
+                            viewportHeight: viewportHeight,
+                            following: following
+                        )
+                        #endif
                     }
                 }
                 // Every mutation, not every append: a streamed answer grows a

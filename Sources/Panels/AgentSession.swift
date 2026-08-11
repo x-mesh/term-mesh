@@ -2280,16 +2280,41 @@ final class AgentSession {
         let renderedRows: Int
         let applyTotalMs: Double
         let applyMaxMs: Double
+        let bottomY: Double
+        let viewportHeight: Double
+        let following: Bool
+        let followDrops: Int
     }
 
     func noteAutoScrollForDebug() { debugAutoScrolls += 1 }
+
+    /// Where the transcript's bottom marker actually sat the last time the
+    /// view measured it, alongside the follow decision that measurement fed.
+    ///
+    /// `auto_scrolls` counts calls to `scrollTo`, which says the view asked;
+    /// it cannot say whether the scroll landed. A pane that is streaming,
+    /// visible, and still not at the bottom shows up here as a `bottomY` that
+    /// stays above the viewport while `following` remains true.
+    @ObservationIgnored private(set) var debugBottomY: Double = 0
+    @ObservationIgnored private(set) var debugViewportHeight: Double = 0
+    @ObservationIgnored private(set) var debugFollowing = true
+    @ObservationIgnored private(set) var debugFollowDrops = 0
+
+    func noteFollowGeometryForDebug(bottomY: Double, viewportHeight: Double, following: Bool) {
+        if debugFollowing, !following { debugFollowDrops += 1 }
+        debugBottomY = bottomY
+        debugViewportHeight = viewportHeight
+        debugFollowing = following
+    }
 
     func renderMetricsForDebug() -> RenderMetrics {
         RenderMetrics(batches: debugAppliedBatches, lines: debugAppliedLines,
                       bytes: debugAppliedBytes, revisions: revision,
                       autoScrolls: debugAutoScrolls, entries: entries.count,
                       renderedRows: rows.count, applyTotalMs: debugApplyTotalMs,
-                      applyMaxMs: debugApplyMaxMs)
+                      applyMaxMs: debugApplyMaxMs, bottomY: debugBottomY,
+                      viewportHeight: debugViewportHeight, following: debugFollowing,
+                      followDrops: debugFollowDrops)
     }
 
     /// Feed one line of the stream, as the reader would.

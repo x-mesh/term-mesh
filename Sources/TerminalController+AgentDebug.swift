@@ -24,6 +24,10 @@ extension TerminalController {
                         "rendered_rows": metrics.renderedRows,
                         "apply_total_ms": metrics.applyTotalMs,
                         "apply_max_ms": metrics.applyMaxMs,
+                        "bottom_y": metrics.bottomY,
+                        "viewport_height": metrics.viewportHeight,
+                        "following": metrics.following,
+                        "follow_drops": metrics.followDrops,
                     ])
                 }
             }
