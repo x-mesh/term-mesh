@@ -2845,6 +2845,7 @@ final class Workspace: Identifiable {
         // a notice — instead of vanishing into a released closure.
         panel.startRemote(
             interruptible: Self.remoteAgentInterruptible(agentCli: session.originSurface.agentCli),
+            cli: session.originSurface.agentCli,
             sink: { [weak relay] line in
                 guard let relay else { throw RemoteAgentPaneError.transportClosed }
                 guard try await relay.sendRemoteKeys(line) else {
@@ -2917,7 +2918,16 @@ final class Workspace: Identifiable {
         // holds the session the poller brings the pane back with the
         // replayed transcript; if the daemon is gone there is nothing to
         // show a banner for.
-        relay.onDisconnect = { [weak self] in
+        relay.onDisconnect = { [weak self, weak session] in
+            // A user chose Disconnect Host. Keep the transcript/pane exactly
+            // where it is; only accidental loss uses the drop-and-reopen
+            // recovery path below. The remote bridge remains daemon-owned.
+            if session?.hostTransportWasDisconnected == true {
+                RemoteWorkLog.infoOffMain(
+                    "Remote agent pane transport disconnected; pane preserved"
+                )
+                return
+            }
             self?.dropRemoteAgentPane(panelId: panelId, reason: "disconnected")
         }
         relay.onError = { error in

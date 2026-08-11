@@ -976,6 +976,97 @@ final class PeerProjectBootstrapTests: XCTestCase {
     }
 
     @MainActor
+    func test_remote_leader_stages_prompt_in_bounded_commands_from_attached_shell() throws {
+        let prompt = String(repeating: "leader 정책\n", count: 500)
+        let promptFile = "/tmp/term-mesh-leader-prompt-team-uuid.txt"
+        let commands = TeamOrchestrator.remoteLeaderPromptStageCommands(
+            systemPrompt: prompt,
+            promptFile: promptFile
+        )
+
+        XCTAssertGreaterThan(commands.count, 2)
+        XCTAssertTrue(commands[0].contains(": > '\(promptFile)'"))
+        XCTAssertTrue(commands[0].contains("TERMMESH_B64_FLAG"))
+        XCTAssertTrue(
+            commands.allSatisfy { $0.utf8.count < 1_024 },
+            "prompt staging must stay below conservative PTY canonical-line limits"
+        )
+        XCTAssertFalse(commands.joined().contains(prompt))
+        let decoded = commands.dropFirst().reduce(into: Data()) { result, command in
+            let prefix = "printf %s '"
+            let suffix = "' | base64"
+            guard let start = command.range(of: prefix)?.upperBound,
+                  let end = command.range(of: suffix, range: start..<command.endIndex)?.lowerBound,
+                  let chunk = Data(base64Encoded: String(command[start..<end]))
+            else {
+                return XCTFail("invalid prompt chunk command: \(command)")
+            }
+            result.append(chunk)
+        }
+        XCTAssertEqual(decoded, Data(prompt.utf8))
+
+        for shell in ["/bin/sh", "/bin/zsh"] {
+            let actualFile = FileManager.default.temporaryDirectory
+                .appendingPathComponent("term-mesh-prompt-\(UUID().uuidString)")
+            defer { try? FileManager.default.removeItem(at: actualFile) }
+            let actualCommands = TeamOrchestrator.remoteLeaderPromptStageCommands(
+                systemPrompt: prompt,
+                promptFile: actualFile.path
+            )
+            let process = Process()
+            process.executableURL = URL(fileURLWithPath: shell)
+            process.arguments = ["-f", "-c", actualCommands.joined(separator: "; ")]
+            try process.run()
+            process.waitUntilExit()
+            XCTAssertEqual(process.terminationStatus, 0, "\(shell) staging failed")
+            XCTAssertEqual(try Data(contentsOf: actualFile), Data(prompt.utf8), shell)
+        }
+
+        let checked = TeamOrchestrator.remoteLeaderCommandCheckingPrompt(
+            launch: "exec claude",
+            systemPrompt: prompt,
+            promptFile: promptFile
+        )
+        XCTAssertTrue(checked.contains("wc -c"))
+        XCTAssertTrue(checked.contains("-ne \(Data(prompt.utf8).count)"))
+        XCTAssertTrue(checked.contains("stty echo"))
+        XCTAssertTrue(checked.contains("else exec claude; fi"))
+    }
+
+    func test_remote_paste_directory_is_shared_home_cache_in_sh_and_zsh() throws {
+        XCTAssertFalse(RemotePasteTransfer.remoteDirectoryCommand.contains("/tmp"))
+        XCTAssertTrue(RemotePasteTransfer.remoteDirectoryCommand.contains("XDG_CACHE_HOME"))
+        XCTAssertTrue(RemotePasteTransfer.remoteDirectoryCommand.contains("$HOME/.cache"))
+        XCTAssertTrue(RemotePasteTransfer.remoteDirectoryCommand.contains("systemctl show -p User"))
+        XCTAssertTrue(RemotePasteTransfer.remoteDirectoryCommand.contains("runuser -u"))
+
+        for shell in ["/bin/sh", "/bin/zsh"] {
+            let root = FileManager.default.temporaryDirectory
+                .appendingPathComponent("term-mesh-paste-\(UUID().uuidString)")
+            let cache = root.appendingPathComponent("cache")
+            defer { try? FileManager.default.removeItem(at: root) }
+            let output = Pipe()
+            let process = Process()
+            process.executableURL = URL(fileURLWithPath: shell)
+            process.arguments = ["-f", "-c", RemotePasteTransfer.remoteDirectoryCommand]
+            process.environment = ProcessInfo.processInfo.environment.merging([
+                "HOME": root.path,
+                "XDG_CACHE_HOME": cache.path,
+            ]) { _, override in override }
+            process.standardOutput = output
+            try process.run()
+            let data = output.fileHandleForReading.readDataToEndOfFile()
+            process.waitUntilExit()
+
+            let expected = cache.appendingPathComponent("term-mesh/paste")
+            XCTAssertEqual(process.terminationStatus, 0, shell)
+            XCTAssertEqual(String(data: data, encoding: .utf8), expected.path, shell)
+            let attributes = try FileManager.default.attributesOfItem(atPath: expected.path)
+            XCTAssertEqual((attributes[.posixPermissions] as? NSNumber)?.intValue, 0o700)
+        }
+    }
+
+    @MainActor
     func test_remote_leader_does_not_inject_policy_into_local_anchor_shell() {
         XCTAssertTrue(
             TeamOrchestrator.shouldInjectLocalLeaderPrompt(

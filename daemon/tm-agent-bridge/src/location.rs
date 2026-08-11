@@ -30,6 +30,44 @@ pub const AGENT_ENV_LOAD_EXIT: i32 = 78;
 pub const REMOTE_PATH: &str = "$HOME/.local/bin:/opt/homebrew/bin:/opt/homebrew/sbin:\
 /usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin";
 
+/// `PATH` for a remote launch: [`REMOTE_PATH`], then a host's configured
+/// directories.
+///
+/// A `PATH` saved for a peer host used to be dropped outright — the baseline
+/// was authoritative and that was the end of it. But a CLI installed somewhere
+/// the baseline does not list (`~/.npm-global/bin`, `~/bin`, a pyenv shim) then
+/// had no way to be reached at all, while the readiness probe searched a wider
+/// set and happily reported it present. The pane opened and the agent inside
+/// it never started.
+///
+/// Configured directories are searched **after** the baseline, not before it.
+/// That order is the whole safety property: the baseline is what guarantees
+/// the binaries term-mesh installs are the ones that run, and a host setting
+/// that could shadow `/usr/bin` or a term-mesh CLI with a same-named file
+/// would take that guarantee away. Appending still solves what the setting is
+/// for — a directory the baseline never lists is now reachable — because
+/// nothing earlier in the search can answer for a CLI that only lives there.
+/// To pin a *particular* binary, configure that CLI's absolute path instead;
+/// that is what the CLI path settings are.
+///
+/// Entries are used verbatim, so `$HOME` and `~` expand as the launching shell
+/// would. Empty segments are dropped; they would silently mean "current
+/// directory" to the shell.
+pub fn path_with_extra(extra: Option<&str>) -> String {
+    let Some(extra) = extra else {
+        return REMOTE_PATH.to_string();
+    };
+    let suffix: Vec<&str> = extra
+        .split(':')
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+        .collect();
+    if suffix.is_empty() {
+        return REMOTE_PATH.to_string();
+    }
+    format!("{}:{}", REMOTE_PATH, suffix.join(":"))
+}
+
 /// Turn wrapper-only exit codes into safe, actionable UI messages.
 ///
 /// Safe meaning: it names the file, never its contents. A profile that failed
@@ -130,7 +168,9 @@ pub fn process_location(
 
     // Sorted so the same inputs always produce the same command — a launch
     // line that reorders between runs is one nobody can diff. BTreeMap does
-    // the sorting; PATH is dropped because REMOTE_PATH below is authoritative.
+    // the sorting. PATH is pulled out of the assignments because it is not
+    // one: see `path_with_extra`.
+    let extra_path = remote_env.get("PATH").cloned();
     let assignments: Vec<String> = remote_env
         .into_iter()
         .filter(|(key, _)| key != "PATH" && is_env_name(key))
@@ -150,7 +190,10 @@ pub fn process_location(
         &format!("exit {PROFILE_LOAD_EXIT}"),
         &format!("exit {AGENT_ENV_LOAD_EXIT}"),
     );
-    inner.push_str(&format!(r#"export PATH="{REMOTE_PATH}"; "#));
+    inner.push_str(&format!(
+        r#"export PATH="{}"; "#,
+        path_with_extra(extra_path.as_deref())
+    ));
 
     // Peer-hosted terminal surfaces already carry IS_SANDBOX. Claude uses it
     // to permit explicitly requested bypass mode under root; the native SSH
@@ -532,5 +575,36 @@ mod tests {
         assert_eq!(shell_quote("has space"), "'has space'");
         assert_eq!(shell_quote("it's"), r#"'it'"'"'s'"#);
         assert_eq!(shell_join(&["a".into(), "b c".into()]), "a 'b c'");
+    }
+}
+
+#[cfg(test)]
+mod path_extra_tests {
+    use super::*;
+
+    #[test]
+    fn no_configured_path_is_the_baseline() {
+        assert_eq!(path_with_extra(None), REMOTE_PATH);
+        assert_eq!(path_with_extra(Some("")), REMOTE_PATH);
+        assert_eq!(path_with_extra(Some("  ")), REMOTE_PATH);
+    }
+
+    /// Configured directories are reachable, and the baseline is searched
+    /// first. A host setting must not be able to answer for `/usr/bin` or for
+    /// a term-mesh CLI with a same-named file placed earlier in the search.
+    #[test]
+    fn configured_directories_are_searched_after_the_baseline() {
+        let path = path_with_extra(Some("/opt/foo/bin:$HOME/.npm-global/bin"));
+        assert!(path.starts_with(REMOTE_PATH));
+        assert!(path.ends_with(":/opt/foo/bin:$HOME/.npm-global/bin"));
+    }
+
+    /// An empty segment means "the current directory" to a shell, which is
+    /// never what a trailing colon in a settings field was meant to say.
+    #[test]
+    fn empty_segments_are_dropped() {
+        assert_eq!(path_with_extra(Some("/opt/foo/bin::")), format!("{REMOTE_PATH}:/opt/foo/bin"));
+        assert_eq!(path_with_extra(Some(":/opt/foo/bin")), format!("{REMOTE_PATH}:/opt/foo/bin"));
+        assert_eq!(path_with_extra(Some(" /opt/foo/bin ")), format!("{REMOTE_PATH}:/opt/foo/bin"));
     }
 }

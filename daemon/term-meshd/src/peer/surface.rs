@@ -692,7 +692,12 @@ fn agent_launch_script(
     ));
     script.push_str(&format!(
         r#"export PATH="{}"; "#,
-        tm_agent_bridge::location::REMOTE_PATH
+        tm_agent_bridge::location::path_with_extra(
+            requested_env
+                .iter()
+                .find(|(key, _)| key == "PATH")
+                .map(|(_, value)| value.as_str())
+        )
     ));
 
     let mut merged: BTreeMap<String, String> = requested_env.iter().cloned().collect();
@@ -707,8 +712,8 @@ fn agent_launch_script(
     let mut assignments = Vec::new();
     for (index, (key, value)) in merged
         .into_iter()
-        // Same explicit exception as the SSH bridge: CLI locations are
-        // configured paths, while PATH is a fixed remote safety baseline.
+        // Same explicit exception as the SSH bridge: PATH is not an assignment
+        // here, it is the extra directories folded into the export above.
         .filter(|(key, _)| key != "PATH")
         .enumerate()
     {
@@ -1979,26 +1984,51 @@ const PREFERRED_TERM: &str = "xterm-ghostty";
 /// same host, an injected `PATH` survives the login shell — the profile
 /// prepends pyenv and appends snap around it rather than overwriting.
 ///
-/// An explicit `PATH` from the host's saved environment is left exactly as
-/// configured; someone who set it means it.
+/// A `PATH` saved for the host is *added* here, exactly as it is for an agent
+/// launch — the same value must not mean one thing in this pane and something
+/// else in the one beside it. `~/.local/bin` comes first (it is part of the
+/// launch baseline agents get), then what the daemon inherited, then the
+/// host's configured directories last, for the same reason the agent path
+/// appends them: a host setting must not shadow a system binary. The login
+/// profile still runs afterwards and keeps whatever it adds.
 fn pane_path(requested_env: &[(String, String)]) -> Option<String> {
-    if requested_env.iter().any(|(key, _)| key == "PATH") {
+    let mut leading: Vec<String> = Vec::new();
+    if let Ok(home) = std::env::var("HOME") {
+        let local_bin = format!("{}/.local/bin", home.trim_end_matches('/'));
+        if std::path::Path::new(&local_bin).is_dir() {
+            leading.push(local_bin);
+        }
+    }
+    let trailing: Vec<String> = requested_env
+        .iter()
+        .find(|(key, _)| key == "PATH")
+        .map(|(_, value)| value.as_str())
+        .unwrap_or_default()
+        .split(':')
+        .map(|entry| entry.trim().to_string())
+        .filter(|entry| !entry.is_empty())
+        .collect();
+    if leading.is_empty() && trailing.is_empty() {
         return None;
     }
-    let home = std::env::var("HOME").ok()?;
-    let local_bin = format!("{}/.local/bin", home.trim_end_matches('/'));
-    if !std::path::Path::new(&local_bin).is_dir() {
-        return None;
-    }
+
     let inherited = std::env::var("PATH").unwrap_or_default();
-    if inherited.split(':').any(|entry| entry == local_bin) {
+    let already: Vec<&str> = inherited.split(':').collect();
+    let mut ordered: Vec<String> = Vec::new();
+    ordered.extend(leading);
+    if !inherited.is_empty() {
+        ordered.push(inherited.clone());
+    }
+    ordered.extend(
+        trailing
+            .into_iter()
+            .filter(|entry| !already.contains(&entry.as_str())),
+    );
+    let joined = ordered.join(":");
+    if joined == inherited {
         return None;
     }
-    Some(if inherited.is_empty() {
-        local_bin
-    } else {
-        format!("{local_bin}:{inherited}")
-    })
+    Some(joined)
 }
 
 fn pane_environment(surface_id: &[u8]) -> Vec<(String, String)> {
@@ -3356,10 +3386,18 @@ mod tests {
         assert_eq!(values.get("REQUESTED_ONLY"), Some(&"requested"));
         assert_eq!(values.get("ORDER"), Some(&"requested"));
         assert_eq!(values.get("TERMMESH_SURFACE_ID"), Some(&"internal"));
+        // PATH is additive, and additive at the end: a configured directory is
+        // reachable but cannot answer ahead of the baseline. Neither replacing
+        // the baseline nor preceding it is allowed — the first would strand
+        // the CLIs term-mesh installs, the second would let a host setting
+        // shadow them with a same-named file.
         assert_ne!(values.get("PATH"), Some(&"/forged"));
         assert!(values
             .get("PATH")
             .is_some_and(|path| path.starts_with(home.path().join(".local/bin").to_str().unwrap())));
+        assert!(values
+            .get("PATH")
+            .is_some_and(|path| path.ends_with(":/forged")));
         assert!(!stdout.contains("login-noise"));
         assert!(!String::from_utf8_lossy(&output.stderr).contains("login-secret"));
     }

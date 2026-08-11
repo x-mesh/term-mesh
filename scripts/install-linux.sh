@@ -7,9 +7,10 @@
 # Service scope is chosen automatically: a per-user service (systemctl
 # --user) when the user's systemd bus is reachable, otherwise a system
 # service (/etc/systemd/system) when running as root. The daemon runs as the
-# account that invoked the installer by default, so a host reached as
-# `root@host` prepares projects and launches panes under the same account.
-# Set TERMMESH_SERVICE_USER to opt into a different system-service account.
+# SSH/login account by default: a sudo install uses SUDO_USER, while a direct
+# root login uses root. That keeps SSH preparation, project ownership, PATH,
+# HOME, and pane processes under one identity. Set TERMMESH_SERVICE_USER to
+# opt into a different system-service account.
 # Hosts with no per-user bus — non-interactive ssh sessions and older
 # systemd such as RHEL/CentOS 7's 219 — take the root/system path; a
 # non-root run there stops with instructions instead of half-installing.
@@ -22,7 +23,8 @@
 #   TERMMESH_INSTALL_REPO  GitHub repo to fetch from (default: x-mesh/term-mesh)
 #   TERMMESH_INSTALL_PREFIX Install directory override (defaults: ~/.local/bin
 #                           for user scope, /usr/local/bin for system scope)
-#   TERMMESH_SERVICE_USER   Account for a system service (default: term-mesh)
+#   TERMMESH_SERVICE_USER   Account for a system service (default: the
+#                           connecting account; SUDO_USER under sudo)
 #
 # What this does NOT do: bind the peer socket to a fixed path chosen for
 # you, or pick surfaces to expose. Those are yours to set in
@@ -32,11 +34,28 @@ set -euo pipefail
 REPO="${TERMMESH_INSTALL_REPO:-x-mesh/term-mesh}"
 TAG="${TERMMESH_INSTALL_TAG:-latest}"
 PREFIX_OVERRIDE="${TERMMESH_INSTALL_PREFIX:-}"
-SERVICE_USER="${TERMMESH_SERVICE_USER:-$(id -un)}"
 BIN_NAME="term-meshd"
 
 log() { printf '==> %s\n' "$*"; }
 die() { printf 'error: %s\n' "$*" >&2; exit 1; }
+
+resolve_connecting_user() {
+  local install_uid=$1 current_user=$2 sudo_user=${3:-} sudo_uid=${4:-}
+  if [[ "$install_uid" == 0 && "$current_user" == root \
+    && -n "$sudo_user" && "$sudo_user" != root \
+    && -n "$sudo_uid" && "$sudo_uid" != 0 ]]; then
+    printf '%s\n' "$sudo_user"
+  else
+    printf '%s\n' "$current_user"
+  fi
+}
+
+# Lets the account-selection contract run on macOS/CI without touching a
+# service manager or filesystem. The full installer simulation remains in
+# scripts/test-install-linux.sh.
+if [[ "${TERMMESH_INSTALL_LIB_ONLY:-0}" == 1 ]]; then
+  return 0 2>/dev/null || exit 0
+fi
 
 [[ "$(uname -s)" == "Linux" ]] || die "this script installs a Linux systemd service; run it on a Linux host"
 command -v systemctl >/dev/null 2>&1 || die "systemctl not found — this script requires systemd"
@@ -47,6 +66,9 @@ command -v tar >/dev/null 2>&1 || die "tar not found"
 # security boundary: a system service must not execute a root-owned daemon
 # with root's HOME/config merely because the user bus happened to be absent.
 INSTALL_UID=$(id -u)
+CONNECTING_USER=$(resolve_connecting_user \
+  "$INSTALL_UID" "$(id -un)" "${SUDO_USER:-}" "${SUDO_UID:-}")
+SERVICE_USER="${TERMMESH_SERVICE_USER:-$CONNECTING_USER}"
 if [[ "$INSTALL_UID" != 0 ]] && systemctl --user show-environment >/dev/null 2>&1; then
   SERVICE_SCOPE=user
   PREFIX="${PREFIX_OVERRIDE:-$HOME/.local/bin}"
@@ -72,8 +94,9 @@ else
   die "cannot reach your user systemd bus, so 'systemctl --user' will not work here.
 This host has no per-user systemd session — common over non-interactive
 ssh, and on older systemd (e.g. RHEL/CentOS 7). Either:
-  • ask an administrator to run this installer as root; it creates an
-    unprivileged '${SERVICE_USER}' system service, or
+  • run it through sudo; the system service will still run as this SSH user:
+        curl -fsSL https://raw.githubusercontent.com/${REPO}/main/scripts/install-linux.sh | sudo env TERMMESH_SERVICE_USER=$(whoami) bash
+    or ask an administrator to set TERMMESH_SERVICE_USER=${SERVICE_USER}, or
   • start a lingering login session first:
         loginctl enable-linger $(whoami)
     then reconnect and re-run, so the --user bus exists."
@@ -334,7 +357,7 @@ fi
 
 mkdir -p "$UNIT_DIR"
 if [[ "$SERVICE_SCOPE" == system ]]; then
-  if [[ "$(id -u "$SERVICE_USER")" == 0 ]]; then
+  if [[ "$SERVICE_USER" == "$CONNECTING_USER" ]]; then
     PROTECT_HOME=false
   else
     PROTECT_HOME=true

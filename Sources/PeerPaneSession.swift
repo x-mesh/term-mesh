@@ -123,6 +123,10 @@ final class PeerPaneHostLease {
     var hostDisplayName: String = ""
 
     fileprivate var refCount = 0
+    /// A user-initiated host disconnect can stop this lease while pane refs
+    /// still exist. Their later releases must not stop it a second time (or,
+    /// more importantly, disturb a replacement lease for the same host).
+    fileprivate var isTornDown = false
 
     fileprivate init(key: PeerPaneHostKey, tunnel: PeerSSHTunnel?) {
         self.key = key
@@ -130,6 +134,8 @@ final class PeerPaneHostLease {
     }
 
     fileprivate func teardown() {
+        guard !isTornDown else { return }
+        isTornDown = true
         tunnel?.stop()
     }
 }
@@ -267,18 +273,40 @@ final class PeerPaneHostRegistry {
     func release(_ lease: PeerPaneHostLease) {
         lease.refCount -= 1
         guard lease.refCount <= 0 else { return }
-        leases[lease.key] = nil
+        // A host disconnect removes a still-referenced lease from the pool so
+        // Reconnect can create a fresh tunnel. Releasing that retired lease
+        // later must not evict the replacement.
+        if leases[lease.key] === lease {
+            leases[lease.key] = nil
+        }
         teardown(lease)
         #if DEBUG
         dlog("peer.pane.lease.down key=\(lease.key)")
         #endif
     }
 
+    /// End this host's pooled transport without releasing pane/mirror refs.
+    /// Existing views keep their session objects and receive ordinary EOF,
+    /// which drives their disconnected UI. A later acquire creates a fresh
+    /// lease instead of reviving this stopped tunnel.
+    @discardableResult
+    func disconnectTransport(for key: PeerPaneHostKey) -> String? {
+        guard let lease = leases[key] else { return nil }
+        leases[key] = nil
+        let sockPath = lease.hostSockPath
+        teardown(lease)
+        #if DEBUG
+        dlog("peer.pane.lease.disconnect key=\(key) refs=\(lease.refCount)")
+        #endif
+        return sockPath
+    }
+
     /// Single teardown funnel so every path that stops a tunnel is counted.
     private func teardown(_ lease: PeerPaneHostLease) {
+        let wasTornDown = lease.isTornDown
         lease.teardown()
         #if DEBUG
-        teardownCountForTests += 1
+        if !wasTornDown { teardownCountForTests += 1 }
         #endif
     }
 
@@ -317,6 +345,10 @@ final class PeerPaneSession {
     let surfaceTitle: String
     let connectedAt = Date()
     private(set) var isTorndown = false
+    /// Distinguishes an explicit host-level transport stop from an accidental
+    /// relay failure. Agent panes normally recreate themselves on failure;
+    /// an intentional disconnect must keep the visible pane in place instead.
+    private(set) var hostTransportWasDisconnected = false
 
     /// Reattach recipe for the disconnect banner's Reconnect action:
     /// how this pane's host was reached and which surface it mirrored.
@@ -650,6 +682,15 @@ final class PeerPaneSession {
     /// been spawned as its shell).
     func start() async throws {
         try await relaySession.start()
+    }
+
+    /// Preserve this pane while its host transport is intentionally ended.
+    /// SSH panes will receive EOF when the pooled tunnel stops. Direct-socket
+    /// panes have no tunnel to stop, so their owned relay is stopped here.
+    func prepareForHostTransportDisconnect(stopRelay: Bool) {
+        hostTransportWasDisconnected = true
+        guard stopRelay else { return }
+        Task { await relaySession.stop() }
     }
 
     /// Idempotent. Must run on every close path — stops the pane's

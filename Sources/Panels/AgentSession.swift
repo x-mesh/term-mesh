@@ -282,8 +282,84 @@ final class AgentSession {
         let duration: TimeInterval?
         let tokensIn: Int?
         let tokensOut: Int?
+        /// Wall-clock time at which the authoritative result arrived.
+        ///
+        /// Duration answers "how long did it take"; this answers "when did it
+        /// finish" when several native panes complete while nobody is looking.
+        let completedAt: Date
         /// What the agent said about how it went, parsed rather than printed.
         var verdict: Verdict?
+
+        init(
+            stop: String,
+            failed: Bool,
+            cost: Double?,
+            duration: TimeInterval?,
+            tokensIn: Int?,
+            tokensOut: Int?,
+            completedAt: Date = Date(),
+            verdict: Verdict? = nil
+        ) {
+            self.stop = stop
+            self.failed = failed
+            self.cost = cost
+            self.duration = duration
+            self.tokensIn = tokensIn
+            self.tokensOut = tokensOut
+            self.completedAt = completedAt
+            self.verdict = verdict
+        }
+    }
+
+    /// Compact, stable timing for a completed native turn.
+    ///
+    /// The status is already a coloured capsule in the footer, so the facts
+    /// begin with the two values people compare across panes: completion time
+    /// and elapsed time. A fixed 24-hour clock avoids AM/PM widening a narrow
+    /// pane and makes adjacent workers scan as one timeline.
+    static func turnFacts(
+        _ end: TurnEnd,
+        timeZone: TimeZone = .autoupdatingCurrent
+    ) -> String {
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = timeZone
+        let components = calendar.dateComponents([.hour, .minute, .second], from: end.completedAt)
+        let clock = String(
+            format: "%02d:%02d:%02d",
+            components.hour ?? 0,
+            components.minute ?? 0,
+            components.second ?? 0
+        )
+        let timing = end.duration.map { "\(clock) (\(elapsedText($0)))" } ?? clock
+        var parts = [timing, end.stop]
+        if let cost = end.cost { parts.append(String(format: "$%.4f", cost)) }
+        if end.tokensIn != nil || end.tokensOut != nil {
+            parts.append("\(end.tokensIn ?? 0)→\(end.tokensOut ?? 0) tok")
+        }
+        return parts.joined(separator: " · ")
+    }
+
+    static func elapsedText(_ duration: TimeInterval) -> String {
+        let seconds = max(0, duration)
+        if seconds < 10 { return String(format: "%.1fs", seconds) }
+        if seconds < 60 { return "\(Int(seconds.rounded()))s" }
+        if seconds < 3_600 {
+            let total = Int(seconds.rounded())
+            return "\(total / 60)m \(total % 60)s"
+        }
+        let totalMinutes = Int((seconds / 60).rounded())
+        return "\(totalMinutes / 60)h \(totalMinutes % 60)m"
+    }
+
+    static func resolvedTurnDuration(
+        reportedMilliseconds: Double?,
+        startedAt: Date?,
+        completedAt: Date
+    ) -> TimeInterval? {
+        if let reportedMilliseconds {
+            return max(0, reportedMilliseconds / 1_000)
+        }
+        return startedAt.map { max(0, completedAt.timeIntervalSince($0)) }
     }
 
     /// The 5-field header, held as fields.
@@ -787,12 +863,7 @@ final class AgentSession {
             case .turnEnded(_, let end):
                 var parts: [String] = []
                 if let status = end.verdict?.status, !status.isEmpty { parts.append(status) }
-                parts.append(end.stop)
-                if let duration = end.duration { parts.append(String(format: "%.1fs", duration)) }
-                if let cost = end.cost { parts.append(String(format: "$%.4f", cost)) }
-                if end.tokensIn != nil || end.tokensOut != nil {
-                    parts.append("\(end.tokensIn ?? 0)→\(end.tokensOut ?? 0) tok")
-                }
+                parts.append(turnFacts(end))
                 return parts.joined(separator: " · ")
             case .notice(_, let text):
                 return "! " + redactingCredentials(text)
@@ -1388,6 +1459,11 @@ final class AgentSession {
             Self.teamIdentityKeys.contains($0.key)
         }
         launchCarriedPath = launch.environment["PATH"] != nil
+        armStartupWatchdog(
+            "no output from \(launch.executable) in \(Int(Self.startupSilenceGrace))s. "
+                + "If it never starts, it is usually missing from that path, or waiting on "
+                + "something that will not arrive — a credential, a login prompt."
+        )
         let p = Process()
         p.executableURL = URL(fileURLWithPath: launch.executable)
         p.arguments = launch.arguments
@@ -1532,10 +1608,22 @@ final class AgentSession {
     /// `interruptible` is the same promise `Launch.interruptible` makes: only
     /// a CLI measured to take `control_request`/`interrupt` on its stdin
     /// stream should offer the button.
+    /// `cli` only names the binary in the watchdog's message, so a session
+    /// that does not know which CLI it is hosting still gets the backstop.
     func startRemote(interruptible: Bool = false,
+                     cli: String? = nil,
                      sink: @escaping @Sendable (Data) async throws -> Void) {
         guard process == nil, remoteSink == nil else { return }
         remoteSink = sink
+        let named = cli.map { "`\($0)`" } ?? "the agent CLI"
+        armStartupWatchdog(
+            "no output from the remote agent in \(Int(Self.startupSilenceGrace))s. "
+                + "If it never starts, the usual cause is that this host does not have "
+                + "\(named) on the PATH its agents launch with — a narrower search than "
+                + "Test Relay uses, so a CLI that probe finds can still be out of reach. "
+                + "Edit Peer Host → Test Relay reports where it is, and PATH there adds "
+                + "directories to search."
+        )
         // A fresh pipeline per session: the decoder must start at a clean
         // line boundary, and batches from any earlier pipeline must keep
         // failing `apply`'s identity guard.
@@ -1668,6 +1756,10 @@ final class AgentSession {
     private func teardown(process expected: Process, terminate: Bool) -> Bool {
         guard process === expected else { return false }
 
+        // Same reasoning as `teardownRemote`: an ended session reports itself,
+        // so a pending silence alarm has nothing left to add.
+        cancelStartupWatchdog()
+
         // A deliberate stop owns completion and must not later become a second
         // process-exited finish when Foundation reports the signal.
         expected.terminationHandler = nil
@@ -1711,6 +1803,9 @@ final class AgentSession {
     /// identity guard, mirroring `teardown`'s `process === p` revocation.
     private func teardownRemote() {
         guard remoteSink != nil else { return }
+        // A session that ended has already said why, or is about to through
+        // the exit notice. Either way the silence question is settled.
+        cancelStartupWatchdog()
         remoteSink = nil
         remoteGeneration &+= 1
         remoteSendTail = nil
@@ -1736,13 +1831,21 @@ final class AgentSession {
         // its own, and its task would sit `in_progress` forever while every
         // instruction behind it waited on a queue that will never drain.
         if turnInFlight {
+            let completedAt = Date()
             let end = TurnEnd(stop: stopped ? "session_stopped" : "process_exited",
                               failed: true, cost: nil,
-                              duration: nil, tokensIn: nil, tokensOut: nil)
+                              duration: Self.resolvedTurnDuration(
+                                reportedMilliseconds: nil,
+                                startedAt: turnStartedAt,
+                                completedAt: completedAt
+                              ),
+                              tokensIn: nil, tokensOut: nil,
+                              completedAt: completedAt)
             append(.turnEnded(id: UUID(), end))
             let answered = currentTaskId
             currentTaskId = nil
             turnInFlight = false
+            turnStartedAt = nil
             // No STATUS, so this reads as NEEDS_REVIEW rather than a success —
             // nobody said it worked, and the agent is not there to say.
             onTurnEnd?(stopped ? "the session was stopped before this turn finished"
@@ -1797,6 +1900,9 @@ final class AgentSession {
     /// The person's `result` would then close the leader's task, or the CLI
     /// would merge the two and one completion would simply never arrive.
     @ObservationIgnored private var turnInFlight = false
+    /// Local fallback for providers that do not include `duration_ms` in their
+    /// result event. Kept off the observation graph: no view needs live time.
+    @ObservationIgnored private var turnStartedAt: Date?
 
     @discardableResult
     private func write(_ text: String, from speaker: Speaker, taskId: String?) throws -> Int {
@@ -1807,6 +1913,7 @@ final class AgentSession {
         // drawn is what the agent confirmed receiving — not what was hoped for.
         pendingSpeaker = speaker
         // Any write opens a turn. Only a leader's carries a task.
+        if !turnInFlight { turnStartedAt = Date() }
         turnInFlight = true
         if speaker == .leader { currentTaskId = taskId }
         setThinking(true)
@@ -2189,6 +2296,7 @@ final class AgentSession {
 
     private func result(_ o: [String: Any]) {
         let usage = o["usage"] as? [String: Any] ?? [:]
+        let completedAt = Date()
         // A turn we stopped on purpose is not a failure.
         let failed = stopRequested ? false : (o["is_error"] as? Bool ?? false)
         let reason = o["stop_reason"] as? String ?? o["subtype"] as? String ?? "?"
@@ -2196,9 +2304,14 @@ final class AgentSession {
             stop: stopRequested ? "stopped" : reason,
             failed: failed,
             cost: o["total_cost_usd"] as? Double,
-            duration: (o["duration_ms"] as? Double).map { $0 / 1000 },
+            duration: Self.resolvedTurnDuration(
+                reportedMilliseconds: o["duration_ms"] as? Double,
+                startedAt: turnStartedAt,
+                completedAt: completedAt
+            ),
             tokensIn: usage["input_tokens"] as? Int,
-            tokensOut: usage["output_tokens"] as? Int
+            tokensOut: usage["output_tokens"] as? Int,
+            completedAt: completedAt
         )
         // The header moves out of the prose and into the turn, where it is a
         // value the footer can render as a verdict. Shown raw *and* parsed was
@@ -2223,6 +2336,7 @@ final class AgentSession {
         append(.turnEnded(id: UUID(), end))
         setThinking(false)
         turnInFlight = false
+        turnStartedAt = nil
         stopRequested = false
         // `result` carries the final answer as a clean string — the boundary is
         // stated rather than inferred from a screen going quiet.
@@ -2266,8 +2380,62 @@ final class AgentSession {
     }
 
     private func append(_ entry: Entry) {
+        // Anything reaching the transcript is proof the launch got somewhere,
+        // which is all the startup watchdog was waiting to hear. Cancelling
+        // here rather than at each producer is deliberate: stdout batches,
+        // stderr notices and protocol events all funnel through this one call,
+        // and a new producer added later would otherwise silently re-arm the
+        // false alarm.
+        cancelStartupWatchdog()
         entries.append(entry)
         trimToCap()
+    }
+
+    /// How long a pane may stay completely silent before it says why it might
+    /// be.
+    ///
+    /// Long enough to cover an SSH round trip, a login profile and a CLI's own
+    /// startup; short enough that nobody sits looking at an empty pane
+    /// wondering whether it is working.
+    ///
+    /// Erring long on purpose. A notice cannot be taken back once it is in the
+    /// transcript, so a pane that was merely slow keeps a wrong explanation
+    /// permanently — and sending someone after a PATH problem they do not have
+    /// costs more than the extra seconds of waiting. The message is written
+    /// the same way: it states the silence as fact and the cause as the usual
+    /// one, not as a diagnosis.
+    private static let startupSilenceGrace: TimeInterval = 30
+
+    @ObservationIgnored private var startupWatchdog: DispatchWorkItem?
+
+    /// Say something when a launch produces nothing at all.
+    ///
+    /// Every failure that *ends* the process is already reported: a non-zero
+    /// exit, a signal, a closed transport. What had no reporter was the launch
+    /// that neither fails nor starts — measured with a peer agent whose CLI
+    /// was absent from the launch PATH but present to the readiness probe. The
+    /// pane opened, the process sat there, and the UI waited forever with
+    /// nothing to show. This is the backstop for that shape of failure, and
+    /// for the ones nobody has hit yet: no matter the cause, the pane
+    /// eventually explains itself instead of staying blank.
+    private func armStartupWatchdog(_ diagnosis: String) {
+        cancelStartupWatchdog()
+        let item = DispatchWorkItem { [weak self] in
+            guard let self, self.startupWatchdog != nil else { return }
+            // Cleared first: `append` cancels the watchdog, and this *is* the
+            // watchdog firing.
+            self.startupWatchdog = nil
+            self.append(.notice(id: UUID(), diagnosis))
+        }
+        startupWatchdog = item
+        DispatchQueue.main.asyncAfter(
+            deadline: .now() + Self.startupSilenceGrace, execute: item
+        )
+    }
+
+    private func cancelStartupWatchdog() {
+        startupWatchdog?.cancel()
+        startupWatchdog = nil
     }
 
     /// Drop the oldest entries once the session exceeds its cap.
@@ -2322,6 +2490,13 @@ final class AgentSession {
     }
 
     func noteAutoScrollForDebug() { debugAutoScrolls += 1 }
+
+    /// Whether a silence alarm is still pending.
+    var hasStartupWatchdogForTesting: Bool { startupWatchdog != nil }
+
+    /// Fire it now rather than waiting out `startupSilenceGrace`. A cancelled
+    /// work item performs nothing, which is exactly the behaviour under test.
+    func fireStartupWatchdogForTesting() { startupWatchdog?.perform() }
 
     /// Where the transcript's bottom marker actually sat the last time the
     /// view measured it, alongside the follow decision that measurement fed.

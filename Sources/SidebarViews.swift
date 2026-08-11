@@ -2719,10 +2719,10 @@ struct RemoteHostGroupView: View, Equatable {
                     Button("Retry Connection") { store.retryConnectingHost(host) }
                 }
             case .connected:
-                // Grouped by what the action touches, because the two
-                // destructive-looking entries are not equally destructive:
-                // Disconnect only drops this Mac's end of the link, while
-                // Clean Up Panes ends processes on the host itself.
+                // Grouped by what the action touches. Browsing the host,
+                // closing local views, and ending remote processes are three
+                // different scopes and their labels must say which one they
+                // affect.
                 Button("Open Surface as Pane…") {
                     store.openSurfaceAsPane(host)
                 }
@@ -2736,23 +2736,14 @@ struct RemoteHostGroupView: View, Equatable {
                 .disabled(host.supportsWorkspaceLifecycle != true)
 
                 Divider()
-                // Two different things, and they must stay two.
-                //
-                // Disconnect drops this Mac's end of the link and leaves every
-                // pane running on the host, so reconnecting picks the work back
-                // up — that reversibility is exactly why it needs no
-                // confirmation. Force Disconnect reaches across the link and
-                // closes those panes, which nothing here can undo.
-                //
-                // These were merged into one unconfirmed "Disconnect" calling
-                // the force path, while the comment above it still described
-                // the safe one. The guard had been removed on the strength of a
-                // property the remaining action did not have, and a routine
-                // disconnect closed five live panes on a peer.
-                if store.hasSidebarLease(for: host.id) {
-                    Button("Disconnect") { store.disconnectSavedHost(host) }
+                // Disconnect ends only the transport: pane UI and host-side
+                // processes survive, and the pane's banner offers reconnect.
+                // Closing local views is a separate, explicitly labelled
+                // action because it discards the visible pane layout.
+                Button("Disconnect Host") {
+                    store.disconnectSavedHost(host)
                 }
-                Button("Force Disconnect (Close All Panes)…", role: .destructive) {
+                Button("Close All Panes and Disconnect…", role: .destructive) {
                     Task { @MainActor in
                         try? await Task.sleep(nanoseconds: 50_000_000)
                         showForceDisconnectConfirm = true
@@ -2868,19 +2859,15 @@ struct RemoteHostGroupView: View, Equatable {
             Text("The saved host profile is removed. Open panes and mirrors stay connected.")
         }
         .confirmationDialog(
-            "Force disconnect \"\(host.displayName)\"?",
+            "Close all panes from \"\(host.displayName)\"?",
             isPresented: $showForceDisconnectConfirm
         ) {
-            Button("Force Disconnect", role: .destructive) {
+            Button("Close All Panes and Disconnect", role: .destructive) {
                 store.forceDisconnectSavedHost(host)
             }
             Button("Cancel", role: .cancel) {}
         } message: {
-            // Worth saying plainly: the panes close here, but whatever was
-            // running inside them keeps running on the host. That is what
-            // makes the difference from Disconnect recoverable at all — the
-            // work survives, only the view of it is gone.
-            Text("Closes every pane, mirror and relay window opened from this host. Remote processes keep running on the host.")
+            Text("Closes every pane, mirror, and relay window opened from this host. Processes running on the host continue.")
         }
         .alert("New Workspace", isPresented: $showNewWorkspaceAlert) {
             TextField("Workspace name", text: $newWorkspaceTitle)

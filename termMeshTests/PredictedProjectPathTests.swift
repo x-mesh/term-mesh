@@ -339,4 +339,111 @@ final class PredictedProjectPathTests: XCTestCase {
             "https://example.com/org/demo.git"
         )
     }
+
+    func testRemoteDirectoryCompletionUsesTheTypedParentAndLeafPrefix() {
+        XCTAssertEqual(
+            RemoteDirectoryLookup.completionQuery(for: "/app/tm-pro"),
+            .init(parentPath: "/app", prefix: "tm-pro")
+        )
+        XCTAssertEqual(
+            RemoteDirectoryLookup.completionQuery(for: "/app/projects/"),
+            .init(parentPath: "/app/projects", prefix: "")
+        )
+        XCTAssertEqual(
+            RemoteDirectoryLookup.completionQuery(for: "~/work"),
+            .init(parentPath: "~", prefix: "work")
+        )
+        XCTAssertEqual(
+            RemoteDirectoryLookup.completionQuery(for: ""),
+            .init(parentPath: "~", prefix: "")
+        )
+    }
+
+    func testRemoteDirectoryListingParsesNulSeparatedPathsAndSortsFolders() throws {
+        let listing = try RemoteDirectoryLookup.parse(
+            "/srv/projects\u{0}./Zulu\u{0}./alpha\u{0}./Beta\u{0}"
+        )
+        XCTAssertEqual(listing.path, "/srv/projects")
+        XCTAssertEqual(listing.parentPath, "/srv")
+        XCTAssertEqual(
+            listing.directories,
+            ["/srv/projects/alpha", "/srv/projects/Beta", "/srv/projects/Zulu"]
+        )
+    }
+
+    func testRemoteDirectoryLookupQuotesThePathAndBoundsTheScanDepth() {
+        let script = RemoteDirectoryLookup.script(for: "/srv/team's projects")
+        XCTAssertTrue(script.contains("p='/srv/team'\\''s projects'"))
+        XCTAssertTrue(script.contains("-mindepth 1 -maxdepth 1"))
+        XCTAssertTrue(script.contains("-print0"))
+    }
+
+    func testRemoteDirectoryLookupScriptListsImmediateVisibleFoldersInSh() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("term-mesh team's projects-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: root) }
+        try FileManager.default.createDirectory(
+            at: root.appendingPathComponent("alpha/nested"),
+            withIntermediateDirectories: true
+        )
+        try FileManager.default.createDirectory(
+            at: root.appendingPathComponent("Beta"),
+            withIntermediateDirectories: true
+        )
+        try FileManager.default.createDirectory(
+            at: root.appendingPathComponent(".hidden"),
+            withIntermediateDirectories: true
+        )
+
+        let process = Process()
+        let output = Pipe()
+        process.executableURL = URL(fileURLWithPath: "/bin/sh")
+        process.arguments = ["-c", RemoteDirectoryLookup.script(for: root.path)]
+        process.standardOutput = output
+        process.standardError = FileHandle.nullDevice
+        try process.run()
+        let data = output.fileHandleForReading.readDataToEndOfFile()
+        process.waitUntilExit()
+        XCTAssertEqual(process.terminationStatus, 0)
+
+        let listing = try RemoteDirectoryLookup.parse(
+            String(data: data, encoding: .utf8) ?? ""
+        )
+        XCTAssertEqual(
+            listing.directories.map { ($0 as NSString).lastPathComponent },
+            ["alpha", "Beta"]
+        )
+    }
+
+    func testRemoteDirectoryMatchesArePrefixFilteredAndBounded() {
+        XCTAssertEqual(
+            RemoteDirectoryLookup.matches(
+                ["/srv/demo", "/srv/Delta", "/srv/other"],
+                prefix: "de",
+                limit: 1
+            ),
+            ["/srv/demo"]
+        )
+    }
+
+    func testRemoteDirectorySelectionMeaningMatchesEveryProjectSource() {
+        XCTAssertEqual(
+            RemoteDirectoryLookup.selectedPath(
+                sourceKind: .existingFolder,
+                folder: "/srv/projects/existing",
+                projectName: "ignored"
+            ),
+            "/srv/projects/existing"
+        )
+        for sourceKind in [ProjectSourceKind.clone, .empty] {
+            XCTAssertEqual(
+                RemoteDirectoryLookup.selectedPath(
+                    sourceKind: sourceKind,
+                    folder: "/srv/projects",
+                    projectName: "demo"
+                ),
+                "/srv/projects/demo"
+            )
+        }
+    }
 }

@@ -977,19 +977,21 @@ final class AgentSessionTests: XCTestCase {
 
     func testVisibleTranscriptSnapshotMatchesNativeRowsAndAppliesTailLimit() {
         let longThought = String(repeating: "x", count: 20) + String(repeating: "y", count: 120)
+        let end = AgentSession.TurnEnd(
+            stop: "end_turn",
+            failed: false,
+            cost: 0.25,
+            duration: 1.2,
+            tokensIn: 3,
+            tokensOut: 5,
+            completedAt: Date(timeIntervalSince1970: 0)
+        )
         let rows = AgentSession.rows(for: [
             .said(id: UUID(), .leader, "inspect this"),
             .answered(id: UUID(), "alpha\nbeta"),
             .thought(id: UUID(), longThought),
             .tool(id: UUID(), .init(name: "Bash", headline: "swift test", result: "folded output")),
-            .turnEnded(id: UUID(), .init(
-                stop: "end_turn",
-                failed: false,
-                cost: 0.25,
-                duration: 1.2,
-                tokensIn: 3,
-                tokensOut: 5
-            )),
+            .turnEnded(id: UUID(), end),
             .notice(id: UUID(), "connection restored"),
         ])
 
@@ -1000,12 +1002,13 @@ final class AgentSessionTests: XCTestCase {
         XCTAssertFalse(snapshot.contains(longThought))
         XCTAssertTrue(snapshot.contains("Bash swift test"))
         XCTAssertFalse(snapshot.contains("folded output"), "collapsed tool output is not user-visible")
-        XCTAssertTrue(snapshot.contains("end_turn · 1.2s · $0.2500 · 3→5 tok"))
+        let turnFacts = AgentSession.turnFacts(end)
+        XCTAssertTrue(snapshot.contains(turnFacts))
         XCTAssertTrue(snapshot.hasSuffix("! connection restored"))
 
         XCTAssertEqual(
             AgentSession.visibleTranscriptText(rows: rows, lineLimit: 2),
-            "end_turn · 1.2s · $0.2500 · 3→5 tok\n! connection restored"
+            "\(turnFacts)\n! connection restored"
         )
         XCTAssertEqual(AgentSession.visibleTranscriptText(rows: rows, lineLimit: 0), "")
     }
@@ -1046,6 +1049,52 @@ final class AgentSessionTests: XCTestCase {
         XCTAssertFalse(snapshot.contains(token),
                        "no transcript row may carry a credential off-process")
         XCTAssertTrue(snapshot.contains("[redacted]"))
+    }
+
+    // MARK: - A pane that says nothing eventually says why
+
+    /// Every failure that *ends* a launch already reports itself — a non-zero
+    /// exit, a signal, a closed transport. The one with no reporter was the
+    /// launch that neither fails nor starts: measured with a peer agent whose
+    /// CLI was missing from the launch PATH but present to the readiness
+    /// probe, the pane opened and waited forever with nothing to show.
+    func testSilentRemoteLaunchEventuallyExplainsItself() {
+        let s = AgentSession()
+        s.startRemote(cli: "codex") { _ in }
+        XCTAssertTrue(s.hasStartupWatchdogForTesting)
+
+        s.fireStartupWatchdogForTesting()
+
+        let text = AgentSession.visibleTranscriptText(rows: s.rows)
+        XCTAssertTrue(text.contains("codex"), text)
+        XCTAssertTrue(text.contains("PATH"), text)
+        XCTAssertFalse(s.hasStartupWatchdogForTesting, "it fires once, not on a timer")
+    }
+
+    /// Anything at all in the transcript proves the launch got somewhere.
+    func testAnyOutputCancelsTheSilenceAlarm() {
+        let s = AgentSession()
+        s.startRemote(cli: "codex") { _ in }
+        s.ingestForTesting(event(["type": "assistant",
+                                  "message": ["content": [["type": "text", "text": "hi"]]]]))
+
+        XCTAssertFalse(s.hasStartupWatchdogForTesting)
+        s.fireStartupWatchdogForTesting()
+        let text = AgentSession.visibleTranscriptText(rows: s.rows)
+        XCTAssertFalse(text.contains("no output from"), text)
+    }
+
+    /// A session that was stopped has already reported itself; a late alarm
+    /// would be noise on top of an answer the user already has.
+    func testStoppingCancelsTheSilenceAlarm() {
+        let s = AgentSession()
+        s.startRemote(cli: "codex") { _ in }
+        s.stop()
+
+        XCTAssertFalse(s.hasStartupWatchdogForTesting)
+        s.fireStartupWatchdogForTesting()
+        let text = AgentSession.visibleTranscriptText(rows: s.rows)
+        XCTAssertFalse(text.contains("no output from"), text)
     }
 
     /// A PEM key spans lines, and a line-bounded pattern took only its header
@@ -1688,6 +1737,54 @@ final class AgentSessionTests: XCTestCase {
     }
 
     // MARK: - The end of a turn
+
+    func testTurnCompletionFactsLeadWithClockAndElapsedTime() {
+        let end = AgentSession.TurnEnd(
+            stop: "end_turn",
+            failed: false,
+            cost: 0.4096,
+            duration: 23.4,
+            tokensIn: 2,
+            tokensOut: 8,
+            completedAt: Date(timeIntervalSince1970: 0)
+        )
+
+        XCTAssertEqual(
+            AgentSession.turnFacts(end, timeZone: TimeZone(secondsFromGMT: 9 * 3_600)!),
+            "09:00:00 (23s) · end_turn · $0.4096 · 2→8 tok"
+        )
+    }
+
+    func testElapsedTimeStaysCompactAcrossTurnLengths() {
+        XCTAssertEqual(AgentSession.elapsedText(2.7), "2.7s")
+        XCTAssertEqual(AgentSession.elapsedText(23.4), "23s")
+        XCTAssertEqual(AgentSession.elapsedText(134), "2m 14s")
+        XCTAssertEqual(AgentSession.elapsedText(3_730), "1h 2m")
+    }
+
+    func testReportedDurationWinsAndLocalStartFillsMissingDuration() {
+        let started = Date(timeIntervalSince1970: 100)
+        let completed = Date(timeIntervalSince1970: 123)
+
+        XCTAssertEqual(
+            AgentSession.resolvedTurnDuration(
+                reportedMilliseconds: 2_700,
+                startedAt: started,
+                completedAt: completed
+            ) ?? -1,
+            2.7,
+            accuracy: 0.001
+        )
+        XCTAssertEqual(
+            AgentSession.resolvedTurnDuration(
+                reportedMilliseconds: nil,
+                startedAt: started,
+                completedAt: completed
+            ) ?? -1,
+            23,
+            accuracy: 0.001
+        )
+    }
 
     /// Stated, not inferred.
     ///

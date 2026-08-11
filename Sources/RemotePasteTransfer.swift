@@ -15,10 +15,17 @@ import Foundation
 /// so no conflict to resolve — the whole class of problem a mirrored folder
 /// creates simply does not arise here.
 enum RemotePasteTransfer {
-    /// Directory the pasted files land in on the peer. Under `/tmp` because
-    /// these are scratch: an agent reads one and moves on, and a reboot is a
-    /// perfectly good cleanup policy.
-    static let remoteDirectory = "/tmp/term-mesh-paste"
+    /// Resolve a scratch directory that both the SSH login and the peer pane
+    /// can see. A system service with `PrivateTmp=true` gets a private /tmp
+    /// (and /var/tmp), so either of those silently produces a path that exists
+    /// for SSH and is missing from the pane. The connecting account's cache is
+    /// shared across both processes when the installer keeps their identities
+    /// aligned. `remoteServiceAccountCommand` also switches a root SSH login
+    /// to an explicitly selected system-service account before touching it.
+    static let remoteDirectoryCommand =
+        remoteServiceAccountCommand(
+            #"umask 077; d="${XDG_CACHE_HOME:-$HOME/.cache}/term-mesh/paste"; mkdir -p "$d" && chmod 700 "$d" && printf %s "$d""#
+        )
 
     /// The peer to send a paste to, or nil when the pane is local.
     ///
@@ -88,18 +95,20 @@ enum RemotePasteTransfer {
             return nil
         }
         let name = uniqueName(for: localPath)
-        let remotePath = "\(remoteDirectory)/\(name)"
         let label = (localPath as NSString).lastPathComponent
         let started = Date()
         RemoteWorkLog.debugOffMain("Sending \(label) (\(describeSize(of: localPath))) → \(sshTarget)")
 
-        guard run("/usr/bin/ssh", [sshTarget, "mkdir -p \(shellQuote(remoteDirectory))"]) else {
+        guard let remoteDirectory = capture(
+            "/usr/bin/ssh", [sshTarget, remoteDirectoryCommand]
+        ), validRemoteDirectory(remoteDirectory) else {
             log("mkdir failed on \(sshTarget)")
-            RemoteWorkLog.infoOffMain("Paste failed: could not create \(remoteDirectory) on \(sshTarget)")
+            RemoteWorkLog.infoOffMain("Paste failed: could not create a shared cache on \(sshTarget)")
             return nil
         }
-        guard run("/usr/bin/scp", ["-q", localPath, "\(sshTarget):\(remotePath)"]) else {
-            log("scp failed \(localPath) -> \(sshTarget)")
+        let remotePath = "\(remoteDirectory)/\(name)"
+        guard sendFile(localPath, to: remotePath, on: sshTarget) else {
+            log("stream failed \(localPath) -> \(sshTarget)")
             RemoteWorkLog.infoOffMain("Paste failed: could not copy \(label) to \(sshTarget)")
             return nil
         }
@@ -148,10 +157,27 @@ enum RemotePasteTransfer {
         "'" + value.replacingOccurrences(of: "'", with: "'\\''") + "'"
     }
 
-    private static func run(_ executable: String, _ arguments: [String]) -> Bool {
+    private static func validRemoteDirectory(_ value: String) -> Bool {
+        value.hasPrefix("/") && !value.contains("\n") && !value.contains("\0")
+    }
+
+    /// Stream over ssh instead of handing a quoted remote path to scp. Modern
+    /// scp switches between legacy shell parsing and SFTP across OS versions;
+    /// stdin + `cat > quoted-path` has one meaning on all supported peers.
+    private static func sendFile(
+        _ localPath: String,
+        to remotePath: String,
+        on target: String
+    ) -> Bool {
+        guard let input = FileHandle(forReadingAtPath: localPath) else { return false }
+        defer { try? input.close() }
         let process = Process()
-        process.executableURL = URL(fileURLWithPath: executable)
-        process.arguments = arguments
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/ssh")
+        process.arguments = [
+            target,
+            remoteServiceAccountCommand("umask 077; cat > \(shellQuote(remotePath))")
+        ]
+        process.standardInput = input
         process.standardOutput = FileHandle.nullDevice
         process.standardError = FileHandle.nullDevice
         do {
@@ -161,6 +187,39 @@ enum RemotePasteTransfer {
         } catch {
             return false
         }
+    }
+
+    private static func capture(_ executable: String, _ arguments: [String]) -> String? {
+        let process = Process()
+        let output = Pipe()
+        process.executableURL = URL(fileURLWithPath: executable)
+        process.arguments = arguments
+        process.standardOutput = output
+        process.standardError = FileHandle.nullDevice
+        do {
+            try process.run()
+            let data = output.fileHandleForReading.readDataToEndOfFile()
+            process.waitUntilExit()
+            guard process.terminationStatus == 0 else { return nil }
+            return String(data: data, encoding: .utf8)
+        } catch {
+            return nil
+        }
+    }
+
+    /// A direct root SSH login normally stays root. Only when the installed
+    /// system unit explicitly names another User= do file operations switch
+    /// to that account, matching the pane without running the daemon itself
+    /// through sudo. Non-root and user-service connections stay untouched.
+    private static func remoteServiceAccountCommand(_ command: String) -> String {
+        let quoted = shellQuote(command)
+        return "u=$(systemctl show -p User --value term-meshd.service 2>/dev/null || true); "
+            + "[ -n \"$u\" ] || u=$(id -un); "
+            + "if [ \"$(id -u)\" -eq 0 ] && [ \"$u\" != root ]; then "
+            + "h=$(getent passwd \"$u\" | awk -F: '{print $6}'); [ -n \"$h\" ] || exit 127; "
+            + "command -v runuser >/dev/null 2>&1 || exit 127; "
+            + "exec runuser -u \"$u\" -- env HOME=\"$h\" XDG_CACHE_HOME= /bin/sh -c \(quoted); "
+            + "else exec /bin/sh -c \(quoted); fi"
     }
 
     private static func log(_ message: String) {
