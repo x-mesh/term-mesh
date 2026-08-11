@@ -925,15 +925,28 @@ private enum PeerSidebarPaletteRole {
     case hostBusy
     case workspaceConnected
     case workspaceWorking
+    case workspaceViewing
 
+    /// A host owns the workspaces drawn under it, and the values used to say
+    /// the opposite: the host row sat at brightness 0.27 while the workspace
+    /// being viewed skipped this table entirely and painted the accent at full
+    /// strength, roughly 0.95. The parent read as the faintest thing in the
+    /// sidebar and its child as the only lit surface on screen.
+    ///
+    /// So the ladder is now deliberate and narrow — host 0.34, connected 0.36,
+    /// working 0.46, viewing 0.54. States stay distinguishable without any of
+    /// them glowing, and white label text gains contrast as the fills darken.
+    /// "Being viewed" is carried by the accent border on the card instead of by
+    /// a bright fill: a line reads at a glance and costs no legibility.
     func components(for colorScheme: ColorScheme) -> (saturation: CGFloat, brightness: CGFloat) {
         let isDark = colorScheme == .dark
         switch self {
-        case .hostExpanded: return isDark ? (0.48, 0.27) : (0.22, 0.97)
-        case .hostCollapsed: return isDark ? (0.58, 0.35) : (0.34, 0.94)
-        case .hostBusy: return isDark ? (0.68, 0.48) : (0.50, 0.90)
-        case .workspaceConnected: return isDark ? (0.65, 0.42) : (0.42, 0.95)
-        case .workspaceWorking: return isDark ? (0.72, 0.58) : (0.70, 0.87)
+        case .hostExpanded: return isDark ? (0.44, 0.34) : (0.20, 0.95)
+        case .hostCollapsed: return isDark ? (0.52, 0.38) : (0.28, 0.93)
+        case .hostBusy: return isDark ? (0.62, 0.46) : (0.44, 0.90)
+        case .workspaceConnected: return isDark ? (0.52, 0.36) : (0.32, 0.94)
+        case .workspaceWorking: return isDark ? (0.58, 0.46) : (0.52, 0.88)
+        case .workspaceViewing: return isDark ? (0.60, 0.54) : (0.64, 0.82)
         }
     }
 }
@@ -2686,7 +2699,10 @@ struct RemoteHostGroupView: View, Equatable {
         }
         .padding(.leading, host.isConnected ? 2 : 10)
         .padding(.trailing, 10)
-        .padding(.vertical, 3)
+        // A shade taller than the rows it heads. At 3pt the host name band was
+        // thinner than the workspace cards under it, which reads as the child
+        // outranking the parent; the fill change alone did not settle that.
+        .padding(.vertical, 5)
         .background {
             RoundedRectangle(cornerRadius: 6)
                 .fill(peerHeaderBackground)
@@ -3111,10 +3127,23 @@ struct RemoteWorkspaceRowView: View {
         case .closed: return AnyShapeStyle(rowBackgroundFill)
         case .connected: return AnyShapeStyle(peerTintGradient(role: .workspaceConnected))
         case .working: return AnyShapeStyle(peerTintGradient(role: .workspaceWorking))
-        case .viewing: return AnyShapeStyle(originalPeerGradient)
+        // Through the palette like every other state. This used to paint the
+        // accent undimmed, which made the card the brightest surface in the
+        // sidebar — brighter than the host that owns it.
+        case .viewing: return AnyShapeStyle(peerTintGradient(role: .workspaceViewing))
         // Deliberately the plain row fill, not a tint: the host accent means
         // "live here", and this window is not where it lives.
         case .elsewhere: return AnyShapeStyle(rowBackgroundFill)
+        }
+    }
+
+    /// What now says "you are looking at this one", in place of the bright
+    /// fill: the accent as a line rather than a field. It survives the fill
+    /// being dimmed because an edge is read by shape, not by luminance.
+    private var separatedCardBorder: Color {
+        switch mirrorVisualState {
+        case .viewing: return Color(nsColor: peerAccentNSColors[min(1, peerAccentNSColors.count - 1)])
+        case .closed, .connected, .working, .elsewhere: return .clear
         }
     }
 
@@ -3381,6 +3410,10 @@ struct RemoteWorkspaceRowView: View {
             .background(
                 RoundedRectangle(cornerRadius: 6)
                     .fill(separatedCardBackground)
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 6)
+                    .strokeBorder(separatedCardBorder, lineWidth: 1.5)
             )
             .padding(.horizontal, 6)
         }
