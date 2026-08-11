@@ -1294,10 +1294,11 @@ class termmesh:
 
     def team_agent_launch_env(self, team_name: str, agent_name: str) -> dict:
         """What a native agent pane's launch carried of its team identity
-        (`debug.team.agent_launch_env`, DEBUG-only). Returns `identity`
-        (dict of the pane's own `TERMMESH_*` identifiers) and `path_present`.
-        The rest of the launch environment is deliberately not exposed."""
-        return dict(self._call("debug.team.agent_launch_env", {
+        (`team.debug.agent_launch_env`, DEBUG-only -- named under `team.`
+        because only that prefix reaches the async team dispatcher). Returns
+        `identity` (dict of the pane's own `TERMMESH_*` identifiers) and
+        `path_present`. The rest of the launch environment is not exposed."""
+        return dict(self._call("team.debug.agent_launch_env", {
             "team_name": team_name, "agent_name": agent_name,
         }) or {})
 

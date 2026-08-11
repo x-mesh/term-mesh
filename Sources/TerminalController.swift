@@ -2445,7 +2445,9 @@ class TerminalController {
         case "team.read":
             return await asyncTeamRead(params: params, id: id)
 #if DEBUG
-        case "debug.team.agent_launch_env":
+        // Named under `team.` rather than `debug.` because only that prefix
+        // reaches this dispatcher (see the `hasPrefix("team.")` gate).
+        case "team.debug.agent_launch_env":
             return await asyncTeamAgentLaunchEnv(params: params, id: id)
 #endif
         case "team.collect":
