@@ -76,6 +76,59 @@ final class PeerHostBinaryInventoryTests: XCTestCase {
         XCTAssertTrue(warnings[0].contains("Reinstall term-meshd"), warnings[0])
     }
 
+    /// A CLI can be installed, found by this probe, and used by every agent on
+    /// the host while the pane beside them cannot see it: agents run with a
+    /// fixed PATH, panes build theirs from the login profile. Measured on a
+    /// host whose `~/.local/bin` held claude, codex and git-kit and whose
+    /// login PATH never mentioned it.
+    func test_reportsWhenPanesCannotSeeTheCLI() {
+        let warnings = PeerHostDoctor.inventoryWarnings(
+            PeerHostDoctor.parseBinaryInventory("""
+            os=Linux
+            ssh-user=root
+            daemon-user=root
+            home=/root
+            login-shell=/bin/bash
+            login-path=/usr/local/bin:/usr/bin:/bin
+            tm-agent=/opt/tools/bin/tm-agent|tm-agent 0.180.0
+            """)
+        )
+        XCTAssertEqual(warnings.count, 1, "\(warnings)")
+        XCTAssertTrue(warnings[0].contains("/opt/tools/bin"), warnings[0])
+        XCTAssertTrue(warnings[0].contains("/bin/bash"), warnings[0])
+        XCTAssertTrue(warnings[0].contains("Agents are unaffected"), warnings[0])
+    }
+
+    /// The daemon prepends `~/.local/bin` to a pane's PATH itself, so naming
+    /// it would report a gap that is already closed.
+    func test_cliUnderHomeLocalBinStaysSilent() {
+        let warnings = PeerHostDoctor.inventoryWarnings(
+            PeerHostDoctor.parseBinaryInventory("""
+            os=Linux
+            ssh-user=root
+            daemon-user=root
+            home=/root
+            login-shell=/bin/bash
+            login-path=/usr/local/bin:/usr/bin:/bin
+            tm-agent=/root/.local/bin/tm-agent|tm-agent 0.180.0
+            """)
+        )
+        XCTAssertEqual(warnings, [], "\(warnings)")
+    }
+
+    /// No login PATH read means no claim about what a pane can see.
+    func test_missingLoginPathStaysSilent() {
+        let warnings = PeerHostDoctor.inventoryWarnings(
+            PeerHostDoctor.parseBinaryInventory("""
+            os=Linux
+            ssh-user=root
+            daemon-user=root
+            tm-agent=/opt/tools/bin/tm-agent|tm-agent 0.180.0
+            """)
+        )
+        XCTAssertEqual(warnings, [], "\(warnings)")
+    }
+
     func test_matchingSSHAndDaemonAccountsStaySilent() {
         let warnings = PeerHostDoctor.inventoryWarnings(
             PeerHostDoctor.parseBinaryInventory("""
