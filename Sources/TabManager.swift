@@ -1274,6 +1274,12 @@ class TabManager {
     }
 
     private func closePanelWithConfirmation(tab: Workspace, panelId: UUID) async {
+        // Each Cmd+W schedules its own task, and a confirmation sheet lets the
+        // next one start before this one has closed anything. Without this the
+        // second press acts on a panel that is already gone: harmless in the
+        // ordinary branch, but in the last-pane branch below it would open a
+        // second replacement terminal for a pane nobody asked to close twice.
+        guard tab.panels[panelId] != nil else { return }
         // Cmd+W closes the focused Bonsplit tab (a "tab" in the UI). The last
         // tab in a workspace takes the workspace with it — but the last
         // workspace does NOT take the window. Cmd+W is the close-a-pane key;
