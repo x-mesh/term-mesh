@@ -78,6 +78,13 @@ TERMMESH_INSTALL_LIB_ONLY=1 source "$INSTALLER"
 [[ "$(resolve_connecting_user 0 root tester 1000)" == tester ]]
 [[ "$(resolve_connecting_user 0 root root 0)" == root ]]
 [[ "$(resolve_connecting_user 1000 tester '' '')" == tester ]]
+# ProtectHome is decided by the home directory, because that is what it hides.
+[[ "$(resolve_protect_home /var/lib/term-mesh)" == true ]]
+[[ "$(resolve_protect_home /home/tester)" == false ]]
+[[ "$(resolve_protect_home /home)" == false ]]
+[[ "$(resolve_protect_home /root)" == false ]]
+[[ "$(resolve_protect_home /run/user/1000)" == false ]]
+[[ "$(resolve_protect_home /srv/term-mesh)" == true ]]
 unset TERMMESH_INSTALL_LIB_ONLY
 
 echo '==> system install follows the connecting account and stays hardened'
@@ -101,6 +108,20 @@ SUDO_USER=tester SUDO_UID=$(id -u tester) \
   TERMMESH_INSTALL_PREFIX=/opt/term-mesh-sudo-user bash "$INSTALLER"
 grep -qx 'User=tester' /etc/systemd/system/term-meshd.service
 grep -qx 'Group=tester' /etc/systemd/system/term-meshd.service
+grep -qx 'Environment=HOME=/home/tester' /etc/systemd/system/term-meshd.service
+grep -qx 'ProtectHome=false' /etc/systemd/system/term-meshd.service
+
+echo '==> a dedicated account created here lives outside /home and stays hardened'
+TERMMESH_SERVICE_USER=term-mesh TERMMESH_INSTALL_PREFIX=/opt/term-mesh-dedicated \
+  bash "$INSTALLER"
+grep -qx 'User=term-mesh' /etc/systemd/system/term-meshd.service
+grep -qx 'Environment=HOME=/var/lib/term-mesh' /etc/systemd/system/term-meshd.service
+grep -qx 'ProtectHome=true' /etc/systemd/system/term-meshd.service
+
+echo '==> a dedicated account that already lives under /home is not hidden from itself'
+TERMMESH_SERVICE_USER=tester TERMMESH_INSTALL_PREFIX=/opt/term-mesh-existing \
+  bash "$INSTALLER"
+grep -qx 'User=tester' /etc/systemd/system/term-meshd.service
 grep -qx 'Environment=HOME=/home/tester' /etc/systemd/system/term-meshd.service
 grep -qx 'ProtectHome=false' /etc/systemd/system/term-meshd.service
 

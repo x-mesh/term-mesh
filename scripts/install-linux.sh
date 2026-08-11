@@ -50,6 +50,23 @@ resolve_connecting_user() {
   fi
 }
 
+# ProtectHome=true empties /home, /root and /run/user for the service. That
+# is free hardening when the daemon's own home is elsewhere — the account this
+# installer creates lives in /var/lib/term-mesh — and it silently breaks the
+# daemon when its home is one of those paths: the pane cannot read ~/.cache,
+# so a pasted file staged over SSH is invisible to the agent that was handed
+# its path, and ~/.term-mesh is not writable either.
+#
+# So decide on the home directory, not on which account it belongs to. The
+# account that connects over SSH always has such a home, and an existing
+# account named through TERMMESH_SERVICE_USER may well have one too.
+resolve_protect_home() {
+  case "${1:-}" in
+    /home|/home/*|/root|/root/*|/run/user/*) printf 'false\n' ;;
+    *) printf 'true\n' ;;
+  esac
+}
+
 # Lets the account-selection contract run on macOS/CI without touching a
 # service manager or filesystem. The full installer simulation remains in
 # scripts/test-install-linux.sh.
@@ -357,11 +374,7 @@ fi
 
 mkdir -p "$UNIT_DIR"
 if [[ "$SERVICE_SCOPE" == system ]]; then
-  if [[ "$SERVICE_USER" == "$CONNECTING_USER" ]]; then
-    PROTECT_HOME=false
-  else
-    PROTECT_HOME=true
-  fi
+  PROTECT_HOME=$(resolve_protect_home "$SERVICE_HOME")
   cat > "$UNIT_PATH" <<EOF
 [Unit]
 Description=term-mesh peer host
