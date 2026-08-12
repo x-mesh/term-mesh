@@ -968,7 +968,9 @@ final class PeerProjectBootstrapTests: XCTestCase {
         XCTAssertFalse(prepare.contains("abab"), "the visible preparation must contain no grant")
         XCTAssertEqual(prepare, "unset HISTFILE; stty -echo")
         XCTAssertTrue(launch.hasPrefix("export TERMMESH_LEADER_GRANT_ID="))
-        XCTAssertTrue(launch.contains("; exec /bin/sh -lc "))
+        XCTAssertTrue(launch.contains(#"getent passwd "$(id -u)""#))
+        XCTAssertTrue(launch.contains(#"exec "$term_mesh_login_shell" -l -c"#))
+        XCTAssertFalse(launch.contains("exec /bin/sh -lc"))
         // The model is shell-quoted, and this whole launch is then quoted again
         // for `sh -lc` — so the inner quotes arrive escaped. One level is
         // consumed by that shell, leaving the CLI with `--model gpt-5`.

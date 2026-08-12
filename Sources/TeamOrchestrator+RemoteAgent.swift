@@ -1518,7 +1518,10 @@ extension TeamOrchestrator {
             workingDirectory: workingDirectory,
             grant: grantResponse.grant,
             systemPromptFile: promptFile,
-            environment: PeerHostEnvironment.stored(forHostKey: host.id),
+            environment: Self.configuredRemoteAgentEnvironment(
+                profile: CLIPathSettings.env(for: cli),
+                explicitHost: PeerHostEnvironment.stored(forHostKey: host.id)
+            ),
             hostBinDirs: host.hostCLIBinDirs
         )
         let command = Self.remoteLeaderCommandCheckingPrompt(
@@ -4118,13 +4121,23 @@ extension TeamOrchestrator {
     /// that no longer dies with anything local, so committing it to a roster
     /// that was already retired strands a bridge on the peer for good.
     @MainActor
+    static func configuredRemoteAgentEnvironment(
+        profile: [String: String],
+        explicitHost: [String: String]
+    ) -> [String: String] {
+        profile.merging(explicitHost) { _, hostValue in hostValue }
+    }
+
+    @MainActor
     static func peerOwnedAgentEnvironment(
         profile: [String: String],
         explicitHost: [String: String],
         internalIdentity: [String: String]
     ) throws -> [String: String] {
-        let merged = profile
-            .merging(explicitHost) { _, hostValue in hostValue }
+        let merged = configuredRemoteAgentEnvironment(
+            profile: profile,
+            explicitHost: explicitHost
+        )
             .merging(internalIdentity) { _, internalValue in internalValue }
         try PeerEnsureEnvironment.validate(merged)
         return Dictionary(
@@ -5692,9 +5705,20 @@ extension TeamOrchestrator {
         // `export` applies to the final CLI, unlike a shell assignment prefix
         // before `mkdir`, which would have scoped the grant to that one setup
         // command only.
-        // Replace the interactive shell after exporting. That drops the grant
-        // as soon as the CLI exits instead of leaving it in a resumed shell.
-        return "export \(exports); exec /bin/sh -lc \(shellQuoted(launch))"
+        //
+        // A terminal surface can inherit SHELL=/bin/sh from systemd even when
+        // the account is configured for zsh. Resolve the account shell again
+        // here so leaders and peer-owned native agents load the same profile
+        // (`~/.zshenv` included). The current terminal shell remains only as a
+        // portable resolver and is replaced before the CLI starts.
+        return "export \(exports); \(remoteAccountLoginShellExec(launch))"
+    }
+
+    static func remoteAccountLoginShellExec(_ command: String) -> String {
+        let resolve = #"term_mesh_login_shell=$(getent passwd "$(id -u)" 2>/dev/null | cut -d: -f7); "#
+            + #"case "$term_mesh_login_shell" in /*/nologin|*/false|"") term_mesh_login_shell=${SHELL:-/bin/sh};; esac; "#
+            + #"case "$term_mesh_login_shell" in /*) ;; *) term_mesh_login_shell=/bin/sh;; esac; "#
+        return resolve + "exec \"$term_mesh_login_shell\" -l -c \(shellQuoted(command))"
     }
 
     /// Secret-free first stage for remote leader launch. The next command is
