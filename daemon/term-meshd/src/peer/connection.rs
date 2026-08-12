@@ -1418,7 +1418,6 @@ const TEAM_CALL_ALLOWED_METHODS: &[&str] = &[
     "team.correlation.get",
     "team.correlation.cancel",
     "team.send",
-    "team.send_key",
     "team.broadcast",
     "team.delegate",
     "team.message.post",
@@ -3744,7 +3743,7 @@ mod team_call_allow_list_tests {
         assert!(team_call_allowed("team.correlation.register"));
         assert!(team_call_allowed("team.correlation.get"));
         assert!(team_call_allowed("team.correlation.cancel"));
-        assert!(team_call_allowed("team.send_key"));
+        assert!(!team_call_allowed("team.send_key"));
         assert!(team_call_allowed("team.task.done"));
         assert!(!team_call_allowed("team.task.reassign"));
     }
@@ -3752,6 +3751,7 @@ mod team_call_allow_list_tests {
     #[test]
     fn scoped_leader_gate_allows_add_without_opening_generic_lifecycle() {
         assert!(team_leader_call_allowed("team.add_agent"));
+        assert!(team_leader_call_allowed("team.send_key"));
         assert!(!team_call_allowed("team.add_agent"));
         for method in [
             "team.list",

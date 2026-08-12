@@ -156,7 +156,7 @@ pub mod team_leader {
     pub const MAX_BOOTSTRAP_PAYLOAD_BYTES: usize = 512;
     /// Extra methods available only through a project-bound leader grant.
     /// Generic `team.call.v1` must continue to reject these lifecycle calls.
-    pub const SCOPED_METHODS: &[&str] = &["team.add_agent"];
+    pub const SCOPED_METHODS: &[&str] = &["team.add_agent", "team.send_key"];
 
     pub fn scoped_method_allowed(method: &str) -> bool {
         SCOPED_METHODS.contains(&method)
@@ -451,8 +451,9 @@ mod team_leader_tests {
     }
 
     #[test]
-    fn only_add_agent_is_scoped_beyond_generic_team_calls() {
+    fn only_leader_specific_input_methods_are_scoped_beyond_generic_team_calls() {
         assert!(scoped_method_allowed("team.add_agent"));
+        assert!(scoped_method_allowed("team.send_key"));
         for method in [
             "team.create",
             "team.destroy",

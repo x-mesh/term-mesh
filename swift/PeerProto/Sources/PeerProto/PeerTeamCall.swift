@@ -22,7 +22,7 @@ import Foundation
 /// an autonomous process rather than a person — the difference between the
 /// two designs is the caller, not an oversight in this one.
 ///
-/// Revisit the day a peer can be someone else's machine. The five directing
+/// Revisit the day a peer can be someone else's machine. The four directing
 /// methods and the two task-writing ones would then need restricting to teams
 /// the connection has already attached a surface for; the reads can stay.
 public enum PeerTeamCall {
@@ -45,7 +45,6 @@ public enum PeerTeamCall {
         "team.correlation.cancel",
         // Directing agents that already exist.
         "team.send",
-        "team.send_key",
         "team.broadcast",
         "team.delegate",
         "team.message.post",

@@ -18,6 +18,7 @@ public enum PeerTeamLeader {
     /// Generic `team.call.v1` peers must not inherit these permissions.
     public static let scopedMethods: Set<String> = [
         "team.add_agent",
+        "team.send_key",
     ]
 
     public static func isAllowed(_ method: String) -> Bool {
