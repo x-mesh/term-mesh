@@ -1007,7 +1007,7 @@ final class ProjectRemoteSurfaceDeletionTests: XCTestCase {
         XCTAssertFalse(
             TeamOrchestrator.shouldDeleteRemoteSurfaceIndividually(
                 isAgent: false,
-                ownsRemoteWorkspace: true
+                belongsToOwnedWorkspace: true
             )
         )
     }
@@ -1016,7 +1016,7 @@ final class ProjectRemoteSurfaceDeletionTests: XCTestCase {
         XCTAssertTrue(
             TeamOrchestrator.shouldDeleteRemoteSurfaceIndividually(
                 isAgent: true,
-                ownsRemoteWorkspace: true
+                belongsToOwnedWorkspace: true
             )
         )
     }
@@ -1025,7 +1025,38 @@ final class ProjectRemoteSurfaceDeletionTests: XCTestCase {
         XCTAssertTrue(
             TeamOrchestrator.shouldDeleteRemoteSurfaceIndividually(
                 isAgent: false,
-                ownsRemoteWorkspace: false
+                belongsToOwnedWorkspace: false
+            )
+        )
+    }
+
+    func test_workspace_ownership_includes_active_and_inactive_tabs_only() {
+        let active = Data(repeating: 0x11, count: 16)
+        let inactive = Data(repeating: 0x22, count: 16)
+        let generic = Data(repeating: 0x33, count: 16)
+        var activeTab = Termmesh_Peer_V1_PaneTab()
+        activeTab.surfaceID = active
+        var inactiveTab = Termmesh_Peer_V1_PaneTab()
+        inactiveTab.surfaceID = inactive
+        var pane = Termmesh_Peer_V1_WorkspacePane()
+        pane.surfaceID = active
+        pane.tabs = [activeTab, inactiveTab]
+        var layout = Termmesh_Peer_V1_WorkspaceLayout()
+        layout.pane = pane
+
+        let owned = peerSurfaceIDs(layout)
+        XCTAssertEqual(owned, [active, inactive])
+        XCTAssertFalse(owned.contains(generic))
+        XCTAssertTrue(
+            TeamOrchestrator.shouldDeleteRemoteSurfaceIndividually(
+                isAgent: false,
+                belongsToOwnedWorkspace: owned.contains(generic)
+            )
+        )
+        XCTAssertFalse(
+            TeamOrchestrator.shouldDeleteRemoteSurfaceIndividually(
+                isAgent: false,
+                belongsToOwnedWorkspace: owned.contains(inactive)
             )
         )
     }
