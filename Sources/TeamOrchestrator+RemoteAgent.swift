@@ -3696,13 +3696,17 @@ extension TeamOrchestrator {
     static func peerAgentSurfaceSpec(
         teamName: String,
         agentInstanceId: String,
+        surfaceInstanceId: String? = nil,
         cli: String,
         workingDirectory: String,
         model: String,
         binaries: RemoteAgentBinaries
     ) -> PeerRunnerSurfaceSpec {
         PeerRunnerSurfaceSpec(
-            key: peerAgentEnsureKey(teamName: teamName, agentInstanceId: agentInstanceId),
+            key: peerAgentEnsureKey(
+                teamName: teamName,
+                agentInstanceId: surfaceInstanceId ?? agentInstanceId
+            ),
             cwd: workingDirectory,
             executable: binaries.bridgePath,
             args: peerAgentBridgeArgs(
@@ -4362,6 +4366,231 @@ extension TeamOrchestrator {
             path: workingDirectory
         )
         return member
+    }
+
+    struct PeerOwnedAgentRestart {
+        let panelID: UUID
+        let member: AgentMember
+        let routeGrantID: Data
+    }
+
+    /// Replace exactly the peer-owned member that a hard restart observed.
+    /// The caller may have crossed several network awaits, so every unrelated
+    /// roster mutation must come from `current`, never from its old snapshot.
+    @MainActor
+    static func teamByReplacingPeerOwnedAgent(
+        current: Team,
+        expected: AgentMember,
+        replacement: AgentMember
+    ) -> Team? {
+        guard let index = current.agents.firstIndex(where: {
+            $0.agentInstanceId == expected.agentInstanceId
+                && $0.panelId == expected.panelId
+                && $0.remoteSurfaceID == expected.remoteSurfaceID
+        }) else { return nil }
+        var updated = current
+        updated.agents[index] = replacement
+        return updated
+    }
+
+    @MainActor
+    func discardPeerOwnedAgentRestart(
+        _ replacement: PeerOwnedAgentRestart,
+        workspace: Workspace
+    ) {
+        workspace.discardPanelForRollback(replacement.panelID)
+        Self.releasePeerOwnedAgentSurface(replacement.member)
+        Task {
+            await PeerTeamLeaderControlPlane.shared.revokeGrant(
+                id: replacement.routeGrantID
+            )
+        }
+    }
+
+    @MainActor
+    func activatePeerOwnedAgentRestart(
+        _ replacement: PeerOwnedAgentRestart,
+        teamName: String,
+        agentInstanceID: String
+    ) {
+        startRemoteAgentRouteKeepalive(
+            teamName: teamName,
+            agentInstanceID: agentInstanceID,
+            grantID: replacement.routeGrantID
+        )
+    }
+
+    /// Replace a peer-owned native agent with a fresh bridge/session while
+    /// preserving its durable roster identity. The old surface is deliberately
+    /// left alive until this returns success, so a probe, ensure, attach, or
+    /// pane-allocation failure cannot destroy the user's current conversation.
+    @MainActor
+    func restartPeerOwnedAgentPaneHard(
+        team: Team,
+        agent: AgentMember,
+        workspace: Workspace,
+        splitFrom: (UUID, SplitOrientation, Bool)
+    ) async -> Result<PeerOwnedAgentRestart, RestartHardError> {
+        guard let hostKey = agent.hostKey,
+              let host = RemoteHostStore.shared.sortedHosts.first(where: {
+                  $0.id == hostKey
+              }),
+              host.isLaunchable
+        else { return .failure(.peerOwnedAgent) }
+
+        let binaries: RemoteAgentBinaries
+        do {
+            binaries = try await Self.ensureRemoteCLIAvailable(
+                cli: agent.cli, host: host
+            )
+        } catch {
+            return .failure(.spawnFailed)
+        }
+        guard await Self.canUsePeerOwnedAgent(
+            host: host, cli: agent.cli, binaries: binaries
+        ) == .available else {
+            return .failure(.peerOwnedAgent)
+        }
+
+        let routeGrant: Termmesh_Peer_V1_TeamLeaderGrant
+        do {
+            routeGrant = try await bootstrapRemoteAgentRoute(teamName: team.id)
+        } catch {
+            return .failure(.spawnFailed)
+        }
+        var grantOwned = true
+        defer {
+            if grantOwned {
+                Task {
+                    await PeerTeamLeaderControlPlane.shared.revokeGrant(
+                        id: routeGrant.grantID
+                    )
+                }
+            }
+        }
+
+        let workingDirectory = agent.originalAgentWorkDir
+            ?? agent.worktreePath
+            ?? team.workingDirectory
+        let spec = Self.peerAgentSurfaceSpec(
+            teamName: team.id,
+            agentInstanceId: agent.agentInstanceId,
+            // EnsureSurface is idempotent by key. Reusing the durable member
+            // id here would reattach the old bridge and preserve its context.
+            surfaceInstanceId: UUID().uuidString,
+            cli: agent.cli,
+            workingDirectory: workingDirectory,
+            model: agent.model,
+            binaries: binaries
+        )
+        let environment: [String: String]
+        do {
+            environment = try Self.peerOwnedAgentEnvironment(
+                profile: CLIPathSettings.activeProfile(for: agent.cli)?.env ?? [:],
+                explicitHost: PeerHostEnvironment.stored(forHostKey: host.id),
+                internalIdentity: Self.remoteNativeAgentEnvironment(
+                    teamName: team.id,
+                    agentName: agent.name,
+                    agentType: agent.agentType,
+                    agentCli: agent.cli,
+                    workspaceId: workspace.id,
+                    socketPath: nil,
+                    routeGrant: routeGrant
+                )
+            )
+        } catch {
+            return .failure(.spawnFailed)
+        }
+
+        let registry = PeerPaneHostRegistry.shared
+        let lease: PeerPaneHostLease
+        do {
+            lease = try await registry.acquire(host.paneHostSpec)
+        } catch {
+            return .failure(.spawnFailed)
+        }
+        let ensured: (session: PeerPaneSession, outcome: PeerEnsureSurfaceOutcome)
+        do {
+            ensured = try await PeerPaneSession.ensureAndAttach(
+                lease: lease,
+                surfaceSpec: spec,
+                attachment: PeerRunnerAttachment(
+                    title: agent.name, lifetime: .keepAlive
+                ),
+                hostSpec: host.paneHostSpec,
+                agentCli: agent.cli,
+                environment: environment,
+                onAgentPostEnsureFailure: { surfaceID in
+                    Self.enqueuePendingPeerAgentSurfaceCleanup(
+                        hostKey: host.id, surfaceID: surfaceID
+                    )
+                }
+            )
+            registry.release(lease)
+        } catch {
+            registry.release(lease)
+            return .failure(.spawnFailed)
+        }
+
+        let session = ensured.session
+        let surfaceID = ensured.outcome.surfaceID
+        func abandonReplacement() {
+            session.teardown()
+            Self.enqueuePendingPeerAgentSurfaceCleanup(
+                hostKey: host.id, surfaceID: surfaceID
+            )
+        }
+        guard ownsPeerAgentSurface(
+            teamName: team.id,
+            agentInstanceID: agent.agentInstanceId,
+            surfaceID: agent.remoteSurfaceID ?? Data()
+        ) else {
+            abandonReplacement()
+            return .failure(.agentNotFound)
+        }
+        guard let panel = workspace.openRemoteAgentPane(
+            session: session,
+            orientation: splitFrom.1,
+            insertFirst: splitFrom.2,
+            focus: false,
+            from: splitFrom.0
+        ) else {
+            abandonReplacement()
+            return .failure(.spawnFailed)
+        }
+        Self.bindPeerOwnedAgentPanel(
+            panel: panel,
+            workspace: workspace,
+            teamName: team.id,
+            agentName: agent.name,
+            agentInstanceId: agent.agentInstanceId,
+            color: agent.color,
+            hostDisplayName: host.displayName
+        )
+
+        if !agent.instructions.isEmpty {
+            let briefing = Self.withoutTerminalProtocol(agent.instructions)
+                + "\n\nThis is your standing brief, not a task. "
+                + "Do no work now: reply with exactly "
+                + "\"Agent \(agent.name) ready.\" and wait."
+            try? panel.session.send(briefing, from: .leader)
+        }
+
+        var replacement = agent
+        replacement.panelId = panel.id
+        replacement.workspaceId = workspace.id
+        replacement.remoteSurfaceID = surfaceID
+        replacement.remoteSurfaceSpawned = true
+        replacement.remoteAgentSurface = true
+        // Ownership moves to the caller. It starts this grant only after the
+        // roster swap and old-pane close both commit; until then the old
+        // surface's keepalive must remain valid for rollback.
+        grantOwned = false
+        return .success(PeerOwnedAgentRestart(
+            panelID: panel.id,
+            member: replacement,
+            routeGrantID: routeGrant.grantID
+        ))
     }
 
     @MainActor

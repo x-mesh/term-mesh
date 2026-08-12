@@ -459,9 +459,14 @@ final class Workspace: Identifiable {
                             // `executor` panes) resolve to the exact pane the
                             // user clicked rather than the first by name.
                             Task { @MainActor in
-                                _ = await TeamOrchestrator.shared.restartAgentPaneHard(
+                                let result = await TeamOrchestrator.shared.restartAgentPaneHard(
                                     panelId: panelId
                                 )
+                                if case .failure(let error) = result {
+                                    RemoteWorkLog.error(
+                                        "Could not restart \(agent.agentName): \(error.message)"
+                                    )
+                                }
                             }
                         }
                     }
@@ -1802,6 +1807,24 @@ final class Workspace: Identifiable {
         return bonsplitController.closeTab(selected.id)
     }
 
+    /// Remove a panel created inside a transaction that failed before commit.
+    /// Unlike `closePanel`, this cannot be vetoed by mirror/pin/confirmation
+    /// policy: the panel was never user-owned state. The Bonsplit did-close
+    /// callback remains the single cleanup funnel for all workspace maps.
+    @discardableResult
+    func discardPanelForRollback(_ panelId: UUID) -> Bool {
+        guard let tabId = surfaceIdFromPanelId(panelId) else {
+            if let session = remoteAgentPaneSessions.removeValue(forKey: panelId) {
+                session.relaySession.onPtyData = nil
+                session.teardown()
+            }
+            panels.removeValue(forKey: panelId)?.close()
+            panelTitles.removeValue(forKey: panelId)
+            return false
+        }
+        return bonsplitController.forceCloseTab(tabId)
+    }
+
     func paneId(forPanelId panelId: UUID) -> PaneID? {
         guard let tabId = surfaceIdFromPanelId(panelId) else { return nil }
         return bonsplitController.allPaneIds.first { paneId in
@@ -2812,6 +2835,7 @@ final class Workspace: Identifiable {
     func openRemoteAgentPane(
         session: PeerPaneSession,
         orientation: SplitOrientation = .horizontal,
+        insertFirst: Bool = false,
         focus: Bool = true,
         from explicitSourcePanelId: UUID? = nil
     ) -> AgentPanel? {
@@ -2836,6 +2860,7 @@ final class Workspace: Identifiable {
         guard let panel = newAgentSplit(
             from: sourcePanelId,
             orientation: orientation,
+            insertFirst: insertFirst,
             agentName: Self.remoteAgentPaneTitle(
                 surfaceTitle: session.surfaceTitle, agentCli: cli, hostLabel: hostLabel
             ),
