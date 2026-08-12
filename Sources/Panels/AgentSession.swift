@@ -2370,6 +2370,11 @@ final class AgentSession {
     }
 
     private func handle(_ parsed: AgentParsedLine) {
+        // A protocol event is output even when it is metadata that draws no row.
+        // Remote launches report their environment before Claude's visible init;
+        // leaving the watchdog armed here produced a false "no output" warning
+        // 30 seconds after that environment had already been logged.
+        cancelStartupWatchdog()
         guard let object = parsed.object else {
             let diagnostic = Self.withoutAnsi(parsed.raw)
             let joined = [streamDiagnostic, diagnostic]
@@ -2722,12 +2727,8 @@ final class AgentSession {
     }
 
     private func append(_ entry: Entry) {
-        // Anything reaching the transcript is proof the launch got somewhere,
-        // which is all the startup watchdog was waiting to hear. Cancelling
-        // here rather than at each producer is deliberate: stdout batches,
-        // stderr notices and protocol events all funnel through this one call,
-        // and a new producer added later would otherwise silently re-arm the
-        // false alarm.
+        // stderr diagnostics do not pass through the stdout parser, so visible
+        // transcript output remains a second way to prove startup succeeded.
         cancelStartupWatchdog()
         entries.append(entry)
         trimToCap()

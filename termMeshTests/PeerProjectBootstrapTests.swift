@@ -1128,6 +1128,20 @@ final class PeerProjectBootstrapTests: XCTestCase {
     }
 
     @MainActor
+    func test_remote_leader_launch_is_staged_outside_the_bounded_pty_line() throws {
+        let fileName = "leader-team-uuid.sh"
+        let stage = TeamOrchestrator.remoteLeaderLaunchSSHStageCommand(fileName: fileName)
+        XCTAssertTrue(stage.contains("leader-launches"))
+        XCTAssertTrue(stage.contains("cat >"))
+        XCTAssertTrue(stage.contains(fileName))
+
+        let path = "/home/test/.cache/term-mesh/leader-launches/\(fileName)"
+        let paneCommand = TeamOrchestrator.remoteLeaderStagedLaunchCommand(path: path)
+        XCTAssertEqual(paneCommand, "/bin/sh '\(path)'")
+        XCTAssertLessThan(paneCommand.utf8.count, 256)
+    }
+
+    @MainActor
     func test_remote_leader_does_not_inject_policy_into_local_anchor_shell() {
         XCTAssertTrue(
             TeamOrchestrator.shouldInjectLocalLeaderPrompt(
