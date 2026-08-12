@@ -222,6 +222,22 @@ struct AgentPanelView: View {
                     .fixedSize(horizontal: false, vertical: true)
                     .padding(.top, 3)
                 }
+                if let environment = session.environmentSummary {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("Shell: \(environment.shell) · login, non-interactive")
+                        Text("Loaded: login profile · ~/.profile \(environment.profileFallback)")
+                        Text("agent-env: \(environment.agentEnv)")
+                        Text(environmentKeyLine(environment))
+                        if let mismatch = session.environmentMismatch {
+                            Label(mismatch, systemImage: "exclamationmark.triangle.fill")
+                                .foregroundStyle(Color.orange)
+                        }
+                    }
+                    .font(.system(size: 10).monospaced())
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .padding(.top, 3)
+                }
             }
             Spacer(minLength: 0)
         }
@@ -229,6 +245,20 @@ struct AgentPanelView: View {
         .frame(maxWidth: .infinity, alignment: .leading)
         .background(providerMarkAccent.opacity(0.07), in: RoundedRectangle(cornerRadius: 8))
         .overlay(RoundedRectangle(cornerRadius: 8).strokeBorder(providerMarkAccent.opacity(0.35)))
+    }
+
+    private func environmentKeyLine(_ environment: AgentEnvironmentSummary) -> String {
+        let keys: [String]
+        switch panel.cli {
+        case "claude":
+            keys = ["AI_MESH_API_KEY", "ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY"]
+        case "codex":
+            keys = ["AI_MESH_API_KEY", "OPENAI_BASE_URL", "OPENAI_API_KEY"]
+        default:
+            keys = ["AI_MESH_API_KEY"]
+        }
+        return keys.map { "\($0) \(environment.presentKeys.contains($0) ? "✓" : "✗")" }
+            .joined(separator: " · ")
     }
 
     /// A compact mark per CLI, in block characters, all nine columns wide so

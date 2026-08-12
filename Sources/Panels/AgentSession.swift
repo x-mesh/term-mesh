@@ -1,6 +1,136 @@
 import Foundation
 import Combine
 
+struct AgentEnvironmentSummary: Equatable, Sendable {
+    static let visibleKeys = [
+        "AI_MESH_API_KEY",
+        "ANTHROPIC_BASE_URL",
+        "ANTHROPIC_AUTH_TOKEN",
+        "ANTHROPIC_API_KEY",
+        "OPENAI_BASE_URL",
+        "OPENAI_API_KEY",
+    ]
+
+    let shell: String
+    let profileFallback: String
+    let agentEnv: String
+    let presentKeys: Set<String>
+
+    static func parse(_ object: [String: Any]) -> AgentEnvironmentSummary? {
+        guard object["type"] as? String == "system",
+              object["subtype"] as? String == "environment",
+              let shell = object["shell"] as? String,
+              let profileFallback = object["profile_fallback"] as? String,
+              let agentEnv = object["agent_env"] as? String,
+              let keys = object["present_keys"] as? [String]
+        else { return nil }
+        return AgentEnvironmentSummary(
+            shell: shell,
+            profileFallback: profileFallback,
+            agentEnv: agentEnv,
+            presentKeys: Set(keys).intersection(visibleKeys)
+        )
+    }
+
+    static func parse(from output: String) -> AgentEnvironmentSummary? {
+        for line in output.split(separator: "\n") {
+            guard let data = String(line).data(using: .utf8),
+                  let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let summary = parse(object)
+            else { continue }
+            return summary
+        }
+        return nil
+    }
+
+    var liveActivityText: String {
+        let present = Self.visibleKeys.filter(presentKeys.contains)
+        let missing = Self.visibleKeys.filter { !presentKeys.contains($0) }
+        return "shell=\(shell) login/non-interactive; ~/.profile=\(profileFallback); "
+            + "agent-env=\(agentEnv); present=\(present.isEmpty ? "none" : present.joined(separator: ",")); "
+            + "missing=\(missing.isEmpty ? "none" : missing.joined(separator: ","))"
+    }
+}
+
+enum RemoteAgentEnvironmentShell {
+    static func exportAssignments(_ environment: [String: String]) -> String {
+        let assignments = PeerHostEnvironment.inlineAssignments(
+            environment.filter { $0.key != "PATH" }
+        )
+        return assignments.isEmpty ? "" : "export \(assignments); "
+    }
+
+    static func loginPrelude(
+        profileFailureAction: String,
+        agentEnvFailureAction: String
+    ) -> String {
+        var script = "term_mesh_profile_fallback=skipped; term_mesh_agent_env=missing; "
+        script += #"case "${SHELL##*/}" in "#
+        script += "bash) if { [ -f \"$HOME/.bash_profile\" ] || [ -f \"$HOME/.bash_login\" ]; } "
+            + "&& [ -f \"$HOME/.profile\" ]; then term_mesh_profile_fallback=loaded; "
+            + ". \"$HOME/.profile\" >/dev/null 2>&1 || { \(profileFailureAction); }; fi ;; "
+        script += "zsh) if [ -f \"$HOME/.profile\" ]; then term_mesh_profile_fallback=loaded; "
+            + ". \"$HOME/.profile\" >/dev/null 2>&1 || { \(profileFailureAction); }; "
+            + "else term_mesh_profile_fallback=missing; fi ;; esac; "
+        script += "if [ -f \"$HOME/.config/term-mesh/agent-env\" ]; then set -a; "
+            + "term_mesh_agent_env=loaded; . \"$HOME/.config/term-mesh/agent-env\" >/dev/null 2>&1 "
+            + "|| { \(agentEnvFailureAction); }; set +a; fi; "
+        return script
+    }
+
+    static var diagnosticEvent: String {
+        var script = #"term_mesh_shell=${SHELL##*/}; case "$term_mesh_shell" in bash|zsh|sh|dash|fish) ;; *) term_mesh_shell=other;; esac; "#
+        script += #"printf '%s' '{"type":"system","subtype":"environment","shell":"'; printf '%s' "$term_mesh_shell"; printf '%s' '","login":true,"interactive":false,"profile_fallback":"'; printf '%s' "$term_mesh_profile_fallback"; printf '%s' '","agent_env":"'; printf '%s' "$term_mesh_agent_env"; printf '%s' '","present_keys":['; term_mesh_sep=; "#
+        for key in AgentEnvironmentSummary.visibleKeys {
+            script += "if [ \"${\(key)+x}\" = x ]; then printf '%s\"%s\"' \"$term_mesh_sep\" \(key); term_mesh_sep=,; fi; "
+        }
+        script += #"printf '%s\n' ']}'; "#
+        return script
+    }
+
+    static var terminalDiagnostic: String {
+        var script = #"term_mesh_shell=${SHELL##*/}; printf '%s' '[term-mesh environment] shell='; printf '%s' "$term_mesh_shell"; printf '%s' ' login/non-interactive ~/.profile='; printf '%s' "$term_mesh_profile_fallback"; printf '%s' ' agent-env='; printf '%s' "$term_mesh_agent_env"; printf '%s' ' present='; term_mesh_sep=; "#
+        for key in AgentEnvironmentSummary.visibleKeys {
+            script += "if [ \"${\(key)+x}\" = x ]; then printf '%s%s' \"$term_mesh_sep\" \(key); term_mesh_sep=,; fi; "
+        }
+        script += #"if [ -z "$term_mesh_sep" ]; then printf '%s' none; fi; printf '\n'; "#
+        return script
+    }
+
+    static func accountLoginShellExec(_ command: String) -> String {
+        let resolve = #"term_mesh_login_shell=$(getent passwd "$(id -u)" 2>/dev/null | cut -d: -f7); "#
+            + #"case "$term_mesh_login_shell" in /*/nologin|*/false|"") term_mesh_login_shell=${SHELL:-/bin/sh};; esac; "#
+            + #"case "$term_mesh_login_shell" in /*) ;; *) term_mesh_login_shell=/bin/sh;; esac; "#
+            + #"export SHELL="$term_mesh_login_shell"; "#
+        return resolve + "exec \"$term_mesh_login_shell\" -l -c \(shellQuoted(command))"
+    }
+
+    private static func shellQuoted(_ value: String) -> String {
+        "'" + value.replacingOccurrences(of: "'", with: "'\\''") + "'"
+    }
+}
+
+@MainActor
+enum AgentEnvironmentComparisonStore {
+    private static var leaderByTeam: [String: AgentEnvironmentSummary] = [:]
+
+    static func recordLeader(_ summary: AgentEnvironmentSummary, teamName: String) {
+        leaderByTeam[teamName] = summary
+    }
+
+    static func mismatchForNative(
+        _ summary: AgentEnvironmentSummary,
+        teamName: String
+    ) -> String? {
+        guard let leader = leaderByTeam[teamName] else { return nil }
+        let different = AgentEnvironmentSummary.visibleKeys.filter {
+            leader.presentKeys.contains($0) != summary.presentKeys.contains($0)
+        }
+        guard !different.isEmpty else { return nil }
+        return "Leader/native environment mismatch: \(different.joined(separator: ", "))"
+    }
+}
+
 /// Splits an NDJSON byte stream without copying the unread tail once per line.
 /// Owned by the stream's serial queue; it is intentionally not thread-safe.
 final class AgentStreamDecoder {
@@ -928,6 +1058,9 @@ final class AgentSession {
     private(set) var isRunning = false
     /// What the CLI announced about itself, shown once rather than per turn.
     private(set) var summary: String?
+    /// Value-free facts reported by the exact shell that launched the agent.
+    private(set) var environmentSummary: AgentEnvironmentSummary?
+    private(set) var environmentMismatch: String?
 
     /// Whether this agent's turn can be stopped. See `Launch.interruptible`.
     private(set) var canInterrupt = false
@@ -949,6 +1082,12 @@ final class AgentSession {
     /// Every native provider uses this same session boundary, so callers do
     /// not need a separate error path for Claude versus a bridged CLI.
     @ObservationIgnored var onDiagnostic: ((DiagnosticSeverity, String) -> Void)?
+    @ObservationIgnored var onEnvironmentSummary: ((AgentEnvironmentSummary) -> Void)?
+
+    func setEnvironmentMismatch(_ value: String?) {
+        guard environmentMismatch != value else { return }
+        environmentMismatch = value
+    }
 
     // MARK: - Turn-state writes
     //
@@ -1461,11 +1600,15 @@ final class AgentSession {
         } else {
             stagedEnvironment = ""
         }
-        let loginLaunch = shellQuoted(
-            stagedEnvironment + "export PATH=\"\(remotePath)\"; exec \(launch)"
-        )
+        let failure = "printf '%s\\n' '{\"type\":\"system\",\"subtype\":\"environment_error\"}'; exit 79"
+        let inner = RemoteAgentEnvironmentShell.loginPrelude(
+            profileFailureAction: failure,
+            agentEnvFailureAction: failure
+        ) + stagedEnvironment
+            + RemoteAgentEnvironmentShell.diagnosticEvent
+            + "export PATH=\"\(remotePath)\"; exec \(launch)"
         return "mkdir -p \(directory) && cd \(directory) && "
-            + "exec \"${SHELL:-/bin/sh}\" -lc \(loginLaunch)"
+            + RemoteAgentEnvironmentShell.accountLoginShellExec(inner)
     }
 
     private static func shellQuoted(_ value: String) -> String {
@@ -2213,6 +2356,19 @@ final class AgentSession {
     }
 
     private func system(_ o: [String: Any]) {
+        if let environment = AgentEnvironmentSummary.parse(o) {
+            guard environmentSummary != environment else { return }
+            environmentSummary = environment
+            onEnvironmentSummary?(environment)
+            return
+        }
+        if o["subtype"] as? String == "environment_error" {
+            reportDiagnostic(
+                .error,
+                "Failed to load ~/.profile or ~/.config/term-mesh/agent-env; no values were logged"
+            )
+            return
+        }
         // Hooks fire a dozen times before an agent does anything, and a running
         // token estimate arrives throughout. Neither is an event a person is
         // watching for; the totals come with the turn.

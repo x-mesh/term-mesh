@@ -1437,11 +1437,25 @@ extension TeamOrchestrator {
         }
         PeerPaneHostRegistry.shared.release(lease)
 
+        let remoteEnvironment = Self.configuredRemoteAgentEnvironment(
+            profile: CLIPathSettings.env(for: cli),
+            explicitHost: PeerHostEnvironment.stored(forHostKey: host.id)
+        )
         do {
 #if DEBUG
             dlog("leader.attach.stage prepare.begin host=\(hostKey)")
 #endif
-            try await Self.prepareRemoteLeader(cli: cli, host: host)
+            if let environment = try await Self.prepareRemoteLeader(
+                cli: cli,
+                host: host,
+                environment: remoteEnvironment
+            ) {
+                AgentEnvironmentComparisonStore.recordLeader(environment, teamName: teamName)
+                RemoteWorkLog.info(
+                    "Leader environment: \(teamName) [\(cli)] on \(host.displayName) — "
+                        + environment.liveActivityText
+                )
+            }
             try await attempt.ensureCurrent()
 #if DEBUG
             dlog("leader.attach.stage prepare.ok host=\(hostKey)")
@@ -1518,10 +1532,7 @@ extension TeamOrchestrator {
             workingDirectory: workingDirectory,
             grant: grantResponse.grant,
             systemPromptFile: promptFile,
-            environment: Self.configuredRemoteAgentEnvironment(
-                profile: CLIPathSettings.env(for: cli),
-                explicitHost: PeerHostEnvironment.stored(forHostKey: host.id)
-            ),
+            environment: remoteEnvironment,
             hostBinDirs: host.hostCLIBinDirs
         )
         let command = Self.remoteLeaderCommandCheckingPrompt(
@@ -2565,11 +2576,12 @@ extension TeamOrchestrator {
     /// from the service that owns the peer surface.
     private static func prepareRemoteLeader(
         cli: String,
-        host: HostEntry
-    ) async throws {
+        host: HostEntry,
+        environment: [String: String]
+    ) async throws -> AgentEnvironmentSummary? {
         guard let sshTarget = host.sshTarget, !sshTarget.isEmpty else {
             try await ensureRemoteCLIAvailable(cli: cli, host: host)
-            return
+            return nil
         }
         guard AgentRolePreset.knownCLIs.contains(cli) else {
             throw RemoteAgentError.cliUnavailable(cli, host.displayName)
@@ -2595,6 +2607,12 @@ extension TeamOrchestrator {
         // would report a perfectly good host as having no CLI, and no leader
         // would start on it again.
         script += "; " + Self.leaderDaemonDiagnostic
+        let environmentProbe = RemoteAgentEnvironmentShell.loginPrelude(
+            profileFailureAction: "term_mesh_profile_fallback=failed",
+            agentEnvFailureAction: "term_mesh_agent_env=failed"
+        ) + RemoteAgentEnvironmentShell.exportAssignments(environment)
+            + RemoteAgentEnvironmentShell.diagnosticEvent
+        script += "; " + RemoteAgentEnvironmentShell.accountLoginShellExec(environmentProbe)
         do {
             let output = try await PeerHostReadinessChecker.runScript(
                 sshTarget: sshTarget,
@@ -2610,6 +2628,7 @@ extension TeamOrchestrator {
                 throw RemoteAgentError.cliUnavailable(cli, host.displayName)
             }
             reportStaleDaemons(in: output, host: host)
+            return AgentEnvironmentSummary.parse(from: output)
         } catch let error as RemoteAgentError {
             throw error
         } catch {
@@ -5698,7 +5717,7 @@ extension TeamOrchestrator {
             teamName: teamName,
             workingDirectory: workingDirectory,
             systemPromptFile: systemPromptFile,
-            environment: environment,
+            environment: environment.filter { $0.key == "PATH" },
             hostBinDirs: hostBinDirs,
             needsSocketAccess: true
         )
@@ -5711,14 +5730,18 @@ extension TeamOrchestrator {
         // here so leaders and peer-owned native agents load the same profile
         // (`~/.zshenv` included). The current terminal shell remains only as a
         // portable resolver and is replaced before the CLI starts.
-        return "export \(exports); \(remoteAccountLoginShellExec(launch))"
+        let failure = "printf '%s\\n' '[term-mesh environment] failed to load ~/.profile or agent-env'; exit 79"
+        let inner = RemoteAgentEnvironmentShell.loginPrelude(
+            profileFailureAction: failure,
+            agentEnvFailureAction: failure
+        ) + RemoteAgentEnvironmentShell.exportAssignments(environment)
+            + RemoteAgentEnvironmentShell.terminalDiagnostic
+            + launch
+        return "export \(exports); \(remoteAccountLoginShellExec(inner))"
     }
 
     static func remoteAccountLoginShellExec(_ command: String) -> String {
-        let resolve = #"term_mesh_login_shell=$(getent passwd "$(id -u)" 2>/dev/null | cut -d: -f7); "#
-            + #"case "$term_mesh_login_shell" in /*/nologin|*/false|"") term_mesh_login_shell=${SHELL:-/bin/sh};; esac; "#
-            + #"case "$term_mesh_login_shell" in /*) ;; *) term_mesh_login_shell=/bin/sh;; esac; "#
-        return resolve + "exec \"$term_mesh_login_shell\" -l -c \(shellQuoted(command))"
+        RemoteAgentEnvironmentShell.accountLoginShellExec(command)
     }
 
     /// Secret-free first stage for remote leader launch. The next command is

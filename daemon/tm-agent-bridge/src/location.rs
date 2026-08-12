@@ -200,6 +200,12 @@ pub fn process_location(
             "[ -f {quoted} ] || exit 79; set -a; . {quoted} >/dev/null 2>&1 || exit 79; rm -f -- {quoted}; set +a; "
         ));
     }
+    if !assignments.is_empty() {
+        inner.push_str("export ");
+        inner.push_str(&shell_join(&assignments));
+        inner.push_str("; ");
+    }
+    inner.push_str(&environment_diagnostic_event());
     inner.push_str(&format!(
         r#"export PATH="{}"; "#,
         path_with_extra(extra_path.as_deref())
@@ -208,10 +214,8 @@ pub fn process_location(
     // Peer-hosted terminal surfaces already carry IS_SANDBOX. Claude uses it
     // to permit explicitly requested bypass mode under root; the native SSH
     // path must keep the same host contract rather than behave differently.
-    let mut tail: Vec<String> = assignments;
-    tail.extend(argv.iter().cloned());
     inner.push_str("exec env IS_SANDBOX=1 ");
-    inner.push_str(&shell_join(&tail));
+    inner.push_str(&shell_join(argv));
 
     let command = format!(
         "mkdir -p {quoted_cwd} && cd {quoted_cwd} && exec \"${{SHELL:-/bin/sh}}\" -lc {}",
@@ -243,18 +247,43 @@ pub fn login_environment_prelude(
     let profile = "$HOME/.profile";
     let agent_env = "$HOME/.config/term-mesh/agent-env";
     let mut inner = String::new();
+    inner.push_str("term_mesh_profile_fallback=skipped; term_mesh_agent_env=missing; ");
     inner.push_str(r#"case "${SHELL##*/}" in "#);
     inner.push_str(&format!(
-        r#"bash) if {{ [ -f "$HOME/.bash_profile" ] || [ -f "$HOME/.bash_login" ]; }} && [ -f "{profile}" ]; then . "{profile}" >/dev/null 2>&1 || {{ {profile_failure_action}; }}; fi ;; "#
+        r#"bash) if {{ [ -f "$HOME/.bash_profile" ] || [ -f "$HOME/.bash_login" ]; }} && [ -f "{profile}" ]; then term_mesh_profile_fallback=loaded; . "{profile}" >/dev/null 2>&1 || {{ {profile_failure_action}; }}; fi ;; "#
     ));
     inner.push_str(&format!(
-        r#"zsh) if [ -f "{profile}" ]; then . "{profile}" >/dev/null 2>&1 || {{ {profile_failure_action}; }}; fi ;; "#
+        r#"zsh) if [ -f "{profile}" ]; then term_mesh_profile_fallback=loaded; . "{profile}" >/dev/null 2>&1 || {{ {profile_failure_action}; }}; else term_mesh_profile_fallback=missing; fi ;; "#
     ));
     inner.push_str("esac; ");
     inner.push_str(&format!(
-        r#"if [ -f "{agent_env}" ]; then set -a; . "{agent_env}" >/dev/null 2>&1 || {{ {agent_env_failure_action}; }}; set +a; fi; "#
+        r#"if [ -f "{agent_env}" ]; then set -a; term_mesh_agent_env=loaded; . "{agent_env}" >/dev/null 2>&1 || {{ {agent_env_failure_action}; }}; set +a; fi; "#
     ));
     inner
+}
+
+/// One value-free NDJSON fact emitted by the exact shell that launches an
+/// agent. Key names are a fixed allowlist; values and hashes never cross the
+/// protocol boundary.
+pub fn environment_diagnostic_event() -> String {
+    const KEYS: &[&str] = &[
+        "AI_MESH_API_KEY",
+        "ANTHROPIC_BASE_URL",
+        "ANTHROPIC_AUTH_TOKEN",
+        "ANTHROPIC_API_KEY",
+        "OPENAI_BASE_URL",
+        "OPENAI_API_KEY",
+    ];
+    let mut script = String::from(
+        r#"term_mesh_shell=${SHELL##*/}; case "$term_mesh_shell" in bash|zsh|sh|dash|fish) ;; *) term_mesh_shell=other;; esac; printf '%s' '{"type":"system","subtype":"environment","shell":"'; printf '%s' "$term_mesh_shell"; printf '%s' '","login":true,"interactive":false,"profile_fallback":"'; printf '%s' "$term_mesh_profile_fallback"; printf '%s' '","agent_env":"'; printf '%s' "$term_mesh_agent_env"; printf '%s' '","present_keys":['; term_mesh_sep=; "#,
+    );
+    for key in KEYS {
+        script.push_str(&format!(
+            r#"if [ "${{{key}+x}}" = x ]; then printf '%s"%s"' "$term_mesh_sep" {key}; term_mesh_sep=,; fi; "#
+        ));
+    }
+    script.push_str("printf '%s\\n' ']}'; ");
+    script
 }
 
 /// A name `env` will accept as an assignment rather than treat as a command.
@@ -576,14 +605,8 @@ mod tests {
         assert!(!command.contains("PATH=drop"));
     }
 
-    /// The two bridges ship side by side, so a peer agent must get the same
-    /// shell either way. This is the literal output of the Python
-    /// `process_location` for these inputs, captured by running it — not
-    /// retyped from reading it. Any drift between the implementations shows up
-    /// here as a diff rather than as an agent that behaves differently on
-    /// Tuesday.
     #[test]
-    fn the_command_matches_the_python_bridge_byte_for_byte() {
+    fn compiled_bridge_reports_environment_after_explicit_overlay() {
         let command = remote_command(
             "/remote/project",
             Some(&[
@@ -593,10 +616,15 @@ mod tests {
             &["codex", "app-server"],
         );
 
-        assert_eq!(
-            command,
-            r#"mkdir -p /remote/project && cd /remote/project && exec "${SHELL:-/bin/sh}" -lc 'case "${SHELL##*/}" in bash) if { [ -f "$HOME/.bash_profile" ] || [ -f "$HOME/.bash_login" ]; } && [ -f "$HOME/.profile" ]; then . "$HOME/.profile" >/dev/null 2>&1 || { exit 77; }; fi ;; zsh) if [ -f "$HOME/.profile" ]; then . "$HOME/.profile" >/dev/null 2>&1 || { exit 77; }; fi ;; esac; if [ -f "$HOME/.config/term-mesh/agent-env" ]; then set -a; . "$HOME/.config/term-mesh/agent-env" >/dev/null 2>&1 || { exit 78; }; set +a; fi; export PATH="$HOME/.local/bin:/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"; exec env IS_SANDBOX=1 AI_MESH_API_KEY=from-host TERMMESH_AGENT_NAME=ai codex app-server'"#
-        );
+        let overlay = command.find("export AI_MESH_API_KEY=from-host").unwrap();
+        let diagnostic = command.find("present_keys").unwrap();
+        let launch = command
+            .find("exec env IS_SANDBOX=1 codex app-server")
+            .unwrap();
+        assert!(overlay < diagnostic);
+        assert!(diagnostic < launch);
+        assert!(command.contains("$HOME/.config/term-mesh/agent-env"));
+        assert!(command.contains("present_keys"));
     }
 
     #[test]

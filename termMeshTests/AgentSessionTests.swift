@@ -239,8 +239,39 @@ final class AgentSessionTests: XCTestCase {
         XCTAssertTrue(launch.arguments.last?.contains(
             "$HOME/.local/bin:/opt/homebrew/bin"
         ) == true)
+        XCTAssertTrue(launch.arguments.last?.contains("$HOME/.profile") == true)
+        XCTAssertTrue(launch.arguments.last?.contains(
+            "$HOME/.config/term-mesh/agent-env"
+        ) == true)
+        XCTAssertTrue(launch.arguments.last?.contains("present_keys") == true)
+        XCTAssertTrue(launch.arguments.last?.contains(
+            #"export SHELL="$term_mesh_login_shell""#
+        ) == true)
         XCTAssertTrue(launch.arguments.last?.contains("review") == true)
         XCTAssertNotEqual(launch.workingDirectory, "/app/project with space")
+    }
+
+    func testEnvironmentEventUpdatesPaneWithoutCarryingValues() {
+        let session = AgentSession()
+        var reported: AgentEnvironmentSummary?
+        session.onEnvironmentSummary = { reported = $0 }
+        session.ingestForTesting(event([
+            "type": "system",
+            "subtype": "environment",
+            "shell": "zsh",
+            "login": true,
+            "interactive": false,
+            "profile_fallback": "loaded",
+            "agent_env": "missing",
+            "present_keys": ["AI_MESH_API_KEY", "UNRECOGNIZED_SECRET"],
+        ]))
+
+        XCTAssertEqual(session.environmentSummary?.shell, "zsh")
+        XCTAssertEqual(session.environmentSummary?.profileFallback, "loaded")
+        XCTAssertEqual(session.environmentSummary?.agentEnv, "missing")
+        XCTAssertEqual(session.environmentSummary?.presentKeys, Set(["AI_MESH_API_KEY"]))
+        XCTAssertEqual(reported, session.environmentSummary)
+        XCTAssertFalse(session.environmentSummary?.liveActivityText.contains("UNRECOGNIZED") == true)
     }
 
     func testRemoteBridgeLaunchDescribesSSHChildWithoutMovingLocalBridgeCwd() throws {

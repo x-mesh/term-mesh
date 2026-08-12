@@ -1644,6 +1644,20 @@ final class Workspace: Identifiable {
                 RemoteWorkLog.error(message)
             }
         }
+        agentPanel.session.onEnvironmentSummary = { [weak agentPanel] environment in
+            let title = agentPanel?.title ?? agentName
+            RemoteWorkLog.info(
+                "Native environment: \(title) [\(cli)] — \(environment.liveActivityText)"
+            )
+            let mismatch = AgentEnvironmentComparisonStore.mismatchForNative(
+                environment,
+                teamName: teamName
+            )
+            agentPanel?.session.setEnvironmentMismatch(mismatch)
+            if let mismatch {
+                RemoteWorkLog.warning("\(mismatch) — team=\(teamName), agent=\(agentName)")
+            }
+        }
         panels[agentPanel.id] = agentPanel
         panelTitles[agentPanel.id] = agentPanel.displayTitle
 

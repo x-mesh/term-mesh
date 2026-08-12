@@ -970,6 +970,11 @@ final class PeerProjectBootstrapTests: XCTestCase {
         XCTAssertTrue(launch.hasPrefix("export TERMMESH_LEADER_GRANT_ID="))
         XCTAssertTrue(launch.contains(#"getent passwd "$(id -u)""#))
         XCTAssertTrue(launch.contains(#"exec "$term_mesh_login_shell" -l -c"#))
+        XCTAssertTrue(launch.contains(#"export SHELL="$term_mesh_login_shell""#))
+        XCTAssertTrue(launch.contains("$HOME/.profile"))
+        XCTAssertTrue(launch.contains("$HOME/.config/term-mesh/agent-env"))
+        XCTAssertTrue(launch.contains("[term-mesh environment]"))
+        XCTAssertTrue(launch.contains("present="))
         XCTAssertFalse(launch.contains("exec /bin/sh -lc"))
         // The model is shell-quoted, and this whole launch is then quoted again
         // for `sh -lc` — so the inner quotes arrive escaped. One level is
