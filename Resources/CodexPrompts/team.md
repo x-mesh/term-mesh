@@ -43,11 +43,13 @@ Parse the first token of `$ARGUMENTS`:
 
 Valid roles: `architect` `executor` `explorer` `frontend` `backend` `tester` `reviewer` `security` `writer` `planner`
 
-Defaults: `--cli claude`, `--model sonnet`. Works for headless and GUI teams. Rejects duplicate name within the team. Run:
+Defaults: `--cli claude`; the model defaults to that CLI's native default. Works for headless and GUI teams. Rejects duplicate name within the team. Run exactly one command:
 
 ```bash
-tm-agent add <role> [--cli X] [--model Y] [--name Z]
+tm-agent add <role> [--cli X] [--model Y] [--name Z] --warmup
 ```
+
+Do not run `status`, `--help`, `preset`, or `runbook` first. Do not run a separate `warmup` or post-add `status`; investigate only if this command fails.
 
 ### `remove <name> [--force]`
 
@@ -157,7 +159,7 @@ Use `--claude-leader` only when the leader pane should be Claude Code, not Codex
 tm-agent status
 tm-agent list
 tm-agent create 3 --adopt
-tm-agent add reviewer                       # team-scoped; works for GUI + headless teams
+tm-agent add reviewer --warmup              # add + readiness check in one call
 tm-agent remove reviewer                    # team-scoped counterpart of add
 tm-agent recycle reviewer                   # guarded hard restart; drops accumulated worker context
 tm-agent attach executor --cli codex        # workspace-adopt scoped (creates ws-* team)

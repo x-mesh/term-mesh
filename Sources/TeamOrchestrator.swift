@@ -3013,6 +3013,16 @@ final class TeamOrchestrator: ObservableObject {
 
         **When in doubt, DELEGATE.** An idle agent is a wasted resource.
 
+        ## Team Composition Fast Path
+
+        When the user directly asks to add one agent and provides a role/CLI/name, run exactly one command:
+        ```
+        \(tmAgent) add <role> --cli <cli> --name <name> --warmup
+        ```
+        Omit only options the user did not specify. Do not probe `status`, `--help`, presets, or runbooks first.
+        Do not run a second `status` or `warmup`: the add response and `--warmup` are the verification.
+        Investigate only if this command fails. Never install runbooks unless the user separately asks for it.
+
         ## TOOL RESTRICTIONS (CRITICAL)
 
         You MUST use `\(tmAgent)` for ALL team operations. The following Claude Code built-in tools create a parallel, disconnected team state and MUST NEVER be used:
@@ -3435,6 +3445,16 @@ final class TeamOrchestrator: ObservableObject {
         - Coordinate dependencies between agents
 
         **When in doubt, DELEGATE.** An idle agent is a wasted resource.
+
+        ## Team Composition Fast Path
+
+        When the user directly asks to add one agent and provides a role/CLI/name, run exactly one command:
+        ```
+        \(tmAgent) add <role> --cli <cli> --name <name> --warmup
+        ```
+        Omit only options the user did not specify. Do not probe `status`, `--help`, presets, or runbooks first.
+        Do not run a second `status` or `warmup`: the add response and `--warmup` are the verification.
+        Investigate only if this command fails. Never install runbooks unless the user separately asks for it.
 
         ## Your Agents
         \(agentList)

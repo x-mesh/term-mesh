@@ -76,11 +76,13 @@ Render JSON output as a human-readable table: `NAME (state, cli, model) — acti
 
 Valid roles: `architect` `executor` `explorer` `frontend` `backend` `tester` `reviewer` `security` `writer` `planner`
 
-Defaults: `--cli claude`, `--model sonnet`. If role is not in the list, print the valid list and stop.
+Defaults: `--cli claude`; the model defaults to that CLI's native default. If role is not in the list, print the valid list and stop. Run exactly one command:
 
 ```bash
-tm-agent attach <role> [--cli X] [--model Y] [--name Z]
+tm-agent add <role> [--cli X] [--model Y] [--name Z] --warmup
 ```
+
+Do not run `status`, `--help`, `preset`, or `runbook` first. Do not run a separate `warmup` or post-add `status`; investigate only if this command fails.
 
 ### `/team remove <name> [--force]`
 
@@ -150,7 +152,7 @@ If `tm-agent` is not in PATH:
 | `/team` (no args) | `/team` | Interactive editor: add/remove/swap/destroy |
 | `/team edit` | `/team edit` | Alias for interactive mode |
 | `/team status` | `/team status` | Formatted status table |
-| `/team add <role>` | `/team add reviewer` | Add agent to team (headless + GUI); cli=claude, model=sonnet defaults; rejects duplicate name |
+| `/team add <role>` | `/team add reviewer` | Add and warm one agent in a single call; CLI-native model default |
 | `/team add <role> --cli codex` | `/team add executor --cli codex` | Add with specific CLI |
 | `/team add <role> --model opus` | `/team add architect --model opus` | Add with specific model |
 | `/team remove <name>` | `/team remove reviewer` | Remove agent from team (team-scoped; cf. `tm-agent detach` = workspace-adopt path) |

@@ -128,6 +128,22 @@ final class RemoteLeaderBriefingTests: XCTestCase {
         )
     }
 
+    func test_bothLeaderKindsUseTheSingleCallAgentAddFastPath() {
+        let claude = TeamOrchestrator.remoteLeaderClaudeSystemPrompt(
+            teamName: "xm",
+            rows: rows,
+            remoteWorkingDirectory: "/Users/jinwoo/work/tm-projects/xm",
+            remoteSocketPath: "/tmp/term-mesh.sock"
+        )
+        let other = nonClaudePrompt()
+
+        for prompt in [claude, other] {
+            XCTAssertTrue(prompt.contains("tm-agent add <role> --cli <cli> --name <name> --warmup"))
+            XCTAssertTrue(prompt.contains("Do not probe `status`, `--help`, presets, or runbooks first."))
+            XCTAssertTrue(prompt.contains("Do not run a second `status` or `warmup`"))
+        }
+    }
+
     /// Recovery restarts a leader whose team already exists, so it reads the
     /// durable roster instead of the creation rows — and had the same hole.
     func test_recoveryBriefsANonClaudeLeaderToo() {

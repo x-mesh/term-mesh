@@ -34,6 +34,15 @@ const DEFAULT_AGENT_NAMES: &[&str] = &[
 ];
 const DEFAULT_AGENT_COLORS: &[&str] = &["green", "blue", "yellow", "magenta", "cyan", "red"];
 
+fn default_model_for_cli(cli: &str) -> &'static str {
+    match cli {
+        "codex" => "gpt-5.6-sol",
+        "gemini" => "gemini-3.1-pro-preview",
+        "kiro" => "sonnet",
+        _ => "sonnet",
+    }
+}
+
 /// Marker for "git-kit is not on this machine", so a caller can tell an
 /// absent tool from a tool that ran and said no. Matched by
 /// `worktree_isolation_unavailable`, never by eyeballing a message.
@@ -76,6 +85,57 @@ enum WorktreePolicyArg {
 mod project_sync_cli_tests {
     use super::*;
     use clap::CommandFactory;
+
+    #[test]
+    fn add_parses_single_call_warmup_and_cli_native_model_default() {
+        let parsed = Cli::try_parse_from([
+            "tm-agent",
+            "add",
+            "reviewer",
+            "--name",
+            "codex-reviewer",
+            "--cli",
+            "codex",
+            "--warmup",
+            "--warmup-timeout",
+            "45",
+        ])
+        .unwrap();
+        let Commands::Add {
+            model,
+            warmup,
+            warmup_timeout,
+            cli,
+            ..
+        } = parsed.command
+        else {
+            panic!("expected add command");
+        };
+        assert!(model.is_none());
+        assert!(warmup);
+        assert_eq!(warmup_timeout, 45);
+        assert_eq!(default_model_for_cli(&cli), "gpt-5.6-sol");
+    }
+
+    #[test]
+    fn add_rejects_warmup_timeout_without_warmup() {
+        assert!(
+            Cli::try_parse_from(["tm-agent", "add", "reviewer", "--warmup-timeout", "45",])
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn warmup_requires_a_success_state_and_a_pong_word() {
+        assert!(warmup_task_succeeded("completed", "pong"));
+        assert!(warmup_task_succeeded(
+            "review_ready",
+            "STATUS: DONE\n\npong"
+        ));
+        assert!(!warmup_task_succeeded("blocked", "pong"));
+        assert!(!warmup_task_succeeded("completed", "no response"));
+        assert!(!warmup_task_succeeded("completed", "ping-ponging"));
+    }
 
     #[test]
     fn parses_project_and_conflict_command_groups() {
@@ -1151,9 +1211,9 @@ enum Commands {
         /// Custom agent name (defaults to agent_type)
         #[arg(long)]
         name: Option<String>,
-        /// Model to use (e.g. sonnet, opus, haiku)
-        #[arg(long, default_value = "sonnet")]
-        model: String,
+        /// Model to use. Defaults to the selected CLI's native default.
+        #[arg(long)]
+        model: Option<String>,
         /// CLI to use (claude, codex, kiro, gemini)
         #[arg(long, default_value = "claude")]
         cli: String,
@@ -1174,6 +1234,12 @@ enum Commands {
         /// out the same way, so this is not guessed from the local path.
         #[arg(long, requires = "host")]
         dir: Option<String>,
+        /// Send a ping task to the new agent and wait until it responds.
+        #[arg(long)]
+        warmup: bool,
+        /// Warmup timeout in seconds (used only with --warmup).
+        #[arg(long, default_value_t = 30, requires = "warmup")]
+        warmup_timeout: u32,
     },
     /// Attach an agent pane to the current workspace's team.
     ///
@@ -4306,6 +4372,7 @@ fn remote_leader_method_allowed(method: &str) -> bool {
             | "team.correlation.get"
             | "team.correlation.cancel"
             | "team.send"
+            | "team.send_key"
             | "team.broadcast"
             | "team.delegate"
             | "team.message.post"
@@ -7484,8 +7551,11 @@ fn main() {
             auto_recycle,
             host,
             dir,
+            warmup,
+            warmup_timeout,
         } => {
             let agent_name = name.unwrap_or_else(|| agent_type.clone());
+            let model = model.unwrap_or_else(|| default_model_for_cli(&cli).to_string());
 
             // Try headless path first
             if let Some(daemon_sock) = detect_daemon_socket() {
@@ -7507,6 +7577,9 @@ fn main() {
                             no_auto_watch,
                             auto_recycle,
                         );
+                        if warmup {
+                            run_warmup(&sock, &team, Some(&agent_name), warmup_timeout);
+                        }
                         return;
                     }
                 }
@@ -7526,6 +7599,9 @@ fn main() {
                 host.as_deref(),
                 dir.as_deref(),
             );
+            if warmup {
+                run_warmup(&sock, &gui_team, Some(&agent_name), warmup_timeout);
+            }
             return;
         }
         Commands::Attach {
@@ -15598,6 +15674,7 @@ fn run_warmup(sock: &PathBuf, team: &str, target: Option<&str>, timeout: u32) {
 
     // Delegate pong task to each agent
     let mut task_ids: Vec<(String, String, Instant)> = Vec::new(); // (agent_name, task_id, start_time)
+    let mut failed: Vec<(String, u128, String)> = Vec::new(); // (agent, ms, reason)
     for agent_val in &targets {
         let name = agent_val["name"].as_str().unwrap_or("?");
         let start = Instant::now();
@@ -15627,9 +15704,21 @@ fn run_warmup(sock: &PathBuf, team: &str, target: Option<&str>, timeout: u32) {
                     task_ids.push((name.to_string(), tid.to_string(), start));
                 } else {
                     eprintln!("  {name}: failed to create task");
+                    failed.push((
+                        name.to_string(),
+                        start.elapsed().as_millis(),
+                        "dispatch failed".into(),
+                    ));
                 }
             }
-            Err(e) => eprintln!("  {name}: delegate error: {e}"),
+            Err(e) => {
+                eprintln!("  {name}: delegate error: {e}");
+                failed.push((
+                    name.to_string(),
+                    start.elapsed().as_millis(),
+                    "dispatch failed".into(),
+                ));
+            }
         }
     }
 
@@ -15655,10 +15744,14 @@ fn run_warmup(sock: &PathBuf, team: &str, target: Option<&str>, timeout: u32) {
                 }),
             ) {
                 let status = v["result"]["status"].as_str().unwrap_or("");
-                if status == "completed" || status == "review_ready" || status == "blocked" {
+                if matches!(status, "completed" | "review_ready" | "blocked") {
                     let ms = start.elapsed().as_millis();
                     let result = v["result"]["result"].as_str().unwrap_or("").to_string();
-                    completed.push((agent_name.clone(), ms, result));
+                    if warmup_task_succeeded(status, &result) {
+                        completed.push((agent_name.clone(), ms, result));
+                    } else {
+                        failed.push((agent_name.clone(), ms, status.to_string()));
+                    }
                     continue;
                 }
             }
@@ -15669,7 +15762,7 @@ fn run_warmup(sock: &PathBuf, team: &str, target: Option<&str>, timeout: u32) {
 
     // Print results
     let pass = completed.len();
-    let fail = task_ids.len() - pass;
+    let fail = failed.len() + pending.len();
     println!();
     for (name, ms, result) in &completed {
         let icon = if result.to_lowercase().contains("pong") {
@@ -15683,6 +15776,9 @@ fn run_warmup(sock: &PathBuf, team: &str, target: Option<&str>, timeout: u32) {
         let ms = start.elapsed().as_millis();
         println!("  ✗ {name}: timeout ({ms}ms)");
     }
+    for (name, ms, reason) in &failed {
+        println!("  ✗ {name}: {reason} without pong ({ms}ms)");
+    }
     println!();
     if fail == 0 {
         println!("All {pass} agent(s) warm ✓");
@@ -15690,6 +15786,13 @@ fn run_warmup(sock: &PathBuf, team: &str, target: Option<&str>, timeout: u32) {
         println!("{pass} warm, {fail} timed out");
         process::exit(1);
     }
+}
+
+fn warmup_task_succeeded(status: &str, result: &str) -> bool {
+    matches!(status, "completed" | "review_ready")
+        && result
+            .split(|character: char| !character.is_ascii_alphanumeric())
+            .any(|word| word.eq_ignore_ascii_case("pong"))
 }
 
 /// Work-stealing: claim the next available pending/unassigned task for this agent.
@@ -17125,6 +17228,7 @@ mod auto_watch_tests {
             "team.task.list",
             "team.task.diff",
             "team.add_agent",
+            "team.send_key",
         ] {
             assert!(remote_leader_method_allowed(method), "{method}");
         }
