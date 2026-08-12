@@ -2393,11 +2393,11 @@ struct NewProjectView: View {
     private func runPlacementRetry() {
         let store = RemoteHostStore.shared
         for host in placementRetryHosts {
-            if case .failed = host.connectionState {
-                _ = store.retryConnectingHost(host)
-            } else {
-                store.connectSavedHost(host)
-            }
+            // A connected host can still be waiting for the authenticated CLI
+            // directory handshake. Reusing connectSavedHost here is a no-op
+            // because it intentionally rejects hosts that already have a
+            // sidebar lease; reset the lease and start a real retry instead.
+            _ = store.retryConnectingHost(host)
         }
     }
 
