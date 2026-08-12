@@ -327,12 +327,16 @@ final class WorkspaceRetrievalStore: ObservableObject {
         }
         dryRun = UserDefaults.standard.bool(forKey: Self.dryRunKey)
         RemoteWorkLog.level = logLevel
-        RemoteWorkLog.sink = { [weak self] message in
+        RemoteWorkLog.sink = { [weak self] message, severity in
             guard let self else { return }
             // No pane is not a reason to drop the line. Connection events
             // arrive before the first remote pane exists, and dropping them
             // was why the drawer looked empty exactly when it mattered.
-            self.recordActivity(paneID: self.selectedPane?.id ?? self.panes.first?.id, message: message)
+            self.recordActivity(
+                paneID: self.selectedPane?.id ?? self.panes.first?.id,
+                message: message,
+                severity: severity
+            )
         }
     }
 
@@ -343,8 +347,15 @@ final class WorkspaceRetrievalStore: ObservableObject {
     /// connected for days.
     private static let activityLimit = 500
 
-    func recordActivity(paneID: RemotePaneID?, message: String) {
-        activity.insert(RemotePaneActivity(paneID: paneID, message: message), at: 0)
+    func recordActivity(
+        paneID: RemotePaneID?,
+        message: String,
+        severity: RemoteWorkLogSeverity = .info
+    ) {
+        activity.insert(
+            RemotePaneActivity(paneID: paneID, message: message, severity: severity),
+            at: 0
+        )
         if activity.count > Self.activityLimit {
             activity.removeLast(activity.count - Self.activityLimit)
         }

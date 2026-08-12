@@ -1991,6 +1991,7 @@ struct NewProjectView: View {
     private func startCreation() {
         if let problem = PeerProjectBootstrap.repositoryURLProblem(gitURL) {
             creationError = problem
+            RemoteWorkLog.error("Could not create \(effectiveName): \(problem)")
             return
         }
         let localDirectory = runsOnHostKey == nil
@@ -2034,6 +2035,7 @@ struct NewProjectView: View {
                 let message = error.localizedDescription
                 creationError = message
                 failRunningBootStep(message: message)
+                RemoteWorkLog.error("Could not create \(effectiveName): \(message)")
             }
         }
     }

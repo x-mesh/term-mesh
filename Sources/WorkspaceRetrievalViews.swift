@@ -446,7 +446,7 @@ private struct RetrievalActivityDrawer: View {
                 Button("Copy All") {
                     let text = store.activity.reversed().map { event in
                         let stamp = event.occurredAt.formatted(date: .omitted, time: .standard)
-                        return "\(stamp)  \(event.message)"
+                        return "\(stamp)  [\(event.severity.rawValue.uppercased())] \(event.message)"
                     }.joined(separator: "\n")
                     NSPasteboard.general.clearContents()
                     NSPasteboard.general.setString(text, forType: .string)
@@ -484,11 +484,16 @@ private struct RetrievalActivityDrawer: View {
             LazyVStack(alignment: .leading, spacing: 2) {
                 ForEach(store.activity.prefix(200)) { event in
                     HStack(alignment: .firstTextBaseline, spacing: 8) {
+                        Image(systemName: activityIcon(for: event.severity))
+                            .font(.system(size: 10, weight: .semibold))
+                            .foregroundStyle(activityColor(for: event.severity))
+                            .accessibilityLabel(event.severity.rawValue.capitalized)
                         Text(event.occurredAt.formatted(date: .omitted, time: .standard))
                             .font(.system(size: 10).monospacedDigit())
                             .foregroundStyle(.secondary)
                         Text(event.message)
                             .font(.system(size: 11))
+                            .foregroundStyle(activityColor(for: event.severity))
                             .textSelection(.enabled)
                             .fixedSize(horizontal: false, vertical: true)
                     }
@@ -497,6 +502,22 @@ private struct RetrievalActivityDrawer: View {
             .padding(.horizontal, 12)
             .padding(.vertical, 6)
             .frame(maxWidth: .infinity, alignment: .leading)
+        }
+    }
+
+    private func activityIcon(for severity: RemoteWorkLogSeverity) -> String {
+        switch severity {
+        case .info: "circle.fill"
+        case .warning: "exclamationmark.triangle.fill"
+        case .error: "xmark.octagon.fill"
+        }
+    }
+
+    private func activityColor(for severity: RemoteWorkLogSeverity) -> Color {
+        switch severity {
+        case .info: .primary
+        case .warning: .orange
+        case .error: .red
         }
     }
 

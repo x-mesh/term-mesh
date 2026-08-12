@@ -238,6 +238,11 @@ final class AgentSession {
         case person
     }
 
+    enum DiagnosticSeverity: Equatable {
+        case warning
+        case error
+    }
+
     enum Entry: Identifiable, Equatable {
         case said(id: UUID, Speaker, String)
         case answered(id: UUID, String)
@@ -939,11 +944,11 @@ final class AgentSession {
     /// side reads its own header out of this; the session does not interpret it.
     @ObservationIgnored var onTurnEnd: ((String, TurnEnd, String?) -> Void)?
 
-    /// Called with the reason a failed turn reported.
+    /// Called for a launch, transport, process, or turn diagnostic.
     ///
-    /// The transcript shows the same reason. Remote panes also wire this to
-    /// Live Activity so a failure remains diagnosable after the pane closes.
-    @ObservationIgnored var onTurnFailure: ((String) -> Void)?
+    /// Every native provider uses this same session boundary, so callers do
+    /// not need a separate error path for Claude versus a bridged CLI.
+    @ObservationIgnored var onDiagnostic: ((DiagnosticSeverity, String) -> Void)?
 
     // MARK: - Turn-state writes
     //
@@ -1171,6 +1176,12 @@ final class AgentSession {
     /// reads it from the relay pump's thread.
     @ObservationIgnored private let remoteStreamsBox = RemoteStreamsBox()
     @ObservationIgnored private var streamResources: StreamResources?
+    /// Recent stderr, retained so a process that exits without a result
+    /// frame still reports the provider's reason rather than only an exit code.
+    @ObservationIgnored private var stderrDiagnostic: String?
+    /// Recent non-protocol output. Remote bridges send startup/provider
+    /// diagnostics on this same byte stream rather than a separate stderr.
+    @ObservationIgnored private var streamDiagnostic: String?
     #if DEBUG
     /// Synchronous decoder behind `consumeForTesting` only — production
     /// bytes (local pipe and remote pipeline alike) decode off-main on
@@ -1497,6 +1508,8 @@ final class AgentSession {
 
     func start(_ launch: Launch) {
         guard process == nil, remoteSink == nil else { return }
+        stderrDiagnostic = nil
+        streamDiagnostic = nil
         launchedTeamIdentity = launch.environment.filter {
             Self.teamIdentityKeys.contains($0.key)
         }
@@ -1585,7 +1598,15 @@ final class AgentSession {
                           !text.isEmpty else { return }
                     DispatchQueue.main.async { [weak self, weak p] in
                         guard let self, let p, self.process === p else { return }
-                        self.append(.notice(id: UUID(), AgentSession.withoutAnsi(text)))
+                        let diagnostic = AgentSession.withoutAnsi(text)
+                        let joined = [self.stderrDiagnostic, diagnostic]
+                            .compactMap { $0 }
+                            .joined(separator: "\n")
+                        self.stderrDiagnostic = AgentSession.middleBounded(
+                            joined,
+                            maxUTF8Bytes: 2_000
+                        )
+                        self.append(.notice(id: UUID(), diagnostic))
                     }
                 }
             }
@@ -1631,7 +1652,7 @@ final class AgentSession {
             try p.run()
         } catch {
             _ = teardown(process: p, terminate: false)
-            append(.notice(id: UUID(), "could not start the agent: \(error.localizedDescription)"))
+            reportDiagnostic(.error, "could not start the agent: \(error.localizedDescription)")
             return
         }
         setRunning(true)
@@ -1656,6 +1677,7 @@ final class AgentSession {
                      cli: String? = nil,
                      sink: @escaping @Sendable (Data) async throws -> Void) {
         guard process == nil, remoteSink == nil else { return }
+        streamDiagnostic = nil
         remoteSink = sink
         let named = cli.map { "`\($0)`" } ?? "the agent CLI"
         armStartupWatchdog(
@@ -1763,9 +1785,15 @@ final class AgentSession {
             let safeReason = reason.isEmpty ? "exited" : reason
             summary = "the remote agent surface ended (\(safeReason))"
         }
-        append(.notice(id: UUID(), summary))
+        let failureReported = signal != 0 || exitCode != 0 || turnInFlight
+        if failureReported {
+            let detail = streamDiagnostic.map { "\(summary): \($0)" } ?? summary
+            reportDiagnostic(.error, detail)
+        } else {
+            append(.notice(id: UUID(), summary))
+        }
         teardownRemote()
-        finishAfterDrain(code: 0)
+        finishAfterDrain(code: 0, failureAlreadyReported: failureReported)
     }
 
     /// The sole natural-exit entry point. The stream queue has already drained
@@ -1862,12 +1890,20 @@ final class AgentSession {
         setCanInterrupt(false)
     }
 
-    private func finishAfterDrain(code: Int32, stopped: Bool = false) {
+    private func finishAfterDrain(
+        code: Int32,
+        stopped: Bool = false,
+        failureAlreadyReported: Bool = false
+    ) {
         setThinking(false)
         streamOpen.removeAll()
         clearStreamingIds()
         if code != 0 {
-            append(.notice(id: UUID(), "the agent exited (\(code))"))
+            let detail = stderrDiagnostic ?? streamDiagnostic
+            let suffix = detail.map { ": \($0)" } ?? ""
+            reportDiagnostic(.error, "the agent exited (\(code))\(suffix)")
+        } else if turnInFlight, !stopped, !failureAlreadyReported {
+            reportDiagnostic(.error, "the agent exited before finishing this turn")
         }
         // A turn that was running when the process went is not going to end on
         // its own, and its task would sit `in_progress` forever while every
@@ -1995,10 +2031,10 @@ final class AgentSession {
                 // The turn already opened optimistically; the transport's
                 // owner sees the same failure and decides the session's
                 // fate. Here it is only worth saying out loud.
-                self.append(.notice(
-                    id: UUID(),
+                self.reportDiagnostic(
+                    .error,
                     "could not deliver to the remote agent: \(error.localizedDescription)"
-                ))
+                )
             }
         }
     }
@@ -2146,7 +2182,12 @@ final class AgentSession {
 
     private func handle(_ parsed: AgentParsedLine) {
         guard let object = parsed.object else {
-            append(.notice(id: UUID(), Self.withoutAnsi(parsed.raw)))
+            let diagnostic = Self.withoutAnsi(parsed.raw)
+            let joined = [streamDiagnostic, diagnostic]
+                .compactMap { $0 }
+                .joined(separator: "\n")
+            streamDiagnostic = Self.middleBounded(joined, maxUTF8Bytes: 2_000)
+            append(.notice(id: UUID(), diagnostic))
             return
         }
         handle(object, preparedChanges: parsed.preparedChanges,
@@ -2377,17 +2418,19 @@ final class AgentSession {
         openTools.removeAll()
         let spoken = saidThisTurn.joined(separator: "\n")
         let final = o["result"] as? String ?? spoken
-        if failed, let detail = Self.failureDetail(
-            final: final,
-            alreadyShown: spoken,
-            stop: reason
-        ) {
-            let diagnostic = Self.middleBounded(
-                Self.redactingCredentials(detail),
-                maxUTF8Bytes: 2_000
-            )
-            append(.notice(id: UUID(), diagnostic))
-            onTurnFailure?(diagnostic)
+        if failed {
+            let activityDetail = final.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                ? (reason.isEmpty ? "the agent reported a failed turn" : "the agent reported: \(reason)")
+                : final
+            if let detail = Self.failureDetail(
+                final: final,
+                alreadyShown: spoken,
+                stop: reason
+            ) {
+                reportDiagnostic(.error, detail)
+            } else {
+                reportDiagnostic(.error, activityDetail, appendToTranscript: false)
+            }
         }
         append(.turnEnded(id: UUID(), end))
         setThinking(false)
@@ -2470,6 +2513,22 @@ final class AgentSession {
         trimToCap()
     }
 
+    private func reportDiagnostic(
+        _ severity: DiagnosticSeverity,
+        _ detail: String,
+        appendToTranscript: Bool = true
+    ) {
+        let diagnostic = Self.middleBounded(
+            Self.redactingCredentials(Self.withoutAnsi(detail)),
+            maxUTF8Bytes: 2_000
+        )
+        guard !diagnostic.isEmpty else { return }
+        if appendToTranscript {
+            append(.notice(id: UUID(), diagnostic))
+        }
+        onDiagnostic?(severity, diagnostic)
+    }
+
     /// How long a pane may stay completely silent before it says why it might
     /// be.
     ///
@@ -2504,7 +2563,7 @@ final class AgentSession {
             // Cleared first: `append` cancels the watchdog, and this *is* the
             // watchdog firing.
             self.startupWatchdog = nil
-            self.append(.notice(id: UUID(), diagnosis))
+            self.reportDiagnostic(.warning, diagnosis)
         }
         startupWatchdog = item
         DispatchQueue.main.asyncAfter(

@@ -1633,6 +1633,17 @@ final class Workspace: Identifiable {
         let agentPanel = AgentPanel(agentName: agentName, teamName: teamName,
                                     workingDirectory: workingDirectory,
                                     cli: cli, color: color)
+        agentPanel.session.onDiagnostic = { [weak agentPanel] severity, detail in
+            let title = agentPanel?.title ?? agentName
+            let message = "Native agent \(severity == .error ? "error" : "warning"): "
+                + "\(title) [\(cli)] — \(detail)"
+            switch severity {
+            case .warning:
+                RemoteWorkLog.warning(message)
+            case .error:
+                RemoteWorkLog.error(message)
+            }
+        }
         panels[agentPanel.id] = agentPanel
         panelTitles[agentPanel.id] = agentPanel.displayTitle
 
@@ -2837,13 +2848,7 @@ final class Workspace: Identifiable {
         let relay = session.relaySession
         let agentSession = panel.session
         let panelId = panel.id
-        let activityTitle = panel.title
         remoteAgentPaneSessions[panelId] = session
-        agentSession.onTurnFailure = { detail in
-            RemoteWorkLog.info(
-                "Native agent turn failed: \(activityTitle) — \(detail)"
-            )
-        }
         // Reattach is the drop path, deliberately: the pane's AgentSession is
         // fixed for the panel's life and `consume` is not idempotent, so a
         // replayed stream needs a fresh pane. Dropping here rebuilds it

@@ -8,6 +8,21 @@ import XCTest
 
 @MainActor
 final class WorkspaceRetrievalStoreTests: XCTestCase {
+    func test_liveActivityPreservesErrorSeverity() {
+        let suite = "WorkspaceRetrievalStoreTests.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        defer {
+            RemoteWorkLog.sink = nil
+            defaults.removePersistentDomain(forName: suite)
+        }
+        let store = WorkspaceRetrievalStore(workspaceID: UUID(), defaults: defaults)
+
+        RemoteWorkLog.error("provider authentication failed")
+
+        XCTAssertEqual(store.activity.first?.message, "provider authentication failed")
+        XCTAssertEqual(store.activity.first?.severity, .error)
+    }
+
     func test_registerPane_createsOneProjectBindingAndSharedSelection() {
         let suite = "WorkspaceRetrievalStoreTests.\(UUID().uuidString)"
         let defaults = UserDefaults(suiteName: suite)!

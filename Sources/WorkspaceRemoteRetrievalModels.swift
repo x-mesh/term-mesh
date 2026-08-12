@@ -96,12 +96,20 @@ struct RemotePaneActivity: Identifiable, Hashable, Sendable {
     /// what made them vanish from the drawer entirely.
     let paneID: RemotePaneID?
     let message: String
+    let severity: RemoteWorkLogSeverity
     let occurredAt: Date
 
-    init(id: UUID = UUID(), paneID: RemotePaneID?, message: String, occurredAt: Date = Date()) {
+    init(
+        id: UUID = UUID(),
+        paneID: RemotePaneID?,
+        message: String,
+        severity: RemoteWorkLogSeverity = .info,
+        occurredAt: Date = Date()
+    ) {
         self.id = id
         self.paneID = paneID
         self.message = message
+        self.severity = severity
         self.occurredAt = occurredAt
     }
 }

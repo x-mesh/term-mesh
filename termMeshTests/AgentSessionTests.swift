@@ -1873,27 +1873,41 @@ final class AgentSessionTests: XCTestCase {
     }
 
     func testAFailedTurnReportsItsReasonToObservers() {
-        var reported: String?
+        var reported: (AgentSession.DiagnosticSeverity, String)?
         let s = AgentSession()
-        s.onTurnFailure = { reported = $0 }
+        s.onDiagnostic = { reported = ($0, $1) }
         s.ingestForTesting(event([
             "type": "result", "subtype": "error", "is_error": true,
             "stop_reason": "failed", "result": "Missing environment variable: AI_MESH_API_KEY",
         ]))
 
-        XCTAssertEqual(reported, "Missing environment variable: AI_MESH_API_KEY")
+        XCTAssertEqual(reported?.0, .error)
+        XCTAssertEqual(reported?.1, "Missing environment variable: AI_MESH_API_KEY")
     }
 
     func testFailedTurnDiagnosticsRedactCredentials() {
         var reported: String?
         let s = AgentSession()
-        s.onTurnFailure = { reported = $0 }
+        s.onDiagnostic = { _, detail in reported = detail }
         s.ingestForTesting(event([
             "type": "result", "is_error": true,
             "result": "request failed with API_KEY=do-not-log-this",
         ]))
 
         XCTAssertEqual(reported, "request failed with API_KEY=[redacted]")
+    }
+
+    func testStartupSilenceReportsAWarningToObservers() {
+        var reported: (AgentSession.DiagnosticSeverity, String)?
+        let s = AgentSession()
+        s.onDiagnostic = { reported = ($0, $1) }
+        s.startRemote(cli: "test-agent") { _ in }
+
+        s.fireStartupWatchdogForTesting()
+
+        XCTAssertEqual(reported?.0, .warning)
+        XCTAssertTrue(reported?.1.contains("no output from the remote agent") == true)
+        s.stop()
     }
 
     func testAFailedTurnShowsOnlyTheReasonAfterStreamedText() {
