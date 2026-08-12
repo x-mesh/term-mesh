@@ -67,10 +67,7 @@ extension TerminalController {
             )
             newId = ws.id
             if command != nil, !shouldFocus {
-                for panel in ws.panels.values {
-                    guard let terminalPanel = panel as? TerminalPanel else { continue }
-                    terminalPanel.surface.requestBackgroundSurfaceStartIfNeeded(reason: "workspaceCreateCommand")
-                }
+                pinWorkspaceUntilCommandSurfaceRealized(ws, on: tabManager)
             }
             if let wt = preCreatedWorktree {
                 ws.worktreeName = wt.name
@@ -106,6 +103,43 @@ extension TerminalController {
         }
         return .ok(result)
     }
+
+    /// A focus-neutral workspace is not normally mounted, so its terminal view
+    /// never enters a window and Ghostty cannot create the surface that runs
+    /// `command`. Keep it mounted only until that first surface exists.
+    private func pinWorkspaceUntilCommandSurfaceRealized(
+        _ workspace: Workspace,
+        on tabManager: TabManager
+    ) {
+        guard !tabManager.workspaceHasReportablePane(workspace.id) else { return }
+        guard !tabManager.surfaceRealizationPins.contains(workspace.id) else { return }
+
+        let workspaceID = workspace.id
+        tabManager.pinWorkspaceForSurfaceRealization(workspaceID)
+        Task { @MainActor [weak tabManager, weak workspace] in
+            defer { tabManager?.unpinWorkspaceForSurfaceRealization(workspaceID) }
+            let deadline = Date().addingTimeInterval(
+                GhosttyPaneSurfaceProvider.surfaceRealizationPinTimeout
+            )
+            while Date() < deadline {
+                try? await Task.sleep(for: GhosttyPaneSurfaceProvider.surfaceRealizationPollInterval)
+                guard let tabManager, let workspace else { return }
+                guard tabManager.tabs.contains(where: { $0.id == workspaceID }) else { return }
+                if tabManager.workspaceHasReportablePane(workspaceID) { return }
+                for panel in workspace.panels.values {
+                    guard let terminal = panel as? TerminalPanel else { continue }
+                    terminal.surface.requestBackgroundSurfaceStartIfNeeded(
+                        reason: "workspaceCreateCommand"
+                    )
+                }
+            }
+            RemoteWorkLog.info(
+                "Workspace \(workspaceID.uuidString.prefix(8)) did not start its queued command "
+                    + "surface within \(Int(GhosttyPaneSurfaceProvider.surfaceRealizationPinTimeout))s"
+            )
+        }
+    }
+
     func v2WorkspaceSelect(params: [String: Any]) -> V2CallResult {
         guard let tabManager = v2ResolveTabManager(params: params) else {
             return .err(code: "unavailable", message: "TabManager not available", data: nil)
