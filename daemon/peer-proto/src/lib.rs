@@ -154,6 +154,13 @@ pub mod team_leader {
     pub const REQUEST_ID_BYTES: usize = 16;
     pub const GRANT_ID_BYTES: usize = 32;
     pub const MAX_BOOTSTRAP_PAYLOAD_BYTES: usize = 512;
+    /// Extra methods available only through a project-bound leader grant.
+    /// Generic `team.call.v1` must continue to reject these lifecycle calls.
+    pub const SCOPED_METHODS: &[&str] = &["team.add_agent"];
+
+    pub fn scoped_method_allowed(method: &str) -> bool {
+        SCOPED_METHODS.contains(&method)
+    }
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub enum ValidationError {
@@ -290,8 +297,8 @@ impl PeerCapabilities {
 #[cfg(test)]
 mod team_leader_tests {
     use super::team_leader::{
-        validate_bootstrap, validate_grant, ReplayGuard, ValidationError, GRANT_ID_BYTES,
-        MAX_BOOTSTRAP_PAYLOAD_BYTES, REQUEST_ID_BYTES,
+        scoped_method_allowed, validate_bootstrap, validate_grant, ReplayGuard, ValidationError,
+        GRANT_ID_BYTES, MAX_BOOTSTRAP_PAYLOAD_BYTES, REQUEST_ID_BYTES,
     };
     use super::{TeamLeaderBootstrapRequest, TeamLeaderGrant, TeamLeaderPlacement, TeamLeaderRole};
 
@@ -441,6 +448,20 @@ mod team_leader_tests {
             replay.consume(&request_id),
             Err(ValidationError::ReplayedRequest)
         );
+    }
+
+    #[test]
+    fn only_add_agent_is_scoped_beyond_generic_team_calls() {
+        assert!(scoped_method_allowed("team.add_agent"));
+        for method in [
+            "team.create",
+            "team.destroy",
+            "team.attach",
+            "team.restart",
+            "team.preset.list",
+        ] {
+            assert!(!scoped_method_allowed(method), "{method}");
+        }
     }
 }
 
