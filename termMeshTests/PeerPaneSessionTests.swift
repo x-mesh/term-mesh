@@ -998,6 +998,39 @@ final class PeerShellSweepTests: XCTestCase {
     }
 }
 
+/// Project deletion must respect the host's last-pane invariant: a dedicated
+/// workspace owns its terminal panes, while native agent surfaces sit outside
+/// that tree and keep their explicit termination path.
+final class ProjectRemoteSurfaceDeletionTests: XCTestCase {
+
+    func test_dedicated_workspace_deletes_terminal_surface_with_workspace() {
+        XCTAssertFalse(
+            TeamOrchestrator.shouldDeleteRemoteSurfaceIndividually(
+                isAgent: false,
+                ownsRemoteWorkspace: true
+            )
+        )
+    }
+
+    func test_peer_owned_agent_is_terminated_even_with_dedicated_workspace() {
+        XCTAssertTrue(
+            TeamOrchestrator.shouldDeleteRemoteSurfaceIndividually(
+                isAgent: true,
+                ownsRemoteWorkspace: true
+            )
+        )
+    }
+
+    func test_terminal_surface_without_owned_workspace_keeps_close_path() {
+        XCTAssertTrue(
+            TeamOrchestrator.shouldDeleteRemoteSurfaceIndividually(
+                isAgent: false,
+                ownsRemoteWorkspace: false
+            )
+        )
+    }
+}
+
 /// One PTY, two windows onto it — the size arbitration between a local pane
 /// and an attached remote viewer.
 final class RemoteViewerSizeArbitrationTests: XCTestCase {

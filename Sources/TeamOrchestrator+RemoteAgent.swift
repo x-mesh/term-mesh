@@ -5220,6 +5220,19 @@ extension TeamOrchestrator {
 
         for remote in remoteSurfaces {
             let label = "surface \(remote.hostKey):\(remote.surfaceID.base64EncodedString())"
+            // A project-owned workspace is the lifecycle boundary for its
+            // terminal panes. ClosePane deliberately refuses to remove the
+            // last pane in a workspace, so deleting that pane first both
+            // fails confirmation and poisons an otherwise successful project
+            // deletion. DeleteWorkspace below tears every pane down
+            // authoritatively. Peer-owned native agents are not in the
+            // workspace tree and still require TerminateSurface here.
+            guard Self.shouldDeleteRemoteSurfaceIndividually(
+                isAgent: remote.isAgent,
+                ownsRemoteWorkspace: team.remoteWorkspaceIDs[remote.hostKey] != nil
+            ) else {
+                continue
+            }
             guard !remote.socket.isEmpty else {
                 failures.append("\(label): host not connected")
                 remaining.append(label)
@@ -5313,6 +5326,20 @@ extension TeamOrchestrator {
                         "host did not confirm removal of \(label)"
                     )
                 }
+                // DeleteWorkspace removed every terminal surface in this
+                // project-owned workspace, including ones skipped by the
+                // individual surface loop above. Retire their durable
+                // ownership records only after the host confirms the
+                // workspace is gone, so a failed delete remains retryable.
+                for record in ManagedPeerSurfaceStore.shared.records(hostKey: hostKey)
+                where record.teamName == teamName {
+                    if let surfaceID = record.surfaceID {
+                        ManagedPeerSurfaceStore.shared.forget(
+                            hostKey: hostKey,
+                            surfaceID: surfaceID
+                        )
+                    }
+                }
                 forgetRemoteWorkspaceID(teamName: teamName, hostKey: hostKey)
                 deleted.append(label)
             } catch {
@@ -5361,6 +5388,16 @@ extension TeamOrchestrator {
             throw RemoteAgentError.projectDeletionIncomplete(report)
         }
         _ = destroyTeam(name: teamName, tabManager: tabManager, archive: false)
+    }
+
+    /// Terminal panes inside a project-owned workspace are removed by the
+    /// workspace lifecycle operation. Agent surfaces live outside that tree
+    /// and must always be terminated by their own registry identity.
+    nonisolated static func shouldDeleteRemoteSurfaceIndividually(
+        isAgent: Bool,
+        ownsRemoteWorkspace: Bool
+    ) -> Bool {
+        isAgent || !ownsRemoteWorkspace
     }
 
     /// Preserve the user's requested endpoint while the pane is connecting.
