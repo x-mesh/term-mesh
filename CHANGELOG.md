@@ -4,6 +4,22 @@ All notable changes to term-mesh are documented here.
 
 ## [Unreleased]
 
+## [0.185.0] - 2026-08-12
+
+**원격 프로젝트 안에서 리더와 에이전트가 같은 환경으로 제대로 움직인다.** 프로젝트 pane에서 연 원격 리더가 새 팀원을 붙이지 못하던 권한 경로를 연결했고, 리더만 API key를 못 읽는 상황은 어떤 셸과 설정이 실제로 적용됐는지 화면에서 확인할 수 있게 했다. Native pane을 새로 시작할 때는 이전 대화가 섞이지 않으며, 교체에 실패해도 기존 작업을 잃지 않는다.
+
+### Fixed
+
+- **원격 프로젝트의 리더가 에이전트를 추가하지 못하던 문제** ([#245](https://github.com/x-mesh/term-mesh/pull/245)) — 프로젝트 안의 리더 pane에서 `tm-agent add`를 실행하면 `unknown method: team.add_agent`로 끝났다. 원격 리더의 명령이 앱으로 돌아오는 인가된 통로를 타지 않고 피어 데몬에 직접 닿았기 때문이다. 이제 프로젝트 권한을 가진 리더만 같은 프로젝트·호스트·경로 안에 팀원을 추가할 수 있다. 다른 프로세스를 임의로 띄우는 일반 peer 권한은 열지 않는다.
+
+- **원격 리더와 Native agent가 서로 다른 환경 변수를 읽던 문제** ([#245](https://github.com/x-mesh/term-mesh/pull/245)) — 같은 프로젝트인데 Native agent는 API key를 읽고 리더만 못 읽거나, 반대로 한쪽만 다른 Claude 설정을 쓰는 상태를 사용자가 확인할 방법이 없었다. 이제 둘 다 계정의 login shell → `~/.profile` fallback → `~/.config/term-mesh/agent-env` → peer host 설정 순서로 환경을 만든다. pane과 Live Activity에는 실제 값 대신 셸·설정 파일 상태와 필요한 key의 존재 여부만 보여주고, 리더와 agent가 다르면 경고한다.
+
+- **Native pane을 reload해도 이전 대화가 남거나 실패 중 pane이 죽던 문제** ([#246](https://github.com/x-mesh/term-mesh/pull/246)) — hard reload가 기존 remote surface를 다시 붙잡아 새 세션처럼 보여도 context가 이어질 수 있었다. 이제 새 surface와 session을 먼저 준비한 뒤 교체한다. 새 pane 준비, layout 정리, team roster, grant handoff 중 하나라도 실패하면 새 자원만 되돌리고 기존 pane은 그대로 살려 둔다.
+
+### Thanks to 1 contributor!
+
+- [@JINWOO-J](https://github.com/JINWOO-J)
+
 ## [0.184.0] - 2026-08-12
 
 **실패가 조용히 지나가지 않는다.** 원격 에이전트 턴이 깨져도 빨간 글씨만 남던 자리에 이제 이유가 적히고, 원격 프로젝트 삭제가 마지막 pane에서 막히던 문제도 걷어냈다. CLI 도구가 보내는 데스크톱 알림(OSC 99)은 아예 인식되지 않고 있었는데, 다시 뜬다.
