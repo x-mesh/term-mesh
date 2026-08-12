@@ -1203,6 +1203,26 @@ final class AgentSessionTests: XCTestCase {
         XCTAssertFalse(text.contains("no output from"), text)
     }
 
+    /// Environment metadata is real stdout even though it intentionally draws no row.
+    func testEnvironmentOutputCancelsTheSilenceAlarm() {
+        let s = AgentSession()
+        s.startRemote(cli: "claude") { _ in }
+        s.ingestForTesting(event([
+            "type": "system",
+            "subtype": "environment",
+            "shell": "zsh",
+            "profile_fallback": "loaded",
+            "agent_env": "missing",
+            "present_keys": ["AI_MESH_API_KEY"],
+        ]))
+
+        XCTAssertNotNil(s.environmentSummary)
+        XCTAssertFalse(s.hasStartupWatchdogForTesting)
+        s.fireStartupWatchdogForTesting()
+        let text = AgentSession.visibleTranscriptText(rows: s.rows)
+        XCTAssertFalse(text.contains("no output from"), text)
+    }
+
     /// A session that was stopped has already reported itself; a late alarm
     /// would be noise on top of an answer the user already has.
     func testStoppingCancelsTheSilenceAlarm() {

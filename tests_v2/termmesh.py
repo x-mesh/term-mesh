@@ -1273,6 +1273,26 @@ class termmesh:
             "agents": agents,
         }) or {})
 
+    def team_list(self) -> List[Dict[str, Any]]:
+        return list(self._call("team.list", {}) or [])
+
+    def debug_project_create(self, directory: str, roles: List[str],
+                             leader_cli: str = "claude",
+                             leader_model: str = "sonnet",
+                             leader_host: Optional[str] = None,
+                             leader_directory: Optional[str] = None) -> dict:
+        params: Dict[str, Any] = {
+            "directory": directory,
+            "roles": roles,
+            "leader_cli": leader_cli,
+            "leader_model": leader_model,
+        }
+        if leader_host:
+            params["leader_host"] = leader_host
+        if leader_directory:
+            params["leader_directory"] = leader_directory
+        return dict(self._call("debug.project.create", params) or {})
+
     def team_destroy(self, team_name: str) -> dict:
         return dict(self._call("team.destroy", {"team_name": team_name}) or {})
 

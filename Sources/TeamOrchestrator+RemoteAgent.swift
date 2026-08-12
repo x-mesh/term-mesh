@@ -567,6 +567,7 @@ extension TeamOrchestrator {
         let hostKey: String
         let workspace: Workspace
         var promptFile: String?
+        var launchFile: String?
         var hostSockPath: String
         var surfaceID: Data?
         var session: PeerPaneSession?
@@ -606,6 +607,12 @@ extension TeamOrchestrator {
                 await TeamOrchestrator.removeRemoteLeaderPrompt(
                     host: host,
                     promptFile: promptFile
+                )
+            }
+            if let launchFile {
+                await TeamOrchestrator.removeRemoteLeaderFile(
+                    host: host,
+                    path: launchFile
                 )
             }
         }
@@ -1535,11 +1542,23 @@ extension TeamOrchestrator {
             environment: remoteEnvironment,
             hostBinDirs: host.hostCLIBinDirs
         )
-        let command = Self.remoteLeaderCommandCheckingPrompt(
+        var command = Self.remoteLeaderCommandCheckingPrompt(
             launch: launch,
             systemPrompt: systemPrompt,
             promptFile: promptFile
         )
+        if host.sshTarget?.isEmpty == false {
+            let launchFileName = "leader-\(teamUUID)-\(UUID().uuidString).sh"
+            guard let stagedLaunchFile = await Self.writeRemoteLeaderLaunchOverSSH(
+                host: host, command: command, fileName: launchFileName
+            ) else {
+                _ = await sendRemoteLeaderStage(session: session, text: "stty echo")
+                await attempt.compensate()
+                throw RemoteAgentError.paneCreationFailed
+            }
+            resources.launchFile = stagedLaunchFile
+            command = Self.remoteLeaderStagedLaunchCommand(path: stagedLaunchFile)
+        }
         let launched = await sendRemoteLeaderStage(
             session: session,
             text: command
@@ -2640,12 +2659,16 @@ extension TeamOrchestrator {
     }
 
     private static func removeRemoteLeaderPrompt(host: HostEntry, promptFile: String) async {
+        await removeRemoteLeaderFile(host: host, path: promptFile)
+    }
+
+    private static func removeRemoteLeaderFile(host: HostEntry, path: String) async {
         guard let sshTarget = host.sshTarget, !sshTarget.isEmpty else { return }
         _ = try? await PeerHostReadinessChecker.runScript(
             sshTarget: sshTarget,
             port: host.sshPort,
             identityFile: host.identityFile,
-            script: "rm -f -- \(shellQuoted(promptFile))",
+            script: "rm -f -- \(shellQuoted(path))",
             timeoutSeconds: 10
         )
     }
@@ -2738,6 +2761,42 @@ extension TeamOrchestrator {
         }
     }
 
+    /// Stage the full leader launch outside the PTY and return a shared path.
+    ///
+    /// Linux canonical PTYs accept only a bounded input line. The login-shell
+    /// prelude, environment diagnostics, grant and policy together can exceed
+    /// that bound; the shell then receives only a prefix and waits forever at
+    /// its continuation prompt. SSH stdin has no such line limit.
+    private static func writeRemoteLeaderLaunchOverSSH(
+        host: HostEntry,
+        command: String,
+        fileName: String
+    ) async -> String? {
+        guard let sshTarget = host.sshTarget, !sshTarget.isEmpty else { return nil }
+        let contents = "umask 077\nrm -f -- \"$0\"\n"
+            + command
+            + "\nstatus=$?\nstty echo\nexit \"$status\"\n"
+        do {
+            let output = try await PeerHostReadinessChecker.runScript(
+                sshTarget: sshTarget,
+                port: host.sshPort,
+                identityFile: host.identityFile,
+                script: remoteLeaderLaunchSSHStageCommand(fileName: fileName),
+                standardInput: Data(contents.utf8),
+                timeoutSeconds: 20
+            )
+            let path = output.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard path.hasPrefix("/"),
+                  !path.contains("\n"),
+                  !path.contains("\0"),
+                  (path as NSString).lastPathComponent == fileName
+            else { return nil }
+            return path
+        } catch {
+            return nil
+        }
+    }
+
     /// Stage an SSH-owned agent's explicit environment without placing API
     /// keys or the scoped team-route bearer in the local ssh process argv.
     /// PATH remains a separate additive bridge setting; every other valid
@@ -2815,6 +2874,23 @@ extension TeamOrchestrator {
                 + "if cat > \"$t\" && chmod 600 \"$t\" && mv -f \"$t\" \"$p\"; "
                 + "then trap - 0 1 2 15; printf %s \"$p\"; else exit 1; fi"
         )
+    }
+
+    static func remoteLeaderLaunchSSHStageCommand(fileName: String) -> String {
+        let quotedName = shellQuoted((fileName as NSString).lastPathComponent)
+        return RemotePasteTransfer.serviceAccountCommand(
+            "umask 077; "
+                + "d=\"${XDG_CACHE_HOME:-$HOME/.cache}/term-mesh/leader-launches\"; "
+                + "mkdir -p \"$d\" && chmod 700 \"$d\" || exit 1; "
+                + "p=\"$d\"/\(quotedName); t=\"$p.tmp.$$\"; "
+                + "trap 'rm -f \"$t\"' 0 1 2 15; "
+                + "if cat > \"$t\" && chmod 600 \"$t\" && mv -f \"$t\" \"$p\"; "
+                + "then trap - 0 1 2 15; printf %s \"$p\"; else exit 1; fi"
+        )
+    }
+
+    static func remoteLeaderStagedLaunchCommand(path: String) -> String {
+        "/bin/sh \(shellQuoted(path))"
     }
 
     /// Send one remote-leader bootstrap line directly to the attached peer
