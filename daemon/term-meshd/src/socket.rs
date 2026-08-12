@@ -891,6 +891,13 @@ fn team_leader_proxy_envelope(
     })
 }
 
+/// The daemon-side entry gate for `peer.leader.call`. This is deliberately
+/// wider than generic `team.call.v1` only by the methods protected by the
+/// leader grant carried in the same request.
+fn leader_proxy_method_allowed(method: &str) -> bool {
+    crate::peer::connection::team_leader_call_allowed(method)
+}
+
 /// `events.publish {kind:"xk_run", …}` — XK-EVENTS-v1 external-run telemetry
 /// (x-kit panel integration Phase 2). Validates, caps sizes, stamps `ts_ms`
 /// server-side (consistent with the task_status/reply publish path), and fans
@@ -2653,9 +2660,7 @@ async fn dispatch(req: &Request, ctx: &Context) -> Response {
             }
             match serde_json::from_value::<P>(req.params.clone()) {
                 Ok(p) => {
-                    if p.method == "team.list"
-                        || !crate::peer::connection::team_call_allowed(&p.method)
-                    {
+                    if !leader_proxy_method_allowed(&p.method) {
                         Err(format!("method_not_allowed: {}", p.method))
                     } else if serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(
                         &p.params_json,
@@ -4555,6 +4560,20 @@ async fn query_gui_team_workers(app_socket: &str, team_id: &str) -> Vec<String> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Regression for v0.185.1: the CLI and Swift owner both allowed a
+    /// project-scoped add, but the daemon rejected it at `peer.leader.call`
+    /// using the narrower generic-peer gate before the grant could be sent.
+    #[test]
+    fn leader_proxy_accepts_scoped_add_before_grant_dispatch() {
+        assert!(leader_proxy_method_allowed("team.add_agent"));
+        assert!(!crate::peer::connection::team_call_allowed(
+            "team.add_agent"
+        ));
+        for method in ["team.list", "team.create", "team.preset.list"] {
+            assert!(!leader_proxy_method_allowed(method), "{method}");
+        }
+    }
 
     #[test]
     fn malformed_gc_params_fail_closed_instead_of_scanning_every_category() {
