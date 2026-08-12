@@ -998,6 +998,70 @@ final class PeerShellSweepTests: XCTestCase {
     }
 }
 
+/// Project deletion must respect the host's last-pane invariant: a dedicated
+/// workspace owns its terminal panes, while native agent surfaces sit outside
+/// that tree and keep their explicit termination path.
+final class ProjectRemoteSurfaceDeletionTests: XCTestCase {
+
+    func test_dedicated_workspace_deletes_terminal_surface_with_workspace() {
+        XCTAssertFalse(
+            TeamOrchestrator.shouldDeleteRemoteSurfaceIndividually(
+                isAgent: false,
+                belongsToOwnedWorkspace: true
+            )
+        )
+    }
+
+    func test_peer_owned_agent_is_terminated_even_with_dedicated_workspace() {
+        XCTAssertTrue(
+            TeamOrchestrator.shouldDeleteRemoteSurfaceIndividually(
+                isAgent: true,
+                belongsToOwnedWorkspace: true
+            )
+        )
+    }
+
+    func test_terminal_surface_without_owned_workspace_keeps_close_path() {
+        XCTAssertTrue(
+            TeamOrchestrator.shouldDeleteRemoteSurfaceIndividually(
+                isAgent: false,
+                belongsToOwnedWorkspace: false
+            )
+        )
+    }
+
+    func test_workspace_ownership_includes_active_and_inactive_tabs_only() {
+        let active = Data(repeating: 0x11, count: 16)
+        let inactive = Data(repeating: 0x22, count: 16)
+        let generic = Data(repeating: 0x33, count: 16)
+        var activeTab = Termmesh_Peer_V1_PaneTab()
+        activeTab.surfaceID = active
+        var inactiveTab = Termmesh_Peer_V1_PaneTab()
+        inactiveTab.surfaceID = inactive
+        var pane = Termmesh_Peer_V1_WorkspacePane()
+        pane.surfaceID = active
+        pane.tabs = [activeTab, inactiveTab]
+        var layout = Termmesh_Peer_V1_WorkspaceLayout()
+        layout.pane = pane
+
+        let owned = peerSurfaceIDs(layout)
+        XCTAssertEqual(owned, [active, inactive])
+        XCTAssertFalse(owned.contains(generic))
+        XCTAssertTrue(
+            TeamOrchestrator.shouldDeleteRemoteSurfaceIndividually(
+                isAgent: false,
+                belongsToOwnedWorkspace: owned.contains(generic)
+            )
+        )
+        XCTAssertFalse(
+            TeamOrchestrator.shouldDeleteRemoteSurfaceIndividually(
+                isAgent: false,
+                belongsToOwnedWorkspace: owned.contains(inactive)
+            )
+        )
+    }
+}
+
 /// One PTY, two windows onto it — the size arbitration between a local pane
 /// and an attached remote viewer.
 final class RemoteViewerSizeArbitrationTests: XCTestCase {

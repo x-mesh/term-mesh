@@ -97,6 +97,29 @@ func peerPaneSummaries(
     return walk(layout)
 }
 
+/// Every terminal surface owned by a peer workspace, including inactive tabs.
+/// `WorkspacePane.surfaceID` names only the active tab; deletion and durable
+/// ownership cleanup must also account for every entry in `tabs[]`.
+func peerSurfaceIDs(
+    _ layout: Termmesh_Peer_V1_WorkspaceLayout
+) -> Set<Data> {
+    func walk(_ node: Termmesh_Peer_V1_WorkspaceLayout) -> Set<Data> {
+        switch node.node {
+        case .pane(let pane):
+            var ids = Set(pane.tabs.map(\.surfaceID).filter { !$0.isEmpty })
+            if !pane.surfaceID.isEmpty {
+                ids.insert(pane.surfaceID)
+            }
+            return ids
+        case .split(let split):
+            return walk(split.first).union(walk(split.second))
+        case .none:
+            return []
+        }
+    }
+    return walk(layout)
+}
+
 /// Fold a peer workspace layout tree into (panes, surfaces, busy panes).
 /// The tree comes free with every `ListWorkspaces` roster fetch, so these
 /// counts cost nothing beyond a walk — no extra RPC, no host change.
