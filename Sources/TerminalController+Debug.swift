@@ -641,7 +641,7 @@ extension TerminalController {
             MainActor.assumeIsolated {
                 // Mirrors what New Project's Create does: rows in, one
                 // workspace and one team out.
-                if let roles = (params["roles"] as? [String]), !roles.isEmpty {
+                if let roles = params["roles"] as? [String] {
                     // Mirrors New Project's Create for a remote project too:
                     // prepare the checkouts, then create the team pointed at
                     // what was made.

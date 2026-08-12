@@ -4,6 +4,18 @@ All notable changes to term-mesh are documented here.
 
 ## [Unreleased]
 
+## [0.185.1] - 2026-08-12
+
+### Fixed
+
+- **Production 앱에서 원격 프로젝트 리더가 열리지 않던 문제** — 긴 시작 명령이 Linux 터미널 입력 한도를 넘으면 명령 끝이 잘려 셸이 `# >`에서 계속 기다렸지만, 앱은 리더가 준비됐다고 표시했다. 이제 긴 시작 내용은 SSH로 안전하게 먼저 옮기고 pane에는 짧은 실행 명령만 보내므로, 원격 리더가 실제 Claude Code 화면까지 열린다.
+
+- **이미 응답한 원격 Native agent에 30초 뒤 잘못된 경고가 뜨던 문제** — 환경 정보도 정상 출력으로 인정해서 `no output from /usr/bin/ssh` 경고가 뒤늦게 나타나지 않는다.
+
+### Thanks to 1 contributor!
+
+- [@JINWOO-J](https://github.com/JINWOO-J)
+
 ## [0.185.0] - 2026-08-12
 
 **원격 프로젝트 안에서 리더와 에이전트가 같은 환경으로 제대로 움직인다.** 프로젝트 pane에서 연 원격 리더가 새 팀원을 붙이지 못하던 권한 경로를 연결했고, 리더만 API key를 못 읽는 상황은 어떤 셸과 설정이 실제로 적용됐는지 화면에서 확인할 수 있게 했다. Native pane을 새로 시작할 때는 이전 대화가 섞이지 않으며, 교체에 실패해도 기존 작업을 잃지 않는다.
