@@ -4,6 +4,16 @@ All notable changes to term-mesh are documented here.
 
 ## [Unreleased]
 
+## [0.185.2] - 2026-08-12
+
+### Fixed
+
+- **원격 프로젝트 리더가 `tm-agent add`로 팀원을 추가하지 못하던 문제** — v0.185.1에서는 리더와 앱이 `team.add_agent`를 허용해도 원격 `term-meshd`의 앞단이 이를 일반 peer 명령으로 잘못 검사해 `method_not_allowed: team.add_agent`로 막았다. 이제 프로젝트·팀에 묶인 leader grant가 있는 경로에서만 agent 추가를 통과시키며, 일반 peer에는 프로세스 생성 권한을 열지 않는다.
+
+### Thanks to 1 contributor!
+
+- [@JINWOO-J](https://github.com/JINWOO-J)
+
 ## [0.185.1] - 2026-08-12
 
 ### Fixed
