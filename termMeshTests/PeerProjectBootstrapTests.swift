@@ -2250,4 +2250,25 @@ final class ProjectCreationRecoveryTests: XCTestCase {
         let after = gate.begin(teamName: "xm-never-began")
         XCTAssertTrue(gate.isCurrent(after), "a later attach starts clean")
     }
+
+    func test_scopedLeaderAddCannotChooseAnotherHostOrDirectory() {
+        let params = GhosttyPaneSurfaceProvider.canonicalizeScopedLeaderParameters(
+            [
+                "team_name": "forged-team",
+                "host": "ssh:attacker",
+                "directory": "/etc",
+                "cli": "codex",
+            ],
+            method: "team.add_agent",
+            teamName: "xm",
+            leaderHostKey: "ssh:root@131.186.23.19",
+            leaderDirectory: "/app/tm-prj/xm"
+        )
+
+        XCTAssertEqual(params["team"] as? String, "xm")
+        XCTAssertEqual(params["team_name"] as? String, "xm")
+        XCTAssertEqual(params["host"] as? String, "ssh:root@131.186.23.19")
+        XCTAssertEqual(params["directory"] as? String, "/app/tm-prj/xm")
+        XCTAssertEqual(params["cli"] as? String, "codex")
+    }
 }

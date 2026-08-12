@@ -14,6 +14,16 @@ public enum PeerTeamLeader {
     public static let maxBootstrapPayloadBytes = 512
     public static let maxCommandPayloadBytes = 64 * 1024
 
+    /// Extra methods available only to a project-scoped autonomous leader.
+    /// Generic `team.call.v1` peers must not inherit these permissions.
+    public static let scopedMethods: Set<String> = [
+        "team.add_agent",
+    ]
+
+    public static func isAllowed(_ method: String) -> Bool {
+        PeerTeamCall.isAllowed(method) || scopedMethods.contains(method)
+    }
+
     public enum ValidationError: String, Error, Sendable, Equatable {
         case payloadTooLarge = "payload_too_large"
         case invalidProject = "invalid_project"
@@ -117,7 +127,7 @@ public enum PeerTeamLeader {
         // surface: it ignores a team parameter and would reveal every team
         // owned by the control-plane host.
         guard request.method != "team.list",
-              PeerTeamCall.isAllowed(request.method) else {
+              isAllowed(request.method) else {
             return .failure(.invalidMethod)
         }
         guard isSafeIdentifier(request.teamUuid, maxBytes: maxTeamUUIDBytes) else {

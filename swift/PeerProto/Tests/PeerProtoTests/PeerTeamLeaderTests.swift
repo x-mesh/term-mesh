@@ -153,6 +153,17 @@ final class PeerTeamLeaderTests: XCTestCase {
         }
     }
 
+    func testScopedLeaderAllowsAddAgentWithoutOpeningGenericPeerLifecycle() {
+        var request = validCommand(grant: validGrant(), requestByte: 9)
+        request.method = "team.add_agent"
+        request.paramsJson = #"{"team_name":"forged","host":"forged","directory":"/etc"}"#
+
+        XCTAssertSuccess(
+            PeerTeamLeader.validateCommandShape(request, encodedBytes: 256)
+        )
+        XCTAssertFalse(PeerTeamCall.isAllowed("team.add_agent"))
+    }
+
     func testControlPlaneRejectsForgedScopeExpiryObserverOversizeAndBadRequestIDBeforeDispatch() async {
         let controlPlane = PeerTeamLeaderControlPlane()
         let registered = validGrant()
