@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
 """Unit coverage for the typed surface.terminate.v1 Python helper."""
 
+import sys
 import unittest
+from pathlib import Path
 
-from tests_v2 import peer_client as pc
+sys.path.insert(0, str(Path(__file__).parent))
+import peer_client as pc
 
 
 class TerminateHelperTests(unittest.TestCase):
