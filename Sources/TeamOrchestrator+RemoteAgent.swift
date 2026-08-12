@@ -476,7 +476,7 @@ extension TeamOrchestrator {
             leaderModel: "",
             leaderCli: nil,
             leaderPanelId: leaderPanelID,
-            leaderEndpoint: .peer(host.id),
+            leaderEndpoint: .peer(hostKey: host.id),
             workingDirectory: remote.workingDirectory,
             workspaceId: workspace.id,
             agents: members,

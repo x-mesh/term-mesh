@@ -4016,8 +4016,9 @@ mod agent_surface_tests {
     use peer_proto::v1::envelope::Payload;
     use peer_proto::v1::{
         AttachMode, AttachSurface, Auth, DetachSurface, Envelope, Hello, Input, ListSurfaces,
-        Ping, SurfaceList,
+        ListTeams, Ping, SurfaceList, Team, TeamMember, UpsertProjectPresentationRequest,
     };
+    use tempfile::TempDir;
     use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
     use tokio::net::UnixStream;
 
@@ -4070,6 +4071,14 @@ mod agent_surface_tests {
         host: Arc<PeerHost>,
         capabilities: Vec<String>,
     ) -> (OwnedReadHalf, OwnedWriteHalf) {
+        handshake_as(host, capabilities, vec![0x42; 16]).await
+    }
+
+    async fn handshake_as(
+        host: Arc<PeerHost>,
+        capabilities: Vec<String>,
+        peer_id: Vec<u8>,
+    ) -> (OwnedReadHalf, OwnedWriteHalf) {
         let (client, server) = UnixStream::pair().expect("socketpair");
         tokio::spawn(async move {
             let _ = run(server, host).await;
@@ -4082,7 +4091,7 @@ mod agent_surface_tests {
                 correlation_id: 0,
                 payload: Some(Payload::Hello(Hello {
                     protocol_version: PROTOCOL_VERSION.into(),
-                    peer_id: vec![0x42; 16],
+                    peer_id,
                     display_name: "agent-surface-test".into(),
                     capabilities,
                     app_version: "test".into(),
@@ -4114,6 +4123,116 @@ mod agent_surface_tests {
             other => panic!("expected AuthResult, got {other:?}"),
         }
         (reader, writer)
+    }
+
+    /// The creating Mac is disposable; the daemon-owned manifest is not.
+    /// Publish from one authenticated installation, drop that connection,
+    /// then prove a different installation discovers the exact live surface
+    /// ids and can attach without EnsureSurface or spawning anything.
+    #[tokio::test]
+    async fn project_manifest_is_discoverable_and_attachable_from_another_peer() {
+        let tmp = TempDir::new().expect("temp dir");
+        let manager = Arc::new(PtyManager::new());
+        let leader = PtySurface::spawn(
+            surface_id_from_name("durable-project-leader"),
+            "durable-project-leader".into(),
+            "/bin/cat",
+            &[],
+            80,
+            24,
+            None,
+        )
+        .expect("spawn leader");
+        let leader_id = leader.surface_id.clone();
+        manager.insert_surface(leader);
+        let member_id = manager
+            .ensure("durable-project-member", &cat_agent_spec())
+            .expect("ensure agent")
+            .surface_id;
+
+        let host = Arc::new(PeerHost::new(manager));
+        host.set_persist_path(tmp.path().join("peer-workspaces.json"));
+
+        let (mut owner_reader, mut owner_writer) = handshake_as(
+            host.clone(),
+            capability::supported_vec(),
+            vec![0x42; 16],
+        )
+        .await;
+        write_envelope(
+            &mut owner_writer,
+            &Envelope {
+                seq: 10,
+                correlation_id: 0,
+                payload: Some(Payload::UpsertProjectPresentationRequest(
+                    UpsertProjectPresentationRequest {
+                        request_id: vec![0x10; 16],
+                        project: Some(Team {
+                            name: "durable-demo".into(),
+                            team_uuid: "uuid-durable-demo".into(),
+                            working_directory: "/tmp".into(),
+                            project_root: "/tmp".into(),
+                            agent_names: vec!["worker".into()],
+                            leader_surface_id: leader_id.clone(),
+                            members: vec![TeamMember {
+                                name: "worker".into(),
+                                agent_instance_id: "worker-instance".into(),
+                                cli: "codex".into(),
+                                working_directory: "/tmp".into(),
+                                surface_id: member_id.clone(),
+                                surface_type: "agent".into(),
+                                ..Default::default()
+                            }],
+                            project_id: "name:durable-demo".into(),
+                            ..Default::default()
+                        }),
+                    },
+                )),
+            },
+        )
+        .await
+        .expect("publish manifest");
+        match recv(&mut owner_reader).await.payload {
+            Some(Payload::UpsertProjectPresentationResponse(response)) => {
+                assert!(response.ok, "{}", response.error_code);
+                assert_eq!(response.revision, 1);
+            }
+            other => panic!("expected upsert response, got {other:?}"),
+        }
+        drop(owner_reader);
+        drop(owner_writer);
+
+        let (mut viewer_reader, mut viewer_writer) = handshake_as(
+            host,
+            capability::supported_vec(),
+            vec![0x43; 16],
+        )
+        .await;
+        write_envelope(
+            &mut viewer_writer,
+            &Envelope {
+                seq: 20,
+                correlation_id: 0,
+                payload: Some(Payload::ListTeams(ListTeams {})),
+            },
+        )
+        .await
+        .expect("list projects");
+        let project = match recv(&mut viewer_reader).await.payload {
+            Some(Payload::TeamList(list)) => {
+                assert_eq!(list.teams.len(), 1);
+                list.teams.into_iter().next().expect("project")
+            }
+            other => panic!("expected team list, got {other:?}"),
+        };
+        assert_eq!(project.name, "durable-demo");
+        assert_eq!(project.leader_surface_id, leader_id);
+        assert_eq!(project.members.len(), 1);
+        assert_eq!(project.members[0].surface_id, member_id);
+        assert!(!project.presentation_owned_by_requester);
+
+        let attached = attach(&mut viewer_reader, &mut viewer_writer, 21, member_id, 0).await;
+        assert!(attached.accepted, "{}", attached.reason);
     }
 
     async fn recv(reader: &mut OwnedReadHalf) -> Envelope {
