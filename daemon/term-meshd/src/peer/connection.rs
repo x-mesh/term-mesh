@@ -1442,7 +1442,7 @@ pub(crate) fn team_call_allowed(method: &str) -> bool {
 }
 
 /// `team.leader.v1` starts with the generic peer ceiling and adds only the
-/// lifecycle methods protected by a project/team-bound grant. Keep this
+/// operations protected by a project/team-bound grant. Keep this
 /// separate from `team_call_allowed`: widening generic peer calls would let
 /// an unscoped machine spawn processes.
 pub(crate) fn team_leader_call_allowed(method: &str) -> bool {
@@ -3749,7 +3749,7 @@ mod team_call_allow_list_tests {
     }
 
     #[test]
-    fn scoped_leader_gate_allows_add_without_opening_generic_lifecycle() {
+    fn scoped_leader_gate_allows_granted_operations_without_opening_generic_peer_access() {
         assert!(team_leader_call_allowed("team.add_agent"));
         assert!(team_leader_call_allowed("team.send_key"));
         assert!(!team_call_allowed("team.add_agent"));

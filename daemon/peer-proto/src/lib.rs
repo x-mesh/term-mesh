@@ -155,7 +155,7 @@ pub mod team_leader {
     pub const GRANT_ID_BYTES: usize = 32;
     pub const MAX_BOOTSTRAP_PAYLOAD_BYTES: usize = 512;
     /// Extra methods available only through a project-bound leader grant.
-    /// Generic `team.call.v1` must continue to reject these lifecycle calls.
+    /// Generic `team.call.v1` must continue to reject these scoped operations.
     pub const SCOPED_METHODS: &[&str] = &["team.add_agent", "team.send_key"];
 
     pub fn scoped_method_allowed(method: &str) -> bool {
