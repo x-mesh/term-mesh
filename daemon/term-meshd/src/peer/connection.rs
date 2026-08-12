@@ -4574,15 +4574,24 @@ mod agent_surface_tests {
         expected: usize,
     ) -> Vec<u8> {
         let mut acc = Vec::with_capacity(expected);
+        let mut wire_bytes = 0_u64;
         while acc.len() < expected {
             match recv(reader).await.payload {
                 Some(Payload::PtyData(data)) => {
                     assert_eq!(data.surface_id, surface_id);
                     assert_eq!(
                         data.byte_seq,
-                        acc.len() as u64,
+                        wire_bytes,
                         "wire byte_seq must tile the payload bytes"
                     );
+                    wire_bytes += data.payload.len() as u64;
+                    if serde_json::from_slice(&data.payload)
+                        .ok()
+                        .as_ref()
+                        .is_some_and(tm_agent_bridge::location::is_environment_diagnostic)
+                    {
+                        continue;
+                    }
                     acc.extend_from_slice(&data.payload);
                 }
                 Some(Payload::WorkspaceUpdate(_)) => continue,
@@ -4810,11 +4819,8 @@ mod agent_surface_tests {
             other => panic!("expected WorkspaceMeta, got {other:?}"),
         }
         send_keys(&mut writer, 31, agent_id.clone(), b"go\n".to_vec()).await;
-        let final_data = recv(&mut reader).await;
-        match final_data.payload {
-            Some(Payload::PtyData(data)) => assert_eq!(data.payload, b"final\n"),
-            other => panic!("expected final PtyData, got {other:?}"),
-        }
+        let final_data = collect_pty_data(&mut reader, &agent_id, b"final\n".len()).await;
+        assert_eq!(final_data, b"final\n");
 
         let unexpected = tokio::time::timeout(
             std::time::Duration::from_millis(200),
@@ -5010,34 +5016,34 @@ mod agent_surface_tests {
         let agent_id = outcome.surface_id.clone();
         let first_line = b"{\"a\":1}\n".to_vec();
         let second_line = b"{\"b\":2}\n".to_vec();
-        let total = (first_line.len() + second_line.len()) as u64;
-
-        // Both lines must be buffered before the resume asks for the cut.
-        tokio::time::timeout(IO_TIMEOUT, async {
-            while outcome.surface.current_byte_seq() < total {
+        // Precondition for the boundary claim: the ring buffered the
+        // environment diagnostic and then one chunk per child line, so the
+        // resume point below IS a chunk boundary.
+        let ring = tokio::time::timeout(IO_TIMEOUT, async {
+            loop {
+                let ring = outcome.surface.replay_snapshot();
+                if ring.len() >= 3 {
+                    break ring;
+                }
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
         })
         .await
         .expect("agent output must reach the ring");
-
-        // Precondition for the boundary claim: the ring buffered the
-        // stream as one chunk per line, so the resume point below IS a
-        // chunk boundary.
-        let ring: Vec<Vec<u8>> = outcome
-            .surface
-            .replay_snapshot()
-            .into_iter()
-            .map(|chunk| chunk.bytes)
-            .collect();
-        assert_eq!(ring, vec![first_line.clone(), second_line.clone()]);
+        let diagnostic_len = ring[0].bytes.len() as u64;
+        assert!(serde_json::from_slice(&ring[0].bytes)
+            .ok()
+            .as_ref()
+            .is_some_and(tm_agent_bridge::location::is_environment_diagnostic));
+        assert_eq!(ring[1].bytes, first_line);
+        assert_eq!(ring[2].bytes, second_line);
 
         let host = Arc::new(PeerHost::new(manager.clone()));
         let (mut reader, mut writer) = handshake(host, capability::supported_vec()).await;
 
         // The client saw the first event before its connection died;
         // resume from the exact start of the second one.
-        let resume_at = first_line.len() as u64;
+        let resume_at = diagnostic_len + first_line.len() as u64;
         let granted = attach(&mut reader, &mut writer, 10, agent_id.clone(), resume_at).await;
         assert!(granted.accepted, "{}", granted.reason);
         assert_eq!(
@@ -5105,10 +5111,10 @@ mod agent_surface_tests {
         let agent_id = outcome.surface_id.clone();
         let expected = b"{\"a\":1}\n{\"b\":2}\n".to_vec();
 
-        // Both lines must be in the ring before the attach asks to resume
-        // past them.
+        // The environment diagnostic and both child lines must be in the
+        // ring before the attach asks to resume past them.
         tokio::time::timeout(IO_TIMEOUT, async {
-            while outcome.surface.current_byte_seq() < expected.len() as u64 {
+            while outcome.surface.replay_snapshot().len() < 3 {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
         })

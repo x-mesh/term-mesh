@@ -1293,6 +1293,19 @@ class termmesh:
             params["leader_directory"] = leader_directory
         return dict(self._call("debug.project.create", params) or {})
 
+    def debug_project_delete(self, team_name: str) -> dict:
+        return dict(self._call("debug.project.delete", {"team": team_name}) or {})
+
+    def debug_project_remote_presentations(self, host: str) -> List[Dict[str, Any]]:
+        result = dict(self._call("debug.project.remote_presentations", {"host": host}) or {})
+        return list(result.get("projects") or [])
+
+    def debug_project_adopt_remote(self, host: str, project_id: str) -> dict:
+        return dict(self._call("debug.project.adopt_remote", {
+            "host": host,
+            "project_id": project_id,
+        }) or {})
+
     def team_destroy(self, team_name: str) -> dict:
         return dict(self._call("team.destroy", {"team_name": team_name}) or {})
 

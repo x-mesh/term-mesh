@@ -857,6 +857,71 @@ extension TerminalController {
         return .ok(["started": true])
     }
 
+    func v2DebugProjectRemotePresentations(params: [String: Any]) -> V2CallResult {
+        guard let handle = params["host"] as? String, !handle.isEmpty,
+              let host = RemoteHostStore.shared.sortedHosts.first(where: {
+                  $0.id == handle
+                      || $0.displayName.caseInsensitiveCompare(handle) == .orderedSame
+              })
+        else {
+            return .err(code: "invalid_params", message: "connected host is required", data: nil)
+        }
+        return .ok([
+            "host": host.id,
+            "projects": host.teams.map(Self.debugRemoteProjectDictionary),
+        ])
+    }
+
+    func v2DebugProjectAdoptRemote(params: [String: Any]) -> V2CallResult {
+        guard let handle = params["host"] as? String, !handle.isEmpty,
+              let projectID = params["project_id"] as? String, !projectID.isEmpty,
+              let tabManager,
+              let host = RemoteHostStore.shared.sortedHosts.first(where: {
+                  $0.id == handle
+                      || $0.displayName.caseInsensitiveCompare(handle) == .orderedSame
+              }),
+              let remote = host.teams.first(where: { $0.projectID == projectID })
+        else {
+            return .err(
+                code: "invalid_params",
+                message: "connected host and exact project_id are required",
+                data: nil
+            )
+        }
+        Task { @MainActor in
+            let adopted = await TeamOrchestrator.shared.adoptRemoteProjectPresentation(
+                remote,
+                host: host,
+                tabManager: tabManager
+            )
+            dlog("debug.project.adopt_remote project=\(projectID) adopted=\(adopted)")
+        }
+        return .ok([
+            "started": true,
+            "team": remote.name,
+            "project_id": remote.projectID,
+            "leader_surface_id": remote.leaderSurfaceID.base64EncodedString(),
+        ])
+    }
+
+    private static func debugRemoteProjectDictionary(_ remote: RemoteTeamSummary) -> [String: Any] {
+        [
+            "name": remote.name,
+            "team_uuid": remote.teamUUID,
+            "project_id": remote.projectID,
+            "working_directory": remote.workingDirectory,
+            "leader_surface_id": remote.leaderSurfaceID.base64EncodedString(),
+            "revision": remote.presentationRevision,
+            "members": remote.members.map { member in
+                [
+                    "name": member.name,
+                    "agent_instance_id": member.agentInstanceID,
+                    "surface_id": member.surfaceID.base64EncodedString(),
+                ] as [String: Any]
+            },
+        ]
+    }
+
     func v2DebugPeerShellInspect(params: [String: Any]) -> V2CallResult {
         guard let handle = params["host"] as? String, !handle.isEmpty,
               let host = RemoteHostStore.shared.sortedHosts.first(where: {

@@ -68,6 +68,9 @@ extension TerminalController {
             // that combination directly instead of inferring it.
             "has_sidebar_lease": RemoteHostStore.shared.hasSidebarLease(for: host.id),
             "workspace_count": host.workspaces.count,
+            // A connected transport is not enough to launch a remote CLI.
+            // The authenticated PATH metadata lands on a second round trip.
+            "launchable": host.isLaunchable,
         ]
         if case .failed(let reason) = host.connectionState {
             dict["failure_reason"] = reason
