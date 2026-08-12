@@ -286,6 +286,11 @@ pub fn environment_diagnostic_event() -> String {
     script
 }
 
+pub fn is_environment_diagnostic(value: &serde_json::Value) -> bool {
+    value.get("type").and_then(serde_json::Value::as_str) == Some("system")
+        && value.get("subtype").and_then(serde_json::Value::as_str) == Some("environment")
+}
+
 /// A name `env` will accept as an assignment rather than treat as a command.
 fn is_env_name(key: &str) -> bool {
     let mut chars = key.chars();

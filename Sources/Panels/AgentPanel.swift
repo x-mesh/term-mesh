@@ -67,6 +67,7 @@ final class AgentPanel: ObservableObject, Panel {
     var displayIcon: String? { "sparkle" }
 
     let session = AgentSession()
+    var onClose: (() -> Void)?
 
     private var focusRequest: (() -> Void)?
 
@@ -170,6 +171,8 @@ final class AgentPanel: ObservableObject, Panel {
     // MARK: - Panel
 
     func close() {
+        onClose?()
+        onClose = nil
         session.stop()
     }
 

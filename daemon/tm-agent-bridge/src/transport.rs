@@ -53,6 +53,9 @@ pub trait Transport {
     /// Why the child can no longer be spoken to, in a sentence a person can
     /// act on.
     fn failure_message(&self) -> String;
+    fn take_environment_diagnostic(&mut self) -> Option<Value> {
+        None
+    }
 }
 
 pub struct ProcessChild {
@@ -67,6 +70,7 @@ pub struct ProcessChild {
     stdin: Option<std::process::ChildStdin>,
     inbox: Receiver<Inbound>,
     stderr_lines: Arc<Mutex<VecDeque<String>>>,
+    environment_diagnostic: Option<Receiver<Value>>,
 }
 
 impl ProcessChild {
@@ -79,6 +83,7 @@ impl ProcessChild {
     pub fn spawn(argv: &[String], cwd: &str) -> std::io::Result<(Self, Receiver<()>)> {
         let located = process_location(&RemoteEnv::from_process(), argv, cwd)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+        let expect_environment_diagnostic = located.cwd.is_none();
         let (program, rest) = located
             .argv
             .split_first()
@@ -104,6 +109,7 @@ impl ProcessChild {
 
         let (tx, inbox) = mpsc::channel();
         let (exit_tx, exit_rx) = mpsc::channel();
+        let (diagnostic_tx, diagnostic_rx) = mpsc::channel();
         std::thread::spawn(move || {
             for line in BufReader::new(stdout).lines() {
                 let Ok(line) = line else { break };
@@ -114,7 +120,12 @@ impl ProcessChild {
                     continue;
                 }
                 if let Ok(Value::Object(map)) = serde_json::from_str::<Value>(line) {
-                    if tx.send(Inbound::Frame(Value::Object(map))).is_err() {
+                    let frame = Value::Object(map);
+                    if crate::location::is_environment_diagnostic(&frame) {
+                        let _ = diagnostic_tx.send(frame);
+                        continue;
+                    }
+                    if tx.send(Inbound::Frame(frame)).is_err() {
                         break;
                     }
                 }
@@ -148,6 +159,7 @@ impl ProcessChild {
                 stdin,
                 inbox,
                 stderr_lines,
+                environment_diagnostic: expect_environment_diagnostic.then_some(diagnostic_rx),
             },
             exit_rx,
         ))
@@ -237,6 +249,13 @@ impl Transport for ProcessChild {
             format!("{failure}: {detail}")
         }
     }
+
+    fn take_environment_diagnostic(&mut self) -> Option<Value> {
+        self.environment_diagnostic
+            .take()?
+            .recv_timeout(Duration::from_secs(10))
+            .ok()
+    }
 }
 
 impl Drop for ProcessChild {
@@ -265,6 +284,7 @@ pub mod testing {
         pub exit: Option<i32>,
         /// When set, `send` fails with this instead of recording the frame.
         pub send_failure: Option<String>,
+        pub environment_diagnostic: Option<Value>,
     }
 
     impl ScriptedChild {
@@ -281,6 +301,7 @@ pub mod testing {
                 alive: true,
                 exit: None,
                 send_failure: None,
+                environment_diagnostic: None,
             }
         }
 
@@ -303,8 +324,14 @@ pub mod testing {
                 alive: true,
                 exit: None,
                 send_failure: None,
+                environment_diagnostic: None,
             };
             (child, tx)
+        }
+
+        pub fn with_environment_diagnostic(mut self, event: Value) -> Self {
+            self.environment_diagnostic = Some(event);
+            self
         }
     }
 
@@ -333,6 +360,10 @@ pub mod testing {
             self.send_failure
                 .clone()
                 .unwrap_or_else(|| "agent process exited".to_string())
+        }
+
+        fn take_environment_diagnostic(&mut self) -> Option<Value> {
+            self.environment_diagnostic.take()
         }
     }
 }

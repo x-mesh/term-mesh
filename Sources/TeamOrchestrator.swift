@@ -1610,6 +1610,7 @@ final class TeamOrchestrator: ObservableObject {
             stopRemoteLeaderGrantKeepalive(teamName: name, revoke: true)
             teams.removeValue(forKey: name)
         }
+        AgentEnvironmentComparisonStore.reset(teamName: name)
 
         // Validate that all required CLI binaries are available
         let cliTypes = Set(agents.map { $0.cli.isEmpty ? "claude" : $0.cli })
@@ -6160,6 +6161,7 @@ final class TeamOrchestrator: ObservableObject {
             heartbeats.removeValue(forKey: name)
             TeamDataStore.shared.unregisterTeam(name)
             RemoteProjectLocationStore.shared.forget(teamName: name)
+            AgentEnvironmentComparisonStore.reset(teamName: name)
             syncTeamStateToDaemon()
             return true
         }
@@ -6209,6 +6211,7 @@ final class TeamOrchestrator: ObservableObject {
         // inherit paths it never created. Anything left on a peer is still
         // reclaimable there with `tm-agent gc`.
         RemoteProjectLocationStore.shared.forget(teamName: name)
+        AgentEnvironmentComparisonStore.reset(teamName: name)
 
         // Clean up dynamic kiro agent profiles
         Self.cleanupKiroProfiles(teamName: name)

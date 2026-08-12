@@ -60,6 +60,12 @@ enum RemoteAgentEnvironmentShell {
         return assignments.isEmpty ? "" : "export \(assignments); "
     }
 
+    static func presenceOverlay(_ environment: [String: String]) -> [String: String] {
+        Dictionary(uniqueKeysWithValues: AgentEnvironmentSummary.visibleKeys.compactMap { key in
+            environment[key] == nil ? nil : (key, "present")
+        })
+    }
+
     static func loginPrelude(
         profileFailureAction: String,
         agentEnvFailureAction: String
@@ -113,9 +119,49 @@ enum RemoteAgentEnvironmentShell {
 @MainActor
 enum AgentEnvironmentComparisonStore {
     private static var leaderByTeam: [String: AgentEnvironmentSummary] = [:]
+    private typealias NativeObserver = (
+        summary: AgentEnvironmentSummary,
+        update: (String?) -> Void
+    )
+    private static var nativeByTeam: [String: [UUID: NativeObserver]] = [:]
 
     static func recordLeader(_ summary: AgentEnvironmentSummary, teamName: String) {
         leaderByTeam[teamName] = summary
+        notifyNatives(teamName: teamName)
+    }
+
+    static func clearLeader(teamName: String) {
+        leaderByTeam.removeValue(forKey: teamName)
+        notifyNatives(teamName: teamName)
+    }
+
+    static func reset(teamName: String) {
+        leaderByTeam.removeValue(forKey: teamName)
+        nativeByTeam.removeValue(forKey: teamName)
+    }
+
+    static func recordNative(
+        _ summary: AgentEnvironmentSummary,
+        teamName: String,
+        id: UUID,
+        update: @escaping (String?) -> Void
+    ) {
+        nativeByTeam[teamName, default: [:]][id] = (summary, update)
+        update(mismatchForNative(summary, teamName: teamName))
+    }
+
+    static func removeNative(teamName: String, id: UUID) {
+        nativeByTeam[teamName]?.removeValue(forKey: id)
+        if nativeByTeam[teamName]?.isEmpty == true {
+            nativeByTeam.removeValue(forKey: teamName)
+        }
+    }
+
+    private static func notifyNatives(teamName: String) {
+        guard let observers = nativeByTeam[teamName] else { return }
+        for observer in observers.values {
+            observer.update(mismatchForNative(observer.summary, teamName: teamName))
+        }
     }
 
     static func mismatchForNative(

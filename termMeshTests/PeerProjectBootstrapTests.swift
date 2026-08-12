@@ -949,7 +949,7 @@ final class PeerProjectBootstrapTests: XCTestCase {
     }
 
     @MainActor
-    func test_remote_leader_launch_exports_route_to_final_cli_without_visible_grant_stage() {
+    func test_remote_leader_launch_exports_route_to_final_cli_without_visible_grant_stage() throws {
         var grant = Termmesh_Peer_V1_TeamLeaderGrant()
         grant.grantID = Data(repeating: 0xab, count: 32)
         grant.projectID = "name:demo"
@@ -967,7 +967,7 @@ final class PeerProjectBootstrapTests: XCTestCase {
 
         XCTAssertFalse(prepare.contains("abab"), "the visible preparation must contain no grant")
         XCTAssertEqual(prepare, "unset HISTFILE; stty -echo")
-        XCTAssertTrue(launch.hasPrefix("export TERMMESH_LEADER_GRANT_ID="))
+        XCTAssertTrue(launch.hasPrefix("export TERMMESH_SAVED_"))
         XCTAssertTrue(launch.contains(#"getent passwd "$(id -u)""#))
         XCTAssertTrue(launch.contains(#"exec "$term_mesh_login_shell" -l -c"#))
         XCTAssertTrue(launch.contains(#"export SHELL="$term_mesh_login_shell""#))
@@ -975,6 +975,13 @@ final class PeerProjectBootstrapTests: XCTestCase {
         XCTAssertTrue(launch.contains("$HOME/.config/term-mesh/agent-env"))
         XCTAssertTrue(launch.contains("[term-mesh environment]"))
         XCTAssertTrue(launch.contains("present="))
+        let profile = try XCTUnwrap(launch.range(of: "$HOME/.config/term-mesh/agent-env"))
+        let protected = try XCTUnwrap(
+            launch.range(of: "TERMMESH_LEADER_GRANT_ID=", options: .backwards)
+        )
+        XCTAssertLessThan(profile.lowerBound, protected.lowerBound)
+        let loginShell = try XCTUnwrap(launch.range(of: #"exec "$term_mesh_login_shell" -l -c"#))
+        XCTAssertFalse(launch[loginShell.lowerBound...].contains(String(repeating: "ab", count: 32)))
         XCTAssertFalse(launch.contains("exec /bin/sh -lc"))
         // The model is shell-quoted, and this whole launch is then quoted again
         // for `sh -lc` — so the inner quotes arrive escaped. One level is

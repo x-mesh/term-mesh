@@ -274,6 +274,44 @@ final class AgentSessionTests: XCTestCase {
         XCTAssertFalse(session.environmentSummary?.liveActivityText.contains("UNRECOGNIZED") == true)
     }
 
+    @MainActor
+    func testEnvironmentPresenceOverlayAndComparisonClearCarryNoValues() {
+        let overlay = RemoteAgentEnvironmentShell.presenceOverlay([
+            "AI_MESH_API_KEY": "super-secret",
+            "UNRELATED": "also-secret",
+        ])
+        XCTAssertEqual(overlay, ["AI_MESH_API_KEY": "present"])
+        XCTAssertFalse(String(describing: overlay).contains("super-secret"))
+
+        let leader = AgentEnvironmentSummary(
+            shell: "zsh", profileFallback: "loaded", agentEnv: "loaded",
+            presentKeys: ["AI_MESH_API_KEY"]
+        )
+        let native = AgentEnvironmentSummary(
+            shell: "zsh", profileFallback: "loaded", agentEnv: "missing",
+            presentKeys: []
+        )
+        AgentEnvironmentComparisonStore.recordLeader(leader, teamName: "reused-team")
+        XCTAssertNotNil(AgentEnvironmentComparisonStore.mismatchForNative(native, teamName: "reused-team"))
+        var observed: String?
+        AgentEnvironmentComparisonStore.recordNative(
+            native, teamName: "reused-team", id: UUID()
+        ) { observed = $0 }
+        XCTAssertNotNil(observed)
+        AgentEnvironmentComparisonStore.clearLeader(teamName: "reused-team")
+        XCTAssertNil(observed)
+        XCTAssertNil(AgentEnvironmentComparisonStore.mismatchForNative(native, teamName: "reused-team"))
+        let removedID = UUID()
+        var removedUpdates = 0
+        AgentEnvironmentComparisonStore.recordNative(
+            native, teamName: "reused-team", id: removedID
+        ) { _ in removedUpdates += 1 }
+        AgentEnvironmentComparisonStore.removeNative(teamName: "reused-team", id: removedID)
+        AgentEnvironmentComparisonStore.recordLeader(leader, teamName: "reused-team")
+        XCTAssertEqual(removedUpdates, 1)
+        AgentEnvironmentComparisonStore.reset(teamName: "reused-team")
+    }
+
     func testRemoteBridgeLaunchDescribesSSHChildWithoutMovingLocalBridgeCwd() throws {
         let launch = AgentSession.remoteBridgeLaunch(
             cli: "codex",

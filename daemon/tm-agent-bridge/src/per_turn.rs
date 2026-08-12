@@ -56,6 +56,7 @@ pub struct PerTurnBridge {
     /// the head of every turn, because for cursor every turn is a new process —
     /// which is exactly the thing this is hiding.
     opened: bool,
+    environment_reported: bool,
     log_dir: Option<PathBuf>,
     log_path: Option<PathBuf>,
 }
@@ -70,6 +71,7 @@ impl PerTurnBridge {
             out,
             thread: None,
             opened: false,
+            environment_reported: false,
             log_dir: None,
             log_path: None,
         }
@@ -332,6 +334,13 @@ impl PerTurnBridge {
             let Ok(obj) = serde_json::from_str::<Value>(line) else {
                 continue;
             };
+            if crate::location::is_environment_diagnostic(&obj) {
+                if !self.environment_reported {
+                    self.out.emit(obj);
+                    self.environment_reported = true;
+                }
+                continue;
+            }
             if let Some(session) = obj.get("session_id").and_then(Value::as_str) {
                 self.thread = Some(session.to_string());
             }
@@ -461,6 +470,15 @@ impl PerTurnBridge {
         let mut lines: Vec<String> = Vec::new();
         for line in BufReader::new(stdout).lines() {
             let Ok(line) = line else { break };
+            if let Ok(obj) = serde_json::from_str::<Value>(&line) {
+                if crate::location::is_environment_diagnostic(&obj) {
+                    if !self.environment_reported {
+                        self.out.emit(obj);
+                        self.environment_reported = true;
+                    }
+                    continue;
+                }
+            }
             // Its argument parser complains on stdout before answering.
             if line.starts_with("# Un-recognized argument") {
                 continue;
@@ -744,6 +762,21 @@ Created conversation 22222222-2222-4222-8222-222222222222\n";
             started.elapsed() < Duration::from_secs(2),
             "the watchdog has to end with the turn, not outlive it"
         );
+    }
+
+    #[test]
+    fn agy_environment_diagnostic_is_not_part_of_the_answer() {
+        let dir = tempfile::tempdir().unwrap();
+        let body = r#"echo '{"type":"system","subtype":"environment","shell":"zsh","profile_fallback":"loaded","agent_env":"loaded","present_keys":[]}'
+echo done"#;
+        let (mut b, sink) = bridge_with(PerTurnCli::Agy, fake_cli(dir.path(), body));
+
+        b.turn("hi", Duration::from_secs(10));
+
+        let events = sink.lock().unwrap();
+        assert_eq!(events.iter().filter(|e| e["subtype"] == "environment").count(), 1);
+        let result = events.iter().find(|e| e["type"] == "result").unwrap();
+        assert_eq!(result["result"], "done");
     }
 
     #[test]

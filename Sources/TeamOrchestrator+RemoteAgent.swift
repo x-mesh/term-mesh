@@ -2610,9 +2610,12 @@ extension TeamOrchestrator {
         let environmentProbe = RemoteAgentEnvironmentShell.loginPrelude(
             profileFailureAction: "term_mesh_profile_fallback=failed",
             agentEnvFailureAction: "term_mesh_agent_env=failed"
-        ) + RemoteAgentEnvironmentShell.exportAssignments(environment)
+        ) + RemoteAgentEnvironmentShell.exportAssignments(
+            RemoteAgentEnvironmentShell.presenceOverlay(environment)
+        )
             + RemoteAgentEnvironmentShell.diagnosticEvent
-        script += "; " + RemoteAgentEnvironmentShell.accountLoginShellExec(environmentProbe)
+        script += "; ( " + RemoteAgentEnvironmentShell.accountLoginShellExec(environmentProbe)
+            + " ) || true"
         do {
             let output = try await PeerHostReadinessChecker.runScript(
                 sshTarget: sshTarget,
@@ -3828,6 +3831,32 @@ extension TeamOrchestrator {
         hostDisplayName: String
     ) {
         panel.runtimeOwnership = .peerOwned(hostName: hostDisplayName)
+        let previousClose = panel.onClose
+        panel.onClose = { [weak panel] in
+            if let id = panel?.id {
+                AgentEnvironmentComparisonStore.removeNative(teamName: teamName, id: id)
+            }
+            previousClose?()
+        }
+        panel.session.onEnvironmentSummary = { [weak panel] environment in
+            RemoteWorkLog.info(
+                "Native environment: \(agentName) [\(panel?.cli ?? "agent")] — "
+                    + environment.liveActivityText
+            )
+            AgentEnvironmentComparisonStore.recordNative(
+                environment,
+                teamName: teamName,
+                id: panel?.id ?? UUID()
+            ) { [weak panel] mismatch in
+                panel?.session.setEnvironmentMismatch(mismatch)
+                if let mismatch {
+                    RemoteWorkLog.warning("\(mismatch) — team=\(teamName), agent=\(agentName)")
+                }
+            }
+        }
+        if let environment = panel.session.environmentSummary {
+            panel.session.onEnvironmentSummary?(environment)
+        }
         workspace.setPanelCustomTitle(
             panelId: panel.id,
             title: "\(Self.colorEmoji(color)) \(agentName) @\(hostDisplayName)"
@@ -5702,14 +5731,23 @@ extension TeamOrchestrator {
         hostBinDirs: [String] = []
     ) -> String {
         let hexGrant = grant.grantID.map { String(format: "%02x", $0) }.joined()
-        let exports = [
-            "TERMMESH_LEADER_GRANT_ID=\(shellQuoted(hexGrant))",
-            "TERMMESH_LEADER_PROJECT_ID=\(shellQuoted(grant.projectID))",
-            "TERMMESH_LEADER_TEAM_UUID=\(shellQuoted(grant.teamUuid))",
-            "TERMMESH_LEADER_EXPIRES_AT=\(grant.expiresAtUnixSecs)",
-            "TERMMESH_LEADER_PEER_ID=\(shellQuoted(PeerIdentity.hexString(PeerIdentity.defaultPeerID())))",
-            "TERMMESH_TEAM=\(shellQuoted(teamName))",
-        ].joined(separator: " ")
+        let protectedValues = [
+            ("TERMMESH_LEADER_GRANT_ID", hexGrant),
+            ("TERMMESH_LEADER_PROJECT_ID", grant.projectID),
+            ("TERMMESH_LEADER_TEAM_UUID", grant.teamUuid),
+            ("TERMMESH_LEADER_EXPIRES_AT", String(grant.expiresAtUnixSecs)),
+            ("TERMMESH_LEADER_PEER_ID", PeerIdentity.hexString(PeerIdentity.defaultPeerID())),
+            ("TERMMESH_TEAM", teamName),
+        ]
+        let savedPrefix = "TERMMESH_SAVED_"
+            + UUID().uuidString.replacingOccurrences(of: "-", with: "_")
+        let savedExports = protectedValues.map { key, value in
+            "\(savedPrefix)_\(key)=\(shellQuoted(value))"
+        }.joined(separator: " ")
+        let restoreProtected = protectedValues.map { key, _ in
+            let saved = "\(savedPrefix)_\(key)"
+            return "export \(key)=\"$\(saved)\"; unset \(saved); "
+        }.joined()
         let launch = remoteAgentCommand(
             cli: cli,
             model: model,
@@ -5735,9 +5773,10 @@ extension TeamOrchestrator {
             profileFailureAction: failure,
             agentEnvFailureAction: failure
         ) + RemoteAgentEnvironmentShell.exportAssignments(environment)
+            + restoreProtected
             + RemoteAgentEnvironmentShell.terminalDiagnostic
             + launch
-        return "export \(exports); \(remoteAccountLoginShellExec(inner))"
+        return "export \(savedExports); " + remoteAccountLoginShellExec(inner)
     }
 
     static func remoteAccountLoginShellExec(_ command: String) -> String {
