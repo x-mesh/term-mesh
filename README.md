@@ -9,7 +9,7 @@
 </p>
 
 <p align="center">
-  Run multiple AI coding agents in parallel with sandboxed worktrees, real-time resource monitoring, and a unified dashboard — all powered by a native GPU-accelerated terminal.
+  Run a team of AI coding agents in parallel — each in its own sandboxed worktree, on this Mac or on any machine you can SSH into — from one native, GPU-accelerated terminal.
 </p>
 
 <p align="center">
@@ -41,6 +41,23 @@ Built on [Ghostty](https://ghostty.org) (libghostty) for Metal GPU-accelerated t
   <img src="docs/assets/vertical-horizontal-tabs-and-splits.png" width="800" alt="Vertical tabs and split panes">
 </p>
 
+### Agent Panes
+An agent does not have to be a terminal you read. A native pane renders the conversation itself: streaming answers, tool calls you can fold away, file edits drawn as a coloured diff, and the cost and elapsed time of each finished turn. Claude speaks the protocol directly; codex, kiro, cursor and agy go through a bridge. Prefer the raw terminal? Settings → Agent Teams → Agent Panes switches back.
+
+### Agent Teams
+One leader, several workers, and a task board they share. The leader delegates, the workers reply with a fixed five-field header (`STATUS` / `FILES` / `VERIFY` / `NEXT` / `FULL_REPORT`), and the app files each reply where the leader can collect it. Workers can sit on different machines than the leader.
+
+```bash
+tm-agent create 3 --adopt          # this pane becomes the leader, three workers join
+tm-agent add reviewer --cli codex  # add one more, on a different CLI
+tm-agent add builder --host jw-server --dir /root/build   # …or a different machine
+tm-agent delegate executor 'implement T1'
+tm-agent wait --timeout 120 --mode any
+```
+
+### Projects
+Point at a repository and a machine, and term-mesh does the rest: clone (or reuse a folder), lay out one worktree per agent, start the leader, and open the team in a workspace. The destination field browses the remote machine's folders, and the branch field completes with Tab.
+
 ### Notification Rings
 Visual notification rings on sidebar tabs alert you when agents need attention — completed tasks, errors, or prompts waiting for input.
 
@@ -70,8 +87,19 @@ Monitoring dashboard available as a **split panel** in-app (Cmd+Shift+D) or **st
 ### Socket API
 Full control via Unix socket and HTTP REST API — automate tab creation, pane management, notifications, and more from scripts or other tools.
 
-### Peer Federation (Mac → Mac handoff)
-Attach another machine's term-mesh from your menu bar — the host's split layout opens in a relay window on your laptop, with live PTY streams in every pane. Drive remote panes with the usual keybindings (Cmd+D split, Cmd+T new tab, Cmd+W close, divider drag, click-to-focus, tab strip switching), and let `ssh -L` tunnel the wire so any host you can SSH into works as a peer. Bonjour LAN discovery and a recent-hosts dropdown make reconnecting a one-keystroke job; auto-reconnect handles sleep/wake and network blips. See [docs/peer-federation-user-guide.md](docs/peer-federation-user-guide.md) for the practical primer.
+### Peer hosts (Mac and Linux)
+Attach another machine from your menu bar — its split layout opens in a relay window on your laptop, with live PTY streams in every pane. Drive remote panes with the usual keybindings (Cmd+D split, Cmd+T new tab, Cmd+W close, divider drag, click-to-focus, tab strip switching). `ssh -L` tunnels the wire, so any host you can SSH into works; Bonjour discovery and a recent-hosts list make reconnecting one keystroke, and auto-reconnect covers sleep/wake and network blips.
+
+A **Mac** peer serves from the app itself. A **Linux** peer runs `term-meshd`, installed by one command:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/x-mesh/term-mesh/main/scripts/install-linux.sh | bash
+```
+
+That also installs `tm-agent` and the agent bridge, so the machine can host agents and not just terminals. Edit Peer Host runs a health check that reports what it found — which binaries, which versions, whether a pane's `PATH` can reach them — instead of leaving a silent failure to guess at. See [docs/peer-linux-host.md](docs/peer-linux-host.md) and the [peer federation primer](docs/peer-federation-user-guide.md).
+
+### Remote agents
+An agent can run on a peer while its pane lives here. The far machine owns the process, so quitting term-mesh does not end the work — reopen and the pane reattaches to the session still running there. Environment values an agent needs (API keys, for instance) travel as a file that the launcher sources and deletes, never as `ssh` command-line arguments, which every other process on that machine can read.
 
 ## Architecture
 
@@ -105,6 +133,22 @@ Attach another machine's term-mesh from your menu bar — the host's split layou
 │  └──────────────────────────────────────────────────┘   │
 └──────────────────────────────────────────────────────────┘
 ```
+
+A peer is the same picture with the terminal on the other end of an SSH tunnel.
+The pane is local; the shell, the agent, and the files are not:
+
+```
+   this Mac                                    peer host
+┌──────────────┐                        ┌────────────────────┐
+│  pane / UI   │                        │  Mac: the app      │
+│  agent panel │◀── ssh -L ── peer ────▶│  Linux: term-meshd │
+│              │      protocol          │                    │
+│  leader ─────┼── delegate / collect ─▶│  shell · agent CLI │
+└──────────────┘                        │  worktrees         │
+                                        └────────────────────┘
+```
+
+The far side owns the process. Quitting here does not end the work there.
 
 ## Install
 
@@ -163,10 +207,12 @@ Auto-updates (Sparkle) handle subsequent versions.
 
 | Component | Version | Notes |
 |-----------|---------|-------|
-| macOS | 13 Ventura+ | Metal 2 required |
+| macOS | 14 Sonoma+ | Metal 2 required |
 | Xcode | 15+ | Swift 5.9+ |
-| Rust | stable 1.75+ | edition 2021 |
+| Rust | stable 1.88+ | edition 2021 |
 | Zig | 0.15+ | For libghostty build |
+
+A peer host needs none of the above — see [Peer hosts](#peer-hosts-mac-and-linux).
 
 ## Quick Start
 
@@ -185,6 +231,8 @@ cd daemon && cargo run --bin term-meshd
 ## CLI Usage
 
 The `term-mesh` CLI controls the app via Unix socket. Install location: `~/bin/term-mesh`
+
+Two more ship beside it: `tm-agent` drives agent teams (see [Agent Teams](#agent-teams)), and `term-mesh-run` wraps a command in a PTY. Homebrew symlinks all three into `$(brew --prefix)/bin`.
 
 ### Running Commands (PTY Wrapper)
 
@@ -341,26 +389,25 @@ Socket path: `$TMPDIR/term-meshd.sock`
 ## Project Structure
 
 ```
-daemon/
-  term-meshd/src/
-    main.rs          # Daemon entry point
-    socket.rs        # Unix Socket JSON-RPC server
-    http.rs          # HTTP/REST API server (axum)
-    monitor.rs       # CPU/memory monitoring + Budget Guard
-    tokens.rs        # JSONL usage tracking + cost calculation
-    watcher.rs       # FSEvents file heatmap
-    worktree.rs      # Git worktree orchestration
-  term-mesh-cli/src/
-    main.rs          # CLI entry point
-    pty.rs           # PTY wrapper
-Sources/
-  DashboardController.swift   # WKWebView dashboard + PID tracking
-  TermMeshDaemon.swift         # Swift RPC client
-Resources/
-  dashboard/index.html         # Dashboard UI (Chart.js)
-scripts/
-  setup.sh                     # Initial build setup
-  reload.sh                    # Rebuild and reload
+Sources/                 # the macOS app (Swift + AppKit + SwiftUI)
+  TeamOrchestrator*.swift    # teams, delegation, remote leaders and agents
+  Peer*.swift                # peer hosts: discovery, tunnels, health, panes
+  Panels/                    # agent panes, terminal panes, browser panes
+  GhosttyTerminalView.swift  # libghostty surface hosting
+  TerminalController*.swift  # the socket API the CLI talks to
+
+daemon/                  # Rust
+  term-meshd/            # the daemon: monitoring, worktrees, peer serving
+  term-mesh-cli/         # `term-mesh` and `tm-agent`
+  term-mesh-peer-relay/  # the helper a remote pane runs
+  tm-agent-bridge/       # agent CLIs that do not speak the protocol natively
+  peer-proto/            # wire types, shared with Swift
+
+swift/PeerProto/         # the peer protocol, Swift side
+vendor/bonsplit/         # the split/tab layout engine (vendored, not a submodule)
+ghostty/                 # libghostty (submodule, JINWOO-J/ghostty fork)
+scripts/                 # setup.sh, reload*.sh, install-linux.sh, release tooling
+docs/                    # peer federation, Linux hosts, protocol notes
 ```
 
 ## Build & Test
