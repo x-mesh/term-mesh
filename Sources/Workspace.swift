@@ -459,9 +459,14 @@ final class Workspace: Identifiable {
                             // `executor` panes) resolve to the exact pane the
                             // user clicked rather than the first by name.
                             Task { @MainActor in
-                                _ = await TeamOrchestrator.shared.restartAgentPaneHard(
+                                let result = await TeamOrchestrator.shared.restartAgentPaneHard(
                                     panelId: panelId
                                 )
+                                if case .failure(let error) = result {
+                                    RemoteWorkLog.error(
+                                        "Could not restart \(agent.agentName): \(error.message)"
+                                    )
+                                }
                             }
                         }
                     }
@@ -2792,6 +2797,7 @@ final class Workspace: Identifiable {
     func openRemoteAgentPane(
         session: PeerPaneSession,
         orientation: SplitOrientation = .horizontal,
+        insertFirst: Bool = false,
         focus: Bool = true,
         from explicitSourcePanelId: UUID? = nil
     ) -> AgentPanel? {
@@ -2816,6 +2822,7 @@ final class Workspace: Identifiable {
         guard let panel = newAgentSplit(
             from: sourcePanelId,
             orientation: orientation,
+            insertFirst: insertFirst,
             agentName: Self.remoteAgentPaneTitle(
                 surfaceTitle: session.surfaceTitle, agentCli: cli, hostLabel: hostLabel
             ),

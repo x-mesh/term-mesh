@@ -2279,6 +2279,43 @@ final class PeerOwnedAgentSurfaceTests: XCTestCase {
         )
     }
 
+    @MainActor
+    func test_restartSpec_usesAFreshEnsureKeyWithoutChangingAgentIdentity() {
+        let agentInstanceID = "11111111-2222-3333-4444-555555555555"
+        let surfaceInstanceID = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+        let binaries = TeamOrchestrator.RemoteAgentBinaries(
+            execPath: "/usr/local/bin/codex",
+            bridgePath: "/usr/local/bin/tm-agent-bridge",
+            cliAvailable: true
+        )
+        let original = TeamOrchestrator.peerAgentSurfaceSpec(
+            teamName: "my-team",
+            agentInstanceId: agentInstanceID,
+            cli: "codex",
+            workingDirectory: "/work",
+            model: "gpt-5",
+            binaries: binaries
+        )
+        let replacement = TeamOrchestrator.peerAgentSurfaceSpec(
+            teamName: "my-team",
+            agentInstanceId: agentInstanceID,
+            surfaceInstanceId: surfaceInstanceID,
+            cli: "codex",
+            workingDirectory: "/work",
+            model: "gpt-5",
+            binaries: binaries
+        )
+
+        XCTAssertNotEqual(original.key, replacement.key)
+        XCTAssertEqual(
+            replacement.key,
+            TeamOrchestrator.peerAgentEnsureKey(
+                teamName: "my-team", agentInstanceId: surfaceInstanceID
+            )
+        )
+        XCTAssertEqual(original.args, replacement.args)
+    }
+
     // MARK: Probe parsing
 
     /// A login shell prints its own greeting around the answer, and
@@ -2876,14 +2913,11 @@ final class PeerOwnedAgentLifecycleTests: XCTestCase {
         }
     }
 
-    /// A hard restart can only build a LOCAL pane: it resolves this Mac's CLI
-    /// binary, hands it a working directory that exists on the peer, and calls
-    /// a spawn that takes no host at all. Completing that swap would also
-    /// overwrite the member with one carrying no `remoteSurfaceID` — throwing
-    /// away the only handle on a bridge that is in no workspace tree and no
-    /// `ManagedPeerSurfaceStore`, so no sweep could ever find it.
+    /// A peer-owned hard restart must replace the pane inside its live peer
+    /// workspace. If that workspace is gone, fail before spawning anything and
+    /// keep the old surface addressable so the user does not lose the session.
     @MainActor
-    func test_recycle_refusesAPeerOwnedAgentInsteadOfRelocatingIt() async {
+    func test_peerOwnedRestartRequiresLiveWorkspaceBeforeReplacement() async {
         let orchestrator = TeamOrchestrator.shared
         let teamName = "peer-owned-recycle-\(UUID().uuidString.prefix(8))"
         defer { orchestrator.forgetTeamForTests(teamName) }
@@ -2914,13 +2948,13 @@ final class PeerOwnedAgentLifecycleTests: XCTestCase {
             agentName: "reviewer"
         )
         guard case .failure(let error) = outcome else {
-            return XCTFail("a peer-owned agent must not be respawned as a local pane")
+            return XCTFail("a peer-owned agent without a live workspace must not be replaced")
         }
-        XCTAssertEqual(error.code, "peer_owned_agent")
+        XCTAssertEqual(error.code, "workspace_missing")
         XCTAssertEqual(
             orchestrator.teams[teamName]?.agents.first?.remoteSurfaceID,
             Data(repeating: 0x5A, count: 16),
-            "the refusal must leave the surface id in the roster — it is the last "
+            "the failure must leave the surface id in the roster — it is the last "
                 + "thing that can address the bridge"
         )
     }
