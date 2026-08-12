@@ -2837,7 +2837,13 @@ final class Workspace: Identifiable {
         let relay = session.relaySession
         let agentSession = panel.session
         let panelId = panel.id
+        let activityTitle = panel.title
         remoteAgentPaneSessions[panelId] = session
+        agentSession.onTurnFailure = { detail in
+            RemoteWorkLog.info(
+                "Native agent turn failed: \(activityTitle) — \(detail)"
+            )
+        }
         // Reattach is the drop path, deliberately: the pane's AgentSession is
         // fixed for the panel's life and `consume` is not idempotent, so a
         // replayed stream needs a fresh pane. Dropping here rebuilds it

@@ -1862,10 +1862,52 @@ final class AgentSessionTests: XCTestCase {
     func testAFailedTurnIsMarkedFailed() throws {
         let s = session([event(["type": "result", "subtype": "error",
                                 "is_error": true, "result": "refused"])])
+        guard case .notice(_, let detail) = try XCTUnwrap(s.entries.first) else {
+            return XCTFail("expected the failure reason before the footer")
+        }
+        XCTAssertEqual(detail, "refused")
         guard case .turnEnded(_, let end) = try XCTUnwrap(s.entries.last) else {
             return XCTFail("expected a turn end")
         }
         XCTAssertTrue(end.failed)
+    }
+
+    func testAFailedTurnReportsItsReasonToObservers() {
+        var reported: String?
+        let s = AgentSession()
+        s.onTurnFailure = { reported = $0 }
+        s.ingestForTesting(event([
+            "type": "result", "subtype": "error", "is_error": true,
+            "stop_reason": "failed", "result": "Missing environment variable: AI_MESH_API_KEY",
+        ]))
+
+        XCTAssertEqual(reported, "Missing environment variable: AI_MESH_API_KEY")
+    }
+
+    func testFailedTurnDiagnosticsRedactCredentials() {
+        var reported: String?
+        let s = AgentSession()
+        s.onTurnFailure = { reported = $0 }
+        s.ingestForTesting(event([
+            "type": "result", "is_error": true,
+            "result": "request failed with API_KEY=do-not-log-this",
+        ]))
+
+        XCTAssertEqual(reported, "request failed with API_KEY=[redacted]")
+    }
+
+    func testAFailedTurnShowsOnlyTheReasonAfterStreamedText() {
+        let s = session([
+            blockStart(0, "text"), delta(0, "partial answer"), blockStop(0),
+            event(["type": "result", "subtype": "error", "is_error": true,
+                   "stop_reason": "failed", "result": "partial answer\n\nprovider unavailable"]),
+        ])
+
+        let notices = s.entries.compactMap { entry -> String? in
+            if case .notice(_, let text) = entry { return text }
+            return nil
+        }
+        XCTAssertEqual(notices, ["provider unavailable"])
     }
 
     // MARK: - The session banner

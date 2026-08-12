@@ -939,6 +939,12 @@ final class AgentSession {
     /// side reads its own header out of this; the session does not interpret it.
     @ObservationIgnored var onTurnEnd: ((String, TurnEnd, String?) -> Void)?
 
+    /// Called with the reason a failed turn reported.
+    ///
+    /// The transcript shows the same reason. Remote panes also wire this to
+    /// Live Activity so a failure remains diagnosable after the pane closes.
+    @ObservationIgnored var onTurnFailure: ((String) -> Void)?
+
     // MARK: - Turn-state writes
     //
     // `@Observable` invalidates on *assignment*, not on change. The turn
@@ -2369,6 +2375,20 @@ final class AgentSession {
             entries[position] = .tool(id: id, call)
         }
         openTools.removeAll()
+        let spoken = saidThisTurn.joined(separator: "\n")
+        let final = o["result"] as? String ?? spoken
+        if failed, let detail = Self.failureDetail(
+            final: final,
+            alreadyShown: spoken,
+            stop: reason
+        ) {
+            let diagnostic = Self.middleBounded(
+                Self.redactingCredentials(detail),
+                maxUTF8Bytes: 2_000
+            )
+            append(.notice(id: UUID(), diagnostic))
+            onTurnFailure?(diagnostic)
+        }
         append(.turnEnded(id: UUID(), end))
         setThinking(false)
         turnInFlight = false
@@ -2376,7 +2396,6 @@ final class AgentSession {
         stopRequested = false
         // `result` carries the final answer as a clean string — the boundary is
         // stated rather than inferred from a screen going quiet.
-        let final = o["result"] as? String ?? saidThisTurn.joined(separator: "\n")
         saidThisTurn.removeAll()
         let answered = currentTaskId
         currentTaskId = nil
@@ -2389,6 +2408,30 @@ final class AgentSession {
             let next = queued.removeFirst()
             try? write(next.text, from: .leader, taskId: next.taskId)
         }
+    }
+
+    /// Return only the failed turn detail that the transcript has not already
+    /// drawn from assistant events. Bridges put provider errors in
+    /// `result.result`; treating that field as callback-only left a red
+    /// `failed` footer with the actual cause invisible.
+    nonisolated static func failureDetail(
+        final: String,
+        alreadyShown: String,
+        stop: String
+    ) -> String? {
+        let final = final.trimmingCharacters(in: .whitespacesAndNewlines)
+        let shown = alreadyShown.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !final.isEmpty else {
+            return stop.isEmpty ? "the agent reported a failed turn" : "the agent reported: \(stop)"
+        }
+        guard !shown.isEmpty else { return final }
+        guard final != shown else { return nil }
+        if final.hasPrefix(shown) {
+            let remainder = final.dropFirst(shown.count)
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            return remainder.isEmpty ? nil : remainder
+        }
+        return final
     }
 
     /// Take the header out of the answers this turn produced, and return it.
