@@ -258,6 +258,19 @@ public final class BonsplitController {
         guard let (pane, tabIndex) = findTabInternal(tabId) else { return false }
         return closeTab(tabId, with: tabIndex, in: pane)
     }
+
+    /// Close a tab without consulting the delegate's user-facing vetoes.
+    /// Internal rollback paths use this after creating a tab that must not
+    /// survive a failed transaction. The normal did-close notification still
+    /// runs so the owner's panel maps and resources are cleaned consistently.
+    @discardableResult
+    public func forceCloseTab(_ tabId: TabID) -> Bool {
+        guard let (pane, _) = findTabInternal(tabId) else { return false }
+        internalController.closeTab(tabId.id, inPane: pane.id)
+        delegate?.splitTabBar(self, didCloseTab: tabId, fromPane: pane.id)
+        notifyGeometryChange()
+        return true
+    }
     
     /// Close a tab by ID in a specific pane.
     /// - Parameter tabId: The tab to close

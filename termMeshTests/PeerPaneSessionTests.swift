@@ -2959,6 +2959,89 @@ final class PeerOwnedAgentLifecycleTests: XCTestCase {
         )
     }
 
+    /// A remote ensure can take long enough for another agent to be added or
+    /// detached. Committing the old Team value would erase that newer change;
+    /// the replacement must patch only the member it originally observed.
+    @MainActor
+    func test_peerOwnedRestartRosterCASPreservesConcurrentMembersAndRejectsStaleTarget() {
+        let orchestrator = TeamOrchestrator.shared
+        let teamName = "peer-owned-restart-cas-\(UUID().uuidString.prefix(8))"
+        defer { orchestrator.forgetTeamForTests(teamName) }
+
+        let oldPanelID = UUID()
+        let oldSurfaceID = Data(repeating: 0x41, count: 16)
+        let replacementPanelID = UUID()
+        let replacementSurfaceID = Data(repeating: 0x42, count: 16)
+        let siblingSurfaceID = Data(repeating: 0x51, count: 16)
+        let old = TeamOrchestrator.AgentMember(
+            id: "reviewer@\(teamName)",
+            agentInstanceId: "reviewer-instance",
+            name: "reviewer",
+            teamName: teamName,
+            cli: "codex",
+            launchCommand: "codex",
+            model: "sonnet",
+            agentType: "reviewer",
+            color: "green",
+            instructions: "",
+            workspaceId: UUID(),
+            panelId: oldPanelID,
+            createdAt: Date(),
+            remoteSurfaceID: oldSurfaceID,
+            remoteSurfaceSpawned: true,
+            remoteAgentSurface: true,
+            hostKey: "ssh:root@peer"
+        )
+        let sibling = TeamOrchestrator.AgentMember(
+            id: "tester@\(teamName)",
+            agentInstanceId: "tester-instance",
+            name: "tester",
+            teamName: teamName,
+            cli: "claude",
+            launchCommand: "claude",
+            model: "sonnet",
+            agentType: "tester",
+            color: "blue",
+            instructions: "",
+            workspaceId: old.workspaceId,
+            panelId: UUID(),
+            createdAt: Date(),
+            remoteSurfaceID: siblingSurfaceID,
+            remoteSurfaceSpawned: true,
+            remoteAgentSurface: true,
+            hostKey: "ssh:root@peer"
+        )
+        var replacement = old
+        replacement.panelId = replacementPanelID
+        replacement.remoteSurfaceID = replacementSurfaceID
+        orchestrator.installTeamForTests(name: teamName, agents: [old, sibling])
+
+        guard let current = orchestrator.teams[teamName],
+              let updated = TeamOrchestrator.teamByReplacingPeerOwnedAgent(
+                  current: current,
+                  expected: old,
+                  replacement: replacement
+              ) else {
+            return XCTFail("the live target should be replaceable")
+        }
+        XCTAssertEqual(updated.agents.count, 2)
+        XCTAssertEqual(updated.agents[0].panelId, replacementPanelID)
+        XCTAssertEqual(updated.agents[1].remoteSurfaceID, siblingSurfaceID)
+
+        XCTAssertNil(TeamOrchestrator.teamByReplacingPeerOwnedAgent(
+            current: updated,
+            expected: old,
+            replacement: replacement
+        ), "a stale completion must not overwrite the already replaced member")
+        let rolledBack = TeamOrchestrator.teamByReplacingPeerOwnedAgent(
+            current: updated,
+            expected: replacement,
+            replacement: old
+        )
+        XCTAssertEqual(rolledBack?.agents[0].panelId, oldPanelID)
+        XCTAssertEqual(rolledBack?.agents[1].remoteSurfaceID, siblingSurfaceID)
+    }
+
     /// Detach/delete/destroy all funnel through this: a member whose bridge
     /// the peer owns gets the terminate, and nothing else does. A local native
     /// agent has no peer surface, and a borrowed (not spawned) surface belongs

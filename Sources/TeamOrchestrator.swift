@@ -5440,23 +5440,67 @@ final class TeamOrchestrator: ObservableObject {
                 migratingAgents.remove(teamAgentKey)
                 return .failure(error)
             case .success(let replacement):
+                func discardReplacement() {
+                    discardPeerOwnedAgentRestart(replacement, workspace: workspace)
+                }
+
+                // The remote ensure crossed several awaits. The window may
+                // have closed, or another lifecycle operation may have
+                // replaced/detached this member in the meantime.
+                guard tabManager.tabs.contains(where: { $0 === workspace }),
+                      let current = teams[teamName]
+                else {
+                    discardReplacement()
+                    migratingAgents.remove(teamAgentKey)
+                    return .failure(.workspaceMissing)
+                }
                 var member = replacement.member
                 member.completedTaskCount = 0
-                team.agents[idx] = member
-                teams[teamName] = team
-                TeamDataStore.shared.registerTeam(
-                    teamName,
-                    agents: team.agents.map {
-                        .init(name: $0.name, instanceId: $0.agentInstanceId)
-                    }
-                )
-                syncTeamStateToDaemon()
+                guard let updated = Self.teamByReplacingPeerOwnedAgent(
+                    current: current,
+                    expected: old,
+                    replacement: member
+                ) else {
+                    discardReplacement()
+                    migratingAgents.remove(teamAgentKey)
+                    return .failure(.agentNotFound)
+                }
+                teams[teamName] = updated
                 // Publish the replacement before closing the old viewer. A
                 // relay teardown can request recovery synchronously; after
                 // this swap, the old surface no longer passes the ownership
                 // check and cannot reappear beside its replacement.
                 let closed = workspace.closePanel(oldPid, force: true)
+                guard closed else {
+                    if let published = teams[teamName],
+                       let rolledBack = Self.teamByReplacingPeerOwnedAgent(
+                           current: published,
+                           expected: member,
+                           replacement: old
+                        ) {
+                        teams[teamName] = rolledBack
+                    }
+                    discardReplacement()
+                    migratingAgents.remove(teamAgentKey)
+                    Logger.team.error(
+                        "[team.restart] mode=hard peer-owned rollback team=\(teamName, privacy: .public) agent=\(agentName, privacy: .public) oldPanel=\(oldPid.uuidString.prefix(8), privacy: .public)"
+                    )
+                    return .failure(.spawnFailed)
+                }
+                TeamDataStore.shared.registerTeam(
+                    teamName,
+                    agents: updated.agents.map {
+                        .init(name: $0.name, instanceId: $0.agentInstanceId)
+                    }
+                )
+                syncTeamStateToDaemon()
+                activatePeerOwnedAgentRestart(
+                    replacement,
+                    teamName: teamName,
+                    agentInstanceID: old.agentInstanceId
+                )
                 Self.releasePeerOwnedAgentSurface(old)
+                scheduleAgentGridEqualization(workspace: workspace)
                 migratingAgents.remove(teamAgentKey)
                 Logger.team.info(
                     "[team.restart] mode=hard peer-owned ok team=\(teamName, privacy: .public) agent=\(agentName, privacy: .public) oldPanel=\(oldPid.uuidString.prefix(8), privacy: .public) newPanel=\(replacement.panelID.uuidString.prefix(8), privacy: .public) close_ok=\(closed, privacy: .public)"

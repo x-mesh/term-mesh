@@ -1787,6 +1787,24 @@ final class Workspace: Identifiable {
         return bonsplitController.closeTab(selected.id)
     }
 
+    /// Remove a panel created inside a transaction that failed before commit.
+    /// Unlike `closePanel`, this cannot be vetoed by mirror/pin/confirmation
+    /// policy: the panel was never user-owned state. The Bonsplit did-close
+    /// callback remains the single cleanup funnel for all workspace maps.
+    @discardableResult
+    func discardPanelForRollback(_ panelId: UUID) -> Bool {
+        guard let tabId = surfaceIdFromPanelId(panelId) else {
+            if let session = remoteAgentPaneSessions.removeValue(forKey: panelId) {
+                session.relaySession.onPtyData = nil
+                session.teardown()
+            }
+            panels.removeValue(forKey: panelId)?.close()
+            panelTitles.removeValue(forKey: panelId)
+            return false
+        }
+        return bonsplitController.forceCloseTab(tabId)
+    }
+
     func paneId(forPanelId panelId: UUID) -> PaneID? {
         guard let tabId = surfaceIdFromPanelId(panelId) else { return nil }
         return bonsplitController.allPaneIds.first { paneId in

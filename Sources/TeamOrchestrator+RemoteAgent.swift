@@ -4310,6 +4310,53 @@ extension TeamOrchestrator {
     struct PeerOwnedAgentRestart {
         let panelID: UUID
         let member: AgentMember
+        let routeGrantID: Data
+    }
+
+    /// Replace exactly the peer-owned member that a hard restart observed.
+    /// The caller may have crossed several network awaits, so every unrelated
+    /// roster mutation must come from `current`, never from its old snapshot.
+    @MainActor
+    static func teamByReplacingPeerOwnedAgent(
+        current: Team,
+        expected: AgentMember,
+        replacement: AgentMember
+    ) -> Team? {
+        guard let index = current.agents.firstIndex(where: {
+            $0.agentInstanceId == expected.agentInstanceId
+                && $0.panelId == expected.panelId
+                && $0.remoteSurfaceID == expected.remoteSurfaceID
+        }) else { return nil }
+        var updated = current
+        updated.agents[index] = replacement
+        return updated
+    }
+
+    @MainActor
+    func discardPeerOwnedAgentRestart(
+        _ replacement: PeerOwnedAgentRestart,
+        workspace: Workspace
+    ) {
+        workspace.discardPanelForRollback(replacement.panelID)
+        Self.releasePeerOwnedAgentSurface(replacement.member)
+        Task {
+            await PeerTeamLeaderControlPlane.shared.revokeGrant(
+                id: replacement.routeGrantID
+            )
+        }
+    }
+
+    @MainActor
+    func activatePeerOwnedAgentRestart(
+        _ replacement: PeerOwnedAgentRestart,
+        teamName: String,
+        agentInstanceID: String
+    ) {
+        startRemoteAgentRouteKeepalive(
+            teamName: teamName,
+            agentInstanceID: agentInstanceID,
+            grantID: replacement.routeGrantID
+        )
     }
 
     /// Replace a peer-owned native agent with a fresh bridge/session while
@@ -4474,15 +4521,14 @@ extension TeamOrchestrator {
         replacement.remoteSurfaceID = surfaceID
         replacement.remoteSurfaceSpawned = true
         replacement.remoteAgentSurface = true
-        startRemoteAgentRouteKeepalive(
-            teamName: team.id,
-            agentInstanceID: agent.agentInstanceId,
-            grantID: routeGrant.grantID
-        )
+        // Ownership moves to the caller. It starts this grant only after the
+        // roster swap and old-pane close both commit; until then the old
+        // surface's keepalive must remain valid for rollback.
         grantOwned = false
-        scheduleAgentGridEqualization(workspace: workspace)
         return .success(PeerOwnedAgentRestart(
-            panelID: panel.id, member: replacement
+            panelID: panel.id,
+            member: replacement,
+            routeGrantID: routeGrant.grantID
         ))
     }
 
