@@ -1,7 +1,6 @@
 # Peer Federation — User Guide
 
-Last updated: 2026-05-06
-Branch: `feat/peer-federation`
+Last updated: 2026-08-13
 
 Peer federation lets one term-mesh.app instance ("client") attach to
 another instance ("host") and keep working in the host's panes as if
@@ -51,6 +50,12 @@ see `peer-federation.md`.
      typing aliases.
    - Recent hosts (most-recent-first) are remembered in the connect
      dialog so reconnecting is one keystroke.
+6. **Resume a daemon-hosted Project from another Mac.** A remote
+   `term-meshd` persists the Project's exact leader/member surface
+   manifest. Quit the creating app, connect to the same host from this
+   or another Mac, then select the Project in the sidebar to attach those
+   live surfaces. Closing a viewer only detaches it; only the owner may
+   delete the Project and its remote resources.
 
 ---
 
@@ -109,7 +114,8 @@ Connection state mirroring:
 
 ## Architecture (one paragraph)
 
-The host runs a Swift `PeerServer` actor on a Unix socket and
+The host runs either a Swift `PeerServer` actor or the Rust `term-meshd`
+peer server on a Unix socket and
 exposes its panes via `GhosttyPaneSurfaceProvider`, which wraps
 `tabManager.tabs[*].bonsplitController.treeSnapshot()` and the
 underlying `TerminalSurface` PTY callbacks. A length-prefixed
@@ -127,6 +133,9 @@ client's NSSplitView tree patches itself in place when the host's
 bonsplit changes (Phase W'). Control commands — split, close,
 focus, divider drag, new tab — flow back to the host on the same
 session as `WorkspaceControl` envelopes (Phase D-6 / D-7).
+Daemon-hosted Projects also persist a project-to-surface manifest, so
+their discovery and exact leader/member attachment do not depend on the
+creating app remaining open.
 
 Useful entry points if you want to read the code:
 - `proto/peer/v1/peer.proto` — wire schema (Swift + Rust bindings

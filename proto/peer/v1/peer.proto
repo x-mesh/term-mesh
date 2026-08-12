@@ -142,6 +142,11 @@ message Hello {
   // it, so an unauthenticated reader learns nothing a connection attempt would
   // not already tell it.
   string session_host_socket = 7;
+  // Previous installation IDs retained after an explicit identity rotation.
+  // Hosts may use these only to recognize ownership of an existing durable
+  // project presentation; they do not grant leader-command routing or any
+  // other peer_id-scoped authority. Bounded to 8 entries by both peers.
+  repeated bytes project_owner_aliases = 8;
 }
 
 message AuthChallenge {
@@ -970,6 +975,8 @@ message TeamMember {
 message UpsertProjectPresentationRequest {
   bytes request_id = 1;
   Team project = 2;
+  // Owner-authorized lifecycle end. Mutually exclusive with project.
+  string delete_project_id = 3;
 }
 
 message UpsertProjectPresentationResponse {

@@ -138,6 +138,9 @@ public enum PeerIncomingMessage: Sendable {
 public struct PeerSessionOptions: Sendable {
     public var displayName: String
     public var peerID: Data
+    /// Previous peer IDs used only to recover durable Project ownership after
+    /// the user explicitly rotates this installation's peer identity.
+    public var projectOwnerAliases: [Data]
     public var appVersion: String
     public var authMethod: String
     public var clientProtocolVersion: String
@@ -149,6 +152,7 @@ public struct PeerSessionOptions: Sendable {
     public init(
         displayName: String = "term-mesh-swift",
         peerID: Data = PeerIdentity.defaultPeerID(),
+        projectOwnerAliases: [Data] = PeerIdentity.previousPeerIDs(),
         appVersion: String = "0.0.1",
         authMethod: String = "ssh-passthrough",
         clientProtocolVersion: String = "1.0.0",
@@ -156,6 +160,7 @@ public struct PeerSessionOptions: Sendable {
     ) {
         self.displayName = displayName
         self.peerID = peerID
+        self.projectOwnerAliases = projectOwnerAliases
         self.appVersion = appVersion
         self.authMethod = authMethod
         self.clientProtocolVersion = clientProtocolVersion
@@ -552,6 +557,30 @@ public actor PeerSession {
         let reply = try await readFrame(
             timeoutSeconds: timeoutSeconds,
             operation: "upsertProjectPresentation"
+        )
+        guard case .upsertProjectPresentationResponse(let response) = reply.payload else {
+            throw PeerSessionError.unexpectedMessage(String(describing: reply.payload))
+        }
+        return response
+    }
+
+    /// Remove a durable project manifest owned by this installation.
+    public func deleteProjectPresentation(
+        projectID: String,
+        timeoutSeconds: TimeInterval = 10
+    ) async throws -> Termmesh_Peer_V1_UpsertProjectPresentationResponse {
+        try requireHostCapability(PeerCapability.projectPresentationV1)
+        try beginDirectResponseRPC()
+        defer { directResponseRPCInFlight = false }
+        var request = Termmesh_Peer_V1_UpsertProjectPresentationRequest()
+        request.requestID = Self.makeEnsureRequestID()
+        request.deleteProjectID = projectID
+        try await sendEnvelope { env in
+            env.upsertProjectPresentationRequest = request
+        }
+        let reply = try await readFrame(
+            timeoutSeconds: timeoutSeconds,
+            operation: "deleteProjectPresentation"
         )
         guard case .upsertProjectPresentationResponse(let response) = reply.payload else {
             throw PeerSessionError.unexpectedMessage(String(describing: reply.payload))
@@ -1410,6 +1439,7 @@ public actor PeerSession {
             var hello = Termmesh_Peer_V1_Hello()
             hello.protocolVersion = options.clientProtocolVersion
             hello.peerID = options.peerID
+            hello.projectOwnerAliases = Array(options.projectOwnerAliases.prefix(PeerIdentity.historyLimit))
             hello.displayName = options.displayName
             hello.appVersion = options.appVersion
             hello.capabilities = options.capabilities

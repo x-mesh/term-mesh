@@ -659,6 +659,7 @@ mod integration_tests {
                     app_version: "test".into(),
                     cli_bin_dirs: vec![],
                     session_host_socket: String::new(),
+                    project_owner_aliases: vec![],
                 })),
             },
         )
@@ -867,6 +868,7 @@ mod integration_tests {
                     app_version: "test".into(),
                     cli_bin_dirs: vec![],
                     session_host_socket: String::new(),
+                    project_owner_aliases: vec![],
                 })),
             },
         )
@@ -993,6 +995,7 @@ mod integration_tests {
                     app_version: "live".into(),
                     cli_bin_dirs: vec![],
                     session_host_socket: String::new(),
+                    project_owner_aliases: vec![],
                 })),
             },
         )
@@ -1186,6 +1189,7 @@ mod integration_tests {
                     app_version: "test".into(),
                     cli_bin_dirs: vec![],
                     session_host_socket: String::new(),
+                    project_owner_aliases: vec![],
                 })),
             },
         )
@@ -1285,6 +1289,7 @@ mod integration_tests {
                     app_version: "test".into(),
                     cli_bin_dirs: vec![],
                     session_host_socket: String::new(),
+                    project_owner_aliases: vec![],
                 })),
             },
         )
@@ -2137,6 +2142,7 @@ mod integration_tests {
                     app_version: "test".into(),
                     cli_bin_dirs: vec![],
                     session_host_socket: String::new(),
+                    project_owner_aliases: vec![],
                 })),
             },
         )
@@ -2501,6 +2507,7 @@ mod integration_tests {
                     app_version: "test".into(),
                     cli_bin_dirs: vec![],
                     session_host_socket: String::new(),
+                    project_owner_aliases: vec![],
                 })),
             },
         )
@@ -2717,6 +2724,7 @@ mod integration_tests {
                     app_version: "test".into(),
                     cli_bin_dirs: vec![],
                     session_host_socket: String::new(),
+                    project_owner_aliases: vec![],
                 })),
             },
         )
@@ -2796,6 +2804,7 @@ mod integration_tests {
                     app_version: "test".into(),
                     cli_bin_dirs: vec![],
                     session_host_socket: String::new(),
+                    project_owner_aliases: vec![],
                 })),
             },
         )
@@ -3175,6 +3184,7 @@ mod integration_tests {
                     app_version: "test".into(),
                     cli_bin_dirs: vec![],
                     session_host_socket: String::new(),
+                    project_owner_aliases: vec![],
                 })),
             },
         )

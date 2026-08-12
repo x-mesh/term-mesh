@@ -1607,9 +1607,28 @@ private struct SidebarPeerProjectsView: View {
             .filter(\.isConnected)
             .flatMap { host in
                 host.teams.compactMap { team in
-                    guard !team.leaderSurfaceID.isEmpty,
-                          orchestrator.teams[team.name] == nil
-                    else { return nil }
+                    guard !team.leaderSurfaceID.isEmpty else { return nil }
+                    let local = orchestrator.teams[team.name].flatMap { candidate in
+                        let localHostKey = candidate.remotePresentationHostKey ?? {
+                            if case let .peer(key) = candidate.leaderEndpoint { return key }
+                            return nil
+                        }()
+                        let localProjectID = candidate.remotePresentationProjectID
+                            ?? "name:\(candidate.id)"
+                        return TeamOrchestrator.remotePresentationIdentityMatches(
+                            localHostKey: localHostKey,
+                            localProjectID: localProjectID,
+                            remoteHostKey: host.id,
+                            remoteProjectID: team.projectID
+                        ) ? candidate : nil
+                    }
+                    guard TeamOrchestrator.shouldOfferRemoteManifest(
+                        hasLocalTeam: local != nil,
+                        localPresentationOwnedByRequester:
+                            local?.ownsRemotePresentation ?? false,
+                        localRevision: local?.remotePresentationRevision ?? 0,
+                        remoteRevision: team.presentationRevision
+                    ) else { return nil }
                     return RemoteManifestItem(host: host, team: team)
                 }
             }
@@ -1784,6 +1803,7 @@ private struct SidebarPeerProjectsView: View {
 
     private func remoteManifestRow(_ item: RemoteManifestItem) -> some View {
         let restoreKey = item.id
+        let isUpdate = orchestrator.teams[item.team.name] != nil
         return Button {
             guard !restoringTeamNames.contains(restoreKey) else { return }
             restoringTeamNames.insert(restoreKey)
@@ -1812,7 +1832,10 @@ private struct SidebarPeerProjectsView: View {
                         ProgressView().controlSize(.small)
                     }
                 }
-                Text("Open on \(item.host.displayName) · \(item.team.members.count) agents")
+                Text(
+                    "\(isUpdate ? "Update from" : "Open on") \(item.host.displayName)"
+                        + " · \(item.team.members.count) agents"
+                )
                     .font(.system(size: 9))
                     .foregroundColor(.secondary)
             }
@@ -1823,7 +1846,11 @@ private struct SidebarPeerProjectsView: View {
         .buttonStyle(.plain)
         .disabled(restoringTeamNames.contains(restoreKey))
         .accessibilityIdentifier("sidebar.projects.remote.\(item.team.name)")
-        .help("Attach the leader and agents already running on this host")
+        .help(
+            isUpdate
+                ? "Replace this viewer with the host's latest project topology"
+                : "Attach the leader and agents already running on this host"
+        )
     }
 
     @ViewBuilder
@@ -1902,17 +1929,29 @@ private struct SidebarPeerProjectsView: View {
         }
         .disabled(teamName(for: group) == nil)
         Divider()
-        Button("Delete Project…", role: .destructive) {
-            guard let teamName = teamName(for: group),
-                  let team = TeamOrchestrator.shared.teams[teamName]
-            else { return }
-            deletionTarget = SidebarProjectDeletionTarget(
-                label: group.identity.label,
-                teamName: teamName,
-                locations: team.remoteProjectLocations
-            )
+        if let teamName = teamName(for: group),
+           let team = TeamOrchestrator.shared.teams[teamName],
+           !team.ownsRemotePresentation {
+            Button("Detach Project") {
+                _ = TeamOrchestrator.shared.destroyTeam(
+                    name: teamName,
+                    tabManager: tabManager,
+                    archive: false
+                )
+            }
+        } else {
+            Button("Delete Project…", role: .destructive) {
+                guard let teamName = teamName(for: group),
+                      let team = TeamOrchestrator.shared.teams[teamName]
+                else { return }
+                deletionTarget = SidebarProjectDeletionTarget(
+                    label: group.identity.label,
+                    teamName: teamName,
+                    locations: team.remoteProjectLocations
+                )
+            }
+            .disabled(teamName(for: group) == nil)
         }
-        .disabled(teamName(for: group) == nil)
     }
 
 

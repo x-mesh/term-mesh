@@ -18,13 +18,11 @@ use peer_proto::v1::{
     workspace_update, AttachMode, AttachResult, AuthChallenge, AuthResult, CreateWorkspaceResponse,
     EnsureSurfaceError as WireEnsureError, EnsureSurfaceErrorCode, EnsureSurfaceRequest,
     EnsureSurfaceResponse, EnsureSurfaceRestartPolicy, EnsureSurfaceResult, Envelope, Error,
-    GridSnapshot, Hello, ScrollbackChunk, SurfaceExited,
-    HostStats, Pong, PtyData, SurfaceList, TerminateSurfaceError as WireTerminateError,
+    GridSnapshot, Hello, HostStats, Pong, PtyData, ScrollbackChunk, SurfaceExited, SurfaceList,
+    Team, TeamCallResponse, TeamList, TeamMember, TerminateSurfaceError as WireTerminateError,
     TerminateSurfaceErrorCode, TerminateSurfaceRequest, TerminateSurfaceResponse,
-    Team, TeamCallResponse, TeamList, TeamMember, TerminateSurfaceResult,
-    UpsertProjectPresentationResponse, Workspace, WorkspaceList,
-    WorkspaceListChanged,
-    WorkspaceMeta, WorkspaceUpdate,
+    TerminateSurfaceResult, UpsertProjectPresentationResponse, Workspace, WorkspaceList,
+    WorkspaceListChanged, WorkspaceMeta, WorkspaceUpdate,
 };
 use peer_proto::{capability, PeerCapabilities};
 use sha2::{Digest, Sha256};
@@ -141,6 +139,9 @@ async fn reader_loop(
     #[allow(unused_assignments)]
     let mut peer_capabilities = PeerCapabilities::default();
     let mut peer_id = Vec::new();
+    // Current identity followed by bounded rotation aliases. Aliases are
+    // consulted only for durable Project presentation ownership.
+    let mut project_owner_peer_ids: Vec<Vec<u8>> = Vec::new();
 
     loop {
         let env = match read_envelope(&mut reader).await {
@@ -183,7 +184,24 @@ async fn reader_loop(
                     send_error(&outgoing_tx, 102, "peer_id must be 16 bytes").await;
                     break;
                 }
+                if hello.project_owner_aliases.len() > 8
+                    || hello.project_owner_aliases.iter().any(|id| id.len() != 16)
+                {
+                    send_error(
+                        &outgoing_tx,
+                        102,
+                        "project_owner_aliases must contain at most 8 16-byte ids",
+                    )
+                    .await;
+                    break;
+                }
                 peer_id = hello.peer_id;
+                project_owner_peer_ids = vec![peer_id.clone()];
+                for alias in hello.project_owner_aliases {
+                    if !project_owner_peer_ids.contains(&alias) {
+                        project_owner_peer_ids.push(alias);
+                    }
+                }
                 peer_capabilities = PeerCapabilities::from_hello(hello.capabilities);
                 tracing::debug!(
                     "peer capabilities: {:?} (ptydata.coalesce.v1={} replay.ring.v1={})",
@@ -356,8 +374,15 @@ async fn reader_loop(
                     .pty
                     .list()
                     .into_iter()
-                    .filter_map(|surface| surface.info().attachable.then_some(surface.surface_id.clone()))
+                    .filter_map(|surface| {
+                        surface
+                            .info()
+                            .attachable
+                            .then_some(surface.surface_id.clone())
+                    })
                     .collect();
+                let project_owner_hex: HashSet<String> =
+                    project_owner_peer_ids.iter().map(hex::encode).collect();
                 for manifest in host.project_presentations() {
                     let Some(leader_surface_id) = hex::decode(&manifest.leader_surface_id)
                         .ok()
@@ -365,27 +390,33 @@ async fn reader_loop(
                     else {
                         continue;
                     };
-                    let members: Vec<TeamMember> = manifest
+                    let Some(members) = manifest
                         .members
                         .iter()
-                        .filter_map(|member| {
+                        .map(|member| {
                             let surface_id = hex::decode(&member.surface_id).ok()?;
-                            live_surface_ids.contains(&surface_id).then_some(TeamMember {
-                                name: member.name.clone(),
-                                agent_instance_id: member.agent_instance_id.clone(),
-                                cli: member.cli.clone(),
-                                model: member.model.clone(),
-                                agent_type: member.agent_type.clone(),
-                                color: member.color.clone(),
-                                working_directory: member.working_directory.clone(),
-                                surface_id,
-                                surface_type: member.surface_type.clone(),
-                            })
+                            live_surface_ids
+                                .contains(&surface_id)
+                                .then_some(TeamMember {
+                                    name: member.name.clone(),
+                                    agent_instance_id: member.agent_instance_id.clone(),
+                                    cli: member.cli.clone(),
+                                    model: member.model.clone(),
+                                    agent_type: member.agent_type.clone(),
+                                    color: member.color.clone(),
+                                    working_directory: member.working_directory.clone(),
+                                    surface_id,
+                                    surface_type: member.surface_type.clone(),
+                                })
                         })
-                        .collect();
-                    if let Some(team) = teams.iter_mut().find(|team| {
-                        team.team_uuid == manifest.team_uuid || team.name == manifest.team_name
-                    }) {
+                        .collect::<Option<Vec<TeamMember>>>()
+                    else {
+                        continue;
+                    };
+                    if let Some(team) = teams
+                        .iter_mut()
+                        .find(|team| team.team_uuid == manifest.team_uuid)
+                    {
                         team.project_id = manifest.project_id;
                         team.leader_surface_id = leader_surface_id;
                         team.agent_names =
@@ -393,7 +424,7 @@ async fn reader_loop(
                         team.members = members;
                         team.presentation_revision = manifest.revision;
                         team.presentation_owned_by_requester =
-                            manifest.owner_peer_id == hex::encode(&peer_id);
+                            project_owner_hex.contains(&manifest.owner_peer_id);
                         if team.project_root.is_empty() {
                             team.project_root = manifest.project_root;
                         }
@@ -409,8 +440,8 @@ async fn reader_loop(
                             members,
                             project_id: manifest.project_id,
                             presentation_revision: manifest.revision,
-                            presentation_owned_by_requester:
-                                manifest.owner_peer_id == hex::encode(&peer_id),
+                            presentation_owned_by_requester: project_owner_hex
+                                .contains(&manifest.owner_peer_id),
                         });
                     }
                 }
@@ -423,62 +454,130 @@ async fn reader_loop(
             }
 
             (HandshakeState::Ready, Payload::UpsertProjectPresentationRequest(request)) => {
-                let response = if !peer_capabilities
+                let (response, presentation_changed) = if !peer_capabilities
                     .has(capability::PROJECT_PRESENTATION_V1)
                 {
-                    UpsertProjectPresentationResponse {
-                        request_id: request.request_id,
-                        ok: false,
-                        error_code: "capability_unavailable".into(),
-                        error_message: "project.presentation.v1 was not negotiated".into(),
-                        ..Default::default()
-                    }
-                } else if request.request_id.len() != 16 {
-                    UpsertProjectPresentationResponse {
-                        request_id: request.request_id,
-                        ok: false,
-                        error_code: "invalid_request".into(),
-                        error_message: "request_id must be 16 bytes".into(),
-                        ..Default::default()
-                    }
-                } else if !lifecycle_request_ids.insert(request.request_id.clone()) {
-                    UpsertProjectPresentationResponse {
-                        request_id: request.request_id,
-                        ok: false,
-                        error_code: "duplicate_request_id".into(),
-                        error_message: "request_id was already used on this connection".into(),
-                        ..Default::default()
-                    }
-                } else if let Some(project) = request.project.as_ref() {
-                    match host.upsert_project_presentation(&peer_id, project) {
-                        Ok(revision) => UpsertProjectPresentationResponse {
-                            request_id: request.request_id,
-                            ok: true,
-                            revision,
-                            ..Default::default()
-                        },
-                        Err(code) => UpsertProjectPresentationResponse {
+                    (
+                        UpsertProjectPresentationResponse {
                             request_id: request.request_id,
                             ok: false,
-                            error_code: code.into(),
-                            error_message: "project presentation was rejected".into(),
+                            error_code: "capability_unavailable".into(),
+                            error_message: "project.presentation.v1 was not negotiated".into(),
                             ..Default::default()
                         },
+                        false,
+                    )
+                } else if request.request_id.len() != 16 {
+                    (
+                        UpsertProjectPresentationResponse {
+                            request_id: request.request_id,
+                            ok: false,
+                            error_code: "invalid_request".into(),
+                            error_message: "request_id must be 16 bytes".into(),
+                            ..Default::default()
+                        },
+                        false,
+                    )
+                } else if !lifecycle_request_ids.insert(request.request_id.clone()) {
+                    (
+                        UpsertProjectPresentationResponse {
+                            request_id: request.request_id,
+                            ok: false,
+                            error_code: "duplicate_request_id".into(),
+                            error_message: "request_id was already used on this connection".into(),
+                            ..Default::default()
+                        },
+                        false,
+                    )
+                } else if !request.delete_project_id.is_empty() {
+                    if request.project.is_some() {
+                        (
+                            UpsertProjectPresentationResponse {
+                                request_id: request.request_id,
+                                ok: false,
+                                error_code: "invalid_manifest".into(),
+                                error_message:
+                                    "project and delete_project_id are mutually exclusive".into(),
+                                ..Default::default()
+                            },
+                            false,
+                        )
+                    } else {
+                        match host.delete_project_presentation(
+                            &project_owner_peer_ids,
+                            &request.delete_project_id,
+                        ) {
+                            Ok(changed) => (
+                                UpsertProjectPresentationResponse {
+                                    request_id: request.request_id,
+                                    ok: true,
+                                    ..Default::default()
+                                },
+                                changed,
+                            ),
+                            Err(code) => (
+                                UpsertProjectPresentationResponse {
+                                    request_id: request.request_id,
+                                    ok: false,
+                                    error_code: code.into(),
+                                    error_message: "project presentation deletion was rejected"
+                                        .into(),
+                                    ..Default::default()
+                                },
+                                false,
+                            ),
+                        }
+                    }
+                } else if let Some(project) = request.project.as_ref() {
+                    match host.upsert_project_presentation(&project_owner_peer_ids, project) {
+                        Ok((revision, changed)) => (
+                            UpsertProjectPresentationResponse {
+                                request_id: request.request_id,
+                                ok: true,
+                                revision,
+                                ..Default::default()
+                            },
+                            changed,
+                        ),
+                        Err(code) => (
+                            UpsertProjectPresentationResponse {
+                                request_id: request.request_id,
+                                ok: false,
+                                error_code: code.into(),
+                                error_message: "project presentation was rejected".into(),
+                                ..Default::default()
+                            },
+                            false,
+                        ),
                     }
                 } else {
-                    UpsertProjectPresentationResponse {
-                        request_id: request.request_id,
-                        ok: false,
-                        error_code: "invalid_manifest".into(),
-                        error_message: "project is required".into(),
-                        ..Default::default()
-                    }
+                    (
+                        UpsertProjectPresentationResponse {
+                            request_id: request.request_id,
+                            ok: false,
+                            error_code: "invalid_manifest".into(),
+                            error_message: "project is required".into(),
+                            ..Default::default()
+                        },
+                        false,
+                    )
                 };
-                send(&outgoing_tx, Envelope {
-                    seq: next_seq(&seq_counter),
-                    correlation_id: env.seq,
-                    payload: Some(Payload::UpsertProjectPresentationResponse(response)),
-                }).await?;
+                send(
+                    &outgoing_tx,
+                    Envelope {
+                        seq: next_seq(&seq_counter),
+                        correlation_id: env.seq,
+                        payload: Some(Payload::UpsertProjectPresentationResponse(response)),
+                    },
+                )
+                .await?;
+                if presentation_changed {
+                    // The workspace roster stream also acts as a cheap
+                    // invalidation signal for the team roster. Its payload is
+                    // already understood by connected clients, which then
+                    // perform a debounced ListTeams refresh.
+                    host.broadcast_workspace_roster();
+                }
             }
 
             (HandshakeState::Ready, Payload::TeamCallRequest(request)) => {
@@ -492,10 +591,7 @@ async fn reader_loop(
                         ok: false,
                         result_json: String::new(),
                         error_code: "method_not_allowed".to_string(),
-                        error_message: format!(
-                            "{} is not callable by a peer",
-                            request.method
-                        ),
+                        error_message: format!("{} is not callable by a peer", request.method),
                     }
                 } else if let Some(manager) = host.team_manager() {
                     run_headless_team_call(
@@ -504,7 +600,7 @@ async fn reader_loop(
                         &request.method,
                         &request.params_json,
                     )
-                        .await
+                    .await
                 } else {
                     TeamCallResponse {
                         ok: false,
@@ -583,7 +679,12 @@ async fn reader_loop(
                 // and authoritative baseline. It avoids a response RPC racing
                 // the receive loop that will consume future pushes.
                 if !peer_capabilities.has(capability::WORKSPACE_LIST_SUBSCRIBE_V1) {
-                    send_error(&outgoing_tx, 106, "workspace roster subscription not negotiated").await;
+                    send_error(
+                        &outgoing_tx,
+                        106,
+                        "workspace roster subscription not negotiated",
+                    )
+                    .await;
                     continue;
                 }
                 // Flip before the baseline goes out. Layout pushes only reach
@@ -596,7 +697,9 @@ async fn reader_loop(
                     Envelope {
                         seq: next_seq(&seq_counter),
                         correlation_id: 0,
-                        payload: Some(Payload::WorkspaceListChanged(WorkspaceListChanged { workspaces })),
+                        payload: Some(Payload::WorkspaceListChanged(WorkspaceListChanged {
+                            workspaces,
+                        })),
                     },
                 )
                 .await?;
@@ -686,8 +789,7 @@ async fn reader_loop(
                         correlation_id: env.seq,
                         payload: Some(Payload::AttachResult(AttachResult {
                             accepted: false,
-                            reason: "agent surface requires capability surface.agent.v1"
-                                .into(),
+                            reason: "agent surface requires capability surface.agent.v1".into(),
                             surface_id: req.surface_id.clone(),
                             initial_seq: 0,
                             granted_mode: AttachMode::Unspecified as i32,
@@ -731,8 +833,7 @@ async fn reader_loop(
                         correlation_id: env.seq,
                         payload: Some(Payload::AttachResult(AttachResult {
                             accepted: false,
-                            reason: "agent surface requires capability surface.agent.v1"
-                                .into(),
+                            reason: "agent surface requires capability surface.agent.v1".into(),
                             surface_id: req.surface_id.clone(),
                             initial_seq: 0,
                             granted_mode: AttachMode::Unspecified as i32,
@@ -829,8 +930,7 @@ async fn reader_loop(
                 // reset its wire-gap baseline, neither of which is safe to
                 // infer from a byte stream. Everyone else gets the same
                 // bytes on the Stage-1 PtyData path.
-                let typed_snapshot_ok =
-                    peer_capabilities.has(capability::GRID_SNAPSHOT_V1);
+                let typed_snapshot_ok = peer_capabilities.has(capability::GRID_SNAPSHOT_V1);
                 // (untyped ANSI chunks, typed (ansi, snap_seq) — exactly one
                 // of the two carries the fresh screen.)
                 let (replay, typed_snapshot) = if resume_from_seq != 0 {
@@ -1129,7 +1229,9 @@ fn host_stats_from(snapshot: &SystemSnapshot) -> HostStats {
     let (net_rx, net_tx) = snapshot
         .network_io
         .iter()
-        .fold((0f64, 0f64), |(rx, tx), io| (rx + io.rx_rate, tx + io.tx_rate));
+        .fold((0f64, 0f64), |(rx, tx), io| {
+            (rx + io.rx_rate, tx + io.tx_rate)
+        });
     HostStats {
         // `load_avg` is [1m, 5m, 15m]. All three travel: the 1-minute
         // figure says how busy the machine is, and the other two say
@@ -1242,7 +1344,11 @@ fn spawn_host_stats_push(
 /// Read per attach: attaches are rare, and a restartless toggle would not
 /// survive the daemon's env snapshot anyway.
 fn fresh_attach_uses_bytes() -> bool {
-    fresh_attach_mode_is_bytes(std::env::var("TERMMESH_PEER_FRESH_ATTACH_MODE").ok().as_deref())
+    fresh_attach_mode_is_bytes(
+        std::env::var("TERMMESH_PEER_FRESH_ATTACH_MODE")
+            .ok()
+            .as_deref(),
+    )
 }
 
 /// Pure decision half of [`fresh_attach_uses_bytes`], split for tests: env
@@ -1621,7 +1727,10 @@ async fn run_headless_team_call(
         }
         "team.send" => {
             let (Some(team), Some(agent)) = (team, agent) else {
-                return err("invalid_params", "team.send needs team_name and agent_name".into());
+                return err(
+                    "invalid_params",
+                    "team.send needs team_name and agent_name".into(),
+                );
             };
             let Some(text) = params.get("text").and_then(|v| v.as_str()) else {
                 return err("invalid_params", "team.send needs text".into());
@@ -1637,7 +1746,10 @@ async fn run_headless_team_call(
         }
         "team.read" => {
             let (Some(team), Some(agent)) = (team, agent) else {
-                return err("invalid_params", "team.read needs team_name and agent_name".into());
+                return err(
+                    "invalid_params",
+                    "team.read needs team_name and agent_name".into(),
+                );
             };
             let lines = params
                 .get("lines")
@@ -1655,7 +1767,10 @@ async fn run_headless_team_call(
         }
         "team.status" => {
             let (Some(team), Some(agent)) = (team, agent) else {
-                return err("invalid_params", "team.status needs team_name and agent_name".into());
+                return err(
+                    "invalid_params",
+                    "team.status needs team_name and agent_name".into(),
+                );
             };
             let mut mgr = manager.lock().await;
             let Some(agent_id) = mgr.resolve_agent_id(team, agent) else {
@@ -1731,8 +1846,7 @@ fn host_hello(seq_counter: &AtomicU64, has_teams: bool) -> Envelope {
             capabilities: capability::supported_vec()
                 .into_iter()
                 .filter(|c| {
-                    has_teams
-                        || (c != capability::TEAM_ROSTER_V1 && c != capability::TEAM_CALL_V1)
+                    has_teams || (c != capability::TEAM_ROSTER_V1 && c != capability::TEAM_CALL_V1)
                 })
                 .collect(),
             app_version: env!("CARGO_PKG_VERSION").into(),
@@ -1742,6 +1856,7 @@ fn host_hello(seq_counter: &AtomicU64, has_teams: bool) -> Envelope {
             // Naming it lets a client reach sessions here directly instead of
             // guessing a path from a socket layout it does not control.
             session_host_socket: std::env::var("TERMMESH_PEER_SOCKET").unwrap_or_default(),
+            project_owner_aliases: vec![],
         })),
     }
 }
@@ -1896,8 +2011,12 @@ impl EnsureWorkGate {
     }
 }
 
-type EnsureWorker =
-    Arc<dyn Fn(String, SurfaceSpec, Vec<(String, String)>) -> Result<EnsureOutcome, EnsureError> + Send + Sync + 'static>;
+type EnsureWorker = Arc<
+    dyn Fn(String, SurfaceSpec, Vec<(String, String)>) -> Result<EnsureOutcome, EnsureError>
+        + Send
+        + Sync
+        + 'static,
+>;
 type TerminateWorker = Arc<dyn Fn(Vec<u8>) -> Result<bool, EnsureError> + Send + Sync + 'static>;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2255,7 +2374,9 @@ fn validate_ensure_request(
         if value.contains('\0') {
             return Err(invalid("env value contains NUL"));
         }
-        env_total = env_total.saturating_add(key.len()).saturating_add(value.len());
+        env_total = env_total
+            .saturating_add(key.len())
+            .saturating_add(value.len());
         if env_total > ENSURE_ENV_TOTAL_MAX_BYTES {
             return Err(too_large("env exceeds 65536 UTF-8 bytes"));
         }
@@ -2753,9 +2874,8 @@ mod ensure_tests {
     use super::{
         admit_ensure_request_id, agent_cli_from_args, dispatch_ensure_surface,
         ensure_response_from_result, send_ensure_response, spawn_error_response,
-        validate_ensure_request, EnsureWorkGate, EnsureWorker, HandshakeState,
-        RequestIdAdmission, ENSURE_CONCURRENCY_LIMIT, ENSURE_ENV_MAX_COUNT,
-        ENSURE_REQUEST_ID_BUDGET,
+        validate_ensure_request, EnsureWorkGate, EnsureWorker, HandshakeState, RequestIdAdmission,
+        ENSURE_CONCURRENCY_LIMIT, ENSURE_ENV_MAX_COUNT, ENSURE_REQUEST_ID_BUDGET,
     };
     use crate::peer::surface::{EnsureError, SurfaceKind};
     use peer_proto::{capability, PeerCapabilities};
@@ -2800,10 +2920,15 @@ mod ensure_tests {
         assert_eq!(error.code, EnsureSurfaceErrorCode::InvalidRequest as i32);
 
         let mut with_env = valid_request();
-        with_env.env.insert("PROFILE_TOKEN".into(), "present".into());
+        with_env
+            .env
+            .insert("PROFILE_TOKEN".into(), "present".into());
         let (_, env_spec, env) = validate_ensure_request(with_env).expect("valid env");
         assert_eq!(env, vec![("PROFILE_TOKEN".into(), "present".into())]);
-        assert_ne!(env_spec.canonical_hash(), env_spec.canonical_hash_with_env(&env));
+        assert_ne!(
+            env_spec.canonical_hash(),
+            env_spec.canonical_hash_with_env(&env)
+        );
 
         let mut invalid_env = valid_request();
         invalid_env.env.insert("BAD=KEY".into(), "secret".into());
@@ -3569,7 +3694,10 @@ mod terminate_tests {
             Arc::new(AtomicU64::new(0)),
         );
 
-        assert!(task.is_none(), "capability absent — nothing should be spawned");
+        assert!(
+            task.is_none(),
+            "capability absent — nothing should be spawned"
+        );
     }
 
     /// A host with no monitor wired (every test constructor, and any
@@ -3832,8 +3960,8 @@ mod team_call_allow_list_tests {
     fn scoped_leader_methods_match_the_cli_allow_list() {
         let cli = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../term-mesh-cli/src/tm_agent.rs");
-        let source = std::fs::read_to_string(&cli)
-            .unwrap_or_else(|e| panic!("read {}: {e}", cli.display()));
+        let source =
+            std::fs::read_to_string(&cli).unwrap_or_else(|e| panic!("read {}: {e}", cli.display()));
         let body = source
             .split_once("fn remote_leader_method_allowed(method: &str) -> bool {")
             .expect("CLI remote-leader allow-list")
@@ -3935,13 +4063,9 @@ mod team_task_diff_tests {
 
     #[tokio::test]
     async fn a_host_with_no_task_board_says_so_rather_than_guessing_a_directory() {
-        let response = run_headless_team_call(
-            &manager(),
-            None,
-            "team.task.diff",
-            r#"{"task_id":"tsk_1"}"#,
-        )
-        .await;
+        let response =
+            run_headless_team_call(&manager(), None, "team.task.diff", r#"{"task_id":"tsk_1"}"#)
+                .await;
         assert!(!response.ok);
         assert_eq!(response.error_code, "unsupported_on_host");
     }
@@ -4016,7 +4140,8 @@ mod agent_surface_tests {
     use peer_proto::v1::envelope::Payload;
     use peer_proto::v1::{
         AttachMode, AttachSurface, Auth, DetachSurface, Envelope, Hello, Input, ListSurfaces,
-        ListTeams, Ping, SurfaceList, Team, TeamMember, UpsertProjectPresentationRequest,
+        ListTeams, Ping, SubscribeWorkspaceList, SurfaceList, Team, TeamMember,
+        UpsertProjectPresentationRequest,
     };
     use tempfile::TempDir;
     use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
@@ -4025,8 +4150,7 @@ mod agent_surface_tests {
     use super::{run, PeerHost, PROTOCOL_VERSION};
     use crate::peer::framing::{read_envelope, write_envelope};
     use crate::peer::surface::{
-        surface_id_from_name, EnsureRestartPolicy, PtyManager, PtySurface, SurfaceKind,
-        SurfaceSpec,
+        surface_id_from_name, EnsureRestartPolicy, PtyManager, PtySurface, SurfaceKind, SurfaceSpec,
     };
 
     const IO_TIMEOUT: Duration = Duration::from_secs(30);
@@ -4079,6 +4203,15 @@ mod agent_surface_tests {
         capabilities: Vec<String>,
         peer_id: Vec<u8>,
     ) -> (OwnedReadHalf, OwnedWriteHalf) {
+        handshake_as_with_owner_aliases(host, capabilities, peer_id, vec![]).await
+    }
+
+    async fn handshake_as_with_owner_aliases(
+        host: Arc<PeerHost>,
+        capabilities: Vec<String>,
+        peer_id: Vec<u8>,
+        project_owner_aliases: Vec<Vec<u8>>,
+    ) -> (OwnedReadHalf, OwnedWriteHalf) {
         let (client, server) = UnixStream::pair().expect("socketpair");
         tokio::spawn(async move {
             let _ = run(server, host).await;
@@ -4097,6 +4230,7 @@ mod agent_surface_tests {
                     app_version: "test".into(),
                     cli_bin_dirs: vec![],
                     session_host_socket: String::new(),
+                    project_owner_aliases,
                 })),
             },
         )
@@ -4153,12 +4287,24 @@ mod agent_surface_tests {
         let host = Arc::new(PeerHost::new(manager));
         host.set_persist_path(tmp.path().join("peer-workspaces.json"));
 
-        let (mut owner_reader, mut owner_writer) = handshake_as(
-            host.clone(),
-            capability::supported_vec(),
-            vec![0x42; 16],
+        let (mut owner_reader, mut owner_writer) =
+            handshake_as(host.clone(), capability::supported_vec(), vec![0x42; 16]).await;
+        let (mut notification_reader, mut notification_writer) =
+            handshake_as(host.clone(), capability::supported_vec(), vec![0x44; 16]).await;
+        write_envelope(
+            &mut notification_writer,
+            &Envelope {
+                seq: 9,
+                correlation_id: 0,
+                payload: Some(Payload::SubscribeWorkspaceList(SubscribeWorkspaceList {})),
+            },
         )
-        .await;
+        .await
+        .expect("subscribe before publish");
+        assert!(matches!(
+            recv(&mut notification_reader).await.payload,
+            Some(Payload::WorkspaceListChanged(_))
+        ));
         write_envelope(
             &mut owner_writer,
             &Envelope {
@@ -4167,6 +4313,7 @@ mod agent_surface_tests {
                 payload: Some(Payload::UpsertProjectPresentationRequest(
                     UpsertProjectPresentationRequest {
                         request_id: vec![0x10; 16],
+                        delete_project_id: String::new(),
                         project: Some(Team {
                             name: "durable-demo".into(),
                             team_uuid: "uuid-durable-demo".into(),
@@ -4183,7 +4330,7 @@ mod agent_surface_tests {
                                 surface_type: "agent".into(),
                                 ..Default::default()
                             }],
-                            project_id: "name:durable-demo".into(),
+                            project_id: "team:uuid-durable-demo".into(),
                             ..Default::default()
                         }),
                     },
@@ -4199,15 +4346,18 @@ mod agent_surface_tests {
             }
             other => panic!("expected upsert response, got {other:?}"),
         }
+        assert!(
+            matches!(
+                recv(&mut notification_reader).await.payload,
+                Some(Payload::WorkspaceListChanged(_))
+            ),
+            "manifest upsert must invalidate connected roster subscribers"
+        );
         drop(owner_reader);
         drop(owner_writer);
 
-        let (mut viewer_reader, mut viewer_writer) = handshake_as(
-            host,
-            capability::supported_vec(),
-            vec![0x43; 16],
-        )
-        .await;
+        let (mut viewer_reader, mut viewer_writer) =
+            handshake_as(host.clone(), capability::supported_vec(), vec![0x43; 16]).await;
         write_envelope(
             &mut viewer_writer,
             &Envelope {
@@ -4231,8 +4381,110 @@ mod agent_surface_tests {
         assert_eq!(project.members[0].surface_id, member_id);
         assert!(!project.presentation_owned_by_requester);
 
-        let attached = attach(&mut viewer_reader, &mut viewer_writer, 21, member_id, 0).await;
+        write_envelope(
+            &mut viewer_writer,
+            &Envelope {
+                seq: 21,
+                correlation_id: 0,
+                payload: Some(Payload::UpsertProjectPresentationRequest(
+                    UpsertProjectPresentationRequest {
+                        request_id: vec![0x11; 16],
+                        delete_project_id: "team:uuid-durable-demo".into(),
+                        project: None,
+                    },
+                )),
+            },
+        )
+        .await
+        .expect("reject viewer deletion");
+        match recv(&mut viewer_reader).await.payload {
+            Some(Payload::UpsertProjectPresentationResponse(response)) => {
+                assert!(!response.ok);
+                assert_eq!(response.error_code, "not_owner");
+            }
+            other => panic!("expected delete response, got {other:?}"),
+        }
+
+        let attached = attach(
+            &mut viewer_reader,
+            &mut viewer_writer,
+            22,
+            member_id.clone(),
+            0,
+        )
+        .await;
         assert!(attached.accepted, "{}", attached.reason);
+
+        host.terminate_surface(&member_id)
+            .expect("terminate member");
+        assert!(
+            matches!(
+                recv(&mut notification_reader).await.payload,
+                Some(Payload::WorkspaceListChanged(_))
+            ),
+            "referenced surface death must invalidate connected roster subscribers"
+        );
+        write_envelope(
+            &mut viewer_writer,
+            &Envelope {
+                seq: 23,
+                correlation_id: 0,
+                payload: Some(Payload::ListTeams(ListTeams {})),
+            },
+        )
+        .await
+        .expect("list after member exit");
+        let list = loop {
+            match recv(&mut viewer_reader).await.payload {
+                Some(Payload::TeamList(list)) => break list,
+                // The preceding attach can leave ordinary stream metadata in
+                // flight before the correlated list response.
+                Some(Payload::WorkspaceUpdate(_))
+                | Some(Payload::PtyData(_))
+                | Some(Payload::SurfaceExited(_)) => continue,
+                other => panic!("expected team list, got {other:?}"),
+            }
+        };
+        assert!(
+            list.teams.is_empty(),
+            "a partial project manifest must not be discoverable"
+        );
+
+        let (mut owner_reader, mut owner_writer) = handshake_as_with_owner_aliases(
+            host.clone(),
+            capability::supported_vec(),
+            vec![0x45; 16],
+            vec![vec![0x42; 16]],
+        )
+        .await;
+        write_envelope(
+            &mut owner_writer,
+            &Envelope {
+                seq: 30,
+                correlation_id: 0,
+                payload: Some(Payload::UpsertProjectPresentationRequest(
+                    UpsertProjectPresentationRequest {
+                        request_id: vec![0x12; 16],
+                        delete_project_id: "team:uuid-durable-demo".into(),
+                        project: None,
+                    },
+                )),
+            },
+        )
+        .await
+        .expect("delete manifest after owner identity rotation");
+        match recv(&mut owner_reader).await.payload {
+            Some(Payload::UpsertProjectPresentationResponse(response)) => {
+                assert!(response.ok, "{}", response.error_code);
+            }
+            other => panic!("expected delete response, got {other:?}"),
+        }
+        assert!(crate::peer::persist::load_project_presentations(
+            &crate::peer::persist::project_presentations_path(
+                &tmp.path().join("peer-workspaces.json")
+            )
+        )
+        .is_empty());
     }
 
     async fn recv(reader: &mut OwnedReadHalf) -> Envelope {
@@ -4665,7 +4917,10 @@ mod agent_surface_tests {
         assert_eq!(line, b"gen\n".to_vec());
 
         let refused = attach(&mut reader, &mut writer, 11, ensured_id.clone(), 0).await;
-        assert!(!refused.accepted, "no respawn spec — raw attach cannot revive");
+        assert!(
+            !refused.accepted,
+            "no respawn spec — raw attach cannot revive"
+        );
         assert_eq!(refused.reason, "surface not found");
 
         manager.remove(&declared_id);

@@ -4,6 +4,22 @@ All notable changes to term-mesh are documented here.
 
 ## [Unreleased]
 
+**원격 Project가 창이 아니라 호스트에 남는다.** Project를 만든 Mac의 앱을 종료해도 원격 `term-meshd`가 리더·에이전트와 그 배선을 보존한다. 같은 Mac이나 다른 Mac에서 호스트에 다시 연결하면 Projects 목록에서 찾아 정확한 pane들에 다시 붙을 수 있다.
+
+### Added
+
+- **원격 Project를 다른 Mac에서도 이어서 연다** — 지금까지 원격 리더와 에이전트 프로세스는 호스트에서 계속 살아도, 어느 surface가 그 Project의 리더·멤버인지 아는 배선은 만든 Mac의 메모리에만 있었다. 앱을 종료하면 Projects 목록이 비었고, 다른 Mac은 host 아래의 개별 pane만 볼 수 있었다. 이제 호스트가 Project manifest를 영속 저장하고 live surface와 함께 제공한다. 호스트의 `term-meshd`가 떠 있는 한 앱을 종료하거나 다른 Mac으로 옮겨도 Projects에서 다시 열 수 있다.
+
+  viewer에서 Project를 닫는 것은 그 Mac의 화면만 detach한다. 원격 프로세스와 manifest를 실제로 지우는 동작은 Project owner에게만 허용한다. Peer ID를 명시적으로 재생성해도 이전 ID를 제한된 ownership alias로 보존하므로 offline host에 남은 Project가 고아가 되지 않는다.
+
+### Fixed
+
+- **원격 리더가 시작 직후 멈추거나 빠른 팀원 추가를 놓치던 문제** — 리더 launch를 PTY 입력과 분리해 staging하고, remote placement가 진행되지 않으면 다시 시작한다. 리더가 준비되자마자 실행한 `tm-agent add`와 Return 입력도 실제 leader surface에 도착했는지 확인한다.
+
+- **원격 Return 입력이 다른 pane에 전달될 수 있던 문제** — remote Return delivery를 해당 Project의 인가된 leader surface로만 제한한다.
+
+- **Project 복구가 늦으면 다른 viewer의 목록이 갱신되지 않던 문제** — daemon 재시작 뒤 surface가 manifest보다 늦게 살아나도 watcher를 다시 연결하고 roster 변경을 알려준다. 일시적으로 leader/member surface가 보이지 않는 동안 publication도 중단하지 않고 재시도한다.
+
 ## [0.185.2] - 2026-08-12
 
 ### Fixed

@@ -12,6 +12,197 @@ import PeerProto
 final class PeerPaneSessionTests: XCTestCase {
 
     @MainActor
+    func testAdoptedProjectCleanupOwnershipSeparatesOwnerFromViewer() {
+        XCTAssertTrue(TeamOrchestrator.adoptedPresentationAllowsRemoteDestruction(
+            presentationOwnedByRequester: true
+        ))
+        XCTAssertFalse(TeamOrchestrator.adoptedPresentationAllowsRemoteDestruction(
+            presentationOwnedByRequester: false
+        ))
+        XCTAssertTrue(TeamOrchestrator.adoptedAgentOwnsRemoteCleanup(
+            presentationOwnedByRequester: true,
+            surfaceType: "agent"
+        ))
+        XCTAssertFalse(TeamOrchestrator.adoptedAgentOwnsRemoteCleanup(
+            presentationOwnedByRequester: false,
+            surfaceType: "agent"
+        ))
+        XCTAssertFalse(TeamOrchestrator.adoptedAgentOwnsRemoteCleanup(
+            presentationOwnedByRequester: true,
+            surfaceType: "terminal"
+        ))
+        XCTAssertTrue(TeamOrchestrator.shouldPersistProjectPresentationSnapshot(
+            presentationOwnedByRequester: true
+        ))
+        XCTAssertFalse(TeamOrchestrator.shouldPersistProjectPresentationSnapshot(
+            presentationOwnedByRequester: false
+        ))
+        let retryDelays = TeamOrchestrator.remoteProjectManifestRetryDelaysNanoseconds
+        XCTAssertFalse(retryDelays.isEmpty)
+        XCTAssertEqual(retryDelays, retryDelays.sorted())
+        XCTAssertLessThanOrEqual(retryDelays.reduce(0, +), 30_000_000_000)
+    }
+
+    func testRemotePresentationIdentityIncludesHostAndProjectID() {
+        XCTAssertTrue(TeamOrchestrator.remotePresentationIdentityMatches(
+            localHostKey: "host-a",
+            localProjectID: "name:mesh-test",
+            remoteHostKey: "host-a",
+            remoteProjectID: "name:mesh-test"
+        ))
+        XCTAssertFalse(TeamOrchestrator.remotePresentationIdentityMatches(
+            localHostKey: "host-a",
+            localProjectID: "name:mesh-test",
+            remoteHostKey: "host-b",
+            remoteProjectID: "name:mesh-test"
+        ))
+        XCTAssertFalse(TeamOrchestrator.remotePresentationIdentityMatches(
+            localHostKey: "host-a",
+            localProjectID: "project-one",
+            remoteHostKey: "host-a",
+            remoteProjectID: "project-two"
+        ))
+    }
+
+    func testRemoteProjectPresentationIDUsesStableUUIDInsteadOfDisplayName() {
+        XCTAssertEqual(
+            TeamOrchestrator.remoteProjectPresentationID(teamUUID: "uuid-a"),
+            "team:uuid-a"
+        )
+        XCTAssertNotEqual(
+            TeamOrchestrator.remoteProjectPresentationID(teamUUID: "uuid-a"),
+            TeamOrchestrator.remoteProjectPresentationID(teamUUID: "uuid-b")
+        )
+    }
+
+    func testRemoteProjectManifestRetriesOnlyRecoverableHostState() {
+        for code in [
+            "persistence_failed",
+            "leader_surface_missing",
+            "member_surface_missing",
+            "member_surface_mismatch",
+        ] {
+            XCTAssertTrue(TeamOrchestrator.remoteProjectManifestShouldRetry(errorCode: code))
+        }
+        for code in ["not_owner", "invalid_manifest", "invalid_member"] {
+            XCTAssertFalse(TeamOrchestrator.remoteProjectManifestShouldRetry(errorCode: code))
+        }
+    }
+
+    @MainActor
+    func testRemotePresentationAttachNeedsConnectionButNotLaunchProvenance() {
+        let leaderID = Data(repeating: 0x42, count: 16)
+        XCTAssertTrue(TeamOrchestrator.remotePresentationCanAttach(
+            leaderSurfaceID: leaderID,
+            isConnected: true,
+            activeSockPath: "/tmp/direct-peer.sock"
+        ))
+        XCTAssertFalse(TeamOrchestrator.remotePresentationCanAttach(
+            leaderSurfaceID: leaderID,
+            isConnected: false,
+            activeSockPath: "/tmp/direct-peer.sock"
+        ))
+        XCTAssertFalse(TeamOrchestrator.remotePresentationCanAttach(
+            leaderSurfaceID: Data(),
+            isConnected: true,
+            activeSockPath: "/tmp/direct-peer.sock"
+        ))
+        XCTAssertTrue(TeamOrchestrator.shouldOfferRemoteManifest(
+            hasLocalTeam: false,
+            localPresentationOwnedByRequester: false,
+            localRevision: 0,
+            remoteRevision: 1
+        ))
+        XCTAssertTrue(TeamOrchestrator.shouldOfferRemoteManifest(
+            hasLocalTeam: true,
+            localPresentationOwnedByRequester: false,
+            localRevision: 1,
+            remoteRevision: 2
+        ))
+        XCTAssertFalse(TeamOrchestrator.shouldOfferRemoteManifest(
+            hasLocalTeam: true,
+            localPresentationOwnedByRequester: false,
+            localRevision: 2,
+            remoteRevision: 2
+        ))
+        XCTAssertFalse(TeamOrchestrator.shouldOfferRemoteManifest(
+            hasLocalTeam: true,
+            localPresentationOwnedByRequester: true,
+            localRevision: 0,
+            remoteRevision: 2
+        ))
+    }
+
+    @MainActor
+    func testRemoteManifestRefusesPartialOrMultiHostTopology() {
+        func member(hostKey: String?, surfaceByte: UInt8?) -> TeamOrchestrator.AgentMember {
+            TeamOrchestrator.AgentMember(
+                id: UUID().uuidString,
+                name: "reviewer",
+                teamName: "durable-demo",
+                cli: "codex",
+                launchCommand: "codex",
+                model: "gpt-5",
+                agentType: "reviewer",
+                color: "green",
+                instructions: "",
+                workspaceId: UUID(),
+                panelId: UUID(),
+                createdAt: Date(),
+                remoteSurfaceID: surfaceByte.map { Data(repeating: $0, count: 16) },
+                remoteSurfaceSpawned: true,
+                remoteAgentSurface: true,
+                hostKey: hostKey
+            )
+        }
+
+        let host = "ssh:root@jw-server"
+        XCTAssertTrue(TeamOrchestrator.remoteManifestCoversEveryAgent(
+            [member(hostKey: host, surfaceByte: 1)],
+            hostKey: host
+        ))
+        XCTAssertFalse(TeamOrchestrator.remoteManifestCoversEveryAgent(
+            [member(hostKey: "ssh:root@another-host", surfaceByte: 2)],
+            hostKey: host
+        ))
+        XCTAssertFalse(TeamOrchestrator.remoteManifestCoversEveryAgent(
+            [member(hostKey: host, surfaceByte: nil)],
+            hostKey: host
+        ))
+    }
+
+    @MainActor
+    func testRemoteManifestSignatureIgnoresTelemetryButTracksTopology() {
+        var team = TeamOrchestrator.Team(
+            id: "durable-demo",
+            leaderSessionId: "leader",
+            leaderMode: "claude",
+            leaderModel: "",
+            leaderCli: "claude",
+            leaderPanelId: UUID(),
+            leaderEndpoint: .peer(hostKey: "host-a"),
+            workingDirectory: "/srv/demo",
+            workspaceId: UUID(),
+            agents: [],
+            createdAt: Date(),
+            worktreeMode: "off",
+            teamUuid: "uuid-demo"
+        )
+        let initial = TeamOrchestrator.remoteProjectManifestSignature(team, hostKey: "host-a")
+        team.leaderReady = true
+        team.leaderFailureDescription = "telemetry only"
+        XCTAssertEqual(
+            initial,
+            TeamOrchestrator.remoteProjectManifestSignature(team, hostKey: "host-a")
+        )
+        team.gitRepoRoot = "/srv/demo-v2"
+        XCTAssertNotEqual(
+            initial,
+            TeamOrchestrator.remoteProjectManifestSignature(team, hostKey: "host-a")
+        )
+    }
+
+    @MainActor
     func testOwnedRelayReconnectBackoffRetriesImmediatelyThenCapsAtThirtySeconds() {
         XCTAssertEqual(PeerRelaySession.reconnectDelaySeconds(attempt: 1), 0)
         XCTAssertEqual(PeerRelaySession.reconnectDelaySeconds(attempt: 2), 2)

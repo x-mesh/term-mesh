@@ -665,6 +665,9 @@ final class RemoteHostStore: ObservableObject {
     /// shares a session with a response-waiting RPC: `WorkspaceListChanged`
     /// frames are pushed asynchronously and PeerSession has one reader.
     private var rosterSubscriptionTasks: [String: Task<Void, Never>] = [:]
+    /// Debounced one-shot ListTeams refreshes triggered by roster pushes.
+    /// Layout updates can be frequent, so never query once per frame.
+    private var teamRosterRefreshTasks: [String: Task<Void, Never>] = [:]
     /// Sidebar-held lease per host key: one ref that keeps the tunnel
     /// alive while the user browses workspaces. Panes/mirrors opened
     /// from here hold their own refs, so a sidebar disconnect never
@@ -1335,32 +1338,7 @@ final class RemoteHostStore: ObservableObject {
                 var teams: [RemoteTeamSummary] = []
                 if conn.hostCapabilities.has(PeerCapability.teamRosterV1) {
                     if let reported = try? await conn.session.listTeams() {
-                        teams = reported.map { team in
-                            RemoteTeamSummary(
-                                name: team.name,
-                                teamUUID: team.teamUuid,
-                                workingDirectory: team.workingDirectory,
-                                projectRootPath: team.projectRoot.isEmpty ? nil : team.projectRoot,
-                                agentNames: team.agentNames,
-                                projectID: team.projectID,
-                                leaderSurfaceID: team.leaderSurfaceID,
-                                members: team.members.map { member in
-                                    RemoteTeamSummary.Member(
-                                        name: member.name,
-                                        agentInstanceID: member.agentInstanceID,
-                                        cli: member.cli,
-                                        model: member.model,
-                                        agentType: member.agentType,
-                                        color: member.color,
-                                        workingDirectory: member.workingDirectory,
-                                        surfaceID: member.surfaceID,
-                                        surfaceType: member.surfaceType
-                                    )
-                                },
-                                presentationRevision: team.presentationRevision,
-                                presentationOwnedByRequester: team.presentationOwnedByRequester
-                            )
-                        }
+                        teams = reported.map(Self.remoteTeamSummary)
                     }
                 }
                 await conn.cancel()
@@ -1388,6 +1366,12 @@ final class RemoteHostStore: ObservableObject {
                 }
                 self.hosts[key]?.workspaces = summaries
                 self.hosts[key]?.teams = teams
+                // A connection may have recovered after the owner's initial
+                // publication attempt. Re-run publication from this concrete
+                // success event even when the team itself did not mutate.
+                TeamOrchestrator.shared.scheduleRemoteProjectManifestPublication(
+                    forHostKey: key
+                )
                 if conn.hostCapabilities.has(PeerCapability.workspaceListSubscribeV1) {
                     self.startWorkspaceSubscription(for: path, key: key)
                 }
@@ -1467,6 +1451,8 @@ final class RemoteHostStore: ObservableObject {
     private func stopWorkspaceSubscription(for key: String) {
         rosterSubscriptionTasks[key]?.cancel()
         rosterSubscriptionTasks[key] = nil
+        teamRosterRefreshTasks[key]?.cancel()
+        teamRosterRefreshTasks[key] = nil
     }
 
     private func applyWorkspaceRoster(
@@ -1490,6 +1476,62 @@ final class RemoteHostStore: ObservableObject {
                 panes: peerPaneSummaries(layout)
             )
         }
+        scheduleTeamRosterRefresh(for: hostSockPath, key: key)
+    }
+
+    private func scheduleTeamRosterRefresh(for path: String, key: String) {
+        teamRosterRefreshTasks[key]?.cancel()
+        teamRosterRefreshTasks[key] = Task { [weak self] in
+            guard let self else { return }
+            try? await Task.sleep(nanoseconds: 200_000_000)
+            guard !Task.isCancelled,
+                  self.hosts[key]?.activeSockPath == path,
+                  self.hosts[key]?.isConnected == true
+            else { return }
+            guard let connection = try? await PeerRelaySession.connect(hostSockPath: path)
+            else { return }
+            guard connection.hostCapabilities.has(PeerCapability.teamRosterV1),
+                  let reported = try? await connection.session.listTeams()
+            else {
+                await connection.cancel()
+                return
+            }
+            await connection.cancel()
+            guard !Task.isCancelled,
+                  self.hosts[key]?.activeSockPath == path,
+                  self.hosts[key]?.isConnected == true
+            else { return }
+            self.hosts[key]?.teams = reported.map(Self.remoteTeamSummary)
+        }
+    }
+
+    private nonisolated static func remoteTeamSummary(
+        _ team: Termmesh_Peer_V1_Team
+    ) -> RemoteTeamSummary {
+        RemoteTeamSummary(
+            name: team.name,
+            teamUUID: team.teamUuid,
+            workingDirectory: team.workingDirectory,
+            projectRootPath: team.projectRoot.isEmpty ? nil : team.projectRoot,
+            agentNames: team.agentNames,
+            projectID: team.projectID,
+            leaderSurfaceID: team.leaderSurfaceID,
+            members: team.members.map { member in
+                RemoteTeamSummary.Member(
+                    name: member.name,
+                    agentInstanceID: member.agentInstanceID,
+                    cli: member.cli,
+                    model: member.model,
+                    agentType: member.agentType,
+                    color: member.color,
+                    workingDirectory: member.workingDirectory,
+                    surfaceID: member.surfaceID,
+                    surfaceType: member.surfaceType
+                )
+            },
+            presentationRevision: team.presentationRevision,
+            presentationOwnedByRequester: team.presentationOwnedByRequester
+        )
     }
 
     /// A dead subscription is a stale sidebar, not an empty remote machine.

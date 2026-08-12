@@ -966,6 +966,12 @@ public nonisolated struct Termmesh_Peer_V1_Hello: Sendable {
   /// not already tell it.
   public var sessionHostSocket: String = String()
 
+  /// Previous installation IDs retained after an explicit identity rotation.
+  /// Hosts may use these only to recognize ownership of an existing durable
+  /// project presentation; they do not grant leader-command routing or any
+  /// other peer_id-scoped authority. Bounded to 8 entries by both peers.
+  public var projectOwnerAliases: [Data] = []
+
   public var unknownFields = SwiftProtobuf.UnknownStorage()
 
   public init() {}
@@ -2519,6 +2525,9 @@ public nonisolated struct Termmesh_Peer_V1_UpsertProjectPresentationRequest: Sen
   /// Clears the value of `project`. Subsequent reads from it will return its default value.
   public mutating func clearProject() {self._project = nil}
 
+  /// Owner-authorized lifecycle end. Mutually exclusive with project.
+  public var deleteProjectID: String = String()
+
   public var unknownFields = SwiftProtobuf.UnknownStorage()
 
   public init() {}
@@ -3628,7 +3637,7 @@ nonisolated extension Termmesh_Peer_V1_Envelope: SwiftProtobuf.Message, SwiftPro
 
 nonisolated extension Termmesh_Peer_V1_Hello: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
   public static let protoMessageName: String = _protobuf_package + ".Hello"
-  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{3}protocol_version\0\u{3}peer_id\0\u{3}display_name\0\u{1}capabilities\0\u{3}app_version\0\u{3}cli_bin_dirs\0\u{3}session_host_socket\0")
+  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{3}protocol_version\0\u{3}peer_id\0\u{3}display_name\0\u{1}capabilities\0\u{3}app_version\0\u{3}cli_bin_dirs\0\u{3}session_host_socket\0\u{3}project_owner_aliases\0")
 
   public mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
     while let fieldNumber = try decoder.nextFieldNumber() {
@@ -3643,6 +3652,7 @@ nonisolated extension Termmesh_Peer_V1_Hello: SwiftProtobuf.Message, SwiftProtob
       case 5: try { try decoder.decodeSingularStringField(value: &self.appVersion) }()
       case 6: try { try decoder.decodeRepeatedStringField(value: &self.cliBinDirs) }()
       case 7: try { try decoder.decodeSingularStringField(value: &self.sessionHostSocket) }()
+      case 8: try { try decoder.decodeRepeatedBytesField(value: &self.projectOwnerAliases) }()
       default: break
       }
     }
@@ -3670,6 +3680,9 @@ nonisolated extension Termmesh_Peer_V1_Hello: SwiftProtobuf.Message, SwiftProtob
     if !self.sessionHostSocket.isEmpty {
       try visitor.visitSingularStringField(value: self.sessionHostSocket, fieldNumber: 7)
     }
+    if !self.projectOwnerAliases.isEmpty {
+      try visitor.visitRepeatedBytesField(value: self.projectOwnerAliases, fieldNumber: 8)
+    }
     try unknownFields.traverse(visitor: &visitor)
   }
 
@@ -3681,6 +3694,7 @@ nonisolated extension Termmesh_Peer_V1_Hello: SwiftProtobuf.Message, SwiftProtob
     if lhs.appVersion != rhs.appVersion {return false}
     if lhs.cliBinDirs != rhs.cliBinDirs {return false}
     if lhs.sessionHostSocket != rhs.sessionHostSocket {return false}
+    if lhs.projectOwnerAliases != rhs.projectOwnerAliases {return false}
     if lhs.unknownFields != rhs.unknownFields {return false}
     return true
   }
@@ -6530,7 +6544,7 @@ nonisolated extension Termmesh_Peer_V1_TeamMember: SwiftProtobuf.Message, SwiftP
 
 nonisolated extension Termmesh_Peer_V1_UpsertProjectPresentationRequest: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
   public static let protoMessageName: String = _protobuf_package + ".UpsertProjectPresentationRequest"
-  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{3}request_id\0\u{1}project\0")
+  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{3}request_id\0\u{1}project\0\u{3}delete_project_id\0")
 
   public mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
     while let fieldNumber = try decoder.nextFieldNumber() {
@@ -6540,6 +6554,7 @@ nonisolated extension Termmesh_Peer_V1_UpsertProjectPresentationRequest: SwiftPr
       switch fieldNumber {
       case 1: try { try decoder.decodeSingularBytesField(value: &self.requestID) }()
       case 2: try { try decoder.decodeSingularMessageField(value: &self._project) }()
+      case 3: try { try decoder.decodeSingularStringField(value: &self.deleteProjectID) }()
       default: break
       }
     }
@@ -6556,12 +6571,16 @@ nonisolated extension Termmesh_Peer_V1_UpsertProjectPresentationRequest: SwiftPr
     try { if let v = self._project {
       try visitor.visitSingularMessageField(value: v, fieldNumber: 2)
     } }()
+    if !self.deleteProjectID.isEmpty {
+      try visitor.visitSingularStringField(value: self.deleteProjectID, fieldNumber: 3)
+    }
     try unknownFields.traverse(visitor: &visitor)
   }
 
   public static func ==(lhs: Termmesh_Peer_V1_UpsertProjectPresentationRequest, rhs: Termmesh_Peer_V1_UpsertProjectPresentationRequest) -> Bool {
     if lhs.requestID != rhs.requestID {return false}
     if lhs._project != rhs._project {return false}
+    if lhs.deleteProjectID != rhs.deleteProjectID {return false}
     if lhs.unknownFields != rhs.unknownFields {return false}
     return true
   }

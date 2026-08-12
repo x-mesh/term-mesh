@@ -23,18 +23,18 @@ use std::time::Duration;
 
 use peer_proto::v1::{
     envelope::Payload, workspace_control, workspace_layout, workspace_update, Envelope, PaneTab,
-    Workspace, WorkspaceControl, WorkspaceLayout, WorkspaceLayoutChanged, WorkspaceListChanged,
-    WorkspacePane, WorkspaceRemoved,
-    TeamLeaderCommandRequest, TeamLeaderCommandResponse, WorkspaceSplit, WorkspaceUpdate,
+    TeamLeaderCommandRequest, TeamLeaderCommandResponse, Workspace, WorkspaceControl,
+    WorkspaceLayout, WorkspaceLayoutChanged, WorkspaceListChanged, WorkspacePane, WorkspaceRemoved,
+    WorkspaceSplit, WorkspaceUpdate,
 };
 use tokio::sync::{mpsc, oneshot, watch};
 
-use crate::monitor::SystemSnapshot;
 use super::persist::PersistedWorkspace;
 use super::surface::{
     surface_id_from_name, EnsureError, EnsureOutcome, PtyManager, PtySurface, SpawnSpec,
     SurfaceKind, SurfaceSpec,
 };
+use crate::monitor::SystemSnapshot;
 
 pub type SurfaceId = Vec<u8>;
 
@@ -794,11 +794,7 @@ impl Broadcaster {
         self.send_to(clients, payload);
     }
 
-    fn send_to(
-        &self,
-        clients: Vec<RegisteredClient>,
-        payload: &peer_proto::v1::envelope::Payload,
-    ) {
+    fn send_to(&self, clients: Vec<RegisteredClient>, payload: &peer_proto::v1::envelope::Payload) {
         for client in clients {
             let env = Envelope {
                 seq: client.seq.fetch_add(1, Ordering::Relaxed) + 1,
@@ -1022,6 +1018,7 @@ pub struct PeerHost {
     project_presentations: Mutex<HashMap<String, super::persist::PersistedProjectPresentation>>,
     project_presentations_path: Mutex<Option<PathBuf>>,
     project_presentations_persistence: Mutex<()>,
+    project_presentation_watchers: Mutex<HashSet<Vec<u8>>>,
 }
 
 /// Debounce window for layout pushes. Mirrors the Swift host's 120 ms
@@ -1146,6 +1143,7 @@ impl PeerHost {
             project_presentations: Mutex::new(HashMap::new()),
             project_presentations_path: Mutex::new(None),
             project_presentations_persistence: Mutex::new(()),
+            project_presentation_watchers: Mutex::new(HashSet::new()),
         }
     }
 
@@ -1167,7 +1165,7 @@ impl PeerHost {
     /// after building the host, and every workspace-lifecycle mutation
     /// below (`create_workspace`/`rename_workspace`/`remove_workspace`)
     /// persists through it via `persist_workspaces`.
-    pub fn set_persist_path(&self, path: PathBuf) {
+    pub fn set_persist_path(self: &Arc<Self>, path: PathBuf) {
         self.pty
             .set_ensured_persist_path(super::persist::ensured_surfaces_path(&path));
         let project_path = super::persist::project_presentations_path(&path);
@@ -1178,11 +1176,14 @@ impl PeerHost {
         *self.project_presentations.lock().unwrap() = records;
         *self.project_presentations_path.lock().unwrap() = Some(project_path);
         *self.persist_path.lock().unwrap() = Some(path);
+        for surface in self.pty.list() {
+            if self.presentation_references_surface(&surface.surface_id) {
+                self.watch_presentation_surface(surface);
+            }
+        }
     }
 
-    pub fn project_presentations(
-        &self,
-    ) -> Vec<super::persist::PersistedProjectPresentation> {
+    pub fn project_presentations(&self) -> Vec<super::persist::PersistedProjectPresentation> {
         self.project_presentations
             .lock()
             .unwrap()
@@ -1191,16 +1192,95 @@ impl PeerHost {
             .collect()
     }
 
+    pub fn delete_project_presentation(
+        &self,
+        owner_peer_ids: &[Vec<u8>],
+        project_id: &str,
+    ) -> Result<bool, &'static str> {
+        if owner_peer_ids.is_empty()
+            || owner_peer_ids.iter().any(|id| id.len() != 16)
+            || project_id.is_empty()
+            || project_id.len() > 128
+        {
+            return Err("invalid_manifest");
+        }
+        let _persist_guard = self.project_presentations_persistence.lock().unwrap();
+        let mut records = self.project_presentations.lock().unwrap();
+        let Some(existing) = records.get(project_id) else {
+            return Ok(false);
+        };
+        if !owner_peer_ids
+            .iter()
+            .any(|peer_id| existing.owner_peer_id == hex::encode(peer_id))
+        {
+            return Err("not_owner");
+        }
+        let previous = records.remove(project_id).expect("checked above");
+        if let Some(path) = self.project_presentations_path.lock().unwrap().clone() {
+            let snapshot: Vec<_> = records.values().cloned().collect();
+            if super::persist::save_project_presentations(&path, &snapshot).is_err() {
+                records.insert(project_id.to_string(), previous);
+                return Err("persistence_failed");
+            }
+        }
+        Ok(true)
+    }
+
+    fn presentation_references_surface(&self, surface_id: &[u8]) -> bool {
+        let encoded = hex::encode(surface_id);
+        self.project_presentations
+            .lock()
+            .unwrap()
+            .values()
+            .any(|record| {
+                record.leader_surface_id == encoded
+                    || record
+                        .members
+                        .iter()
+                        .any(|member| member.surface_id == encoded)
+            })
+    }
+
+    fn watch_presentation_surface(self: &Arc<Self>, surface: Arc<PtySurface>) -> bool {
+        if !self
+            .project_presentation_watchers
+            .lock()
+            .unwrap()
+            .insert(surface.surface_id.clone())
+        {
+            return false;
+        }
+        let host = Arc::downgrade(self);
+        tokio::spawn(async move {
+            while !surface.dead.load(Ordering::Acquire) {
+                tokio::select! {
+                    _ = surface.dead_notify.notified() => {},
+                    _ = tokio::time::sleep(Duration::from_millis(100)) => {},
+                }
+            }
+            let Some(host) = host.upgrade() else { return };
+            host.project_presentation_watchers
+                .lock()
+                .unwrap()
+                .remove(&surface.surface_id);
+            if host.presentation_references_surface(&surface.surface_id) {
+                host.broadcast_workspace_roster();
+            }
+        });
+        true
+    }
+
     /// Replace one complete manifest. First writer owns the project; later
     /// updates must come from that same authenticated installation. Every
     /// named surface is checked against the live registry before persistence,
     /// so discovery can never advertise an unrelated or already-dead pane.
     pub fn upsert_project_presentation(
-        &self,
-        peer_id: &[u8],
+        self: &Arc<Self>,
+        owner_peer_ids: &[Vec<u8>],
         project: &peer_proto::v1::Team,
-    ) -> Result<u64, &'static str> {
-        if peer_id.len() != 16
+    ) -> Result<(u64, bool), &'static str> {
+        if owner_peer_ids.is_empty()
+            || owner_peer_ids.iter().any(|id| id.len() != 16)
             || project.project_id.is_empty()
             || project.project_id.len() > 128
             || project.name.is_empty()
@@ -1223,7 +1303,9 @@ impl PeerHost {
         let Some(leader) = surfaces.get(&project.leader_surface_id) else {
             return Err("leader_surface_missing");
         };
-        if !leader.info().attachable { return Err("leader_surface_missing"); }
+        if !leader.info().attachable {
+            return Err("leader_surface_missing");
+        }
 
         let mut seen_instances = HashSet::new();
         let mut seen_surfaces = HashSet::from([project.leader_surface_id.clone()]);
@@ -1266,22 +1348,29 @@ impl PeerHost {
         }
 
         let _persist_guard = self.project_presentations_persistence.lock().unwrap();
-        let owner = hex::encode(peer_id);
+        let owner = hex::encode(&owner_peer_ids[0]);
         let mut records = self.project_presentations.lock().unwrap();
         if let Some(existing) = records.get(&project.project_id) {
-            let existing_leader_is_live = hex::decode(&existing.leader_surface_id)
-                .ok()
-                .and_then(|id| surfaces.get(&id))
-                .is_some_and(|surface| surface.info().attachable);
-            if existing.owner_peer_id != owner && existing_leader_is_live {
+            // Surface liveness is not an ownership-transfer protocol. A dead
+            // leader may be replaced by its owner, but it must not turn a
+            // durable project ID into a first-writer race for other peers.
+            if !owner_peer_ids
+                .iter()
+                .any(|peer_id| existing.owner_peer_id == hex::encode(peer_id))
+            {
                 return Err("not_owner");
             }
         }
         let revision = records
             .get(&project.project_id)
             .map_or(1, |record| record.revision.saturating_add(1));
-        let record = super::persist::PersistedProjectPresentation {
-            owner_peer_id: owner,
+        let mut record = super::persist::PersistedProjectPresentation {
+            // Preserve the original owner while an alias authorizes this
+            // write. Rotation recovery must not silently rewrite ownership;
+            // that keeps every retained alias usable across offline hosts.
+            owner_peer_id: records
+                .get(&project.project_id)
+                .map_or(owner, |record| record.owner_peer_id.clone()),
             project_id: project.project_id.clone(),
             team_name: project.name.clone(),
             team_uuid: project.team_uuid.clone(),
@@ -1291,6 +1380,28 @@ impl PeerHost {
             members,
             revision,
         };
+        if let Some(existing) = records.get(&project.project_id) {
+            record.revision = existing.revision;
+            if existing == &record {
+                let existing_revision = existing.revision;
+                let watched = std::iter::once(project.leader_surface_id.as_slice())
+                    .chain(
+                        project
+                            .members
+                            .iter()
+                            .map(|member| member.surface_id.as_slice()),
+                    )
+                    .filter_map(|surface_id| surfaces.get(surface_id).cloned())
+                    .collect::<Vec<_>>();
+                drop(records);
+                let mut watchers_changed = false;
+                for surface in watched {
+                    watchers_changed |= self.watch_presentation_surface(surface);
+                }
+                return Ok((existing_revision, watchers_changed));
+            }
+            record.revision = revision;
+        }
         let previous = records.insert(project.project_id.clone(), record);
         if let Some(path) = self.project_presentations_path.lock().unwrap().clone() {
             let snapshot: Vec<_> = records.values().cloned().collect();
@@ -1303,7 +1414,20 @@ impl PeerHost {
                 return Err("persistence_failed");
             }
         }
-        Ok(revision)
+        let watched = std::iter::once(project.leader_surface_id.as_slice())
+            .chain(
+                project
+                    .members
+                    .iter()
+                    .map(|member| member.surface_id.as_slice()),
+            )
+            .filter_map(|surface_id| surfaces.get(surface_id).cloned())
+            .collect::<Vec<_>>();
+        drop(records);
+        for surface in watched {
+            self.watch_presentation_surface(surface);
+        }
+        Ok((revision, true))
     }
 
     /// Wire the daemon's system monitor so connections can push `HostStats`.
@@ -2218,8 +2342,14 @@ mod tests {
         std::fs::create_dir_all(&nested).expect("mkdir");
         std::fs::create_dir(repo.join(".git")).expect("mkdir .git");
 
-        assert_eq!(walk_to_git_root(nested.to_str().unwrap()), repo.to_string_lossy());
-        assert_eq!(walk_to_git_root(repo.to_str().unwrap()), repo.to_string_lossy());
+        assert_eq!(
+            walk_to_git_root(nested.to_str().unwrap()),
+            repo.to_string_lossy()
+        );
+        assert_eq!(
+            walk_to_git_root(repo.to_str().unwrap()),
+            repo.to_string_lossy()
+        );
     }
 
     #[test]
@@ -3296,11 +3426,9 @@ mod tests {
         let host = Arc::new(PeerHost::new(Arc::clone(&manager)));
 
         let (plain_tx, mut plain_rx) = mpsc::channel(8);
-        let _plain = host.clients.register(
-            plain_tx,
-            Arc::new(AtomicU64::new(0)),
-            vec![0xC1; 16],
-        );
+        let _plain = host
+            .clients
+            .register(plain_tx, Arc::new(AtomicU64::new(0)), vec![0xC1; 16]);
         assert!(
             !host.clients.has_roster_subscriber(),
             "registering alone must not imply a subscription"
@@ -3749,7 +3877,7 @@ mod tests {
             team_uuid: "team-uuid".into(),
             working_directory: "/tmp".into(),
             leader_surface_id: leader.surface_id.clone(),
-            project_id: "name:demo".into(),
+            project_id: "team:team-uuid".into(),
             members: vec![peer_proto::v1::TeamMember {
                 name: "executor".into(),
                 agent_instance_id: "instance-1".into(),
@@ -3762,30 +3890,104 @@ mod tests {
         };
 
         assert_eq!(
-            host.upsert_project_presentation(&[1; 16], &project),
-            Ok(1)
+            host.upsert_project_presentation(&[vec![1; 16]], &project),
+            Ok((1, true))
         );
         assert_eq!(
-            host.upsert_project_presentation(&[1; 16], &project),
-            Ok(2)
+            host.upsert_project_presentation(&[vec![1; 16]], &project),
+            Ok((1, false))
         );
         assert_eq!(
-            host.upsert_project_presentation(&[2; 16], &project),
+            host.upsert_project_presentation(&[vec![2; 16]], &project),
             Err("not_owner")
         );
         let persisted = crate::peer::persist::load_project_presentations(
             &crate::peer::persist::project_presentations_path(&workspace_path),
         );
         assert_eq!(persisted.len(), 1);
-        assert_eq!(persisted[0].revision, 2);
+        assert_eq!(persisted[0].revision, 1);
+
+        let mut changed = project.clone();
+        changed.name = "renamed".into();
+        assert_eq!(
+            host.upsert_project_presentation(&[vec![1; 16]], &changed),
+            Ok((2, true))
+        );
 
         let mut missing = project;
         missing.members[0].surface_id = vec![9; 16];
         assert_eq!(
-            host.upsert_project_presentation(&[1; 16], &missing),
+            host.upsert_project_presentation(&[vec![1; 16]], &missing),
             Err("member_surface_missing")
         );
-        host.terminate_surface(&leader.surface_id).unwrap();
+        let leader_surface = host
+            .pty
+            .list()
+            .into_iter()
+            .find(|surface| surface.surface_id == leader.surface_id)
+            .unwrap();
+        let member_surface = host
+            .pty
+            .list()
+            .into_iter()
+            .find(|surface| surface.surface_id == member.surface_id)
+            .unwrap();
+        let restarted_manager = Arc::new(PtyManager::new());
+        let restarted = Arc::new(PeerHost::new(Arc::clone(&restarted_manager)));
+        restarted.set_persist_path(workspace_path.clone());
+        restarted_manager.insert_surface(leader_surface);
+        restarted_manager.insert_surface(member_surface);
+        assert_eq!(
+            restarted.upsert_project_presentation(&[vec![1; 16]], &changed),
+            Ok((2, true))
+        );
+        let (tx, mut rx) = mpsc::channel(8);
+        let _guard = restarted.clients.register_with_roster_flag(
+            tx,
+            Arc::new(AtomicU64::new(0)),
+            vec![3; 16],
+            Arc::new(AtomicBool::new(true)),
+        );
+        restarted.terminate_surface(&leader.surface_id).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let envelope = rx.recv().await.expect("restored watcher broadcast");
+                if matches!(envelope.payload, Some(Payload::WorkspaceListChanged(_))) {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("restored watcher broadcast timeout");
+        let replacement_leader = host.ensure_surface("manifest-leader-v2", &spec).unwrap();
+        let mut takeover = changed.clone();
+        takeover.leader_surface_id = replacement_leader.surface_id.clone();
+        assert_eq!(
+            host.upsert_project_presentation(&[vec![2; 16]], &takeover),
+            Err("not_owner")
+        );
+        assert_eq!(
+            host.delete_project_presentation(&[vec![2; 16]], "team:team-uuid"),
+            Err("not_owner")
+        );
+        assert_eq!(
+            host.upsert_project_presentation(&[vec![2; 16], vec![1; 16]], &takeover),
+            Ok((3, true))
+        );
+        assert_eq!(
+            host.delete_project_presentation(&[vec![2; 16], vec![1; 16]], "team:team-uuid"),
+            Ok(true)
+        );
+        assert_eq!(
+            host.delete_project_presentation(&[vec![1; 16]], "team:team-uuid"),
+            Ok(false)
+        );
+        assert!(crate::peer::persist::load_project_presentations(
+            &crate::peer::persist::project_presentations_path(&workspace_path),
+        )
+        .is_empty());
+        host.terminate_surface(&replacement_leader.surface_id)
+            .unwrap();
         host.terminate_surface(&member.surface_id).unwrap();
     }
 

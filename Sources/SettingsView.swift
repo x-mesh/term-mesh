@@ -487,7 +487,7 @@ struct SettingsView: View {
             }
             Button("Cancel", role: .cancel) {}
         } message: {
-            Text("Existing peer pairings may stop working. Restart active peer sessions after regenerating this ID.")
+            Text("Existing peer pairings may stop working. Durable Project ownership is retained on this Mac. Restart active peer sessions after regenerating this ID.")
         }
     }
 

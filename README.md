@@ -58,6 +58,8 @@ tm-agent wait --timeout 120 --mode any
 ### Projects
 Point at a repository and a machine, and term-mesh does the rest: clone (or reuse a folder), lay out one worktree per agent, start the leader, and open the team in a workspace. The destination field browses the remote machine's folders, and the branch field completes with Tab.
 
+A Project created on a peer belongs to that host, not to the Mac window that created it. As long as the host's `term-meshd` and its sessions are running, you can quit the local app, connect again from this or another Mac, select the Project in the sidebar, and reattach its exact leader and member panes. Closing a viewer only detaches that Mac; deleting the Project from its owner ends the remote resources.
+
 ### Notification Rings
 Visual notification rings on sidebar tabs alert you when agents need attention — completed tasks, errors, or prompts waiting for input.
 
@@ -99,7 +101,7 @@ curl -fsSL https://raw.githubusercontent.com/x-mesh/term-mesh/main/scripts/insta
 That also installs `tm-agent` and the agent bridge, so the machine can host agents and not just terminals. Edit Peer Host runs a health check that reports what it found — which binaries, which versions, whether a pane's `PATH` can reach them — instead of leaving a silent failure to guess at. See [docs/peer-linux-host.md](docs/peer-linux-host.md) and the [peer federation primer](docs/peer-federation-user-guide.md).
 
 ### Remote agents
-An agent can run on a peer while its pane lives here. The far machine owns the process, so quitting term-mesh does not end the work — reopen and the pane reattaches to the session still running there. Environment values an agent needs (API keys, for instance) travel as a file that the launcher sources and deletes, never as `ssh` command-line arguments, which every other process on that machine can read.
+An agent can run on a peer while its pane lives here. The far machine owns both the process and the Project manifest that maps it back to the right leader and member panes. Quitting term-mesh does not end the work — reconnect to the host, select the Project, and the app reattaches to the sessions still running there. Environment values an agent needs (API keys, for instance) travel as a file that the launcher sources and deletes, never as `ssh` command-line arguments, which every other process on that machine can read.
 
 ## Architecture
 

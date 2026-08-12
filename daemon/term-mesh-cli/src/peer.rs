@@ -773,6 +773,7 @@ fn connect_and_authenticate(
                 cli_bin_dirs: vec![],
                 // A client owns no sessions, so it names no owner.
                 session_host_socket: String::new(),
+                project_owner_aliases: vec![],
             })),
         },
     )?;

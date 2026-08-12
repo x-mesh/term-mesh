@@ -490,6 +490,7 @@ mod tests {
                 app_version: "0.98.2".into(),
                 cli_bin_dirs: vec![],
                 session_host_socket: String::new(),
+                project_owner_aliases: vec![],
             })),
         };
 
@@ -577,6 +578,7 @@ mod tests {
                 app_version: "0.0.0".into(),
                 cli_bin_dirs: vec![],
                 session_host_socket: String::new(),
+                project_owner_aliases: vec![],
             })),
         };
         let bytes = env.encode_to_vec();
@@ -608,6 +610,7 @@ mod tests {
                 app_version: "9.9.9".into(),
                 cli_bin_dirs: vec![],
                 session_host_socket: String::new(),
+                project_owner_aliases: vec![],
             })),
         };
         let bytes = env.encode_to_vec();
@@ -634,6 +637,7 @@ mod tests {
                 app_version: "1.2.3".into(),
                 cli_bin_dirs: vec![],
                 session_host_socket: String::new(),
+                project_owner_aliases: vec![],
             })),
         };
         let bytes = env.encode_to_vec();
@@ -666,6 +670,7 @@ mod tests {
                 app_version: "0.0.0".into(),
                 cli_bin_dirs: vec![],
                 session_host_socket: String::new(),
+                project_owner_aliases: vec![],
             })),
         };
         let mut bytes = env.encode_to_vec();

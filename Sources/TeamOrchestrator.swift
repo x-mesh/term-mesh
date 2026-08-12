@@ -199,6 +199,18 @@ final class TeamOrchestrator: ObservableObject {
         /// different installation. Viewers may attach and interact, but only
         /// the original owner may rewrite the durable topology.
         var ownsRemotePresentation: Bool = true
+        /// Last daemon manifest revision materialized by this viewer. Owners
+        /// publish their live roster directly and leave this at zero.
+        var remotePresentationRevision: UInt64 = 0
+        /// Stable daemon identity for an adopted presentation. Team names are
+        /// user-facing and may collide across connected hosts, so discovery
+        /// and replacement must never use `id` alone.
+        var remotePresentationProjectID: String? = nil
+        var remotePresentationHostKey: String? = nil
+        /// Exact leader identity for an adopted daemon manifest. Non-owner
+        /// viewers keep this only in team state so the shell cleanup registry
+        /// never mistakes somebody else's process for a managed orphan.
+        var remoteLeaderSurfaceID: Data? = nil
     }
 
     struct AgentPaneIdentity: Equatable {
@@ -259,6 +271,10 @@ final class TeamOrchestrator: ObservableObject {
     /// project's surfaces. This is separate from local live snapshots: a new
     /// Mac has no access to those snapshots and discovers through the host.
     var remoteProjectManifestTasks: [String: Task<Void, Never>] = [:]
+    /// Last topology scheduled for publication. This is intentionally
+    /// separate from fleet/task telemetry: heartbeat and message updates run
+    /// through the same daemon sync funnel but must not create revisions.
+    var remoteProjectManifestSignatures: [String: String] = [:]
     /// Same single-flight need as the two above, one level down: a rewound
     /// stream can drop the same peer-owned agent pane twice before the first
     /// reattach has opened its replacement, and two reattaches would leave two
@@ -509,6 +525,29 @@ final class TeamOrchestrator: ObservableObject {
         )
         syncTeamStateToDaemon()
         return true
+    }
+
+    /// Atomically exchange a non-owner viewer after its replacement workspace
+    /// has attached every surface. Returns any window-detached old workspace
+    /// so the caller can close its local sessions after the commit.
+    func replaceAdoptedRemoteProject(
+        _ team: Team,
+        expectedWorkspaceID: UUID,
+        expectedRevision: UInt64
+    ) -> (replaced: Bool, detachedWorkspace: Workspace?) {
+        guard let current = teams[team.id],
+              !current.ownsRemotePresentation,
+              current.workspaceId == expectedWorkspaceID,
+              current.remotePresentationRevision == expectedRevision
+        else { return (false, nil) }
+        let detached = detachedProjectWorkspaces.removeValue(forKey: team.id)
+        teams[team.id] = team
+        TeamDataStore.shared.registerTeam(
+            team.id,
+            agents: team.agents.map { .init(name: $0.name, instanceId: $0.agentInstanceId) }
+        )
+        syncTeamStateToDaemon()
+        return (true, detached)
     }
 
     /// Publish the new local viewer for one existing peer agent.
@@ -6233,6 +6272,12 @@ final class TeamOrchestrator: ObservableObject {
         archive: Bool = true
     ) -> Bool {
         guard let team = teams[name] else { return false }
+        remoteProjectManifestTasks.removeValue(forKey: name)?.cancel()
+        remoteProjectManifestSignatures.removeValue(forKey: name)
+        let mayTerminateRemotePresentation =
+            Self.adoptedPresentationAllowsRemoteDestruction(
+                presentationOwnedByRequester: team.ownsRemotePresentation
+            )
         // A detached project still owns a live Workspace. Move it into the
         // caller's manager so the normal explicit teardown below closes every
         // panel/session instead of only deleting the team metadata.
@@ -6256,8 +6301,10 @@ final class TeamOrchestrator: ObservableObject {
         // is also the last moment anything knows the surface id — an agent
         // surface is in no workspace tree and in no `ManagedPeerSurfaceStore`,
         // so once the roster goes, no sweep and no `tm-agent gc` can find it.
-        for agent in team.agents where agent.remoteAgentSurface {
-            Self.releasePeerOwnedAgentSurface(agent)
+        if mayTerminateRemotePresentation {
+            for agent in team.agents where agent.remoteAgentSurface {
+                Self.releasePeerOwnedAgentSurface(agent)
+            }
         }
 
         // D3-A P2 (b): release any pending claude-sid watcher slots so
@@ -6285,22 +6332,27 @@ final class TeamOrchestrator: ObservableObject {
             return true
         }
 
-        // Send Ctrl-C to all agent panels
-        for agent in team.agents {
-            guard let pid = agent.panelId else { continue }
-            if let panel = workspace.terminalPanel(for: pid) {
-                panel.sendText("\u{03}")  // Ctrl-C
+        // A non-owner viewer is only detaching its local sessions. Sending
+        // terminal input here would terminate processes owned by the peer.
+        if mayTerminateRemotePresentation {
+            for agent in team.agents {
+                guard let pid = agent.panelId else { continue }
+                if let panel = workspace.terminalPanel(for: pid) {
+                    panel.sendText("\u{03}")  // Ctrl-C
+                }
             }
         }
 
         // Send exit after a delay, then close workspace and clean up worktrees
         let wsRef = workspace
         let teamCopy = team
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
-            for agent in teamCopy.agents {
-                guard let pid = agent.panelId else { continue }
-                if let panel = wsRef.terminalPanel(for: pid) {
-                    panel.sendText("exit\n")
+        if mayTerminateRemotePresentation {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+                for agent in teamCopy.agents {
+                    guard let pid = agent.panelId else { continue }
+                    if let panel = wsRef.terminalPanel(for: pid) {
+                        panel.sendText("exit\n")
+                    }
                 }
             }
         }
@@ -6688,6 +6740,14 @@ final class TeamOrchestrator: ObservableObject {
     ///   completes before the daemon is stopped. The normal destroy path
     ///   defaults to false so the UI doesn't block on disk I/O.
     private func archivePaneTeamIfApplicable(_ team: Team, synchronous: Bool = false) {
+        guard Self.shouldPersistProjectPresentationSnapshot(
+            presentationOwnedByRequester: team.ownsRemotePresentation
+        ) else {
+            #if DEBUG
+            dlog("[archive_pane] skip — non-owner presentation team=\(team.id)")
+            #endif
+            return
+        }
         // Skip headless teams — the daemon's `headless.destroy_team` already
         // writes their archive. Pane-mode agents always have a `panelId` (real
         // GUI pane); headless agents have `panelId == nil` (daemon subprocess).
@@ -6876,6 +6936,9 @@ final class TeamOrchestrator: ObservableObject {
             (Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String) ?? "unknown"
         let appSocketPath = SocketControlSettings.socketPath()
         for team in teams.values {
+            guard Self.shouldPersistProjectPresentationSnapshot(
+                presentationOwnedByRequester: team.ownsRemotePresentation
+            ) else { continue }
             // Mirror the archive skip rule: headless teams are persisted by
             // the daemon itself.
             let isHeadless = !team.agents.isEmpty && team.agents.allSatisfy { $0.panelId == nil }

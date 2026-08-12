@@ -295,22 +295,90 @@ extension TeamOrchestrator {
     /// state funnel runs. A viewer restart must learn this from the daemon;
     /// local UserDefaults/live snapshots are intentionally not part of the
     /// discovery contract.
-    func scheduleRemoteProjectManifestPublication() {
+    func scheduleRemoteProjectManifestPublication(forHostKey requestedHostKey: String? = nil) {
         for team in teams.values {
-            guard case .peer = team.leaderEndpoint,
+            guard case let .peer(hostKey) = team.leaderEndpoint,
+                  requestedHostKey == nil || requestedHostKey == hostKey,
                   team.ownsRemotePresentation
             else { continue }
+            let signature = Self.remoteProjectManifestSignature(team, hostKey: hostKey)
+            // Ordinary team syncs include high-frequency task/message state.
+            // Only topology changes schedule a new revision. A concrete host
+            // reconnect bypasses this guard because the daemon may have been
+            // replaced since the last successful publication.
+            if requestedHostKey == nil,
+               remoteProjectManifestSignatures[team.id] == signature {
+                continue
+            }
+            remoteProjectManifestSignatures[team.id] = signature
             remoteProjectManifestTasks[team.id]?.cancel()
             remoteProjectManifestTasks[team.id] = Task { @MainActor [weak self] in
-                try? await Task.sleep(nanoseconds: 250_000_000)
-                guard !Task.isCancelled, let self else { return }
-                await self.publishRemoteProjectManifest(teamName: team.id)
-                self.remoteProjectManifestTasks[team.id] = nil
+                for delay in Self.remoteProjectManifestRetryDelaysNanoseconds {
+                    try? await Task.sleep(nanoseconds: delay)
+                    guard !Task.isCancelled, let self else { return }
+                    if await self.publishRemoteProjectManifest(teamName: team.id) {
+                        return
+                    }
+                }
             }
         }
     }
 
-    private func publishRemoteProjectManifest(teamName: String) async {
+    static func remoteProjectManifestSignature(
+        _ team: Team,
+        hostKey: String
+    ) -> String {
+        let members = team.agents.map { agent in
+            [
+                agent.agentInstanceId,
+                agent.name,
+                agent.cli,
+                agent.model,
+                agent.agentType,
+                agent.color,
+                agent.originalAgentWorkDir ?? team.workingDirectory,
+                agent.remoteSurfaceID?.base64EncodedString() ?? "",
+                agent.remoteAgentSurface ? "agent" : "terminal",
+                agent.hostKey ?? "",
+            ].joined(separator: "\u{1f}")
+        }.joined(separator: "\u{1e}")
+        let leaderID = ManagedPeerSurfaceStore.shared.leaderRecord(
+            hostKey: hostKey,
+            teamName: team.id
+        )?.surfaceID?.base64EncodedString() ?? ""
+        return [
+            team.id,
+            team.teamUuid ?? "",
+            team.workingDirectory,
+            team.gitRepoRoot ?? "",
+            hostKey,
+            leaderID,
+            members,
+        ].joined(separator: "\u{1d}")
+    }
+
+    /// A project name is presentation copy, not identity. The team UUID is
+    /// generated once and retained across leader/app reconnects, so two
+    /// same-named projects on one daemon remain independent.
+    nonisolated static func remoteProjectPresentationID(teamUUID: String) -> String {
+        "team:\(teamUUID)"
+    }
+
+    /// Initial debounce plus bounded reconnect retries. A successful host
+    /// refresh also starts a fresh sequence, so recovery is not limited to
+    /// this window.
+    nonisolated static let remoteProjectManifestRetryDelaysNanoseconds: [UInt64] = [
+        250_000_000,
+        1_000_000_000,
+        2_000_000_000,
+        4_000_000_000,
+        8_000_000_000,
+    ]
+
+    /// Returns false only for a transient transport/persistence failure that
+    /// is worth retrying. Invalid or unsupported topology is terminal until a
+    /// later team mutation schedules a new publication.
+    private func publishRemoteProjectManifest(teamName: String) async -> Bool {
         guard let team = teams[teamName],
               let rawTeamUUID = team.teamUuid,
               !rawTeamUUID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
@@ -320,10 +388,23 @@ extension TeamOrchestrator {
                   teamName: teamName
               )?.surfaceID,
               !leaderSurfaceID.isEmpty,
-              let host = RemoteHostStore.shared.sortedHosts.first(where: { $0.id == hostKey }),
-              !host.activeSockPath.isEmpty
-        else { return }
+              let host = RemoteHostStore.shared.sortedHosts.first(where: { $0.id == hostKey })
+        else { return true }
+        guard host.isConnected, !host.activeSockPath.isEmpty else { return false }
         let teamUUID = rawTeamUUID
+
+        // v1 manifests live on the daemon that owns the leader and contain
+        // daemon-local surface ids. Publishing only the matching subset would
+        // make a multi-host team look complete while silently dropping its
+        // other members after a viewer restart. Until the wire carries a
+        // per-member endpoint, decline the whole manifest instead.
+        guard Self.remoteManifestCoversEveryAgent(team.agents, hostKey: hostKey) else {
+            RemoteWorkLog.info(
+                "Could not persist project \(team.id) on \(host.displayName): "
+                    + "project.presentation.v1 requires every agent on the leader host"
+            )
+            return true
+        }
 
         var project = Termmesh_Peer_V1_Team()
         project.name = team.id
@@ -333,12 +414,9 @@ extension TeamOrchestrator {
         project.agentNames = team.agents.map(\.name)
         project.createdAtUnixSecs = UInt64(max(0, team.createdAt.timeIntervalSince1970))
         project.leaderSurfaceID = leaderSurfaceID
-        project.projectID = "name:\(team.id)"
+        project.projectID = Self.remoteProjectPresentationID(teamUUID: teamUUID)
         project.members = team.agents.compactMap { agent in
-            guard agent.hostKey == hostKey,
-                  let surfaceID = agent.remoteSurfaceID,
-                  !surfaceID.isEmpty
-            else { return nil }
+            guard let surfaceID = agent.remoteSurfaceID else { return nil }
             var member = Termmesh_Peer_V1_TeamMember()
             member.name = agent.name
             member.agentInstanceID = agent.agentInstanceId
@@ -354,10 +432,10 @@ extension TeamOrchestrator {
 
         guard let connection = try? await PeerRelaySession.connect(
             hostSockPath: host.activeSockPath
-        ) else { return }
+        ) else { return false }
         guard connection.hostCapabilities.has(PeerCapability.projectPresentationV1) else {
             await connection.cancel()
-            return
+            return true
         }
         do {
             let response = try await connection.session.upsertProjectPresentation(project)
@@ -368,12 +446,108 @@ extension TeamOrchestrator {
                         + response.errorCode
                 )
             }
+            return response.ok
+                || !Self.remoteProjectManifestShouldRetry(errorCode: response.errorCode)
         } catch {
             await connection.cancel()
             RemoteWorkLog.info(
                 "Could not persist project \(team.id) on \(host.displayName): \(error)"
             )
+            return false
         }
+    }
+
+    static func remoteManifestCoversEveryAgent(
+        _ agents: [AgentMember],
+        hostKey: String
+    ) -> Bool {
+        agents.allSatisfy { agent in
+            agent.hostKey == hostKey
+                && agent.remoteSurfaceID?.isEmpty == false
+        }
+    }
+
+    /// Surface restoration can lag behind tunnel reconnection. These errors
+    /// describe an otherwise valid topology that may become publishable during
+    /// the bounded retry window; ownership/validation failures are terminal.
+    nonisolated static func remoteProjectManifestShouldRetry(errorCode: String) -> Bool {
+        [
+            "persistence_failed",
+            "leader_surface_missing",
+            "member_surface_missing",
+            "member_surface_mismatch",
+        ].contains(errorCode)
+    }
+
+    static func adoptedAgentOwnsRemoteCleanup(
+        presentationOwnedByRequester: Bool,
+        surfaceType: String
+    ) -> Bool {
+        presentationOwnedByRequester
+            && SessionHostPanes.isAgentSurfaceType(surfaceType)
+    }
+
+    static func adoptedPresentationAllowsRemoteDestruction(
+        presentationOwnedByRequester: Bool
+    ) -> Bool {
+        presentationOwnedByRequester
+    }
+
+    /// A viewer must rediscover the project from the peer daemon after an app
+    /// restart. Persisting its local attachment as an owner-restorable pane
+    /// snapshot would lose the ownership bit and could later let that viewer
+    /// destroy the peer-owned leader.
+    nonisolated static func shouldPersistProjectPresentationSnapshot(
+        presentationOwnedByRequester: Bool
+    ) -> Bool {
+        presentationOwnedByRequester
+    }
+
+    static func remotePresentationCanAttach(
+        leaderSurfaceID: Data,
+        isConnected: Bool,
+        activeSockPath: String
+    ) -> Bool {
+        !leaderSurfaceID.isEmpty
+            && isConnected
+            && !activeSockPath.isEmpty
+    }
+
+    nonisolated static func shouldOfferRemoteManifest(
+        hasLocalTeam: Bool,
+        localPresentationOwnedByRequester: Bool,
+        localRevision: UInt64,
+        remoteRevision: UInt64
+    ) -> Bool {
+        !hasLocalTeam
+            || (!localPresentationOwnedByRequester && remoteRevision > localRevision)
+    }
+
+    nonisolated static func remotePresentationIdentityMatches(
+        localHostKey: String?,
+        localProjectID: String?,
+        remoteHostKey: String,
+        remoteProjectID: String
+    ) -> Bool {
+        localHostKey == remoteHostKey && localProjectID == remoteProjectID
+    }
+
+    private static func remotePresentationIdentityMatches(
+        team: Team,
+        remote: RemoteTeamSummary,
+        hostKey: String
+    ) -> Bool {
+        let localHostKey = team.remotePresentationHostKey ?? {
+            if case let .peer(key) = team.leaderEndpoint { return key }
+            return nil
+        }()
+        let localProjectID = team.remotePresentationProjectID ?? "name:\(team.id)"
+        return remotePresentationIdentityMatches(
+            localHostKey: localHostKey,
+            localProjectID: localProjectID,
+            remoteHostKey: hostKey,
+            remoteProjectID: remote.projectID
+        )
     }
 
     /// Adopt a daemon-owned project discovered on a host into this window.
@@ -385,14 +559,39 @@ extension TeamOrchestrator {
         host: HostEntry,
         tabManager: TabManager
     ) async -> Bool {
-        if teams[remote.name] != nil {
+        let namedTeam = teams[remote.name]
+        let matchingTeam = namedTeam.flatMap {
+            Self.remotePresentationIdentityMatches(
+                team: $0,
+                remote: remote,
+                hostKey: host.id
+            ) ? $0 : nil
+        }
+        // The app's runtime team namespace is name-keyed. A same-name project
+        // on another host remains discoverable, but must never replace or
+        // restore this unrelated team.
+        guard namedTeam == nil || matchingTeam != nil else { return false }
+        if let existing = matchingTeam,
+           existing.ownsRemotePresentation
+            || remote.presentationRevision <= existing.remotePresentationRevision {
             return await restoreDetachedProjectPresentation(
                 teamName: remote.name,
                 tabManager: tabManager
             )
         }
-        guard !remote.leaderSurfaceID.isEmpty,
-              host.isLaunchable
+        guard !projectRestoreInFlight.contains(remote.name) else { return false }
+        projectRestoreInFlight.insert(remote.name)
+        defer { projectRestoreInFlight.remove(remote.name) }
+
+        // Keep an existing viewer intact until every replacement surface has
+        // attached. The final team swap is synchronous on MainActor, after
+        // which only the obsolete local workspace is closed.
+        let updateTarget = matchingTeam
+        guard Self.remotePresentationCanAttach(
+            leaderSurfaceID: remote.leaderSurfaceID,
+            isConnected: host.isConnected,
+            activeSockPath: host.activeSockPath
+        )
         else { return false }
 
         let workspace = tabManager.addWorkspace(
@@ -412,13 +611,15 @@ extension TeamOrchestrator {
             tabManager.closeWorkspace(workspace)
             return false
         }
-        ManagedPeerSurfaceStore.shared.remember(
-            hostKey: host.id,
-            surfaceID: remote.leaderSurfaceID,
-            teamName: remote.name,
-            role: "leader",
-            workingDirectory: remote.workingDirectory
-        )
+        if remote.presentationOwnedByRequester {
+            ManagedPeerSurfaceStore.shared.remember(
+                hostKey: host.id,
+                surfaceID: remote.leaderSurfaceID,
+                teamName: remote.name,
+                role: "leader",
+                workingDirectory: remote.workingDirectory
+            )
+        }
 
         var members: [AgentMember] = []
         for descriptor in remote.members {
@@ -440,10 +641,12 @@ extension TeamOrchestrator {
                     )
                 }
             ) else {
-                ManagedPeerSurfaceStore.shared.forget(
-                    hostKey: host.id,
-                    surfaceID: remote.leaderSurfaceID
-                )
+                if remote.presentationOwnedByRequester {
+                    ManagedPeerSurfaceStore.shared.forget(
+                        hostKey: host.id,
+                        surfaceID: remote.leaderSurfaceID
+                    )
+                }
                 tabManager.closeWorkspace(workspace)
                 return false
             }
@@ -462,7 +665,10 @@ extension TeamOrchestrator {
                 panelId: panelID,
                 createdAt: Date(),
                 remoteSurfaceID: descriptor.surfaceID,
-                remoteSurfaceSpawned: false,
+                remoteSurfaceSpawned: Self.adoptedAgentOwnsRemoteCleanup(
+                    presentationOwnedByRequester: remote.presentationOwnedByRequester,
+                    surfaceType: descriptor.surfaceType
+                ),
                 remoteAgentSurface: descriptor.surfaceType == "agent",
                 hostKey: host.id,
                 originalAgentWorkDir: descriptor.workingDirectory
@@ -484,15 +690,51 @@ extension TeamOrchestrator {
             gitRepoRoot: remote.projectRootPath,
             worktreeMode: "off",
             teamUuid: remote.teamUUID,
-            ownsRemotePresentation: remote.presentationOwnedByRequester
+            ownsRemotePresentation: remote.presentationOwnedByRequester,
+            remotePresentationRevision: remote.presentationRevision,
+            remotePresentationProjectID: remote.projectID,
+            remotePresentationHostKey: host.id,
+            remoteLeaderSurfaceID: remote.leaderSurfaceID
         )
-        guard installAdoptedRemoteProject(team) else {
-            ManagedPeerSurfaceStore.shared.forget(
-                hostKey: host.id,
-                surfaceID: remote.leaderSurfaceID
+        if let updateTarget {
+            let oldTabManager = AppDelegate.shared?.tabManagerFor(
+                tabId: updateTarget.workspaceId
             )
-            tabManager.closeWorkspace(workspace)
-            return false
+            let replacement = replaceAdoptedRemoteProject(
+                team,
+                expectedWorkspaceID: updateTarget.workspaceId,
+                expectedRevision: updateTarget.remotePresentationRevision
+            )
+            guard replacement.replaced else {
+                if remote.presentationOwnedByRequester {
+                    ManagedPeerSurfaceStore.shared.forget(
+                        hostKey: host.id,
+                        surfaceID: remote.leaderSurfaceID
+                    )
+                }
+                tabManager.closeWorkspace(workspace)
+                return false
+            }
+            if let oldTabManager,
+               let oldWorkspace = oldTabManager.tabs.first(where: {
+                   $0.id == updateTarget.workspaceId
+               }) {
+                oldTabManager.closeTab(oldWorkspace)
+            } else if let detached = replacement.detachedWorkspace {
+                tabManager.attachWorkspace(detached, select: false)
+                tabManager.closeTab(detached)
+            }
+        } else {
+            guard installAdoptedRemoteProject(team) else {
+                if remote.presentationOwnedByRequester {
+                    ManagedPeerSurfaceStore.shared.forget(
+                        hostKey: host.id,
+                        surfaceID: remote.leaderSurfaceID
+                    )
+                }
+                tabManager.closeWorkspace(workspace)
+                return false
+            }
         }
         WorkspaceProjectNames.shared.declare(
             workspaceId: workspace.id,
@@ -1490,6 +1732,10 @@ extension TeamOrchestrator {
         )
         for team in teams.values {
             guard team.leaderEndpoint == .peer(hostKey: hostKey) else { continue }
+            if let surfaceID = team.remoteLeaderSurfaceID {
+                result.insert(surfaceID)
+                continue
+            }
             if let record = ManagedPeerSurfaceStore.shared.leaderRecord(
                 hostKey: hostKey,
                 teamName: team.id
@@ -2397,10 +2643,11 @@ extension TeamOrchestrator {
 
         if progress.leaderPanelID == nil,
            case let .peer(leaderHostKey) = original.leaderEndpoint,
-           let leaderSurfaceID = ManagedPeerSurfaceStore.shared.leaderRecord(
-               hostKey: leaderHostKey,
-               teamName: teamName
-           )?.surfaceID,
+           let leaderSurfaceID = original.remoteLeaderSurfaceID
+               ?? ManagedPeerSurfaceStore.shared.leaderRecord(
+                   hostKey: leaderHostKey,
+                   teamName: teamName
+               )?.surfaceID,
            let panelID = await attachRestoredRemoteSurface(
                hostKey: leaderHostKey,
                surfaceID: leaderSurfaceID,
@@ -2591,6 +2838,9 @@ extension TeamOrchestrator {
     func closeRemoteLeaderSurfaceIfNeeded(teamName: String) {
         stopRemoteLeaderGrantKeepalive(teamName: teamName, revoke: true)
         guard let team = teams[teamName],
+              Self.adoptedPresentationAllowsRemoteDestruction(
+                  presentationOwnedByRequester: team.ownsRemotePresentation
+              ),
               case let .peer(hostKey) = team.leaderEndpoint,
               let record = ManagedPeerSurfaceStore.shared.leaderRecord(
                   hostKey: hostKey,
@@ -5709,6 +5959,13 @@ extension TeamOrchestrator {
         guard let team = teams[teamName] else {
             throw RemoteAgentError.teamNotFound(teamName)
         }
+        // A discovered presentation is a local viewer, not an ownership
+        // grant. Its destructive action is therefore a detach: close only
+        // this app's sessions and leave the daemon-owned surfaces and files.
+        guard team.ownsRemotePresentation else {
+            _ = destroyTeam(name: teamName, tabManager: tabManager, archive: false)
+            return
+        }
         // Before anything is read, let alone removed. A leader attach that is
         // still in flight commits by writing a surface record and a checkout;
         // if it does that after the snapshot below, deletion has already
@@ -6014,6 +6271,37 @@ extension TeamOrchestrator {
             // next attempt.
             RemoteWorkLog.info("Could not delete \(teamName): \(report)")
             throw RemoteAgentError.projectDeletionIncomplete(report)
+        }
+        if case let .peer(hostKey) = team.leaderEndpoint,
+           let teamUUID = team.teamUuid,
+           !teamUUID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            guard let host = RemoteHostStore.shared.sortedHosts.first(where: { $0.id == hostKey }),
+                  !host.activeSockPath.isEmpty
+            else {
+                throw RemoteAgentError.projectDeletionIncomplete(
+                    "manifest \(hostKey): host not connected"
+                )
+            }
+            let connection = try await PeerRelaySession.connect(hostSockPath: host.activeSockPath)
+            do {
+                let response: Termmesh_Peer_V1_UpsertProjectPresentationResponse?
+                if connection.hostCapabilities.has(PeerCapability.projectPresentationV1) {
+                    response = try await connection.session.deleteProjectPresentation(
+                        projectID: Self.remoteProjectPresentationID(teamUUID: teamUUID)
+                    )
+                } else {
+                    response = nil
+                }
+                await connection.cancel()
+                guard response?.ok != false else {
+                    throw RemoteAgentError.projectDeletionIncomplete(
+                        "manifest \(hostKey): \(response?.errorCode ?? "unknown")"
+                    )
+                }
+            } catch {
+                await connection.cancel()
+                throw error
+            }
         }
         _ = destroyTeam(name: teamName, tabManager: tabManager, archive: false)
     }
